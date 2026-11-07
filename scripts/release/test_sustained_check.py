@@ -1939,3 +1939,157 @@ class DayRecord(unittest.TestCase):
                 self.assertEqual(code, 1)
                 self.assertNotIn("**Day tier: clean.**", text)
 
+
+
+def smaps(mappings):
+    """A /proc/PID/smaps from (start, end, perms, name, rss_kb) tuples."""
+    lines = []
+    for start, end, perms, name, rss in mappings:
+        size = (int(end, 16) - int(start, 16)) // 1024
+        lines.append(f"{start}-{end} {perms} 00000000 00:00 0 {name}".rstrip())
+        lines += [f"Size:           {size:>8} kB", "KernelPageSize:        4 kB", f"Rss:            {rss:>8} kB",
+                  f"Pss:            {rss:>8} kB", f"Anonymous:      {0 if name.startswith('/') else rss:>8} kB",
+                  "VmFlags: rd wr mr mw me ac sd"]
+    return "\n".join(lines) + "\n"
+
+
+def bun_mappings(heap=5000, arena=20000, other=8000):
+    """Bun's mappings, by the classes bun-memory.awk tells apart."""
+    return [
+        ("555555554000", "555555560000", "r--p", "/usr/local/bin/bun", 40),               # file
+        ("555555600000", "555556000000", "rw-p", "[heap]", heap),                           # main arena
+        ("7f0000000000", "7f0002000000", "rw-p", "", arena),                                # arena heap, in use
+        ("7f0002000000", "7f0004000000", "---p", "", 0),                                    # ... and its reserve
+        ("7f0004000000", "7f0008000000", "rw-p", "", 30000),                                # a full 64 MiB arena heap
+        ("7f1000000000", "7f1000001000", "---p", "", 0),                                    # guard page
+        ("7f1000001000", "7f1000801000", "rw-p", "", 300),                                  # thread stack
+        ("7f2000000000", "7f2000400000", "rw-p", "", other),                                # aligned, no reserve: other
+        ("7f2000400000", "7f2000500000", "r-xp", "/usr/lib/aarch64-linux-gnu/libc.so.6", 900),  # file
+        ("7f3000000000", "7f3000100000", "rw-p", "", 50),                                   # after a file: other
+        ("7f5000000000", "7f5003ff0000", "rw-p", "", 100),                                  # arena heap
+        ("7f5003ff0000", "7f5004000000", "---p", "", 0),                                    # 64 KiB reserve, not a guard
+        ("7f5004000000", "7f5004100000", "rw-p", "", 70),                                   # so this is other
+        ("7ffd00000000", "7ffd00021000", "rw-p", "[stack]", 132),                           # main thread stack
+        ("ffffffffff600000", "ffffffffff601000", "--xp", "[vsyscall]", 0),
+    ]
+
+
+class BunMemory(Evidence):
+    """#1417: Bun's RSS grew in the day runs, but the record couldn't say
+    what grew. Each inventory classifies Bun's smaps; memory.jsonl keeps
+    every sample and the record tables them hourly."""
+
+    awk = Path(__file__).parent / "sustained" / "bun-memory.awk"
+
+    def breakdown(self, mappings, threads=41):
+        import subprocess
+        with tempfile.TemporaryDirectory() as folder:
+            proc = Path(folder) / "100"
+            proc.mkdir()
+            (proc / "status").write_text(f"Name:\tbun\nVmRSS:\t 70000 kB\nThreads:\t{threads}\n")
+            (proc / "smaps_rollup").write_text(
+                "55555554000-ffffffffff601000 ---p 00000000 00:00 0 [rollup]\nRss:              69000 kB\n"
+                "Anonymous:        65000 kB\nPrivate_Dirty:    64000 kB\nSwap:                 12 kB\n")
+            (proc / "smaps").write_text(smaps(mappings))
+            return subprocess.run(["awk", "-f", str(self.awk), str(proc / "status"), str(proc / "smaps_rollup"),
+                                   str(proc / "smaps")], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                  check=True, timeout=30).stdout
+
+    def test_the_awk_program_classifies_heap_arenas_stacks_other_and_file_memory(self):
+        values = checker.parse_inventory(self.breakdown(bun_mappings()))
+        number = lambda kind: checker.inventory_number(values, kind)
+        self.assertEqual((number("bun_mem_rss_kb"), number("bun_mem_anonymous_kb"), number("bun_mem_private_dirty_kb"),
+                          number("bun_mem_swap_kb"), number("bun_mem_threads")), (69000, 65000, 64000, 12, 41))
+        self.assertEqual(number("bun_mem_heap_kb"), 5000)
+        self.assertEqual((number("bun_mem_arena_kb"), number("bun_mem_arenas")), (50100, 3))
+        self.assertEqual((number("bun_mem_stack_kb"), number("bun_mem_stacks")), (432, 2))
+        self.assertEqual(number("bun_mem_other_anon_kb"), 8120)
+        self.assertEqual(number("bun_mem_file_kb"), 940)
+        self.assertEqual(values["bun_mem_top"], ["7f0004000000 30000 arena", "7f0000000000 20000 arena",
+                                                 "7f2000000000 8000 other", "555555600000 5000 heap",
+                                                 "7f1000001000 300 stack"])
+
+    def test_glibc_named_mappings_are_classified_by_name(self):
+        values = checker.parse_inventory(self.breakdown([
+            ("7f6000100000", "7f6000200000", "rw-p", "[anon: glibc: malloc arena]", 700),
+            ("7f6000200000", "7f6000300000", "rw-p", "[anon: glibc: pthread stack: 1234]", 60)]))
+        self.assertEqual(checker.inventory_number(values, "bun_mem_arena_kb"), 700)
+        self.assertEqual(checker.inventory_number(values, "bun_mem_stack_kb"), 60)
+
+    def test_the_guest_report_ships_the_awk_program_intact(self):
+        # The report runs over `bash -s` in the guest; the program travels
+        # inside it, quoted, and must reach awk byte for byte.
+        import subprocess
+        release = Path(__file__).parent
+        script = (release / "qualify-sustained.sh").read_text()
+        function = script[script.index("guest_report() {"):]
+        function = function[:function.index("\n}\n") + 3]
+        report = subprocess.run(["bash", "-c", f"bun_memory_awk={self.awk} export_retention=/dev/null\n"
+                                 + function + "guest_report"], stdout=subprocess.PIPE, text=True, check=True).stdout
+        subprocess.run(["bash", "-n"], input=report, text=True, check=True)
+        self.assertIn('awk "$bun_memory_awk" /proc/"$pid"/status /proc/"$pid"/smaps_rollup /proc/"$pid"/smaps', report)
+        prelude = report[:report.index("section() {")]
+        shipped = subprocess.run(["bash", "-c", prelude + 'printf %s "$bun_memory_awk"'], stdout=subprocess.PIPE,
+                                 text=True, check=True).stdout
+        self.assertEqual(shipped, self.awk.read_text().rstrip("\n"))
+
+    def run_hours(self, hours, node="rb-a-1", **grow):
+        """Evaluate one heavy snapshot every 20 minutes for HOURS hours, each
+        kind's RSS from grow[kind](hour)."""
+        for step in range(hours * 3 + 1):
+            hour = step / 3
+            mappings = bun_mappings(**{kind: int(curve(hour)) for kind, curve in grow.items()})
+            inventory = INVENTORY + self.breakdown(mappings)
+            self.evaluate(self.snapshot(ts=NOW + step * 1200, **{f"inventory__{node.replace('-', '__')}_txt": inventory}))
+
+    def test_every_sample_appends_one_row_per_node(self):
+        self.run_hours(1)
+        rows = [json.loads(line) for line in (self.evidence / "memory.jsonl").read_text().splitlines()]
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(rows[0]["node"], "rb-a-1")
+        self.assertEqual(rows[0]["pid"], 100)
+        self.assertEqual((rows[0]["heap_kb"], rows[0]["arena_kb"], rows[0]["arenas"], rows[0]["threads"]), (5000, 50100, 3, 41))
+        self.assertEqual(rows[0]["top"][0], ["7f0004000000", 30000, "arena"])
+        self.assertEqual(rows[-1]["ts"], NOW + 3600)
+        # The trends the leak checks and the record already use are kept.
+        self.assertEqual(checker.load_state(self.evidence)["trends"]["rb-a-1"]["rss_kb"]["first"], 300000)
+
+    def test_an_inventory_without_a_breakdown_appends_nothing(self):
+        self.evaluate(self.snapshot(**{"inventory__rb__a__1_txt": INVENTORY}))
+        self.assertFalse((self.evidence / "memory.jsonl").exists())
+
+    def test_arenas_that_plateau_after_the_first_hour_are_not_what_grew(self):
+        # The arenas fill in the first hour, then stop; a little other
+        # anonymous memory keeps coming.
+        self.run_hours(6, arena=lambda hour: 10000 + 50000 * min(hour, 1), other=lambda hour: 8000 + 512 * hour)
+        lines = checker.bun_memory.section(self.evidence)
+        self.assertIn("**other anonymous** grew most after the first hour: +2.5 MiB over 5:00 h:mm", "\n".join(lines))
+        table = [line for line in lines if line.startswith("| ") and not line.startswith("| Time")]
+        self.assertEqual([line.split(" | ")[0] for line in table], ["| 0:00", "| 1:00", "| 2:00", "| 3:00", "| 4:00", "| 5:00", "| 6:00"])
+        self.assertEqual(table[1], "| 1:00 | 100 | 67.4 | 4.9 | 88.0 (3) | 0.4 | 8.4 | 0.9 | 41 |")
+        self.assertEqual(table[6].split(" | ")[4], "88.0 (3)")
+
+    def test_a_heap_that_grows_every_hour_is_named(self):
+        self.run_hours(4, heap=lambda hour: 5000 + 10240 * hour)
+        text = "\n".join(checker.bun_memory.section(self.evidence))
+        self.assertIn("- rb-a-1: **heap** grew most after the first hour: +30.0 MiB over 3:00 h:mm", text)
+        self.assertIn("arenas +0.0", text)
+
+    def test_the_first_hour_of_a_restarted_bun_is_not_enough_to_judge(self):
+        self.run_hours(2, heap=lambda hour: 5000 + 10240 * hour)
+        self.evaluate(self.snapshot(ts=NOW + 3 * 3600, **{"inventory__rb__a__1_txt": INVENTORY.replace("bun_pid 100", "bun_pid 200")
+                                                           + self.breakdown(bun_mappings())}))
+        text = "\n".join(checker.bun_memory.section(self.evidence))
+        self.assertIn("- rb-a-1: not enough data: the last Bun process (pid 200) has no samples after its first hour.", text)
+        self.assertIn("| 3:00 | 200 |", text)
+
+    def test_the_record_carries_the_breakdown(self):
+        self.run_hours(2, heap=lambda hour: 5000 + 10240 * hour)
+        (self.evidence / "metadata.json").write_text(json.dumps({
+            "schedule": "none", "started_at": NOW, "finished_at": NOW + 7200, "cycles": 0}))
+        record = self.evidence / "record.md"
+        checker.render(self.evidence, record)
+        text = record.read_text()
+        self.assertIn("## Bun memory by kind", text)
+        self.assertIn("### rb-a-1", text)
+        self.assertLess(text.index("## Resource trends"), text.index("## Bun memory by kind"))

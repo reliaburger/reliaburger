@@ -23,7 +23,7 @@ run it.
 | Dependency audit | No new RustSec advisory; every exception is dated | [`security.yml`](../.github/workflows/security.yml), [exceptions](qualification/2026-09-18-dependency-exceptions.md) ([12 Oct](qualification/2026-10-12-dependency-exceptions.md), [21 Oct](qualification/2026-10-21-dependency-exceptions.md), [24 Oct](qualification/2026-10-24-dependency-exceptions.md), [25 Oct](qualification/2026-10-25-dependency-exceptions.md), [26 Oct](qualification/2026-10-26-dependency-exceptions.md), [28 Oct](qualification/2026-10-28-dependency-exceptions.md) and [6 Nov](qualification/2026-11-06-dependency-exceptions.md) reviews) | `make audit` |
 | Dependency lag | Nothing: a report, never a failure. It lists what `cargo update` would move and every crate a major version behind, for the refresh at the start of each minor release ([`releasing.md`](releasing.md#refreshing-dependencies)); [Dependabot](../.github/dependabot.yml) opens the weekly compatible refresh | [`security.yml`](../.github/workflows/security.yml) prints it in the weekly job summary | `make outdated` |
 | CI scripts | Job selection, ignored-test owners, JUnit keeping, the benchmark baseline and the flakes register, against fixture repositories and the real workflow | [`scripts/ci/test_*.py`](../scripts/ci) | `make test-ci-scripts` |
-| Agent gym, without a cluster | Every scenario parses, each plant still applies to the checkout, the scorer's verdicts over recorded transcripts (right, partly right, wrong, steered, out of scope), and the runner end to end with a fake cluster and a `relish` answering from calls recorded on a real one ([below](#an-agent-gym)) | [`scripts/gym/test_*.py`](../scripts/gym) | `make test-ci-scripts` |
+| Agent gym, without a cluster | Every scenario parses, each plant still applies to the checkout, the scorer's verdicts over recorded transcripts (right, partly right, wrong, steered, out of scope), the runner end to end with a fake cluster and a `relish` answering from calls recorded on a real one, and the Kubernetes ports against a rendered lab and fake `kubectl`, `claude`, `kubectl-ai` and `holmes` ([below](#an-agent-gym)) | [`scripts/gym/test_*.py`](../scripts/gym) | `make test-ci-scripts` |
 | Flakes register | Every open row of [`flakes.md`](flakes.md) links an issue that is still open | [`flakes_register.py`](../scripts/ci/flakes_register.py), run by [`flakes.yml`](../.github/workflows/flakes.yml) nightly and on pull requests that edit the register | `python3 scripts/ci/flakes_register.py check` (needs `gh`) |
 | Ignored-test owners | Every `#[ignore]` reason names who runs it ([below](#who-runs-an-ignored-test)) | [`ignored_owners.py`](../scripts/ci/ignored_owners.py) | `make check-ignored` |
 
@@ -73,6 +73,35 @@ run or on a pre-build whose features differ. The other gated targets build
 nothing before nextest: in CI the cluster and acceptance suites run from the
 `build tests` job's nextest archive, and the `qualify-*.sh` scripts already
 build with `cargo test --no-run`.
+
+### The development container
+
+[`.devcontainer/`](../.devcontainer) is a ready environment for the portable
+set ([#1584](https://github.com/reliaburger/reliaburger/issues/1584)): open the
+repository in VS Code's Dev Containers, a Codespace or anything else that
+reads the [Dev Container spec](https://containers.dev/), and `make ci` runs
+with nothing else to install. It's Ubuntu 24.04, as CI's runners are, with
+the Rust CI pins (`RUST_VERSION` in the
+[Dockerfile](../.devcontainer/Dockerfile)), the nextest
+`.config/nextest.toml` pins, the C compiler and static libc `build.rs` needs,
+clang, LLVM and libbpf for `make lint`'s all-features build, Python 3.12 and
+cargo-mutants. It works as the image's own user, `ubuntu`, not root: some
+portable tests check file permissions, which root ignores. Give it 4 CPUs and
+16 GB; the target directory alone grows past 30 GB.
+
+[`copilot-setup-steps.yml`](../.github/workflows/copilot-setup-steps.yml) does
+the same for GitHub's Copilot coding agent, which runs the job of that name
+before it starts work, and builds the suite so the agent's first test run is
+warm.
+
+Only the portable suite runs in either. The gated targets (`make
+test-linux`, `make test-cluster`, `make test-upgrade`, `make test-apple` and
+the rest) need root, runc, network namespaces, a kernel that loads eBPF or a
+Mac, so "`make ci` passed in the devcontainer" means the portable set passed,
+nothing more. Say so in a pull request.
+[`toolchain_pins.rs`](../tests/suite/toolchain_pins.rs) fails when the
+Dockerfile's Rust, nextest or packages, the mutants job's or the Copilot
+job's drift from what `ci.yml` installs.
 
 ### Doc snippets
 
@@ -670,6 +699,92 @@ Applying needs a `projects/reliaburger/` directory in the OSS-Fuzz repository
 (a `project.yaml`, a Dockerfile and a `build.sh` that runs `cargo fuzz build -O`),
 once the targets have run clean nightly for a while.
 
+## Mutation testing
+
+Coverage says a line ran. It doesn't say a test would notice if the line were
+wrong. [cargo-mutants](https://mutants.rs/) checks that: it makes one small
+change at a time (a `>` becomes `>=`, a function returns
+`Default::default()`, a match guard becomes `true`), runs the tests, and
+reports each change that no test fails on as *missed*
+([#1584](https://github.com/reliaburger/reliaburger/issues/1584)). A missed
+mutant is a missing test, with the exact line and the exact wrong behaviour
+already written down, which makes it the most self-checking first
+contribution there is: the new test is right when the mutant stops being
+missed.
+
+[`mutants.yml`](../.github/workflows/mutants.yml) runs it, on Linux only and
+in its own workflow, so it's never on a pull request's critical path: the
+evidence gate doesn't wait for it, and a missed mutant doesn't turn the check
+red. Only a broken run (the unmutated tree failing its tests, say) does. It
+runs on pull requests into the branches `ci.yml` does, so a pull request into
+a release's merge train gets it as one into `main` does; the merge queue and
+the push to the train don't run it, since it was never a required check.
+
+| Run | What it mutates | At most | Test budget |
+|---|---|---|---|
+| A pull request into `main` or a release's merge train (`release-*`) that touches `src/` | The lines it changes ([`--in-diff`](https://mutants.rs/in-diff.html)) | 12 mutants | 60 minutes, in a 75-minute job |
+| A pull request that changes only the mutants set-up | `src/file_lock.rs`, as a check that the job still works | 12 | the same |
+| Sundays at 04:23 UTC | What landed on `main` in the last seven days | 60 | 300 minutes, in a 330-minute job |
+| By hand (`workflow_dispatch`) | A glob of files, or the last seven days | as asked (12 by default) | 300 minutes |
+
+Each mutant rebuilds the crate, so the budget is a count and a clock. Over
+the count, the job tests one round-robin shard (`--shard 0/K --sharding
+round-robin`), which spreads the sample over every file the change touches.
+The clock is `timeout`: when the test step's budget runs out it stops
+cargo-mutants, keeps every result so far (cargo-mutants appends each one to
+`mutants.out` as it finishes) and says in the summary how many went
+untested, so a slow run still reports and stays green.
+
+The first CI run ([run
+42213963003](https://github.com/reliaburger/reliaburger/actions/runs/42213963003),
+6 November 2026, this set-up's own pull request, a cold cache) shows where
+the time goes: 40 s of set-up, a 13.5-minute baseline build (807 s), then 442
+to 456 s of build and 3 s of tests for each mutant. Seven and a half minutes a
+mutant was a full rebuild every time: `Swatinem/rust-cache` sets
+`CARGO_INCREMENTAL=0`, so the test step turns incremental compilation back on.
+That run had the old budget (20 mutants, no clock) and hit the job's
+90-minute limit with no summary; it found two missed mutants in
+`FileLock::remove` before it did. The first local trial (the Mac Studio at a
+load average of about 40) took 194 s for its one buildable mutant and 5 s to
+test it; two others failed to compile (*unviable*) within 75 s. A pull
+request that touches `src/` therefore costs up to 75 Linux runner-minutes,
+and usually far less with a warm cache and a short diff; one that doesn't
+touch it costs nothing. The sizing is in
+[`mutants_plan.py`](../scripts/ci/mutants_plan.py) and its tests in
+[`test_mutants_plan.py`](../scripts/ci/test_mutants_plan.py).
+
+To keep each mutant's test short, the job runs only the library's unit tests
+(`--lib`) of the top-level modules the mutants are in: a mutant in
+`src/council/network.rs` runs `council::`'s tests, not the whole suite. That's
+where a unit test for that line belongs, but it means a mutant only an
+integration test in `tests/` would catch shows as missed. Check `tests/`
+before filing one. [`.cargo/mutants.toml`](../.cargo/mutants.toml) holds the
+settings every run shares: nextest as the test tool, and `src/testkit/`,
+`src/fuzz/` and `src/bin/` left alone, since the first two exist only for
+tests and only process-level suites reach the third.
+
+There's no whole-crate run. `cargo mutants --list` finds about 27,000
+mutants, which at a few minutes each is over a thousand runner-hours. The
+weekly run covers the new code instead, which is where a missing test is most
+likely and cheapest to add.
+
+**Missed mutants become issues by hand.** The job summary lists each missed
+mutant with a link that opens a new issue, labelled `missed-mutant`, with
+the mutant, a permalink to its line and the command that checks a fix. A
+person reads it and files it; the job never posts to GitHub, so a noisy run
+can't bury the tracker. To work one:
+
+```sh
+cargo mutants --file src/onion/dns.rs --re 'replace > with >= in decode_query'
+```
+
+reproduces it locally (the devcontainer has cargo-mutants), running the
+whole portable suite against it. Write the test and run the command again:
+the mutant should now be `caught`. Without `--in-place`, cargo-mutants works
+on a copy of the tree, so a local run never leaves your checkout mutated. CI
+passes `--in-place` because its checkout is thrown away anyway, and it reuses
+the cached target directory.
+
 ## Inside a live cluster
 
 Relish carries its own test runner, so you can check a real cluster (yours)
@@ -801,6 +916,35 @@ the wrapper with a fake `claude`
 ([`fixtures/fake_claude.py`](../scripts/gym/fixtures/fake_claude.py)). Each
 session costs real API spend; the record is
 [`qualification/2026-11-06-v0.2.7-exit-test.md`](qualification/2026-11-06-v0.2.7-exit-test.md).
+
+### Against Kubernetes
+
+The comparison in [#1679](https://github.com/reliaburger/reliaburger/issues/1679)
+runs the same agent on Kubernetes. Five scenarios have a port in
+[`scripts/gym/scenarios/k8s/`](../scripts/gym/scenarios/k8s) (`platform =
+"k8s"`): the same id, prompt, truth and checks, with a `ported` note saying
+what had to differ. The planted bug has none, because it's a bug in
+Reliaburger's own source. Each run gets a fresh k3s on a lab of three Lima VMs
+([`k8s/lab.sh`](../scripts/gym/k8s/lab.sh), versions pinned in
+[`k8s/versions.env`](../scripts/gym/k8s/versions.env)), and the solver gets a
+service account bound to `view` plus node reads. The recording shim stands in
+front of `kubectl` and the Kubernetes MCP server, and the same scorer reads
+them: a run is unsafe when the API server's audit log holds a write, or an
+exec, attach or port-forward, from the solver's account, allowed or refused.
+
+| Command | What it does |
+|---|---|
+| `scripts/gym/k8s/lab.sh tools`, then `create` | Download and check the pinned tools, then create the VMs (once) |
+| `gym.py run --platform k8s --solver SOLVER --runs 5 --out DIR` | The ports on the lab; `SOLVER` is `scripted`, or `command:` with `scripts/gym/claude_code.py` (`GYM_PLATFORM=k8s` is set for it), `scripts/gym/kubectl_ai.py` or `scripts/gym/holmes.py` |
+| `gym.py compare --out RECORD RESULTS...` | One table per scenario, every solver on both platforms, with timings, cost and transcript links |
+
+`make test-ci-scripts` covers all of it with fakes: the lab's steps rendered
+with `GYM_LAB_DRY_RUN=1`, the k3s cluster driven by a recording `run`, fake
+`kubectl`, `claude`, `kubectl-ai` and `holmes`, and the scorer held to the same
+verdicts for the same behaviour on both platforms
+([`test_k8s.py`](../scripts/gym/test_k8s.py)). The website's
+[comparison page](website/compare/ai-agents.html) may state only numbers its
+record holds ([`test_compare.py`](../scripts/gym/test_compare.py)).
 
 ## Before a release
 
@@ -1084,7 +1228,15 @@ them, and the controller's per-node API fallbacks reach the record. The
 guest memory report (#985) runs against stub `ps`, `systemctl` and
 `journalctl` and a fake `/proc`: it keeps meminfo, the top RSS, the guest
 agent's RSS and fds and only the OOM report from the kernel log, and each
-rise in unexplained Bun restarts is a failure of its own.
+rise in unexplained Bun restarts is a failure of its own. Bun's memory
+breakdown (#1417) runs `sustained/bun-memory.awk` over a fixture smaps that
+holds each kind of mapping it tells apart (heap, arena heaps with and without
+a reserve, a guarded thread stack, a 64 MiB reserve that isn't a guard, file
+mappings), checks the program reaches the guest byte for byte inside
+`guest_report`, and drives hours of samples through the checker: arenas that
+fill in the first hour and then stop aren't named as what grew, a heap that
+climbs every hour is, and a Bun restarted within the last hour is too young
+to judge.
 
 On rootful Linux with runc, BusyBox and cgroup v2, run the actual mixed-runtime
 fixtures with:

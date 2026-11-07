@@ -17,6 +17,13 @@ and records each `tools/call` as the `relish agent` command the tool is, with
 the envelope it answered as the output. A Claude Code solver that uses the
 plugin's MCP server is then scored from the same log as one that types the
 commands into a shell. The server process itself isn't a call.
+
+The Kubernetes side of the comparison (#1679) records the same way. The
+runner installs this shim as `kubectl`, and as `kubernetes-mcp-server`, the
+MCP server its Claude Code solver uses: a kubectl call is logged as its argv,
+and an MCP tool call as `kubernetes-mcp-server tool NAME --key=value...`. The
+installed script names the program and the real binary (`GYM_SHIM_AS`,
+`GYM_SHIM_REAL`); without them it's `relish` and `GYM_REAL_RELISH`, as before.
 """
 import json
 import os
@@ -36,10 +43,14 @@ def _kept(text):
     return text[:MAX_KEPT_BYTES] + "\n[gym: output cut]"
 
 
-def record(log_path, argv, exit_code, stdout, stderr, started, seconds, via=None):
+# The MCP servers the shim knows how to record, by the program it stands in for.
+KUBERNETES_MCP = "kubernetes-mcp-server"
+
+
+def record(log_path, argv, exit_code, stdout, stderr, started, seconds, via=None, program="relish"):
     """Append one call to the log as a JSON line."""
     entry = {
-        "argv": ["relish", *argv],
+        "argv": [program, *argv],
         "exit": exit_code,
         "stdout": _kept(stdout),
         "stderr": _kept(stderr),
@@ -71,6 +82,16 @@ def tool_argv(name, arguments):
     return argv
 
 
+def k8s_tool_argv(name, arguments):
+    """The argv a Kubernetes MCP tool call is recorded as: `tool NAME --key=value...`."""
+    argv = ["tool", name]
+    for key, value in sorted((arguments or {}).items()):
+        if value is None:
+            continue
+        argv.append(f"--{key}={value if isinstance(value, str) else json.dumps(value)}")
+    return argv
+
+
 def _tool_output(message):
     """The text a tool answered with, and the exit code it stands for."""
     if "error" in message:
@@ -90,11 +111,18 @@ def _parse(line):
     return message if isinstance(message, dict) else None
 
 
-def serve_mcp(real, argv, log_path, stdin=None, stdout=None):
-    """Run `relish mcp` with its stdio passed through, recording tool calls."""
+def serve_mcp(real, argv, log_path, stdin=None, stdout=None, program="relish", env=None):
+    """Run an MCP server with its stdio passed through, recording tool calls.
+
+    `relish mcp` tool calls are recorded as the `relish agent` command each
+    tool is; any other server's as `tool NAME --key=value...`.
+    """
     stdin = stdin or sys.stdin.buffer
     stdout = stdout or sys.stdout.buffer
-    server = subprocess.Popen([real, *argv], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    to_argv = tool_argv if program == "relish" else k8s_tool_argv
+    server = subprocess.Popen(
+        [real, *argv], stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env
+    )
     pending = {}
     lock = threading.Lock()
 
@@ -128,21 +156,26 @@ def serve_mcp(real, argv, log_path, stdin=None, stdout=None):
             continue
         name, arguments, started, clock = request
         text, exit_code = _tool_output(message)
-        record(log_path, tool_argv(name, arguments), exit_code, text, "", started,
-               time.monotonic() - clock, via="mcp")
+        record(log_path, to_argv(name, arguments), exit_code, text, "", started,
+               time.monotonic() - clock, via="mcp", program=program)
     server.stdout.close()
     return server.wait()
 
 
 def main(argv):
-    real = os.environ["GYM_REAL_RELISH"]
+    program = os.environ.get("GYM_SHIM_AS", "relish")
+    real = os.environ.get("GYM_SHIM_REAL") or os.environ["GYM_REAL_RELISH"]
     log_path = os.environ["GYM_CALL_LOG"]
-    if argv[:1] == ["mcp"] and not {"--help", "-h", "--list"} & set(argv):
-        return serve_mcp(real, argv, log_path)
+    # The real program doesn't need to know it was shimmed.
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GYM_SHIM_")}
+    if program == "relish" and argv[:1] == ["mcp"] and not {"--help", "-h", "--list"} & set(argv):
+        return serve_mcp(real, argv, log_path, env=env)
+    if program == KUBERNETES_MCP and not {"--help", "-h", "--version"} & set(argv):
+        return serve_mcp(real, argv, log_path, program=program, env=env)
     started = time.time()
     clock = time.monotonic()
     completed = subprocess.run(
-        [real, *argv], capture_output=True, text=True, errors="replace", check=False
+        [real, *argv], capture_output=True, text=True, errors="replace", check=False, env=env
     )
     record(
         log_path,
@@ -152,6 +185,7 @@ def main(argv):
         completed.stderr,
         started,
         time.monotonic() - clock,
+        program=program,
     )
     sys.stdout.write(completed.stdout)
     sys.stderr.write(completed.stderr)
@@ -168,6 +202,19 @@ def install(bin_dir, real_relish, python=sys.executable):
     )
     script.chmod(0o755)
     return {"GYM_REAL_RELISH": str(real_relish)}
+
+
+def install_program(bin_dir, program, real, python=sys.executable):
+    """Write a recording `program` (e.g. `kubectl`) that runs `real` into `bin_dir`."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    script = bin_dir / program
+    script.write_text(
+        "#!/bin/sh\n"
+        f'exec env GYM_SHIM_AS="{program}" GYM_SHIM_REAL="{real}" '
+        f'"{python}" "{os.path.abspath(__file__)}" "$@"\n'
+    )
+    script.chmod(0o755)
+    return script
 
 
 def read_log(log_path):

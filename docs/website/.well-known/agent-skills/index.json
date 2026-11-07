@@ -3,7 +3,7 @@
   "skills": [
     {
       "description": "Use when operating, debugging or upgrading a Reliaburger cluster, or when you suspect a bug in Reliaburger itself. Reliaburger is a container orchestrator in one binary. Its CLI, `relish`, has a family of commands built for LLM agents, `relish agent`: each prints one line of JSON, never prompts and stays within a byte budget, and `relish agent source` reads the exact source the binary was built from.",
-      "digest": "sha256:88fc58a3598919c08bc5dd1ffbc22e583f1af6e92c812f2fb43088c68da90be3",
+      "digest": "sha256:6c6ce5a11f9a6415d5a3f830bd22566ae1b75b498d205f22d70d33d85c1eec07",
       "name": "reliaburger",
       "type": "skill-md",
       "url": "/.well-known/agent-skills/reliaburger/SKILL.md"

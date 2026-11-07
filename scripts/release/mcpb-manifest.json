@@ -1,0 +1,96 @@
+{
+  "author": {
+    "name": "Miko Pawlikowski",
+    "url": "https://reliaburger.com"
+  },
+  "compatibility": {
+    "platforms": [
+      "darwin",
+      "linux"
+    ]
+  },
+  "description": "Read-only Reliaburger cluster diagnosis: the relish agent commands as MCP tools.",
+  "display_name": "Reliaburger relish",
+  "documentation": "https://github.com/reliaburger/reliaburger/blob/v0.2.7/docs/manual/16_working-with-an-ai-agent.md",
+  "homepage": "https://reliaburger.com/agents",
+  "keywords": [
+    "reliaburger",
+    "relish",
+    "orchestrator",
+    "containers",
+    "sre"
+  ],
+  "license": "Apache-2.0",
+  "manifest_version": "0.3",
+  "name": "relish",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/reliaburger/reliaburger"
+  },
+  "server": {
+    "entry_point": "server/relish",
+    "mcp_config": {
+      "args": [
+        "mcp"
+      ],
+      "command": "${__dirname}/server/relish"
+    },
+    "type": "binary"
+  },
+  "support": "https://github.com/reliaburger/reliaburger/issues",
+  "tools": [
+    {
+      "description": "How to use relish as an agent: the manual chapter, as Markdown sections",
+      "name": "guide"
+    },
+    {
+      "description": "This binary's version, commit, target and cluster formats",
+      "name": "version"
+    },
+    {
+      "description": "The JSON Schema of the envelope and of each command's data",
+      "name": "schema"
+    },
+    {
+      "description": "This binary's source: version, commit, digest, file count, and the commit every node runs",
+      "name": "source_version"
+    },
+    {
+      "description": "Files with their size in bytes and their line count",
+      "name": "source_tree"
+    },
+    {
+      "description": "Search the source with a regular expression, line by line",
+      "name": "source_grep"
+    },
+    {
+      "description": "Print up to 400 numbered lines of one file: `path` or `path:from-to`",
+      "name": "source_show"
+    },
+    {
+      "description": "An app's recent log lines, newest kept, each wrapped as untrusted",
+      "name": "logs"
+    },
+    {
+      "description": "Up to ten sections that mention every word, best first, each with a short excerpt and the `show` command that prints it",
+      "name": "manual_search"
+    },
+    {
+      "description": "One chapter, or one section of it, as Markdown: `diagnostics` or `diagnostics#relish-path-can-a-reach-b`",
+      "name": "manual_show"
+    },
+    {
+      "description": "The first call: findings, unknowns, faults, alerts, one line per app and the newest events, in one bounded answer",
+      "name": "context"
+    },
+    {
+      "description": "Every finding with its evidence, read-only next steps, and pointers into the manual and the source",
+      "name": "diagnose"
+    },
+    {
+      "description": "What a finding means, its thresholds and where it's decided; every finding when no id is given. Reads only this binary",
+      "name": "explain"
+    }
+  ],
+  "version": "0.2.7"
+}

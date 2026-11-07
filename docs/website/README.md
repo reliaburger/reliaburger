@@ -277,6 +277,14 @@ outlives its page. So after changing a page, or adding one, run `make
 agent-docs` and commit the copy with it. `agents.html` and `agents.md` are
 the exception: both come straight from the manual's agent chapter.
 
+`assets/copy.js` puts two buttons at the top of each page's `<main>`: "Copy
+as Markdown", which fetches the copy the `alternate` link names and puts it
+on the clipboard, and "Open in Claude", a link to `https://claude.ai/new?q=`
+with a one-line prompt naming the copy's full address. The script makes
+them, so a page without JavaScript has neither, and a page without an
+`alternate` link gets none. Every page must load `copy.js`; a test checks
+it, and that the buttons never appear in a page's markup.
+
 `llms.txt`, also generated, lists every copy under "Website".
 `.well-known/agent-skills/index.json` is the skills discovery index
 ([Agent Skills Discovery RFC](https://github.com/cloudflare/agent-skills-discovery-rfc)
@@ -304,6 +312,15 @@ the reviewed train implementation and planned features. Learning-curve judgement
 are qualitative, and source inspection is not a benchmark or security certification.
 When refreshing a comparison, review commands, installation assumptions and both
 application and platform upgrade procedures. Preserve section anchors.
+
+`compare/ai-agents.html` is different: it reports measurements, an AI agent
+operating Reliaburger and Kubernetes on the agent gym's faults
+([#1679](https://github.com/reliaburger/reliaburger/issues/1679)). Its numbers
+come from one record in `docs/qualification/`, named in its `gym-record`
+meta tag, and `scripts/gym/test_compare.py` fails if the page states a number
+that record doesn't hold. Until the real runs the tag is empty, the page says
+"No results yet" and quotes only the lab's pinned versions, and it carries
+`noindex`. The index doesn't link it until then.
 
 Serve the directory with the preview command above and open `/compare/` or
 `/compare/methodology.html`. Check all local links and fragments, desktop and narrow

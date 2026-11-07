@@ -6,7 +6,9 @@
 //! Linux `relish`) for the nodes; `test` runs the portable suite; `try` boots
 //! a separately named cluster from those binaries, with its own
 //! `RELIABURGER_HOME`; `diff` shows the change and which tests ran against
-//! it, for `relish agent report`; `destroy` removes the throwaway clusters.
+//! it, for `relish agent report`; `apply` makes an edit from a unified diff,
+//! for an agent with no editor of its own; `destroy` removes the throwaway
+//! clusters.
 //!
 //! Nothing here touches the user's own cluster or contexts, and nothing
 //! signs what it builds: a patched binary can't take the countersigned
@@ -16,6 +18,7 @@
 //! where it keeps clusters, so the tests swap in small fake `cargo` and
 //! `relish` scripts and never compile the real crate.
 
+mod apply;
 mod builder;
 mod cargo;
 mod cluster;
@@ -29,6 +32,7 @@ use super::budget::Rendered;
 use super::envelope::{AgentError, BuildInfo, CommandName, ErrorCode, NextStep};
 use super::source::{Answer, Bundle, render_answer};
 
+pub use apply::{AppliedFile, AppliedHunk, ApplyData};
 pub use builder::{BuildData, BuildHow, BuildStep, BuiltBinary, Platform};
 pub use cargo::CompilerError;
 pub use cluster::{DestroyData, DestroyedCluster, TryData};
@@ -97,6 +101,18 @@ pub enum PatchCommand {
         /// The workspace `init` made.
         dir: PathBuf,
     },
+    /// Apply a unified diff to the workspace, matching each hunk by its
+    /// lines rather than its header's counts. All or nothing.
+    Apply {
+        /// The workspace `init` made.
+        dir: PathBuf,
+        /// The diff itself, or `@file` to read it from a file.
+        #[arg(allow_hyphen_values = true)]
+        diff: String,
+        /// Match every hunk and report, but write nothing.
+        #[arg(long)]
+        check: bool,
+    },
     /// Remove the workspace's throwaway cluster, or every one with `--all`.
     /// The workspace and its source stay.
     Destroy {
@@ -118,6 +134,7 @@ impl PatchCommand {
             PatchCommand::Test { .. } => CommandName::PatchTest,
             PatchCommand::Try { .. } => CommandName::PatchTry,
             PatchCommand::Diff { .. } => CommandName::PatchDiff,
+            PatchCommand::Apply { .. } => CommandName::PatchApply,
             PatchCommand::Destroy { .. } => CommandName::PatchDestroy,
         }
     }
@@ -259,6 +276,10 @@ pub async fn answer(
         }
         PatchCommand::Diff { dir } => {
             let result = workspace::diff(dir);
+            render_answer(name, build, result, &[], max_bytes, rerun)
+        }
+        PatchCommand::Apply { dir, diff, check } => {
+            let result = apply::read_diff(diff).and_then(|text| apply::apply(dir, &text, *check));
             render_answer(name, build, result, &[], max_bytes, rerun)
         }
         PatchCommand::Destroy { dir, all } => {
@@ -434,6 +455,14 @@ mod tests {
                 "patch try",
             ),
             (PatchCommand::Diff { dir: dir.clone() }, "patch diff"),
+            (
+                PatchCommand::Apply {
+                    dir: dir.clone(),
+                    diff: "@fix.diff".to_string(),
+                    check: false,
+                },
+                "patch apply",
+            ),
             (
                 PatchCommand::Destroy {
                     dir: None,

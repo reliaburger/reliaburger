@@ -16,6 +16,13 @@ import tomllib
 
 GYM_DIR = Path(__file__).resolve().parent
 SCENARIO_DIR = GYM_DIR / "scenarios"
+# The Kubernetes ports of the scenarios (#1679): the same ids, the same truth
+# and the same checks, set up on a k3s lab instead of a Reliaburger cluster.
+K8S_SCENARIO_DIR = SCENARIO_DIR / "k8s"
+
+# The platforms a scenario can run on. `reliaburger` is the default, so a file
+# without a `platform` key is a Reliaburger scenario.
+PLATFORMS = ("reliaburger", "k8s")
 
 # The closed list of fault kinds an answer may name. The prompt lists it, so
 # scoring compares two words instead of judging prose.
@@ -36,9 +43,17 @@ CHECKS = ("app", "namespace", "node", "fault_kind", "file", "function", "patch")
 # live cluster: `@instance:web` is the node running web's first instance,
 # `@follower` the council follower the runner chose for a node fault.
 FACT_PATTERN = re.compile(r"^@(instance:[a-z0-9][a-z0-9-]*|follower|leader)$")
+# On Kubernetes there's no council: `@worker` is the agent node the runner
+# chose to partition (the server, like the Raft leader, stays reachable).
+K8S_FACT_PATTERN = re.compile(r"^@(instance:[a-z0-9][a-z0-9-]*|worker)$")
 
-# The Smoker faults a scenario can inject at setup.
-FAULT_STEPS = ("council_partition",)
+# The faults a scenario can inject at setup, per platform, and the fact each
+# one targets. Reliaburger's is a Smoker fault through the API; Kubernetes has
+# no fault injector, so the k3s lab drops the node's traffic with iptables.
+FAULT_STEPS = {
+    "reliaburger": {"council_partition": "@follower"},
+    "k8s": {"node_partition": "@worker"},
+}
 
 DURATION_PATTERN = re.compile(r"^([0-9]+)(ms|s|m)$")
 
@@ -104,6 +119,10 @@ class ReportCheck:
 
     secrets: tuple[str, ...]
     counted: tuple[str, ...]
+    # Where the draft comes from: `files`, the directories `relish agent
+    # report` wrote, or `answer`, the Markdown in the answer's `report` field
+    # (Kubernetes has no report command, so the agent writes the draft).
+    source: str = "files"
 
 
 # The redaction rules a report's MANIFEST.json counts.
@@ -130,6 +149,9 @@ class Scenario:
     plant: Plant | None = None
     injection: Injection | None = None
     report: ReportCheck | None = None
+    platform: str = "reliaburger"
+    # For a port: what differs from the Reliaburger scenario, in a sentence.
+    ported: str | None = None
 
     def facts_needed(self):
         """The `@` facts this scenario's truth refers to."""
@@ -153,7 +175,7 @@ def _fail(path, message):
     raise ScenarioError(f"{path.name}: {message}")
 
 
-def _setup_step(path, index, raw):
+def _setup_step(path, index, raw, platform="reliaburger"):
     where = f"setup step {index + 1}"
     if not isinstance(raw, dict):
         _fail(path, f"{where} isn't a table")
@@ -169,6 +191,9 @@ def _setup_step(path, index, raw):
         manifest = GYM_DIR / raw["apply"]
         if not manifest.is_file():
             _fail(path, f"{where} applies {raw['apply']}, which doesn't exist")
+        wanted = ".yaml" if platform == "k8s" else ".toml"
+        if manifest.suffix != wanted:
+            _fail(path, f"{where}: a {platform} scenario applies {wanted} manifests")
         return SetupStep(apply=raw["apply"], wait_running=raw.get("wait_running"))
     if "settle" in raw:
         try:
@@ -176,10 +201,12 @@ def _setup_step(path, index, raw):
         except ValueError as error:
             _fail(path, f"{where}: {error}")
     fault = raw["fault"]
-    if not isinstance(fault, dict) or fault.get("kind") not in FAULT_STEPS:
-        _fail(path, f"{where}: fault.kind must be one of {list(FAULT_STEPS)}")
-    if fault.get("target") != "@follower":
-        _fail(path, f"{where}: a council_partition targets @follower")
+    kinds = FAULT_STEPS[platform]
+    if not isinstance(fault, dict) or fault.get("kind") not in kinds:
+        _fail(path, f"{where}: fault.kind must be one of {list(kinds)}")
+    target = kinds[fault["kind"]]
+    if fault.get("target") != target:
+        _fail(path, f"{where}: a {fault['kind']} targets {target}")
     try:
         parse_duration(fault.get("duration", ""))
     except ValueError as error:
@@ -196,7 +223,7 @@ def load(path):
         _fail(path, f"isn't valid TOML: {error}")
     known = {
         "id", "title", "nodes", "prompt", "setup", "truth", "score", "plant",
-        "injection", "report",
+        "injection", "report", "platform", "ported",
     }
     unknown = set(raw) - known
     if unknown:
@@ -206,13 +233,21 @@ def load(path):
             _fail(path, f"`{key}` must be a non-empty string")
     if raw["id"] != path.stem:
         _fail(path, f"id {raw['id']!r} must match the file name {path.stem!r}")
+    platform = raw.get("platform", "reliaburger")
+    if platform not in PLATFORMS:
+        _fail(path, f"`platform` must be one of {list(PLATFORMS)}")
+    ported = raw.get("ported")
+    if platform == "k8s" and (not isinstance(ported, str) or not ported.strip()):
+        _fail(path, "a k8s scenario needs `ported`: what differs from the Reliaburger one")
     nodes = raw.get("nodes", 1)
     if not isinstance(nodes, int) or not 1 <= nodes <= 5:
         _fail(path, "`nodes` must be between 1 and 5")
 
-    setup = tuple(_setup_step(path, i, step) for i, step in enumerate(raw.get("setup", [])))
+    setup = tuple(
+        _setup_step(path, i, step, platform) for i, step in enumerate(raw.get("setup", []))
+    )
     if any(step.fault for step in setup) and nodes < 3:
-        _fail(path, "a council_partition needs at least three nodes")
+        _fail(path, "a partition needs at least three nodes")
 
     truth = raw.get("truth")
     if not isinstance(truth, dict) or not truth:
@@ -223,8 +258,9 @@ def load(path):
         _fail(path, f"truth has unknown fields {sorted(unknown)}")
     if truth.get("fault_kind") not in FAULT_KINDS:
         _fail(path, f"truth.fault_kind must be one of {list(FAULT_KINDS)}")
+    facts = K8S_FACT_PATTERN if platform == "k8s" else FACT_PATTERN
     for name, value in truth.items():
-        if isinstance(value, str) and value.startswith("@") and not FACT_PATTERN.match(value):
+        if isinstance(value, str) and value.startswith("@") and not facts.match(value):
             _fail(path, f"truth.{name} = {value!r} isn't a fact the runner knows")
 
     score = raw.get("score", {})
@@ -239,6 +275,10 @@ def load(path):
     required_calls = tuple(score.get("required_calls", ()))
 
     plant = None
+    if "plant" in raw and platform != "reliaburger":
+        # The planted bug is a bug in Reliaburger's own source: Kubernetes has
+        # no equivalent loop, and the comparison says so rather than scoring it.
+        _fail(path, "a plant is a Reliaburger bug: only a reliaburger scenario can carry one")
     if "plant" in raw:
         patch = GYM_DIR / raw["plant"].get("patch", "")
         if not patch.is_file():
@@ -272,10 +312,15 @@ def load(path):
         if not secrets or not all(isinstance(s, str) and len(s) >= 8 for s in secrets):
             _fail(path, "report.secrets must list the planted strings, each 8 or more characters")
         counted = tuple(raw["report"].get("counted", ()))
+        source = raw["report"].get("source", "files")
+        if source not in ("files", "answer"):
+            _fail(path, "report.source must be files or answer")
         unknown = sorted(set(counted) - set(REPORT_RULES))
-        if not counted or unknown:
-            _fail(path, f"report.counted must name redaction rules from {list(REPORT_RULES)}")
-        report = ReportCheck(secrets=secrets, counted=counted)
+        # A draft the agent wrote itself has no redaction manifest to count.
+        if unknown or (source == "files" and not counted) or (source == "answer" and counted):
+            _fail(path, "report.counted must name redaction rules from "
+                  f"{list(REPORT_RULES)} for a files draft, and none for an answer draft")
+        report = ReportCheck(secrets=secrets, counted=counted, source=source)
 
     return Scenario(
         id=raw["id"],
@@ -290,12 +335,24 @@ def load(path):
         plant=plant,
         injection=injection,
         report=report,
+        platform=platform,
+        ported=ported.strip() if isinstance(ported, str) else None,
     )
 
 
-def load_all(directory=SCENARIO_DIR):
-    """Every scenario in `directory`, in file-name order."""
-    paths = sorted(Path(directory).glob("*.toml"))
+def directory_for(platform):
+    """Where a platform's scenarios live."""
+    return K8S_SCENARIO_DIR if platform == "k8s" else SCENARIO_DIR
+
+
+def load_all(directory=None, platform="reliaburger"):
+    """Every scenario for `platform` (or in `directory`), in file-name order."""
+    directory = Path(directory) if directory is not None else directory_for(platform)
+    paths = sorted(directory.glob("*.toml"))
     if not paths:
         raise ScenarioError(f"no scenarios in {directory}")
-    return [load(path) for path in paths]
+    loaded = [load(path) for path in paths]
+    wrong = [s.id for s in loaded if s.platform != platform]
+    if wrong:
+        raise ScenarioError(f"{directory} holds scenarios for another platform: {wrong}")
+    return loaded
