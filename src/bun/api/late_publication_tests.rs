@@ -26,6 +26,11 @@ const TASKS: u64 = 20;
 const SYNC_INTERVAL: Duration = Duration::from_millis(10);
 /// Short, so the caller expires while the writer is held.
 const CALLER_DEADLINE: Duration = Duration::from_millis(200);
+/// The restarted node's write timeout. Only the first node needs a deadline
+/// its held writer outlasts; after the restart every write is an fsync'd
+/// publication that a loaded host can keep past 200 ms, which fenced the
+/// reopened node and answered the retry 503 (#1641). This only guards a hang.
+const RESTARTED_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One standalone node with durable job storage under `data`, its leader
 /// loop and a fake executor that counts every attempt in `executed`.
@@ -37,7 +42,7 @@ struct StandaloneNode {
 }
 
 impl StandaloneNode {
-    async fn start(data: &Path, executed: Arc<AtomicU64>) -> Self {
+    async fn start(data: &Path, executed: Arc<AtomicU64>, write_timeout: Duration) -> Self {
         let shutdown = CancellationToken::new();
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(16);
         // No agent: task arrays don't go through it. Holding the receiver
@@ -84,7 +89,7 @@ impl StandaloneNode {
                 SYNC_INTERVAL,
                 Duration::from_secs(30),
             )
-            .with_write_timeout(CALLER_DEADLINE)
+            .with_write_timeout(write_timeout)
             .with_storage(data)
             .await
             .unwrap(),
@@ -180,7 +185,7 @@ fn published_runs(data: &Path) -> Vec<u64> {
 async fn a_late_publication_after_the_caller_times_out_keeps_one_durable_run_identity() {
     let data = tempfile::tempdir().unwrap();
     let executed = Arc::new(AtomicU64::new(0));
-    let first = StandaloneNode::start(data.path(), Arc::clone(&executed)).await;
+    let first = StandaloneNode::start(data.path(), Arc::clone(&executed), CALLER_DEADLINE).await;
     let writer = Arc::new(std::sync::Barrier::new(2));
     first.service.pause_next_publication(Arc::clone(&writer));
 
@@ -240,7 +245,8 @@ async fn a_late_publication_after_the_caller_times_out_keeps_one_durable_run_ide
     drop(first);
 
     // Restart and reconcile: the retry finds the late write's run.
-    let reopened = StandaloneNode::start(data.path(), Arc::clone(&executed)).await;
+    let reopened =
+        StandaloneNode::start(data.path(), Arc::clone(&executed), RESTARTED_WRITE_TIMEOUT).await;
     let (status, answer) = reopened.submit("late-request").await;
     assert_eq!(status, 202, "{answer}");
     assert_eq!(answer["batch_id"], run, "the retry created a second run");
@@ -267,8 +273,17 @@ async fn a_late_publication_after_the_caller_times_out_keeps_one_durable_run_ide
         "every task ran exactly once"
     );
 
-    // New work takes the next identity, never the late run's.
+    // New work takes the next identity, never the late run's. Its
+    // publication is held past the first node's caller deadline, as a loaded
+    // host's fsync can hold it: the restarted node still admits it.
+    let held = Arc::new(std::sync::Barrier::new(2));
+    reopened.service.pause_next_publication(Arc::clone(&held));
+    let release = tokio::task::spawn_blocking(move || {
+        std::thread::sleep(CALLER_DEADLINE * 3);
+        held.wait();
+    });
     let (status, answer) = reopened.submit("next-request").await;
+    release.await.unwrap();
     assert_eq!(status, 202, "{answer}");
     assert!(answer["batch_id"].as_u64().unwrap() > run, "{answer}");
     reopened.shutdown.cancel();
