@@ -450,6 +450,12 @@
     "test": "two_node_cluster_survives_losing_the_non_voter"
   },
   {
+    "source": "tests/council_self_healing.rs",
+    "function": "a_replaced_voter_coming_back_joins_as_a_learner_without_an_election",
+    "binary": "reliaburger::council_self_healing",
+    "test": "a_replaced_voter_coming_back_joins_as_a_learner_without_an_election"
+  },
+  {
     "source": "tests/ebpf.rs",
     "function": "onion_objects_use_only_the_original_bpf_instruction_set",
     "binary": "reliaburger::ebpf",

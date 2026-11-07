@@ -319,7 +319,7 @@ async fn single_node_leader() -> Arc<CouncilNode> {
     )
     .await
     .unwrap();
-    router.register(1, node.raft().clone()).await;
+    router.register(1, &node).await;
     let mut members = BTreeMap::new();
     members.insert(
         1u64,
@@ -1147,7 +1147,7 @@ async fn follower_forwarding_cannot_bypass_a_failed_cluster_prerequisite() {
             .await
             .unwrap(),
         );
-        network.register(id, node.raft().clone()).await;
+        network.register(id, &node).await;
         councils.push(node);
     }
     councils[0]
@@ -1274,7 +1274,7 @@ async fn assert_handover_keeps_an_uncertain_prerequisite_claim(mode: &str) {
             .await
             .unwrap(),
         );
-        network.register(id, node.raft().clone()).await;
+        network.register(id, &node).await;
         councils.push(node);
     }
     councils[0]

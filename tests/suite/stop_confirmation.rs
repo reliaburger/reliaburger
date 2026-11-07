@@ -46,7 +46,7 @@ async fn memory_council(
         .await
         .unwrap(),
     );
-    router.register(id, node.raft().clone()).await;
+    router.register(id, &node).await;
     node
 }
 

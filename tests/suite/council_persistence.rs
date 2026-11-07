@@ -49,7 +49,7 @@ async fn run_and_compact(raft_dir: &Path) {
     let node = CouncilNode::new(1, config, network, log_store, state_machine, None)
         .await
         .unwrap();
-    router.register(1, node.raft().clone()).await;
+    router.register(1, &node).await;
     node.initialize(BTreeMap::from([(1, node_info())]))
         .await
         .unwrap();

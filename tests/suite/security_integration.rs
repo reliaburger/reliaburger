@@ -615,7 +615,7 @@ async fn single_node_leader() -> std::sync::Arc<reliaburger::council::node::Coun
     )
     .await
     .unwrap();
-    router.register(1, node.raft().clone()).await;
+    router.register(1, &node).await;
     node.initialize(std::collections::BTreeMap::from([(
         1u64,
         CouncilNodeInfo::new("127.0.0.1:9001".parse().unwrap(), "node-1".to_string()),

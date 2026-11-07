@@ -359,7 +359,7 @@ async fn two_node_cluster_survives_losing_the_non_voter() {
         )
         .await
         .unwrap();
-        router.register(rid(index), node.raft().clone()).await;
+        router.register(rid(index), &node).await;
         nodes.push(Arc::new(node));
     }
     nodes[0]
@@ -444,11 +444,12 @@ async fn two_node_cluster_survives_losing_the_non_voter() {
 /// leadership and the leader's term stay where they were, and the returning
 /// node ends up a learner, not a voter.
 ///
-/// It fails today, every time: the returning node's higher term deposes the
-/// leader as soon as the leader replicates to it. It runs once #1524's fix
-/// lands.
+/// Before #1524's fix it failed every time: the returning node campaigned
+/// while it was out of gossip, and its higher term deposed the leader as
+/// soon as the leader replicated to it. Now it starts with its elections
+/// held, and the leader's first AppendEntries ends the hold.
 #[tokio::test]
-#[ignore = "#1524: fails until a returning replaced voter stops forcing an election"]
+#[ignore = "run with make test-cluster"]
 async fn a_replaced_voter_coming_back_joins_as_a_learner_without_an_election() {
     use reliaburger::council::log_store::MemLogStore;
     use reliaburger::council::network::InMemoryRaftNetworkFactory;
@@ -480,7 +481,7 @@ async fn a_replaced_voter_coming_back_joins_as_a_learner_without_an_election() {
         )
         .await
         .unwrap();
-        router.register(rid(index), node.raft().clone()).await;
+        router.register(rid(index), &node).await;
         stores.push(store);
         nodes.push(Arc::new(node));
     }
@@ -567,7 +568,14 @@ async fn a_replaced_voter_coming_back_joins_as_a_learner_without_an_election() {
         .await
         .unwrap(),
     );
-    router.register(rid(victim), returned.raft().clone()).await;
+    assert!(
+        returned.elections_held_on_return(),
+        "the returning node didn't hold its elections"
+    );
+    // Its own gossip view names the live leader, as a returning node's does
+    // once gossip has caught up, though the others don't see it yet.
+    returned.report_gossip_leader(true);
+    router.register(rid(victim), &returned).await;
     spawn_council_reconciler_with_config(
         Arc::clone(&returned),
         membership_rx.clone(),
@@ -577,15 +585,15 @@ async fn a_replaced_voter_coming_back_joins_as_a_learner_without_an_election() {
         config.clone(),
         shutdown.clone(),
     );
-    // Out of gossip for now, as a node is in the seconds before gossip
-    // sees it again: it campaigns on its own election timer, the voters
-    // refuse it while the leader's lease holds, and each failed campaign
-    // raises its term past the leader's.
-    let campaigned = wait_until(Duration::from_secs(10), || {
-        returned.metrics().borrow().current_term > term_before
-    })
-    .await;
-    assert!(campaigned, "the returning node never campaigned");
+    // Out of the others' gossip for several election timeouts, as a node is
+    // in the seconds before gossip sees it again. Before the fix it
+    // campaigned within one, raising its term past the leader's.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        returned.metrics().borrow().current_term,
+        term_before,
+        "the returning node campaigned while it held its elections"
+    );
     membership_tx.send(gossip(&everyone)).unwrap();
 
     // Watch for long enough to see it added back and replicated to, and
@@ -611,6 +619,10 @@ async fn a_replaced_voter_coming_back_joins_as_a_learner_without_an_election() {
         !voters_of(&nodes[leader]).contains(&rid(victim)),
         "the returning node got its vote back: {:?}",
         voters_of(&nodes[leader])
+    );
+    assert!(
+        returned.leader_contact().heard() && !returned.elections_held_on_return(),
+        "the leader's replication didn't end the returning node's hold"
     );
 
     shutdown.cancel();

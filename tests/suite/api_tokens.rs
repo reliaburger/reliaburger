@@ -41,7 +41,7 @@ async fn api_with_capacity(capacity: bool) -> (Arc<CouncilNode>, Router) {
         .await
         .unwrap(),
     );
-    network.register(1, council.raft().clone()).await;
+    network.register(1, &council).await;
     council
         .initialize(BTreeMap::from([(1, CouncilNodeInfo::default())]))
         .await
@@ -422,7 +422,7 @@ async fn follower_batch_submission_preserves_the_callers_credential_for_leader_a
             .await
             .unwrap(),
         );
-        network.register(id, council.raft().clone()).await;
+        network.register(id, &council).await;
         nodes.push(council);
     }
     nodes[0]

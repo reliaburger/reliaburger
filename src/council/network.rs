@@ -22,6 +22,7 @@ use super::connection_pool::{
     SERVER_IDLE_TIMEOUT,
 };
 use super::fence::{Admission, RecoveryFence};
+use super::return_hold::{LeaderContact, counts_as_leader_contact};
 use super::types::{CouncilNodeInfo, TypeConfig};
 use super::types::{RecoveryClaim, RecoveryId};
 
@@ -45,14 +46,18 @@ impl std::error::Error for RouterError {}
 // InMemoryRaftRouter
 // ---------------------------------------------------------------------------
 
+/// A node as the router holds it: its Raft handle and its leader contact.
+type RegisteredNode = (Raft<TypeConfig>, LeaderContact);
+
 /// Routes Raft RPCs between in-memory nodes.
 ///
-/// Each node registers its `Raft<TypeConfig>` handle. Sends look up
-/// the target's handle and call its method directly. Partitions
-/// silently return `Unreachable`.
+/// Each node registers its `Raft<TypeConfig>` handle and its
+/// [`LeaderContact`]. Sends look up the target's handle and call its method
+/// directly, noting the contact as the TCP server does. Partitions silently
+/// return `Unreachable`.
 #[derive(Clone, Default)]
 pub struct InMemoryRaftRouter {
-    rafts: Arc<Mutex<HashMap<u64, Raft<TypeConfig>>>>,
+    rafts: Arc<Mutex<HashMap<u64, RegisteredNode>>>,
     partitions: Arc<Mutex<HashSet<(u64, u64)>>>,
 }
 
@@ -71,9 +76,12 @@ impl InMemoryRaftRouter {
         Self::default()
     }
 
-    /// Register a Raft instance with the router.
-    pub async fn register(&self, id: u64, raft: Raft<TypeConfig>) {
-        self.rafts.lock().await.insert(id, raft);
+    /// Register a council node with the router.
+    pub async fn register(&self, id: u64, node: &super::CouncilNode) {
+        self.rafts
+            .lock()
+            .await
+            .insert(id, (node.raft().clone(), node.leader_contact()));
     }
 
     /// Simulate a network partition between `a` and `b` (bidirectional).
@@ -94,7 +102,7 @@ impl InMemoryRaftRouter {
     }
 
     /// Look up a Raft handle, returning Unreachable if partitioned or not found.
-    async fn lookup(&self, from: u64, target: u64) -> Result<Raft<TypeConfig>, Unreachable> {
+    async fn lookup(&self, from: u64, target: u64) -> Result<RegisteredNode, Unreachable> {
         if self.is_partitioned(from, target).await {
             return Err(Unreachable::new(&RouterError(format!(
                 "partitioned: {} -> {}",
@@ -157,14 +165,19 @@ impl RaftNetwork<TypeConfig> for InMemoryRaftNetwork {
         rpc: AppendEntriesRequest<TypeConfig>,
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<u64>, RPCError<u64, CouncilNodeInfo, RaftError<u64>>> {
-        let raft = self
+        let (raft, contact) = self
             .router
             .lookup(self.source_id, self.target)
             .await
             .map_err(RPCError::Unreachable)?;
-        raft.append_entries(rpc)
+        let response = raft
+            .append_entries(rpc)
             .await
-            .map_err(|e| RPCError::Network(NetworkError::new(&e)))
+            .map_err(|e| RPCError::Network(NetworkError::new(&e)))?;
+        if counts_as_leader_contact(&response) {
+            contact.note();
+        }
+        Ok(response)
     }
 
     async fn install_snapshot(
@@ -175,7 +188,7 @@ impl RaftNetwork<TypeConfig> for InMemoryRaftNetwork {
         InstallSnapshotResponse<u64>,
         RPCError<u64, CouncilNodeInfo, RaftError<u64, InstallSnapshotError>>,
     > {
-        let raft = self
+        let (raft, _) = self
             .router
             .lookup(self.source_id, self.target)
             .await
@@ -190,7 +203,7 @@ impl RaftNetwork<TypeConfig> for InMemoryRaftNetwork {
         rpc: VoteRequest<u64>,
         _option: RPCOption,
     ) -> Result<VoteResponse<u64>, RPCError<u64, CouncilNodeInfo, RaftError<u64>>> {
-        let raft = self
+        let (raft, _) = self
             .router
             .lookup(self.source_id, self.target)
             .await
@@ -361,6 +374,7 @@ pub async fn serve_raft_rpc(
     serve_raft_rpc_with_limit_and_node_gate(
         listener,
         raft,
+        LeaderContact::new(),
         shutdown,
         tls,
         fence,
@@ -377,9 +391,14 @@ pub async fn serve_raft_rpc(
 /// each request on an open connection re-checks the peer's certificate, so
 /// a revocation takes effect at the peer's next RPC rather than when its
 /// connection closes.
+///
+/// Each AppendEntries from a leader notes `contact`, which ends a returning
+/// node's hold on its elections (#1524).
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_raft_rpc_with_node_gate(
     listener: tokio::net::TcpListener,
     raft: Raft<TypeConfig>,
+    contact: LeaderContact,
     shutdown: tokio_util::sync::CancellationToken,
     tls: Option<tokio_rustls::TlsAcceptor>,
     fence: RecoveryFence,
@@ -389,6 +408,7 @@ pub async fn serve_raft_rpc_with_node_gate(
     serve_raft_rpc_with_limit_and_node_gate(
         listener,
         raft,
+        contact,
         shutdown,
         tls,
         fence,
@@ -412,6 +432,7 @@ pub async fn serve_raft_rpc_with_limit(
     serve_raft_rpc_with_limit_and_node_gate(
         listener,
         raft,
+        LeaderContact::new(),
         shutdown,
         tls,
         fence,
@@ -428,6 +449,7 @@ pub async fn serve_raft_rpc_with_limit(
 pub async fn serve_raft_rpc_with_limit_and_node_gate(
     listener: tokio::net::TcpListener,
     raft: Raft<TypeConfig>,
+    contact: LeaderContact,
     shutdown: tokio_util::sync::CancellationToken,
     tls: Option<tokio_rustls::TlsAcceptor>,
     fence: RecoveryFence,
@@ -466,6 +488,7 @@ pub async fn serve_raft_rpc_with_limit_and_node_gate(
                         // Failing to set it only costs latency.
                         let _ = stream.set_nodelay(true);
                         let raft = raft.clone();
+                        let contact = contact.clone();
                         let fence = fence.clone();
                         let connection_gate = node_gate.clone();
                         match tls.clone() {
@@ -501,6 +524,7 @@ pub async fn serve_raft_rpc_with_limit_and_node_gate(
                                     serve_connection(
                                         tls_stream,
                                         raft,
+                                        contact,
                                         fence,
                                         connection_gate,
                                         still_admitted,
@@ -511,7 +535,14 @@ pub async fn serve_raft_rpc_with_limit_and_node_gate(
                             None => {
                                 tokio::spawn(async move {
                                     let _permit = permit;
-                                    serve_connection(stream, raft, fence, connection_gate, |_| true)
+                                    serve_connection(
+                                        stream,
+                                        raft,
+                                        contact,
+                                        fence,
+                                        connection_gate,
+                                        |_| true,
+                                    )
                                         .await;
                                 });
                             }
@@ -541,6 +572,7 @@ pub async fn serve_raft_rpc_with_limit_and_node_gate(
 async fn serve_connection<S, F>(
     mut stream: S,
     raft: Raft<TypeConfig>,
+    contact: LeaderContact,
     fence: RecoveryFence,
     node_gate: crate::smoker::node_fault::NodeTransportGate,
     admitted: F,
@@ -560,7 +592,7 @@ async fn serve_connection<S, F>(
         }
         let served = tokio::time::timeout(
             RAFT_ACCEPT_DEADLINE,
-            handle_raft_frame(&mut stream, &payload, &raft, &fence),
+            handle_raft_frame(&mut stream, &payload, &raft, &contact, &fence),
         )
         .await;
         if !matches!(served, Ok(true)) || opened.elapsed() >= SERVER_CONNECTION_MAX_AGE {
@@ -575,6 +607,7 @@ async fn handle_raft_frame<S: AsyncWrite + Unpin>(
     stream: &mut S,
     payload: &[u8],
     raft: &Raft<TypeConfig>,
+    contact: &LeaderContact,
     fence: &RecoveryFence,
 ) -> bool {
     // JSON, not a binary format: AppendEntries carries log entries whose
@@ -616,7 +649,12 @@ async fn handle_raft_frame<S: AsyncWrite + Unpin>(
 
     let response = match rpc {
         RaftRpc::AppendEntries(req) => match raft.append_entries(req).await {
-            Ok(resp) => RaftRpcResponse::AppendEntries(resp),
+            Ok(resp) => {
+                if counts_as_leader_contact(&resp) {
+                    contact.note();
+                }
+                RaftRpcResponse::AppendEntries(resp)
+            }
             Err(_) => return false,
         },
         RaftRpc::Vote(req) => match raft.vote(req).await {

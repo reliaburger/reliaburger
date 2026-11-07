@@ -68,7 +68,7 @@ async fn single_node_leader(id: u64) -> Arc<CouncilNode> {
     )
     .await
     .unwrap();
-    router.register(id, node.raft().clone()).await;
+    router.register(id, &node).await;
     let mut members = BTreeMap::new();
     members.insert(
         id,

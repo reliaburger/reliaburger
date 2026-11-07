@@ -3009,7 +3009,43 @@ What happens when a voter the planner replaced while it was down comes back? It 
 
 Then gossip sees the node again. To the reconciler it's just a live spare, so the leader adds it as a learner and starts replicating to it. The node answers with its higher term, and Raft's rule is that anyone who hears a higher term steps down, the leader included. The node can't win the election that follows, because its log is behind, so the cost is a few seconds without writes. That's every time a replaced voter returns.
 
-We found this by reading the code (#1524), and the test came before any fix: `a_replaced_voter_coming_back_joins_as_a_learner_without_an_election` in `tests/council_self_healing.rs`. The first version passed, and that was misleading. The returning node was added back within 200 ms, before its election timer had fired, so its term never rose. The version that counts waits until the node has campaigned, and then the leader steps down every time. It stays `#[ignore]`d under #1524 until the fix lands. The fix has a cost to weigh: stopping a returning node from campaigning while a leader is alive mustn't slow the election after a real leader failure.
+We found this by reading the code (#1524), and the test came before any fix: `a_replaced_voter_coming_back_joins_as_a_learner_without_an_election` in `tests/council_self_healing.rs`. The first version passed, and that was misleading. The returning node was added back within 200 ms, before its election timer had fired, so its term never rose. The version that counted waited until the node had campaigned, and then the leader stepped down every time.
+
+The fix had a cost to weigh: stopping a returning node from campaigning mustn't slow the election after a real leader failure. So it can't be "hold every voter while gossip shows a leader", which would make every failover wait for gossip to declare the leader dead. It has to single out the node that's *back*, and only until it has heard from a leader.
+
+Both halves turned out harder than they look. A node is "back" when it starts on a log store that already holds a vote: a fresh node has never voted. That's one storage call before openraft starts, and it lets us start openraft with elections already switched off, so there's no window in which the election timer could fire first:
+
+```rust
+let returning = log_store
+    .read_vote()
+    .await
+    .map_err(|e| CouncilError::Fatal(e.to_string()))?
+    .is_some();
+let mut openraft_config = config.to_openraft_config();
+openraft_config.enable_elect = !returning;
+```
+
+"Has heard from a leader" was the hard half. Our first attempt asked openraft's metrics, and a probe showed why that can't work: a restarted node restores its committed vote, so `current_leader` names the old leader at once, before anyone has said a word to it. Nothing in the metrics separates "I remember who led" from "the leader has spoken to me since I started". So the transport records it. Every AppendEntries a leader sends, over the TCP server or the in-memory router the tests use, notes a `LeaderContact` on the receiving node, unless the node refused it with a higher vote. `LeaderContact` is a `watch` channel of one `bool` behind an `Arc`, so the transport and the node's hold share it by cloning.
+
+The hold then ends at the first of three things, and the decision is a pure function:
+
+```rust
+pub fn return_hold_ends(
+    heard_from_leader: bool,
+    gossip_names_live_leader: bool,
+    now: Instant,
+    grace_until: Instant,
+    cap_until: Instant,
+) -> bool {
+    heard_from_leader || now >= cap_until || (now >= grace_until && !gossip_names_live_leader)
+}
+```
+
+A voter that is still a member hears from the leader within a heartbeat, so its hold is over almost before it starts. A replaced voter hears nothing until the reconciler adds it back as a learner, and then follows at its old term. After a whole-council restart somebody has to lead: openraft brings the old leader back at its old term, the others hear from it, and the leader's own hold ends when the startup grace (three election timeouts) passes with gossip naming no live leader. "Live" means the leader's own gossip hint, for a node gossip counts alive, not suspect. And a cap of ten election timeouts stops a stale hint about a dying leader from holding a node for long.
+
+The return hold shares `ElectionHold` with the handover hold from the next section, because both switch the same openraft setting. An `AtomicBool` records whether the return hold is still on. Each release switches elections back on only when the other hold isn't running, and both releases do it under the same `watch` write lock, so one can't switch elections on just as the other starts. `Ordering::SeqCst` on the atomic asks for the strongest ordering, which is the right default when you aren't measuring for speed.
+
+The reproducer changed with the fix. It now checks that the returning node's term doesn't move in the two seconds it spends outside the others' gossip, which is longer than it used to take to campaign. It then checks that leadership and the leader's term stay put once it's added back, and that the leader's replication ended the hold. It passed six runs out of six, and it runs in `make test-cluster` again.
 
 ### Resigning under disk pressure
 

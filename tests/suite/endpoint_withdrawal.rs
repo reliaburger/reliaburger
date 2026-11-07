@@ -61,7 +61,7 @@ async fn council_with_log(
         .await
         .unwrap(),
     );
-    network.register(1, node.raft().clone()).await;
+    network.register(1, &node).await;
     if initialise {
         node.initialize(BTreeMap::from([(
             1,

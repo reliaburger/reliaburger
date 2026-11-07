@@ -375,7 +375,7 @@ async fn council() -> Arc<CouncilNode> {
     )
     .await
     .unwrap();
-    router.register(1, node.raft().clone()).await;
+    router.register(1, &node).await;
     node.initialize(std::collections::BTreeMap::from([(
         1u64,
         CouncilNodeInfo::new(

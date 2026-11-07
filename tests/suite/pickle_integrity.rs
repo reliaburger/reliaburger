@@ -564,7 +564,7 @@ async fn a_peer_committed_manifest_is_visible_through_the_authoritative_catalogu
     )
     .await
     .unwrap();
-    raft_router.register(1, council.raft().clone()).await;
+    raft_router.register(1, &council).await;
     council
         .initialize(BTreeMap::from([(
             1,
