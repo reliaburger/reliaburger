@@ -93,6 +93,30 @@ each full run takes one ([portable macOS in one job](testing.md#portable-macos-i
 Dependabot's PRs never get macOS unless labelled; the nightly on `main`
 covers them.
 
+### Every issue closes itself
+
+Every issue a release resolves closes automatically when its fix reaches
+`main`, never by hand (maintainer decision of 6 November 2026). GitHub only
+acts on a closing keyword such as `Fixes #1234` when the PR merges into the
+default branch, so the keyword in a PR into a train does nothing. Four rules
+make up for that:
+
+- **The train's commits say it too.** A PR into a train carries `Fixes #N`
+  in its body and in its commit messages, one line per issue. The commits
+  reach `main` with the gate PR, and GitHub closes the issue then.
+- **The gate PR names every issue.** Before the gate PR merges into `main`,
+  rebuild its body with a `Fixes #N` line for every issue the train
+  resolves: list the train's merged PRs and collect their lines.
+- **Unfinished issues move at freeze.** An issue the train only partly
+  resolves is split, the done part closed by the train and the rest filed
+  for the next release, or moved to the next milestone whole, with the
+  decision recorded on it. `Part of #N` is for an issue that stays open on
+  purpose.
+- **The milestone is empty after the release.** Once the gate PR has merged
+  and the post-release docs PR with it, the release's milestone holds no open
+  issue. One still open is either a missing `Fixes` line, which you add in
+  the next PR to `main`, or an issue that should have moved at freeze.
+
 ### Merging through the queue
 
 Every train merges through GitHub's merge queue (maintainer decision of 6
@@ -571,6 +595,23 @@ before it records a run.
 The move is a fresh cluster, as [from 0.2.0](#upgrading-from-020), with the
 same steps and the same losses.
 
+### Upgrading from 0.2.6
+
+0.2.7 keeps 0.2.6's formats, protocol 57 and state format 73: `CURRENT` in
+`src/compatibility.rs` is the same at both tags. So a 0.2.6 cluster's nodes
+accept 0.2.7's binary, and `relish upgrade start v0.2.7` rolls it in place,
+workers first and the leader last. It's the first pair of releases that can
+roll since 0.2.2 and 0.2.3, and the first since 0.2.4 stopped moving a
+restarting node's replicas
+([#1449](https://github.com/reliaburger/reliaburger/issues/1449)).
+
+No one has yet walked a cluster from the published 0.2.6 to the published
+0.2.7. The gate's upgrade walks went from the candidate to a soak build of
+the same commit and back
+([8-hour final](qualification/2026-11-07-v0.2.7-job-qualification.md)), which
+proves the walk itself but not the two releases together. If a walk fails, a
+fresh cluster, as [from 0.2.0](#upgrading-from-020), still works.
+
 ## Signing identity
 
 Configure `RELIABURGER_RELEASE_KEY` as a secret of the `release` GitHub
@@ -756,7 +797,7 @@ digest, writes the formula, and pushes it as one commit, `relish 0.2.7`. A
 dry run needs no secrets:
 
 ```sh
-gh release download v0.2.6 --repo reliaburger/reliaburger --pattern candidate.json
+gh release download v0.2.7 --repo reliaburger/reliaburger --pattern candidate.json
 python3 scripts/release/homebrew.py formula --record candidate.json
 ```
 
@@ -874,7 +915,7 @@ and the [release asset digest fields](https://docs.github.com/en/rest/releases/r
 The website and installer are separate static assets under `docs/website`,
 published by `static.yml`. GitHub Pages cannot select a different response for
 curl and a browser at `/`; the shell endpoint is `/install.sh`. The bootstrap
-installs the version in its `RELIABURGER_VERSION` default (`v0.2.6` today), so
+installs the version in its `RELIABURGER_VERSION` default (`v0.2.7` today), so
 bump that default in the same change that announces a newer release. Both
 scripts need a mode, `--laptop` or `--install-only`; with none they explain the
 choices and exit 2. For a release from before 0.2.2 the bootstrap drops
