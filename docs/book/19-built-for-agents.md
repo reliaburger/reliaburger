@@ -719,6 +719,20 @@ what it found: the manifest would claim secrets that weren't there. Every
 rule now recognises its own marker and leaves it alone, and a property test
 checks that a second pass changes nothing and counts nothing.
 
+That property test later found a case no rule's own marker covers (#1717).
+In `https://password="\v"@`, the vertical tab is whitespace, so the URL rule
+saw no user information and let it pass. The secret-key rule then turned
+`"\v"` into `"[redacted]"`, and that took out the very character that had
+stopped the URL rule. A second pass found `https://password="[redacted]"@`,
+a clean userinfo, and redacted it. A space isn't the only character that
+can go missing this way. A bare value can hold a `/`, a `?` or a `#`, and
+any of them stops the URL rule just as well. Changing the order doesn't
+help: the URL rule already runs first, and the secret-key rule has to run
+last so it can see the other rules' markers. So `redact` now runs the URL
+rule twice, once before the secret-key rule and once after it. The second
+run only ever sees text the secret-key rule has finished with, so a third
+pass has nothing left to find.
+
 The regexes are compiled once, on first use, into `static`s:
 
 ```rust

@@ -107,6 +107,11 @@ impl RedactionCounts {
 /// anything, so it goes before the rules that look inside lines. The rules
 /// that recognise a secret by its own shape come next, and the key-based
 /// rule goes last, so `token=rbrg_…` is counted once, as the token it is.
+///
+/// The URL rule then runs once more. A redacted key value can take out the
+/// space, `/`, `?` or `#` that stopped it, as in `https://password="\v"@`,
+/// and without the second run the next call over this output would find
+/// user information this one missed (#1717).
 pub fn redact(text: &str, counts: &mut RedactionCounts) -> String {
     let text = redact_pem_private_keys(text, counts);
     let text = redact_encrypted_values(&text, counts);
@@ -114,7 +119,8 @@ pub fn redact(text: &str, counts: &mut RedactionCounts) -> String {
     let text = redact_url_credentials(&text, counts);
     let text = redact_jwts(&text, counts);
     let text = redact_reliaburger_tokens(&text, counts);
-    redact_secret_key_values(&text, counts)
+    let text = redact_secret_key_values(&text, counts);
+    redact_url_credentials(&text, counts)
 }
 
 /// `text` with every secret the rules recognise replaced by a marker.
@@ -732,6 +738,36 @@ mod tests {
         );
         assert_eq!(counts.count(Rule::SecretKeyValue), 0);
         assert_eq!(counts.total(), 2);
+    }
+
+    #[test]
+    fn a_secret_value_hiding_a_url_userinfo_is_redacted_in_one_pass() {
+        // #1717: the `\v` stops the URL rule, then the `password=` rule
+        // redacts the quoted value around it, which leaves a userinfo with
+        // no whitespace for a second pass to find.
+        let input = "rbrg_api-key: api-key: \"token\": \"https://password=\"\u{b}\"@";
+        let (once, _) = run(input);
+        let (twice, counts) = run(&once);
+        assert_eq!(twice, once);
+        assert!(counts.is_empty(), "the second pass fired {counts:?}");
+        assert!(once.ends_with("\"https://[redacted]@"), "{once}");
+    }
+
+    #[test]
+    fn a_secret_value_with_a_slash_or_space_inside_a_userinfo_is_redacted_in_one_pass() {
+        for input in [
+            "https://password=a/b'@host",
+            "https://password='a b'@host",
+            "https://token=\"x?y#z\"@host",
+        ] {
+            let (once, _) = run(input);
+            let (twice, counts) = run(&once);
+            assert_eq!(twice, once, "{input}");
+            assert!(
+                counts.is_empty(),
+                "{input}: the second pass fired {counts:?}"
+            );
+        }
     }
 
     #[test]
