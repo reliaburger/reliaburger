@@ -277,6 +277,7 @@ net, not a promise: read what you share before you post it anywhere.</p>
 <tr><td><code>relish agent patch test</code></td><td>Run the portable test suite in the workspace, optionally filtered</td></tr>
 <tr><td><code>relish agent patch try</code></td><td>Boot a throwaway cluster from the workspace's binaries, with its own <code>RELIABURGER_HOME</code></td></tr>
 <tr><td><code>relish agent patch diff</code></td><td>The change against the extracted source, and the tests that ran</td></tr>
+<tr><td><code>relish agent patch apply</code></td><td>Apply a unified diff to the workspace, matching each hunk by its lines rather than its header's counts. All or nothing</td></tr>
 <tr><td><code>relish agent patch destroy</code></td><td>Remove the workspace's throwaway cluster, or every one with <code>--all</code>. The workspace and its source stay</td></tr>
 <tr><td><code>relish agent setup</code></td><td>Wire Reliaburger into the AI agents on this machine. Shows the diff; writes only with --yes</td></tr>
 </tbody></table>
@@ -529,7 +530,7 @@ adds the <code>wtf</code>, quorum and skew checks.</p>
 <section class="agents-section" id="proving-a-fix">
 <h2>Proving a fix <a class="permalink" href="#proving-a-fix" aria-label="Link to this section">#</a></h2>
 <p>When the source shows that a bug is in Reliaburger itself, <code>relish agent patch</code> lets an agent fix it, run the tests and boot a throwaway cluster with
-the fix, all without touching your cluster. It takes six commands, each
+the fix, all without touching your cluster. It takes seven commands, each
 naming the same workspace directory.</p>
 <p><code>init</code> extracts the source, as <code>source extract</code> does, and puts it on a branch
 called <code>patch</code>:</p>
@@ -538,6 +539,21 @@ called <code>patch</code>:</p>
 <p>The agent then edits files in <code>./fix</code> with whatever it edits files with.
 <code>patch</code> keeps its own state, binaries and logs in <code>./fix/.reliaburger-patch/</code>,
 which git ignores.</p>
+<p>An agent with no editor of its own, only <code>relish</code>, makes its edit with
+<code>apply</code>. It takes a unified diff, inline or as <code>@file</code>:</p>
+<pre><code class="language-sh">relish agent patch apply ./fix @fix.diff
+</code></pre>
+<p><code>apply</code> reads each hunk's lines and ignores its <code>@@</code> line counts, which a
+hand-written diff often gets wrong. Each hunk applies where its context and
+<code>-</code> lines sit in the file, nearest the line its header names. The answer
+lists every hunk with the line it applied at, how far that was from the
+header's line, and <code>recounted: true</code> when the header's counts were wrong.
+It's all or nothing: when one hunk's lines aren't in the file, nothing is
+written, and the <code>usage</code> error names the hunk, such as <code>hunk 2 of src/relish/client.rs (@@ -28,6 +28,8 @@)</code>, and the first line the file doesn't
+have. <code>--check</code> matches every hunk and writes nothing. <code>apply</code> only writes
+files inside the workspace: never <code>.git/</code> or <code>.reliaburger-patch/</code>, never a
+path with <code>..</code>, and never through a symbolic link. Afterwards <code>diff</code> prints
+the change as git writes it, with correct headers.</p>
 <p><code>test</code> runs the portable suite in the workspace, or only the tests whose name
 contains a filter:</p>
 <pre><code class="language-sh">relish agent patch test ./fix classify_error
@@ -589,7 +605,9 @@ each file's line counts, any build changes, and every test run and build with
 whether it ran against the change as it is now:</p>
 <pre><code class="language-sh">relish agent patch diff ./fix
 </code></pre>
-<p>That's what a report needs: what changed, and which tests prove it.</p>
+<p>That's what a report needs: what changed, and which tests prove it. Its
+<code>data.diff</code> applies with a plain <code>git apply</code>, so a report should carry it
+rather than the diff the agent wrote by hand.</p>
 <p><code>destroy</code> removes the workspace's throwaway cluster, or every one with
 <code>--all</code>. The workspace and its change stay:</p>
 <pre><code class="language-sh">relish agent patch destroy ./fix

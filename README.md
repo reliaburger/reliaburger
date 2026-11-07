@@ -185,7 +185,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish agent`: Commands for LLM agents: one JSON envelope, bounded, never interactive *(0.2.7, not in 0.2.6)*
   - `relish agent guide`: How to use relish as an agent: the manual chapter, as Markdown sections *(0.2.7, not in 0.2.6)*
   - `relish agent version`: This binary's version, commit, target and cluster formats *(0.2.7, not in 0.2.6)*
-  - `relish agent schema [guide|version|schema|source-version|source-tree|source-grep|source-show|source-extract|logs|manual-search|manual-show|context|diagnose|explain|upgrade-check|report|patch-init|patch-build|patch-test|patch-try|patch-diff|patch-destroy|setup]`: The JSON Schema of the envelope and of each command's data *(0.2.7, not in 0.2.6)*
+  - `relish agent schema [guide|version|schema|source-version|source-tree|source-grep|source-show|source-extract|logs|manual-search|manual-show|context|diagnose|explain|upgrade-check|report|patch-init|patch-build|patch-test|patch-try|patch-diff|patch-apply|patch-destroy|setup]`: The JSON Schema of the envelope and of each command's data *(0.2.7, not in 0.2.6)*
   - `relish agent source`: The source this binary was built from: search it, read it, extract it *(0.2.7, not in 0.2.6)*
     - `relish agent source version`: This binary's source: version, commit, digest, file count, and the commit every node runs *(0.2.7, not in 0.2.6)*
     - `relish agent source tree [PREFIX]`: Files with their size in bytes and their line count *(0.2.7, not in 0.2.6)*
@@ -207,6 +207,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
     - `relish agent patch test <DIR> [FILTER]`: Run the portable test suite in the workspace, optionally filtered *(0.2.7, not in 0.2.6)*
     - `relish agent patch try <DIR>`: Boot a throwaway cluster from the workspace's binaries, with its own `RELIABURGER_HOME` *(0.2.7, not in 0.2.6)*
     - `relish agent patch diff <DIR>`: The change against the extracted source, and the tests that ran *(0.2.7, not in 0.2.6)*
+    - `relish agent patch apply <DIR> <DIFF>`: Apply a unified diff to the workspace, matching each hunk by its lines rather than its header's counts. All or nothing *(0.2.7, not in 0.2.6)*
     - `relish agent patch destroy [DIR]`: Remove the workspace's throwaway cluster, or every one with `--all`. The workspace and its source stay *(0.2.7, not in 0.2.6)*
   - `relish agent setup [claude-code|codex|cursor|vscode|goose|gemini]...`: Wire Reliaburger into the AI agents on this machine. Shows the diff; writes only with --yes *(0.2.7, not in 0.2.6)*
 - `relish mcp`: Serve the `relish agent` commands as read-only MCP tools over stdio *(0.2.7, not in 0.2.6)*

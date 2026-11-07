@@ -1791,6 +1791,7 @@ agent all three, under `relish agent patch`:
 | `test DIR [FILTER]` | The portable suite, and says that's all it was |
 | `try DIR [--nodes 1\|3]` | A throwaway cluster from those binaries, with its own `RELIABURGER_HOME` |
 | `diff DIR` | The change, and which tests and builds ran against it |
+| `apply DIR DIFF` | A unified diff, inline or `@file`, matched by its lines rather than its hunk counts |
 | `destroy DIR` or `--all` | The throwaway clusters; never the change |
 
 Every one of them prints the same envelope as the rest of the chapter. The
@@ -2002,6 +2003,82 @@ over the closure's type, so there's no allocation and no indirection, and
 `FnOnce`, the least demanding of the three closure traits, lets the caller
 hand over a closure that moves things out of whatever it captured.
 
+### A diff whose headers don't matter
+
+`apply` came after the 0.2.7 exit test, which comes later in this chapter. An
+agent fixed the planted bug five times out of five, and four of those patches
+didn't apply: every line was right and the `@@ -28,6 +28,8 @@` counts were
+off by one or two, so `git apply` called them corrupt. Nothing in the loop let
+the agent edit a file and have a tool write the diff. An agent with an editor
+can do that in the workspace; the gym's solver, limited to `relish`, can't.
+[#1691](https://github.com/reliaburger/reliaburger/issues/1691) offered two
+ways out: `patch apply`, which takes a diff and applies it tolerantly, or
+`patch edit --path --old --new`, a structured replace. We built only
+`apply`. It takes what the agent already produces, so the agent needs no new
+habit, and one call can change several files. `edit` would have been a second
+way to do the same thing.
+
+Why not shell out to `git apply --recount`? It would apply the same diffs,
+but it reports a failure as `patch failed: src/relish/client.rs:28`, with no hunk
+number, and says nothing about the hunks that matched. Doing it ourselves is
+a few hundred lines, and it lets the answer say per hunk where it applied and
+whether its header was wrong. The parser treats the
+header as a hint. A hunk's body runs until the next `@@`, the next `---`/`+++`
+pair or a line that can't be in a hunk, whatever the counts say. Its context
+and `-` lines are what the file has now; its context and `+` lines are what
+it will have. The hunk applies where the first set sits in the file, after the
+previous hunk and nearest the line the header named:
+
+```rust
+fn find(lines: &[String], old: &[&str], expected: usize, from: usize) -> Option<usize> {
+    if old.len() > lines.len() {
+        return None;
+    }
+    (from..=lines.len() - old.len())
+        .filter(|&at| lines[at..at + old.len()].iter().zip(old).all(|(a, b)| a == b))
+        .min_by_key(|&at| at.abs_diff(expected))
+}
+```
+
+`from..=end` is an inclusive range. `filter` keeps the positions where the
+slice of the file equals the hunk's lines (`zip` walks the two side by side,
+like Python's), and `min_by_key` picks the one nearest `expected`, the first
+on a tie. Context must match exactly; there's no fuzz, because a hunk that
+lands on the wrong `}` is worse than a refusal.
+
+The parsed hunk borrows its lines from the diff text instead of copying them:
+
+```rust
+enum Line<'a> {
+    Context(&'a str),
+    Removed(&'a str),
+    Added(&'a str),
+}
+```
+
+`'a` is the same lifetime parameter as in `region` above, on a type this time:
+a `Line<'a>` can't outlive the `&'a str` it was parsed from. The diff string
+lives for the whole of `apply`, so the compiler lets every `Hunk` and `Line`
+point into it, and no line is copied until it's written into the new file.
+
+Three choices make it safe to hand to an agent. It's all or nothing: every
+hunk of every file is matched in memory first, so a refusal leaves the
+workspace as it was. A hunk that matches nowhere is a `usage` error, the same
+code as any other bad argument, and its message names the hunk and the first
+line the file doesn't have: `hunk 2 of src/relish/client.rs (@@ -28,6 +28,8 @@ ...)
+doesn't apply: the file has no line "        Kind::TimedOut"`. And it only
+writes inside the workspace. A path must be plain names, no `..` and no root,
+not under `.git/` (a hook there runs on the user's next `git checkout`) or
+`.reliaburger-patch/` (the state every other command trusts), and no part of
+it may be a symbolic link, because one could point anywhere. Renames, binary
+diffs and quoted paths are refused rather than half-handled.
+
+Taking the diff from standard input would have been the shell-friendly
+choice, but `relish agent` promises no stdin, so the diff comes the way
+`report`'s long fields do: inline, or `@file`. Inline needs one clap setting.
+A diff starts with `---`, which clap would read as a flag, so the argument
+carries `#[arg(allow_hyphen_values = true)]`.
+
 ### The tests
 
 The commands are functions over a `Tools`: which `cargo` to run, which
@@ -2014,7 +2091,7 @@ starts a VM.
 
 There's a snapshot for every shape: `init`, a build, a build with compiler
 errors, a build refused for touching `build.rs`, a test run with a failure, a
-filtered run that passes, `diff`, `try` and `destroy`. The unit tests check
+filtered run that passes, `diff`, `apply`, `try` and `destroy`. The unit tests check
 the rest: the plan (one cargo run on Linux, the build VM on macOS, a clear
 refusal elsewhere); that the snapshot sees untracked files and leaves the
 index alone; that a test run against an older snapshot isn't current; that
@@ -2022,7 +2099,12 @@ index alone; that a test run against an older snapshot isn't current; that
 the user's endpoint or token; that a second `try` is a `conflict` until
 `destroy`; that `destroy` runs `local destroy` in the cluster's own home,
 keeps the shared cache and the workspace, and keeps the home when the VMs
-won't go; and that no block of ports lands on a default.
+won't go; and that no block of ports lands on a default. For `apply`, a diff with both hunk counts wrong applies, and the diff
+`patch diff` prints then passes a plain `git apply --check` against the
+extracted source; a hunk whose context doesn't match is a `usage` error
+naming it and writes nothing; a diff naming `../`, an absolute path, `.git/`,
+`.reliaburger-patch/` or a path through a symbolic link is refused, and one
+that applies changes nothing outside the workspace.
 
 ## Drafting the report
 
@@ -3927,7 +4009,7 @@ patches applying plain and one needing `--recount`, both reverted tests
 passing every time. That closed criterion 2, and the exit test passed. The
 fix for the underlying problem, a way for `relish agent patch` to hand the
 agent a correct diff instead of making it write hunk headers (#1691), went
-into 0.2.8.
+into 0.2.8 as `patch apply`.
 
 There was one more quiet lesson in the report runs. In one of them the agent
 paraphrased every secret away before the report ever saw it ("password
