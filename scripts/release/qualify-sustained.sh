@@ -96,6 +96,7 @@ job_controller=$repository/scripts/release/job_soak.py
 job_inventory=$repository/scripts/release/job_soak_inventory.py
 export_retention=$repository/scripts/release/soak_export_retention.py
 guest_memory=$repository/scripts/release/sustained/guest-memory.sh
+bun_memory_awk=$repository/scripts/release/sustained/bun-memory.awk
 history_client=$repository/scripts/release/council_history.py
 linearizability=$repository/scripts/release/linearizability.py
 history_clients=4
@@ -1035,6 +1036,9 @@ job_mark_fault() {
 # Everything one guest reports in a single shell: leak inventory, served
 # certificates, exporter source/destination and snapshot archives.
 guest_report() {
+    # Bun's memory by kind (#1417) is one awk pass over its smaps; the
+    # program travels inside the report, quoted for `bash -s`.
+    printf 'bun_memory_awk=%q\n' "$(cat "$bun_memory_awk")"
     cat <<'GUEST'
 section() { printf '@@ %s\n' "$1"; }
 section inventory
@@ -1048,6 +1052,9 @@ if [ "${pid:-0}" -gt 0 ]; then
     # Heap and other private memory against mapped files (#1417).
     echo "bun_rss_anon_kb $(awk '/^RssAnon/ {print $2}' /proc/"$pid"/status)"
     echo "bun_rss_file_kb $(awk '/^RssFile/ {print $2}' /proc/"$pid"/status)"
+    # Heap, glibc thread arenas, thread stacks, other anonymous and
+    # file-backed memory, and the largest anonymous mappings: bun_mem_* lines.
+    awk "$bun_memory_awk" /proc/"$pid"/status /proc/"$pid"/smaps_rollup /proc/"$pid"/smaps 2>/dev/null || true
     # utime + stime: fields 14 and 15, counted after comm's closing parenthesis.
     echo "bun_cpu_ticks $(sed 's/.*) //' /proc/"$pid"/stat | awk '{print $12 + $13}')"
     echo "clk_tck $(getconf CLK_TCK)"
