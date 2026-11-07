@@ -23,15 +23,32 @@ batch of jobs on it, breaks it and watches it heal. Five minutes is the target.
 
 ## Five minutes, zero to cluster
 
-0.2.6 was released on 6 November 2026, and the one-line installer fetches
+0.2.7 was released on 7 November 2026, and the one-line installer fetches
 its signed binaries. You'll need a Mac with Apple silicon, or Linux with QEMU
-and KVM, plus about 8 GiB of free memory and 15 GiB of disk.
+and KVM, plus about 8 GiB of free memory and 15 GiB of disk. You can check
+any release file yourself with
+`gh attestation verify` ([how](docs/releasing.md#build-provenance-attestations)).
 
 `--laptop` asks for a development cluster on this computer. Without a flag the
 installer only explains the choices, including clusters on Linux machines you
 already have (`--install-only`, then the [Linux servers guide](docs/linux-servers.md)).
 Until 1.0.0, Reliaburger is good enough for home labs and dev clusters, not
 for production.
+
+From 0.2.7 your agent can do it for you: tell it "Set up a Reliaburger cluster
+for me. Start at https://reliaburger.com/agents." The playbook there
+([working with an AI agent](docs/manual/16_working-with-an-ai-agent.md#setting-up-a-cluster-for-your-human))
+has it ask where the cluster should run and create nothing that costs money
+without your yes.
+
+Already have `relish` 0.2.7 and an agent you use? Add
+`relish mcp`, its read-only MCP server, with
+[Add to Cursor](https://cursor.com/en/install-mcp?name=reliaburger&config=eyJhcmdzIjpbIm1jcCJdLCJjb21tYW5kIjoicmVsaXNoIn0%3D) or
+[Add to VS Code](https://insiders.vscode.dev/redirect?url=vscode%3Amcp%2Finstall%3F%257B%2522args%2522%253A%255B%2522mcp%2522%255D%252C%2522command%2522%253A%2522relish%2522%252C%2522name%2522%253A%2522reliaburger%2522%257D);
+Goose's button is on [the agents page](https://reliaburger.com/agents#add-to-your-agent).
+In Claude Code it's `claude mcp add reliaburger -- relish mcp`, and
+`relish agent setup` wires up every agent on this machine, showing the diff
+before it writes anything.
 
 ```sh
 # Install relish and build a three-node cluster in Linux VMs on this laptop
@@ -95,27 +112,27 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish setup`: Guided setup: detect or install bun, then write a starter config
 - `relish local <status|start|stop|destroy> [NODE]`: Manage a laptop cluster created by setup --quickstart
 - `relish init [DIR]`: Initialise a new cluster (generates CAs, age keypair, node identity)
-- `relish cluster`: Create a cluster of bare-metal appliances (docs/manual/15_appliance.md) *(0.3.0, not in 0.2.6)*
-  - `relish cluster create --bare-metal --name <NAME> --operator <OPERATORS>... <DIRECTORY> <MACHINES>...`: Create a cluster for appliance machines: its PKI and admin token on this machine, and a seed per machine for an RBSEED stick *(0.3.0, not in 0.2.6)*
-- `relish image`: Appliance OS images: download, write to a disk, and seed machines *(0.3.0, not in 0.2.6)*
-  - `relish image download`: Download the newest OS build for every architecture and check it against the release key *(0.3.0, not in 0.2.6)*
-  - `relish image write <IMAGE> <DEVICE>`: Write a disk image (.raw or .raw.zst) onto a device, erasing it *(0.3.0, not in 0.2.6)*
-  - `relish image seed <DIRECTORY> <MACHINES>...`: Write seeds for machines joining a running bare-metal cluster *(0.3.0, not in 0.2.6)*
-  - `relish image delete <REFERENCE>`: Delete a registry tag: the same as `relish images delete` *(0.3.0, not in 0.2.6)*
-- `relish machines`: Unclaimed appliances on the LAN: list them, or claim them with seeds over the network *(0.3.0, not in 0.2.6)*
-  - `relish machines claim <DIRECTORY> <MACHINES>...`: Claim machines: compare each one's claim key with its console, then send it a seed, joining it to the cluster in DIRECTORY (or, with --create, making a new cluster there from them) *(0.3.0, not in 0.2.6)*
-- `relish netboot <DIR>`: Install appliances over the network: ProxyDHCP, TFTP and HTTP for the OS that `relish image download` saved *(0.3.0, not in 0.2.6)*
-- `relish os`: The appliance OS across the cluster: what each node runs, and rolling a new version out node by node *(0.3.0, not in 0.2.6)*
-  - `relish os list`: Each node's OS version, and the newest release *(0.3.0, not in 0.2.6)*
-  - `relish os upgrade [VERSION]`: Roll an OS version across the cluster, one node at a time: workers, then the council, the leader last. Each node's workloads move off before it reboots *(0.3.0, not in 0.2.6)*
-  - `relish os status`: The rollout in progress, or the last one *(0.3.0, not in 0.2.6)*
-  - `relish os resume`: Carry on with a paused rollout, retrying the node that stopped it *(0.3.0, not in 0.2.6)*
-  - `relish os abort`: Stop the rollout; nodes keep the version they're on *(0.3.0, not in 0.2.6)*
+- `relish cluster`: Create a cluster of bare-metal appliances (docs/manual/15_appliance.md) *(0.3.0, not in 0.2.7)*
+  - `relish cluster create --bare-metal --name <NAME> --operator <OPERATORS>... <DIRECTORY> <MACHINES>...`: Create a cluster for appliance machines: its PKI and admin token on this machine, and a seed per machine for an RBSEED stick *(0.3.0, not in 0.2.7)*
+- `relish image`: Appliance OS images: download, write to a disk, and seed machines *(0.3.0, not in 0.2.7)*
+  - `relish image download`: Download the newest OS build for every architecture and check it against the release key *(0.3.0, not in 0.2.7)*
+  - `relish image write <IMAGE> <DEVICE>`: Write a disk image (.raw or .raw.zst) onto a device, erasing it *(0.3.0, not in 0.2.7)*
+  - `relish image seed <DIRECTORY> <MACHINES>...`: Write seeds for machines joining a running bare-metal cluster *(0.3.0, not in 0.2.7)*
+  - `relish image delete <REFERENCE>`: Delete a registry tag: the same as `relish images delete` *(0.3.0, not in 0.2.7)*
+- `relish machines`: Unclaimed appliances on the LAN: list them, or claim them with seeds over the network *(0.3.0, not in 0.2.7)*
+  - `relish machines claim <DIRECTORY> <MACHINES>...`: Claim machines: compare each one's claim key with its console, then send it a seed, joining it to the cluster in DIRECTORY (or, with --create, making a new cluster there from them) *(0.3.0, not in 0.2.7)*
+- `relish netboot <DIR>`: Install appliances over the network: ProxyDHCP, TFTP and HTTP for the OS that `relish image download` saved *(0.3.0, not in 0.2.7)*
+- `relish os`: The appliance OS across the cluster: what each node runs, and rolling a new version out node by node *(0.3.0, not in 0.2.7)*
+  - `relish os list`: Each node's OS version, and the newest release *(0.3.0, not in 0.2.7)*
+  - `relish os upgrade [VERSION]`: Roll an OS version across the cluster, one node at a time: workers, then the council, the leader last. Each node's workloads move off before it reboots *(0.3.0, not in 0.2.7)*
+  - `relish os status`: The rollout in progress, or the last one *(0.3.0, not in 0.2.7)*
+  - `relish os resume`: Carry on with a paused rollout, retrying the node that stopped it *(0.3.0, not in 0.2.7)*
+  - `relish os abort`: Stop the rollout; nodes keep the version they're on *(0.3.0, not in 0.2.7)*
 - `relish join --node-id <NODE_ID> <ADDR>`: Join an existing cluster
 - `relish join-token`: Manage short-lived node-enrolment tokens
   - `relish join-token create --node-id <NODE_ID>`: Create a single-use token for enrolling one node
-  - `relish join-token list`: List join tokens: node id, expiry and whether each has been used *(0.3.0, not in 0.2.6)*
-  - `relish join-token revoke <NODE_ID>`: Revoke every unused join token for a node id *(0.3.0, not in 0.2.6)*
+  - `relish join-token list`: List join tokens: node id, expiry and whether each has been used *(0.3.0, not in 0.2.7)*
+  - `relish join-token revoke <NODE_ID>`: Revoke every unused join token for a node id *(0.3.0, not in 0.2.7)*
 - `relish nodes`: List cluster nodes and their gossip state
 - `relish council`: Show the council (Raft) on every node, or recover from full loss
   - `relish council status`: Show every node's view of the council (the default)
@@ -181,6 +198,37 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish test`: Run the built-in integration test suite against the cluster
 - `relish bench`: Run reproducible performance benchmarks against the real data plane
 
+**Work with an AI agent** ([working with an AI agent](docs/manual/16_working-with-an-ai-agent.md))
+
+- `relish agent`: Commands for LLM agents: one JSON envelope, bounded, never interactive
+  - `relish agent guide`: How to use relish as an agent: the manual chapter, as Markdown sections
+  - `relish agent version`: This binary's version, commit, target and cluster formats
+  - `relish agent schema [guide|version|schema|source-version|source-tree|source-grep|source-show|source-extract|logs|manual-search|manual-show|context|diagnose|explain|upgrade-check|report|patch-init|patch-build|patch-test|patch-try|patch-diff|patch-destroy|setup]`: The JSON Schema of the envelope and of each command's data
+  - `relish agent source`: The source this binary was built from: search it, read it, extract it
+    - `relish agent source version`: This binary's source: version, commit, digest, file count, and the commit every node runs
+    - `relish agent source tree [PREFIX]`: Files with their size in bytes and their line count
+    - `relish agent source grep <PATTERN>`: Search the source with a regular expression, line by line
+    - `relish agent source show <TARGET>`: Print up to 400 numbered lines of one file: `path` or `path:from-to`
+    - `relish agent source extract <DIR>`: Write the source into a new or empty directory, as a git repository when git is installed
+  - `relish agent logs <APP>`: An app's recent log lines, newest kept, each wrapped as untrusted
+  - `relish agent manual`: The manual compiled into this binary: search it, show a section
+    - `relish agent manual search <WORDS>...`: Up to ten sections that mention every word, best first, each with a short excerpt and the `show` command that prints it
+    - `relish agent manual show <TARGET>`: One chapter, or one section of it, as Markdown: `diagnostics` or `diagnostics#relish-path-can-a-reach-b`
+  - `relish agent context`: The first call: findings, unknowns, faults, alerts, one line per app and the newest events, in one bounded answer
+  - `relish agent diagnose`: Every finding with its evidence, read-only next steps, and pointers into the manual and the source
+  - `relish agent explain [ID]`: What a finding means, its thresholds and where it's decided; every finding when no id is given. Reads only this binary
+  - `relish agent upgrade-check`: Whether the cluster can take the latest release: `ready`, `up_to_date`, `needs_fresh_cluster`, `blocked` or `unknown`
+  - `relish agent report --title <TITLE> --what-happened <WHAT_HAPPENED> --expected <EXPECTED> --not-tested <NOT_TESTED> --caught-by <CAUGHT_BY> --out <OUT>`: Draft a redacted bug report for a human to post. Never posts
+  - `relish agent patch`: Build, test and try a fix on a throwaway cluster
+    - `relish agent patch init <DIR>`: Extract this binary's source into a new workspace, on a `patch` branch
+    - `relish agent patch build <DIR>`: Build the workspace: `relish` for this machine, `bun` and a Linux `relish` for the nodes (in the build VM on macOS). Both by default
+    - `relish agent patch test <DIR> [FILTER]`: Run the portable test suite in the workspace, optionally filtered
+    - `relish agent patch try <DIR>`: Boot a throwaway cluster from the workspace's binaries, with its own `RELIABURGER_HOME`
+    - `relish agent patch diff <DIR>`: The change against the extracted source, and the tests that ran
+    - `relish agent patch destroy [DIR]`: Remove the workspace's throwaway cluster, or every one with `--all`. The workspace and its source stay
+  - `relish agent setup [claude-code|codex|cursor|vscode|goose|gemini]...`: Wire Reliaburger into the AI agents on this machine. Shows the diff; writes only with --yes
+- `relish mcp`: Serve the `relish agent` commands as read-only MCP tools over stdio
+
 **Break things on purpose** ([chaos](docs/manual/05_chaos.md))
 
 - `relish fault`: Inject faults for chaos testing (Smoker)
@@ -217,8 +265,8 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
   - `relish ca backup --out <OUT>`: Write the root CA's key and certificate to a sealed file you keep
   - `relish ca verify --fingerprint <FINGERPRINT> <FILE>`: Check a root CA backup offline
   - `relish ca rotate --role <ROLE>`: Rotate an intermediate CA, signing the new one with your root backup
-- `relish identity`: Rotate the key that signs workload identity tokens *(0.3.0, not in 0.2.6)*
-  - `relish identity rotate-signing-key`: Sign workload identity tokens with a new key *(0.3.0, not in 0.2.6)*
+- `relish identity`: Rotate the key that signs workload identity tokens *(0.3.0, not in 0.2.7)*
+  - `relish identity rotate-signing-key`: Sign workload identity tokens with a new key *(0.3.0, not in 0.2.7)*
 - `relish sign --key <KEY> <IMAGE>`: Sign a Pickle-hosted image with your own key so `require_signatures` admits it
   - `relish sign keygen --out <OUT>`: Generate an image signing key and print the public key line for `[images.trust_policy] keys`
 - `relish audit`: Show who did what: the durable audit log of applies, deletes, execs, upgrades, faults, tokens and the other changes to the cluster
@@ -281,7 +329,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 
 ## What's in the binary
 
-This is what 0.2.6, the release the installer fetches, does.
+This is what 0.2.7, the release the installer fetches, does.
 
 **Runs Kubernetes YAML.** `relish apply -f` converts Deployments, StatefulSets,
 DaemonSets, Services, Ingresses, Jobs, CronJobs, HPAs and Namespaces on the
@@ -416,7 +464,8 @@ and your own, which `--external-key` adds as relish downloads the build for
 each node's platform. Until 1.0 it works only between builds with the same
 cluster formats. 0.2.3 kept 0.2.2's, and a 0.2.2 cluster rolled onto it in
 place ([record](docs/qualification/2026-10-29-rolling-walk-0.2.2-to-0.2.3.md));
-0.2.4, 0.2.5 and 0.2.6 each change them again, so a 0.2.5 cluster moves to 0.2.6 as a fresh cluster. A release with other cluster formats, or a
+0.2.4, 0.2.5 and 0.2.6 each change them again, and 0.2.7 keeps 0.2.6's, so a
+0.2.6 cluster can roll onto 0.2.7 in place. A release with other cluster formats, or a
 rollback to a version some node doesn't hold, is refused before anything is
 recorded.
 
@@ -431,15 +480,19 @@ cover the logic. On top of them sit crash-recovery suites that kill the agent at
 awkward moment, multi-node failover and council-loss tests, power-cut fixtures
 that pull the plug on a VM mid-write, a live-cluster test runner you can point
 at your own cluster (`relish test`), and a soak that installs the signed
-release the way you would and then breaks it for hours. CI never retries a
-failure. See [how Reliaburger is tested](docs/testing.md).
+release the way you would and then breaks it for hours. An agent gym breaks
+throwaway clusters in ways it knows and scores whatever diagnoses them, an AI
+agent included, against the ground truth (`make test-gym`, from 0.2.7; Claude Code plugs in with `scripts/gym/claude_code.py`). CI
+never retries a failure. See [how Reliaburger is tested](docs/testing.md).
 
 **A terminal UI and a web dashboard.** Run `relish` with no arguments for the
 TUI; `relish dashboard` opens the web UI through your authenticated CLI session.
 
 **The manual ships in the binary.** `relish manual` is a searchable reader with
-runnable examples, and `relish source` fuzzy-searches the exact source tree the
-binary was built from. Neither needs a network.
+runnable examples, and `relish source` fuzzy-searches the exact source the
+binary was built from: everything it takes to build it again, its tests and
+its design docs, which CI proves by building from the copy inside the binary.
+Neither needs a network.
 
 ## What you don't install
 
@@ -462,7 +515,7 @@ binary was built from. Neither needs a network.
 Config is TOML. The [whitepaper](docs/whitepaper.md) explains the architecture
 and its trade-offs; the [design docs](docs/design/) cover each subsystem.
 
-## Limits in 0.2.6
+## Limits in 0.2.7
 
 - **Clusters need rootful runc on Linux with eBPF.** macOS runs containers in
   managed Linux VMs; native macOS `bun` runs plain processes only.
@@ -524,7 +577,12 @@ in [docs/book/](docs/book/).
 
 Bug reports and pull requests are welcome. Read the
 [contributing guide](CONTRIBUTING.md) first: changes come with tests and a
-matching update to the book.
+matching update to the book. Report a bug through an
+[issue form](https://github.com/reliaburger/reliaburger/issues/new/choose), which
+asks for the version, a reproducer and what you didn't test. You're welcome to
+use AI tools if you say so and a human answers for every line; agents start
+with [AGENTS.md](AGENTS.md). Vulnerabilities go privately, as
+[SECURITY.md](SECURITY.md) describes, and there's no bounty.
 
 ## Licence
 

@@ -54,8 +54,10 @@ Native runners avoid depending on tools installed outside a cross-build
 container. Runner labels follow GitHub's
 [hosted runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
 The initial Linux build baseline is Ubuntu 22.04. Compatibility with older
-systems is not promised. macOS builds are not yet Developer ID signed or
-notarised; don't equate an Actions build with clean-host acceptance.
+systems is not promised. From 0.2.7 a candidate's macOS `relish` is
+Developer ID signed and notarised once the maintainer has added the Apple
+secrets ([macOS notarisation](#macos-notarisation)); until then it isn't, and
+either way an Actions build is no substitute for clean-host acceptance.
 
 ## Merge trains and their CI
 
@@ -64,15 +66,16 @@ version (`release-0-2-1`), and one gate PR takes the train into `main`. CI
 treats the three kinds of run differently ([which jobs run](testing.md#which-jobs-a-pull-request-runs)):
 
 - **A PR into the train** gets the light set: lint and format, minimum Rust,
-  portable Linux with the coverage floor, the demo app and the optimised
-  contract boundaries, in 15–20 minutes. A `full-ci` label adds everything
-  except the three macOS shards: privileged Linux (on Ubuntu 24.04 and 26.04), cluster, acceptance,
-  upgrades and benchmarks. The macOS shards run on the PR only when it
+  portable Linux with the coverage floor, the demo app, the source bundle
+  build and the optimised contract boundaries, in about 25 minutes. A
+  `full-ci` label adds everything except portable macOS: privileged
+  Linux (on Ubuntu 24.04 and 26.04), cluster, acceptance,
+  upgrades and benchmarks. Portable macOS runs on the PR only when it
   touches macOS-specific code or carries a `macos` label.
-- **The merge queue**, where a train has one, runs every job, macOS shards
-  and heavy suites included, on the batch merged onto the train, before any
-  of it lands. The queue requires the single check `ignored-test evidence`,
-  which waits for every other job and demands every evidence owner.
+- **The merge queue** runs every job, portable macOS and the heavy suites
+  included, on the batch merged onto the train, before any of it lands. The
+  queue requires the single check `ignored-test evidence`, which waits for
+  every other job and demands every evidence owner.
 - **The push to the train** runs everything on the result, macOS included.
 - **The gate PR** into `main` gets the light set on each push, because the
   push to the train has just run everything on the same code
@@ -86,8 +89,61 @@ So nothing reaches a train, or `main`, without the full set having passed on
 that exact commit. macOS runs on every push and on the nightly, on the
 release gate PR and on the candidate build, but not on ordinary pull
 requests: the organisation's plan runs at most five macOS jobs at once, and
-each full run takes three. Dependabot's PRs never get macOS unless labelled;
-the nightly on `main` covers them.
+each full run takes one ([portable macOS in one job](testing.md#portable-macos-in-one-job)).
+Dependabot's PRs never get macOS unless labelled; the nightly on `main`
+covers them.
+
+### Every issue closes itself
+
+Every issue a release resolves closes automatically when its fix reaches
+`main`, never by hand (maintainer decision of 6 November 2026). GitHub only
+acts on a closing keyword such as `Fixes #1234` when the PR merges into the
+default branch, so the keyword in a PR into a train does nothing. Four rules
+make up for that:
+
+- **The train's commits say it too.** A PR into a train carries `Fixes #N`
+  in its body and in its commit messages, one line per issue. The commits
+  reach `main` with the gate PR, and GitHub closes the issue then.
+- **The gate PR names every issue.** Before the gate PR merges into `main`,
+  rebuild its body with a `Fixes #N` line for every issue the train
+  resolves: list the train's merged PRs and collect their lines.
+- **Unfinished issues move at freeze.** An issue the train only partly
+  resolves is split, the done part closed by the train and the rest filed
+  for the next release, or moved to the next milestone whole, with the
+  decision recorded on it. `Part of #N` is for an issue that stays open on
+  purpose.
+- **The milestone is empty after the release.** Once the gate PR has merged
+  and the post-release docs PR with it, the release's milestone holds no open
+  issue. One still open is either a missing `Fixes` line, which you add in
+  the next PR to `main`, or an issue that should have moved at freeze.
+
+### Merging through the queue
+
+Every train merges through GitHub's merge queue (maintainer decision of 6
+November 2026). The repository ruleset "release trains merge queue" holds the
+queue and its one required check, `ignored-test evidence`, and it names each
+train branch exactly: GitHub doesn't allow a wildcard such as `release-*` in a
+ruleset with a merge-queue rule. So when a train opens, the maintainer adds
+its branch (`refs/heads/release-0-2-8`, say) to that ruleset by name, in the
+same sitting as creating the branch. A train missing from the ruleset has
+no queue, and its PRs merge on the light set alone; that's how 0.2.2 to 0.2.6
+merged, because the ruleset still named only `release-0-2-1`.
+
+Merge a PR into a train with `gh pr merge --merge --auto`, or the "Merge when
+ready" button, which adds it to the queue. Don't merge it directly. The queue
+builds a temporary branch with the train plus the PR (and up to three more
+waiting behind it), and `ci.yml`'s `merge_group` trigger runs every job on it.
+The PR lands only if `ignored-test evidence` passes on that exact commit. A
+batch that fails drops the PR that broke it, and the rest go round again.
+
+Why bother, when the push to the train runs everything anyway? Because the
+push runs after the merge. Without the queue, a PR that passed the light set
+could break the macOS or heavy suites, and the train would carry the break
+until someone noticed the push run. Merges also landed faster than the push
+runs finished: each merge cancelled the previous push run, so in early
+November four of six pushes to `release-0-2-7` were cancelled 31 to 52
+minutes in, and those commits never had a finished full run. With the queue,
+every commit on a train has passed every job before it got there.
 
 ## Refreshing dependencies
 
@@ -165,6 +221,17 @@ reports; for function names, build from source with
 `CARGO_PROFILE_RELEASE_STRIP=none`. Nothing reads symbols at runtime. The
 measurements, including build times and the backtrace check, are in
 [qualification/2026-09-24-binary-size.md](qualification/2026-09-24-binary-size.md).
+
+### The source bundle
+
+From 0.2.7 every release `relish` carries the build, test and read set it was
+built from, as one zstd tarball of about 4.7 MB
+([#1570](https://github.com/reliaburger/reliaburger/issues/1570)). `build.rs`
+packs it at level 19, which adds about 10 seconds to the release build. The
+build job sets `RELIABURGER_REQUIRE_CLEAN_SOURCE=1`, so `build.rs` fails the
+build when git lists any change in the embedded paths: a release bundle is
+exactly its commit. Recording the bundle's digest in `candidate.json` is still
+to do (#1570).
 
 ## Cluster compatibility
 
@@ -528,11 +595,28 @@ before it records a run.
 The move is a fresh cluster, as [from 0.2.0](#upgrading-from-020), with the
 same steps and the same losses.
 
-The 0.3.0 appliance train carries everything up to 0.2.6 plus the appliance
+The 0.3.0 appliance train carries everything up to 0.2.7 plus the appliance
 OS rollout and the cluster-wide council size, both new Raft requests and new
 fields in council state, so its builds are at protocol 58 and state format
-74, one past 0.2.6's 57/73. A 0.2.x leader offered a 0.3.0 development build
+74, one past 0.2.7's 57/73. A 0.2.x leader offered a 0.3.0 development build
 refuses it before it records a run, and the move is a fresh cluster.
+
+### Upgrading from 0.2.6
+
+0.2.7 keeps 0.2.6's formats, protocol 57 and state format 73: `CURRENT` in
+`src/compatibility.rs` is the same at both tags. So a 0.2.6 cluster's nodes
+accept 0.2.7's binary, and `relish upgrade start v0.2.7` rolls it in place,
+workers first and the leader last. It's the first pair of releases that can
+roll since 0.2.2 and 0.2.3, and the first since 0.2.4 stopped moving a
+restarting node's replicas
+([#1449](https://github.com/reliaburger/reliaburger/issues/1449)).
+
+No one has yet walked a cluster from the published 0.2.6 to the published
+0.2.7. The gate's upgrade walks went from the candidate to a soak build of
+the same commit and back
+([8-hour final](qualification/2026-11-07-v0.2.7-job-qualification.md)), which
+proves the walk itself but not the two releases together. If a walk fails, a
+fresh cluster, as [from 0.2.0](#upgrading-from-020), still works.
 
 ## Signing identity
 
@@ -613,6 +697,130 @@ half. Keep an offline backup of the private key
 with the release key's. Losing it costs nothing that matters: generate a
 new pair, replace the secret and the line, and the next night uses it.
 
+## Checks a stranger can run
+
+The release key proves a binary to `relish` and `bun`, which carry its public
+half. Someone deciding whether to install Reliaburger at all, an agent among
+them, has neither, so from 0.2.7 a release carries two checks that need
+nothing from us, and a third way in
+([#1583](https://github.com/reliaburger/reliaburger/issues/1583)).
+
+### Build provenance attestations
+
+The candidate job of a manual build of `main` runs
+[`actions/attest-build-provenance`](https://github.com/actions/attest-build-provenance)
+over every file in `dist/` once `candidate.json` is recorded: each binary,
+`.sig`, PDF, guest image, `SHA256SUMS`, `install.sh`, both metadata files and
+`candidate.json` itself. Each gets a Sigstore-signed
+[SLSA provenance](https://slsa.dev/spec/v1.0/provenance) statement naming
+the file's SHA-256, the repository, `build.yml`, the commit and the run. Anyone
+can check one with the GitHub CLI, no account needed beyond `gh`'s own
+sign-in:
+
+```sh
+gh attestation verify relish-macos-aarch64 --repo reliaburger/reliaburger \
+  --signer-workflow reliaburger/reliaburger/.github/workflows/build.yml \
+  --source-ref refs/heads/main
+```
+
+`--signer-workflow` and `--source-ref` matter: without them, any workflow in
+the repository, on any branch, could have made the attestation. The
+installer's `--help` prints the same command for an installed
+`~/.reliaburger/bin/relish`.
+
+The attestation doesn't change what promotion publishes. It's stored in
+GitHub's attestation store (and, the repository being public, in Sigstore's
+public transparency log), keyed by each file's digest, never written into
+`dist/`. So `candidate.json` and the digest the gate records are what they'd
+have been without it, and the step after it, `candidate.py verify`, proves it
+on every build: an extra file or a changed byte fails the candidate there,
+before anything is uploaded. Promotion publishes the same bytes, so the
+attestations made at build time describe the published files exactly.
+
+A train's nightly build isn't attested: it's never a release, and
+`--source-ref refs/heads/main` would refuse it anyway.
+
+`promote.yml` runs the stranger's check itself before it creates the draft:
+every file of the downloaded candidate must verify with those flags. A
+candidate built before 0.2.7, or by anything but `main`'s `build.yml`, stops
+there, with no draft to clean up. The job reads attestations
+(`attestations: read`) and publishes nothing new.
+
+### macOS notarisation
+
+The `notarise-macos` job takes `relish-macos-aarch64` from the build, signs it
+with a Developer ID Application certificate (hardened runtime, secure
+timestamp, identifier `com.reliaburger.relish`), submits it to Apple's notary
+service, waits for `Accepted`, checks it still runs, and replaces the
+`binaries-macos-aarch64` artefact with the signed file. The candidate job
+waits for it, so everything that hashes or signs the binary sees the notarised
+bytes. [`notarise_macos.sh`](../scripts/release/notarise_macos.sh) does the
+work, in a throwaway keychain it deletes afterwards. A bare Mach-O file can't
+carry a stapled ticket, so Gatekeeper checks the notarisation online the first
+time it runs.
+
+It needs five secrets of the `release` environment, the same one that guards
+the release key:
+
+| Secret | What it holds |
+| --- | --- |
+| `APPLE_DEVELOPER_ID_P12` | base64 of a `.p12` holding the Developer ID Application certificate and its private key |
+| `APPLE_DEVELOPER_ID_P12_PASSWORD` | the password that `.p12` was exported with |
+| `APPLE_NOTARY_KEY` | base64 of an App Store Connect API key (`AuthKey_….p8`) with the Developer role |
+| `APPLE_NOTARY_KEY_ID` | that key's ID |
+| `APPLE_NOTARY_ISSUER_ID` | the issuer ID shown above the team's API keys |
+
+The maintainer sets them up once, from an Apple Developer Program membership:
+
+```sh
+base64 < developer-id.p12 | gh secret set APPLE_DEVELOPER_ID_P12 --env release
+gh secret set APPLE_DEVELOPER_ID_P12_PASSWORD --env release
+base64 < AuthKey_KEYID.p8 | gh secret set APPLE_NOTARY_KEY --env release
+gh secret set APPLE_NOTARY_KEY_ID --env release
+gh secret set APPLE_NOTARY_ISSUER_ID --env release
+```
+
+With none of them, the job logs a notice ("relish-macos-aarch64 is NOT
+notarised"), says so in the run summary and succeeds, leaving the binary as
+built; that's also every train's nightly build, since the `nightly`
+environment has no Apple secrets. With only some, it fails and names the
+missing ones. A rejected submission fails the build and prints Apple's log.
+
+### The Homebrew tap
+
+`brew install reliaburger/tap/relish` needs a repository named
+`reliaburger/homebrew-tap` holding `Formula/relish.rb`. This repository holds
+the formula's template, [`relish.rb.in`](../scripts/release/relish.rb.in),
+and its generator, [`homebrew.py`](../scripts/release/homebrew.py). The
+formula installs only the CLI, from the release's own `relish-*` assets at
+the digests `candidate.json` records, and says that `relish upgrade` still
+upgrades the cluster.
+
+`promote.yml`'s `homebrew-tap` job runs after publication, in a job of its own
+so a tap that fails to update never touches the release. It downloads the
+published `candidate.json`, refuses it unless its SHA-256 is the qualified
+digest, writes the formula, and pushes it as one commit, `relish 0.2.7`. A
+dry run needs no secrets:
+
+```sh
+gh release download v0.2.7 --repo reliaburger/reliaburger --pattern candidate.json
+python3 scripts/release/homebrew.py formula --record candidate.json
+```
+
+The maintainer does this once before the first release that should reach
+Homebrew:
+
+1. Create the public repository `reliaburger/homebrew-tap`, with a README so
+   it has a `main` branch.
+2. Create a fine-grained personal access token whose only repository is
+   `reliaburger/homebrew-tap`, with Contents read and write, and store it as
+   `HOMEBREW_TAP_TOKEN` in the `release` environment:
+   `gh secret set HOMEBREW_TAP_TOKEN --env release`.
+3. After the next promotion, check the commit in the tap, then
+   `brew install reliaburger/tap/relish` on a Mac and `relish --version`.
+
+Without the token, the job logs that the tap wasn't updated and succeeds.
+
 ## Metadata and publication
 
 Candidate building and release publication are separate manual operations.
@@ -678,7 +886,9 @@ candidate and requires an exact file inventory and matching lengths/hashes.
 It then uploads those unchanged files to a new draft, checks GitHub's stored
 asset digests and publishes. It neither compiles nor signs. An existing release
 refuses replacement; a failed upload/check leaves a draft for investigation,
-not an automatically repaired or overwritten release.
+not an automatically repaired or overwritten release. Before the draft, it
+checks every file's [build provenance attestation](#build-provenance-attestations);
+after publication, a separate job updates the [Homebrew tap](#the-homebrew-tap).
 
 The digest input must come from the qualification record. Copying a fresh digest
 from unqualified downloads defeats the gate. Workflow verification establishes
@@ -696,6 +906,8 @@ and the [release asset digest fields](https://docs.github.com/en/rest/releases/r
   `compatibility`, the `protocol` and `state` pair `package.py` reads from
   `CURRENT` in `src/compatibility.rs`, so `relish upgrade check` and `start`
   can tell a release that needs a fresh cluster from one that can roll.
+  From 0.2.7 it also carries `notes`, one line pointing at the release page,
+  which `relish agent upgrade-check` passes on inside an untrusted envelope.
   `external_signature` is always `null` in published metadata: only the
   operator holds that key, so `relish upgrade start <version>` takes
   `--external-key` (or a countersigned `--sig`) and adds it.
@@ -709,7 +921,7 @@ and the [release asset digest fields](https://docs.github.com/en/rest/releases/r
 The website and installer are separate static assets under `docs/website`,
 published by `static.yml`. GitHub Pages cannot select a different response for
 curl and a browser at `/`; the shell endpoint is `/install.sh`. The bootstrap
-installs the version in its `RELIABURGER_VERSION` default (`v0.2.6` today), so
+installs the version in its `RELIABURGER_VERSION` default (`v0.2.7` today), so
 bump that default in the same change that announces a newer release. Both
 scripts need a mode, `--laptop` or `--install-only`; with none they explain the
 choices and exit 2. For a release from before 0.2.2 the bootstrap drops

@@ -38,6 +38,40 @@ pub(super) struct PendingCaller {
     pub(super) namespace: String,
     /// The restart count the read was for; a restarted caller is read again.
     pub(super) restarts: u32,
+    /// The job attempt the caller is, for one that isn't an app instance
+    /// (#1602). A runtime slot's instance id comes back for the next
+    /// attempt, under a new cgroup, so a proven cgroup is kept per attempt.
+    pub(super) attempt: Option<AttemptRun>,
+}
+
+impl PendingCaller {
+    /// Which run of the instance id the read was for.
+    fn generation(&self) -> (InstanceId, u32, Option<AttemptRun>) {
+        (self.id.clone(), self.restarts, self.attempt)
+    }
+}
+
+/// One attempt of one task of one job run: what keeps a runtime slot's
+/// reused instance id apart from the attempt it ran before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct AttemptRun {
+    /// The job run (batch).
+    pub(super) batch_id: u64,
+    /// The task's index in the run.
+    pub(super) index: u32,
+    /// The attempt number, from 1.
+    pub(super) attempt: u8,
+}
+
+impl AttemptRun {
+    /// The run `attempt` is.
+    pub(super) fn of(attempt: &crate::bun::live_attempts::LiveAttempt) -> Self {
+        Self {
+            batch_id: attempt.batch_id,
+            index: attempt.index,
+            attempt: attempt.attempt,
+        }
+    }
 }
 
 /// An injected fault whose caller hasn't been answered yet.
@@ -50,7 +84,7 @@ pub(super) struct Injection {
     /// They count as reached even if a later turn's own read runs out of
     /// time again: their key is in the map, or the runtime proved they have
     /// no cgroup to key.
-    settled: Vec<(InstanceId, u32)>,
+    settled: Vec<(InstanceId, u32, Option<AttemptRun>)>,
     /// How many tasks this injection has sent to read callers.
     reads: u32,
     response: oneshot::Sender<Result<FaultSummary, BunError>>,
@@ -91,6 +125,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// it acts on, sending a task for the callers this turn couldn't name.
     pub(super) async fn answer_fault_injection(&mut self, mut injection: Injection) {
         let Some(rule) = self.fault_registry.get(injection.rule_id) else {
+            self.network_faults
+                .unproven_sources
+                .remove(&injection.rule_id);
             self.spawn_cuts(std::mem::take(&mut injection.late_cuts));
             let _ = injection.response.send(Err(BunError::FaultRejected {
                 reason: "the fault was cleared while it was being applied".into(),
@@ -103,10 +140,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .iter()
                 .filter(|caller| {
                     applies_to_caller(rule, &caller.app, &caller.namespace)
-                        && !injection
-                            .settled
-                            .iter()
-                            .any(|(id, restarts)| *id == caller.id && *restarts == caller.restarts)
+                        && !injection.settled.contains(&caller.generation())
                 })
                 .cloned()
                 .collect()
@@ -115,6 +149,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         };
 
         if unreached.is_empty() {
+            // Accepted while every source was pending (#1601): the reads
+            // are in, so a source is proven now or there is none to act on.
+            if self
+                .network_faults
+                .unproven_sources
+                .remove(&injection.rule_id)
+                && !self.source_proven(rule)
+            {
+                let source = rule.fault_type.source_app().unwrap_or_default();
+                let reason = super::faults::no_proven_source(source);
+                self.refuse_injection(injection, reason).await;
+                return;
+            }
             let Injection {
                 summary,
                 late_cuts,
@@ -185,12 +232,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 None => unread.push(caller.id.0),
                 Some(Ok(cgroup)) => {
                     if let Some(cgroup) = cgroup {
-                        self.network_faults
-                            .caller_cgroups
-                            .insert(caller.id.clone(), (caller.restarts, cgroup));
+                        self.network_faults.remember_cgroup(&caller, cgroup);
                         proven.push(caller.id.0.clone());
                     }
-                    injection.settled.push((caller.id, caller.restarts));
+                    injection.settled.push(caller.generation());
                 }
                 // As in `local_callers`: a runtime that can't prove a cgroup
                 // leaves the caller out, and says why.
@@ -199,7 +244,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         "smoker: caller {} has no provable cgroup: {error}",
                         caller.id
                     );
-                    injection.settled.push((caller.id, caller.restarts));
+                    injection.settled.push(caller.generation());
                 }
             }
         }
@@ -258,6 +303,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Take an injection back and tell its caller why.
     async fn refuse_injection(&mut self, mut injection: Injection, reason: String) {
         self.fault_registry.remove(injection.rule_id);
+        self.network_faults
+            .unproven_sources
+            .remove(&injection.rule_id);
         // Converging without the rule takes back every key it wrote.
         self.reconcile_network_faults().await;
         self.spawn_cuts(std::mem::take(&mut injection.late_cuts));

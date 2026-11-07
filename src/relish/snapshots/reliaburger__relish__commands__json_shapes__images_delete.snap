@@ -1,0 +1,8 @@
+---
+source: src/relish/commands.rs
+expression: "json(&DeletedTag { repository: \"team/web\", tag: \"v1\", })"
+---
+{
+  "repository": "team/web",
+  "tag": "v1"
+}

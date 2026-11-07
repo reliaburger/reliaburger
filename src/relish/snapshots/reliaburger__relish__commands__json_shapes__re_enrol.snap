@@ -1,0 +1,8 @@
+---
+source: src/relish/commands.rs
+expression: "json(&ReenrolReport\n{\n    data_dir: PathBuf::from(\"/var/lib/reliaburger\"), replaced_at_epoch:\n    Some(1),\n})"
+---
+{
+  "data_dir": "/var/lib/reliaburger",
+  "replaced_at_epoch": 1
+}

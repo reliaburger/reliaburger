@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "reliaburger": {
+      "args": [
+        "mcp"
+      ],
+      "command": "relish"
+    }
+  }
+}

@@ -153,7 +153,8 @@ fn validate_capacity(
     Ok(())
 }
 
-fn free_disk(root: &Path) -> Result<u64> {
+/// Bytes free to an unprivileged user on the filesystem holding `root`.
+pub fn free_disk(root: &Path) -> Result<u64> {
     #[cfg(unix)]
     {
         let stats = nix::sys::statvfs::statvfs(root)?;

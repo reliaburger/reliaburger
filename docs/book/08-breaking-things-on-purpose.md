@@ -589,6 +589,80 @@ really running first), so the agent caches the id per instance and restart
 count. A restart bumps the count, the next tick looks the cgroup up again, and
 the new cgroup gets its key.
 
+The cache has a cold start, though. Before the injection there's no rule that
+names `frontend` as a source, so nothing has looked its cgroup up. The turn
+that injects the partition asks the runtime, under the agent loop's 500 ms
+turn budget. On an idle node that takes a few milliseconds. Under the 0.2.6
+jobs soak, with thousands of job attempts queueing on runc's lifecycle lock,
+it took longer than the turn, and the operator got this:
+
+```text
+fault rejected: no running instance of source app soak-redis-client on this node has a verified workload cgroup
+```
+
+The frontend was running. The check that refused it, `check_fault_sources`,
+had read "the runtime didn't answer in time" as "the runtime said no" (#1601).
+Those are different answers, and `local_callers` already kept them apart: a
+caller whose lookup times out goes into `pending_callers`, and one the runtime
+answered for gets either `Some(cgroup)` or `None`. So the check now has three
+outcomes. A proven source passes, as before. A source that's only pending
+passes too, and the rule's id goes into `unproven_sources`. No running
+instance, or a runtime that answered and couldn't prove a cgroup, is still
+refused, with the same message.
+
+Passing a pending source doesn't mean the operator hears "applied" straight
+away. The injection's answer already waits for pending callers, because a
+partition that reaches two frontends out of three isn't in place (#625). It
+sends a task to read their cgroups with ten seconds' patience, off the loop,
+and keys each one the task proves. Waiting longer inside the turn would have
+been the obvious fix and the wrong one: every other command and health check
+queues behind a turn that waits. The one new step is at the end. If the rule
+went in with no proven source and the reads find none after all, the agent
+refuses the fault then, takes the rule back out of the registry and
+reconverges, so no key it wrote survives. Otherwise you'd get a partition
+that reports itself in place and keys nothing, which is a quieter version of
+the bug. A source the runtime still can't name after the follow-up reads is
+refused too, and the reason says it timed out. Meanwhile the health tick keeps
+asking every second, and it writes a key only for a cgroup the runtime proved.
+`desired_connect_faults` takes the cgroup from `filter_map(|caller|
+caller.cgroup_id)`, which drops every `None`, so an unverified caller never
+gets a key.
+
+Job attempts had the same bug, by a different road (#1602). A fault can
+name a job as its source, and each attempt that runs in a runtime instance
+of its own is a caller too, listed by `attempt_callers` rather than the
+supervisor. Its lookup under the turn's deadline turned a timeout into
+`None` and never marked the attempt pending, so the follow-up never read
+it and a busy node refused the fault. Making it pending was the easy half.
+The other half was a cache. An app instance's proven cgroup is kept per
+restart count, so the follow-up's proof survives the reconcile that comes
+next. Attempts weren't cached at all, on purpose: a runtime slot's instance
+id comes back for the next task, under a new cgroup. Without a cache, the
+follow-up would prove the attempt, and the very next reconcile would ask
+the slow runtime again, miss the deadline again, and key nothing, while
+the operator heard "applied". So attempts now get their own cache,
+`attempt_cgroups`, keyed by instance id but holding the attempt it was
+read for:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct AttemptRun {
+    pub(super) batch_id: u64,
+    pub(super) index: u32,
+    pub(super) attempt: u8,
+}
+```
+
+A cached cgroup counts only while the live attempt under that id is the
+same run, the same task index and the same attempt number. A reused slot
+is a different `AttemptRun`, so its entry is dropped and read again. It's
+the restart count's job, done with the identity jobs actually have. The
+struct derives `Copy` because it's three small numbers: copying it is as
+cheap as copying a pointer, and it saves a `.clone()` everywhere a pending
+caller is compared. `source_proven` checks this cache as well, so a fault
+accepted on a pending attempt is refused if the follow-up finds no cgroup,
+exactly as for an app.
+
 ### The pool that didn't notice
 
 With the partition landing on the right node, we ran the demo again. `relish

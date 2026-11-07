@@ -155,6 +155,10 @@ jobs:
     runs-on: ${{ matrix.runner }}
     env:
       RELIABURGER_GIT_SHA: ${{ github.sha }}
+      # relish embeds its source (#1570); build.rs fails the build when git
+      # lists a change in what it embeds, so a release carries its commit.
+      # TODO(#1570): record the bundle digest in candidate.json.
+      RELIABURGER_REQUIRE_CLEAN_SOURCE: "1"
       # A train's nightly build trusts the nightly key instead of the release
       # keys (src/upgrade/keys.rs), so the bun it signs can never reach a
       # released cluster. Main's build never has the feature.
@@ -277,6 +281,51 @@ jobs:
           compression-level: 0
           retention-days: 7
 
+  notarise-macos:
+    # Developer ID signs and notarises relish-macos-aarch64 (#1583), so a Mac
+    # that has never seen it opens it without a Gatekeeper prompt. codesign
+    # rewrites the file, so this runs before the candidate job records,
+    # signs or attests anything: candidate.json, the .sig, SHA256SUMS and the
+    # installer's pinned digest all cover the notarised bytes, and promotion
+    # still publishes exactly what was qualified. It takes the candidate
+    # job's environment; only `release` holds the Apple secrets, so a train's
+    # nightly build, and every build until the maintainer adds them, says
+    # it wasn't notarised and leaves the binary as built.
+    environment: ${{ github.ref == 'refs/heads/main' && 'release' || 'nightly' }}
+    needs: build-binaries
+    if: >-
+      ${{ !cancelled() && github.event_name == 'workflow_dispatch'
+      && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release-'))
+      && needs.build-binaries.result == 'success' }}
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download the macOS relish
+        uses: actions/download-artifact@v4
+        with:
+          name: binaries-macos-aarch64
+          path: dist
+      - name: Sign and notarise the macOS relish
+        id: notarise
+        env:
+          APPLE_DEVELOPER_ID_P12: ${{ secrets.APPLE_DEVELOPER_ID_P12 }}
+          APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          APPLE_NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: scripts/release/notarise_macos.sh dist/relish-macos-aarch64
+      - name: Replace the macOS relish with the notarised one
+        # Same name, so the candidate job's `binaries-*` download takes it.
+        if: steps.notarise.outputs.notarised == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-macos-aarch64
+          path: dist/relish-macos-aarch64
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 7
+
   candidate:
     # Signs only a commit that passed the whole of ci.yml: in this run, or in
     # the run ci-evidence found. A skipped validate-release counts only with
@@ -291,11 +340,18 @@ jobs:
       && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release-'))
       && needs.build-pdf.result == 'success' && needs.build-binaries.result == 'success'
       && needs.build-guest-images.result == 'success' && needs.test-packaging.result == 'success'
+      && needs.notarise-macos.result == 'success'
       && (needs.validate-release.result == 'success'
       || (needs.validate-release.result == 'skipped' && needs.ci-evidence.result == 'success'
       && needs.ci-evidence.outputs.reuse == 'true')) }}
-    needs: [ci-evidence, validate-release, build-pdf, build-binaries, build-guest-images, test-packaging]
+    needs: [ci-evidence, validate-release, build-pdf, build-binaries, build-guest-images, test-packaging, notarise-macos]
     runs-on: ubuntu-24.04
+    # Attestations (#1583): the OIDC token is the attestation's identity, and
+    # the attestation store is where `gh attestation verify` finds it.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
       - name: Download PDFs
@@ -365,10 +421,37 @@ jobs:
           # The log line is what `gh run view --log` finds; the summary is
           # for people reading the run page.
           echo "Qualification manifest SHA-256: $digest"
+          echo "QUALIFIED_DIGEST=$digest" >> "$GITHUB_ENV"
           if [ -n "$CI_RUN" ]; then source_ci="reused ci.yml run $CI_RUN, attempt $CI_RUN_ATTEMPT"; else source_ci="ran in this build"; fi
           echo "Source CI: $source_ci"
           printf 'Channel: %s\n\nCandidate commit: `%s`\n\nRun: `%s`, attempt: `%s`\n\nSource CI: %s\n\nQualification manifest SHA-256: `%s`\n' \
             "$CHANNEL" "$CANDIDATE_COMMIT" "$CANDIDATE_RUN" "$CANDIDATE_ATTEMPT" "$source_ci" "$digest" >> "$GITHUB_STEP_SUMMARY"
+      - name: Attest the build provenance of every asset
+        # A Sigstore-signed SLSA provenance statement per file, naming this
+        # workflow, commit and run, so anyone can check a download with
+        # `gh attestation verify FILE --repo reliaburger/reliaburger
+        # --signer-workflow reliaburger/reliaburger/.github/workflows/build.yml
+        # --source-ref refs/heads/main` (#1583). It covers the bytes
+        # candidate.json records, candidate.json itself included, and goes
+        # to GitHub's attestation store, not into dist: the candidate, its
+        # digest and what promotion publishes don't change. Main's
+        # candidates only; a train's nightly build is never a release.
+        if: github.ref == 'refs/heads/main'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*
+      - name: Check the candidate is still exactly what was recorded
+        env:
+          CANDIDATE_COMMIT: ${{ github.sha }}
+          CANDIDATE_RUN: ${{ github.run_id }}
+          CANDIDATE_ATTEMPT: ${{ github.run_attempt }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+        run: >-
+          python3 scripts/release/candidate.py verify --directory dist
+          --version "$RELEASE_TAG" --repository "$RELEASE_REPOSITORY"
+          --commit "$CANDIDATE_COMMIT" --run-id "$CANDIDATE_RUN"
+          --run-attempt "$CANDIDATE_ATTEMPT" --channel "$CHANNEL"
+          --qualified-digest "$QUALIFIED_DIGEST"
       - name: Preserve the qualification manifest on its own
         # A few kilobytes that hash to the digest above, so qualification
         # can read it without the whole candidate. Staging and promotion

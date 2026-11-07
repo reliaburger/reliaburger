@@ -1,0 +1,9 @@
+---
+source: src/relish/commands.rs
+expression: "json(&JoinReport\n{\n    node: \"node-02\".to_string(), identity_dir: PathBuf::from(\"identity\"),\n    root_ca_fingerprint: \"sha256:ab12\".to_string(),\n})"
+---
+{
+  "node": "node-02",
+  "identity_dir": "identity",
+  "root_ca_fingerprint": "sha256:ab12"
+}

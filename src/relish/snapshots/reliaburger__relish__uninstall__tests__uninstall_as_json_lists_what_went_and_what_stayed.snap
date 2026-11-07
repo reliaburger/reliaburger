@@ -1,0 +1,16 @@
+---
+source: src/relish/uninstall.rs
+expression: "crate::relish::output::format_output(&report,\ncrate::relish::OutputFormat::Json).unwrap()"
+---
+{
+  "home": "/home/me/.reliaburger",
+  "removed": [
+    "/home/me/.reliaburger/bin"
+  ],
+  "kept": [
+    "/home/me/.reliaburger/notes.txt"
+  ],
+  "notes": [
+    "remove the line that adds /home/me/.reliaburger/bin to PATH from your shell's rc file"
+  ]
+}

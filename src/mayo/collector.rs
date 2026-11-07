@@ -71,6 +71,18 @@ impl SystemCollector {
         self.disks.refresh(true);
     }
 
+    /// [`refresh`](Self::refresh) on a blocking thread, for async callers:
+    /// it reads `/proc` for every process on the host and `statvfs`es every
+    /// mount. The collector moves to that thread and comes back; the error
+    /// is a panic there, which loses it.
+    pub async fn refreshed(mut self) -> Result<Self, tokio::task::JoinError> {
+        tokio::task::spawn_blocking(move || {
+            self.refresh();
+            self
+        })
+        .await
+    }
+
     /// Collect node-level metrics (CPU, memory, disk, network).
     pub fn collect_node_metrics(&self) -> Vec<CollectedMetric> {
         let mut metrics = Vec::new();
@@ -243,6 +255,20 @@ impl Default for SystemCollector {
 
 #[cfg(test)]
 mod tests {
+    /// The collection loop refreshed sysinfo on a runtime worker every
+    /// tick: a read of several `/proc/<pid>` files for every process on the
+    /// host, and a `statvfs` of every mount. A node running host jobs has
+    /// thousands of processes. With the blocking pool held busy, a pending
+    /// first poll means the refresh waits for a blocking thread rather than
+    /// running inline (#1674).
+    #[test]
+    fn refreshing_runs_off_the_runtime() {
+        let collector = super::SystemCollector::new();
+        let collector =
+            crate::off_runtime::assert_runs_on_blocking_pool(collector.refreshed()).unwrap();
+        assert!(!collector.collect_node_metrics().is_empty());
+    }
+
     #[test]
     fn exited_processes_are_forgotten_on_refresh() {
         let mut collector = SystemCollector::new();

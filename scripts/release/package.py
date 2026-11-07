@@ -224,7 +224,11 @@ def package_release(directory, version, repository, key, trusted, pins, forbidde
             }
             checksums.append(f"{digest}  {path.name}\n")
         name = "metadata.json" if binary == "bun" else "cli-metadata.json"
-        release = {"version": version, "compatibility": compatibility, "platforms": artifacts}
+        # The notes themselves are written on the release page after packaging;
+        # `relish agent upgrade-check` passes this pointer on, untrusted.
+        notes = f"Release notes: https://github.com/{repository}/releases/tag/{version}"
+        release = {"version": version, "compatibility": compatibility, "notes": notes,
+                   "platforms": artifacts}
         outputs[name] = {"schema": 1, "latest": version, "releases": [release]}
     outputs[GUEST_METADATA] = guest_image_metadata(directory, version, key, pins)
     for image in outputs[GUEST_METADATA]["images"].values():

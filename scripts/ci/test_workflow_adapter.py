@@ -14,6 +14,13 @@ import contracts as c
 class WorkflowAdapter(unittest.TestCase):
     def setUp(self):
         self.a = importlib.import_module('workflow_adapter')
+        # CI runs portable macOS as one partition (SHARDS is 1). The merge
+        # is written for any count, and only several shards can overlap or
+        # leave gaps, so these tests split it three ways; the test of one
+        # shard that lists everything checks the real count.
+        shards = patch.dict(self.a.w.SHARDS, {'portable-darwin': 3})
+        shards.start()
+        self.addCleanup(shards.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name).resolve()
         self.incoming = self.root / 'incoming'
@@ -57,7 +64,7 @@ class WorkflowAdapter(unittest.TestCase):
                    manifest_sha256=c.digest(self.manifest_path),
                    files={name: c.digest(directory / name) for name in names})
         if shard is not None:
-            row['shard'] = [shard, 3]
+            row['shard'] = [shard, self.a.w.SHARDS[gate]]
         (directory / 'gate-seal.json').write_text(json.dumps(row))
         output = self.a.output_name(gate, label or shard)
         self.needs[self.a.JOBS[gate]]['outputs'][output] = c.digest(directory / 'gate-seal.json')
@@ -101,6 +108,22 @@ class WorkflowAdapter(unittest.TestCase):
         verified = self.aggregate()
         self.assertEqual(verified[('portable-darwin', 'darwin')], {self.darwin})
         self.assertEqual(set(self.a.w.SHARDS), {'portable-darwin'})
+
+    def test_ci_runs_portable_macos_as_one_shard_that_lists_everything(self):
+        with patch.dict(self.a.w.SHARDS, {'portable-darwin': 1}):
+            self.assertEqual(self.a.owner_units({('portable-darwin', 'darwin')}), [('portable-darwin', 'darwin', 1)])
+            self.assertEqual(self.a.parse_shard('portable-darwin', '1/1'), 1)
+            for text in ('1/3', '2/1', '0/1'):
+                with self.subTest(text=text), self.assertRaises(c.Invalid):
+                    self.a.parse_shard('portable-darwin', text)
+            for shard in (1, 2, 3):
+                shutil.rmtree(self.incoming / ('contract-darwin-portable-darwin-' + str(shard)))
+            self.needs['macos']['outputs'] = {}
+            everything = {1: set().union(*self.lists.values())}
+            self.envelope('portable-darwin', 'darwin', 1, discovery=self.discovery(1, everything))
+            verified = self.aggregate()
+            self.assertEqual(verified[('portable-darwin', 'darwin')], {self.darwin})
+            self.assertEqual(list(self.needs['macos']['outputs']), ['portable_darwin_1_sha256'])
 
     def test_a_missing_or_failed_shard_blocks_aggregation(self):
         for change in ['output', 'envelope']:

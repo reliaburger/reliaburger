@@ -279,7 +279,7 @@ impl ChaosGuard {
                     }
                 }
                 Ok(Err(
-                    crate::relish::RelishError::AgentUnreachable
+                    crate::relish::RelishError::AgentUnreachable { .. }
                     | crate::relish::RelishError::RequestTimeout,
                 ))
                 | Err(_) => {

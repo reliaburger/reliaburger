@@ -1,0 +1,25 @@
+---
+source: src/relish/fault.rs
+expression: "crate::relish::output::format_output(&ScenarioPlan::new(\"refusal\", &timeline),\nOutputFormat::Json).unwrap()"
+---
+{
+  "name": "refusal",
+  "steps": [
+    {
+      "at_secs": 0.0,
+      "description": "kill a replica",
+      "fault": "kill",
+      "target": "web",
+      "value": "",
+      "duration": null
+    },
+    {
+      "at_secs": 0.0,
+      "description": "slow the rest",
+      "fault": "delay",
+      "target": "web",
+      "value": "200ms",
+      "duration": null
+    }
+  ]
+}

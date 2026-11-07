@@ -79,7 +79,7 @@ It verifies `bun` against the release signatures, asks a few questions and
 writes a starter `reliaburger.toml`. Pass `--yes` to accept every default.
 Real containers need runc on Linux, and a cluster needs rootful runc with eBPF
 (see `cluster-basics`). On macOS, use the quickstart above: it runs the same
-runc path inside Linux VMs. Apple Container isn't supported in 0.2.6.
+runc path inside Linux VMs. Apple Container isn't supported in 0.2.7.
 
 ## From source, without containers
 
@@ -111,6 +111,26 @@ You should see the `hello` workload in `Running` state. Open
 <http://127.0.0.1:9117/> for the web dashboard, or run `relish` with no
 arguments for the terminal one. The process runtime supervises real processes but
 doesn't isolate them, so keep it for trying things out.
+
+## Checking a download
+
+From 0.2.7, every release file carries a build
+provenance attestation: a signed statement that the build workflow on `main`
+made a file with exactly this SHA-256. Check the `relish` you installed with
+the GitHub CLI (<https://cli.github.com>), the same command
+`install.sh --help` prints:
+
+```sh
+gh attestation verify ~/.reliaburger/bin/relish --repo reliaburger/reliaburger \
+  --signer-workflow reliaburger/reliaburger/.github/workflows/build.yml \
+  --source-ref refs/heads/main
+```
+
+The last two flags matter: without them, any workflow in the repository, on
+any branch, could have made the attestation. Any other release file works in
+place of the binary: `SHA256SUMS`, `install.sh`, `metadata.json`, a guest
+image. Releases before 0.2.7 and nightly builds carry no attestation, so the
+check fails for them.
 
 ## Where to next
 

@@ -31,6 +31,7 @@ jobs:
     permissions:
       contents: write
       actions: read
+      attestations: read
     env:
       GH_TOKEN: ${{ github.token }}
       RELEASE_TAG: ${{ inputs.tag }}
@@ -66,6 +67,19 @@ jobs:
             --version "$RELEASE_TAG" --repository "$RELEASE_REPOSITORY" \
             --commit "$CANDIDATE_COMMIT" --run-id "$CANDIDATE_RUN" \
             --qualified-digest "$QUALIFIED_DIGEST"
+      - name: Check every asset carries the candidate build's attestation
+        # Read-only: what a stranger will run against the published files
+        # (#1583). A candidate built before attestations, or by any workflow,
+        # branch or repository but main's build.yml, stops here, before a
+        # draft exists.
+        run: |
+          for asset in dist/*; do
+            gh attestation verify "$asset" --repo "$RELEASE_REPOSITORY" \
+              --signer-workflow "$RELEASE_REPOSITORY/.github/workflows/build.yml" \
+              --source-ref refs/heads/main >/dev/null \
+              || { echo "no build provenance attestation for $(basename "$asset")" >&2; exit 1; }
+            echo "attested: $(basename "$asset")"
+          done
       - name: Upload unchanged assets to a new draft
         run: |
           gh release create "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" \
@@ -78,3 +92,35 @@ jobs:
             --qualified-digest "$QUALIFIED_DIGEST"
           gh release edit "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" \
             --verify-tag --draft=false --latest
+
+  homebrew-tap:
+    # The tap's formula pins the published relish binaries (#1583). It runs
+    # only after publication, in a job of its own, so a tap that fails to
+    # update never touches the release, and it reads only the published
+    # candidate.json, checked against the qualified digest. The token is a
+    # secret of the `release` environment, which only main can reach.
+    # Without it the job says so and succeeds.
+    needs: promote
+    if: github.ref == 'refs/heads/main'
+    environment: release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.tag }}
+      RELEASE_REPOSITORY: ${{ github.repository }}
+      QUALIFIED_DIGEST: ${{ inputs.qualified_digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Write the formula from the published release
+        run: |
+          gh release download "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" \
+            --pattern candidate.json --dir published
+          python3 scripts/release/homebrew.py formula --record published/candidate.json \
+            --qualified-digest "$QUALIFIED_DIGEST" --output relish.rb
+          { echo '### Homebrew formula'; echo '```ruby'; cat relish.rb; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Push the formula to the tap
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: python3 scripts/release/homebrew.py publish --formula relish.rb --version "$RELEASE_TAG"

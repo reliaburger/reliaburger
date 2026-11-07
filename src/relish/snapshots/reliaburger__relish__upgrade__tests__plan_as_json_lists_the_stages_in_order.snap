@@ -1,0 +1,28 @@
+---
+source: src/relish/upgrade.rs
+expression: "crate::relish::output::format_output(&UpgradePlan::new(\"v0.2.0\", 5, 2, 1, 2),\ncrate::relish::OutputFormat::Json).unwrap()"
+---
+{
+  "version": "v0.2.0",
+  "nodes": 8,
+  "parallel": 2,
+  "stages": [
+    {
+      "role": "workers",
+      "nodes": 5,
+      "batches": 3
+    },
+    {
+      "role": "council",
+      "nodes": 2,
+      "batches": 2
+    },
+    {
+      "role": "leader",
+      "nodes": 1,
+      "batches": 1
+    }
+  ],
+  "estimated_secs": 270,
+  "seconds_per_node": 45
+}

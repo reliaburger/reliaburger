@@ -559,6 +559,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 reason: "kernel source policy is unavailable".into(),
             })?;
         self.cgroup_ns_bpf_keys.insert(cgroup_id);
+        self.firewall_writes.namespaces.forget(&cgroup_id);
         crate::sesame::firewall::write_cgroup_namespace_entry(
             &mut self.lock_kernel(&handle).await.bpf,
             cgroup_id,
@@ -582,6 +583,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             // Remember partial publication before attempting the write. The
             // durable source owner retains every grant until confirmed cleanup.
             self.firewall_bpf_keys.insert(key);
+            self.firewall_writes.firewall.forget(&key);
             crate::sesame::firewall::write_firewall_entry(
                 &mut self.lock_kernel(&handle).await.bpf,
                 key,
@@ -663,6 +665,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     instance_id: instance_id.clone(),
                     reason: "kernel source policy is unavailable".into(),
                 })?;
+            self.firewall_writes.namespaces.forget(&binding.cgroup_id);
+            self.firewall_writes
+                .firewall
+                .forget_where(|key| key.src_cgroup_id == binding.cgroup_id);
             crate::sesame::firewall::delete_cgroup_firewall_state(
                 &mut handle.lock().await.bpf,
                 binding.cgroup_id,
@@ -1298,7 +1304,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
         // Unknown kernel keys are not proof of abandoned ownership. Retained
         // source owners authorise individual retirement; reconciliation retries
-        // only the keys it already owns.
+        // only the keys it already owns. The sweep's reconcile writes every
+        // entry, not just the changed ones, so an entry something else
+        // removed comes back.
+        self.firewall_writes.clear();
         self.sync_firewall_ebpf().await;
     }
 

@@ -30,6 +30,8 @@ pub(super) enum FollowUp {
     },
     /// A kill, pause or resume fault's signals were sent, or weren't.
     Signalled(super::signal_faults::Signalled),
+    /// A CPU, memory or disk I/O fault's cgroup writes landed, or didn't.
+    CgroupFaultWritten(super::resource_faults::CgroupFaultWritten),
     /// The cgroups of the callers an injection couldn't name in its turn
     /// were read, or ran out of time.
     CallersRead(super::fault_coverage::CallersRead),
@@ -143,6 +145,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
             }
             Ok((_, FollowUp::Signalled(done))) => self.finish_signal_fault(done),
+            Ok((_, FollowUp::CgroupFaultWritten(done))) => self.finish_cgroup_fault(done),
             Ok((_, FollowUp::CallersRead(read))) => self.finish_callers_read(read).await,
             Ok((_, FollowUp::NodePressure(done))) => {
                 self.finish_node_pressure(done).await;

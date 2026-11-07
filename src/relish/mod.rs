@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod audit_cmd;
 pub mod bare_metal;
 pub mod bench_cmd;
@@ -40,6 +41,7 @@ pub mod local_context;
 pub mod machines;
 pub mod manifest;
 pub mod manual;
+pub mod mcp;
 pub mod metrics_cmd;
 pub mod netboot;
 pub mod os;
@@ -54,10 +56,12 @@ pub mod recover_guard;
 pub mod released_cli;
 pub mod setup;
 pub mod source;
+pub mod source_bundle;
 pub mod test_cmd;
 mod tls;
 pub mod tui;
 pub mod uninstall;
+pub mod unknown_command;
 pub mod upgrade;
 pub mod wtf;
 pub mod wtf_cmd;
@@ -102,12 +106,99 @@ impl CommandOutcome {
     }
 }
 
+/// A command that takes over the whole terminal (#1569).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FullScreen {
+    /// `relish` with no subcommand, or `relish tui`.
+    Tui,
+    /// The `relish manual` reader.
+    Manual,
+    /// The `relish source` browser.
+    Source,
+}
+
+impl FullScreen {
+    /// Refuse at once unless stdin and stdout are both a terminal: the TUI
+    /// reads keys in raw mode and draws on an alternate screen, and with no
+    /// terminal it fails with an ioctl error or waits for keys that never
+    /// come.
+    pub fn require_terminal(self) -> Result<(), RelishError> {
+        use std::io::IsTerminal;
+        self.check_terminal(std::io::stdin().is_terminal() && std::io::stdout().is_terminal())
+    }
+
+    fn check_terminal(self, interactive: bool) -> Result<(), RelishError> {
+        if interactive {
+            Ok(())
+        } else {
+            Err(RelishError::NoTerminal(self))
+        }
+    }
+
+    /// How the command is named in a message.
+    fn name(self) -> &'static str {
+        match self {
+            FullScreen::Tui => "the relish TUI",
+            FullScreen::Manual => "relish manual",
+            FullScreen::Source => "relish source",
+        }
+    }
+
+    /// What to run instead from a shell with no terminal.
+    fn instead(self) -> &'static str {
+        match self {
+            FullScreen::Tui => {
+                "`relish agent guide` lists the commands that print plain output, such as `relish status`"
+            }
+            FullScreen::Manual => "`relish agent manual search` and `show` print it as Markdown",
+            FullScreen::Source => "`relish agent source` searches and prints the source",
+        }
+    }
+}
+
+/// Why a connection to a Bun agent never carried a request. Each cause's
+/// message ends with what to try, because "is it running?" was wrong for
+/// most of them (#1567).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum UnreachableCause {
+    /// The host name didn't resolve to an address.
+    #[error(
+        "the host name doesn't resolve; check the address in --endpoint, RELIABURGER_ENDPOINT or the current context"
+    )]
+    NameResolution,
+    /// The host answered, and nothing listened on the port.
+    #[error("connection refused; check that bun runs there and listens on that port")]
+    Refused,
+    /// The TLS handshake reached the server's certificate, and relish didn't
+    /// trust it: an unknown CA, the wrong name, an expired certificate.
+    #[error(
+        "the server's certificate isn't trusted ({0}); pass the cluster CA with --ca-cert or RELIABURGER_CA_CERT"
+    )]
+    UntrustedCertificate(String),
+    /// The TCP connection opened, and the TLS handshake failed for a reason
+    /// other than the certificate.
+    #[error("TLS handshake failed ({0}); check the endpoint is https and serves TLS")]
+    Tls(String),
+    /// Nothing answered before relish gave up.
+    #[error(
+        "no answer before the connect timeout; the host may be down, or a firewall may drop packets to that port"
+    )]
+    TimedOut,
+    /// Anything else, as the network stack described it.
+    #[error("{0}")]
+    Other(String),
+}
+
 /// Errors from Relish CLI operations.
 #[derive(Debug, thiserror::Error)]
 pub enum RelishError {
     /// Configuration parse or validation failure.
     #[error("{0}")]
     Config(#[from] ConfigError),
+
+    /// The embedded source bundle couldn't be read or extracted.
+    #[error("{0}")]
+    SourceBundle(#[from] source_bundle::SourceBundleError),
 
     /// JSON serialisation failure.
     #[error("failed to serialise JSON: {0}")]
@@ -121,9 +212,19 @@ pub enum RelishError {
     #[error("{command} requires a running Bun agent (not available in single-node mode yet)")]
     AgentRequired { command: String },
 
-    /// The Bun agent is not reachable.
-    #[error("bun agent not reachable at localhost:9117 (is it running?)")]
-    AgentUnreachable,
+    /// No connection to the Bun agent carried the request: it names the
+    /// endpoint relish dialled and why that failed (#1567).
+    #[error("cannot reach the bun agent at {endpoint}: {cause}")]
+    AgentUnreachable {
+        /// The scheme, host and port relish dialled (`https://10.0.0.5:9117`).
+        endpoint: String,
+        /// What went wrong, with what to do about it.
+        cause: UnreachableCause,
+    },
+
+    /// A full-screen command ran without a terminal (#1569).
+    #[error("{} needs a terminal, and stdin or stdout isn't one; {}", .0.name(), .0.instead())]
+    NoTerminal(FullScreen),
 
     /// A WebSocket connection or frame failed.
     #[error("websocket: {0}")]
@@ -132,6 +233,13 @@ pub enum RelishError {
     /// A command-line flag value could not be parsed.
     #[error("invalid --{flag} value: {reason}")]
     InvalidFlag { flag: String, reason: String },
+
+    /// `relish upgrade plan` couldn't see the live cluster, so it won't
+    /// guess its shape (#1568).
+    #[error(
+        "can't plan an upgrade for a cluster relish couldn't see ({0}); fix that, or pass --cluster-size N to plan for a cluster of N nodes"
+    )]
+    UnseenCluster(Box<RelishError>),
 
     /// A request to the agent timed out. The operation may still be running.
     #[error("request timed out (the operation may still be running on the agent)")]
@@ -267,4 +375,34 @@ pub enum RelishError {
     /// The master key or security state `relish init` wrote couldn't be read.
     #[error("{0}")]
     SecurityFiles(#[from] crate::sesame::bootstrap::BootstrapError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_full_screen_command_runs_on_a_terminal() {
+        for command in [FullScreen::Tui, FullScreen::Manual, FullScreen::Source] {
+            assert!(command.check_terminal(true).is_ok(), "{command:?}");
+        }
+    }
+
+    /// Each refusal names the plain-output command to run instead.
+    #[test]
+    fn a_full_screen_command_without_a_terminal_names_what_to_run_instead() {
+        let refusal = |command: FullScreen| command.check_terminal(false).unwrap_err().to_string();
+        assert_eq!(
+            refusal(FullScreen::Tui),
+            "the relish TUI needs a terminal, and stdin or stdout isn't one; `relish agent guide` lists the commands that print plain output, such as `relish status`"
+        );
+        assert_eq!(
+            refusal(FullScreen::Manual),
+            "relish manual needs a terminal, and stdin or stdout isn't one; `relish agent manual search` and `show` print it as Markdown"
+        );
+        assert_eq!(
+            refusal(FullScreen::Source),
+            "relish source needs a terminal, and stdin or stdout isn't one; `relish agent source` searches and prints the source"
+        );
+    }
 }

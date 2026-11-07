@@ -89,6 +89,7 @@ pub fn find_chapter(chapters: &[assets::Chapter], query: &str) -> Result<usize, 
 
 /// `relish manual [CHAPTER]` — open the reader, on `chapter` if given.
 pub async fn run(chapter: Option<&str>) -> Result<(), RelishError> {
+    crate::relish::FullScreen::Manual.require_terminal()?;
     let Some(query) = chapter else {
         return reader::run("chapters", documents(), None).await;
     };
@@ -100,20 +101,39 @@ pub async fn run(chapter: Option<&str>) -> Result<(), RelishError> {
 }
 
 /// `relish manual examples` — extract the embedded examples under `dir`.
-pub fn examples(dir: &Path) -> Result<(), RelishError> {
+pub fn examples(dir: &Path, output: crate::relish::OutputFormat) -> Result<(), RelishError> {
     let written = assets::write_examples(dir)?;
-    if written.is_empty() {
-        println!(
-            "examples already present under {}",
-            dir.join("examples").display()
-        );
-    } else {
-        for path in &written {
-            println!("wrote {}", path.display());
+    crate::relish::output::print_output(
+        &ExamplesReport {
+            directory: dir.join("examples"),
+            written,
+        },
+        output,
+    )
+}
+
+/// What `relish manual examples` wrote. An empty `written` means every
+/// example was already there.
+#[derive(Debug, serde::Serialize)]
+pub struct ExamplesReport {
+    pub directory: std::path::PathBuf,
+    pub written: Vec<std::path::PathBuf>,
+}
+
+impl std::fmt::Display for ExamplesReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.written.is_empty() {
+            return writeln!(
+                f,
+                "examples already present under {}",
+                self.directory.display()
+            );
         }
-        println!("try: relish apply examples/phase-1/proc-first-run.toml");
+        for path in &self.written {
+            writeln!(f, "wrote {}", path.display())?;
+        }
+        writeln!(f, "try: relish apply examples/phase-1/proc-first-run.toml")
     }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -194,5 +214,21 @@ mod tests {
         assert_eq!(documents.len(), assets::chapters().len());
         assert_eq!(documents[0].title, "Getting started");
         assert!(!documents[0].lines.is_empty());
+    }
+
+    #[test]
+    fn examples_as_json_list_what_was_written() {
+        insta::assert_snapshot!(
+            crate::relish::output::format_output(
+                &ExamplesReport {
+                    directory: std::path::PathBuf::from("./examples"),
+                    written: vec![std::path::PathBuf::from(
+                        "./examples/phase-1/proc-first-run.toml"
+                    )],
+                },
+                crate::relish::OutputFormat::Json
+            )
+            .unwrap()
+        );
     }
 }

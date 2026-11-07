@@ -26,20 +26,20 @@ Nothing is fetched from anywhere else. With scripts disabled a `<noscript>`
 note links the `.cast` file, and the written tour works as before.
 
 `assets/why-carousel.js` turns the "Built differently" section (`#why`), a
-plain list of five architectural differences, into a slideshow: one at a
-time, a new one every nine seconds, with previous, next, five dots and a Pause
+plain list of six architectural differences, into a slideshow: one at a
+time, a new one every nine seconds, with previous, next, six dots and a Pause
 and Play button. Pause and Play always take effect; it also stops while a
 mouse rests on it and when keyboard focus comes in (until Play), never because
 of a tap, and doesn't rotate at all for visitors who prefer reduced motion. It follows the WAI-ARIA
 carousel pattern, so the slide text is a polite live region only while it
 isn't rotating by itself. The drawings are inline SVG animated by CSS in
 `style.css`, so reduced motion stills them and nothing loads from elsewhere.
-Without JavaScript all five stay stacked.
+Without JavaScript all six stay stacked.
 
 Don't add other scripts. The footer names all three, so change them together.
 
-Every `<section>` has a stable `id` (`why`, `install`, `tour`, `netboot`, `start`,
-`docs`, `internals`, `next`, `contributing`) and every section heading a `#` permalink, shown on
+Every `<section>` has a stable `id` (`why`, `install`, `tour`, `netboot`, `debug`,
+`start`, `docs`, `internals`, `next`, `contributing`) and every section heading a `#` permalink, shown on
 hover or focus, so a section can be shared as `reliaburger.com/#install`.
 Renaming an `id` breaks links people have already shared; add a new section
 instead. `tests/suite/website.rs` checks the ids, the permalinks and that the
@@ -76,6 +76,32 @@ the narration says so. Its commands sit in `<code data-netboot>` elements,
 which `tests/suite/website.rs` parses with the real CLI. Re-record it when
 `relish netboot` or `relish machines` change what they print.
 
+### For agents
+
+The page opens with one line for AI agents, "Are you an AI agent? Start
+here", above the masthead: it links `/agents` (as `agents.html`, which also
+works from a local preview), `agents.md` and `llms.txt`. Those three files,
+the skill and the plugin are generated from the manual chapter
+`docs/manual/16_working-with-an-ai-agent.md` by `src/relish/agent/guide.rs`;
+`make agent-docs` rewrites them, and `tests/suite/agent_docs.rs` fails while
+one is stale, so never edit them by hand. `/agents` uses this directory's
+`style.css` (the `.agents-*` rules) and `assets/copy.js`, nothing else. The
+generator makes each `## ` heading a `<section>` with its slug as `id` (the
+same anchors GitHub makes), a contents list, and the "Add it to your agent"
+box: Cursor, VS Code and Goose install links and the `claude mcp add` line,
+all built from the server name and command line `relish agent setup` writes.
+The README carries the same links through cursor.com and vscode.dev, because
+GitHub drops links with other schemes.
+
+The "Debug the platform, not just your app" section (`#debug`) shows what an
+agent does from 0.2.7. Its commands carry `data-agent-command`, and
+`tests/suite/website.rs` parses each with the real CLI. Its recording slot
+(`#agent-recording`) has no `data-cast` until a real session is recorded
+([#1579](https://github.com/reliaburger/reliaburger/issues/1579)), so the
+player leaves it alone and it says there's no recording yet. When the cast
+lands, put it in `assets/`, add `data-cast` and a `.recording-screen` as the
+tour's figure has, and drop the pending note.
+
 ### Re-recording the tour
 
 `scripts/demo/tour.sh` runs the tour for real: it reads the commands from this
@@ -100,7 +126,7 @@ so it can't touch yours:
 
 ```sh
 RELIABURGER_HOME=~/.rbtour scripts/demo/tour.sh \
-  --record docs/website/assets/tour.cast --install v0.2.6
+  --record docs/website/assets/tour.cast --install v0.2.7
 RELIABURGER_HOME=~/.rbtour ~/.rbtour/bin/relish local destroy --yes
 RELIABURGER_HOME=~/.rbtour ~/.rbtour/bin/relish uninstall --yes
 rm -rf ~/.rbtour
@@ -137,11 +163,17 @@ published tarball holds exactly that directory. Until a promotion's site
 change deploys, the live tarball is the previous release's, so a re-record
 always shows the repository copy, and says so on screen. The build step runs in a scratch directory, so
 `burger/` never lands in the checkout. The published recording was made with
-`--install v0.2.6` on the default ports.
+`--install v0.2.7` on the default ports.
 `asciinema play docs/website/assets/tour.cast` plays the result in a terminal.
 
+After `relish wtf` the script adds one step the page's tour list doesn't
+have, "Ask your agent": `relish agent context`, `relish agent diagnose` and
+`relish agent guide` on the same cluster, each piped through `jq` so a person
+can read the JSON. They aren't `data-tour` commands, because the agent
+section has its own steps. Without `jq` the script skips the step.
+
 `--record` writes the installed version into the cast's title (`Reliaburger
-0.2.6: the five-minute tour`), and the caption under the player names it too.
+0.2.7: the five-minute tour`), and the caption under the player names it too.
 `tests/suite/website.rs` checks that both match `install.sh`'s default, so a
 promotion that forgets the re-record fails CI.
 
@@ -247,7 +279,7 @@ link when you promote a release. The source quickstart intentionally matches
 Both it and the generated installer are POSIX sh, so `curl … | sh` works where
 `sh` is dash or busybox, not only bash. `scripts/release/test_package.py` runs
 them under every POSIX shell it finds and under `shellcheck -s sh` when present.
-It installs `v0.2.6` unless `RELIABURGER_VERSION` names another release; bump
+It installs `v0.2.7` unless `RELIABURGER_VERSION` names another release; bump
 that default when you promote a newer one. Every line the site shows names a
 mode (`sh -s -- --laptop`): with no arguments both scripts only explain the
 choices and exit 2, and the bootstrap does it before downloading anything.
@@ -258,6 +290,32 @@ published, it fails with a message saying so. The generated installer itself
 lives in the GitHub release, with native CLI checksums supplied by release
 packaging.
 
+### Markdown copies, the skills index and `llms.txt`
+
+Every page has a Markdown copy beside it, at its path with `.md` for `.html`
+(`index.md`, `compare/nomad.md`, `feedback/index.md`), and names it in its
+`<head>` with `<link rel="alternate" type="text/markdown" href="….md">`. Don't
+edit a copy: `make agent-docs` writes them from the pages
+(`tests/suite/website_markdown.rs`). It keeps each page's `<main>`, drops
+scripts, SVG, buttons, navigation, `aria-hidden` elements and the `#`
+permalinks, makes every link absolute against `https://reliaburger.com/`, and
+converts the rest with htmd. `make ci` fails while a copy differs from its
+page, while a page lacks its `alternate` link or copy, and while a copy
+outlives its page. So after changing a page, or adding one, run `make
+agent-docs` and commit the copy with it. `agents.html` and `agents.md` are
+the exception: both come straight from the manual's agent chapter.
+
+`llms.txt`, also generated, lists every copy under "Website".
+`.well-known/agent-skills/index.json` is the skills discovery index
+([Agent Skills Discovery RFC](https://github.com/cloudflare/agent-skills-discovery-rfc)
+0.2.0), pointing at the copy of the `reliaburger` skill beside it with the
+SHA-256 of its bytes; `make agent-docs` rewrites both when the chapter
+changes. The Pages workflow publishes `.well-known` because
+`upload-pages-artifact@v3` packs dot-directories; v4 needs
+`include-hidden-files: true`, and `tests/suite/agent_docs.rs` checks for one or
+the other. The workflow stamps the released minor version into
+`feedback/index.md` as it does into the page.
+
 ### Comparison pages
 
 `compare/index.html` links six practical comparisons; `compare/methodology.html`
@@ -265,8 +323,8 @@ explains the evidence and version boundaries. Public pages foreground Reliaburge
 strengths and honest trade-offs. Adaptation recommendations belong in the separate
 [Markdown research writeup](../research/2026-10-15-competitor-review.md).
 Each public page is hand-maintained static HTML,
-using `style.css` and the small `comparisons.css` extension. There is no generated
-copy or build dependency. The homepage links them under the stable `compare` id.
+using `style.css` and the small `comparisons.css` extension, with no build
+dependency; only its Markdown copy is generated (above). The homepage links them under the stable `compare` id.
 
 Keep evidence adjacent to factual claims. Pin source-code links to the inspected
 commit or tag; date moving documentation. Distinguish the public installer release,

@@ -1,0 +1,14 @@
+---
+source: src/relish/commands.rs
+expression: "json(&BuildReport\n{\n    images:\n    vec![BuiltImage\n    {\n        name: \"web\".to_string(), context_digest:\n        super::tests::MYAPP_V1.to_string(), build_id: 7, image:\n        \"team/web:v1\".to_string(),\n    }],\n})"
+---
+{
+  "images": [
+    {
+      "name": "web",
+      "context_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "build_id": 7,
+      "image": "team/web:v1"
+    }
+  ]
+}

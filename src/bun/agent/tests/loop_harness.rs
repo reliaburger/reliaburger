@@ -1293,7 +1293,19 @@ async fn each_consumer_sync_turn_names_its_step_and_times_its_slow_awaits() {
         .supervisor
         .grill()
         .set_inventory_delay(Some(std::time::Duration::from_millis(50)));
-    let turns = consumer_sync_turns(&mut agent, 1, catalog, ingress).await;
+    let all_turns = consumer_sync_turns(&mut agent, 1, catalog, ingress).await;
+    // A write that outlasts the turn's 500 ms runtime budget carries on off
+    // the loop, and the rest of its step runs in a later turn once it has
+    // landed: `install` after the publish step's write, `landed` after any
+    // other. The stall is 50 ms, but on a loaded host the write itself can
+    // take the rest of the budget (#1619), so either may appear.
+    let landing = |turn: &&crate::bun::loop_meter::TurnRecord| {
+        matches!(
+            turn.detail,
+            Some("consumer_sync/landed" | "consumer_sync/install")
+        )
+    };
+    let turns: Vec<_> = all_turns.iter().filter(|turn| !landing(turn)).collect();
     let steps: Vec<_> = turns.iter().map(|turn| turn.detail).collect();
     assert_eq!(
         steps,
@@ -1329,9 +1341,49 @@ async fn each_consumer_sync_turn_names_its_step_and_times_its_slow_awaits() {
         "{candidate}'s inventory read: {:?}",
         candidate.part(TurnPart::RuntimeInventory)
     );
-    let publish = &turns[4];
-    assert!(publish.part(TurnPart::ViewInstall).is_some(), "{publish}");
-    assert!(publish.part(TurnPart::FirewallSync).is_some(), "{publish}");
+    // The view is installed in the publish turn, or in the `install` turn
+    // after it when the publish step's write landed late.
+    let installing: Vec<_> = all_turns
+        .iter()
+        .filter(|turn| {
+            matches!(
+                turn.detail,
+                Some("consumer_sync/publish" | "consumer_sync/install")
+            )
+        })
+        .collect();
+    for part in [TurnPart::ViewInstall, TurnPart::FirewallSync] {
+        assert!(
+            installing.iter().any(|turn| turn.part(part).is_some()),
+            "{part:?}: {installing:?}"
+        );
+    }
+}
+
+/// The #1417 memory run of 0.2.6 (6 November 2026): a
+/// `consumer_sync/journal` turn took 1,805 ms, 1,579 of them waiting for
+/// the eBPF handle's lock inside one view install. Nothing holding that
+/// lock did I/O or awaited; job tasks take it for a map write or two each,
+/// thousands of times a second. But the install took the lock once per
+/// service, and tokio's lock is fair, so each service joined the back of
+/// the queue again. A view install now takes the lock once for every
+/// service in the view. Without the eBPF data path, the agent records each
+/// hold's services in its place, so the test sees how many holds there were.
+#[cfg(not(all(feature = "ebpf", target_os = "linux")))]
+#[tokio::test]
+async fn a_view_install_takes_the_kernel_lock_once_for_all_its_services() {
+    let (mut agent, _root, _, ingress) = recovered_consumer().await;
+    crate::bun::agent::routing::take_kernel_publications();
+    consumer_sync_turns(&mut agent, 1, large_catalogue(20, 30000), ingress).await;
+    let holds: Vec<usize> = crate::bun::agent::routing::take_kernel_publications()
+        .iter()
+        .map(Vec::len)
+        .collect();
+    assert_eq!(
+        holds,
+        [20],
+        "one hold of the kernel lock per view install, not one per service"
+    );
 }
 
 /// A catalogue of `services` services, three remote backends each, on
@@ -1605,6 +1657,55 @@ async fn a_consumer_view_is_installed_only_after_its_journal_write_lands() {
     assert_eq!(
         agent.consumer_owner().unwrap().phase,
         crate::bun::consumer_owners::ConsumerPhase::Active
+    );
+}
+
+/// The 0.2.6 jobs final (#1606): one `consumer_sync/compact` turn took
+/// 1,232 ms, all of it journal write, while every other consumer step
+/// handed its slow write off at the turn's deadline. Here every write of a
+/// changed view is that slow, compaction's included, and each turn of the
+/// synchronisation, compaction's included, hands off within the budget.
+#[tokio::test]
+async fn a_consumer_compaction_hands_a_slow_journal_write_off_at_the_turn_deadline() {
+    let (mut agent, _root, ingress) = published_consumer().await;
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
+    let (response, reply) = oneshot::channel();
+    agent
+        .request_consumer_sync(crate::bun::agent::consumer::ConsumerRequest {
+            generation: 2,
+            catalog: moved_remote_backend(),
+            ingress,
+            withdrawals: vec![],
+            answer: Some(crate::bun::agent::consumer::ConsumerAnswer {
+                requested_at_ns: crate::onion::lease::boot_clock_ns(),
+                response,
+            }),
+        })
+        .await;
+    let mut compactions = 0;
+    while !agent.consumer_syncs.is_idle() || agent.discovery_write_in_flight() {
+        let turn = one_consumer_sync_turn(&mut agent).await;
+        if turn.detail == Some("consumer_sync/compact") {
+            compactions += 1;
+            assert!(
+                agent.discovery_write_in_flight(),
+                "the compaction wrote nothing to hand off: {turn}"
+            );
+        }
+        assert!(
+            turn.took < TURN_BUDGET,
+            "{turn} waited for a {STALLED_JOURNAL_WRITE:?} journal write: {:?}",
+            turn.part(TurnPart::JournalWrite)
+        );
+    }
+    assert_eq!(compactions, 1, "the synchronisation never compacted");
+    assert!(reply.await.unwrap().unwrap().published);
+    assert_eq!(
+        agent.consumer_owner().unwrap().publications.len(),
+        1,
+        "the earlier view was not compacted away"
     );
 }
 

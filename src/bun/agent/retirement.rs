@@ -123,7 +123,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.forget_retired_egress_owner(instance_id).await?;
         // Validate the mount source before a new runtime can consume it. The
         // preparation is idempotent and preserves this workload's credentials.
-        self.prepare_instance_identity(instance_id)
+        self.prepare_instance_identity(instance_id).await
     }
 
     pub(super) async fn retire_initialisers(

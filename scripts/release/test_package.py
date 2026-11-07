@@ -110,6 +110,17 @@ class ReleasePackageTests(unittest.TestCase):
         bun = json.loads((self.assets / "metadata.json").read_text())
         self.assertEqual(bun["releases"][0]["compatibility"], expected)
 
+    def test_metadata_json_points_at_the_release_notes(self):
+        # `relish agent upgrade-check` passes this on, untrusted, so an agent
+        # can show a human where the notes are.
+        self.package()
+        for name in ("metadata.json", "cli-metadata.json"):
+            document = json.loads((self.assets / name).read_text())
+            self.assertEqual(
+                document["releases"][0]["notes"],
+                "Release notes: https://github.com/reliaburger/reliaburger/releases/tag/v0.1.0",
+            )
+
     def test_installer_pins_cli_hash_and_refuses_modified_download(self):
         self.package()
         installer = self.assets / "install.sh"
@@ -268,6 +279,12 @@ exit 1
                     result = subprocess.run([shell, str(self.assets / "install.sh"), flag], env=env, capture_output=True)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertIn("--laptop", result.stdout.decode())
+                    # How a stranger checks the files (#1583), with this
+                    # release's repository filled in.
+                    self.assertIn("gh attestation verify ~/.reliaburger/bin/relish --repo reliaburger/reliaburger",
+                                  result.stdout.decode())
+                    self.assertIn("--signer-workflow reliaburger/reliaburger/.github/workflows/build.yml",
+                                  result.stdout.decode())
                     self.assertFalse(calls.exists())
                     self.assertFalse((home / ".reliaburger").exists())
 

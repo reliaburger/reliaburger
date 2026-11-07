@@ -1,0 +1,9 @@
+---
+source: src/relish/dev.rs
+expression: "json(&ReleaseKeyReport\n{\n    private_key: std::path::Path::new(\"keys/release.key\"), public_key_file:\n    std::path::Path::new(\"keys/release.pub\"), public_key: \"ed25519:abc\",\n})"
+---
+{
+  "private_key": "keys/release.key",
+  "public_key_file": "keys/release.pub",
+  "public_key": "ed25519:abc"
+}

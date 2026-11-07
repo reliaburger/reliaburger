@@ -57,5 +57,48 @@ class PromoteWorkflowTests(unittest.TestCase):
                 self.assertNotIn("${{ inputs.", line)
 
 
+def job(text, name):
+    match = re.search(rf"^  {re.escape(name)}:\n(.*?)(?=^  [a-z][a-z-]*:\n|\Z)", text, re.M | re.S)
+    if not match:
+        raise AssertionError(f"promote.yml has no job {name!r}")
+    return match.group(1)
+
+
+class StrangerChecksTests(unittest.TestCase):
+    """Promotion checks attestations and feeds the Homebrew tap without changing a byte (#1583)."""
+
+    def setUp(self):
+        self.text = WORKFLOW.read_text()
+        self.promote = job(self.text, "promote")
+        self.tap = job(self.text, "homebrew-tap")
+
+    def test_every_asset_is_attested_before_a_draft_exists(self):
+        check = self.promote.index("- name: Check every asset carries the candidate build's attestation")
+        fetch = self.promote.index("- name: Download and verify the qualified candidate")
+        draft = self.promote.index("- name: Upload unchanged assets to a new draft")
+        self.assertLess(fetch, check)
+        self.assertLess(check, draft)
+        self.assertIn("attestations: read", self.promote)
+        step = self.promote[check:draft]
+        self.assertIn('gh attestation verify "$asset" --repo "$RELEASE_REPOSITORY"', step)
+        self.assertIn('--signer-workflow "$RELEASE_REPOSITORY/.github/workflows/build.yml"', step)
+        self.assertIn("--source-ref refs/heads/main", step)
+        self.assertIn("for asset in dist/*; do", step)
+
+    def test_the_tap_updates_only_after_publication_in_a_job_of_its_own(self):
+        self.assertIn("needs: promote", self.tap)
+        self.assertIn("if: github.ref == 'refs/heads/main'", self.tap)
+        self.assertIn("environment: release", self.tap)
+        self.assertNotIn("contents: write", self.tap)
+        self.assertNotIn("HOMEBREW_TAP_TOKEN", self.promote)
+
+    def test_the_formula_comes_from_the_published_record_at_the_qualified_digest(self):
+        self.assertIn("--pattern candidate.json", self.tap)
+        self.assertIn('--qualified-digest "$QUALIFIED_DIGEST"', self.tap)
+        self.assertIn("python3 scripts/release/homebrew.py formula --record published/candidate.json", self.tap)
+        self.assertIn("python3 scripts/release/homebrew.py publish --formula relish.rb", self.tap)
+        self.assertEqual(self.text.count("secrets.HOMEBREW_TAP_TOKEN"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

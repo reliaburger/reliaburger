@@ -1,0 +1,9 @@
+---
+source: src/relish/commands.rs
+expression: "json(&SearchRows(vec![serde_json::json!({\"count\": 3})]))"
+---
+[
+  {
+    "count": 3
+  }
+]

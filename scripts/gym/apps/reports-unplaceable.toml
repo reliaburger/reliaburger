@@ -1,0 +1,10 @@
+# An app that asks for a node label no node has, so the scheduler can't place
+# it anywhere.
+
+[app.reports]
+exec = "@TESTAPP@"
+command = ["--mode", "healthy", "--port", "@SECOND_PORT@"]
+port = @SECOND_PORT@
+
+[app.reports.placement]
+required = ["disk=nvme-raid"]

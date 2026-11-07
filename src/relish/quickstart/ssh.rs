@@ -264,6 +264,16 @@ impl Ssh {
         local_port: u16,
         remote_port: u16,
     ) -> Result<Tunnel> {
+        // The loop below takes "something answers on the local port" to mean
+        // the forward is up, so nothing may answer there before ssh starts:
+        // otherwise whatever already listens there answers while ssh is still
+        // logging in, and setup talks to it instead of Bun (#1608).
+        if answers_on(local_port).await {
+            bail!(
+                "{target}: can't tunnel through port {local_port} on this machine, because \
+                 something else is listening on it"
+            );
+        }
         let forward = format!("127.0.0.1:{local_port}:127.0.0.1:{remote_port}");
         let mut command = self.command(
             target,
@@ -281,10 +291,7 @@ impl Ssh {
             if let Some(status) = child.try_wait()? {
                 bail!("{target}: the tunnel to port {remote_port} closed ({status})");
             }
-            if tokio::net::TcpStream::connect(("127.0.0.1", local_port))
-                .await
-                .is_ok()
-            {
+            if answers_on(local_port).await {
                 return Ok(Tunnel { _child: child });
             }
             if tokio::time::Instant::now() >= deadline {
@@ -293,6 +300,23 @@ impl Ssh {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
+}
+
+/// Whether a listener accepts connections on a loopback port.
+///
+/// A connection to a port nothing listens on can still succeed: when the
+/// kernel picks that same port as the connection's source, TCP's
+/// "simultaneous open" connects the socket to itself. That only happens on a
+/// port in the ephemeral range, which a test's ports are, so such a
+/// connection doesn't count.
+async fn answers_on(port: u16) -> bool {
+    let Ok(stream) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await else {
+        return false;
+    };
+    !matches!(
+        (stream.local_addr(), stream.peer_addr()),
+        (Ok(local), Ok(peer)) if local == peer
+    )
 }
 
 /// A running `ssh -L`, killed when dropped.
@@ -472,6 +496,39 @@ mod tests {
         assert_eq!(args[port + 1], "2222");
         let end = args.iter().position(|arg| *arg == "--").unwrap();
         assert_eq!(args[end + 1], "u@a");
+    }
+
+    /// While ssh is still logging in, something else listening on the local
+    /// port would answer the tunnel's probe, and setup would talk to it as if
+    /// it were Bun: in a test, that waited out the 60 s readiness deadline
+    /// (#1608).
+    #[tokio::test]
+    async fn a_tunnel_refuses_a_local_port_something_else_listens_on() {
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("ssh");
+        // An ssh that takes its time to log in, as a real one does.
+        std::fs::write(&script, "sleep 5\n").unwrap();
+        let ssh = Ssh::shell_script(script, Duration::from_secs(10), "");
+        let squatter = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = squatter.local_addr().unwrap().port();
+        let started = std::time::Instant::now();
+        let error = ssh
+            .tunnel(&target("u@a"), port, 9117)
+            .await
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            format!(
+                "u@a: can't tunnel through port {port} on this machine, because something \
+                 else is listening on it"
+            )
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "it never ran ssh"
+        );
     }
 
     #[tokio::test]

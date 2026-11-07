@@ -1,7 +1,24 @@
-# What relish v0.2.6 accepts, read from its -h pages by
+# What relish v0.2.7 accepts, read from its -h pages by
 # scripts/release/released_cli.py. Regenerate it when docs/website/install.sh's
 # default version changes; tests/suite/website.rs checks the two match.
-version	v0.2.6
+version	v0.2.7
+argument	relish agent explain	[ID]
+argument	relish agent logs	<APP>
+argument	relish agent manual search	<WORDS>...
+argument	relish agent manual show	<TARGET>
+argument	relish agent patch build	<DIR>
+argument	relish agent patch destroy	[DIR]
+argument	relish agent patch diff	<DIR>
+argument	relish agent patch init	<DIR>
+argument	relish agent patch test	<DIR>
+argument	relish agent patch test	[FILTER]
+argument	relish agent patch try	<DIR>
+argument	relish agent schema	[COMMAND]
+argument	relish agent setup	[AGENTS]...
+argument	relish agent source extract	<DIR>
+argument	relish agent source grep	<PATTERN>
+argument	relish agent source show	<TARGET>
+argument	relish agent source tree	[PREFIX]
 argument	relish apply	[PATH_OR_URL]
 argument	relish batch	[PATH]
 argument	relish batch cancel	<ID>
@@ -93,6 +110,33 @@ argument	relish upgrade plan	<VERSION>
 argument	relish upgrade rollback	[VERSION]
 argument	relish upgrade start	[VERSION]
 command	relish
+command	relish agent
+command	relish agent context
+command	relish agent diagnose
+command	relish agent explain
+command	relish agent guide
+command	relish agent logs
+command	relish agent manual
+command	relish agent manual search
+command	relish agent manual show
+command	relish agent patch
+command	relish agent patch build
+command	relish agent patch destroy
+command	relish agent patch diff
+command	relish agent patch init
+command	relish agent patch test
+command	relish agent patch try
+command	relish agent report
+command	relish agent schema
+command	relish agent setup
+command	relish agent source
+command	relish agent source extract
+command	relish agent source grep
+command	relish agent source show
+command	relish agent source tree
+command	relish agent source version
+command	relish agent upgrade-check
+command	relish agent version
 command	relish apply
 command	relish audit
 command	relish batch
@@ -178,6 +222,7 @@ command	relish logs-export
 command	relish logs-search
 command	relish manual
 command	relish manual examples
+command	relish mcp
 command	relish metrics
 command	relish nodes
 command	relish path
@@ -228,6 +273,83 @@ option	relish	--ca-cert	<CA_CERT>
 option	relish	--endpoint	<ENDPOINT>	
 option	relish	--token	<TOKEN>	
 option	relish	-o,--output	<OUTPUT>	human,json,yaml
+option	relish agent	--max-bytes	<MAX_BYTES>	
+option	relish agent context	--events	<EVENTS>	
+option	relish agent context	--max-bytes	<MAX_BYTES>	
+option	relish agent diagnose	--app	<APP>	
+option	relish agent diagnose	--max-bytes	<MAX_BYTES>	
+option	relish agent explain	--max-bytes	<MAX_BYTES>	
+option	relish agent guide	--max-bytes	<MAX_BYTES>	
+option	relish agent logs	--grep	<GREP>	
+option	relish agent logs	--instance	<INSTANCE>	
+option	relish agent logs	--line-bytes	<LINE_BYTES>	
+option	relish agent logs	--max-bytes	<MAX_BYTES>	
+option	relish agent logs	--namespace	<NAMESPACE>	
+option	relish agent logs	--since	<SINCE>	
+option	relish agent logs	--stream	<STREAM>	stdout,stderr
+option	relish agent logs	--tail	<TAIL>	
+option	relish agent logs	--until	<UNTIL>	
+option	relish agent manual	--max-bytes	<MAX_BYTES>	
+option	relish agent manual search	--max-bytes	<MAX_BYTES>	
+option	relish agent manual show	--max-bytes	<MAX_BYTES>	
+option	relish agent patch	--max-bytes	<MAX_BYTES>	
+option	relish agent patch build	--allow-build-changes		
+option	relish agent patch build	--bun		
+option	relish agent patch build	--max-bytes	<MAX_BYTES>	
+option	relish agent patch build	--relish		
+option	relish agent patch destroy	--all		
+option	relish agent patch destroy	--max-bytes	<MAX_BYTES>	
+option	relish agent patch diff	--max-bytes	<MAX_BYTES>	
+option	relish agent patch init	--max-bytes	<MAX_BYTES>	
+option	relish agent patch test	--allow-build-changes		
+option	relish agent patch test	--max-bytes	<MAX_BYTES>	
+option	relish agent patch try	--max-bytes	<MAX_BYTES>	
+option	relish agent patch try	--nodes	<NODES>	
+option	relish agent report	--caught-by	<CAUGHT_BY>	test,gate,smoker-fault,review,unknown
+option	relish agent report	--caught-how	<CAUGHT_HOW>	
+option	relish agent report	--duplicate-of	<DUPLICATE_OF>	
+option	relish agent report	--error-code	<ERROR_CODE>	
+option	relish agent report	--evidence	<EVIDENCE>	
+option	relish agent report	--expected	<EXPECTED>	
+option	relish agent report	--finding	<FINDING>	
+option	relish agent report	--fixed-in	<FIXED_IN>	
+option	relish agent report	--include-logs		
+option	relish agent report	--keep-addresses		
+option	relish agent report	--max-bytes	<MAX_BYTES>	
+option	relish agent report	--not-tested	<NOT_TESTED>	
+option	relish agent report	--out	<OUT>	
+option	relish agent report	--patch	<PATCH>	
+option	relish agent report	--reproducer	<REPRODUCER>	
+option	relish agent report	--site	<SITE>	
+option	relish agent report	--title	<TITLE>	
+option	relish agent report	--what-happened	<WHAT_HAPPENED>	
+option	relish agent schema	--max-bytes	<MAX_BYTES>	
+option	relish agent setup	--dry-run		
+option	relish agent setup	--force		
+option	relish agent setup	--max-bytes	<MAX_BYTES>	
+option	relish agent setup	--remove		
+option	relish agent setup	--yes		
+option	relish agent source	--max-bytes	<MAX_BYTES>	
+option	relish agent source	--offline		
+option	relish agent source extract	--max-bytes	<MAX_BYTES>	
+option	relish agent source extract	--offline		
+option	relish agent source grep	--context	<CONTEXT>	
+option	relish agent source grep	--max-bytes	<MAX_BYTES>	
+option	relish agent source grep	--max-matches	<MAX_MATCHES>	
+option	relish agent source grep	--offline		
+option	relish agent source grep	--path	<PATH>	
+option	relish agent source grep	-i,--ignore-case		
+option	relish agent source show	--max-bytes	<MAX_BYTES>	
+option	relish agent source show	--offline		
+option	relish agent source tree	--depth	<DEPTH>	
+option	relish agent source tree	--max-bytes	<MAX_BYTES>	
+option	relish agent source tree	--offline		
+option	relish agent source version	--max-bytes	<MAX_BYTES>	
+option	relish agent source version	--offline		
+option	relish agent upgrade-check	--max-bytes	<MAX_BYTES>	
+option	relish agent upgrade-check	--metadata	<FILE>	
+option	relish agent upgrade-check	--url	<URL>	
+option	relish agent version	--max-bytes	<MAX_BYTES>	
 option	relish apply	--dry-run		
 option	relish apply	--rerun-jobs		
 option	relish apply	-f,--file	<PATH_OR_URL>	
@@ -277,7 +399,7 @@ option	relish ca backup	--recipient	<RECIPIENT>
 option	relish ca backup	-o,--output	<OUTPUT>	
 option	relish ca backup	API token for authenticating to the agent. Overrides	`RELIABURGER_TOKEN`	
 option	relish ca backup	Bun API base URL. Overrides `RELIABURGER_ENDPOINT` and the default local address	(`http[s]://127.0.0.1:9117`)	
-option	relish ca backup	Output format: human,json,or yaml. A command that has no machine output refuses json and yaml rather than ignoring them [default: human] [possible values: human,json,yaml]		human,json,yaml
+option	relish ca backup	Output format: human,json,or yaml. Every command takes json and yaml except the interactive ones,which refuse them [default: human] [possible values: human,json,yaml]		human,json,yaml
 option	relish ca backup	Path to the cluster CA certificate (PEM). When set,the CLI reaches the agent API over HTTPS. Overrides	`RELIABURGER_CA_CERT`	
 option	relish ca backup	Print help (see more with	'--help')	
 option	relish ca backup	Read the passphrase from the first line of this file instead of	asking	
@@ -293,7 +415,7 @@ option	relish ca rotate	--root-backup	<ROOT_BACKUP>
 option	relish ca rotate	-o,--output	<OUTPUT>	
 option	relish ca rotate	API token for authenticating to the agent. Overrides	`RELIABURGER_TOKEN`	
 option	relish ca rotate	Bun API base URL. Overrides `RELIABURGER_ENDPOINT` and the default local address	(`http[s]://127.0.0.1:9117`)	
-option	relish ca rotate	Output format: human,json,or yaml. A command that has no machine output refuses json and yaml rather than ignoring them [default: human] [possible values: human,json,yaml]		human,json,yaml
+option	relish ca rotate	Output format: human,json,or yaml. Every command takes json and yaml except the interactive ones,which refuse them [default: human] [possible values: human,json,yaml]		human,json,yaml
 option	relish ca rotate	Path to the cluster CA certificate (PEM). When set,the CLI reaches the agent API over HTTPS. Overrides	`RELIABURGER_CA_CERT`	
 option	relish ca rotate	Print help (see more with	'--help')	
 option	relish ca rotate	Read the backup's passphrase from the first line of this file instead of	asking	
@@ -307,7 +429,7 @@ option	relish ca verify	--passphrase-file	<PASSPHRASE_FILE>
 option	relish ca verify	-o,--output	<OUTPUT>	
 option	relish ca verify	API token for authenticating to the agent. Overrides	`RELIABURGER_TOKEN`	
 option	relish ca verify	Bun API base URL. Overrides `RELIABURGER_ENDPOINT` and the default local address	(`http[s]://127.0.0.1:9117`)	
-option	relish ca verify	Output format: human,json,or yaml. A command that has no machine output refuses json and yaml rather than ignoring them [default: human] [possible values: human,json,yaml]		human,json,yaml
+option	relish ca verify	Output format: human,json,or yaml. Every command takes json and yaml except the interactive ones,which refuse them [default: human] [possible values: human,json,yaml]		human,json,yaml
 option	relish ca verify	Path to the cluster CA certificate (PEM). When set,the CLI reaches the agent API over HTTPS. Overrides	`RELIABURGER_CA_CERT`	
 option	relish ca verify	Print help (see more with	'--help')	
 option	relish ca verify	Read the passphrase from the first line of this file instead of	asking	
@@ -470,7 +592,7 @@ option	relish join	-o,--output	<OUTPUT>
 option	relish join	Bun API base URL. Overrides `RELIABURGER_ENDPOINT` and the default local address	(`http[s]://127.0.0.1:9117`)	
 option	relish join	Directory to write the received identity into. Defaults to `identity` in the current directory (matching `relish	init`)	
 option	relish join	Join token issued by `relish init` or `relish join-token	create`	
-option	relish join	Output format: human,json,or yaml. A command that has no machine output refuses json and yaml rather than ignoring them [default: human] [possible values: human,json,yaml]		human,json,yaml
+option	relish join	Output format: human,json,or yaml. Every command takes json and yaml except the interactive ones,which refuse them [default: human] [possible values: human,json,yaml]		human,json,yaml
 option	relish join	Path to the cluster CA certificate (PEM). When set,the CLI reaches the agent API over HTTPS. Overrides	`RELIABURGER_CA_CERT`	
 option	relish join	Pin the cluster's root CA fingerprint (`sha256:...`). When set,a member offering a different root CA is	refused	
 option	relish join	Print	help	
@@ -495,6 +617,10 @@ option	relish logs-export	--source	<SOURCE>
 option	relish manual	--port	<PORT>	
 option	relish manual	--web		
 option	relish manual examples	--dir	<DIR>	
+option	relish mcp	--list		
+option	relish mcp	--namespace	<NAMESPACE>	
+option	relish mcp	--no-logs		
+option	relish mcp	--toolsets	<TOOLSET>	
 option	relish metrics	--name	<NAME>	
 option	relish metrics	--namespace	<NAMESPACE>	
 option	relish metrics	--since	<SINCE>	
@@ -557,7 +683,7 @@ option	relish setup	Directory to install the bun binary into (default:	~/.reliab
 option	relish setup	Directory to write reliaburger.toml into [default:	.]	
 option	relish setup	HTTPS directory containing unchanged signed release candidate	assets	
 option	relish setup	Host port forwarded to the managed Pickle registry (default:	15050)	
-option	relish setup	Output format: human,json,or yaml. A command that has no machine output refuses json and yaml rather than ignoring them [default: human] [possible values: human,json,yaml]		human,json,yaml
+option	relish setup	Output format: human,json,or yaml. Every command takes json and yaml except the interactive ones,which refuse them [default: human] [possible values: human,json,yaml]		human,json,yaml
 option	relish setup	Path to the cluster CA certificate (PEM). When set,the CLI reaches the agent API over HTTPS. Overrides	`RELIABURGER_CA_CERT`	
 option	relish setup	Print	help	
 option	relish setup	Release metadata URL [default:	https://github.com/reliaburger/reliaburger/releases/latest/download/metadata.json]	

@@ -2511,6 +2511,8 @@ async fn drive_pending_restarts(&mut self) {
 }
 ```
 
+The agent never calls `maybe_restart()` for an exited app directly any more. It goes through `retry_restart`, which calls it and, when the instance moves back to Pending, records a `restart` event, so every restart leaves one timestamped event behind whether it happened straight away or after a backoff. `relish wtf` counts those events to spot a crash loop, and when one path skipped them, it missed one (#1652, Chapter 15).
+
 The filter logic is specific: only instances that are Pending *and* have been restarted at least once. Fresh deploys are driven by `deploy()` directly. Restarted instances are driven by this method on the next health tick.
 
 `.filter_map()` combines filtering and transforming. For each instance that passes the filter, it tries to extract the OCI spec. `i.oci_spec.as_ref()` converts `Option<OciSpec>` to `Option<&OciSpec>` (borrowing the inner value without moving it), then `.map(|spec| ...)` transforms the `Some` case while leaving `None` unchanged. `filter_map` drops the `None`s and unwraps the `Some`s. In Go, you'd write an `if` inside a `for` loop. The Rust version chains iterators, which avoids the intermediate `Vec` until `.collect()` materialises the results at the end.
