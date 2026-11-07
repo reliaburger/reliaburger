@@ -3102,8 +3102,21 @@ SHA-256 is the qualified digest), and adds one `mcpb` package per platform
 with the digest the record holds, using `scripts/release/mcp_registry.py`.
 It never hashes a bundle itself, so it can't disagree with what was
 qualified. The job only writes the entry: publishing needs the maintainer's
-GitHub login to the organisation, so it keeps the file as an artefact for
-them to run `mcp-publisher publish` with.
+GitHub login to the organisation, so it keeps the file as an artefact.
+
+Publishing it is one command, `make mcp-registry-publish TAG=v0.2.8`, and
+it trusts the artefact no more than the job trusted its inputs. A
+dispatched workflow run doesn't list its inputs, so `promote.yml` now has a
+`run-name` of `Promote <tag>`, and `mcp_registry_publish.py` finds the run
+by that name. It downloads the entry and compares each package's
+`fileSha256` with the digest GitHub stores for the published asset, a
+second, independent source for the same bytes. Only when they agree does it
+run `mcp-publisher`, logging in first if the registry token it keeps is
+missing or expired. The token is a JWT, three base64url parts separated by
+dots, and the middle one is JSON with an `exp` time, so checking it needs no
+network. The tests put fake `gh` and `mcp-publisher` scripts first on
+`PATH`, the trick `test_homebrew.py` uses, so they never reach GitHub or the
+registry.
 
 A bundle installed from a desktop client has no shell to pass `--endpoint`
 from, so the manifest's `user_config` declares two settings the client
@@ -4553,9 +4566,10 @@ ones, command by command, each with the reason it lost.
   not images from a badge service: the site makes no third-party requests.
 - **Content negotiation on `Accept: text/markdown`.** GitHub Pages can't
   vary on headers.
-- **Publishing to the MCP Registry.** It needs the maintainer's GitHub
-  login, so it waits for them. 0.2.8 built the bundles and the entry it
-  publishes (#1695).
+- **Publishing to the MCP Registry from CI.** It needs the maintainer's
+  GitHub login to the organisation, so CI writes the entry and
+  `make mcp-registry-publish` checks and publishes it from their machine
+  (#1695).
 - **The manual as MCP resources.** `manual search` and `manual show` are
   tools already.
 - **An HTTP transport for MCP.** Remote MCP is #1092, with authentication of

@@ -856,13 +856,41 @@ git show v0.2.8:server.json > tagged-server.json
 python3 scripts/release/mcp_registry.py --record candidate.json --server tagged-server.json
 ```
 
-The maintainer publishes it after each promotion, signed in to GitHub as an
-account that can publish for the `reliaburger` organisation:
+Publishing it is the maintainer's one release-time step, after each
+promotion:
 
-1. `brew install mcp-publisher`, once.
-2. `gh run download <promote run> --name mcp-registry-server-json --dir registry`.
-3. `cd registry && mcp-publisher login github && mcp-publisher publish`.
-4. Check it: `curl "https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.reliaburger/relish"`.
+```sh
+make mcp-registry-publish TAG=v0.2.8
+```
+
+[`mcp_registry_publish.py`](../scripts/release/mcp_registry_publish.py) finds
+the successful `promote.yml` run for the tag (runs are named
+`Promote <tag>`; pass `--run <id>` to the script for one that isn't),
+downloads its `mcp-registry-server-json` artefact into a temporary directory
+and checks the entry before anything is sent: its name is
+`io.github.reliaburger/relish`, its version is the tag's, and it has exactly
+one `mcpb` package per relish platform, each pointing at the tag's
+`relish-<platform>.mcpb` with the SHA-256 GitHub stores for that published
+asset. The release must be public, not a draft or pre-release. Then it runs
+`mcp-publisher login github`, only when there's no unexpired registry token in
+`~/.config/mcp-publisher/token.json`, and `mcp-publisher publish` in that
+directory. Any failed check publishes nothing. Its tests fake `gh` and
+`mcp-publisher` on `PATH`.
+
+Once, before the first publish:
+
+1. `brew install mcp-publisher`.
+2. Use a GitHub account that belongs to the `reliaburger` organisation:
+   the registry's `io.github.reliaburger/` namespace is proved by a GitHub
+   login. `mcp-publisher login github` opens GitHub's device sign-in. If
+   the publish is refused for the namespace, check that the registry can
+   see your membership of the organisation (a public membership, or the
+   registry's GitHub app allowed in the organisation).
+3. `gh auth login`, if `gh` isn't signed in already; the command uses it to
+   find the run and the release.
+
+After publishing, check it:
+`curl "https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.reliaburger/relish"`.
 
 The registry is in preview and may reset its data; publishing again is safe.
 

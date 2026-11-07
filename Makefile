@@ -1,4 +1,4 @@
-.PHONY: build test warm-executables test-cargo test-doc test-slow test-images test-linux test-rootless-runc test-cluster test-hollow test-upgrade test-upgrade-node test-upgrade-cluster test-apple test-standard-clients test-gym test-gpu test-s3 test-ci-scripts check-ignored coverage check fmt lint lint-macos audit outdated clean pdf loc help bench bench-large ci ci-bench rollout-demo gitops-demo observability-demo kubernetes-demo toml-demo readme-commands agent-docs bench-task-arrays fuzz-tools fuzz-build fuzz-smoke fuzz-corpus-check fuzz-corpus-seed
+.PHONY: build test warm-executables test-cargo test-doc test-slow test-images test-linux test-rootless-runc test-cluster test-hollow test-upgrade test-upgrade-node test-upgrade-cluster test-apple test-standard-clients test-gym test-gpu test-s3 test-ci-scripts check-ignored coverage check fmt lint lint-macos audit outdated clean pdf loc help bench bench-large ci ci-bench rollout-demo gitops-demo observability-demo kubernetes-demo toml-demo readme-commands agent-docs mcp-registry-publish bench-task-arrays fuzz-tools fuzz-build fuzz-smoke fuzz-corpus-check fuzz-corpus-seed
 
 CARGO = cargo
 NEXTEST_PROFILE ?= default
@@ -182,6 +182,10 @@ ci-bench: ci bench ## Run the portable CI checks, then the 5-250 node gossip ben
 
 readme-commands: ## Regenerate the relish command list in README.md from the CLI definition
 	RELIABURGER_UPDATE_README=1 $(CARGO) test --bin relish readme_command_list_matches_the_cli
+
+mcp-registry-publish: ## Check a promoted release's MCP Registry entry and publish it (maintainer only): make mcp-registry-publish TAG=v0.2.8
+	@test -n "$(TAG)" || { echo "usage: make mcp-registry-publish TAG=v0.2.8" >&2; exit 2; }
+	python3 scripts/release/mcp_registry_publish.py --tag "$(TAG)"
 
 agent-docs: ## Regenerate the agent-facing files from the manual's agent chapter, and every website page's Markdown copy
 	RELIABURGER_UPDATE_AGENT_DOCS=1 $(CARGO) test --test suite -- --exact \
