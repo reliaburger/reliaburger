@@ -112,27 +112,27 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish setup`: Guided setup: detect or install bun, then write a starter config
 - `relish local <status|start|stop|destroy> [NODE]`: Manage a laptop cluster created by setup --quickstart
 - `relish init [DIR]`: Initialise a new cluster (generates CAs, age keypair, node identity)
-- `relish cluster`: Create a cluster of bare-metal appliances (docs/manual/15_appliance.md) *(0.3.0, not in 0.2.6)*
-  - `relish cluster create --bare-metal --name <NAME> --operator <OPERATORS>... <DIRECTORY> <MACHINES>...`: Create a cluster for appliance machines: its PKI and admin token on this machine, and a seed per machine for an RBSEED stick *(0.3.0, not in 0.2.6)*
-- `relish image`: Appliance OS images: download, write to a disk, and seed machines *(0.3.0, not in 0.2.6)*
-  - `relish image download`: Download the newest OS build for every architecture and check it against the release key *(0.3.0, not in 0.2.6)*
-  - `relish image write <IMAGE> <DEVICE>`: Write a disk image (.raw or .raw.zst) onto a device, erasing it *(0.3.0, not in 0.2.6)*
-  - `relish image seed <DIRECTORY> <MACHINES>...`: Write seeds for machines joining a running bare-metal cluster *(0.3.0, not in 0.2.6)*
-  - `relish image delete <REFERENCE>`: Delete a registry tag: the same as `relish images delete` *(0.3.0, not in 0.2.6)*
-- `relish machines`: Unclaimed appliances on the LAN: list them, or claim them with seeds over the network *(0.3.0, not in 0.2.6)*
-  - `relish machines claim <DIRECTORY> <MACHINES>...`: Claim machines: compare each one's claim key with its console, then send it a seed, joining it to the cluster in DIRECTORY (or, with --create, making a new cluster there from them) *(0.3.0, not in 0.2.6)*
-- `relish netboot <DIR>`: Install appliances over the network: ProxyDHCP, TFTP and HTTP for the OS that `relish image download` saved *(0.3.0, not in 0.2.6)*
-- `relish os`: The appliance OS across the cluster: what each node runs, and rolling a new version out node by node *(0.3.0, not in 0.2.6)*
-  - `relish os list`: Each node's OS version, and the newest release *(0.3.0, not in 0.2.6)*
-  - `relish os upgrade [VERSION]`: Roll an OS version across the cluster, one node at a time: workers, then the council, the leader last. Each node's workloads move off before it reboots *(0.3.0, not in 0.2.6)*
-  - `relish os status`: The rollout in progress, or the last one *(0.3.0, not in 0.2.6)*
-  - `relish os resume`: Carry on with a paused rollout, retrying the node that stopped it *(0.3.0, not in 0.2.6)*
-  - `relish os abort`: Stop the rollout; nodes keep the version they're on *(0.3.0, not in 0.2.6)*
+- `relish cluster`: Create a cluster of bare-metal appliances (docs/manual/15_appliance.md) *(0.3.0, not in 0.2.7)*
+  - `relish cluster create --bare-metal --name <NAME> --operator <OPERATORS>... <DIRECTORY> <MACHINES>...`: Create a cluster for appliance machines: its PKI and admin token on this machine, and a seed per machine for an RBSEED stick *(0.3.0, not in 0.2.7)*
+- `relish image`: Appliance OS images: download, write to a disk, and seed machines *(0.3.0, not in 0.2.7)*
+  - `relish image download`: Download the newest OS build for every architecture and check it against the release key *(0.3.0, not in 0.2.7)*
+  - `relish image write <IMAGE> <DEVICE>`: Write a disk image (.raw or .raw.zst) onto a device, erasing it *(0.3.0, not in 0.2.7)*
+  - `relish image seed <DIRECTORY> <MACHINES>...`: Write seeds for machines joining a running bare-metal cluster *(0.3.0, not in 0.2.7)*
+  - `relish image delete <REFERENCE>`: Delete a registry tag: the same as `relish images delete` *(0.3.0, not in 0.2.7)*
+- `relish machines`: Unclaimed appliances on the LAN: list them, or claim them with seeds over the network *(0.3.0, not in 0.2.7)*
+  - `relish machines claim <DIRECTORY> <MACHINES>...`: Claim machines: compare each one's claim key with its console, then send it a seed, joining it to the cluster in DIRECTORY (or, with --create, making a new cluster there from them) *(0.3.0, not in 0.2.7)*
+- `relish netboot <DIR>`: Install appliances over the network: ProxyDHCP, TFTP and HTTP for the OS that `relish image download` saved *(0.3.0, not in 0.2.7)*
+- `relish os`: The appliance OS across the cluster: what each node runs, and rolling a new version out node by node *(0.3.0, not in 0.2.7)*
+  - `relish os list`: Each node's OS version, and the newest release *(0.3.0, not in 0.2.7)*
+  - `relish os upgrade [VERSION]`: Roll an OS version across the cluster, one node at a time: workers, then the council, the leader last. Each node's workloads move off before it reboots *(0.3.0, not in 0.2.7)*
+  - `relish os status`: The rollout in progress, or the last one *(0.3.0, not in 0.2.7)*
+  - `relish os resume`: Carry on with a paused rollout, retrying the node that stopped it *(0.3.0, not in 0.2.7)*
+  - `relish os abort`: Stop the rollout; nodes keep the version they're on *(0.3.0, not in 0.2.7)*
 - `relish join --node-id <NODE_ID> <ADDR>`: Join an existing cluster
 - `relish join-token`: Manage short-lived node-enrolment tokens
   - `relish join-token create --node-id <NODE_ID>`: Create a single-use token for enrolling one node
-  - `relish join-token list`: List join tokens: node id, expiry and whether each has been used *(0.3.0, not in 0.2.6)*
-  - `relish join-token revoke <NODE_ID>`: Revoke every unused join token for a node id *(0.3.0, not in 0.2.6)*
+  - `relish join-token list`: List join tokens: node id, expiry and whether each has been used *(0.3.0, not in 0.2.7)*
+  - `relish join-token revoke <NODE_ID>`: Revoke every unused join token for a node id *(0.3.0, not in 0.2.7)*
 - `relish nodes`: List cluster nodes and their gossip state
 - `relish council`: Show the council (Raft) on every node, or recover from full loss
   - `relish council status`: Show every node's view of the council (the default)
@@ -265,8 +265,8 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
   - `relish ca backup --out <OUT>`: Write the root CA's key and certificate to a sealed file you keep
   - `relish ca verify --fingerprint <FINGERPRINT> <FILE>`: Check a root CA backup offline
   - `relish ca rotate --role <ROLE>`: Rotate an intermediate CA, signing the new one with your root backup
-- `relish identity`: Rotate the key that signs workload identity tokens *(0.3.0, not in 0.2.6)*
-  - `relish identity rotate-signing-key`: Sign workload identity tokens with a new key *(0.3.0, not in 0.2.6)*
+- `relish identity`: Rotate the key that signs workload identity tokens *(0.3.0, not in 0.2.7)*
+  - `relish identity rotate-signing-key`: Sign workload identity tokens with a new key *(0.3.0, not in 0.2.7)*
 - `relish sign --key <KEY> <IMAGE>`: Sign a Pickle-hosted image with your own key so `require_signatures` admits it
   - `relish sign keygen --out <OUT>`: Generate an image signing key and print the public key line for `[images.trust_policy] keys`
 - `relish audit`: Show who did what: the durable audit log of applies, deletes, execs, upgrades, faults, tokens and the other changes to the cluster

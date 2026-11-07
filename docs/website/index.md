@@ -400,7 +400,7 @@ Old mini PCs, thin clients, anything x86\_64 or arm64 with UEFI network boot: pl
 
 Three machines with blank disks network-boot into Reliaburger and become one cluster. They’re QEMU VMs with UEFI firmware on a virtual switch, run by [scripts/demo/netboot.sh](https://github.com/reliaburger/reliaburger/blob/main/scripts/demo/netboot.sh) in CI, serving a lab build of the OS signed with that run’s own key. Idle time is cut to two seconds; every wait says how long it really took. speed 
 
-Show the commands from blank disks to a cluster (0.3.0, not in 0.2.6)
+Show the commands from blank disks to a cluster (0.3.0, not in 0.2.7)
 
 1.  In each machine’s firmware setup, turn on UEFI network boot and turn Secure Boot off. A blank disk falls through to the network by itself.
 
