@@ -58,6 +58,7 @@ REQUIRED_JOBS = (
     "minimum Rust 1.97.0",
     "source bundle builds",
     "portable Linux",
+    "doctests and feature tests",
     "privileged Linux",
     "privileged Linux (Ubuntu 26.04)",
     "build tests",
