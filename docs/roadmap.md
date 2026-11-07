@@ -486,9 +486,10 @@ migration and no feature gate
   fleet control plane can extend it later. On 7 October 2026 the maintainer
   scoped the milestone to the OS, netboot and appliance work; fault
   pre-checks and the acceptance gates 0.1.0 didn't close moved to Later.
-  WebSocket drain parity and ACME (F08,
-  [#369](https://github.com/reliaburger/reliaburger/issues/369)) stay in its
-  milestone. Exit test: three Dell Wyse 3040s from power-on to a cluster
+  WebSocket drain parity (F08,
+  [#369](https://github.com/reliaburger/reliaburger/issues/369)) stays in its
+  milestone. On 6 November 2026, ACME moved to 0.4.0
+  ([#1667](https://github.com/reliaburger/reliaburger/issues/1667)). Exit test: three Dell Wyse 3040s from power-on to a cluster
   ([decisions](plans/2026-10-02-plan-appliance-wyse-lab.md#decisions-7-october-2026)).
   Its merge train is [#490](https://github.com/reliaburger/reliaburger/pull/490),
   which waits for the 0.2.x patch releases.

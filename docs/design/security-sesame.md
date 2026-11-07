@@ -1820,7 +1820,7 @@ council_size = 3
 
 **Impact:** Everything §5.12 lists. The holder can sign gossip that every node accepts, call node APIs with the service token, read the Raft log at rest, and unwrap the age keys, the intermediate CA keys and the OIDC signing key from council state.
 
-**Response:** Rebuild the cluster. None of the master key, the service token or the OIDC signing key can be rotated yet (§5.12), and rotating the keys that can be rotated doesn't help while the master key unwraps their replacements.
+**Response:** Rebuild the cluster. Neither the master key nor the service token can be rotated yet (§5.12), and rotating the keys that can be rotated doesn't help while the master key unwraps their replacements.
 1. Create a new cluster: `relish init` on fresh or reinstalled machines, or `relish machines claim --create` for appliances. It gets a new master key, CA, age key and OIDC key.
 2. Seal every secret again for the new cluster: `relish secret pubkey` gives its age public key for `relish secret encrypt`. Values sealed to the old cluster's key are readable by whoever holds the old master key.
 3. Apply your configs to the new cluster and move traffic to it.
@@ -1893,8 +1893,8 @@ The threat model assumes:
 1. Isolate the compromised council node immediately.
 2. Rotate all intermediate CAs: `relish ca rotate --role ROLE --root-backup FILE` for each role (§5.8).
 3. Rotate the age keypair: `relish secret rotate`.
-4. The OIDC signing key, the master key and the service token can't be rotated yet: there's no command for any of them ([#709](https://github.com/reliaburger/reliaburger/issues/709), §5.12). The node held all three, so the attacker can mint workload JWTs, sign gossip and call node APIs as the cluster for as long as the cluster lives. **Rebuild the cluster** (§7.7) rather than trusting rotations of the keys that can be rotated.
-5. If you must keep the cluster running while you rebuild, rotate what you can now: every API token except the service token (`relish token`), the intermediate CAs and the age keypair (steps 2 and 3).
+4. Rotate the workload signing key: `relish identity rotate-signing-key` (§5.7a). The old key keeps verifying for its 4,500 s window, so tokens the attacker minted before you rotate stay valid until it ends. The master key and the service token can't be rotated yet: there's no command for either ([#709](https://github.com/reliaburger/reliaburger/issues/709), §5.12). The node held both, so the attacker can sign gossip and call node APIs as the cluster for as long as the cluster lives. **Rebuild the cluster** (§7.7) rather than trusting rotations of the keys that can be rotated.
+5. If you must keep the cluster running while you rebuild, rotate what you can now: every API token except the service token (`relish token`), the intermediate CAs, the age keypair and the workload signing key (steps 2 to 4).
 6. Audit all cluster activity during the compromise window: `relish audit --cluster --since <start> --until <end>` lists every node's records, with the principal and source address of each action (§5.11). Read the compromised node's log before you rebuild it; there is no central copy yet.
 7. Investigate the attack vector and harden council node access.
 
