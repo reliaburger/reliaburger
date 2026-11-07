@@ -8,7 +8,7 @@ name: measure macOS relish-only
 on:
   pull_request:
     branches: [release-0-2-8]
-    types: [opened]
+    types: [opened, synchronize]
 
 permissions:
   contents: read
@@ -53,7 +53,7 @@ jobs:
           cargo nextest run --locked --no-tests=fail --lib --bin relish --test suite \
             -E 'binary_id(reliaburger::bin/relish) | (binary_id(reliaburger) & test(/^relish::/)) | (binary_id(reliaburger::suite) & test(/^relish_/))'
       - name: Doctests under relish
-        run: cargo test --locked --doc -- relish::
+        run: 'cargo test --locked --doc -- relish::'
       - name: Memory pressure log
         if: always()
         run: cat "$RUNNER_TEMP/vm_stat.log"
