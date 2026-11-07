@@ -810,11 +810,15 @@ jobs:
   macos:
     outputs:
       portable_darwin_1_sha256: ${{ steps.portable_darwin.outputs.portable_darwin_1_sha256 }}
-    # The portable suite on macOS, in one job: one compile, the lint, every
-    # test (partition hash:1/1, SHARDS in scripts/ci/workflow_assembly.py)
-    # and the doctests. Three shards each compiled the same suite for 17-40
-    # minutes to test for about 3, and took three of the five macOS runners
-    # the organisation's plan allows (plan 2026-11-06, F1).
+    # Bun ships for Linux only, so macOS builds and tests relish and the
+    # code only macOS compiles (#1720): the lint compile-checks bun, `make
+    # test-macos` runs relish's tests and the macOS-only ones (partition
+    # hash:1/1, SHARDS in scripts/ci/workflow_assembly.py), and the doctests
+    # are relish's. Bun, grill, cluster and eBPF tests run on Linux. The whole
+    # portable suite took a 66-minute median here; relish alone took 31 from
+    # a cold cache (#1699). It's one job, not three shards that each compiled
+    # the same suite (plan 2026-11-06, F1). scripts/release/ci_reuse.py waits
+    # for this job by name.
     name: portable macOS
     needs: changes
     if: needs.changes.outputs.macos == 'true'
@@ -836,9 +840,9 @@ jobs:
         run: rm -rf -- target/contracts
       # One pass, all features: the macOS-only code is in it, and the lint
       # job runs the no-features pass on Linux (see lint-macos in Makefile).
-      - name: Lint every target, with all features
+      - name: Lint the library, relish and bun (bun's compile check), all features
         run: make lint-macos
-      - name: Portable tests
+      - name: Relish and macOS-only tests
         id: portable_darwin
         run: |
           python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate portable-darwin --shard "1/1" --host darwin --directory "target/contracts/darwin/portable-darwin-1" --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
@@ -850,8 +854,10 @@ jobs:
           path: target/contracts/darwin/portable-darwin-1
           if-no-files-found: error
           retention-days: 14
-      - name: Doctests
-        run: make test-doc
+      # Linux runs every doctest; this one compiles the crate's doctests and
+      # runs relish's.
+      - name: Relish's doctests
+        run: 'cargo test --locked --doc -- relish::'
   benchmarks:
     # Criterion output is uploaded, not gated, so pull requests only pay for
     # the release build when they touch the gossip protocol or its benches.

@@ -18,7 +18,7 @@ run it.
 | Integration suite | Real Bun and Relish processes over HTTP, TLS and the registry | [`tests/suite/`](../tests/suite) | `make test` |
 | Doctests | Examples in doc comments compile and run | `///` blocks | `make test-doc` |
 | Doc snippets | Every `relish` command and TOML block a reader copies from the manual, the READMEs and the whitepaper parses with the real code ([below](#doc-snippets)) | [`tests/suite/doc_snippets.rs`](../tests/suite/doc_snippets.rs) | `make test` |
-| Lint and format | Clippy with warnings as errors, all features and none; the macOS job runs the all-features pass only, because that one holds the macOS-only code | [`Makefile`](../Makefile) | `make lint`, `make lint-macos`, `make fmt-check` |
+| Lint and format | Clippy with warnings as errors, all features and none, over every target; the macOS job runs the all-features pass only, because that one holds the macOS-only code, over the library, `relish` and `bun` ([what runs on macOS](#what-runs-on-macos-and-what-runs-on-linux)) | [`Makefile`](../Makefile) | `make lint`, `make lint-macos`, `make fmt-check` |
 | Coverage floor | Line coverage of the portable suite never drops below 78.65% | `COVERAGE_MIN_LINES` in the [`Makefile`](../Makefile) | `make coverage` |
 | Dependency audit | No new RustSec advisory; every exception is dated | [`security.yml`](../.github/workflows/security.yml), [exceptions](qualification/2026-09-18-dependency-exceptions.md) ([12 Oct](qualification/2026-10-12-dependency-exceptions.md), [21 Oct](qualification/2026-10-21-dependency-exceptions.md), [24 Oct](qualification/2026-10-24-dependency-exceptions.md), [25 Oct](qualification/2026-10-25-dependency-exceptions.md), [26 Oct](qualification/2026-10-26-dependency-exceptions.md), [28 Oct](qualification/2026-10-28-dependency-exceptions.md) and [6 Nov](qualification/2026-11-06-dependency-exceptions.md) reviews) | `make audit` |
 | Dependency lag | Nothing: a report, never a failure. It lists what `cargo update` would move and every crate a major version behind, for the refresh at the start of each minor release ([`releasing.md`](releasing.md#refreshing-dependencies)); [Dependabot](../.github/dependabot.yml) opens the weekly compatible refresh | [`security.yml`](../.github/workflows/security.yml) prints it in the weekly job summary | `make outdated` |
@@ -450,6 +450,9 @@ evidence gate calls a heavy selection without macOS `train-full` and accepts
 it, like the light set, only on a `pull_request` event, and never on a
 `release-gate` PR. For macOS-only code the PR runs portable macOS itself; for
 anything else, check it on a Mac with `make test`, or add the `macos` label.
+Either way the job runs relish and the macOS-only tests, not the whole suite
+([what runs on macOS](#what-runs-on-macos-and-what-runs-on-linux)), so in CI a
+change to Bun, grill or the cluster code is tested on Linux only.
 
 Every train merges through the merge queue, with `gh pr merge --merge --auto`
 ([merging through the queue](releasing.md#merging-through-the-queue)).
@@ -495,14 +498,58 @@ an HTTP `Range` request, abandons an attempt after 60 s without a byte, logs
 its progress, checks the zip's digest and stops at 13 minutes, inside the
 step's 14.
 
+### What runs on macOS and what runs on Linux
+
+Bun ships for Linux only, and the quickstart runs it in a Lima VM on a Mac.
+What a Mac user runs natively is `relish`. So the macOS job builds and tests
+`relish` and the code only macOS compiles, and only compile-checks `bun`
+([#1720](https://github.com/reliaburger/reliaburger/issues/1720), maintainer
+decision of 7 November 2026):
+
+| | macOS (`portable macOS`) | Linux |
+|---|---|---|
+| Lint | `make lint-macos`: Clippy, all features, on the library, `relish` and `bun`. Linting `bun` is its compile check | `make lint`: every target, all features and none |
+| Tests | `make test-macos`: the `relish` binary's tests, `relish::` in the library (the quickstart preflight, the dashboard and the manual's web view among them) and the suite's `relish_*` modules, plus the tests only macOS compiles: `grill::apple::` (the Apple Container adapter against a fake CLI), `grill::records::tests::absolute_start_time*` (process start times off Linux), the suite's `user_directories::macos_*` and the `runtime_selection` binary | `make coverage` (portable Linux): every portable test, `relish`'s included, under line coverage |
+| Doctests | `relish::`'s, `cargo test --locked --doc -- relish::` | all of them, `make test-doc` |
+| Bun, grill, cluster, eBPF | not run; Cargo still links `bun` and `testapp`, because it builds every binary for an integration test | portable Linux, privileged Linux, cluster and acceptance |
+
+`make test-macos` runs the same selection on any machine. The filterset is in
+the [`Makefile`](../Makefile), and
+[`test_macos_selection.py`](../scripts/ci/test_macos_selection.py) pins it,
+with the lint and the doctest step, so widening or narrowing what macOS proves
+is a reviewed change. Test code only macOS compiles is built by `make
+test-macos` but linted only by `make lint` on a Mac.
+
+The evidence manifest follows the same line. A finite case requires the
+`portable-darwin` gate only when the macOS filterset selects it, or the
+evidence gate would wait for a case the job never runs.
+[`macos_selection.py apply`](../scripts/ci/macos_selection.py) sets that,
+deterministically, in the manifest and the [qualification
+matrix](testing/qualification-matrix.md): a case that requires
+`portable-linux` keeps `portable-darwin` exactly when the filterset selects it.
+On 7 November 2026 that took `portable-darwin` off 231 of 250 cases, which
+all keep `portable-linux`; the 19 left are relish's. The test above fails
+when a manifest case, or a matrix row, disagrees with the filterset.
+
+Measured on [#1699](https://github.com/reliaburger/reliaburger/pull/1699): a
+relish-only macOS job took 31.2 minutes from a cold cache, 23.5 of them
+building the library, `relish` and suite test binaries, against a 66-minute
+median for the whole portable suite on macOS. relish's unit tests live in the
+library, so its test binary still compiles the whole crate; splitting `relish`
+into its own crate is planned in
+[#1725](https://github.com/reliaburger/reliaburger/issues/1725).
+
 ### Portable macOS in one job
 
-The portable suite on macOS runs as one job, `portable macOS`: it compiles
-the suite once, runs `make lint-macos`, runs every portable test with
-`make test` under `--partition hash:1/1` (`SHARDS` in
+The macOS tests run as one job, `portable macOS`
+([`scripts/release/ci_reuse.py`](../scripts/release/ci_reuse.py) waits for it
+by that name): it compiles once, runs `make lint-macos`, runs `make
+test-macos` ([above](#what-runs-on-macos-and-what-runs-on-linux)) under
+`--partition hash:1/1` (`SHARDS` in
 [`workflow_assembly.py`](../scripts/ci/workflow_assembly.py)), which nextest
-treats as the whole suite, and runs the doctests. It takes about 30 to 50
-minutes in one runner, depending on the compile.
+treats as the whole selection, and runs relish's doctests. Until #1720 it ran
+the whole portable suite: a 66-minute median over six runs on 6 and 7
+November 2026, 52 to 76 minutes depending on the compile.
 
 From 12 October to 6 November 2026 it ran as three shards, `portable macOS
 (1/3)` to `(3/3)`, each under `--partition hash:K/3`. They didn't pay. Each
@@ -546,11 +593,11 @@ Reading the source can't prove that a particular host/feature combination
 compiled or ran a case. Actual discovery
 must confirm the literal binary and full name before completion can qualify it.
 
-The workflow has eleven owners: Linux portable coverage, macOS portable tests,
-optimised cron boundaries, rootless Linux, privileged Linux storage/runtime,
-owned OCI interruptions, cluster, slow acceptance, node upgrade, cluster upgrade
-and standard registry clients. They keep their full existing selections and
-prerequisites. The finite cases are required observations within those commands,
+The workflow has eleven owners: Linux portable coverage, macOS relish and
+macOS-only tests (`make test-macos`), optimised cron boundaries, rootless Linux,
+privileged Linux storage/runtime, owned OCI interruptions, cluster, slow
+acceptance, node upgrade, cluster upgrade and standard registry clients. They
+keep their full existing selections and prerequisites. The finite cases are required observations within those commands,
 not permission to run a reduced replacement suite. The independent cron crate
 imports the actual production parser; its two required boundary oracles don't
 replace the owner's other imported tests.
