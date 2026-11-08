@@ -2241,6 +2241,21 @@ impl BunClient {
         Ok(retirement)
     }
 
+    /// The whole cluster at a glance (`GET /v1/cluster/summary`).
+    pub async fn cluster_summary(
+        &self,
+    ) -> Result<crate::bun::summary::ClusterSummary, RelishError> {
+        self.get_typed_json("/v1/cluster/summary").await
+    }
+
+    /// What the scheduler has committed on each node
+    /// (`GET /v1/cluster/capacity`).
+    pub async fn cluster_capacity(
+        &self,
+    ) -> Result<crate::bun::summary::ClusterCapacity, RelishError> {
+        self.get_typed_json("/v1/cluster/capacity").await
+    }
+
     /// Get cluster node membership.
     pub async fn nodes(&self) -> Result<Vec<NodeStatus>, RelishError> {
         let url = format!("{}/v1/cluster/nodes", self.base_url);

@@ -226,6 +226,14 @@ pub const ROUTE_MATRIX: &[Route] = &[
     gated(Post, "/v1/test/leases/{id}/renew", Deployer, Cluster(ADMIN)),
     gated(Delete, "/v1/test/leases/{id}", Deployer, Cluster(ADMIN)),
     route(Get, "/v1/cluster/nodes", AnyToken),
+    // The summary is scoped in its handler: a scoped token sees its own
+    // apps and jobs, and the cluster-wide sections come back `missing`.
+    route(Get, "/v1/cluster/summary", AnyToken),
+    // The shares the summary is built from, and the capacity behind it,
+    // cover every tenant: the handlers refuse a scoped token.
+    route(Get, "/v1/cluster/summary/node", AnyToken),
+    route(Get, "/v1/cluster/summary/leader", AnyToken),
+    route(Get, "/v1/cluster/capacity", AnyToken),
     // The relay only authenticates; the target node applies the forwarded
     // route's own requirement to the caller's credential.
     route(Get, "/v1/nodes/{node}/relay/{*path}", AnyToken),

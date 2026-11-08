@@ -923,7 +923,7 @@ at three, so no hollow node becomes a voter.
 
 | Command | What it does |
 |---|---|
-| `make test-hollow` | Twenty hollow nodes: they converge, a replica runs on each, a quarter stop and come back. A check that the harness works, not a measurement |
+| `make test-hollow` | Twenty hollow nodes: they converge, a replica runs on each, a quarter stop and come back. A check that the harness works, not a measurement. And a hundred hollow nodes running 1,000 one-replica apps: `GET /v1/cluster/summary` answers inside its 1 s budget, with the nodes, council, apps, instances, capacity and versions sections complete and the answer under 8 KiB |
 | `scripts/release/qualify-hollow-nodes.sh --sizes 100,500,1000` | One measured run per size, one at a time, each to `hollow-<N>.json`, then a table from [`hollow_summary.py`](../scripts/release/hollow_summary.py) |
 
 A run measures gossip convergence, the council's CPU and memory (it has its

@@ -82,6 +82,9 @@ pub struct ClusterRuntime {
     /// reaped. For reporting on the cluster only: placement, the council and
     /// the registry read the live-only `ClusterHandle::membership_rx`.
     pub roster_rx: watch::Receiver<Vec<MembershipSnapshot>>,
+    /// This node's gossip counters: updates received and the last
+    /// membership change, read by `GET /v1/cluster/summary`.
+    pub gossip_stats: crate::mustard::stats::GossipStats,
 }
 
 /// Configuration for starting the cluster runtime, derived from node config.
@@ -310,6 +313,7 @@ pub async fn start(
     }
     let (directory_tx, directory_rx) = watch::channel(NodeDirectory::default());
     node.set_directory_watch(directory_tx);
+    let gossip_stats = node.stats();
     // The gossip node is spawned *after* the council is built, so a restarted
     // node can seed gossip from its restored Raft membership (see below).
 
@@ -737,6 +741,7 @@ pub async fn start(
             rollup_store,
             directory_rx,
             roster_rx,
+            gossip_stats,
         },
     ))
 }
