@@ -854,6 +854,26 @@ fn main() -> anyhow::Result<()> {
     runtime.block_on(run_agent(cli))
 }
 
+/// Start the agent loop's stall watchdog, unless `threshold_ms` is 0. A
+/// watchdog that can't start is reported and Bun runs without it.
+fn start_loop_watchdog(
+    loop_meter: &reliaburger::bun::loop_meter::LoopTurnMeter,
+    threshold_ms: u64,
+) -> Option<reliaburger::bun::loop_watchdog::LoopWatchdog> {
+    use reliaburger::bun::loop_watchdog::{LoopWatchdog, WatchdogSettings};
+    if threshold_ms == 0 {
+        return None;
+    }
+    let settings = WatchdogSettings::with_threshold(std::time::Duration::from_millis(threshold_ms));
+    match LoopWatchdog::spawn_to_stderr(loop_meter.heartbeat(), settings) {
+        Ok(watchdog) => Some(watchdog),
+        Err(error) => {
+            eprintln!("bun: agent loop stall watchdog not started: {error}");
+            None
+        }
+    }
+}
+
 /// Cap glibc's malloc arenas before the runtime starts its threads.
 ///
 /// glibc hands busy threads their own arena (up to eight per core) and keeps
@@ -1425,6 +1445,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     let event_store = Arc::new(RwLock::new(events));
     agent.set_event_store(Arc::clone(&event_store));
     let loop_meter = agent.loop_meter();
+    // A std thread that snapshots every Bun thread when a loop turn stalls
+    // (#1707). It lives as long as this binding: to the end of the run.
+    let _loop_watchdog = start_loop_watchdog(&loop_meter, config.node.loop_stall_snapshot_ms);
     // `/v1/status` reads the loop's published snapshot through this.
     let status_reader = agent.status_reader();
     // How this node reaches peer agent APIs: https + CA trust under mTLS,

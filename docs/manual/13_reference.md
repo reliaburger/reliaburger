@@ -318,7 +318,7 @@ startup instead of being ignored.
 
 | Section | For |
 |---------|-----|
-| `[node]` | `name`, `labels` (matched by `placement`) |
+| `[node]` | `name`, `labels` (matched by `placement`), `loop_stall_snapshot_ms` (750: when one turn of Bun's agent loop runs this long, a watchdog thread writes a snapshot of every Bun thread to the journal, starting `bun: agent loop stalled`; at most ten an hour; `0` turns it off) |
 | `[cluster]` | `name`, `join`, ports, `[cluster.backup]` (see `operations`) |
 | `[storage]` | data directories, `allowed_host_paths`, `audit_max_bytes` (see `security`), `[storage.snapshots]` (see `images-and-volumes`) |
 | `[resources]` | CPU and memory held back for the node itself (`500m` or `0.5` cores, `512Mi`) |
