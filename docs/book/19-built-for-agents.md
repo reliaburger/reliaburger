@@ -5407,12 +5407,23 @@ retried approval reaches a new leader. The retry finds the outcome.
 The checks are the ones a state machine can make deterministically, from
 its own state and numbers in the entry: the proposal is still pending and
 not past its expiry by the stamped clock; the approver isn't an agent and
-isn't the author, by token name, so a rotated token is still its own
-author; every app is still at its `before` revision; nobody else holds a
+isn't the author, by credential or by token name, so a rotated token is
+still its own author; every app is still at its `before` revision; nobody else holds a
 lease on one. The leader judged the policies before it wrote the entry, and
 the entry carries the generation it judged at, the same fence as
 `PolicyFenced` in chapter 18: if a policy changed in between, the entry
 answers `PolicyGenerationMoved` and the leader judges again.
+
+The author's own rights go the other way. Revoking a token deletes it, and
+`relish token create` accepts the name again, so a name isn't a credential.
+Withdrawing a proposal and answering a retry by its idempotency key
+compare `principal_id`, the digest of the exact secret, through
+`Principal::is_credential`; a token made later under the name gets
+neither. Refusing self-approval and counting the eight pending proposals
+an author may have use `Principal::may_be`, credential *or* name, so a new
+token can't approve its old self's proposal or buy eight more. Two
+methods with two names, rather than one `==` in four places, make each
+call site say which question it's asking.
 
 ### All or nothing, on a copy
 

@@ -390,7 +390,7 @@ pub(super) async fn proposal_approve_handler(
         approval: Approval::Human(by),
         ..
     } = &proposal.state
-        && by.name == approver.name
+        && by.is_credential(&approver)
     {
         return answer_decided(&proposal);
     }
@@ -572,7 +572,9 @@ async fn authorise_decider(
     crate::sesame::auth::authorize_user(auth, crate::sesame::types::ApiRole::Deployer)?;
     let proposal = read_proposal(state, auth, id).await?;
     authorise_apps(state, auth, action, proposal.apps()).await?;
-    if auth.is_some_and(|auth| auth.token_name == proposal.author.name) {
+    // By name too: a rotated token, or one made again under the same
+    // name, is still its author here.
+    if auth.is_some() && proposal.author.may_be(&principal_of(auth)) {
         return Err(refusal_response(
             &ProposalRefusal::SelfApproval {
                 id,
