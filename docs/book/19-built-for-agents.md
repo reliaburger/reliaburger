@@ -1611,6 +1611,44 @@ whole typed summary; only the schema points elsewhere. (In Go you'd reach
 for a struct tag, and the tag would be a string nothing checks. Here the
 attribute names a function, so a typo doesn't compile.)
 
+### The TUI's dashboard
+
+The TUI's front page was three lists: every app with its instances, every
+node, and the last eight events. The header counted nodes from gossip's
+list and apps from the instance list, so a node that didn't answer simply
+made both numbers smaller.
+
+Now the dashboard prints `relish status`'s screen, then the events. The TUI
+fetches the summary in the same `tokio::join!` as everything else it polls,
+and the reducer stores it like any other result: on an error it keeps the
+last one and shows `DISCONNECTED`. The lines come from `assess`, so a node
+that timed out reads `2 alive, 0 suspect, 0 dead; partial (2 of 3 nodes)`
+in yellow, exactly as on the command line. The TUI doesn't run `wtf`'s
+checks, so it drops that line rather than print "skipped".
+
+The header reads the summary too. Its helper takes the section and a
+closure that picks the count:
+
+```rust
+fn counted<T>(section: &Section<T>, noun: &str, count: impl Fn(&T) -> u32) -> String {
+    let Some(value) = &section.value else {
+        return format!("{noun} unknown");
+    };
+```
+
+`let ... else` is a pattern with an escape hatch: if the pattern doesn't
+match, the `else` block runs, and it must leave the function (`return`,
+`break` or a panic). After it, `value` is in scope, unwrapped. It's the Rust
+spelling of Go's `if v == nil { return ... }` without the nil. A partial
+section comes out as `2 nodes, partial (2 of 3 nodes)`; a missing one as
+`nodes unknown`, never `0 nodes`.
+
+The apps, nodes and jobs views still read their lists. They're lists:
+that's what the summary isn't for.
+
+The snapshot tests cover a healthy cluster, a degraded app, an empty
+cluster and a new scenario, `NodeMissing`, where node-3 didn't answer.
+
 ## Logs and the manual
 
 An agent chasing a crash loop wants two more things before it opens the

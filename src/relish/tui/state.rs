@@ -5,6 +5,7 @@ use std::collections::{HashMap, VecDeque};
 use crate::bun::agent::{ClusterInstanceStatus, CouncilStatus, JobStatus, NodeStatus};
 use crate::bun::cluster_view::{ClusterDeployHistory, NodeTagged};
 use crate::bun::events::ClusterEvent;
+use crate::bun::summary::ClusterSummary;
 use crate::mayo::rollup::MetricsQueryResult;
 use crate::wrapper::types::RouteInfo;
 
@@ -75,6 +76,9 @@ pub enum View {
 /// Everything fetched from the agent.
 #[derive(Debug, Clone, Default)]
 pub struct ClusterData {
+    /// The cluster at a glance (`GET /v1/cluster/summary`): what the
+    /// dashboard and the header show. `None` until the first one arrives.
+    pub summary: Option<ClusterSummary>,
     pub instances: Vec<ClusterInstanceStatus>,
     pub nodes: Vec<NodeStatus>,
     pub council: Option<CouncilStatus>,
