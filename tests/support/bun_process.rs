@@ -119,6 +119,34 @@ fn safe_relish_phase(args: &[&str]) -> &'static str {
 /// How long a helper waits for Bun or Relish before failing the test.
 pub const WAIT: Duration = Duration::from_secs(30);
 
+/// Stop a Mac idle-sleeping while the process `pid` runs.
+///
+/// A fixture's leases expire by the wall clock, which keeps running while
+/// the Mac sleeps, but the test's own deadlines are `Instant`s, which on
+/// macOS don't. A laptop that idles into sleep mid-test wakes with its
+/// leases expired and their cleanup done, and the test fails as if the
+/// product had lost its work (#1527). `caffeinate -i -w` holds an
+/// idle-sleep assertion until `pid` exits. A closed lid still sleeps; the
+/// runner's report names that case. Elsewhere this does nothing.
+fn keep_host_awake_while_running(pid: u32) {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let Ok(mut caffeinate) = Command::new("/usr/bin/caffeinate")
+        .args(["-i", "-w", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return;
+    };
+    // caffeinate exits once `pid` does; reap it then.
+    std::thread::spawn(move || {
+        let _ = caffeinate.wait();
+    });
+}
+
 /// A running `bun` child, terminated (SIGTERM, then SIGKILL) on drop.
 pub struct BunProcess {
     pub child: Child,
@@ -155,10 +183,9 @@ impl BunProcess {
         if clustered {
             command.arg("--cluster");
         }
-        Self {
-            child: command.spawn().unwrap(),
-            log_path,
-        }
+        let child = command.spawn().unwrap();
+        keep_host_awake_while_running(child.id());
+        Self { child, log_path }
     }
 
     /// Panic with Bun's log if the process has already exited.
