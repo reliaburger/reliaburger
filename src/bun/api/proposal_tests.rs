@@ -405,7 +405,8 @@ async fn conflicts_leases_and_stale_proposals() {
             .any(|record| record.details["code"] == "lease_held")
     );
 
-    // A person writes web in between: approval fails, nothing changes.
+    // A person writes web in between: the approval answers `stale`, the
+    // proposal is recorded failed, and nothing changes.
     cluster
         .council
         .write(crate::council::types::RaftRequest::AppSpec {
@@ -417,12 +418,19 @@ async fn conflicts_leases_and_stale_proposals() {
     let (status, body) = cluster
         .post("/v1/proposals/1/approve", &cluster.alice, String::new())
         .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["state"], "failed");
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "stale");
+    assert_eq!(body["view"]["state"], "failed");
     assert!(
-        body["outcome"].as_str().unwrap().contains("changed"),
+        body["view"]["outcome"].as_str().unwrap().contains("changed"),
         "{body}"
     );
+    // Asking again answers the same.
+    let (status, body) = cluster
+        .post("/v1/proposals/1/approve", &cluster.alice, String::new())
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "stale");
     assert_eq!(
         cluster.replicas("web", "shop").await,
         crate::config::Replicas::Fixed(4)
@@ -546,5 +554,79 @@ async fn an_agent_token_is_never_admin_and_short_lived() {
     assert!(
         (now + 8 * 3600 - 60..=now + 8 * 3600 + 60).contains(&expires),
         "{expires}"
+    );
+}
+
+/// The gym's finding (#1682): an agent's undo of a change a person has
+/// changed again since is refused when it's proposed, with the code
+/// `stale`, as a person's `relish undo` is. Approving it would have
+/// overwritten the person's change.
+#[tokio::test]
+async fn an_agents_undo_is_stale_once_a_person_changed_the_app_again() {
+    let cluster = cluster("proposal-undo-stale").await;
+    let (status, body) = cluster.scale(&cluster.holmes, "shop", "web", 5).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = cluster
+        .post("/v1/proposals/1/approve", &cluster.bob, String::new())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // A person ships a new version and scales back by hand.
+    let mut person = web_spec(3);
+    person.image = Some("web:1.5".to_string());
+    cluster
+        .council
+        .write(crate::council::types::RaftRequest::AppSpec {
+            app_id: crate::meat::AppId::new("web", "shop"),
+            spec: person,
+        })
+        .await
+        .unwrap();
+
+    let undo = serde_json::json!({
+        "kind": "undo", "namespace": "shop", "of": 1, "reason": "the scale didn't help",
+    });
+    let (status, body) = cluster.propose(&cluster.holmes, undo).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "stale");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("after proposal 1 applied"),
+        "{body}"
+    );
+    let (status, body) = cluster
+        .post("/v1/proposals/1/undo", &cluster.alice, String::new())
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "stale");
+    let web = cluster.council.desired_state().await.apps
+        [&crate::meat::AppId::new("web", "shop")]
+        .clone();
+    assert_eq!(web.image.as_deref(), Some("web:1.5"));
+}
+
+/// An agent's undo starts from exactly what the original left: its
+/// `before` is the original's `after`.
+#[tokio::test]
+async fn an_agents_undo_starts_from_what_the_original_left() {
+    let cluster = cluster("proposal-undo-before").await;
+    cluster.scale(&cluster.holmes, "shop", "web", 5).await;
+    let (_, original) = cluster
+        .post("/v1/proposals/1/approve", &cluster.bob, String::new())
+        .await;
+    let undo = serde_json::json!({
+        "kind": "undo", "namespace": "shop", "of": 1, "reason": "the scale didn't help",
+    });
+    let (status, body) = cluster.propose(&cluster.holmes, undo).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["kind"], "undo");
+    assert_eq!(
+        body["revisions"][0]["before"], original["revisions"][0]["after"],
+        "{body}"
+    );
+    assert_eq!(
+        body["revisions"][0]["after"], original["revisions"][0]["before"],
+        "{body}"
     );
 }

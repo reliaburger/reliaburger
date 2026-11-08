@@ -386,15 +386,26 @@ fn undo_changes(
     now_unix_ms: u64,
 ) -> Result<(String, Vec<AppChange>), ProposalRefusal> {
     let original = desired.proposals.undoable(of, now_unix_ms)?;
-    let changes = original
-        .changes
-        .iter()
-        .map(|change| AppChange {
+    // An undo starts from what the original left. If anyone has changed an
+    // app since, putting `before` back would overwrite that change, so the
+    // undo is stale from the start, as a person's direct undo is.
+    let mut changes = Vec::with_capacity(original.changes.len());
+    for change in &original.changes {
+        if current_app(desired, &change.app).revision != change.after.revision {
+            return Err(ProposalRefusal::Stale {
+                app: change.app.to_string(),
+                what: format!(
+                    "after proposal {of} applied; undoing would overwrite that, so propose the \
+                     change you want instead"
+                ),
+            });
+        }
+        changes.push(AppChange {
             app: change.app.clone(),
-            before: current_app(desired, &change.app),
+            before: change.after.clone(),
             after: change.after_undo(),
-        })
-        .collect();
+        });
+    }
     Ok((original.namespace.clone(), changes))
 }
 

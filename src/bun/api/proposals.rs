@@ -348,7 +348,7 @@ pub(super) async fn proposal_approve_handler(
     } = &proposal.state
         && by.name == approver.name
     {
-        return Json(proposal.view(crate::testkit::lease::now_unix_millis())).into_response();
+        return answer_decided(&proposal);
     }
     let Some(council) = &state.council else {
         return standalone();
@@ -613,7 +613,42 @@ async fn answer_outcome(
     };
     let message = message.replace("{}", &proposal.id.to_string());
     record_proposal(state, auth, action, &proposal, message).await;
+    if matches!(proposal.state, crate::proposal::ProposalState::Failed { .. }) {
+        return answer_decided(&proposal);
+    }
     Json(proposal.view(now)).into_response()
+}
+
+/// The answer for a proposal that's already decided: its view, or, when
+/// its approval wrote nothing, the refusal that says why (`stale`,
+/// `lease_held` or `guardrail`) with the view beside it. An approval that
+/// changed nothing isn't a success, so a script reading the status or an
+/// agent reading the code doesn't take it for one.
+fn answer_decided(proposal: &Proposal) -> Response {
+    let view = proposal.view(crate::testkit::lease::now_unix_millis());
+    let crate::proposal::ProposalState::Failed { why, .. } = &proposal.state else {
+        return Json(view).into_response();
+    };
+    let refusal = match why {
+        crate::proposal::FailedReason::Stale { app, .. } => ProposalRefusal::Stale {
+            app: app.to_string(),
+            what: "after the proposal was made, so it wasn't applied; propose again".to_string(),
+        },
+        crate::proposal::FailedReason::Lease { lease } => ProposalRefusal::LeaseHeld {
+            lease: lease.clone(),
+        },
+        crate::proposal::FailedReason::Guardrail { rule, message } => {
+            ProposalRefusal::Guardrail {
+                rule: rule.clone(),
+                message: message.clone(),
+            }
+        }
+        crate::proposal::FailedReason::Refused { reason } => ProposalRefusal::WrongState {
+            id: proposal.id,
+            state: format!("failed: {reason}"),
+        },
+    };
+    refusal_response(&refusal, Some(view))
 }
 
 /// The audit record for `action` on `proposal`, by the caller.
