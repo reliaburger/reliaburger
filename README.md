@@ -187,7 +187,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish agent`: Commands for LLM agents: one JSON envelope, bounded, never interactive
   - `relish agent guide`: How to use relish as an agent: the manual chapter, as Markdown sections
   - `relish agent version`: This binary's version, commit, target and cluster formats
-  - `relish agent schema [guide|version|schema|source-version|source-tree|source-grep|source-show|source-extract|logs|manual-search|manual-show|context|diagnose|explain|upgrade-check|report|patch-init|patch-build|patch-test|patch-try|patch-diff|patch-apply|patch-destroy|setup]`: The JSON Schema of the envelope and of each command's data
+  - `relish agent schema [guide|version|schema|source-version|source-tree|source-grep|source-show|source-extract|logs|manual-search|manual-show|context|diagnose|explain|upgrade-check|report|patch-init|patch-build|patch-test|patch-try|patch-diff|patch-apply|patch-destroy|setup|status]`: The JSON Schema of the envelope and of each command's data
   - `relish agent source`: The source this binary was built from: search it, read it, extract it
     - `relish agent source version`: This binary's source: version, commit, digest, file count, and the commit every node runs
     - `relish agent source tree [PREFIX]`: Files with their size in bytes and their line count
@@ -198,7 +198,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
   - `relish agent manual`: The manual compiled into this binary: search it, show a section
     - `relish agent manual search <WORDS>...`: Up to ten sections that mention every word, best first, each with a short excerpt and the `show` command that prints it
     - `relish agent manual show <TARGET>`: One chapter, or one section of it, as Markdown: `diagnostics` or `diagnostics#relish-path-can-a-reach-b`
-  - `relish agent context`: The first call: findings, unknowns, faults, alerts, one line per app and the newest events, in one bounded answer
+  - `relish agent context`: The first call: `relish status`'s screen and summary, findings, unknowns and the newest events, in one bounded answer
   - `relish agent diagnose`: Every finding with its evidence, read-only next steps, and pointers into the manual and the source
   - `relish agent explain [ID]`: What a finding means, its thresholds and where it's decided; every finding when no id is given. Reads only this binary
   - `relish agent upgrade-check`: Whether the cluster can take the latest release: `ready`, `up_to_date`, `needs_fresh_cluster`, `blocked` or `unknown`
