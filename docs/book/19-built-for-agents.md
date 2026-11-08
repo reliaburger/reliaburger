@@ -5765,6 +5765,43 @@ each app, and a `Some` fails it. A proposal that ends, however it ends,
 ends its leases. All four are pure, so the proposal entry stays
 deterministic too.
 
+### A person's write, and the lease in its way
+
+A person never needs a lease to change an app, but someone else's lease on
+it stops them by name. `relish apply`, `deploy`, `stop`, `delete`,
+`rollback` and `release` check the leases on the leader before they write,
+and someone else's lease answers `409` with `code: "lease_held"`:
+
+```text
+app:shop/web is held by holmes for 87s more (rolling back); repeat with --break-lease to take it over
+```
+
+Repeated with `--break-lease`, the leader breaks each lease in the way,
+writes `lease.broken` naming who broke whose, and makes the change. People
+win over agents, always, and the audit log shows when they did. The flag
+travels as a header, `x-reliaburger-break-lease: acknowledged`, the same
+way `--rerun-jobs` does, and a follower forwarding the write to the leader
+copies it with the caller's credential.
+
+Checking and writing are two steps, so a lease could be taken between them.
+The write therefore goes to the council inside a fence:
+
+```rust
+RaftRequest::LeaseFenced { lease_generation: u64, change: Box<RaftRequest> }
+```
+
+The state machine applies `change` only while the lease generation is the
+one the leader checked at, and otherwise answers `LeaseGenerationMoved`,
+and the leader checks again. It compares two numbers and never reads a
+lease, exactly like `PolicyFenced` in chapter 18. Here the generation's odd
+rule pays off: renewing doesn't move it, so an agent renewing its lease
+every minute never makes a person's apply retry, and a take, release, break
+or expiry, which change who holds what, do.
+
+The leader's own writes (scheduling, rollouts, the autoscaler), GitOps and
+a test lease's apply aren't fenced. A lease coordinates people and agents;
+it doesn't stop the cluster from running.
+
 ### Who sees what
 
 `relish agent context` gained a `leases` section, at most 50 lines, with the

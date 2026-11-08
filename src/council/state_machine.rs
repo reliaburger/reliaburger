@@ -1506,6 +1506,37 @@ impl StateMachineInner {
                 }
                 return response;
             }
+            RaftRequest::LeaseFenced {
+                lease_generation,
+                change,
+            } => {
+                let fenced = match change.as_ref() {
+                    RaftRequest::AppSpec { .. }
+                    | RaftRequest::AppStop { .. }
+                    | RaftRequest::AppDelete { .. }
+                    | RaftRequest::AppRelease { .. } => true,
+                    RaftRequest::PolicyFenced { change, .. } => {
+                        matches!(change.as_ref(), RaftRequest::AppSpec { .. })
+                    }
+                    _ => false,
+                };
+                if !fenced {
+                    return Some(CouncilResponse::Refused {
+                        reason: "a lease fence carries only a person's app write".into(),
+                    });
+                }
+                // The leader checked the leases at `lease_generation`; a
+                // take, release, break or expiry since then moved it, and
+                // the write waits for the leader to check again. A renewal
+                // doesn't move it, so a busy agent never makes a person's
+                // apply retry.
+                if *lease_generation != self.state.agent_leases.generation {
+                    return Some(CouncilResponse::LeaseGenerationMoved {
+                        current: self.state.agent_leases.generation,
+                    });
+                }
+                return self.apply_request_at(change, position);
+            }
             RaftRequest::LeaseTake {
                 request,
                 observed_at_unix_ms,
@@ -12026,5 +12057,45 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(restored.desired_state().await.proposals, held.proposals);
+    }
+
+    /// A person's write fenced on the lease generation applies while it's
+    /// current, waits while a take moved it, and isn't held up by a renewal.
+    #[test]
+    fn a_lease_fenced_write_applies_only_at_the_generation_it_was_checked_at() {
+        use crate::proposal::lease::{DEFAULT_LEASE_TTL_MS, LeaseTarget};
+        let mut inner = StateMachineInner::default();
+        let web = AppId::new("web", "shop");
+        let fenced = |generation| RaftRequest::LeaseFenced {
+            lease_generation: generation,
+            change: Box::new(RaftRequest::AppSpec {
+                app_id: web.clone(),
+                spec: web_spec("web:2"),
+            }),
+        };
+        inner.apply_request(&take_lease("holmes", 1_000));
+        assert_eq!(inner.state.agent_leases.generation, 1);
+        assert!(matches!(
+            inner.apply_request(&fenced(0)),
+            Some(CouncilResponse::LeaseGenerationMoved { current: 1 })
+        ));
+        assert!(!inner.state.apps.contains_key(&web));
+        // A renewal doesn't move the generation.
+        inner.apply_request(&RaftRequest::LeaseRenew {
+            target: LeaseTarget::app("shop", "web"),
+            holder: lease_holder("holmes"),
+            ttl_ms: DEFAULT_LEASE_TTL_MS,
+            observed_at_unix_ms: 2_000,
+        });
+        assert!(inner.apply_request(&fenced(1)).is_none());
+        assert_eq!(inner.state.apps[&web].image.as_deref(), Some("web:2"));
+        // Only an app write may be fenced.
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::LeaseFenced {
+                lease_generation: 1,
+                change: Box::new(RaftRequest::PolicyDelete { name: "x".into() }),
+            }),
+            Some(CouncilResponse::Refused { .. })
+        ));
     }
 }

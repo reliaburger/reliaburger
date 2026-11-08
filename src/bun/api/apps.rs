@@ -334,12 +334,46 @@ pub(super) async fn cluster_app_change(
     {
         return refusal;
     }
+    // Someone else's lease on the app stops a person's write, by name,
+    // unless they asked to break it (#1686).
+    let break_lease = match crate::bun::lease_fence::break_lease_requested(caller_headers) {
+        Ok(requested) => requested,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": error })),
+            )
+                .into_response();
+        }
+    };
+    let apps = [app_id.clone()];
     let request = match change {
         AppChange::Stop => crate::council::types::RaftRequest::AppStop { app_id },
         AppChange::Delete { .. } => crate::council::types::RaftRequest::AppDelete { app_id },
         AppChange::Release => crate::council::types::RaftRequest::AppRelease { app_id },
     };
-    match council.write(request).await {
+    let mut written = None;
+    for _ in 0..crate::bun::lease_fence::LEASE_ATTEMPTS {
+        let generation =
+            match super::leases::clear_leases_for_write(&state, &council, auth, &apps, break_lease)
+                .await
+            {
+                Ok(generation) => generation,
+                Err(refusal) => return refusal.into_response(),
+            };
+        let fenced = crate::bun::lease_fence::fence(generation, request.clone());
+        match council.write(fenced).await {
+            Ok(crate::council::CouncilResponse::LeaseGenerationMoved { .. }) => continue,
+            other => {
+                written = Some(other);
+                break;
+            }
+        }
+    }
+    let Some(written) = written else {
+        return super::leases::LeaseWriteRefusal::Churn.into_response();
+    };
+    match written {
         Ok(crate::council::CouncilResponse::Refused { reason }) => {
             let status = match change {
                 AppChange::Release => StatusCode::CONFLICT,

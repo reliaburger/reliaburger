@@ -1384,6 +1384,14 @@ pub(crate) fn copy_forwarded_auth(
             request = request.header(name.as_str(), value.as_bytes());
         }
     }
+    // A person's `--break-lease` travels with their credential, so the
+    // leader, which checks the leases, sees it (#1686).
+    if let Some(value) = headers.get(crate::bun::lease_fence::BREAK_LEASE_HEADER) {
+        request = request.header(
+            crate::bun::lease_fence::BREAK_LEASE_HEADER,
+            value.as_bytes(),
+        );
+    }
     request
 }
 

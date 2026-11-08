@@ -133,6 +133,9 @@ pub struct BunClient {
     token: Option<String>,
     ca_pem: Option<Vec<u8>>,
     service_endpoints: Option<crate::bun::capabilities::ServiceEndpoints>,
+    /// Ask writes to break any agent lease in their way (`--break-lease`,
+    /// #1686).
+    break_lease: bool,
 }
 
 /// Options for fetching or streaming logs.
@@ -726,6 +729,7 @@ impl BunClient {
                     websocket_tls: None,
                     ca_pem: None,
                     service_endpoints: None,
+                    break_lease: false,
                     token: token.map(str::to_string),
                 };
             }
@@ -789,6 +793,7 @@ impl BunClient {
             websocket_tls,
             ca_pem: ca_pem.map(<[u8]>::to_vec),
             service_endpoints: None,
+            break_lease: false,
             token: token.map(str::to_string),
         }
     }
@@ -828,6 +833,7 @@ impl BunClient {
             websocket_tls: self.websocket_tls.clone(),
             ca_pem: self.ca_pem.clone(),
             service_endpoints: None,
+            break_lease: self.break_lease,
             token: self.token.clone(),
         }
     }
@@ -876,6 +882,23 @@ impl BunClient {
     }
 
     /// Use another bearer credential with this connection's existing trust roots and forwards.
+    /// The same client, asking its app writes (apply, stop, delete,
+    /// rollback, release) to break any agent lease in their way: the
+    /// `x-reliaburger-break-lease` header (#1686).
+    pub fn breaking_leases(mut self, break_lease: bool) -> Self {
+        self.break_lease = break_lease;
+        self
+    }
+
+    /// `request` with the break-lease header, when this client asks for it.
+    fn lease_header(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if self.break_lease {
+            request.header(crate::bun::lease_fence::BREAK_LEASE_HEADER, "acknowledged")
+        } else {
+            request
+        }
+    }
+
     pub fn with_token(&self, token: &str) -> Self {
         let mut client = Self::build(&self.base_url, Some(token), self.ca_pem.as_deref());
         client.service_endpoints = self.service_endpoints.clone();
@@ -972,6 +995,7 @@ impl BunClient {
                         websocket_tls: None,
                         ca_pem: None,
                         service_endpoints: None,
+                        break_lease: false,
                         token: None,
                     });
             }
@@ -982,6 +1006,7 @@ impl BunClient {
                     websocket_tls: None,
                     ca_pem: None,
                     service_endpoints: None,
+                    break_lease: false,
                     token: None,
                 };
             }
@@ -1099,7 +1124,7 @@ impl BunClient {
             body: format!("failed to serialise config: {e}"),
         })?;
 
-        let mut request = self.http()?.post(&url).body(toml_str);
+        let mut request = self.lease_header(self.http()?.post(&url).body(toml_str));
         if rerun_jobs {
             request = request.header("x-reliaburger-rerun-jobs", "acknowledged");
         }
@@ -1240,8 +1265,7 @@ impl BunClient {
             force_query(force)
         );
         let response = self
-            .http()?
-            .post(&url)
+            .lease_header(self.http()?.post(&url))
             .send()
             .await
             .map_err(classify_error)?;
@@ -1868,8 +1892,7 @@ impl BunClient {
     pub async fn stop(&self, app: &str, namespace: &str) -> Result<(), RelishError> {
         let url = format!("{}/v1/stop/{}/{}", self.base_url, app, namespace);
         let response = self
-            .http()?
-            .post(&url)
+            .lease_header(self.http()?.post(&url))
             .send()
             .await
             .map_err(classify_error)?;
@@ -1905,8 +1928,7 @@ impl BunClient {
             force_query(force)
         );
         let response = self
-            .http()?
-            .post(&url)
+            .lease_header(self.http()?.post(&url))
             .send()
             .await
             .map_err(classify_error)?;
@@ -1926,8 +1948,7 @@ impl BunClient {
     pub async fn release(&self, app: &str, namespace: &str) -> Result<(), RelishError> {
         let url = format!("{}/v1/release/{}/{}", self.base_url, app, namespace);
         let response = self
-            .http()?
-            .post(&url)
+            .lease_header(self.http()?.post(&url))
             .send()
             .await
             .map_err(classify_error)?;

@@ -535,6 +535,18 @@ pub enum RaftRequest {
     /// the state machine refuses a release of an app that isn't there or
     /// has no owner.
     AppRelease { app_id: AppId },
+    /// A person's direct app write, made after the leader checked the agent
+    /// leases at `lease_generation` (#1686). The state machine applies
+    /// `change` only while the lease generation is still `lease_generation`,
+    /// and otherwise answers `LeaseGenerationMoved`, so the leader checks
+    /// the leases again. It compares two numbers, like `PolicyFenced`.
+    ///
+    /// `change` is an `AppSpec`, a `PolicyFenced` app write, `AppStop`,
+    /// `AppDelete` or `AppRelease`.
+    LeaseFenced {
+        lease_generation: u64,
+        change: Box<RaftRequest>,
+    },
     /// Take a lease on an app or a namespace for the caller (#1686), or
     /// renew it when the caller already holds it. `observed_at_unix_ms` is
     /// the leader's clock when it built the entry, so every replica judges
@@ -674,6 +686,10 @@ pub enum CouncilResponse {
     /// the policies are now at `current`. Nothing applied; the leader
     /// evaluates the app again and retries (#1117).
     PolicyGenerationMoved { current: u64 },
+    /// A `LeaseFenced` write was checked against leases at an older
+    /// generation; the leases are now at `current`. Nothing applied; the
+    /// leader checks the leases again and retries (#1686).
+    LeaseGenerationMoved { current: u64 },
     /// What a lease entry did, or why it changed nothing (#1686).
     AgentLease(Box<crate::proposal::lease::LeaseOutcome>),
     /// What a proposal entry did, or why it changed nothing (#1682).

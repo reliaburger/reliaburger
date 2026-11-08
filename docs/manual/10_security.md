@@ -313,6 +313,21 @@ that, use `relish rollback`. A proposal nobody decides expires after an hour
 (the agent may ask for 5 minutes to 24 hours). At most 64 wait at once, 8
 per author and one per app.
 
+An agent may hold a short **lease** on an app or a namespace while it
+works (`relish lease list` shows them). Someone else's lease stops your own
+`relish apply`, `deploy`, `stop`, `delete`, `rollback` or `release` of that
+app, naming the holder, why and for how long:
+
+```text
+app:shop/web is held by holmes for 87s more (rolling back); repeat with --break-lease to take it over
+```
+
+Repeat the command with `--break-lease` and the cluster ends the lease,
+records `lease.broken` with your name, and makes the change. People win
+over agents; the audit log shows when they did. Your own lease never stops
+you, and the cluster's own work (scheduling, rollouts, the autoscaler) and
+GitOps aren't held back by any.
+
 Proposals are judged by your policies like any apply: the `after` specs go
 through every app policy with `source = "proposal"`, a deny refuses the
 proposal (the agent sees `guardrail`), and warnings are shown first to

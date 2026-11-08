@@ -225,6 +225,8 @@ pub struct Compatibility {
 /// (`GET /v1/cluster/summary`).
 /// Agent proposals (#1682): `DesiredState::proposals`, the `Proposal*` Raft
 /// requests, the `Proposal` council response, and `ApiToken::kind`.
+/// Lease fences (#1686): the `LeaseFenced` Raft request and the
+/// `LeaseGenerationMoved` council response.
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 58,
     state: 74,
