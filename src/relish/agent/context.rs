@@ -98,7 +98,10 @@ pub struct Section<T> {
     pub state: SectionState,
     /// Why it's partial or unknown.
     pub reason: Option<String>,
-    /// What was seen; empty and `unknown` isn't "none".
+    // `SectionState::Unknown` says that empty isn't "none": `Section` is
+    // generic, so a field doc here is repeated in the schema once per
+    // section, and `relish agent schema context` has to fit 24 KiB.
+    /// What was seen.
     pub items: Vec<T>,
 }
 
@@ -110,7 +113,7 @@ pub enum SectionState {
     Known,
     /// Some sources answered; `items` is a lower bound.
     Partial,
-    /// Nothing could be read.
+    /// Nothing could be read: empty `items` isn't "none".
     Unknown,
 }
 

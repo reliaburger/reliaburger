@@ -640,14 +640,16 @@ mod tests {
         // Every command's schema together outgrew the default budget once
         // `context` and `diagnose` arrived; `schema <command>` is the
         // bounded call, and the test below holds each one to the default.
+        // The whole schema passed 128 KiB when 0.2.8's timeline, verify,
+        // leases and proposals met on the train.
         let rendered = run(
-            &parse("agent schema --max-bytes 131072").unwrap(),
+            &parse("agent schema --max-bytes 196608").unwrap(),
             "relish agent schema",
         )
         .await;
         assert_eq!(rendered.exit, ExitStatus::Answered);
         let value = json_of(&rendered);
-        assert_eq!(value["truncated"], false, "the whole schema fits 128 KiB");
+        assert_eq!(value["truncated"], false, "the whole schema fits 192 KiB");
         let names: Vec<&str> = value["data"]["commands"]
             .as_array()
             .unwrap()
