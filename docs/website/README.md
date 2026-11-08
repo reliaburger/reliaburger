@@ -243,8 +243,8 @@ written from the published binary's own help by
 README and in the tour chapter against it. The tour may only use released
 commands. Anything else has to say which release adds it, in the words
 "0.3.0, not in 0.2.2" (the build's version, then the installer's), in the
-same paragraph, `<details>` or section. The README's generated command list
-labels such commands itself. When the installer's default changes, regenerate
+same paragraph, `<details>` or section. The generated command list in the
+manual's reference chapter labels such commands itself. When the installer's default changes, regenerate
 the snapshot; the test refuses a snapshot for another version.
 
 The page leads with the one-line install now that releases are published;
