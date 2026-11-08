@@ -430,7 +430,7 @@ See [getting started](00_getting-started.md) and [cluster basics](02_cluster-bas
 - `relish join --node-id <NODE_ID> <ADDR>`: Join an existing cluster
 - `relish join-token`: Manage short-lived node-enrolment tokens
   - `relish join-token create --node-id <NODE_ID>`: Create a single-use token for enrolling one node
-- `relish nodes`: List cluster nodes and their gossip state
+- `relish nodes`: List cluster nodes: gossip state, version, usage and what's allocated
 - `relish council`: Show the council (Raft) on every node, or recover from full loss
   - `relish council status`: Show every node's view of the council (the default)
   - `relish council recover --data-dir <DATA_DIR>`: Recover a cluster whose entire council was lost
@@ -444,7 +444,8 @@ See [getting started](00_getting-started.md) and [cluster basics](02_cluster-bas
 See [deploy an app](01_deploy-an-app.md) and [writing a controller](15_writing-a-controller.md).
 
 - `relish apply [PATH_OR_URL]`: Apply a Reliaburger TOML or Kubernetes YAML manifest
-- `relish status`: Show cluster and app status
+- `relish status`: Is the cluster all right? One screen: a verdict, then one line per part of the cluster with the command that lists the detail
+- `relish apps [NAME]`: List apps with their state, problems first; with NAME, that app's instances *(0.2.8, not in 0.2.7)*
 - `relish inspect <NAME>`: Show every instance of an app across the cluster, with its node
 - `relish exec <APP> [COMMAND]...`: Run a command once inside a running instance and exit with its exit code. Not interactive: no stdin and no terminal
 - `relish deploy <PATH>`: Trigger a rolling deploy for an app
@@ -495,6 +496,7 @@ See [observability](04_observability.md).
 - `relish logs-export --dest <DEST>`: Copy a node's Parquet log files here, or have it ship them to object storage
 - `relish logs-search <SOURCE> <SQL>`: Search exported Parquet log archives with SQL
 - `relish events`: Show the cluster's recent events: deploys, restarts, health, faults, tokens, secrets and audited operations, newest last
+- `relish timeline`: What changed in a window, newest first: events (with the decisions they record), the audit log and an app's deploys *(0.2.8, not in 0.2.7)*
 
 ### Diagnose and test
 
@@ -512,7 +514,7 @@ See [working with an AI agent](16_working-with-an-ai-agent.md).
 - `relish agent`: Commands for LLM agents: one JSON envelope, bounded, never interactive
   - `relish agent guide`: How to use relish as an agent: the manual chapter, as Markdown sections
   - `relish agent version`: This binary's version, commit, target and cluster formats
-  - `relish agent schema [guide|version|schema|source-version|source-tree|source-grep|source-show|source-extract|logs|manual-search|manual-show|context|diagnose|explain|upgrade-check|report|patch-init|patch-build|patch-test|patch-try|patch-diff|patch-apply|patch-destroy|setup]`: The JSON Schema of the envelope and of each command's data
+  - `relish agent schema [guide|version|schema|source-version|source-tree|source-grep|source-show|source-extract|logs|manual-search|manual-show|context|diagnose|explain|timeline|upgrade-check|verify|report|patch-init|patch-build|patch-test|patch-try|patch-diff|patch-apply|patch-destroy|setup|lease-take|lease-renew|lease-release|propose|proposals|withdraw|undo|status]`: The JSON Schema of the envelope and of each command's data
   - `relish agent source`: The source this binary was built from: search it, read it, extract it
     - `relish agent source version`: This binary's source: version, commit, digest, file count, and the commit every node runs
     - `relish agent source tree [PREFIX]`: Files with their size in bytes and their line count
@@ -523,10 +525,12 @@ See [working with an AI agent](16_working-with-an-ai-agent.md).
   - `relish agent manual`: The manual compiled into this binary: search it, show a section
     - `relish agent manual search <WORDS>...`: Up to ten sections that mention every word, best first, each with a short excerpt and the `show` command that prints it
     - `relish agent manual show <TARGET>`: One chapter, or one section of it, as Markdown: `diagnostics` or `diagnostics#relish-path-can-a-reach-b`
-  - `relish agent context`: The first call: findings, unknowns, faults, alerts, one line per app and the newest events, in one bounded answer
+  - `relish agent context`: The first call: `relish status`'s screen and summary, findings, unknowns, active faults and the newest events, in one bounded answer
   - `relish agent diagnose`: Every finding with its evidence, read-only next steps, and pointers into the manual and the source
-  - `relish agent explain [ID]`: What a finding means, its thresholds and where it's decided; every finding when no id is given. Reads only this binary
+  - `relish agent explain [ID]`: What a finding means and where it's decided, or why the cluster made a decision: --restart, --placement, --refusal
+  - `relish agent timeline`: What changed in a window: events, audit and deploys, newest first *(0.2.8, not in 0.2.7)*
   - `relish agent upgrade-check`: Whether the cluster can take the latest release: `ready`, `up_to_date`, `needs_fresh_cluster`, `blocked` or `unknown`
+  - `relish agent verify`: Whether the cluster runs the published release, byte for byte: `verified`, `mismatch` or `unknown` *(0.2.8, not in 0.2.7)*
   - `relish agent report --title <TITLE> --what-happened <WHAT_HAPPENED> --expected <EXPECTED> --not-tested <NOT_TESTED> --caught-by <CAUGHT_BY> --out <OUT>`: Draft a redacted bug report for a human to post. Never posts
   - `relish agent patch`: Build, test and try a fix on a throwaway cluster
     - `relish agent patch init <DIR>`: Extract this binary's source into a new workspace, on a `patch` branch
@@ -537,7 +541,27 @@ See [working with an AI agent](16_working-with-an-ai-agent.md).
     - `relish agent patch apply <DIR> <DIFF>`: Apply a unified diff to the workspace, matching each hunk by its lines rather than its header's counts. All or nothing *(0.2.8, not in 0.2.7)*
     - `relish agent patch destroy [DIR]`: Remove the workspace's throwaway cluster, or every one with `--all`. The workspace and its source stay
   - `relish agent setup [claude-code|codex|cursor|vscode|goose|gemini]...`: Wire Reliaburger into the AI agents on this machine. Shows the diff; writes only with --yes
+  - `relish agent lease`: Take, renew or release a lease on an app or a namespace *(0.2.8, not in 0.2.7)*
+    - `relish agent lease take <app|namespace> <NAME>`: Take a lease before changing an app or a namespace, or renew yours *(0.2.8, not in 0.2.7)*
+    - `relish agent lease renew <app|namespace> <NAME>`: Extend a lease you hold *(0.2.8, not in 0.2.7)*
+    - `relish agent lease release <app|namespace> <NAME>`: Give up a lease you hold *(0.2.8, not in 0.2.7)*
+  - `relish agent propose --reason <REASON> <apply|scale|rollback|stop|delete> <TARGET>`: Propose a change for a person to approve: apply, scale, rollback, stop or delete. Shows the summary, blast radius and undo command *(0.2.8, not in 0.2.7)*
+  - `relish agent proposals [ID]`: Proposals you can see, newest first; one when given its number *(0.2.8, not in 0.2.7)*
+  - `relish agent withdraw <ID>`: Withdraw a pending proposal you made *(0.2.8, not in 0.2.7)*
+  - `relish agent undo --reason <REASON> <ID>`: Propose undoing an applied proposal, for a person to approve *(0.2.8, not in 0.2.7)*
 - `relish mcp`: Serve the `relish agent` commands as read-only MCP tools over stdio
+- `relish lease`: List, take, renew, release or break leases on apps and namespaces, which keep agents and people from changing the same thing at once *(0.2.8, not in 0.2.7)*
+  - `relish lease list`: List the leases held now: target, holder, time left and purpose *(0.2.8, not in 0.2.7)*
+  - `relish lease take <app|namespace> <NAME>`: Take a lease to keep agents out while you work; renews one you hold *(0.2.8, not in 0.2.7)*
+  - `relish lease renew <app|namespace> <NAME>`: Extend a lease you hold *(0.2.8, not in 0.2.7)*
+  - `relish lease release <app|namespace> <NAME>`: Give up a lease you hold *(0.2.8, not in 0.2.7)*
+  - `relish lease break <app|namespace> <NAME>`: End someone else's lease (deployer or above over the target; audited) *(0.2.8, not in 0.2.7)*
+- `relish proposal`: List, show, approve or reject the changes agents propose. Approving applies it; each shows its blast radius and undo command first *(0.2.8, not in 0.2.7)*
+  - `relish proposal list`: Every proposal you can see, newest first *(0.2.8, not in 0.2.7)*
+  - `relish proposal show <ID>`: One proposal: summary, undo, findings, blast radius, diff, reason *(0.2.8, not in 0.2.7)*
+  - `relish proposal approve <ID>`: Approve a proposal, which applies it at once. You can't approve your own, and need deployer rights over every app it touches *(0.2.8, not in 0.2.7)*
+  - `relish proposal reject <ID>`: Reject a pending proposal *(0.2.8, not in 0.2.7)*
+- `relish undo <ID>`: Put an applied proposal back, if nothing has changed its apps since *(0.2.8, not in 0.2.7)*
 
 ### Break things on purpose
 
@@ -616,6 +640,7 @@ See [operations](12_operations.md).
   - `relish upgrade rollback [VERSION]`: Roll back to a previous version (cluster: version required)
   - `relish upgrade resume`: Resume a paused upgrade
   - `relish upgrade abort`: End a paused upgrade in which no node has moved. When some nodes already swapped, use `rollback <version>` instead
+- `relish verify`: Check the cluster runs exactly the published release: each node's bun and this relish, by SHA-256 and release signature *(0.2.8, not in 0.2.7)*
 - `relish gitops`: Show or change the cluster's GitOps configuration
   - `relish gitops status`: Show the cluster's GitOps configuration, sync status and what GitOps owns. Credentials are never shown
   - `relish gitops set <PATH>`: Replace the cluster's GitOps configuration from a TOML file holding a `[gitops]` section (admin only; audited). Credentials in it are sealed with the cluster master key before they reach Raft
