@@ -1,0 +1,37 @@
+name: Feature status
+
+# Every issue docs/features.toml links must still be open
+# (scripts/ci/features_page.py check-issues): a known issue that closed has
+# been fixed, and a planned feature whose issue closed is built or dropped,
+# so its row needs updating. Issues close without anyone editing the file,
+# so this runs nightly, and on pull requests that edit it.
+#
+# It is its own workflow because it reads issues, like flakes.yml: ci.yml is
+# also called from workflows that grant only `contents: read`.
+
+on:
+  schedule:
+    - cron: "47 3 * * *"
+  pull_request:
+    branches: [main, "codex/**", "fix/**", "release-*"]
+    paths:
+      - docs/features.toml
+      - scripts/ci/features_page.py
+      - .github/workflows/features.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: read
+
+jobs:
+  issues:
+    name: every feature row links open issues
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check each linked issue's state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci/features_page.py check-issues
