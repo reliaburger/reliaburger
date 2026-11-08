@@ -815,8 +815,7 @@ refuse it, exit `2` and say they're interactive: `tui`, `dashboard`,
 `--ssh`, which asks its questions as it goes. Without a terminal, as in an
 agent's shell, `relish`, `relish manual` and `relish source` exit at once and
 name the command to use instead. The `reference` chapter lists what each
-command's JSON holds. `relish status -o json` answers in the `relish agent`
-envelope.
+command's JSON holds.
 
 Unlike `relish agent`, these commands keep their own exit codes: `relish wtf`
 exits `1` for a critical finding and `3` for warnings only, not because you
