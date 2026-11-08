@@ -200,15 +200,20 @@ pub(super) async fn proposal_create_handler(
     let author = principal_of(auth);
     let now = crate::testkit::lease::now_unix_millis();
     let desired = council.desired_state().await;
+    let history_target = rollback_history_target(&state, &desired, &request).await;
     let built = {
         let author = author.clone();
         let request = request.clone();
         tokio::task::spawn_blocking(move || {
             let policies = desired.policies.clone();
-            let built =
-                crate::proposal::build::build(&desired, &request, &author, now, |app, spec| {
-                    crate::proposal::guard::fill_defaults(&policies, &author, app, spec)
-                });
+            let built = crate::proposal::build::build_with_history(
+                &desired,
+                &request,
+                &author,
+                now,
+                |app, spec| crate::proposal::guard::fill_defaults(&policies, &author, app, spec),
+                history_target.as_ref(),
+            );
             (built, policies)
         })
         .await
@@ -317,6 +322,30 @@ pub(super) async fn proposal_create_handler(
         }
     }
     (StatusCode::CREATED, Json(created.view(now))).into_response()
+}
+
+/// For a proposed rollback the council has no released spec for, the
+/// target `relish rollback` would take from the nodes' deploy history.
+/// `None` for every other request, and when the council has one: asking
+/// every node is only worth it when the cheap answer is missing.
+async fn rollback_history_target(
+    state: &ApiState,
+    desired: &crate::council::types::DesiredState,
+    request: &ProposalRequest,
+) -> Option<crate::config::app::AppSpec> {
+    if request.kind != RequestKind::Rollback {
+        return None;
+    }
+    let namespace = request.namespace.as_deref().unwrap_or("default");
+    let app = crate::meat::AppId::new(request.app.as_deref()?, namespace);
+    let current = desired.apps.get(&app)?;
+    let released = desired.rollouts.get(&app).and_then(|rollouts| {
+        crate::bun::cluster_view::released_rollback_target(rollouts, current)
+    });
+    if released.is_some() {
+        return None;
+    }
+    super::deploys::history_rollback_target(state, &app.name, namespace, Some(current)).await
 }
 
 /// `POST /v1/proposals/{id}/approve`: a person approves, and the leader
