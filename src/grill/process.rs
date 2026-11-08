@@ -955,13 +955,22 @@ impl super::Grill for ProcessGrill {
         }
         // The app's own stop signal (#1121), SIGTERM unless it names one.
         let signal = entry.spec.stop_signal().to_nix();
+        // Each signal is followed by SIGCONT: a workload Smoker paused can't
+        // run its stop handler until it runs again.
+        let resume = nix::sys::signal::Signal::SIGCONT;
         if entry.child.as_ref().and_then(|child| child.id()).is_some() {
             signal_child_group(entry, signal).map_err(error)?;
+            if entry.state != ContainerState::Stopped {
+                signal_child_group(entry, resume).map_err(error)?;
+            }
             if entry.state != ContainerState::Stopped {
                 entry.state = ContainerState::Stopping;
             }
         } else if entry.adopted.is_some() {
             entry.state = if signal_adopted_process(entry, signal).map_err(error)? {
+                // Best effort: a process already exiting can't be verified,
+                // and needs no SIGCONT.
+                let _ = signal_adopted_process(entry, resume);
                 ContainerState::Stopping
             } else {
                 ContainerState::Stopped
@@ -1740,6 +1749,43 @@ mod tests {
         grill.stop(&id).await.unwrap();
 
         wait_for_state(&grill, &id, ContainerState::Stopped).await;
+    }
+
+    /// A paused workload (Smoker's SIGSTOP) runs its stop handler at once:
+    /// the stop signal is followed by SIGCONT.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_lets_a_paused_workload_run_its_handler() {
+        let dir = tempfile::tempdir().unwrap();
+        let ready = dir.path().join("ready");
+        let grill = ProcessGrill::new();
+        let id = InstanceId("paused-0".to_string());
+        let script = format!(
+            "trap 'exit 3' TERM; touch '{}'; while :; do sleep 0.05; done",
+            ready.display()
+        );
+        grill
+            .create(
+                &id,
+                &spec_with_args(vec!["/bin/sh".into(), "-c".into(), script]),
+            )
+            .await
+            .unwrap();
+        grill.start(&id).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !ready.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the workload never got ready");
+        let pid = grill.pid(&id).await.unwrap().unwrap();
+        crate::smoker::process::pause_process(pid as i32).unwrap();
+
+        grill.stop(&id).await.unwrap();
+
+        wait_for_state(&grill, &id, ContainerState::Stopped).await;
+        assert_eq!(grill.exit_code(&id).await.unwrap(), Some(3));
     }
 
     #[cfg(unix)]
