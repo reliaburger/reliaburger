@@ -4409,6 +4409,19 @@ mod tests {
         ));
     }
 
+    /// Every command a `relish status` line can point at is one this CLI
+    /// parses, so a hint can't name a command that doesn't exist.
+    #[test]
+    fn every_status_hint_is_a_real_command() {
+        for hint in reliaburger::relish::status_cmd::HINTS {
+            let words: Vec<&str> = hint.split_whitespace().collect();
+            assert_eq!(words[0], "relish", "{hint}");
+            if let Err(error) = Cli::try_parse_from(&words) {
+                panic!("`{hint}` doesn't parse: {error}");
+            }
+        }
+    }
+
     #[test]
     fn parse_status_command() {
         let cli = parse(&["relish", "status"]).unwrap();

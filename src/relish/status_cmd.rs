@@ -23,8 +23,9 @@ use super::agent::envelope::{AgentError, BuildInfo, CommandName, Envelope, NextS
 use super::client::BunClient;
 use super::{CommandOutcome, OutputFormat, RelishError};
 use crate::bun::summary::ClusterSummary;
+use crate::bun::summary::verdict::APP_LIST_HINT;
 pub use crate::bun::summary::verdict::{
-    Line, Mark, Verdict, WtfCheck, assess, grouped, problems, span, verdict,
+    HINTS, Line, Mark, Verdict, WtfCheck, assess, grouped, problems, span, verdict,
 };
 
 /// How long `relish status` waits for `wtf`'s checks before it shows "not
@@ -174,7 +175,7 @@ pub fn next_steps(data: &StatusData) -> Vec<NextStep> {
     }
     if steps.is_empty() {
         steps.push(NextStep {
-            run: "relish apps".to_string(),
+            run: APP_LIST_HINT.to_string(),
             why: "list every app with its state".to_string(),
             read_only: true,
         });
@@ -217,9 +218,14 @@ fn colour_of(mark: Mark) -> &'static str {
     }
 }
 
-/// The widest a line's text gets before the command column; longer text
-/// pushes its own command further right rather than every line's.
-const TEXT_COLUMN_MAX: usize = 60;
+/// The widest a line's text gets beside the command column. Longer text
+/// wraps onto the rows below, so every command starts in the same column;
+/// with the section names and the longest command, the screen fits 100
+/// columns.
+const TEXT_COLUMN_MAX: usize = 56;
+
+/// The section-name column, with the space after it.
+const SECTION_WIDTH: usize = 11;
 
 /// The one-screen view. `colour` adds ANSI colour to the verdict and to
 /// each line that needs attention.
@@ -252,27 +258,73 @@ pub fn render(data: &StatusData, colour: bool) -> String {
         .iter()
         .filter(|line| line.next.is_some())
         .map(|line| line.text.chars().count())
-        .filter(|width| *width <= TEXT_COLUMN_MAX)
         .max()
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .min(TEXT_COLUMN_MAX);
     for line in &data.lines {
-        let text = match &line.next {
-            Some(next) => format!("{:<column$}  {next}", line.text),
-            None => line.text.clone(),
+        let rows = match &line.next {
+            Some(next) => {
+                let mut rows = wrap(&line.text, column);
+                rows[0] = format!("{:<column$}  {next}", rows[0]);
+                rows
+            }
+            None => vec![line.text.clone()],
         };
-        let painted = match colour_of(line.mark) {
-            paint if colour && !paint.is_empty() => format!("{paint}{text}{RESET}"),
-            _ => text,
-        };
-        let _ = writeln!(out, "{:<10} {painted}", line.section);
+        for (index, row) in rows.into_iter().enumerate() {
+            let section = if index == 0 { line.section } else { "" };
+            let row = match colour_of(line.mark) {
+                paint if colour && !paint.is_empty() => format!("{paint}{row}{RESET}"),
+                _ => row,
+            };
+            let _ = writeln!(out, "{section:<SECTION_WIDTH$}{row}");
+        }
     }
     out
+}
+
+/// `text` in rows of at most `width` characters, so a long line's command
+/// keeps its column. It breaks between clauses (after `, ` or `; `) where
+/// it can, and between words inside a clause too wide for a row; a word
+/// wider than `width` gets a row of its own. Never empty.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    // Each clause keeps its trailing separator, without the space.
+    let mut clauses = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(", ").into_iter().chain(rest.find("; ")).min() {
+        clauses.push(&rest[..=at]);
+        rest = &rest[at + 2..];
+    }
+    clauses.push(rest);
+
+    let mut rows = vec![String::new()];
+    for clause in clauses {
+        let pieces: Vec<&str> = if clause.chars().count() > width {
+            clause.split(' ').collect()
+        } else {
+            vec![clause]
+        };
+        for piece in pieces {
+            let Some(row) = rows.last_mut() else {
+                break;
+            };
+            if !row.is_empty() && row.chars().count() + 1 + piece.chars().count() > width {
+                rows.push(piece.to_string());
+            } else {
+                if !row.is_empty() {
+                    row.push(' ');
+                }
+                row.push_str(piece);
+            }
+        }
+    }
+    rows
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bun::summary::*;
+    use crate::bun::summary::verdict::{apps_line, jobs_line};
 
     /// 8 November 2026, 14:02:11 UTC.
     const NOW_MS: u64 = 1_794_146_531_000;
@@ -417,9 +469,17 @@ mod tests {
             firing: 1,
             first: vec!["disk_high on node-3".to_string()],
         });
+        summary.jobs = Section::complete(JobsSection {
+            running: 12,
+            tasks_running: 40,
+            tasks_queued: 340,
+            succeeded_last_hour: 9,
+            failed_last_hour: 3,
+            scheduled: 0,
+        });
         let data = status_data(summary, checked(1, 1));
         assert_eq!(data.verdict, Verdict::Degraded);
-        assert_eq!(data.problems, 4, "nodes, apps, alerts and wtf");
+        assert_eq!(data.problems, 5, "nodes, apps, jobs, alerts and wtf");
         insta::assert_snapshot!(render(&data, false));
     }
 
@@ -527,7 +587,7 @@ mod tests {
             "{}",
             council.text
         );
-        assert_eq!(council.next.as_deref(), Some("relish council"));
+        assert_eq!(council.next.as_deref(), Some("relish council status"));
     }
 
     #[test]
@@ -706,7 +766,7 @@ mod tests {
         });
         let data = status_data(summary, checked(1, 0));
         let runs: Vec<String> = next_steps(&data).into_iter().map(|s| s.run).collect();
-        assert_eq!(runs, ["relish council", "relish wtf"]);
+        assert_eq!(runs, ["relish council status", "relish wtf"]);
     }
 
     #[test]
@@ -719,5 +779,271 @@ mod tests {
         assert_eq!(span(240_000), "4 m");
         assert_eq!(span(3 * 3_600_000), "3 h");
         assert_eq!(span(2 * 86_400_000), "2 d");
+    }
+
+    /// The numbers the apps line shows outside its parentheses add up to
+    /// the total: an unschedulable app is already down or degraded, so it's
+    /// an aside, not another bucket.
+    #[test]
+    fn the_apps_line_parts_add_up_to_the_total() {
+        let cases = [
+            AppsSection {
+                total: 4,
+                running: 2,
+                degraded: 1,
+                down: 1,
+                unschedulable: 1,
+                ..AppsSection::default()
+            },
+            AppsSection {
+                total: 9,
+                running: 3,
+                degraded: 2,
+                down: 1,
+                unknown: 1,
+                stopped: 2,
+                unschedulable: 3,
+                ..AppsSection::default()
+            },
+            AppsSection {
+                total: 1000,
+                running: 1000,
+                ..AppsSection::default()
+            },
+        ];
+        for apps in cases {
+            let text = apps_line(&apps).text;
+            let (total, parts) = text.split_once(": ").unwrap();
+            let outside = parts.split(" (").next().unwrap();
+            let sum: u32 = outside
+                .split(", ")
+                .map(|part| {
+                    let count = part.split(' ').next().unwrap().replace(',', "");
+                    count.parse::<u32>().unwrap()
+                })
+                .sum();
+            assert_eq!(
+                total.replace(',', "").parse::<u32>().unwrap(),
+                sum,
+                "{text}"
+            );
+            assert_eq!(sum, apps.total, "{text}");
+        }
+        let text = apps_line(&AppsSection {
+            total: 4,
+            running: 2,
+            degraded: 1,
+            down: 1,
+            unschedulable: 1,
+            ..AppsSection::default()
+        })
+        .text;
+        assert_eq!(text, "4: 2 running, 1 degraded, 1 down (1 unschedulable)");
+    }
+
+    /// The jobs line shows what runs, what waits and what failed, whenever
+    /// any of it isn't zero.
+    #[test]
+    fn the_jobs_line_shows_running_queued_and_failed() {
+        let line = jobs_line(&JobsSection {
+            running: 12,
+            tasks_running: 40,
+            tasks_queued: 340,
+            succeeded_last_hour: 9,
+            failed_last_hour: 3,
+            scheduled: 2,
+        });
+        assert_eq!(
+            line.text,
+            "12 running (40 tasks), 340 tasks queued, 3 failed and 9 succeeded in the last hour, 2 scheduled"
+        );
+        assert_eq!(line.mark, Mark::Problem);
+        let quiet_queue = jobs_line(&JobsSection {
+            running: 1,
+            tasks_running: 4,
+            ..JobsSection::default()
+        });
+        assert_eq!(quiet_queue.text, "1 running (4 tasks)");
+        let failed_only = jobs_line(&JobsSection {
+            failed_last_hour: 1,
+            ..JobsSection::default()
+        });
+        assert_eq!(failed_only.text, "1 failed in the last hour");
+    }
+
+    /// Every next command starts in the same column, however long a line's
+    /// text, and the screen fits 100 columns.
+    #[test]
+    fn hints_line_up_in_one_column_within_a_hundred_columns() {
+        for data in fixtures() {
+            let screen = render(&data, false);
+            let columns: Vec<usize> = screen
+                .lines()
+                .filter_map(|line| {
+                    HINTS
+                        .iter()
+                        .filter_map(|hint| line.find(&format!("  {hint}")))
+                        .min()
+                        .map(|at| at + 2)
+                })
+                .collect();
+            assert!(
+                columns.windows(2).all(|pair| pair[0] == pair[1]),
+                "{columns:?}\n{screen}"
+            );
+            for line in screen.lines() {
+                assert!(line.chars().count() <= 100, "{} wide: {line}", line.len());
+            }
+        }
+    }
+
+    #[test]
+    fn long_text_wraps_between_clauses_then_words() {
+        assert_eq!(
+            wrap(
+                "leader node-1 (term 41), 2/3 voters, quorum ok, 0 lagging; partial (2 of 3 nodes)",
+                56
+            ),
+            [
+                "leader node-1 (term 41), 2/3 voters, quorum ok,",
+                "0 lagging; partial (2 of 3 nodes)"
+            ]
+        );
+        assert_eq!(
+            wrap("one clause that is far too long for its row", 20),
+            ["one clause that is", "far too long for its", "row"]
+        );
+        assert_eq!(wrap("short", 56), ["short"]);
+        assert_eq!(wrap("", 56), [""]);
+    }
+
+    /// Every command a line names is one `relish` has; the CLI test in
+    /// `src/bin/relish.rs` parses each of [`HINTS`].
+    #[test]
+    fn every_next_command_is_a_listed_hint() {
+        for data in fixtures() {
+            for line in &data.lines {
+                if let Some(next) = &line.next {
+                    assert!(HINTS.contains(&next.as_str()), "{next}");
+                }
+            }
+            for step in next_steps(&data) {
+                assert!(HINTS.contains(&step.run.as_str()), "{}", step.run);
+            }
+        }
+    }
+
+    /// One summary per kind of line that names a command, for the layout
+    /// and hint tests.
+    fn fixtures() -> Vec<StatusData> {
+        let mut problems = healthy();
+        let partial = Coverage {
+            answered: 2,
+            asked: 3,
+        };
+        let reasons = ["node-3: timed out".to_string()];
+        problems.nodes = Section::from_nodes(
+            NodesSection {
+                alive: 2,
+                suspect: 1,
+                disk_pressure: 1,
+                ..NodesSection::default()
+            },
+            partial,
+            &reasons,
+        );
+        problems.council = Section::from_nodes(
+            CouncilSection {
+                leader: Some("node-1".to_string()),
+                term: 41,
+                voters: 3,
+                voters_answering: 2,
+                quorum_ok: true,
+                lagging: 1,
+                other_leaders: vec!["node-3".to_string()],
+            },
+            partial,
+            &reasons,
+        );
+        problems.versions = Section::complete(VersionsSection {
+            versions: vec![
+                VersionCount {
+                    version: "0.2.8".to_string(),
+                    nodes: 2,
+                },
+                VersionCount {
+                    version: "0.2.7".to_string(),
+                    nodes: 1,
+                },
+            ],
+            upgrade_in_progress: true,
+        });
+        problems.apps = Section::from_nodes(
+            AppsSection {
+                total: 104,
+                running: 99,
+                degraded: 3,
+                down: 1,
+                unknown: 1,
+                unschedulable: 1,
+                ..AppsSection::default()
+            },
+            partial,
+            &reasons,
+        );
+        problems.jobs = Section::complete(JobsSection {
+            running: 12,
+            tasks_running: 40,
+            tasks_queued: 340,
+            succeeded_last_hour: 9,
+            failed_last_hour: 3,
+            scheduled: 2,
+        });
+        problems.faults = Section::complete(FaultsSection {
+            active: 2,
+            soonest: vec![FaultBrief {
+                kind: "latency".to_string(),
+                target: "api".to_string(),
+                namespace: Some("default".to_string()),
+                remaining_seconds: 360,
+            }],
+        });
+        problems.alerts = Section::complete(AlertsSection {
+            firing: 2,
+            first: vec!["disk_high on node-3".to_string()],
+        });
+        problems.gitops = Section::complete(GitOpsSection {
+            configured: true,
+            commit: None,
+            synced_at_unix_seconds: None,
+            error: Some("fetch failed: connection refused".to_string()),
+        });
+        let mut stale = healthy();
+        stale.usage.value.as_mut().unwrap().newest_sample_unix_ms = Some(NOW_MS - 600_000);
+        stale.certs.value.as_mut().unwrap().soonest = Some(CertBrief {
+            subject: "node-2".to_string(),
+            not_after_unix_seconds: NOW_MS / 1000 + 86_400,
+        });
+        let mut down = healthy();
+        down.council = Section::complete(CouncilSection {
+            leader: None,
+            term: 42,
+            voters: 3,
+            voters_answering: 1,
+            quorum_ok: false,
+            lagging: 0,
+            other_leaders: Vec::new(),
+        });
+        vec![
+            status_data(healthy(), checked(0, 0)),
+            status_data(problems, checked(1, 1)),
+            status_data(stale, WtfCheck::Late { budget_seconds: 2 }),
+            status_data(
+                down,
+                WtfCheck::Failed {
+                    reason: "no answer".to_string(),
+                },
+            ),
+        ]
     }
 }

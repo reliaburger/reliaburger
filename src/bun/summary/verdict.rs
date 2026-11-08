@@ -19,6 +19,33 @@ const STALE_METRICS_MS: u64 = 120_000;
 /// A certificate expiring sooner than this many days is a problem.
 const CERT_WARNING_DAYS: u64 = 30;
 
+/// The commands a line can name as its next step, as `relish` parses them;
+/// `every_status_hint_is_a_real_command` in `src/bin/relish.rs` holds each
+/// one to the CLI.
+pub const NODES_HINT: &str = "relish nodes --unhealthy";
+pub const COUNCIL_HINT: &str = "relish council status";
+pub const UPGRADE_HINT: &str = "relish upgrade status";
+pub const APPS_HINT: &str = "relish apps --unhealthy";
+pub const APP_LIST_HINT: &str = "relish apps";
+pub const JOBS_HINT: &str = "relish jobs";
+pub const FAULTS_HINT: &str = "relish fault list";
+pub const GITOPS_HINT: &str = "relish gitops status";
+pub const WTF_HINT: &str = "relish wtf";
+
+/// Every command `relish status` can suggest, on a line or as a `next`
+/// step.
+pub const HINTS: &[&str] = &[
+    NODES_HINT,
+    COUNCIL_HINT,
+    UPGRADE_HINT,
+    APPS_HINT,
+    APP_LIST_HINT,
+    JOBS_HINT,
+    FAULTS_HINT,
+    GITOPS_HINT,
+    WTF_HINT,
+];
+
 /// The cluster's verdict, worst last.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -238,7 +265,7 @@ fn section_line<T>(
             section,
             format!("unknown: {reason}"),
             Mark::Problem,
-            Some("relish wtf"),
+            Some(WTF_HINT),
         );
     };
     let mut line = describe(seen);
@@ -252,7 +279,7 @@ fn section_line<T>(
         line.text = format!("{}; partial ({coverage})", line.text);
         if line.mark < Mark::Problem {
             line.mark = Mark::Problem;
-            line.next = Some("relish nodes --unhealthy".to_string());
+            line.next = Some(NODES_HINT.to_string());
         }
     }
     line
@@ -279,7 +306,7 @@ fn nodes_line(nodes: &crate::bun::summary::NodesSection) -> Line {
     } else {
         Mark::Quiet
     };
-    let next = (mark > Mark::Quiet).then_some("relish nodes --unhealthy");
+    let next = (mark > Mark::Quiet).then_some(NODES_HINT);
     flagged("nodes", text, mark, next)
 }
 
@@ -312,7 +339,7 @@ fn council_line(council: &crate::bun::summary::CouncilSection) -> Line {
     } else {
         Mark::Quiet
     };
-    let next = (mark > Mark::Quiet).then_some("relish council");
+    let next = (mark > Mark::Quiet).then_some(COUNCIL_HINT);
     flagged("council", text, mark, next)
 }
 
@@ -343,15 +370,10 @@ fn versions_line(versions: &crate::bun::summary::VersionsSection) -> Line {
     let mixed = versions.versions.len() > 1;
     if versions.upgrade_in_progress {
         text.push_str(": upgrade in progress");
-        flagged("versions", text, Mark::Note, Some("relish upgrade status"))
+        flagged("versions", text, Mark::Note, Some(UPGRADE_HINT))
     } else if mixed {
         text.push_str(": mixed, and no upgrade runs");
-        flagged(
-            "versions",
-            text,
-            Mark::Problem,
-            Some("relish upgrade status"),
-        )
+        flagged("versions", text, Mark::Problem, Some(UPGRADE_HINT))
     } else {
         quiet("versions", text)
     }
@@ -402,7 +424,7 @@ fn usage_line(usage: &crate::bun::summary::UsageSection, now_ms: u64) -> Line {
             let age = now_ms.saturating_sub(at);
             let _ = write!(text, "; newest sample {} old", span(age));
             if age > STALE_METRICS_MS {
-                return flagged("usage", text, Mark::Problem, Some("relish wtf"));
+                return flagged("usage", text, Mark::Problem, Some(WTF_HINT));
             }
             quiet("usage", text)
         }
@@ -413,58 +435,73 @@ fn usage_line(usage: &crate::bun::summary::UsageSection, now_ms: u64) -> Line {
     }
 }
 
-fn apps_line(apps: &crate::bun::summary::AppsSection) -> Line {
+pub(crate) fn apps_line(apps: &crate::bun::summary::AppsSection) -> Line {
     if apps.total == 0 {
         return quiet("apps", "none deployed");
     }
-    let mut text = format!("{}: {} running", grouped(apps.total.into()), apps.running);
+    // Each app is in exactly one of these, so they add up to the total.
+    let mut text = format!(
+        "{}: {} running",
+        grouped(apps.total.into()),
+        grouped(apps.running.into())
+    );
     for (count, what) in [
         (apps.degraded, "degraded"),
         (apps.down, "down"),
         (apps.unknown, "unknown"),
         (apps.stopped, "stopped"),
-        (apps.unschedulable, "unschedulable"),
     ] {
         if count > 0 {
-            let _ = write!(text, ", {count} {what}");
+            let _ = write!(text, ", {} {what}", grouped(count.into()));
         }
+    }
+    // An unschedulable app is already degraded or down (or unknown), so
+    // it's an aside in parentheses, not another bucket.
+    if apps.unschedulable > 0 {
+        let _ = write!(text, " ({} unschedulable)", apps.unschedulable);
     }
     let troubled = apps.degraded + apps.down + apps.unknown + apps.unschedulable;
     if troubled > 0 {
-        flagged("apps", text, Mark::Problem, Some("relish apps --unhealthy"))
+        flagged("apps", text, Mark::Problem, Some(APPS_HINT))
     } else {
         quiet("apps", text)
     }
 }
 
-fn jobs_line(jobs: &crate::bun::summary::JobsSection) -> Line {
+pub(crate) fn jobs_line(jobs: &crate::bun::summary::JobsSection) -> Line {
     let mut parts = Vec::new();
     if jobs.running > 0 {
         parts.push(format!(
-            "{} running ({} tasks running, {} queued)",
-            jobs.running,
-            grouped(jobs.tasks_running),
-            grouped(jobs.tasks_queued)
+            "{} running ({} tasks)",
+            grouped(jobs.running.into()),
+            grouped(jobs.tasks_running)
         ));
+    }
+    if jobs.tasks_queued > 0 {
+        parts.push(format!("{} tasks queued", grouped(jobs.tasks_queued)));
+    }
+    let mut hour = Vec::new();
+    if jobs.failed_last_hour > 0 {
+        hour.push(format!("{} failed", grouped(jobs.failed_last_hour.into())));
+    }
+    if jobs.succeeded_last_hour > 0 {
+        hour.push(format!(
+            "{} succeeded",
+            grouped(jobs.succeeded_last_hour.into())
+        ));
+    }
+    if !hour.is_empty() {
+        parts.push(format!("{} in the last hour", hour.join(" and ")));
     }
     if jobs.scheduled > 0 {
         parts.push(format!("{} scheduled", jobs.scheduled));
-    }
-    if jobs.succeeded_last_hour > 0 {
-        parts.push(format!(
-            "{} succeeded in the last hour",
-            jobs.succeeded_last_hour
-        ));
-    }
-    if jobs.failed_last_hour > 0 {
-        parts.push(format!("{} failed in the last hour", jobs.failed_last_hour));
     }
     if parts.is_empty() {
         return quiet("jobs", "none running or finished in the last hour");
     }
     let text = parts.join(", ");
     if jobs.failed_last_hour > 0 {
-        flagged("jobs", text, Mark::Problem, Some("relish jobs"))
+        flagged("jobs", text, Mark::Problem, Some(JOBS_HINT))
     } else {
         quiet("jobs", text)
     }
@@ -503,7 +540,7 @@ fn faults_line(faults: &crate::bun::summary::FaultsSection) -> Line {
     if faults.active > 1 {
         let _ = write!(text, ", and {} more", faults.active - 1);
     }
-    flagged("faults", text, Mark::Note, Some("relish fault list"))
+    flagged("faults", text, Mark::Note, Some(FAULTS_HINT))
 }
 
 fn alerts_line(alerts: &crate::bun::summary::AlertsSection) -> Line {
@@ -514,7 +551,7 @@ fn alerts_line(alerts: &crate::bun::summary::AlertsSection) -> Line {
     if alerts.firing > 1 {
         let _ = write!(text, ", and {} more", alerts.firing - 1);
     }
-    flagged("alerts", text, Mark::Problem, Some("relish wtf"))
+    flagged("alerts", text, Mark::Problem, Some(WTF_HINT))
 }
 
 fn certs_line(certs: &crate::bun::summary::CertsSection, now_seconds: u64) -> Line {
@@ -526,13 +563,13 @@ fn certs_line(certs: &crate::bun::summary::CertsSection, now_seconds: u64) -> Li
             "certs",
             format!("EXPIRED: {}", soonest.subject),
             Mark::Problem,
-            Some("relish wtf"),
+            Some(WTF_HINT),
         );
     }
     let days = (soonest.not_after_unix_seconds - now_seconds) / 86_400;
     let text = format!("soonest expiry {days} days ({})", soonest.subject);
     if days < CERT_WARNING_DAYS {
-        flagged("certs", text, Mark::Problem, Some("relish wtf"))
+        flagged("certs", text, Mark::Problem, Some(WTF_HINT))
     } else {
         quiet("certs", text)
     }
@@ -544,7 +581,7 @@ fn gitops_line(gitops: &crate::bun::summary::GitOpsSection, now_seconds: u64) ->
             "gitops",
             format!("failing: {error}"),
             Mark::Problem,
-            Some("relish gitops status"),
+            Some(GITOPS_HINT),
         );
     }
     let text = match (&gitops.commit, gitops.synced_at_unix_seconds) {
@@ -570,13 +607,13 @@ fn wtf_line(wtf: &WtfCheck) -> Line {
             "wtf",
             format!("not checked in time ({budget_seconds} s budget)"),
             Mark::Note,
-            Some("relish wtf"),
+            Some(WTF_HINT),
         ),
         WtfCheck::Failed { reason } => flagged(
             "wtf",
             format!("couldn't run: {reason}"),
             Mark::Note,
-            Some("relish wtf"),
+            Some(WTF_HINT),
         ),
         WtfCheck::Checked {
             critical,
@@ -601,7 +638,7 @@ fn wtf_line(wtf: &WtfCheck) -> Line {
             } else {
                 Mark::Quiet
             };
-            let next = (mark > Mark::Quiet).then_some("relish wtf");
+            let next = (mark > Mark::Quiet).then_some(WTF_HINT);
             flagged("wtf", text, mark, next)
         }
     }
