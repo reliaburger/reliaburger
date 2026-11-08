@@ -444,7 +444,7 @@ class Leaks(Evidence):
         state = {}
         def sample(ts, image, rss_kb):
             text = INVENTORY.replace("bun_rss_kb 300000", f"bun_rss_kb {rss_kb}") + f"bun_image {image}\n"
-            return checker.resource_trend_findings(state, "rb-a-2", checker.parse_inventory(text), ts)
+            return checker.resource_trend_findings(state, "rb-a-2", checker.parse_inventory(text), ts, final=True)
         start = NOW - 4 * 3600
         self.assertEqual(sample(start, "a1", 217124), [])
         self.assertEqual(sample(start + 3000, "b2", 242000), [])
@@ -467,12 +467,126 @@ class Leaks(Evidence):
         state = {}
         def sample(ts, pid, rss_kb):
             text = INVENTORY.replace("bun_pid 100", f"bun_pid {pid}").replace("bun_rss_kb 300000", f"bun_rss_kb {rss_kb}")
-            return checker.resource_trend_findings(state, "rb-a-1", checker.parse_inventory(text), ts)
+            return checker.resource_trend_findings(state, "rb-a-1", checker.parse_inventory(text), ts, final=True)
         self.assertEqual(sample(NOW, 100, 100000), [])
         self.assertEqual(sample(NOW + 3600, 100, 100000), [])
         self.assertEqual([item["check"] for item in sample(NOW + 3700, 100, 130000)], ["leak-rss"])
         self.assertEqual(sample(NOW + 3800, 101, 50000), [])
         self.assertEqual(sample(NOW + 3900, 101, 130000), [])
+
+
+# The 0.2.7 memory run (docs/qualification/2026-11-08-v0.2.7-memory-run.md):
+# each node's pid, RSS and store sizes at every settle and heavy check.
+MEM027 = Path(__file__).parent / "testdata" / "mem027" / "mem027-warm.jsonl"
+
+
+class StoreAwareWarmSample(unittest.TestCase):
+    """#1417: outside a final, leak-rss takes its warm sample once Bun's log
+    and metrics stores have filled, between the hour and six hours."""
+
+    FULL = int(0.9 * checker.SOAK_STORE_CAP_KB) + 1
+
+    def setUp(self):
+        self.state = {}
+
+    def sample(self, ts, rss_kb, logs_kb=0, metrics_kb=0, kind="heavy", node="rb-a-1", pid=100, final=False):
+        text = (INVENTORY.replace("bun_pid 100", f"bun_pid {pid}").replace("bun_rss_kb 300000", f"bun_rss_kb {rss_kb}")
+                .replace("disk logs 20\n", f"disk logs {logs_kb}\ndisk metrics {metrics_kb}\n"))
+        found = checker.resource_trend_findings(self.state, node, checker.parse_inventory(text), ts, kind=kind, final=final)
+        return [item["check"] for item in found]
+
+    def replay(self, final=False):
+        """leak-rss failures per node over the 0.2.7 memory run."""
+        failures = {}
+        for line in MEM027.read_text().splitlines():
+            row = json.loads(line)
+            found = self.sample(row["ts"], row["rss_kb"], row["logs_kb"], row["metrics_kb"], kind=row["kind"],
+                                node=row["node"], pid=row["pid"], final=final)
+            failures[row["node"][-1]] = failures.get(row["node"][-1], 0) + found.count("leak-rss")
+        return failures
+
+    def warm(self, node="rb-a-1"):
+        return self.state["resources"][node].get("rss_warm_kb")
+
+    def test_the_warm_sample_waits_for_both_stores_to_fill(self):
+        self.sample(NOW, 100000)
+        self.assertEqual(self.sample(NOW + 3600, 150000, logs_kb=self.FULL), [])
+        self.assertIsNone(self.warm())
+        self.assertEqual(self.sample(NOW + 7200, 200000, logs_kb=self.FULL, metrics_kb=self.FULL - 2), [])
+        self.assertIsNone(self.warm())
+        self.assertEqual(self.sample(NOW + 10800, 210000, logs_kb=self.FULL, metrics_kb=self.FULL), [])
+        self.assertEqual(self.warm(), 210000)
+        self.assertEqual(self.sample(NOW + 14400, 262500, logs_kb=self.FULL, metrics_kb=self.FULL), [])
+        self.assertEqual(self.sample(NOW + 18000, 262501, logs_kb=self.FULL, metrics_kb=self.FULL), ["leak-rss"])
+
+    def test_full_stores_never_take_it_before_the_hour(self):
+        self.sample(NOW, 100000, logs_kb=self.FULL, metrics_kb=self.FULL)
+        self.sample(NOW + 3599, 120000, logs_kb=self.FULL, metrics_kb=self.FULL)
+        self.assertIsNone(self.warm())
+        self.sample(NOW + 3600, 130000, logs_kb=self.FULL, metrics_kb=self.FULL)
+        self.assertEqual(self.warm(), 130000)
+
+    def test_stores_that_never_fill_take_it_at_six_hours(self):
+        self.sample(NOW, 100000)
+        for hour in range(1, 6):
+            self.assertEqual(self.sample(NOW + hour * 3600, 100000 + hour * 50000), [])
+        self.assertIsNone(self.warm())
+        self.sample(NOW + 6 * 3600, 400000)
+        self.assertEqual(self.warm(), 400000)
+
+    def test_only_a_heavy_check_takes_it(self):
+        self.sample(NOW, 100000)
+        self.sample(NOW + 7 * 3600, 150000, logs_kb=self.FULL, metrics_kb=self.FULL, kind="settle")
+        self.assertIsNone(self.warm())
+        self.sample(NOW + 7 * 3600 + 300, 160000, logs_kb=self.FULL, metrics_kb=self.FULL)
+        self.assertEqual(self.warm(), 160000)
+
+    def test_a_final_keeps_the_hour(self):
+        # #1062 needs leak-rss armed for an hour of an 8-hour final.
+        self.sample(NOW, 100000, kind="settle", final=True)
+        self.sample(NOW + 3600, 110000, kind="settle", final=True)
+        self.assertEqual(self.warm(), 110000)
+
+    def test_a_new_process_waits_for_its_own_warm_sample(self):
+        self.sample(NOW, 100000)
+        self.sample(NOW + 3600, 150000, logs_kb=self.FULL, metrics_kb=self.FULL)
+        self.assertEqual(self.warm(), 150000)
+        self.sample(NOW + 3700, 50000, logs_kb=self.FULL, metrics_kb=self.FULL, pid=101)
+        self.assertIsNone(self.warm())
+
+    def test_leak_rss_arms_at_the_warm_sample(self):
+        for minute in range(0, 6 * 60 + 31, 5):
+            self.sample(NOW + minute * 60, 200000)
+        exposure = self.state["exposure"]["rb-a-1"]["leak-rss"]
+        self.assertEqual(exposure["armed_seconds"], 30 * 60)
+        self.assertEqual(exposure["samples"], 7)
+
+    def test_the_record_says_when_each_warm_sample_was_taken(self):
+        self.state["nodes"] = NODES
+        self.sample(NOW, 100000)
+        self.sample(NOW + 5400, 213456, logs_kb=self.FULL, metrics_kb=self.FULL)
+        text = "\n".join(checker.exposure_lines(self.state, gated=False))
+        self.assertIn("- rb-a-1: the last Bun process's `leak-rss` warm sample was 213,456 kB, 1:30 h:mm in.", text)
+        self.assertNotIn("- rb-a-2:", text)
+
+    def test_the_cap_is_the_harness_max_storage(self):
+        script = (Path(__file__).parent / "qualify-sustained.sh").read_text()
+        for store in ("logs", "metrics"):
+            self.assertIn(f"{store}.max_storage_mb={checker.SOAK_STORE_CAP_KB // 1024}\n", script)
+
+    def test_the_hour_fails_the_0_2_7_memory_run_on_node_2_only(self):
+        failures = self.replay(final=True)
+        self.assertEqual((failures["1"], failures["3"]), (0, 0))
+        self.assertGreater(failures["2"], 0)
+
+    def test_store_aware_warm_samples_pass_the_0_2_7_memory_run(self):
+        # Node 1's stores filled in 1.4 hours; nodes 2 and 3 reached six
+        # hours first. Node 2 still grew about 2.4 MiB an hour after its
+        # warm sample, which is what the recorded slope is for.
+        self.assertEqual(self.replay(), {"1": 0, "2": 0, "3": 0})
+        warm = {node[-1]: (state["rss_warm_kb"], round((state["rss_warm_at"] - state["started"]) / 3600, 1))
+                for node, state in self.state["resources"].items()}
+        self.assertEqual(warm, {"1": (244376, 1.4), "2": (220228, 6.1), "3": (212192, 6.1)})
 
 
 class Exports(Evidence):
@@ -1626,7 +1740,7 @@ class CheckerExposure(Evidence):
     def sample(self, ts, pid, rss_kb=300000, fd=300):
         inventory = INVENTORY.replace("bun_pid 100", f"bun_pid {pid}").replace(
             "bun_rss_kb 300000", f"bun_rss_kb {rss_kb}").replace("bun_fd 300", f"bun_fd {fd}")
-        checker.resource_trend_findings(self.state, "rb-a-1", checker.parse_inventory(inventory), ts)
+        checker.resource_trend_findings(self.state, "rb-a-1", checker.parse_inventory(inventory), ts, final=True)
 
     def setUp(self):
         super().setUp()
@@ -2074,6 +2188,27 @@ class BunMemory(Evidence):
         text = "\n".join(checker.bun_memory.section(self.evidence))
         self.assertIn("- rb-a-1: **heap** grew most after the first hour: +30.0 MiB over 3:00 h:mm", text)
         self.assertIn("arenas +0.0", text)
+
+    def test_each_node_gets_its_six_hour_rss_slope(self):
+        # #1417's figures for the 0.2.7 memory run: nodes 1 and 3 levelled
+        # off, node 2 kept growing.
+        (self.evidence / "memory.jsonl").write_text(MEM027.read_text())
+        text = "\n".join(checker.bun_memory.section(self.evidence))
+        for node, slope in (("1", "+0.60"), ("2", "+2.37"), ("3", "+0.69")):
+            self.assertIn(f"- rb-ff0253160ea8-{node}: RSS slope over the last 6 hours: {slope} MiB/h "
+                          "(least squares; recorded, not gated).", text)
+
+    def test_a_bun_younger_than_six_hours_has_no_slope(self):
+        self.run_hours(4)
+        text = "\n".join(checker.bun_memory.section(self.evidence))
+        self.assertIn("- rb-a-1: no 6-hour RSS slope: the last Bun process (pid 100) ran for 4:00 h:mm.", text)
+
+    def test_a_restart_starts_the_slope_again(self):
+        rows = [dict(ts=NOW + minute * 60, node="rb-a-1", pid=100 if minute < 7 * 60 else 200,
+                     rss_kb=100000 + minute * 1024) for minute in range(0, 14 * 60, 5)]
+        self.assertEqual(round(checker.bun_memory.rss_slope(rows), 2), 60.0)
+        rows[-1]["pid"] = 300
+        self.assertIsNone(checker.bun_memory.rss_slope(rows))
 
     def test_the_first_hour_of_a_restarted_bun_is_not_enough_to_judge(self):
         self.run_hours(2, heap=lambda hour: 5000 + 10240 * hour)

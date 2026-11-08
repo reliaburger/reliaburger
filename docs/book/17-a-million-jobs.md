@@ -4478,6 +4478,20 @@ hour on every node, with one unbroken half-hour among them. The final grew
 from eight hours to about ten and a half. We chose that over cutting the faults to six,
 because the faults are what the eight hours were for.
 
+The hour itself turned out to be too simple a baseline for long runs. In
+0.2.7's 24-hour memory run, node 2's RSS followed its log store, which the
+volume writer's eight lines a second took 15 hours to fill, so at the hour
+node 2 was at 76% of where it ended and `leak-rss` failed it 13 times.
+Moving the hour to two or four hours still failed it. So outside a final
+the warm sample now waits for the node's log and metrics stores to be 90%
+full, between the hour and six hours. On its own that would hide a real
+leak that starts late, so the record also gives each node's RSS slope over
+its last six hours, fitted by least squares. Nodes 1 and 3, which levelled
+off, show about 0.6 MiB an hour and node 2 about 2.4, and the next memory
+run decides what slope fails. A final keeps the plain hour, because its
+quiet tail is sized for it. The test replays that run's 867 samples, so
+the rule is checked against the data that prompted it.
+
 My first proposal for the tail was 90 minutes, an hour to arm and half an
 hour to compare, beside a 60-minute exposure threshold. Do the arithmetic and
 that fails every final. The last cycle ends with an upgrade walk and a
