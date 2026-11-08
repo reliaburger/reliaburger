@@ -73,7 +73,8 @@ pub struct McpOptions {
     /// Also offer the tools that propose changes and take leases: propose,
     /// proposals, withdraw, undo and lease. A person or an admin's policy
     /// approves each proposal. From the saved admin context, relish mcp
-    /// makes a deployer agent token for them, confined to --namespace.
+    /// makes a deployer agent token for them, confined to --namespace,
+    /// which it then needs.
     #[arg(long)]
     pub propose: bool,
 }
@@ -118,6 +119,34 @@ pub const ADMIN_TOKEN_WARNING: &str = "relish mcp: warning: this connection carr
 credentials, so the agent's read-only tools run with an admin token. Make a read-only one \
 with `relish token create --name agent --role read-only --ttl-days 1` and put it in the MCP \
 bundle's token setting, or in RELIABURGER_TOKEN in the agent's MCP server entry.";
+
+/// What `relish mcp --propose` prints on stderr, once, when it sends a
+/// token it didn't make. relish can't ask the cluster whether a token is a
+/// person's or an agent's, so it says what happens if it's a person's.
+pub const PERSON_TOKEN_WARNING: &str = "relish mcp: warning: --propose is sending a token relish mcp didn't make, so it can't tell whether it's an agent's. If it's a person's, the agent's proposals are that person's: a guardrail that matches author.kind == \"agent\" doesn't see them. Give it an agent token, made with `relish token create --name holmes --agent --role deployer --namespaces shop`.";
+
+/// The warning to print when `relish mcp`, proposing when `propose` is
+/// set, sends a token from `origin` that may be a person's: one given to
+/// it with `--token` or `RELIABURGER_TOKEN`. The tokens it makes from the
+/// admin context are agent tokens.
+pub fn person_token_warning(origin: TokenOrigin, propose: bool) -> Option<&'static str> {
+    (propose && origin == TokenOrigin::Explicit).then_some(PERSON_TOKEN_WARNING)
+}
+
+/// Why `relish mcp` won't serve with `options` and a token from `origin`,
+/// if it won't. From the saved admin context `--propose` makes a deployer
+/// agent token, and without `--namespace` that token could propose, and
+/// take leases, in every namespace.
+pub fn propose_scope_refusal(origin: TokenOrigin, options: &McpOptions) -> Option<RelishError> {
+    let unscoped = options.propose && options.namespace.is_none();
+    (unscoped && origin == TokenOrigin::ContextAdmin).then(|| RelishError::InvalidFlag {
+        flag: "propose".to_string(),
+        reason: "from the saved admin context, relish mcp --propose makes a deployer agent \
+                 token, and without --namespace it could propose in every namespace; pass \
+                 --namespace NAME, or give it an agent token of your own in RELIABURGER_TOKEN"
+            .to_string(),
+    })
+}
 
 /// How long `relish mcp` waits for the cluster to say whether an explicit
 /// token is an admin one, before it stops asking and says nothing.
@@ -600,6 +629,12 @@ pub async fn run(options: &McpOptions) -> Result<(), RelishError> {
         return Ok(());
     }
     let origin = crate::relish::client::token_origin();
+    if let Some(refusal) = propose_scope_refusal(origin, options) {
+        return Err(refusal);
+    }
+    if let Some(warning) = person_token_warning(origin, options.propose) {
+        eprintln!("{warning}");
+    }
     let server = match origin {
         TokenOrigin::ContextAdmin => match Managed::from_context(
             options.namespace.as_deref(),

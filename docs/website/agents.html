@@ -363,6 +363,9 @@ the closest ids in the hint. The table under "Every finding" in
 <p>Or <code>take namespace shop</code>. It lasts 2m (<code>--ttl</code>, up to 15m); <code>renew</code> and
 <code>release</code> it. Someone else's is <code>lease_held</code> (exit <code>4</code>), and <code>error.lease</code>
 names the holder. <code>--wait</code> retries; <code>context</code> lists <code>leases</code>.</p>
+<p>An agent can renew its lease forever. A namespace lease blocks every
+person's write there, so if an agent sits on one, repeat your command with
+<code>--break-lease</code> to end it.</p>
 </section>
 <section class="agents-section" id="proposing-a-change">
 <h2>Proposing a change <a class="permalink" href="#proposing-a-change" aria-label="Link to this section">#</a></h2>
@@ -794,7 +797,11 @@ approve tool, and <code>propose</code> takes no <code>apply</code> (it reads a l
 a deployer agent token,
 <code>relish token create --name holmes --agent --role deployer --namespaces shop</code>.
 From the saved admin context it makes one itself, confined to <code>--namespace</code>,
-in <code>mcp-propose-token.json</code>.</p>
+in <code>mcp-propose-token-&lt;namespace&gt;.json</code>, and refuses to start without
+<code>--namespace</code>: an unscoped one could propose in every namespace. Given a
+token by <code>--token</code> or <code>RELIABURGER_TOKEN</code>, it warns on stderr that it can't
+tell a person's token from an agent's. A person's proposals are that
+person's, and a guardrail matching <code>author.kind == "agent"</code> doesn't see them.</p>
 <p>Three flags narrow what it offers:</p>
 <table><thead><tr><th>Flag</th><th>Meaning</th></tr></thead><tbody>
 <tr><td><code>--toolsets source,manual</code></td><td>Only the tools whose command starts with one of these words</td></tr>

@@ -364,6 +364,10 @@ Or `take namespace shop`. It lasts 2m (`--ttl`, up to 15m); `renew` and
 `release` it. Someone else's is `lease_held` (exit `4`), and `error.lease`
 names the holder. `--wait` retries; `context` lists `leases`.
 
+An agent can renew its lease forever. A namespace lease blocks every
+person's write there, so if an agent sits on one, repeat your command with
+`--break-lease` to end it.
+
 ## Proposing a change
 
 An agent never changes the cluster. It proposes, and a person approves:
@@ -922,7 +926,11 @@ approve tool, and `propose` takes no `apply` (it reads a local file). Give it
 a deployer agent token,
 `relish token create --name holmes --agent --role deployer --namespaces shop`.
 From the saved admin context it makes one itself, confined to `--namespace`,
-in `mcp-propose-token.json`.
+in `mcp-propose-token-<namespace>.json`, and refuses to start without
+`--namespace`: an unscoped one could propose in every namespace. Given a
+token by `--token` or `RELIABURGER_TOKEN`, it warns on stderr that it can't
+tell a person's token from an agent's. A person's proposals are that
+person's, and a guardrail matching `author.kind == "agent"` doesn't see them.
 
 Three flags narrow what it offers:
 

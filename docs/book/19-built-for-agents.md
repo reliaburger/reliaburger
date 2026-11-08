@@ -5133,6 +5133,12 @@ What we kept is the shape:
   `principal_id`, so only that exact credential renews or releases.
 - **No reviving.** A renewal after the expiry is refused: the caller takes
   the lease again, and anyone else may have taken it first.
+- **No cap on renewals.** A lease lasts at most 15 minutes per take, but its
+  holder may renew it as often as it likes. That's the design (#1682): an
+  agent halfway through a fix shouldn't lose its claim. The cost is that an
+  agent's namespace lease, renewed in a loop, blocks every person's write in
+  that namespace until someone repeats the write with `--break-lease`. The
+  manual says so where it explains leases.
 - **A leader-only reaper**, `src/bun/lease_reaper.rs`, which checks its own
   copy before it writes, so a quiet cluster writes nothing, and resumes on a
   new leader because the leases live in Raft.
@@ -5750,6 +5756,26 @@ server wants is one enum, `credentials::Purpose`, with the role and the file
 name as methods on it, so the two can't be mixed up. The read-only token is
 an agent token now too, so the audit log names everything an MCP connection
 does as an agent's.
+
+"Confined to `--namespace`" was a promise the first version didn't keep.
+`--namespace` is optional, and without it `obtain` asked for a token with
+no namespaces at all, so the help said one thing and the token did another:
+it could propose, and take namespace leases, everywhere. With a broad
+approve policy that's an agent auto-applying cluster-wide. Now
+`propose_scope_refusal` refuses `--propose` from the saved admin context
+without `--namespace`, before anything is minted, and says to pass it. We
+didn't add a flag for a cluster-wide proposing token. Someone who wants one
+can make it with `relish token create --agent` and hand it over, which is a
+choice they make on purpose rather than by leaving a flag out.
+
+The other way round there's a gap relish can't close. Give `relish mcp
+--propose` a person's deployer token in `RELIABURGER_TOKEN` and it proposes
+as that person, so a guardrail written as `author.kind == "agent"` never
+sees the agent's proposals. There's no "who am I" route, and the role probe
+relish mcp already uses (`GET /v1/token/list`) tells admin from not-admin,
+not a person from an agent. So `person_token_warning` warns on stderr for
+every token `relish mcp` didn't make itself. It's noisy for someone who did
+hand it an agent token, and honest: relish can't tell, so it says so.
 
 ### The tests
 

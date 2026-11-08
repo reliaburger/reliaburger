@@ -1361,3 +1361,61 @@ async fn a_proposing_server_from_an_admin_context_sends_its_own_proposing_token(
         "{seen:?}"
     );
 }
+
+fn propose_options(namespace: Option<&str>) -> McpOptions {
+    McpOptions {
+        toolsets: Vec::new(),
+        no_logs: false,
+        namespace: namespace.map(str::to_string),
+        list: false,
+        propose: true,
+    }
+}
+
+/// From the saved admin context, `--propose` without `--namespace` would
+/// mint a deployer agent token for every namespace. It's refused, and the
+/// refusal says to pass `--namespace`.
+#[test]
+fn propose_from_the_admin_context_needs_a_namespace() {
+    use crate::relish::client::TokenOrigin;
+    let refusal = propose_scope_refusal(TokenOrigin::ContextAdmin, &propose_options(None))
+        .expect("an unscoped proposing token is refused");
+    let message = refusal.to_string();
+    assert!(message.contains("--namespace"), "{message}");
+    assert!(
+        propose_scope_refusal(TokenOrigin::ContextAdmin, &propose_options(Some("shop"))).is_none()
+    );
+    // A token someone gave it carries its own scope; plain relish mcp
+    // mints a read-only one, which may read every namespace.
+    assert!(propose_scope_refusal(TokenOrigin::Explicit, &propose_options(None)).is_none());
+    let mut reading = propose_options(None);
+    reading.propose = false;
+    assert!(propose_scope_refusal(TokenOrigin::ContextAdmin, &reading).is_none());
+}
+
+/// `--propose` with a token relish mcp didn't make warns: relish can't
+/// tell a person's token from an agent's, and a person's proposals slip
+/// past guardrails that match agents.
+#[test]
+fn propose_with_a_token_relish_mcp_didnt_make_warns() {
+    use crate::relish::client::TokenOrigin;
+    assert_eq!(
+        person_token_warning(TokenOrigin::Explicit, true),
+        Some(PERSON_TOKEN_WARNING)
+    );
+    for (origin, propose) in [
+        (TokenOrigin::Explicit, false),
+        (TokenOrigin::ContextAdmin, true),
+        (TokenOrigin::Absent, true),
+    ] {
+        assert_eq!(
+            person_token_warning(origin, propose),
+            None,
+            "{origin:?} {propose}"
+        );
+    }
+    let warning = PERSON_TOKEN_WARNING;
+    assert!(warning.contains("author.kind"), "{warning}");
+    assert!(warning.contains("--agent"), "{warning}");
+    assert!(!warning.contains('\n'), "one line: {warning}");
+}
