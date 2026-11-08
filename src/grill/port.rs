@@ -161,21 +161,6 @@ fn host_port_is_free(port: u16) -> bool {
 mod tests {
     use super::*;
 
-    /// A port nothing on the host listens on, for tests whose range is a
-    /// port or two wide. Fixed ports (5000 is AirPlay on macOS) may be taken.
-    fn unused_host_port() -> u16 {
-        loop {
-            let port = std::net::TcpListener::bind("0.0.0.0:0")
-                .unwrap()
-                .local_addr()
-                .unwrap()
-                .port();
-            if port < u16::MAX - 2 && host_port_is_free(port + 1) {
-                return port;
-            }
-        }
-    }
-
     /// Linux hands out ephemeral source ports from 32768 by default
     /// (`net.ipv4.ip_local_port_range`), so a published port at or above it
     /// can collide with an outgoing connection (#700).
@@ -187,6 +172,11 @@ mod tests {
         assert!(end <= 32768, "default range reaches {end}");
     }
 
+    /// The only test that probes the host. It holds the port it probes, so
+    /// it depends on no fixed port number. Every other test here checks
+    /// bookkeeping only and builds its allocator `without_host_probe()`:
+    /// another listener on the runner, even a sibling test in the same
+    /// nextest run, would otherwise make the allocator skip a port (#1711).
     #[tokio::test]
     async fn allocator_skips_a_port_bound_on_the_host() {
         // A host daemon listening on a port must never be shadowed by a
@@ -205,7 +195,7 @@ mod tests {
 
     #[tokio::test]
     async fn last_free_port_is_found_even_in_a_nearly_full_pool() {
-        let allocator = PortAllocator::new(1000, 65000);
+        let allocator = PortAllocator::new(1000, 65000).without_host_probe();
         for port in 1000..64999 {
             allocator.reserve(port).await.unwrap();
         }
@@ -217,7 +207,7 @@ mod tests {
 
     #[tokio::test]
     async fn allocate_returns_port_in_range() {
-        let alloc = PortAllocator::new(10000, 10010);
+        let alloc = PortAllocator::new(10000, 10010).without_host_probe();
         let port = alloc.allocate().await.unwrap();
         assert!((10000..10010).contains(&port));
     }
@@ -232,7 +222,7 @@ mod tests {
 
     #[tokio::test]
     async fn allocate_no_duplicates() {
-        let alloc = PortAllocator::new(10000, 10100);
+        let alloc = PortAllocator::new(10000, 10100).without_host_probe();
         let mut ports = HashSet::new();
         for _ in 0..50 {
             let port = alloc.allocate().await.unwrap();
@@ -242,7 +232,7 @@ mod tests {
 
     #[tokio::test]
     async fn release_makes_port_available() {
-        let alloc = PortAllocator::new(10000, 10001);
+        let alloc = PortAllocator::new(10000, 10001).without_host_probe();
         let port = alloc.allocate().await.unwrap();
         assert_eq!(port, 10000);
 
@@ -255,7 +245,7 @@ mod tests {
 
     #[tokio::test]
     async fn allocate_exhausts_range() {
-        let alloc = PortAllocator::new(10000, 10003);
+        let alloc = PortAllocator::new(10000, 10003).without_host_probe();
         alloc.allocate().await.unwrap();
         alloc.allocate().await.unwrap();
         alloc.allocate().await.unwrap();
@@ -271,14 +261,14 @@ mod tests {
 
     #[tokio::test]
     async fn release_unallocated_port_rejected() {
-        let alloc = PortAllocator::new(10000, 10010);
+        let alloc = PortAllocator::new(10000, 10010).without_host_probe();
         let err = alloc.release(10005).await.unwrap_err();
         assert!(matches!(err, PortError::NotAllocated { port: 10005 }));
     }
 
     #[tokio::test]
     async fn is_allocated_tracks_state() {
-        let alloc = PortAllocator::new(10000, 10010);
+        let alloc = PortAllocator::new(10000, 10010).without_host_probe();
         let port = alloc.allocate().await.unwrap();
         assert!(alloc.is_allocated(port).await);
 
@@ -288,7 +278,7 @@ mod tests {
 
     #[tokio::test]
     async fn allocated_count_tracks_correctly() {
-        let alloc = PortAllocator::new(10000, 10010);
+        let alloc = PortAllocator::new(10000, 10010).without_host_probe();
         assert_eq!(alloc.allocated_count().await, 0);
 
         let p1 = alloc.allocate().await.unwrap();
@@ -303,16 +293,15 @@ mod tests {
 
     #[tokio::test]
     async fn single_port_range() {
-        let free = unused_host_port();
-        let alloc = PortAllocator::new(free, free + 1);
+        let alloc = PortAllocator::new(10000, 10001).without_host_probe();
         let port = alloc.allocate().await.unwrap();
-        assert_eq!(port, free);
+        assert_eq!(port, 10000);
         assert!(alloc.allocate().await.is_err());
     }
 
     #[tokio::test]
     async fn total_ports_returns_range_size() {
-        let alloc = PortAllocator::new(10000, 10050);
+        let alloc = PortAllocator::new(10000, 10050).without_host_probe();
         assert_eq!(alloc.total_ports(), 50);
     }
 
@@ -320,8 +309,7 @@ mod tests {
     /// count against the range's exhaustion cap.
     #[tokio::test]
     async fn out_of_range_reserve_does_not_exhaust_the_pool() {
-        let free = unused_host_port();
-        let alloc = PortAllocator::new(free, free + 2); // two allocatable ports
+        let alloc = PortAllocator::new(10000, 10002).without_host_probe(); // two allocatable ports
         // Reserve several out-of-range ports (as adoption does).
         for p in [80u16, 443, 8080] {
             alloc.reserve(p).await.unwrap();
@@ -334,7 +322,7 @@ mod tests {
 
     #[tokio::test]
     async fn total_ports_saturates_on_an_inverted_range() {
-        let alloc = PortAllocator::new(6000, 5000);
+        let alloc = PortAllocator::new(6000, 5000).without_host_probe();
         assert_eq!(alloc.total_ports(), 0);
     }
 
@@ -344,14 +332,14 @@ mod tests {
             start: 20000,
             end: 20005,
         };
-        let alloc = PortAllocator::from_config(&range);
+        let alloc = PortAllocator::from_config(&range).without_host_probe();
         let port = alloc.allocate().await.unwrap();
         assert!((20000..20005).contains(&port));
     }
 
     #[tokio::test]
     async fn concurrent_allocation_no_duplicates() {
-        let alloc = PortAllocator::new(10000, 10100);
+        let alloc = PortAllocator::new(10000, 10100).without_host_probe();
         let mut handles = Vec::new();
 
         for _ in 0..50 {
@@ -371,7 +359,7 @@ mod tests {
 
     #[tokio::test]
     async fn double_release_rejected() {
-        let alloc = PortAllocator::new(10000, 10010);
+        let alloc = PortAllocator::new(10000, 10010).without_host_probe();
         let port = alloc.allocate().await.unwrap();
         alloc.release(port).await.unwrap();
         assert!(alloc.release(port).await.is_err());

@@ -133,8 +133,9 @@ merged, because the ruleset still named only `release-0-2-1`.
 
 Merge a PR into a train with `gh pr merge --merge --auto`, or the "Merge when
 ready" button, which adds it to the queue. Don't merge it directly. The queue
-builds a temporary branch with the train plus the PR (and up to three more
-waiting behind it), and `ci.yml`'s `merge_group` trigger runs every job on it.
+builds a temporary branch with the train plus the PR (and up to seven more
+waiting behind it: the ruleset's group size went from 4 to 8 on 7 November
+2026, #1724), and `ci.yml`'s `merge_group` trigger runs every job on it.
 The PR lands only if `ignored-test evidence` passes on that exact commit. A
 batch that fails drops the PR that broke it, and the rest go round again.
 
