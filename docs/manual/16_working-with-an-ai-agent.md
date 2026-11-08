@@ -46,9 +46,9 @@ If you're an agent operating or debugging a Reliaburger cluster:
   A warning starting `source_mismatch:` means a node runs another commit, and
   links that commit's code.
 - **Use `-o json` for everything else.** Every `relish` command takes it
-  except the six interactive ones: `tui`, `dashboard`, `manual`, `source`,
-  `dev shell` and the guided `setup`. `setup --quickstart` and `setup --ssh`
-  take it.
+  except the eight interactive ones: `tui`, `dashboard`, `manual`, `source`,
+  `dev shell`, the guided `setup`, `machines claim` and `netboot`. `setup
+  --quickstart` and `setup --ssh` take it.
 - **Never post, change or file anything without your human.** Draft it, show
   it, and let them send it.
 - **Asked to set up a cluster?** Follow the playbook "Setting up a cluster for
@@ -788,10 +788,11 @@ field names and no URL carries, gets through. Read `MANIFEST.json` and
 ## Every other command
 
 The rest of `relish` was written for people first, but every command takes
-`-o json` (or `-o yaml`) and prints the same facts its table shows. Six
+`-o json` (or `-o yaml`) and prints the same facts its table shows. Eight
 refuse it, exit `2` and say they're interactive: `tui`, `dashboard`,
-`manual`, `source`, `dev shell` and `setup` without `--quickstart` or
-`--ssh`, which asks its questions as it goes. Without a terminal, as in an
+`manual`, `source`, `dev shell`, `setup` without `--quickstart` or `--ssh`,
+which asks its questions as it goes, `machines claim`, which asks you to
+compare claim keys, and `netboot`, which serves until stopped. Without a terminal, as in an
 agent's shell, `relish`, `relish manual` and `relish source` exit at once and
 name the command to use instead. The `reference` chapter lists what each
 command's JSON holds.

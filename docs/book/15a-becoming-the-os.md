@@ -747,6 +747,36 @@ scan() {
 
 If you mostly write Python, read `local -A hash` as `hash = {}` (a bash associative array), and `local -n into=$2` as "`into` is another name for the caller's variable whose name is in `$2`", which is how bash passes a dictionary by reference. `< <(...)` feeds the loop from a command, and every name travels between NUL bytes (`-print0`, `-z`, `read -d ''`), the only byte a path can't contain. That's the same reason Rust's `std::ffi::OsStr` exists: a file name isn't text until you check. The `\037` is the old ASCII unit separator, and it isn't decoration. Our first try split fields on tabs, and `read` treats a tab as whitespace, collapsing the empty link target of every regular file and shifting the name into the wrong field. Nine tests in `image/tests/test_etc_sync.py` run the real script against temporary directories, and they caught it before any machine did. A full `/etc` of 1,439 files now syncs in 0.2 s, and the emulated boot reaches it at 10 s.
 
+### Answers a script can read
+
+The appliance commands were written before 0.2.7 made every `relish` command print JSON ([Chapter 19](19-built-for-agents.md)), so for a while they refused `-o json` (#1709). Each one printed its result as it went, with `println!` calls scattered through the work. Giving them JSON meant pulling the result apart from the printing.
+
+So each command now builds one value and prints it once. `relish os status` builds an `OsStatus`, `relish image download` a `Downloaded`, `relish cluster create` a `ClusterCreated`, and so on. Each derives `Serialize` for scripts and implements `Display` for people, and `print_output` picks one by the `-o` flag:
+
+```rust
+#[derive(Debug, Clone, Serialize)]
+pub struct OsStatus {
+    pub active: Option<OsRollout>,
+    pub last: Option<OsRollout>,
+}
+
+impl fmt::Display for OsStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (&self.active, &self.last) {
+            (Some(rollout), _) => f.write_str(&render_rollout(rollout)),
+            (None, Some(last)) => { /* "No OS rollout in progress. The last one:" */ }
+            (None, None) => writeln!(f, "No OS rollout in progress, and none has run."),
+        }
+    }
+}
+```
+
+`Display` is Rust's trait for "how this looks as text", the one `format!("{}")` calls, much as `__str__` is in Python or `String()` in Go. The table code didn't change. It just moved from the command into `fmt`, so the people's view and the scripts' view are made from the same value and can't drift apart. A script asking `relish -o json os status` with no rollout gets `{"active": null, "last": null}` rather than a sentence it would have to parse.
+
+Lines that report work in progress, such as each file `image download` checks, go through `progress`. That prints to stdout for people and to stderr under `-o json`, so stdout holds exactly one JSON document. `cluster create` has a question too: without `--yes` it waits for the operator to say the master key is backed up. Under `-o json`, that question goes to stderr as well.
+
+Two commands stay interactive and refuse `-o json`. `relish machines claim` asks the operator to compare each machine's claim key with its console, one at a time, and that question is the point of the command. `relish netboot` serves installs until it's stopped, so it never has a result to print.
+
 ## Becoming a node
 
 A freshly installed appliance knows nothing. It has bun, an empty data partition and a network card. Before bun can start, the machine needs a `node.toml`, a certificate signed by the cluster's CA and the cluster's master key. Where do they come from on a box with no login?

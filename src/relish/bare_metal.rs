@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::appliance::seed::{JoinSeed, SeedConfig, SeedRole, UpgradeSeed};
 use crate::relish::RelishError;
+use crate::relish::output::{OutputFormat, print_output, progress};
 use crate::sesame::types::{ApiRole, TokenScope};
 
 /// One machine in the fleet.
@@ -417,14 +418,65 @@ pub async fn add(
     )?;
     for node in &added {
         if !admitted(&fleet, node.address) {
-            println!(
-                "{} isn't in a network the cluster admits (cluster create --network); add it to \
+            eprintln!(
+                "warning: {} isn't in a network the cluster admits (cluster create --network); add it to \
                  [security] bootstrap_peers on the existing nodes, or it can't reach them to join",
                 node.address
             );
         }
     }
     Ok(added.into_iter().zip(written).collect())
+}
+
+/// A machine and the seed written for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SeededNode {
+    pub name: String,
+    pub mac: String,
+    pub address: IpAddr,
+    pub seed: PathBuf,
+}
+
+impl SeededNode {
+    fn new(node: &FleetNode, seed: &Path) -> Self {
+        Self {
+            name: node.name.clone(),
+            mac: node.mac.clone(),
+            address: node.address,
+            seed: seed.to_path_buf(),
+        }
+    }
+}
+
+impl std::fmt::Display for SeededNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "  {} ({} at {}): {}",
+            self.name,
+            self.mac,
+            self.address,
+            self.seed.display()
+        )
+    }
+}
+
+/// What `relish image seed` answers: the machines added, with their seeds.
+#[derive(Debug, Clone, Serialize)]
+pub struct Seeds {
+    pub nodes: Vec<SeededNode>,
+}
+
+impl std::fmt::Display for Seeds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for node in &self.nodes {
+            write!(f, "{node}")?;
+        }
+        writeln!(
+            f,
+            "Copy the new seeds onto the RBSEED stick (seeds/ keeps one per MAC)."
+        )
+    }
 }
 
 /// `relish image seed <dir> MAC@IP...`: add machines to a running cluster,
@@ -434,18 +486,14 @@ pub async fn run_add(
     machines: &[(String, IpAddr)],
     token_ttl: Duration,
     ssh_key: Option<Vec<u8>>,
+    output: OutputFormat,
 ) -> Result<(), RelishError> {
-    for (node, seed) in add(directory, machines, token_ttl, ssh_key).await? {
-        println!(
-            "  {} ({} at {}): {}",
-            node.name,
-            node.mac,
-            node.address,
-            seed.display()
-        );
-    }
-    println!("Copy the new seeds onto the RBSEED stick (seeds/ keeps one per MAC).");
-    Ok(())
+    let nodes = add(directory, machines, token_ttl, ssh_key)
+        .await?
+        .iter()
+        .map(|(node, seed)| SeededNode::new(node, seed))
+        .collect();
+    print_output(&Seeds { nodes }, output)
 }
 
 /// The relish context for a bare-metal cluster: node 1's API with the admin
@@ -476,39 +524,85 @@ pub fn context(
     })
 }
 
-/// `relish cluster create --bare-metal`: create the cluster, save its
-/// context (unless another cluster's context is in the way), and say what
-/// to do next.
-pub fn run_create(options: &CreateOptions, yes: bool) -> Result<(), RelishError> {
+/// What `relish cluster create --bare-metal` answers.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClusterCreated {
+    pub cluster: String,
+    pub directory: PathBuf,
+    pub root_ca_fingerprint: String,
+    /// How many voters the council grows to.
+    pub council_size: crate::council::CouncilSize,
+    /// Node 1 first.
+    pub nodes: Vec<SeededNode>,
+    /// The only copy of the root CA key, and the identity that opens it.
+    pub root_backup: super::quickstart::security::RootBackupFiles,
+    /// The master key's directory, to back up.
+    pub secrets: PathBuf,
+    pub context: ContextReport,
+}
+
+impl ClusterCreated {
+    /// The report for `created`, made from `options`.
+    pub fn new(created: &Created, options: &CreateOptions, context: ContextReport) -> Self {
+        Self {
+            cluster: created.fleet.cluster.clone(),
+            directory: options.directory.clone(),
+            root_ca_fingerprint: created.fleet.ca_fingerprint.clone(),
+            council_size: options.council_size,
+            nodes: created
+                .fleet
+                .nodes
+                .iter()
+                .zip(&created.seeds)
+                .map(|(node, seed)| SeededNode::new(node, seed))
+                .collect(),
+            root_backup: created.root_backup.clone(),
+            secrets: options.directory.join("secrets"),
+            context,
+        }
+    }
+}
+
+impl std::fmt::Display for ClusterCreated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let dir = self.directory.display();
+        writeln!(f, "cluster {} created in {dir}", self.cluster)?;
+        writeln!(f, "  root CA: {}", self.root_ca_fingerprint)?;
+        writeln!(f, "  council: up to {} voters", self.council_size)?;
+        for node in &self.nodes {
+            write!(f, "{node}")?;
+        }
+        writeln!(f)?;
+        writeln!(
+            f,
+            "The root CA key is only in {}, which {} opens. Move both offline, apart \
+             from each other: no node holds either, and `relish ca rotate` needs them.",
+            self.root_backup.backup.display(),
+            self.root_backup.identity.display()
+        )?;
+        writeln!(
+            f,
+            "Copy {dir}/stick/seeds onto a USB stick labelled RBSEED (FAT32), then boot each machine with it."
+        )?;
+        write!(f, "{}", self.context)
+    }
+}
+
+/// `relish cluster create --bare-metal`: create the cluster, have its
+/// master key backed up, save its context (unless another cluster's
+/// context is in the way), and say what to do next.
+pub fn run_create(
+    options: &CreateOptions,
+    yes: bool,
+    output: OutputFormat,
+) -> Result<(), RelishError> {
     use std::io::IsTerminal;
     let secrets = options.directory.join("secrets");
     let check = backup_check(yes, std::io::stdin().is_terminal(), &secrets)?;
     let created = create(options)?;
-    let dir = options.directory.display();
-    println!("cluster {} created in {dir}", created.fleet.cluster);
-    println!("  root CA: {}", created.fleet.ca_fingerprint);
-    println!("  council: up to {} voters", options.council_size);
-    for (node, seed) in created.fleet.nodes.iter().zip(&created.seeds) {
-        println!(
-            "  {} ({} at {}): {}",
-            node.name,
-            node.mac,
-            node.address,
-            seed.display()
-        );
-    }
-    println!();
-    println!(
-        "The root CA key is only in {}, which {} opens. Move both offline, apart \
-         from each other: no node holds either, and `relish ca rotate` needs them.",
-        created.root_backup.backup.display(),
-        created.root_backup.identity.display()
-    );
-    back_up(check, &secrets)?;
-    println!(
-        "Copy {dir}/stick/seeds onto a USB stick labelled RBSEED (FAT32), then boot each machine with it."
-    );
-    adopt(&created, &options.directory)
+    back_up(check, &secrets, output)?;
+    let context = adopt(&created, &options.directory)?;
+    print_output(&ClusterCreated::new(&created, options, context), output)
 }
 
 /// How a new cluster's master-key backup gets confirmed.
@@ -534,19 +628,26 @@ pub fn backup_check(yes: bool, terminal: bool, secrets: &Path) -> Result<BackupC
 }
 
 /// Tell the operator what to back up and, unless `--yes` said not to,
-/// wait at the terminal until they've done it.
-pub fn back_up(check: BackupCheck, secrets: &Path) -> Result<(), RelishError> {
-    match check {
-        BackupCheck::Remind => {
-            println!("{}", backup_reminder(secrets));
-            println!("(--yes: not waiting for you to confirm the backup)");
+/// wait at the terminal until they've done it. With `-o json` or `yaml`
+/// the reminder and the question go to stderr, leaving stdout for data.
+pub fn back_up(
+    check: BackupCheck,
+    secrets: &Path,
+    output: OutputFormat,
+) -> Result<(), RelishError> {
+    let input = &mut std::io::stdin().lock();
+    match (check, output) {
+        (BackupCheck::Remind, _) => {
+            progress(output, backup_reminder(secrets));
+            progress(output, "(--yes: not waiting for you to confirm the backup)");
             Ok(())
         }
-        BackupCheck::Ask => confirm_backup(
-            &mut std::io::stdin().lock(),
-            &mut std::io::stdout(),
-            secrets,
-        ),
+        (BackupCheck::Ask, OutputFormat::Human) => {
+            confirm_backup(input, &mut std::io::stdout(), secrets)
+        }
+        (BackupCheck::Ask, OutputFormat::Json | OutputFormat::Yaml) => {
+            confirm_backup(input, &mut std::io::stderr(), secrets)
+        }
     }
 }
 
@@ -584,31 +685,58 @@ pub fn confirm_backup(
     }
 }
 
+/// How relish reaches a new cluster: whether its context was saved, and
+/// what to export if another cluster's was in the way.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ContextReport {
+    /// Whether relish now talks to this cluster.
+    pub adopted: bool,
+    pub endpoint: String,
+    pub ca_cert: PathBuf,
+    pub token_file: PathBuf,
+}
+
+impl std::fmt::Display for ContextReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.adopted {
+            return writeln!(
+                f,
+                "relish now talks to this cluster (node 1, {}).",
+                self.endpoint
+            );
+        }
+        writeln!(
+            f,
+            "Another cluster's relish context is in place, so it was kept. To use this one:"
+        )?;
+        writeln!(f, "  export RELIABURGER_ENDPOINT={}", self.endpoint)?;
+        writeln!(f, "  export RELIABURGER_CA_CERT={}", self.ca_cert.display())?;
+        writeln!(
+            f,
+            "  export RELIABURGER_TOKEN=$(cat {})",
+            self.token_file.display()
+        )
+    }
+}
+
 /// Point relish at a newly created cluster, unless another cluster's
 /// context is in the way.
-pub fn adopt(created: &Created, directory: &Path) -> Result<(), RelishError> {
+pub fn adopt(created: &Created, directory: &Path) -> Result<ContextReport, RelishError> {
     let context = context(&created.fleet, directory, &created.admin_token)?;
     let path = super::local_context::default_path()?;
-    let saved = match super::local_context::LocalContext::load(&path) {
+    let adopted = match super::local_context::LocalContext::load(&path) {
         Ok(None) => context.save(&path).map(|()| true)?,
         Ok(Some(existing)) if existing.owner == context.owner => {
             context.save(&path).map(|()| true)?
         }
         _ => false,
     };
-    let dir = directory.display();
-    if saved {
-        println!(
-            "relish now talks to this cluster (node 1, {}).",
-            context.endpoint
-        );
-    } else {
-        println!("Another cluster's relish context is in place, so it was kept. To use this one:");
-        println!("  export RELIABURGER_ENDPOINT={}", context.endpoint);
-        println!("  export RELIABURGER_CA_CERT={}", context.ca_cert.display());
-        println!("  export RELIABURGER_TOKEN=$(cat {dir}/secrets/admin.token)");
-    }
-    Ok(())
+    Ok(ContextReport {
+        adopted,
+        endpoint: context.endpoint,
+        ca_cert: context.ca_cert,
+        token_file: directory.join("secrets").join("admin.token"),
+    })
 }
 
 fn pem(label: &str, der: &[u8]) -> String {
@@ -892,6 +1020,91 @@ mod tests {
             std::fs::read_to_string(&context.ca_cert)
                 .unwrap()
                 .starts_with("-----BEGIN CERTIFICATE-----")
+        );
+    }
+
+    #[test]
+    fn the_create_report_names_the_seeds_the_root_backup_and_how_to_connect() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = options(
+            dir.path(),
+            &[
+                "d8:9e:f3:00:00:01@192.168.1.51",
+                "d8:9e:f3:00:00:02@192.168.1.52",
+            ],
+        );
+        let created = create(&options).unwrap();
+        let context = ContextReport {
+            adopted: false,
+            endpoint: "https://192.168.1.51:9117".into(),
+            ca_cert: PathBuf::from("/c/root-ca.crt"),
+            token_file: PathBuf::from("/c/secrets/admin.token"),
+        };
+        let report = ClusterCreated::new(&created, &options, context);
+
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["cluster"], "home");
+        assert_eq!(json["root_ca_fingerprint"], created.fleet.ca_fingerprint);
+        assert_eq!(json["nodes"].as_array().unwrap().len(), 2);
+        assert_eq!(json["nodes"][1]["mac"], "d8:9e:f3:00:00:02");
+        assert_eq!(json["nodes"][1]["address"], "192.168.1.52");
+        assert_eq!(
+            json["nodes"][1]["seed"],
+            created.seeds[1].display().to_string()
+        );
+        assert_eq!(
+            json["root_backup"]["backup"],
+            created.root_backup.backup.display().to_string()
+        );
+        assert_eq!(json["context"]["adopted"], false);
+        assert_eq!(json["context"]["token_file"], "/c/secrets/admin.token");
+
+        let text = report.to_string();
+        assert!(text.starts_with(&format!(
+            "cluster home created in {}\n  root CA: ",
+            dir.path().display()
+        )));
+        assert!(text.contains(&format!(
+            "  {} (d8:9e:f3:00:00:02 at 192.168.1.52): {}\n",
+            created.fleet.nodes[1].name,
+            created.seeds[1].display()
+        )));
+        assert!(text.contains("Move both offline"));
+        assert!(text.ends_with("  export RELIABURGER_TOKEN=$(cat /c/secrets/admin.token)\n"));
+    }
+
+    #[test]
+    fn the_seed_report_lists_each_new_machine_then_what_to_do_with_the_seeds() {
+        let seeds = Seeds {
+            nodes: vec![SeededNode {
+                name: "home-4".into(),
+                mac: "d8:9e:f3:00:00:04".into(),
+                address: "192.168.1.54".parse().unwrap(),
+                seed: PathBuf::from("/c/stick/seeds/d8-9e-f3-00-00-04.seed"),
+            }],
+        };
+        assert_eq!(
+            seeds.to_string(),
+            "  home-4 (d8:9e:f3:00:00:04 at 192.168.1.54): /c/stick/seeds/d8-9e-f3-00-00-04.seed\n\
+             Copy the new seeds onto the RBSEED stick (seeds/ keeps one per MAC).\n"
+        );
+        assert_eq!(
+            serde_json::to_value(&seeds).unwrap()["nodes"][0]["name"],
+            "home-4"
+        );
+    }
+
+    #[test]
+    fn an_adopted_context_says_relish_talks_to_the_new_cluster() {
+        let context = ContextReport {
+            adopted: true,
+            endpoint: "https://192.168.1.51:9117".into(),
+            ca_cert: PathBuf::from("/c/root-ca.crt"),
+            token_file: PathBuf::from("/c/secrets/admin.token"),
+        };
+        assert_eq!(
+            context.to_string(),
+            "relish now talks to this cluster (node 1, https://192.168.1.51:9117).\n"
         );
     }
 

@@ -24,7 +24,7 @@ use crate::relish::RelishError;
 use crate::relish::bare_metal;
 
 /// An unclaimed machine found on the LAN.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Discovered {
     pub addresses: Vec<IpAddr>,
     pub macs: Vec<String>,
@@ -105,6 +105,18 @@ pub fn find<'a>(machines: &'a [Discovered], target: &str) -> Option<&'a Discover
     machines
         .iter()
         .find(|m| m.macs.contains(&wanted) || m.addresses.iter().any(|a| a.to_string() == target))
+}
+
+/// What `relish machines` answers: the machines that announced themselves,
+/// as a list for scripts and the table for people.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(transparent)]
+pub struct MachineList(pub Vec<Discovered>);
+
+impl std::fmt::Display for MachineList {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&render(&self.0))
+    }
 }
 
 /// The `relish machines` table.
@@ -449,7 +461,7 @@ pub async fn run_claim(options: &ClaimOptions) -> Result<(), RelishError> {
                 .zip(created.seeds.iter().cloned())
                 .collect::<Vec<_>>();
             if let Some(check) = backup {
-                bare_metal::back_up(check, &secrets)?;
+                bare_metal::back_up(check, &secrets, crate::relish::output::OutputFormat::Human)?;
             }
             (Some(created), seeds)
         }
@@ -488,7 +500,7 @@ pub async fn run_claim(options: &ClaimOptions) -> Result<(), RelishError> {
             created.fleet.cluster,
             options.directory.display()
         );
-        bare_metal::adopt(created, &options.directory)?;
+        print!("{}", bare_metal::adopt(created, &options.directory)?);
     }
     Ok(())
 }
@@ -621,6 +633,25 @@ mod tests {
              192.168.1.51      d8:9e:f3:12:34:56 x86_64   3f9a-12bc-77de-0a41\n"
         );
         assert_eq!(render(&[]), "no unclaimed machines answered\n");
+    }
+
+    #[test]
+    fn the_list_as_data_keeps_every_address_and_mac() {
+        let mut both = machine("fe80::5054:ff:fe00:1", "52:54:00:00:00:01");
+        both.addresses.push("10.42.0.11".parse().unwrap());
+        assert_eq!(
+            serde_json::to_value(MachineList(vec![both])).unwrap(),
+            serde_json::json!([{
+                "addresses": ["fe80::5054:ff:fe00:1", "10.42.0.11"],
+                "macs": ["52:54:00:00:00:01"],
+                "arch": "x86_64",
+                "short_fingerprint": "3f9a-12bc-77de-0a41"
+            }])
+        );
+        assert_eq!(
+            serde_json::to_value(MachineList(vec![])).unwrap(),
+            serde_json::json!([])
+        );
     }
 
     #[test]

@@ -13,11 +13,13 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use futures_util::StreamExt;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::os::{OsChannel, OsError, SumsEntry};
 use crate::relish::RelishError;
 use crate::relish::netboot::Arch;
+use crate::relish::output::{OutputFormat, print_output, progress};
 use crate::upgrade::signing::PublicKey;
 
 /// Where the newest OS release is named.
@@ -98,19 +100,68 @@ pub fn select_architectures(
     Ok(chosen)
 }
 
-/// The last line `download` prints: which architectures it saved, and where.
-pub fn saved_summary(directory: &Path, saved: &[Arch]) -> String {
-    let names: Vec<&str> = saved.iter().map(|arch| arch.directory()).collect();
-    let paths: Vec<String> = saved
-        .iter()
-        .map(|arch| format!("{}/", directory.join(arch.directory()).display()))
-        .collect();
-    format!(
-        "Saved {} under {} ({})",
-        names.join(" and "),
-        directory.display(),
-        paths.join(", ")
-    )
+/// What `relish image download` answers: the release, and every file it
+/// checked into place.
+#[derive(Debug, Clone, Serialize)]
+pub struct Downloaded {
+    pub directory: PathBuf,
+    pub version: String,
+    pub architectures: Vec<DownloadedArch>,
+}
+
+/// One architecture's build, saved in `<directory>/<arch>/`.
+#[derive(Debug, Clone, Serialize)]
+pub struct DownloadedArch {
+    pub arch: String,
+    /// The GitHub release the files came from.
+    pub tag: String,
+    pub files: Vec<DownloadedFile>,
+}
+
+/// One file of a build, checked against the signed `SHA256SUMS`.
+#[derive(Debug, Clone, Serialize)]
+pub struct DownloadedFile {
+    pub name: String,
+    pub path: PathBuf,
+    /// How much was fetched; `None` when a checked copy was already there.
+    pub fetched_bytes: Option<u64>,
+}
+
+impl std::fmt::Display for Downloaded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names: Vec<&str> = self.architectures.iter().map(|a| a.arch.as_str()).collect();
+        let paths: Vec<String> = self
+            .architectures
+            .iter()
+            .map(|a| format!("{}/", self.directory.join(&a.arch).display()))
+            .collect();
+        writeln!(
+            f,
+            "Saved {} under {} ({})",
+            names.join(" and "),
+            self.directory.display(),
+            paths.join(", ")
+        )
+    }
+}
+
+/// What `relish image write` answers.
+#[derive(Debug, Clone, Serialize)]
+pub struct Written {
+    pub image: PathBuf,
+    pub device: PathBuf,
+    pub bytes: u64,
+}
+
+impl std::fmt::Display for Written {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "wrote {} MB to {}",
+            self.bytes / 1_000_000,
+            self.device.display()
+        )
+    }
 }
 
 /// "x86_64 or aarch64".
@@ -204,6 +255,7 @@ pub async fn download(
     directory: &Path,
     everything: bool,
     trust: &ChannelTrust,
+    output: OutputFormat,
 ) -> Result<(), RelishError> {
     if let Some(warning) = trust.warning() {
         eprintln!("relish image download: {warning}");
@@ -217,23 +269,34 @@ pub async fn download(
     let channel = trust.verify(&channel_bytes, &signature)?;
     let offered: Vec<String> = channel.architectures.keys().cloned().collect();
     let chosen = select_architectures(&offered, requested, &channel.version)?;
+    let mut architectures = Vec::new();
     for arch in &chosen {
-        download_arch(
-            &client,
-            channel_url,
-            &channel,
-            *arch,
-            directory,
-            everything,
-            trust,
-        )
-        .await?;
+        architectures.push(
+            download_arch(
+                &client,
+                channel_url,
+                &channel,
+                *arch,
+                directory,
+                everything,
+                trust,
+                output,
+            )
+            .await?,
+        );
     }
-    println!("{}", saved_summary(directory, &chosen));
-    Ok(())
+    print_output(
+        &Downloaded {
+            directory: directory.to_path_buf(),
+            version: channel.version,
+            architectures,
+        },
+        output,
+    )
 }
 
 /// Fetch and verify one architecture's build into `<directory>/<arch>/`.
+#[allow(clippy::too_many_arguments)]
 async fn download_arch(
     client: &reqwest::Client,
     channel_url: &str,
@@ -242,7 +305,8 @@ async fn download_arch(
     directory: &Path,
     everything: bool,
     trust: &ChannelTrust,
-) -> Result<(), RelishError> {
+    output: OutputFormat,
+) -> Result<DownloadedArch, RelishError> {
     let arch = arch.directory();
     let entry = channel
         .architectures
@@ -265,12 +329,16 @@ async fn download_arch(
         arch_dir.join(format!("{}.sig", entry.sums)),
         &sums_signature,
     )?;
-    println!(
-        "OS {} for {arch} ({}), checked against {}",
-        channel.version,
-        entry.tag,
-        trust.checked_against()
+    progress(
+        output,
+        format!(
+            "OS {} for {arch} ({}), checked against {}",
+            channel.version,
+            entry.tag,
+            trust.checked_against()
+        ),
     );
+    let mut files = Vec::new();
     for name in wanted(&entries, &channel.version, everything) {
         let expected = entries
             .iter()
@@ -279,7 +347,12 @@ async fn download_arch(
             .unwrap_or_default();
         let path = local_path(&arch_dir, &name);
         if path.is_file() && sha256_file(&path)? == expected {
-            println!("  {name}: already here");
+            progress(output, format!("  {name}: already here"));
+            files.push(DownloadedFile {
+                name,
+                path,
+                fetched_bytes: None,
+            });
             continue;
         }
         let url = asset_url(channel_url, &entry.tag, &name)?;
@@ -289,9 +362,21 @@ async fn download_arch(
             let _ = std::fs::remove_file(&path);
             failed(&e.to_string())
         })?;
-        println!("  {name}: {} MB, checked", bytes / 1_000_000);
+        progress(
+            output,
+            format!("  {name}: {} MB, checked", bytes / 1_000_000),
+        );
+        files.push(DownloadedFile {
+            name,
+            path,
+            fetched_bytes: Some(bytes),
+        });
     }
-    Ok(())
+    Ok(DownloadedArch {
+        arch: arch.to_string(),
+        tag: entry.tag.clone(),
+        files,
+    })
 }
 
 pub(crate) async fn fetch(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, RelishError> {
@@ -353,7 +438,7 @@ pub fn sha256_file(path: &Path) -> std::io::Result<String> {
 /// `relish image write`: copy a disk image (decompressing `.zst`) onto a
 /// device, such as a disk you install the appliance on directly or a stick
 /// to run it from. Everything on the device is lost.
-pub fn write(image: &Path, device: &Path, confirmed: bool) -> Result<u64, RelishError> {
+pub fn write(image: &Path, device: &Path, confirmed: bool) -> Result<Written, RelishError> {
     if !confirmed {
         return Err(failed(&format!(
             "this erases everything on {}; run again with --yes if that's what you want",
@@ -381,7 +466,11 @@ pub fn write(image: &Path, device: &Path, confirmed: bool) -> Result<u64, Relish
         total += read as u64;
     }
     target.sync_all()?;
-    Ok(total)
+    Ok(Written {
+        image: image.to_path_buf(),
+        device: device.to_path_buf(),
+        bytes: total,
+    })
 }
 
 fn failed(message: &str) -> RelishError {
@@ -514,15 +603,50 @@ mod tests {
         assert!(parse_arch("arm64").is_err());
     }
 
+    fn downloaded(arches: &[&str]) -> Downloaded {
+        Downloaded {
+            directory: PathBuf::from("os"),
+            version: "2026.41.0".into(),
+            architectures: arches
+                .iter()
+                .map(|arch| DownloadedArch {
+                    arch: arch.to_string(),
+                    tag: "os-v2026.41.0".into(),
+                    files: vec![DownloadedFile {
+                        name: "boot.ipxe".into(),
+                        path: Path::new("os").join(arch).join("netboot/boot.ipxe"),
+                        fetched_bytes: None,
+                    }],
+                })
+                .collect(),
+        }
+    }
+
     #[test]
     fn the_summary_names_each_architecture_saved() {
         assert_eq!(
-            saved_summary(Path::new("os"), &[Arch::X86_64, Arch::Arm64]),
-            "Saved x86_64 and aarch64 under os (os/x86_64/, os/aarch64/)"
+            downloaded(&["x86_64", "aarch64"]).to_string(),
+            "Saved x86_64 and aarch64 under os (os/x86_64/, os/aarch64/)\n"
         );
         assert_eq!(
-            saved_summary(Path::new("os"), &[Arch::X86_64]),
-            "Saved x86_64 under os (os/x86_64/)"
+            downloaded(&["x86_64"]).to_string(),
+            "Saved x86_64 under os (os/x86_64/)\n"
+        );
+    }
+
+    #[test]
+    fn a_download_as_data_lists_every_file_and_whether_it_was_fetched() {
+        let json = serde_json::to_value(downloaded(&["x86_64"])).unwrap();
+        assert_eq!(json["version"], "2026.41.0");
+        assert_eq!(json["architectures"][0]["arch"], "x86_64");
+        assert_eq!(json["architectures"][0]["tag"], "os-v2026.41.0");
+        assert_eq!(
+            json["architectures"][0]["files"][0],
+            serde_json::json!({
+                "name": "boot.ipxe",
+                "path": "os/x86_64/netboot/boot.ipxe",
+                "fetched_bytes": null
+            })
         );
     }
 
@@ -649,7 +773,18 @@ mod tests {
         std::fs::write(&device, b"").unwrap();
         assert!(write(&image, &device, false).is_err());
         assert_eq!(std::fs::read(&device).unwrap(), b"");
-        assert_eq!(write(&image, &device, true).unwrap(), raw.len() as u64);
+        let written = write(&image, &device, true).unwrap();
+        assert_eq!(written.bytes, raw.len() as u64);
+        assert_eq!(written.device, device);
         assert_eq!(std::fs::read(&device).unwrap(), raw);
+        assert_eq!(
+            Written {
+                image: image.clone(),
+                device: PathBuf::from("/dev/sdb"),
+                bytes: 2_400_000_000,
+            }
+            .to_string(),
+            "wrote 2400 MB to /dev/sdb\n"
+        );
     }
 }
