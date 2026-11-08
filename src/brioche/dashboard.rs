@@ -191,8 +191,8 @@ pub fn render_summary_fragment(summary: Option<&ClusterSummary>) -> String {
 pub fn status_dot(state: &str) -> &'static str {
     match state.to_lowercase().as_str() {
         "running" | "alive" | "healthy" => "<span class=\"dot-green\">●</span>",
-        "pending" | "preparing" => "<span class=\"dot-amber\">●</span>",
-        "failed" | "unhealthy" | "dead" | "blocked" => "<span class=\"dot-red\">●</span>",
+        "pending" | "preparing" | "degraded" | "troubled" => "<span class=\"dot-amber\">●</span>",
+        "failed" | "unhealthy" | "dead" | "blocked" | "down" => "<span class=\"dot-red\">●</span>",
         _ => "<span class=\"dot-grey\">●</span>",
     }
 }
@@ -568,6 +568,15 @@ mod tests {
         // A normal value round-trips unchanged (no over-escaping).
         assert_eq!(escape_html("web-frontend"), "web-frontend");
         assert_eq!(escape_html("prod_namespace"), "prod_namespace");
+    }
+
+    #[test]
+    fn app_states_get_the_dots_their_words_deserve() {
+        assert!(status_dot("down").contains("dot-red"));
+        assert!(status_dot("degraded").contains("dot-amber"));
+        assert!(status_dot("troubled").contains("dot-amber"));
+        assert!(status_dot("stopped").contains("dot-grey"));
+        assert!(status_dot("unknown").contains("dot-grey"));
     }
 
     #[test]

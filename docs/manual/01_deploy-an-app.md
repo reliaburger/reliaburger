@@ -314,11 +314,12 @@ App: big (namespace shop)
   Blocked:   namespace "shop" would exceed CPU quota: 3000+2000 > 4000m
 ```
 
-The dashboard marks the app `blocked` with the same reason on its page, and
-`relish wtf` raises a `quota-blocked` warning. The reason lives in the
-council, so any node gives the same answer. Raise the budget, or shrink or
-delete other apps in the namespace, and the next scheduling pass (a few seconds
-later) places the app and clears the reason.
+The dashboard lists the app as `down` and says `Not placed, blocked:` with
+the same reason on its page, and `relish wtf` raises a `quota-blocked`
+warning. The reason lives in the council, so any node gives the same answer.
+Raise the budget, or shrink or delete other apps in the namespace, and the
+next scheduling pass (a few seconds later) places the app and clears the
+reason.
 
 The same budget covers jobs. The leader charges each job attempt it lets start
 against the namespace's `cpu`, `memory` and GPU budget, after the namespace's

@@ -366,7 +366,7 @@ matching gates run.
 
 Brioche is a single HTML page. No React, no Vue, no webpack. The server renders the HTML with current data, embeds a 2KB CSS stylesheet, and sends it. The browser refreshes every 5 seconds via a `<meta http-equiv="refresh">` tag.
 
-The dashboard shows three sections: apps (name, status, instance count), nodes (name, state, app count), and alerts. Status dots are green for healthy, amber for pending, red for failed. The dark theme is easy on the eyes during those late-night debugging sessions.
+The dashboard shows three sections: apps (name, status, instance count), nodes (name, state, app count), and alerts. Status dots are green for healthy, amber for pending, red for failed. (From 0.2.8 an app's status is the word `relish apps` uses, `running`, `degraded`, `down` or `stopped`, from one shared rollup; see [Built for Humans and Their Agents](19-built-for-agents.md#brioches-dashboard).) The dark theme is easy on the eyes during those late-night debugging sessions.
 
 Total payload: under 10KB. First paint: instant.
 

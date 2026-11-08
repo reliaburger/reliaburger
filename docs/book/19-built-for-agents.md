@@ -1717,9 +1717,17 @@ every app" with the reason where the table would be. A test drives exactly
 that through the real router: a peer on a port nothing listens on, then `/`
 and `/ui/fragment/summary`, both expected to say `DEGRADED` and `partial`.
 
-The app table itself still uses its own rollup, with Brioche's `pending`,
-`blocked` and `unhealthy` words. It's a list, and its states predate
-`app_state`; moving it over is a separate change.
+The app table had its own rollup too, with words of its own: `pending`
+until every replica ran, `blocked` when the quota or a missing volume home
+held the app back, `unhealthy` when any instance had failed. So one app
+could be `degraded` in `relish apps` and `pending` on the page. Now
+`statuses_to_dashboard_apps` counts the running instances per app and asks
+`summary::app_state` for the word, the same call the summary and `relish
+apps` make. It passes `nodes_unanswered: false`, which is true here: the
+statuses come from every node or the call fails. A blocked app reads
+`down` in the table, as it does in `relish apps`, and its page still says
+`Not placed, blocked:` and why. The status dots learned the new words:
+amber for `degraded`, red for `down`.
 
 ## Logs and the manual
 

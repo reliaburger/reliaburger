@@ -132,58 +132,50 @@ pub(super) async fn ui_logout_handler(
 }
 
 /// Build dashboard app rows from instance statuses.
+///
+/// Each row's state is [`crate::bun::summary::app_state`]'s word, the
+/// rollup the summary, `relish apps` and `relish status` use, so an app
+/// can't read `degraded` in one place and something else here. The
+/// statuses come from every node or the call fails, so no node is
+/// unanswered; findings are `wtf`'s, which Brioche doesn't run.
 pub(super) fn statuses_to_dashboard_apps(
     statuses: &[InstanceStatus],
     desired: &[crate::bun::diagnostics::DesiredAppEvidence],
 ) -> Vec<DashboardApp> {
-    let mut rows = std::collections::BTreeMap::new();
-    for app in desired {
-        rows.insert(
-            (app.namespace.clone(), app.app.clone()),
+    let mut running: std::collections::BTreeMap<(&str, &str), usize> =
+        std::collections::BTreeMap::new();
+    for instance in statuses
+        .iter()
+        .filter(|instance| instance.state == "running")
+    {
+        *running
+            .entry((instance.namespace.as_str(), instance.app_name.as_str()))
+            .or_default() += 1;
+    }
+    let mut rows: Vec<DashboardApp> = desired
+        .iter()
+        .map(|app| {
+            let instances_running = running
+                .get(&(app.namespace.as_str(), app.app.as_str()))
+                .copied()
+                .unwrap_or(0);
+            let state = crate::bun::summary::app_state(
+                app.desired_replicas,
+                u32::try_from(instances_running).unwrap_or(u32::MAX),
+                false,
+                false,
+            );
             DashboardApp {
                 name: app.app.clone(),
                 namespace: app.namespace.clone(),
-                instances_running: 0,
+                instances_running,
                 instances_desired: app.desired_replicas as usize,
-                state: "pending".to_string(),
-            },
-        );
-    }
-    for instance in statuses {
-        let Some(row) = rows.get_mut(&(instance.namespace.clone(), instance.app_name.clone()))
-        else {
-            continue;
-        };
-        if instance.state == "running" {
-            row.instances_running += 1;
-        }
-        if matches!(instance.state.as_str(), "failed" | "unhealthy") {
-            row.state = "unhealthy".into();
-        }
-    }
-    // A quota block, or a volume app waiting for its home node (#423): either
-    // way the scheduler holds it back on purpose, so it reads as blocked.
-    for app in desired
-        .iter()
-        .filter(|app| app.blocked.is_some() || app.volume_home_away.is_some())
-    {
-        if let Some(row) = rows.get_mut(&(app.namespace.clone(), app.app.clone()))
-            && row.state == "pending"
-        {
-            row.state = "blocked".into();
-        }
-    }
-    for row in rows.values_mut() {
-        if row.state != "unhealthy" && row.instances_running == row.instances_desired {
-            row.state = if row.instances_desired == 0 {
-                "stopped"
-            } else {
-                "running"
+                state: state.word().to_string(),
             }
-            .into();
-        }
-    }
-    rows.into_values().collect()
+        })
+        .collect();
+    rows.sort_by(|left, right| (&left.namespace, &left.name).cmp(&(&right.namespace, &right.name)));
+    rows
 }
 
 pub(super) async fn gather_dashboard_apps(

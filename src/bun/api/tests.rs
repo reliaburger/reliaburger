@@ -7649,7 +7649,7 @@ fn council_app_evidence_names_the_nodes_holding_an_apps_volume() {
 }
 
 #[test]
-fn dashboard_shows_desired_replicas_and_counts_only_running_instances() {
+fn dashboard_states_come_from_the_shared_app_rollup() {
     let mut running: InstanceStatus = serde_json::from_value(serde_json::json!({
         "id":"web-0", "app_name":"web", "namespace":"default", "state":"running",
         "restart_count":0,"host_port":null,"pid":null
@@ -7688,19 +7688,39 @@ fn dashboard_shows_desired_replicas_and_counts_only_running_instances() {
             volume_homes: Vec::new(),
         },
     ];
-    let rows = statuses_to_dashboard_apps(&[running.clone(), failed], &desired);
+    let rows = statuses_to_dashboard_apps(&[running.clone(), failed.clone()], &desired);
     let web = rows.iter().find(|row| row.name == "web").unwrap();
     assert_eq!((web.instances_running, web.instances_desired), (1, 3));
-    assert_ne!(web.state, "running");
+    assert_eq!(web.state, "degraded", "the word relish apps and status use");
     let pending = rows.iter().find(|row| row.name == "pending").unwrap();
     assert_eq!(
         (pending.instances_running, pending.instances_desired),
         (0, 2)
     );
-    assert_eq!(pending.state, "pending");
+    assert_eq!(pending.state, "down");
 
-    // #326: an app the namespace quota keeps off every node reads as
-    // blocked, not as waiting for room.
+    // Every replica running reads `running`, even beside a failed extra.
+    let mut second = running.clone();
+    second.id = "web-2".into();
+    let mut third = running.clone();
+    third.id = "web-3".into();
+    let rows = statuses_to_dashboard_apps(&[running.clone(), second, third, failed], &desired);
+    assert_eq!(
+        rows.iter().find(|row| row.name == "web").unwrap().state,
+        "running"
+    );
+
+    // An app that wants no replicas is stopped.
+    let mut stopped = desired.clone();
+    stopped[1].desired_replicas = 0;
+    let rows = statuses_to_dashboard_apps(&[running.clone()], &stopped);
+    assert_eq!(
+        rows.iter().find(|row| row.name == "pending").unwrap().state,
+        "stopped"
+    );
+
+    // #326, #423: an app the quota or a missing volume home holds back is
+    // `down` in the table, as in `relish apps`; its page says why.
     let mut quota_blocked = desired.clone();
     quota_blocked[1].blocked = Some(crate::meat::quota::QuotaError::MaxAppsExceeded {
         namespace: "default".into(),
@@ -7708,15 +7728,10 @@ fn dashboard_shows_desired_replicas_and_counts_only_running_instances() {
         limit: 1,
     });
     let rows = statuses_to_dashboard_apps(&[running.clone()], &quota_blocked);
-    let pending = rows.iter().find(|row| row.name == "pending").unwrap();
-    assert_eq!(pending.state, "blocked");
-
-    // #423: so does a volume app waiting for the node that holds its data.
-    let mut waiting = desired.clone();
-    waiting[1].volume_home_away = Some("node-2".into());
-    let rows = statuses_to_dashboard_apps(&[running.clone()], &waiting);
-    let pending = rows.iter().find(|row| row.name == "pending").unwrap();
-    assert_eq!(pending.state, "blocked");
+    assert_eq!(
+        rows.iter().find(|row| row.name == "pending").unwrap().state,
+        "down"
+    );
 
     running.state = "stopped".into();
     let rows = statuses_to_dashboard_apps(&[running], &desired);
