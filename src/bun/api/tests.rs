@@ -273,7 +273,7 @@ async fn seeded_council_with_log(
     )
     .await
     .unwrap();
-    raft_router.register(1, node.raft().clone()).await;
+    raft_router.register(1, &node).await;
     let mut members = BTreeMap::new();
     members.insert(
         1,
@@ -1628,7 +1628,7 @@ async fn lease_reads_forward_user_authority_and_refuse_an_isolated_leader() {
             .await
             .unwrap(),
         );
-        network.register(id, node.raft().clone()).await;
+        network.register(id, &node).await;
         nodes.push(node);
     }
     nodes[0].initialize(members).await.unwrap();
@@ -1834,7 +1834,7 @@ async fn council_and_network(
             .await
             .unwrap(),
         );
-        network.register(id, node.raft().clone()).await;
+        network.register(id, &node).await;
         nodes.push(node);
     }
     nodes[0].initialize(members).await.unwrap();
@@ -1932,7 +1932,7 @@ async fn follower_with_history_of_a_recording_leader(
             .await
             .unwrap(),
         );
-        network.register(id, node.raft().clone()).await;
+        network.register(id, &node).await;
         nodes.push(node);
     }
     nodes[0].initialize(members).await.unwrap();
@@ -2284,7 +2284,7 @@ async fn router_of_a_leader_without_quorum(
             .await
             .unwrap(),
         );
-        network.register(id, node.raft().clone()).await;
+        network.register(id, &node).await;
         nodes.push(node);
     }
     nodes[0].initialize(members).await.unwrap();
@@ -2470,7 +2470,7 @@ async fn a_node_with_no_leader_or_a_closed_fence_answers_run_calls_503_not_404()
         )
         .await
         .unwrap();
-        network.register(1, node.raft().clone()).await;
+        network.register(1, &node).await;
         if initialised {
             let info = CouncilNodeInfo::new("127.0.0.1:9444".parse().unwrap(), "node-1");
             node.initialize(std::collections::BTreeMap::from([(1, info)]))
@@ -2934,7 +2934,7 @@ async fn lease_created_through_a_lagging_follower_is_in_its_replica_when_returne
             .await
             .unwrap(),
         );
-        network.register(id, node.raft().clone()).await;
+        network.register(id, &node).await;
         nodes.push(node);
     }
     nodes[0].initialize(members).await.unwrap();
@@ -4192,7 +4192,7 @@ async fn seeded_council_with_ikm(tag: &str) -> Arc<crate::council::CouncilNode> 
     )
     .await
     .unwrap();
-    raft_router.register(1, node.raft().clone()).await;
+    raft_router.register(1, &node).await;
     let mut members = BTreeMap::new();
     members.insert(
         1,
@@ -7200,7 +7200,7 @@ async fn health_says_whether_this_node_is_a_council_voter() {
         )
         .await
         .unwrap();
-        router.register(1, node.raft().clone()).await;
+        router.register(1, &node).await;
         if initialised {
             let info = CouncilNodeInfo::new("127.0.0.1:9444".parse().unwrap(), "node-1");
             node.initialize(std::collections::BTreeMap::from([(1, info)]))
@@ -10087,7 +10087,7 @@ async fn a_follower_forwards_the_signed_webhook_and_handover_keeps_its_admitted_
             .await
             .unwrap(),
         );
-        transport.register(id, node.raft().clone()).await;
+        transport.register(id, &node).await;
         nodes.push(node);
         listeners.push(listener);
     }
@@ -10393,7 +10393,7 @@ async fn whole_webhook_budget_bounds_held_follower_metadata_and_restores_reserva
             .await
             .unwrap(),
         );
-        transport.register(id, node.raft().clone()).await;
+        transport.register(id, &node).await;
         nodes.push(node);
         listeners.push(listener);
     }

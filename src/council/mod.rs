@@ -23,6 +23,7 @@ pub mod owner;
 pub mod proof;
 pub mod recovery;
 pub(crate) mod recovery_storage;
+pub mod return_hold;
 pub mod selection;
 pub mod state_machine;
 pub mod types;

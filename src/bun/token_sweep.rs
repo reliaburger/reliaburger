@@ -184,7 +184,7 @@ mod tests {
         )
         .await
         .unwrap();
-        raft_router.register(1, node.raft().clone()).await;
+        raft_router.register(1, &node).await;
         let members = BTreeMap::from([(
             1,
             CouncilNodeInfo {

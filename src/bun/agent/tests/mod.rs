@@ -4109,7 +4109,7 @@ async fn catalogue_council(raft_port: u16) -> Arc<CouncilNode> {
     )
     .await
     .unwrap();
-    router.register(1, node.raft().clone()).await;
+    router.register(1, &node).await;
     let address = std::net::SocketAddr::from(([127, 0, 0, 1], raft_port));
     node.initialize(std::collections::BTreeMap::from([(
         1u64,

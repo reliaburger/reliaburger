@@ -201,7 +201,7 @@ pub async fn build_council() -> (Vec<Arc<CouncilNode>>, InMemoryRaftRouter) {
         )
         .await
         .unwrap();
-        router.register(rid(index), node.raft().clone()).await;
+        router.register(rid(index), &node).await;
         nodes.push(Arc::new(node));
     }
 

@@ -492,6 +492,7 @@ pub async fn start(
 
     let raft_listener = tokio::net::TcpListener::bind(raft_addr).await?;
     let raft = council.raft().clone();
+    let rpc_contact = council.leader_contact();
     let rpc_shutdown = shutdown.clone();
     let rpc_acceptor = raft_acceptor.clone();
     let rpc_node_gate = node_gate.clone();
@@ -503,6 +504,7 @@ pub async fn start(
         serve_raft_rpc_with_node_gate(
             raft_listener,
             raft,
+            rpc_contact,
             rpc_shutdown,
             rpc_acceptor,
             rpc_fence,
@@ -563,6 +565,16 @@ pub async fn start(
         Arc::clone(&council),
         directory_rx.clone(),
         disk_pressured_tx,
+        shutdown.clone(),
+    );
+
+    // A council node back on its old log holds its elections while gossip
+    // names a live leader, until a leader replicates to it (#1524).
+    spawn_gossip_leader_reporter(
+        Arc::clone(&council),
+        directory_rx.clone(),
+        membership_rx.clone(),
+        NodeId::new(&params.node_name),
         shutdown.clone(),
     );
 
@@ -1366,6 +1378,50 @@ pub fn spawn_disk_pressure_consumer(
     });
 }
 
+/// Whether gossip names a live leader other than `self_node` (#1524): the
+/// leader's own hint, for a node gossip counts alive. A suspect leader
+/// doesn't count, so a hint left over from a dying leader can't keep a
+/// returning node from campaigning.
+pub fn gossip_names_live_leader(
+    directory: &NodeDirectory,
+    members: &[MembershipSnapshot],
+    self_node: &NodeId,
+) -> bool {
+    directory.leader.as_ref().is_some_and(|hint| {
+        hint.node_id != *self_node
+            && members
+                .iter()
+                .any(|member| member.node_id == hint.node_id && member.state == NodeState::Alive)
+    })
+}
+
+/// Tell a council node that came back on its old log whether gossip names
+/// a live leader, until its return hold ends (#1524). Elsewhere it reports
+/// nothing and exits at once.
+pub fn spawn_gossip_leader_reporter(
+    council: Arc<CouncilNode>,
+    mut directory_rx: watch::Receiver<NodeDirectory>,
+    mut membership_rx: watch::Receiver<Vec<MembershipSnapshot>>,
+    self_node: NodeId,
+    shutdown: CancellationToken,
+) {
+    tokio::spawn(async move {
+        while council.elections_held_on_return() {
+            // One borrow at a time (#1273): copy the hint out first.
+            let directory = directory_rx.borrow().clone();
+            let live = gossip_names_live_leader(&directory, &membership_rx.borrow(), &self_node);
+            council.report_gossip_leader(live);
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                changed = directory_rx.changed() => if changed.is_err() { break },
+                changed = membership_rx.changed() => if changed.is_err() { break },
+                // The hold can end on contact alone, with gossip quiet.
+                () = tokio::time::sleep(RECONCILE_INTERVAL) => {}
+            }
+        }
+    });
+}
+
 /// One reconciler tick: observe, plan, execute at most one action.
 #[allow(clippy::too_many_arguments)]
 async fn reconcile_council_once(
@@ -1661,6 +1717,88 @@ mod tests {
     use crate::cluster::identity::raft_id_from_name;
     use crate::mustard::state::NodeState;
 
+    fn leader_hint(name: &str) -> LeaderHint {
+        LeaderHint {
+            node_id: NodeId::new(name),
+            term: 3,
+            recovery_epoch: 0,
+            api_address: "127.0.0.1:9000".parse().unwrap(),
+            reporting_address: "127.0.0.1:9001".parse().unwrap(),
+        }
+    }
+
+    fn gossip_member(name: &str, state: NodeState) -> MembershipSnapshot {
+        MembershipSnapshot {
+            node_id: NodeId::new(name),
+            address: "127.0.0.1:9443".parse().unwrap(),
+            state,
+            incarnation: 1,
+            is_council: false,
+            is_leader: false,
+            labels: BTreeMap::new(),
+            first_seen: Instant::now(),
+            resources: None,
+        }
+    }
+
+    #[test]
+    fn gossip_names_a_live_leader_when_the_hint_names_an_alive_peer() {
+        let directory = NodeDirectory {
+            leader: Some(leader_hint("node-1")),
+            ..NodeDirectory::default()
+        };
+        let members = [gossip_member("node-1", NodeState::Alive)];
+        assert!(gossip_names_live_leader(
+            &directory,
+            &members,
+            &NodeId::new("node-2")
+        ));
+    }
+
+    #[test]
+    fn gossip_names_no_live_leader_without_a_hint() {
+        let members = [gossip_member("node-1", NodeState::Alive)];
+        assert!(!gossip_names_live_leader(
+            &NodeDirectory::default(),
+            &members,
+            &NodeId::new("node-2")
+        ));
+    }
+
+    #[test]
+    fn a_hint_naming_this_node_is_no_live_leader() {
+        let directory = NodeDirectory {
+            leader: Some(leader_hint("node-2")),
+            ..NodeDirectory::default()
+        };
+        let members = [gossip_member("node-2", NodeState::Alive)];
+        assert!(!gossip_names_live_leader(
+            &directory,
+            &members,
+            &NodeId::new("node-2")
+        ));
+    }
+
+    #[test]
+    fn a_hint_naming_a_suspect_or_unknown_node_is_no_live_leader() {
+        let directory = NodeDirectory {
+            leader: Some(leader_hint("node-1")),
+            ..NodeDirectory::default()
+        };
+        let suspect = [gossip_member("node-1", NodeState::Suspect)];
+        assert!(!gossip_names_live_leader(
+            &directory,
+            &suspect,
+            &NodeId::new("node-2")
+        ));
+        let other = [gossip_member("node-3", NodeState::Alive)];
+        assert!(!gossip_names_live_leader(
+            &directory,
+            &other,
+            &NodeId::new("node-2")
+        ));
+    }
+
     #[test]
     fn reconciler_without_a_size_cap_grows_the_council_to_seven() {
         let config = CouncilReconcilerConfig::with_size_cap(None);
@@ -1698,7 +1836,7 @@ mod tests {
         )
         .await
         .unwrap();
-        router.register(1, council.raft().clone()).await;
+        router.register(1, &council).await;
         let members = BTreeMap::from([(1, info("bootstrap", 9444))]);
         let security = crate::sesame::types::SecurityState {
             next_serial: 42,
@@ -1740,7 +1878,7 @@ mod tests {
         )
         .await
         .unwrap();
-        router.register(1, council.raft().clone()).await;
+        router.register(1, &council).await;
         let members = BTreeMap::from([(1, info("bootstrap", 9444))]);
         initialise_bootstrap(&council, members, None, None)
             .await
@@ -1775,7 +1913,7 @@ mod tests {
             )
             .await
             .unwrap();
-            router.register(id, council.raft().clone()).await;
+            router.register(id, &council).await;
             nodes.push(council);
         }
         initialise_bootstrap(
@@ -1869,7 +2007,7 @@ mod tests {
             )
             .await
             .unwrap();
-            router.register(id, node.raft().clone()).await;
+            router.register(id, &node).await;
             nodes.push(node);
         }
         let self_id = raft_id_from_name("node-1");
@@ -2134,7 +2272,7 @@ mod tests {
             )
             .await
             .unwrap();
-            router.register(id, node.raft().clone()).await;
+            router.register(id, &node).await;
             nodes.push(node);
         }
 
@@ -2222,7 +2360,7 @@ mod tests {
             )
             .await
             .unwrap();
-            router.register(id, node.raft().clone()).await;
+            router.register(id, &node).await;
             nodes.push(node);
         }
 
@@ -2324,7 +2462,7 @@ mod tests {
             )
             .await
             .unwrap();
-            router.register(id, node.raft().clone()).await;
+            router.register(id, &node).await;
             nodes.push(node);
         }
 
@@ -2420,7 +2558,7 @@ mod tests {
         )
         .await
         .unwrap();
-        router.register(id, node.raft().clone()).await;
+        router.register(id, &node).await;
         let mut members = BTreeMap::new();
         members.insert(id, info("node-1", 9444));
         node.initialize(members).await.unwrap();
@@ -2535,7 +2673,7 @@ mod tests {
             )
             .await
             .unwrap();
-            router.register(id, node.raft().clone()).await;
+            router.register(id, &node).await;
             members.insert(id, info(name, 9444 + 2 * index as u16));
             nodes.push(node);
         }

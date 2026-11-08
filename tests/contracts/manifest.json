@@ -7364,6 +7364,33 @@
       ]
     },
     {
+      "id": "issue-1524-returning-voter-hold",
+      "issue": 1524,
+      "promise": "A voter replaced while it was down and then restarted on its old Raft state holds its elections until it hears from a leader, so rejoining as a learner never deposes the leader or raises its term.",
+      "supported_paths": [
+        "In-process clusters on the real cluster runtime and the in-memory Raft router"
+      ],
+      "refused_paths": [
+        "A returning node's election campaign while a leader it can reach is live"
+      ],
+      "boundaries": [
+        "After the grace with no live leader in gossip, or at the cap, the hold ends and the node may campaign, as a whole-cluster restart needs."
+      ],
+      "cases": [
+        {
+          "id": "returning-voter-a_replaced_voter_coming_back_joins_as_a_learner_without_an_election",
+          "binary": "reliaburger::council_self_healing",
+          "test": "a_replaced_voter_coming_back_joins_as_a_learner_without_an_election",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/council_self_healing.rs"
+          ]
+        }
+      ]
+    },
+    {
       "id": "issue-696-gossip-datagram-budget",
       "issue": 696,
       "promise": "Gossip probes from nodes with the longest names and a full label set fit the 1,400-byte datagram, so those nodes keep acknowledging and stay alive through churn.",

@@ -18,6 +18,7 @@
 //! campaigns again.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use openraft::Raft;
@@ -75,20 +76,57 @@ pub fn campaign_round(election_timeout_max: Duration) -> Duration {
 /// [`hold_until`](Self::hold_until) switches elections off and starts the
 /// task that switches them back on. Repeated holds only push the deadline
 /// out, so the reconciler can renew a hold every tick.
+///
+/// A node back on its old log holds its elections for a second reason, until
+/// it hears from a leader ([`hold_on_return`](Self::hold_on_return), #1524).
+/// Elections come back on only when neither hold is left; both releases run
+/// under `until`'s write lock, so one can't switch elections on just as the
+/// other starts.
 pub(crate) struct ElectionHold {
     raft: Raft<TypeConfig>,
     self_id: u64,
     until: Arc<watch::Sender<Option<Instant>>>,
+    returning: Arc<AtomicBool>,
 }
 
 impl ElectionHold {
-    /// A hold for `raft`, not yet held.
-    pub(crate) fn new(raft: Raft<TypeConfig>, self_id: u64) -> Self {
+    /// A hold for `raft`, not yet held. `returning` says whether openraft was
+    /// started with elections off because the node is back on its old log.
+    pub(crate) fn new(raft: Raft<TypeConfig>, self_id: u64, returning: bool) -> Self {
         Self {
             raft,
             self_id,
             until: Arc::new(watch::Sender::new(None)),
+            returning: Arc::new(AtomicBool::new(returning)),
         }
+    }
+
+    /// Keep elections off, as openraft started, until the return hold ends
+    /// (see [`super::return_hold`]): a leader's AppendEntries arrives, the
+    /// grace passes with gossip naming no live leader, or the cap passes.
+    pub(crate) fn hold_on_return(
+        &self,
+        contact: watch::Receiver<bool>,
+        gossip_leader: watch::Receiver<bool>,
+        grace: Duration,
+        cap: Duration,
+    ) {
+        let now = Instant::now();
+        tokio::spawn(release_on_return(
+            self.raft.clone(),
+            Arc::clone(&self.until),
+            Arc::clone(&self.returning),
+            contact,
+            gossip_leader,
+            now + grace,
+            now + cap,
+        ));
+    }
+
+    /// Whether this node is still holding its elections since it came back
+    /// on its old log.
+    pub(crate) fn is_held_on_return(&self) -> bool {
+        self.returning.load(Ordering::SeqCst)
     }
 
     /// Stop campaigning until another voter leads or `until` passes,
@@ -108,6 +146,7 @@ impl ElectionHold {
                 self.raft.clone(),
                 self.self_id,
                 Arc::clone(&self.until),
+                Arc::clone(&self.returning),
             ));
         }
     }
@@ -123,6 +162,7 @@ async fn release_when_settled(
     raft: Raft<TypeConfig>,
     self_id: u64,
     until: Arc<watch::Sender<Option<Instant>>>,
+    returning: Arc<AtomicBool>,
 ) {
     let mut metrics = raft.metrics();
     loop {
@@ -137,7 +177,9 @@ async fn release_when_settled(
             if !hold_ends(self_id, leader, Instant::now(), deadline) {
                 return false;
             }
-            raft.runtime_config().elect(true);
+            if !returning.load(Ordering::SeqCst) {
+                raft.runtime_config().elect(true);
+            }
             *held = None;
             true
         });
@@ -153,6 +195,52 @@ async fn release_when_settled(
                 }
             }
             () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {}
+        }
+    }
+}
+
+/// End a returning node's hold (#1524) once
+/// [`return_hold_ends`](super::return_hold::return_hold_ends) says so.
+async fn release_on_return(
+    raft: Raft<TypeConfig>,
+    until: Arc<watch::Sender<Option<Instant>>>,
+    returning: Arc<AtomicBool>,
+    mut contact: watch::Receiver<bool>,
+    mut gossip_leader: watch::Receiver<bool>,
+    grace_until: Instant,
+    cap_until: Instant,
+) {
+    loop {
+        let now = Instant::now();
+        // Copy each value out in its own statement: never two watch borrows
+        // at once (#1273).
+        let heard = *contact.borrow();
+        let gossip_names_leader = *gossip_leader.borrow();
+        if super::return_hold::return_hold_ends(
+            heard,
+            gossip_names_leader,
+            now,
+            grace_until,
+            cap_until,
+        ) {
+            until.send_if_modified(|handover| {
+                returning.store(false, Ordering::SeqCst);
+                if handover.is_none() {
+                    raft.runtime_config().elect(true);
+                }
+                false
+            });
+            return;
+        }
+        let next = if now < grace_until {
+            grace_until
+        } else {
+            cap_until
+        };
+        tokio::select! {
+            changed = contact.changed() => if changed.is_err() { return },
+            changed = gossip_leader.changed() => if changed.is_err() { return },
+            () = tokio::time::sleep_until(tokio::time::Instant::from_std(next)) => {}
         }
     }
 }

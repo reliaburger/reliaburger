@@ -1973,7 +1973,7 @@ mod tests {
         )
         .await
         .unwrap();
-        router.register(1, node.raft().clone()).await;
+        router.register(1, &node).await;
         let members = std::collections::BTreeMap::from([(
             1u64,
             CouncilNodeInfo::new("127.0.0.1:9001".parse().unwrap(), "node-1".to_string()),
@@ -2136,7 +2136,7 @@ mod tests {
         )
         .await
         .unwrap();
-        router.register(1, node.raft().clone()).await;
+        router.register(1, &node).await;
         let members = std::collections::BTreeMap::from([(
             1u64,
             CouncilNodeInfo::new("127.0.0.1:9002".parse().unwrap(), "node-1".to_string()),

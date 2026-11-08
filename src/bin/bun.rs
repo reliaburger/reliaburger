@@ -4814,7 +4814,7 @@ mod tests {
         )
         .await
         .unwrap();
-        raft_router.register(1, council.raft().clone()).await;
+        raft_router.register(1, &council).await;
         let mut members = BTreeMap::new();
         members.insert(
             1,

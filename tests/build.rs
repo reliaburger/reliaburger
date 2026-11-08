@@ -186,7 +186,7 @@ async fn single_node_leader() -> Arc<CouncilNode> {
     )
     .await
     .unwrap();
-    router.register(1, node.raft().clone()).await;
+    router.register(1, &node).await;
     let mut members = BTreeMap::new();
     members.insert(
         1u64,
@@ -221,7 +221,7 @@ async fn single_node_leader_with_security() -> Arc<CouncilNode> {
     )
     .await
     .unwrap();
-    router.register(1, node.raft().clone()).await;
+    router.register(1, &node).await;
     let mut members = BTreeMap::new();
     members.insert(
         1u64,
@@ -1402,7 +1402,7 @@ async fn two_node_council_with_security() -> (Arc<CouncilNode>, Arc<CouncilNode>
         )
         .await
         .unwrap();
-        router.register(id, node.raft().clone()).await;
+        router.register(id, &node).await;
         nodes.push(Arc::new(node));
     }
     let members = BTreeMap::from([
