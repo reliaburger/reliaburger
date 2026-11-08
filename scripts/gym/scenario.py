@@ -32,6 +32,9 @@ FAULT_KINDS = (
     "node_partitioned",
     "relish_bug",
     "binary_drift",
+    # A Smoker fault someone injected (`relish gym run`'s paused-app and
+    # killed-instance scenarios, #1683).
+    "injected_fault",
     "none",
     "other",
 )

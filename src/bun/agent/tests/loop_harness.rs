@@ -1748,6 +1748,51 @@ async fn a_consumer_compaction_hands_a_slow_journal_write_off_at_the_turn_deadli
     );
 }
 
+/// The 0.2.7 jobs final (#1707): a `consumer_sync/journal` turn took
+/// 1,215 ms, all of it journal write. A recovered consumer's first answer
+/// takes the journal step's other branch, which journals `Withdrawing`
+/// before anything publishes. Its write, and every later one, is that
+/// slow here, and each turn still hands off within the budget.
+#[tokio::test]
+async fn a_recovered_consumers_journal_step_hands_a_slow_write_off_at_the_turn_deadline() {
+    let (mut agent, _root, catalog, ingress) = recovered_consumer().await;
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
+    let (response, reply) = oneshot::channel();
+    agent
+        .request_consumer_sync(crate::bun::agent::consumer::ConsumerRequest {
+            generation: 1,
+            catalog,
+            ingress,
+            withdrawals: vec![],
+            answer: Some(crate::bun::agent::consumer::ConsumerAnswer {
+                requested_at_ns: crate::onion::lease::boot_clock_ns(),
+                response,
+            }),
+        })
+        .await;
+    let mut journal_steps = 0;
+    while !agent.consumer_syncs.is_idle() || agent.discovery_write_in_flight() {
+        let turn = one_consumer_sync_turn(&mut agent).await;
+        if turn.detail == Some("consumer_sync/journal") {
+            journal_steps += 1;
+            assert!(
+                agent.discovery_write_in_flight(),
+                "the journal step wrote nothing to hand off: {turn}"
+            );
+        }
+        assert!(
+            turn.took < TURN_BUDGET,
+            "{turn} waited for a {STALLED_JOURNAL_WRITE:?} journal write: {:?}",
+            turn.part(TurnPart::JournalWrite)
+        );
+    }
+    assert_eq!(journal_steps, 1, "the synchronisation never journalled");
+    assert!(reply.await.unwrap().unwrap().published);
+    assert_eq!(installed_remote_port(&agent), Some(30001));
+}
+
 /// A journal write that fails after the turn moved on fences discovery as
 /// a failed inline write does: ownership becomes uncertain, readiness says
 /// so, the view it would have recorded never reaches the kernel, and the

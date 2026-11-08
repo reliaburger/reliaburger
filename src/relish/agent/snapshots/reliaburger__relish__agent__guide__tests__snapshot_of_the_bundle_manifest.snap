@@ -25,6 +25,7 @@ expression: "artefact(paths::MCPB_MANIFEST)"
     "sre"
   ],
   "license": "Apache-2.0",
+  "long_description": "Read-only Reliaburger cluster diagnosis: the relish agent commands as MCP tools.\n\nWith the token setting empty, relish uses its current context, which may hold an admin token, and warns on stderr when it does; make a read-only token with `relish token create --name agent --role read-only --ttl-days 1` and put it in the token setting.",
   "manifest_version": "0.3",
   "name": "relish",
   "repository": {

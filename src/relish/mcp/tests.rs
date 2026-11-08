@@ -736,3 +736,55 @@ async fn wrong_arguments_are_a_tool_error_with_a_usage_envelope() {
         "{error}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The admin-token warning (#1695, decision (d)).
+
+/// A probe that never answers, so a test can show the warning doesn't wait
+/// on the network when the role is known locally.
+fn never() -> std::future::Pending<Option<crate::relish::client::TokenAccess>> {
+    std::future::pending()
+}
+
+#[tokio::test]
+async fn the_context_admin_token_warns_without_asking_the_cluster() {
+    use crate::relish::client::TokenOrigin;
+    let warning = tokio::time::timeout(
+        Duration::from_secs(5),
+        admin_warning(TokenOrigin::ContextAdmin, never()),
+    )
+    .await
+    .expect("a role known locally needs no network");
+    assert_eq!(warning, Some(ADMIN_TOKEN_WARNING));
+}
+
+#[tokio::test]
+async fn an_explicit_admin_token_warns() {
+    use crate::relish::client::{TokenAccess, TokenOrigin};
+    let warning = admin_warning(TokenOrigin::Explicit, async { Some(TokenAccess::Admin) }).await;
+    assert_eq!(warning, Some(ADMIN_TOKEN_WARNING));
+}
+
+#[tokio::test]
+async fn a_read_only_token_or_an_unknown_role_warns_about_nothing() {
+    use crate::relish::client::{TokenAccess, TokenOrigin};
+    for access in [None, Some(TokenAccess::Lesser), Some(TokenAccess::Rejected)] {
+        let warning = admin_warning(TokenOrigin::Explicit, async { access }).await;
+        assert_eq!(warning, None, "{access:?}");
+    }
+    let warning = admin_warning(TokenOrigin::Absent, never()).await;
+    assert_eq!(warning, None, "no token, nothing to ask and nothing to say");
+}
+
+#[test]
+fn the_warning_says_how_to_make_a_read_only_token_and_where_it_goes() {
+    let warning = ADMIN_TOKEN_WARNING;
+    assert!(warning.contains("admin"), "{warning}");
+    assert!(
+        warning.contains(crate::relish::agent::guide::READ_ONLY_TOKEN_COMMAND),
+        "{warning}"
+    );
+    assert!(warning.contains("RELIABURGER_TOKEN"), "{warning}");
+    assert!(warning.contains("token setting"), "{warning}");
+    assert!(!warning.contains('\n'), "one line: {warning}");
+}

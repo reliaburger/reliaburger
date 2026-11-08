@@ -234,6 +234,9 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
   - `relish fault list`: List all active faults
   - `relish fault clear [TARGET]`: Clear faults — all, by numeric id, or by service name
   - `relish fault scenario <PATH>`: Run a scripted chaos scenario from a TOML file
+- `relish gym`: Test your own agent on your own cluster: break a staging namespace in known ways, run the agent, score it *(0.2.8, not in 0.2.7)*
+  - `relish gym run --namespace <NAMESPACE>`: Deploy the gym's apps into a staging namespace, break them, run your agent, score it and clean up *(0.2.8, not in 0.2.7)*
+  - `relish gym list`: List the scenarios: what each deploys, breaks and scores *(0.2.8, not in 0.2.7)*
 
 **Security and access** ([security and access](docs/manual/10_security.md))
 
@@ -472,7 +475,10 @@ that pull the plug on a VM mid-write, a live-cluster test runner you can point
 at your own cluster (`relish test`), and a soak that installs the signed
 release the way you would and then breaks it for hours. An agent gym breaks
 throwaway clusters in ways it knows and scores whatever diagnoses them, an AI
-agent included, against the ground truth (`make test-gym`, from 0.2.7; Claude Code plugs in with `scripts/gym/claude_code.py`). CI
+agent included, against the ground truth (`make test-gym`, from 0.2.7; Claude Code plugs in with `scripts/gym/claude_code.py`).
+`relish gym run` *(0.2.8, not in 0.2.7)* does the same on your own cluster: it breaks a
+staging namespace you name, runs your agent with a read-only token scoped to
+it, cleans up on every way out, and writes a report for your security review. CI
 never retries a failure. See [how Reliaburger is tested](docs/testing.md).
 
 **A terminal UI and a web dashboard.** Run `relish` with no arguments for the
