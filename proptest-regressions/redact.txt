@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc bb96771bc7965d55efa1c69e07443406072fc4e5d744e41ce183889a5095178a # shrinks to text = "rbrg_api-key: api-key: \"token\": \"https://password=\"\u{b}\"@"
