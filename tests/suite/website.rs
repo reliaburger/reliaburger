@@ -628,6 +628,52 @@ fn readme_quick_start_is_part_of_the_tour() {
     assert!(lines.contains(&"relish build burger/burger.toml".to_string()));
 }
 
+/// Whitespace collapsed to single spaces, so where markup breaks a line
+/// doesn't count.
+fn normalise(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The README opens with the homepage's hero, word for word: the headline,
+/// the agents line and the lede. Only the logo and the title come before it.
+#[test]
+fn readme_hero_matches_the_homepage() {
+    let page = read("docs/website/index.html");
+    let element = |open: &str, close: &str| {
+        let start = page
+            .find(open)
+            .unwrap_or_else(|| panic!("index.html lost {open:?}"));
+        let body = &page[start..];
+        let body = &body[body.find('>').unwrap() + 1..];
+        let body = &body[..body.find(close).unwrap()];
+        decode(&strip_tags(&body.replace("<br>", " ")))
+    };
+    let homepage = normalise(
+        &[
+            element("<h1 id=\"title\"", "</h1>"),
+            element("<p class=\"headline-agents\"", "</p>"),
+            element("<p class=\"lede\"", "</p>"),
+        ]
+        .join(" "),
+    );
+    assert!(homepage.contains("served ready"), "{homepage:?}");
+
+    let readme = read("README.md");
+    let (start_marker, end_marker) = ("<!-- hero:start -->", "<!-- hero:end -->");
+    let start = readme.find(start_marker).expect("README lost its hero") + start_marker.len();
+    let end = readme.find(end_marker).expect("README's hero has no end");
+    let hero = normalise(&readme[start..end].replace("**", ""));
+    assert_eq!(
+        hero, homepage,
+        "the README's hero differs from index.html's"
+    );
+    assert_eq!(
+        normalise(&strip_tags(&readme[..start - start_marker.len()])),
+        "# Reliaburger",
+        "only the logo and the title may come before the hero"
+    );
+}
+
 /// The `id` of every `<section>` on the homepage, in page order.
 fn section_ids(page: &str) -> Vec<Option<String>> {
     page.match_indices("<section")
@@ -970,15 +1016,16 @@ fn unreleased_label() -> String {
     released_cli().unreleased_label(upcoming)
 }
 
-/// The README with its generated command list cut out, and that list.
-fn readme_split() -> (String, String) {
-    use reliaburger::relish::command_reference::{END_MARKER, START_MARKER};
-    let readme = read("README.md");
-    let start = readme.find(START_MARKER).unwrap();
-    let end = readme.find(END_MARKER).unwrap();
+/// The manual's reference chapter with its generated command list cut out,
+/// and that list.
+fn reference_split() -> (String, String) {
+    use reliaburger::relish::command_reference::{END_MARKER, REFERENCE_CHAPTER, START_MARKER};
+    let reference = read(REFERENCE_CHAPTER);
+    let start = reference.find(START_MARKER).unwrap();
+    let end = reference.find(END_MARKER).unwrap();
     (
-        format!("{}{}", &readme[..start], &readme[end..]),
-        readme[start..end].to_string(),
+        format!("{}{}", &reference[..start], &reference[end..]),
+        reference[start..end].to_string(),
     )
 }
 
@@ -1070,8 +1117,9 @@ fn homepage_mentions() -> Vec<(String, String)> {
 }
 
 /// A visitor installs the release `install.sh` names, so every command the
-/// site, the README and the tour offer must exist in it, or say which
-/// release adds it. The tour itself may only use released commands.
+/// site, the README, the tour and the manual's command list offer must exist
+/// in it, or say which release adds it. The tour itself may only use
+/// released commands.
 #[test]
 fn every_advertised_command_exists_in_the_installed_release() {
     let released = released_cli();
@@ -1086,7 +1134,9 @@ fn every_advertised_command_exists_in_the_installed_release() {
     let label = unreleased_label();
     let mut failures = Vec::new();
 
-    let (readme, generated) = readme_split();
+    use reliaburger::relish::command_reference::{REFERENCE_CHAPTER, REGENERATE_COMMAND};
+    let readme = read("README.md");
+    let (reference, generated) = reference_split();
     let start = readme.find(INSTALL_LINE).unwrap();
     let end = start + readme[start..].find("```").unwrap();
     let quick_start: Vec<String> = readme[start..end]
@@ -1113,16 +1163,20 @@ fn every_advertised_command_exists_in_the_installed_release() {
         match (released.check(synopsis), labelled) {
             (Ok(()), false) | (Err(_), true) => {}
             (Ok(()), true) => failures.push(format!(
-                "README labels `{synopsis}` ({label}), but {installer} has it"
+                "{REFERENCE_CHAPTER} labels `{synopsis}` ({label}), but {installer} has it"
             )),
             (Err(rejection), false) => failures.push(format!(
-                "README lists `{synopsis}` unlabelled: {rejection}; run `make readme-commands`"
+                "{REFERENCE_CHAPTER} lists `{synopsis}` unlabelled: {rejection}; run `{REGENERATE_COMMAND}`"
             )),
         }
     }
-    assert!(entries > 50, "found only {entries} README command entries");
+    assert!(
+        entries > 50,
+        "found only {entries} command entries in {REFERENCE_CHAPTER}"
+    );
 
     let mut mentions = markdown_mentions(&readme);
+    mentions.extend(markdown_mentions(&reference));
     mentions.extend(markdown_mentions(&read(
         "docs/manual/08_five-minute-tour.md",
     )));
@@ -1138,6 +1192,7 @@ fn every_advertised_command_exists_in_the_installed_release() {
         "docs/website/index.html",
         "docs/manual/08_five-minute-tour.md",
         "docs/manual/14_batch-jobs.md",
+        REFERENCE_CHAPTER,
     ] {
         for found in stale.captures_iter(&read(path)) {
             if &found[2] != installed || &found[1] == installed {
