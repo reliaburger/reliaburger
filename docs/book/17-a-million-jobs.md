@@ -5047,6 +5047,56 @@ group against a real secure node, checking that both job cases pass and
 confirm their cleanup. The refusal stays: a case that applies a job under the
 wrong lease fails loudly rather than slipping through.
 
+### The laptop that went to sleep
+
+Once, on 2 November, the job catalogue's cron case timed out waiting for its
+first firing, and the job's row had vanished from the listing altogether
+(#1527). The apply had committed the definition, nothing in the case stops or
+forgets a job, and three investigations read every path that drops a cron
+definition without finding one that could have fired. Well over a hundred
+stressed runs, at load up to twice the core count, never reproduced it.
+
+The answer was in the Mac's power log, not the code. `pmset -g log` showed the
+laptop going into idle sleep at 14:43:25, eleven seconds after the case
+started, and waking at 14:52:03. Two clocks then disagreed. The case's 90 s
+deadline is a `std::time::Instant`, and on macOS an `Instant` doesn't move
+while the machine sleeps, so on waking the case still had most of its budget.
+The lease's expiry is wall-clock time on the server, which did move: the lease
+had run out minutes earlier. The leader's TTL reaper did exactly what it's for
+and cleaned the lease up, forgetting its job's definition. The case kept
+polling a listing with nothing in it until its deadline caught up.
+
+You can't put a laptop to sleep from a test, but you can do to the lease what
+the sleep did. Renewing the cron case's lease with a 1 s TTL, as its owner,
+while the case waits reproduces the 2 November message word for word: `last
+saw 0 row(s): []; last query error: None`.
+
+Nothing in the product was wrong. A lease whose owner falls silent past its
+expiry has to be reclaimed, and the server can't tell a sleeping laptop from a
+crashed runner. What was wrong was that the failure blamed the product. So the
+fix is two things. The test fixture that starts Bun now runs
+`caffeinate -i -w <pid>` on macOS, which stops idle sleep for as long as that
+Bun runs (a closed lid still sleeps). And the runner names the condition when
+it happens anyway. It notes the wall-clock time alongside the `Instant` when a
+case starts:
+
+```rust
+let start = Instant::now();
+let wall_start = std::time::SystemTime::now();
+```
+
+`SystemTime` is the wall clock, and `elapsed()` on it returns a `Result`,
+because the wall clock can be stepped backwards and then there's no sensible
+answer. When a case doesn't pass and the wall clock ran more than 10 s ahead
+of the monotonic one, `host_suspension_note` adds that to the reason: the host
+slept or its clock was stepped, so the lease may have expired mid-case. The
+job waits also say more when a job has no row at all: whether its definition
+exists and has a `cron`, what its deployment's state is, and whether the
+case's lease is active, being cleaned up, or gone. The leader's reaper used
+to reclaim a lease without a word, so Bun's log had nothing to show either;
+now it logs a line when it takes an expired lease. The next reader gets the
+cause in the failure message, not three rounds of reading.
+
 ### Lessons
 
 **Two schedulers sharing a ledger must share a view of it.** The budget was
@@ -5061,6 +5111,11 @@ everything would have looked simpler and counted every app twice.
 because one caller still used it, and it kept collecting findings for the
 whole time it was alive. Moving that last caller was most of the work; the
 deletion itself was the easy part.
+
+**Know which clock each side keeps.** A deadline on one clock and an expiry
+on another agree only while both run at the same rate. A sleeping laptop
+stops one and not the other, and the flake that comes out of it looks like
+the product losing work.
 
 ## Telling visitors what they can actually run
 

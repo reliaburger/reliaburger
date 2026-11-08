@@ -7,7 +7,7 @@ import coverage_contract as k
 class Coverage(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.path=Path(self.tmp.name)/'child.json'
-        self.tools={name:dict(path='/tools/'+name,sha256='a'*64,version=version,version_command=['/tools/'+name,'--version'],exit_code=0) for name,version in [('cargo','cargo 1.98.0'),('rustc','rustc 1.98.0 (synthetic fixture)\ncommit-hash: '+ 'a'*40 +'\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.0\nLLVM version: 22'),('nextest','cargo-nextest 0.9.145'),('coverage','cargo-llvm-cov 0.9.1')]}
+        self.tools={name:dict(path='/tools/'+name,sha256='a'*64,version=version,version_command=['/tools/'+name,'--version'],exit_code=0) for name,version in [('cargo','cargo 1.98.0'),('rustc','rustc 1.98.0 (synthetic fixture)\ncommit-hash: '+ 'a'*40 +'\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.0\nLLVM version: 22'),('nextest','cargo-nextest 0.9.151'),('coverage','cargo-llvm-cov 0.9.1')]}
         self.tools['rustc']['version_command'].append('--verbose')
         self.tools['coverage']['version_command'].insert(1, 'llvm-cov')
         self.env=k.snapshot_environment({'RUSTC_WRAPPER':'/tools/coverage','CARGO_LLVM_COV':'1','__CARGO_LLVM_COV_RUSTC_WRAPPER':'1','__CARGO_LLVM_COV_RUSTC_WRAPPER_RUSTFLAGS':'-C\x1finstrument-coverage\x1f--cfg=coverage','__CARGO_LLVM_COV_RUSTC_WRAPPER_CRATE_NAMES':'reliaburger,bun,relish','LLVM_PROFILE_FILE':'/work/target/llvm-cov-target/reliaburger-%p-%8m.profraw'})

@@ -72,7 +72,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.98.0
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest@0.9.145,cargo-mutants@27.1.0
+          tool: cargo-nextest@0.9.151,cargo-mutants@27.1.0
       # Only the weekly run and runs by hand save the cache, so pull requests
       # don't eat into the quota ci.yml keeps for main.
       - uses: Swatinem/rust-cache@v2

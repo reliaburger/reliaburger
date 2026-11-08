@@ -213,9 +213,16 @@ pub struct Compatibility {
 /// A node with no Raft seat fetches the leader's view of the security state
 /// from `/v1/cluster/security-view` (#1477), which a 0.2.5 leader doesn't
 /// serve, so such a node would wait for API tokens that never come.
+///
+/// 0.2.8, agents you can trust (58/74): one bump for the whole release,
+/// made by its first wire or state change. Each later 0.2.8 change adds its
+/// line below this one, not another bump.
+/// A state report's `ResourceUsage` carries `gpu_used` as a `u32` and a new
+/// `gpu_total`, so the leader counts GPUs instead of assuming none
+/// (`GET /v1/cluster/summary`).
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 57,
-    state: 73,
+    protocol: 58,
+    state: 74,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

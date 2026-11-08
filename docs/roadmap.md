@@ -376,10 +376,12 @@ migration and no feature gate
   [release log](release-log.md#023-two-billion-a-day)), with one slow
   `upgrade_verify` turn in a host disk stall accepted by the maintainer
   ([#1381](https://github.com/reliaburger/reliaburger/issues/1381)). The day
-  run's memory growth, full disk and slow turn are fixed in 0.2.4
-  ([#1417](https://github.com/reliaburger/reliaburger/issues/1417),
-  [#1418](https://github.com/reliaburger/reliaburger/issues/1418),
-  [#1419](https://github.com/reliaburger/reliaburger/issues/1419)). It ships
+  run's slow turn was fixed in 0.2.4
+  ([#1419](https://github.com/reliaburger/reliaburger/issues/1419)); its
+  memory growth ([#1417](https://github.com/reliaburger/reliaburger/issues/1417),
+  0.2.8) and full disk
+  ([#1418](https://github.com/reliaburger/reliaburger/issues/1418), 0.3.0)
+  are still open. It ships
   with the `zstd` 0.13 advisories under a reviewed exception
   ([#1367](https://github.com/reliaburger/reliaburger/pull/1367)). 0.2.3 keeps
   0.2.2's formats, the first release to do so, and a 0.2.2 cluster rolled onto
@@ -509,7 +511,7 @@ migration and no feature gate
   claiming machines over the LAN, weekly signed OS builds with A/B updates,
   and the quickstart guest on Ubuntu 26.04. The claim flow is designed so the
   fleet control plane can extend it later. Alongside it: the acceptance gates
-  0.1.0 didn't close (V01–V04, below), WebSocket drain parity and ACME (F08,
+  0.1.0 didn't close (V01–V04, below), WebSocket drain parity (F08,
   [#369](https://github.com/reliaburger/reliaburger/issues/369)), and fault
   pre-checks that read the leader's gossip view
   ([#334](https://github.com/reliaburger/reliaburger/issues/334)). Exit test:
@@ -522,7 +524,8 @@ migration and no feature gate
   [#268](https://github.com/reliaburger/reliaburger/pull/268)). 0.4.0 is planned
   maintenance: cordon, drain and uncordon, cold moves that carry volumes, and
   checkpoint moves that keep memory while connections reconnect, with a Redis
-  demo. 0.4.1 is maintenance without downtime: moves across appliance builds,
+  demo. 0.4.0 also brings ACME certificates for the ingress
+  ([#1667](https://github.com/reliaburger/reliaburger/issues/1667)). 0.4.1 is maintenance without downtime: moves across appliance builds,
   and 0.3.0's A/B OS updates draining and rebooting each node in turn. Moves join
   the V02 soak's fault kinds rather than getting a soak of their own.
   Managed-volume retirement and the Apple runtime (F10,
@@ -633,7 +636,7 @@ migration and no feature gate
 
 ## Known gaps
 
-What 0.1.0 shipped without, each with an issue. The
+What's still missing, with its issue where one exists. The
 [whitepaper](whitepaper.md) describes the full vision; this page tracks only
 what's shipped and what's scheduled.
 
@@ -662,19 +665,21 @@ what's shipped and what's scheduled.
 - **Whitepaper design ahead of the binary.** The [whitepaper](whitepaper.md)
   marks each of these as planned where it describes them: the reporting tree,
   resource-aware council selection, per-app rollups and remote-read
-  ([#364](https://github.com/reliaburger/reliaburger/issues/364)); node-by-node
-  rollouts ([#692](https://github.com/reliaburger/reliaburger/issues/692));
-  GitOps config in Raft ([#693](https://github.com/reliaburger/reliaburger/issues/693));
-  a real live-voter guard and odd council sizes
-  ([#694](https://github.com/reliaburger/reliaburger/issues/694)); faults that
-  revert after a Bun crash ([#699](https://github.com/reliaburger/reliaburger/issues/699));
-  OOM protection and host resolvers ([#700](https://github.com/reliaburger/reliaburger/issues/700));
-  init-container images and GPU refusal ([#701](https://github.com/reliaburger/reliaburger/issues/701));
-  selector-based Kubernetes import ([#703](https://github.com/reliaburger/reliaburger/issues/703));
-  an offline root CA ([#709](https://github.com/reliaburger/reliaburger/issues/709));
-  static builds ([#401](https://github.com/reliaburger/reliaburger/issues/401));
-  Raft snapshot encryption ([#402](https://github.com/reliaburger/reliaburger/issues/402));
-  keyless cosign ([#619](https://github.com/reliaburger/reliaburger/issues/619)).
+  ([#364](https://github.com/reliaburger/reliaburger/issues/364)); an offline
+  root CA ([#709](https://github.com/reliaburger/reliaburger/issues/709));
+  keyless cosign ([#619](https://github.com/reliaburger/reliaburger/issues/619));
+  fully leader-coordinated rollouts
+  ([#1776](https://github.com/reliaburger/reliaburger/issues/1776)), static builds
+  ([#1774](https://github.com/reliaburger/reliaburger/issues/1774)) and Raft
+  snapshot encryption ([#1775](https://github.com/reliaburger/reliaburger/issues/1775)).
+- **Custom alert rules.** Each node evaluates five built-in rules; you can't
+  define your own yet ([#1773](https://github.com/reliaburger/reliaburger/issues/1773), planned for 0.4.0).
+- **Scale beyond three nodes.** Every release is soaked on three nodes. The
+  [hollow-node record](qualification/2026-10-28-hollow-nodes.md) found limits
+  at 500 and 1,000 nodes
+  ([#1411](https://github.com/reliaburger/reliaburger/issues/1411),
+  [#1412](https://github.com/reliaburger/reliaburger/issues/1412),
+  [#1413](https://github.com/reliaburger/reliaburger/issues/1413)).
 - **Known bugs and flakes.** The bugs the 10 October audit
   ([#674](https://github.com/reliaburger/reliaburger/issues/674)) found outside
   jobs were fixed in [0.2.1](https://github.com/reliaburger/reliaburger/milestone/16)

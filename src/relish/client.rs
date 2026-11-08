@@ -808,6 +808,12 @@ impl BunClient {
         &self.base_url
     }
 
+    /// The cluster CA this client pins, PEM, when it has one. `relish gym
+    /// run` hands it to the solver, which never gets the user's token.
+    pub fn ca_pem(&self) -> Option<&[u8]> {
+        self.ca_pem.as_deref()
+    }
+
     /// Address another node with the same authenticated, CA-pinned HTTP
     /// client. Cluster fan-out must not silently lose the caller's bearer or
     /// replace its trust roots while changing only the authority.
@@ -1633,6 +1639,17 @@ impl BunClient {
         parse_typed_response(response).await
     }
 
+    /// Fetch a test resource lease as its owner sees it: its state and its
+    /// server-side expiry. A lease whose cleanup has finished is gone, and
+    /// the server answers 404.
+    pub async fn test_lease(
+        &self,
+        lease_id: &str,
+    ) -> Result<crate::testkit::lease::TestLease, RelishError> {
+        self.get_typed_json(&format!("/v1/test/leases/{lease_id}"))
+            .await
+    }
+
     /// Renew an active test resource lease as its authenticated owner.
     ///
     /// The node-local job recovery integration test uses this endpoint. The
@@ -2259,6 +2276,21 @@ impl BunClient {
             });
         }
         Ok(retirement)
+    }
+
+    /// The whole cluster at a glance (`GET /v1/cluster/summary`).
+    pub async fn cluster_summary(
+        &self,
+    ) -> Result<crate::bun::summary::ClusterSummary, RelishError> {
+        self.get_typed_json("/v1/cluster/summary").await
+    }
+
+    /// What the scheduler has committed on each node
+    /// (`GET /v1/cluster/capacity`).
+    pub async fn cluster_capacity(
+        &self,
+    ) -> Result<crate::bun::summary::ClusterCapacity, RelishError> {
+        self.get_typed_json("/v1/cluster/capacity").await
     }
 
     /// Get cluster node membership.

@@ -59,6 +59,17 @@ and trade-offs against other projects, with dated evidence and explicit release 
   Bun refuses their state, snapshots and backups, so create a new cluster.
   Rolling upgrades need matching protocol and state formats; see the
   [compatibility policy](releasing.md#cluster-compatibility).
+- **Three nodes are what's qualified.** Every release is soaked on three
+  nodes. The [hollow-node record](qualification/2026-10-28-hollow-nodes.md)
+  found the leader refusing report connections from 500 nodes up
+  ([#1411](https://github.com/reliaburger/reliaburger/issues/1411)), its API
+  slowing sharply between 500 and 1,000
+  ([#1412](https://github.com/reliaburger/reliaburger/issues/1412)), and gossip
+  at 1,000 not settling within six minutes
+  ([#1413](https://github.com/reliaburger/reliaburger/issues/1413)).
+- **Alerts are five built-in node rules.** CPU, memory and disk thresholds,
+  delivered by webhook; you can't define your own rules yet
+  ([manual](manual/04_observability.md#alerts)).
 - **One Bun per writable image store.** Registry startup claims exclusive
   ownership of the image store's upload directory.
 - **Test volumes have no snapshots.** Disposable test-volume snapshots aren't
@@ -416,13 +427,14 @@ No installation needed. This is what you get by default.
 
 ## Building
 
-The portable test gate requires cargo-nextest 0.9.145 or newer. That release
-fixes capture-pipe inheritance between concurrent macOS tests, which could make
-a completed test appear to leak a child process. CI pins 0.9.145 and treats a
-leak as a failure at the existing 100 ms deadline.
+The portable test gate requires cargo-nextest 0.9.151 or newer. 0.9.145 fixed
+capture-pipe inheritance between concurrent macOS tests, which could make a
+completed test appear to leak a child process, and 0.9.151 is past
+[GHSA-vc25-qg58-w57c](https://github.com/nextest-rs/nextest/security/advisories/GHSA-vc25-qg58-w57c).
+CI pins 0.9.151 and treats a leak as a failure at the existing 100 ms deadline.
 
 ```sh
-cargo install cargo-nextest --locked --version 0.9.145
+cargo install cargo-nextest --locked --version 0.9.151
 ```
 
 The [Makefile](../Makefile) provides all build targets:
@@ -464,6 +476,7 @@ make test-rootless-runc    # rootless runc port and replacement test (never sudo
 make test-cluster          # failover, healing, recovery, placement and chaos
 make test-hollow           # a three-member council and twenty hollow nodes (#1401)
 make test-gym              # the agent gym's scenarios on throwaway clusters, scored (#1086)
+make test-gym-user         # relish gym run on a throwaway cluster: baseline, then Ctrl-C, nothing left (#1683)
 make test-upgrade-node     # real single-node binary replacement
 make test-upgrade-cluster  # real rolling cluster replacement
 make coverage              # portable suite under line coverage (LCOV) and the floor
@@ -1413,6 +1426,8 @@ The bun agent exposes a local HTTP API on port 9117:
 | `GET` | `/v1/logs/{app}/{namespace}` | Captured stdout/stderr (`?tail=N&follow=true`) |
 | `POST` | `/v1/exec/{app}/{namespace}` | Execute a command (JSON body: `{"command":["..."]}`) |
 | `GET` | `/v1/cluster/nodes` | List cluster nodes (gossip membership, dead members included with state `dead`) |
+| `GET` | `/v1/cluster/summary` | The whole cluster at a glance: counts per section (nodes, council, gossip, versions, capacity, usage, apps, instances, jobs, logs, faults, alerts, certs, GitOps), each marked `complete`, `partial` or `missing` with the nodes that answered. A scoped token sees its own apps and jobs; the cluster-wide sections come back `missing` |
+| `GET` | `/v1/cluster/capacity` | Requested CPU, memory and GPUs against schedulable capacity per node, from the leader's state reports; unscoped tokens only |
 | `GET` | `/v1/cluster/council` | Council (Raft) status |
 | `POST` | `/v1/cluster/join` | Join with a single-use token, node ID, CSR and format compatibility |
 | `POST` | `/v1/cluster/renew` | Renew the authenticated TLS node’s CSR on the leader; requires the service token, current peer certificate and format compatibility |
