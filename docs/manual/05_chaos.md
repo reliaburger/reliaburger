@@ -24,6 +24,10 @@ relish fault node-pressure node-03 --cpu 80% --memory 90% --acknowledge
 Workload faults take `--namespace` (default `default`), `--instance` to hit
 one instance, `--duration` and `--reason`, which is recorded with the fault.
 
+A paused instance still reports its pid in `relish status`, and you can stop
+or delete it without clearing the pause first: Bun follows the stop signal
+with SIGCONT, so the instance gets its usual chance to shut down cleanly.
+
 ### Jobs and task arrays
 
 A workload fault can name a job or a task array as well as an app. It reaches
