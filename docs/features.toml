@@ -764,11 +764,11 @@ name = "Alerts and webhooks"
 status = "beta"
 since = "0.1.0"
 summary = "Five built-in rules on CPU, memory and disk, plus a critical alert for every failed job run, delivered to webhooks, optionally HMAC-signed."
-restrictions = "You can't define your own alert rules yet."
-issues = []
+restrictions = "You can't define your own alert rules yet (#1773, planned for 0.4.0)."
+issues = [1773]
 docs = ["docs/manual/04_observability.md#alerts"]
 evidence = "Manual 04 'Alerts': 'You can't define your own rules yet.' Job failure alerts since 0.2.0. The README's 'Alert rules evaluate in the agent' and the 'Prometheus, Alertmanager' row of 'What you don't install' read as if you could."
-needs_maintainer = "No issue tracks user-defined alert rules. File one so this row can link it, and soften the README's Alertmanager comparison?"
+needs_maintainer = "Soften the README's Alertmanager comparison until #1773 lands?"
 
 [[group.feature]]
 name = "Events"
