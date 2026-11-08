@@ -725,6 +725,9 @@ enum Command {
     /// Show the cluster's recent events: deploys, restarts, health, faults,
     /// tokens, secrets and audited operations, newest last.
     Events(Box<EventsOptions>),
+    /// What changed in a window, newest first: events (with the decisions
+    /// they record), the audit log and an app's deploys.
+    Timeline(Box<reliaburger::relish::agent::timeline::TimelineArgs>),
     /// Manage volume snapshots (Btrfs-backed volumes only).
     Snapshot {
         #[command(subcommand)]
@@ -2127,6 +2130,9 @@ async fn main() -> ExitCode {
             )
             .await
         }
+        Command::Timeline(args) => {
+            reliaburger::relish::agent::timeline::human(&args, cli.output).await
+        }
         Command::Fault { ref action } => match action {
             FaultAction::Delay(options) => {
                 let FaultDelayArgs {
@@ -3099,6 +3105,7 @@ fn output_support(command: &Command) -> OutputSupport {
         | Command::Resolve { .. }
         | Command::Audit(_)
         | Command::Events(_)
+        | Command::Timeline(_)
         | Command::Deploy { .. }
         | Command::CancelDeploy { .. }
         | Command::History { .. }

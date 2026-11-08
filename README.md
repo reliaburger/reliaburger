@@ -174,6 +174,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish logs-export --dest <DEST>`: Copy a node's Parquet log files here, or have it ship them to object storage
 - `relish logs-search <SOURCE> <SQL>`: Search exported Parquet log archives with SQL
 - `relish events`: Show the cluster's recent events: deploys, restarts, health, faults, tokens, secrets and audited operations, newest last
+- `relish timeline`: What changed in a window, newest first: events (with the decisions they record), the audit log and an app's deploys *(0.2.7, not in 0.2.6)*
 
 **Diagnose and test** ([diagnostics](docs/manual/07_diagnostics.md))
 
@@ -187,7 +188,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish agent`: Commands for LLM agents: one JSON envelope, bounded, never interactive *(0.2.7, not in 0.2.6)*
   - `relish agent guide`: How to use relish as an agent: the manual chapter, as Markdown sections *(0.2.7, not in 0.2.6)*
   - `relish agent version`: This binary's version, commit, target and cluster formats *(0.2.7, not in 0.2.6)*
-  - `relish agent schema [guide|version|schema|source-version|source-tree|source-grep|source-show|source-extract|logs|manual-search|manual-show|context|diagnose|explain|upgrade-check|report|patch-init|patch-build|patch-test|patch-try|patch-diff|patch-apply|patch-destroy|setup]`: The JSON Schema of the envelope and of each command's data *(0.2.7, not in 0.2.6)*
+  - `relish agent schema [guide|version|schema|source-version|source-tree|source-grep|source-show|source-extract|logs|manual-search|manual-show|context|diagnose|explain|timeline|upgrade-check|report|patch-init|patch-build|patch-test|patch-try|patch-diff|patch-apply|patch-destroy|setup]`: The JSON Schema of the envelope and of each command's data *(0.2.7, not in 0.2.6)*
   - `relish agent source`: The source this binary was built from: search it, read it, extract it *(0.2.7, not in 0.2.6)*
     - `relish agent source version`: This binary's source: version, commit, digest, file count, and the commit every node runs *(0.2.7, not in 0.2.6)*
     - `relish agent source tree [PREFIX]`: Files with their size in bytes and their line count *(0.2.7, not in 0.2.6)*
@@ -200,7 +201,8 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
     - `relish agent manual show <TARGET>`: One chapter, or one section of it, as Markdown: `diagnostics` or `diagnostics#relish-path-can-a-reach-b` *(0.2.7, not in 0.2.6)*
   - `relish agent context`: The first call: findings, unknowns, faults, alerts, one line per app and the newest events, in one bounded answer *(0.2.7, not in 0.2.6)*
   - `relish agent diagnose`: Every finding with its evidence, read-only next steps, and pointers into the manual and the source *(0.2.7, not in 0.2.6)*
-  - `relish agent explain [ID]`: What a finding means, its thresholds and where it's decided; every finding when no id is given. Reads only this binary *(0.2.7, not in 0.2.6)*
+  - `relish agent explain [ID]`: What a finding means and where it's decided, or why the cluster made a decision: --restart, --placement, --refusal *(0.2.7, not in 0.2.6)*
+  - `relish agent timeline`: What changed in a window: events, audit and deploys, newest first *(0.2.7, not in 0.2.6)*
   - `relish agent upgrade-check`: Whether the cluster can take the latest release: `ready`, `up_to_date`, `needs_fresh_cluster`, `blocked` or `unknown` *(0.2.7, not in 0.2.6)*
   - `relish agent report --title <TITLE> --what-happened <WHAT_HAPPENED> --expected <EXPECTED> --not-tested <NOT_TESTED> --caught-by <CAUGHT_BY> --out <OUT>`: Draft a redacted bug report for a human to post. Never posts *(0.2.7, not in 0.2.6)*
   - `relish agent patch`: Build, test and try a fix on a throwaway cluster *(0.2.7, not in 0.2.6)*

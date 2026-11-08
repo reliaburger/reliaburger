@@ -61,22 +61,30 @@ for findings.
 
 | Rule | Recorded by | Evidence |
 |---|---|---|
-| `placement.scored` | the leader, when `plan_pass` commits new placements for an app | per placed ordinal: node, spread (replicas already there), total score and its four parts (bin-pack, preferred labels, image locality, stability, with the weights); how many nodes the filter left; up to three runner-up nodes with their scores |
-| `placement.short` | the existing shortfall event | the `UnplacedReason` (`no_ready_node`, `no_label_match`, `no_container_runtime`, `no_capable_node`, `no_room`), missing replicas |
-| `restart.process_exited` | `retry_restart` | attempt, restart limit, the exit status when the runtime reported one |
-| `restart.health_failed` | `restart_published_unhealthy` | attempt, restart limit, consecutive failed probes, the unhealthy threshold, the probe kind |
+| `placement.scored` | the leader, when `plan_pass`'s placements commit | per new instance: node, its replicas already there, total score and its four parts, how many nodes passed the filter, the runner-up; replicas wanted and kept |
+| `placement.daemon` | the same, for a daemon set | per instance its node; how many nodes passed the filter |
+| `placement.volume_home` | the same, for an app returning to its volumes | per instance the node that holds them |
+| `placement.short` | the existing shortfall event | the `UnplacedReason` (`no_ready_node`, `no_label_match`, `no_container_runtime`, `no_capable_node`, `no_room`), placed and wanted |
+| `placement.quota_blocked` | the leader, when an app newly can't fit its namespace quota | the quota error |
+| `restart.process_exited` | `retry_restart` | instance, attempt, restart limit, the backoff waited out |
+| `restart.start_failed` | `retry_restart`, after `record_failed_restart` | the same |
+| `restart.health_failed` | `restart_published_unhealthy` | the same, plus consecutive failed probes, the unhealthy threshold, the probe and its interval |
 | `restart.budget_exhausted` | `retry_restart`'s `RestartLimitExceeded` arm | attempts made, restart limit |
-| `restart.launch_failed` | `record_failed_restart` | the runtime's reason (as untrusted text) |
-| `deploy.refused.policy` | `policy_refusal` | the policies, the denials; now with the app and namespace |
-| `deploy.refused.owner` | `owner_refusal` | the owner, the caller |
-| `deploy.refused.capacity` | the capacity admission probe | the scheduler's refusal |
-| `deploy.refused.council` | the `Refused` arm of the council write | the state machine's reason |
+| `restart.sidecar_exited` | `finish_sidecar_relaunch` | the instance, the sidecar, its restarts |
+| `deploy.refused.policy` | `policy_refusal` | the policies and the workloads they denied; one denied workload is now the record's app |
+| `deploy.refused.owner` | `record_owner_refusal` in `cluster_apply` | the workload, `not_the_caller` or `claimed` |
+| `deploy.refused.council` | the `Refused` arm of the council write | the workload, the state machine's reason |
 
-The three refusals that leave nothing today become audit records (action
+The process's exit status isn't recorded: no runtime reports it to the
+restart path today. The instance carries a `restart_cause`, set where it
+stops (an observed exit, a failed start) and taken by the restart that
+records the decision.
+
+The two refusals that left nothing become audit records (action
 `deploy.refused`), so they go to the durable audit log as well as the ring,
-attributed to the caller like every other audited action. The refusal
-limiter (#798) applies to them as it does to `api.refused`, so a client
-retrying a refused apply in a loop can't flood the log.
+attributed to the caller like every other audited action, exactly as
+`policy.denied` already was. The capacity probe's refusal isn't recorded:
+only a test lease sends it.
 
 Placement records one event per app per committed change, never one per
 replica and never one per pass: a pass that changes nothing records nothing.
@@ -198,8 +206,8 @@ instead of showing a quiet hour.
 
 ## Out of scope
 
-- **Counterfactuals.** "Why not node-3?" is answered only as far as the three
-  runner-ups and the filter's count go. A full per-node rejection reason for
+- **Counterfactuals.** "Why not node-3?" is answered only as far as the
+  runner-up and the filter's count go. A full per-node rejection reason for
   every node would cost a record per node per placement.
 - **Jobs and task arrays.** They place through the task-array leader, at up
   to millions of runs; a record per placement would flush every other event

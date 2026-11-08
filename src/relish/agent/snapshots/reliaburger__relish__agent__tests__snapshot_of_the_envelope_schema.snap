@@ -165,6 +165,11 @@ expression: "schema_of::<Envelope<Value>>()"
           "type": "string"
         },
         {
+          "const": "timeline",
+          "description": "`relish agent timeline`.",
+          "type": "string"
+        },
+        {
           "const": "upgrade-check",
           "description": "`relish agent upgrade-check`.",
           "type": "string"

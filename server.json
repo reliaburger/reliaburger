@@ -22,7 +22,8 @@
         "manual_show",
         "context",
         "diagnose",
-        "explain"
+        "explain",
+        "timeline"
       ],
       "transport": "stdio"
     }

@@ -88,8 +88,12 @@
       "name": "diagnose"
     },
     {
-      "description": "What a finding means, its thresholds and where it's decided; every finding when no id is given. Reads only this binary",
+      "description": "What a finding means and where it's decided, or why the cluster made a decision: --restart, --placement, --refusal",
       "name": "explain"
+    },
+    {
+      "description": "What changed in a window: events, audit and deploys, newest first",
+      "name": "timeline"
     }
   ],
   "version": "0.2.7"

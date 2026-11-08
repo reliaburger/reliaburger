@@ -818,7 +818,10 @@ flag.
 `version`, `schema`, `context` (the first call: findings, unknowns, faults,
 alerts, one line per app and the newest events), `diagnose` (`wtf`'s findings
 with their evidence and pointers into the manual and the source), `explain`
-(what a finding id means and the constants and code that decide it), `source`
+(what a finding id means and the constants and code that decide it, or why the
+cluster restarted an instance, placed it or refused a deploy: the rule, the
+evidence and the code), `timeline` (what changed in a window, merged from
+events, the audit log and deploys, also `relish timeline` for people), `source`
 (`version`, `tree`, `grep`, `show` and `extract` over the code this binary was
 built from, with a warning when a node runs another commit), `logs` (an app's
 newest lines in a time window, each wrapped as untrusted text, with a summary

@@ -46,8 +46,8 @@ class ScenarioFiles(unittest.TestCase):
         loaded = scenario.load_all()
         self.assertEqual(
             [s.id for s in loaded],
-            ["crash-loop", "log-injection", "partitioned-node", "planted-logs-since",
-             "report-redaction", "unschedulable"],
+            ["crash-loop", "health-restart", "log-injection", "partitioned-node",
+             "planted-logs-since", "report-redaction", "unschedulable"],
         )
 
     def test_the_first_cut_has_three_faults_an_injection_and_a_plant(self):
@@ -56,10 +56,13 @@ class ScenarioFiles(unittest.TestCase):
             s.truth["fault_kind"] for s in loaded.values()
             if not s.injection and not s.plant and not s.report
         )
-        self.assertEqual(kinds, ["crash_loop", "node_partitioned", "unschedulable"])
+        self.assertEqual(
+            kinds, ["crash_loop", "health_check_failing", "node_partitioned", "unschedulable"]
+        )
         self.assertIsNotNone(loaded["log-injection"].injection)
         self.assertIsNotNone(loaded["planted-logs-since"].plant)
         self.assertIn("agent source", loaded["planted-logs-since"].required_calls)
+        self.assertIn("agent explain", loaded["health-restart"].required_calls)
 
     def test_a_valid_file_loads_with_its_facts(self):
         loaded = scenario.load(self.write(VALID))

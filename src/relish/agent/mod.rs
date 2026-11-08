@@ -27,8 +27,10 @@ pub mod patch;
 pub mod report;
 pub mod setup;
 pub mod source;
+pub mod timeline;
 pub mod untrusted;
 pub mod upgrade_check;
+pub mod why;
 
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -89,12 +91,11 @@ pub enum AgentCommand {
     /// Every finding with its evidence, read-only next steps, and pointers
     /// into the manual and the source.
     Diagnose(diagnose::DiagnoseArgs),
-    /// What a finding means, its thresholds and where it's decided; every
-    /// finding when no id is given. Reads only this binary.
-    Explain {
-        /// A finding id, e.g. `crashloop`.
-        id: Option<String>,
-    },
+    /// What a finding means and where it's decided, or why the cluster
+    /// made a decision: --restart, --placement, --refusal
+    Explain(why::ExplainArgs),
+    /// What changed in a window: events, audit and deploys, newest first
+    Timeline(timeline::TimelineArgs),
     /// Whether the cluster can take the latest release: `ready`,
     /// `up_to_date`, `needs_fresh_cluster`, `blocked` or `unknown`.
     UpgradeCheck(upgrade_check::UpgradeCheckArgs),
@@ -128,7 +129,8 @@ impl AgentCommand {
             AgentCommand::Manual { command } => command.name(),
             AgentCommand::Context(_) => CommandName::Context,
             AgentCommand::Diagnose(_) => CommandName::Diagnose,
-            AgentCommand::Explain { .. } => CommandName::Explain,
+            AgentCommand::Explain(_) => CommandName::Explain,
+            AgentCommand::Timeline(_) => CommandName::Timeline,
             AgentCommand::UpgradeCheck(_) => CommandName::UpgradeCheck,
             AgentCommand::Report(_) => CommandName::Report,
             AgentCommand::Patch(options) => options.command.name(),
@@ -179,7 +181,8 @@ pub async fn run(options: &AgentOptions, rerun: &str) -> Rendered {
         AgentCommand::Manual { command } => manual::run(command, max_bytes, rerun),
         AgentCommand::Context(args) => context::run(args, max_bytes, rerun).await,
         AgentCommand::Diagnose(args) => diagnose::run_diagnose(args, max_bytes, rerun).await,
-        AgentCommand::Explain { id } => diagnose::run_explain(id.as_deref(), max_bytes, rerun),
+        AgentCommand::Explain(args) => why::run(args, max_bytes, rerun).await,
+        AgentCommand::Timeline(args) => timeline::run(args, max_bytes, rerun).await,
         AgentCommand::UpgradeCheck(args) => upgrade_check::run(args, max_bytes, rerun).await,
         AgentCommand::Report(args) => report::run(args, max_bytes, rerun),
         AgentCommand::Patch(patch) => patch::run(patch, max_bytes, rerun).await,
@@ -278,6 +281,7 @@ pub fn data_schema(command: CommandName) -> Option<Value> {
         CommandName::Context => Some(schema_of::<context::ContextData>()),
         CommandName::Diagnose => Some(schema_of::<diagnose::DiagnoseData>()),
         CommandName::Explain => Some(schema_of::<diagnose::ExplainData>()),
+        CommandName::Timeline => Some(schema_of::<timeline::TimelineData>()),
         CommandName::UpgradeCheck => Some(schema_of::<upgrade_check::UpgradeCheckData>()),
         CommandName::Report => Some(schema_of::<report::ReportData>()),
         CommandName::PatchInit => Some(schema_of::<patch::InitData>()),
@@ -573,6 +577,7 @@ mod tests {
                 "context",
                 "diagnose",
                 "explain",
+                "timeline",
                 "upgrade-check",
                 "report",
                 "patch init",
@@ -715,12 +720,21 @@ mod tests {
         assert_eq!(diagnose.app.as_deref(), Some("web"));
         let options = parse("agent explain crashloop").unwrap();
         assert!(
-            matches!(&options.command, AgentCommand::Explain { id: Some(id) } if id == "crashloop")
+            matches!(&options.command, AgentCommand::Explain(explain) if explain.id.as_deref() == Some("crashloop"))
         );
         assert!(matches!(
             parse("agent explain").unwrap().command,
-            AgentCommand::Explain { id: None }
+            AgentCommand::Explain(explain) if explain.id.is_none() && !explain.rules
         ));
+        let options = parse("agent explain --restart web-0 --namespace payments").unwrap();
+        assert!(matches!(
+            &options.command,
+            AgentCommand::Explain(explain)
+                if explain.restart.as_deref() == Some("web-0") && explain.namespace == "payments"
+        ));
+        let options = parse("agent timeline --app web --since 10m --limit 50").unwrap();
+        assert_eq!(options.command.name(), CommandName::Timeline);
+        assert!(parse("agent timeline --limit 501").is_err());
         assert_eq!(
             command_named(&args("agent explain --bogus")),
             CommandName::Explain
