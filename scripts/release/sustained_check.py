@@ -52,6 +52,7 @@ import sys
 import time
 import tomllib
 import bun_memory
+import loop_stalls
 import job_soak
 import job_soak_inventory
 import soak_charts
@@ -912,6 +913,7 @@ def evaluate(evidence, snapshot):
             served = parse_openssl(text)
             findings += certificate_findings(check, served.get("not_after"), now, margin, node)
             findings += served_serial_findings(state, kind, node, served.get("serial"), now)
+        loop_stalls.append(evidence, node, now, loop_stalls.extract(read(snapshot, f"loop_stalls-{node}.txt")))
         text = read(snapshot, f"inventory-{node}.txt")
         if text is not None:
             inventory = parse_inventory(text)
@@ -2115,6 +2117,7 @@ def render(evidence, record):
             lines.append(f"| {node} | {measure} | {entry['first']} | {entry.get('last', entry['first'])} | {entry['max']} |")
     lines.append("")
     lines += bun_memory.section(evidence)
+    lines += loop_stalls.section(evidence)
     charts_directory = record.parent / f"{record.stem}-charts"
     lines += soak_charts.section(soak_charts.write_charts(evidence, charts_directory), charts_directory.name)
     lines += ["## Failures", ""]
@@ -2299,6 +2302,8 @@ def main(argv=None):
     keep.add_argument("vms", nargs="+")
     reason = commands.add_parser("curl-reason")
     reason.add_argument("code", type=int)
+    stalls = commands.add_parser("loop-stalls", help="print the agent loop stall snapshots in a journal excerpt (#1707)")
+    stalls.add_argument("journal")
     failures = commands.add_parser("test-failures", help="why a relish test JSON run failed (#1068)")
     failures.add_argument("report")
     failures.add_argument("stderr", nargs="?")
@@ -2408,6 +2413,11 @@ def main(argv=None):
         return 0
     if args.command == "curl-reason":
         print(curl_reason(args.code))
+        return 0
+    if args.command == "loop-stalls":
+        blocks = loop_stalls.extract(Path(args.journal).read_text(errors="replace"))
+        if blocks:
+            print("\n\n".join(blocks))
         return 0
     if args.command == "test-failures":
         stderr_text = Path(args.stderr).read_text(errors="replace") if args.stderr and Path(args.stderr).exists() else ""
