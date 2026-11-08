@@ -28,6 +28,7 @@ PLATFORMS = ("reliaburger", "k8s")
 # scoring compares two words instead of judging prose.
 FAULT_KINDS = (
     "crash_loop",
+    "health_check_failing",
     "unschedulable",
     "node_partitioned",
     "relish_bug",

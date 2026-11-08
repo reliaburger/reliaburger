@@ -3911,6 +3911,7 @@ async fn a_restore_is_refused_while_an_instance_awaits_its_restart() {
             identity: None,
             identity_mount: None,
             launch_failure: None,
+            restart_cause: None,
         },
     );
     agent

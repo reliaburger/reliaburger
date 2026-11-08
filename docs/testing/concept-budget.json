@@ -4,15 +4,15 @@
     "reason": "Measured on 8 November 2026 (#1681): app, job, namespace, permission, policy, build, template and use"
   },
   "commands": {
-    "budget": 166,
-    "reason": "Measured on 8 November 2026 (#1681) at 159: every relish command and subcommand at every depth, none of them hidden. Raised to 161 for #1689: `relish verify` for people and `relish agent verify` for agents, one check of the cluster against the published release. Raised by 5 more for #1683: `relish gym`, `gym run` and `gym list`, plus the hidden `gym record` and `gym baseline` that `gym run` starts for the solver"
+    "budget": 168,
+    "reason": "Measured on 8 November 2026 (#1681) at 159: every relish command and subcommand at every depth, none of them hidden. Raised to 161 for #1685: `relish timeline` for people and `relish agent timeline` for agents, the incident timeline. Raised by 2 more for #1689: `relish verify` for people and `relish agent verify` for agents, one check of the cluster against the published release. Raised by 5 more for #1683: `relish gym`, `gym run` and `gym list`, plus the hidden `gym record` and `gym baseline` that `gym run` starts for the solver"
   },
   "flags": {
-    "budget": 393,
-    "reason": "Measured on 8 November 2026 (#1681) at 375: named flags on every command, global ones once. Raised to 383 for #1689: `relish verify` and `relish agent verify` each take --release-url, --metadata, --cli-metadata and --artefacts, so a check can run offline against files on disk. Raised by 10 more for #1683: `relish gym run`'s nine flags (the staging namespace, solver, scenarios, runs, timeout, output directory, image and the two consents) and `gym record`'s --log"
+    "budget": 408,
+    "reason": "Measured on 8 November 2026 (#1681) at 375: named flags on every command, global ones once. Raised to 390 for #1685: the two timeline commands' window and scope flags, and `relish agent explain`'s --restart, --placement, --refusal and --rules, which ask why the cluster made a decision. Raised by 8 more for #1689: `relish verify` and `relish agent verify` each take --release-url, --metadata, --cli-metadata and --artefacts, so a check can run offline against files on disk. Raised by 10 more for #1683: `relish gym run`'s nine flags (the staging namespace, solver, scenarios, runs, timeout, output directory, image and the two consents) and `gym record`'s --log"
   },
   "distinct_flags": {
-    "budget": 175,
-    "reason": "Measured on 8 November 2026 (#1681) at 169: distinct flag names across all commands. Raised to 171 for #1689: `relish verify`'s --cli-metadata and --artefacts are new names. Raised by 4 more for #1683: new flag names on `relish gym run` and `gym record`"
+    "budget": 179,
+    "reason": "Measured on 8 November 2026 (#1681) at 169: distinct flag names across all commands. Raised to 173 for #1685: `relish agent explain`'s --restart, --placement, --refusal and --rules. Raised by 2 more for #1689: `relish verify`'s --cli-metadata and --artefacts are new names. Raised by 4 more for #1683: new flag names on `relish gym run` and `gym record`"
   }
 }

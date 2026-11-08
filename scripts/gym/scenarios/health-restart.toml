@@ -1,0 +1,34 @@
+# Restarts that aren't crashes: web v2 keeps running but fails its health
+# check, so Bun restarts it again and again. `wtf` sees the restarts; only the
+# restart's decision (`relish agent explain --restart`) says the rule was the
+# health check, with the failed probes as evidence.
+id = "health-restart"
+title = "Restarts that aren't crashes"
+nodes = 1
+
+prompt = """
+The `web` app keeps restarting since its last deploy. Find out why the cluster
+restarts it: which app, on which node, and what kind of fault. Don't guess
+from the restart count: find the rule the cluster applied.
+"""
+
+[[setup]]
+apply = "apps/web-v1.toml"
+wait_running = "web"
+
+[[setup]]
+apply = "apps/web-v2-unhealthy.toml"
+
+# Long enough for the health check to fail twice in a row a few times over.
+[[setup]]
+settle = "60s"
+
+[truth]
+app = "web"
+namespace = "default"
+node = "@instance:web"
+fault_kind = "health_check_failing"
+
+[score]
+checks = ["app", "node", "fault_kind"]
+required_calls = ["agent explain"]

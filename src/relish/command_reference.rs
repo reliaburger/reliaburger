@@ -141,6 +141,7 @@ pub const GROUPS: &[CommandGroup] = &[
             "logs-export",
             "logs-search",
             "events",
+            "timeline",
         ],
     },
     CommandGroup {

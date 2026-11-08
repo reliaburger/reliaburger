@@ -74,7 +74,13 @@ class Scenarios(unittest.TestCase):
             sorted(K8S),
             ["crash-loop", "log-injection", "partitioned-node", "report-redaction", "unschedulable"],
         )
-        self.assertEqual(set(RELIABURGER) - set(K8S), {"planted-logs-since", "release-drift"})
+        # Not ported: the planted bug is in Reliaburger's own source, and the
+        # health restart asks for a decision record, which a kubelet keeps
+        # only as a pod event (#1685). The release drift checks Reliaburger's
+        # own published release (#1689).
+        self.assertEqual(
+            set(RELIABURGER) - set(K8S), {"health-restart", "planted-logs-since", "release-drift"}
+        )
         self.assertTrue(all(s.platform == "k8s" and s.ported for s in K8S.values()))
         self.assertTrue(all(s.platform == "reliaburger" for s in RELIABURGER.values()))
 

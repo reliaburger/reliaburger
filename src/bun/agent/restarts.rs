@@ -40,6 +40,7 @@ use tokio_util::sync::CancellationToken;
 use super::launch_evidence::{EgressResolution, EgressResolver, LaunchEvidence, retains_network};
 use super::*;
 use super::{BunAgent, BunError, ContainerState, Grill, InstanceId, kill_runtime_instance};
+use crate::bun::restart::RestartCause;
 use crate::grill::oci::OciSpec;
 use crate::grill::runc_intent::NetworkReference;
 
@@ -985,19 +986,39 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // LOOP-INLINE: in-memory lock, no I/O
         match self.supervisor.maybe_restart(id, Instant::now()).await {
             Ok(true) => {
-                if let Some(instance) = self.supervisor.get_instance(id) {
-                    self.record_event(
-                        crate::bun::events::EventKind::Restart,
-                        crate::bun::events::EventSeverity::Warning,
-                        Some(instance.app_name.clone()),
-                        Some(instance.namespace.clone()),
-                        format!(
-                            "instance {id} restarted (attempt {})",
-                            instance.restart_count
-                        ),
-                    )
-                    .await;
-                }
+                let Some(instance) = self.supervisor.get_instance_mut(id) else {
+                    return;
+                };
+                // Only an exit or a failed start sets `retry_pending`, and
+                // each names itself; an unnamed stop is taken as an exit.
+                let cause = instance
+                    .restart_cause
+                    .take()
+                    .unwrap_or(RestartCause::ProcessExited);
+                let rule = match cause {
+                    RestartCause::ProcessExited => "restart.process_exited",
+                    RestartCause::StartFailed => "restart.start_failed",
+                };
+                let decision = crate::bun::restart::restart_decision(
+                    rule,
+                    &id.0,
+                    instance.restart_count,
+                    &instance.restart_policy,
+                );
+                let (app, namespace, attempt) = (
+                    instance.app_name.clone(),
+                    instance.namespace.clone(),
+                    instance.restart_count,
+                );
+                self.record_decision(
+                    crate::bun::events::EventKind::Restart,
+                    crate::bun::events::EventSeverity::Warning,
+                    Some(app),
+                    Some(namespace),
+                    format!("instance {id} restarted (attempt {attempt})"),
+                    decision,
+                )
+                .await;
             }
             Ok(false) => {}
             Err(BunError::RestartLimitExceeded { .. }) => {
@@ -1006,9 +1027,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 {
                     instance.state = failed;
                     instance.retry_pending = false;
+                    instance.restart_cause = None;
                 }
                 if let Some(instance) = self.supervisor.get_instance(id) {
-                    self.record_event(
+                    let decision = crate::bun::decisions::Decision::new("restart.budget_exhausted")
+                        .with("instance", &id.0)
+                        .with("attempts", instance.restart_count)
+                        .with(
+                            "restart_limit",
+                            crate::bun::restart::restart_limit(&instance.restart_policy),
+                        );
+                    self.record_decision(
                         crate::bun::events::EventKind::JobFailed,
                         crate::bun::events::EventSeverity::Warning,
                         Some(instance.app_name.clone()),
@@ -1017,6 +1046,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                             "workload {} exhausted its restart budget",
                             instance.app_name
                         ),
+                        decision,
                     )
                     .await;
                 }
@@ -1043,6 +1073,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         {
             instance.state = stopping;
             instance.retry_pending = true;
+            instance.restart_cause = Some(RestartCause::StartFailed);
         }
         if let Some(instance) = self.supervisor.get_instance(id) {
             self.record_event(

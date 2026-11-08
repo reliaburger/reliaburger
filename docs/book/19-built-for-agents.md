@@ -5196,6 +5196,186 @@ than matching text. A step is then `job["steps"][i]["uses"]`, and indexing a
 so a missing field fails the assertion that reads it, with the field's name in
 the message.
 
+## Asking the cluster why
+
+An agent in an incident asks two questions `wtf` can't answer. What changed
+just before it broke? And why did the cluster do what it did: why is `web-1`
+on `node-2`, why did `web-0` restart, why was my deploy refused? 0.4.2 had
+the first one planned as an incident timeline (#1084). 0.2.8 pulls it
+forward with the second, as #1685.
+
+The second question is the interesting one, because when we looked, most of
+the answers didn't exist anywhere. A successful placement left nothing behind
+but its result. Both restart paths wrote the same sentence, "instance web-0
+restarted (attempt 3)", so a crash and a failed health check looked the same.
+A deploy refused by a resource owner, or by the council's state machine, was
+an HTTP answer to whoever sent it and then gone. You can't explain a decision
+by reading the code afterwards, either: the scores depend on how full each
+node was at that moment, and the health counters reset as soon as the
+instance restarts. The evidence exists for an instant, inside the function
+that decides. So that's where we record it.
+
+### A rule and its evidence, in a field we already had
+
+Every event already carries `details`, a `BTreeMap<String, String>` of
+machine-readable facts that's serialised only when it isn't empty. A decision
+is an ordinary event whose `details` has a `rule` key and one key per piece
+of evidence. No new record type, no new store, no new endpoint, and no wire
+format change: an old node reads a new event the same way it reads any other.
+That matters more than it sounds. A new `EventKind` variant would have been
+the obvious design, and it would have made every older peer fail to
+deserialise the events relay, which means a `protocol` bump in
+`src/compatibility.rs` and a fresh cluster.
+
+`src/bun/decisions.rs` holds the catalogue, one `DecisionRule` per rule
+with its id, what it means and the evidence keys it records, and a small
+builder for recording one:
+
+```rust
+pub fn new(rule: &'static str) -> Self {
+    Decision {
+        details: BTreeMap::from([(RULE_KEY.to_string(), rule.to_string())]),
+        dropped: 0,
+    }
+}
+
+pub fn with(mut self, key: impl Into<String>, value: impl Display) -> Self {
+    let key = key.into();
+    if self.details.len() > EVIDENCE_KEYS_MAX && !self.details.contains_key(&key) {
+        self.dropped += 1;
+        return self;
+    }
+    self.details.insert(key, bounded(value.to_string()));
+    self
+}
+```
+
+Two Rust details are doing work here. `rule: &'static str` accepts only a
+string that lives for the whole program, which in practice means a literal
+in the source. That's on purpose: the catalogue test finds where each rule is
+decided by searching the embedded source for `"restart.health_failed"`, the
+same trick `explain` uses for findings, and a rule id built at run time would
+hide from it. And `value: impl Display` takes anything that can print itself:
+a `u32` attempt count, a `&str`, a `NodeId`, or a whole `ReplicaChoice`
+whose `Display` writes the score line. `impl Trait` in argument position is
+shorthand for a generic parameter, so the compiler writes a copy of `with`
+for each type it's called with, the way a C++ template would, and there's no
+boxing. `with` takes `self` by value and returns it, which is what lets the
+calls chain: `Decision::new(rule).with("attempt", 3).with("threshold", 3)`.
+
+Every value is cut to 200 bytes and a decision keeps at most 16 keys, counting
+the rest in `evidence_dropped`. The events ring holds 1,024 events per node,
+and a placement of a 40-replica app shouldn't be able to take a megabyte of
+it.
+
+### Where each decision is made
+
+A restart had a problem: by the time `retry_restart` runs, nothing says why
+the instance stopped. The process exit and the failed start both set
+`retry_pending` and walk away. So each now leaves its reason on the instance,
+`restart_cause: Option<RestartCause>`, and the restart takes it:
+
+```rust
+let cause = instance
+    .restart_cause
+    .take()
+    .unwrap_or(RestartCause::ProcessExited);
+```
+
+`Option::take` swaps `None` into the field and hands back what was there, so
+the cause is used once and can't leak into the next restart. A health-check
+restart had the opposite problem: `maybe_restart` resets the health counters,
+so the evidence (three failed probes, threshold three) has to be read
+*before* the restart, and recorded after it succeeds.
+
+Placement is decided in `Scheduler::schedule_fixed`, which already scored
+every candidate and took the first. It now keeps a `ReplicaChoice` per
+replica: the node, how many of the app's replicas were already there (the
+first sort key), the score split into its four parts, how many nodes passed
+the filter and the runner-up. The score's parts come from `score_parts`,
+which the sort itself uses through `ScoreParts::total`, so the explanation
+and the decision can't disagree; a proptest checks the parts add up to the
+score over random nodes. The leader records one event per app when the
+placement pass commits, and only when the placements changed: a pass that
+changes nothing records nothing, so a steady cluster doesn't fill its ring
+with reasons. `number_placements`, which gives the new replicas their
+ordinals, now also returns which ordinal each one got, so a reason lands
+under the instance it explains (`default__web-1`), not just the node.
+
+The refusals go through `record_caller_action`, like every other audited
+action, so they reach the durable audit log as well as the ring and name the
+caller.
+
+### Reading it back
+
+`relish agent explain` keeps its finding id and grows flags:
+`--restart web-0`, `--placement web-1`, `--refusal web` and `--rules`.
+A finding question still reads only the binary. A decision question reads
+the cluster through the timeline's own merge, picks the records whose rule
+is of the right kind and names the instance, and adds the rule's meaning,
+the line that decides it and the events on the same node in the two minutes
+before. Ask why `web-0` restarted and you get `restart.health_failed`,
+`consecutive_failures: 3`, `threshold: 3`, the probe, and the `health` event
+that came 30 seconds earlier.
+
+When nothing matches, the answer is `not_found`, with how far back the
+records reach. It never says the restart didn't happen. The ring is in
+memory, a busy node rolls it over in minutes, and a node restart empties it,
+so "I can't see one" is all we know.
+
+`relish agent timeline` (and `relish timeline` for people) merges the events,
+the audit log and an app's deploy history into one list, newest first so the
+byte budget drops the oldest. Each source reports `known`, `partial` or
+`unknown`, and an audited action that's both in the ring and in the log is
+shown once.
+
+The first draft of `collect` had a lesson in it. It wrapped each source's
+timeout in one closure:
+
+```rust
+let timed = |result: Result<_, Elapsed>| result.unwrap_or(Err(RelishError::RequestTimeout));
+```
+
+and then called it on the events, the audit log and the deploy history, three
+different types. A Go or Python programmer would expect that to work. It
+doesn't: a closure's parameter types are inferred once, from its first use,
+and then fixed, so the second call was a type error. Closures can't be
+generic. A function can, so `timed` became `fn timed<T>(...)`, and the
+compiler writes one copy per `T`.
+
+### What we left out
+
+- **"Why not node-3?"** The record keeps the runner-up and how many nodes
+  passed the filter, not a reason for every node. That would be a record per
+  node per placement.
+- **Jobs and task arrays.** At a million runs, a placement record each would
+  push every other event out of the ring.
+- **A durable decision log.** Restart and placement records die with the
+  ring. Keeping them needs a store with its own retention, which belongs with
+  the server-side `/v1/timeline` that stays in #1084.
+- **Every other decision.** Autoscaler steps, drains, rollout auto-rollbacks
+  and disk-pressure evictions can each join the catalogue later with one
+  record call and a test. The capacity probe's refusal is left out too: only
+  a test lease sends it.
+
+### The tests
+
+Each rule has a unit test at the place it's decided: the restart decision's
+backoff and budget, a replacement recording why it went to the node it did
+(and not recording the replicas that stayed), a daemon set and a returning
+volume app recording their own rules, a converged app recording nothing, a
+shortfall and a quota block each recorded once. The policy and owner tests
+that already sent refused applies now also check the decision on the audit
+record. Insta snapshots fix the shape of a restart answer and a timeline.
+The timeline's tests cover the order across nodes and sources, the window,
+the limit, the duplicate in ring and log, an audit log the token can't read,
+and a full ring that doesn't reach the window's start.
+
+Three tests read the real embedded source, like the finding tests do: every
+rule in the catalogue is decided in exactly one function, every rule-like
+literal the code records is in the catalogue, and every rule is in the
+manual. Add a rule in one place and forget another, and one of them fails.
+
 ## What we didn't do
 
 The three big refusals are at the start of the chapter. These are the smaller

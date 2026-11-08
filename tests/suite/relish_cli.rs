@@ -1120,6 +1120,63 @@ fn agent_report_writes_a_redacted_draft_and_posts_nothing() {
     }
 }
 
+/// A stub Bun that answers `/v1/events` with one health-check restart of
+/// `web-0` and the event before it, and refuses `/v1/audit` the way a
+/// token without audit access is refused (#1685).
+async fn stub_bun_with_a_health_restart() -> (String, tokio::task::JoinHandle<()>) {
+    use axum::{Json, Router, routing::get};
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let details = reliaburger::bun::restart::restart_decision(
+        "restart.health_failed",
+        "default__web-0",
+        2,
+        &reliaburger::bun::restart::RestartPolicy::default(),
+    )
+    .with("consecutive_failures", 2)
+    .with("threshold", 2)
+    .into_details();
+    let events = serde_json::json!({
+        "events": [
+            {
+                "sequence": 1, "timestamp": now - 40, "kind": "health",
+                "severity": "warning", "app": "web", "namespace": "default",
+                "node": "node-1", "message": "instance default__web-0 became unhealthy"
+            },
+            {
+                "sequence": 2, "timestamp": now - 30, "kind": "restart",
+                "severity": "warning", "app": "web", "namespace": "default",
+                "node": "node-1", "details": details,
+                "message": "instance default__web-0 restarted (attempt 2)"
+            }
+        ],
+        "warnings": []
+    });
+    let app = Router::new()
+        .route(
+            "/v1/events",
+            get(move || {
+                let events = events.clone();
+                async move { Json(events) }
+            }),
+        )
+        .route(
+            "/v1/audit",
+            get(|| async {
+                (
+                    axum::http::StatusCode::FORBIDDEN,
+                    "insufficient permissions",
+                )
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (endpoint, server)
+}
+
 /// A single node on v0.2.7 whose binary isn't the one the release
 /// publishes, for `relish verify` and `relish agent verify` (#1689).
 async fn drifted_node() -> (String, tokio::task::JoinHandle<()>) {
@@ -1173,6 +1230,7 @@ async fn run_against(endpoint: &str, args: &[&str]) -> Output {
         std::time::Duration::from_secs(60),
         tokio::process::Command::new(env!("CARGO_BIN_EXE_relish"))
             .args(args)
+            .stdin(std::process::Stdio::null())
             .env("RELIABURGER_ENDPOINT", endpoint)
             .env_remove("RELIABURGER_TOKEN")
             .env_remove("RELIABURGER_CA_CERT")
@@ -1182,6 +1240,54 @@ async fn run_against(endpoint: &str, args: &[&str]) -> Output {
     .await
     .unwrap()
     .unwrap()
+}
+
+/// #1685: `relish agent explain --restart` answers with the rule, the
+/// evidence and the event before it, and says the audit log was unreadable.
+#[tokio::test]
+async fn agent_explain_says_why_an_instance_restarted() {
+    let (endpoint, server) = stub_bun_with_a_health_restart().await;
+    let output = run_against(&endpoint, &["agent", "explain", "--restart", "web-0"]).await;
+    server.abort();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let value = agent_envelope(&output);
+    assert_eq!(value["command"], "explain");
+    let decision = &value["data"]["decisions"][0];
+    assert_eq!(decision["rule"], "restart.health_failed");
+    assert_eq!(decision["evidence"]["threshold"], "2");
+    assert_eq!(decision["related"][0]["kind"], "health");
+    assert_eq!(
+        decision["decided_in"]["function"], "restart_published_unhealthy",
+        "{decision}"
+    );
+    assert_eq!(value["data"]["sources"][1]["state"], "unknown");
+}
+
+/// #1685: the timeline merges what the stub has, newest first, as an agent
+/// envelope and as a table.
+#[tokio::test]
+async fn timeline_lists_what_changed_newest_first() {
+    let (endpoint, server) = stub_bun_with_a_health_restart().await;
+    let agent = run_against(&endpoint, &["agent", "timeline", "--since", "10m"]).await;
+    let human = run_against(&endpoint, &["timeline", "--since", "10m"]).await;
+    server.abort();
+    assert_eq!(agent.status.code(), Some(0), "{agent:?}");
+    let value = agent_envelope(&agent);
+    let kinds: Vec<&str> = value["data"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["restart", "health"]);
+    assert_eq!(
+        value["next"][0]["run"],
+        "relish agent explain --restart default__web-0"
+    );
+    assert!(human.status.success(), "{human:?}");
+    let table = String::from_utf8_lossy(&human.stdout);
+    assert!(table.contains("restart.health_failed"), "{table}");
+    assert!(table.contains("audit: unknown"), "{table}");
 }
 
 /// #1689: offline, against a node whose binary drifted, both commands say

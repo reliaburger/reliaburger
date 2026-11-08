@@ -272,7 +272,8 @@ net, not a promise: read what you share before you post it anywhere.</p>
 <tr><td><code>relish agent manual show</code></td><td>One chapter, or one section of it, as Markdown: <code>diagnostics</code> or <code>diagnostics#relish-path-can-a-reach-b</code></td></tr>
 <tr><td><code>relish agent context</code></td><td>The first call: findings, unknowns, faults, alerts, one line per app and the newest events, in one bounded answer</td></tr>
 <tr><td><code>relish agent diagnose</code></td><td>Every finding with its evidence, read-only next steps, and pointers into the manual and the source</td></tr>
-<tr><td><code>relish agent explain</code></td><td>What a finding means, its thresholds and where it's decided; every finding when no id is given. Reads only this binary</td></tr>
+<tr><td><code>relish agent explain</code></td><td>What a finding means and where it's decided, or why the cluster made a decision: --restart, --placement, --refusal</td></tr>
+<tr><td><code>relish agent timeline</code></td><td>What changed in a window: events, audit and deploys, newest first</td></tr>
 <tr><td><code>relish agent upgrade-check</code></td><td>Whether the cluster can take the latest release: <code>ready</code>, <code>up_to_date</code>, <code>needs_fresh_cluster</code>, <code>blocked</code> or <code>unknown</code></td></tr>
 <tr><td><code>relish agent verify</code></td><td>Whether the cluster runs the published release, byte for byte: <code>verified</code>, <code>mismatch</code> or <code>unknown</code></td></tr>
 <tr><td><code>relish agent report</code></td><td>Draft a redacted bug report for a human to post. Never posts</td></tr>
@@ -296,16 +297,11 @@ binary itself. Its default budget is 80 KiB, not 24, so the whole chapter
 comes back in one call, with nothing trimmed. Given a smaller <code>--max-bytes</code>,
 the last sections go first, and the <code>next</code> step asks for a <code>--max-bytes</code> that
 fits it all.</p>
-<p><code>relish agent version</code> prints the version, commit, target and cluster formats
-of this binary:</p>
-<pre><code class="language-sh">relish agent version
-</code></pre>
-<p><code>relish agent schema</code> prints the JSON Schema of the envelope and of every
-command's <code>data</code>; name a command to get only its schema:</p>
+<p><code>relish agent schema</code> prints the JSON Schema of the envelope and every
+command's <code>data</code>. All together they're over the default budget, so name the
+command you need; each fits on its own:</p>
 <pre><code class="language-sh">relish agent schema version
 </code></pre>
-<p>All of them together are bigger than the default budget, so a bare <code>relish agent schema</code> comes back trimmed; name the command you need, as above. Each
-one fits on its own.</p>
 </section>
 <section class="agents-section" id="reading-the-cluster">
 <h2>Reading the cluster <a class="permalink" href="#reading-the-cluster" aria-label="Link to this section">#</a></h2>
@@ -343,20 +339,14 @@ event message quoting one, travels only inside <code>untrusted</code>; where <co
 sentence quoted it, <code>diagnose</code> says <code>&lt;the app's log line, in events as untrusted text&gt;</code> instead. The <code>suggestion</code> can name commands that change the
 cluster, such as <code>relish rollback</code>: those are for you to run, not your agent.</p>
 <p><code>diagnose</code> exits <code>0</code> whatever it finds; <code>relish wtf</code>'s exit codes don't apply.</p>
-<p><code>explain</code> says what a finding id means, and reads only the binary, never the
-cluster:</p>
-<pre><code class="language-sh">relish agent explain crashloop
-relish agent explain
-</code></pre>
-<p>You get the <code>meaning</code>, the <code>severities</code> it comes at, its <code>thresholds</code> (each
-with the constant's name, its <code>value</code> and <code>unit</code>, and where it's defined),
-<code>decided_in</code> (the line in <code>src/relish/wtf/diagnose.rs</code> that reports it, and
-the function around it) and the <code>manual</code> section. The thresholds are the very
-constants the check compares against, and the line is found by searching the
-embedded source for the id, so neither can drift from the code. With no id,
-<code>explain</code> lists every finding. An id <code>wtf</code> doesn't have is <code>not_found</code>, with
-the closest ids in the hint. The table under "Every finding" in
-<code>diagnostics</code> lists them all.</p>
+<p><code>explain crashloop</code> says what a finding means, reading only the binary: its
+<code>meaning</code>, <code>thresholds</code> (the constants the check compares against) and
+<code>decided_in</code>, the line that reports it. With no id it lists every finding.</p>
+<p><code>explain --restart web-0</code>, <code>--placement web-1</code> or <code>--refusal web</code> asks why
+the cluster did something: the <code>rule</code>, its <code>evidence</code> and the code that
+decides it. A decision the records don't hold is <code>not_found</code>, meaning
+unknown, not "didn't happen". <code>timeline --since 15m</code> lists what changed,
+newest first. Both are in <code>diagnostics#relish-timeline-what-changed-and-why-did-it-do-that</code>.</p>
 </section>
 <section class="agents-section" id="reading-an-apps-logs">
 <h2>Reading an app's logs <a class="permalink" href="#reading-an-apps-logs" aria-label="Link to this section">#</a></h2>

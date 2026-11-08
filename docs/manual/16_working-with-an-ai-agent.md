@@ -247,7 +247,8 @@ net, not a promise: read what you share before you post it anywhere.
 | `relish agent manual show` | One chapter, or one section of it, as Markdown: `diagnostics` or `diagnostics#relish-path-can-a-reach-b` |
 | `relish agent context` | The first call: findings, unknowns, faults, alerts, one line per app and the newest events, in one bounded answer |
 | `relish agent diagnose` | Every finding with its evidence, read-only next steps, and pointers into the manual and the source |
-| `relish agent explain` | What a finding means, its thresholds and where it's decided; every finding when no id is given. Reads only this binary |
+| `relish agent explain` | What a finding means and where it's decided, or why the cluster made a decision: --restart, --placement, --refusal |
+| `relish agent timeline` | What changed in a window: events, audit and deploys, newest first |
 | `relish agent upgrade-check` | Whether the cluster can take the latest release: `ready`, `up_to_date`, `needs_fresh_cluster`, `blocked` or `unknown` |
 | `relish agent verify` | Whether the cluster runs the published release, byte for byte: `verified`, `mismatch` or `unknown` |
 | `relish agent report` | Draft a redacted bug report for a human to post. Never posts |
@@ -277,23 +278,13 @@ comes back in one call, with nothing trimmed. Given a smaller `--max-bytes`,
 the last sections go first, and the `next` step asks for a `--max-bytes` that
 fits it all.
 
-`relish agent version` prints the version, commit, target and cluster formats
-of this binary:
-
-```sh
-relish agent version
-```
-
-`relish agent schema` prints the JSON Schema of the envelope and of every
-command's `data`; name a command to get only its schema:
+`relish agent schema` prints the JSON Schema of the envelope and every
+command's `data`. All together they're over the default budget, so name the
+command you need; each fits on its own:
 
 ```sh
 relish agent schema version
 ```
-
-All of them together are bigger than the default budget, so a bare `relish
-agent schema` comes back trimmed; name the command you need, as above. Each
-one fits on its own.
 
 ## Reading the cluster
 
@@ -342,23 +333,15 @@ cluster, such as `relish rollback`: those are for you to run, not your agent.
 
 `diagnose` exits `0` whatever it finds; `relish wtf`'s exit codes don't apply.
 
-`explain` says what a finding id means, and reads only the binary, never the
-cluster:
+`explain crashloop` says what a finding means, reading only the binary: its
+`meaning`, `thresholds` (the constants the check compares against) and
+`decided_in`, the line that reports it. With no id it lists every finding.
 
-```sh
-relish agent explain crashloop
-relish agent explain
-```
-
-You get the `meaning`, the `severities` it comes at, its `thresholds` (each
-with the constant's name, its `value` and `unit`, and where it's defined),
-`decided_in` (the line in `src/relish/wtf/diagnose.rs` that reports it, and
-the function around it) and the `manual` section. The thresholds are the very
-constants the check compares against, and the line is found by searching the
-embedded source for the id, so neither can drift from the code. With no id,
-`explain` lists every finding. An id `wtf` doesn't have is `not_found`, with
-the closest ids in the hint. The table under "Every finding" in
-`diagnostics` lists them all.
+`explain --restart web-0`, `--placement web-1` or `--refusal web` asks why
+the cluster did something: the `rule`, its `evidence` and the code that
+decides it. A decision the records don't hold is `not_found`, meaning
+unknown, not "didn't happen". `timeline --since 15m` lists what changed,
+newest first. Both are in `diagnostics#relish-timeline-what-changed-and-why-did-it-do-that`.
 
 ## Reading an app's logs
 

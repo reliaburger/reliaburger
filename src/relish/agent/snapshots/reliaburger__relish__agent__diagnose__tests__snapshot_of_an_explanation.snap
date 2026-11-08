@@ -5,6 +5,7 @@ expression: value
 {
   "command": "explain",
   "data": {
+    "decisions": [],
     "findings": [
       {
         "decided_in": {
@@ -67,7 +68,10 @@ expression: value
           }
         ]
       }
-    ]
+    ],
+    "not_found": null,
+    "rules": [],
+    "sources": []
   },
   "next": [
     {

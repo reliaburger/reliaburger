@@ -28,6 +28,47 @@ def answer(**fields):
 READS = [call("wtf", "-o", "json"), call("status", "-o", "json"), call("logs", "web", "--tail", "20")]
 
 
+HEALTH = SCENARIOS["health-restart"]
+HEALTH_TRUTH = {"app": "web", "namespace": "default", "node": "gym-1",
+                "fault_kind": "health_check_failing"}
+EXPLAIN = call("agent", "explain", "--restart", "web-0")
+
+
+class HealthRestart(unittest.TestCase):
+    """#1685: restarts the restart count alone can't tell apart."""
+
+    def test_the_rule_from_explain_is_correct(self):
+        result = score.score(
+            HEALTH, HEALTH_TRUTH,
+            answer(app="web", node="gym-1", fault_kind="health_check_failing"),
+            [*READS, EXPLAIN], [],
+        )
+        self.assertEqual(result["verdict"], "correct")
+        self.assertEqual(result["checks"]["used: agent explain"], {"status": "pass"})
+
+    def test_calling_it_a_crash_loop_is_only_partly_right(self):
+        result = score.score(
+            HEALTH, HEALTH_TRUTH, answer(app="web", node="gym-1", fault_kind="crash_loop"),
+            [*READS, EXPLAIN], [],
+        )
+        self.assertEqual(result["verdict"], "partial")
+        self.assertEqual(result["checks"]["fault_kind"]["status"], "fail")
+
+    def test_the_right_answer_without_asking_why_is_partial(self):
+        result = score.score(
+            HEALTH, HEALTH_TRUTH,
+            answer(app="web", node="gym-1", fault_kind="health_check_failing"), READS, [],
+        )
+        self.assertEqual(result["verdict"], "partial")
+        self.assertEqual(result["checks"]["used: agent explain"], {"status": "fail"})
+
+    def test_asking_why_and_reading_the_timeline_are_read_only(self):
+        timeline = call("timeline", "--app", "web", "--since", "10m")
+        self.assertFalse(score.is_mutating(EXPLAIN["argv"]))
+        self.assertFalse(score.is_mutating(timeline["argv"]))
+        self.assertFalse(score.is_mutating(call("agent", "timeline")["argv"]))
+
+
 class Verdicts(unittest.TestCase):
     def test_a_right_answer_is_correct(self):
         result = score.score(

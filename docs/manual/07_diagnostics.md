@@ -165,6 +165,75 @@ means, the numbers that decide it and the line of code that does (see
 | `alerts-firing` | warning | An alert is firing |
 | `cpu-throttling` | warning | An app was CPU throttled |
 
+## `relish timeline`: what changed, and why did it do that?
+
+A finding tells you what's wrong now. In an incident you also want to know
+what changed just before, and why the cluster did what it did. `relish
+timeline` answers the first:
+
+```sh
+relish timeline --app web --since 15m
+relish timeline --since 10m --until 1762560000
+```
+
+It merges three sources into one list, newest first: each node's events
+(deploys, restarts, health, placement, alerts, faults, audited operations),
+the audit log (applies, policy changes, refused deploys, faults, tokens,
+including the ones that have left the events ring) and, with `--app`, the
+app's deploy history. `--since` and `--until` take a duration or epoch
+seconds, and a window covers at most a day; `--limit` (100 by default, at most
+500) keeps the newest. Set `--until` to when it broke to see the minutes
+before.
+
+Above the list, each source says how much of it was seen. Events live in
+memory, the newest 1,024 per node, so on a busy node the start of a long
+window may be gone, and the timeline says so instead of showing a quiet hour.
+A node that didn't answer is named, and a token that may not read the audit
+log gets the rest of the timeline with the audit source marked unknown. `-o
+json` prints the same data `relish agent timeline` returns.
+
+### Decisions and their rules
+
+Some entries are decisions, with a `rule` and the evidence it compared. The
+scheduler, a node's restart loop and the apply path record them at the moment
+they decide, because a moment later the evidence is gone: the scores, the
+failed probes, the policy that said no. `relish agent explain` reads them
+back:
+
+```sh
+relish agent explain --restart web-0
+relish agent explain --placement web-1 --namespace payments
+relish agent explain --refusal web
+relish agent explain --rules
+```
+
+Each answer gives the rule, what it means, the evidence, the line of code
+that decides it and what happened on the same node in the two minutes before.
+A decision the records no longer hold comes back with `not_found`, saying how
+far back the records reach: unknown, not "it didn't happen".
+
+| Rule | Means |
+|------|-------|
+| `placement.scored` | The scheduler put a new replica on the node running fewest of the app's replicas, then the highest score; the evidence has the score's parts, how many nodes passed the filter and the runner-up |
+| `placement.daemon` | A daemon set runs on every node that passes the filter |
+| `placement.volume_home` | An app with managed volumes went back to the nodes that hold them |
+| `placement.short` | Some replicas found no node, and why: the first constraint none met |
+| `placement.quota_blocked` | The namespace quota has no room for the app |
+| `restart.process_exited` | The process stopped, so the node restarted it within the restart budget, after the backoff |
+| `restart.start_failed` | The runtime couldn't start the instance, so the node cleaned up and tried again |
+| `restart.health_failed` | The instance failed `threshold` health probes in a row, so the node restarted it |
+| `restart.budget_exhausted` | The instance used its whole restart budget, so the node gave up and marked it failed |
+| `restart.sidecar_exited` | A sidecar exited and was restarted on its own |
+| `deploy.refused.policy` | An enforcing policy denied the apply |
+| `deploy.refused.owner` | The apply named an owner the caller can't speak for |
+| `deploy.refused.council` | The council refused the write: a lease, an owner elsewhere, a quota |
+
+The leader records one placement decision per app per change; a pass that
+changes nothing records nothing. Jobs and task arrays don't record
+placements: at a million runs they'd flush every other event out of the
+ring. Restart and placement records live in the events ring, so they don't
+survive a node restart. Refused deploys also go to the audit log, which does.
+
 ## `relish path`: can A reach B?
 
 `path` walks the network path between two apps hop by hop. It finds a running

@@ -45,6 +45,7 @@ pub const READ_ONLY_COMMANDS: &[&str] = &[
     "routes",
     "source",
     "status",
+    "timeline",
     "top",
     "wtf",
 ];
@@ -73,6 +74,7 @@ pub const USAGE_EXIT: i32 = 2;
 /// so scoring compares two words instead of judging prose.
 pub const FAULT_KINDS: &[&str] = &[
     "crash_loop",
+    "health_check_failing",
     "unschedulable",
     "node_partitioned",
     "relish_bug",

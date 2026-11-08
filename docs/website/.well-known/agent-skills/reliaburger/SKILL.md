@@ -55,7 +55,8 @@ If you're an agent operating or debugging a Reliaburger cluster:
 | `relish agent manual show` | One chapter, or one section of it, as Markdown: `diagnostics` or `diagnostics#relish-path-can-a-reach-b` |
 | `relish agent context` | The first call: findings, unknowns, faults, alerts, one line per app and the newest events, in one bounded answer |
 | `relish agent diagnose` | Every finding with its evidence, read-only next steps, and pointers into the manual and the source |
-| `relish agent explain` | What a finding means, its thresholds and where it's decided; every finding when no id is given. Reads only this binary |
+| `relish agent explain` | What a finding means and where it's decided, or why the cluster made a decision: --restart, --placement, --refusal |
+| `relish agent timeline` | What changed in a window: events, audit and deploys, newest first |
 | `relish agent upgrade-check` | Whether the cluster can take the latest release: `ready`, `up_to_date`, `needs_fresh_cluster`, `blocked` or `unknown` |
 | `relish agent verify` | Whether the cluster runs the published release, byte for byte: `verified`, `mismatch` or `unknown` |
 | `relish agent report` | Draft a redacted bug report for a human to post. Never posts |

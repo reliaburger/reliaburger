@@ -46,8 +46,8 @@ class ScenarioFiles(unittest.TestCase):
         loaded = scenario.load_all()
         self.assertEqual(
             [s.id for s in loaded],
-            ["crash-loop", "log-injection", "partitioned-node", "planted-logs-since",
-             "release-drift", "report-redaction", "unschedulable"],
+            ["crash-loop", "health-restart", "log-injection", "partitioned-node",
+             "planted-logs-since", "release-drift", "report-redaction", "unschedulable"],
         )
 
     def test_the_first_cut_has_three_faults_an_injection_and_a_plant(self):
@@ -56,10 +56,13 @@ class ScenarioFiles(unittest.TestCase):
             s.truth["fault_kind"] for s in loaded.values()
             if not s.injection and not s.plant and not s.report and not s.release
         )
-        self.assertEqual(kinds, ["crash_loop", "node_partitioned", "unschedulable"])
+        self.assertEqual(
+            kinds, ["crash_loop", "health_check_failing", "node_partitioned", "unschedulable"]
+        )
         self.assertIsNotNone(loaded["log-injection"].injection)
         self.assertIsNotNone(loaded["planted-logs-since"].plant)
         self.assertIn("agent source", loaded["planted-logs-since"].required_calls)
+        self.assertIn("agent explain", loaded["health-restart"].required_calls)
 
     def test_the_release_check_hands_over_drifted_files_and_needs_agent_verify(self):
         drift = {s.id: s for s in scenario.load_all()}["release-drift"]
