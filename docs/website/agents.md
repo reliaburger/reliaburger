@@ -886,9 +886,8 @@ It uses the same connection as every other `relish` command: `--endpoint`,
 `--token`, `--ca-cert`, their environment variables, or the saved local
 context. Put the flags before `mcp`, as in `relish --token "$TOKEN" mcp`.
 Give it a read-only token; `bun` decides what the token may read, and the
-server can't get round that. With the saved context's admin token it sends a
-read-only token of its own instead (see "Wiring up your agent"). Given an
-admin token, it warns on stderr.
+server can't get round that. Given the saved context's admin token, it uses
+its own read-only token (see below); any other admin token gets a warning.
 
 Every `relish agent` command that only reads becomes a tool, named after it
 with `_` between the words: `version`, `schema`, `source_version`,
@@ -936,10 +935,9 @@ The repository's [`server.json`](https://github.com/reliaburger/reliaburger/blob
 lists `relish mcp` in the [MCP Registry](https://registry.modelcontextprotocol.io)
 as `io.github.reliaburger/relish`. From 0.2.8 each release carries an
 [MCP Bundle](https://github.com/modelcontextprotocol/mcpb) per platform,
-`relish-<platform>.mcpb`, which the entry lists with SHA-256s. Clients that
-install bundles, such as Claude Desktop, run the `relish` inside. A bundle
-asks for nothing and uses the saved context. Two optional settings, an
-endpoint and a [read-only token](#a-read-only-token), arrive as
+`relish-<platform>.mcpb`, which the entry lists with SHA-256s. A client that
+installs bundles, such as Claude Desktop, runs the `relish` inside with the
+saved context. Two optional settings, an endpoint and a [read-only token](#a-read-only-token), arrive as
 `RELIABURGER_ENDPOINT` and `RELIABURGER_TOKEN`; empty means unset.
 
 ## Wiring up your agent
@@ -1021,15 +1019,13 @@ A server map left empty goes too, so a file setup changed reads as it did
 before, and a file setup created is left as `{}`. Restart the agent after
 either.
 
-The entry runs plain `relish` from your `PATH`, so upgrades don't break it.
-An editor started from the macOS Dock may not see your shell's `PATH`; if it
-can't start `relish`, put the output of `command -v relish` in the entry's
-`command`, and setup calls it a `conflict`: it's yours now.
+The entry runs plain `relish` from your `PATH`. If an editor started from the
+macOS Dock can't find it, put `command -v relish`'s output in the entry's
+`command`; setup then calls it a `conflict`, as it's yours now.
 
 Setup also installs the Reliaburger skill for Claude Code, at
-`~/.claude/skills/reliaburger/SKILL.md`, by the same rules.
-
-With an admin context, setup also makes `relish mcp` a read-only token
+`~/.claude/skills/reliaburger/SKILL.md`, by the same rules. With an admin
+context, it also makes `relish mcp` a read-only token
 (`data.mcp_token`), a day long and renewed as it runs out, in `mcp-token.json`
 beside the context, mode 0600. `--remove` revokes it.
 
