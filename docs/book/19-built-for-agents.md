@@ -3529,6 +3529,114 @@ stderr, a read-only token prints nothing, and a context whose endpoint has
 nothing behind it still warns. All three check that every stdout line parses
 as JSON-RPC.
 
+### A read-only token of its own
+
+The warning is a stopgap. [#1730](https://github.com/reliaburger/reliaburger/issues/1730)
+is the second half of decision (d): when the token `relish mcp` would send is
+the context's admin one, it makes a read-only token for itself and sends that
+instead. Nobody has to fill in the bundle's token field, and the agent's
+connection never carries admin credentials.
+
+`src/relish/mcp/credentials.rs` holds the whole policy. The first time a tool
+is called, `obtain` looks for `mcp-token.json` beside `context.json`. A token
+there that belongs to this cluster (the context's `owner` and endpoint) and
+has more than five minutes left is used as it is, with no round trip.
+Otherwise it asks the cluster, with the admin token, two things. First
+`GET /v1/token/list`, the same admin-only probe as the warning: a 403 means
+the context's token isn't admin after all, so there's nothing to make and
+`relish mcp` sends it unchanged. Then `POST /v1/token/create` for a
+`read-only` token named `relish-mcp-<time>-<pid>`, with a one-day lifetime
+and, under `--namespace payments`, confined to that namespace (and kept in
+`mcp-token-payments.json`, so two servers with different namespaces don't
+replace each other's). The new token is saved and the one it replaces is
+revoked, best effort, so they don't pile up in `relish token list`.
+
+Why on the first tool call and not at start? A client gives up on a server
+that's slow to answer `initialize`, and a laptop cluster that isn't running
+yet would turn into a server that never starts. Done lazily, the first call
+after the cluster comes up gets its token.
+
+The file is written the way the context is: `atomic_write_mode` with mode
+0600 in a 0700 directory, and `load` refuses a file anyone else can read.
+`StoredToken` has no `Debug`, like `LocalContext`, so no `{:?}` can print the
+secret. Only `relish mcp` and `relish agent setup` read it.
+
+Sending it took one change to the client. Every `relish agent` command builds
+its own `BunClient` through `default_local`, which asks `resolve_token` for a
+bearer: `--token`, then `RELIABURGER_TOKEN`, and with neither, the context's
+own. `relish mcp` now sets a third source in between:
+
+```rust
+static MCP_TOKEN: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+pub(crate) fn resolve_token() -> Option<String> {
+    explicit_token().or_else(mcp_token)
+}
+```
+
+A `static` with a lock in it is Rust's version of a guarded global. It has to
+be built at compile time, which `RwLock::new` allows because it's a `const
+fn`. The project prefers tokio's locks, but `resolve_token` is synchronous
+and holds this one only long enough to clone a string, never across an
+`.await`, so the standard library's is the right tool. `.read()` returns a
+`Result` because a thread that panics while holding a lock "poisons" it;
+`unwrap_or_else(PoisonError::into_inner)` takes the value anyway, since an
+`Option<String>` can't be left half-written. Why not pass the token down? It
+would mean a parameter through every agent command for the sake of one
+caller, and a `tokio::task_local!` would quietly fall back to the admin token
+in any task that didn't inherit it. A process-wide value set before any tool
+runs can't miss.
+
+"Never fall back to admin" is enforced in `Server::call`:
+
+```rust
+if let Err(error) = managed.ensure(false).await {
+    return Ok(tool_result(&no_token(command, &error, &rerun)));
+}
+let rendered = agent::run(&options, &rerun).await;
+if !unauthenticated(&rendered) {
+    return Ok(tool_result(&rendered));
+}
+```
+
+If there's no read-only token, the tool doesn't run: the agent gets an error
+envelope saying the cluster refused (with the cluster's own words) and how to
+make a token by hand. If the cluster answers a tool with a 401, the stored
+token was revoked or expired early, so `ensure(true)` skips it, makes a new
+one, and the call runs once more. `ensure` holds a `tokio::sync::Mutex` while
+it works, so two tool calls arriving together make one token, not two.
+
+`relish agent setup` does the same thing ahead of time. Its answer gained an
+`mcp_token` change beside the agents' entries: in the preview, a one-line
+diff saying a read-only token for `relish mcp` will be made, never the
+secret; with `--yes`, the token itself; with `--remove`, revocation. Making
+it needs the network, and setup does its file work in `spawn_blocking`, so
+the plan carries a boxed closure, `Box<dyn FnOnce(Action) -> Result<bool,
+String> + Send>`, that calls `Handle::block_on` on the runtime. Blocking on
+the runtime is forbidden on its worker threads and fine on a
+`spawn_blocking` thread, which is exactly where the closure runs. The tests
+hand setup a closure that records what it was asked to do, so they check
+"the preview makes nothing" and "`--yes` makes it once" without a cluster.
+
+The tests for `credentials` run against a stand-in API with an admin bearer
+and a read-only one: an admin context makes a `read-only` token with
+`ttl_days: 1` and stores it with mode 0600; a stored token is reused with no
+request at all; a read-only context makes nothing; an expired token, one
+about to expire and one from another cluster are replaced, the old one
+revoked; a namespace confines the token and gets its own file, and a
+namespace that could escape the directory is refused; a cluster that refuses
+creation is a `Refused` error naming the cluster's reason, with nothing
+stored. In `src/relish/mcp/tests.rs` the server does the rest end to end: it
+sends the token it made, a refusal fails the tool without any other request,
+and a revoked stored token gets a 401, a new token and a retry, with the
+admin bearer never seen on a tool's request. And the suite test from the
+warning now checks the opposite of what it did: started from an admin
+context, `relish mcp` prints no warning, because there's no admin token left
+to warn about. `admin_warning`'s first arm is now
+`TokenOrigin::ContextAdmin | TokenOrigin::Absent => false`: a `|` in a
+`match` pattern matches either variant, like two `case` labels sharing one
+body in C, without the fall-through.
+
 ### The tests
 
 `src/relish/mcp/tests.rs` drives the server over `tokio::io::duplex`, an

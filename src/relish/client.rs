@@ -477,6 +477,31 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// The `--endpoint` CLI override, set once from `main` before dispatch.
 static CLI_ENDPOINT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 
+/// The read-only token `relish mcp` made for itself from an admin context
+/// (#1730), sent in place of the context's own token. A `std` lock, not a
+/// tokio one, because [`resolve_token`] is synchronous and holds it only to
+/// clone the string, never across an `.await`.
+static MCP_TOKEN: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// Send `token` in place of the managed context's admin token from now on,
+/// or stop doing so with `None`. Only `relish mcp` calls this. An explicit
+/// `--token` or `RELIABURGER_TOKEN` still wins.
+pub fn set_mcp_token(token: Option<String>) {
+    // A poisoned lock means a panic mid-write of an `Option<String>`, which
+    // can't leave it half-written; take the value either way.
+    let mut slot = MCP_TOKEN
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *slot = token;
+}
+
+fn mcp_token() -> Option<String> {
+    MCP_TOKEN
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
 /// An invalid Bun API base URL supplied through Relish's connection options.
 #[derive(Debug, thiserror::Error)]
 pub enum EndpointError {
@@ -531,8 +556,14 @@ fn resolve_ca_cert() -> Option<std::path::PathBuf> {
 }
 
 /// Resolve the auth token: the `--token` flag takes precedence over the
-/// `RELIABURGER_TOKEN` environment variable.
-fn resolve_token() -> Option<String> {
+/// `RELIABURGER_TOKEN` environment variable, and either over the read-only
+/// token `relish mcp` made for itself.
+pub(crate) fn resolve_token() -> Option<String> {
+    explicit_token().or_else(mcp_token)
+}
+
+/// The token the user gave: `--token`, else `RELIABURGER_TOKEN`.
+fn explicit_token() -> Option<String> {
     pick_token(CLI_TOKEN.get(), std::env::var("RELIABURGER_TOKEN").ok())
 }
 
@@ -568,7 +599,7 @@ pub enum TokenOrigin {
 /// the network. An explicit `--endpoint` bypasses the context's
 /// credentials, so with no explicit token there's no token at all.
 pub fn token_origin() -> TokenOrigin {
-    if resolve_token().is_some() {
+    if explicit_token().is_some() {
         return TokenOrigin::Explicit;
     }
     if endpoint_overridden() {

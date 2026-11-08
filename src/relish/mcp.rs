@@ -18,12 +18,15 @@
 //! The protocol comes from `rmcp`, the official Rust SDK, with only its
 //! server and stdio features.
 
+pub mod credentials;
 pub mod tools;
 
 #[cfg(test)]
 mod tests;
 
 use std::collections::BTreeSet;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::FromArgMatches;
 use rmcp::model::{
@@ -38,7 +41,8 @@ use crate::relish::RelishError;
 use crate::relish::agent::{
     self, AgentError, AgentOptions, CommandName, DEFAULT_MAX_BYTES, ErrorCode, ExitStatus, Rendered,
 };
-use crate::relish::client::{TokenAccess, TokenOrigin};
+use crate::relish::client::{BunClient, TokenAccess, TokenOrigin};
+use credentials::{Credential, CredentialError};
 use tools::{Selection, ToolSpec};
 
 /// `relish mcp`'s flags.
@@ -98,26 +102,26 @@ const ROLE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2
 
 /// The warning to print for a token from `origin`, if it's an admin one.
 ///
-/// The managed context's token is known to be admin, so that needs no
-/// network. Only an explicit `--token` or `RELIABURGER_TOKEN` awaits `probe`,
-/// the cluster's word on the token; `None` there (no answer, an error) means
-/// unknown, and unknown stays quiet.
+/// The managed context's token is admin, but `relish mcp` never sends it:
+/// it swaps in a read-only token of its own ([`Managed`], #1730), so there's
+/// nothing to say and nothing to ask. Only an explicit `--token` or
+/// `RELIABURGER_TOKEN` awaits `probe`, the cluster's word on the token;
+/// `None` there (no answer, an error) means unknown, and unknown stays
+/// quiet.
 pub async fn admin_warning(
     origin: TokenOrigin,
     probe: impl std::future::Future<Output = Option<TokenAccess>>,
 ) -> Option<&'static str> {
     let admin = match origin {
-        TokenOrigin::ContextAdmin => true,
+        TokenOrigin::ContextAdmin | TokenOrigin::Absent => false,
         TokenOrigin::Explicit => probe.await == Some(TokenAccess::Admin),
-        TokenOrigin::Absent => false,
     };
     admin.then_some(ADMIN_TOKEN_WARNING)
 }
 
 /// Print [`ADMIN_TOKEN_WARNING`] on stderr when the token this process sends
 /// is an admin one, without holding up the server: the check runs beside it.
-fn spawn_admin_warning() -> tokio::task::JoinHandle<()> {
-    let origin = crate::relish::client::token_origin();
+fn spawn_admin_warning(origin: TokenOrigin) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let probe = async {
             let client = crate::relish::client::BunClient::default_local();
@@ -132,10 +136,99 @@ fn spawn_admin_warning() -> tokio::task::JoinHandle<()> {
     })
 }
 
+/// `relish mcp`'s own read-only token, for a server started from an admin
+/// context (#1730): where it's kept, what it's for, and the admin client
+/// that makes a new one.
+pub struct Managed {
+    path: PathBuf,
+    scope: credentials::Scope,
+    admin: BunClient,
+    /// Held while a token is checked or made, so two calls at once don't
+    /// make two. `true` once the cluster has said the context's token isn't
+    /// admin after all, so there's nothing to make.
+    context_not_admin: tokio::sync::Mutex<bool>,
+}
+
+impl std::fmt::Debug for Managed {
+    // By hand: `BunClient` carries the admin bearer and has no `Debug`.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Managed")
+            .field("path", &self.path)
+            .field("scope", &self.scope)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Managed {
+    /// A token kept at `path` for `scope`, made with `admin` when needed.
+    pub fn new(path: PathBuf, scope: credentials::Scope, admin: BunClient) -> Managed {
+        Managed {
+            path,
+            scope,
+            admin,
+            context_not_admin: tokio::sync::Mutex::new(false),
+        }
+    }
+
+    /// For the saved local context, scoped to `namespace`. `None` without a
+    /// context.
+    pub fn from_context(namespace: Option<&str>) -> Result<Option<Managed>, RelishError> {
+        let context_path = crate::relish::local_context::default_path()?;
+        let Some(context) = crate::relish::local_context::LocalContext::load(&context_path)? else {
+            return Ok(None);
+        };
+        let path = credentials::path_beside(&context_path, namespace).map_err(|error| {
+            RelishError::InvalidFlag {
+                flag: "namespace".to_string(),
+                reason: error.to_string(),
+            }
+        })?;
+        // `None` asks for the context's own token, never an override.
+        let admin = context.client(None, None)?;
+        let scope = credentials::Scope {
+            owner: context.owner.clone(),
+            endpoint: context.endpoint.clone(),
+            namespace: namespace.map(str::to_string),
+        };
+        Ok(Some(Managed::new(path, scope, admin)))
+    }
+
+    /// Make sure every request from here on sends a read-only token: the
+    /// stored one, or a new one. `renew` skips the stored one, because the
+    /// cluster has just rejected it. An error leaves no token to send, and
+    /// the caller runs nothing.
+    async fn ensure(&self, renew: bool) -> Result<(), CredentialError> {
+        let mut context_not_admin = self.context_not_admin.lock().await;
+        if *context_not_admin && !renew {
+            return Ok(());
+        }
+        let (credential, _) = credentials::obtain(
+            &self.path,
+            &self.scope,
+            &self.admin,
+            credentials::now(),
+            renew,
+        )
+        .await?;
+        match credential {
+            Credential::ReadOnly(token) => crate::relish::client::set_mcp_token(Some(token)),
+            Credential::ContextNotAdmin => {
+                *context_not_admin = true;
+                crate::relish::client::set_mcp_token(None);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The MCP server: the tools it offers and how to run them.
 #[derive(Debug, Clone)]
 pub struct Server {
     tools: Vec<ToolSpec>,
+    /// Set when `relish mcp` started from an admin context: the read-only
+    /// token it sends instead.
+    managed: Option<Arc<Managed>>,
 }
 
 impl Server {
@@ -144,7 +237,15 @@ impl Server {
         let all = tools::derive(agent::agent_command(), &tools::data_schema);
         Ok(Server {
             tools: tools::select(all, selection)?,
+            managed: None,
         })
+    }
+
+    /// This server, sending `managed`'s read-only token rather than the
+    /// context's admin one.
+    pub fn with_managed(mut self, managed: Managed) -> Self {
+        self.managed = Some(Arc::new(managed));
+        self
     }
 
     /// The tools, as `tools/list` returns them.
@@ -181,8 +282,45 @@ impl Server {
                 return Ok(tool_result(&usage(command, message.trim_end(), &rerun)));
             }
         };
+        let Some(managed) = &self.managed else {
+            return Ok(tool_result(&agent::run(&options, &rerun).await));
+        };
+        if let Err(error) = managed.ensure(false).await {
+            return Ok(tool_result(&no_token(command, &error, &rerun)));
+        }
+        let rendered = agent::run(&options, &rerun).await;
+        if !unauthenticated(&rendered) {
+            return Ok(tool_result(&rendered));
+        }
+        // Revoked, or expired sooner than it said: make a new read-only
+        // token and ask once more.
+        if let Err(error) = managed.ensure(true).await {
+            return Ok(tool_result(&no_token(command, &error, &rerun)));
+        }
         Ok(tool_result(&agent::run(&options, &rerun).await))
     }
+}
+
+/// Whether the cluster turned the request's token away (401).
+fn unauthenticated(rendered: &Rendered) -> bool {
+    serde_json::from_str::<Value>(&rendered.json)
+        .is_ok_and(|envelope| envelope["error"]["code"] == "unauthenticated")
+}
+
+/// The answer to a tool call that ran nothing because there's no read-only
+/// token to send.
+fn no_token(command: CommandName, error: &CredentialError, rerun: &str) -> Rendered {
+    let code = match error {
+        CredentialError::Refused { status: 403, .. } => ErrorCode::Forbidden,
+        CredentialError::Refused { .. } => ErrorCode::Api,
+        CredentialError::ContextRejected => ErrorCode::Unauthenticated,
+        CredentialError::Unreachable(_) => ErrorCode::Unreachable,
+        CredentialError::Storage { .. } => ErrorCode::Internal,
+        CredentialError::BadNamespace(_) => ErrorCode::Usage,
+    };
+    let error = AgentError::new(code, error.to_string())
+        .with_hint("relish mcp sends only a read-only token, never the context's admin one");
+    agent::failure(command, error, DEFAULT_MAX_BYTES, rerun)
 }
 
 /// The protocol error for a tool the server doesn't offer, saying why when
@@ -279,7 +417,15 @@ pub async fn run(options: &McpOptions) -> Result<(), RelishError> {
         println!("{tools}");
         return Ok(());
     }
-    let warning = spawn_admin_warning();
+    let origin = crate::relish::client::token_origin();
+    let server = match origin {
+        TokenOrigin::ContextAdmin => match Managed::from_context(options.namespace.as_deref())? {
+            Some(managed) => server.with_managed(managed),
+            None => server,
+        },
+        TokenOrigin::Explicit | TokenOrigin::Absent => server,
+    };
+    let warning = spawn_admin_warning(origin);
     let running = server
         .serve(rmcp::transport::stdio())
         .await

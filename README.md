@@ -50,7 +50,9 @@ Already have `relish` 0.2.7 and an agent you use? Add
 Goose's button is on [the agents page](https://reliaburger.com/agents#add-to-your-agent).
 In Claude Code it's `claude mcp add reliaburger -- relish mcp`, and
 `relish agent setup` wires up every agent on this machine, showing the diff
-before it writes anything.
+before it writes anything. From an admin context, `relish mcp` makes and
+sends a read-only token of its own, so an agent never holds admin
+credentials.
 
 ```sh
 # Install relish and build a three-node cluster in Linux VMs on this laptop

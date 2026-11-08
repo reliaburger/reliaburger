@@ -886,7 +886,9 @@ It uses the same connection as every other `relish` command: `--endpoint`,
 `--token`, `--ca-cert`, their environment variables, or the saved local
 context. Put the flags before `mcp`, as in `relish --token "$TOKEN" mcp`.
 Give it a read-only token; `bun` decides what the token may read, and the
-server can't get round that. Started with an admin token, it warns on stderr.
+server can't get round that. With the saved context's admin token it sends a
+read-only token of its own instead (see "Wiring up your agent"). Given an
+admin token, it warns on stderr.
 
 Every `relish agent` command that only reads becomes a tool, named after it
 with `_` between the words: `version`, `schema`, `source_version`,
@@ -931,16 +933,14 @@ relish mcp --toolsets source,manual --no-logs
 token scoped to the namespace is.
 
 The repository's [`server.json`](https://github.com/reliaburger/reliaburger/blob/main/server.json)
-describes `relish mcp` for the [MCP Registry](https://registry.modelcontextprotocol.io)
+lists `relish mcp` in the [MCP Registry](https://registry.modelcontextprotocol.io)
 as `io.github.reliaburger/relish`. From 0.2.8 each release carries an
 [MCP Bundle](https://github.com/modelcontextprotocol/mcpb) per platform,
-`relish-<platform>.mcpb`, and the registry entry lists them with their
-SHA-256s. A client that installs bundles, such as Claude Desktop, runs the
-`relish` inside, with no `install.sh`. It asks for nothing and uses the
-saved local context. Two optional settings point it elsewhere: a cluster API
-endpoint and a [read-only token](#a-read-only-token), passed as
-`RELIABURGER_ENDPOINT` and `RELIABURGER_TOKEN`. Left empty, they count as
-unset. For other flags, or your own `relish`, use `relish mcp` as above.
+`relish-<platform>.mcpb`, which the entry lists with SHA-256s. Clients that
+install bundles, such as Claude Desktop, run the `relish` inside. A bundle
+asks for nothing and uses the saved context. Two optional settings, an
+endpoint and a [read-only token](#a-read-only-token), arrive as
+`RELIABURGER_ENDPOINT` and `RELIABURGER_TOKEN`; empty means unset.
 
 ## Wiring up your agent
 
@@ -1021,14 +1021,17 @@ A server map left empty goes too, so a file setup changed reads as it did
 before, and a file setup created is left as `{}`. Restart the agent after
 either.
 
-The server entry runs plain `relish`, found on your `PATH`, so an upgrade that
-moves the binary doesn't break it. An editor started from the Dock on macOS
-may not see your shell's `PATH`. If Cursor or VS Code says it can't start
-`relish`, put the output of `command -v relish` in the entry's `command`.
-Setup then reports that entry as a `conflict`, which is right: it's yours now.
+The entry runs plain `relish` from your `PATH`, so upgrades don't break it.
+An editor started from the macOS Dock may not see your shell's `PATH`; if it
+can't start `relish`, put the output of `command -v relish` in the entry's
+`command`, and setup calls it a `conflict`: it's yours now.
 
 Setup also installs the Reliaburger skill for Claude Code, at
 `~/.claude/skills/reliaburger/SKILL.md`, by the same rules.
+
+With an admin context, setup also makes `relish mcp` a read-only token
+(`data.mcp_token`), a day long and renewed as it runs out, in `mcp-token.json`
+beside the context, mode 0600. `--remove` revokes it.
 
 ## Sending us a bug or a fix
 

@@ -332,14 +332,15 @@ async fn a_read_only_token_prints_no_warning() {
     assert!(!stderr.contains("admin"), "{stderr}");
 }
 
-/// The managed context's token is the cluster's admin token, so relish
-/// warns without asking anyone: this context's endpoint has nothing behind
-/// it.
+/// The managed context's token is the cluster's admin token, so relish mcp
+/// swaps in a read-only token of its own (#1730) and has nothing to warn
+/// about. It makes that token on the first tool call, not at start: this
+/// context's endpoint has nothing behind it, and the session still starts.
 #[tokio::test]
-async fn the_managed_context_warns_without_reaching_the_cluster() {
+async fn the_managed_context_starts_without_a_warning_or_a_round_trip() {
     let home = tempfile::tempdir().unwrap();
-    let ca = home.path().join("ca.pem");
-    std::fs::write(&ca, "not used").unwrap();
+    let ca =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pem/root-ca.crt.pem");
     let context = json!({
         "schema": 1,
         "owner": "suite",
@@ -359,9 +360,6 @@ async fn the_managed_context_warns_without_reaching_the_cluster() {
     command.arg("mcp");
     let (lines, stderr) = session(command).await;
     assert_only_frames(&lines);
-    assert_eq!(
-        stderr.matches("admin credentials").count(),
-        1,
-        "one warning: {stderr}"
-    );
+    assert!(!stderr.contains("admin"), "{stderr}");
+    assert!(!home.path().join("mcp-token.json").exists());
 }
