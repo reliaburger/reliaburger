@@ -79,7 +79,7 @@ It verifies `bun` against the release signatures, asks a few questions and
 writes a starter `reliaburger.toml`. Pass `--yes` to accept every default.
 Real containers need runc on Linux, and a cluster needs rootful runc with eBPF
 (see `cluster-basics`). On macOS, use the quickstart above: it runs the same
-runc path inside Linux VMs. Apple Container isn't supported in 0.2.6.
+runc path inside Linux VMs. Apple Container isn't supported in 0.2.7.
 
 ## From source, without containers
 
@@ -114,7 +114,7 @@ doesn't isolate them, so keep it for trying things out.
 
 ## Checking a download
 
-From 0.2.7 (0.2.7, not in 0.2.6), every release file carries a build
+From 0.2.7, every release file carries a build
 provenance attestation: a signed statement that the build workflow on `main`
 made a file with exactly this SHA-256. Check the `relish` you installed with
 the GitHub CLI (<https://cli.github.com>), the same command
