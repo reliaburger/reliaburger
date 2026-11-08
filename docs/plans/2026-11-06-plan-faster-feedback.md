@@ -4,7 +4,7 @@ Created 6 November 2026, for the maintainer to review. It surveys every loop
 we wait on, from `make ci` on a laptop to the 8-hour final, says where the
 time goes with measured numbers, and ranks what would shorten each loop.
 Nothing in CI, the Makefile or the code has changed; parts of it may go into
-[0.2.7](2026-11-04-plan-0.2.7.md).
+[0.2.7](archive/2026-11-04-plan-0.2.7.md).
 
 It builds on the October plan, [CI and test
 efficiency](2026-10-11-ci-and-test-efficiency.md), whose [18 October
@@ -256,7 +256,9 @@ job's timeout rises to match. Or, simpler, the runbook says to dispatch only
 after `main`'s CI is green; the script change makes that impossible to
 forget.
 **Risk:** low. Every rule about what may be reused stays.
-**When:** 0.2.7.
+**When:** 0.2.7. Done in 0.2.8
+([#1722](https://github.com/reliaburger/reliaburger/issues/1722)): the
+script waits, and `candidate.json` names the run as `source_ci`.
 
 ### F5. Run the nightly qualification every night
 

@@ -80,7 +80,8 @@ class StageTests(unittest.TestCase):
         self.run = dict(id=123, run_attempt=2, head_sha="a" * 40)
         self.digest = record_candidate(self.directory, self.pins, version="v0.1.0",
                                        repository="reliaburger/reliaburger", commit="a" * 40,
-                                       run_id=123, run_attempt=2, source_digest="sha256:" + "c" * 64)
+                                       run_id=123, run_attempt=2, source_digest="sha256:" + "c" * 64,
+                                       source_ci=dict(run_id=456, run_attempt=1))
         self.document = verify_downloaded(self.directory, self.pins, "reliaburger/reliaburger",
                                           self.run, self.digest)
         self.tag = "staging-v0.1.0-123-2"
@@ -206,7 +207,8 @@ class NightlyStagingTests(unittest.TestCase):
         self.identity = dict(version="v0.2.4", repository="reliaburger/reliaburger", commit="a" * 40,
                              run_id=123, run_attempt=1)
         self.digest = record_candidate(self.directory, self.pins, channel="nightly",
-                                       source_digest="sha256:" + "c" * 64, **self.identity)
+                                       source_digest="sha256:" + "c" * 64,
+                                       source_ci=dict(run_id=456, run_attempt=1), **self.identity)
         self.run = dict(id=123, run_attempt=1, head_sha="a" * 40, head_branch="release-0-2-4",
                         event="workflow_dispatch", path=".github/workflows/build.yml",
                         status="completed", conclusion="success",
@@ -226,7 +228,8 @@ class NightlyStagingTests(unittest.TestCase):
 
     def test_a_release_record_never_verifies_as_a_nightly(self):
         (self.directory / "candidate.json").unlink()
-        digest = record_candidate(self.directory, self.pins, source_digest="sha256:" + "c" * 64, **self.identity)
+        digest = record_candidate(self.directory, self.pins, source_digest="sha256:" + "c" * 64,
+                                  source_ci=dict(run_id=123, run_attempt=1), **self.identity)
         with self.assertRaises(ValueError):
             candidate.verify_candidate(self.directory, self.pins, digest, channel="nightly", **self.identity)
 
