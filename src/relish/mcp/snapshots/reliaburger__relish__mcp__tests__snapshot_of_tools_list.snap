@@ -166,6 +166,7 @@ expression: listed_for_snapshot(server.tools())
             "context",
             "diagnose",
             "explain",
+            "timeline",
             "upgrade-check",
             "report",
             "patch-init",
@@ -974,18 +975,39 @@ expression: listed_for_snapshot(server.tools())
       "readOnlyHint": true,
       "title": "relish agent explain"
     },
-    "description": "What a finding means, its thresholds and where it's decided; every finding when no id is given. Reads only this binary",
+    "description": "What a finding means and where it's decided, or why the cluster made a decision: --restart, --placement, --refusal",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
         "id": {
-          "description": "A finding id, e.g. `crashloop`",
+          "description": "A finding id, e.g. `crashloop`. Reads only this binary",
           "type": "string"
         },
         "max_bytes": {
           "default": 24576,
           "description": "Largest answer to print, in bytes (at least 1024; by default 24576, and 65536 for `guide`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
           "type": "integer"
+        },
+        "namespace": {
+          "default": "default",
+          "description": "The namespace of the instance or app",
+          "type": "string"
+        },
+        "placement": {
+          "description": "Why this instance is on its node, or why it has none",
+          "type": "string"
+        },
+        "refusal": {
+          "description": "Why deploys of this app were refused",
+          "type": "string"
+        },
+        "restart": {
+          "description": "Why this instance restarted: `web-0` or `default__web-0`",
+          "type": "string"
+        },
+        "rules": {
+          "description": "Every decision rule: what it means, its evidence and where it's decided. Reads only this binary",
+          "type": "boolean"
         }
       },
       "type": "object"
@@ -1036,5 +1058,94 @@ expression: listed_for_snapshot(server.tools())
       "type": "object"
     },
     "title": "relish agent explain"
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true,
+      "title": "relish agent timeline"
+    },
+    "description": "What changed in a window: events, audit and deploys, newest first",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "app": {
+          "description": "Only what touched this app; adds its deploy history",
+          "type": "string"
+        },
+        "limit": {
+          "default": 100,
+          "description": "The newest entries in the window to return, at most 500",
+          "type": "integer"
+        },
+        "max_bytes": {
+          "default": 24576,
+          "description": "Largest answer to print, in bytes (at least 1024; by default 24576, and 65536 for `guide`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
+          "type": "integer"
+        },
+        "namespace": {
+          "description": "The app's namespace; every namespace when left out",
+          "type": "string"
+        },
+        "since": {
+          "default": "1h",
+          "description": "Start of the window: a duration before now (30s, 15m, 2h, 1d) or epoch seconds. At most a day before `--until`",
+          "type": "string"
+        },
+        "until": {
+          "description": "End of the window, the same way; now when left out. Set it to the failure's time to see what came before it",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "timeline",
+    "outputSchema": {
+      "description": "The relish.agent/v1 envelope. `ok` says whether the command answered: then `data` is the answer, otherwise `error` says why not.",
+      "properties": {
+        "command": {
+          "type": "string"
+        },
+        "data": "<relish agent timeline data schema>",
+        "error": {
+          "description": "Why the command couldn't answer: code, message, endpoint, status, hint.",
+          "type": "object"
+        },
+        "next": {
+          "description": "Commands worth running next, each with run, why and read_only.",
+          "type": "array"
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "relish": {
+          "description": "The build of relish that answered.",
+          "type": "object"
+        },
+        "schema": {
+          "const": "relish.agent/v1"
+        },
+        "truncated": {
+          "description": "The answer was trimmed to fit max_bytes; a warning says what was cut.",
+          "type": "boolean"
+        },
+        "warnings": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "schema",
+        "command",
+        "ok",
+        "relish"
+      ],
+      "type": "object"
+    },
+    "title": "relish agent timeline"
   }
 ]
