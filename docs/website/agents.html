@@ -769,7 +769,7 @@ and talks to it over stdin and stdout; it opens no port. In Claude Code:</p>
 <code>--token</code>, <code>--ca-cert</code>, their environment variables, or the saved local
 context. Put the flags before <code>mcp</code>, as in <code>relish --token "$TOKEN" mcp</code>.
 Give it a read-only token; <code>bun</code> decides what the token may read, and the
-server can't get round that.</p>
+server can't get round that. Started with an admin token, it warns on stderr.</p>
 <p>Every <code>relish agent</code> command that only reads becomes a tool, named after it
 with <code>_</code> between the words: <code>version</code>, <code>schema</code>, <code>source_version</code>,
 <code>source_grep</code>, <code>manual_search</code>, <code>logs</code> and so on. A tool's arguments are the
