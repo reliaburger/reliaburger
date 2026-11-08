@@ -59,7 +59,7 @@ The reasoning behind all this is in the [agent research
 note](../plans/2026-11-04-research-agent-friendly.md), what other projects do
 is in the [onboarding
 scan](../plans/2026-11-04-research-agent-onboarding-scan.md), and the order
-of the work is in the [0.2.7 plan](../plans/2026-11-04-plan-0.2.7.md).
+of the work is in the [0.2.7 plan](../plans/archive/2026-11-04-plan-0.2.7.md).
 
 ### What we chose not to build
 
@@ -718,6 +718,20 @@ audit writer, then a bug report quoting the audit log) and each pass counts
 what it found: the manifest would claim secrets that weren't there. Every
 rule now recognises its own marker and leaves it alone, and a property test
 checks that a second pass changes nothing and counts nothing.
+
+That property test later found a case no rule's own marker covers (#1717).
+In `https://password="\v"@`, the vertical tab is whitespace, so the URL rule
+saw no user information and let it pass. The secret-key rule then turned
+`"\v"` into `"[redacted]"`, and that took out the very character that had
+stopped the URL rule. A second pass found `https://password="[redacted]"@`,
+a clean userinfo, and redacted it. A space isn't the only character that
+can go missing this way. A bare value can hold a `/`, a `?` or a `#`, and
+any of them stops the URL rule just as well. Changing the order doesn't
+help: the URL rule already runs first, and the secret-key rule has to run
+last so it can see the other rules' markers. So `redact` now runs the URL
+rule twice, once before the secret-key rule and once after it. The second
+run only ever sees text the secret-key rule has finished with, so a third
+pass has nothing left to find.
 
 The regexes are compiled once, on first use, into `static`s:
 
@@ -2258,7 +2272,7 @@ the draft always picks "An AI agent drafted it, and a human checked every
 line". "Human review" is the form's three checkboxes, written unticked: a human
 read the whole report, checked the redaction, and searched for the
 fingerprint. Only the human can tick them. That's the disclosure the
-[0.2.7 plan](../plans/2026-11-04-plan-0.2.7.md) asks of everyone.
+[0.2.7 plan](../plans/archive/2026-11-04-plan-0.2.7.md) asks of everyone.
 
 ### Unverified until proven
 
@@ -3455,7 +3469,7 @@ go wrong, and each one became a rule with a test:
 - **No blanket approval.** No entry carries Gemini's `trust`, an
   `autoApprove` list or a wildcard, and setup never opens Claude Code's
   `settings.json`, where `permissions` live. The [0.2.7
-  plan](../plans/2026-11-04-plan-0.2.7.md)'s safety line is that our docs
+  plan](../plans/archive/2026-11-04-plan-0.2.7.md)'s safety line is that our docs
   never advise "always allow"; it would be odd for our code to do it quietly.
 
 ### Six agents, one table
