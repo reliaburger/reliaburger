@@ -89,7 +89,8 @@ your yes. To give an agent you already use the read-only MCP server,
 (Goose's button is on [the agents page](https://reliaburger.com/agents#add-to-your-agent)),
 or run `claude mcp add reliaburger -- relish mcp` for Claude Code.
 `relish agent setup` wires up every agent on this machine, and shows the diff
-before it writes anything.
+before it writes anything. From an admin context, `relish mcp` makes and sends
+a read-only token of its own, so an agent never holds admin credentials.
 
 ## What's in it
 

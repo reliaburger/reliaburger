@@ -108,6 +108,7 @@ expression: answer
       }
     ],
     "applied": false,
+    "mcp_token": null,
     "server": {
       "command": [
         "relish",

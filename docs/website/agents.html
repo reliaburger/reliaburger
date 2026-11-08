@@ -756,7 +756,8 @@ and talks to it over stdin and stdout; it opens no port. In Claude Code:</p>
 <code>--token</code>, <code>--ca-cert</code>, their environment variables, or the saved local
 context. Put the flags before <code>mcp</code>, as in <code>relish --token "$TOKEN" mcp</code>.
 Give it a read-only token; <code>bun</code> decides what the token may read, and the
-server can't get round that. Started with an admin token, it warns on stderr.</p>
+server can't get round that. Given the saved context's admin token, it uses
+its own read-only token (see below); any other admin token gets a warning.</p>
 <p>Every <code>relish agent</code> command that only reads becomes a tool, named after it
 with <code>_</code> between the words: <code>version</code>, <code>schema</code>, <code>source_version</code>,
 <code>source_grep</code>, <code>manual_search</code>, <code>logs</code> and so on. A tool's arguments are the
@@ -790,16 +791,13 @@ so it must never also be able to change anything or send anything out.</p>
 <p><code>--namespace</code> narrows what the agent asks for. It isn't a permission: a
 token scoped to the namespace is.</p>
 <p>The repository's <a href="https://github.com/reliaburger/reliaburger/blob/main/server.json"><code>server.json</code></a>
-describes <code>relish mcp</code> for the <a href="https://registry.modelcontextprotocol.io">MCP Registry</a>
+lists <code>relish mcp</code> in the <a href="https://registry.modelcontextprotocol.io">MCP Registry</a>
 as <code>io.github.reliaburger/relish</code>. From 0.2.8 each release carries an
 <a href="https://github.com/modelcontextprotocol/mcpb">MCP Bundle</a> per platform,
-<code>relish-&lt;platform&gt;.mcpb</code>, and the registry entry lists them with their
-SHA-256s. A client that installs bundles, such as Claude Desktop, runs the
-<code>relish</code> inside, with no <code>install.sh</code>. It asks for nothing and uses the
-saved local context. Two optional settings point it elsewhere: a cluster API
-endpoint and a <a href="#a-read-only-token">read-only token</a>, passed as
-<code>RELIABURGER_ENDPOINT</code> and <code>RELIABURGER_TOKEN</code>. Left empty, they count as
-unset. For other flags, or your own <code>relish</code>, use <code>relish mcp</code> as above.</p>
+<code>relish-&lt;platform&gt;.mcpb</code>, which the entry lists with SHA-256s. A client that
+installs bundles, such as Claude Desktop, runs the <code>relish</code> inside with the
+saved context. Two optional settings, an endpoint and a <a href="#a-read-only-token">read-only token</a>, arrive as
+<code>RELIABURGER_ENDPOINT</code> and <code>RELIABURGER_TOKEN</code>; empty means unset.</p>
 </section>
 <section class="agents-section" id="wiring-up-your-agent">
 <h2>Wiring up your agent <a class="permalink" href="#wiring-up-your-agent" aria-label="Link to this section">#</a></h2>
@@ -861,13 +859,14 @@ also only previews:</p>
 <p>A server map left empty goes too, so a file setup changed reads as it did
 before, and a file setup created is left as <code>{}</code>. Restart the agent after
 either.</p>
-<p>The server entry runs plain <code>relish</code>, found on your <code>PATH</code>, so an upgrade that
-moves the binary doesn't break it. An editor started from the Dock on macOS
-may not see your shell's <code>PATH</code>. If Cursor or VS Code says it can't start
-<code>relish</code>, put the output of <code>command -v relish</code> in the entry's <code>command</code>.
-Setup then reports that entry as a <code>conflict</code>, which is right: it's yours now.</p>
+<p>The entry runs plain <code>relish</code> from your <code>PATH</code>. If an editor started from the
+macOS Dock can't find it, put <code>command -v relish</code>'s output in the entry's
+<code>command</code>; setup then calls it a <code>conflict</code>, as it's yours now.</p>
 <p>Setup also installs the Reliaburger skill for Claude Code, at
-<code>~/.claude/skills/reliaburger/SKILL.md</code>, by the same rules.</p>
+<code>~/.claude/skills/reliaburger/SKILL.md</code>, by the same rules. With an admin
+context, it also makes <code>relish mcp</code> a read-only token
+(<code>data.mcp_token</code>), a day long and renewed as it runs out, in <code>mcp-token.json</code>
+beside the context, mode 0600. <code>--remove</code> revokes it.</p>
 </section>
 <section class="agents-section" id="sending-us-a-bug-or-a-fix">
 <h2>Sending us a bug or a fix <a class="permalink" href="#sending-us-a-bug-or-a-fix" aria-label="Link to this section">#</a></h2>

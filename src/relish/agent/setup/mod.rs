@@ -17,6 +17,12 @@
 //! - No entry approves anything: no `trust`, no auto-approve, no wildcard.
 //!
 //! `--remove` takes the entries (and the skill) back out, by the same rules.
+//!
+//! When the saved context holds the cluster's admin token, setup also makes
+//! `relish mcp` its own read-only token (#1730,
+//! [`crate::relish::mcp::credentials`]), so the agents it wires never carry
+//! admin credentials. The preview says so; `--yes` makes it; `--remove`
+//! revokes it.
 
 pub mod clients;
 pub mod edit;
@@ -79,6 +85,10 @@ pub struct SetupData {
     pub server: Server,
     /// Every agent setup knows, found or not, in a fixed order.
     pub agents: Vec<AgentPlan>,
+    /// `relish mcp`'s own read-only token, made from the context's admin
+    /// one so no agent carries admin credentials. `null` when the context
+    /// isn't an admin one (or there's none), so there's nothing to make.
+    pub mcp_token: Option<Change>,
 }
 
 /// Adding or removing.
@@ -141,6 +151,8 @@ pub enum ChangeKind {
     McpServer,
     /// The Reliaburger skill.
     Skill,
+    /// `relish mcp`'s read-only token, kept beside the context.
+    McpToken,
 }
 
 /// What happens to one entry.
@@ -170,6 +182,68 @@ impl ChangeStatus {
     }
 }
 
+/// What setup can do about `relish mcp`'s read-only token, when the saved
+/// context holds an admin one.
+pub struct TokenPlan {
+    /// Where the token is kept.
+    pub path: PathBuf,
+    /// Whether a token that's still good is already there.
+    pub stored: bool,
+    /// Make the token ([`Action::Install`]) or revoke and delete it
+    /// ([`Action::Remove`]). `Ok(false)` means there was nothing to do: the
+    /// cluster says the context's token isn't admin. Called only with
+    /// `--yes`.
+    pub apply: Box<dyn FnOnce(Action) -> Result<bool, String> + Send>,
+}
+
+/// The line the token's diff shows: what it is and why, never the secret.
+fn token_line() -> String {
+    format!(
+        "read-only API token for relish mcp: role read-only, {days}-day lifetime, renewed when \
+         it runs out; relish mcp sends it instead of the context's admin token\n",
+        days = crate::relish::mcp::credentials::TOKEN_TTL_DAYS
+    )
+}
+
+/// Plan, and with `--yes` make, the token change.
+fn plan_token(token: TokenPlan, action: Action, yes: bool) -> Change {
+    let exists = token.stored || (action == Action::Remove && token.path.exists());
+    let status = match (action, exists) {
+        (Action::Install, false) => ChangeStatus::Add,
+        (Action::Remove, true) => ChangeStatus::Remove,
+        (Action::Install, true) | (Action::Remove, false) => ChangeStatus::Unchanged,
+    };
+    let mut change = change(
+        ChangeKind::McpToken,
+        token.path.clone(),
+        "token".to_string(),
+        status,
+    );
+    if !status.changes_something() {
+        return change;
+    }
+    let line = token_line();
+    change.diff = Some(match action {
+        Action::Install => diff(&token.path, "", &line),
+        Action::Remove => diff(&token.path, &line, ""),
+    });
+    if yes {
+        match (token.apply)(action) {
+            Ok(true) => change.written = true,
+            Ok(false) => {
+                change.note = Some(match action {
+                    Action::Install => "the cluster says the context's token isn't admin, so \
+                                        relish mcp uses it as it is"
+                        .to_string(),
+                    Action::Remove => "it was already gone".to_string(),
+                })
+            }
+            Err(error) => change.note = Some(format!("not written: {error}")),
+        }
+    }
+    change
+}
+
 /// A planned change, with the text to write.
 #[derive(Debug, Clone)]
 struct Planned {
@@ -183,7 +257,12 @@ struct Planned {
 /// Work out, and with `--yes` make, every change.
 ///
 /// `skill` is the skill file's text, when this build carries one.
-pub fn setup(options: &SetupOptions, home: &Home, skill: Option<&str>) -> SetupData {
+pub fn setup(
+    options: &SetupOptions,
+    home: &Home,
+    skill: Option<&str>,
+    token: Option<TokenPlan>,
+) -> SetupData {
     let action = if options.remove {
         Action::Remove
     } else {
@@ -223,6 +302,7 @@ pub fn setup(options: &SetupOptions, home: &Home, skill: Option<&str>) -> SetupD
             command: mcp_command_line(),
         },
         agents,
+        mcp_token: token.map(|token| plan_token(token, action, options.yes)),
     }
 }
 
@@ -476,10 +556,11 @@ pub fn answer(
     options: &SetupOptions,
     home: &Home,
     skill: Option<&str>,
+    token: Option<TokenPlan>,
     build: BuildInfo,
     rerun: &str,
 ) -> Envelope<SetupData> {
-    let data = setup(options, home, skill);
+    let data = setup(options, home, skill, token);
     let changes: Vec<(Client, Change)> = data
         .agents
         .iter()
@@ -500,7 +581,9 @@ pub fn answer(
     }
     let pending = changes
         .iter()
-        .any(|(_, change)| change.status.changes_something());
+        .map(|(_, change)| change)
+        .chain(&data.mcp_token)
+        .any(|change| change.status.changes_something());
     if !data.applied && pending {
         next.push(NextStep {
             run: format!("{} --yes", without_dry_run(rerun)),
@@ -517,6 +600,17 @@ pub fn answer(
                 change.entry
             ));
         }
+    }
+    if let Some(note) = data
+        .mcp_token
+        .as_ref()
+        .and_then(|token| token.note.as_deref())
+        .filter(|note| note.starts_with("not written"))
+    {
+        warnings.push(format!(
+            "relish mcp's read-only token: {note}; relish mcp will try again when it starts, \
+             and sends only a read-only token, never the admin one"
+        ));
     }
     let mut restart: Vec<&str> = changes
         .iter()
@@ -552,6 +646,7 @@ fn without_dry_run(rerun: &str) -> String {
 pub async fn run(options: &SetupOptions, max_bytes: usize, rerun: &str) -> Rendered {
     let options = options.clone();
     let rerun_for_task = rerun.to_string();
+    let token = token_plan();
     // File I/O, and packing the source digest on a dev build, so off the
     // async worker threads.
     let outcome = tokio::task::spawn_blocking(move || {
@@ -560,6 +655,7 @@ pub async fn run(options: &SetupOptions, max_bytes: usize, rerun: &str) -> Rende
             &options,
             &home,
             Some(SKILL_MD),
+            token,
             BuildInfo::current(),
             &rerun_for_task,
         ))
@@ -579,6 +675,56 @@ pub async fn run(options: &SetupOptions, max_bytes: usize, rerun: &str) -> Rende
             rerun,
         ),
     }
+}
+
+/// The token plan for this machine: `None` unless the token `relish mcp`
+/// would send is the saved context's admin one.
+fn token_plan() -> Option<TokenPlan> {
+    use crate::relish::client::{TokenOrigin, token_origin};
+    use crate::relish::mcp::credentials;
+    if token_origin() != TokenOrigin::ContextAdmin {
+        return None;
+    }
+    let context_path = crate::relish::local_context::default_path().ok()?;
+    let context = crate::relish::local_context::LocalContext::load(&context_path)
+        .ok()
+        .flatten()?;
+    let path = credentials::path_beside(&context_path, None).ok()?;
+    let scope = credentials::Scope {
+        owner: context.owner.clone(),
+        endpoint: context.endpoint.clone(),
+        namespace: None,
+    };
+    let stored = credentials::StoredToken::load(&path)
+        .ok()
+        .flatten()
+        .is_some_and(|stored| stored.usable(&scope, credentials::now()));
+    let runtime = tokio::runtime::Handle::current();
+    let token_path = path.clone();
+    let apply = move |action: Action| -> Result<bool, String> {
+        let admin = context
+            .client(None, None)
+            .map_err(|error| error.to_string())?;
+        // `apply` runs inside `spawn_blocking`, where blocking on the
+        // runtime is allowed: that thread isn't one of its workers.
+        runtime
+            .block_on(async {
+                match action {
+                    Action::Install => {
+                        credentials::obtain(&token_path, &scope, &admin, credentials::now(), false)
+                            .await
+                            .map(|(_, obtained)| obtained != credentials::Obtained::NotNeeded)
+                    }
+                    Action::Remove => credentials::remove(&token_path, &admin).await,
+                }
+            })
+            .map_err(|error| error.to_string())
+    };
+    Some(TokenPlan {
+        path,
+        stored,
+        apply: Box::new(apply),
+    })
 }
 
 fn failed(error: AgentError, max_bytes: usize, rerun: &str) -> Rendered {

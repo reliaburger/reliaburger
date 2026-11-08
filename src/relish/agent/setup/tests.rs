@@ -133,10 +133,20 @@ fn build() -> BuildInfo {
 }
 
 fn run_in(home: &TestHome, line: &str, skill: Option<&str>) -> Value {
+    run_with_token(home, line, skill, None)
+}
+
+fn run_with_token(
+    home: &TestHome,
+    line: &str,
+    skill: Option<&str>,
+    token: Option<TokenPlan>,
+) -> Value {
     let envelope = answer(
         &options(line),
         &home.home,
         skill,
+        token,
         build(),
         format!("relish agent setup {line}").trim_end(),
     );
@@ -530,4 +540,114 @@ fn the_written_configs_approve_nothing() {
             assert!(!text.contains(word), "{path} contains {word}: {text}");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// relish mcp's read-only token (#1730).
+
+/// A token plan whose `apply` records the action it was asked for and
+/// answers with `outcome`.
+fn token_plan(
+    home: &TestHome,
+    stored: bool,
+    outcome: Result<bool, String>,
+) -> (TokenPlan, std::sync::Arc<std::sync::Mutex<Vec<Action>>>) {
+    let calls: std::sync::Arc<std::sync::Mutex<Vec<Action>>> = Default::default();
+    let record = calls.clone();
+    let plan = TokenPlan {
+        path: home.path(".reliaburger/mcp-token.json"),
+        stored,
+        apply: Box::new(move |action| {
+            record.lock().unwrap().push(action);
+            outcome
+        }),
+    };
+    (plan, calls)
+}
+
+#[test]
+fn an_admin_context_shows_the_read_only_token_in_the_preview_and_makes_nothing() {
+    let home = TestHome::with_every_agent();
+    let (plan, calls) = token_plan(&home, false, Ok(true));
+    let answer = run_with_token(&home, "", Some(SKILL), Some(plan));
+    let token = &answer["data"]["mcp_token"];
+    assert_eq!(token["kind"], "mcp_token");
+    assert_eq!(token["status"], "add");
+    assert_eq!(token["written"], false);
+    let diff = token["diff"].as_str().unwrap();
+    assert!(diff.contains("read-only"), "{diff}");
+    assert!(
+        diff.contains("instead of the context's admin token"),
+        "{diff}"
+    );
+    assert!(calls.lock().unwrap().is_empty(), "a preview mints nothing");
+    assert!(
+        answer["next"][0]["run"]
+            .as_str()
+            .unwrap()
+            .ends_with("--yes")
+    );
+}
+
+#[test]
+fn yes_makes_the_read_only_token() {
+    let home = TestHome::with_every_agent();
+    let (plan, calls) = token_plan(&home, false, Ok(true));
+    let answer = run_with_token(&home, "--yes", Some(SKILL), Some(plan));
+    assert_eq!(answer["data"]["mcp_token"]["written"], true);
+    assert_eq!(*calls.lock().unwrap(), [Action::Install]);
+}
+
+#[test]
+fn a_stored_token_is_left_alone() {
+    let home = TestHome::with_every_agent();
+    let (plan, calls) = token_plan(&home, true, Ok(true));
+    let answer = run_with_token(&home, "--yes", Some(SKILL), Some(plan));
+    assert_eq!(answer["data"]["mcp_token"]["status"], "unchanged");
+    assert!(calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn without_an_admin_context_there_is_no_token_to_make() {
+    let home = TestHome::with_every_agent();
+    let answer = run_in(&home, "--yes", Some(SKILL));
+    assert!(answer["data"]["mcp_token"].is_null());
+}
+
+#[test]
+fn a_context_the_cluster_says_isnt_admin_makes_no_token() {
+    let home = TestHome::with_every_agent();
+    let (plan, _) = token_plan(&home, false, Ok(false));
+    let answer = run_with_token(&home, "--yes", Some(SKILL), Some(plan));
+    let token = &answer["data"]["mcp_token"];
+    assert_eq!(token["written"], false);
+    assert!(
+        token["note"].as_str().unwrap().contains("isn't admin"),
+        "{token}"
+    );
+}
+
+#[test]
+fn a_cluster_that_refuses_the_token_is_a_clear_warning() {
+    let home = TestHome::with_every_agent();
+    let refusal = "the cluster refused to create a read-only token for relish mcp (HTTP 403: no)";
+    let (plan, _) = token_plan(&home, false, Err(refusal.to_string()));
+    let answer = run_with_token(&home, "--yes", Some(SKILL), Some(plan));
+    let token = &answer["data"]["mcp_token"];
+    assert_eq!(token["written"], false);
+    assert!(token["note"].as_str().unwrap().contains(refusal), "{token}");
+    let warnings = answer["warnings"].to_string();
+    assert!(warnings.contains(refusal), "{warnings}");
+    assert!(warnings.contains("never the admin one"), "{warnings}");
+}
+
+#[test]
+fn remove_takes_the_token_back_out() {
+    let home = TestHome::with_every_agent();
+    home.write(".reliaburger/mcp-token.json", "{}");
+    let (plan, calls) = token_plan(&home, true, Ok(true));
+    let answer = run_with_token(&home, "--remove --yes", Some(SKILL), Some(plan));
+    assert_eq!(answer["data"]["mcp_token"]["status"], "remove");
+    assert_eq!(answer["data"]["mcp_token"]["written"], true);
+    assert_eq!(*calls.lock().unwrap(), [Action::Remove]);
 }
