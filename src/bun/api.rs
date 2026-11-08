@@ -63,6 +63,7 @@ mod registry;
 mod secrets;
 mod snapshots;
 mod status;
+mod summary;
 mod test_leases;
 mod ui;
 mod upgrade;
@@ -131,6 +132,9 @@ use snapshots::{
 use status::{
     cluster_statuses, collect_cluster_statuses, current_apps_handler, events_handler, jobs_handler,
     status_app_handler, status_handler, top_handler, ws_events_handler,
+};
+use summary::{
+    cluster_capacity_handler, cluster_summary_handler, leader_view_handler, node_summary_handler,
 };
 use test_leases::{
     authenticated_test_user, find_test_lease, forward_test_lease_request, lease_error_response,
@@ -726,6 +730,10 @@ pub fn router_with_upgrade(
             axum::routing::delete(test_lease_release_handler),
         )
         .route("/v1/cluster/nodes", get(nodes_handler))
+        .route("/v1/cluster/summary", get(cluster_summary_handler))
+        .route("/v1/cluster/summary/node", get(node_summary_handler))
+        .route("/v1/cluster/summary/leader", get(leader_view_handler))
+        .route("/v1/cluster/capacity", get(cluster_capacity_handler))
         .route(
             "/v1/nodes/{node}/relay/{*path}",
             get(node_relay_handler).post(node_relay_handler).layer(
@@ -1376,6 +1384,9 @@ mod policy_tests;
 
 #[cfg(test)]
 mod cluster_view_tests;
+
+#[cfg(test)]
+mod summary_tests;
 
 #[cfg(test)]
 mod token_tests;

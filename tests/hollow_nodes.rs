@@ -236,6 +236,138 @@ async fn twenty_hollow_nodes_join_a_three_member_council_and_run_a_replica_each(
     assert!(churn.rejoined_ms.is_some(), "stopped nodes never rejoined");
 }
 
+/// A hundred hollow nodes running a thousand apps: `GET /v1/cluster/summary`
+/// stays one bounded answer and arrives inside the one second `relish
+/// status` has, with every section complete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts a council process and a hundred hollow nodes; run with make test-hollow"]
+async fn a_hundred_hollow_nodes_and_a_thousand_apps_summarise_within_a_second() {
+    const NODES: usize = 100;
+    const APPS: usize = 1000;
+    const BUDGET: Duration = Duration::from_secs(1);
+    let blocks = hollow::free_blocks(NODES, HOLLOW_PORTS.0, HOLLOW_PORTS.1);
+    assert_eq!(blocks.len(), NODES, "not enough free port blocks");
+    let council = CouncilProcess::start(3);
+    let mut fleet = Fleet {
+        nodes: (0..NODES).map(|_| None).collect(),
+        blocks,
+        counters: Arc::new(FleetCounters::default()),
+        data: tempfile::tempdir().unwrap(),
+        seeds: council.seeds(),
+        report_interval_secs: 1,
+    };
+    let all: Vec<usize> = (0..NODES).collect();
+    fleet.start(&all, 25).await.unwrap();
+    let wait = Duration::from_secs(180);
+    let council_ref = &council;
+    let joined = time_until(wait, Duration::from_millis(250), move || async move {
+        council_ref
+            .nodes()
+            .await
+            .is_some_and(|nodes| alive_names(&nodes).len() >= NODES + 3)
+    })
+    .await;
+    assert!(
+        joined.is_some(),
+        "the council never listed every node alive"
+    );
+
+    // Ten applies of a hundred one-replica apps each.
+    for batch in 0..APPS / 100 {
+        let mut toml = String::new();
+        for app in batch * 100..(batch + 1) * 100 {
+            toml.push_str(&format!(
+                "[app.summary-{app:04}]\nimage = \"hollow/summary:1\"\nreplicas = 1\n\n\
+                 [app.summary-{app:04}.placement]\nrequired = [\"role=hollow\"]\n\n"
+            ));
+        }
+        let config = Config::parse(&toml).unwrap();
+        tokio::time::timeout(Duration::from_secs(60), council.api[0].apply(&config))
+            .await
+            .expect("an apply timed out")
+            .expect("an apply failed");
+    }
+    let view = &fleet;
+    let placed = time_until(wait, Duration::from_millis(200), move || async move {
+        view.running().await >= APPS
+    })
+    .await;
+    assert!(
+        placed.is_some(),
+        "only {} of {APPS} replicas ran",
+        fleet.running().await
+    );
+
+    // Each node's share reads its agent's published status, which trails
+    // the runtime by a tick; wait for the summary to see every replica.
+    let client = &council.api[0];
+    let caught_up = time_until(
+        Duration::from_secs(60),
+        Duration::from_millis(500),
+        || async {
+            client.cluster_summary().await.is_ok_and(|summary| {
+                summary
+                    .apps
+                    .value
+                    .is_some_and(|apps| apps.running as usize >= APPS)
+            })
+        },
+    )
+    .await;
+    assert!(
+        caught_up.is_some(),
+        "the summary never saw every app running"
+    );
+
+    let mut timings = Vec::new();
+    let mut last = None;
+    for _ in 0..5 {
+        let started = Instant::now();
+        let summary = client.cluster_summary().await.expect("the summary failed");
+        timings.push(started.elapsed());
+        last = Some(summary);
+    }
+    let summary = last.unwrap();
+    let slowest = timings.iter().max().copied().unwrap();
+    let json = serde_json::to_string(&summary).unwrap();
+    println!(
+        "{}",
+        serde_json::json!({
+            "nodes": NODES + 3,
+            "apps": APPS,
+            "summary_ms": timings.iter().map(|t| t.as_secs_f64() * 1000.0).collect::<Vec<_>>(),
+            "summary_bytes": json.len(),
+        })
+    );
+    for index in 0..fleet.nodes.len() {
+        fleet.stop(index).await;
+    }
+    council.stop();
+
+    assert!(slowest < BUDGET, "the slowest summary took {slowest:?}");
+    let nodes = summary.nodes.value.as_ref().unwrap();
+    assert_eq!(nodes.alive as usize, NODES + 3);
+    let apps = summary.apps.value.as_ref().unwrap();
+    assert!(apps.total as usize >= APPS);
+    assert_eq!(apps.worst.len(), 0, "{:?}", apps.worst);
+    for (name, source) in [
+        ("nodes", summary.nodes.source),
+        ("council", summary.council.source),
+        ("apps", summary.apps.source),
+        ("instances", summary.instances.source),
+        ("capacity", summary.capacity.source),
+        ("versions", summary.versions.source),
+    ] {
+        assert_eq!(
+            source,
+            reliaburger::bun::summary::Source::Complete,
+            "{name}: {json}"
+        );
+    }
+    // Counts, not rows: the answer doesn't grow with the cluster.
+    assert!(json.len() < 8 * 1024, "{} bytes", json.len());
+}
+
 /// The measured run: `RELIABURGER_HOLLOW_NODES` hollow nodes (default 100),
 /// with the JSON report written to `RELIABURGER_HOLLOW_REPORT`.
 #[tokio::test(flavor = "multi_thread")]

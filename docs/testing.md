@@ -263,6 +263,7 @@ record goes in [`qualification/`](qualification):
 | `qualify-ssh-setup.sh` (`relish setup --ssh` end to end) | Lima on the host. It creates three disposable VMs from `ssh-setup-vm.yaml` (or `--machines N`; eight puts one past the council's cap of seven), on Ubuntu 24.04 or, with `--ubuntu 26.04`, the newest LTS, builds a cluster on them over SSH, checks `status` and `wtf` and that every node's Bun stays up, runs setup again to show it resumes without restarting a node, shows a second operator refused, and deletes the VMs | The maintainer, before any release that touches SSH setup (`src/relish/quickstart/ssh.rs`, `server.rs`, `server_runner.rs`), from 0.2.6 ([#1529](https://github.com/reliaburger/reliaburger/issues/1529)) |
 | `nightly-qualify.sh` (the power-cut runs and the soak tiers, one after another on a train's tip) | The quiet host with Lima, a staged build of the tip for the soaks, and the signed soak bun for the job final | The quiet host every night, from 0.2.4 ([nightly qualification](releasing.md#nightly-qualification-on-the-train-tip)); `nightly.py freeze-check` compares the candidate with the latest green night. `make test-ci-scripts` tests its plan, record and freeze rule ([`test_nightly.py`](../scripts/release/test_nightly.py)) |
 | `make test-gym` (the agent gym's scenarios on throwaway local clusters, [below](#an-agent-gym)) | macOS or Linux, about ten minutes and the ports from `GYM_PORT_BASE` (default 29400) to 29413 free; nothing else. `GYM_SOLVER=command:PROGRAM` runs an agent instead of the scripted baseline, which costs API spend | The maintainer, before any release that changes `relish wtf`, `relish agent` or a scenario; the 0.2.7 exit test ([#1093](https://github.com/reliaburger/reliaburger/issues/1093)) runs it with an agent. The record goes in [`qualification/`](qualification) |
+| `make test-gym-user` (`relish gym run` on a throwaway local cluster: the baseline, then Ctrl-C mid-run, [below](#on-a-users-cluster-relish-gym-run)) | macOS or Linux, about ten minutes, and the ports from `GYM_PORT_BASE` free; no API spend | The maintainer, before any release that changes `relish gym`, Smoker's workload faults or token scoping |
 | `qualify-profile.sh` (the release profile: where the time goes, against the previous release) | A quiet Mac with Lima: no build or soak beside it. It creates and deletes a disposable VM, and runs `perf` on each version's never-shipped profiling build from `build.yml` | The maintainer, on every release from 0.2.4, after the tag ([release step 9](releasing.md#staging-a-candidate)). Its rules report what they would flag and don't gate yet. `make test-ci-scripts` tests its parsing, medians, rules and README ([`test_profile.py`](../scripts/release/test_profile.py)) |
 
 ### Benchmarks in CI
@@ -923,7 +924,7 @@ at three, so no hollow node becomes a voter.
 
 | Command | What it does |
 |---|---|
-| `make test-hollow` | Twenty hollow nodes: they converge, a replica runs on each, a quarter stop and come back. A check that the harness works, not a measurement |
+| `make test-hollow` | Twenty hollow nodes: they converge, a replica runs on each, a quarter stop and come back. A check that the harness works, not a measurement. And a hundred hollow nodes running 1,000 one-replica apps: `GET /v1/cluster/summary` answers inside its 1 s budget, with the nodes, council, apps, instances, capacity and versions sections complete and the answer under 8 KiB |
 | `scripts/release/qualify-hollow-nodes.sh --sizes 100,500,1000` | One measured run per size, one at a time, each to `hollow-<N>.json`, then a table from [`hollow_summary.py`](../scripts/release/hollow_summary.py) |
 
 A run measures gossip convergence, the council's CPU and memory (it has its
@@ -1024,6 +1025,30 @@ verdicts for the same behaviour on both platforms
 ([`test_k8s.py`](../scripts/gym/test_k8s.py)). The website's
 [comparison page](website/compare/ai-agents.html) may state only numbers its
 record holds ([`test_compare.py`](../scripts/gym/test_compare.py)).
+
+### On a user's cluster: `relish gym run`
+
+[#1683](https://github.com/reliaburger/reliaburger/issues/1683) brings the
+gym to a user's own cluster, from the binary they already have
+([plan](plans/2026-11-08-plan-gym-for-users.md), manual chapter `chaos`). Six
+scenarios ship in `relish` (`src/relish/gym/catalogue.rs`): ports of
+`crash-loop`, `log-injection`, `unschedulable` and `report-redaction`, plus
+`paused-app` (a Smoker `pause`) and `killed-instance` (three Smoker `kill`s),
+all confined to one staging namespace the user names.
+
+The scorer is a Rust port of `score.py` (`src/relish/gym/score.rs`), since
+`relish` ships without Python or the repository. The two share
+[`fixtures/parity/scoring.json`](../scripts/gym/fixtures/parity/scoring.json):
+the read-only command lists, the fault vocabulary, a table of calls with their
+mutating and refused classification, and whole transcripts with their
+expected verdicts. `test_score.py` and the Rust tests both score every case,
+so a rule changed on one side fails the other's tests until it matches.
+
+| Command | What it does |
+|---|---|
+| `make test` | The Rust side: namespace rules and consent, the scorer against the shared fixtures, the recording `relish`, the solver's process group on timeout and cancel, redaction, the report (insta), and the runner against a fake cluster on every way out (scored, crashed solver, timeout, Ctrl-C, a panic, a refused fault, a cleanup the cluster won't finish), each checking nothing is left; `tests/suite/relish_gym.rs` drives the binary against a stub API that records every request |
+| `make test-ci-scripts` | `test_score.py`'s parity cases and `test_user_gym.py`, the meta-test's checks |
+| `make test-gym-user` | The gym tests the command on a fresh local cluster: `relish gym run --solver baseline` over every scenario, then a run whose solver only sleeps, interrupted with SIGINT once its fault is in; after each it asks the cluster, as admin, that no fault, gym app or solver token is left. About five minutes, no API spend; the record lands in `GYM_OUT/user`. [First run](qualification/2026-11-08-gym-for-users-e2e.md): six of six correct, Ctrl-C clean, and a Bun bug where a paused process-runtime instance can't be deleted |
 
 ### The concept budget
 

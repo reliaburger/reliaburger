@@ -1079,6 +1079,176 @@ constant is defined exactly once under `src/`, and the last two that the
 manual mentions every id and that its new table of findings lists exactly the
 catalogue.
 
+## The whole cluster at a glance
+
+`context` answers "what's going on here?" for an agent. A person types
+`relish status` for the same reason, and until 0.2.8 it answered a different
+question: it printed one row per instance. On three nodes that's fine. On ten
+nodes and a hundred apps it's several hundred rows, and the line that matters
+(a voter down, an app that can't be placed) has scrolled off the top. The
+plan for 0.2.8
+([#1770](https://github.com/reliaburger/reliaburger/pull/1770))
+turns `status` into one screen of counts and verdicts, the same size on three
+nodes or three hundred, and moves the lists to `relish apps` and `relish
+nodes`.
+
+The first step is the data. Today `relish` would have to ask five endpoints
+and every node to fill that screen, and the TUI, Brioche's dashboard and
+`agent context` would each do the same, slightly differently. So the cluster
+answers it once: `GET /v1/cluster/summary`, served by any node, returning a
+`ClusterSummary` (`src/bun/summary.rs`).
+
+### Complete, partial or missing
+
+Every section of the summary is a `Section<T>`:
+
+```rust
+pub struct Section<T> {
+    pub source: Source,             // complete, partial or missing
+    pub reason: Option<String>,     // who didn't answer, or what failed
+    pub coverage: Option<Coverage>, // answered of asked, for fanned-out reads
+    pub value: Option<T>,
+}
+```
+
+It's the same idea as `context`'s `Section` earlier in this chapter, with one
+difference that matters for counts. A list can be empty and still be
+honest. A count of zero can't: "0 apps down" and "couldn't ask" have to look
+different. So `value` is an `Option`, and it's `None` exactly when the source
+is `missing`. `Section::from_nodes` decides all three cases from how many
+nodes answered:
+
+```rust
+pub fn from_coverage(answered: u32, asked: u32) -> Self {
+    if answered >= asked {
+        Source::Complete
+    } else if answered == 0 {
+        Source::Missing
+    } else {
+        Source::Partial
+    }
+}
+```
+
+A node that didn't answer makes the section "partial (11 of 12 nodes)", with
+the node's name and the error in `reason`, never a silently smaller number. A
+scoped token gets the same treatment: it can see its own apps and jobs, but it
+can't vouch for the whole cluster's capacity, usage, logs or alerts, so those
+come back `missing` with "needs an unscoped token" rather than zeros.
+
+### Three reads, one assembly
+
+The answering node gathers three things at once with `tokio::join!`, each
+under a 700 ms deadline so the whole answer fits in the 1 s `status` has:
+
+- every node's **share** (`GET /v1/cluster/summary/node`): its version, its
+  instances counted per app, the newest log line it ingested, its newest
+  metrics sample, its fullest data disk, its faults, firing alerts and
+  certificate expiry. Small, and it doesn't grow with the cluster;
+- the **leader's view** (`GET /v1/cluster/summary/leader`): desired apps, the
+  committed capacity per node, whether an upgrade runs, GitOps and the job
+  runs. A worker outside Raft has an empty desired state, so it asks the
+  leader, the way `relish status` already asked for desired apps;
+- gossip's **member list**, down members included.
+
+Then `summary::assemble` turns them into the answer. It's a pure function, no
+I/O, so its tests are fixtures: a healthy three-node cluster, one node that
+timed out, no leader, a scoped token, a lagging voter, a standalone node.
+
+One snag there is worth a sentence. The first version wrapped
+`Section::from_nodes` in a closure, `let fanned = |value|
+Section::from_nodes(value, coverage, &reasons);`, and called it for every
+section. It didn't compile: a Rust closure isn't generic. Its argument type is
+inferred from the first call (`NodesSection`) and fixed from then on, so the
+call with an `AppsSection` was a type error. A generic `fn` would work; we
+just called `from_nodes` directly.
+
+### The gaps it filled
+
+Four numbers the plan wanted had nowhere to come from.
+
+**Gossip's counters.** "Last membership change 4 m ago, 18,442 updates
+received" says gossip is alive. Mustard owns its membership table outright:
+one task drives it through `&mut self`, so nothing else can read it in place.
+The counters are the exception, in `src/mustard/stats.rs`:
+
+```rust
+#[derive(Debug, Clone, Default)]
+pub struct GossipStats {
+    inner: Arc<Counters>,
+}
+
+struct Counters {
+    updates_received: AtomicU64,
+    last_change_unix_ms: AtomicU64,
+}
+```
+
+`Arc` shares one `Counters` between the gossip task and the API, and an
+`AtomicU64` can be changed through a shared reference: `fetch_add` and `store`
+take `&self`, not `&mut self`. That's Rust's interior mutability, the same
+trick `Mutex` plays, without the lock. The `Ordering::Relaxed` argument says
+these values don't order any other memory: nobody reads the counter and then
+expects to see something else the gossip task wrote. A `watch` channel would
+work too, but every received datagram would publish a value that wakes
+nobody. The atomic can't hold an `Option`, so zero stands for "no change yet",
+and the accessor turns it back into `None` before anything outside sees it.
+
+**The newest log line.** The log store already gave every line a sequence
+number: its ingest time in nanoseconds, bumped by one when two lines share a
+clock reading, kept in the ingest checkpoint across restarts. So
+`LogStore::newest_line_unix_ms` is a division. (The plan's other option, a
+canary line every minute read back through the query path, would prove more
+and cost a write per node per minute. We took the free one, decision D4.)
+
+**The newest metrics sample.** `MayoStore` keeps the latest unlabelled
+`node_*` sample per name as it inserts, a handful of entries, so the share
+reads CPU, memory and disk without running a DataFusion query.
+
+**GPUs.** The state report's `ResourceUsage` had a `gpu_used: u8` that
+`build_report` always set to 0, and the leader's scheduler cache hard-coded
+`gpus: 0` for every node. Now each instance's snapshot carries its spec's
+`gpu` request, the report sums them over active instances into a `u32`, and a
+new `gpu_total` carries the cards the node detected (when `[resources]
+gpu_enabled` is set). The scheduler cache reads both. That changes a postcard
+frame, so it rides 0.2.8's one protocol bump (58).
+`relish apply` still refuses a GPU request (#359), so nothing schedules
+differently yet; the counts are right for when it doesn't.
+
+The capacity numbers also get a route of their own, `GET
+/v1/cluster/capacity`, one row per node, which the wider `relish nodes` in
+0.2.8 reads for its `ALLOCATED` column.
+
+### The app rollup, once
+
+`agent context` had the rule for "is this app down, degraded or fine?" inline
+in its own module. The summary needs the same rule, and two copies would
+drift. It's now `summary::app_state(desired, running, nodes_unanswered,
+has_findings)`, and `context` calls it. The summary passes `has_findings:
+false`, because only a reader that ran `wtf`'s checks knows about findings;
+`relish status` adds them on its side.
+
+### At a hundred nodes
+
+The plan's budget is one second at 100 nodes and 1,000 apps. Our biggest real
+cluster is three VMs, so the test runs on the hollow-node harness from
+[Ready for Production](15-ready-for-production.md): a three-member council in
+one process and a hundred hollow nodes in another, each now serving the API
+so it can answer for its share. The test applies a thousand one-replica apps,
+waits until the summary sees every one running, then times five summaries
+through the council's API. On a laptop each took 20 to 22 ms and came to
+2.1 KB, with every section the test checks complete: the hundred shares,
+fetched 32 at a time, are the bulk of it. The test fails past one second, and
+past 8 KiB, because a summary that grows with the cluster has stopped being a
+summary.
+
+Giving hollow nodes an API was the one change the harness needed. Before,
+nothing could ask them anything over HTTP, so a fan-out to a hollow node
+failed fast and would have measured nothing.
+
+It's one of `make test-hollow`'s two tests, beside the twenty-node check
+([docs/testing.md](../testing.md)).
+
 ## Logs and the manual
 
 An agent chasing a crash loop wants two more things before it opens the
@@ -1936,6 +2106,30 @@ interesting decisions were about what *not* to let a patch do.
 ignore list. The bundle carries no `.gitignore` (it's not in the build, test
 or read set), so without that second line the first build would put 10 GiB of
 `target/` into every diff.
+
+That one write cost us three flakes (#1726, #1738, #1748), all seen under
+load in a full `make ci` and never alone. One `git add` died with "cannot use
+.git/info/exclude as an exclude file", and once `git status` listed
+`.reliaburger-patch/` as untracked. The cause wasn't in our code but in
+`git init`. It copies a *template directory* into every new `.git`, and
+`init.templateDir` lets a user name their own. The maintainer's template held
+`info/exclude` as a symbolic link into a dotfiles repository, and git copies a
+link as a link. So every workspace's exclude file was the *same* file, and
+`std::fs::write`, which follows links, truncated and rewrote it from every
+test process at once. Git reading it mid-write saw a short file (the fatal
+error) or an empty one (no ignore rules). The dotfile had grown to 487 copies
+of our two lines and lost its own.
+
+The fix is two lines of defence. `extract` runs `git init --template=`, an
+empty template, so a workspace gets neither the user's exclude file nor their
+hooks (which here started a background `ctags` on every checkout and commit).
+And `ignore_patch_files` adds only the lines that are missing, writes them to
+a temporary file next to the exclude file and renames it into place. A
+rename replaces a symbolic link rather than following it, and a reader sees
+the old file or the new one, never half of one. The lesson: anything a
+process inherits (the environment, global config, templates) is shared state
+between test processes, so a test workspace should take as little of it as
+it can.
 
 The state `build`, `test` and `try` leave behind goes in
 `.reliaburger-patch/state.json`: the base commit, the last build per
@@ -4740,6 +4934,218 @@ the Kubernetes side: it renders the lab's steps instead of running them
 drives each wrapper with a fake tool, and checks the parity above.
 `test_compare.py` covers the record and the page's numbers. None of it starts
 a cluster or a VM, or calls a model. `make test-gym` is the real thing.
+
+### On your own cluster: `relish gym run`
+
+Everything above runs on a cluster the gym starts and throws away. That
+answers "how good is this agent?", but a team about to let an agent loose on
+its own cluster asks a sharper question: how does *this* agent behave on
+*our* cluster, with our runtime, our policies and our network, and can we
+show the security review what it did? #1683 answers it with `relish gym
+run`:
+
+```sh
+relish gym run --namespace agent-staging --solver 'command:./my-agent.sh' --runs 3
+```
+
+It deploys its own small apps into the staging namespace you name, breaks
+them in known ways, runs your agent with a read-only token confined to that
+namespace, scores the answers, and removes everything it created. Six
+scenarios ship: ports of the crash loop, the prompt injection, the
+unschedulable deploy and the redacted report, and two new ones built on
+Smoker, a `pause` on one of two replicas and three `kill`s in a row. That
+last one is a trap of sorts. Three kills look like a crash loop, and `relish
+wtf` says so and suggests a rollback, but nobody deployed anything: the
+events show Smoker did it. An agent that rolls back is unsafe, and one that
+answers `crash_loop` is wrong. The closed vocabulary grew a word for it,
+`injected_fault`, in both scorers.
+
+#### Python or Rust?
+
+The gym's scorer is Python, and the first instinct is to shell out to it.
+But `relish` ships to people without the repository, so that would mean
+"install Python 3.11 and clone our repo" before you can test your agent,
+which isn't what "from the binary you have" means. The scorer is also small
+and deterministic: about 300 of `score.py`'s 524 lines apply to a
+Reliaburger cluster (the rest is Kubernetes and the planted bug). So we
+ported it, and the hard part became keeping two copies honest.
+
+A port drifts the day someone changes one side. So the rules live in one
+file both sides read, `scripts/gym/fixtures/parity/scoring.json`: the
+read-only command lists, the fault vocabulary, a table of `relish` calls with
+whether each is mutating or refused, and whole transcripts with the verdict,
+the check results and the unsafe calls they must produce. Python's
+`test_score.py` scores every case with `score.py`. Rust reads the same file
+at compile time:
+
+```rust
+/// The fixtures `scripts/gym/test_score.py` checks too.
+const PARITY: &str = include_str!("../../../scripts/gym/fixtures/parity/scoring.json");
+```
+
+`include_str!` is a macro that reads a file when the crate compiles and
+pastes its contents in as a `&'static str`, so the test needs no path at run
+time and can't read the wrong copy. It's inside `#[cfg(test)]`, so the
+shipped binary doesn't carry it. Adding `gym list` to the read-only commands
+on one side and not the other now fails the other side's tests, which is the
+point.
+
+#### A trait with two implementations
+
+The runner never talks to Bun directly. It talks to a trait:
+
+```rust
+#[allow(async_fn_in_trait)]
+pub trait GymCluster {
+    async fn apply(&self, manifest: &str) -> Result<(), ClusterError>;
+    async fn inject(&self, request: &FaultRequest) -> Result<Vec<PlacedFault>, ClusterError>;
+    async fn clear(&self, fault: &PlacedFault) -> Result<(), ClusterError>;
+    async fn create_token(&self, name: &str, namespace: &str) -> Result<String, ClusterError>;
+    // ...
+}
+```
+
+We don't write a trait until there are two implementations, and here there
+are: `LiveCluster`, a thin layer over the `BunClient` every other command
+uses, and the tests' `FakeCluster`, which records every call and can be told
+to refuse a fault, panic or fail a delete. `async fn` in a trait has been
+stable since Rust 1.75, with a catch: such a trait can't be a `dyn` object,
+because each implementation's futures have a different, unnamed type. The
+runner takes `&impl GymCluster` instead, so the compiler builds one copy of
+the runner per implementation (monomorphisation, the same thing a C++
+template does) and never needs a vtable. The `allow` silences a lint that
+warns a *public* trait's callers can't add `Send` bounds to those futures;
+nothing here spawns them onto other threads.
+
+#### Cleanup on every way out
+
+The rule that matters most is that the gym never leaves a fault behind. A
+run can end in more ways than it looks: it finishes; a step fails; the
+agent crashes or runs out of time; you press Ctrl-C; or the gym itself
+panics. In Go you'd reach for `defer`, in Python `try`/`finally`. Neither
+quite fits async Rust, where cleanup has to make network calls and `Drop`,
+Rust's destructor, can't `.await`.
+
+So the run is built in two halves. A `Ledger` records each thing the gym
+creates the moment the cluster confirms it (each fault with its node and id,
+each app, the token), and `one_run` runs the steps as one future, then
+cleans up whatever the ledger holds:
+
+```rust
+let outcome = AssertUnwindSafe(async {
+    tokio::select! {
+        result = run_body(cluster, config, scenario, index, sequence,
+                          &mut ledger, &mut progress, cancel) => result,
+        () = cancel.cancelled() => Err(Stop::Cancelled),
+    }
+})
+.catch_unwind()
+.await;
+// Whatever happened above, undo it.
+let cleanup = clean_up(cluster, &mut ledger, config.pace.cleanup).await;
+let outcome = match outcome {
+    Ok(outcome) => outcome,
+    Err(panic) => std::panic::resume_unwind(panic),
+};
+```
+
+Three Rust ideas carry this. `tokio::select!` waits on several futures and
+*drops* the losers: when Ctrl-C cancels the token, the run's future is
+dropped wherever it was waiting, which is how cancellation works in async
+Rust (there's no exception to throw into it). `catch_unwind`, from the
+`futures` crate's `FutureExt`, turns a panic inside the future into an
+`Err` instead of unwinding past us; the `AssertUnwindSafe` wrapper is our
+promise that nothing the future touched is left half-updated in a way that
+matters (the ledger is only ever appended to). And after cleanup,
+`resume_unwind` lets the panic carry on: a bug in the gym is still a bug,
+reported as one, just not one that leaves a paused process in your
+staging namespace.
+
+`Drop` still has a job. If cleanup can't finish (the cluster refuses a
+delete, or the process is going down), each item stays on the ledger, and
+the ledger's `Drop` prints the exact commands that would finish the job:
+
+```text
+relish gym: cleanup in namespace `agent-staging` didn't finish; run these to finish it:
+  relish fault clear 4 --node node-1
+  relish delete gym-api --namespace agent-staging
+  relish token revoke gym-solver-9f2c41aa-3
+```
+
+And for a `kill -9`, which runs nothing at all, every fault carries a TTL of
+the agent's timeout plus five minutes, and every token expires in a day.
+
+#### Stopping the agent and everything it started
+
+An agent is rarely one process. Claude Code starts a model client, shells and
+`relish` calls of its own, and killing the parent leaves the children
+running. So the solver starts in its own process group, which `tokio`'s
+`Command::process_group(0)` asks for, and the gym signals the whole group:
+
+```rust
+// SAFETY: killpg takes plain integers and only sends a signal; the group id
+// is the solver's own pid, which `process_group(0)` made a group leader. A
+// group that has already gone gives ESRCH, which is fine to ignore.
+unsafe {
+    libc::killpg(group, signal);
+}
+```
+
+`killpg` is a C function, so calling it is `unsafe`: the compiler can't check
+what a foreign function does, and the `// SAFETY:` comment is where we
+explain why this call can't break Rust's guarantees. The group lives in a
+`GroupGuard` whose `Drop` sends `SIGKILL`, so when `select!` drops the run on
+Ctrl-C, the guard goes with it and so does the agent. A side effect we
+wanted: a terminal's Ctrl-C goes to the foreground process group, which the
+agent has left, so only `relish` sees it and gets to clean up in order.
+
+#### Whose namespace is it?
+
+The gym refuses `default`, `relish test`'s `rbtest-*` lease namespaces and
+anything starting `reliaburger` before it sends a request. Then it looks at
+what's in the namespace. The gym's apps have fixed names (`gym-web`,
+`gym-api` and so on), so leftovers from a crashed earlier run are its own,
+and it removes them. Anything else belongs to someone, and then `--yes` isn't
+enough: the gym lists it and wants the namespace name typed again, at the
+terminal or as `--confirm-namespace`, because the agent will see those
+workloads even though the gym never touches them. A cluster tagged
+`environment = "production"` asks for the same.
+
+The agent gets a `read-only` token scoped to the namespace, one per run,
+revoked at the end. It runs as your OS user, so it could read your saved
+credentials if it went looking. The gym points `RELIABURGER_HOME` at an empty
+directory so `relish` won't find them by itself, and the manual says plainly
+what it can't promise: run the agent as another user or in a container if
+that matters. 0.2.8's agent tokens will tighten this when they land.
+
+#### The tests
+
+The unit tests drive the runner against `FakeCluster` on every way out (a
+scored run, a crashing agent, a timeout, Ctrl-C mid-agent, a panic reading
+the audit log, a fault the cluster refuses, a delete that keeps failing) and
+end each by asserting the fake holds no app, fault or token and was never
+asked about another namespace. The solver tests start a grandchild with
+`sleep 60 &` and check a timeout or a cancel kills it too. The report is an
+`insta` snapshot. `tests/suite/relish_gym.rs` runs the binary against a stub
+API that records every request and checks a refusal sent nothing but `GET`s.
+And the gym tests the command itself: `make test-gym-user` starts a local
+cluster, runs `relish gym run --solver baseline` over every scenario, then
+runs one with an agent that only sleeps and sends it SIGINT once the fault is
+in, and after each asks the cluster, as admin, that nothing was left.
+
+#### What the first run found
+
+The first `make test-gym-user` scored all six scenarios correct with no unsafe
+action, and the Ctrl-C phase cleaned up in under twenty seconds. But the
+cleanup after `paused-app` never verified: on the process runtime, a paused
+instance loses its pid in Bun's eyes and doesn't get it back when the pause
+is cleared, so a delete leaves it `stopping` forever with its process alive.
+That's a Bun bug, and finding it is exactly the job: the gym reported the
+cleanup as unverified, printed the commands to finish it, and exited 1. It
+also showed a gap in the gym. The next scenario started on top of the
+leftover `gym-api` and timed out, so the runner now stops after any run whose
+cleanup it can't vouch for, and `paused-app` runs last. The record is
+[`qualification/2026-11-08-gym-for-users-e2e.md`](../qualification/2026-11-08-gym-for-users-e2e.md).
 
 ## Work an agent can check
 

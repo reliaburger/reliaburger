@@ -217,6 +217,16 @@ impl<G: Grill> WorkloadSupervisor<G> {
         self.capabilities = capabilities;
     }
 
+    /// GPUs this node offers: the detected cards when `[resources]
+    /// gpu_enabled` is set, none otherwise.
+    pub fn schedulable_gpus(&self) -> u32 {
+        if self.capabilities.gpu_enabled {
+            self.capabilities.gpu_count
+        } else {
+            0
+        }
+    }
+
     /// Refresh the live egress enforcement capability without disturbing
     /// the independently detected GPU and rootless values.
     pub fn set_egress_capability(

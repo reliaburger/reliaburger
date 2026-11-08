@@ -1,4 +1,4 @@
-.PHONY: build test warm-executables test-cargo test-doc test-slow test-images test-linux test-rootless-runc test-cluster test-hollow test-upgrade test-upgrade-node test-upgrade-cluster test-apple test-standard-clients test-gym test-gpu test-s3 test-ci-scripts check-ignored coverage coverage-html check fmt lint lint-macos test-macos audit outdated clean pdf loc help bench bench-large ci ci-bench rollout-demo gitops-demo observability-demo kubernetes-demo toml-demo readme-commands agent-docs mcp-registry-publish bench-task-arrays fuzz-tools fuzz-build fuzz-smoke fuzz-corpus-check fuzz-corpus-seed
+.PHONY: build test warm-executables test-cargo test-doc test-slow test-images test-linux test-rootless-runc test-cluster test-hollow test-upgrade test-upgrade-node test-upgrade-cluster test-apple test-standard-clients test-gym test-gym-user test-gpu test-s3 test-ci-scripts check-ignored coverage coverage-html check fmt lint lint-macos test-macos audit outdated clean pdf loc help bench bench-large ci ci-bench rollout-demo gitops-demo observability-demo kubernetes-demo toml-demo readme-commands agent-docs mcp-registry-publish bench-task-arrays fuzz-tools fuzz-build fuzz-smoke fuzz-corpus-check fuzz-corpus-seed
 
 CARGO = cargo
 NEXTEST_PROFILE ?= default
@@ -74,8 +74,8 @@ test-rootless-runc: ## Prove rootless runc networking and port adoption as a non
 test-cluster: ## Run all real multi-node cluster acceptance suites and the scripted feature demos
 	RELIABURGER_CLUSTER_TESTS=1 $(NEXTEST) --run-ignored=only -E 'binary(cluster_failover) | binary(cluster_gossip) | binary(council_self_healing) | binary(council_disaster_recovery) | binary(placement) | binary(cluster_task_arrays) | binary(registry_durability) | binary(demos)'
 
-test-hollow: ## Run the 20-node hollow-node harness check (#1401); measured fleets run through scripts/release/qualify-hollow-nodes.sh
-	$(NEXTEST) --run-ignored=only -E 'binary(hollow_nodes) & test(twenty_hollow_nodes)'
+test-hollow: ## Run the 20-node hollow-node harness check (#1401) and the 100-node, 1,000-app summary budget; measured fleets run through scripts/release/qualify-hollow-nodes.sh
+	$(NEXTEST) --run-ignored=only -E 'binary(hollow_nodes) & (test(twenty_hollow_nodes) | test(a_hundred_hollow_nodes))'
 
 test-upgrade: ## Run all real-binary self-upgrade acceptance tests
 	RELIABURGER_UPGRADE_TESTS=1 $(NEXTEST) --run-ignored=only -E 'binary(self_upgrade) | binary(self_upgrade_cluster)'
@@ -105,6 +105,14 @@ test-gym: ## Run the agent gym's scenarios on throwaway local clusters (#1086); 
 	python3 scripts/release/require_python.py
 	$(CARGO) build --locked --bin relish --bin bun --bin testapp
 	python3 scripts/gym/gym.py run --solver '$(GYM_SOLVER)' --runs $(GYM_RUNS) --port-base $(GYM_PORT_BASE) --out '$(GYM_OUT)'
+
+# `relish gym run` (#1683), tested by the gym: the baseline over every
+# scenario on a fresh local cluster, then a Ctrl-C mid-run, each followed by a
+# check that no fault, gym app or solver token is left. No API spend.
+test-gym-user: ## Test `relish gym run` on a throwaway local cluster (#1683): the baseline, then Ctrl-C mid-run, checking cleanup
+	python3 scripts/release/require_python.py
+	$(CARGO) build --locked --bin relish --bin bun --bin testapp
+	python3 scripts/gym/gym.py user --port-base $(GYM_PORT_BASE) --out '$(GYM_OUT)/user'
 
 test-gpu: ## Detect a real NVIDIA GPU (needs the GPU and nvidia-smi)
 	RELIABURGER_GPU_TESTS=1 $(NEXTEST) --run-ignored=only -E 'test(=bun::gpu::tests::nvidia_detector_finds_hardware)'
