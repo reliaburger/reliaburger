@@ -1216,6 +1216,7 @@ async fn leased_token_cleanup_survives_leader_failure_without_revoking_operator_
         name: "operator".into(),
         token_hash: vec![1; 32],
         role: ApiRole::Admin,
+        kind: reliaburger::sesame::types::TokenKind::Human,
         scope: TokenScope::default(),
         expires_at: None,
         created_at: SystemTime::now(),
@@ -1243,6 +1244,7 @@ async fn leased_token_cleanup_survives_leader_failure_without_revoking_operator_
         name: "rbtest-leader-scope".into(),
         token_hash: vec![3; 32],
         role: ApiRole::Deployer,
+        kind: reliaburger::sesame::types::TokenKind::Human,
         scope: TokenScope {
             apps: None,
             namespaces: Some(vec![lease.namespace.clone()]),

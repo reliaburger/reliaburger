@@ -239,6 +239,26 @@ expression: "schema_of::<Envelope<Value>>()"
           "const": "lease release",
           "description": "`relish agent lease release`.",
           "type": "string"
+        },
+        {
+          "const": "propose",
+          "description": "`relish agent propose`.",
+          "type": "string"
+        },
+        {
+          "const": "proposals",
+          "description": "`relish agent proposals`.",
+          "type": "string"
+        },
+        {
+          "const": "withdraw",
+          "description": "`relish agent withdraw`.",
+          "type": "string"
+        },
+        {
+          "const": "undo",
+          "description": "`relish agent undo`.",
+          "type": "string"
         }
       ]
     },
@@ -324,14 +344,24 @@ expression: "schema_of::<Envelope<Value>>()"
           "const": "lease_held",
           "description": "Someone else holds a lease on what you asked for; `lease` says who,\nwhy and for how long.",
           "type": "string"
+        },
+        {
+          "const": "stale",
+          "description": "An app changed since the proposal saw it.",
+          "type": "string"
+        },
+        {
+          "const": "guardrail",
+          "description": "A policy or built-in rule refused the proposal.",
+          "type": "string"
         }
       ]
     },
     "LeaseLine": {
-      "description": "One lease, as agents see it. `purpose` is the holder's own words.",
+      "description": "One lease, as agents see it.",
       "properties": {
         "expires_in_seconds": {
-          "description": "Whole seconds left when the cluster answered.",
+          "description": "Seconds left.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -341,7 +371,7 @@ expression: "schema_of::<Envelope<Value>>()"
           "type": "string"
         },
         "proposal": {
-          "description": "The pending proposal that pins it, if one does.",
+          "description": "The proposal that pins it.",
           "format": "uint64",
           "minimum": 0,
           "type": [
@@ -351,7 +381,7 @@ expression: "schema_of::<Envelope<Value>>()"
         },
         "purpose": {
           "$ref": "#/$defs/Untrusted",
-          "description": "What the holder said it's doing, wrapped as untrusted."
+          "description": "The holder's own words."
         },
         "target": {
           "description": "`app:shop/web` or `namespace:shop`.",
@@ -420,7 +450,12 @@ expression: "schema_of::<Envelope<Value>>()"
         },
         {
           "const": "lease_purpose",
-          "description": "What a lease's holder said it's doing (#1686).",
+          "description": "A lease's purpose (#1686).",
+          "type": "string"
+        },
+        {
+          "const": "proposal_reason",
+          "description": "A proposal's reason (#1682).",
           "type": "string"
         }
       ]
@@ -449,37 +484,37 @@ expression: "schema_of::<Envelope<Value>>()"
       "type": "object"
     },
     "UntrustedText": {
-      "description": "Untrusted text, cleaned: control characters and ANSI escapes removed\n(tabs kept), secrets redacted, each line capped at `line_bytes_max`.",
+      "description": "Untrusted text, without control characters or secrets, lines capped.",
       "properties": {
         "app": {
-          "description": "The app it's about, when it's about one.",
+          "description": "The app it's about.",
           "type": [
             "string",
             "null"
           ]
         },
         "instance": {
-          "description": "The instance that wrote it, when one did.",
+          "description": "The instance that wrote it.",
           "type": [
             "string",
             "null"
           ]
         },
         "line_bytes_max": {
-          "description": "The longest a line may be, in bytes. A longer one was cut and ends in\n`…[cut]`.",
+          "description": "The longest a line may be, in bytes; a cut one ends in `…[cut]`.",
           "format": "uint",
           "minimum": 0,
           "type": "integer"
         },
         "lines": {
-          "description": "The text, one line per item, in the order the command chose: what\nmatters most first, because a byte budget trims from the end.",
+          "description": "The text, one line per item, what matters most first.",
           "items": {
             "type": "string"
           },
           "type": "array"
         },
         "namespace": {
-          "description": "The app's namespace, when it's about an app.",
+          "description": "Its namespace.",
           "type": [
             "string",
             "null"
@@ -494,7 +529,7 @@ expression: "schema_of::<Envelope<Value>>()"
           "description": "Who wrote the text."
         },
         "truncated": {
-          "description": "Whether a line was cut, or the command left lines out. The byte\nbudget's own cuts are reported in the envelope's warnings instead.",
+          "description": "Whether a line was cut, or lines were left out.",
           "type": "boolean"
         }
       },

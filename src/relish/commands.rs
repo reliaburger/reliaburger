@@ -5783,6 +5783,7 @@ mod tests {
             namespaces: None,
             lifetime: super::super::client::TokenLifetime::Default,
             inherit_permissions: false,
+            agent: false,
         };
         let result = token_create_with_client(&request, OutputFormat::Human, &bogus_client()).await;
         assert!(result.is_err(), "unreachable agent must be an error");

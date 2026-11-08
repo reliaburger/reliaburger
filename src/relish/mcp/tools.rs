@@ -61,6 +61,22 @@ pub const EXCLUDED: &[Exclusion] = &[
         command: "lease",
         why: "takes, renews and releases council leases; arrives with `relish mcp --propose` (#1682)",
     },
+    Exclusion {
+        command: "propose",
+        why: "writes a proposal to the council; arrives with `relish mcp --propose` (#1682)",
+    },
+    Exclusion {
+        command: "proposals",
+        why: "reads proposals; arrives with the proposing tools in `relish mcp --propose` (#1682)",
+    },
+    Exclusion {
+        command: "withdraw",
+        why: "withdraws a proposal; arrives with `relish mcp --propose` (#1682)",
+    },
+    Exclusion {
+        command: "undo",
+        why: "proposes an undo; arrives with `relish mcp --propose` (#1682)",
+    },
 ];
 
 /// The exclusion for `command`, if there is one. An excluded group, such as

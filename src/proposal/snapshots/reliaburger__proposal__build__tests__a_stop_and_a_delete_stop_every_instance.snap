@@ -1,0 +1,8 @@
+---
+source: src/proposal/build_tests.rs
+expression: "delete.summary.join(\"\\n\")"
+---
+Delete shop/web. Its instances' local state goes with it.
+Touches 1 app on 2 nodes (node-a, node-b); stops 3 instances.
+Serves https://shop.example.com/ and the service web.shop.
+Undo: `relish undo 17` creates web again from its spec.

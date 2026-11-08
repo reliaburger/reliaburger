@@ -136,18 +136,18 @@ pub struct LeaseData {
     pub attempts: u32,
 }
 
-/// One lease, as agents see it. `purpose` is the holder's own words.
+/// One lease, as agents see it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct LeaseLine {
     /// `app:shop/web` or `namespace:shop`.
     pub target: String,
     /// The holder's token name.
     pub holder: String,
-    /// What the holder said it's doing, wrapped as untrusted.
+    /// The holder's own words.
     pub purpose: Untrusted,
-    /// Whole seconds left when the cluster answered.
+    /// Seconds left.
     pub expires_in_seconds: u64,
-    /// The pending proposal that pins it, if one does.
+    /// The proposal that pins it.
     pub proposal: Option<u64>,
 }
 

@@ -220,6 +220,8 @@ pub struct Compatibility {
 /// Agent leases (#1686): `DesiredState::agent_leases`, the `LeaseTake`,
 /// `LeaseRenew`, `LeaseRelease`, `LeaseBreak` and `LeaseExpire` Raft
 /// requests and the `AgentLease` council response.
+/// Agent proposals (#1682): `DesiredState::proposals`, the `Proposal*` Raft
+/// requests, the `Proposal` council response, and `ApiToken::kind`.
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 58,
     state: 74,

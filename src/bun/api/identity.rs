@@ -330,6 +330,14 @@ pub(super) async fn token_create_handler(
         namespaces: Option<Vec<String>>,
         #[serde(default)]
         ttl_days: Option<u64>,
+        /// A lifetime in seconds; an agent token's is 8 hours by default
+        /// and at most 7 days (#1682).
+        #[serde(default)]
+        ttl_seconds: Option<u64>,
+        /// An agent token: read-only unless the role is `deployer`, never
+        /// `admin`, short-lived (#1682).
+        #[serde(default)]
+        agent: bool,
         /// No expiry, overriding the node's default lifetime.
         #[serde(default)]
         no_expiry: bool,
@@ -475,7 +483,27 @@ pub(super) async fn token_create_handler(
         apps: req.apps.clone(),
         namespaces: req.namespaces.clone(),
     };
-    let mut expires_at = match req.ttl_days {
+    if let Some(refusal) = agent_token_refusal(
+        &req.role,
+        req.agent,
+        req.ttl_days,
+        req.ttl_seconds,
+        req.no_expiry,
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": refusal })),
+        )
+            .into_response();
+    }
+    let ttl_days = req.ttl_days;
+    let ttl_seconds = req
+        .ttl_seconds
+        .or(req.agent.then_some(DEFAULT_AGENT_TOKEN_TTL_SECONDS));
+    let mut expires_at = match ttl_days {
+        _ if ttl_seconds.is_some() => ttl_seconds.and_then(|seconds| {
+            std::time::SystemTime::now().checked_add(std::time::Duration::from_secs(seconds))
+        }),
         Some(_) if req.no_expiry => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -525,7 +553,12 @@ pub(super) async fn token_create_handler(
     // Minting costs one SHA-256 (#912), so it runs inline: no blocking pool.
     let expires_unix = expires_at.map(unix_seconds);
     let created = match crate::sesame::token::create_token(&req.name, role, scope, expires_at) {
-        Ok(created) => created,
+        Ok(mut created) => {
+            if req.agent {
+                created.token.kind = crate::sesame::types::TokenKind::Agent;
+            }
+            created
+        }
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -552,6 +585,10 @@ pub(super) async fn token_create_handler(
     let mut details = std::collections::BTreeMap::from([
         ("token".to_string(), req.name.clone()),
         ("role".to_string(), req.role.clone()),
+        (
+            "kind".to_string(),
+            if req.agent { "agent" } else { "human" }.to_string(),
+        ),
     ]);
     if let Some(at) = expires_unix {
         details.insert("expires_at".to_string(), at.to_string());
@@ -574,6 +611,7 @@ pub(super) async fn token_create_handler(
     Json(serde_json::json!({
         "name": req.name,
         "role": req.role,
+        "kind": if req.agent { "agent" } else { "human" },
         "token": created.plaintext,
         "expires_at": expires_unix,
     }))
@@ -1084,4 +1122,45 @@ pub(super) async fn join_token_create_handler(
         )
             .into_response(),
     }
+}
+
+/// An agent token's lifetime when none is asked for: 8 hours (#1682).
+pub(crate) const DEFAULT_AGENT_TOKEN_TTL_SECONDS: u64 = 8 * 60 * 60;
+
+/// The longest agent token: 7 days.
+pub(crate) const MAX_AGENT_TOKEN_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
+
+/// Why a token request breaks the agent token rules, or the lifetime
+/// rules every token shares, if it does.
+fn agent_token_refusal(
+    role: &str,
+    agent: bool,
+    ttl_days: Option<u64>,
+    ttl_seconds: Option<u64>,
+    no_expiry: bool,
+) -> Option<String> {
+    if ttl_seconds.is_some() && (ttl_days.is_some() || no_expiry) {
+        return Some("ttl_seconds can't be given with ttl_days or no_expiry".to_string());
+    }
+    if ttl_seconds == Some(0) {
+        return Some("ttl_seconds must be positive".to_string());
+    }
+    if !agent {
+        return None;
+    }
+    if role == "admin" {
+        return Some(
+            "an agent token is read-only or deployer, never admin: the boundary is the token"
+                .to_string(),
+        );
+    }
+    if no_expiry || ttl_days.is_some() {
+        return Some(
+            "an agent token's lifetime is set with ttl_seconds (--ttl), at most 7 days".to_string(),
+        );
+    }
+    if ttl_seconds.is_some_and(|seconds| seconds > MAX_AGENT_TOKEN_TTL_SECONDS) {
+        return Some("an agent token lives at most 7 days".to_string());
+    }
+    None
 }

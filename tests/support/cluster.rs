@@ -546,6 +546,13 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
         name.clone(),
         shutdown.clone(),
     ));
+    // Bun's leader-only proposal reaper (#1682).
+    tasks.push(reliaburger::bun::proposals::spawn_proposal_reaper(
+        Arc::clone(&council),
+        Some(Arc::clone(&event_store)),
+        name.clone(),
+        shutdown.clone(),
+    ));
 
     let membership_table: Arc<RwLock<Vec<NodeMembershipInfo>>> = Arc::new(RwLock::new(Vec::new()));
     // Every member gossip has shown, so the relay and node-fault reversal
