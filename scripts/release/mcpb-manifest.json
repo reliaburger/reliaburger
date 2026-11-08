@@ -85,7 +85,7 @@
       "name": "manual_show"
     },
     {
-      "description": "The first call: findings, unknowns, faults, alerts, one line per app and the newest events, in one bounded answer",
+      "description": "The first call: `relish status`'s screen and summary, findings, unknowns and the newest events, in one bounded answer",
       "name": "context"
     },
     {

@@ -133,7 +133,7 @@ success or failure;</li>
 <li>never prompts, never opens a TUI and never reads stdin, so it runs the same
 in a script, a CI job or an agent's tool call;</li>
 <li>stays within a byte budget, 24 KiB unless you pass <code>--max-bytes</code> (64 KiB
-for <code>relish agent guide</code>, the one answer you read whole);</li>
+for <code>guide</code>, the one answer you read whole, and 32 for <code>schema</code>);</li>
 <li>exits with a code that says whether it answered, not what the answer was.</li>
 </ul>
 <p><code>-o</code> is accepted and ignored: there's only one format.</p>
@@ -215,12 +215,12 @@ exit code is the verdict.</p>
 <section class="agents-section" id="byte-budgets">
 <h2>Byte budgets <a class="permalink" href="#byte-budgets" aria-label="Link to this section">#</a></h2>
 <p>Every command's default budget is 24 KiB, about 6,000 tokens, except
-<code>relish agent guide</code>'s, which is 64 KiB so this whole chapter comes back in
-one call. <code>--max-bytes</code> overrides either. When an answer is bigger than the
-budget, <code>relish agent</code> trims it and keeps
-the JSON valid. It drops items from the end of the longest arrays in <code>data</code>
-first (commands put what matters most at the front), then shortens long
-strings, which end in <code>…[cut]</code>. Then it says so:</p>
+<code>guide</code>'s, 64 KiB so this whole chapter comes back in one call, and
+<code>schema</code>'s, 32. <code>--max-bytes</code> overrides any of them. When an answer is
+bigger than the budget, <code>relish agent</code> trims it and keeps the JSON valid. It
+drops items from the end of the longest arrays in <code>data</code> first (commands put
+what matters most at the front), then shortens long strings, which end in
+<code>…[cut]</code>. Then it says so:</p>
 <ul>
 <li><code>truncated</code> is <code>true</code>;</li>
 <li>a warning names each cut, such as <code>/data/apps: kept 34 of 200 items</code>;</li>
@@ -269,7 +269,7 @@ net, not a promise: read what you share before you post it anywhere.</p>
 <tr><td><code>relish agent logs</code></td><td>An app's recent log lines, newest kept, each wrapped as untrusted</td></tr>
 <tr><td><code>relish agent manual search</code></td><td>Up to ten sections that mention every word, best first, each with a short excerpt and the <code>show</code> command that prints it</td></tr>
 <tr><td><code>relish agent manual show</code></td><td>One chapter, or one section of it, as Markdown: <code>diagnostics</code> or <code>diagnostics#relish-path-can-a-reach-b</code></td></tr>
-<tr><td><code>relish agent context</code></td><td>The first call: findings, unknowns, faults, alerts, one line per app and the newest events, in one bounded answer</td></tr>
+<tr><td><code>relish agent context</code></td><td>The first call: <code>relish status</code>'s screen and summary, findings, unknowns and the newest events, in one bounded answer</td></tr>
 <tr><td><code>relish agent diagnose</code></td><td>Every finding with its evidence, read-only next steps, and pointers into the manual and the source</td></tr>
 <tr><td><code>relish agent explain</code></td><td>What a finding means, its thresholds and where it's decided; every finding when no id is given. Reads only this binary</td></tr>
 <tr><td><code>relish agent upgrade-check</code></td><td>Whether the cluster can take the latest release: <code>ready</code>, <code>up_to_date</code>, <code>needs_fresh_cluster</code>, <code>blocked</code> or <code>unknown</code></td></tr>
@@ -311,21 +311,17 @@ one fits on its own.</p>
 with <code>context</code>, the way you'd start with <code>relish status</code>:</p>
 <pre><code class="language-sh">relish agent context
 </code></pre>
-<p><code>data</code> has <code>wtf</code>'s summary and its findings in one line each (<code>critical</code>,
-<code>warnings</code>), the checks it couldn't make (<code>unknown</code>), the active Smoker
-<code>faults</code>, the firing <code>alerts</code>, one line per app (<code>apps</code>, the worst first:
-<code>down</code>, <code>degraded</code>, <code>troubled</code>, <code>unknown</code>, <code>running</code>, <code>stopped</code>) and the
+<p><code>data</code> has <code>relish status</code>'s screen (<code>status</code>: its <code>verdict</code>, its <code>lines</code>
+and the cluster <code>summary</code> behind them), <code>wtf</code>'s findings in one line each
+(<code>critical</code>, <code>warnings</code>), the checks it couldn't make (<code>unknown</code>) and the
 newest cluster events (<code>timeline</code>, newest first, each message in an
 <code>untrusted</code> object). <code>--events</code> sets how many events, 20 by default and at
 most 200.</p>
-<p><code>faults</code>, <code>alerts</code>, <code>apps</code> and <code>timeline</code> each say how much they saw:
-<code>state</code> is <code>known</code>, <code>partial</code> (some nodes didn't answer; the list is a
-lower bound) or <code>unknown</code> (nothing could be read, with <code>reason</code> saying why).
-An empty list with <code>unknown</code> means "couldn't look", never "none". The same
-goes for <code>unknown</code> at the top: a check <code>wtf</code> couldn't make stays unknown
-here, and is never counted as OK. On a big cluster the byte budget trims the
-longest lists from the end and says what it cut, so the worst apps and the
-newest events survive.</p>
+<p>Each summary section has a <code>source</code>: <code>complete</code>, <code>partial</code> (some nodes
+didn't answer; counts are lower bounds, and its line says <code>partial (2 of 3 nodes)</code>) or <code>missing</code> (<code>value</code> is <code>null</code>, <code>reason</code> says why). Missing never
+means zero, and a check <code>wtf</code> couldn't make is never counted as OK. The
+summary is the same size on any cluster; on a big one the budget trims the
+oldest events.</p>
 <p><code>diagnose</code> is <code>relish wtf</code> for an agent: the same checks, with the evidence
 behind each finding.</p>
 <pre><code class="language-sh">relish agent diagnose
