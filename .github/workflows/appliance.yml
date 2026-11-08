@@ -118,6 +118,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: appliance-${{ matrix.target }}
+          # PR runs restore main's cache but don't save their own, so they
+          # can't push main's caches out of the repository's quota.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build bun and relish
         run: |
           sudo apt-get update -qq
