@@ -993,6 +993,33 @@ verdicts for the same behaviour on both platforms
 [comparison page](website/compare/ai-agents.html) may state only numbers its
 record holds ([`test_compare.py`](../scripts/gym/test_compare.py)).
 
+### The concept budget
+
+How much does an agent have to learn before it can drive Reliaburger? We
+count it, and hold the count to
+[`testing/concept-budget.json`](testing/concept-budget.json)
+([#1681](https://github.com/reliaburger/reliaburger/issues/1681)). The test
+is `the_concept_counts_match_their_budget` in `src/bin/relish.rs`, and the
+counting lives in
+[`src/relish/concept_budget.rs`](../src/relish/concept_budget.rs).
+
+| Count | Read from | What counts |
+|---|---|---|
+| `resource_kinds` | serde's field list for `config::Config` | Every top-level table `relish apply` takes (`[app.*]`, `[job.*]`, ...). Kubernetes YAML imports into these, so it adds none |
+| `commands` | `Cli::command()`, clap's tree before it's built | Every subcommand at every depth, hidden ones too, so hiding a command is no way under the budget. Not `relish` itself, not clap's `help` |
+| `flags` | the same tree | Every flag with a long or short name on every command, hidden ones too. A global flag counts once, where it's declared. Not positionals, not `--help` or `--version` |
+| `distinct_flags` | the same tree | Distinct flag names: `--namespace` on thirty commands counts once |
+
+The test fails whenever a count differs from its budget. Over budget, it says
+to raise `budget` in the same pull request and give the reason in `reason`, so
+a reviewer sees every new concept as a diff. Under budget, it asks for the
+budget to come down to the new count, so it ratchets. An empty `reason`
+fails too.
+
+`relish agent guide` has a byte budget of its own, 64 KiB, held by
+`the_agent_chapter_fits_the_guides_default_budget` in
+`src/relish/agent/guide.rs`.
+
 ## Before a release
 
 Nothing ships that hasn't been built once, signed, staged and installed the way

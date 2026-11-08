@@ -437,6 +437,69 @@ the Rust reader ("the fields are private so the only ways to build one
 are...") now explains Rust internals to an agent. Those notes moved into
 plain `//` comments, which schemars ignores.
 
+### A budget on concepts, too
+
+Bytes per answer are one cost. The other is everything an agent has to know
+before it asks a sensible question: which kinds of thing it can apply, which
+commands exist, which flags they take. Kubernetes' trouble here isn't any one
+command. It's the sheer number of resource kinds, and the add-ons that bring
+their own. So we count ours, and a test holds the count still (#1681).
+
+On 8 November 2026 the numbers were 8 resource kinds (`app`, `job`,
+`namespace`, `permission`, `policy`, `build`, `template` and `use`), 159
+`relish` commands and subcommands, none of them hidden, and 375 flags across
+them, 169 of them distinct. The budget lives in
+`docs/testing/concept-budget.json`, each number with the reason it is what it
+is, and the test fails when a count moves either way. Up, and the message
+says to raise the budget in the same pull request and say why: a new concept
+becomes a line a reviewer has to agree with. Down, and it asks for the budget
+to come down too, so it ratchets.
+
+Hidden commands count. Hiding one from `--help` doesn't stop an agent
+meeting it in a script, an error or the manual, and it mustn't be a way to
+sneak under the budget.
+
+Counting from the real definitions took two tricks. The commands come from
+clap's `CommandFactory::command()`, the same tree `relish` parses with, read
+*before* clap builds it: building copies every global flag into every
+subcommand and adds `help`, which would count `--token` 160 times.
+
+The resource kinds come from serde. `#[derive(Deserialize)]` on `Config`
+generates code that, when asked to deserialise, calls
+`deserializer.deserialize_struct(name, FIELDS, visitor)`, where `FIELDS` is
+the list of field names under their serde names (`use`, not the Rust field
+`uses`). So we wrote a deserialiser that reads no input at all:
+
+```rust
+impl<'de> Deserializer<'de> for &mut FieldProbe {
+    type Error = de::value::Error;
+
+    fn deserialize_struct<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        fields: &'static [&'static str],
+        _visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        self.fields = Some(fields);
+        Err(de::Error::custom("field names recorded"))
+    }
+    // every other deserialize_* method refuses
+}
+```
+
+It writes down the field list and refuses. `Deserializer` is the trait serde
+formats implement (serde_json and toml each have one), and serde's
+`forward_to_deserialize_any!` macro fills in the thirty-odd methods we don't
+care about. `&'static [&'static str]` is a slice of string slices that live
+for the whole program, because the derive baked them into the binary. In Go
+you'd reach for `reflect` and read struct tags; in Python, `dataclasses.fields`.
+Rust has no runtime reflection, but serde's derive already wrote the list
+down for us. Add a ninth table to `Config` and the count goes up on its own.
+
+What we left out: tokens and time per task against Kubernetes, which need
+the gym's comparison harness, and a budget on the fields inside each kind.
+`relish agent guide` already has its 64 KiB test.
+
 ### The rest of `relish`
 
 The contract covers `relish agent`, but an agent will run plain `relish`
