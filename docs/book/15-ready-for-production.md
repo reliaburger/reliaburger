@@ -1096,6 +1096,22 @@ didn't move, and the evidence owner still checks it: `coverage_owner.py` pins th
 by stage, so it now expects three stages instead of five, and the floor check is part of the
 last one.
 
+Two smaller fixes came with it
+([#1724](https://github.com/reliaburger/reliaburger/issues/1724)). `make ci` now runs its
+quick checks first: formatting, the ignored-test owners and the CI scripts' own tests take a
+minute or two, and a slip in one of them used to show only after Clippy and the whole suite
+had compiled. Make runs a target's prerequisites in the order they're listed (unless you pass
+`-j`), so the fix is the order of one line. The lint job in CI does the same, running `rustfmt`
+before it restores a cache.
+
+The other was the cache quota. GitHub keeps 10 GB of caches per repository and quietly evicts
+the least recently used beyond that, and we were at 9.57 GB. A cache saved on a pull request
+that has since merged can never be restored again, but it still counts, and it can push out
+`main`'s, which every train PR restores. A nightly workflow now deletes caches whose pull
+request is closed, whose branch is gone, or which a newer cache of the same family on the
+same ref has replaced. The rule is a pure function, `stale(caches, open_pulls, branches)`,
+tested on fixtures, with the `gh` calls kept at the edges so it can be tested without network access.
+
 ### A release gate that fits in a week
 
 Pull requests were quick by 0.2.3. The release wasn't. From code freeze to ready-to-tag took

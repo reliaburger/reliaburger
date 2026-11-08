@@ -75,6 +75,13 @@ class LocalGateTests(unittest.TestCase):
         self.assertTrue(any("unittest discover -s scripts/ci" in line for line in ci), ci)
         self.assertTrue(any("ignored_owners.py reasons" in line for line in ci), ci)
 
+    def test_make_ci_runs_the_quick_checks_before_any_build(self):
+        # A format slip or an unowned #[ignore] fails in seconds, not after
+        # Clippy and the suite have compiled (#1724).
+        prerequisites = re.search(r"^ci: ([^#\n]*)", (REPO / "Makefile").read_text(), re.M).group(1).split()
+        self.assertEqual(prerequisites[:3], ["fmt-check", "check-ignored", "test-ci-scripts"])
+        self.assertEqual(set(prerequisites[3:]), {"lint", "test", "test-doc"})
+
     def test_coverage_writes_one_report_that_also_enforces_the_floor(self):
         # Each `llvm-cov report` merges every profile and reads every
         # binary's coverage map again, about two minutes each; one call
@@ -554,6 +561,18 @@ class TrainAndQueueTests(unittest.TestCase):
             self.assertNotIn("if:", block)
         cache = next(step for step in steps(macos) if "Swatinem/rust-cache@" in step)
         self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' }}", cache)
+
+    def test_the_lint_job_checks_formatting_before_restoring_or_building_anything(self):
+        # rustfmt needs no build: run it before the cache restore and the
+        # apt step, so a format slip fails the job within a minute (#1724).
+        blocks = steps(self.jobs["lint"])
+        fmt = next(index for index, step in enumerate(blocks) if "make fmt-check" in step)
+        cache = next(index for index, step in enumerate(blocks) if "Swatinem/rust-cache@" in step)
+        apt = next(index for index, step in enumerate(blocks) if "apt-get" in step)
+        clippy = next(index for index, step in enumerate(blocks) if "make lint" in step and "fmt" not in step)
+        self.assertLess(fmt, cache)
+        self.assertLess(fmt, apt)
+        self.assertLess(fmt, clippy)
 
     def test_the_heavy_jobs_wait_for_their_own_selection(self):
         for name in ["linux", "linux-next", "build-tests", "cluster", "acceptance"]:

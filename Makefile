@@ -201,7 +201,10 @@ test-ci-scripts: ## Test the CI scripts: job selection, ignored-test owners and 
 check-ignored: ## Fail when an #[ignore] reason names no gate, script, fixture parent or issue
 	python3 scripts/ci/ignored_owners.py reasons
 
-ci: fmt-check lint test test-doc test-ci-scripts check-ignored ## Run the portable CI checks
+# The checks that take seconds come first, so a format slip or an unowned
+# #[ignore] fails before Clippy and the suite compile anything (#1724). Make
+# runs prerequisites in the order listed unless you pass -j.
+ci: fmt-check check-ignored test-ci-scripts lint test test-doc ## Run the portable CI checks, quickest first
 
 ci-bench: ci bench ## Run the portable CI checks, then the 5-250 node gossip benchmarks (no privileged, cluster or upgrade suites)
 

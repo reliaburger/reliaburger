@@ -27,9 +27,11 @@ run it.
 | Flakes register | Every open row of [`flakes.md`](flakes.md) links an issue that is still open | [`flakes_register.py`](../scripts/ci/flakes_register.py), run by [`flakes.yml`](../.github/workflows/flakes.yml) nightly and on pull requests that edit the register | `python3 scripts/ci/flakes_register.py check` (needs `gh`) |
 | Ignored-test owners | Every `#[ignore]` reason names who runs it ([below](#who-runs-an-ignored-test)) | [`ignored_owners.py`](../scripts/ci/ignored_owners.py) | `make check-ignored` |
 
-`make ci` runs the portable set locally, the same way CI does: formatting,
-lint, the portable suite, doctests, the CI scripts' tests and the ignored-test
-owner check. `make ci-bench` is `make ci` followed by `make bench`. Neither
+`make ci` runs the portable set locally, the same way CI does, quickest
+first: formatting, the ignored-test owner check and the CI scripts' tests
+take a minute or two between them, so a slip there fails before lint, the
+portable suite and the doctests compile anything. CI's lint job likewise
+checks formatting before it restores a cache. `make ci-bench` is `make ci` followed by `make bench`. Neither
 runs a privileged, cluster or upgrade suite; those have their own targets
 below, because they need root, a provisioned host or a lot of wall time.
 
@@ -588,6 +590,26 @@ ways to keep the merge honest.
 [`test_shard_partition.py`](../scripts/ci/test_shard_partition.py) checks the
 merge against what the pinned nextest really prints, on a throwaway crate.
 Coverage is unaffected: only the Linux portable job measures it.
+
+### Trimming the Actions caches
+
+GitHub keeps 10 GB of caches per repository and evicts the least recently
+used beyond that, so a cache nothing will restore pushes out one a job still
+needs. On 6 November 2026 we were at 9.57 GB. Every night,
+[`cache-trim.yml`](../.github/workflows/cache-trim.yml) runs
+[`trim_caches.py`](../scripts/ci/trim_caches.py), which deletes a cache when
+
+- its ref is a closed or merged pull request's;
+- its ref is a branch that no longer exists, such as a merge-queue group's;
+- or a newer cache of the same family was saved on the same ref. The family is
+  the key without its trailing hashes and run ids, so a lock-file change
+  supersedes `v0-rust-portable-Linux-x64-<env>-<lock>`, and a newer run
+  supersedes `task-array-bench-<run id>`.
+
+Everything else stays. `python3 scripts/ci/trim_caches.py --repository
+reliaburger/reliaburger` prints what it would delete; `--apply` deletes it.
+The rule can't shrink `main`'s current caches, which hold most of the quota
+(about 9 GB on 7 November), only stop stale ones from evicting them.
 
 ## Finite contracts and current evidence
 
