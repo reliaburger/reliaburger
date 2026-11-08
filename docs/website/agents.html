@@ -269,7 +269,7 @@ net, not a promise: read what you share before you post it anywhere.</p>
 <tr><td><code>relish agent logs</code></td><td>An app's recent log lines, newest kept, each wrapped as untrusted</td></tr>
 <tr><td><code>relish agent manual search</code></td><td>Up to ten sections that mention every word, best first, each with a short excerpt and the <code>show</code> command that prints it</td></tr>
 <tr><td><code>relish agent manual show</code></td><td>One chapter, or one section of it, as Markdown: <code>diagnostics</code> or <code>diagnostics#relish-path-can-a-reach-b</code></td></tr>
-<tr><td><code>relish agent context</code></td><td>The first call: <code>relish status</code>'s screen and summary, findings, unknowns and the newest events, in one bounded answer</td></tr>
+<tr><td><code>relish agent context</code></td><td>The first call: <code>relish status</code>'s screen and summary, findings, unknowns, active faults and the newest events, in one bounded answer</td></tr>
 <tr><td><code>relish agent diagnose</code></td><td>Every finding with its evidence, read-only next steps, and pointers into the manual and the source</td></tr>
 <tr><td><code>relish agent explain</code></td><td>What a finding means, its thresholds and where it's decided; every finding when no id is given. Reads only this binary</td></tr>
 <tr><td><code>relish agent upgrade-check</code></td><td>Whether the cluster can take the latest release: <code>ready</code>, <code>up_to_date</code>, <code>needs_fresh_cluster</code>, <code>blocked</code> or <code>unknown</code></td></tr>
@@ -313,15 +313,16 @@ with <code>context</code>, the way you'd start with <code>relish status</code>:<
 </code></pre>
 <p><code>data</code> has <code>relish status</code>'s screen (<code>status</code>: its <code>verdict</code>, its <code>lines</code>
 and the cluster <code>summary</code> behind them), <code>wtf</code>'s findings in one line each
-(<code>critical</code>, <code>warnings</code>), the checks it couldn't make (<code>unknown</code>) and the
-newest cluster events (<code>timeline</code>, newest first, each message in an
-<code>untrusted</code> object). <code>--events</code> sets how many events, 20 by default and at
-most 200.</p>
+(<code>critical</code>, <code>warnings</code>), the checks it couldn't make (<code>unknown</code>), the
+Smoker <code>faults</code> (how many are <code>active</code>, and the ten that expire soonest,
+each with who injected it) and the newest cluster events (<code>timeline</code>, newest
+first, each message in an <code>untrusted</code> object). <code>--events</code> sets how many
+events, 20 by default and at most 200.</p>
 <p>Each summary section has a <code>source</code>: <code>complete</code>, <code>partial</code> (some nodes
-didn't answer; counts are lower bounds, and its line says <code>partial (2 of 3 nodes)</code>) or <code>missing</code> (<code>value</code> is <code>null</code>, <code>reason</code> says why). Missing never
-means zero, and a check <code>wtf</code> couldn't make is never counted as OK. The
-summary is the same size on any cluster; on a big one the budget trims the
-oldest events.</p>
+didn't answer; counts are lower bounds, and its line says <code>partial (2 of 3 nodes)</code>) or <code>missing</code> (<code>value</code> is <code>null</code>, <code>reason</code> says why). <code>faults</code> and
+<code>timeline</code> say the same with <code>state</code>: <code>known</code>, <code>partial</code> or <code>unknown</code>.
+Unknown never means zero or none. The answer is the same size on any
+cluster; on a big one the budget trims the oldest events.</p>
 <p><code>diagnose</code> is <code>relish wtf</code> for an agent: the same checks, with the evidence
 behind each finding.</p>
 <pre><code class="language-sh">relish agent diagnose

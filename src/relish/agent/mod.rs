@@ -84,7 +84,7 @@ pub enum AgentCommand {
         command: manual::ManualCommand,
     },
     /// The first call: `relish status`'s screen and summary, findings,
-    /// unknowns and the newest events, in one bounded answer.
+    /// unknowns, active faults and the newest events, in one bounded answer.
     Context(context::ContextArgs),
     /// Every finding with its evidence, read-only next steps, and pointers
     /// into the manual and the source.

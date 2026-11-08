@@ -882,7 +882,7 @@ commands for that:
 
 | Command | Answers |
 |---|---|
-| `context` | `wtf`'s findings in one line each, what it couldn't see, faults, alerts, one line per app, the newest events (from 0.2.8, `relish status`'s screen in place of the faults, alerts and apps) |
+| `context` | `wtf`'s findings in one line each, what it couldn't see, faults, alerts, one line per app, the newest events (from 0.2.8, `relish status`'s screen in place of the alerts and apps, and only the soonest faults) |
 | `diagnose [--app APP]` | Every finding with its evidence, read-only next steps, and pointers into the manual and the source |
 | `explain [ID]` | What a finding means, the numbers that decide it, and the line of code that does |
 
@@ -1590,11 +1590,20 @@ before, and each answered "how many apps are down?" its own way.
 every fault, every alert, one line per app. On two thousand apps that's
 most of the 24 KiB, and the budget had to cut it, which is what "Worst
 first, so the budget cuts the right end" earlier in this chapter was about.
-Now those three lists are gone, and `data.status` carries `relish status`'s
-screen instead: the verdict, one line per section, and the summary itself.
-The summary is the same size on three nodes or three hundred, so the only
-things left that grow with the cluster are `wtf`'s findings and the
-timeline.
+Now `data.status` carries `relish status`'s screen instead: the verdict,
+one line per section, and the summary itself. The summary is the same size
+on three nodes or three hundred, so the alert and app lists went.
+
+The faults list stayed, bounded. The summary counts faults and names the
+soonest five by kind and target, but not who injected them, and that's the
+question an agent most needs answered before it calls something an outage:
+is this a drill? So `faults` keeps each fault's id and `injected_by`, lists
+at most `FAULTS_MAX` (ten) of them, the soonest to expire first, and counts
+every one in `active`, which is an `Option<usize>`. When the fault evidence
+couldn't be read it's `null`, never 0, for the same reason the summary's
+`value` is an `Option`. A context with any fault adds `relish fault list` to
+`next`. The only lists left that grow with the cluster are `wtf`'s findings
+and the timeline.
 
 `status` is a `Section<StatusView>`, the summary's own `Section` type. When
 `GET /v1/cluster/summary` fails, it's `missing` with the error as `reason`,

@@ -832,7 +832,7 @@ expression: listed_for_snapshot(server.tools())
       "readOnlyHint": true,
       "title": "relish agent context"
     },
-    "description": "The first call: `relish status`'s screen and summary, findings, unknowns and the newest events, in one bounded answer",
+    "description": "The first call: `relish status`'s screen and summary, findings, unknowns, active faults and the newest events, in one bounded answer",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {

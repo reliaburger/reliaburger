@@ -245,7 +245,7 @@ net, not a promise: read what you share before you post it anywhere.
 | `relish agent logs` | An app's recent log lines, newest kept, each wrapped as untrusted |
 | `relish agent manual search` | Up to ten sections that mention every word, best first, each with a short excerpt and the `show` command that prints it |
 | `relish agent manual show` | One chapter, or one section of it, as Markdown: `diagnostics` or `diagnostics#relish-path-can-a-reach-b` |
-| `relish agent context` | The first call: `relish status`'s screen and summary, findings, unknowns and the newest events, in one bounded answer |
+| `relish agent context` | The first call: `relish status`'s screen and summary, findings, unknowns, active faults and the newest events, in one bounded answer |
 | `relish agent diagnose` | Every finding with its evidence, read-only next steps, and pointers into the manual and the source |
 | `relish agent explain` | What a finding means, its thresholds and where it's decided; every finding when no id is given. Reads only this binary |
 | `relish agent upgrade-check` | Whether the cluster can take the latest release: `ready`, `up_to_date`, `needs_fresh_cluster`, `blocked` or `unknown` |
@@ -305,17 +305,18 @@ relish agent context
 
 `data` has `relish status`'s screen (`status`: its `verdict`, its `lines`
 and the cluster `summary` behind them), `wtf`'s findings in one line each
-(`critical`, `warnings`), the checks it couldn't make (`unknown`) and the
-newest cluster events (`timeline`, newest first, each message in an
-`untrusted` object). `--events` sets how many events, 20 by default and at
-most 200.
+(`critical`, `warnings`), the checks it couldn't make (`unknown`), the
+Smoker `faults` (how many are `active`, and the ten that expire soonest,
+each with who injected it) and the newest cluster events (`timeline`, newest
+first, each message in an `untrusted` object). `--events` sets how many
+events, 20 by default and at most 200.
 
 Each summary section has a `source`: `complete`, `partial` (some nodes
 didn't answer; counts are lower bounds, and its line says `partial (2 of 3
-nodes)`) or `missing` (`value` is `null`, `reason` says why). Missing never
-means zero, and a check `wtf` couldn't make is never counted as OK. The
-summary is the same size on any cluster; on a big one the budget trims the
-oldest events.
+nodes)`) or `missing` (`value` is `null`, `reason` says why). `faults` and
+`timeline` say the same with `state`: `known`, `partial` or `unknown`.
+Unknown never means zero or none. The answer is the same size on any
+cluster; on a big one the budget trims the oldest events.
 
 `diagnose` is `relish wtf` for an agent: the same checks, with the evidence
 behind each finding.

@@ -28,7 +28,7 @@ use crate::bun::summary::{ClusterSummary, Section as SummarySection};
 use crate::relish::RelishError;
 use crate::relish::client::BunClient;
 use crate::relish::status_cmd::wtf_check;
-use crate::relish::wtf::{self, WtfFinding, WtfReport};
+use crate::relish::wtf::{self, Evidence, FaultObservation, WtfFinding, WtfInputs, WtfReport};
 
 /// How many events `--events` asks for unless told otherwise.
 pub const DEFAULT_EVENTS: usize = 20;
@@ -43,6 +43,10 @@ pub const EVENT_LINE_BYTES_MAX: usize = 200;
 /// How long the events request may take. The answer goes out without the
 /// timeline rather than waiting longer.
 const EVENTS_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The most faults `context` lists. They're the ones that expire soonest;
+/// `active` counts them all and `relish fault list` lists them all.
+pub const FAULTS_MAX: usize = 10;
 
 /// How long the summary request may take. The answering node gives each
 /// peer 700 ms, so this only runs out when that node itself is stuck.
@@ -77,6 +81,9 @@ pub struct ContextData {
     pub warnings: Vec<FindingLine>,
     /// Checks whose evidence couldn't be read. Unknown is never OK.
     pub unknown: Vec<UnknownLine>,
+    /// Smoker faults injected now, with who injected them: what you see
+    /// may be a drill.
+    pub faults: FaultList,
     /// The newest cluster events, newest first.
     pub timeline: Section<TimelineEntry>,
 }
@@ -146,6 +153,78 @@ impl<T> Section<T> {
     }
 }
 
+/// The Smoker faults active now: every one counted, the soonest to expire
+/// listed.
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+pub struct FaultList {
+    /// Whether `active` and `items` cover every node.
+    pub state: SectionState,
+    /// Why it's partial or unknown.
+    pub reason: Option<String>,
+    /// How many faults are active, on the nodes that answered. `null`
+    /// when none could be read: unknown, never zero.
+    pub active: Option<usize>,
+    /// The ones that expire soonest, at most ten. `relish fault list` has
+    /// the rest.
+    pub items: Vec<FaultLine>,
+}
+
+/// An active Smoker fault.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct FaultLine {
+    /// The fault's id.
+    pub id: u64,
+    /// What kind of fault, e.g. `delay`.
+    pub kind: String,
+    /// What it targets.
+    pub target: String,
+    /// Who injected it.
+    pub injected_by: String,
+    /// Seconds until it expires.
+    pub remaining_seconds: u64,
+}
+
+impl FaultList {
+    /// The list from `wtf`'s fault evidence, soonest to expire first.
+    fn from_evidence(evidence: &Evidence<Vec<FaultObservation>>) -> Self {
+        let (state, reason, faults) = match evidence {
+            Evidence::Available { value, .. } => (SectionState::Known, None, value),
+            Evidence::AvailableWithCaveat { value, caveat, .. } => {
+                (SectionState::Known, Some(caveat.clone()), value)
+            }
+            Evidence::Degraded { value, reason, .. } => {
+                (SectionState::Partial, Some(reason.clone()), value)
+            }
+            Evidence::Unavailable { reason } | Evidence::Unsupported { reason } => {
+                return FaultList {
+                    state: SectionState::Unknown,
+                    reason: Some(reason.clone()),
+                    active: None,
+                    items: Vec::new(),
+                };
+            }
+        };
+        let mut soonest: Vec<&FaultObservation> = faults.iter().collect();
+        soonest.sort_by_key(|fault| (fault.remaining_seconds, fault.id));
+        FaultList {
+            state,
+            reason,
+            active: Some(faults.len()),
+            items: soonest
+                .into_iter()
+                .take(FAULTS_MAX)
+                .map(|fault| FaultLine {
+                    id: fault.id,
+                    kind: fault.fault_type.clone(),
+                    target: fault.target.clone(),
+                    injected_by: fault.injected_by.clone(),
+                    remaining_seconds: fault.remaining_seconds,
+                })
+                .collect(),
+        }
+    }
+}
+
 /// A finding in one line.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct FindingLine {
@@ -203,17 +282,18 @@ pub async fn run(args: &ContextArgs, max_bytes: usize, rerun: &str) -> Rendered 
     render_answer(
         CommandName::Context,
         BuildInfo::current(),
-        Ok(context(&report, summary, events, args.events)),
+        Ok(context(&inputs, &report, summary, events, args.events)),
         &[],
         max_bytes,
         rerun,
     )
 }
 
-/// The context of a cluster from what `wtf` diagnosed, the cluster
-/// summary and the newest `limit` events. Pure, so the tests run it over
-/// fixtures.
+/// The context of a cluster from what `wtf` collected and diagnosed, the
+/// cluster summary and the newest `limit` events. Pure, so the tests run
+/// it over fixtures.
 pub fn context(
+    inputs: &WtfInputs,
     report: &WtfReport,
     summary: Result<ClusterSummary, RelishError>,
     events: Result<ClusterEvents, RelishError>,
@@ -236,6 +316,7 @@ pub fn context(
         critical: lines(&report.critical),
         warnings: lines(&report.warnings),
         unknown: unknown_lines(report),
+        faults: FaultList::from_evidence(&inputs.cluster.faults),
         timeline: timeline(events, limit),
     };
     let mut next = vec![NextStep {
@@ -264,6 +345,13 @@ pub fn context(
                 super::shell_quote(&worst.app)
             ),
             why: format!("why {} is {}", worst.app, worst.state.word()),
+            read_only: true,
+        });
+    }
+    if data.faults.active.is_some_and(|active| active > 0) {
+        next.push(NextStep {
+            run: "relish fault list".to_string(),
+            why: "every active fault, beyond the ones that expire soonest".to_string(),
             read_only: true,
         });
     }
@@ -583,7 +671,7 @@ mod tests {
         max_bytes: usize,
     ) -> (Rendered, Value) {
         let report = wtf::diagnose(inputs);
-        let answer = context(&report, summary, events, limit);
+        let answer = context(inputs, &report, summary, events, limit);
         let rendered = render_answer(
             CommandName::Context,
             fixture_build(),
@@ -705,6 +793,89 @@ mod tests {
         assert_eq!(value["data"]["critical"][0]["id"], "crashloop");
     }
 
+    fn fault(id: u64, remaining_seconds: u64) -> FaultObservation {
+        FaultObservation {
+            id,
+            fault_type: "delay".to_string(),
+            target: format!("svc-{id}"),
+            injected_by: "operator".to_string(),
+            remaining_seconds,
+        }
+    }
+
+    #[test]
+    fn each_fault_comes_with_who_injected_it() {
+        let (_, value) = rendered(
+            &inputs(),
+            Ok(summary()),
+            Ok(events(0)),
+            DEFAULT_EVENTS,
+            DEFAULT_MAX_BYTES,
+        );
+        let faults = &value["data"]["faults"];
+        assert_eq!(faults["state"], "known");
+        assert_eq!(faults["active"], 1);
+        assert_eq!(
+            faults["items"][0],
+            serde_json::json!({
+                "id": 7,
+                "kind": "delay",
+                "target": "api",
+                "injected_by": "operator",
+                "remaining_seconds": 240,
+            })
+        );
+        let runs: Vec<&str> = value["next"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|step| step["run"].as_str().unwrap())
+            .collect();
+        assert!(runs.contains(&"relish fault list"), "{runs:?}");
+    }
+
+    #[test]
+    fn many_faults_keep_the_soonest_and_count_the_rest() {
+        let mut inputs = inputs();
+        inputs.cluster.faults = available((0..500).map(|id| fault(id, 10_000 - id)).collect());
+        let (rendered, value) = rendered(
+            &inputs,
+            Ok(summary()),
+            Ok(events(0)),
+            DEFAULT_EVENTS,
+            DEFAULT_MAX_BYTES,
+        );
+        let faults = &value["data"]["faults"];
+        assert_eq!(faults["active"], 500);
+        let items = faults["items"].as_array().unwrap();
+        assert_eq!(items.len(), FAULTS_MAX);
+        assert_eq!(items[0]["id"], 499, "the soonest to expire first");
+        assert_eq!(items[0]["remaining_seconds"], 10_000 - 499);
+        assert_eq!(value["truncated"], false, "bounded before the budget");
+        assert!(rendered.json.len() < DEFAULT_MAX_BYTES);
+    }
+
+    #[test]
+    fn no_faults_is_known_and_empty_with_no_fault_step() {
+        let mut inputs = inputs();
+        inputs.cluster.faults = available(Vec::new());
+        let (_, value) = rendered(
+            &inputs,
+            Ok(summary()),
+            Ok(events(0)),
+            DEFAULT_EVENTS,
+            DEFAULT_MAX_BYTES,
+        );
+        let faults = &value["data"]["faults"];
+        assert_eq!(faults["state"], "known");
+        assert_eq!(faults["active"], 0);
+        assert!(
+            !value["next"].to_string().contains("relish fault list"),
+            "{}",
+            value["next"]
+        );
+    }
+
     #[test]
     fn unknown_evidence_stays_unknown() {
         let mut inputs = inputs();
@@ -719,6 +890,13 @@ mod tests {
             DEFAULT_MAX_BYTES,
         );
         let data = &value["data"];
+        assert_eq!(data["faults"]["state"], "unknown");
+        assert_eq!(data["faults"]["items"], serde_json::json!([]));
+        assert_eq!(data["faults"]["active"], Value::Null, "not zero: unknown");
+        assert_eq!(
+            data["faults"]["reason"],
+            "node node-2: faults: connection refused"
+        );
         let sources: Vec<&str> = data["unknown"]
             .as_array()
             .unwrap()

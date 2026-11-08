@@ -969,7 +969,7 @@ A release `relish` embeds the build, test and read set (the manifest and lockfil
 | Command | Purpose |
 |---------|---------|
 | `relish agent guide` | How to use `relish` as an agent: the manual's agent chapter, as sections |
-| `relish agent context` | The first call: `relish status`'s screen and summary, findings, unknowns, newest events |
+| `relish agent context` | The first call: `relish status`'s screen and summary, findings, unknowns, active faults, newest events |
 | `relish agent diagnose` / `explain` | Every finding with its evidence; what a finding means, its thresholds and the line of code that decides it |
 | `relish agent logs` / `manual` | An app's newest log lines in a window, wrapped as untrusted; search and show the compiled-in manual |
 | `relish agent source` | `version`, `tree`, `grep`, `show` and `extract` over the source this binary was built from |

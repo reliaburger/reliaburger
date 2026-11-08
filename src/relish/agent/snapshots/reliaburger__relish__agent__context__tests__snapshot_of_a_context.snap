@@ -18,6 +18,20 @@ expression: value
         "title": "app web/default restarted repeatedly"
       }
     ],
+    "faults": {
+      "active": 1,
+      "items": [
+        {
+          "id": 7,
+          "injected_by": "operator",
+          "kind": "delay",
+          "remaining_seconds": 240,
+          "target": "api"
+        }
+      ],
+      "reason": null,
+      "state": "known"
+    },
     "status": {
       "source": "complete",
       "value": {
@@ -371,6 +385,11 @@ expression: value
       "read_only": true,
       "run": "relish agent diagnose --app worker",
       "why": "why worker is down"
+    },
+    {
+      "read_only": true,
+      "run": "relish fault list",
+      "why": "every active fault, beyond the ones that expire soonest"
     }
   ],
   "ok": true,
