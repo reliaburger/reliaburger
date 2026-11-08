@@ -26,6 +26,7 @@ mod grant_fence;
 pub mod health;
 pub mod host_paths;
 pub mod job_events;
+pub mod lease_fence;
 pub mod lease_reaper;
 pub mod live_attempts;
 pub mod loop_meter;

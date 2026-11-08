@@ -378,3 +378,113 @@ async fn the_reaper_expires_a_lapsed_lease_and_audits_it() {
         serde_json::json!([])
     );
 }
+
+// --- A person's write meets a lease (#1686, step 2c) -----------------------
+
+impl Cluster {
+    async fn seed_web(&self) {
+        let spec: crate::config::app::AppSpec =
+            toml::from_str("image = \"web:1\"\nreplicas = 2\nnamespace = \"shop\"").unwrap();
+        self.council
+            .write(crate::council::types::RaftRequest::AppSpec {
+                app_id: crate::meat::AppId::new("web", "shop"),
+                spec: Box::new(spec),
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn post_breaking(
+        &self,
+        uri: &str,
+        bearer: &str,
+        body: String,
+        break_lease: bool,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut request = axum::http::Request::post(uri);
+        if break_lease {
+            request = request.header(crate::bun::lease_fence::BREAK_LEASE_HEADER, "acknowledged");
+        }
+        self.send(request, bearer, body).await
+    }
+}
+
+/// Someone else's lease refuses a person's stop, delete or apply of the
+/// app, naming the holder; `--break-lease` breaks it, audited, and the
+/// write goes ahead. The holder's own writes aren't held back.
+#[tokio::test]
+async fn a_persons_write_meets_a_lease_and_breaks_it_only_when_asked() {
+    let cluster = cluster("lease-fence").await;
+    cluster.seed_web().await;
+    cluster.take(&cluster.holmes, WEB, "rolling back").await;
+
+    let (status, body) = cluster
+        .post_breaking("/v1/stop/web/shop", &cluster.alice, String::new(), false)
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "lease_held");
+    assert_eq!(body["lease"]["holder"], "holmes");
+    assert!(
+        body["error"].as_str().unwrap().contains("--break-lease"),
+        "{body}"
+    );
+    let apply = "[app.web]\nimage = \"web:2\"\nreplicas = 2\nnamespace = \"shop\"\n".to_string();
+    let (status, body) = cluster
+        .post_breaking("/v1/apply", &cluster.alice, apply.clone(), false)
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "lease_held");
+    let desired = cluster.council.desired_state().await;
+    let web = crate::meat::AppId::new("web", "shop");
+    assert_eq!(desired.apps[&web].image.as_deref(), Some("web:1"));
+    assert!(!desired.stopped_apps.contains(&web));
+
+    // The holder's own write isn't held back by its own lease.
+    let (status, body) = cluster
+        .post_breaking("/v1/stop/web/shop", &cluster.holmes, String::new(), false)
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+
+    // A person breaks it: the lease ends, audited, and the write lands.
+    let (status, body) = cluster
+        .post_breaking("/v1/apply", &cluster.alice, apply, true)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let desired = cluster.council.desired_state().await;
+    assert_eq!(desired.apps[&web].image.as_deref(), Some("web:2"));
+    assert!(desired.agent_leases.leases.is_empty());
+    let broken = cluster.records("lease.broken").await;
+    assert_eq!(broken.len(), 1);
+    assert_eq!(broken[0].details["holder"], "holmes");
+    assert_eq!(broken[0].details["token_name"], "alice");
+}
+
+/// A namespace lease holds back a write to any app in it, and a malformed
+/// break-lease header is refused rather than ignored.
+#[tokio::test]
+async fn a_namespace_lease_fences_every_app_in_it() {
+    let cluster = cluster("lease-fence-namespace").await;
+    cluster.seed_web().await;
+    cluster.take(&cluster.capacity, SHOP, "rebalancing").await;
+    let (status, body) = cluster
+        .post_breaking("/v1/delete/web/shop", &cluster.alice, String::new(), false)
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["lease"]["target"], "namespace:shop");
+    let request = axum::http::Request::post("/v1/delete/web/shop")
+        .header(crate::bun::lease_fence::BREAK_LEASE_HEADER, "please");
+    let (status, _) = cluster.send(request, &cluster.alice, String::new()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, body) = cluster
+        .post_breaking("/v1/delete/web/shop", &cluster.alice, String::new(), true)
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert!(
+        !cluster
+            .council
+            .desired_state()
+            .await
+            .apps
+            .contains_key(&crate::meat::AppId::new("web", "shop"))
+    );
+}

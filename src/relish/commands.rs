@@ -31,8 +31,10 @@ pub async fn apply(
     source: &super::manifest::ManifestSource,
     output: OutputFormat,
     dry_run: bool,
+    break_lease: bool,
 ) -> Result<(), RelishError> {
-    apply_with_client(source, output, dry_run, &BunClient::default_local()).await
+    let client = BunClient::default_local().breaking_leases(break_lease);
+    apply_with_client(source, output, dry_run, &client).await
 }
 
 /// Read a local config file for `lint`, `deploy`, `diff` and `compile`:
@@ -992,8 +994,14 @@ fn exec_outcome(exit_code: i32) -> super::CommandOutcome {
 }
 
 /// Stop all instances of an app.
-pub async fn stop(app: &str, namespace: &str, output: OutputFormat) -> Result<(), RelishError> {
-    stop_with_client(app, namespace, output, &BunClient::default_local()).await
+pub async fn stop(
+    app: &str,
+    namespace: &str,
+    break_lease: bool,
+    output: OutputFormat,
+) -> Result<(), RelishError> {
+    let client = BunClient::default_local().breaking_leases(break_lease);
+    stop_with_client(app, namespace, output, &client).await
 }
 
 async fn stop_with_client(
@@ -1014,9 +1022,11 @@ pub async fn delete(
     app: &str,
     namespace: &str,
     force: bool,
+    break_lease: bool,
     output: OutputFormat,
 ) -> Result<(), RelishError> {
-    delete_with_client(app, namespace, force, output, &BunClient::default_local()).await
+    let client = BunClient::default_local().breaking_leases(break_lease);
+    delete_with_client(app, namespace, force, output, &client).await
 }
 
 async fn delete_with_client(
@@ -1033,8 +1043,16 @@ async fn delete_with_client(
 }
 
 /// Hand an app a controller owns back to `relish apply` and GitOps (#1125).
-pub async fn release(app: &str, namespace: &str, output: OutputFormat) -> Result<(), RelishError> {
-    BunClient::default_local().release(app, namespace).await?;
+pub async fn release(
+    app: &str,
+    namespace: &str,
+    break_lease: bool,
+    output: OutputFormat,
+) -> Result<(), RelishError> {
+    BunClient::default_local()
+        .breaking_leases(break_lease)
+        .release(app, namespace)
+        .await?;
     print_output(&AppChange::new(AppAction::Released, app, namespace), output)
 }
 
@@ -2083,11 +2101,16 @@ impl std::fmt::Display for RouteTable {
 /// (if the app already exists, the agent performs a rolling update).
 /// With `--dry-run`, prints the plan and exits 0 without deploying;
 /// otherwise an unreachable agent is an error (X5).
-pub async fn deploy(path: &Path, output: OutputFormat, dry_run: bool) -> Result<(), RelishError> {
+pub async fn deploy(
+    path: &Path,
+    output: OutputFormat,
+    dry_run: bool,
+    break_lease: bool,
+) -> Result<(), RelishError> {
     let config = load_config_file(path)?;
     config.validate_intrinsic()?;
 
-    let client = BunClient::default_local();
+    let client = BunClient::default_local().breaking_leases(break_lease);
 
     if dry_run {
         // Same live diff as `apply --dry-run`: a reachable agent supplies
@@ -2261,9 +2284,10 @@ pub async fn rollback(
     app: &str,
     namespace: &str,
     force: bool,
+    break_lease: bool,
     output: OutputFormat,
 ) -> Result<(), RelishError> {
-    let client = BunClient::default_local();
+    let client = BunClient::default_local().breaking_leases(break_lease);
     client.health().await?;
     // X3: rollback used to only print advice. It now calls the server,
     // which redeploys the previous successful spec.

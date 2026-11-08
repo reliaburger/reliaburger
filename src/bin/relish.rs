@@ -598,6 +598,10 @@ enum Command {
         /// Request another job run; unresolved outcomes require grant-specific replay.
         #[arg(long, conflicts_with = "dry_run")]
         rerun_jobs: bool,
+        /// Break any agent lease on the app in your way (audited); without
+        /// it, someone else's lease refuses the change, naming them.
+        #[arg(long)]
+        break_lease: bool,
     },
     /// Show cluster and app status.
     Status,
@@ -660,6 +664,10 @@ enum Command {
         /// directory). Defaults to "default".
         #[arg(long, default_value = "default")]
         namespace: String,
+        /// Break any agent lease on the app in your way (audited); without
+        /// it, someone else's lease refuses the change, naming them.
+        #[arg(long)]
+        break_lease: bool,
     },
     /// Remove an app from the cluster; each node then stops its instances.
     Delete {
@@ -672,6 +680,10 @@ enum Command {
         /// the repository declares it.
         #[arg(long)]
         force: bool,
+        /// Break any agent lease on the app in your way (audited); without
+        /// it, someone else's lease refuses the change, naming them.
+        #[arg(long)]
+        break_lease: bool,
     },
     /// Take an app back from the controller that owns it, so `relish apply` and GitOps manage it again (owner or admin).
     Release {
@@ -680,6 +692,10 @@ enum Command {
         /// Namespace the app lives in. Defaults to "default".
         #[arg(long, default_value = "default")]
         namespace: String,
+        /// Break any agent lease on the app in your way (audited); without
+        /// it, someone else's lease refuses the change, naming them.
+        #[arg(long)]
+        break_lease: bool,
     },
     /// Initialise a new cluster (generates CAs, age keypair, node identity).
     Init(Box<InitOptions>),
@@ -737,6 +753,10 @@ enum Command {
         /// Show the plan without deploying (exits 0 even with no agent).
         #[arg(long)]
         dry_run: bool,
+        /// Break any agent lease on the app in your way (audited); without
+        /// it, someone else's lease refuses the change, naming them.
+        #[arg(long)]
+        break_lease: bool,
     },
     /// Cancel a node-local deploy and wait for its current work to finish.
     CancelDeploy {
@@ -763,6 +783,10 @@ enum Command {
         /// the repository declares.
         #[arg(long)]
         force: bool,
+        /// Break any agent lease on the app in your way (audited); without
+        /// it, someone else's lease refuses the change, naming them.
+        #[arg(long)]
+        break_lease: bool,
     },
     /// Validate a config file without deploying.
     Lint {
@@ -1985,13 +2009,14 @@ async fn main() -> ExitCode {
             ref file,
             dry_run,
             rerun_jobs,
+            break_lease,
         } => match reliaburger::relish::manifest::ManifestSource::parse(
             // The ArgGroup makes exactly one of the two present.
             path.as_deref().or(file.as_deref()).unwrap_or_default(),
         ) {
             Err(error) => Err(error),
             Ok(source) if rerun_jobs => commands::rerun_jobs(&source, cli.output).await,
-            Ok(source) => commands::apply(&source, cli.output, dry_run).await,
+            Ok(source) => commands::apply(&source, cli.output, dry_run, break_lease).await,
         },
         Command::Status => commands::status(cli.output).await,
         Command::Dashboard { port, no_open } => {
@@ -2062,16 +2087,19 @@ async fn main() -> ExitCode {
         Command::Stop {
             ref app,
             ref namespace,
-        } => commands::stop(app, namespace, cli.output).await,
+            break_lease,
+        } => commands::stop(app, namespace, break_lease, cli.output).await,
         Command::Delete {
             ref app,
             ref namespace,
             force,
-        } => commands::delete(app, namespace, force, cli.output).await,
+            break_lease,
+        } => commands::delete(app, namespace, force, break_lease, cli.output).await,
         Command::Release {
             ref app,
             ref namespace,
-        } => commands::release(app, namespace, cli.output).await,
+            break_lease,
+        } => commands::release(app, namespace, break_lease, cli.output).await,
         Command::Init(options) => commands::init_with_security(
             &options.dir,
             &options.cluster_name,
@@ -2450,7 +2478,11 @@ async fn main() -> ExitCode {
                 .await
             }
         },
-        Command::Deploy { ref path, dry_run } => commands::deploy(path, cli.output, dry_run).await,
+        Command::Deploy {
+            ref path,
+            dry_run,
+            break_lease,
+        } => commands::deploy(path, cli.output, dry_run, break_lease).await,
         Command::CancelDeploy { ref operation_id } => {
             commands::cancel_deploy(operation_id, cli.output).await
         }
@@ -2462,7 +2494,8 @@ async fn main() -> ExitCode {
             ref app,
             ref namespace,
             force,
-        } => commands::rollback(app, namespace, force, cli.output).await,
+            break_lease,
+        } => commands::rollback(app, namespace, force, break_lease, cli.output).await,
         Command::Lint { ref path } => commands::lint(path, cli.output),
         Command::Compile { ref path } => commands::compile(path, cli.output),
         Command::Diff {
@@ -4330,7 +4363,7 @@ mod tests {
     fn parse_apply_command() {
         let cli = parse(&["relish", "apply", "config.toml"]).unwrap();
         assert!(
-            matches!(cli.command, Command::Apply { ref path, file: None, dry_run: false, rerun_jobs: false } if path.as_deref() == Some("config.toml"))
+            matches!(cli.command, Command::Apply { ref path, file: None, dry_run: false, rerun_jobs: false, break_lease: false } if path.as_deref() == Some("config.toml"))
         );
     }
 
@@ -4399,7 +4432,7 @@ mod tests {
         let cli = parse(&["relish", "delete", "web", "--namespace", "team-a"]).unwrap();
         assert!(matches!(
             cli.command,
-            Command::Delete { ref app, ref namespace, force: false } if app == "web" && namespace == "team-a"
+            Command::Delete { ref app, ref namespace, force: false, break_lease: false } if app == "web" && namespace == "team-a"
         ));
     }
 

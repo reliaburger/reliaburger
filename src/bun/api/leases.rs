@@ -398,7 +398,7 @@ fn refusal_response(refusal: &LeaseRefusal) -> Response {
 }
 
 /// The audit record for what a lease write did.
-async fn record_lease_outcome(
+pub(super) async fn record_lease_outcome(
     state: &ApiState,
     auth: Option<&crate::sesame::auth::AuthContext>,
     target: &LeaseTarget,
@@ -451,4 +451,86 @@ async fn record_lease_outcome(
         },
     )
     .await;
+}
+
+/// Why a person's direct write can't go ahead past the leases on its apps.
+#[derive(Debug)]
+pub(super) enum LeaseWriteRefusal {
+    /// Someone else holds this lease, and the write didn't ask to break it.
+    Held(Box<AgentLease>),
+    /// The council couldn't be written to break a lease.
+    Unavailable(String),
+    /// The leases kept changing while the leader checked them.
+    Churn,
+}
+
+impl LeaseWriteRefusal {
+    /// The sentence a streamed apply reports.
+    pub(super) fn message(&self) -> String {
+        let now = crate::testkit::lease::now_unix_millis();
+        match self {
+            LeaseWriteRefusal::Held(lease) => crate::bun::lease_fence::held_message(lease, now),
+            LeaseWriteRefusal::Unavailable(error) => {
+                format!("could not break the lease: {error}")
+            }
+            LeaseWriteRefusal::Churn => {
+                "the leases on these apps kept changing; try again".to_string()
+            }
+        }
+    }
+
+    /// The HTTP answer: 409 `lease_held` with the lease, or 503.
+    pub(super) fn into_response(self) -> Response {
+        let now = crate::testkit::lease::now_unix_millis();
+        match self {
+            LeaseWriteRefusal::Held(lease) => (
+                StatusCode::CONFLICT,
+                Json(crate::bun::lease_fence::held_body(&lease, now)),
+            )
+                .into_response(),
+            LeaseWriteRefusal::Unavailable(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": self.message(), "code": "council_unavailable" })),
+            )
+                .into_response(),
+            LeaseWriteRefusal::Churn => (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": self.message(), "code": "conflict" })),
+            )
+                .into_response(),
+        }
+    }
+}
+
+/// Before a person's direct write of `apps`, on the leader: the lease
+/// generation to fence the write on, once no one else's lease is in the
+/// way. With `break_lease`, each lease in the way is broken first and
+/// audited as `lease.broken`; without it, the first one refuses the write.
+pub(super) async fn clear_leases_for_write(
+    state: &ApiState,
+    council: &crate::council::CouncilNode,
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    apps: &[crate::meat::AppId],
+    break_lease: bool,
+) -> Result<u64, LeaseWriteRefusal> {
+    let by = lease_holder(auth);
+    for _ in 0..crate::bun::lease_fence::LEASE_ATTEMPTS {
+        let now = crate::testkit::lease::now_unix_millis();
+        let (generation, blocking) =
+            crate::bun::lease_fence::blockers(council, apps, &by.principal_id, now).await;
+        let Some(first) = blocking.first() else {
+            return Ok(generation);
+        };
+        if !break_lease {
+            return Err(LeaseWriteRefusal::Held(Box::new(first.clone())));
+        }
+        let broken = crate::bun::lease_fence::break_leases(council, &blocking, by.clone())
+            .await
+            .map_err(|error| LeaseWriteRefusal::Unavailable(error.to_string()))?;
+        for lease in broken {
+            let target = lease.target.clone();
+            record_lease_outcome(state, auth, &target, &LeaseOutcome::Broken { lease }).await;
+        }
+    }
+    Err(LeaseWriteRefusal::Churn)
 }

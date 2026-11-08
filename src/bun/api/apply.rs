@@ -796,7 +796,45 @@ pub(super) async fn cluster_apply(
         .map(|resource| crate::lettuce::types::managed_apply_warning(resource))
         .collect();
 
+    // Someone else's agent lease on an app stops a person's apply, by
+    // name, unless they asked to break it (#1686). A test lease's apply
+    // owns its namespace and isn't fenced.
+    let break_lease = match crate::bun::lease_fence::break_lease_requested(&caller_headers) {
+        Ok(requested) => requested,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": error })),
+            )
+                .into_response();
+        }
+    };
+    let leased_apps: Vec<crate::meat::AppId> = config
+        .app
+        .iter()
+        .map(|(name, spec)| {
+            crate::meat::AppId::new(name, spec.namespace.as_deref().unwrap_or("default"))
+        })
+        .collect();
+    let mut lease_generation = None;
+    if lease_id.is_none() && !leased_apps.is_empty() {
+        match super::leases::clear_leases_for_write(
+            &state,
+            &council,
+            auth.as_ref(),
+            &leased_apps,
+            break_lease,
+        )
+        .await
+        {
+            Ok(generation) => lease_generation = Some(generation),
+            Err(refusal) => return refusal.into_response(),
+        }
+    }
+
     let (event_tx, event_rx) = mpsc::channel::<ApplyEvent>(32);
+    let lease_state = state.clone();
+    let lease_auth = auth.clone();
     tokio::spawn(async move {
         let mut config = config;
         let filled = admission.filled.iter().map(ToString::to_string);
@@ -874,10 +912,47 @@ pub(super) async fn cluster_apply(
         )
         .into();
         let mut policy_attempts = 0usize;
+        let mut lease_attempts = 0usize;
         while let Some(request) = pending.pop_front() {
             let describe = describe_write(&request);
             let app_id = written_app(&request);
-            match council.write(request.clone()).await {
+            let write = match lease_generation {
+                Some(generation) if crate::bun::lease_fence::fenced_app(&request).is_some() => {
+                    crate::bun::lease_fence::fence(generation, request.clone())
+                }
+                _ => request.clone(),
+            };
+            match council.write(write).await {
+                // A lease was taken, released or broken since the leader
+                // checked: check again, and stop if one is now in the way.
+                Ok(crate::council::CouncilResponse::LeaseGenerationMoved { .. }) => {
+                    lease_attempts += 1;
+                    pending.push_front(request);
+                    let checked = if lease_attempts > crate::bun::lease_fence::LEASE_ATTEMPTS {
+                        Err(super::leases::LeaseWriteRefusal::Churn)
+                    } else {
+                        super::leases::clear_leases_for_write(
+                            &lease_state,
+                            &council,
+                            lease_auth.as_ref(),
+                            &leased_apps,
+                            break_lease,
+                        )
+                        .await
+                    };
+                    match checked {
+                        Ok(generation) => lease_generation = Some(generation),
+                        Err(refusal) => {
+                            let _ = event_tx
+                                .send(ApplyEvent::Error {
+                                    message: format!("{describe}: {}", refusal.message()),
+                                })
+                                .await;
+                            return;
+                        }
+                    }
+                    continue;
+                }
                 Ok(crate::council::CouncilResponse::PolicyGenerationMoved { .. }) => {
                     policy_attempts += 1;
                     pending.push_front(request);
