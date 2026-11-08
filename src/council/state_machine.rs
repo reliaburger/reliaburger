@@ -1501,6 +1501,69 @@ impl StateMachineInner {
                 }
                 return response;
             }
+            RaftRequest::LeaseTake {
+                request,
+                observed_at_unix_ms,
+            } => {
+                let outcome = self
+                    .state
+                    .agent_leases
+                    .take(request, *observed_at_unix_ms)
+                    .into();
+                return Some(CouncilResponse::AgentLease(Box::new(outcome)));
+            }
+            RaftRequest::LeaseRenew {
+                target,
+                holder,
+                ttl_ms,
+                observed_at_unix_ms,
+            } => {
+                let outcome = self
+                    .state
+                    .agent_leases
+                    .renew(target, holder, *ttl_ms, *observed_at_unix_ms)
+                    .into();
+                return Some(CouncilResponse::AgentLease(Box::new(outcome)));
+            }
+            RaftRequest::LeaseRelease {
+                target,
+                holder,
+                observed_at_unix_ms,
+            } => {
+                use crate::proposal::lease::LeaseOutcome;
+                let outcome =
+                    match self
+                        .state
+                        .agent_leases
+                        .release(target, holder, *observed_at_unix_ms)
+                    {
+                        Ok(lease) => LeaseOutcome::Released { lease },
+                        Err(refusal) => LeaseOutcome::Refused { refusal },
+                    };
+                return Some(CouncilResponse::AgentLease(Box::new(outcome)));
+            }
+            RaftRequest::LeaseBreak {
+                target,
+                by: _,
+                observed_at_unix_ms,
+            } => {
+                use crate::proposal::lease::LeaseOutcome;
+                let outcome = match self
+                    .state
+                    .agent_leases
+                    .break_lease(target, *observed_at_unix_ms)
+                {
+                    Ok(lease) => LeaseOutcome::Broken { lease },
+                    Err(refusal) => LeaseOutcome::Refused { refusal },
+                };
+                return Some(CouncilResponse::AgentLease(Box::new(outcome)));
+            }
+            RaftRequest::LeaseExpire { now_unix_ms } => {
+                let leases = self.state.agent_leases.expire(*now_unix_ms);
+                return Some(CouncilResponse::AgentLease(Box::new(
+                    crate::proposal::lease::LeaseOutcome::Expired { leases },
+                )));
+            }
             RaftRequest::AppRelease { app_id } => {
                 let Some(spec) = self.state.apps.get_mut(app_id) else {
                     return Some(CouncilResponse::Refused {
@@ -11259,5 +11322,146 @@ mod tests {
         assert!(!state.apps.contains_key(&AppId::new("declared", "default")));
         assert_eq!(state.apps[&web].owner.as_deref(), Some("ctl"));
         assert!(!state.gitops_owned.apps.contains(&web));
+    }
+
+    // --- Agent leases (#1686) ---------------------------------------------
+
+    fn lease_holder(name: &str) -> crate::proposal::lease::LeaseHolder {
+        crate::proposal::lease::LeaseHolder {
+            name: name.to_string(),
+            principal_id: format!("token:{name}"),
+        }
+    }
+
+    fn take_lease(who: &str, at: u64) -> RaftRequest {
+        RaftRequest::LeaseTake {
+            request: crate::proposal::lease::LeaseRequest {
+                target: crate::proposal::lease::LeaseTarget::app("shop", "web"),
+                holder: lease_holder(who),
+                purpose: format!("{who} at work"),
+                ttl_ms: crate::proposal::lease::DEFAULT_LEASE_TTL_MS,
+            },
+            observed_at_unix_ms: at,
+        }
+    }
+
+    fn lease_outcome(response: Option<CouncilResponse>) -> crate::proposal::lease::LeaseOutcome {
+        match response {
+            Some(CouncilResponse::AgentLease(outcome)) => *outcome,
+            other => panic!("expected a lease outcome, got {other:?}"),
+        }
+    }
+
+    /// Every lease entry answers with what it did, judged by the time the
+    /// leader stamped in it, and a refusal leaves the leases alone.
+    #[test]
+    fn lease_entries_take_conflict_renew_release_and_expire_by_the_stamped_clock() {
+        use crate::proposal::lease::{
+            DEFAULT_LEASE_TTL_MS, LeaseOutcome, LeaseRefusal, LeaseTarget,
+        };
+        let mut inner = StateMachineInner::default();
+        let web = LeaseTarget::app("shop", "web");
+        assert!(matches!(
+            lease_outcome(inner.apply_request(&take_lease("holmes", 1_000))),
+            LeaseOutcome::Taken { .. }
+        ));
+        match lease_outcome(inner.apply_request(&take_lease("capacity", 2_000))) {
+            LeaseOutcome::Refused {
+                refusal: LeaseRefusal::Held { lease },
+            } => assert_eq!(lease.holder.name, "holmes"),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            lease_outcome(inner.apply_request(&RaftRequest::LeaseRenew {
+                target: web.clone(),
+                holder: lease_holder("capacity"),
+                ttl_ms: DEFAULT_LEASE_TTL_MS,
+                observed_at_unix_ms: 3_000,
+            })),
+            LeaseOutcome::Refused {
+                refusal: LeaseRefusal::Held { .. }
+            }
+        ));
+        assert!(matches!(
+            lease_outcome(inner.apply_request(&RaftRequest::LeaseRenew {
+                target: web.clone(),
+                holder: lease_holder("holmes"),
+                ttl_ms: DEFAULT_LEASE_TTL_MS,
+                observed_at_unix_ms: 3_000,
+            })),
+            LeaseOutcome::Renewed { .. }
+        ));
+        assert_eq!(inner.state.agent_leases.generation, 1);
+        // Not lapsed yet at the stamped time: nothing expires.
+        assert_eq!(
+            lease_outcome(inner.apply_request(&RaftRequest::LeaseExpire {
+                now_unix_ms: 3_000 + DEFAULT_LEASE_TTL_MS - 1,
+            })),
+            LeaseOutcome::Expired { leases: Vec::new() }
+        );
+        match lease_outcome(inner.apply_request(&RaftRequest::LeaseExpire {
+            now_unix_ms: 3_000 + DEFAULT_LEASE_TTL_MS,
+        })) {
+            LeaseOutcome::Expired { leases } => assert_eq!(leases.len(), 1),
+            other => panic!("{other:?}"),
+        }
+        assert!(inner.state.agent_leases.leases.is_empty());
+        assert_eq!(inner.state.agent_leases.generation, 2);
+
+        inner.apply_request(&take_lease("holmes", 500_000));
+        assert!(matches!(
+            lease_outcome(inner.apply_request(&RaftRequest::LeaseRelease {
+                target: web.clone(),
+                holder: lease_holder("capacity"),
+                observed_at_unix_ms: 500_001,
+            })),
+            LeaseOutcome::Refused { .. }
+        ));
+        assert!(matches!(
+            lease_outcome(inner.apply_request(&RaftRequest::LeaseRelease {
+                target: web.clone(),
+                holder: lease_holder("holmes"),
+                observed_at_unix_ms: 500_001,
+            })),
+            LeaseOutcome::Released { .. }
+        ));
+        inner.apply_request(&take_lease("holmes", 600_000));
+        match lease_outcome(inner.apply_request(&RaftRequest::LeaseBreak {
+            target: web.clone(),
+            by: lease_holder("alice"),
+            observed_at_unix_ms: 600_001,
+        })) {
+            LeaseOutcome::Broken { lease } => assert_eq!(lease.holder.name, "holmes"),
+            other => panic!("{other:?}"),
+        }
+        assert!(inner.state.agent_leases.leases.is_empty());
+    }
+
+    /// Two replicas applying the same lease entries hold the same leases,
+    /// whatever their own clocks say, and a snapshot carries them.
+    #[tokio::test]
+    async fn leases_replay_the_same_everywhere_and_survive_a_snapshot() {
+        let entries = || {
+            vec![
+                normal_entry(1, 1, take_lease("holmes", 10_000)),
+                normal_entry(1, 2, take_lease("capacity", 20_000)),
+            ]
+        };
+        let mut first = CouncilStateMachine::new();
+        let mut second = CouncilStateMachine::new();
+        first.apply_fixture(entries()).await.unwrap();
+        second.apply_fixture(entries()).await.unwrap();
+        let held = first.desired_state().await.agent_leases;
+        assert_eq!(held, second.desired_state().await.agent_leases);
+        assert_eq!(held.leases["app:shop/web"].holder.name, "holmes");
+
+        let mut builder = first.get_snapshot_builder().await;
+        let snapshot = builder.build_snapshot().await.unwrap();
+        let mut restored = CouncilStateMachine::new();
+        restored
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        assert_eq!(restored.desired_state().await.agent_leases, held);
     }
 }

@@ -54,6 +54,7 @@ mod gitops;
 mod identity;
 mod internal;
 mod join;
+pub(crate) mod leases;
 mod logs;
 mod metrics;
 mod node_info;
@@ -101,6 +102,10 @@ use internal::{
 use join::{
     cluster_ca_handler, join_handler, node_renewal_handler, node_security_view_handler,
     node_trust_ack_handler,
+};
+use leases::{
+    lease_break_handler, lease_release_handler, lease_renew_handler, lease_take_handler,
+    leases_handler,
 };
 use logs::{
     logs_archive_file_handler, logs_archive_handler, logs_cross_node_handler, logs_entries_handler,
@@ -808,6 +813,10 @@ pub fn router_with_upgrade(
         .route("/v1/rollback/{app}/{namespace}", post(rollback_handler))
         .route("/v1/gitops", get(gitops_status_handler))
         .route("/v1/gitops/config", post(gitops_config_handler))
+        .route("/v1/leases", get(leases_handler).post(lease_take_handler))
+        .route("/v1/leases/renew", post(lease_renew_handler))
+        .route("/v1/leases/release", post(lease_release_handler))
+        .route("/v1/leases/break", post(lease_break_handler))
         .route("/v1/policies", get(policies_handler))
         .route("/v1/policies/audit", get(policy_audit_handler))
         .route("/v1/policies/{name}/delete", post(policy_delete_handler))
@@ -1377,6 +1386,8 @@ mod permission_tests;
 
 #[cfg(test)]
 mod contract_tests;
+#[cfg(test)]
+mod lease_tests;
 #[cfg(test)]
 mod owner_tests;
 #[cfg(test)]

@@ -62,6 +62,10 @@ pub const EXCLUDED: &[Exclusion] = &[
         command: "setup",
         why: "writes the configuration of the user's agents",
     },
+    Exclusion {
+        command: "lease",
+        why: "takes, renews and releases council leases; arrives with `relish mcp --propose` (#1682)",
+    },
 ];
 
 /// The exclusion for `command`, if there is one. An excluded group, such as

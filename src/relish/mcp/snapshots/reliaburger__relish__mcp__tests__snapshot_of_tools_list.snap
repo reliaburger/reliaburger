@@ -177,7 +177,10 @@ expression: listed_for_snapshot(server.tools())
             "patch-diff",
             "patch-apply",
             "patch-destroy",
-            "setup"
+            "setup",
+            "lease-take",
+            "lease-renew",
+            "lease-release"
           ],
           "type": "string"
         },

@@ -5824,6 +5824,17 @@
           "sources": [
             "tests/cluster_failover.rs"
           ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-cluster_failover-an_agent_lease_survives_a_leader_change_and_the_new_leader_expires_it",
+          "binary": "reliaburger::cluster_failover",
+          "test": "an_agent_lease_survives_a_leader_change_and_the_new_leader_expires_it",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_failover.rs"
+          ]
         }
       ]
     },

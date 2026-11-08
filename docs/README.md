@@ -1056,7 +1056,11 @@ reasons), `verify` (whether every node's `bun` and this `relish` are the
 published release, by SHA-256 and release signature, also as `relish verify`
 for people, with `--metadata` for air-gapped clusters), `patch` (build, test and try a fix on a throwaway cluster), `report`
 (a redacted bug report, with a fingerprint for finding duplicates, for a human
-to read and post; it never posts, and makes no network call) and `setup`, which
+to read and post; it never posts, and makes no network call), `lease` (`take`,
+`renew` and `release` a short lease on an app or a namespace before changing
+it; someone else's is `lease_held`, naming them; `relish lease` is the
+people's side, with `list` and `break`, and `context` lists every lease) and
+`setup`, which
 adds the `relish mcp` server to Claude Code, Codex, Cursor, VS Code, Goose and
 Gemini CLI: it shows the diff, writes only with `--yes`, never touches an entry
 it didn't write, and approves no tools. `relish mcp` serves the read-only

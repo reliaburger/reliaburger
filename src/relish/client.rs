@@ -3322,6 +3322,61 @@ impl BunClient {
         self.get_typed_json("/v1/policies/audit").await
     }
 
+    /// The live agent leases this caller's scope reaches (`GET /v1/leases`,
+    /// #1686).
+    pub async fn leases(&self) -> Result<crate::proposal::lease::LeaseListing, RelishError> {
+        self.get_typed_json("/v1/leases").await
+    }
+
+    /// Take a lease, or renew one this caller holds. A lease someone else
+    /// holds is a 409 whose body has `code: "lease_held"` and the `lease`.
+    pub async fn lease_take(
+        &self,
+        request: &crate::proposal::lease::TakeLeaseRequest,
+    ) -> Result<crate::proposal::lease::LeaseAnswer, RelishError> {
+        self.lease_post("/v1/leases", request).await
+    }
+
+    /// Extend a lease this caller holds.
+    pub async fn lease_renew(
+        &self,
+        request: &crate::proposal::lease::RenewLeaseRequest,
+    ) -> Result<crate::proposal::lease::LeaseAnswer, RelishError> {
+        self.lease_post("/v1/leases/renew", request).await
+    }
+
+    /// Give up a lease this caller holds.
+    pub async fn lease_release(
+        &self,
+        request: &crate::proposal::lease::LeaseTargetRequest,
+    ) -> Result<crate::proposal::lease::LeaseAnswer, RelishError> {
+        self.lease_post("/v1/leases/release", request).await
+    }
+
+    /// End anyone's lease (deployer or above over the target; audited).
+    pub async fn lease_break(
+        &self,
+        request: &crate::proposal::lease::LeaseTargetRequest,
+    ) -> Result<crate::proposal::lease::LeaseAnswer, RelishError> {
+        self.lease_post("/v1/leases/break", request).await
+    }
+
+    async fn lease_post<T: serde::Serialize>(
+        &self,
+        path: &str,
+        request: &T,
+    ) -> Result<crate::proposal::lease::LeaseAnswer, RelishError> {
+        let body = serde_json::to_string(request).map_err(|error| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to encode the request: {error}"),
+        })?;
+        let answer = self.post_json(path, body).await?;
+        serde_json::from_value(answer).map_err(|error| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse response: {error}"),
+        })
+    }
+
     /// Delete a policy (admin only).
     pub async fn delete_policy(&self, name: &str) -> Result<(), RelishError> {
         let name: String = url::form_urlencoded::byte_serialize(name.as_bytes()).collect();

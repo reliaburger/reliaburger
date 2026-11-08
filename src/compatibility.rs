@@ -217,6 +217,9 @@ pub struct Compatibility {
 /// 0.2.8, agents you can trust (58/74): one bump for the whole release,
 /// made by its first wire or state change. Each later 0.2.8 change adds its
 /// line below this one, not another bump.
+/// Agent leases (#1686): `DesiredState::agent_leases`, the `LeaseTake`,
+/// `LeaseRenew`, `LeaseRelease`, `LeaseBreak` and `LeaseExpire` Raft
+/// requests and the `AgentLease` council response.
 /// A state report's `ResourceUsage` carries `gpu_used` as a `u32` and a new
 /// `gpu_total`, so the leader counts GPUs instead of assuming none
 /// (`GET /v1/cluster/summary`).

@@ -179,9 +179,18 @@ fn the_exclusions_are_the_commands_that_write_build_or_reach_past_the_cluster() 
             "patch",
             "upgrade-check",
             "verify",
-            "setup"
+            "setup",
+            "lease"
         ]
     );
+    // A lease is a write to the council: `relish mcp` stays read-only.
+    for command in ["lease take", "lease renew", "lease release"] {
+        assert_eq!(
+            tools::exclusion(command).map(|e| e.command),
+            Some("lease"),
+            "{command}"
+        );
+    }
     for exclusion in tools::EXCLUDED {
         assert!(!exclusion.why.is_empty(), "{exclusion:?}");
     }

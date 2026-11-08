@@ -68,5 +68,8 @@ If you're an agent operating or debugging a Reliaburger cluster:
 | `relish agent patch apply` | Apply a unified diff to the workspace, matching each hunk by its lines rather than its header's counts. All or nothing |
 | `relish agent patch destroy` | Remove the workspace's throwaway cluster, or every one with `--all`. The workspace and its source stay |
 | `relish agent setup` | Wire Reliaburger into the AI agents on this machine. Shows the diff; writes only with --yes |
+| `relish agent lease take` | Take a lease before changing an app or a namespace, or renew yours |
+| `relish agent lease renew` | Extend a lease you hold |
+| `relish agent lease release` | Give up a lease you hold |
 
 `relish agent guide` prints the whole chapter this skill is made from, as the installed `relish` has it, and `relish agent schema` the shape of every answer.

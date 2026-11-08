@@ -109,6 +109,18 @@ pub enum CommandName {
     PatchDestroy,
     /// `relish agent setup`.
     Setup,
+    /// `relish agent lease take`.
+    #[serde(rename = "lease take")]
+    #[value(name = "lease-take")]
+    LeaseTake,
+    /// `relish agent lease renew`.
+    #[serde(rename = "lease renew")]
+    #[value(name = "lease-renew")]
+    LeaseRenew,
+    /// `relish agent lease release`.
+    #[serde(rename = "lease release")]
+    #[value(name = "lease-release")]
+    LeaseRelease,
 }
 
 impl CommandName {
@@ -142,6 +154,9 @@ impl CommandName {
             CommandName::PatchApply => "patch apply",
             CommandName::PatchDestroy => "patch destroy",
             CommandName::Setup => "setup",
+            CommandName::LeaseTake => "lease take",
+            CommandName::LeaseRenew => "lease renew",
+            CommandName::LeaseRelease => "lease release",
         }
     }
 
@@ -174,6 +189,9 @@ impl CommandName {
         CommandName::PatchApply,
         CommandName::PatchDestroy,
         CommandName::Setup,
+        CommandName::LeaseTake,
+        CommandName::LeaseRenew,
+        CommandName::LeaseRelease,
     ];
 }
 
@@ -261,6 +279,9 @@ pub enum ErrorCode {
     UnsupportedPlatform,
     /// Something went wrong inside `relish` itself.
     Internal,
+    /// Someone else holds a lease on what you asked for; `lease` says who,
+    /// why and for how long.
+    LeaseHeld,
 }
 
 /// The process exit status of a `relish agent` command.
@@ -306,7 +327,7 @@ impl ErrorCode {
             | ErrorCode::TlsUntrusted
             | ErrorCode::Timeout
             | ErrorCode::Unauthenticated => ExitStatus::Unreachable,
-            ErrorCode::Forbidden => ExitStatus::Refused,
+            ErrorCode::Forbidden | ErrorCode::LeaseHeld => ExitStatus::Refused,
             ErrorCode::NotFound
             | ErrorCode::Conflict
             | ErrorCode::Api
@@ -332,6 +353,9 @@ pub struct AgentError {
     pub status: Option<u16>,
     /// What to do about it, when we know.
     pub hint: Option<String>,
+    /// The lease in the way, for `lease_held`; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease: Option<Box<super::lease::LeaseLine>>,
 }
 
 impl AgentError {
@@ -343,6 +367,7 @@ impl AgentError {
             endpoint: None,
             status: None,
             hint: None,
+            lease: None,
         }
     }
 

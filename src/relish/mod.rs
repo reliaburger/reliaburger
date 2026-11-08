@@ -37,6 +37,7 @@ pub mod k8s_export;
     clippy::single_match
 )]
 pub mod k8s_import;
+pub mod lease_cmd;
 pub mod local_context;
 pub mod manifest;
 pub mod manual;
