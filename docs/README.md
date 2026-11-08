@@ -637,13 +637,14 @@ No installation needed. This is what you get by default.
 
 ## Building
 
-The portable test gate requires cargo-nextest 0.9.145 or newer. That release
-fixes capture-pipe inheritance between concurrent macOS tests, which could make
-a completed test appear to leak a child process. CI pins 0.9.145 and treats a
-leak as a failure at the existing 100 ms deadline.
+The portable test gate requires cargo-nextest 0.9.151 or newer. 0.9.145 fixed
+capture-pipe inheritance between concurrent macOS tests, which could make a
+completed test appear to leak a child process, and 0.9.151 is past
+[GHSA-vc25-qg58-w57c](https://github.com/nextest-rs/nextest/security/advisories/GHSA-vc25-qg58-w57c).
+CI pins 0.9.151 and treats a leak as a failure at the existing 100 ms deadline.
 
 ```sh
-cargo install cargo-nextest --locked --version 0.9.145
+cargo install cargo-nextest --locked --version 0.9.151
 ```
 
 The [Makefile](../Makefile) provides all build targets:
@@ -685,6 +686,7 @@ make test-rootless-runc    # rootless runc port and replacement test (never sudo
 make test-cluster          # failover, healing, recovery, placement and chaos
 make test-hollow           # a three-member council and twenty hollow nodes (#1401)
 make test-gym              # the agent gym's scenarios on throwaway clusters, scored (#1086)
+make test-gym-user         # relish gym run on a throwaway cluster: baseline, then Ctrl-C, nothing left (#1683)
 make test-upgrade-node     # real single-node binary replacement
 make test-upgrade-cluster  # real rolling cluster replacement
 make coverage              # portable suite under line coverage (LCOV) and the floor

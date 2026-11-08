@@ -532,6 +532,9 @@ See [chaos](05_chaos.md).
   - `relish fault list`: List all active faults
   - `relish fault clear [TARGET]`: Clear faults — all, by numeric id, or by service name
   - `relish fault scenario <PATH>`: Run a scripted chaos scenario from a TOML file
+- `relish gym`: Test your own agent on your own cluster: break a staging namespace in known ways, run the agent, score it *(0.2.8, not in 0.2.7)*
+  - `relish gym run --namespace <NAMESPACE>`: Deploy the gym's apps into a staging namespace, break them, run your agent, score it and clean up *(0.2.8, not in 0.2.7)*
+  - `relish gym list`: List the scenarios: what each deploys, breaks and scores *(0.2.8, not in 0.2.7)*
 
 ### Security and access
 

@@ -121,7 +121,7 @@ jobs:
       # the pinned nextest really lists, on a throwaway crate.
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest@0.9.145
+          tool: cargo-nextest@0.9.151
       - name: Test the CI scripts
         run: make test-ci-scripts
       - name: Every ignored test names its owner
@@ -280,7 +280,7 @@ jobs:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest@0.9.145,cargo-llvm-cov@0.9.1
+          tool: cargo-nextest@0.9.151,cargo-llvm-cov@0.9.1
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: portable
@@ -363,7 +363,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.98.0
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest@0.9.145
+          tool: cargo-nextest@0.9.151
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: linux-privileged
@@ -476,7 +476,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.98.0
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest@0.9.145
+          tool: cargo-nextest@0.9.151
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: linux-privileged-2604
@@ -524,7 +524,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.98.0
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest@0.9.145
+          tool: cargo-nextest@0.9.151
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: linux-debug
@@ -563,7 +563,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.98.0
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest@0.9.145
+          tool: cargo-nextest@0.9.151
       - name: Fetch the test archive
         # actions/download-artifact took 33 s to almost 5 minutes for the
         # 3 GB archive, logged nothing while it ran, and a retry after its
@@ -626,7 +626,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.98.0
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest@0.9.145
+          tool: cargo-nextest@0.9.151
       - name: Fetch the test archive
         # actions/download-artifact took 33 s to almost 5 minutes for the
         # 3 GB archive, logged nothing while it ran, and a retry after its
@@ -742,7 +742,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.98.0
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest@0.9.145
+          tool: cargo-nextest@0.9.151
       - name: Actual-source optimized cron boundaries
         id: optimized_cron
         run: |
@@ -774,7 +774,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.98.0
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest@0.9.145
+          tool: cargo-nextest@0.9.151
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: s3
@@ -859,7 +859,7 @@ jobs:
           components: clippy
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest@0.9.145
+          tool: cargo-nextest@0.9.151
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: macos
