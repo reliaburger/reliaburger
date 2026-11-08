@@ -200,15 +200,20 @@ pub(super) async fn proposal_create_handler(
     let author = principal_of(auth);
     let now = crate::testkit::lease::now_unix_millis();
     let desired = council.desired_state().await;
+    let history_target = rollback_history_target(&state, &desired, &request).await;
     let built = {
         let author = author.clone();
         let request = request.clone();
         tokio::task::spawn_blocking(move || {
             let policies = desired.policies.clone();
-            let built =
-                crate::proposal::build::build(&desired, &request, &author, now, |app, spec| {
-                    crate::proposal::guard::fill_defaults(&policies, &author, app, spec)
-                });
+            let built = crate::proposal::build::build_with_history(
+                &desired,
+                &request,
+                &author,
+                now,
+                |app, spec| crate::proposal::guard::fill_defaults(&policies, &author, app, spec),
+                history_target.as_ref(),
+            );
             (built, policies)
         })
         .await
@@ -282,10 +287,17 @@ pub(super) async fn proposal_create_handler(
         "proposal.created",
         &created,
         format!(
-            "{} proposed {} ({})",
+            "{} proposed {} ({}){}",
             author.name,
             created.id,
-            created.summary.first().cloned().unwrap_or_default()
+            created.summary.first().cloned().unwrap_or_default(),
+            // Built-in rule 3 kept it for a person although a policy
+            // matched: say so, so nobody wonders why it waits.
+            verdict
+                .held
+                .as_deref()
+                .map(|held| format!("; {held}"))
+                .unwrap_or_default()
         ),
     )
     .await;
@@ -319,6 +331,31 @@ pub(super) async fn proposal_create_handler(
     (StatusCode::CREATED, Json(created.view(now))).into_response()
 }
 
+/// For a proposed rollback the council has no released spec for, the
+/// target `relish rollback` would take from the nodes' deploy history.
+/// `None` for every other request, and when the council has one: asking
+/// every node is only worth it when the cheap answer is missing.
+async fn rollback_history_target(
+    state: &ApiState,
+    desired: &crate::council::types::DesiredState,
+    request: &ProposalRequest,
+) -> Option<crate::config::app::AppSpec> {
+    if request.kind != RequestKind::Rollback {
+        return None;
+    }
+    let namespace = request.namespace.as_deref().unwrap_or("default");
+    let app = crate::meat::AppId::new(request.app.as_deref()?, namespace);
+    let current = desired.apps.get(&app)?;
+    let released = desired
+        .rollouts
+        .get(&app)
+        .and_then(|rollouts| crate::bun::cluster_view::released_rollback_target(rollouts, current));
+    if released.is_some() {
+        return None;
+    }
+    super::deploys::history_rollback_target(state, &app.name, namespace, Some(current)).await
+}
+
 /// `POST /v1/proposals/{id}/approve`: a person approves, and the leader
 /// applies it in the same Raft entry. The same approver asking again gets
 /// the outcome.
@@ -348,7 +385,7 @@ pub(super) async fn proposal_approve_handler(
     } = &proposal.state
         && by.name == approver.name
     {
-        return Json(proposal.view(crate::testkit::lease::now_unix_millis())).into_response();
+        return answer_decided(&proposal);
     }
     let Some(council) = &state.council else {
         return standalone();
@@ -613,7 +650,43 @@ async fn answer_outcome(
     };
     let message = message.replace("{}", &proposal.id.to_string());
     record_proposal(state, auth, action, &proposal, message).await;
+    if matches!(
+        proposal.state,
+        crate::proposal::ProposalState::Failed { .. }
+    ) {
+        return answer_decided(&proposal);
+    }
     Json(proposal.view(now)).into_response()
+}
+
+/// The answer for a proposal that's already decided: its view, or, when
+/// its approval wrote nothing, the refusal that says why (`stale`,
+/// `lease_held` or `guardrail`) with the view beside it. An approval that
+/// changed nothing isn't a success, so a script reading the status or an
+/// agent reading the code doesn't take it for one.
+fn answer_decided(proposal: &Proposal) -> Response {
+    let view = proposal.view(crate::testkit::lease::now_unix_millis());
+    let crate::proposal::ProposalState::Failed { why, .. } = &proposal.state else {
+        return Json(view).into_response();
+    };
+    let refusal = match why {
+        crate::proposal::FailedReason::Stale { app, .. } => ProposalRefusal::Stale {
+            app: app.to_string(),
+            what: "after the proposal was made, so it wasn't applied; propose again".to_string(),
+        },
+        crate::proposal::FailedReason::Lease { lease } => ProposalRefusal::LeaseHeld {
+            lease: lease.clone(),
+        },
+        crate::proposal::FailedReason::Guardrail { rule, message } => ProposalRefusal::Guardrail {
+            rule: rule.clone(),
+            message: message.clone(),
+        },
+        crate::proposal::FailedReason::Refused { reason } => ProposalRefusal::WrongState {
+            id: proposal.id,
+            state: format!("failed: {reason}"),
+        },
+    };
+    refusal_response(&refusal, Some(view))
 }
 
 /// The audit record for `action` on `proposal`, by the caller.

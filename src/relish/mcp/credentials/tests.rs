@@ -115,6 +115,7 @@ fn scope(namespace: Option<&str>) -> Scope {
         owner: "laptop".to_string(),
         endpoint: "https://127.0.0.1:19117".to_string(),
         namespace: namespace.map(str::to_string),
+        purpose: Purpose::Read,
     }
 }
 
@@ -561,4 +562,51 @@ fn relish_mcp_tokens_are_known_by_their_name() {
     assert!(made_by_relish_mcp("relish-mcp-1762000000-4242"));
     assert!(!made_by_relish_mcp("agent"));
     assert!(!made_by_relish_mcp("my-relish-mcp-1"));
+}
+
+/// #1682: the read-only token is an agent token, and `--propose`'s is a
+/// deployer agent token in a file of its own, confined to the namespace.
+#[tokio::test]
+async fn a_proposing_token_is_a_scoped_deployer_agent_token_in_its_own_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let context = directory.path().join("context.json");
+    let path = path_for(&context, Some("shop"), Purpose::Propose).unwrap();
+    assert_eq!(path, directory.path().join("mcp-propose-token-shop.json"));
+    assert_eq!(
+        path_for(&context, None, Purpose::Propose).unwrap(),
+        directory.path().join("mcp-propose-token.json")
+    );
+    let cluster = Cluster::start(false).await;
+    let mut proposing = scope(Some("shop"));
+    proposing.purpose = Purpose::Propose;
+    obtain(&path, &proposing, &cluster.client(ADMIN), now(), None)
+        .await
+        .unwrap();
+    let body = &cluster.creations().await[0].body;
+    assert_eq!(body["role"], "deployer");
+    assert_eq!(body["agent"], true);
+    assert_eq!(body["namespaces"], serde_json::json!(["shop"]));
+    assert!(
+        body["name"]
+            .as_str()
+            .unwrap()
+            .starts_with("relish-mcp-propose-"),
+        "{body}"
+    );
+    // `relish agent setup --remove` finds it beside the read-only ones.
+    assert!(files_beside(&context).unwrap().contains(&path));
+
+    let read_only = directory.path().join("mcp-token.json");
+    obtain(
+        &read_only,
+        &scope(None),
+        &cluster.client(ADMIN),
+        now(),
+        None,
+    )
+    .await
+    .unwrap();
+    let body = &cluster.creations().await[1].body;
+    assert_eq!(body["role"], "read-only");
+    assert_eq!(body["agent"], true);
 }

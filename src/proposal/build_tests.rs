@@ -257,3 +257,31 @@ fn the_reason_is_redacted_flattened_and_capped() {
     assert!(!proposal.reason.contains(&"0".repeat(64)));
     assert!(proposal.reason.len() <= MAX_REASON_BYTES);
 }
+
+/// The gym's finding (#1682): after a crash loop the council has no
+/// released spec to go back to, but the nodes' deploy history does, and a
+/// person's `relish rollback` uses it. A proposed rollback takes the same
+/// target, which the API looks up the same way.
+#[test]
+fn a_rollback_without_a_released_spec_takes_the_deploy_history_target() {
+    let mut desired = desired();
+    desired.rollouts.clear();
+    let rollback = request(RequestKind::Rollback, Some("web"));
+    assert!(matches!(
+        refused(&desired, &rollback),
+        ProposalRefusal::Invalid { reason } if reason.contains("no released spec")
+    ));
+    let from_history = spec("image = \"web:1.3\"\nreplicas = 3\nport = 8080");
+    let proposal = build_with_history(
+        &desired,
+        &rollback,
+        &holmes(),
+        NOW,
+        as_declared,
+        Some(&from_history),
+    )
+    .unwrap();
+    let after = proposal.changes[0].after.spec.as_deref().unwrap();
+    assert_eq!(after.image.as_deref(), Some("web:1.3"));
+    assert_eq!(proposal.kind, ProposalKind::Rollback);
+}

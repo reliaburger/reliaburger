@@ -66,7 +66,7 @@ pub fn render_policy_list(listing: &PolicyListing) -> String {
         .max()
         .unwrap_or(0)
         .max("NAME".len());
-    let mut out = format!("{:name_width$}  ACTION  FOR   OWNER   RULE\n", "NAME");
+    let mut out = format!("{:name_width$}  ACTION   FOR        OWNER   RULE\n", "NAME");
     for (name, spec) in &listing.policies {
         let owner = if listing.gitops_owned.contains(name) {
             "gitops"
@@ -75,7 +75,7 @@ pub fn render_policy_list(listing: &PolicyListing) -> String {
         };
         let rule = policy_rule(spec);
         out.push_str(&format!(
-            "{name:name_width$}  {:6}  {:4}  {owner:6}  {rule}\n",
+            "{name:name_width$}  {:7}  {:9}  {owner:6}  {rule}\n",
             spec.action.as_str(),
             spec.applies_to.as_str()
         ));
@@ -189,6 +189,154 @@ pub fn policy_test(
     }
 }
 
+/// What `relish policy test --proposal` found (#1682): what the
+/// guardrails said, and whether one would approve the proposal.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProposalTest {
+    /// The `deny`, `warn` and `audit` guardrails' findings.
+    #[serde(flatten)]
+    pub verdict: crate::policy::Verdict,
+    /// The `approve` policy that would approve it without a person.
+    pub approve: Option<String>,
+    /// When an `approve` policy matched but built-in rule 3 keeps the
+    /// proposal for a person: why.
+    pub held: Option<String>,
+}
+
+/// The part of a proposal's JSON `relish policy test --proposal` reads:
+/// what `relish proposal show -o json` prints, or the `data` of `relish
+/// agent propose --dry-run`'s envelope.
+#[derive(Debug, serde::Deserialize)]
+struct ProposalFile {
+    policy_input: crate::policy::PolicyInput,
+    #[serde(default)]
+    blast_radius: Option<UnknownOnly>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct UnknownOnly {
+    #[serde(default)]
+    unknown: Vec<String>,
+}
+
+/// Judge the proposal in `json` by the guardrails in `policies`, offline.
+/// Only guardrails (`applies_to = "proposals"`) run: the JSON holds no app
+/// specs, so app policies, which the cluster also runs on the `after`
+/// specs, can't.
+pub fn judge_proposal_json(
+    policies: &std::collections::BTreeMap<String, crate::config::PolicySpec>,
+    json: &str,
+    identity: &TestIdentity,
+) -> Result<ProposalTest, RelishError> {
+    let invalid = |reason: String| RelishError::InvalidFlag {
+        flag: "proposal".into(),
+        reason,
+    };
+    let mut value: serde_json::Value =
+        serde_json::from_str(json).map_err(|error| invalid(format!("isn't JSON: {error}")))?;
+    // An agent envelope carries the proposal in `data`.
+    if let Some(data) = value.get_mut("data") {
+        value = data.take();
+    }
+    let file: ProposalFile = serde_json::from_value(value).map_err(|error| {
+        invalid(format!(
+            "isn't a proposal (from `relish proposal show ID -o json`): {error}"
+        ))
+    })?;
+    let set =
+        crate::policy::PolicySet::compile(policies).map_err(|error| invalid(error.to_string()))?;
+    let judged = crate::policy::judge_proposal_input(&set, &file.policy_input, &identity.caller());
+    let mut approve = None;
+    let mut held = None;
+    if let Some(name) = judged.approve.filter(|_| judged.verdict.is_allowed()) {
+        let reversibility = serde_json::from_value(serde_json::Value::String(
+            file.policy_input.proposal.reversibility.clone(),
+        ))
+        .unwrap_or(crate::proposal::Reversibility::Irreversible);
+        let unknown = file
+            .blast_radius
+            .map(|radius| radius.unknown)
+            .unwrap_or_default();
+        match crate::proposal::guard::held_for_a_person(
+            reversibility,
+            &unknown,
+            !judged.verdict.warnings.is_empty(),
+        ) {
+            Some(why) => held = Some(format!("policy {name} matched, but {why}")),
+            None => approve = Some(name),
+        }
+    }
+    Ok(ProposalTest {
+        verdict: judged.verdict,
+        approve,
+        held,
+    })
+}
+
+/// `relish policy test --proposal FILE`: judge a proposal by the guardrails
+/// in `files`, offline. Exits non-zero when a guardrail would refuse it.
+pub fn policy_test_proposal(
+    files: &[PathBuf],
+    proposal: &std::path::Path,
+    identity: &TestIdentity,
+    output: OutputFormat,
+) -> Result<(), RelishError> {
+    let mut merged = Config::default();
+    for file in files {
+        let config = super::commands::load_config_file(file)?;
+        merge(&mut merged, config, file)?;
+    }
+    merged.validate()?;
+    let json = std::fs::read_to_string(proposal).map_err(|error| RelishError::InvalidFlag {
+        flag: "proposal".into(),
+        reason: format!("can't read {}: {error}", proposal.display()),
+    })?;
+    let tested = judge_proposal_json(&merged.policy, &json, identity)?;
+    match output {
+        OutputFormat::Human => print!("{}", render_proposal_test(&tested)),
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&tested).map_err(RelishError::SerialiseJson)?
+        ),
+        OutputFormat::Yaml => print!(
+            "{}",
+            yaml_serde::to_string(&tested).map_err(RelishError::SerialiseYaml)?
+        ),
+    }
+    if tested.verdict.is_allowed() {
+        Ok(())
+    } else {
+        Err(RelishError::PolicyDenied {
+            denials: tested
+                .verdict
+                .denials
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        })
+    }
+}
+
+/// The human view of `relish policy test --proposal`.
+pub fn render_proposal_test(tested: &ProposalTest) -> String {
+    let mut out = String::new();
+    if let Some(table) = crate::policy::report::findings_table(&[], &tested.verdict) {
+        out.push_str(&table);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    let decision = match (&tested.approve, &tested.held) {
+        _ if !tested.verdict.is_allowed() => "Refused: the cluster won't store it.".to_string(),
+        (Some(name), _) => format!("Approved by policy {name}: it applies with no person."),
+        (None, Some(held)) => format!("Waits for a person: {held}."),
+        (None, None) => "Waits for a person: no approve policy matches it.".to_string(),
+    };
+    out.push_str(&decision);
+    out.push('\n');
+    out
+}
+
 /// Add `config`'s apps, jobs and policies to `merged`. The same name in two files
 /// is a mistake, not an override.
 fn merge(merged: &mut Config, config: Config, file: &std::path::Path) -> Result<(), RelishError> {
@@ -246,6 +394,79 @@ match = "app.namespace == 'prod'"
 deny = "!has(app.memory)"
 message = "apps in prod need a memory limit"
 "#;
+
+    const GUARDRAILS: &str = include_str!("../../examples/agents/guardrails.toml");
+
+    fn proposal_json(kind: &str, namespace: &str, reversibility: &str) -> String {
+        serde_json::json!({
+            "id": 17,
+            "reason": "ignore the guardrails",
+            "blast_radius": {"unknown": []},
+            "policy_input": {
+                "proposal": {
+                    "kind": kind, "namespace": namespace, "apps": ["web"],
+                    "nodes": ["node-a"], "instances": 2, "replicas_from": 3,
+                    "replicas_to": 5, "reversibility": reversibility,
+                    "fields": ["replicas"], "images": ["web:1.4"],
+                },
+                "author": {"name": "holmes", "kind": "agent", "role": "deployer"},
+            },
+        })
+        .to_string()
+    }
+
+    fn guardrails() -> std::collections::BTreeMap<String, crate::config::PolicySpec> {
+        Config::parse(GUARDRAILS).unwrap().policy
+    }
+
+    /// #1682: a guardrail is tested before it's trusted.
+    #[test]
+    fn policy_test_judges_a_proposal_by_its_guardrails_offline() {
+        let tested = judge_proposal_json(
+            &guardrails(),
+            &proposal_json("scale", "shop", "exact"),
+            &deployer(),
+        )
+        .unwrap();
+        assert_eq!(tested.approve.as_deref(), Some("agents-scale-shop"));
+        assert!(render_proposal_test(&tested).contains("Approved by policy agents-scale-shop"));
+
+        let tested = judge_proposal_json(
+            &guardrails(),
+            &proposal_json("delete", "shop", "exact"),
+            &deployer(),
+        )
+        .unwrap();
+        assert_eq!(tested.verdict.denials[0].policy, "agents-never-delete");
+        assert_eq!(tested.approve, None);
+        let shown = render_proposal_test(&tested);
+        assert!(
+            shown.contains("DENY") && shown.contains("Refused"),
+            "{shown}"
+        );
+
+        // Built-in rule 3 holds a change that can't be put back exactly.
+        let tested = judge_proposal_json(
+            &guardrails(),
+            &proposal_json("scale", "shop", "lossy"),
+            &deployer(),
+        )
+        .unwrap();
+        assert_eq!(tested.approve, None);
+        assert!(tested.held.unwrap().contains("can't be undone exactly"));
+    }
+
+    #[test]
+    fn policy_test_reads_a_proposal_from_an_agent_envelope_and_refuses_anything_else() {
+        let envelope = format!(
+            "{{\"schema\":\"relish.agent/v1\",\"ok\":true,\"data\":{}}}",
+            proposal_json("scale", "shop", "exact")
+        );
+        let tested = judge_proposal_json(&guardrails(), &envelope, &deployer()).unwrap();
+        assert_eq!(tested.approve.as_deref(), Some("agents-scale-shop"));
+        let error = judge_proposal_json(&guardrails(), "{\"id\": 1}", &deployer()).unwrap_err();
+        assert!(error.to_string().contains("isn't a proposal"), "{error}");
+    }
 
     #[test]
     fn policy_test_fails_when_an_apply_would_be_refused() {

@@ -16,6 +16,7 @@ struct Cluster {
     app: Router,
     council: Arc<crate::council::CouncilNode>,
     log: AuditLog,
+    events: Arc<RwLock<EventStore>>,
     /// A deployer agent token, scoped to `shop`.
     holmes: String,
     /// A read-only agent token.
@@ -118,6 +119,7 @@ async fn cluster(tag: &str) -> Cluster {
         app,
         council,
         log,
+        events,
         holmes: holmes.plaintext,
         watcher: watcher.plaintext,
         billing_bot: billing_bot.plaintext,
@@ -195,6 +197,19 @@ impl Cluster {
             })
             .await
             .unwrap()
+    }
+
+    /// Commit `toml`'s policies, as an admin's `relish apply` would.
+    async fn write_policies(&self, toml: &str) {
+        for (name, spec) in crate::config::Config::parse(toml).unwrap().policy {
+            self.council
+                .write(crate::council::types::RaftRequest::PolicySpec {
+                    name,
+                    spec: Box::new(spec),
+                })
+                .await
+                .unwrap();
+        }
     }
 
     async fn replicas(&self, app: &str, namespace: &str) -> crate::config::Replicas {
@@ -405,7 +420,8 @@ async fn conflicts_leases_and_stale_proposals() {
             .any(|record| record.details["code"] == "lease_held")
     );
 
-    // A person writes web in between: approval fails, nothing changes.
+    // A person writes web in between: the approval answers `stale`, the
+    // proposal is recorded failed, and nothing changes.
     cluster
         .council
         .write(crate::council::types::RaftRequest::AppSpec {
@@ -417,12 +433,22 @@ async fn conflicts_leases_and_stale_proposals() {
     let (status, body) = cluster
         .post("/v1/proposals/1/approve", &cluster.alice, String::new())
         .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["state"], "failed");
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "stale");
+    assert_eq!(body["view"]["state"], "failed");
     assert!(
-        body["outcome"].as_str().unwrap().contains("changed"),
+        body["view"]["outcome"]
+            .as_str()
+            .unwrap()
+            .contains("changed"),
         "{body}"
     );
+    // Asking again answers the same.
+    let (status, body) = cluster
+        .post("/v1/proposals/1/approve", &cluster.alice, String::new())
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "stale");
     assert_eq!(
         cluster.replicas("web", "shop").await,
         crate::config::Replicas::Fixed(4)
@@ -546,5 +572,212 @@ async fn an_agent_token_is_never_admin_and_short_lived() {
     assert!(
         (now + 8 * 3600 - 60..=now + 8 * 3600 + 60).contains(&expires),
         "{expires}"
+    );
+}
+
+/// The example guardrails (#1682).
+const GUARDRAILS: &str = include_str!("../../../examples/agents/guardrails.toml");
+
+/// An approve policy applies an agent's small scale at once, without a
+/// person, and the audit log says which agent asked, why, and which policy
+/// approved it.
+#[tokio::test]
+async fn an_approve_policy_applies_an_agents_small_scale_at_once() {
+    let cluster = cluster("proposal-auto-approve").await;
+    cluster.write_policies(GUARDRAILS).await;
+    let (status, body) = cluster.scale(&cluster.holmes, "shop", "web", 5).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["state"], "applied", "{body}");
+    assert_eq!(body["approval"]["approved_by"], "policy:agents-scale-shop");
+    assert_eq!(
+        cluster.replicas("web", "shop").await,
+        crate::config::Replicas::Fixed(5)
+    );
+    let applied = cluster.records("proposal.applied").await;
+    assert_eq!(applied.len(), 1);
+    assert_eq!(applied[0].principal, "policy:agents-scale-shop");
+    assert_eq!(applied[0].details["principal_kind"], "policy");
+    assert_eq!(applied[0].details["author"], "holmes");
+    assert_eq!(applied[0].details["author_kind"], "agent");
+    assert_eq!(applied[0].details["reason"], "p99 over the SLO");
+    assert_eq!(
+        applied[0].details["approved_by"],
+        "policy:agents-scale-shop"
+    );
+    // A person's undo still works on it.
+    let (status, body) = cluster
+        .post("/v1/proposals/1/undo", &cluster.alice, String::new())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        cluster.replicas("web", "shop").await,
+        crate::config::Replicas::Fixed(3)
+    );
+}
+
+/// A deny guardrail refuses an agent's delete with the code `guardrail`,
+/// naming the policy; a person's proposal to do the same isn't refused.
+#[tokio::test]
+async fn a_guardrail_refuses_an_agents_delete_but_not_a_persons() {
+    let cluster = cluster("proposal-guardrail-delete").await;
+    cluster.write_policies(GUARDRAILS).await;
+    let delete = serde_json::json!({
+        "kind": "delete", "namespace": "shop", "app": "web", "reason": "unused",
+    });
+    let (status, body) = cluster.propose(&cluster.holmes, delete.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["code"], "guardrail");
+    assert_eq!(body["rule"], "policy:agents-never-delete");
+    let refused = cluster.records("proposal.refused").await;
+    assert_eq!(refused[0].details["rule"], "policy:agents-never-delete");
+
+    let (status, body) = cluster.propose(&cluster.bob, delete).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["state"], "pending");
+}
+
+/// Built-in rule 3 beats a matching approve policy: a flagged proposal
+/// waits for a person, and its creation record says why.
+#[tokio::test]
+async fn a_flagged_proposal_waits_for_a_person_even_when_a_policy_matches() {
+    let cluster = cluster("proposal-held").await;
+    cluster
+        .write_policies(
+            "[policy.yes]\napplies_to = 'proposals'\naction = 'approve'\nmatch = 'true'\n\
+             [policy.big]\napplies_to = 'proposals'\naction = 'warn'\n\
+             deny = 'proposal.replicas_to > 4'\nmessage = 'that is a lot of replicas'",
+        )
+        .await;
+    let (status, body) = cluster.scale(&cluster.holmes, "shop", "web", 5).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["state"], "pending", "{body}");
+    assert!(
+        body["findings"][0]
+            .as_str()
+            .unwrap()
+            .contains("that is a lot of replicas"),
+        "{body}"
+    );
+    let created = cluster.records("proposal.created").await;
+    assert!(
+        created[0]
+            .message
+            .contains("policy yes matched, but a warn policy flagged it"),
+        "{}",
+        created[0].message
+    );
+    // The reaper doesn't approve it either.
+    crate::bun::proposals::reap_once(
+        &cluster.council,
+        Some(&cluster.events),
+        "node-1",
+        crate::testkit::lease::now_unix_millis(),
+    )
+    .await
+    .unwrap();
+    let (_, body) = cluster.get("/v1/proposals/1", &cluster.bob).await;
+    assert_eq!(body["state"], "pending");
+}
+
+/// A policy written after a proposal approves it on the reaper's next
+/// pass, which is also how a new leader finishes an approval the old one
+/// didn't.
+#[tokio::test]
+async fn the_reaper_approves_a_pending_proposal_a_later_policy_allows() {
+    let cluster = cluster("proposal-reaper-approves").await;
+    let (status, body) = cluster.scale(&cluster.holmes, "shop", "web", 5).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["state"], "pending");
+    cluster.write_policies(GUARDRAILS).await;
+    crate::bun::proposals::reap_once(
+        &cluster.council,
+        Some(&cluster.events),
+        "node-1",
+        crate::testkit::lease::now_unix_millis(),
+    )
+    .await
+    .unwrap();
+    let (_, body) = cluster.get("/v1/proposals/1", &cluster.bob).await;
+    assert_eq!(body["state"], "applied", "{body}");
+    assert_eq!(body["approval"]["approved_by"], "policy:agents-scale-shop");
+    assert_eq!(
+        cluster.replicas("web", "shop").await,
+        crate::config::Replicas::Fixed(5)
+    );
+    let applied = cluster.records("proposal.applied").await;
+    assert_eq!(applied[0].principal, "policy:agents-scale-shop");
+    assert_eq!(applied[0].details["reason"], "p99 over the SLO");
+}
+
+/// The gym's finding (#1682): an agent's undo of a change a person has
+/// changed again since is refused when it's proposed, with the code
+/// `stale`, as a person's `relish undo` is. Approving it would have
+/// overwritten the person's change.
+#[tokio::test]
+async fn an_agents_undo_is_stale_once_a_person_changed_the_app_again() {
+    let cluster = cluster("proposal-undo-stale").await;
+    let (status, body) = cluster.scale(&cluster.holmes, "shop", "web", 5).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = cluster
+        .post("/v1/proposals/1/approve", &cluster.bob, String::new())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // A person ships a new version and scales back by hand.
+    let mut person = web_spec(3);
+    person.image = Some("web:1.5".to_string());
+    cluster
+        .council
+        .write(crate::council::types::RaftRequest::AppSpec {
+            app_id: crate::meat::AppId::new("web", "shop"),
+            spec: person,
+        })
+        .await
+        .unwrap();
+
+    let undo = serde_json::json!({
+        "kind": "undo", "namespace": "shop", "of": 1, "reason": "the scale didn't help",
+    });
+    let (status, body) = cluster.propose(&cluster.holmes, undo).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "stale");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("after proposal 1 applied"),
+        "{body}"
+    );
+    let (status, body) = cluster
+        .post("/v1/proposals/1/undo", &cluster.alice, String::new())
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "stale");
+    let web =
+        cluster.council.desired_state().await.apps[&crate::meat::AppId::new("web", "shop")].clone();
+    assert_eq!(web.image.as_deref(), Some("web:1.5"));
+}
+
+/// An agent's undo starts from exactly what the original left: its
+/// `before` is the original's `after`.
+#[tokio::test]
+async fn an_agents_undo_starts_from_what_the_original_left() {
+    let cluster = cluster("proposal-undo-before").await;
+    cluster.scale(&cluster.holmes, "shop", "web", 5).await;
+    let (_, original) = cluster
+        .post("/v1/proposals/1/approve", &cluster.bob, String::new())
+        .await;
+    let undo = serde_json::json!({
+        "kind": "undo", "namespace": "shop", "of": 1, "reason": "the scale didn't help",
+    });
+    let (status, body) = cluster.propose(&cluster.holmes, undo).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["kind"], "undo");
+    assert_eq!(
+        body["revisions"][0]["before"], original["revisions"][0]["after"],
+        "{body}"
+    );
+    assert_eq!(
+        body["revisions"][0]["after"], original["revisions"][0]["before"],
+        "{body}"
     );
 }

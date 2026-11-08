@@ -184,7 +184,7 @@ impl AgentCommand {
             | AgentCommand::Propose(_)
             | AgentCommand::Proposals(_)
             | AgentCommand::Withdraw { .. }
-            | AgentCommand::Undo { .. } => ClusterUse::Required,
+            | AgentCommand::Undo(_) => ClusterUse::Required,
         }
     }
 

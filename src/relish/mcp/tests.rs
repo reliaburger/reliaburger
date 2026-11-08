@@ -179,18 +179,14 @@ fn the_exclusions_are_the_commands_that_write_build_or_reach_past_the_cluster() 
             "patch",
             "upgrade-check",
             "verify",
-            "setup",
-            "lease",
-            "propose",
-            "proposals",
-            "withdraw",
-            "undo"
+            "setup"
         ]
     );
-    // A lease is a write to the council: `relish mcp` stays read-only.
+    // A lease is a write to the council: only `--propose` offers it.
     for command in ["lease take", "lease renew", "lease release"] {
+        assert!(tools::exclusion(command).is_none(), "{command}");
         assert_eq!(
-            tools::exclusion(command).map(|e| e.command),
+            tools::proposing(command).map(|p| p.command),
             Some("lease"),
             "{command}"
         );
@@ -890,6 +886,7 @@ fn managed(directory: &std::path::Path, url: &str) -> Managed {
             owner: "laptop".to_string(),
             endpoint: "https://127.0.0.1:19117".to_string(),
             namespace: None,
+            purpose: credentials::Purpose::Read,
         },
         crate::relish::client::BunClient::new_with_token(url, Some(CONTEXT_ADMIN)),
     )
@@ -1171,4 +1168,197 @@ async fn a_refusal_is_remembered_and_asked_again_only_after_a_while() {
         .await;
     server.call("logs", &logs_arguments()).await.unwrap();
     assert_eq!(seen.lock().await.len(), 4, "asked again after the backoff");
+}
+
+// ---------------------------------------------------------------------------
+// `relish mcp --propose` (#1682).
+
+fn proposing_tools() -> Vec<ToolSpec> {
+    tools::derive_with(
+        crate::relish::agent::agent_command(),
+        &tools::data_schema,
+        true,
+    )
+}
+
+/// The tools `--propose` adds, and nothing else: a new command that writes
+/// to the council must be named in `PROPOSING` or `EXCLUDED`.
+#[test]
+fn propose_adds_exactly_the_proposing_tools() {
+    let plain = names(&real_tools());
+    let proposing = names(&proposing_tools());
+    let added: Vec<&String> = proposing
+        .iter()
+        .filter(|name| !plain.contains(name))
+        .collect();
+    assert_eq!(
+        added,
+        [
+            "lease_take",
+            "lease_renew",
+            "lease_release",
+            "propose",
+            "proposals",
+            "withdraw",
+            "undo"
+        ]
+    );
+    let listed: Vec<&str> = tools::PROPOSING.iter().map(|p| p.command).collect();
+    assert_eq!(
+        listed,
+        ["lease", "propose", "proposals", "withdraw", "undo"]
+    );
+    // No tool approves, rejects or undoes directly: those are a person's
+    // top-level commands, outside `relish agent`.
+    for name in &proposing {
+        for word in ["approve", "reject", "break"] {
+            assert!(!name.contains(word), "{name}");
+        }
+    }
+    // The rest stay out.
+    for excluded in [
+        "patch_init",
+        "setup",
+        "report",
+        "source_extract",
+        "upgrade_check",
+    ] {
+        assert!(!proposing.iter().any(|name| name == excluded), "{excluded}");
+    }
+}
+
+/// A proposing tool writes a council record, never a workload: not
+/// read-only, not destructive. Reading proposals is read-only.
+#[test]
+fn proposing_tools_are_annotated_as_council_writes() {
+    for spec in proposing_tools() {
+        let annotations = spec.tool.annotations.as_ref().unwrap();
+        let writes = tools::proposing(&spec.command).is_some_and(|p| !p.read_only);
+        assert_eq!(
+            annotations.read_only_hint,
+            Some(!writes),
+            "{}",
+            spec.command
+        );
+        assert_eq!(
+            annotations.destructive_hint,
+            Some(false),
+            "{}",
+            spec.command
+        );
+        assert_eq!(annotations.open_world_hint, Some(false), "{}", spec.command);
+        if writes {
+            assert_eq!(annotations.idempotent_hint, Some(false), "{}", spec.command);
+        }
+    }
+}
+
+/// `propose apply` reads a local TOML file, so through MCP it would read
+/// any file the server can: it isn't offered.
+#[test]
+fn propose_through_mcp_offers_no_apply_from_a_local_file() {
+    let tools = proposing_tools();
+    let propose = find(&tools, "propose");
+    let schema = Value::Object((*propose.tool.input_schema).clone());
+    let kinds = schema["properties"]["kind"]["enum"].as_array().unwrap();
+    assert!(!kinds.contains(&json!("apply")), "{kinds:?}");
+    assert!(kinds.contains(&json!("scale")), "{kinds:?}");
+    let error = propose
+        .command_line(&object(json!({
+            "kind": "apply", "target": "/etc/passwd", "reason": "r"
+        })))
+        .unwrap_err();
+    assert!(error.contains("reads a local file"), "{error}");
+    let line = propose
+        .command_line(&object(json!({
+            "kind": "scale", "target": "web", "replicas": 5, "reason": "p99"
+        })))
+        .unwrap();
+    assert!(line.contains(&"--replicas=5".to_string()), "{line:?}");
+}
+
+#[tokio::test]
+async fn without_propose_the_proposing_tools_are_refused_and_named_in_the_instructions() {
+    let (mut client, answer) = Client::initialised(default_server()).await;
+    let instructions = answer["result"]["instructions"].as_str().unwrap();
+    assert!(
+        instructions.contains("relish mcp --propose"),
+        "{instructions}"
+    );
+    assert!(
+        instructions.contains("deployer agent token"),
+        "{instructions}"
+    );
+    let answer = client
+        .call(
+            "propose",
+            json!({"kind": "scale", "target": "web", "reason": "r"}),
+        )
+        .await;
+    let message = answer["error"]["message"].as_str().unwrap();
+    assert!(message.contains("relish mcp --propose"), "{message}");
+    let answer = client.call("lease_take", json!({})).await;
+    let message = answer["error"]["message"].as_str().unwrap();
+    assert!(message.contains("relish mcp --propose"), "{message}");
+}
+
+#[tokio::test]
+async fn with_propose_the_server_lists_them_and_says_a_person_approves() {
+    let server = Server::new(&Selection {
+        propose: true,
+        ..Selection::default()
+    })
+    .unwrap();
+    let (mut client, answer) = Client::initialised(server).await;
+    let instructions = answer["result"]["instructions"].as_str().unwrap();
+    assert!(
+        instructions.contains("a person or an admin's policy approves"),
+        "{instructions}"
+    );
+    let listed = client.request("tools/list", json!({})).await;
+    let names: Vec<&str> = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"propose"), "{names:?}");
+    assert!(names.contains(&"lease_take"), "{names:?}");
+}
+
+/// From an admin context, `--propose` sends a deployer agent token of its
+/// own, kept apart from the read-only one.
+#[tokio::test]
+async fn a_proposing_server_from_an_admin_context_sends_its_own_proposing_token() {
+    let directory = tempfile::tempdir().unwrap();
+    let (url, seen) = token_cluster(false, &[]).await;
+    crate::relish::client::set_cli_endpoint(Some(url.clone())).unwrap();
+    let managed = Managed::new(
+        directory.path().join("mcp-propose-token.json"),
+        credentials::Scope {
+            owner: "laptop".to_string(),
+            endpoint: "https://127.0.0.1:19117".to_string(),
+            namespace: None,
+            purpose: credentials::Purpose::Propose,
+        },
+        crate::relish::client::BunClient::new_with_token(&url, Some(CONTEXT_ADMIN)),
+    );
+    let server = Server::new(&Selection {
+        propose: true,
+        ..Selection::default()
+    })
+    .unwrap()
+    .with_managed(managed);
+    server
+        .call("proposals", &serde_json::Map::new())
+        .await
+        .unwrap();
+    assert!(directory.path().join("mcp-propose-token.json").exists());
+    assert!(!directory.path().join("mcp-token.json").exists());
+    let seen = seen.lock().await.clone();
+    assert!(
+        seen.iter()
+            .any(|(path, bearer)| path == "/v1/proposals" && bearer == "rbrg_minted_0"),
+        "{seen:?}"
+    );
 }

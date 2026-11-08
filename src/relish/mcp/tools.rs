@@ -14,6 +14,12 @@
 //! a tool that could would turn a prompt injection in a log line into an
 //! action. The tools/list snapshot in the tests is where a reviewer sees a
 //! new tool arrive.
+//!
+//! [`PROPOSING`] is the one exception, and only under `relish mcp
+//! --propose` (#1682): the commands that write a proposal or a lease to the
+//! council. They change no workload. A person, or a policy an admin wrote,
+//! approves a proposal, and nothing in `relish agent` can approve, reject or
+//! undo directly, so the worst an injected instruction can do is ask.
 
 use std::any::TypeId;
 use std::collections::BTreeSet;
@@ -62,37 +68,82 @@ pub const EXCLUDED: &[Exclusion] = &[
         command: "setup",
         why: "writes the configuration of the user's agents",
     },
-    Exclusion {
+];
+
+/// A `relish agent` command only `relish mcp --propose` offers (#1682).
+#[derive(Debug, Clone, Copy)]
+pub struct Proposing {
+    /// The command, or group of commands, after `relish agent`.
+    pub command: &'static str,
+    /// What it does to the council.
+    pub what: &'static str,
+    /// Whether it only reads.
+    pub read_only: bool,
+}
+
+/// The proposing commands: they write proposals and leases to the council,
+/// never a workload. Plain `relish mcp` names them in its instructions and
+/// refuses them, saying how to get them.
+pub const PROPOSING: &[Proposing] = &[
+    Proposing {
         command: "lease",
-        why: "takes, renews and releases council leases; arrives with `relish mcp --propose` (#1682)",
+        what: "takes, renews and releases leases on apps and namespaces",
+        read_only: false,
     },
-    Exclusion {
+    Proposing {
         command: "propose",
-        why: "writes a proposal to the council; arrives with `relish mcp --propose` (#1682)",
+        what: "proposes a change for a person or an admin's policy to approve",
+        read_only: false,
     },
-    Exclusion {
+    Proposing {
         command: "proposals",
-        why: "reads proposals; arrives with the proposing tools in `relish mcp --propose` (#1682)",
+        what: "reads proposals",
+        read_only: true,
     },
-    Exclusion {
+    Proposing {
         command: "withdraw",
-        why: "withdraws a proposal; arrives with `relish mcp --propose` (#1682)",
+        what: "withdraws a proposal it made",
+        read_only: false,
     },
-    Exclusion {
+    Proposing {
         command: "undo",
-        why: "proposes an undo; arrives with `relish mcp --propose` (#1682)",
+        what: "proposes undoing an applied proposal",
+        read_only: false,
     },
 ];
+
+/// The proposing entry for `command`, if there is one; a group covers every
+/// command under it.
+pub fn proposing(command: &str) -> Option<&'static Proposing> {
+    PROPOSING
+        .iter()
+        .find(|entry| covers(entry.command, command))
+}
+
+/// Argument values `relish mcp` never passes, and why: `propose apply`
+/// reads a local TOML file, so through MCP it would read any file the
+/// server can.
+const REFUSED_VALUES: &[(&str, &str, &str, &str)] = &[(
+    "propose",
+    "kind",
+    "apply",
+    "reads a local file, so relish mcp doesn't offer it; propose scale, rollback, stop or \
+     delete, or run `relish agent propose apply` yourself",
+)];
+
+fn covers(group: &str, command: &str) -> bool {
+    command == group
+        || command
+            .strip_prefix(group)
+            .is_some_and(|rest| rest.starts_with(' '))
+}
 
 /// The exclusion for `command`, if there is one. An excluded group, such as
 /// `patch`, excludes every command under it (`patch init`, `patch try`).
 pub fn exclusion(command: &str) -> Option<&'static Exclusion> {
-    EXCLUDED.iter().find(|excluded| {
-        command == excluded.command
-            || command
-                .strip_prefix(excluded.command)
-                .is_some_and(|rest| rest.starts_with(' '))
-    })
+    EXCLUDED
+        .iter()
+        .find(|excluded| covers(excluded.command, command))
 }
 
 /// The shape of one argument's value, as JSON and on the command line.
@@ -166,6 +217,16 @@ pub fn command_name(command: &str) -> Option<CommandName> {
 /// gives a command's `data` schema ([`data_schema`]); the tests pass
 /// stand-ins for both.
 pub fn derive(tree: clap::Command, schema: &dyn Fn(&str) -> Option<Value>) -> Vec<ToolSpec> {
+    derive_with(tree, schema, false)
+}
+
+/// [`derive`], with the [`PROPOSING`] commands too when `propose` is set:
+/// `relish mcp --propose`.
+pub fn derive_with(
+    tree: clap::Command,
+    schema: &dyn Fn(&str) -> Option<Value>,
+    propose: bool,
+) -> Vec<ToolSpec> {
     let mut tree = tree;
     // Building copies global flags (`--max-bytes`, `source --offline`) into
     // every subcommand, so each leaf lists all the flags it accepts.
@@ -175,6 +236,7 @@ pub fn derive(tree: clap::Command, schema: &dyn Fn(&str) -> Option<Value>) -> Ve
     leaves
         .into_iter()
         .filter(|(words, _)| exclusion(&words.join(" ")).is_none())
+        .filter(|(words, _)| propose || proposing(&words.join(" ")).is_none())
         .filter_map(|(words, command)| {
             let name = words.join(" ");
             let data = schema(&name)?;
@@ -217,14 +279,18 @@ fn tool_spec(words: &[String], command: &clap::Command, data: Value) -> ToolSpec
         .unwrap_or_else(|| format!("relish agent {name}"));
     let mut input = input_schema(command);
     with_budget_default(&mut input, &name);
+    without_refused_values(&mut input, &name);
     let mut tool = Tool::new(tool_name(&name), description, Arc::new(input));
     tool.title = Some(format!("relish agent {name}"));
     tool.output_schema = Some(Arc::new(output_schema(data)));
+    // A proposing tool writes a council record, never a workload, so it
+    // isn't destructive; it isn't read-only or idempotent either.
+    let writes = proposing(&name).is_some_and(|entry| !entry.read_only);
     tool.annotations = Some(
         ToolAnnotations::with_title(format!("relish agent {name}"))
-            .read_only(true)
+            .read_only(!writes)
             .destructive(false)
-            .idempotent(true)
+            .idempotent(!writes)
             // The tool's world is this binary and the cluster it points at.
             .open_world(false),
     );
@@ -307,6 +373,22 @@ fn input_schema(command: &clap::Command) -> JsonObject {
     }
     schema.insert("additionalProperties".into(), json!(false));
     schema
+}
+
+/// Take [`REFUSED_VALUES`] out of a command's `enum`s, so the schema
+/// offers only what `relish mcp` passes.
+fn without_refused_values(schema: &mut JsonObject, command: &str) {
+    for (refused_command, property, value, _) in REFUSED_VALUES {
+        if *refused_command != command {
+            continue;
+        }
+        if let Some(Value::Object(properties)) = schema.get_mut("properties")
+            && let Some(Value::Object(property)) = properties.get_mut(*property)
+            && let Some(Value::Array(choices)) = property.get_mut("enum")
+        {
+            choices.retain(|choice| choice != value);
+        }
+    }
 }
 
 /// `--max-bytes` has no clap default because the default depends on the
@@ -427,6 +509,8 @@ pub struct Selection {
     pub no_logs: bool,
     /// Fix every `namespace` argument to this one.
     pub namespace: Option<String>,
+    /// Offer the [`PROPOSING`] tools too: `relish mcp --propose`.
+    pub propose: bool,
 }
 
 /// Why a [`Selection`] can't be served.
@@ -505,6 +589,13 @@ impl ToolSpec {
     /// read as another flag, and positionals go after `--` for the same
     /// reason. clap then parses the line exactly as it parses a typed one.
     pub fn command_line(&self, arguments: &JsonObject) -> Result<Vec<String>, String> {
+        for (command, property, value, why) in REFUSED_VALUES {
+            if self.command == *command
+                && arguments.get(*property).and_then(Value::as_str) == Some(*value)
+            {
+                return Err(format!("{property} {value} {why}"));
+            }
+        }
         for key in arguments.keys() {
             if let Some(value) = self.pinned.get(key) {
                 return Err(format!(

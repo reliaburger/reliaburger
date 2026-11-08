@@ -230,6 +230,8 @@ pub struct Compatibility {
 /// An instance status carries `age_seconds`, and the relay forwards
 /// `/v1/cluster/summary/node`, for `relish apps` and `relish nodes`.
 /// The summary's council section names `other_leaders`, a split brain.
+/// Guardrails (#1682): a policy's `applies_to = "proposals"` and `action =
+/// "approve"`, and a finding's `kind = "proposal"`.
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 58,
     state: 74,

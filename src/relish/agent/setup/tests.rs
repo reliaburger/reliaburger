@@ -554,6 +554,7 @@ fn preview() -> String {
         owner: "laptop".to_string(),
         endpoint: "https://127.0.0.1:19117".to_string(),
         namespace: None,
+        purpose: crate::relish::mcp::credentials::Purpose::Read,
     };
     crate::relish::mcp::credentials::shape(&scope, None, 1_790_000_000)
 }

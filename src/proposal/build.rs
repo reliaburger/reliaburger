@@ -84,6 +84,21 @@ pub fn build(
     now_unix_ms: u64,
     fill: impl Fn(&AppId, &AppSpec) -> AppSpec,
 ) -> Result<Proposal, ProposalRefusal> {
+    build_with_history(desired, request, author, now_unix_ms, fill, None)
+}
+
+/// [`build`], with the rollback target the nodes' deploy history gives
+/// (`crate::bun::cluster_view::rollback_target`), for when the council
+/// has no released spec to go back to: after a crash loop, say. A person's
+/// `relish rollback` falls back the same way, so both pick the same spec.
+pub fn build_with_history(
+    desired: &DesiredState,
+    request: &ProposalRequest,
+    author: &Principal,
+    now_unix_ms: u64,
+    fill: impl Fn(&AppId, &AppSpec) -> AppSpec,
+    history_target: Option<&AppSpec>,
+) -> Result<Proposal, ProposalRefusal> {
     let namespace = request
         .namespace
         .clone()
@@ -124,7 +139,8 @@ pub fn build(
                 return invalid("this kind names an app in `app`");
             };
             let app = AppId::new(name, &namespace);
-            let (kind, change) = one_app_change(desired, one_app, &app, request.replicas)?;
+            let (kind, change) =
+                one_app_change(desired, one_app, &app, request.replicas, history_target)?;
             (kind, namespace, vec![change])
         }
     };
@@ -233,6 +249,7 @@ fn one_app_change(
     kind: RequestKind,
     app: &AppId,
     replicas: Option<u32>,
+    history_target: Option<&AppSpec>,
 ) -> Result<(ProposalKind, AppChange), ProposalRefusal> {
     let before = current_app(desired, app);
     let Some(spec) = before.spec.as_deref().cloned() else {
@@ -279,9 +296,13 @@ fn one_app_change(
         }
         RequestKind::Delete => (ProposalKind::Delete, AppRevision::new(None, false)),
         RequestKind::Rollback => {
-            let target = desired.rollouts.get(app).and_then(|rollouts| {
-                crate::bun::cluster_view::released_rollback_target(rollouts, &spec)
-            });
+            let target = desired
+                .rollouts
+                .get(app)
+                .and_then(|rollouts| {
+                    crate::bun::cluster_view::released_rollback_target(rollouts, &spec)
+                })
+                .or_else(|| history_target.cloned());
             let Some(mut target) = target else {
                 return invalid(&format!(
                     "{app} has no released spec that differs from the current one"
@@ -386,15 +407,26 @@ fn undo_changes(
     now_unix_ms: u64,
 ) -> Result<(String, Vec<AppChange>), ProposalRefusal> {
     let original = desired.proposals.undoable(of, now_unix_ms)?;
-    let changes = original
-        .changes
-        .iter()
-        .map(|change| AppChange {
+    // An undo starts from what the original left. If anyone has changed an
+    // app since, putting `before` back would overwrite that change, so the
+    // undo is stale from the start, as a person's direct undo is.
+    let mut changes = Vec::with_capacity(original.changes.len());
+    for change in &original.changes {
+        if current_app(desired, &change.app).revision != change.after.revision {
+            return Err(ProposalRefusal::Stale {
+                app: change.app.to_string(),
+                what: format!(
+                    "after proposal {of} applied; undoing would overwrite that, so propose the \
+                     change you want instead"
+                ),
+            });
+        }
+        changes.push(AppChange {
             app: change.app.clone(),
-            before: current_app(desired, &change.app),
+            before: change.after.clone(),
             after: change.after_undo(),
-        })
-        .collect();
+        });
+    }
     Ok((original.namespace.clone(), changes))
 }
 

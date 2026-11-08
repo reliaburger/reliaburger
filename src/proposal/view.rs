@@ -57,6 +57,10 @@ pub struct ProposalView {
     /// True once the specs have been dropped: the record stays, the undo
     /// doesn't.
     pub compacted: bool,
+    /// What a guardrail policy sees of it, `proposal` and `author`, for
+    /// `relish policy test --proposal` (#1682). Never the reason.
+    #[serde(default)]
+    pub policy_input: crate::policy::PolicyInput,
     /// The author's stated reason, in its own words. Untrusted.
     pub reason: String,
 }
@@ -258,6 +262,7 @@ impl Proposal {
             },
             outcome,
             compacted: self.compacted,
+            policy_input: super::guard::policy_input(self),
             reason: self.reason.clone(),
         }
     }
