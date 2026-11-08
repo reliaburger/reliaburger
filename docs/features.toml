@@ -318,10 +318,10 @@ name = "Task arrays"
 status = "ready"
 since = "0.2.0"
 summary = "The same command run thousands or millions of times, stored as a template and a count rather than a record per task."
-restrictions = "Over a 24-hour run at 31,000 jobs a second, one node's Bun memory was still growing at the end."
+restrictions = "Over a 24-hour run at 31,000 jobs a second, one node's Bun memory was still growing at the end. In 0.2.3's day run one node's job storage filled its disk; 0.2.7's run peaked at 28 MiB and didn't repeat it, but the cause isn't fixed (#1418)."
 issues = [1417, 1418]
 docs = ["docs/manual/14_batch-jobs.md#submit-compact-work", "docs/manual/01_deploy-an-app.md#task-arrays"]
-evidence = "0.2.7 jobs final: median 1,048,576-task array in 140 s. The 0.2.7 memory run (docs/qualification/2026-11-08-v0.2.7-memory-run.md) counted 2,709,190,725 host-job tasks in 24 hours, 31,352 a second; #1417 (0.2.8) is from it. #1418 (0.3.0), one node's job instance storage filling its disk in the 0.2.3 day run, didn't recur: instance storage peaked at 28 MiB."
+evidence = "0.2.7 jobs final: median 1,048,576-task array in 140 s. The 0.2.7 memory run (docs/qualification/2026-11-08-v0.2.7-memory-run.md) counted 2,709,190,725 host-job tasks in 24 hours, 31,352 a second; #1417 (0.2.8) is from it. #1418 (0.3.0) is from the 0.2.3 day run and still open."
 needs_maintainer = "Ready, though #1417 and #1418 only show up in a day-long run at 20,000 to 31,000 a second. Downgrade to Beta if you count them as serious."
 
 [[group.feature]]
