@@ -2093,3 +2093,104 @@ class BunMemory(Evidence):
         self.assertIn("## Bun memory by kind", text)
         self.assertIn("### rb-a-1", text)
         self.assertLess(text.index("## Resource trends"), text.index("## Bun memory by kind"))
+
+
+STALL_JOURNAL = """\
+Nov 07 14:04:11 rb-a-1 bun[812]: bun: agent loop turn took 300 ms in command (status)
+Nov 07 14:04:12 rb-a-1 bun[812]: bun: agent loop stalled 812 ms in follow_up (consumer_sync/journal), 312 ms past its turn deadline; thread snapshot (pid 812, 3 threads):
+Nov 07 14:04:12 rb-a-1 bun[812]: bun:   tid 820 tokio-runtime-w D wchan=jbd2_log_wait_commit syscall=openat(0xffffff9c, 0xffff8000, 0x80241) [ran the agent loop]
+Nov 07 14:04:12 rb-a-1 bun[812]: bun:     jbd2_log_wait_commit+0xc4/0x120
+Nov 07 14:04:12 rb-a-1 runc[999]: unrelated child output
+Nov 07 14:04:12 rb-a-1 bun[812]: bun:   tid 821 tokio-runtime-w S wchan=futex_wait_queue syscall=futex(0xaaaa0000, 0x189, 0x0)
+Nov 07 14:04:12 rb-a-1 bun[812]: bun:   tid 830 loop-watchdog R [this watchdog]
+Nov 07 14:04:12 rb-a-1 bun[812]: bun: end of thread snapshot
+Nov 07 14:04:13 rb-a-1 bun[812]: bun: agent loop turn took 1215 ms in follow_up (consumer_sync/journal): journal write 1215 ms
+Nov 07 15:00:00 rb-a-1 bun[812]: bun: agent loop stalled 900 ms in command (status), 400 ms past its turn deadline; thread snapshot skipped: 10 already this hour
+"""
+
+
+class LoopStalls(Evidence):
+    """#1707: a slow turn's line said the loop woke 700 ms late, but not
+    what held it. Bun's stall watchdog writes a thread snapshot to the
+    journal; the soak keeps every one and each failure bundle gets its own."""
+
+    def test_blocks_are_cut_out_of_a_journal_with_unrelated_lines_left_out(self):
+        blocks = checker.loop_stalls.extract(STALL_JOURNAL)
+        self.assertEqual(len(blocks), 2)
+        first = blocks[0].splitlines()
+        self.assertIn("agent loop stalled 812 ms", first[0])
+        self.assertTrue(first[-1].endswith("bun: end of thread snapshot"))
+        self.assertEqual(len(first), 6)
+        self.assertNotIn("unrelated child output", blocks[0])
+        self.assertNotIn("turn took", blocks[0])
+        self.assertIn("thread snapshot skipped", blocks[1])
+
+    def test_a_block_without_its_closing_line_is_kept_and_marked(self):
+        cut = "\n".join(STALL_JOURNAL.splitlines()[1:4])
+        blocks = checker.loop_stalls.extract(cut)
+        self.assertEqual(len(blocks), 1)
+        self.assertTrue(blocks[0].endswith("(block cut off)"))
+
+    def test_the_guest_report_reads_new_stall_lines_into_their_own_section(self):
+        script = (Path(__file__).parent / "qualify-sustained.sh").read_text()
+        report = script[script.index("guest_report() {"):]
+        report = report[:report.index("\n}\n")]
+        stalls = report[report.index("section loop_stalls"):report.index("section ingress")]
+        self.assertIn("--cursor-file=/var/tmp/soak-stall.cursor", stalls)
+        self.assertIn("agent loop stalled", stalls)
+        # A light check drops everything from the ingress section on; the
+        # stall section comes before it, so light checks carry it too.
+        self.assertLess(report.index("section loop_stalls"), report.index("section ingress"))
+
+    def test_every_check_appends_its_blocks_and_the_record_lists_them(self):
+        directory = self.snapshot()
+        (directory / "loop_stalls-rb-a-1.txt").write_text(STALL_JOURNAL)
+        self.evaluate(directory)
+        self.evaluate(self.snapshot(ts=NOW + 60))
+        rows = checker.loop_stalls.read(self.evidence)
+        self.assertEqual([(row["node"], row["ts"]) for row in rows], [("rb-a-1", NOW), ("rb-a-1", NOW)])
+        (self.evidence / "metadata.json").write_text(json.dumps({
+            "schedule": "none", "started_at": NOW, "finished_at": NOW + 600, "cycles": 0}))
+        record = self.evidence / "record.md"
+        checker.render(self.evidence, record)
+        text = record.read_text()
+        self.assertIn("## Agent loop stalls", text)
+        self.assertIn("- Stalls: rb-a-1 2", text)
+        # The blocked thread is listed; the sleeping one and the watchdog aren't.
+        self.assertIn("tid 820 tokio-runtime-w D wchan=jbd2_log_wait_commit", text)
+        self.assertNotIn("tid 821", text)
+        self.assertNotIn("tid 830", text)
+
+    def test_a_run_without_stalls_says_so(self):
+        self.assertIn("- None recorded.", checker.loop_stalls.section(self.evidence))
+
+    def test_a_failure_bundle_gets_the_stall_blocks_from_its_journal(self):
+        import subprocess
+        release = Path(__file__).parent
+        script = (release / "qualify-sustained.sh").read_text()
+        bundle = script[script.index("record_failure() {"):script.index("setup_fail() {")]
+        journal = self.evidence / "journal-fixture.txt"
+        journal.write_text(STALL_JOURNAL)
+        stubs = f"""
+checker={release / 'sustained_check.py'}
+check() {{ python3 "$checker" "$@"; }}
+evidence={self.evidence}
+vm=([1]=rb-a-1 [2]=rb-a-2 [3]=rb-a-3)
+down=(0 0 0 1)
+gsh() {{ if [ "$1" = 1 ]; then cat {journal}; fi; }}
+api_get() {{ :; }}
+memory_report() {{ :; }}
+rel() {{ :; }}
+event() {{ :; }}
+say() {{ :; }}
+mkdir -p "$evidence/failures"
+"""
+        subprocess.run(["bash", "-c", stubs + bundle + "\nrecord_failure settle-check 'slow turn'"],
+                       check=True, timeout=60, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        failure = self.evidence / "failures" / "1"
+        stalls = (failure / "loop-stalls-rb-a-1.txt").read_text()
+        self.assertIn("tid 820 tokio-runtime-w D wchan=jbd2_log_wait_commit", stalls)
+        self.assertIn("thread snapshot skipped", stalls)
+        self.assertTrue((failure / "journal-rb-a-1.txt").exists())
+        # No stall in a node's journal: no empty file beside it.
+        self.assertFalse((failure / "loop-stalls-rb-a-2.txt").exists())

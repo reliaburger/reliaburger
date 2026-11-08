@@ -906,7 +906,7 @@ The `?` converts a `CryptoError` into a `RaftEncryptionError` on the way out, th
 
 Be clear about what this buys. The master key lives on the node, in `master.key`, because every node needs it to unwrap CA keys and authenticate gossip. So the encryption protects a stolen disk, a copied `log.redb` or a careless backup of the data directory. It doesn't protect against someone with root on a running node: they can read the master key as easily as Bun can. And it only covers log entries. The Raft snapshot, `snapshot.redb`, which holds token hashes, wrapped keys and the whole desired state, is written in plaintext, and so are Raft's vote and log-position records. A cluster started without a master key writes a plaintext log too.
 
-We decided to say exactly that rather than extend the encryption now. The snapshot would need the same key, which sits on the same host, so encrypting it with the master key would add work without changing who can read it. The real fix is a key the host's root account can't simply read, sealed to a TPM or derived from the node's hardware identity, and that's 0.3.0 appliance work ([#402](https://github.com/reliaburger/reliaburger/issues/402)).
+We decided to say exactly that rather than extend the encryption now. The snapshot would need the same key, which sits on the same host, so encrypting it with the master key would add work without changing who can read it. The real fix is a key the host's root account can't simply read, sealed to a TPM or derived from the node's hardware identity, and that's planned, though no issue tracks it yet.
 
 ## eBPF firewall wiring
 

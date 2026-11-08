@@ -151,7 +151,12 @@ h2:hover .permalink, .permalink:focus-visible, .permalink[data-copied] { opacity
 .why-dot[aria-current="true"]::before { background: var(--accent); border-color: var(--accent); }
 /* Only the animated shapes scale about their own centre: transform-origin also
    moves the rotate() in a transform attribute, which the seeds and timer use. */
-.why-layer, .why-addon, .why-sparkle, .why-ripple, .why-council, .why-onion, .why-task, .why-victim { transform-box: fill-box; transform-origin: center; }
+.why-layer, .why-addon, .why-sparkle, .why-ripple, .why-council, .why-onion, .why-task, .why-victim, .why-sent, .why-back, .why-blink { transform-box: fill-box; transform-origin: center; }
+.why-type { stroke-dasharray: 120; animation: why-type 6s ease-out infinite backwards; }
+.why-sent, .why-back { opacity: 0; }
+.why-sent { animation: why-send 6s ease-in-out infinite; }
+.why-back { animation: why-return 6s ease-in-out infinite; }
+.why-blink { animation: why-blink 6s ease-in-out infinite; }
 .why-addon { opacity: 0; animation: why-addon 9s ease-in-out infinite; }
 .why-layer { animation: why-assemble 9s ease-in-out infinite; }
 .why-sparkle { animation: why-twinkle 3s ease-in-out infinite; }
@@ -173,6 +178,10 @@ h2:hover .permalink, .permalink:focus-visible, .permalink[data-copied] { opacity
 .why-line { stroke: #e8c08f; animation: why-read 6s linear infinite; }
 .why-lens { animation: why-scan 6s ease-in-out infinite; }
 .why-reply { transform-box: fill-box; transform-origin: 20% 100%; animation: why-answer 6s ease-out infinite; }
+@keyframes why-type { 0% { stroke-dashoffset: 120; opacity: 1; } 8%, 72% { stroke-dashoffset: 0; opacity: 1; } 80%, 100% { stroke-dashoffset: 0; opacity: 0; } }
+@keyframes why-send { 0% { opacity: 0; transform: none; } 4% { opacity: 1; transform: none; } 16% { opacity: 1; transform: translate(-24px, 0); } 20%, 100% { opacity: 0; transform: translate(-24px, 0); } }
+@keyframes why-return { 0%, 50% { opacity: 0; transform: none; } 54% { opacity: 1; transform: none; } 66% { opacity: 1; transform: translate(24px, 0); } 70%, 100% { opacity: 0; transform: translate(24px, 0); } }
+@keyframes why-blink { 0%, 68%, 74%, 100% { transform: none; } 71% { transform: scaleY(.15); } }
 @keyframes why-assemble {
   0%, 12% { transform: translate(var(--dx), var(--dy)) scale(.45); }
   40%, 86% { transform: none; }

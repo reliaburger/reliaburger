@@ -785,10 +785,32 @@ esac
                 expected = "darwin" if platform.startswith("macos-") else "linux"
                 self.assertEqual(manifest["compatibility"]["platforms"], [expected])
                 self.assertEqual(manifest["server"]["entry_point"], "server/relish")
-                for field in ("manifest_version", "name", "description", "server", "tools"):
+                for field in ("manifest_version", "name", "description", "server", "tools", "user_config"):
                     self.assertEqual(manifest[field], template[field])
                 digest = hashlib.sha256(path.read_bytes()).hexdigest()
                 self.assertIn(f"{digest}  {path.name}\n", sums)
+
+    def test_each_bundle_is_signed_with_the_release_key_like_every_binary(self):
+        # The same envelope as `relish-<platform>.sig`. MCPB clients don't
+        # read it: they only recognise a certificate signature inside the
+        # bundle. It lets anyone check the bundle against the release key.
+        self.package()
+        for platform in PLATFORMS["relish"]:
+            with self.subTest(platform=platform):
+                path = self.assets / mcpb_name(platform)
+                envelope = json.loads(path.with_name(path.name + ".sig").read_text())
+                self.assertEqual(set(envelope), {"schema", "sha256", "embedded", "external"})
+                self.assertEqual(envelope["schema"], 1)
+                self.assertIsNone(envelope["external"])
+                self.assertEqual(envelope["sha256"], hashlib.sha256(path.read_bytes()).hexdigest())
+                self.assertTrue(self.verify_signature(path.read_bytes(), envelope["embedded"]))
+                self.assertFalse(self.verify_signature(path.read_bytes() + b"x", envelope["embedded"]))
+
+    def test_a_failed_bundle_signature_writes_no_bundle_or_signature(self):
+        (self.assets / "bun-linux-aarch64").unlink()
+        with self.assertRaises(ValueError):
+            self.package()
+        self.assertEqual(list(self.assets.glob("*.mcpb*")), [])
 
     def test_bun_gets_no_bundle(self):
         self.package()

@@ -589,8 +589,8 @@ real world it touched.
 ## Coverage is a map, not a target
 
 `cargo-llvm-cov` instruments the compiled programme and records which source regions execute.
-Our `make coverage` runs the portable suite once under instrumentation and emits LCOV plus an
-HTML report. On Linux CI that same run is the test gate, so we don't pay for the suite twice. The first combined Linux CI measurement covered
+Our `make coverage` runs the portable suite once under instrumentation and writes an LCOV
+report; `make coverage-html` turns the same counters into HTML when someone wants to read them. On Linux CI that same run is the test gate, so we don't pay for the suite twice. The first combined Linux CI measurement covered
 79.65% of lines, so CI starts at 78.65%, one percentage point lower, and can ratchet upwards.
 
 Instrumented programmes write their counters to a `.profraw` file as they exit. Our
@@ -922,6 +922,15 @@ links a successor. Re-running those loops for the register paid for itself strai
 one test whose old cause was fixed failed twice in a hundred runs for a new one, a stop that
 races the child's own exit on macOS.
 
+Some flakes are tests that quietly share the machine. The port allocator skips any port
+something on the host already listens on, so a published port never shadows a host daemon.
+Its bookkeeping tests built the allocator the same way, over the fixed range 10000 to 10003,
+and one failed on a macOS runner with the range "exhausted" after only two allocations
+(#1711): something else held one of those ports. Those tests now opt out of the probe with
+`without_host_probe()`, because they check counting, not the host. One test keeps the probe,
+and it binds an ephemeral port itself first, so the port the probe must refuse is one the test
+holds, whatever else the runner is doing.
+
 ### Light checks on the train, everything in the queue
 
 By 0.2.1 the waiting was back. Every pull request into a train got the whole of CI, and a
@@ -1069,6 +1078,52 @@ filterset, evaluates it against each case's binary and test name, and keeps `por
 exactly where the job will run the case. Every one keeps `portable-linux`. A test fails if the
 manifest or the qualification matrix ever disagrees with the filterset, so narrowing what
 macOS proves is a change somebody has to review, not something that happens by accident.
+
+With macOS off the light set, portable Linux was every train PR's critical path, at about 30
+minutes in the five green train PRs before
+[#1723](https://github.com/reliaburger/reliaburger/issues/1723). Only about 15 of those
+minutes were the build and the tests. The rest was three things the coverage run didn't need.
+
+The doctests and the nightly-signing key test ran after it, in the same job, and took about six
+minutes between them. Neither is instrumented, so neither could reuse the coverage build;
+they only waited for it. They now run in their own job, `doctests and feature tests`, which
+starts when portable Linux does and finishes long before it.
+
+The coverage run ended with three `cargo llvm-cov report` calls: LCOV, HTML and the floor. Each
+call merges every `.profraw` file into one profile and then reads every test binary's coverage
+map again, so each cost about two minutes. One call does both jobs that matter, because
+`--fail-under-lines` works with any output format: cargo-llvm-cov writes the LCOV file, then
+asks `llvm-cov` for a JSON summary and compares its line percentage with the floor.
+
+```make
+$(COVERAGE_REPORT) --lcov --output-path target/coverage/lcov.info --fail-under-lines $(COVERAGE_MIN_LINES)
+```
+
+Nobody opens the HTML on a pull request, so CI writes it only on pushes to `main` and the
+nightly, with `make coverage-html`, from the counters the run already left behind. The floor
+didn't move, and the evidence owner still checks it: `coverage_owner.py` pins the recipe stage
+by stage, so it now expects three stages instead of five, and the floor check is part of the
+last one.
+
+On the change's own pull request, portable Linux took 17.0 minutes, its coverage step 15.3
+against 23 to 27 before, and the new job 5.7. The light set's critical path went from about
+30 minutes to about 17.
+
+Two smaller fixes came with it
+([#1724](https://github.com/reliaburger/reliaburger/issues/1724)). `make ci` now runs its
+quick checks first: formatting, the ignored-test owners and the CI scripts' own tests take a
+minute or two, and a slip in one of them used to show only after Clippy and the whole suite
+had compiled. Make runs a target's prerequisites in the order they're listed (unless you pass
+`-j`), so the fix is the order of one line. The lint job in CI does the same, running `rustfmt`
+before it restores a cache.
+
+The other was the cache quota. GitHub keeps 10 GB of caches per repository and quietly evicts
+the least recently used beyond that, and we were at 9.57 GB. A cache saved on a pull request
+that has since merged can never be restored again, but it still counts, and it can push out
+`main`'s, which every train PR restores. A nightly workflow now deletes caches whose pull
+request is closed, whose branch is gone, or which a newer cache of the same family on the
+same ref has replaced. The rule is a pure function, `stale(caches, open_pulls, branches)`,
+tested on fixtures, with the `gh` calls kept at the edges so it can be tested without network access.
 
 ### A release gate that fits in a week
 
@@ -7410,6 +7465,136 @@ so for some 700 ms nothing polled the turn's future or checked its timer.
 That's #1606 again: a late wake-up, not a missing deadline. This time no
 disk-pressure prune ran in that second, so the hunt for what held the
 runtime goes on.
+
+#### Catching the stall in the act
+
+The list got shorter, and 0.2.7's jobs final still found a turn that ran
+late (#1707):
+
+```
+14:04:12 bun: agent loop turn took 1215 ms in follow_up (consumer_sync/journal): journal write 1215 ms
+14:04:12 bun: a discovery journal write took 1219 ms; the agent loop went on meanwhile
+```
+
+Same shape as #1606: the write was handed off, so the deadline fired, but
+about 700 ms late. This time nothing else logged in that second. No prune,
+no export. Something held a worker, and the log can't say what, because by
+the time a turn ends and its line gets written, whatever held it has let
+go.
+
+The best theory has to do with how tokio schedules. Each worker thread has
+a LIFO slot, a one-task fast lane: when a task wakes another, the woken
+one goes there and runs next on the same worker. It's good for latency,
+since the task's data is still in the cache. But other workers can't steal
+from that slot. If the worker then blocks in a system call, say an
+`open` that waits for the ext4 journal commit a concurrent `fsync` forced,
+the task in its slot waits too, however idle the other workers are. #1742
+moved one such call, a control socket's `bind`, onto the blocking pool.
+Was that the one? A theory isn't evidence. We wanted the next soak to
+catch the stall while it was happening and say which thread held it, and
+in which call.
+
+So Bun now has a watchdog. The loop meter already marks the start and end
+of each turn; it now also stamps a `LoopHeartbeat`:
+
+```rust
+pub fn begin(&self, branch: LoopBranch, detail: Option<&'static str>) {
+    if let Ok(mut slot) = self.detail.lock() {
+        *slot = detail;
+    }
+    self.branch.store(branch as u8, Ordering::Relaxed);
+    self.loop_thread.store(current_thread_id(), Ordering::Relaxed);
+    self.turn_started_ms.store(self.now_ms(), Ordering::Release);
+}
+```
+
+The fields are atomics (`AtomicU64`, `AtomicU8`, `AtomicU32`): integers
+that two threads can read and write without a lock, like C11's
+`_Atomic` or Go's `sync/atomic`. Each operation names an `Ordering`, which
+says what other memory the operation makes visible. `Relaxed` promises
+only that the value itself is never torn. The last store is `Release`, and
+the watchdog's load of it is `Acquire`: once the watchdog sees the new
+start time, it also sees every store made before it, the branch and the
+thread id included. The detail is a `&'static str`, a pointer and a length,
+which no atomic holds, so it sits in a `std::sync::Mutex`. That's allowed
+here: the loop holds it to store one pointer, the watchdog to copy one,
+and neither holds it across an `.await`.
+
+`current_thread_id` asks Linux for the thread's id once per thread:
+
+```rust
+thread_local! {
+    static TID: u32 = u32::try_from(nix::unistd::gettid().as_raw()).unwrap_or(0);
+}
+TID.with(|tid| *tid)
+```
+
+`thread_local!` is Rust's version of C's `__thread`: each thread gets its
+own `TID`, set the first time that thread reads it. `gettid` is a real
+system call, and a turn shouldn't make one for an answer that never
+changes.
+
+The watchdog itself is a `std::thread`, not a tokio task. That's the whole
+point: a task would be queued behind the same blocked worker it's meant
+to catch. Every 100 ms it reads the heartbeat, and an `IncidentTracker`
+decides what to do. A turn that has run past the threshold (750 ms by
+default, `[node] loop_stall_snapshot_ms`) is a stall. Each stall gets one
+snapshot, however long it lasts; the watchdog re-arms when the loop gets
+to a new turn, and takes at most ten snapshots an hour. The tracker never
+reads a clock. It takes "now" and the turn's start time as arguments, so
+its tests (`a_turn_past_the_threshold_is_captured_once`,
+`the_watchdog_rearms_once_the_stalled_turn_ends`,
+`snapshots_past_the_hourly_limit_are_rate_limited`) are plain function
+calls, with no sleeping and no flakes.
+
+A snapshot reads every thread of Bun from `/proc/self/task/<tid>/`: its
+name, its state from `stat` (`R` running, `S` sleeping, `D` in
+uninterruptible sleep, which is how a thread waiting on a disk looks), its
+wait channel, the system call in flight with its first arguments, and for
+any thread that isn't sleeping, the kernel stack, cut to twelve frames.
+It goes to stderr, and so to the journal, as one block:
+
+```
+bun: agent loop stalled 812 ms in follow_up (consumer_sync/journal), 312 ms past its turn deadline; thread snapshot (pid 4242, 41 threads):
+bun:   tid 4250 tokio-runtime-w D wchan=jbd2_log_wait_commit syscall=openat(0xffffff9c, 0xffff8000, 0x80241) [ran the agent loop]
+bun:     jbd2_log_wait_commit+0xc4/0x120
+bun:     ...
+bun:   tid 4251 tokio-runtime-w S wchan=futex_wait_queue syscall=futex(0xaaaa0000, 0x189, 0x0)
+bun:   tid 4260 loop-watchdog R [this watchdog]
+bun: end of thread snapshot
+```
+
+That example is made up, but it's the shape of the answer we hope for:
+the worker that last ran the loop, in `D`, in `openat`, waiting for a
+journal commit. Kernel stacks need root, which Bun has on a node; without
+it each one says `permission denied` and the rest of the snapshot still
+comes out. The whole block is capped at 32 KiB.
+
+What about the userspace stack, the Rust function each thread is in? You
+can't read another thread's stack from outside it. The usual way is to
+signal every thread and walk its stack in the signal handler, which takes
+`unsafe` code, calls the unwinder where only async-signal-safe functions
+are allowed, and could hang the process we're trying to diagnose. The
+kernel's view is enough for this bug: which thread, which syscall, waiting
+on what.
+
+The watchdog's integration test does on purpose what we suspect Bun does
+by accident. It builds a two-worker runtime whose threads are named
+`stall-worker`, begins a turn and then calls `std::thread::sleep` for
+1.5 s on the worker. The test checks for exactly one snapshot, with the
+`stall-worker` thread marked as the loop's, in `S`, in `nanosleep`. Earlier
+we said blocking a test runtime on purpose proves only that tokio behaves
+like tokio. That's still true, and it's what we need here: a worker that
+really is stuck, for the watchdog to see.
+
+The soak keeps the evidence. Each guest report reads the journal lines
+since its last read (a `journalctl` cursor file, like the panic count) into
+a `loop_stalls` section, and the checker keeps every block in
+`loop-stalls.jsonl`. The record lists each stall with the threads that
+were in `D` and the one that ran the loop. A failure bundle also gets
+`loop-stalls-<vm>.txt`, cut from the journal it copies, so the stall sits
+next to the failure it caused. When the next soak stalls, #1707 gets its
+answer from the evidence, not from another theory.
 
 #### The lock that went to the back of the queue
 
