@@ -728,6 +728,7 @@ async fn token_plan(action: Action) -> Option<TokenPlan> {
         owner: context.owner.clone(),
         endpoint: context.endpoint.clone(),
         namespace: None,
+        purpose: credentials::Purpose::Read,
     };
     let now = credentials::now();
     let mut rejected = None;
