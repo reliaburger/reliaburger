@@ -133,7 +133,7 @@ fn stored(name: &str, token: &str, expires_at: Option<u64>) -> StoredToken {
 
 fn read_only(credential: &Credential) -> &str {
     match credential {
-        Credential::ReadOnly(token) => token,
+        Credential::Minted(token) => token,
         Credential::ContextNotAdmin => panic!("expected a read-only token"),
     }
 }

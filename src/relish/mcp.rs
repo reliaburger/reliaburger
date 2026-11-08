@@ -335,7 +335,7 @@ impl Managed {
         };
         state.refused = None;
         match credential {
-            Credential::ReadOnly(token) => {
+            Credential::Minted(token) => {
                 crate::relish::client::set_mcp_token(Some(token.clone()));
                 state.current = Some(token);
             }
