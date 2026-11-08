@@ -13,6 +13,11 @@
 /// default), jobs, or both. `action = "audit"` records a finding without
 /// warning or refusing.
 ///
+/// `applies_to = "proposals"` (#1682) makes a guardrail: it judges an
+/// agent's proposed change rather than a workload, and `action =
+/// "approve"`, which only such a policy may have, approves the proposals
+/// its `match` picks without a person.
+///
 /// Policies are committed to Raft like permissions, and only an admin may
 /// write them. The leader evaluates them (`crate::policy`); the state
 /// machine only stores them. See chapter 18 of the book.
@@ -61,6 +66,10 @@ pub enum PolicyAction {
     /// Accept the apply silently and record the finding in the audit log
     /// (#1119). `relish policy audit` lists it too.
     Audit,
+    /// Approve the proposals `match` picks, with no person (#1682). Only a
+    /// policy that applies to proposals may have it, and it has a `match`
+    /// and nothing else.
+    Approve,
 }
 
 impl PolicyAction {
@@ -70,6 +79,7 @@ impl PolicyAction {
             PolicyAction::Deny => "deny",
             PolicyAction::Warn => "warn",
             PolicyAction::Audit => "audit",
+            PolicyAction::Approve => "approve",
         }
     }
 }
@@ -85,6 +95,9 @@ pub enum PolicyTarget {
     Jobs,
     /// Apps and jobs, seen only as `workload`: the fields they share.
     Both,
+    /// Proposed changes (#1682), seen as `proposal` and `author`: a
+    /// guardrail.
+    Proposals,
 }
 
 impl PolicyTarget {
@@ -94,6 +107,7 @@ impl PolicyTarget {
             PolicyTarget::Apps => "apps",
             PolicyTarget::Jobs => "jobs",
             PolicyTarget::Both => "both",
+            PolicyTarget::Proposals => "proposals",
         }
     }
 
@@ -133,6 +147,18 @@ mod tests {
         let spec: PolicySpec = toml::from_str("deny = 'true'\naction = 'audit'").unwrap();
         assert_eq!(spec.action, PolicyAction::Audit);
         assert!(toml::from_str::<PolicySpec>("deny = 'true'\naction = 'log'").is_err());
+    }
+
+    /// #1682: a guardrail applies to proposals, and only it may approve.
+    #[test]
+    fn proposals_and_approve_are_spelt_in_lowercase() {
+        let spec: PolicySpec =
+            toml::from_str("match = 'true'\napplies_to = 'proposals'\naction = 'approve'").unwrap();
+        assert_eq!(spec.applies_to, PolicyTarget::Proposals);
+        assert_eq!(spec.action, PolicyAction::Approve);
+        let back = toml::to_string(&spec).unwrap();
+        assert!(back.contains("applies_to = \"proposals\""), "{back}");
+        assert!(back.contains("action = \"approve\""), "{back}");
     }
 
     /// #1119: a policy without `applies_to` judges apps, as every policy

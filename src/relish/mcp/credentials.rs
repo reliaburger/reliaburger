@@ -12,6 +12,13 @@
 //! a cluster that won't make a read-only token is an error, not a reason to
 //! fall back.
 //!
+//! `relish mcp --propose` (#1682) keeps a second token the same way, in
+//! `mcp-propose-token.json` (or `mcp-propose-token-<namespace>.json`): an
+//! agent token with the deployer role, which may propose changes and take
+//! leases but, being an agent's, changes nothing directly. Both tokens are
+//! agent tokens, so the audit log names them as an agent's. Which one a
+//! server wants is its [`Purpose`].
+//!
 //! Making a token happens under a file lock beside the token file
 //! (`mcp-token.lock`), so several `relish mcp` processes starting together
 //! make one token between them: the first makes it, the rest find it saved.
@@ -107,6 +114,45 @@ pub struct Scope {
     pub endpoint: String,
     /// `relish mcp --namespace`: the token is confined to it.
     pub namespace: Option<String>,
+    /// What the token is for.
+    pub purpose: Purpose,
+}
+
+/// What `relish mcp`'s token is for, which decides its role and file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Purpose {
+    /// Reading: a read-only agent token, for plain `relish mcp`.
+    Read,
+    /// Proposing (#1682): a deployer agent token, for `relish mcp
+    /// --propose`. The cluster lets an agent token's deployer role propose
+    /// and take leases, and nothing else.
+    Propose,
+}
+
+impl Purpose {
+    /// The role the token is made with.
+    pub fn role(self) -> &'static str {
+        match self {
+            Purpose::Read => "read-only",
+            Purpose::Propose => "deployer",
+        }
+    }
+
+    /// The file name before any `-<namespace>` and `.json`.
+    fn file_stem(self) -> &'static str {
+        match self {
+            Purpose::Read => "mcp-token",
+            Purpose::Propose => "mcp-propose-token",
+        }
+    }
+
+    /// What follows [`TOKEN_NAME_PREFIX`] in the token's name.
+    fn name_infix(self) -> &'static str {
+        match self {
+            Purpose::Read => "",
+            Purpose::Propose => "propose-",
+        }
+    }
 }
 
 /// The read-only token as stored on disk. No `Debug`, so diagnostics can't
@@ -219,7 +265,7 @@ pub fn shape(scope: &Scope, stored: Option<&StoredToken>, now: u64) -> String {
         owner: scope.owner.clone(),
         endpoint: scope.endpoint.clone(),
         namespace: scope.namespace.clone(),
-        name: token_name(now),
+        name: token_name(scope.purpose, now),
         token: String::new(),
         expires_at: Some(now.saturating_add(TOKEN_TTL_DAYS * 24 * 60 * 60)),
     });
@@ -228,14 +274,18 @@ pub fn shape(scope: &Scope, stored: Option<&StoredToken>, now: u64) -> String {
     serde_json::to_string_pretty(&preview).unwrap_or_default()
 }
 
-/// The name for a token made at `now` by this process.
-fn token_name(now: u64) -> String {
-    format!("{TOKEN_NAME_PREFIX}{now}-{}", std::process::id())
+/// The name for a token for `purpose` made at `now` by this process.
+fn token_name(purpose: Purpose, now: u64) -> String {
+    format!(
+        "{TOKEN_NAME_PREFIX}{}{now}-{}",
+        purpose.name_infix(),
+        std::process::id()
+    )
 }
 
-/// Every token file beside `context`: `mcp-token.json` and each
-/// `mcp-token-<namespace>.json`, sorted by name. None when the directory
-/// isn't there.
+/// Every token file beside `context`: `mcp-token.json`,
+/// `mcp-propose-token.json`, and each one's `-<namespace>.json`, sorted by
+/// name. None when the directory isn't there.
 pub fn files_beside(context: &Path) -> Result<Vec<PathBuf>, CredentialError> {
     let Some(directory) = context.parent() else {
         return Ok(Vec::new());
@@ -255,11 +305,14 @@ pub fn files_beside(context: &Path) -> Result<Vec<PathBuf>, CredentialError> {
         let Some(name) = name.to_str() else {
             continue;
         };
-        let token_file = name == "mcp-token.json"
-            || name
-                .strip_prefix("mcp-token-")
+        let token_file = [Purpose::Read, Purpose::Propose].iter().any(|purpose| {
+            let stem = purpose.file_stem();
+            name.strip_prefix(stem)
                 .and_then(|rest| rest.strip_suffix(".json"))
-                .is_some_and(valid_namespace);
+                .is_some_and(|rest| {
+                    rest.is_empty() || rest.strip_prefix('-').is_some_and(valid_namespace)
+                })
+        });
         if token_file {
             files.push(context.with_file_name(name));
         }
@@ -268,11 +321,21 @@ pub fn files_beside(context: &Path) -> Result<Vec<PathBuf>, CredentialError> {
     Ok(files)
 }
 
-/// Where the token for `namespace` lives, beside `context`.
+/// Where the read-only token for `namespace` lives, beside `context`.
 pub fn path_beside(context: &Path, namespace: Option<&str>) -> Result<PathBuf, CredentialError> {
+    path_for(context, namespace, Purpose::Read)
+}
+
+/// Where the token for `purpose` and `namespace` lives, beside `context`.
+pub fn path_for(
+    context: &Path,
+    namespace: Option<&str>,
+    purpose: Purpose,
+) -> Result<PathBuf, CredentialError> {
+    let stem = purpose.file_stem();
     let name = match namespace {
-        None => "mcp-token.json".to_string(),
-        Some(namespace) if valid_namespace(namespace) => format!("mcp-token-{namespace}.json"),
+        None => format!("{stem}.json"),
+        Some(namespace) if valid_namespace(namespace) => format!("{stem}-{namespace}.json"),
         Some(namespace) => return Err(CredentialError::BadNamespace(namespace.to_string())),
     };
     Ok(context.with_file_name(name))
@@ -345,15 +408,17 @@ pub async fn obtain(
         TokenAccess::Lesser => return Ok((Credential::ContextNotAdmin, Obtained::NotNeeded)),
         TokenAccess::Rejected => return Err(CredentialError::ContextRejected),
     }
-    let name = token_name(now);
+    let name = token_name(scope.purpose, now);
     let request = TokenRequest {
         name: name.clone(),
-        role: "read-only".to_string(),
+        role: scope.purpose.role().to_string(),
         apps: None,
         namespaces: scope.namespace.clone().map(|namespace| vec![namespace]),
         lifetime: TokenLifetime::Days(TOKEN_TTL_DAYS),
         inherit_permissions: false,
-        agent: false,
+        // An agent's MCP connection carries an agent token (#1682): the
+        // audit log names it as one, and a deployer one only proposes.
+        agent: true,
     };
     let issued = bounded(admin.token_create(&request)).await?;
     let fresh = StoredToken {

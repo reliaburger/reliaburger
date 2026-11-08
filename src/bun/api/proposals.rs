@@ -287,10 +287,17 @@ pub(super) async fn proposal_create_handler(
         "proposal.created",
         &created,
         format!(
-            "{} proposed {} ({})",
+            "{} proposed {} ({}){}",
             author.name,
             created.id,
-            created.summary.first().cloned().unwrap_or_default()
+            created.summary.first().cloned().unwrap_or_default(),
+            // Built-in rule 3 kept it for a person although a policy
+            // matched: say so, so nobody wonders why it waits.
+            verdict
+                .held
+                .as_deref()
+                .map(|held| format!("; {held}"))
+                .unwrap_or_default()
         ),
     )
     .await;
@@ -339,9 +346,10 @@ async fn rollback_history_target(
     let namespace = request.namespace.as_deref().unwrap_or("default");
     let app = crate::meat::AppId::new(request.app.as_deref()?, namespace);
     let current = desired.apps.get(&app)?;
-    let released = desired.rollouts.get(&app).and_then(|rollouts| {
-        crate::bun::cluster_view::released_rollback_target(rollouts, current)
-    });
+    let released = desired
+        .rollouts
+        .get(&app)
+        .and_then(|rollouts| crate::bun::cluster_view::released_rollback_target(rollouts, current));
     if released.is_some() {
         return None;
     }
@@ -642,7 +650,10 @@ async fn answer_outcome(
     };
     let message = message.replace("{}", &proposal.id.to_string());
     record_proposal(state, auth, action, &proposal, message).await;
-    if matches!(proposal.state, crate::proposal::ProposalState::Failed { .. }) {
+    if matches!(
+        proposal.state,
+        crate::proposal::ProposalState::Failed { .. }
+    ) {
         return answer_decided(&proposal);
     }
     Json(proposal.view(now)).into_response()
@@ -666,12 +677,10 @@ fn answer_decided(proposal: &Proposal) -> Response {
         crate::proposal::FailedReason::Lease { lease } => ProposalRefusal::LeaseHeld {
             lease: lease.clone(),
         },
-        crate::proposal::FailedReason::Guardrail { rule, message } => {
-            ProposalRefusal::Guardrail {
-                rule: rule.clone(),
-                message: message.clone(),
-            }
-        }
+        crate::proposal::FailedReason::Guardrail { rule, message } => ProposalRefusal::Guardrail {
+            rule: rule.clone(),
+            message: message.clone(),
+        },
         crate::proposal::FailedReason::Refused { reason } => ProposalRefusal::WrongState {
             id: proposal.id,
             state: format!("failed: {reason}"),
