@@ -552,6 +552,52 @@ pub fn endpoint_overridden() -> bool {
     resolve_endpoint().is_some()
 }
 
+/// Where the bearer token a command sends comes from, which is what `relish`
+/// knows about its role without asking the cluster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenOrigin {
+    /// `--token` or `RELIABURGER_TOKEN`: any role, which only the cluster
+    /// knows.
+    Explicit,
+    /// The managed local context's own token. `relish setup` saves the
+    /// cluster's admin token there, so its role is admin.
+    ContextAdmin,
+    /// No token at all.
+    Absent,
+}
+
+/// Where the token [`BunClient::default_local`] sends comes from.
+///
+/// It reads the flags, the environment and the local context file, and never
+/// the network. An explicit `--endpoint` bypasses the context's
+/// credentials, so with no explicit token there's no token at all.
+pub fn token_origin() -> TokenOrigin {
+    if resolve_token().is_some() {
+        return TokenOrigin::Explicit;
+    }
+    if endpoint_overridden() {
+        return TokenOrigin::Absent;
+    }
+    let context = super::local_context::default_path()
+        .and_then(|path| super::local_context::LocalContext::load(&path));
+    match context {
+        Ok(Some(_)) => TokenOrigin::ContextAdmin,
+        _ => TokenOrigin::Absent,
+    }
+}
+
+/// What the cluster says a token may do, as far as telling admin from the
+/// rest goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenAccess {
+    /// An admin token.
+    Admin,
+    /// A valid token with a lesser role (deployer or read-only).
+    Lesser,
+    /// The cluster rejected it: unknown, expired or revoked (401).
+    Rejected,
+}
+
 /// Precedence rule for [`resolve_token`], split out to be testable without the
 /// process-global flag and environment. A present `--token` flag wins;
 /// otherwise fall back to the environment value, unless it's blank.
@@ -1558,6 +1604,17 @@ impl BunClient {
             .await
             .map_err(classify_error)?;
         parse_typed_response(response).await
+    }
+
+    /// Fetch a test resource lease as its owner sees it: its state and its
+    /// server-side expiry. A lease whose cleanup has finished is gone, and
+    /// the server answers 404.
+    pub async fn test_lease(
+        &self,
+        lease_id: &str,
+    ) -> Result<crate::testkit::lease::TestLease, RelishError> {
+        self.get_typed_json(&format!("/v1/test/leases/{lease_id}"))
+            .await
     }
 
     /// Renew an active test resource lease as its authenticated owner.
@@ -2604,6 +2661,33 @@ impl BunClient {
     /// secret.
     pub async fn token_list(&self) -> Result<TokenListing, RelishError> {
         self.get_typed_json::<TokenListing>("/v1/token/list").await
+    }
+
+    /// Ask the cluster whether this client's token is an admin one.
+    ///
+    /// There's no "who am I" route, so this asks for `GET /v1/token/list`,
+    /// which only admin may read and which changes nothing: 2xx is admin,
+    /// 403 a valid token with a lesser role, 401 a token the cluster
+    /// rejects. Any other answer is an error. The caller bounds the wait.
+    pub async fn token_access(&self) -> Result<TokenAccess, RelishError> {
+        let response = self
+            .http()?
+            .get(format!("{}/v1/token/list", self.base_url))
+            .send()
+            .await
+            .map_err(classify_error)?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(TokenAccess::Admin);
+        }
+        match status.as_u16() {
+            401 => Ok(TokenAccess::Rejected),
+            403 => Ok(TokenAccess::Lesser),
+            code => Err(RelishError::ApiError {
+                status: code,
+                body: response.text().await.unwrap_or_default(),
+            }),
+        }
     }
 
     /// Create an API token via the agent (persisted in Raft). Returns the

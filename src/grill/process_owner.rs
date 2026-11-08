@@ -644,6 +644,19 @@ impl OwnedChild {
     }
 }
 
+impl OwnedChild {
+    /// Send the workload its stop `signal`, then SIGCONT.
+    ///
+    /// A workload that Smoker paused (SIGSTOP) can't run a handler for its
+    /// stop signal until it runs again, so it would sit out its whole grace
+    /// and die by SIGKILL. SIGCONT lets it shut down at once; one that isn't
+    /// stopped ignores it.
+    fn stop(&self, signal: Signal) -> io::Result<()> {
+        self.signal(signal)?;
+        self.signal(Signal::SIGCONT)
+    }
+}
+
 impl Drop for OwnedChild {
     fn drop(&mut self) {
         if !self.reaped {
@@ -680,8 +693,16 @@ fn observe_exit(pid: u32) -> io::Result<Option<Option<i32>>> {
     if observed != pid as i32 {
         return Err(io::Error::other("unexpected child exit identity"));
     }
-    // SAFETY: si_pid identified this child exit event, whose status is valid.
-    let code = (info.si_code == nix::libc::CLD_EXITED).then(|| unsafe { info.si_status() });
+    let code = match info.si_code {
+        // SAFETY: si_pid and si_code identified this child's exit, whose
+        // status is valid.
+        nix::libc::CLD_EXITED => Some(unsafe { info.si_status() }),
+        nix::libc::CLD_KILLED | nix::libc::CLD_DUMPED => None,
+        // XNU reports a stopped child even though only WEXITED was asked for.
+        // A paused workload hasn't exited: reading this as an exit sent the
+        // owner into a blocking wait and silenced it for good.
+        _ => return Ok(None),
+    };
     Ok(Some(code))
 }
 
@@ -741,12 +762,12 @@ fn respond(
                         }
                     }
                 }
-                action => match child.signal(match action {
+                action => match match action {
                     // The app's own stop signal (#1121), from the spec this
                     // owner was launched with.
-                    Action::Terminate => record.launch.spec.stop_signal().to_nix(),
-                    _ => Signal::SIGKILL,
-                }) {
+                    Action::Terminate => child.stop(record.launch.spec.stop_signal().to_nix()),
+                    _ => child.signal(Signal::SIGKILL),
+                } {
                     Ok(()) => serde_json::json!({"accepted": true}),
                     Err(error) => serde_json::json!({"error": error.to_string()}),
                 },
@@ -906,7 +927,11 @@ fn retire_children(owner: &mut OwnedChild) -> io::Result<bool> {
             }
             return Ok(false);
         }
-        owner.child.wait()?;
+        // Never block: this owner is single-threaded, and while it waits it
+        // answers nobody, so nothing could stop or even see the workload.
+        if owner.child.try_wait()?.is_none() {
+            return Ok(false);
+        }
         owner.reaped = true;
         return Ok(true);
     }
@@ -995,6 +1020,137 @@ mod tests {
             owned.child.wait().unwrap();
             owned.reaped = true;
         }
+    }
+
+    /// Whether `ps` reports `pid` as stopped (state `T`).
+    fn is_stopped(pid: u32) -> bool {
+        let output = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout)
+            .trim_start()
+            .starts_with('T')
+    }
+
+    /// Wait up to five seconds for `pid` to be stopped or running.
+    fn wait_until_stopped(pid: u32, stopped: bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while is_stopped(pid) != stopped {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pid {pid} never became stopped={stopped}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A paused workload (Smoker's `pause` sends SIGSTOP) hasn't exited.
+    /// XNU's `waitid` reports a stopped child even when asked only for
+    /// exits, as `CLD_STOPPED`. Read as an exit, it sent the owner into a
+    /// blocking wait on a child that never exited, so the owner stopped
+    /// answering and nothing could stop the workload again.
+    #[test]
+    fn a_stopped_child_has_not_exited() {
+        let child = Command::new("/bin/sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut owned = OwnedChild {
+            child,
+            reaped: false,
+        };
+        let pid = owned.child.id();
+        kill(Pid::from_raw(pid as i32), Signal::SIGSTOP).unwrap();
+        wait_until_stopped(pid, true);
+        // Give the stop event time to be queued for the parent.
+        std::thread::sleep(Duration::from_millis(100));
+
+        assert_eq!(observe_exit(pid).unwrap(), None);
+        #[cfg(target_os = "macos")]
+        assert!(
+            !retire_children_without_waiting(&mut owned),
+            "a stopped child counted as gone"
+        );
+
+        kill(Pid::from_raw(pid as i32), Signal::SIGCONT).unwrap();
+        wait_until_stopped(pid, false);
+        assert_eq!(observe_exit(pid).unwrap(), None);
+        owned.signal(Signal::SIGKILL).unwrap();
+        while observe_exit(pid).unwrap().is_none() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        owned.child.wait().unwrap();
+        owned.reaped = true;
+    }
+
+    /// Run `retire_children` on a thread and fail if it hasn't returned in
+    /// five seconds: the owner is single-threaded, so a retirement that
+    /// blocks stops it serving its control socket.
+    #[cfg(target_os = "macos")]
+    fn retire_children_without_waiting(owned: &mut OwnedChild) -> bool {
+        let pid = Pid::from_raw(owned.child.id() as i32);
+        std::thread::scope(|scope| {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            scope.spawn(move || {
+                let _ = sender.send(retire_children(owned).unwrap());
+            });
+            let retired = receiver.recv_timeout(Duration::from_secs(5));
+            if retired.is_err() {
+                // The scope joins its thread: end the blocked wait first.
+                let _ = kill(pid, Signal::SIGKILL);
+            }
+            retired.expect("retiring a stopped child blocked the owner")
+        })
+    }
+
+    /// A stop must not wait for a pause to be cleared: the stop signal is
+    /// followed by SIGCONT, so a paused workload runs its handler at once.
+    /// (A signal with no handler kills a stopped process anyway; one the
+    /// workload traps waits until it runs again.)
+    #[test]
+    fn stopping_a_paused_child_continues_it_to_take_the_signal() {
+        let marker = tempfile::tempdir().unwrap();
+        let ready = marker.path().join("ready");
+        let child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "trap 'exit 3' TERM; touch '{}'; while :; do sleep 0.05; done",
+                ready.display()
+            ))
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut owned = OwnedChild {
+            child,
+            reaped: false,
+        };
+        let pid = owned.child.id();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !ready.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the shell never got ready"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        kill(Pid::from_raw(pid as i32), Signal::SIGSTOP).unwrap();
+        wait_until_stopped(pid, true);
+
+        owned.stop(Signal::SIGTERM).unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while observe_exit(pid).unwrap().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a paused child never took its stop signal"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let status = owned.child.wait().unwrap();
+        owned.reaped = true;
+        assert_eq!(status.code(), Some(3), "the handler didn't run: {status:?}");
     }
 
     #[test]
