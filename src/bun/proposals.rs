@@ -366,9 +366,14 @@ pub fn outcome_event(outcome: &ProposalOutcome, principal: &str, node: &str) -> 
         ),
         _ => return None,
     };
-    Some(proposal_event(
-        action, principal, proposal, node, now, message,
-    ))
+    let mut event = proposal_event(action, principal, proposal, node, now, message);
+    if principal.starts_with("policy:") {
+        // The approver was an admin's policy, not a token.
+        event
+            .details
+            .insert("principal_kind".to_string(), "policy".to_string());
+    }
+    Some(event)
 }
 
 /// Run [`reap_once`] every [`PROPOSAL_REAPER_INTERVAL`] until `shutdown`.

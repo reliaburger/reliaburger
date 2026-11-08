@@ -224,6 +224,8 @@ pub struct Compatibility {
 /// requests, the `Proposal` council response, and `ApiToken::kind`.
 /// Lease fences (#1686): the `LeaseFenced` Raft request and the
 /// `LeaseGenerationMoved` council response.
+/// Guardrails (#1682): a policy's `applies_to = "proposals"` and `action =
+/// "approve"`, and a finding's `kind = "proposal"`.
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 58,
     state: 74,

@@ -33,6 +33,7 @@ pub fn findings_table(filled: &[Filled], verdict: &Verdict) -> Option<String> {
                 PolicyAction::Deny => "DENY".to_string(),
                 PolicyAction::Warn => "WARN".to_string(),
                 PolicyAction::Audit => "AUDIT".to_string(),
+                PolicyAction::Approve => "APPROVE".to_string(),
             },
             format!(
                 "{} {}/{}",

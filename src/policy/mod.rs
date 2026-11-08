@@ -26,6 +26,7 @@
 pub mod audit;
 mod check;
 mod defaults;
+mod proposal;
 pub mod report;
 
 use std::collections::{BTreeMap, HashMap};
@@ -39,11 +40,15 @@ use crate::meat::types::AppId;
 use crate::sesame::types::ApiRole;
 
 pub use check::{
-    APP_FIELDS, CALLER_FIELDS, JOB_FIELDS, MAX_COLLECTION_ENTRIES, MAX_COMPREHENSION_NESTING,
-    MAX_DEFAULT_BYTES, MAX_EXPRESSION_BYTES, MAX_MESSAGE_BYTES, POLICY_VARIABLES, PolicyError,
-    PolicyField, UNFILLABLE_FIELDS, WORKLOAD_FIELDS, app_fields, check_policy, workload_variables,
+    APP_FIELDS, AUTHOR_FIELDS, CALLER_FIELDS, JOB_FIELDS, MAX_COLLECTION_ENTRIES,
+    MAX_COMPREHENSION_NESTING, MAX_DEFAULT_BYTES, MAX_EXPRESSION_BYTES, MAX_MESSAGE_BYTES,
+    POLICY_VARIABLES, PROPOSAL_FIELDS, PolicyError, PolicyField, UNFILLABLE_FIELDS,
+    WORKLOAD_FIELDS, app_fields, check_policy, workload_variables,
 };
 pub use defaults::Filled;
+pub use proposal::{
+    AuthorFacts, PolicyInput, ProposalFacts, ProposalJudgement, judge_proposal_input,
+};
 
 /// What `GET /v1/policies` answers: every policy, by name, and the
 /// generation the set is at.
@@ -135,6 +140,8 @@ pub enum WorkloadKind {
     App,
     /// A `[job.*]`.
     Job,
+    /// A proposed change (#1682), judged by a guardrail.
+    Proposal,
 }
 
 impl WorkloadKind {
@@ -143,15 +150,17 @@ impl WorkloadKind {
         match self {
             WorkloadKind::App => "app",
             WorkloadKind::Job => "job",
+            WorkloadKind::Proposal => "proposal",
         }
     }
 
     fn judged_by(self, target: PolicyTarget) -> bool {
         matches!(
             (self, target),
-            (_, PolicyTarget::Both)
+            (WorkloadKind::App | WorkloadKind::Job, PolicyTarget::Both)
                 | (WorkloadKind::App, PolicyTarget::Apps)
                 | (WorkloadKind::Job, PolicyTarget::Jobs)
+                | (WorkloadKind::Proposal, PolicyTarget::Proposals)
         )
     }
 }
@@ -181,6 +190,7 @@ impl std::fmt::Display for Finding {
                 PolicyAction::Deny => "denies",
                 PolicyAction::Warn => "warns about",
                 PolicyAction::Audit => "audits",
+                PolicyAction::Approve => "approves",
             },
             self.kind.as_str(),
             self.workload.namespace,
@@ -227,7 +237,9 @@ impl Verdict {
         match finding.action {
             PolicyAction::Deny => self.denials.push(finding),
             PolicyAction::Warn => self.warnings.push(finding),
-            PolicyAction::Audit => self.audits.push(finding),
+            // An approve policy has no `deny`, so it never finds anything;
+            // were it to, recording it is the harmless choice.
+            PolicyAction::Audit | PolicyAction::Approve => self.audits.push(finding),
         }
     }
 }

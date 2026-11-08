@@ -1479,6 +1479,10 @@ enum PolicyAction {
         /// The role a policy sees in `caller.role`.
         #[arg(long, value_enum, default_value_t = PolicyRoleArg::Deployer)]
         role: PolicyRoleArg,
+        /// Judge this proposal's JSON (`relish proposal show ID -o json`)
+        /// by the guardrails in the files, instead of their apps and jobs.
+        #[arg(long, value_name = "FILE")]
+        proposal: Option<PathBuf>,
     },
 }
 
@@ -2732,22 +2736,30 @@ async fn main() -> ExitCode {
                 source,
                 caller,
                 role,
-            } => reliaburger::relish::policy_cmd::policy_test(
-                files,
-                &reliaburger::relish::policy_cmd::TestIdentity {
+                proposal,
+            } => {
+                let identity = reliaburger::relish::policy_cmd::TestIdentity {
                     caller: caller.clone(),
                     role: match role {
                         PolicyRoleArg::Admin => reliaburger::sesame::types::ApiRole::Admin,
                         PolicyRoleArg::Deployer => reliaburger::sesame::types::ApiRole::Deployer,
                         PolicyRoleArg::ReadOnly => reliaburger::sesame::types::ApiRole::ReadOnly,
                     },
-                    source: match source {
-                        PolicySourceArg::Apply => reliaburger::policy::Source::Apply,
-                        PolicySourceArg::Gitops => reliaburger::policy::Source::GitOps,
+                    source: match (proposal, source) {
+                        (Some(_), _) => reliaburger::policy::Source::Proposal,
+                        (None, PolicySourceArg::Apply) => reliaburger::policy::Source::Apply,
+                        (None, PolicySourceArg::Gitops) => reliaburger::policy::Source::GitOps,
                     },
-                },
-                cli.output,
-            ),
+                };
+                match proposal {
+                    Some(proposal) => reliaburger::relish::policy_cmd::policy_test_proposal(
+                        files, proposal, &identity, cli.output,
+                    ),
+                    None => {
+                        reliaburger::relish::policy_cmd::policy_test(files, &identity, cli.output)
+                    }
+                }
+            }
         },
         Command::Ca { action } => match &action {
             CaAction::Backup {
