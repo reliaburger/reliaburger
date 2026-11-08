@@ -269,7 +269,11 @@ token scoped to some apps or namespaces sees only the events about them, and
 none that name no namespace (see `writing-a-controller`).
 
 The TUI shows apps, nodes, jobs, routes, live logs and events; press `?`
-inside for keys. It needs a terminal of at least 80×24. With no terminal on
+inside for keys. Its dashboard, the first screen, and the top of the web
+dashboard show what `relish status` shows: the verdict and one line per
+part of the cluster, read from the same cluster summary (`GET
+/v1/cluster/summary`). Neither runs `wtf`'s checks, so neither has a `wtf`
+line; `relish status` does. It needs a terminal of at least 80×24. With no terminal on
 stdin or stdout (a pipe, a cron job, an AI agent's shell), `relish`, `relish
 manual` and `relish source` exit at once with an error that names the plain
 output command to use instead: `relish agent guide`, `relish agent manual` or
@@ -281,7 +285,10 @@ that leaves shows as a `warning │` line where it happened. The jobs and events
 tables have a NODE column, and an app's Deploys tab lists one row per node
 that rolled each deploy out. When a node doesn't answer, the view keeps what
 the others sent and adds a yellow `incomplete: node … timed out` line, so a
-short list never passes for a complete one. On the web dashboard, a node's
+short list never passes for a complete one. The summary lines do the same
+in their own words: `2 alive, 0 suspect, 0 dead; partial (2 of 3 nodes)`,
+and the header's counts say `partial` too. If the web dashboard can't list
+every app, it says so above the table and still shows the summary. On the web dashboard, a node's
 page lists that node's apps (or says it didn't answer) and charts CPU and
 memory only on the node's own dashboard.
 

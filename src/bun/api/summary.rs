@@ -32,17 +32,50 @@ pub(super) async fn cluster_summary_handler(
     gossip: Option<axum::Extension<crate::mustard::stats::GossipStats>>,
     identity: Option<axum::Extension<crate::sesame::credentials::LiveNodeIdentity>>,
 ) -> Response {
-    let auth = auth.as_deref();
+    let sources = SummarySources {
+        known: known.as_deref(),
+        directory: directory.as_deref(),
+        gossip: gossip.as_deref(),
+        identity: identity.as_deref(),
+    };
+    Json(gather_cluster_summary(&state, auth.as_deref(), sources).await).into_response()
+}
+
+/// What a node reads the summary from besides its state: the request
+/// extensions the router layers in. Each is absent on a standalone node or
+/// in a test that doesn't set it.
+#[derive(Clone, Copy)]
+pub(super) struct SummarySources<'a> {
+    pub(super) known: Option<&'a KnownMembers>,
+    pub(super) directory: Option<&'a LeaderDirectory>,
+    pub(super) gossip: Option<&'a crate::mustard::stats::GossipStats>,
+    pub(super) identity: Option<&'a crate::sesame::credentials::LiveNodeIdentity>,
+}
+
+/// Assemble the summary as `auth` may see it. The summary route and
+/// Brioche's dashboard both call this, so the page and `relish status`
+/// read one answer.
+pub(super) async fn gather_cluster_summary(
+    state: &ApiState,
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    sources: SummarySources<'_>,
+) -> crate::bun::summary::ClusterSummary {
+    let SummarySources {
+        known,
+        directory,
+        gossip,
+        identity,
+    } = sources;
     let scoped = crate::sesame::auth::require_unscoped(auth).is_err();
     let metrics = !scoped
-        && enforce_cluster_permission(&state, auth, crate::config::PermissionAction::Metrics)
+        && enforce_cluster_permission(state, auth, crate::config::PermissionAction::Metrics)
             .await
             .is_ok();
     let (local, (peers, unanswered), leader, members) = tokio::join!(
-        local_node_summary(&state, identity.as_deref()),
-        peer_node_summaries(&state),
-        leader_view_from_leader(&state, directory.as_deref()),
-        cluster_members(&state, known.as_deref()),
+        local_node_summary(state, identity),
+        peer_node_summaries(state),
+        leader_view_from_leader(state, directory),
+        cluster_members(state, known),
     );
     let mut shares = vec![local];
     shares.extend(peers);
@@ -50,21 +83,20 @@ pub(super) async fn cluster_summary_handler(
     for share in &mut shares {
         scope_node_summary(share, auth);
     }
-    let summary = crate::bun::summary::assemble(&SummaryInputs {
+    crate::bun::summary::assemble(&SummaryInputs {
         now_unix_ms: system_time_millis(std::time::SystemTime::now()),
-        answered_by: local_node_name(&state),
-        version: running_version(&state),
+        answered_by: local_node_name(state),
+        version: running_version(state),
         visibility: Visibility { scoped, metrics },
         members,
-        gossip: gossip.map(|axum::Extension(stats)| GossipCounters {
+        gossip: gossip.map(|stats| GossipCounters {
             updates_received: stats.updates_received(),
             last_change_unix_ms: stats.last_change_unix_ms(),
         }),
         shares,
         unanswered,
         leader,
-    });
-    Json(summary).into_response()
+    })
 }
 
 /// `GET /v1/cluster/summary/node`: this node's share of the summary. The

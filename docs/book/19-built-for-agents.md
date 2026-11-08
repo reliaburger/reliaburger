@@ -1649,6 +1649,54 @@ that's what the summary isn't for.
 The snapshot tests cover a healthy cluster, a degraded app, an empty
 cluster and a new scenario, `NodeMissing`, where node-3 didn't answer.
 
+### Brioche's dashboard
+
+Brioche's front page had three big numbers at the top: nodes, apps and
+alerts. The node count was gossip's list, or 1 when there was no list; the
+app count was the length of the app table. The app table came from
+`/v1/status?cluster=true`, which fails outright when any node doesn't answer,
+so a node that timed out turned the whole page into a 503. That's the
+moment you most need a dashboard.
+
+Now the numbers are gone and a "Cluster" section takes their place: the
+verdict as a badge, then a table with one row per summary section, the rows
+that need attention coloured with the alert classes the stylesheet already
+had. It refreshes itself every five seconds from a new fragment,
+`/ui/fragment/summary`, the way the app and node tables do. No CSS or
+JavaScript changed: `brioche/dist/` holds hand-written files that
+`rust-embed` compiles into the binary, with no build step, and the existing
+classes were enough.
+
+Brioche runs inside Bun, so it doesn't fetch the summary over HTTP. The
+summary route's body became a function,
+
+```rust
+pub(super) async fn gather_cluster_summary(
+    state: &ApiState,
+    auth: Option<&AuthContext>,
+    sources: SummarySources<'_>,
+) -> ClusterSummary
+```
+
+and the route, the page and the fragment all call it. `SummarySources<'a>`
+bundles the four request extensions the summary reads (the known members,
+the leader directory, gossip's counters and the node's identity), each an
+`Option<&'a T>`. The `'a` is a lifetime parameter: it says the struct holds
+borrows that live no longer than the request it came from, so the compiler
+won't let one escape into a spawned task. Deriving `Copy` on it is fine for
+the same reason: copying a struct of references copies the pointers, never
+what they point at.
+
+The page also stopped failing when the app list can't be read. It renders
+the summary, which says `partial (1 of 2 nodes)`, and puts "Couldn't list
+every app" with the reason where the table would be. A test drives exactly
+that through the real router: a peer on a port nothing listens on, then `/`
+and `/ui/fragment/summary`, both expected to say `DEGRADED` and `partial`.
+
+The app table itself still uses its own rollup, with Brioche's `pending`,
+`blocked` and `unhealthy` words. It's a list, and its states predate
+`app_state`; moving it over is a separate change.
+
 ## Logs and the manual
 
 An agent chasing a crash loop wants two more things before it opens the

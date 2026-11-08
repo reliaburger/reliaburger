@@ -110,6 +110,15 @@ pub struct Line {
 
 /// One line per section of `summary`, then `wtf`'s.
 pub fn assess(summary: &ClusterSummary, wtf: &WtfCheck) -> Vec<Line> {
+    let mut lines = section_lines(summary);
+    lines.push(wtf_line(wtf));
+    lines
+}
+
+/// One line per section of `summary`, for a reader that doesn't run
+/// `wtf`'s checks (the TUI, Brioche): no `wtf` line at all, rather than one
+/// that says it was skipped.
+pub fn section_lines(summary: &ClusterSummary) -> Vec<Line> {
     let now = summary.generated_at_unix_ms;
     let standalone = summary
         .council
@@ -190,7 +199,6 @@ pub fn assess(summary: &ClusterSummary, wtf: &WtfCheck) -> Vec<Line> {
     }
     // TODO(#1682): an `agents` line (leases held, proposals waiting for
     // approval) once the lease and proposal client APIs exist.
-    lines.push(wtf_line(wtf));
     lines
 }
 

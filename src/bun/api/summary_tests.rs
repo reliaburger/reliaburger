@@ -240,6 +240,39 @@ async fn a_peer_that_does_not_answer_makes_the_summary_partial_and_names_it() {
 }
 
 #[tokio::test]
+async fn brioches_dashboard_shows_the_summary_and_says_partial() {
+    let shutdown = CancellationToken::new();
+    let (app, _dirs) = router(
+        Fixture {
+            membership: vec![
+                member("node-1", "127.0.0.1:9117"),
+                member("node-2", "127.0.0.1:9"),
+            ],
+            ..Fixture::default()
+        },
+        &shutdown,
+    );
+    for uri in ["/", "/ui/fragment/summary"] {
+        let (status, body) = get(&app, uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        let html = String::from_utf8(body).unwrap();
+        assert!(html.contains("DEGRADED"), "{uri}: {html}");
+        assert!(
+            html.contains("partial (1 of 2 nodes)"),
+            "a node that didn't answer is named, not dropped: {html}"
+        );
+        assert!(html.contains("relish nodes --unhealthy"), "{uri}: {html}");
+    }
+    let (_, page) = get(&app, "/", None).await;
+    let page = String::from_utf8(page).unwrap();
+    assert!(
+        page.contains("hx-get=\"/ui/fragment/summary\""),
+        "the summary refreshes on its own: {page}"
+    );
+    shutdown.cancel();
+}
+
+#[tokio::test]
 async fn a_scoped_token_gets_its_own_view_and_no_cluster_wide_routes() {
     let shutdown = CancellationToken::new();
     let scoped = crate::sesame::token::create_token(

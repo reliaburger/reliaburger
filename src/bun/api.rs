@@ -145,8 +145,8 @@ use test_leases::{
 use ui::{
     app_detail_handler, app_env_handler, dashboard_handler, fragment_alerts_handler,
     fragment_apps_handler, fragment_batches_handler, fragment_instances_handler,
-    fragment_nodes_handler, gitops_handler, login_handler, node_detail_handler, ui_logout_handler,
-    ui_session_handler,
+    fragment_nodes_handler, fragment_summary_handler, gitops_handler, login_handler,
+    node_detail_handler, ui_logout_handler, ui_session_handler,
 };
 use upgrade::{
     upgrade_abort_handler, upgrade_apply_handler, upgrade_cluster_handler,
@@ -648,6 +648,7 @@ pub fn router_with_upgrade(
         .route("/ui/fragment/apps", get(fragment_apps_handler))
         .route("/ui/fragment/batches", get(fragment_batches_handler))
         .route("/ui/fragment/nodes", get(fragment_nodes_handler))
+        .route("/ui/fragment/summary", get(fragment_summary_handler))
         .route("/ui/fragment/alerts", get(fragment_alerts_handler))
         .route(
             "/ui/fragment/app/{app}/{namespace}/instances",

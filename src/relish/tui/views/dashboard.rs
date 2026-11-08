@@ -8,7 +8,7 @@
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::bun::summary::verdict::{Mark, Verdict, WtfCheck, assess, problems, verdict};
+use crate::bun::summary::verdict::{Mark, Verdict, problems, section_lines, verdict};
 use crate::relish::tui::app::TuiApp;
 use crate::relish::tui::theme;
 
@@ -37,12 +37,9 @@ pub fn lines(app: &TuiApp) -> Vec<Line<'static>> {
 }
 
 /// The verdict and one line per section. The TUI doesn't run `wtf`'s
-/// checks, so its line is left out rather than shown as skipped.
+/// checks, so there's no `wtf` line.
 fn status_lines(summary: &crate::bun::summary::ClusterSummary) -> Vec<Line<'static>> {
-    let lines: Vec<_> = assess(summary, &WtfCheck::Skipped)
-        .into_iter()
-        .filter(|line| line.section != "wtf")
-        .collect();
+    let lines = section_lines(summary);
     let verdict = verdict(&lines);
     let problems = match problems(&lines) {
         0 => "no problems".to_string(),

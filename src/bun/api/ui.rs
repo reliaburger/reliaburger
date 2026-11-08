@@ -198,30 +198,33 @@ pub(super) async fn gather_dashboard_apps(
     Ok(statuses_to_dashboard_apps(&statuses, &desired))
 }
 
-/// Build the dashboard data from current agent state.
+/// Build the dashboard data from current agent state: the cluster
+/// summary, as `auth` may see it, and the lists below it. A node that
+/// doesn't answer leaves the app list out with the reason, rather than
+/// failing the page: the summary above it says how much the cluster saw.
 pub(super) async fn gather_dashboard_data(
     state: &ApiState,
-    directory: Option<&LeaderDirectory>,
-) -> Result<DashboardData, String> {
-    let apps = gather_dashboard_apps(state, directory).await?;
-
-    let alerts = firing_dashboard_alerts(state).await;
-    let alert_count = alerts.len();
-
-    let nodes = gather_dashboard_nodes(state).await;
-    // The node count follows the real membership when we have it. A
-    // standalone node with no gossip table still shows itself as one node.
-    let node_count = if nodes.is_empty() { 1 } else { nodes.len() };
-
-    Ok(DashboardData {
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    sources: super::summary::SummarySources<'_>,
+) -> DashboardData {
+    let (summary, apps, alerts, nodes) = tokio::join!(
+        super::summary::gather_cluster_summary(state, auth, sources),
+        gather_dashboard_apps(state, sources.directory),
+        firing_dashboard_alerts(state),
+        gather_dashboard_nodes(state),
+    );
+    let (apps, apps_error) = match apps {
+        Ok(apps) => (apps, None),
+        Err(error) => (Vec::new(), Some(error)),
+    };
+    DashboardData {
         cluster_name: String::new(),
-        node_count,
-        app_count: apps.len(),
-        alert_count,
+        summary: Some(summary),
+        apps_error,
         apps,
         nodes,
         alerts,
-    })
+    }
 }
 
 /// Build the dashboard node rows from the live gossip membership (AUTH7).
@@ -275,12 +278,18 @@ pub(super) fn html_response(html: String) -> Response {
 pub(super) async fn dashboard_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     directory: Option<axum::Extension<LeaderDirectory>>,
+    known: Option<axum::Extension<KnownMembers>>,
+    gossip: Option<axum::Extension<crate::mustard::stats::GossipStats>>,
+    identity: Option<axum::Extension<crate::sesame::credentials::LiveNodeIdentity>>,
     State(state): State<ApiState>,
 ) -> Response {
-    let mut data = match gather_dashboard_data(&state, directory.as_deref()).await {
-        Ok(data) => data,
-        Err(error) => return unavailable_response(error),
+    let sources = super::summary::SummarySources {
+        known: known.as_deref(),
+        directory: directory.as_deref(),
+        gossip: gossip.as_deref(),
+        identity: identity.as_deref(),
     };
+    let mut data = gather_dashboard_data(&state, auth.as_deref(), sources).await;
     if enforce_cluster_permission(
         &state,
         auth.as_deref(),
@@ -290,7 +299,6 @@ pub(super) async fn dashboard_handler(
     .is_err()
     {
         data.alerts.clear();
-        data.alert_count = 0;
     }
     html_response(render_dashboard(&data))
 }
@@ -532,6 +540,27 @@ pub(super) async fn fragment_apps_handler(
         Ok(apps) => html_response(fragments::render_apps_table_fragment(&apps)),
         Err(error) => unavailable_response(error),
     }
+}
+
+/// `GET /ui/fragment/summary` — the cluster summary's lines, for HTMX swap.
+pub(super) async fn fragment_summary_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    directory: Option<axum::Extension<LeaderDirectory>>,
+    known: Option<axum::Extension<KnownMembers>>,
+    gossip: Option<axum::Extension<crate::mustard::stats::GossipStats>>,
+    identity: Option<axum::Extension<crate::sesame::credentials::LiveNodeIdentity>>,
+    State(state): State<ApiState>,
+) -> Response {
+    let sources = super::summary::SummarySources {
+        known: known.as_deref(),
+        directory: directory.as_deref(),
+        gossip: gossip.as_deref(),
+        identity: identity.as_deref(),
+    };
+    let summary = super::summary::gather_cluster_summary(&state, auth.as_deref(), sources).await;
+    html_response(crate::brioche::dashboard::render_summary_fragment(Some(
+        &summary,
+    )))
 }
 
 /// `GET /ui/fragment/nodes` — nodes table HTML fragment for HTMX swap.
