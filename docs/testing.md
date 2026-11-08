@@ -408,12 +408,12 @@ jobs. What else runs depends on where the change is going:
 
 | Run | Jobs | Typical wall time |
 |---|---|---|
-| Pull request into a merge train (`release-*`, e.g. `release-0-2-4`) | The light set: CI policy, dependency audit, lint and format, minimum Rust, the demo app, the source bundle build, portable Linux (with coverage), the doctests and the nightly-signing key test, and the optimised contract boundaries | about 22 minutes, set by portable Linux (#1723) |
+| Pull request into a merge train (`release-*`, e.g. `release-0-2-4`) | The light set: CI policy, dependency audit, lint and format, minimum Rust, the demo app, the source bundle build, portable Linux (with coverage), the doctests and the nightly-signing key test, and the optimised contract boundaries | about 17 minutes, set by portable Linux, down from 30 (#1723); more on a slow runner |
 | The same, labelled `full-ci` | The light set plus privileged Linux, the cluster, acceptance and upgrade suites, and the benchmarks the change touches | about 45 minutes |
 | The gate PR (a train into `main`) | The light set on each push; with `full-ci`, the heavy suites too | as above |
 | The gate PR labelled `release-gate` | Everything, portable macOS included; the evidence gate refuses less | about 45 minutes, plus any wait for macOS runners |
 | Any other pull request into `main` | The light set plus the heavy suites and the benchmarks the change touches | about 45 minutes |
-| Pull request stacked on any other branch | The light set; the heavy suites only with `full-ci` | about 22 minutes |
+| Pull request stacked on any other branch | The light set; the heavy suites only with `full-ci` | about 17 minutes |
 | Push to a train or to `main`, merge-queue group, nightly, manual, `build.yml`'s candidate build | Everything | about 45 minutes, plus any wait for macOS runners |
 
 **macOS only where it adds something**

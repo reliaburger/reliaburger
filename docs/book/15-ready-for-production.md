@@ -1096,6 +1096,10 @@ didn't move, and the evidence owner still checks it: `coverage_owner.py` pins th
 by stage, so it now expects three stages instead of five, and the floor check is part of the
 last one.
 
+On the change's own pull request, portable Linux took 17.0 minutes, its coverage step 15.3
+against 23 to 27 before, and the new job 5.7. The light set's critical path went from about
+30 minutes to about 17.
+
 Two smaller fixes came with it
 ([#1724](https://github.com/reliaburger/reliaburger/issues/1724)). `make ci` now runs its
 quick checks first: formatting, the ignored-test owners and the CI scripts' own tests take a
