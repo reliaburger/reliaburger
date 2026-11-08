@@ -1628,6 +1628,18 @@ the real `curl … | sh` install against it on every host we advertise.
     default, the release log's newest entry isn't this release, or a chart
     isn't a byte-for-byte copy of this release's record.
 
+    Update [`features.toml`](features.toml) to the release: its `release`,
+    `released` and `reviewed` lines, the status of every row the release
+    moved, the `since` version of each new feature, and the known issues it
+    ships with (from the release closure record). Planned rows that shipped
+    get a status and a `since`. Then run `make features-page` and
+    `make agent-docs` for the page and its Markdown copy, and
+    `python3 scripts/ci/features_page.py check-issues` to find rows that
+    still link a closed issue; the nightly
+    [`features.yml`](../.github/workflows/features.yml) fails until they're
+    fixed. `scripts/ci/test_features_page.py` fails while the TOML names a
+    release other than the bootstrap's default.
+
     Add the release's paragraph to the top of the
     [release log](release-log.md): the promotion date, how long qualifying it
     took and how many candidates, what each soak found and what fixed it, and
