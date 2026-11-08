@@ -357,8 +357,7 @@ the closest ids in the hint. The table under "Every finding" in
 </section>
 <section class="agents-section" id="taking-turns-leases">
 <h2>Taking turns: leases <a class="permalink" href="#taking-turns-leases" aria-label="Link to this section">#</a></h2>
-<p>Take a lease before you change an app, so no other agent or person changes
-it under you:</p>
+<p>Take a lease before you change an app, so no other agent or person does:</p>
 <pre><code class="language-sh">relish agent lease take app web --namespace shop --purpose "rolling back" --wait 60s
 </code></pre>
 <p>Or <code>take namespace shop</code>. It lasts 2m (<code>--ttl</code>, up to 15m); <code>renew</code> and
@@ -418,8 +417,7 @@ to take in at once, so an agent reads it in pieces. <code>search</code> finds se
 <pre><code class="language-sh">relish agent manual search rolling deploy
 </code></pre>
 <p>Each of the (at most ten) hits has the chapter, its title, the section's
-heading and anchor, a short excerpt, and <code>show</code>, the command that prints the
-section. <code>total_hits</code> counts every section that matched. A word in a heading
+heading and anchor, an excerpt, and <code>show</code>, the command that prints it. <code>total_hits</code> counts every section that matched. A word in a heading
 counts ten times one in the text.</p>
 <p><code>show</code> prints a chapter, or one section and its subsections, as Markdown:</p>
 <pre><code class="language-sh">relish agent manual show diagnostics#relish-path-can-a-reach-b
@@ -802,16 +800,16 @@ so it must never also change anything or send anything out.</p>
 <p><code>--namespace</code> narrows what the agent asks for. It isn't a permission: a
 token scoped to the namespace is.</p>
 <p>The repository's <a href="https://github.com/reliaburger/reliaburger/blob/main/server.json"><code>server.json</code></a>
-describes <code>relish mcp</code> for the <a href="https://registry.modelcontextprotocol.io">MCP Registry</a>,
-as <code>io.github.reliaburger/relish</code>: stdio, read-only and the tools above.
-From 0.2.8, every release also carries an
-<a href="https://github.com/modelcontextprotocol/mcpb">MCP Bundle</a> per platform
-(<code>relish-linux-x86_64.mcpb</code>, <code>relish-linux-aarch64.mcpb</code>,
-<code>relish-macos-aarch64.mcpb</code>), which the registry entry lists with their
-SHA-256s. A client that installs MCP Bundles, such as Claude Desktop, runs
-the <code>relish</code> inside one with no <code>install.sh</code>. It takes no flags, so it uses
-the default local address or the saved local context; to connect elsewhere,
-or use your own <code>relish</code>, point your client at <code>relish mcp</code> as above.</p>
+describes <code>relish mcp</code> for the <a href="https://registry.modelcontextprotocol.io">MCP Registry</a>
+as <code>io.github.reliaburger/relish</code>. From 0.2.8 each release carries an
+<a href="https://github.com/modelcontextprotocol/mcpb">MCP Bundle</a> per platform,
+<code>relish-&lt;platform&gt;.mcpb</code>, and the registry entry lists them with their
+SHA-256s. A client that installs bundles, such as Claude Desktop, runs the
+<code>relish</code> inside, with no <code>install.sh</code>. It asks for nothing and uses the
+saved local context. Two optional settings point it elsewhere: a cluster API
+endpoint and a <a href="#a-read-only-token">read-only token</a>, passed as
+<code>RELIABURGER_ENDPOINT</code> and <code>RELIABURGER_TOKEN</code>. Left empty, they count as
+unset. For other flags, or your own <code>relish</code>, use <code>relish mcp</code> as above.</p>
 </section>
 <section class="agents-section" id="wiring-up-your-agent">
 <h2>Wiring up your agent <a class="permalink" href="#wiring-up-your-agent" aria-label="Link to this section">#</a></h2>

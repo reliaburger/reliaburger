@@ -356,8 +356,7 @@ the closest ids in the hint. The table under "Every finding" in
 
 ## Taking turns: leases
 
-Take a lease before you change an app, so no other agent or person changes
-it under you:
+Take a lease before you change an app, so no other agent or person does:
 
 ```sh
 relish agent lease take app web --namespace shop --purpose "rolling back" --wait 60s
@@ -431,8 +430,7 @@ relish agent manual search rolling deploy
 ```
 
 Each of the (at most ten) hits has the chapter, its title, the section's
-heading and anchor, a short excerpt, and `show`, the command that prints the
-section. `total_hits` counts every section that matched. A word in a heading
+heading and anchor, an excerpt, and `show`, the command that prints it. `total_hits` counts every section that matched. A word in a heading
 counts ten times one in the text.
 
 `show` prints a chapter, or one section and its subsections, as Markdown:
@@ -935,16 +933,16 @@ relish mcp --toolsets source,manual --no-logs
 token scoped to the namespace is.
 
 The repository's [`server.json`](https://github.com/reliaburger/reliaburger/blob/main/server.json)
-describes `relish mcp` for the [MCP Registry](https://registry.modelcontextprotocol.io),
-as `io.github.reliaburger/relish`: stdio, read-only and the tools above.
-From 0.2.8, every release also carries an
-[MCP Bundle](https://github.com/modelcontextprotocol/mcpb) per platform
-(`relish-linux-x86_64.mcpb`, `relish-linux-aarch64.mcpb`,
-`relish-macos-aarch64.mcpb`), which the registry entry lists with their
-SHA-256s. A client that installs MCP Bundles, such as Claude Desktop, runs
-the `relish` inside one with no `install.sh`. It takes no flags, so it uses
-the default local address or the saved local context; to connect elsewhere,
-or use your own `relish`, point your client at `relish mcp` as above.
+describes `relish mcp` for the [MCP Registry](https://registry.modelcontextprotocol.io)
+as `io.github.reliaburger/relish`. From 0.2.8 each release carries an
+[MCP Bundle](https://github.com/modelcontextprotocol/mcpb) per platform,
+`relish-<platform>.mcpb`, and the registry entry lists them with their
+SHA-256s. A client that installs bundles, such as Claude Desktop, runs the
+`relish` inside, with no `install.sh`. It asks for nothing and uses the
+saved local context. Two optional settings point it elsewhere: a cluster API
+endpoint and a [read-only token](#a-read-only-token), passed as
+`RELIABURGER_ENDPOINT` and `RELIABURGER_TOKEN`. Left empty, they count as
+unset. For other flags, or your own `relish`, use `relish mcp` as above.
 
 ## Wiring up your agent
 

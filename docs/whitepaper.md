@@ -88,9 +88,9 @@ K3s, k0s, and MicroK8s make Kubernetes smaller. They reduce binary size and reso
 
 There's a large and growing market of teams who need more than Docker Compose (which doesn't do multi-node or rolling deploys) but far less than Kubernetes. These teams typically have 2-200 nodes, run web applications and APIs behind load balancers, and want their containers running reliably without dedicating a full-time platform engineering team to the task.
 
-Reliaburger is built for these teams. It's one node agent (`bun`) and one CLI (`relish`), and the agent includes everything you need to run containers in production: scheduling, networking, ingress with built-in TLS (from the cluster's own CA or your certificate; automatic ACME certificates are planned, [#369](https://github.com/reliaburger/reliaburger/issues/369)), service discovery, a container image registry, log collection, metrics and dashboards, GitOps, and a web UI. No plugins. No ecosystem to assemble. No YAML to wrestle.
+Reliaburger is built for these teams. It's one node agent (`bun`) and one CLI (`relish`), and the agent includes everything you need to run containers: scheduling, networking, ingress with built-in TLS (from the cluster's own CA or your certificate; automatic ACME certificates are planned for 0.4.0, [#1667](https://github.com/reliaburger/reliaburger/issues/1667)), service discovery, a container image registry, log collection, metrics and dashboards, GitOps, and a web UI. No plugins. No ecosystem to assemble. No YAML to wrestle. Until 1.0.0, though, it's good enough for home labs and dev clusters, not production.
 
-The architecture is designed for 10,000 nodes to provide headroom, but the primary audience is teams with 2-200 nodes who benefit from a single, well-tested architecture rather than separate solutions for small and large clusters.
+The architecture is designed for 10,000 nodes to provide headroom, but the primary audience is teams with 2-200 nodes who benefit from a single, well-tested architecture rather than separate solutions for small and large clusters. Those are design targets, not measurements: every release is soaked on three nodes, and the [hollow-node record](qualification/2026-10-28-hollow-nodes.md) found limits at 500 and 1,000 nodes ([#1411](https://github.com/reliaburger/reliaburger/issues/1411), [#1412](https://github.com/reliaburger/reliaburger/issues/1412), [#1413](https://github.com/reliaburger/reliaburger/issues/1413)).
 
 More and more of those teams work with an LLM agent beside them. From 0.2.7 Reliaburger is built for both: every `relish` carries its own source, so an agent can trace a bug to the exact function, prove a fix on a throwaway cluster and draft a report for a human to post, and because releases come in days and upgrades take one command, the fix comes back to the team quickly. Section 17 describes that loop.
 
@@ -144,7 +144,7 @@ Reliaburger is designed to meet the following quantitative targets. These engine
 
 Reliaburger ships as two binaries: `bun`, the node agent, and `relish`, the CLI. Every component of a node (the scheduler, ingress proxy, image registry, metrics store, log collector, GitOps engine, eBPF service discovery, and web UI) is compiled into `bun`. There's no separate control-plane binary and no plugin to pick, and the two binaries come from one release, so there's no compatibility matrix between components.
 
-The binaries aren't static. Release builds link glibc (`*-linux-gnu`), and a Linux node needs a few host packages: `runc`, `uidmap`, `iptables`, `iproute2`, `nftables` and `btrfs-progs` (the [Linux servers guide](linux-servers.md#1-prerequisites-and-network-requirements) installs them). Static musl builds are planned with the 0.3.0 appliance ([#401](https://github.com/reliaburger/reliaburger/issues/401)).
+The binaries aren't static. Release builds link glibc (`*-linux-gnu`), and a Linux node needs a few host packages: `runc`, `uidmap`, `iptables`, `iproute2`, `nftables` and `btrfs-progs` (the [Linux servers guide](linux-servers.md#1-prerequisites-and-network-requirements) installs them). Static musl builds are planned, though no issue tracks them yet.
 
 ### 3.2 Apps, Not Pods
 
@@ -152,7 +152,7 @@ The unit of deployment is an **App**, not a Pod/Deployment/Service triple. At it
 
 ### 3.3 Convention Over Configuration
 
-Sensible defaults everywhere, with security-sensitive choices left explicit. An ingress route is plain HTTP unless it selects `tls = "cluster"` (the cluster's Ingress CA) or `tls = "explicit"` (an operator-supplied certificate and key). Automatic public certificate provisioning is a post-v1 feature: `auto` and `acme` are rejected rather than quietly weakening the route. Health checks use sane timeouts. Rolling deploys are the default strategy. Log collection is on by default. Reliaburger collects metrics automatically. Configuration is for overriding defaults, not for bootstrapping basic functionality.
+Sensible defaults everywhere, with security-sensitive choices left explicit. An ingress route is plain HTTP unless it selects `tls = "cluster"` (the cluster's Ingress CA) or `tls = "explicit"` (an operator-supplied certificate and key). Automatic public certificate provisioning is planned for 0.4.0 ([#1667](https://github.com/reliaburger/reliaburger/issues/1667)): until then `auto` and `acme` are rejected rather than quietly weakening the route. Health checks use sane timeouts. Rolling deploys are the default strategy. Log collection is on by default. Reliaburger collects metrics automatically. Configuration is for overriding defaults, not for bootstrapping basic functionality.
 
 ### 3.4 Homogeneous Nodes
 
@@ -749,7 +749,7 @@ allow = ["api.stripe.com:443", "hooks.slack.com:443"]
 
 ### 11.4 Data at Rest
 
-Reliaburger encrypts Raft log entries at rest with AES-256-GCM, under a key derived (HKDF-SHA256, with a fresh salt per entry) from the cluster master key. That key is stored on the node, so the encryption protects a stolen disk or a copied log file, not a node whose root account is compromised. The Raft snapshot (`snapshot.redb`, holding token hashes, wrapped keys and the desired state) isn't encrypted, and neither are Raft's vote and log-position metadata. A cluster with no master key writes its log in plaintext. The CA and age private keys inside the Raft state carry their own HKDF-wrapped encryption under the same master key. Encrypting the snapshot too, with a key sealed to a TPM or derived from node identity, is 0.3.0 appliance work ([#402](https://github.com/reliaburger/reliaburger/issues/402)).
+Reliaburger encrypts Raft log entries at rest with AES-256-GCM, under a key derived (HKDF-SHA256, with a fresh salt per entry) from the cluster master key. That key is stored on the node, so the encryption protects a stolen disk or a copied log file, not a node whose root account is compromised. The Raft snapshot (`snapshot.redb`, holding token hashes, wrapped keys and the desired state) isn't encrypted, and neither are Raft's vote and log-position metadata. A cluster with no master key writes its log in plaintext. The CA and age private keys inside the Raft state carry their own HKDF-wrapped encryption under the same master key. Encrypting the snapshot too, with a key sealed to a TPM or derived from node identity, is planned, though no issue tracks it yet.
 
 Certificate revocation uses a CRL kept in the council's replicated state; each node refreshes its copy as revocations commit.
 
@@ -862,7 +862,7 @@ When `require_signed_commits` is enabled, Lettuce only applies commits that are 
 
 Reliaburger includes a complete observability stack with zero configuration:
 
-**Metrics (Mayo):** Per-node store (Parquet, queried with SQL) that collects node CPU, memory, disk and network, plus per-app CPU and memory. Jobs get their own series: attempt, success, failure and retry counters, duration histograms, and CPU and memory for running tasks read from their cgroups, labelled only by namespace, definition, profile and node. Apps that declare `metrics = {}` have their Prometheus `/metrics` endpoint scraped by the node running each instance. Data is kept at one resolution for `retention_days` (7 by default) and then pruned; tiered downsampling is planned. Council members aggregate one-minute rollups for cluster-wide dashboards. Alerts are fixed threshold rules; PromQL-style custom alerts are planned (see [design/metrics-mayo.md](design/metrics-mayo.md)). Five default alerts ship active out of the box, all on node-level metrics: node CPU above 90 %, node memory above 85 % and above 70 %, node disk above 80 %, and node CPU below 5 % for half an hour.
+**Metrics (Mayo):** Per-node store (Parquet, queried with SQL) that collects node CPU, memory, disk and network, plus per-app CPU and memory. Jobs get their own series: attempt, success, failure and retry counters, duration histograms, and CPU and memory for running tasks read from their cgroups, labelled only by namespace, definition, profile and node. Apps that declare `metrics = {}` have their Prometheus `/metrics` endpoint scraped by the node running each instance. Data is kept at one resolution for `retention_days` (7 by default) and then pruned; tiered downsampling is planned. Council members aggregate one-minute rollups for cluster-wide dashboards. Alerts are fixed threshold rules; you can't define your own yet, and PromQL-style custom alerts are planned (see [design/metrics-mayo.md](design/metrics-mayo.md)). Five default alerts ship active out of the box, all on node-level metrics: node CPU above 90 %, node memory above 85 % and above 70 %, node disk above 80 %, and node CPU below 5 % for half an hour.
 
 **Logs (Ketchup):** Captures stdout/stderr from every container. Structured storage with timestamp-based indexing and zstd compression. `relish logs --json-field key=value` filters JSON lines on the client, after the server has returned the lines you asked for; server-side field queries are planned. Each node exports its log files to a directory, `s3://` or `gs://` on a schedule.
 
@@ -1126,7 +1126,7 @@ Reliaburger verifies binary integrity via dual signatures: an embedded signing k
 
 ## 22. Multi-Cluster (Franchise)
 
-> **Status: planned — not yet implemented in the current binary.** Nothing in this section runs today. Franchise is a forward-looking design: there is no WAN gossip ring, no `relish franchise` command, no cross-cluster service discovery, and no franchise dashboard. In fact the binary actively refuses the one hook that exists in the config schema — an app that declares `egress.allow_franchise` is refused when a node deploys it, rather than run with the rule silently unenforced (moving that refusal to config validation is [#701](https://github.com/reliaburger/reliaburger/issues/701)). The rest of this section describes the intended design, kept here so the vision is on record.
+> **Status: planned — not yet implemented in the current binary.** Nothing in this section runs today. Franchise is a forward-looking design: there is no WAN gossip ring, no `relish franchise` command, no cross-cluster service discovery, and no franchise dashboard. In fact the binary actively refuses the one hook that exists in the config schema: `relish apply` and `relish lint` refuse an app that declares `egress.allow_franchise`, and a node refuses to deploy one that slips through, rather than run it with the rule silently unenforced. The rest of this section describes the intended design, kept here so the vision is on record.
 
 Reliaburger clusters are independent by design. Each has its own Raft consensus, its own CA hierarchy, and its own lifecycle. Franchise extends this model to give you visibility and connectivity across multiple clusters without coupling them.
 
@@ -1256,7 +1256,7 @@ The Reliaburger column describes 0.2.7. Rows marked *Target* are design goals fr
 | **Max cluster size** | ~5,000 nodes | ~5,000 nodes | ~10,000 nodes | 1 host | **Target: 10,000 nodes (unmeasured)** |
 | **Volume model** | Local + CSI (network) | Same as K8s | Local + CSI | Docker volumes | **Local only (by design)** |
 | **Multi-node** | Yes | Yes | Yes | No | **Yes** |
-| **Rolling deploys** | Yes | Yes | Yes | No | **Yes, per node (node-local auto-rollback; cluster-coordinated rollouts planned, #692)** |
+| **Rolling deploys** | Yes | Yes | Yes | No | **Yes, one node at a time (a failed rollout stops as `RolloutFailed`; one cluster-wide surge budget is planned)** |
 | **Autoscaling** | HPA (separate config) | Same as K8s | External | No | **Built-in** |
 | **Time to first deploy** | Hours to days | Minutes to 30 min | 30 min to hours | Minutes | **Target: < 5 min (unmeasured)** |
 | **Written in** | Go | Go | Go | Go | **Rust** |

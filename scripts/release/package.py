@@ -3,7 +3,8 @@
 
 Each relish platform also gets `relish-<platform>.mcpb`, an MCP Bundle
 (https://github.com/modelcontextprotocol/mcpb) of `mcpb-manifest.json` and
-that platform's relish, which the MCP Registry entry points at (#1695).
+that platform's relish, which the MCP Registry entry points at (#1695), with
+a `.sig` envelope like every binary's.
 
 OpenSSL 3 performs Ed25519 operations. The private key is PKCS#8 DER, matching
 `relish dev keygen`. This script never creates or rotates the release identity.
@@ -287,14 +288,21 @@ def package_release(directory, version, repository, key, trusted, pins, forbidde
     for image in outputs[GUEST_METADATA]["images"].values():
         checksums.append(f"{image['sha256']}  {image['asset']}\n")
     # One MCP Bundle per relish platform, for the MCP Registry (#1695). The
-    # binary inside is the signed one above, byte for byte; the bundle itself
-    # is covered by SHA256SUMS, candidate.json and the build attestation.
+    # binary inside is the signed one above, byte for byte. The bundle gets
+    # the same `.sig` envelope as every binary, and SHA256SUMS,
+    # candidate.json and the build attestation cover it too. MCPB clients
+    # don't read the `.sig`: they only recognise a PKCS#7 signature from an
+    # OS-trusted code-signing certificate inside the bundle (`mcpb sign`).
     if manifest is None:
         manifest = json.loads(MCPB_MANIFEST.read_text())
     bundles = {mcpb_name(platform): mcpb_bundle(directory / f"relish-{platform}", manifest, version, platform)
                for platform in PLATFORMS["relish"]}
     for name, data in bundles.items():
-        checksums.append(f"{hashlib.sha256(data).hexdigest()}  {name}\n")
+        digest = hashlib.sha256(data).hexdigest()
+        outputs[name + ".sig"] = {
+            "schema": 1, "sha256": digest, "embedded": sign_bytes(key, data), "external": None,
+        }
+        checksums.append(f"{digest}  {name}\n")
 
     # No metadata is written until every expected artefact has been signed.
     for name, document in outputs.items():

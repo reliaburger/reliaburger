@@ -1592,7 +1592,7 @@ The temptation was to build something simpler: a custom iterator over Parquet fi
 
 ### Five default alerts cover 90% of incidents
 
-We thought operators would want to define custom alert rules from day one. In practice, the five defaults (CPU throttle, OOM risk, memory high, disk high, CPU idle) catch nearly every production incident that metrics can detect. Custom rules are a Phase 11 feature, and nobody has complained about the delay.
+We thought operators would want to define custom alert rules from day one. In practice, the five defaults (CPU throttle, OOM risk, memory high, disk high, CPU idle) catch nearly every production incident that metrics can detect. Custom rules still aren't supported, and nobody has complained yet.
 
 The lesson: don't build config for things that have obvious defaults. Ship the defaults, add config later if someone needs it.
 

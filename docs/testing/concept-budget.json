@@ -1,0 +1,18 @@
+{
+  "resource_kinds": {
+    "budget": 8,
+    "reason": "Measured on 8 November 2026 (#1681): app, job, namespace, permission, policy, build, template and use"
+  },
+  "commands": {
+    "budget": 169,
+    "reason": "Measured on 8 November 2026 (#1681): every relish command and subcommand at every depth, none of them hidden; 169 from #1686, which adds leases between agents: `relish lease` (list, take, renew, release, break) for people and `relish agent lease` (take, renew, release) for agents, as the 0.2.8 design specifies"
+  },
+  "flags": {
+    "budget": 389,
+    "reason": "Measured on 8 November 2026 (#1681): named flags on every command, global ones once; 389 from #1686's lease commands (the target's --namespace, --purpose, --ttl/--for and --wait)"
+  },
+  "distinct_flags": {
+    "budget": 171,
+    "reason": "Measured on 8 November 2026 (#1681): distinct flag names across all commands; 171 from #1686: --purpose, and --for on `relish lease take` as the design's human story writes it"
+  }
+}
