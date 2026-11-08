@@ -891,6 +891,12 @@ enum Command {
         #[command(subcommand)]
         action: GitopsAction,
     },
+    /// List, take, renew, release or break leases on apps and namespaces,
+    /// which keep agents and people from changing the same thing at once.
+    Lease {
+        #[command(subcommand)]
+        action: LeaseAction,
+    },
     /// List, audit or delete the cluster's policies, or test policies offline.
     Policy {
         #[command(subcommand)]
@@ -1370,6 +1376,46 @@ enum PolicyAction {
         #[arg(long, value_enum, default_value_t = PolicyRoleArg::Deployer)]
         role: PolicyRoleArg,
     },
+}
+
+/// `relish lease`'s subcommands.
+#[derive(Subcommand)]
+enum LeaseAction {
+    /// List the leases held now: target, holder, time left and purpose.
+    List,
+    /// Take a lease to keep agents out while you work; renews one you hold.
+    Take {
+        #[command(flatten)]
+        target: reliaburger::relish::agent::lease::TargetArgs,
+        /// What you're doing, for whoever finds it held.
+        #[arg(long, default_value = "")]
+        purpose: String,
+        /// How long to hold it: 30s to 15m; 2m when left out.
+        #[arg(long = "for", value_parser = parse_lease_ttl)]
+        ttl: Option<std::time::Duration>,
+    },
+    /// Extend a lease you hold.
+    Renew {
+        #[command(flatten)]
+        target: reliaburger::relish::agent::lease::TargetArgs,
+        /// The new lifetime from now: 30s to 15m; 2m when left out.
+        #[arg(long = "for", value_parser = parse_lease_ttl)]
+        ttl: Option<std::time::Duration>,
+    },
+    /// Give up a lease you hold.
+    Release {
+        #[command(flatten)]
+        target: reliaburger::relish::agent::lease::TargetArgs,
+    },
+    /// End someone else's lease (deployer or above over the target; audited).
+    Break {
+        #[command(flatten)]
+        target: reliaburger::relish::agent::lease::TargetArgs,
+    },
+}
+
+fn parse_lease_ttl(value: &str) -> Result<std::time::Duration, String> {
+    reliaburger::relish::agent::lease::parse_ttl(value)
 }
 
 /// `relish policy test --source`.
@@ -2490,6 +2536,24 @@ async fn main() -> ExitCode {
             GitopsAction::Set { path } => commands::gitops_set(path, cli.output).await,
             GitopsAction::Disable => commands::gitops_disable(cli.output).await,
         },
+        Command::Lease { action } => {
+            use reliaburger::relish::lease_cmd;
+            match &action {
+                LeaseAction::List => lease_cmd::lease_list(cli.output).await,
+                LeaseAction::Take {
+                    target,
+                    purpose,
+                    ttl,
+                } => lease_cmd::lease_take(target, purpose, *ttl, cli.output).await,
+                LeaseAction::Renew { target, ttl } => {
+                    lease_cmd::lease_renew(target, *ttl, cli.output).await
+                }
+                LeaseAction::Release { target } => {
+                    lease_cmd::lease_release(target, cli.output).await
+                }
+                LeaseAction::Break { target } => lease_cmd::lease_break(target, cli.output).await,
+            }
+        }
         Command::Policy { action } => match &action {
             PolicyAction::List => reliaburger::relish::policy_cmd::policy_list(cli.output).await,
             PolicyAction::Audit => reliaburger::relish::policy_cmd::policy_audit(cli.output).await,
@@ -3089,6 +3153,7 @@ fn output_support(command: &Command) -> OutputSupport {
         | Command::Batch { .. }
         | Command::Gitops { .. }
         | Command::Policy { .. }
+        | Command::Lease { .. }
         | Command::Token { .. }
         | Command::Upgrade { .. }
         | Command::Status
@@ -3278,6 +3343,7 @@ mod tests {
         "secret",
         "gitops",
         "policy",
+        "lease",
         "ca",
         "token",
         "join-token",
@@ -3382,7 +3448,7 @@ mod tests {
                 "agent {name} isn't a command"
             );
         }
-        for name in ["report", "patch", "setup"] {
+        for name in ["report", "patch", "setup", "lease"] {
             assert!(!READ_ONLY_AGENT_COMMANDS.contains(&name));
         }
     }

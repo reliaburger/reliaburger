@@ -21,6 +21,7 @@ pub mod diagnose;
 pub mod envelope;
 pub mod fit;
 pub mod guide;
+pub mod lease;
 pub mod logs;
 pub mod manual;
 pub mod patch;
@@ -105,6 +106,8 @@ pub enum AgentCommand {
     /// Wire Reliaburger into the AI agents on this machine. Shows the diff;
     /// writes only with --yes.
     Setup(setup::SetupOptions),
+    /// Take, renew or release a lease on an app or a namespace.
+    Lease(lease::LeaseOptions),
 }
 
 impl AgentOptions {
@@ -133,6 +136,7 @@ impl AgentCommand {
             AgentCommand::Report(_) => CommandName::Report,
             AgentCommand::Patch(options) => options.command.name(),
             AgentCommand::Setup(_) => CommandName::Setup,
+            AgentCommand::Lease(options) => options.command.name(),
         }
     }
 }
@@ -184,6 +188,7 @@ pub async fn run(options: &AgentOptions, rerun: &str) -> Rendered {
         AgentCommand::Report(args) => report::run(args, max_bytes, rerun),
         AgentCommand::Patch(patch) => patch::run(patch, max_bytes, rerun).await,
         AgentCommand::Setup(setup) => setup::run(setup, max_bytes, rerun).await,
+        AgentCommand::Lease(lease) => lease::run(lease, max_bytes, rerun).await,
     }
 }
 
@@ -288,6 +293,9 @@ pub fn data_schema(command: CommandName) -> Option<Value> {
         CommandName::PatchApply => Some(schema_of::<patch::ApplyData>()),
         CommandName::PatchDestroy => Some(schema_of::<patch::DestroyData>()),
         CommandName::Setup => Some(schema_of::<setup::SetupData>()),
+        CommandName::LeaseTake | CommandName::LeaseRenew | CommandName::LeaseRelease => {
+            Some(schema_of::<lease::LeaseData>())
+        }
     }
 }
 
@@ -404,7 +412,7 @@ pub fn rerun_command(args: &[String]) -> String {
 }
 
 /// `word` as a POSIX shell reads it back unchanged.
-fn shell_quote(word: &str) -> String {
+pub(crate) fn shell_quote(word: &str) -> String {
     let plain = !word.is_empty()
         && word
             .chars()
@@ -582,7 +590,10 @@ mod tests {
                 "patch diff",
                 "patch apply",
                 "patch destroy",
-                "setup"
+                "setup",
+                "lease take",
+                "lease renew",
+                "lease release"
             ]
         );
         let envelope = &value["data"]["envelope"];

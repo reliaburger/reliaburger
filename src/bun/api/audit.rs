@@ -175,6 +175,12 @@ pub(crate) const HANDLER_AUDITED_ROUTES: &[(RouteMethod, &str)] = &[
     (Post, "/v1/ca/rotation/prepare"),
     (Post, "/v1/ca/rotation/begin"),
     (Post, "/v1/ca/rotation/finalize"),
+    // A lease write's action depends on its outcome: a take of a lease the
+    // caller holds is a renewal, and a conflict is recorded too (#1686).
+    (Post, "/v1/leases"),
+    (Post, "/v1/leases/renew"),
+    (Post, "/v1/leases/release"),
+    (Post, "/v1/leases/break"),
 ];
 
 /// Mutating routes that are not audited, and why. A new `POST` or `DELETE`

@@ -16,10 +16,12 @@ use serde::Serialize;
 use super::budget::Rendered;
 use super::diagnose::{ClusterHeader, Summary, UnknownLine, unknown_lines};
 use super::envelope::{AgentError, BuildInfo, CommandName, NextStep};
+use super::lease::LeaseLine;
 use super::source::{Answer, render_answer};
 use super::untrusted::{Origin, Untrusted};
 use crate::bun::cluster_view::ClusterEvents;
 use crate::bun::events::ClusterEvent;
+use crate::proposal::lease::LeaseListing;
 use crate::relish::RelishError;
 use crate::relish::client::BunClient;
 use crate::relish::wtf::{self, Evidence, WtfFinding, WtfInputs, WtfReport};
@@ -37,6 +39,10 @@ pub const EVENT_LINE_BYTES_MAX: usize = 200;
 /// How long the events request may take. The answer goes out without the
 /// timeline rather than waiting longer.
 const EVENTS_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The most leases the answer lists. The cluster holds at most 256;
+/// `relish lease list` has them all.
+pub const CONTEXT_LEASES_MAX: usize = 50;
 
 /// `relish agent context`'s flags.
 #[derive(Debug, Clone, clap::Args)]
@@ -70,6 +76,10 @@ pub struct ContextData {
     pub alerts: Section<AlertLine>,
     /// One line per app, the worst first.
     pub apps: Section<AppLine>,
+    /// Leases held now (#1686): who's changing what, why, and for how
+    /// long. Take one with `relish agent lease take` before you change
+    /// something; one held by someone else means wait or give up.
+    pub leases: Section<LeaseLine>,
     /// The newest cluster events, newest first.
     pub timeline: Section<TimelineEntry>,
 }
@@ -228,9 +238,10 @@ pub struct TimelineEntry {
 /// Run `relish agent context`.
 pub async fn run(args: &ContextArgs, max_bytes: usize, rerun: &str) -> Rendered {
     let client = BunClient::default_local();
-    let (collected, events) = tokio::join!(
+    let (collected, events, leases) = tokio::join!(
         wtf::collect(&client, None),
         tokio::time::timeout(EVENTS_TIMEOUT, client.events(args.events)),
+        tokio::time::timeout(EVENTS_TIMEOUT, client.leases()),
     );
     let inputs = match collected {
         Ok(inputs) => inputs,
@@ -246,11 +257,12 @@ pub async fn run(args: &ContextArgs, max_bytes: usize, rerun: &str) -> Rendered 
         }
     };
     let events = events.unwrap_or(Err(RelishError::RequestTimeout));
+    let leases = leases.unwrap_or(Err(RelishError::RequestTimeout));
     let report = wtf::diagnose(&inputs);
     render_answer(
         CommandName::Context,
         BuildInfo::current(),
-        Ok(context(&inputs, &report, events, args.events)),
+        Ok(context(&inputs, &report, events, leases, args.events)),
         &[],
         max_bytes,
         rerun,
@@ -263,6 +275,7 @@ pub fn context(
     inputs: &WtfInputs,
     report: &WtfReport,
     events: Result<ClusterEvents, RelishError>,
+    leases: Result<LeaseListing, RelishError>,
     limit: usize,
 ) -> Answer<ContextData> {
     let lines = |findings: &[WtfFinding]| -> Vec<FindingLine> {
@@ -294,6 +307,7 @@ pub fn context(
             message: alert.message.clone(),
         }),
         apps: apps(inputs, report),
+        leases: lease_section(leases),
         timeline: timeline(events, limit),
     };
     let mut next = vec![NextStep {
@@ -381,6 +395,31 @@ fn apps(inputs: &WtfInputs, report: &WtfReport) -> Section<AppLine> {
         (left.state, &left.namespace, &left.app).cmp(&(right.state, &right.namespace, &right.app))
     });
     section
+}
+
+/// The live leases, in target order, at most [`CONTEXT_LEASES_MAX`].
+fn lease_section(leases: Result<LeaseListing, RelishError>) -> Section<LeaseLine> {
+    let leases = match leases {
+        Ok(leases) => leases,
+        Err(error) => return Section::unknown(format!("leases: {error}")),
+    };
+    let total = leases.leases.len();
+    let reason = (total > CONTEXT_LEASES_MAX).then(|| {
+        format!(
+            "{} more leases; `relish lease list` has them all",
+            total - CONTEXT_LEASES_MAX
+        )
+    });
+    Section {
+        state: SectionState::Known,
+        reason,
+        items: leases
+            .leases
+            .iter()
+            .take(CONTEXT_LEASES_MAX)
+            .map(LeaseLine::of)
+            .collect(),
+    }
 }
 
 /// The newest events, newest first, so a byte budget trims the oldest.
@@ -572,6 +611,49 @@ mod tests {
         }
     }
 
+    fn leases() -> LeaseListing {
+        LeaseListing {
+            leases: vec![crate::proposal::lease::LeaseView {
+                target: "app:default/web".to_string(),
+                kind: crate::proposal::lease::LeaseKind::App,
+                namespace: "default".to_string(),
+                app: Some("web".to_string()),
+                holder: "holmes".to_string(),
+                purpose: "investigating the crash loop".to_string(),
+                proposal: None,
+                acquired_at_unix_ms: 1_000,
+                expires_at_unix_ms: 121_000,
+                expires_in_seconds: 87,
+            }],
+            generation: 1,
+        }
+    }
+
+    #[test]
+    fn leases_are_listed_with_their_purpose_untrusted_and_bounded() {
+        let one = lease_section(Ok(leases()));
+        assert_eq!(one.state, SectionState::Known);
+        assert_eq!(one.items[0].holder, "holmes");
+        let json = serde_json::to_value(&one.items[0]).unwrap();
+        assert_eq!(json["purpose"]["untrusted"]["origin"], "lease_purpose");
+
+        let mut many = leases();
+        let first = many.leases[0].clone();
+        many.leases = (0..CONTEXT_LEASES_MAX + 3)
+            .map(|index| crate::proposal::lease::LeaseView {
+                target: format!("app:default/app-{index}"),
+                ..first.clone()
+            })
+            .collect();
+        let bounded = lease_section(Ok(many));
+        assert_eq!(bounded.items.len(), CONTEXT_LEASES_MAX);
+        assert!(bounded.reason.unwrap().starts_with("3 more leases"));
+
+        let unknown = lease_section(Err(RelishError::RequestTimeout));
+        assert_eq!(unknown.state, SectionState::Unknown);
+        assert!(unknown.items.is_empty());
+    }
+
     fn fixture_build() -> BuildInfo {
         BuildInfo {
             version: "0.2.7".to_string(),
@@ -588,7 +670,7 @@ mod tests {
         max_bytes: usize,
     ) -> (Rendered, Value) {
         let report = wtf::diagnose(inputs);
-        let answer = context(inputs, &report, events, limit);
+        let answer = context(inputs, &report, events, Ok(leases()), limit);
         let rendered = render_answer(
             CommandName::Context,
             fixture_build(),

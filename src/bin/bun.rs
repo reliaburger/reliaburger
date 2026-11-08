@@ -2025,6 +2025,14 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             .await?;
         }
 
+        // Leader-only: remove agent leases whose time has passed, with a
+        // `lease.expired` audit record each (#1686).
+        reliaburger::bun::lease_reaper::spawn_lease_reaper(
+            Arc::clone(council),
+            Some(Arc::clone(&event_store)),
+            node_name.clone(),
+            shutdown.clone(),
+        );
         // Leader-only: drop tokens a day past their expiry, never the last
         // Admin (F05 I2). Followers tick too, and do nothing.
         tokio::spawn(reliaburger::bun::token_sweep::run_token_sweep_loop(

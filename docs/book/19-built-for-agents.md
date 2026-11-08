@@ -76,7 +76,9 @@ didn't do.
   "look at the logs" from "roll back the deploy" and ask a human before the
   second. `relish mcp` offers no tool that writes or reaches past the cluster
   API. Agents that may change things, through proposals a human approves,
-  are the other half of the AI SRE milestone, and they stay in 0.4.2.
+  were the other half of the AI SRE milestone; 0.2.8 pulls them forward
+  (#1682). Its first piece is in this chapter: [leases](#taking-turns-leases),
+  which change a council record and never a workload.
 - **Nothing posts.** `relish agent report` writes files and prints the `gh`
   command that would post them. A human reads the draft and runs it. Patched
   binaries stay unsigned, so they can't reach a real cluster either.
@@ -4387,6 +4389,189 @@ than matching text. A step is then `job["steps"][i]["uses"]`, and indexing a
 `Value` with a key that isn't there gives `Value::Null` instead of panicking,
 so a missing field fails the assertion that reads it, with the field's name in
 the message.
+
+## Taking turns: leases
+
+Read-only agents can't step on each other. Agents that change things can,
+and 0.2.8 is the release where they start to: an agent proposes a change and
+a person, or a policy, approves it (#1682). Before any of that lands, two
+agents, or an agent and a person, need a way to say "I'm working on `web`,
+keep off". [#1686](https://github.com/reliaburger/reliaburger/issues/1686) is
+that: a short lease on an app or a namespace, held in the council, visible to
+everyone, and audited. The design is in
+[`docs/plans/2026-11-08-design-agent-proposals.md`](../plans/2026-11-08-design-agent-proposals.md#locks-between-agents);
+this section is its first piece.
+
+```sh
+relish agent lease take app web --namespace shop --purpose "rolling back a crash loop" --wait 60s
+```
+
+A free lease is granted. A lease the caller already holds is renewed. A
+lease someone else holds, or a namespace lease around the app, comes back as
+a new error code, `lease_held`, carrying who holds it, what they said they're
+doing and how many seconds they have left. With `--wait` the CLI retries
+with jittered backoff until the wait runs out. There's no queue. Fairness
+between waiting agents isn't worth a queue's failure modes (who holds a
+place in it when the leader dies?), and the holder's name tells a waiting
+agent whether to bother.
+
+### Not a test lease
+
+The council already had leases: `relish test` takes one to own an isolated
+namespace, and the leader's reaper cleans up everything in it when it ends
+(chapter 15). We reused that machinery's shape and none of its code. A test
+lease owns resources and destroys them; an agent lease owns nothing. It's a
+claim on the right to change something that already exists. Sharing a type
+would have meant a `TestLease` with a flag that switches off half of it.
+
+What we kept is the shape:
+
+- **The leader's clock, in the entry.** `LeaseTake` carries
+  `observed_at_unix_ms`, stamped by the leader when it builds the request.
+  Every replica applies the same entry against the same instant, so a
+  follower whose clock runs a second fast can't decide differently. Nothing
+  in `src/proposal/lease.rs` reads a clock.
+- **The credential, not the name.** The holder is the token's
+  `principal_id`, so only that exact credential renews or releases.
+- **No reviving.** A renewal after the expiry is refused: the caller takes
+  the lease again, and anyone else may have taken it first.
+- **A leader-only reaper**, `src/bun/lease_reaper.rs`, which checks its own
+  copy before it writes, so a quiet cluster writes nothing, and resumes on a
+  new leader because the leases live in Raft.
+
+A lapsed lease stops counting the moment its time passes, whether or not the
+reaper has removed it yet: every rule compares the expiry with the clock in
+the request. The reaper exists to tidy up, move the generation and write the
+`lease.expired` record, not to make expiry true.
+
+### The target as a tagged enum
+
+A lease is on one app or one namespace:
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LeaseTarget {
+    App { namespace: String, app: String },
+    Namespace { namespace: String },
+}
+```
+
+This is the fourth way to write an enum from earlier in the chapter, the one
+we hadn't used. `tag = "kind"` is serde's *internally tagged* form: the
+variant's name goes in a `kind` field beside the variant's own fields, so
+the API sees `{"kind":"app","namespace":"shop","app":"web"}`, which is what
+you'd design by hand. The default (*externally tagged*) would have wrapped it,
+`{"App":{"namespace":"shop","app":"web"}}`.
+
+Conflicts are one method with a `match` on two targets at once:
+
+```rust
+pub fn overlaps(&self, other: &LeaseTarget) -> bool {
+    match (self, other) {
+        (LeaseTarget::App { .. }, LeaseTarget::App { .. }) => self == other,
+        (LeaseTarget::Namespace { namespace }, other)
+        | (other, LeaseTarget::Namespace { namespace }) => {
+            other.namespace_name() == namespace
+        }
+    }
+}
+```
+
+Matching on a tuple `(self, other)` lets one arm handle "either side is a
+namespace": the `|` joins two patterns that bind the same names, so
+`namespace` is the namespace lease's and `other` is whichever target is left.
+Two namespaces compare their names, and a namespace and an app compare the
+app's namespace. Two apps conflict only when they're the same app. The
+compiler checks that the arms cover every pair.
+
+### One outcome type for the wire
+
+Every lease entry answers with what it did:
+
+```rust
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum LeaseOutcome {
+    Taken { lease: AgentLease },
+    Renewed { lease: AgentLease },
+    Released { lease: AgentLease },
+    Broken { lease: AgentLease },
+    Expired { leases: Vec<AgentLease> },
+    Refused { refusal: LeaseRefusal },
+}
+```
+
+The methods on `AgentLeases` return a `Result<LeaseGrant, LeaseRefusal>`,
+which is what a Rust caller wants. The state machine needs a value it can
+send back to the API through Raft, so `LeaseOutcome` implements
+`From<Result<LeaseGrant, LeaseRefusal>>`, and the state machine's arm is
+`self.state.agent_leases.take(request, *observed_at_unix_ms).into()`. `From`
+is the trait behind `.into()`: implement `From<A> for B` and every `A` gains
+an `.into()` that gives a `B`, with the target type worked out from where the
+value goes. Go has no equivalent; you'd write a function and call it.
+
+A refusal is applied like any other entry, changes nothing, and travels back
+with its reason. `LeaseRefusal` derives `thiserror::Error` for the sentence a
+person reads and `Serialize` for the wire, so the same value is both.
+
+### A generation that ignores renewals
+
+`AgentLeases` keeps a `generation` that moves on every take, release, break
+and expiry, and never on a renewal. Nothing reads it yet. It's for the next
+step: a human's direct `relish apply` will carry the generation it checked
+the leases at, and the state machine will refuse it if the generation has
+moved, the same fence chapter 18 built for policies. A busy agent renewing
+every minute mustn't make every human apply retry, so renewals stay out.
+
+### The seam for proposals
+
+#1682 builds proposals on top of this, in the same Raft entries, so the
+interface is four methods on `AgentLeases`, documented at the top of
+`src/proposal/lease.rs`:
+
+```rust
+pub fn take(&mut self, request: &LeaseRequest, now_unix_ms: u64) -> Result<LeaseGrant, LeaseRefusal>;
+pub fn pin(&mut self, target: &LeaseTarget, proposal: u64, expires_at_unix_ms: u64, now_unix_ms: u64) -> Result<(), LeaseRefusal>;
+pub fn blocker(&self, app: &AppId, principal_id: &str, now_unix_ms: u64) -> Option<&AgentLease>;
+pub fn end_pinned(&mut self, proposal: u64) -> Vec<AgentLease>;
+```
+
+Creating a proposal takes a lease on each app it touches and pins it, so the
+lease lasts as long as the proposal waits. Approving one asks `blocker` for
+each app, and a `Some` fails it. A proposal that ends, however it ends,
+ends its leases. All four are pure, so the proposal entry stays
+deterministic too.
+
+### Who sees what
+
+`relish agent context` gained a `leases` section, at most 50 lines, with the
+holder's `purpose` wrapped as untrusted text under a new origin,
+`lease_purpose`. Another agent wrote it, and an agent reading it is reading
+words it didn't write. `GET /v1/leases` shows a scoped token the leases on
+its apps and on their namespaces, because a namespace lease covers those
+apps too.
+
+Taking a lease needs a deployer token with `deploy` on the app, or on every
+app in the namespace for a namespace lease; a read-only token can only look.
+The routes record their own audit records, rather than leaving it to the
+audit layer, because the action depends on the outcome: taking a lease you
+hold is `lease.renewed`, and a conflict is `lease.refused`, naming the
+holder. `relish mcp` doesn't offer the lease commands. It stays read-only
+until `relish mcp --propose` arrives with proposals.
+
+### The tests
+
+The rules are unit tests in `src/proposal/lease.rs`, one per transition:
+grant, renew by taking again, refusal naming the holder, namespace against
+app both ways, a lapsed lease free to anyone, renewal only by the holder and
+never after expiry, release, break, expiry by the given clock, pinning, and
+the limits of 16 per holder and 256 in the cluster. The state machine tests
+apply the five entries and check that two replicas fed the same entries hold
+the same leases, and that a snapshot carries them. `src/bun/api/lease_tests.rs`
+drives the routes through the real router and reads the audit log back.
+`tests/cluster_failover.rs` takes a lease through a follower, kills the
+leader, and checks that the new leader still refuses a second holder and
+then expires the lease on time.
 
 ## What we didn't do
 

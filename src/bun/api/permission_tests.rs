@@ -1417,6 +1417,9 @@ fn principal_body(path: &str) -> Option<&'static str> {
         "/v1/exec/{app}/{namespace}" => r#"{"command":["true"]}"#,
         "/v1/test/leases" | "/v1/test/leases/{id}/renew" => r#"{"ttl_seconds":60}"#,
         "/v1/snapshots/{namespace}/{app}/restore" => r#"{"name":"nightly"}"#,
+        "/v1/leases" | "/v1/leases/renew" | "/v1/leases/release" | "/v1/leases/break" => {
+            r#"{"target":{"kind":"app","namespace":"default","app":"web"}}"#
+        }
         "/v1/fault" => {
             r#"{"fault_type":{"type":"Pause"},"target_service":"api","namespace":"default","duration":{"secs":1,"nanos":0},"injected_by":""}"#
         }

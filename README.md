@@ -187,7 +187,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish agent`: Commands for LLM agents: one JSON envelope, bounded, never interactive
   - `relish agent guide`: How to use relish as an agent: the manual chapter, as Markdown sections
   - `relish agent version`: This binary's version, commit, target and cluster formats
-  - `relish agent schema [guide|version|schema|source-version|source-tree|source-grep|source-show|source-extract|logs|manual-search|manual-show|context|diagnose|explain|upgrade-check|report|patch-init|patch-build|patch-test|patch-try|patch-diff|patch-apply|patch-destroy|setup]`: The JSON Schema of the envelope and of each command's data
+  - `relish agent schema [guide|version|schema|source-version|source-tree|source-grep|source-show|source-extract|logs|manual-search|manual-show|context|diagnose|explain|upgrade-check|report|patch-init|patch-build|patch-test|patch-try|patch-diff|patch-apply|patch-destroy|setup|lease-take|lease-renew|lease-release]`: The JSON Schema of the envelope and of each command's data
   - `relish agent source`: The source this binary was built from: search it, read it, extract it
     - `relish agent source version`: This binary's source: version, commit, digest, file count, and the commit every node runs
     - `relish agent source tree [PREFIX]`: Files with their size in bytes and their line count
@@ -212,7 +212,17 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
     - `relish agent patch apply <DIR> <DIFF>`: Apply a unified diff to the workspace, matching each hunk by its lines rather than its header's counts. All or nothing *(0.2.8, not in 0.2.7)*
     - `relish agent patch destroy [DIR]`: Remove the workspace's throwaway cluster, or every one with `--all`. The workspace and its source stay
   - `relish agent setup [claude-code|codex|cursor|vscode|goose|gemini]...`: Wire Reliaburger into the AI agents on this machine. Shows the diff; writes only with --yes
+  - `relish agent lease`: Take, renew or release a lease on an app or a namespace *(0.2.8, not in 0.2.7)*
+    - `relish agent lease take <app|namespace> <NAME>`: Take a lease before changing an app or a namespace, or renew yours *(0.2.8, not in 0.2.7)*
+    - `relish agent lease renew <app|namespace> <NAME>`: Extend a lease you hold *(0.2.8, not in 0.2.7)*
+    - `relish agent lease release <app|namespace> <NAME>`: Give up a lease you hold *(0.2.8, not in 0.2.7)*
 - `relish mcp`: Serve the `relish agent` commands as read-only MCP tools over stdio
+- `relish lease`: List, take, renew, release or break leases on apps and namespaces, which keep agents and people from changing the same thing at once *(0.2.8, not in 0.2.7)*
+  - `relish lease list`: List the leases held now: target, holder, time left and purpose *(0.2.8, not in 0.2.7)*
+  - `relish lease take <app|namespace> <NAME>`: Take a lease to keep agents out while you work; renews one you hold *(0.2.8, not in 0.2.7)*
+  - `relish lease renew <app|namespace> <NAME>`: Extend a lease you hold *(0.2.8, not in 0.2.7)*
+  - `relish lease release <app|namespace> <NAME>`: Give up a lease you hold *(0.2.8, not in 0.2.7)*
+  - `relish lease break <app|namespace> <NAME>`: End someone else's lease (deployer or above over the target; audited) *(0.2.8, not in 0.2.7)*
 
 **Break things on purpose** ([chaos](docs/manual/05_chaos.md))
 

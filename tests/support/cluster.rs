@@ -539,6 +539,14 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
         ));
     }
 
+    // Bun's leader-only agent lease reaper (#1686), with its audit records.
+    tasks.push(reliaburger::bun::lease_reaper::spawn_lease_reaper(
+        Arc::clone(&council),
+        Some(Arc::clone(&event_store)),
+        name.clone(),
+        shutdown.clone(),
+    ));
+
     let membership_table: Arc<RwLock<Vec<NodeMembershipInfo>>> = Arc::new(RwLock::new(Vec::new()));
     // Every member gossip has shown, so the relay and node-fault reversal
     // reach a node-killed peer as `bun` wires them.

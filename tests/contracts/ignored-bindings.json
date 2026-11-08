@@ -301,6 +301,12 @@
   },
   {
     "source": "tests/cluster_failover.rs",
+    "function": "an_agent_lease_survives_a_leader_change_and_the_new_leader_expires_it",
+    "binary": "reliaburger::cluster_failover",
+    "test": "an_agent_lease_survives_a_leader_change_and_the_new_leader_expires_it"
+  },
+  {
+    "source": "tests/cluster_failover.rs",
     "function": "an_admin_removes_a_policy_that_denies_everything_through_any_node",
     "binary": "reliaburger::cluster_failover",
     "test": "an_admin_removes_a_policy_that_denies_everything_through_any_node"
