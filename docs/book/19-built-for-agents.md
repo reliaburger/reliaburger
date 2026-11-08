@@ -3959,33 +3959,39 @@ runs can't miss.
 "Never fall back to admin" is enforced in `Server::call`:
 
 ```rust
-if let Err(error) = managed.ensure(false).await {
-    return Ok(tool_result(&no_token(command, &error, &rerun)));
-}
+let sent = match managed.ensure().await {
+    Ok(sent) => sent,
+    Err(error) => {
+        return Ok(tool_result(&without_token(&mut options, cluster, &error, &rerun).await));
+    }
+};
 let rendered = agent::run(&options, &rerun).await;
-if !unauthenticated(&rendered) {
-    return Ok(tool_result(&rendered));
-}
+let renew = unauthenticated(&rendered)
+    || (carries_unauthenticated(&rendered) && managed.rejects(sent.as_deref()).await);
 ```
 
-If there's no read-only token, the tool doesn't run: the agent gets an error
-envelope saying the cluster refused (with the cluster's own words) and how to
-make a token by hand. If the cluster answers a tool with a 401, the stored
-token was revoked or expired early, so `ensure(true)` skips it, makes a new
-one, and the call runs once more. `ensure` holds a `tokio::sync::Mutex` while
-it works, so two tool calls arriving together make one token, not two.
+If there's no read-only token, a tool that needs the cluster doesn't run:
+the agent gets an error envelope saying the cluster refused (with the
+cluster's own words) and how to make a token by hand. If the cluster turns
+the token away, it was revoked or expired early, so `renew` makes a new one
+and the call runs once more. `Managed` holds a `tokio::sync::Mutex` while it
+works, so two tool calls arriving together make one token, not two: `renew`
+is handed the token the call went out with, and if the one held now is
+different, another call has already replaced it. The
+next section explains `without_token`, `carries_unauthenticated` and why
+that mutex wasn't enough.
 
-`relish agent setup` does the same thing ahead of time. Its answer gained an
-`mcp_token` change beside the agents' entries: in the preview, a one-line
-diff saying a read-only token for `relish mcp` will be made, never the
-secret; with `--yes`, the token itself; with `--remove`, revocation. Making
-it needs the network, and setup does its file work in `spawn_blocking`, so
-the plan carries a boxed closure, `Box<dyn FnOnce(Action) -> Result<bool,
-String> + Send>`, that calls `Handle::block_on` on the runtime. Blocking on
-the runtime is forbidden on its worker threads and fine on a
-`spawn_blocking` thread, which is exactly where the closure runs. The tests
-hand setup a closure that records what it was asked to do, so they check
-"the preview makes nothing" and "`--yes` makes it once" without a cluster.
+`relish agent setup` does the same thing ahead of time. Its answer gained
+`mcp_tokens` changes beside the agents' entries: in the preview, the token
+file's JSON with the secret replaced by `[redacted]`; with `--yes`, the
+token itself; with `--remove`, revocation. Making it needs the network, and
+setup does its file work in `spawn_blocking`, so the plan carries a boxed
+closure, `Box<dyn FnMut(Action, &Path) -> Result<bool, String> + Send>`,
+that calls `Handle::block_on` on the runtime. Blocking on the runtime is
+forbidden on its worker threads and fine on a `spawn_blocking` thread,
+which is exactly where the closure runs. The tests hand setup a closure
+that records what it was asked to do, so they check "the preview makes
+nothing" and "`--yes` makes it once" without a cluster.
 
 The tests for `credentials` run against a stand-in API with an admin bearer
 and a read-only one: an admin context makes a `read-only` token with
@@ -4005,6 +4011,125 @@ to warn about. `admin_warning`'s first arm is now
 `TokenOrigin::ContextAdmin | TokenOrigin::Absent => false`: a `|` in a
 `match` pattern matches either variant, like two `case` labels sharing one
 body in C, without the fall-through.
+
+### What a live cluster found
+
+The tests above all passed, and then someone ran the branch against a real
+cluster for an afternoon and found seven things wrong. None was a crash.
+Each was a place where the stand-in API was kinder than `bun`.
+
+**A dead token that nobody noticed.** The reviewer called `context`, ran
+`relish token revoke` on the `relish-mcp-` token, and called `context`
+again. It answered with `isError: false`, a cluster called `unknown` with
+no nodes, and every section `unknown: API error (status 401): invalid
+token`. The renewal only looked for a top-level `error.code ==
+"unauthenticated"`, and `context` and `diagnose` never fail that way: `wtf`
+turns every failed source into evidence, which is the point of it. So the
+dead token stayed, and every new session reused it, because `usable` checks
+only the expiry written in the file.
+
+The reviewer suggested counting an answer whose sections all failed with a
+401 as unauthenticated. We went one step further, because "all" is hard to
+pin down (some unknowns are derived and carry no status, and a relayed node
+can disagree with the leader). `carries_unauthenticated` only spots the
+words `API error (status 401)` anywhere in the answer, which could even be
+a log line quoting them. Then `rejects` asks the cluster the real
+question, with the same admin-only `GET /v1/token/list` the role probe
+uses, sent with the read-only token: a 403 means "valid, not admin", a 401
+means "dead". Only a 401 renews. That costs one cheap request, and only
+when an answer looks wrong. `relish agent setup` asks the same question of
+a stored token that's still good on disk, so it reports a revoked one as
+replaced rather than `unchanged`. `relish mcp` itself still reuses the
+stored token with no round trip; the check runs only after a suspicious
+answer.
+
+**Offline tools that went down with the cluster.** `Server::call` ran
+`ensure` before every tool, so with `bun` stopped and no token stored,
+`version` and `manual_search` answered `unreachable`. They read nothing but
+the binary. The fix is a property every command has to declare:
+
+```rust
+pub enum ClusterUse { None, Optional, Required }
+
+pub fn cluster_use(&self) -> ClusterUse {
+    match self {
+        AgentCommand::Guide | AgentCommand::Version | /* ... */ => ClusterUse::None,
+        AgentCommand::Source(options) if options.offline => ClusterUse::None,
+        AgentCommand::Source(_) => ClusterUse::Optional,
+        AgentCommand::Logs(_) | AgentCommand::Context(_) | /* ... */ => ClusterUse::Required,
+    }
+}
+```
+
+There's no `_ =>` arm, on purpose. Rust insists a `match` covers every
+variant, so a new `AgentCommand` doesn't compile until someone decides
+which kind it is. In Go a `switch` with a missing case quietly does
+nothing; here the compiler asks. The `if options.offline` is a *match
+guard*: the arm applies only when the condition holds, and otherwise the
+next arm gets a turn. The `source_*` tools are the interesting middle case.
+They answer from the binary's bundle and ask the cluster which commit its
+nodes run, as an extra. Without a read-only token, `without_token` sets
+`--offline` and runs them anyway, rather than failing or (worse) letting
+that extra request go out with the admin token.
+
+**Three servers, three tokens.** An editor that starts three agents starts
+three `relish mcp` processes at once. Each found no file, each made a
+token, and the file kept the last, orphaning two. The `tokio::sync::Mutex`
+only covers tool calls inside one process. `obtain` now takes a file lock
+beside the token file, through the project's `FileLock` (every lock goes
+through it, and a test fails the build otherwise), then reads the file
+again. The first process makes the token; the others wait, find it, and
+use it. The fast path, a good token already on disk, takes no lock.
+
+`FileLock` is a guard: `let _lock = lock(path).await?;` holds it until
+`_lock` goes out of scope at the end of the function, whichever way the
+function leaves, `?` included. That's RAII, the same idea as a C++
+destructor or a Go `defer` you can't forget to write. Note the name:
+`_lock`, not `_`. A bare `_` drops the value straight away, which would
+take the lock and release it on the same line. Waiting for the lock blocks
+a thread (it polls `flock`), so it runs in `spawn_blocking`. And because
+renewal now takes the rejected token rather than a `bool`, a server that
+waited for another one's renewal sees the file holds a different token and
+uses it instead of making a fourth.
+
+**Leftovers.** `relish agent setup --remove` only knew `mcp-token.json`;
+the files `relish mcp --namespace` makes stayed behind with live tokens in
+them. `files_beside` lists every `mcp-token-<namespace>.json` (the same
+namespace check that keeps a name from escaping the directory), and the
+answer's `mcp_token` became `mcp_tokens`, one change per file.
+
+**Warnings about tokens that look after themselves.** A one-day token
+spends its whole life inside the 14-day expiry warning, so `relish token
+list` told the admin to rotate every `relish-mcp-` token, and `relish wtf`
+listed a `token-expiring` finding for each. Rotating one gives it a new
+secret that `relish mcp` doesn't have, which is the dead-token bug again.
+A token carries no "made by" field, and adding one would change the state
+format for a warning, so the name prefix is the mark:
+`credentials::made_by_relish_mcp` checks it, and both warnings skip those
+tokens. A token you name `relish-mcp-something` yourself is skipped too.
+The manual's agent chapter is at its 64 KiB guide budget, so it says only
+that `--remove` revokes them all; the doc comment on `TOKEN_NAME_PREFIX`
+carries the rest.
+
+**Small things.** The `Unreachable` error now names the same by-hand
+fallback as the `Refused` one. A refusal is remembered for a minute
+(`REFUSAL_BACKOFF`), so a cluster that says no isn't asked twice per tool
+call; answering from memory needs the error twice, once to keep and once
+to return, so `CredentialError` derives `Clone`. Setup's diff used to show
+a sentence as the file's content; it now shows the JSON, built by
+serialising a `StoredToken` whose secret has been swapped for `[redacted]`,
+so the preview can't drift from the real format. And the revoke of a
+replaced token now checks the endpoint as well as the owner, because it
+revokes by name and a name from another cluster could belong to someone
+else here.
+
+The tests are the reviewer's reproductions, each written first and watched
+failing. A stand-in token is revoked and `context` and `diagnose` must come
+back with a new one; a token one route still turns away must be kept, with
+the probe seen on the wire. Five offline tools must answer with nothing
+listening. Three `obtain` calls on a multi-threaded runtime must make one
+token (before the lock it was three). Two `relish-mcp-` tokens and one of
+ours go into each warning, and only ours comes out.
 
 ### The tests
 

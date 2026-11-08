@@ -121,7 +121,51 @@ impl AgentOptions {
     }
 }
 
+/// Whether a command talks to the cluster. `relish mcp` asks, because a
+/// command that does needs its read-only token first, and one that doesn't
+/// should answer with the cluster down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterUse {
+    /// It reads only this binary: its build, manual, schemas or source.
+    None,
+    /// It answers from this binary and asks the cluster only to add to
+    /// that, which [`AgentCommand::answer_offline`] turns off.
+    Optional,
+    /// It needs the cluster to answer.
+    Required,
+}
+
 impl AgentCommand {
+    /// Whether this command talks to the cluster. A new command has to say,
+    /// because this `match` names every one.
+    pub fn cluster_use(&self) -> ClusterUse {
+        match self {
+            AgentCommand::Guide
+            | AgentCommand::Version
+            | AgentCommand::Schema { .. }
+            | AgentCommand::Manual { .. }
+            | AgentCommand::Explain { .. }
+            | AgentCommand::Report(_) => ClusterUse::None,
+            AgentCommand::Source(options) if options.offline => ClusterUse::None,
+            // Which commit the nodes run, beside the bundle's own.
+            AgentCommand::Source(_) => ClusterUse::Optional,
+            AgentCommand::Logs(_)
+            | AgentCommand::Context(_)
+            | AgentCommand::Diagnose(_)
+            | AgentCommand::UpgradeCheck(_)
+            | AgentCommand::Patch(_)
+            | AgentCommand::Setup(_) => ClusterUse::Required,
+        }
+    }
+
+    /// Answer without asking the cluster, for a [`ClusterUse::Optional`]
+    /// command. Any other is left as it is.
+    pub fn answer_offline(&mut self) {
+        if let AgentCommand::Source(options) = self {
+            options.offline = true;
+        }
+    }
+
     /// The name the envelope's `command` field carries.
     pub fn name(&self) -> CommandName {
         match self {

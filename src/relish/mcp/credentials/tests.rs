@@ -51,8 +51,9 @@ impl Cluster {
                         body,
                     });
                     let admin = bearer == ADMIN;
+                    let reader = bearer == READER || bearer.starts_with("rbrg_minted_");
                     match (method, uri.path(), admin) {
-                        (_, _, false) if bearer == READER => {
+                        (_, _, false) if reader => {
                             (StatusCode::FORBIDDEN, "requires admin role".to_string())
                         }
                         (_, _, false) => (StatusCode::UNAUTHORIZED, "invalid token".to_string()),
@@ -147,7 +148,7 @@ async fn an_admin_context_mints_a_scoped_read_only_token_with_a_ttl_and_stores_i
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("mcp-token.json");
     let cluster = Cluster::start(false).await;
-    let (credential, obtained) = obtain(&path, &scope(None), &cluster.client(ADMIN), now(), false)
+    let (credential, obtained) = obtain(&path, &scope(None), &cluster.client(ADMIN), now(), None)
         .await
         .unwrap();
     assert_eq!(obtained, Obtained::Minted);
@@ -185,7 +186,7 @@ async fn a_namespace_confines_the_token_and_gets_its_own_file() {
         &scope(Some("payments")),
         &cluster.client(ADMIN),
         now(),
-        false,
+        None,
     )
     .await
     .unwrap();
@@ -212,7 +213,7 @@ async fn a_usable_stored_token_is_reused_without_asking_the_cluster() {
         .save(&path)
         .unwrap();
     let cluster = Cluster::start(false).await;
-    let (credential, obtained) = obtain(&path, &scope(None), &cluster.client(ADMIN), now(), false)
+    let (credential, obtained) = obtain(&path, &scope(None), &cluster.client(ADMIN), now(), None)
         .await
         .unwrap();
     assert_eq!(obtained, Obtained::Reused);
@@ -225,7 +226,7 @@ async fn a_read_only_context_mints_nothing() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("mcp-token.json");
     let cluster = Cluster::start(false).await;
-    let (credential, obtained) = obtain(&path, &scope(None), &cluster.client(READER), now(), false)
+    let (credential, obtained) = obtain(&path, &scope(None), &cluster.client(READER), now(), None)
         .await
         .unwrap();
     assert_eq!(obtained, Obtained::NotNeeded);
@@ -242,7 +243,7 @@ async fn an_expired_stored_token_is_replaced_and_the_old_one_revoked() {
         .save(&path)
         .unwrap();
     let cluster = Cluster::start(false).await;
-    let (credential, obtained) = obtain(&path, &scope(None), &cluster.client(ADMIN), now(), false)
+    let (credential, obtained) = obtain(&path, &scope(None), &cluster.client(ADMIN), now(), None)
         .await
         .unwrap();
     assert_eq!(obtained, Obtained::Minted);
@@ -271,7 +272,7 @@ async fn a_token_about_to_expire_or_from_another_cluster_is_not_reused() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("mcp-token.json");
         token.save(&path).unwrap();
-        let (_, obtained) = obtain(&path, &scope(None), &cluster.client(ADMIN), now(), false)
+        let (_, obtained) = obtain(&path, &scope(None), &cluster.client(ADMIN), now(), None)
             .await
             .unwrap();
         assert_eq!(obtained, Obtained::Minted, "{}", token.token);
@@ -288,9 +289,15 @@ async fn renewing_replaces_a_rejected_token_with_a_new_read_only_one() {
         .save(&path)
         .unwrap();
     let cluster = Cluster::start(false).await;
-    let (credential, obtained) = obtain(&path, &scope(None), &cluster.client(ADMIN), now(), true)
-        .await
-        .unwrap();
+    let (credential, obtained) = obtain(
+        &path,
+        &scope(None),
+        &cluster.client(ADMIN),
+        now(),
+        Some("rbrg_revoked"),
+    )
+    .await
+    .unwrap();
     assert_eq!(obtained, Obtained::Minted);
     assert_eq!(read_only(&credential), "rbrg_minted_0");
 }
@@ -300,7 +307,7 @@ async fn a_cluster_that_refuses_token_creation_is_a_clear_error_and_stores_nothi
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("mcp-token.json");
     let cluster = Cluster::start(true).await;
-    let error = obtain(&path, &scope(None), &cluster.client(ADMIN), now(), false)
+    let error = obtain(&path, &scope(None), &cluster.client(ADMIN), now(), None)
         .await
         .err()
         .expect("a refusal is an error");
@@ -325,11 +332,18 @@ async fn an_unreachable_cluster_is_an_error_too() {
     let address = listener.local_addr().unwrap();
     drop(listener);
     let admin = BunClient::new_with_token(&format!("http://{address}"), Some(ADMIN));
-    let error = obtain(&path, &scope(None), &admin, now(), false)
+    let error = obtain(&path, &scope(None), &admin, now(), None)
         .await
         .err()
         .expect("no cluster, no token");
     assert!(matches!(error, CredentialError::Unreachable(_)), "{error}");
+    // #1763 review: name the fallback, as a refusal does.
+    let message = error.to_string();
+    assert!(
+        message.contains("relish token create --name agent --role read-only --ttl-days 1"),
+        "{message}"
+    );
+    assert!(message.contains("RELIABURGER_TOKEN"), "{message}");
 }
 
 #[test]
@@ -363,4 +377,188 @@ async fn removing_revokes_the_token_and_deletes_the_file() {
         .filter(|seen| seen.path == "/v1/token/revoke")
         .collect();
     assert_eq!(revoked.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Follow-ups from the live-cluster review of #1763.
+
+/// Revoked or rotated behind relish mcp's back, a stored token still looks
+/// usable on disk; only the cluster can say it's dead.
+#[tokio::test]
+async fn the_cluster_says_whether_it_still_accepts_a_token() {
+    let cluster = Cluster::start(false).await;
+    let admin = cluster.client(ADMIN);
+    assert_eq!(accepted(&admin, "rbrg_minted_7").await, Some(true));
+    assert_eq!(accepted(&admin, "rbrg_revoked").await, Some(false));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let nowhere = BunClient::new_with_token(&format!("http://{address}"), Some(ADMIN));
+    assert_eq!(accepted(&nowhere, "rbrg_minted_7").await, None, "can't say");
+}
+
+/// Two servers saw the same token rejected; the second to get the lock
+/// finds the first one's new token and uses it.
+#[tokio::test]
+async fn renewing_keeps_a_token_another_server_has_already_renewed() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("mcp-token.json");
+    stored("relish-mcp-new", "rbrg_renewed", Some(now() + 3_600))
+        .save(&path)
+        .unwrap();
+    let cluster = Cluster::start(false).await;
+    let (credential, obtained) = obtain(
+        &path,
+        &scope(None),
+        &cluster.client(ADMIN),
+        now(),
+        Some("rbrg_revoked"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(obtained, Obtained::Reused);
+    assert_eq!(read_only(&credential), "rbrg_renewed");
+    assert!(cluster.creations().await.is_empty());
+}
+
+/// #1763 review: three `relish mcp` processes starting together each made
+/// a token, the file kept one and the other two were orphaned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn servers_starting_together_make_one_token_between_them() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("mcp-token.json");
+    let cluster = Arc::new(Cluster::start(false).await);
+    let tasks: Vec<_> = (0..3)
+        .map(|_| {
+            let path = path.clone();
+            let cluster = cluster.clone();
+            tokio::spawn(async move {
+                let (credential, _) =
+                    obtain(&path, &scope(None), &cluster.client(ADMIN), now(), None)
+                        .await
+                        .unwrap();
+                read_only(&credential).to_string()
+            })
+        })
+        .collect();
+    let mut tokens = Vec::new();
+    for task in tasks {
+        tokens.push(task.await.unwrap());
+    }
+    assert_eq!(cluster.creations().await.len(), 1, "one token made");
+    assert!(
+        tokens.iter().all(|token| token == "rbrg_minted_0"),
+        "{tokens:?}"
+    );
+}
+
+/// The revoke of a replaced token names it by name alone, so a token from
+/// another endpoint (another cluster under the same context owner) is left
+/// alone: its name could be someone else's here.
+#[tokio::test]
+async fn a_replaced_token_from_another_endpoint_is_not_revoked_here() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("mcp-token.json");
+    let mut elsewhere = stored(
+        "relish-mcp-elsewhere",
+        "rbrg_elsewhere",
+        Some(now() + 3_600),
+    );
+    elsewhere.endpoint = "https://10.0.0.9:19117".to_string();
+    elsewhere.save(&path).unwrap();
+    let cluster = Cluster::start(false).await;
+    let (_, obtained) = obtain(&path, &scope(None), &cluster.client(ADMIN), now(), None)
+        .await
+        .unwrap();
+    assert_eq!(obtained, Obtained::Minted);
+    let revoked: Vec<_> = cluster
+        .seen()
+        .await
+        .into_iter()
+        .filter(|seen| seen.path == "/v1/token/revoke")
+        .collect();
+    assert!(revoked.is_empty(), "{revoked:?}");
+}
+
+/// `--remove` must find the namespace files too.
+#[test]
+fn every_token_file_beside_the_context_is_found() {
+    let directory = tempfile::tempdir().unwrap();
+    let context = directory.path().join("context.json");
+    for name in [
+        "context.json",
+        "mcp-token.json",
+        "mcp-token-payments.json",
+        "mcp-token-ops-2.json",
+        "mcp-token-Bad.json",
+        "mcp-token-.json",
+        "mcp-token.lock",
+        "other.json",
+    ] {
+        std::fs::write(directory.path().join(name), "{}").unwrap();
+    }
+    let found: Vec<String> = files_beside(&context)
+        .unwrap()
+        .iter()
+        .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        found,
+        [
+            "mcp-token-ops-2.json",
+            "mcp-token-payments.json",
+            "mcp-token.json"
+        ]
+    );
+    let empty = tempfile::tempdir().unwrap();
+    assert!(
+        files_beside(&empty.path().join("context.json"))
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// `relish agent setup` previews the file: its JSON as written, with the
+/// secret replaced.
+#[test]
+fn a_token_files_preview_is_its_json_with_the_secret_redacted() {
+    let held = stored("relish-mcp-1", "rbrg_the_secret", Some(1_900_000_000));
+    for preview in [
+        shape(&scope(None), Some(&held), now()),
+        shape(&scope(None), None, now()),
+    ] {
+        assert!(!preview.contains("rbrg_the_secret"), "{preview}");
+        let json: serde_json::Value = serde_json::from_str(&preview).unwrap();
+        assert_eq!(json["token"], crate::redact::REDACTED, "{preview}");
+        assert_eq!(json["owner"], "laptop");
+        let keys: Vec<&String> = json.as_object().unwrap().keys().collect();
+        assert_eq!(
+            keys,
+            [
+                "endpoint",
+                "expires_at",
+                "name",
+                "namespace",
+                "owner",
+                "schema",
+                "token"
+            ]
+        );
+    }
+    let at = now();
+    let fresh: serde_json::Value = serde_json::from_str(&shape(&scope(None), None, at)).unwrap();
+    assert!(
+        fresh["name"].as_str().unwrap().starts_with("relish-mcp-"),
+        "{fresh}"
+    );
+    assert_eq!(fresh["expires_at"], at + TOKEN_TTL_DAYS * 86_400);
+}
+
+/// The tokens relish mcp makes live a day and renew themselves, so the
+/// expiry warning skips them by their name.
+#[test]
+fn relish_mcp_tokens_are_known_by_their_name() {
+    assert!(made_by_relish_mcp("relish-mcp-1762000000-4242"));
+    assert!(!made_by_relish_mcp("agent"));
+    assert!(!made_by_relish_mcp("my-relish-mcp-1"));
 }

@@ -39,7 +39,8 @@ use serde_json::Value;
 
 use crate::relish::RelishError;
 use crate::relish::agent::{
-    self, AgentError, AgentOptions, CommandName, DEFAULT_MAX_BYTES, ErrorCode, ExitStatus, Rendered,
+    self, AgentError, AgentOptions, ClusterUse, CommandName, DEFAULT_MAX_BYTES, ErrorCode,
+    ExitStatus, Rendered,
 };
 use crate::relish::client::{BunClient, TokenAccess, TokenOrigin};
 use credentials::{Credential, CredentialError};
@@ -136,6 +137,11 @@ fn spawn_admin_warning(origin: TokenOrigin) -> tokio::task::JoinHandle<()> {
     })
 }
 
+/// How long `relish mcp` remembers that the cluster said no to a token
+/// (refused to make one, or rejected the context's own), answering every
+/// tool call that needs one from memory instead of asking again.
+pub const REFUSAL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// `relish mcp`'s own read-only token, for a server started from an admin
 /// context (#1730): where it's kept, what it's for, and the admin client
 /// that makes a new one.
@@ -144,9 +150,31 @@ pub struct Managed {
     scope: credentials::Scope,
     admin: BunClient,
     /// Held while a token is checked or made, so two calls at once don't
-    /// make two. `true` once the cluster has said the context's token isn't
-    /// admin after all, so there's nothing to make.
-    context_not_admin: tokio::sync::Mutex<bool>,
+    /// make two. Another process is kept out by the file lock in
+    /// [`credentials::obtain`].
+    state: tokio::sync::Mutex<ManagedState>,
+}
+
+/// Which token [`Managed::obtain`] is after.
+#[derive(Debug, Clone, Copy)]
+enum Want<'a> {
+    /// Any good one: the one held, the stored one, or a new one.
+    Any,
+    /// One other than this, which the cluster has just rejected (`None`:
+    /// the context's own was sent).
+    Replacing(Option<&'a str>),
+}
+
+/// What [`Managed`] knows between tool calls.
+#[derive(Default)]
+struct ManagedState {
+    /// The cluster has said the context's token isn't admin after all, so
+    /// there's nothing to make.
+    context_not_admin: bool,
+    /// The read-only token being sent.
+    current: Option<String>,
+    /// When the cluster last said no, and what it said.
+    refused: Option<(std::time::Instant, CredentialError)>,
 }
 
 impl std::fmt::Debug for Managed {
@@ -167,7 +195,7 @@ impl Managed {
             path,
             scope,
             admin,
-            context_not_admin: tokio::sync::Mutex::new(false),
+            state: tokio::sync::Mutex::default(),
         }
     }
 
@@ -195,30 +223,94 @@ impl Managed {
     }
 
     /// Make sure every request from here on sends a read-only token: the
-    /// stored one, or a new one. `renew` skips the stored one, because the
-    /// cluster has just rejected it. An error leaves no token to send, and
-    /// the caller runs nothing.
-    async fn ensure(&self, renew: bool) -> Result<(), CredentialError> {
-        let mut context_not_admin = self.context_not_admin.lock().await;
-        if *context_not_admin && !renew {
-            return Ok(());
+    /// stored one, or a new one. Returns the token being sent, `None` when
+    /// it's the context's own because that isn't admin. An error leaves no
+    /// token to send, and the caller runs nothing that needs one.
+    async fn ensure(&self) -> Result<Option<String>, CredentialError> {
+        self.obtain(Want::Any).await
+    }
+
+    /// Replace `rejected`, the token the cluster has just turned away. If
+    /// another call already has, its token stands.
+    async fn renew(&self, rejected: Option<&str>) -> Result<Option<String>, CredentialError> {
+        self.obtain(Want::Replacing(rejected)).await
+    }
+
+    async fn obtain(&self, want: Want<'_>) -> Result<Option<String>, CredentialError> {
+        let mut state = self.state.lock().await;
+        let current_stands = match want {
+            Want::Any => state.context_not_admin,
+            Want::Replacing(rejected) => {
+                !state.context_not_admin && state.current.as_deref() != rejected
+            }
+        };
+        if current_stands {
+            return Ok(state.current.clone());
         }
-        let (credential, _) = credentials::obtain(
+        if let Some((at, error)) = &state.refused
+            && at.elapsed() < REFUSAL_BACKOFF
+        {
+            return Err(error.clone());
+        }
+        let rejected = match want {
+            Want::Any => None,
+            Want::Replacing(rejected) => rejected,
+        };
+        let obtained = credentials::obtain(
             &self.path,
             &self.scope,
             &self.admin,
             credentials::now(),
-            renew,
+            rejected,
         )
-        .await?;
+        .await;
+        let credential = match obtained {
+            Ok((credential, _)) => credential,
+            Err(error) => {
+                // A "no" stays a "no" for a while; no answer at all is
+                // worth asking again straight away.
+                if matches!(
+                    error,
+                    CredentialError::Refused { .. } | CredentialError::ContextRejected
+                ) {
+                    state.refused = Some((std::time::Instant::now(), error.clone()));
+                }
+                return Err(error);
+            }
+        };
+        state.refused = None;
         match credential {
-            Credential::ReadOnly(token) => crate::relish::client::set_mcp_token(Some(token)),
+            Credential::ReadOnly(token) => {
+                crate::relish::client::set_mcp_token(Some(token.clone()));
+                state.current = Some(token);
+            }
             Credential::ContextNotAdmin => {
-                *context_not_admin = true;
+                state.context_not_admin = true;
+                state.current = None;
                 crate::relish::client::set_mcp_token(None);
             }
         }
-        Ok(())
+        Ok(state.current.clone())
+    }
+
+    /// Whether the cluster has stopped accepting `sent`, the token a call
+    /// went out with: it answers the admin-only probe with a 401. `false`
+    /// when it can't say, or when the context's own token was sent.
+    async fn rejects(&self, sent: Option<&str>) -> bool {
+        match sent {
+            Some(token) => credentials::accepted(&self.admin, token).await == Some(false),
+            None => false,
+        }
+    }
+
+    /// Pretend the last refusal came `by` earlier, so a test needn't wait.
+    #[cfg(test)]
+    async fn age_refusal(&self, by: std::time::Duration) {
+        if let Some((at, _)) = &mut self.state.lock().await.refused
+            && let Some(earlier) = at.checked_sub(by)
+        {
+            *at = earlier;
+        }
     }
 }
 
@@ -275,7 +367,7 @@ impl Server {
         let parsed = agent::agent_command()
             .try_get_matches_from(&line)
             .and_then(|matches| AgentOptions::from_arg_matches(&matches));
-        let options = match parsed {
+        let mut options = match parsed {
             Ok(options) => options,
             Err(error) => {
                 let message = error.to_string();
@@ -285,19 +377,52 @@ impl Server {
         let Some(managed) = &self.managed else {
             return Ok(tool_result(&agent::run(&options, &rerun).await));
         };
-        if let Err(error) = managed.ensure(false).await {
-            return Ok(tool_result(&no_token(command, &error, &rerun)));
+        let cluster = options.command.cluster_use();
+        // A tool that reads only this binary needs no token, so it answers
+        // with the cluster down too.
+        if cluster == ClusterUse::None {
+            return Ok(tool_result(&agent::run(&options, &rerun).await));
         }
+        let sent = match managed.ensure().await {
+            Ok(sent) => sent,
+            Err(error) => {
+                return Ok(tool_result(
+                    &without_token(&mut options, cluster, &error, &rerun).await,
+                ));
+            }
+        };
         let rendered = agent::run(&options, &rerun).await;
-        if !unauthenticated(&rendered) {
+        let renew = unauthenticated(&rendered)
+            || (carries_unauthenticated(&rendered) && managed.rejects(sent.as_deref()).await);
+        if !renew {
             return Ok(tool_result(&rendered));
         }
-        // Revoked, or expired sooner than it said: make a new read-only
-        // token and ask once more.
-        if let Err(error) = managed.ensure(true).await {
-            return Ok(tool_result(&no_token(command, &error, &rerun)));
+        // Revoked, rotated, or expired sooner than it said: make a new
+        // read-only token and ask once more.
+        if let Err(error) = managed.renew(sent.as_deref()).await {
+            return Ok(tool_result(
+                &without_token(&mut options, cluster, &error, &rerun).await,
+            ));
         }
         Ok(tool_result(&agent::run(&options, &rerun).await))
+    }
+}
+
+/// The answer when there's no read-only token to send: a tool that only
+/// adds what the cluster says answers without it; any other fails, saying
+/// why.
+async fn without_token(
+    options: &mut AgentOptions,
+    cluster: ClusterUse,
+    error: &CredentialError,
+    rerun: &str,
+) -> Rendered {
+    match cluster {
+        ClusterUse::Optional => {
+            options.command.answer_offline();
+            agent::run(options, rerun).await
+        }
+        ClusterUse::None | ClusterUse::Required => no_token(options.command.name(), error, rerun),
     }
 }
 
@@ -305,6 +430,15 @@ impl Server {
 fn unauthenticated(rendered: &Rendered) -> bool {
     serde_json::from_str::<Value>(&rendered.json)
         .is_ok_and(|envelope| envelope["error"]["code"] == "unauthenticated")
+}
+
+/// Whether an answer carries a 401 somewhere inside it. `context` and
+/// `diagnose` don't fail when every request is turned away: they answer
+/// with every section `unknown` and the API error as its reason. That alone
+/// isn't proof (one node may disagree, or a log line may quote the words),
+/// so the caller asks the cluster about the token before renewing it.
+fn carries_unauthenticated(rendered: &Rendered) -> bool {
+    rendered.json.contains("API error (status 401)")
 }
 
 /// The answer to a tool call that ran nothing because there's no read-only
