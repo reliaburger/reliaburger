@@ -3111,7 +3111,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     };
     // The leader's registry endpoints accept only mTLS node certificates, so
     // a plaintext cluster's registry can't forward or replicate (#792). Say
-    // so once here; the reaper, `relish status` and `relish wtf` carry it on.
+    // so once here; the reaper and `relish wtf` carry it on.
     let registry_needs_mtls = registry_forwarder
         .as_ref()
         .is_some_and(|forwarder| forwarder.requires_mtls());

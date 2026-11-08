@@ -81,6 +81,7 @@ target/debug/bun --runtime process --config examples/node/process-runtime.toml
 # In another terminal
 target/debug/relish apply examples/phase-1/proc-first-run.toml
 target/debug/relish status
+target/debug/relish apps
 target/debug/relish            # terminal UI
 open http://127.0.0.1:9117/    # web dashboard
 ```

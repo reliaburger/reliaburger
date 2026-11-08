@@ -200,6 +200,8 @@ pub(super) fn relay_allows(method: &axum::http::Method, path: &str) -> bool {
         "v1/version",
         // Each node knows whether its own `[gitops]` drifts (#1286).
         "v1/gitops",
+        // `relish nodes` shows each node's version and usage.
+        "v1/cluster/summary/node",
     ];
     match *method {
         // `relish test` compares each node's own deploy history.

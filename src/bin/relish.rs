@@ -657,8 +657,35 @@ enum Command {
         #[arg(long)]
         break_lease: bool,
     },
-    /// Show cluster and app status.
-    Status,
+    /// Is the cluster all right? One screen: a verdict, then one line per part
+    /// of the cluster with the command that lists the detail.
+    Status {
+        /// Skip `relish wtf`'s checks, which otherwise run with a 2 s budget.
+        #[arg(long)]
+        quick: bool,
+        /// Exit 1 when the cluster is DEGRADED and 2 when it's DOWN, for
+        /// scripts and monitoring.
+        #[arg(long)]
+        check: bool,
+    },
+    /// List apps with their state, problems first; with NAME, that app's
+    /// instances.
+    Apps {
+        /// List this app's instances instead.
+        name: Option<String>,
+        /// Only apps in this namespace.
+        #[arg(long)]
+        namespace: Option<String>,
+        /// Only apps that aren't running and ready.
+        #[arg(long)]
+        unhealthy: bool,
+        /// Only apps with an instance on this node.
+        #[arg(long)]
+        node: Option<String>,
+        /// List every instance of every app, one row each.
+        #[arg(long, conflicts_with = "name")]
+        instances: bool,
+    },
     /// Stream logs from an app or job.
     Logs(Box<LogsOptions>),
     /// Copy a node's Parquet log files here, or have it ship them to object storage.
@@ -753,8 +780,13 @@ enum Command {
     },
     /// Initialise a new cluster (generates CAs, age keypair, node identity).
     Init(Box<InitOptions>),
-    /// List cluster nodes and their gossip state.
-    Nodes,
+    /// List cluster nodes: gossip state, version, usage and what's allocated.
+    Nodes {
+        /// Only nodes that aren't alive, are cordoned or are under disk
+        /// pressure.
+        #[arg(long)]
+        unhealthy: bool,
+    },
     /// Permanently retire a stopped or fenced node; return requires fresh enrolment.
     DecommissionNode {
         /// Old cluster identity to retire permanently.
@@ -2083,7 +2115,35 @@ async fn main() -> ExitCode {
             Ok(source) if rerun_jobs => commands::rerun_jobs(&source, cli.output).await,
             Ok(source) => commands::apply(&source, cli.output, dry_run, break_lease).await,
         },
-        Command::Status => commands::status(cli.output).await,
+        Command::Status { quick, check } => {
+            return finish_outcome(
+                reliaburger::relish::status_cmd::run(reliaburger::relish::status_cmd::StatusArgs {
+                    quick,
+                    check,
+                    output: cli.output,
+                })
+                .await,
+            );
+        }
+        Command::Apps {
+            ref name,
+            ref namespace,
+            unhealthy,
+            ref node,
+            instances,
+        } => {
+            reliaburger::relish::apps_cmd::run(
+                reliaburger::relish::apps_cmd::AppsArgs {
+                    name: name.clone(),
+                    namespace: namespace.clone(),
+                    unhealthy,
+                    node: node.clone(),
+                    instances,
+                },
+                cli.output,
+            )
+            .await
+        }
         Command::Dashboard { port, no_open } => {
             reliaburger::relish::dashboard::run(port, no_open).await
         }
@@ -2176,7 +2236,9 @@ async fn main() -> ExitCode {
             },
             cli.output,
         ),
-        Command::Nodes => commands::nodes(cli.output).await,
+        Command::Nodes { unhealthy } => {
+            reliaburger::relish::nodes_cmd::run(unhealthy, cli.output).await
+        }
         Command::DecommissionNode {
             node_id,
             workloads_stopped,
@@ -3388,10 +3450,11 @@ fn output_support(command: &Command) -> OutputSupport {
         | Command::Token { .. }
         | Command::Upgrade { .. }
         | Command::Verify(_)
-        | Command::Status
+        | Command::Status { .. }
+        | Command::Apps { .. }
         | Command::Top
         | Command::Metrics(_)
-        | Command::Nodes
+        | Command::Nodes { .. }
         | Command::DecommissionNode { .. }
         | Command::Resolve { .. }
         | Command::Audit(_)
@@ -3594,9 +3657,11 @@ mod tests {
         "bench",
     ];
 
+    /// `deploys` is closest to `deploy`, a write. (`apps` was, before it became
+    /// a command of its own, #1093.)
     #[test]
-    fn relish_apps_never_suggests_a_mutating_command() {
-        for line in ["apps", "apps show", "-o json apps"] {
+    fn a_word_closest_to_a_write_never_suggests_a_mutating_command() {
+        for line in ["deploys", "deploys show", "-o json deploys"] {
             let (text, lead) = answer_unknown(line);
             for mutating in MUTATING {
                 assert!(!text.contains(&format!("'{mutating}'")), "{line}: {text}");
@@ -4542,10 +4607,29 @@ mod tests {
         ));
     }
 
+    /// Every command a `relish status` line can point at is one this CLI
+    /// parses, so a hint can't name a command that doesn't exist.
+    #[test]
+    fn every_status_hint_is_a_real_command() {
+        for hint in reliaburger::relish::status_cmd::HINTS {
+            let words: Vec<&str> = hint.split_whitespace().collect();
+            assert_eq!(words[0], "relish", "{hint}");
+            if let Err(error) = Cli::try_parse_from(&words) {
+                panic!("`{hint}` doesn't parse: {error}");
+            }
+        }
+    }
+
     #[test]
     fn parse_status_command() {
         let cli = parse(&["relish", "status"]).unwrap();
-        assert!(matches!(cli.command, Command::Status));
+        assert!(matches!(
+            cli.command,
+            Command::Status {
+                quick: false,
+                check: false
+            }
+        ));
     }
 
     #[test]
@@ -4701,7 +4785,7 @@ mod tests {
     #[test]
     fn parse_nodes_command() {
         let cli = parse(&["relish", "nodes"]).unwrap();
-        assert!(matches!(cli.command, Command::Nodes));
+        assert!(matches!(cli.command, Command::Nodes { unhealthy: false }));
     }
 
     #[test]

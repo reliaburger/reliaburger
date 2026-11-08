@@ -107,6 +107,9 @@ fn safe_relish_phase(args: &[&str]) -> &'static str {
     if args.contains(&"council") {
         return "membership-council-command";
     }
+    if args.contains(&"apps") {
+        return "apps-command";
+    }
     if args.contains(&"status") {
         return "status-command";
     }

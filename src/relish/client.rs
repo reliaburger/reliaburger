@@ -2310,6 +2310,13 @@ impl BunClient {
         self.get_typed_json("/v1/cluster/summary").await
     }
 
+    /// This node's own share of the summary: its version, usage and disks
+    /// (`GET /v1/cluster/summary/node`). Pair it with [`Self::via_node`] to
+    /// ask one node.
+    pub async fn node_summary(&self) -> Result<crate::bun::summary::NodeSummary, RelishError> {
+        self.get_typed_json("/v1/cluster/summary/node").await
+    }
+
     /// What the scheduler has committed on each node
     /// (`GET /v1/cluster/capacity`).
     pub async fn cluster_capacity(

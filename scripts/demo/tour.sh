@@ -405,10 +405,16 @@ resource_summary() {
     printf '\n'
 }
 
-# Running instances of an app, from `relish status` (NODE INSTANCE APP
-# NAMESPACE STATE ...). $2, if given, leaves out a node by name suffix.
+# Every instance with its node (NODE INSTANCE APP NAMESPACE STATE ...), then
+# why any app isn't fully running: `relish apps --instances` from 0.2.8,
+# `relish status` before it, since the tour runs the published release.
+instances() {
+    relish apps --instances 2>/dev/null || relish status 2>/dev/null
+}
+
+# Running instances of an app. $2, if given, leaves out a node by name suffix.
 running() {
-    relish status 2>/dev/null \
+    instances \
         | awk -v app="$1" -v skip="${2:-}" \
             '$3 == app && $5 == "running" && (skip == "" || $1 !~ skip "$") { n++ } END { print n + 0 }'
 }
@@ -457,7 +463,7 @@ rolled_to() {
 
 patty_rollout_failed() {
     burger_is "len(rows('patty')) > 0" || LOST_LAYER=1
-    relish status 2>/dev/null | grep -q '^patty (namespace default) RolloutFailed'
+    instances | grep -q '^patty (namespace default) RolloutFailed'
 }
 
 # The patties' instance numbers, sorted, one line.

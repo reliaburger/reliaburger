@@ -13923,6 +13923,7 @@ fn runtime_unknown_is_serialised_only_when_set() {
         pid: Some(7),
         runtime_unknown: false,
         status_age_ms: None,
+        age_seconds: None,
         reason: None,
     };
     let plain = serde_json::to_value(&status).unwrap();

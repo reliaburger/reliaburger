@@ -129,10 +129,17 @@ pub enum CommandName {
     Withdraw,
     /// `relish agent undo`.
     Undo,
+    /// `relish status -o json`: not under `relish agent`, but it answers in
+    /// the same envelope. Its `data` schema (the whole cluster summary) is
+    /// bigger than `relish agent schema`'s budget, so the schema command
+    /// doesn't offer it.
+    #[value(skip)]
+    Status,
 }
 
 impl CommandName {
-    /// The command as a caller types it after `relish agent`.
+    /// The command as a caller types it after `relish agent`, or after
+    /// `relish` for `status`.
     pub fn as_str(self) -> &'static str {
         match self {
             CommandName::Agent => "agent",
@@ -169,6 +176,7 @@ impl CommandName {
             CommandName::Proposals => "proposals",
             CommandName::Withdraw => "withdraw",
             CommandName::Undo => "undo",
+            CommandName::Status => "status",
         }
     }
 

@@ -202,6 +202,10 @@ pub struct CouncilSection {
     pub quorum_ok: bool,
     /// Voters more than [`LAGGING_ENTRIES`] behind the leader's log.
     pub lagging: u32,
+    /// Leaders other serving nodes name besides `leader`: a split brain
+    /// when it isn't empty (#424).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub other_leaders: Vec<String>,
 }
 
 /// A voter more than this many log entries behind the leader is lagging,
@@ -904,8 +908,14 @@ fn council_section(
             voters_answering: 0,
             quorum_ok: true,
             lagging: 0,
+            other_leaders: Vec::new(),
         });
     };
+    let other_leaders: Vec<String> = named
+        .keys()
+        .filter(|name| Some(**name) != leader.as_deref())
+        .map(|name| (*name).to_string())
+        .collect();
     let voters = &authority.council.voters;
     let answering: Vec<&&NodeSummary> = serving
         .iter()
@@ -931,6 +941,7 @@ fn council_section(
         voters_answering: count(answering.len()),
         quorum_ok: answering.len() > voters.len() / 2,
         lagging: count(lagging),
+        other_leaders,
     };
     let missing: Vec<String> = voters
         .iter()
@@ -1688,6 +1699,20 @@ mod tests {
         inputs.shares[2].council.last_applied = Some(100);
         let council = assemble(&inputs).council.value.unwrap();
         assert_eq!(council.lagging, 1);
+    }
+
+    /// #424: a split brain looks healthy from either half, so the summary
+    /// names every leader a serving node names, not just the most-named.
+    #[test]
+    fn a_split_council_names_its_other_leader() {
+        let mut inputs = healthy();
+        inputs.shares[2].council.leader = Some("node-3".to_string());
+        inputs.shares[2].council.term = 9;
+        let council = assemble(&inputs).council.value.unwrap();
+        assert_eq!(council.leader.as_deref(), Some("node-1"));
+        assert_eq!(council.other_leaders, ["node-3"]);
+        let whole = assemble(&healthy()).council.value.unwrap();
+        assert!(whole.other_leaders.is_empty());
     }
 
     #[test]

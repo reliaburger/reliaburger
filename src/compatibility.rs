@@ -227,6 +227,9 @@ pub struct Compatibility {
 /// requests, the `Proposal` council response, and `ApiToken::kind`.
 /// Lease fences (#1686): the `LeaseFenced` Raft request and the
 /// `LeaseGenerationMoved` council response.
+/// An instance status carries `age_seconds`, and the relay forwards
+/// `/v1/cluster/summary/node`, for `relish apps` and `relish nodes`.
+/// The summary's council section names `other_leaders`, a split brain.
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 58,
     state: 74,

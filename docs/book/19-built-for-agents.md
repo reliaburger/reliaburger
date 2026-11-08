@@ -1230,7 +1230,8 @@ in its own module. The summary needs the same rule, and two copies would
 drift. It's now `summary::app_state(desired, running, nodes_unanswered,
 has_findings)`, and `context` calls it. The summary passes `has_findings:
 false`, because only a reader that ran `wtf`'s checks knows about findings;
-`relish status` adds them on its side.
+`relish agent context` adds them on its side; `relish status` shows `wtf`'s
+count on a line of its own.
 
 ### At a hundred nodes
 
@@ -1252,6 +1253,288 @@ failed fast and would have measured nothing.
 
 It's one of `make test-hollow`'s two tests, beside the twenty-node check
 ([docs/testing.md](../testing.md)).
+
+## One screen: `relish status`
+
+The summary is only half the job. Somebody has to read it, and the first
+somebody is `relish status`, the command people type when they want to know
+whether the cluster is all right.
+
+It used to answer a different question. It printed a council header, then
+one row per instance (`NODE INSTANCE APP NAMESPACE STATE PID RESTARTS`), then
+free-text lines for apps that couldn't be placed. On the three-node
+quickstart that's fine. On ten nodes and a hundred apps it's several hundred
+rows, and the one line that matters, a voter down or an app nobody can place,
+has scrolled off the top. The table answers "what runs where?". Nobody types
+`status` for that.
+
+Now it prints one screen, the same height on three nodes or three hundred:
+
+```
+
+nodes      2 alive, 1 suspect, 0 dead                                relish nodes --unhealthy
+council    leader node-1 (term 41), 3/3 voters, quorum ok, 0 lagging
+gossip     3 members, last change 4 m ago, 18,442 updates received
+versions   bun 0.2.8 on 3 nodes
+capacity   cpu 61% allocated (14 of 24 cores), memory 54%
+usage      cpu 34% (busiest node-2 81%), memory 47%, disk 38%; newest sample 6 s old
+apps       4: 2 running, 1 degraded, 1 down (1 unschedulable)        relish apps --unhealthy
+instances  9 of 9 running
+jobs       12 running (40 tasks), 340 tasks queued,                  relish jobs
+           3 failed and 9 succeeded in the last hour
+logs       newest line 2 s old, slowest node 9 s (node-3)
+faults     1 active: latency on api (default), 6 m left              relish fault list
+alerts     1 firing: disk_high on node-3                             relish wtf
+certs      soonest expiry 61 days (node-2)
+wtf        1 critical, 1 warning: app web is down                    relish wtf
+```
+
+The first line is the verdict: `HEALTHY`, `DEGRADED` or `DOWN`, and how many
+problems are behind it. A glance at one line is enough. Each line that needs
+attention ends in the command that shows the detail, and on a terminal it's
+coloured. The lists themselves moved to `relish apps` and `relish nodes`,
+which can grow filters for large clusters without making `status` any longer.
+
+Three details came out of the first review. The numbers on the apps line add
+up to its total: an unschedulable app is already down or degraded, so it's
+an aside in parentheses, not a fifth bucket that counts it twice. The
+commands all start in one column, at most 56 characters in, and text longer
+than that wraps between clauses onto the row below rather than pushing its
+own command off to the right; the whole screen fits 100 columns. And every
+command a line can name is in one list, `status_cmd::HINTS`, which a test
+in `src/bin/relish.rs` parses with the real CLI. The council's hint said
+`relish council`, which works (the subcommand defaults to `status`) but
+isn't the command the manual teaches; now it says `relish council status`.
+
+### Lines, marks and a verdict
+
+`src/relish/status_cmd.rs` splits the work in two. `assess` turns a
+`ClusterSummary` into a `Vec<Line>`, and `render` lays the lines out. Neither
+does any I/O, so the tests run them over fixtures.
+
+Every line carries a `Mark`:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, JsonSchema)]
+pub enum Mark {
+    Quiet,
+    Note,
+    Problem,
+    Down,
+}
+```
+
+Deriving `PartialOrd` and `Ord` on an enum orders the variants as they're
+declared, so `Quiet < Note < Problem < Down`, and the verdict is just the
+worst mark on the screen:
+
+```rust
+let worst = lines.iter().map(|line| line.mark).max().unwrap_or(Mark::Quiet);
+let verdict = match worst {
+    Mark::Down => Verdict::Down,
+    Mark::Problem => Verdict::Degraded,
+    Mark::Quiet | Mark::Note => Verdict::Healthy,
+};
+```
+
+In C you'd write the same thing with an `int` and four `#define`s, and
+nothing would stop someone comparing a mark with a node count. Here `max()`
+only works because the compiler knows how to order a `Mark`, and the `match`
+has to name every variant, so a fifth mark can't be forgotten.
+
+`Note` is the interesting one. An upgrade in progress leaves nodes on two
+versions, and an injected fault is a fault you asked for. Both deserve a line
+that names a command (`relish upgrade status`, `relish fault list`), but
+neither makes the cluster unhealthy. Without `Note` we'd have had to pick
+between a screen that cries wolf during every upgrade and one that hides it.
+
+`DOWN` is kept for one thing: the council has no leader or has lost its
+quorum, so nothing can change. A node that's dead, an app that's down, a
+certificate about to expire: those are `DEGRADED`. The cluster still serves.
+
+### A section that saw less
+
+Every section of the summary is a `Section<T>` that says whether it's
+complete, partial or missing. `status` turns that into words with one
+generic function:
+
+```rust
+fn section_line<T>(
+    section: &'static str,
+    value: &Section<T>,
+    scoped: bool,
+    describe: impl Fn(&T) -> Line,
+) -> Line
+```
+
+`impl Fn(&T) -> Line` takes any function or closure that turns a section's
+value into a line. It's like passing a function pointer in C, except the
+closure can capture variables (`|gossip| gossip_line(gossip, now)` captures
+`now`), and the compiler makes a copy of `section_line` for each closure, so
+there's no indirect call. `section_line` handles the cases every section
+shares. A missing section says `unknown:` and the reason, and is a problem:
+a count over nobody isn't a zero. A partial one gets `; partial (2 of 3
+nodes)` after its text and is a problem too, even if its numbers look fine,
+because the node that didn't answer is where the bad news would be. A scoped
+token sees less by design, so for it a missing section just says `not
+visible to a scoped token`.
+
+A standalone node is its own case. It runs no gossip, so the summary's
+member list is empty and the gossip section is missing. Read naively, that's
+"0 alive" and a `DOWN` verdict, which is exactly what the first run against
+a real standalone Bun printed. The fixtures had all been three-node clusters.
+`assess` now spots a standalone node (a complete council section with no
+voters) and says so in three quiet lines.
+
+### A split brain
+
+The old header asked every node for its view of the council and printed
+`leader A AND B` when two halves each had a leader (#424). The summary picks
+the leader most serving nodes name, which on its own would show a split
+council as healthy. So the summary's council section gained
+`other_leaders`: every other leader a serving node names. `status` prints
+`SPLIT: leader node-1 AND node-3` and marks it a problem, pointing at
+`relish council status`, which shows each node's view. `wtf`'s council check, which
+runs by default, reports a real split as critical.
+
+### `wtf` in the same call
+
+`status` runs `wtf`'s checks alongside the summary (decision D1 in the
+plan), each with its own budget:
+
+```rust
+let (summary, wtf) = tokio::join!(client.cluster_summary(), async {
+    if args.quick {
+        WtfCheck::Skipped
+    } else {
+        run_wtf(client, WTF_BUDGET).await
+    }
+});
+```
+
+`tokio::join!` polls both futures at once and waits for both, like Go's
+`sync.WaitGroup` around two goroutines, but without spawning anything: both
+run on the current task. `run_wtf` wraps `wtf`'s collection in
+`tokio::time::timeout`, two seconds. Past that, the line reads `not checked
+in time (2 s budget)`. That's a note, not a problem: a slow check isn't
+evidence of anything. On a hundred nodes `wtf` usually runs out of time;
+`--quick` skips it.
+
+The two report different things. The summary counts; `wtf` diagnoses.
+Registry warnings (lost images, a plaintext registry that needs mTLS) used to
+be special lines in the old status. `wtf` already reports both, so they left
+`status`, and its `wtf` line counts them.
+
+### Exit codes and JSON
+
+`relish status` exits 0 whenever it got an answer, `DEGRADED` or not
+(decision D2). That's the rule every agent-facing command follows: the exit
+code says whether the command worked, and the verdict is in the output.
+Scripts that want the verdict as an exit code pass `--check`: 1 for
+`DEGRADED`, 2 for `DOWN`. Yes, 2 is also clap's code for a usage error. We
+kept the plan's numbers. A monitoring script tests its command line once, by
+hand, and from then on a 2 means down.
+
+`-o json` prints the agent envelope from earlier in this chapter, with
+`command: "status"`. `data` holds the verdict, the problem count, every line
+with its mark and command, `wtf`'s outcome, and the whole summary. `next`
+holds the commands from the lines that need attention, worst first, each
+once. On a healthy cluster it suggests `relish apps`.
+
+```rust
+pub fn envelope(data: &StatusData) -> Envelope<&StatusData> {
+```
+
+`Envelope<T>` is generic over its `data`, and here `T` is `&StatusData`, a
+reference. serde serialises a reference exactly as the value behind it, so
+the envelope borrows the data instead of copying the summary.
+
+One snag: `relish agent schema` prints each command's `data` schema within
+its 24 KiB budget, and the summary's schema is about 36 KiB. schemars writes
+a separate definition for each `Section<T>`, and there are fourteen. So
+`CommandName::Status` is in the envelope's list of commands but not in the
+list `relish agent schema` offers. `data_schema(Status)` still works, and a
+test holds it to that.
+
+### `relish apps` and `relish nodes`
+
+`relish apps` is one row per app, problems first:
+
+```
+NAMESPACE      APP                  STATE      READY   RESTARTS NODES                    AGE
+prod           db                   down       0/1     0        -                        -
+prod           api                  degraded   1/2     1        node-1,node-2            2h
+prod           web                  running    3/3     3        node-1,node-2,node-3     3h
+prod           batch                stopped    0/0     0        -                        -
+```
+
+The state comes from `summary::app_state`, the same rollup the summary and
+`relish agent context` use, so an app can't be `degraded` in one place and
+`running` in another. "Problems first" is free: `AppState`'s variants are
+declared worst first and it derives `Ord`, so sorting by `(state, namespace,
+app)` does it. `--namespace`, `--node` and `--unhealthy` narrow the list.
+`relish apps NAME` lists that app's instances, the old status table with an
+AGE column, and `--instances` lists every instance (decision D3).
+
+AGE needed a number nothing served. Each node's supervisor has known when it
+created an instance since phase 1 (`created_at`, an `Instant`). An `Instant`
+is a point on a monotonic clock that means nothing to another machine, so
+it can't cross the wire. The status snapshot now carries
+`age_seconds: created_at.elapsed()` instead, and an app's AGE is its oldest
+instance's.
+
+`relish apps` asks each node itself, through the entry node's relay, three
+seconds each, rather than calling `/v1/status?cluster=true`. That endpoint
+fails outright when any node doesn't answer, which is the moment you most
+need the list. A node that doesn't answer is a warning on stderr, and an app
+short of replicas then reads `unknown`, not `down`: its missing instances may
+be running on the silent node.
+
+`relish nodes` grew `VERSION`, `CPU`, `MEM`, `DISK` and `ALLOCATED`. The
+first four come from each node's share of the summary
+(`/v1/cluster/summary/node`, which the relay now forwards), the last from
+`/v1/cluster/capacity`. `--unhealthy` keeps the nodes that aren't alive, are
+cordoned, are under disk pressure or didn't answer.
+
+### What else moved
+
+Changing what `status` prints broke everything that read it. The tour's
+`running()` helper did `awk` on the status columns; it now reads `relish apps
+--instances`, whose first five columns are the same, and falls back to
+`relish status` on an older install. The tour itself still shows `relish
+status`: it may only use commands a visitor's installed release has, so it
+moves to `relish apps` when 0.2.8 ships and the tour is re-recorded. The gym, three Rust tests and the GitOps demo
+read `relish apps --instances -o json`, which prints the same array of
+instances `status -o json` used to. The SSH-setup qualification still greps
+`3/3 voters`, now on the council line.
+
+And `apps` is a real command now. #1093 had taught `relish apps` to point at
+`relish status`, because clap's closest guess for it was `apply`, a write.
+The manual's example of that moved to `relish deploys`.
+
+The concept budget (#1681) grew by one command and seven flags, raised in
+`docs/testing/concept-budget.json` in the same change. Two of the flags,
+`--unhealthy` and `--instances`, are names an agent hasn't seen before.
+
+### The tests
+
+- `status_cmd.rs` has `insta` snapshots for a healthy cluster, a degraded
+  one, an upgrade in progress and a node that didn't answer, plus tests for a
+  council without quorum (`DOWN`), a split council, a scoped token, a
+  standalone node, a section that couldn't be read, the `--check` exit codes,
+  the JSON envelope and its `next` steps, and one that renders a thousand
+  apps in the same number of lines as four. `the_apps_line_parts_add_up_to_the_total`
+  parses the apps line back and sums it; `hints_line_up_in_one_column_within_a_hundred_columns`
+  renders four very different screens and checks every command's column
+  and every row's width; `every_next_command_is_a_listed_hint` and the CLI's
+  `every_status_hint_is_a_real_command` keep the hints honest.
+- `apps_cmd.rs` snapshots the app table and an app's instances, checks the
+  filters and the `unknown` state when a node doesn't answer, and keeps the
+  old status tests for each reason line (#326, #423, #692, #702, #881).
+- `nodes_cmd.rs` snapshots the wider table with problems first and checks
+  `--unhealthy` and the JSON.
+- `status_says_how_old_each_instance_is` covers the new `age_seconds`;
+  `a_split_council_names_its_other_leader` covers the summary's new field.
 
 ## Logs and the manual
 

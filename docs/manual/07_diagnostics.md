@@ -11,8 +11,8 @@ evidence, and prints a categorised report: CRITICAL, WARNING, UNKNOWN and OK.
 It doesn't just list problems. It links a crashloop to the recent deploy and
 the error log line behind it. A crashloop is three `restart` events for one
 app inside 15 minutes; Bun records one for every restart, so `relish events`
-shows the same history `wtf` read. A high lifetime `restart_count` in
-`relish status` on its own isn't one.
+shows the same history `wtf` read. A high lifetime restart count in
+`relish apps` on its own isn't one.
 
 You only need to reach one node. `wtf`, `inspect` and `path` send every
 per-node request through the node you're connected to (`/v1/nodes/<node>/relay/...`), carrying
@@ -28,6 +28,10 @@ relish wtf --watch               # re-run every 30s until Ctrl-C (human output o
 relish wtf --watch --interval 5  # re-run every 5s instead
 relish --output json wtf         # one exact report for machines
 ```
+
+`relish status` runs the same checks with a 2 s budget and counts what they
+find on its `wtf` line, naming the worst finding, so a glance at status tells
+you whether `wtf` is worth running. `relish status --quick` skips them.
 
 An OK row always rests on an observed, timestamped fact; a missing or
 inherently incomplete source becomes UNKNOWN, never a green pass. The exit code
@@ -99,20 +103,20 @@ rather than a generic under-replication.
 An app the scheduler could place only in part gets an `Unplaced:` line saying
 how many of its replicas found a node and why the rest didn't: no ready node,
 no node with its required labels, none that can enforce its needs or run its
-host binary, or no room. `relish status` prints the same line, and `wtf`
+host binary, or no room. `relish apps` prints the same reason, and `wtf`
 reports it as an `unschedulable` warning with that reason (see
 `deploy-an-app`).
 
 An app whose current spec failed to roll out on a node is marked
 `RolloutFailed`: the leader holds its other nodes on the previous version and
 won't try the failed spec again. `wtf` reports it as a `rollout-failed`
-warning naming the node and the reason, and `relish status` prints the same
+warning naming the node and the reason, and `relish apps` prints the same
 line. Applying a different spec (a scale change counts), or `relish rollback`,
 clears it; applying the same spec again doesn't (see `deploy-an-app`).
 
 An instance whose binary isn't on its node, or isn't executable, is `failed`
 with the reason, such as `binary not found: /usr/local/bin/ghost-server`.
-`relish status` prints it under the table, and `wtf` reports a critical
+`relish apps NAME` prints it under the instance table, and `wtf` reports a critical
 `launch-failed` finding naming each instance, its node and the reason, in place
 of a generic under-replication (see `deploy-an-app`).
 

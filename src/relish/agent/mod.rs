@@ -180,7 +180,11 @@ impl AgentCommand {
             | AgentCommand::Verify(_)
             | AgentCommand::Patch(_)
             | AgentCommand::Setup(_)
-            | AgentCommand::Lease(_) => ClusterUse::Required,
+            | AgentCommand::Lease(_)
+            | AgentCommand::Propose(_)
+            | AgentCommand::Proposals(_)
+            | AgentCommand::Withdraw { .. }
+            | AgentCommand::Undo { .. } => ClusterUse::Required,
         }
     }
 
@@ -386,6 +390,7 @@ pub fn data_schema(command: CommandName) -> Option<Value> {
             Some(schema_of::<propose::ProposalData>())
         }
         CommandName::Proposals => Some(schema_of::<propose::ProposalsData>()),
+        CommandName::Status => Some(schema_of::<crate::relish::status_cmd::StatusData>()),
     }
 }
 

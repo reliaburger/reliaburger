@@ -154,12 +154,14 @@ A usage error is an envelope too. Give `relish agent version` a flag it
 doesn't have and it prints a failure with the `usage` code on stdout, not
 clap's text on stderr. Only `--help` prints ordinary help.
 
-An unknown command is a usage error too, and its "did you mean" only names
-commands that read: `statsu` suggests `relish status`, but `apps`, closest to
-`apply`, points at `relish status` (`relish agent context` under `relish
-agent`), first in the `hint`. A typo of a command that writes, such as
-`aply`, gets no suggestion: relish can't tell a person from an agent.
-`relish --help` lists everything.
+A command relish doesn't know is a usage error too, and its "did you mean"
+only ever names a command that reads. Type `statsu` and relish suggests
+`relish status`. Type `deploys` and the closest name is `deploy`, which writes,
+so relish leaves it out and points at `relish status` instead; under
+`relish agent` it points at `relish agent context`, and the envelope's `hint`
+opens with the suggestion. A typo of a command that writes, such as `aply`,
+gets no suggestion at all, for a person or an agent alike: relish can't tell
+which one is typing. `relish --help` lists everything.
 
 ## Exit codes
 

@@ -790,6 +790,7 @@ Leave Bun running. In a second terminal:
 ```sh
 target/debug/relish apply examples/phase-1/proc-first-run.toml
 target/debug/relish status
+target/debug/relish apps
 target/debug/relish top
 ```
 
@@ -1036,6 +1037,16 @@ it, is in the manual's [reference](manual/13_reference.md#every-relish-command).
 That list is generated from relish's own command definitions, so it matches
 the binary. `relish help COMMAND` (or `--help` on any command) shows every
 flag.
+
+`relish status` answers "is my cluster all right?" on one screen, the same
+size on any cluster: a `HEALTHY`, `DEGRADED` or `DOWN` verdict, then one line
+per part of the cluster from `GET /v1/cluster/summary` plus `relish wtf`'s
+checks (2 s budget, `--quick` skips them), each line that needs attention
+ending in the command to run next. It exits 0 when it got an answer;
+`--check` exits 1 on `DEGRADED` and 2 on `DOWN`. `-o json` prints the agent
+envelope. The lists live in `relish apps` (one row per app, problems first;
+`relish apps NAME` or `--instances` for instances) and `relish nodes`
+(version, usage and allocation per node); both filter with `--unhealthy`.
 
 `relish agent` is the family for LLM agents: every command prints one
 `relish.agent/v1` JSON envelope within a byte budget, never prompts, and exits
@@ -1431,8 +1442,8 @@ Operational constraints:
   state, redundancy target, live node count, under-replicated layer count and
   lost images. Copies on dead nodes don't count: heal re-replicates after a
   node loss, with each chosen node copying straight from a live holder, and an
-  image with no live copy left is reported lost by `relish status` and
-  `relish wtf`.
+  image with no live copy left is reported lost by `relish wtf`, which
+  `relish status` counts on its `wtf` line.
 - `relish images delete repo:tag` (OCI `DELETE /v2/<name>/manifests/<tag>`)
   untags an image. A manifest untagged for `gc_retain_days` expires, unless an
   app or job pins it, and GC reclaims its layers.
@@ -1498,7 +1509,7 @@ interval = 10
 timeout = 5
 ```
 
-An app runs a host binary (`exec`, or an inline `script` through `/bin/sh`) or an `image`. A host app runs on the node itself, and only when the node's `[process_workloads] allowed_binaries` names its binary. An image app needs a container runtime. The process runtime (ProcessGrill) runs host apps only, so it refuses an image app: `relish apply`, `relish status` and `relish wtf` say it `needs a container runtime to run image ...`. In a cluster the scheduler places an image app only on nodes that run containers.
+An app runs a host binary (`exec`, or an inline `script` through `/bin/sh`) or an `image`. A host app runs on the node itself, and only when the node's `[process_workloads] allowed_binaries` names its binary. An image app needs a container runtime. The process runtime (ProcessGrill) runs host apps only, so it refuses an image app: `relish apply`, `relish apps` and `relish wtf` say it `needs a container runtime to run image ...`. In a cluster the scheduler places an image app only on nodes that run containers.
 
 On runc, an image app runs the way Kubernetes would run it. Everything below is optional:
 
@@ -1530,9 +1541,9 @@ source = "/srv/import"              # host path: never chowned by Bun
 
 A managed volume is `chown`ed to the container process's host uid and gid (container uid `u` is host uid `2000000000 + u`) the first time it's mounted, and left alone after that, so an entrypoint that hands `/data` to a service user keeps it that way across restarts. If the image's `USER` (or `run_as_user`) changes, files the previous user owned move to the new one. A host-path directory stays as you made it: own it by the mapped uid (`sudo chown 2000000999:2000000999 /srv/import` for container uid 999) or make it world-writable, otherwise Bun logs a warning at start and the container can only read it. There is no `fs_group`; `relish import` drops Kubernetes `fsGroup` with a warning. A node mounts a host path only under a prefix in its `[storage] allowed_host_paths` (empty by default, so every host path is refused) and never its own storage or security directories; a token with a `[permission]` block also needs `host-exec` to deploy one.
 
-In a cluster the scheduler places every replica that fits. An app it can place only in part shows `is unschedulable: placed N of M replicas` and why in `relish status`, `relish inspect` and `relish wtf`. An `exec` or `script` app only goes to nodes whose `[process_workloads]` allowlist names its binary. A live node whose reports stop keeps its replicas for `[reporting_tree] stale_node_grace_secs` (five minutes), then they move.
+In a cluster the scheduler places every replica that fits. An app it can place only in part shows `is unschedulable: placed N of M replicas` and why in `relish apps`, `relish inspect` and `relish wtf`. An `exec` or `script` app only goes to nodes whose `[process_workloads]` allowlist names its binary. A live node whose reports stop keeps its replicas for `[reporting_tree] stale_node_grace_secs` (five minutes), then they move.
 
-A managed volume stays on its node, and so does its app: restarting Bun, rebooting or losing the node from gossip never moves it to a node with an empty volume. While its node is away the app waits, `relish status` and `relish inspect` name the node, and `relish wtf` reports it as critical. `relish decommission-node <node> --workloads-stopped --reason <why>` (or new `placement.required` labels) is the explicit way to move it, onto a new, empty volume.
+A managed volume stays on its node, and so does its app: restarting Bun, rebooting or losing the node from gossip never moves it to a node with an empty volume. While its node is away the app waits, `relish apps` and `relish inspect` name the node, and `relish wtf` reports it as critical. `relish decommission-node <node> --workloads-stopped --reason <why>` (or new `placement.required` labels) is the explicit way to move it, onto a new, empty volume.
 
 An app that serves Prometheus metrics declares where, and every node scrapes its own instances of it (no Prometheus install needed):
 
@@ -1947,7 +1958,7 @@ An app env value `PROVIDER[name:path]` is resolved when an instance launches,
 by a binary the node names in `[secret_providers.name]` in `node.toml`, over
 JSON on stdin and stdout with a timeout and an output cap. The scheduler places
 such an app only on nodes that run its provider, and a provider that fails
-keeps that instance from starting, with the reason in `relish status` and
+keeps that instance from starting, with the reason in `relish apps` and
 `relish wtf`. See [Secrets from a provider](manual/10_security.md#secrets-from-a-provider).
 
 ### OCI release qualification

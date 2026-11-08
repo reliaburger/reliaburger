@@ -1,0 +1,21 @@
+---
+source: src/relish/status_cmd.rs
+expression: "render(&data, false)"
+---
+cluster: DEGRADED, 3 problems (node-1 answered at 14:02:11 UTC)
+
+nodes      2 alive, 1 suspect, 0 dead; partial (2 of 3 nodes)        relish nodes --unhealthy
+council    leader node-1 (term 41), 2/3 voters, quorum ok,           relish council status
+           0 lagging; partial (2 of 3 nodes)
+gossip     3 members, last change 4 m ago, 18,442 updates received
+versions   bun 0.2.8 on 3 nodes
+capacity   cpu 61% allocated (14 of 24 cores), memory 54%
+usage      cpu 34% (busiest node-2 81%), memory 47%, disk 38%; newest sample 6 s old
+apps       4: 3 running, 1 unknown; partial (2 of 3 nodes)           relish apps --unhealthy
+instances  9 of 9 running
+jobs       12 succeeded in the last hour
+logs       newest line 2 s old, slowest node 9 s (node-3)
+faults     none active
+alerts     none firing
+certs      soonest expiry 61 days (node-2)
+wtf        not checked in time (2 s budget)                          relish wtf

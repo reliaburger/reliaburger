@@ -158,7 +158,7 @@ clap's text on stderr. Only `--help` prints ordinary help.
 
 A command relish doesn't know is a usage error too, and its "did you mean"
 only ever names a command that reads. Type `statsu` and relish suggests
-`relish status`. Type `apps` and the closest name is `apply`, which writes,
+`relish status`. Type `deploys` and the closest name is `deploy`, which writes,
 so relish leaves it out and points at `relish status` instead; under
 `relish agent` it points at `relish agent context`, and the envelope's `hint`
 opens with the suggestion. A typo of a command that writes, such as `aply`,

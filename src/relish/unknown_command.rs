@@ -1,10 +1,11 @@
 //! What `relish` says about a command it doesn't know.
 //!
 //! clap answers an unknown subcommand with "a similar subcommand exists" and
-//! picks the closest name, whatever that command does. For `relish apps` the
-//! closest is `apply`, so a read-only agent's natural guess was pointed
-//! straight at a write (#1093). Here we keep clap's suggestions only when
-//! they read, and otherwise point at the command to start from.
+//! picks the closest name, whatever that command does. For `relish apps`,
+//! before that command existed, the closest was `apply`, so a read-only
+//! agent's natural guess was pointed straight at a write (#1093). Here we
+//! keep clap's suggestions only when they read, and otherwise point at the
+//! command to start from.
 //!
 //! The rule is the same for a human and an agent, because relish can't tell
 //! them apart: an agent may run the plain CLI and read the same stderr. A
@@ -17,6 +18,7 @@ use clap::error::{ContextKind, ContextValue, ErrorKind};
 /// subcommands changes the cluster or the files on this machine. A command
 /// missing from here is never suggested, so a new one is safe by default.
 pub const READ_ONLY_COMMANDS: &[&str] = &[
+    "apps",
     "audit",
     "batch-status",
     "compile",
@@ -228,7 +230,7 @@ mod tests {
 
     #[test]
     fn a_word_closest_to_a_mutating_command_suggests_where_to_start() {
-        let (text, lead) = answer(&["relish", "apps"]);
+        let (text, lead) = answer(&["relish", "app"]);
         assert!(!text.contains("'apply'"), "{text}");
         assert!(
             text.contains("`relish status` is the place to start"),

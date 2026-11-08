@@ -27,7 +27,7 @@ source checkout, with Bun started from the repository root:
 ```sh
 bun --runtime process --config examples/node/process-runtime.toml
 relish apply examples/phase-1/proc-minimal-app.toml
-relish status
+relish apps
 ```
 
 Outside a checkout, `relish manual examples` writes every example config into
@@ -302,10 +302,11 @@ running apps are never evicted to make room. The app says why everywhere you'd
 look:
 
 ```text
-$ relish status
-no workloads running
+$ relish apps --namespace shop
+NAMESPACE      APP                  STATE      READY   RESTARTS NODES                    AGE
+shop           big                  down       0/2     0        -                        -
 
-big (namespace shop) is not placed, blocked: namespace "shop" would exceed CPU quota: 3000+2000 > 4000m
+big (namespace shop) not placed, blocked: namespace "shop" would exceed CPU quota: 3000+2000 > 4000m
 
 $ relish inspect big
 App: big (namespace shop)
@@ -338,10 +339,11 @@ the cluster only has room for two, and you get two, plus a reason that stays
 until the third finds a home:
 
 ```text
-$ relish status
-...
+$ relish apps --unhealthy
+NAMESPACE      APP                  STATE      READY   RESTARTS NODES                    AGE
+default        web                  degraded   2/3     0        node-1,node-2            5m
 
-web (namespace default) is unschedulable: placed 2 of 3 replicas: no node that can run it has room
+web (namespace default) unschedulable: placed 2 of 3 replicas: no node that can run it has room
 
 $ relish inspect web
 App: web (namespace default)
@@ -376,8 +378,9 @@ $ relish apply ghost.toml
   creating instance default__ghost-0
 error: API error (status 500): instance default__ghost-0 cannot launch: binary not found: /usr/local/bin/ghost-server
 
-$ relish status
-...
+$ relish apps ghost
+NODE                     INSTANCE             APP             NAMESPACE    STATE      PID        RESTARTS AGE
+node-1                   default__ghost-0     ghost           default      failed     -          0        1m
 
 default__ghost-0 (ghost, namespace default) failed on node-1: binary not found: /usr/local/bin/ghost-server
 ```
@@ -427,7 +430,7 @@ command's exit code.
 
 In a cluster, `relish stop` and `relish delete` return as soon as the council
 has recorded the change. Each node then retires its instances on its own, and
-a node that's unreachable does so when it comes back. Run `relish status` (or
+a node that's unreachable does so when it comes back. Run `relish apps web` (or
 `relish inspect web`) to watch the instances go.
 
 A delete followed straight away by an apply of the same file may not restart
@@ -447,14 +450,14 @@ instance won't pick up is anything outside the spec:
   disk. The kept process still runs the old one.
 - **State the process holds in memory**, such as a cache or a connection pool.
 
-When you need fresh processes, wait until `relish status` shows none of the
+When you need fresh processes, wait until `relish apps web` shows none of the
 app's instances before you apply again.
 
 Commands that take an app name also take `--namespace` (default `default`).
 
 ## Instance names
 
-Every replica gets a name you'll see in `status`, `inspect`, logs and metrics:
+Every replica gets a name you'll see in `apps NAME`, `inspect`, logs and metrics:
 `default__web-0`, `default__web-1`, and so on, namespace first. The number is
 the replica's ordinal, and the leader hands them out across the whole cluster,
 so three replicas on three nodes are `-0`, `-1` and `-2` and no two share a
@@ -655,7 +658,9 @@ running.
 In a cluster a failed rollout also marks the app `RolloutFailed`. The leader
 keeps the desired spec as you applied it but stops handing it to nodes: the
 nodes that already run it keep it, the rest stay on the previous version, and
-nothing retries it. `relish status` prints the node and the reason:
+nothing retries it. `relish apps web` prints the node and the reason under
+its instances (`relish apps` gives the same reason, shorter, under the app's
+row):
 
 ```text
 web (namespace default) RolloutFailed on node-2: default__web-g3-0 failed its health check; apply a different spec or roll back

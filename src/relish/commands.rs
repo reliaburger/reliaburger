@@ -91,7 +91,7 @@ pub async fn rerun_jobs(
 fn apply_summary(created: usize, instances: &[String]) -> String {
     if instances.is_empty() {
         format!(
-            "applied {created} app(s); the scheduler places them now (watch with `relish status`)"
+            "applied {created} app(s); the scheduler places them now (watch with `relish apps`)"
         )
     } else {
         format!("deployed {created} instance(s): {}", instances.join(", "))
@@ -173,90 +173,6 @@ async fn apply_with_client(
             Err(error)
         }
     }
-}
-
-/// Show cluster and app status.
-pub async fn status(output: OutputFormat) -> Result<(), RelishError> {
-    status_with_client(output, &BunClient::default_local()).await
-}
-
-async fn status_with_client(output: OutputFormat, client: &BunClient) -> Result<(), RelishError> {
-    let statuses = client.cluster_status().await?;
-
-    match output {
-        OutputFormat::Human => {
-            // One line of council health first: a split or fenced council
-            // must not hide behind a healthy-looking instance list (#424).
-            // A node list that can't be read just drops the header.
-            if let Ok(nodes) = client.nodes().await
-                && !nodes.is_empty()
-            {
-                let observations = crate::relish::council_view::survey_nodes(client, &nodes).await;
-                let summary = crate::relish::council_view::summarise(&observations);
-                print!(
-                    "{}",
-                    crate::relish::council_view::render_status_header(&summary)
-                );
-            }
-            // A Lost image can't be pulled or deployed until someone pushes
-            // it again (#697); say so before the instance list.
-            if let Ok(capabilities) = client.capabilities().await
-                && let Some(placement) = capabilities.placement
-            {
-                print!("{}", render_registry_needs_mtls(&placement.registry));
-                print!("{}", render_lost_images(&placement.registry));
-            }
-            // The council knows why an app isn't placed. That is extra
-            // detail: an agent that can't say still shows its instances.
-            let desired = client.desired_apps().await.unwrap_or_default();
-            print!("{}", render_status(&statuses, &desired));
-        }
-        OutputFormat::Json => {
-            let json =
-                serde_json::to_string_pretty(&statuses).map_err(RelishError::SerialiseJson)?;
-            println!("{json}");
-        }
-        OutputFormat::Yaml => {
-            let yaml = yaml_serde::to_string(&statuses).map_err(RelishError::SerialiseYaml)?;
-            print!("{yaml}");
-        }
-    }
-
-    Ok(())
-}
-
-/// The `relish status` warning for a plaintext cluster's registry (#792):
-/// one line naming the fix, or nothing when the registry can forward.
-pub fn render_registry_needs_mtls(
-    registry: &crate::pickle::capability::RegistryCapabilityEvidence,
-) -> String {
-    if !registry.needs_mtls {
-        return String::new();
-    }
-    "registry: needs mTLS; this plaintext cluster can't push or read cluster images. \
-     Start the cluster with TLS (`relish init`, then `relish join`)\n"
-        .to_string()
-}
-
-/// The `relish status` warning for Lost images (design §7.3): one line
-/// naming them, or nothing when none are lost.
-pub fn render_lost_images(
-    registry: &crate::pickle::capability::RegistryCapabilityEvidence,
-) -> String {
-    if registry.lost_image_count == 0 {
-        return String::new();
-    }
-    let mut names = registry.lost_images.join(", ");
-    let unnamed = registry
-        .lost_image_count
-        .saturating_sub(registry.lost_images.len());
-    if unnamed > 0 {
-        names.push_str(&format!(" and {unnamed} more"));
-    }
-    format!(
-        "registry: {} lost image(s), no live node holds them: {names}; re-push them\n",
-        registry.lost_image_count
-    )
 }
 
 /// The `relish logs` flags, as typed.
@@ -1067,7 +983,7 @@ pub struct AppChange<'a> {
 }
 
 /// The change an [`AppChange`] asked for. Stopping and deleting are
-/// requests: the nodes act on them, and `relish status` shows when they have.
+/// requests: the nodes act on them, and `relish apps` shows when they have.
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AppAction {
@@ -1093,11 +1009,11 @@ impl std::fmt::Display for AppChange<'_> {
         match self.action {
             AppAction::StopRequested => writeln!(
                 f,
-                "stop requested for {app}; check `relish status` for completion; `relish apply` starts it again"
+                "stop requested for {app}; check `relish apps {app}` for completion; `relish apply` starts it again"
             ),
             AppAction::DeleteRequested => writeln!(
                 f,
-                "delete requested for {app}; check `relish status` for remaining instances"
+                "delete requested for {app}; check `relish apps {app}` for remaining instances"
             ),
             AppAction::Released => writeln!(
                 f,
@@ -1434,49 +1350,6 @@ pub async fn decommission_node(
             yaml_serde::to_string(&retirement).map_err(RelishError::SerialiseYaml)?
         ),
     }
-    Ok(())
-}
-
-/// List cluster nodes and their gossip state.
-pub async fn nodes(output: OutputFormat) -> Result<(), RelishError> {
-    nodes_with_client(output, &BunClient::default_local()).await
-}
-
-async fn nodes_with_client(output: OutputFormat, client: &BunClient) -> Result<(), RelishError> {
-    let nodes = client.nodes().await?;
-
-    if nodes.is_empty() {
-        println!("no cluster nodes (single-node mode)");
-    } else {
-        match output {
-            OutputFormat::Human => {
-                println!(
-                    "{:<20} {:<22} {:<10} {:<8} {:<8}",
-                    "NODE", "ADDRESS", "STATE", "COUNCIL", "LEADER"
-                );
-                for n in &nodes {
-                    println!(
-                        "{:<20} {:<22} {:<10} {:<8} {:<8}",
-                        n.node_id,
-                        n.address,
-                        n.state,
-                        if n.is_council { "yes" } else { "-" },
-                        if n.is_leader { "yes" } else { "-" },
-                    );
-                }
-            }
-            OutputFormat::Json => {
-                let json =
-                    serde_json::to_string_pretty(&nodes).map_err(RelishError::SerialiseJson)?;
-                println!("{json}");
-            }
-            OutputFormat::Yaml => {
-                let yaml = yaml_serde::to_string(&nodes).map_err(RelishError::SerialiseYaml)?;
-                print!("{yaml}");
-            }
-        }
-    }
-
     Ok(())
 }
 
@@ -2695,112 +2568,9 @@ pub async fn top(output: OutputFormat) -> Result<(), RelishError> {
     Ok(())
 }
 
-/// The human `relish status` output: every instance with its node, then each
-/// app the scheduler won't place and why (#326). Without that line an
-/// over-quota app is just missing from the table.
-fn render_status(
-    statuses: &[crate::bun::agent::ClusterInstanceStatus],
-    desired: &[crate::bun::diagnostics::DesiredAppEvidence],
-) -> String {
-    use std::fmt::Write as _;
-
-    let mut output = String::new();
-    if statuses.is_empty() {
-        output.push_str("no workloads running\n");
-    } else {
-        let _ = writeln!(
-            output,
-            "{:<24} {:<20} {:<15} {:<12} {:<10} {:<10} {:<6}",
-            "NODE", "INSTANCE", "APP", "NAMESPACE", "STATE", "PID", "RESTARTS"
-        );
-        for row in statuses {
-            let s = &row.instance;
-            let _ = writeln!(
-                output,
-                "{:<24} {:<20} {:<15} {:<12} {:<10} {:<10} {:<6}",
-                row.node,
-                s.id,
-                s.app_name,
-                s.namespace,
-                s.state,
-                pid_cell(s),
-                s.restart_count
-            );
-        }
-    }
-    let blocked: Vec<_> = desired
-        .iter()
-        .filter_map(|app| app.blocked.as_ref().map(|reason| (app, reason)))
-        .collect();
-    let waiting: Vec<_> = desired
-        .iter()
-        .filter_map(|app| app.volume_home_away.as_ref().map(|home| (app, home)))
-        .collect();
-    let failed: Vec<_> = desired
-        .iter()
-        .filter_map(|app| app.rollout_failed.as_ref().map(|failure| (app, failure)))
-        .collect();
-    let short: Vec<_> = desired
-        .iter()
-        .filter_map(|app| app.unschedulable.as_ref().map(|short| (app, short)))
-        .collect();
-    let refused: Vec<_> = statuses
-        .iter()
-        .filter_map(|row| row.instance.reason.as_ref().map(|reason| (row, reason)))
-        .collect();
-    if !blocked.is_empty()
-        || !waiting.is_empty()
-        || !failed.is_empty()
-        || !short.is_empty()
-        || !refused.is_empty()
-    {
-        output.push('\n');
-    }
-    // #881: the runtime refused the launch, so waiting won't start it.
-    for (row, reason) in refused {
-        let _ = writeln!(
-            output,
-            "{} ({}, namespace {}) failed on {}: {reason}",
-            row.instance.id, row.instance.app_name, row.instance.namespace, row.node
-        );
-    }
-    for (app, reason) in blocked {
-        let _ = writeln!(
-            output,
-            "{} (namespace {}) is not placed, blocked: {reason}",
-            app.app, app.namespace
-        );
-    }
-    // #423: the app isn't lost, it waits for the node holding its data.
-    for (app, home) in waiting {
-        let _ = writeln!(
-            output,
-            "{} (namespace {}) waits for {home}, which holds its volume and is out of the cluster",
-            app.app, app.namespace
-        );
-    }
-    // #692: the leader won't try this spec again until a different one is applied.
-    for (app, failure) in failed {
-        let _ = writeln!(
-            output,
-            "{} (namespace {}) RolloutFailed on {}: {}; apply a different spec or roll back",
-            app.app, app.namespace, failure.node, failure.reason
-        );
-    }
-    // #702: the scheduler placed what fits and says why the rest has no node.
-    for (app, short) in short {
-        let _ = writeln!(
-            output,
-            "{} (namespace {}) is unschedulable: {short}",
-            app.app, app.namespace
-        );
-    }
-    output
-}
-
 /// An instance's PID for a table: `-` when it has none, `?` when the node's
 /// runtime didn't answer in time.
-fn pid_cell(status: &crate::bun::agent::InstanceStatus) -> String {
+pub(crate) fn pid_cell(status: &crate::bun::agent::InstanceStatus) -> String {
     match status.pid {
         Some(pid) => pid.to_string(),
         None if status.runtime_unknown => "?".to_string(),
@@ -5347,7 +5117,7 @@ mod tests {
     fn a_cluster_apply_says_the_apps_are_being_placed() {
         assert_eq!(
             apply_summary(4, &[]),
-            "applied 4 app(s); the scheduler places them now (watch with `relish status`)"
+            "applied 4 app(s); the scheduler places them now (watch with `relish apps`)"
         );
         assert_eq!(
             apply_summary(2, &["default__web-0".into(), "default__web-1".into()]),
@@ -5375,6 +5145,7 @@ mod tests {
                 pid,
                 runtime_unknown: false,
                 status_age_ms: None,
+                age_seconds: None,
                 reason: None,
             },
             cpu_percent: cpu,
@@ -6106,155 +5877,6 @@ spec:
         assert!(build_log_options(backwards, 1_750_000_000).is_err());
     }
 
-    fn evidence(app: &str, replicas: u32) -> crate::bun::diagnostics::DesiredAppEvidence {
-        crate::bun::diagnostics::DesiredAppEvidence {
-            owner: None,
-            app: app.to_string(),
-            namespace: "prod".to_string(),
-            desired_replicas: replicas,
-            scheduled_replicas: 0,
-            placements: Default::default(),
-            service_port: None,
-            blocked: None,
-            volume_home_away: None,
-            unschedulable: None,
-            rollout_failed: None,
-            volume_homes: Vec::new(),
-        }
-    }
-
-    /// #326: an app the namespace quota keeps off every node has no
-    /// instance row, so `relish status` names it and says why.
-    #[test]
-    fn status_names_an_over_quota_app_and_why() {
-        let blocked = crate::bun::diagnostics::DesiredAppEvidence {
-            blocked: Some(crate::meat::quota::QuotaError::CpuExceeded {
-                namespace: "prod".to_string(),
-                current: 0,
-                requested: 1600,
-                limit: 1000,
-            }),
-            ..evidence("greedy", 2)
-        };
-        let output = render_status(&[], &[evidence("fine", 1), blocked]);
-        assert_eq!(
-            output,
-            "no workloads running\n\n\
-             greedy (namespace prod) is not placed, blocked: \
-             namespace \"prod\" would exceed CPU quota: 0+1600 > 1000m\n"
-        );
-    }
-
-    /// #692: an app whose rollout failed shows `RolloutFailed`, where and
-    /// why, and how to clear it.
-    #[test]
-    fn status_names_an_app_whose_rollout_failed() {
-        let failed = crate::bun::diagnostics::DesiredAppEvidence {
-            rollout_failed: Some(crate::meat::deploy_types::RolloutFailure {
-                fingerprint: "abc".to_string(),
-                node: "node-3".to_string(),
-                reason: "web-g2-0 failed its health check".to_string(),
-                at_unix_ms: 1,
-            }),
-            ..evidence("web", 3)
-        };
-        let output = render_status(&[], &[evidence("fine", 1), failed]);
-        assert_eq!(
-            output,
-            "no workloads running\n\n\
-             web (namespace prod) RolloutFailed on node-3: web-g2-0 failed its health check; \
-             apply a different spec or roll back\n"
-        );
-    }
-
-    /// #423: an app waiting for the node that holds its volume isn't just
-    /// missing from the table; status says which node it waits for.
-    #[test]
-    fn status_names_a_volume_app_waiting_for_its_home_node() {
-        let waiting = crate::bun::diagnostics::DesiredAppEvidence {
-            volume_home_away: Some("node-2".to_string()),
-            rollout_failed: None,
-            ..evidence("db", 1)
-        };
-        let output = render_status(&[], &[evidence("fine", 1), waiting]);
-        assert_eq!(
-            output,
-            "no workloads running\n\n\
-             db (namespace prod) waits for node-2, which holds its volume and is out of the \
-             cluster\n"
-        );
-    }
-
-    /// #702: an app placed only in part says how many replicas found a
-    /// node and why the rest didn't.
-    #[test]
-    fn status_says_how_much_of_a_short_app_is_placed_and_why() {
-        let short = crate::bun::diagnostics::DesiredAppEvidence {
-            unschedulable: Some(crate::meat::types::Unschedulable {
-                placed: 2,
-                wanted: 3,
-                reason: crate::meat::types::UnplacedReason::NoRoom,
-            }),
-            ..evidence("web", 3)
-        };
-        let output = render_status(&[], &[evidence("fine", 1), short]);
-        assert_eq!(
-            output,
-            "no workloads running\n\n\
-             web (namespace prod) is unschedulable: placed 2 of 3 replicas: \
-             no node that can run it has room\n"
-        );
-    }
-
-    /// #881: an instance the runtime refused to launch says why under the
-    /// table, so a missing binary isn't just a `failed` cell.
-    #[test]
-    fn status_names_an_instance_that_could_not_launch_and_why() {
-        let row = crate::bun::agent::ClusterInstanceStatus {
-            node: "node-1".to_string(),
-            instance: crate::bun::agent::InstanceStatus {
-                id: "default__ghost-0".to_string(),
-                app_name: "ghost".to_string(),
-                namespace: "default".to_string(),
-                state: "failed".to_string(),
-                restart_count: 0,
-                host_port: None,
-                exit_code: None,
-                pid: None,
-                runtime_unknown: false,
-                status_age_ms: None,
-                reason: Some("binary not found: /opt/ghost/server".to_string()),
-            },
-        };
-        let output = render_status(&[row], &[]);
-        assert!(
-            output.ends_with(
-                "\ndefault__ghost-0 (ghost, namespace default) failed on node-1: \
-                 binary not found: /opt/ghost/server\n"
-            ),
-            "{output}"
-        );
-    }
-
-    #[test]
-    fn status_without_blocked_apps_is_just_the_table() {
-        assert_eq!(
-            render_status(&[], &[evidence("fine", 1)]),
-            "no workloads running\n"
-        );
-    }
-
-    #[tokio::test]
-    async fn status_returns_agent_unreachable() {
-        let err = status_with_client(OutputFormat::Human, &bogus_client())
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, RelishError::AgentUnreachable { .. }),
-            "got: {err:?}"
-        );
-    }
-
     #[tokio::test]
     async fn logs_returns_agent_unreachable() {
         let options = super::super::client::LogOptions::default();
@@ -6482,17 +6104,6 @@ spec:
             .await
             .unwrap_err();
         assert!(matches!(err, RelishError::AgentUnreachable { .. }));
-    }
-
-    #[tokio::test]
-    async fn nodes_returns_agent_unreachable() {
-        let err = nodes_with_client(OutputFormat::Human, &bogus_client())
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, RelishError::AgentUnreachable { .. }),
-            "got: {err:?}"
-        );
     }
 
     #[tokio::test]
@@ -6822,35 +6433,6 @@ spec:
                 .as_str(),
             MYAPP_V2
         );
-    }
-
-    #[test]
-    fn status_names_lost_images_and_stays_quiet_otherwise() {
-        let mut registry = crate::pickle::capability::RegistryCapabilityEvidence::default();
-        assert_eq!(render_lost_images(&registry), "");
-
-        registry.lost_images = vec!["web:v1".into(), "api@sha256:abc".into()];
-        registry.lost_image_count = 3;
-
-        assert_eq!(
-            render_lost_images(&registry),
-            "registry: 3 lost image(s), no live node holds them: web:v1, api@sha256:abc \
-             and 1 more; re-push them\n"
-        );
-    }
-
-    #[test]
-    fn status_says_once_that_a_plaintext_registry_needs_mtls() {
-        let mut registry = crate::pickle::capability::RegistryCapabilityEvidence::default();
-        assert_eq!(render_registry_needs_mtls(&registry), "");
-
-        registry.needs_mtls = true;
-
-        let line = render_registry_needs_mtls(&registry);
-        assert_eq!(line.lines().count(), 1, "{line}");
-        assert!(line.starts_with("registry: "), "{line}");
-        assert!(line.contains("needs mTLS"), "{line}");
-        assert!(line.contains("relish init"), "{line}");
     }
 
     #[test]

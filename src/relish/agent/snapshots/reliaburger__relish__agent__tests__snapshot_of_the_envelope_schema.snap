@@ -269,6 +269,11 @@ expression: "schema_of::<Envelope<Value>>()"
           "const": "undo",
           "description": "`relish agent undo`.",
           "type": "string"
+        },
+        {
+          "const": "status",
+          "description": "`relish status -o json`: not under `relish agent`, but it answers in\nthe same envelope. Its `data` schema (the whole cluster summary) is\nbigger than `relish agent schema`'s budget, so the schema command\ndoesn't offer it.",
+          "type": "string"
         }
       ]
     },

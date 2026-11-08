@@ -207,9 +207,9 @@ class ScriptedSolver:
             return None
 
     def diagnose(self):
-        """Name the fault from `relish wtf`, and its node from `status`."""
+        """Name the fault from `relish wtf`, and its node from `apps --instances`."""
         report = self.relish_json("wtf", "-o", "json") or {}
-        instances = self.relish_json("status", "-o", "json") or []
+        instances = self.relish_json("apps", "--instances", "-o", "json") or []
         # Read every app's log, as an agent would. The baseline never acts on
         # what it reads; the scorer checks where the text travelled.
         for app in sorted({row.get("app_name") for row in instances if row.get("app_name")}):

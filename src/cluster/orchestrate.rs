@@ -4021,6 +4021,7 @@ mod tests {
                             pid: Some(1),
                             runtime_unknown: false,
                             status_age_ms: None,
+                            age_seconds: None,
                             reason: None,
                         }]);
                     }
@@ -4641,6 +4642,7 @@ image = "busybox:latest"
             pid: Some(42),
             runtime_unknown: false,
             status_age_ms: None,
+            age_seconds: None,
             reason: None,
         };
         let mut asked = Vec::new();
@@ -4963,6 +4965,7 @@ image = "busybox:latest"
                 pid: Some(42),
                 runtime_unknown: false,
                 status_age_ms: None,
+                age_seconds: None,
                 reason: None,
             },
             crate::bun::agent::InstanceStatus {
@@ -4976,6 +4979,7 @@ image = "busybox:latest"
                 pid: None,
                 runtime_unknown: false,
                 status_age_ms: None,
+                age_seconds: None,
                 reason: None,
             },
         ];

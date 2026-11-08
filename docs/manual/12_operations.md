@@ -740,8 +740,11 @@ epoch stops that, as long as they can reach the recovered side:
   those.
 
 `relish council status` shows such a node as `fenced` (its epoch column reads
-`0 < 1`, or `1 split` for a split), `relish status` prints a warning line, and
-`relish wtf` reports it as CRITICAL until you re-enrol it.
+`0 < 1`, or `1 split` for a split), and `relish wtf` reports it as CRITICAL
+until you re-enrol it, so `relish status` counts it on its `wtf` line. If
+status sees two leaders at once, its `council` line reads `SPLIT: leader node-1
+AND node-4`; with no leader or no majority it reads `NO LEADER` or `QUORUM
+LOST`, and the verdict is `DOWN`.
 Stop the node, then:
 
 ```sh

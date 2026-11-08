@@ -7502,7 +7502,7 @@ async fn namespace_scoped_token_lists_only_its_namespace_images() {
 }
 
 /// #326: the council's record of why an app isn't placed reaches every
-/// reader of desired-app evidence (`relish status`, `inspect`, `wtf`
+/// reader of desired-app evidence (`relish apps`, `inspect`, `wtf`
 /// and the dashboard).
 #[test]
 fn council_app_evidence_carries_the_quota_block() {

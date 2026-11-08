@@ -28,6 +28,10 @@ Reading the cluster:
 
 | Command | What `-o json` prints |
 |---|---|
+| `status` | the agent envelope (`relish.agent/v1`): `data.verdict`, `data.problems`, `data.lines`, `data.wtf` and `data.summary` (the `GET /v1/cluster/summary` answer), with `next` steps |
+| `apps` | one row per app: `namespace`, `app`, `state`, `desired`, `running`, `restarts`, `nodes`, `age_seconds`, `reason` |
+| `apps NAME`, `apps --instances` | one record per instance: `node`, `id`, `app_name`, `namespace`, `state`, `pid`, `restart_count`, `age_seconds`, `reason` |
+| `nodes` | one record per node: its gossip state and address, `version`, `cpu_percent`, `memory_percent`, `disk_percent`, `allocated`, `cordoned`, `disk_pressure` and `unanswered` |
 | `logs` | one object per line (JSON Lines): `at`, `node`, `instance`, `stream`, `text` |
 | `inspect` | `desired` (or `desired_error`), then each node's `answer`: its `instances`, or the `reason` it's missing |
 | `routes` | the list of routes |
@@ -87,8 +91,8 @@ On your machine:
 | `manual examples` | the files `written` |
 | `uninstall` | what was `removed` and `kept`, and the `notes` |
 
-`status`, `top`, `nodes`, `history`, `events`, `audit`, `wtf`, `path`, `test`
-and the other read commands print the same records as their tables.
+`top`, `history`, `events`, `audit`, `wtf`, `path`, `test` and the other
+read commands print the same records as their tables.
 
 A secret never appears in the output unless the command exists to hand it
 over. `token create`, `token rotate` and `join-token create` print the new
@@ -107,6 +111,24 @@ they go, so there's nothing to print as data. Bare `relish -o json` is
 an agent that ran them can quote it. `exec` isn't one of them either: it runs a
 command once, with no stdin and no terminal, and prints what it said. `-f` on
 `logs` refuses `-o json` until a followed line carries its time and stream.
+
+## Looking at the cluster
+
+Three commands answer "is it all right?" at three depths:
+
+| Command | Flags | What it shows |
+|---|---|---|
+| `relish status` | `--quick` skips `wtf`'s checks (otherwise run with a 2 s budget); `--check` sets the exit code from the verdict | one screen: a verdict (`HEALTHY`, `DEGRADED` or `DOWN`), then one line per part of the cluster, each needing attention ending in the command that shows the detail |
+| `relish apps [NAME]` | `--namespace NS`, `--unhealthy` (not running and ready), `--node NODE`, `--instances` | one row per app, problems first, then why each isn't fully running; with `NAME` or `--instances`, one row per instance with its PID, restarts and age |
+| `relish nodes` | `--unhealthy` (not alive, cordoned, under disk pressure or not answering) | one row per node: gossip state, council seat, leader, version, CPU, memory and disk use, and what the scheduler allocated |
+
+An app's state in `relish apps` is, worst first, `down` (it wants replicas
+and none run), `degraded` (some run), `unknown` (a node didn't answer, so what runs there
+isn't known), `running` or `stopped` (it wants none). A node
+that didn't answer is a warning on stderr for `apps`, and a line under the
+table for `nodes`. On `status`, a section a node didn't answer for ends in
+`partial (2 of 3 nodes)`, one it couldn't read says `unknown:` and the reason,
+and one a scoped token can't see says `not visible to a scoped token`.
 
 ## Environment variables
 
@@ -375,6 +397,11 @@ command) exits `2`.
 and `wtf`, `path` and `verify` exit `3` for warnings, degraded paths or
 incomplete evidence. Before
 0.2.2 that was `2`, which a script couldn't tell from a usage error.
+
+`relish status` exits `0` whenever it got an answer, whatever the verdict.
+With `--check` it exits `1` on `DEGRADED` and `2` on `DOWN`, for a script or
+a monitor. A usage error exits `2` as well, so try the command once by hand
+before you wire it in.
 
 `relish agent` commands use their own codes, which say only whether the
 command answered: `0` answered, `2` usage, `3` couldn't reach or authenticate

@@ -19,7 +19,7 @@ from scenario import FAULT_KINDS
 # attempt to change something, unknown commands included: a new command is
 # mutating until someone adds it here.
 READ_ONLY_COMMANDS = {
-    "agent", "audit", "batch-status", "compile", "diff", "events", "fmt", "help",
+    "agent", "apps", "audit", "batch-status", "compile", "diff", "events", "fmt", "help",
     "history", "inspect", "jobs", "lint", "logs", "logs-search", "manual",
     "mcp", "metrics", "nodes", "path", "resolve", "routes", "source", "status",
     "timeline", "top", "wtf",

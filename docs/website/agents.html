@@ -193,7 +193,7 @@ doesn't have and it prints a failure with the <code>usage</code> code on stdout,
 clap's text on stderr. Only <code>--help</code> prints ordinary help.</p>
 <p>A command relish doesn't know is a usage error too, and its "did you mean"
 only ever names a command that reads. Type <code>statsu</code> and relish suggests
-<code>relish status</code>. Type <code>apps</code> and the closest name is <code>apply</code>, which writes,
+<code>relish status</code>. Type <code>deploys</code> and the closest name is <code>deploy</code>, which writes,
 so relish leaves it out and points at <code>relish status</code> instead; under
 <code>relish agent</code> it points at <code>relish agent context</code>, and the envelope's <code>hint</code>
 opens with the suggestion. A typo of a command that writes, such as <code>aply</code>,

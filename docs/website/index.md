@@ -634,6 +634,7 @@ target/debug/bun --runtime process \
 target/debug/relish apply \
   examples/phase-1/proc-first-run.toml
 target/debug/relish status
+target/debug/relish apps
 target/debug/relish
 ```
 

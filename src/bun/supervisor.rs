@@ -62,7 +62,7 @@ pub struct WorkloadInstance {
     /// Bind-mounted into the container at `/run/reliaburger/identity/`.
     pub identity_mount: Option<std::path::PathBuf>,
     /// Why the runtime refused to launch this instance (#881), shown by
-    /// `relish status` and `relish wtf`. Set only on a `Failed` instance.
+    /// `relish apps` and `relish wtf`. Set only on a `Failed` instance.
     pub launch_failure: Option<String>,
     /// Why it's waiting to restart, set when it stops and cleared when the
     /// restart records its decision.
