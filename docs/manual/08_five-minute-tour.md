@@ -7,7 +7,7 @@ bad one back, scale one up, set a house rule, kill one, slow it down and lose a 
 `relish manual tour`.
 
 It needs a Mac with Apple silicon, or Linux with QEMU and KVM, plus about 8 GiB
-of free memory and 15 GiB of disk. The one-line install fetches the signed 0.2.6 release.
+of free memory and 15 GiB of disk. The one-line install fetches the signed 0.2.7 release.
 
 ## Install and build the cluster
 
@@ -194,7 +194,7 @@ triple patty.
 ## Set a house rule
 
 ```sh
-curl -fsSLO https://raw.githubusercontent.com/reliaburger/reliaburger/v0.2.6/examples/policies/platform.toml
+curl -fsSLO https://raw.githubusercontent.com/reliaburger/reliaburger/v0.2.7/examples/policies/platform.toml
 relish policy test -f platform.toml -f burger/burger.toml
 ```
 
