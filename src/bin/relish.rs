@@ -4014,12 +4014,6 @@ mod tests {
         })
     }
 
-    /// The README's command list is rendered from `Cli`. With
-    /// `RELIABURGER_UPDATE_README` set (`make readme-commands`), this test
-    /// rewrites the region instead of checking it.
-    // Import and export only exist with the default `kubernetes` feature, so
-    // the README describes that build.
-    #[cfg(feature = "kubernetes")]
     #[test]
     fn common_job_commands_accept_singletons_schedules_and_explicit_replay() {
         assert!(
@@ -4065,17 +4059,23 @@ mod tests {
         );
     }
 
+    /// The manual reference's command list is rendered from `Cli`. With
+    /// `RELIABURGER_UPDATE_REFERENCE` set (`make reference-commands`), this
+    /// test rewrites the region instead of checking it.
+    // Import and export only exist with the default `kubernetes` feature, so
+    // the reference describes that build.
+    #[cfg(feature = "kubernetes")]
     #[test]
-    fn readme_command_list_matches_the_cli() {
+    fn reference_command_list_matches_the_cli() {
         use clap::CommandFactory;
         use reliaburger::relish::command_reference::{
-            Availability, GROUPS, REGENERATE_COMMAND, render, replace_region,
+            Availability, GROUPS, REFERENCE_CHAPTER, REGENERATE_COMMAND, render, replace_region,
         };
         use reliaburger::relish::released_cli::ReleasedCli;
 
         let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let readme_path = repository.join("README.md");
-        let readme = std::fs::read_to_string(&readme_path).unwrap();
+        let reference_path = repository.join(REFERENCE_CHAPTER);
+        let reference = std::fs::read_to_string(&reference_path).unwrap();
         // Commands the installer's release lacks are labelled with this
         // build's version (0.2.0-dev labels them "0.2.0").
         let released = ReleasedCli::parse(
@@ -4089,15 +4089,15 @@ mod tests {
         };
         let section =
             render(&Cli::command(), GROUPS, Some(&availability)).unwrap_or_else(|e| panic!("{e}"));
-        let updated = replace_region(&readme, &section).unwrap_or_else(|e| panic!("{e}"));
+        let updated = replace_region(&reference, &section).unwrap_or_else(|e| panic!("{e}"));
 
-        if std::env::var_os("RELIABURGER_UPDATE_README").is_some() {
-            std::fs::write(&readme_path, &updated).unwrap();
+        if std::env::var_os("RELIABURGER_UPDATE_REFERENCE").is_some() {
+            std::fs::write(&reference_path, &updated).unwrap();
             return;
         }
         assert!(
-            updated == readme,
-            "README.md's relish command list is out of date; run `{REGENERATE_COMMAND}`"
+            updated == reference,
+            "{REFERENCE_CHAPTER}'s relish command list is out of date; run `{REGENERATE_COMMAND}`"
         );
     }
 

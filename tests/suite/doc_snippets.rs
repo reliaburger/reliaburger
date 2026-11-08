@@ -1,8 +1,8 @@
 //! Doc snippet tests (#708): what people copy out of the docs must work.
 //!
-//! The manual (compiled into `relish`), `README.md`, `docs/README.md` and
-//! `docs/whitepaper.md` hold dozens of shell and TOML blocks. Every one is
-//! checked here against the real code:
+//! The manual (compiled into `relish`), `README.md`, `docs/README.md`,
+//! `docs/whitepaper.md` and `CONTRIBUTING.md` hold dozens of shell and TOML
+//! blocks. Every one is checked here against the real code:
 //!
 //! - In ```sh, ```bash, ```shell and ```console blocks, every `relish`
 //!   invocation (also as `target/debug/relish`, `cargo run --bin relish --`,
@@ -80,7 +80,12 @@ fn manual_files() -> Vec<String> {
     files
 }
 
-const OTHER_FILES: &[&str] = &["README.md", "docs/README.md", "docs/whitepaper.md"];
+const OTHER_FILES: &[&str] = &[
+    "README.md",
+    "docs/README.md",
+    "docs/whitepaper.md",
+    "CONTRIBUTING.md",
+];
 
 fn all_files() -> Vec<String> {
     let mut files = manual_files();

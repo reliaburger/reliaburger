@@ -83,8 +83,8 @@ build with `cargo test --no-run`.
 
 The manual ships inside `relish`, so a wrong snippet ships in the binary.
 [`doc_snippets.rs`](../tests/suite/doc_snippets.rs) reads
-`docs/manual/*.md`, `README.md`, `docs/README.md` and `docs/whitepaper.md`
-and checks three things:
+`docs/manual/*.md`, `README.md`, `docs/README.md`, `docs/whitepaper.md` and
+`CONTRIBUTING.md`, and checks three things:
 
 - **Shell blocks** (`sh`, `bash`, `shell`, `console`): every `relish`
   invocation parses with the real CLI under `RELISH_PARSE_ONLY=1`. It finds
