@@ -41,7 +41,7 @@ pub use envelope::{AgentError, BuildInfo, CommandName, Envelope, ErrorCode, Exit
 #[derive(Debug, Clone, clap::Args)]
 pub struct AgentOptions {
     /// Largest answer to print, in bytes (at least 1024; by default 24576,
-    /// and 65536 for `guide`). A bigger answer is trimmed, marked
+    /// and 81920 for `guide`). A bigger answer is trimmed, marked
     /// `truncated`, and says how to get the rest.
     // No clap default: the default depends on the command, so `None` means
     // "not given" and [`AgentOptions::max_bytes`] picks the command's.
@@ -473,17 +473,17 @@ mod tests {
     }
 
     #[test]
-    fn guide_defaults_to_64_kib_and_every_other_command_to_24_kib() {
+    fn guide_defaults_to_80_kib_and_every_other_command_to_24_kib() {
         use clap::ValueEnum;
         for &command in CommandName::value_variants() {
             let expected = match command {
-                CommandName::Guide => 64 * 1024,
+                CommandName::Guide => 80 * 1024,
                 _ => 24 * 1024,
             };
             assert_eq!(default_max_bytes(command), expected, "{command:?}");
         }
         assert_eq!(default_max_bytes(CommandName::Agent), 24 * 1024);
-        assert_eq!(parse("agent guide").unwrap().max_bytes(), 64 * 1024);
+        assert_eq!(parse("agent guide").unwrap().max_bytes(), 80 * 1024);
         for line in [
             "agent version",
             "agent schema",
