@@ -33,6 +33,33 @@ const STALE_METRICS_MS: u64 = 120_000;
 /// A certificate expiring sooner than this many days is a problem.
 const CERT_WARNING_DAYS: u64 = 30;
 
+/// The commands a line can name as its next step, as `relish` parses them;
+/// `every_status_hint_is_a_real_command` in `src/bin/relish.rs` holds each
+/// one to the CLI.
+const NODES_HINT: &str = "relish nodes --unhealthy";
+const COUNCIL_HINT: &str = "relish council status";
+const UPGRADE_HINT: &str = "relish upgrade status";
+const APPS_HINT: &str = "relish apps --unhealthy";
+const APP_LIST_HINT: &str = "relish apps";
+const JOBS_HINT: &str = "relish jobs";
+const FAULTS_HINT: &str = "relish fault list";
+const GITOPS_HINT: &str = "relish gitops status";
+const WTF_HINT: &str = "relish wtf";
+
+/// Every command `relish status` can suggest, on a line or as a `next`
+/// step.
+pub const HINTS: &[&str] = &[
+    NODES_HINT,
+    COUNCIL_HINT,
+    UPGRADE_HINT,
+    APPS_HINT,
+    APP_LIST_HINT,
+    JOBS_HINT,
+    FAULTS_HINT,
+    GITOPS_HINT,
+    WTF_HINT,
+];
+
 /// The flags `relish status` takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StatusArgs {
@@ -262,7 +289,7 @@ pub fn next_steps(data: &StatusData) -> Vec<NextStep> {
     }
     if steps.is_empty() {
         steps.push(NextStep {
-            run: "relish apps".to_string(),
+            run: APP_LIST_HINT.to_string(),
             why: "list every app with its state".to_string(),
             read_only: true,
         });
@@ -417,7 +444,7 @@ fn section_line<T>(
             section,
             format!("unknown: {reason}"),
             Mark::Problem,
-            Some("relish wtf"),
+            Some(WTF_HINT),
         );
     };
     let mut line = describe(seen);
@@ -431,7 +458,7 @@ fn section_line<T>(
         line.text = format!("{}; partial ({coverage})", line.text);
         if line.mark < Mark::Problem {
             line.mark = Mark::Problem;
-            line.next = Some("relish nodes --unhealthy".to_string());
+            line.next = Some(NODES_HINT.to_string());
         }
     }
     line
@@ -458,7 +485,7 @@ fn nodes_line(nodes: &crate::bun::summary::NodesSection) -> Line {
     } else {
         Mark::Quiet
     };
-    let next = (mark > Mark::Quiet).then_some("relish nodes --unhealthy");
+    let next = (mark > Mark::Quiet).then_some(NODES_HINT);
     flagged("nodes", text, mark, next)
 }
 
@@ -491,7 +518,7 @@ fn council_line(council: &crate::bun::summary::CouncilSection) -> Line {
     } else {
         Mark::Quiet
     };
-    let next = (mark > Mark::Quiet).then_some("relish council");
+    let next = (mark > Mark::Quiet).then_some(COUNCIL_HINT);
     flagged("council", text, mark, next)
 }
 
@@ -522,15 +549,10 @@ fn versions_line(versions: &crate::bun::summary::VersionsSection) -> Line {
     let mixed = versions.versions.len() > 1;
     if versions.upgrade_in_progress {
         text.push_str(": upgrade in progress");
-        flagged("versions", text, Mark::Note, Some("relish upgrade status"))
+        flagged("versions", text, Mark::Note, Some(UPGRADE_HINT))
     } else if mixed {
         text.push_str(": mixed, and no upgrade runs");
-        flagged(
-            "versions",
-            text,
-            Mark::Problem,
-            Some("relish upgrade status"),
-        )
+        flagged("versions", text, Mark::Problem, Some(UPGRADE_HINT))
     } else {
         quiet("versions", text)
     }
@@ -581,7 +603,7 @@ fn usage_line(usage: &crate::bun::summary::UsageSection, now_ms: u64) -> Line {
             let age = now_ms.saturating_sub(at);
             let _ = write!(text, "; newest sample {} old", span(age));
             if age > STALE_METRICS_MS {
-                return flagged("usage", text, Mark::Problem, Some("relish wtf"));
+                return flagged("usage", text, Mark::Problem, Some(WTF_HINT));
             }
             quiet("usage", text)
         }
@@ -596,21 +618,30 @@ fn apps_line(apps: &crate::bun::summary::AppsSection) -> Line {
     if apps.total == 0 {
         return quiet("apps", "none deployed");
     }
-    let mut text = format!("{}: {} running", grouped(apps.total.into()), apps.running);
+    // Each app is in exactly one of these, so they add up to the total.
+    let mut text = format!(
+        "{}: {} running",
+        grouped(apps.total.into()),
+        grouped(apps.running.into())
+    );
     for (count, what) in [
         (apps.degraded, "degraded"),
         (apps.down, "down"),
         (apps.unknown, "unknown"),
         (apps.stopped, "stopped"),
-        (apps.unschedulable, "unschedulable"),
     ] {
         if count > 0 {
-            let _ = write!(text, ", {count} {what}");
+            let _ = write!(text, ", {} {what}", grouped(count.into()));
         }
+    }
+    // An unschedulable app is already degraded or down (or unknown), so
+    // it's an aside in parentheses, not another bucket.
+    if apps.unschedulable > 0 {
+        let _ = write!(text, " ({} unschedulable)", apps.unschedulable);
     }
     let troubled = apps.degraded + apps.down + apps.unknown + apps.unschedulable;
     if troubled > 0 {
-        flagged("apps", text, Mark::Problem, Some("relish apps --unhealthy"))
+        flagged("apps", text, Mark::Problem, Some(APPS_HINT))
     } else {
         quiet("apps", text)
     }
@@ -620,30 +651,36 @@ fn jobs_line(jobs: &crate::bun::summary::JobsSection) -> Line {
     let mut parts = Vec::new();
     if jobs.running > 0 {
         parts.push(format!(
-            "{} running ({} tasks running, {} queued)",
-            jobs.running,
-            grouped(jobs.tasks_running),
-            grouped(jobs.tasks_queued)
+            "{} running ({} tasks)",
+            grouped(jobs.running.into()),
+            grouped(jobs.tasks_running)
         ));
+    }
+    if jobs.tasks_queued > 0 {
+        parts.push(format!("{} tasks queued", grouped(jobs.tasks_queued)));
+    }
+    let mut hour = Vec::new();
+    if jobs.failed_last_hour > 0 {
+        hour.push(format!("{} failed", grouped(jobs.failed_last_hour.into())));
+    }
+    if jobs.succeeded_last_hour > 0 {
+        hour.push(format!(
+            "{} succeeded",
+            grouped(jobs.succeeded_last_hour.into())
+        ));
+    }
+    if !hour.is_empty() {
+        parts.push(format!("{} in the last hour", hour.join(" and ")));
     }
     if jobs.scheduled > 0 {
         parts.push(format!("{} scheduled", jobs.scheduled));
-    }
-    if jobs.succeeded_last_hour > 0 {
-        parts.push(format!(
-            "{} succeeded in the last hour",
-            jobs.succeeded_last_hour
-        ));
-    }
-    if jobs.failed_last_hour > 0 {
-        parts.push(format!("{} failed in the last hour", jobs.failed_last_hour));
     }
     if parts.is_empty() {
         return quiet("jobs", "none running or finished in the last hour");
     }
     let text = parts.join(", ");
     if jobs.failed_last_hour > 0 {
-        flagged("jobs", text, Mark::Problem, Some("relish jobs"))
+        flagged("jobs", text, Mark::Problem, Some(JOBS_HINT))
     } else {
         quiet("jobs", text)
     }
@@ -682,7 +719,7 @@ fn faults_line(faults: &crate::bun::summary::FaultsSection) -> Line {
     if faults.active > 1 {
         let _ = write!(text, ", and {} more", faults.active - 1);
     }
-    flagged("faults", text, Mark::Note, Some("relish fault list"))
+    flagged("faults", text, Mark::Note, Some(FAULTS_HINT))
 }
 
 fn alerts_line(alerts: &crate::bun::summary::AlertsSection) -> Line {
@@ -693,7 +730,7 @@ fn alerts_line(alerts: &crate::bun::summary::AlertsSection) -> Line {
     if alerts.firing > 1 {
         let _ = write!(text, ", and {} more", alerts.firing - 1);
     }
-    flagged("alerts", text, Mark::Problem, Some("relish wtf"))
+    flagged("alerts", text, Mark::Problem, Some(WTF_HINT))
 }
 
 fn certs_line(certs: &crate::bun::summary::CertsSection, now_seconds: u64) -> Line {
@@ -705,13 +742,13 @@ fn certs_line(certs: &crate::bun::summary::CertsSection, now_seconds: u64) -> Li
             "certs",
             format!("EXPIRED: {}", soonest.subject),
             Mark::Problem,
-            Some("relish wtf"),
+            Some(WTF_HINT),
         );
     }
     let days = (soonest.not_after_unix_seconds - now_seconds) / 86_400;
     let text = format!("soonest expiry {days} days ({})", soonest.subject);
     if days < CERT_WARNING_DAYS {
-        flagged("certs", text, Mark::Problem, Some("relish wtf"))
+        flagged("certs", text, Mark::Problem, Some(WTF_HINT))
     } else {
         quiet("certs", text)
     }
@@ -723,7 +760,7 @@ fn gitops_line(gitops: &crate::bun::summary::GitOpsSection, now_seconds: u64) ->
             "gitops",
             format!("failing: {error}"),
             Mark::Problem,
-            Some("relish gitops status"),
+            Some(GITOPS_HINT),
         );
     }
     let text = match (&gitops.commit, gitops.synced_at_unix_seconds) {
@@ -749,13 +786,13 @@ fn wtf_line(wtf: &WtfCheck) -> Line {
             "wtf",
             format!("not checked in time ({budget_seconds} s budget)"),
             Mark::Note,
-            Some("relish wtf"),
+            Some(WTF_HINT),
         ),
         WtfCheck::Failed { reason } => flagged(
             "wtf",
             format!("couldn't run: {reason}"),
             Mark::Note,
-            Some("relish wtf"),
+            Some(WTF_HINT),
         ),
         WtfCheck::Checked {
             critical,
@@ -780,7 +817,7 @@ fn wtf_line(wtf: &WtfCheck) -> Line {
             } else {
                 Mark::Quiet
             };
-            let next = (mark > Mark::Quiet).then_some("relish wtf");
+            let next = (mark > Mark::Quiet).then_some(WTF_HINT);
             flagged("wtf", text, mark, next)
         }
     }
@@ -854,9 +891,14 @@ fn colour_of(mark: Mark) -> &'static str {
     }
 }
 
-/// The widest a line's text gets before the command column; longer text
-/// pushes its own command further right rather than every line's.
-const TEXT_COLUMN_MAX: usize = 60;
+/// The widest a line's text gets beside the command column. Longer text
+/// wraps onto the rows below, so every command starts in the same column;
+/// with the section names and the longest command, the screen fits 100
+/// columns.
+const TEXT_COLUMN_MAX: usize = 56;
+
+/// The section-name column, with the space after it.
+const SECTION_WIDTH: usize = 11;
 
 /// The one-screen view. `colour` adds ANSI colour to the verdict and to
 /// each line that needs attention.
@@ -889,21 +931,66 @@ pub fn render(data: &StatusData, colour: bool) -> String {
         .iter()
         .filter(|line| line.next.is_some())
         .map(|line| line.text.chars().count())
-        .filter(|width| *width <= TEXT_COLUMN_MAX)
         .max()
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .min(TEXT_COLUMN_MAX);
     for line in &data.lines {
-        let text = match &line.next {
-            Some(next) => format!("{:<column$}  {next}", line.text),
-            None => line.text.clone(),
+        let rows = match &line.next {
+            Some(next) => {
+                let mut rows = wrap(&line.text, column);
+                rows[0] = format!("{:<column$}  {next}", rows[0]);
+                rows
+            }
+            None => vec![line.text.clone()],
         };
-        let painted = match colour_of(line.mark) {
-            paint if colour && !paint.is_empty() => format!("{paint}{text}{RESET}"),
-            _ => text,
-        };
-        let _ = writeln!(out, "{:<10} {painted}", line.section);
+        for (index, row) in rows.into_iter().enumerate() {
+            let section = if index == 0 { line.section } else { "" };
+            let row = match colour_of(line.mark) {
+                paint if colour && !paint.is_empty() => format!("{paint}{row}{RESET}"),
+                _ => row,
+            };
+            let _ = writeln!(out, "{section:<SECTION_WIDTH$}{row}");
+        }
     }
     out
+}
+
+/// `text` in rows of at most `width` characters, so a long line's command
+/// keeps its column. It breaks between clauses (after `, ` or `; `) where
+/// it can, and between words inside a clause too wide for a row; a word
+/// wider than `width` gets a row of its own. Never empty.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    // Each clause keeps its trailing separator, without the space.
+    let mut clauses = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(", ").into_iter().chain(rest.find("; ")).min() {
+        clauses.push(&rest[..=at]);
+        rest = &rest[at + 2..];
+    }
+    clauses.push(rest);
+
+    let mut rows = vec![String::new()];
+    for clause in clauses {
+        let pieces: Vec<&str> = if clause.chars().count() > width {
+            clause.split(' ').collect()
+        } else {
+            vec![clause]
+        };
+        for piece in pieces {
+            let Some(row) = rows.last_mut() else {
+                break;
+            };
+            if !row.is_empty() && row.chars().count() + 1 + piece.chars().count() > width {
+                rows.push(piece.to_string());
+            } else {
+                if !row.is_empty() {
+                    row.push(' ');
+                }
+                row.push_str(piece);
+            }
+        }
+    }
+    rows
 }
 
 #[cfg(test)]
@@ -1054,9 +1141,17 @@ mod tests {
             firing: 1,
             first: vec!["disk_high on node-3".to_string()],
         });
+        summary.jobs = Section::complete(JobsSection {
+            running: 12,
+            tasks_running: 40,
+            tasks_queued: 340,
+            succeeded_last_hour: 9,
+            failed_last_hour: 3,
+            scheduled: 0,
+        });
         let data = status_data(summary, checked(1, 1));
         assert_eq!(data.verdict, Verdict::Degraded);
-        assert_eq!(data.problems, 4, "nodes, apps, alerts and wtf");
+        assert_eq!(data.problems, 5, "nodes, apps, jobs, alerts and wtf");
         insta::assert_snapshot!(render(&data, false));
     }
 
@@ -1164,7 +1259,7 @@ mod tests {
             "{}",
             council.text
         );
-        assert_eq!(council.next.as_deref(), Some("relish council"));
+        assert_eq!(council.next.as_deref(), Some("relish council status"));
     }
 
     #[test]
@@ -1340,7 +1435,7 @@ mod tests {
         });
         let data = status_data(summary, checked(1, 0));
         let runs: Vec<String> = next_steps(&data).into_iter().map(|s| s.run).collect();
-        assert_eq!(runs, ["relish council", "relish wtf"]);
+        assert_eq!(runs, ["relish council status", "relish wtf"]);
     }
 
     #[test]
@@ -1353,5 +1448,271 @@ mod tests {
         assert_eq!(span(240_000), "4 m");
         assert_eq!(span(3 * 3_600_000), "3 h");
         assert_eq!(span(2 * 86_400_000), "2 d");
+    }
+
+    /// The numbers the apps line shows outside its parentheses add up to
+    /// the total: an unschedulable app is already down or degraded, so it's
+    /// an aside, not another bucket.
+    #[test]
+    fn the_apps_line_parts_add_up_to_the_total() {
+        let cases = [
+            AppsSection {
+                total: 4,
+                running: 2,
+                degraded: 1,
+                down: 1,
+                unschedulable: 1,
+                ..AppsSection::default()
+            },
+            AppsSection {
+                total: 9,
+                running: 3,
+                degraded: 2,
+                down: 1,
+                unknown: 1,
+                stopped: 2,
+                unschedulable: 3,
+                ..AppsSection::default()
+            },
+            AppsSection {
+                total: 1000,
+                running: 1000,
+                ..AppsSection::default()
+            },
+        ];
+        for apps in cases {
+            let text = apps_line(&apps).text;
+            let (total, parts) = text.split_once(": ").unwrap();
+            let outside = parts.split(" (").next().unwrap();
+            let sum: u32 = outside
+                .split(", ")
+                .map(|part| {
+                    let count = part.split(' ').next().unwrap().replace(',', "");
+                    count.parse::<u32>().unwrap()
+                })
+                .sum();
+            assert_eq!(
+                total.replace(',', "").parse::<u32>().unwrap(),
+                sum,
+                "{text}"
+            );
+            assert_eq!(sum, apps.total, "{text}");
+        }
+        let text = apps_line(&AppsSection {
+            total: 4,
+            running: 2,
+            degraded: 1,
+            down: 1,
+            unschedulable: 1,
+            ..AppsSection::default()
+        })
+        .text;
+        assert_eq!(text, "4: 2 running, 1 degraded, 1 down (1 unschedulable)");
+    }
+
+    /// The jobs line shows what runs, what waits and what failed, whenever
+    /// any of it isn't zero.
+    #[test]
+    fn the_jobs_line_shows_running_queued_and_failed() {
+        let line = jobs_line(&JobsSection {
+            running: 12,
+            tasks_running: 40,
+            tasks_queued: 340,
+            succeeded_last_hour: 9,
+            failed_last_hour: 3,
+            scheduled: 2,
+        });
+        assert_eq!(
+            line.text,
+            "12 running (40 tasks), 340 tasks queued, 3 failed and 9 succeeded in the last hour, 2 scheduled"
+        );
+        assert_eq!(line.mark, Mark::Problem);
+        let quiet_queue = jobs_line(&JobsSection {
+            running: 1,
+            tasks_running: 4,
+            ..JobsSection::default()
+        });
+        assert_eq!(quiet_queue.text, "1 running (4 tasks)");
+        let failed_only = jobs_line(&JobsSection {
+            failed_last_hour: 1,
+            ..JobsSection::default()
+        });
+        assert_eq!(failed_only.text, "1 failed in the last hour");
+    }
+
+    /// Every next command starts in the same column, however long a line's
+    /// text, and the screen fits 100 columns.
+    #[test]
+    fn hints_line_up_in_one_column_within_a_hundred_columns() {
+        for data in fixtures() {
+            let screen = render(&data, false);
+            let columns: Vec<usize> = screen
+                .lines()
+                .filter_map(|line| {
+                    HINTS
+                        .iter()
+                        .filter_map(|hint| line.find(&format!("  {hint}")))
+                        .min()
+                        .map(|at| at + 2)
+                })
+                .collect();
+            assert!(
+                columns.windows(2).all(|pair| pair[0] == pair[1]),
+                "{columns:?}\n{screen}"
+            );
+            for line in screen.lines() {
+                assert!(line.chars().count() <= 100, "{} wide: {line}", line.len());
+            }
+        }
+    }
+
+    #[test]
+    fn long_text_wraps_between_clauses_then_words() {
+        assert_eq!(
+            wrap(
+                "leader node-1 (term 41), 2/3 voters, quorum ok, 0 lagging; partial (2 of 3 nodes)",
+                56
+            ),
+            [
+                "leader node-1 (term 41), 2/3 voters, quorum ok,",
+                "0 lagging; partial (2 of 3 nodes)"
+            ]
+        );
+        assert_eq!(
+            wrap("one clause that is far too long for its row", 20),
+            ["one clause that is", "far too long for its", "row"]
+        );
+        assert_eq!(wrap("short", 56), ["short"]);
+        assert_eq!(wrap("", 56), [""]);
+    }
+
+    /// Every command a line names is one `relish` has; the CLI test in
+    /// `src/bin/relish.rs` parses each of [`HINTS`].
+    #[test]
+    fn every_next_command_is_a_listed_hint() {
+        for data in fixtures() {
+            for line in &data.lines {
+                if let Some(next) = &line.next {
+                    assert!(HINTS.contains(&next.as_str()), "{next}");
+                }
+            }
+            for step in next_steps(&data) {
+                assert!(HINTS.contains(&step.run.as_str()), "{}", step.run);
+            }
+        }
+    }
+
+    /// One summary per kind of line that names a command, for the layout
+    /// and hint tests.
+    fn fixtures() -> Vec<StatusData> {
+        let mut problems = healthy();
+        let partial = Coverage {
+            answered: 2,
+            asked: 3,
+        };
+        let reasons = ["node-3: timed out".to_string()];
+        problems.nodes = Section::from_nodes(
+            NodesSection {
+                alive: 2,
+                suspect: 1,
+                disk_pressure: 1,
+                ..NodesSection::default()
+            },
+            partial,
+            &reasons,
+        );
+        problems.council = Section::from_nodes(
+            CouncilSection {
+                leader: Some("node-1".to_string()),
+                term: 41,
+                voters: 3,
+                voters_answering: 2,
+                quorum_ok: true,
+                lagging: 1,
+                other_leaders: vec!["node-3".to_string()],
+            },
+            partial,
+            &reasons,
+        );
+        problems.versions = Section::complete(VersionsSection {
+            versions: vec![
+                VersionCount {
+                    version: "0.2.8".to_string(),
+                    nodes: 2,
+                },
+                VersionCount {
+                    version: "0.2.7".to_string(),
+                    nodes: 1,
+                },
+            ],
+            upgrade_in_progress: true,
+        });
+        problems.apps = Section::from_nodes(
+            AppsSection {
+                total: 104,
+                running: 99,
+                degraded: 3,
+                down: 1,
+                unknown: 1,
+                unschedulable: 1,
+                ..AppsSection::default()
+            },
+            partial,
+            &reasons,
+        );
+        problems.jobs = Section::complete(JobsSection {
+            running: 12,
+            tasks_running: 40,
+            tasks_queued: 340,
+            succeeded_last_hour: 9,
+            failed_last_hour: 3,
+            scheduled: 2,
+        });
+        problems.faults = Section::complete(FaultsSection {
+            active: 2,
+            soonest: vec![FaultBrief {
+                kind: "latency".to_string(),
+                target: "api".to_string(),
+                namespace: Some("default".to_string()),
+                remaining_seconds: 360,
+            }],
+        });
+        problems.alerts = Section::complete(AlertsSection {
+            firing: 2,
+            first: vec!["disk_high on node-3".to_string()],
+        });
+        problems.gitops = Section::complete(GitOpsSection {
+            configured: true,
+            commit: None,
+            synced_at_unix_seconds: None,
+            error: Some("fetch failed: connection refused".to_string()),
+        });
+        let mut stale = healthy();
+        stale.usage.value.as_mut().unwrap().newest_sample_unix_ms = Some(NOW_MS - 600_000);
+        stale.certs.value.as_mut().unwrap().soonest = Some(CertBrief {
+            subject: "node-2".to_string(),
+            not_after_unix_seconds: NOW_MS / 1000 + 86_400,
+        });
+        let mut down = healthy();
+        down.council = Section::complete(CouncilSection {
+            leader: None,
+            term: 42,
+            voters: 3,
+            voters_answering: 1,
+            quorum_ok: false,
+            lagging: 0,
+            other_leaders: Vec::new(),
+        });
+        vec![
+            status_data(healthy(), checked(0, 0)),
+            status_data(problems, checked(1, 1)),
+            status_data(stale, WtfCheck::Late { budget_seconds: 2 }),
+            status_data(
+                down,
+                WtfCheck::Failed {
+                    reason: "no answer".to_string(),
+                },
+            ),
+        ]
     }
 }

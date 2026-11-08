@@ -1267,22 +1267,22 @@ has scrolled off the top. The table answers "what runs where?". Nobody types
 Now it prints one screen, the same height on three nodes or three hundred:
 
 ```
-cluster: DEGRADED, 4 problems (node-1 answered at 14:02:11 UTC)
 
-nodes      2 alive, 1 suspect, 0 dead                         relish nodes --unhealthy
+nodes      2 alive, 1 suspect, 0 dead                                relish nodes --unhealthy
 council    leader node-1 (term 41), 3/3 voters, quorum ok, 0 lagging
 gossip     3 members, last change 4 m ago, 18,442 updates received
 versions   bun 0.2.8 on 3 nodes
 capacity   cpu 61% allocated (14 of 24 cores), memory 54%
 usage      cpu 34% (busiest node-2 81%), memory 47%, disk 38%; newest sample 6 s old
-apps       4: 2 running, 1 degraded, 1 down, 1 unschedulable  relish apps --unhealthy
+apps       4: 2 running, 1 degraded, 1 down (1 unschedulable)        relish apps --unhealthy
 instances  9 of 9 running
-jobs       12 succeeded in the last hour
+jobs       12 running (40 tasks), 340 tasks queued,                  relish jobs
+           3 failed and 9 succeeded in the last hour
 logs       newest line 2 s old, slowest node 9 s (node-3)
-faults     1 active: latency on api (default), 6 m left       relish fault list
-alerts     1 firing: disk_high on node-3                      relish wtf
+faults     1 active: latency on api (default), 6 m left              relish fault list
+alerts     1 firing: disk_high on node-3                             relish wtf
 certs      soonest expiry 61 days (node-2)
-wtf        1 critical, 1 warning: app web is down             relish wtf
+wtf        1 critical, 1 warning: app web is down                    relish wtf
 ```
 
 The first line is the verdict: `HEALTHY`, `DEGRADED` or `DOWN`, and how many
@@ -1290,6 +1290,17 @@ problems are behind it. A glance at one line is enough. Each line that needs
 attention ends in the command that shows the detail, and on a terminal it's
 coloured. The lists themselves moved to `relish apps` and `relish nodes`,
 which can grow filters for large clusters without making `status` any longer.
+
+Three details came out of the first review. The numbers on the apps line add
+up to its total: an unschedulable app is already down or degraded, so it's
+an aside in parentheses, not a fifth bucket that counts it twice. The
+commands all start in one column, at most 56 characters in, and text longer
+than that wraps between clauses onto the row below rather than pushing its
+own command off to the right; the whole screen fits 100 columns. And every
+command a line can name is in one list, `status_cmd::HINTS`, which a test
+in `src/bin/relish.rs` parses with the real CLI. The council's hint said
+`relish council`, which works (the subcommand defaults to `status`) but
+isn't the command the manual teaches; now it says `relish council status`.
 
 ### Lines, marks and a verdict
 
@@ -1379,7 +1390,7 @@ the leader most serving nodes name, which on its own would show a split
 council as healthy. So the summary's council section gained
 `other_leaders`: every other leader a serving node names. `status` prints
 `SPLIT: leader node-1 AND node-3` and marks it a problem, pointing at
-`relish council`, which shows each node's view. `wtf`'s council check, which
+`relish council status`, which shows each node's view. `wtf`'s council check, which
 runs by default, reports a real split as critical.
 
 ### `wtf` in the same call
@@ -1508,7 +1519,11 @@ The concept budget (#1681) grew by one command and seven flags, raised in
   council without quorum (`DOWN`), a split council, a scoped token, a
   standalone node, a section that couldn't be read, the `--check` exit codes,
   the JSON envelope and its `next` steps, and one that renders a thousand
-  apps in the same number of lines as four.
+  apps in the same number of lines as four. `the_apps_line_parts_add_up_to_the_total`
+  parses the apps line back and sums it; `hints_line_up_in_one_column_within_a_hundred_columns`
+  renders four very different screens and checks every command's column
+  and every row's width; `every_next_command_is_a_listed_hint` and the CLI's
+  `every_status_hint_is_a_real_command` keep the hints honest.
 - `apps_cmd.rs` snapshots the app table and an app's instances, checks the
   filters and the `unknown` state when a node doesn't answer, and keeps the
   old status tests for each reason line (#326, #423, #692, #702, #881).

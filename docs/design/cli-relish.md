@@ -888,27 +888,31 @@ past that the `wtf` line reads `not checked in time (2 s budget)`, and
 
 ```
 $ relish status
-cluster: DEGRADED, 4 problems (node-1 answered at 14:02:11 UTC)
 
-nodes      2 alive, 1 suspect, 0 dead                         relish nodes --unhealthy
+nodes      2 alive, 1 suspect, 0 dead                                relish nodes --unhealthy
 council    leader node-1 (term 41), 3/3 voters, quorum ok, 0 lagging
 gossip     3 members, last change 4 m ago, 18,442 updates received
 versions   bun 0.2.8 on 3 nodes
 capacity   cpu 61% allocated (14 of 24 cores), memory 54%
 usage      cpu 34% (busiest node-2 81%), memory 47%, disk 38%; newest sample 6 s old
-apps       4: 2 running, 1 degraded, 1 down, 1 unschedulable  relish apps --unhealthy
+apps       4: 2 running, 1 degraded, 1 down (1 unschedulable)        relish apps --unhealthy
 instances  9 of 9 running
-jobs       12 succeeded in the last hour
+jobs       12 running (40 tasks), 340 tasks queued,                  relish jobs
+           3 failed and 9 succeeded in the last hour
 logs       newest line 2 s old, slowest node 9 s (node-3)
-faults     1 active: latency on api (default), 6 m left       relish fault list
-alerts     1 firing: disk_high on node-3                      relish wtf
+faults     1 active: latency on api (default), 6 m left              relish fault list
+alerts     1 firing: disk_high on node-3                             relish wtf
 certs      soonest expiry 61 days (node-2)
-wtf        1 critical, 1 warning: app web is down             relish wtf
+wtf        1 critical, 1 warning: app web is down                    relish wtf
 ```
 
 The verdict is `HEALTHY`, `DEGRADED`, or `DOWN` when the council has lost its
 quorum or its leader. A line that needs attention ends in the command that
-shows the detail, and it's coloured only on a terminal. A `gitops` line
+shows the detail, and it's coloured only on a terminal. The commands start
+in one column, at most 56 characters in; longer text wraps between clauses
+onto the next row, so the screen fits 100 columns. The apps line's counts
+add up to its total, with unschedulable apps (already down or degraded) as
+an aside in parentheses. A `gitops` line
 appears only when GitOps is configured. A section a node didn't answer for
 ends in `; partial (2 of 3 nodes)`, one that couldn't be read says
 `unknown: <reason>`, and a scoped token's hidden sections say
