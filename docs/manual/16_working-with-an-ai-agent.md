@@ -91,7 +91,7 @@ Every `relish agent` command:
   success or failure;
 - never prompts, never opens a TUI and never reads stdin, so it runs the same
   in a script, a CI job or an agent's tool call;
-- stays within a byte budget, 24 KiB unless you pass `--max-bytes` (64 KiB
+- stays within a byte budget, 24 KiB unless you pass `--max-bytes` (80 KiB
   for `relish agent guide`, the one answer you read whole);
 - exits with a code that says whether it answered, not what the answer was.
 
@@ -181,7 +181,7 @@ exit code is the verdict.
 ## Byte budgets
 
 Every command's default budget is 24 KiB, about 6,000 tokens, except
-`relish agent guide`'s 64 KiB, so this whole chapter comes back in one call.
+`relish agent guide`'s 80 KiB, so this whole chapter comes back in one call.
 `--max-bytes` overrides either. An answer over budget is trimmed and stays
 valid JSON: items go from the end of the longest arrays in `data` first
 (commands put what matters most at the front), then long strings are
@@ -270,7 +270,7 @@ relish agent guide
 
 `data.sections` holds it one section at a time, each with its `heading` and
 its `markdown`, and `data.commands` lists the commands above, read from the
-binary itself. Its default budget is 64 KiB, not 24, so the whole chapter
+binary itself. Its default budget is 80 KiB, not 24, so the whole chapter
 comes back in one call, with nothing trimmed. Given a smaller `--max-bytes`,
 the last sections go first, and the `next` step asks for a `--max-bytes` that
 fits it all.

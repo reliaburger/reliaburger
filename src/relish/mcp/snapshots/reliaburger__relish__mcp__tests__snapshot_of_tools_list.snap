@@ -16,8 +16,8 @@ expression: listed_for_snapshot(server.tools())
       "additionalProperties": false,
       "properties": {
         "max_bytes": {
-          "default": 65536,
-          "description": "Largest answer to print, in bytes (at least 1024; by default 24576, and 65536 for `guide`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
+          "default": 81920,
+          "description": "Largest answer to print, in bytes (at least 1024; by default 24576, and 81920 for `guide`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
           "type": "integer"
         }
       },
@@ -84,7 +84,7 @@ expression: listed_for_snapshot(server.tools())
       "properties": {
         "max_bytes": {
           "default": 24576,
-          "description": "Largest answer to print, in bytes (at least 1024; by default 24576, and 65536 for `guide`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
+          "description": "Largest answer to print, in bytes (at least 1024; by default 24576, and 81920 for `guide`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
           "type": "integer"
         }
       },
@@ -184,7 +184,7 @@ expression: listed_for_snapshot(server.tools())
         },
         "max_bytes": {
           "default": 24576,
-          "description": "Largest answer to print, in bytes (at least 1024; by default 24576, and 65536 for `guide`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
+          "description": "Largest answer to print, in bytes (at least 1024; by default 24576, and 81920 for `guide`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
           "type": "integer"
         }
       },
@@ -251,7 +251,7 @@ expression: listed_for_snapshot(server.tools())
       "properties": {
         "max_bytes": {
           "default": 24576,
-          "description": "Largest answer to print, in bytes (at least 1024; by default 24576, and 65536 for `guide`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
+          "description": "Largest answer to print, in bytes (at least 1024; by default 24576, and 81920 for `guide`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
           "type": "integer"
         },
         "offline": {
@@ -326,7 +326,7 @@ expression: listed_for_snapshot(server.tools())
         },
         "max_bytes": {
           "default": 24576,
-          "description": "Largest answer to print, in bytes (at least 1024; by default 24576, and 65536 for `guide`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
+          "description": "Largest answer to print, in bytes (at least 1024; by default 24576, and 81920 for `guide`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
           "type": "integer"
         },
         "offline": {
@@ -410,7 +410,7 @@ expression: listed_for_snapshot(server.tools())
         },
         "max_bytes": {
           "default": 24576,
-          "description": "Largest answer to print, in bytes (at least 1024; by default 24576, and 65536 for `guide`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
+          "description": "Largest answer to print, in bytes (at least 1024; by default 24576, and 81920 for `guide`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
           "type": "integer"
         },
         "max_matches": {
@@ -497,7 +497,7 @@ expression: listed_for_snapshot(server.tools())
       "properties": {
         "max_bytes": {
           "default": 24576,
-          "description": "Largest answer to print, in bytes (at least 1024; by default 24576, and 65536 for `guide`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
+          "description": "Largest answer to print, in bytes (at least 1024; by default 24576, and 81920 for `guide`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
           "type": "integer"
         },
         "offline": {
@@ -592,7 +592,7 @@ expression: listed_for_snapshot(server.tools())
         },
         "max_bytes": {
           "default": 24576,
-          "description": "Largest answer to print, in bytes (at least 1024; by default 24576, and 65536 for `guide`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
+          "description": "Largest answer to print, in bytes (at least 1024; by default 24576, and 81920 for `guide`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
           "type": "integer"
         },
         "namespace": {
@@ -689,7 +689,7 @@ expression: listed_for_snapshot(server.tools())
       "properties": {
         "max_bytes": {
           "default": 24576,
-          "description": "Largest answer to print, in bytes (at least 1024; by default 24576, and 65536 for `guide`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
+          "description": "Largest answer to print, in bytes (at least 1024; by default 24576, and 81920 for `guide`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
           "type": "integer"
         },
         "words": {
@@ -766,7 +766,7 @@ expression: listed_for_snapshot(server.tools())
       "properties": {
         "max_bytes": {
           "default": 24576,
-          "description": "Largest answer to print, in bytes (at least 1024; by default 24576, and 65536 for `guide`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
+          "description": "Largest answer to print, in bytes (at least 1024; by default 24576, and 81920 for `guide`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
           "type": "integer"
         },
         "target": {
@@ -845,7 +845,7 @@ expression: listed_for_snapshot(server.tools())
         },
         "max_bytes": {
           "default": 24576,
-          "description": "Largest answer to print, in bytes (at least 1024; by default 24576, and 65536 for `guide`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
+          "description": "Largest answer to print, in bytes (at least 1024; by default 24576, and 81920 for `guide`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
           "type": "integer"
         }
       },
@@ -916,7 +916,7 @@ expression: listed_for_snapshot(server.tools())
         },
         "max_bytes": {
           "default": 24576,
-          "description": "Largest answer to print, in bytes (at least 1024; by default 24576, and 65536 for `guide`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
+          "description": "Largest answer to print, in bytes (at least 1024; by default 24576, and 81920 for `guide`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
           "type": "integer"
         }
       },
@@ -987,7 +987,7 @@ expression: listed_for_snapshot(server.tools())
         },
         "max_bytes": {
           "default": 24576,
-          "description": "Largest answer to print, in bytes (at least 1024; by default 24576, and 65536 for `guide`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
+          "description": "Largest answer to print, in bytes (at least 1024; by default 24576, and 81920 for `guide`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
           "type": "integer"
         }
       },

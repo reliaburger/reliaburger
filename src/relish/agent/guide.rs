@@ -1334,7 +1334,7 @@ Intro paragraph.\n\n## In brief\n\n\
     }
 
     /// `relish agent guide` is the one document an agent reads whole, so
-    /// its default budget (64 KiB, not 24) returns every section in one
+    /// its default budget (80 KiB, not 24) returns every section in one
     /// call, the setup playbook (#1579) last, with no `next` asking for
     /// more.
     #[test]
@@ -1359,8 +1359,9 @@ Intro paragraph.\n\n## In brief\n\n\
     }
 
     /// The guide's default budget exists so the whole chapter comes back in
-    /// one call. If chapter 16 outgrows it, someone has to choose: split
-    /// the chapter, or raise `GUIDE_MAX_BYTES` knowing what it costs.
+    /// one call. When chapter 16 outgrew 64 KiB, the maintainer chose to
+    /// keep it whole and raise `GUIDE_MAX_BYTES` to 80 KiB (8 Nov 2026).
+    /// Outgrowing that is the same choice again, made deliberately.
     #[test]
     fn the_agent_chapter_fits_the_guides_default_budget() {
         let rendered = run(1024 * 1024, "relish agent guide");

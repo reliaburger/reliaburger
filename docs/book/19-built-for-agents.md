@@ -331,7 +331,7 @@ tokens ([docs](https://code.claude.com/docs/en/mcp)). One `relish logs` on a
 chatty app can blow past that. So every
 `relish agent` command has a budget, 24 KiB by default (about 6,000 tokens),
 and `--max-bytes` to change it. `relish agent guide` is the one exception, at
-64 KiB: it's the one document an agent reads whole, so trimming it would only
+80 KiB: it's the one document an agent reads whole, so trimming it would only
 cost a second call for the rest. `AgentOptions` holds `--max-bytes` as an
 `Option<usize>` with no clap default, and `AgentOptions::max_bytes()` fills in
 the command's own default when it's `None`, because a clap default can't
@@ -500,7 +500,7 @@ down for us. Add a ninth table to `Config` and the count goes up on its own.
 
 What we left out: tokens and time per task against Kubernetes, which need
 the gym's comparison harness, and a budget on the fields inside each kind.
-`relish agent guide` already has its 64 KiB test.
+`relish agent guide` already has its 80 KiB test.
 
 ### The rest of `relish`
 
@@ -3042,7 +3042,7 @@ deterministic, that regenerating from its own output changes nothing, that a
 missing or doubled marker is an error, that an edited chapter makes every
 file quoting it stale, and that a skill description over the format's 1,024
 characters is refused. Three read the embedded chapter. One checks that the
-guide's 64 KiB default returns every section, untrimmed and with no `next`
+guide's 80 KiB default returns every section, untrimmed and with no `next`
 asking for more. One fails when the chapter outgrows that budget, with a
 message saying to split the chapter or raise `GUIDE_MAX_BYTES` deliberately.
 And one checks that an explicit 24 KiB budget drops sections only from the
@@ -3946,10 +3946,12 @@ checked.
 
 The playbook made the agent chapter bigger than the 24 KiB every other
 `relish agent` command defaults to, so the first `relish agent guide` call
-trimmed it every time. That's why the guide got its own 64 KiB default (see
+trimmed it every time. That's why the guide got its own default (see
 "Why a byte budget" above): the chapter is the one document an agent reads
-whole. The budget still works as a budget. Ask for less with `--max-bytes`
-and the guide drops sections from the end, says so, and its `next` step asks
+whole. It started at 64 KiB. Leases and proposals took the chapter past that
+in 0.2.8, and the maintainer raised it to 80 KiB rather than split the
+chapter, with room for what comes next. The budget still works as a budget.
+Ask for less with `--max-bytes` and the guide drops sections from the end, says so, and its `next` step asks
 for a budget that fits. The playbook is the last section on purpose, since an
 agent already driving a cluster needs it least. The guide tests check both
 sides: at the default every section comes back untrimmed, and at an explicit
