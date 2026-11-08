@@ -190,7 +190,7 @@ const STATUS_RUNTIME_READ_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// meets a slow runtime many times still ends well inside the 1 s turn
 /// budget. What doesn't finish in time fails the step, and the tick, the
 /// deploy worker or the caller tries again.
-const TURN_RUNTIME_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+pub(crate) const TURN_RUNTIME_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// How long a runtime read may take when no turn is running: during startup
 /// adoption, which already gives each runtime inspection 10 s.

@@ -14,8 +14,8 @@ bundle or hashes one itself. Run it locally against any candidate's record
 as a dry run.
 
 Publishing the entry needs the maintainer's GitHub login to the
-`reliaburger` organisation: `mcp-publisher publish` in the directory that
-holds the written `server.json` (docs/releasing.md).
+`reliaburger` organisation: `make mcp-registry-publish TAG=<tag>`
+(`mcp_registry_publish.py`, docs/releasing.md).
 """
 import argparse
 import copy

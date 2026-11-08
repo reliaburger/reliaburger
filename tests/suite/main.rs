@@ -66,6 +66,7 @@ mod issue_forms;
 mod live_node_identity;
 mod log_export;
 mod logs_cross_node;
+mod loop_watchdog;
 mod managed_status;
 mod metrics_aggregation;
 mod missing_binary;

@@ -550,11 +550,11 @@ pub fn endpoint_overridden() -> bool {
 
 /// Precedence rule for [`resolve_token`], split out to be testable without the
 /// process-global flag and environment. A present `--token` flag wins;
-/// otherwise fall back to the environment value.
+/// otherwise fall back to the environment value, unless it's blank.
 fn pick_token(cli_flag: Option<&Option<String>>, env: Option<String>) -> Option<String> {
     match cli_flag {
         Some(Some(t)) => Some(t.clone()),
-        _ => env,
+        _ => unless_blank(env),
     }
 }
 
@@ -562,8 +562,18 @@ fn pick_token(cli_flag: Option<&Option<String>>, env: Option<String>) -> Option<
 fn pick_endpoint(cli_flag: Option<&Option<String>>, env: Option<String>) -> Option<String> {
     match cli_flag {
         Some(Some(endpoint)) => Some(endpoint.clone()),
-        _ => env,
+        _ => unless_blank(env),
     }
+}
+
+/// An environment value, or `None` when it's empty or only whitespace.
+///
+/// An MCP Bundle client passes an optional setting the user left blank as
+/// an empty variable (#1695). Blank means "not set", so `relish` falls back
+/// to the current context instead of refusing an empty URL or sending an
+/// empty bearer in place of the context's own token.
+fn unless_blank(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.trim().is_empty())
 }
 
 /// Validate an operator-supplied Bun API base URL.
@@ -1550,6 +1560,17 @@ impl BunClient {
             .await
             .map_err(classify_error)?;
         parse_typed_response(response).await
+    }
+
+    /// Fetch a test resource lease as its owner sees it: its state and its
+    /// server-side expiry. A lease whose cleanup has finished is gone, and
+    /// the server answers 404.
+    pub async fn test_lease(
+        &self,
+        lease_id: &str,
+    ) -> Result<crate::testkit::lease::TestLease, RelishError> {
+        self.get_typed_json(&format!("/v1/test/leases/{lease_id}"))
+            .await
     }
 
     /// Renew an active test resource lease as its authenticated owner.
@@ -4312,6 +4333,37 @@ mod tests {
             Some("https://env.example:9117".to_string())
         );
         assert_eq!(pick_endpoint(None, None), None);
+    }
+
+    /// #1695: an MCPB client passes an optional setting the user left blank
+    /// as an empty variable. Blank must mean "not set", so the saved
+    /// context's own token is used rather than an empty bearer.
+    #[test]
+    fn blank_token_variable_counts_as_unset() {
+        for blank in ["", "   ", "\t\n"] {
+            assert_eq!(pick_token(None, Some(blank.to_string())), None);
+            assert_eq!(pick_token(Some(&None), Some(blank.to_string())), None);
+        }
+        let flag = Some("rbrg_flag".to_string());
+        assert_eq!(
+            pick_token(Some(&flag), Some(String::new())),
+            Some("rbrg_flag".to_string())
+        );
+    }
+
+    /// #1695: a blank `RELIABURGER_ENDPOINT` falls back to the current
+    /// context instead of failing as an invalid URL.
+    #[test]
+    fn blank_endpoint_variable_counts_as_unset() {
+        for blank in ["", "   ", "\t\n"] {
+            assert_eq!(pick_endpoint(None, Some(blank.to_string())), None);
+            assert_eq!(pick_endpoint(Some(&None), Some(blank.to_string())), None);
+        }
+        let flag = Some("https://flag.example:9117".to_string());
+        assert_eq!(
+            pick_endpoint(Some(&flag), Some(String::new())),
+            Some("https://flag.example:9117".to_string())
+        );
     }
 
     /// A firewall that drops packets makes the connection time out. Nothing

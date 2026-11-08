@@ -12,11 +12,14 @@
 //! that broke the rule never finishes.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::mayo::collector::CollectedMetric;
 use crate::mayo::types::MetricKey;
+
+use super::loop_watchdog::LoopHeartbeat;
 
 /// The metric name the histogram is exported under.
 pub const TURN_METRIC: &str = "bun_agent_loop_turn_seconds";
@@ -88,6 +91,11 @@ impl LoopBranch {
 
     fn index(self) -> usize {
         self as usize
+    }
+
+    /// The branch whose `as u8` is `index`, for the watchdog's heartbeat.
+    pub(crate) fn from_index(index: u8) -> Option<LoopBranch> {
+        Self::ALL.get(usize::from(index)).copied()
     }
 }
 
@@ -276,6 +284,8 @@ pub struct LoopTurnMeter {
     /// The timed parts of the turn in progress. The loop runs one turn at a
     /// time, so one set serves every turn, and `begin` clears it.
     parts: PartTimes,
+    /// What the stall watchdog reads: the turn in progress (#1707).
+    heartbeat: Arc<LoopHeartbeat>,
     /// Test-only: the longest finished turn and the turn in progress. A
     /// `std` mutex is fine here: it guards a copy and is never held across
     /// an `await`.
@@ -300,6 +310,7 @@ impl LoopTurnMeter {
         Self {
             branches: [const { BranchHistogram::new() }; LoopBranch::ALL.len()],
             parts: PartTimes::new(),
+            heartbeat: Arc::new(LoopHeartbeat::new()),
             #[cfg(test)]
             worst: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -313,6 +324,7 @@ impl LoopTurnMeter {
     /// op it handles, for the slow-turn log.
     pub fn begin(&self, branch: LoopBranch, detail: Option<&'static str>) -> Turn {
         self.parts.clear();
+        self.heartbeat.begin(branch, detail);
         let turn = Turn {
             branch,
             detail,
@@ -325,6 +337,11 @@ impl LoopTurnMeter {
         turn
     }
 
+    /// The heartbeat the stall watchdog watches.
+    pub fn heartbeat(&self) -> Arc<LoopHeartbeat> {
+        Arc::clone(&self.heartbeat)
+    }
+
     /// Add `took` to what `part` has cost the turn in progress.
     pub fn add_part(&self, part: TurnPart, took: Duration) {
         self.parts.add(part, took);
@@ -332,6 +349,7 @@ impl LoopTurnMeter {
 
     /// Record a finished turn, and log it when it ran long.
     pub fn finish(&self, turn: Turn) {
+        self.heartbeat.finish();
         let took = turn.started.elapsed();
         self.branches[turn.branch.index()].observe(took);
         if took >= SLOW_TURN_LOG_THRESHOLD {
@@ -469,6 +487,27 @@ impl LoopTurnMeter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_turn_stamps_the_watchdogs_heartbeat_while_it_runs() {
+        let meter = LoopTurnMeter::new();
+        let heartbeat = meter.heartbeat();
+        assert_eq!(heartbeat.current(), None);
+        let turn = meter.begin(LoopBranch::DeployOp, Some("health_probe_result"));
+        let stamp = heartbeat.current().unwrap();
+        assert_eq!(stamp.branch, LoopBranch::DeployOp);
+        assert_eq!(stamp.detail, Some("health_probe_result"));
+        meter.finish(turn);
+        assert_eq!(heartbeat.current(), None);
+    }
+
+    #[test]
+    fn every_branch_round_trips_through_its_heartbeat_index() {
+        for branch in LoopBranch::ALL {
+            assert_eq!(LoopBranch::from_index(branch as u8), Some(branch));
+        }
+        assert_eq!(LoopBranch::from_index(u8::MAX), None);
+    }
 
     fn value(samples: &[CollectedMetric], name: &str, labels: &[(&str, &str)]) -> Option<f64> {
         samples
