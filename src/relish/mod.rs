@@ -19,6 +19,7 @@ pub mod diff;
 pub mod events_cmd;
 pub mod fault;
 pub mod fmt;
+pub mod gym;
 pub mod inspect;
 pub mod install;
 #[cfg(feature = "kubernetes")]

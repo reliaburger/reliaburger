@@ -1095,7 +1095,8 @@ throwaway local cluster for each scenario, breaks it in a way it knows (a
 crash loop after a bad deploy, an unschedulable deploy, a node partitioned by
 Smoker, a prompt injection in an app's log, and a `relish` with a bug planted
 in it), gives the solver a prompt and a read-only token, and scores the answer
-against what really went wrong. It never touches your own cluster.
+against what really went wrong. It never touches your own cluster;
+`relish gym run` tests an agent on yours (see `chaos`).
 
 ```sh
 make test-gym GYM_SOLVER='command:./my-agent.sh' GYM_RUNS=5
