@@ -323,8 +323,8 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bun::summary::*;
     use crate::bun::summary::verdict::{apps_line, jobs_line};
+    use crate::bun::summary::*;
 
     /// 8 November 2026, 14:02:11 UTC.
     const NOW_MS: u64 = 1_794_146_531_000;
