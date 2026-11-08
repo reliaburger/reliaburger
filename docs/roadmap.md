@@ -668,10 +668,12 @@ what's shipped and what's scheduled.
   ([#364](https://github.com/reliaburger/reliaburger/issues/364)); an offline
   root CA ([#709](https://github.com/reliaburger/reliaburger/issues/709));
   keyless cosign ([#619](https://github.com/reliaburger/reliaburger/issues/619));
-  fully leader-coordinated rollouts, static builds and Raft snapshot
-  encryption, which have no issue yet.
+  fully leader-coordinated rollouts
+  ([#1776](https://github.com/reliaburger/reliaburger/issues/1776)), static builds
+  ([#1774](https://github.com/reliaburger/reliaburger/issues/1774)) and Raft
+  snapshot encryption ([#1775](https://github.com/reliaburger/reliaburger/issues/1775)).
 - **Custom alert rules.** Each node evaluates five built-in rules; you can't
-  define your own yet.
+  define your own yet ([#1773](https://github.com/reliaburger/reliaburger/issues/1773), planned for 0.4.0).
 - **Scale beyond three nodes.** Every release is soaked on three nodes. The
   [hollow-node record](qualification/2026-10-28-hollow-nodes.md) found limits
   at 500 and 1,000 nodes

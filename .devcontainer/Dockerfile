@@ -14,7 +14,7 @@ FROM ubuntu:24.04
 # dtolnay/rust-toolchain. Bump it with them.
 ARG RUST_VERSION=1.98.0
 # .config/nextest.toml's nextest-version, which every CI job installs.
-ARG NEXTEST_VERSION=0.9.145
+ARG NEXTEST_VERSION=0.9.151
 # The cargo-mutants mutants.yml installs, for killing a missed mutant locally.
 ARG MUTANTS_VERSION=27.1.0
 

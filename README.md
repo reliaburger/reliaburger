@@ -13,7 +13,7 @@ metrics, logs, GitOps, jobs and fault injection are compiled into that agent.
 There's no control plane to assemble and no add-ons to install. A Linux node
 needs a few distribution packages (`runc`, `nftables`, `iproute2` and friends,
 listed in the [Linux servers guide](docs/linux-servers.md)), and releases are
-glibc builds; static builds are planned, though no issue tracks them yet.
+glibc builds; static builds are planned ([#1774](https://github.com/reliaburger/reliaburger/issues/1774)).
 
 It applies most Kubernetes manifests directly and tells you what it had to
 change or drop (see [what converts](docs/manual/09_kubernetes.md)). The tour below
@@ -234,6 +234,9 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
   - `relish fault list`: List all active faults
   - `relish fault clear [TARGET]`: Clear faults — all, by numeric id, or by service name
   - `relish fault scenario <PATH>`: Run a scripted chaos scenario from a TOML file
+- `relish gym`: Test your own agent on your own cluster: break a staging namespace in known ways, run the agent, score it *(0.2.8, not in 0.2.7)*
+  - `relish gym run --namespace <NAMESPACE>`: Deploy the gym's apps into a staging namespace, break them, run your agent, score it and clean up *(0.2.8, not in 0.2.7)*
+  - `relish gym list`: List the scenarios: what each deploys, breaks and scores *(0.2.8, not in 0.2.7)*
 
 **Security and access** ([security and access](docs/manual/10_security.md))
 
@@ -466,7 +469,10 @@ that pull the plug on a VM mid-write, a live-cluster test runner you can point
 at your own cluster (`relish test`), and a soak that installs the signed
 release the way you would and then breaks it for hours. An agent gym breaks
 throwaway clusters in ways it knows and scores whatever diagnoses them, an AI
-agent included, against the ground truth (`make test-gym`, from 0.2.7; Claude Code plugs in with `scripts/gym/claude_code.py`). CI
+agent included, against the ground truth (`make test-gym`, from 0.2.7; Claude Code plugs in with `scripts/gym/claude_code.py`).
+`relish gym run` *(0.2.8, not in 0.2.7)* does the same on your own cluster: it breaks a
+staging namespace you name, runs your agent with a read-only token scoped to
+it, cleans up on every way out, and writes a report for your security review. CI
 never retries a failure. See [how Reliaburger is tested](docs/testing.md).
 
 **A terminal UI and a web dashboard.** Run `relish` with no arguments for the
@@ -508,7 +514,7 @@ and its trade-offs; the [design docs](docs/design/) cover each subsystem.
 - **Ingress certificates don't come from ACME.** Use the cluster CA or supply
   your own files. ACME is planned for 0.4.0
   ([#1667](https://github.com/reliaburger/reliaburger/issues/1667)).
-- **Alerts are five built-in node rules.** You can't define your own yet.
+- **Alerts are five built-in node rules.** You can't define your own yet ([#1773](https://github.com/reliaburger/reliaburger/issues/1773)).
 - **No PromQL.** Metrics are read through `relish metrics`, the dashboards and
   the API.
 - **`fault bandwidth` is refused** until it's implemented
