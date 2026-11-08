@@ -70,6 +70,7 @@ Every page on reliaburger.com, as Markdown.
 - [Comparison method · Reliaburger](https://reliaburger.com/compare/methodology.md)
 - [Reliaburger compared with Nomad](https://reliaburger.com/compare/nomad.md)
 - [Reliaburger compared with Uncloud](https://reliaburger.com/compare/uncloud.md)
+- [Feature status · Reliaburger](https://reliaburger.com/features.md)
 - [Reliaburger feedback](https://reliaburger.com/feedback/index.md)
 
 ## Optional
