@@ -3829,6 +3829,39 @@ Every one of those `relish agent` commands is new in 0.2.7, and the installer
 still fetches 0.2.6 until the release, so each place that names one says
 "0.2.7, not in 0.2.6", the label the release check already demands.
 
+### A first slide that only says what shipped
+
+0.2.8 puts a seventh slide at the front of the carousel (#1731): "Native to
+AI agents from day one, not bolted on." Is that true? Mostly it's old news
+told in one place. The first design doc, checked in on 4 March 2026, already
+promised `--output json` on every command a script could run, and the JSON
+formatter arrived two days later. The embedded source came in July, before
+0.1.0. `relish agent` and `relish mcp` are 0.2.7's. So every claim on the
+slide is one we could point at: the default role of `relish token create` is
+`read-only`, `relish agent report` redacts its draft, and Claude Code passed
+0.2.7's exit test in the gym holding a read-only token. The slide links that
+record and the gym's section on `/agents`.
+
+What it leaves out matters as much. The gym doesn't run on every release
+(it costs API money, and `make test-gym` is the maintainer's to run before a
+release that changes the agent commands), so the slide doesn't say it does.
+Proposals and guardrails (#1682) aren't built yet, so they aren't there either.
+
+There's a word problem too. The next slide calls `bun` "the one agent every
+node runs", and that came first. So the new slide never says plain "agent":
+it's an AI agent, your agent, or part of `relish agent`. A test reads every
+"agent" on the slide and fails on any other.
+
+The drawing is a terminal and a small robot holding a key. A dot leaves the
+robot, JSON lines type themselves into the terminal, a dot goes back, and the
+robot blinks. The lines "type" with a trick worth knowing: give a stroke a
+dash pattern longer than the line (`stroke-dasharray: 120`) and animate
+`stroke-dashoffset` from 120 to 0, and the dash slides into view. The
+resting state is offset 0, a fully drawn line, so when reduced motion turns
+the animation off, the lines are simply there. The carousel script counts
+its slides, so the seventh needed markup and CSS only. The footer and the
+site's README now say seven, and a test holds them to the count.
+
 ### A recording slot with nothing in it
 
 The section is meant to carry a recording of a real agent session. Recordings
@@ -3926,7 +3959,8 @@ Goose has no web form, so the README points at `/agents` for it.
   shows the rest.
 - `tests/suite/website.rs` checks that the agent line comes before the
   masthead and links three files the site publishes, that the hero carries
-  the headline, that there are six slides, that every command in the agent
+  the headline, that there are six slides (seven from 0.2.8, with the AI-agent
+  one first and every "agent" on it unambiguous), that every command in the agent
   section parses with the real CLI, that the recording slot is in one of its
   two honest states, that `/agents` and the README carry exactly the links
   `install_links()` makes and the command they start parses, that every
