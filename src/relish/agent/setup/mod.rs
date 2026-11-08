@@ -17,6 +17,12 @@
 //! - No entry approves anything: no `trust`, no auto-approve, no wildcard.
 //!
 //! `--remove` takes the entries (and the skill) back out, by the same rules.
+//!
+//! When the saved context holds the cluster's admin token, setup also makes
+//! `relish mcp` its own read-only token (#1730,
+//! [`crate::relish::mcp::credentials`]), so the agents it wires never carry
+//! admin credentials. The preview says so; `--yes` makes it; `--remove`
+//! revokes it.
 
 pub mod clients;
 pub mod edit;
@@ -79,6 +85,12 @@ pub struct SetupData {
     pub server: Server,
     /// Every agent setup knows, found or not, in a fixed order.
     pub agents: Vec<AgentPlan>,
+    /// `relish mcp`'s own read-only tokens, made from the context's admin
+    /// one so no agent carries admin credentials: `mcp-token.json` to make,
+    /// or with `--remove` it and every `mcp-token-<namespace>.json`. Empty
+    /// when the context isn't an admin one (or there's none), so there's
+    /// nothing to do.
+    pub mcp_tokens: Vec<Change>,
 }
 
 /// Adding or removing.
@@ -141,6 +153,8 @@ pub enum ChangeKind {
     McpServer,
     /// The Reliaburger skill.
     Skill,
+    /// `relish mcp`'s read-only token, kept beside the context.
+    McpToken,
 }
 
 /// What happens to one entry.
@@ -170,6 +184,90 @@ impl ChangeStatus {
     }
 }
 
+/// One of `relish mcp`'s token files.
+pub struct TokenFile {
+    /// Where it is, or would be.
+    pub path: PathBuf,
+    /// Whether a token that's still good is there (for `--remove`, whether
+    /// the file is there at all).
+    pub stored: bool,
+    /// The file's JSON with the secret redacted, for the diff.
+    pub preview: String,
+    /// Why a token that's there doesn't count, for the answer to say.
+    pub note: Option<String>,
+}
+
+/// What setup can do about `relish mcp`'s read-only tokens, when the saved
+/// context holds an admin one.
+pub struct TokenPlan {
+    /// The files: `mcp-token.json` to make, or every token file there is
+    /// to remove.
+    pub files: Vec<TokenFile>,
+    /// Make the token at a path ([`Action::Install`]) or revoke and delete
+    /// it ([`Action::Remove`]). `Ok(false)` means there was nothing to do:
+    /// the cluster says the context's token isn't admin, or the file had
+    /// already gone. Called only with `--yes`.
+    pub apply: ApplyToken,
+}
+
+/// Makes or removes the token at a path; see [`TokenPlan::apply`].
+pub type ApplyToken = Box<dyn FnMut(Action, &Path) -> Result<bool, String> + Send>;
+
+/// Plan, and with `--yes` make, the change for every token file.
+fn plan_tokens(token: TokenPlan, action: Action, yes: bool) -> Vec<Change> {
+    let TokenPlan { files, mut apply } = token;
+    files
+        .into_iter()
+        .map(|file| plan_token(file, &mut apply, action, yes))
+        .collect()
+}
+
+/// Plan, and with `--yes` make, the change for one token file.
+fn plan_token(
+    file: TokenFile,
+    apply: &mut dyn FnMut(Action, &Path) -> Result<bool, String>,
+    action: Action,
+    yes: bool,
+) -> Change {
+    let exists = file.stored || (action == Action::Remove && file.path.exists());
+    let status = match (action, exists) {
+        (Action::Install, false) => ChangeStatus::Add,
+        (Action::Remove, true) => ChangeStatus::Remove,
+        (Action::Install, true) | (Action::Remove, false) => ChangeStatus::Unchanged,
+    };
+    let mut change = change(
+        ChangeKind::McpToken,
+        file.path.clone(),
+        "token".to_string(),
+        status,
+    );
+    change.note = file.note;
+    if !status.changes_something() {
+        return change;
+    }
+    // The file's JSON, never the secret: the preview has it redacted.
+    let contents = format!("{}\n", file.preview);
+    change.diff = Some(match action {
+        Action::Install => diff(&file.path, "", &contents),
+        Action::Remove => diff(&file.path, &contents, ""),
+    });
+    if yes {
+        match apply(action, &file.path) {
+            Ok(true) => change.written = true,
+            Ok(false) => {
+                change.note = Some(match action {
+                    Action::Install => "the cluster says the context's token isn't admin, so \
+                                        relish mcp uses it as it is"
+                        .to_string(),
+                    Action::Remove => "it was already gone".to_string(),
+                })
+            }
+            Err(error) => change.note = Some(format!("not written: {error}")),
+        }
+    }
+    change
+}
+
 /// A planned change, with the text to write.
 #[derive(Debug, Clone)]
 struct Planned {
@@ -183,7 +281,12 @@ struct Planned {
 /// Work out, and with `--yes` make, every change.
 ///
 /// `skill` is the skill file's text, when this build carries one.
-pub fn setup(options: &SetupOptions, home: &Home, skill: Option<&str>) -> SetupData {
+pub fn setup(
+    options: &SetupOptions,
+    home: &Home,
+    skill: Option<&str>,
+    token: Option<TokenPlan>,
+) -> SetupData {
     let action = if options.remove {
         Action::Remove
     } else {
@@ -223,6 +326,7 @@ pub fn setup(options: &SetupOptions, home: &Home, skill: Option<&str>) -> SetupD
             command: mcp_command_line(),
         },
         agents,
+        mcp_tokens: token.map_or_else(Vec::new, |token| plan_tokens(token, action, options.yes)),
     }
 }
 
@@ -476,10 +580,11 @@ pub fn answer(
     options: &SetupOptions,
     home: &Home,
     skill: Option<&str>,
+    token: Option<TokenPlan>,
     build: BuildInfo,
     rerun: &str,
 ) -> Envelope<SetupData> {
-    let data = setup(options, home, skill);
+    let data = setup(options, home, skill, token);
     let changes: Vec<(Client, Change)> = data
         .agents
         .iter()
@@ -500,7 +605,9 @@ pub fn answer(
     }
     let pending = changes
         .iter()
-        .any(|(_, change)| change.status.changes_something());
+        .map(|(_, change)| change)
+        .chain(&data.mcp_tokens)
+        .any(|change| change.status.changes_something());
     if !data.applied && pending {
         next.push(NextStep {
             run: format!("{} --yes", without_dry_run(rerun)),
@@ -517,6 +624,17 @@ pub fn answer(
                 change.entry
             ));
         }
+    }
+    for note in data
+        .mcp_tokens
+        .iter()
+        .filter_map(|token| token.note.as_deref())
+        .filter(|note| note.starts_with("not written"))
+    {
+        warnings.push(format!(
+            "relish mcp's read-only token: {note}; relish mcp will try again when it starts, \
+             and sends only a read-only token, never the admin one"
+        ));
     }
     let mut restart: Vec<&str> = changes
         .iter()
@@ -552,6 +670,12 @@ fn without_dry_run(rerun: &str) -> String {
 pub async fn run(options: &SetupOptions, max_bytes: usize, rerun: &str) -> Rendered {
     let options = options.clone();
     let rerun_for_task = rerun.to_string();
+    let action = if options.remove {
+        Action::Remove
+    } else {
+        Action::Install
+    };
+    let token = token_plan(action).await;
     // File I/O, and packing the source digest on a dev build, so off the
     // async worker threads.
     let outcome = tokio::task::spawn_blocking(move || {
@@ -560,6 +684,7 @@ pub async fn run(options: &SetupOptions, max_bytes: usize, rerun: &str) -> Rende
             &options,
             &home,
             Some(SKILL_MD),
+            token,
             BuildInfo::current(),
             &rerun_for_task,
         ))
@@ -579,6 +704,108 @@ pub async fn run(options: &SetupOptions, max_bytes: usize, rerun: &str) -> Rende
             rerun,
         ),
     }
+}
+
+/// The token plan for this machine: `None` unless the token `relish mcp`
+/// would send is the saved context's admin one.
+///
+/// To make the token, a stored one that's still good on disk is checked
+/// with the cluster too (one cheap admin-only read), so a token revoked or
+/// rotated behind `relish mcp`'s back is replaced, not called unchanged.
+/// To remove, every token file beside the context is in the plan.
+async fn token_plan(action: Action) -> Option<TokenPlan> {
+    use crate::relish::client::{TokenOrigin, token_origin};
+    use crate::relish::mcp::credentials;
+    if token_origin() != TokenOrigin::ContextAdmin {
+        return None;
+    }
+    let context_path = crate::relish::local_context::default_path().ok()?;
+    let context = crate::relish::local_context::LocalContext::load(&context_path)
+        .ok()
+        .flatten()?;
+    let admin = context.client(None, None).ok()?;
+    let scope = credentials::Scope {
+        owner: context.owner.clone(),
+        endpoint: context.endpoint.clone(),
+        namespace: None,
+    };
+    let now = credentials::now();
+    let mut rejected = None;
+    let files = match action {
+        Action::Install => {
+            let path = credentials::path_beside(&context_path, None).ok()?;
+            let usable = credentials::StoredToken::load(&path)
+                .ok()
+                .flatten()
+                .filter(|stored| stored.usable(&scope, now));
+            let mut note = None;
+            if let Some(stored) = usable.as_ref()
+                && credentials::accepted(&admin, &stored.token).await == Some(false)
+            {
+                note = Some(
+                    "the cluster rejects the stored token (revoked or rotated); a new one \
+                     replaces it"
+                        .to_string(),
+                );
+                rejected = Some(stored.token.clone());
+            }
+            vec![TokenFile {
+                path,
+                stored: usable.is_some() && rejected.is_none(),
+                preview: credentials::shape(&scope, None, now),
+                note,
+            }]
+        }
+        Action::Remove => {
+            let mut files: Vec<TokenFile> = credentials::files_beside(&context_path)
+                .ok()?
+                .into_iter()
+                .map(|path| {
+                    let stored = credentials::StoredToken::load(&path).ok().flatten();
+                    TokenFile {
+                        preview: credentials::shape(&scope, stored.as_ref(), now),
+                        path,
+                        stored: true,
+                        note: None,
+                    }
+                })
+                .collect();
+            if files.is_empty() {
+                files.push(TokenFile {
+                    path: credentials::path_beside(&context_path, None).ok()?,
+                    stored: false,
+                    preview: String::new(),
+                    note: None,
+                });
+            }
+            files
+        }
+    };
+    let runtime = tokio::runtime::Handle::current();
+    let apply = move |action: Action, path: &Path| -> Result<bool, String> {
+        // `apply` runs inside `spawn_blocking`, where blocking on the
+        // runtime is allowed: that thread isn't one of its workers.
+        runtime
+            .block_on(async {
+                match action {
+                    Action::Install => credentials::obtain(
+                        path,
+                        &scope,
+                        &admin,
+                        credentials::now(),
+                        rejected.as_deref(),
+                    )
+                    .await
+                    .map(|(_, obtained)| obtained != credentials::Obtained::NotNeeded),
+                    Action::Remove => credentials::remove(path, &admin).await,
+                }
+            })
+            .map_err(|error| error.to_string())
+    };
+    Some(TokenPlan {
+        files,
+        apply: Box::new(apply),
+    })
 }
 
 fn failed(error: AgentError, max_bytes: usize, rerun: &str) -> Rendered {

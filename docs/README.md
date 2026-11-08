@@ -857,6 +857,7 @@ adds the `relish mcp` server to Claude Code, Codex, Cursor, VS Code, Goose and
 Gemini CLI: it shows the diff, writes only with `--yes`, never touches an entry
 it didn't write, and approves no tools. `relish mcp` serves the read-only
 commands as MCP tools over stdio (`claude mcp add reliaburger -- relish mcp`),
+sending a read-only token it makes for itself when the context's is admin,
 derived from the same definitions, with `--toolsets`, `--no-logs` and
 `--namespace` to narrow them; commands that write, build or reach past the
 cluster API aren't tools. See [Working with an AI

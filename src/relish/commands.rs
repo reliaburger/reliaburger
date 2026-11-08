@@ -4744,10 +4744,13 @@ pub async fn token_list(output: OutputFormat) -> Result<(), RelishError> {
 
 /// One line per token that has expired, or expires within
 /// [`crate::sesame::token::TOKEN_EXPIRY_WARNING`] of `now`, saying what to do.
+/// The tokens `relish mcp` makes are left out: they live a day and it
+/// renews them itself, and rotating one only gets it rejected under it.
 fn token_expiry_warnings(tokens: &[super::client::TokenSummary], now: u64) -> Vec<String> {
     let horizon = now.saturating_add(crate::sesame::token::TOKEN_EXPIRY_WARNING.as_secs());
     tokens
         .iter()
+        .filter(|token| !super::mcp::credentials::made_by_relish_mcp(&token.name))
         .filter_map(|token| {
             let at = token.expires_at.filter(|at| *at <= horizon)?;
             let name = &token.name;
@@ -5795,6 +5798,32 @@ mod tests {
                 "token gone has expired; create a replacement, or rotate it with \
                  `relish token rotate gone` before the expiry sweep removes it",
             ]
+        );
+    }
+
+    /// The tokens `relish mcp` makes live a day and renew themselves, so
+    /// they'd always be in the window, and rotating one only gets it
+    /// rejected under `relish mcp` (#1763 review).
+    #[test]
+    fn token_list_doesnt_warn_about_the_tokens_relish_mcp_makes() {
+        use super::super::client::{TokenScopeSummary, TokenSummary};
+        let now = 1_790_337_600;
+        let summary = |name: &str, expires_at: u64| TokenSummary {
+            name: name.to_string(),
+            role: "read-only".to_string(),
+            scope: TokenScopeSummary::default(),
+            created_at: now - 3_600,
+            expires_at: Some(expires_at),
+            last_used: None,
+        };
+        let tokens = [
+            summary("relish-mcp-1790334000-4242", now + 23 * 3_600),
+            summary("relish-mcp-1790000000-17", now - 60),
+            summary("agent", now + 23 * 3_600),
+        ];
+        assert_eq!(
+            token_expiry_warnings(&tokens, now),
+            ["token agent expires in 23h; rotate it with `relish token rotate agent`"]
         );
     }
 
