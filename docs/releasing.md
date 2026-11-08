@@ -927,8 +927,28 @@ Anything else (no such run, a re-run, a failed, cancelled or skipped job,
 another commit, an API error) runs the full suite in `validate-release`, as every
 build did before 0.2.4. Reusing the run takes the candidate from about 2 hours
 to about 50 minutes, the macOS `relish` build's time; most of the hour saved
-was spent waiting for hosted macOS runners. The job summary's *Source CI*
-line names the run and attempt the candidate rests on.
+was spent waiting for hosted macOS runners.
+
+You don't have to wait for `main`'s CI before dispatching the build. If a
+push, merge-queue or nightly run on the commit is still queued or running,
+`find passing CI` waits for it, asking again every minute for up to two hours,
+and then applies the same rules
+([#1722](https://github.com/reliaburger/reliaburger/issues/1722)). Until 0.2.8
+it only looked at finished runs, so 0.2.6's and 0.2.7's candidates, each
+dispatched seconds after the gate PR merged, ran the whole suite again: 89
+minutes for 0.2.6 instead of about 53, plus three macOS jobs queued behind
+the push's own. The build jobs don't depend on the search and run meanwhile,
+so the wait costs nothing until it outlasts them. If the run fails, skips a
+job or is still going after two hours, the suite runs here. If no run exists
+yet (a build dispatched the moment a merge lands can ask before GitHub has
+created one), it keeps asking for three minutes first. Runs from a pull
+request are never waited for, because they could never be reused.
+
+The job summary's *Source CI* line names, and links, the run and attempt the
+candidate rests on, and how long the build waited for it. `candidate.json`
+records the same run as `source_ci` (`run_id` and `run_attempt`): the reused
+`ci.yml` run, or the build's own run when it ran the suite itself. Cite it in
+the qualification record.
 
 Only after those checks pass does it collect the two built guest images, sign
 all six binaries and both images' digests, and upload `candidate-<commit>-<attempt>` as an Actions artefact.
