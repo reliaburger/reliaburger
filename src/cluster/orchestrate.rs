@@ -1977,7 +1977,7 @@ fn build_cluster_cache(
             allocatable: Resources {
                 cpu_millicores: u64::from(usage.cpu_total_millicores),
                 memory_bytes: u64::from(usage.memory_total_mb) * 1024 * 1024,
-                gpus: 0,
+                gpus: usage.gpu_total,
             },
             // App requests plus what task attempts and reusable executors
             // hold in the same node budget. Apps and jobs share one ledger
@@ -1987,7 +1987,7 @@ fn build_cluster_cache(
                     .saturating_add(report.job_reservations.cpu_millicores),
                 memory_bytes: (u64::from(usage.memory_used_mb) * 1024 * 1024)
                     .saturating_add(report.job_reservations.memory_bytes),
-                gpus: 0,
+                gpus: usage.gpu_used,
             },
             labels: member.labels.clone(),
             ready: reports
@@ -5050,6 +5050,7 @@ image = "busybox:latest"
                 memory_used_mb: 256,
                 disk_used_mb: 0,
                 gpu_used: 0,
+                gpu_total: 0,
                 allocated_ports: vec![],
                 cpu_total_millicores: cpu_total,
                 memory_total_mb: 8192,
@@ -5129,6 +5130,31 @@ image = "busybox:latest"
                 .unwrap()
                 .ready
         );
+    }
+
+    #[test]
+    fn cache_carries_the_gpus_a_node_reports() {
+        let members = vec![member("gpu", 1)];
+        let mut gpu = report(4000, 0);
+        gpu.resource_usage.gpu_total = 4;
+        gpu.resource_usage.gpu_used = 1;
+        let mut reports = AggregatedState {
+            leadership_epoch: None,
+            receive_deadlines: Default::default(),
+            reports: HashMap::from([(NodeId::new("gpu"), gpu)]),
+            stale_nodes: vec![],
+            stale_since: Default::default(),
+            capabilities: HashMap::new(),
+            readiness: HashMap::new(),
+        };
+        reports.receive_deadlines = HashMap::from([(
+            NodeId::new("gpu"),
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        )]);
+        let cache = build_cluster_cache(&members, &reports);
+        let node = cache.get_node(&NodeId::new("gpu")).unwrap();
+        assert_eq!(node.allocatable.gpus, 4);
+        assert_eq!(node.allocated.gpus, 1);
     }
 
     #[test]

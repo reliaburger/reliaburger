@@ -778,6 +778,10 @@ pub struct MayoStore {
     /// Counter for unique Parquet file names. Seeded past any existing files
     /// so a restart never clobbers a previous run's data.
     flush_counter: u64,
+    /// The newest unlabelled `node_*` sample per metric name: what the
+    /// node's own collector last measured, read by the cluster summary
+    /// without a query. A handful of entries, never more.
+    latest_node: std::collections::BTreeMap<String, Sample>,
     #[cfg(test)]
     test_gate: Option<Arc<MayoWriteGate>>,
 }
@@ -796,6 +800,7 @@ impl MayoStore {
             data_dir,
             backend: Backend::Local,
             flush_counter,
+            latest_node: std::collections::BTreeMap::new(),
             #[cfg(test)]
             test_gate: None,
         }
@@ -820,6 +825,7 @@ impl MayoStore {
             data_dir,
             backend: Backend::Remote { store, prefix },
             flush_counter,
+            latest_node: std::collections::BTreeMap::new(),
             #[cfg(test)]
             test_gate: None,
         })
@@ -856,6 +862,12 @@ impl MayoStore {
     /// Insert a metric sample into the buffer.
     pub fn insert(&mut self, key: &MetricKey, sample: Sample) {
         self.clear_completed_flush();
+        if key.labels.is_empty() && key.name.0.starts_with("node_") {
+            let latest = self.latest_node.entry(key.name.0.clone()).or_insert(sample);
+            if sample.timestamp >= latest.timestamp {
+                *latest = sample;
+            }
+        }
         self.buffer.push(BufferedSample {
             timestamp: sample.timestamp,
             metric_name: key.name.0.clone(),
@@ -871,6 +883,21 @@ impl MayoStore {
             let overflow = self.buffer.len() - available;
             self.buffer.drain(0..overflow);
         }
+    }
+
+    /// The newest sample of the node-level metric `name` (such as
+    /// `node_cpu_usage_percent`), as inserted since this store opened.
+    pub fn latest_node_sample(&self, name: &str) -> Option<Sample> {
+        self.latest_node.get(name).copied()
+    }
+
+    /// When the newest node-level sample was taken, Unix seconds: proof the
+    /// node's collector is running. `None` before its first sample.
+    pub fn newest_node_sample_time(&self) -> Option<u64> {
+        self.latest_node
+            .values()
+            .map(|sample| sample.timestamp)
+            .max()
     }
 
     /// Insert with the current timestamp (convenience).
@@ -1519,6 +1546,32 @@ pub(crate) fn file_max_timestamp(path: &Path) -> Option<u64> {
 mod tests {
     use super::*;
     use crate::mayo::types::MetricKey;
+
+    #[test]
+    fn the_store_keeps_the_newest_node_sample_for_the_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = MayoStore::new(dir.path().to_path_buf());
+        assert_eq!(store.newest_node_sample_time(), None);
+        let cpu = MetricKey::simple("node_cpu_usage_percent");
+        store.insert(&cpu, Sample::at(200, 40.0));
+        store.insert(&cpu, Sample::at(100, 90.0)); // late and older: ignored
+        store.insert(
+            &MetricKey::simple("node_memory_used_bytes"),
+            Sample::at(150, 1.0),
+        );
+        // An app's metric isn't a node measurement.
+        let mut labels = std::collections::BTreeMap::new();
+        labels.insert("app".to_string(), "web".to_string());
+        store.insert(
+            &MetricKey::with_labels("node_cpu_usage_percent", labels),
+            Sample::at(900, 1.0),
+        );
+        assert_eq!(
+            store.latest_node_sample("node_cpu_usage_percent"),
+            Some(Sample::at(200, 40.0))
+        );
+        assert_eq!(store.newest_node_sample_time(), Some(200));
+    }
 
     #[tokio::test]
     async fn prune_reports_failed_deletions_and_preserves_survivors() {

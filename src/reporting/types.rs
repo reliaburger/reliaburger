@@ -182,7 +182,11 @@ pub struct ResourceUsage {
     pub cpu_used_millicores: u32,
     pub memory_used_mb: u32,
     pub disk_used_mb: u64,
-    pub gpu_used: u8,
+    /// GPUs requested by running instances.
+    pub gpu_used: u32,
+    /// GPUs the node offers: detected cards, when `[resources]
+    /// gpu_enabled` is set.
+    pub gpu_total: u32,
     pub allocated_ports: Vec<u16>,
     /// Schedulable CPU capacity.
     pub cpu_total_millicores: u32,
@@ -296,6 +300,7 @@ mod tests {
                 memory_used_mb: 1024,
                 disk_used_mb: 5000,
                 gpu_used: 0,
+                gpu_total: 0,
                 allocated_ports: vec![8080],
                 cpu_total_millicores: 4000,
                 memory_total_mb: 8192,

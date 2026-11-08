@@ -1425,6 +1425,8 @@ The bun agent exposes a local HTTP API on port 9117:
 | `GET` | `/v1/logs/{app}/{namespace}` | Captured stdout/stderr (`?tail=N&follow=true`) |
 | `POST` | `/v1/exec/{app}/{namespace}` | Execute a command (JSON body: `{"command":["..."]}`) |
 | `GET` | `/v1/cluster/nodes` | List cluster nodes (gossip membership, dead members included with state `dead`) |
+| `GET` | `/v1/cluster/summary` | The whole cluster at a glance: counts per section (nodes, council, gossip, versions, capacity, usage, apps, instances, jobs, logs, faults, alerts, certs, GitOps), each marked `complete`, `partial` or `missing` with the nodes that answered. A scoped token sees its own apps and jobs; the cluster-wide sections come back `missing` |
+| `GET` | `/v1/cluster/capacity` | Requested CPU, memory and GPUs against schedulable capacity per node, from the leader's state reports; unscoped tokens only |
 | `GET` | `/v1/cluster/council` | Council (Raft) status |
 | `POST` | `/v1/cluster/join` | Join with a single-use token, node ID, CSR and format compatibility |
 | `POST` | `/v1/cluster/renew` | Renew the authenticated TLS node’s CSR on the leader; requires the service token, current peer certificate and format compatibility |

@@ -29,6 +29,15 @@ process-heavy = { max-threads = 2 }
 upgrade-heavy = { max-threads = 1 }
 crash-recovery = { max-threads = 1 }
 
+# The hollow-node checks share one port range and each starts a council
+# process and a fleet, so they run one at a time. The 100-node summary
+# check starts a hundred nodes and schedules a thousand apps before it
+# measures; the limit only has to catch a hang.
+[[profile.default.overrides]]
+filter = 'binary(hollow_nodes)'
+test-group = "cluster-heavy"
+slow-timeout = { period = "120s", terminate-after = 5 }
+
 # Each scripted demo (scripts/demo/) starts its own cluster and walks
 # several rollouts or GitOps syncs, each waiting on real health checks.
 [[profile.default.overrides]]
