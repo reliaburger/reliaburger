@@ -59,6 +59,17 @@ and trade-offs against other projects, with dated evidence and explicit release 
   Bun refuses their state, snapshots and backups, so create a new cluster.
   Rolling upgrades need matching protocol and state formats; see the
   [compatibility policy](releasing.md#cluster-compatibility).
+- **Three nodes are what's qualified.** Every release is soaked on three
+  nodes. The [hollow-node record](qualification/2026-10-28-hollow-nodes.md)
+  found the leader refusing report connections from 500 nodes up
+  ([#1411](https://github.com/reliaburger/reliaburger/issues/1411)), its API
+  slowing sharply between 500 and 1,000
+  ([#1412](https://github.com/reliaburger/reliaburger/issues/1412)), and gossip
+  at 1,000 not settling within six minutes
+  ([#1413](https://github.com/reliaburger/reliaburger/issues/1413)).
+- **Alerts are five built-in node rules.** CPU, memory and disk thresholds,
+  delivered by webhook; you can't define your own rules yet
+  ([manual](manual/04_observability.md#alerts)).
 - **One Bun per writable image store.** Registry startup claims exclusive
   ownership of the image store's upload directory.
 - **Test volumes have no snapshots.** Disposable test-volume snapshots aren't
@@ -457,6 +468,7 @@ cargo test
 ```sh
 make test                  # portable nextest suite
 make test-doc              # doctests (nextest does not run them)
+make test-macos            # what the macOS CI job runs: relish and the macOS-only tests
 make test-slow             # genuine wall-clock acceptance tests
 sudo make test-linux       # runc, netns, eBPF, Btrfs, Buildah and root-only tests
 make test-rootless-runc    # rootless runc port and replacement test (never sudo)
@@ -465,7 +477,8 @@ make test-hollow           # a three-member council and twenty hollow nodes (#14
 make test-gym              # the agent gym's scenarios on throwaway clusters, scored (#1086)
 make test-upgrade-node     # real single-node binary replacement
 make test-upgrade-cluster  # real rolling cluster replacement
-make coverage              # portable suite under line coverage (HTML and LCOV)
+make coverage              # portable suite under line coverage (LCOV) and the floor
+make coverage-html         # HTML report from the last make coverage run
 make audit                 # fail on new RustSec dependency findings
 ```
 

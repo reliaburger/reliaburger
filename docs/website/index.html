@@ -68,7 +68,7 @@
         </figure>
       </section>
 
-      <!-- Six architectural differences. Without script it's a plain list, all six
+      <!-- The architectural differences. Without script it's a plain list, every one
            stacked; assets/why-carousel.js shows one at a time and adds the controls.
            The drawings are decorative (the text says it all) and animate with CSS
            only, so prefers-reduced-motion turns them into still frames.
@@ -80,6 +80,58 @@
         </div>
         <div class="why-carousel" data-carousel>
           <ol class="why-slides">
+            <li class="why-slide" id="why-ai-agents">
+              <svg class="why-art why-ask" viewBox="0 0 240 160" width="240" height="160" aria-hidden="true" focusable="false">
+                <rect x="8" y="22" width="126" height="116" rx="8" fill="#181b19"/>
+                <g fill="#555e57">
+                  <circle cx="20" cy="33" r="3"/><circle cx="30" cy="33" r="3"/><circle cx="40" cy="33" r="3"/>
+                </g>
+                <path d="M18 46 l5 4 l-5 4" fill="none" stroke="#f49463" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                <path d="M30 50 H98" stroke="#e8c08f" stroke-width="3" stroke-linecap="round"/>
+                <g stroke-width="3" stroke-linecap="round">
+                  <path class="why-type" style="animation-delay: 1.2s" d="M18 66 H24" stroke="#f4bf3a"/>
+                  <g class="why-type" style="animation-delay: 1.45s">
+                    <path d="M26 78 H48" stroke="#7fbf4a"/><path d="M56 78 H104" stroke="#e8c08f"/>
+                  </g>
+                  <g class="why-type" style="animation-delay: 1.7s">
+                    <path d="M26 90 H42" stroke="#7fbf4a"/><path d="M50 90 H118" stroke="#e8c08f"/>
+                  </g>
+                  <g class="why-type" style="animation-delay: 1.95s">
+                    <path d="M26 102 H54" stroke="#7fbf4a"/><path d="M62 102 H92" stroke="#e8c08f"/>
+                  </g>
+                  <g class="why-type" style="animation-delay: 2.2s">
+                    <path d="M26 114 H40" stroke="#7fbf4a"/><path d="M48 114 H110" stroke="#e8c08f"/>
+                  </g>
+                  <path class="why-type" style="animation-delay: 2.45s" d="M18 126 H24" stroke="#f4bf3a"/>
+                </g>
+                <path d="M140 70 H164" stroke="#c9d0c9" stroke-width="2" stroke-linecap="round" stroke-dasharray="2 5"/>
+                <circle class="why-sent" cx="164" cy="70" r="4.5" fill="#f4bf3a" stroke="#dc7f33" stroke-width="1.5"/>
+                <circle class="why-back" cx="140" cy="70" r="4.5" fill="#7fbf4a" stroke="#4f8a2b" stroke-width="1.5"/>
+                <path d="M196 30 V44" stroke="#555e57" stroke-width="2.5" stroke-linecap="round"/>
+                <path class="why-sparkle" d="M196 22 l1.6 4.4 l4.4 1.6 l-4.4 1.6 l-1.6 4.4 l-1.6 -4.4 l-4.4 -1.6 l4.4 -1.6 Z" fill="#f4bf3a"/>
+                <rect x="170" y="44" width="52" height="42" rx="11" fill="#555e57"/>
+                <rect x="177" y="52" width="38" height="24" rx="7" fill="#fafbf9"/>
+                <g class="why-blink" fill="#181b19">
+                  <circle cx="189" cy="64" r="3.5"/><circle cx="203" cy="64" r="3.5"/>
+                </g>
+                <rect x="176" y="90" width="40" height="28" rx="7" fill="#a3ada4"/>
+                <g fill="none" stroke="#dc7f33" stroke-width="3" stroke-linecap="round">
+                  <circle cx="182" cy="134" r="6"/>
+                  <path d="M188 134 H214 M208 134 V140 M214 134 V139"/>
+                </g>
+              </svg>
+              <div class="why-copy">
+                <h3 class="why-punchline">Native to AI agents from day one, not bolted on.</h3>
+                <p>JSON from every command a script can run was in the first design doc, and
+                  <code>relish agent</code> and <code>relish mcp</code> give your agent bounded
+                  answers, read-only MCP tools and the exact source its binary was built from. A
+                  new token is read-only unless you ask for more, the bug reports your agent
+                  drafts come out redacted, and Claude Code, holding a read-only token, passed
+                  <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-06-v0.2.7-exit-test.md">0.2.7’s
+                  exit test</a> in <a href="agents.html#measuring-an-agent-on-your-cluster">a gym
+                  for AI agents</a>.</p>
+              </div>
+            </li>
             <li class="why-slide" id="why-one-agent">
               <svg class="why-art why-assemble" viewBox="0 0 240 160" width="240" height="160" aria-hidden="true" focusable="false">
                 <g fill="none" stroke="#a3ada4" stroke-width="1.5" stroke-dasharray="4 3">
@@ -1138,7 +1190,7 @@ target/debug/relish</code></pre>
       <a href="https://github.com/reliaburger/reliaburger/blob/main/LICENSE">Apache 2.0</a>
       <span class="footer-note">HTML and CSS. Three small scripts: one adds the copy buttons and
         the Markdown and Claude links, one plays the recordings with a copy of the asciinema player
-        served from this site, and one turns the six differences into a slideshow. No tracking, no third-party requests.</span>
+        served from this site, and one turns the seven differences into a slideshow. No tracking, no third-party requests.</span>
     </footer>
   </div>
   <script src="./assets/copy.js" defer></script>

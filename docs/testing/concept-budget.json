@@ -1,0 +1,18 @@
+{
+  "resource_kinds": {
+    "budget": 8,
+    "reason": "Measured on 8 November 2026 (#1681): app, job, namespace, permission, policy, build, template and use"
+  },
+  "commands": {
+    "budget": 159,
+    "reason": "Measured on 8 November 2026 (#1681): every relish command and subcommand at every depth, none of them hidden"
+  },
+  "flags": {
+    "budget": 375,
+    "reason": "Measured on 8 November 2026 (#1681): named flags on every command, global ones once"
+  },
+  "distinct_flags": {
+    "budget": 169,
+    "reason": "Measured on 8 November 2026 (#1681): distinct flag names across all commands"
+  }
+}

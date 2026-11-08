@@ -191,6 +191,38 @@ class SourceCiReuseTests(unittest.TestCase):
         self.assertIn('source_ci="reused ci.yml run $CI_RUN, attempt $CI_RUN_ATTEMPT"', record)
         self.assertIn('echo "Source CI: $source_ci"', record)
 
+    def test_the_search_waits_for_a_run_still_going_within_its_timeout(self):
+        # A candidate is dispatched while main's push CI still runs (#1722):
+        # the search waits for it, and the job's timeout must outlast the wait,
+        # so the script reaches its own deadline and says why it gave up.
+        evidence = job(self.text, "ci-evidence")
+        wait = int(re.search(r'--wait-minutes (\d+)', evidence).group(1))
+        timeout = int(re.search(r"^    timeout-minutes: (\d+)$", evidence, re.M).group(1))
+        self.assertGreaterEqual(wait, 60)
+        self.assertGreater(timeout, wait + 5)
+
+    def test_the_build_jobs_never_wait_for_the_search(self):
+        # The wait overlaps the binary builds; only the suite and the
+        # candidate job depend on it.
+        for name in ("changes", "build-pdf", "build-binaries", "build-profiling", "build-guest-images",
+                     "test-packaging", "notarise-macos"):
+            with self.subTest(job=name):
+                self.assertNotIn("ci-evidence", job(self.text, name))
+
+    def test_the_record_names_the_ci_run_the_candidate_rests_on(self):
+        # candidate.json says which ci.yml run passed: the reused one, or this
+        # build's own when validate-release ran (#1722).
+        record = step_named(self.text, "Record exact candidate identity and all asset digests")
+        self.assertIn("VALIDATE_RESULT: ${{ needs.validate-release.result }}", record)
+        self.assertIn('if [ "$VALIDATE_RESULT" = success ]; then', record)
+        self.assertIn('ci_run=$CANDIDATE_RUN ci_attempt=$CANDIDATE_ATTEMPT', record)
+        self.assertIn('ci_run=$CI_RUN ci_attempt=$CI_RUN_ATTEMPT', record)
+        self.assertIn('--source-ci-run "$ci_run" --source-ci-attempt "$ci_attempt"', record)
+        self.assertIn('echo "SOURCE_CI_RUN=$ci_run"', record)
+        self.assertIn('echo "SOURCE_CI_ATTEMPT=$ci_attempt"', record)
+        verify = step_named(self.text, "Check the candidate is still exactly what was recorded")
+        self.assertIn('--source-ci-run "$SOURCE_CI_RUN" --source-ci-attempt "$SOURCE_CI_ATTEMPT"', verify)
+
 
 def run_script(block):
     """The shell script of a step's `run: |`, dedented."""

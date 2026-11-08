@@ -14,27 +14,31 @@ Kubernetes hands you the ingredients. Reliaburger hands you the burger: app sche
 
 ## Built differently
 
-1.  ### One agent instead of a dozen add-ons.
+1.  ### Native to AI agents from day one, not bolted on.
+
+    JSON from every command a script can run was in the first design doc, and `relish agent` and `relish mcp` give your agent bounded answers, read-only MCP tools and the exact source its binary was built from. A new token is read-only unless you ask for more, the bug reports your agent drafts come out redacted, and Claude Code, holding a read-only token, passed [0.2.7’s exit test](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-06-v0.2.7-exit-test.md) in [a gym for AI agents](https://reliaburger.com/agents.html#measuring-an-agent-on-your-cluster).
+
+2.  ### One agent instead of a dozen add-ons.
 
     App scheduling, batch jobs, metrics, logs, service discovery, ingress, PKI, a Docker registry, consensus, GitOps and fault injection are compiled into `bun`, the one agent every node runs. There’s no Prometheus, CoreDNS, ingress controller, etcd or Argo CD to install, upgrade and keep in step with each other.
 
-2.  ### Seven voters at most. Everyone else gossips.
+3.  ### Seven voters at most. Everyone else gossips.
 
     A Raft council inside the agent holds the cluster’s state, and the cluster picks its voters from your ordinary nodes, never more than seven. Every node finds the others and notices failures through SWIM gossip, so a bigger cluster doesn’t mean a bigger quorum or a separate etcd to run.
 
-3.  ### Service discovery in the kernel, with no proxy in the path.
+4.  ### Service discovery in the kernel, with no proxy in the path.
 
     Every app gets a stable virtual IP, and an eBPF hook on `connect()` sends each connection straight to a healthy backend before its first packet leaves. There’s no kube-proxy and no sidecar on the hop, and the same hook decides who may connect at all.
 
-4.  ### A million tasks, stored as one.
+5.  ### A million tasks, stored as one.
 
     Batch jobs run beside your apps under the same CPU and memory admission, and a task array is stored as a template and a count, not a record per task. Each job picks its isolation: a fresh container, a shared container with a process per task, or an allowlisted host command.
 
-5.  ### Chaos is a command, not an install.
+6.  ### Chaos is a command, not an install.
 
     `relish fault` adds latency, partitions, DNS failures, kills and CPU, memory or disk pressure from inside the agent, so there’s no chaos operator to deploy. Every fault ends on its own, and the cluster refuses one that would take out every replica or put the council’s quorum at risk.
 
-6.  ### Your agent can read the recipe.
+7.  ### Your agent can read the recipe.
 
     New in 0.2.7, `relish agent` answers an AI agent in one line of JSON within a byte budget, and carries the manual and the exact source its binary was built from. Your agent reads how a finding is decided instead of guessing, and with a read-only token it can read the cluster and change nothing.
 

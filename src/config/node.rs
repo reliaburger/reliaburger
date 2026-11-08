@@ -641,13 +641,35 @@ impl Default for UpgradeSection {
 }
 
 /// Node identity and labels.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NodeSection {
     /// Node name. Defaults to `node-<gossip_port>` if omitted.
     pub name: Option<String>,
     /// Arbitrary key-value labels for placement constraints.
     pub labels: BTreeMap<String, String>,
+    /// How long, in milliseconds, one turn of Bun's agent loop may run
+    /// before a watchdog thread writes a snapshot of every Bun thread to the
+    /// journal (#1707). Default 750; 0 turns the watchdog off. A written
+    /// node.toml leaves the default out.
+    #[serde(skip_serializing_if = "is_default_loop_stall_snapshot_ms")]
+    pub loop_stall_snapshot_ms: u64,
+}
+
+const DEFAULT_LOOP_STALL_SNAPSHOT_MS: u64 = 750;
+
+fn is_default_loop_stall_snapshot_ms(value: &u64) -> bool {
+    *value == DEFAULT_LOOP_STALL_SNAPSHOT_MS
+}
+
+impl Default for NodeSection {
+    fn default() -> Self {
+        Self {
+            name: None,
+            labels: BTreeMap::new(),
+            loop_stall_snapshot_ms: DEFAULT_LOOP_STALL_SNAPSHOT_MS,
+        }
+    }
 }
 
 /// Cluster membership configuration.
@@ -1340,6 +1362,19 @@ pub struct AlertDestination {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_loop_stall_snapshot_threshold_defaults_to_the_watchdogs_and_parses() {
+        let config = NodeConfig::parse("").unwrap();
+        assert_eq!(
+            u128::from(config.node.loop_stall_snapshot_ms),
+            crate::bun::loop_watchdog::DEFAULT_STALL_THRESHOLD.as_millis()
+        );
+        let set = NodeConfig::parse("[node]\nloop_stall_snapshot_ms = 400\n").unwrap();
+        assert_eq!(set.node.loop_stall_snapshot_ms, 400);
+        let off = NodeConfig::parse("[node]\nloop_stall_snapshot_ms = 0\n").unwrap();
+        assert_eq!(off.node.loop_stall_snapshot_ms, 0);
+    }
 
     #[test]
     fn allowed_host_paths_defaults_to_empty() {
