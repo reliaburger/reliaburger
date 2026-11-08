@@ -19,6 +19,10 @@ KEYS = ("rss_kb", "anonymous_kb", "private_dirty_kb", "swap_kb", "threads", "hea
 KINDS = (("heap_kb", "heap"), ("arena_kb", "arenas"), ("stack_kb", "stacks"), ("other_anon_kb", "other anonymous"),
          ("file_kb", "file"))
 HOUR = 3600
+# The window of the RSS slope the record gives each node (#1417): recorded,
+# not gated, until a run says what a levelled-off slope is. Nodes 1 and 3
+# of the 0.2.7 memory run, which levelled off, give 0.6 to 0.7 MiB an hour.
+SLOPE_WINDOW = 6 * HOUR
 
 
 def number(inventory, kind):
@@ -114,6 +118,31 @@ def growth_line(node, rows):
             f"(others, MiB: {others}).")
 
 
+def rss_slope(rows):
+    """The least-squares slope of the last Bun process's RSS over its last
+    SLOPE_WINDOW, in MiB an hour, or None when that process hasn't run for
+    SLOPE_WINDOW."""
+    process = [row for row in rows if row.get("pid") == rows[-1].get("pid") and isinstance(row.get("rss_kb"), int)]
+    if not process or process[-1]["ts"] - process[0]["ts"] < SLOPE_WINDOW:
+        return None
+    window = [row for row in process if row["ts"] >= process[-1]["ts"] - SLOPE_WINDOW]
+    hours = [(row["ts"] - window[0]["ts"]) / HOUR for row in window]
+    mib = [row["rss_kb"] / 1024 for row in window]
+    mean_hour, mean_mib = sum(hours) / len(hours), sum(mib) / len(mib)
+    return (sum((hour - mean_hour) * (size - mean_mib) for hour, size in zip(hours, mib))
+            / sum((hour - mean_hour) ** 2 for hour in hours))
+
+
+def slope_line(node, rows):
+    slope = rss_slope(rows)
+    if slope is None:
+        process = [row for row in rows if row.get("pid") == rows[-1].get("pid")]
+        return (f"- {node}: no {SLOPE_WINDOW // HOUR}-hour RSS slope: the last Bun process (pid {rows[-1].get('pid')}) "
+                f"ran for {elapsed(process[-1]['ts'] - process[0]['ts'])} h:mm.")
+    return (f"- {node}: RSS slope over the last {SLOPE_WINDOW // HOUR} hours: {slope:+.2f} MiB/h "
+            "(least squares; recorded, not gated).")
+
+
 def section(evidence):
     """The record's `Bun memory by kind` section; empty when the run has no
     memory.jsonl."""
@@ -135,5 +164,5 @@ def section(evidence):
             lines.append(f"| {elapsed(row['ts'] - first)} | {row.get('pid')} | {mib(row.get('rss_kb'))} | "
                          f"{mib(row.get('heap_kb'))} | {arenas} | {mib(row.get('stack_kb'))} | "
                          f"{mib(row.get('other_anon_kb'))} | {mib(row.get('file_kb'))} | {threads} |")
-        lines += ["", growth_line(node, rows), ""]
+        lines += ["", growth_line(node, rows), slope_line(node, rows), ""]
     return lines

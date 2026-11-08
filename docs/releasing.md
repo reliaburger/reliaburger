@@ -1425,7 +1425,17 @@ the real `curl … | sh` install against it on every host we advertise.
    64 MiB boundary. Each sample is a line per node in `memory.jsonl` in the
    evidence directory, and the record's "Bun memory by kind" section tables
    each node hourly and says which kind grew most after the first hour.
-   It's evidence only: `leak-rss` still judges VmRSS. The
+   It's evidence only: `leak-rss` still judges VmRSS. Each node's line
+   there also gives its RSS slope over the last six hours (least squares,
+   MiB an hour), recorded but not gated. Outside a final, `leak-rss` takes
+   its warm sample at the first heavy check where the node's log and
+   metrics stores are each 90% of the soak's 8 MiB `max_storage_mb`, never
+   before the hour and at six hours at the latest, because Bun's malloc
+   grows with those stores and a slowly filled store made the hour too early
+   a baseline (the 0.2.7 memory run). A final keeps the hour, so the quiet
+   tail still arms it. The record's exposure section says when each node's
+   warm sample was taken
+   ([#1417](https://github.com/reliaburger/reliaburger/issues/1417)). The
    nodes export logs and metrics to `soak-export` on their own disks; once a
    metrics export's source has been gone for 30 minutes, and the checker has
    seen it at the destination, the harness deletes it
