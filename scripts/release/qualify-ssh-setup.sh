@@ -163,9 +163,9 @@ fi
 if [[ $failed == no ]]; then
     status=$(RELIABURGER_HOME=$home "$relish" status 2>&1 || true)
     if grep -q "$voters/$voters voters" <<<"$status"; then
-        pass "relish status" "$(head -1 <<<"$status")"
+        pass "relish status" "$(grep -m1 '^council' <<<"$status")"
     else
-        fail "relish status" "$(head -1 <<<"$status")"
+        fail "relish status" "$(head -3 <<<"$status" | tr '\n' ' ')"
     fi
     wtf=$(RELIABURGER_HOME=$home "$relish" wtf 2>&1 || true)
     summary=$(grep -m1 '^Summary:' <<<"$wtf" || echo "no summary")

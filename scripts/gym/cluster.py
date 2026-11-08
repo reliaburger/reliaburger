@@ -240,7 +240,7 @@ class LocalCluster:
             raise ClusterError(f"relish apply {relative} failed: {completed.stderr.strip()}")
 
     def instances(self):
-        return status_instances(self.relish_json(["status"]))
+        return status_instances(self.relish_json(["apps", "--instances"]))
 
     def wait_running(self, app):
         def running():
@@ -356,7 +356,7 @@ class LocalCluster:
 
 
 def status_instances(document):
-    """`relish status -o json` as [{"app", "namespace", "node", "state"}]."""
+    """`relish apps --instances -o json` as [{"app", "namespace", "node", "state"}]."""
     rows = document if isinstance(document, list) else document.get("instances", [])
     instances = []
     for row in rows:
