@@ -75,6 +75,7 @@ mod node_renewal;
 mod onion;
 mod owned_commands;
 mod parquet_safety;
+mod paused_workloads;
 mod pickle_cluster;
 mod pickle_integrity;
 mod platform_policies;
