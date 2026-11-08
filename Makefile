@@ -74,8 +74,8 @@ test-rootless-runc: ## Prove rootless runc networking and port adoption as a non
 test-cluster: ## Run all real multi-node cluster acceptance suites and the scripted feature demos
 	RELIABURGER_CLUSTER_TESTS=1 $(NEXTEST) --run-ignored=only -E 'binary(cluster_failover) | binary(cluster_gossip) | binary(council_self_healing) | binary(council_disaster_recovery) | binary(placement) | binary(cluster_task_arrays) | binary(registry_durability) | binary(demos)'
 
-test-hollow: ## Run the 20-node hollow-node harness check (#1401); measured fleets run through scripts/release/qualify-hollow-nodes.sh
-	$(NEXTEST) --run-ignored=only -E 'binary(hollow_nodes) & test(twenty_hollow_nodes)'
+test-hollow: ## Run the 20-node hollow-node harness check (#1401) and the 100-node, 1,000-app summary budget; measured fleets run through scripts/release/qualify-hollow-nodes.sh
+	$(NEXTEST) --run-ignored=only -E 'binary(hollow_nodes) & (test(twenty_hollow_nodes) | test(a_hundred_hollow_nodes))'
 
 test-upgrade: ## Run all real-binary self-upgrade acceptance tests
 	RELIABURGER_UPGRADE_TESTS=1 $(NEXTEST) --run-ignored=only -E 'binary(self_upgrade) | binary(self_upgrade_cluster)'
