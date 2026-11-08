@@ -1,0 +1,18 @@
+{
+  "resource_kinds": {
+    "budget": 8,
+    "reason": "Measured on 8 November 2026 (#1681): app, job, namespace, permission, policy, build, template and use"
+  },
+  "commands": {
+    "budget": 161,
+    "reason": "Measured on 8 November 2026 (#1681) at 159: every relish command and subcommand at every depth, none of them hidden. Raised to 161 for #1689: `relish verify` for people and `relish agent verify` for agents, one check of the cluster against the published release"
+  },
+  "flags": {
+    "budget": 383,
+    "reason": "Measured on 8 November 2026 (#1681) at 375: named flags on every command, global ones once. Raised to 383 for #1689: `relish verify` and `relish agent verify` each take --release-url, --metadata, --cli-metadata and --artefacts, so a check can run offline against files on disk"
+  },
+  "distinct_flags": {
+    "budget": 171,
+    "reason": "Measured on 8 November 2026 (#1681) at 169: distinct flag names across all commands. Raised to 171 for #1689: `relish verify`'s --cli-metadata and --artefacts are new names"
+  }
+}

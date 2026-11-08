@@ -99,6 +99,11 @@ pub const MCPB_MANIFEST_VERSION: &str = "0.3";
 /// Where a bundle keeps its `relish`, relative to the bundle's root.
 pub const MCPB_ENTRY_POINT: &str = "server/relish";
 
+/// The command that makes the read-only token a bundle's `token` setting
+/// asks for. A day is enough for one session.
+pub const READ_ONLY_TOKEN_COMMAND: &str =
+    "relish token create --name agent --role read-only --ttl-days 1";
+
 /// `relish mcp`'s name in the MCP Registry. The `io.github.reliaburger`
 /// namespace is the one a GitHub login to the organisation proves.
 pub const MCP_REGISTRY_NAME: &str = "io.github.reliaburger/relish";
@@ -955,6 +960,12 @@ fn mcp_server_json(agent: &Command, version: &str) -> String {
 /// client that installs the bundle runs the `relish` inside it, so the
 /// command is relative to the bundle's directory, never a `relish` on the
 /// `PATH`.
+///
+/// It asks for nothing by default. Two optional settings, an endpoint and a
+/// read-only token, reach `relish` as `RELIABURGER_ENDPOINT` and
+/// `RELIABURGER_TOKEN`. A client passes a setting the user left blank as
+/// an empty string, and `relish` treats an empty variable as unset, so an
+/// unconfigured bundle uses `relish`'s current context (#1695).
 fn mcpb_manifest_json(agent: &Command, version: &str) -> String {
     let tools: Vec<serde_json::Value> = served_tools(agent)
         .into_iter()
@@ -987,6 +998,32 @@ fn mcpb_manifest_json(agent: &Command, version: &str) -> String {
             "mcp_config": {
                 "command": format!("${{__dirname}}/{MCPB_ENTRY_POINT}"),
                 "args": args,
+                "env": {
+                    "RELIABURGER_ENDPOINT": "${user_config.endpoint}",
+                    "RELIABURGER_TOKEN": "${user_config.token}",
+                },
+            },
+        },
+        "user_config": {
+            "endpoint": {
+                "type": "string",
+                "title": "Cluster API endpoint (optional)",
+                "description": "The Bun API address, such as https://10.0.0.5:9117. \
+                    Leave it empty to use relish's current context.",
+                "required": false,
+                "default": "",
+            },
+            "token": {
+                "type": "string",
+                "title": "Read-only API token (optional)",
+                "description": format!(
+                    "A read-only token, made with `{READ_ONLY_TOKEN_COMMAND}`: \
+                     {REPOSITORY}/blob/main/docs/manual/{CHAPTER_FILE}#a-read-only-token. \
+                     Leave it empty to use relish's current context."
+                ),
+                "sensitive": true,
+                "required": false,
+                "default": "",
             },
         },
         "tools": tools,
@@ -1736,6 +1773,54 @@ Intro paragraph.\n\n## In brief\n\n\
             value["compatibility"]["platforms"],
             serde_json::json!(["darwin", "linux"]),
             "release packaging narrows this to one platform per bundle"
+        );
+    }
+
+    /// #1695: the bundle asks for nothing by default. Its two settings are
+    /// optional and empty, so a bundle nobody configured uses relish's
+    /// current context, and the token one asks for a read-only token only.
+    #[test]
+    fn the_bundle_takes_an_optional_endpoint_and_read_only_token() {
+        let value: serde_json::Value =
+            serde_json::from_str(&artefact(paths::MCPB_MANIFEST)).unwrap();
+        let settings = value["user_config"].as_object().unwrap();
+        assert_eq!(
+            settings.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["endpoint", "token"]
+        );
+        for (name, setting) in settings {
+            assert_eq!(setting["type"], "string", "{name}");
+            assert_eq!(setting["required"], false, "{name}");
+            assert_eq!(setting["default"], "", "{name}");
+            assert!(setting["title"].as_str().unwrap().contains("(optional)"));
+            let words = format!("{} {}", setting["title"], setting["description"]);
+            assert!(!words.to_lowercase().contains("admin"), "{name}: {words}");
+        }
+        let endpoint = &settings["endpoint"];
+        assert!(endpoint.get("sensitive").is_none());
+        assert!(
+            endpoint["description"]
+                .as_str()
+                .unwrap()
+                .contains("Leave it empty to use relish's current context")
+        );
+        let token = &settings["token"];
+        assert_eq!(token["sensitive"], true);
+        assert!(token["title"].as_str().unwrap().starts_with("Read-only"));
+        let description = token["description"].as_str().unwrap();
+        assert!(
+            description.contains(READ_ONLY_TOKEN_COMMAND),
+            "{description}"
+        );
+        assert!(description.contains(&format!(
+            "{REPOSITORY}/blob/main/docs/manual/{CHAPTER_FILE}#a-read-only-token"
+        )));
+        assert_eq!(
+            value["server"]["mcp_config"]["env"],
+            serde_json::json!({
+                "RELIABURGER_ENDPOINT": "${user_config.endpoint}",
+                "RELIABURGER_TOKEN": "${user_config.token}",
+            })
         );
     }
 

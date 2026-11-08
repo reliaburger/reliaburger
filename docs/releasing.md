@@ -90,8 +90,34 @@ that exact commit. macOS runs on every push and on the nightly, on the
 release gate PR and on the candidate build, but not on ordinary pull
 requests: the organisation's plan runs at most five macOS jobs at once, and
 each full run takes one ([portable macOS in one job](testing.md#portable-macos-in-one-job)).
+That job builds and tests `relish` and the macOS-only code; Bun's tests run
+on Linux only ([what runs on macOS](testing.md#what-runs-on-macos-and-what-runs-on-linux)).
 Dependabot's PRs never get macOS unless labelled; the nightly on `main`
 covers them.
+
+### Every issue closes itself
+
+Every issue a release resolves closes automatically when its fix reaches
+`main`, never by hand (maintainer decision of 6 November 2026). GitHub only
+acts on a closing keyword such as `Fixes #1234` when the PR merges into the
+default branch, so the keyword in a PR into a train does nothing. Four rules
+make up for that:
+
+- **The train's commits say it too.** A PR into a train carries `Fixes #N`
+  in its body and in its commit messages, one line per issue. The commits
+  reach `main` with the gate PR, and GitHub closes the issue then.
+- **The gate PR names every issue.** Before the gate PR merges into `main`,
+  rebuild its body with a `Fixes #N` line for every issue the train
+  resolves: list the train's merged PRs and collect their lines.
+- **Unfinished issues move at freeze.** An issue the train only partly
+  resolves is split, the done part closed by the train and the rest filed
+  for the next release, or moved to the next milestone whole, with the
+  decision recorded on it. `Part of #N` is for an issue that stays open on
+  purpose.
+- **The milestone is empty after the release.** Once the gate PR has merged
+  and the post-release docs PR with it, the release's milestone holds no open
+  issue. One still open is either a missing `Fixes` line, which you add in
+  the next PR to `main`, or an issue that should have moved at freeze.
 
 ### Merging through the queue
 
@@ -107,8 +133,9 @@ merged, because the ruleset still named only `release-0-2-1`.
 
 Merge a PR into a train with `gh pr merge --merge --auto`, or the "Merge when
 ready" button, which adds it to the queue. Don't merge it directly. The queue
-builds a temporary branch with the train plus the PR (and up to three more
-waiting behind it), and `ci.yml`'s `merge_group` trigger runs every job on it.
+builds a temporary branch with the train plus the PR (and up to seven more
+waiting behind it: the ruleset's group size went from 4 to 8 on 7 November
+2026, #1724), and `ci.yml`'s `merge_group` trigger runs every job on it.
 The PR lands only if `ignored-test evidence` passes on that exact commit. A
 batch that fails drops the PR that broke it, and the rest go round again.
 
@@ -590,6 +617,23 @@ before it records a run.
 The move is a fresh cluster, as [from 0.2.0](#upgrading-from-020), with the
 same steps and the same losses.
 
+### Upgrading from 0.2.6
+
+0.2.7 keeps 0.2.6's formats, protocol 57 and state format 73: `CURRENT` in
+`src/compatibility.rs` is the same at both tags. So a 0.2.6 cluster's nodes
+accept 0.2.7's binary, and `relish upgrade start v0.2.7` rolls it in place,
+workers first and the leader last. It's the first pair of releases that can
+roll since 0.2.2 and 0.2.3, and the first since 0.2.4 stopped moving a
+restarting node's replicas
+([#1449](https://github.com/reliaburger/reliaburger/issues/1449)).
+
+No one has yet walked a cluster from the published 0.2.6 to the published
+0.2.7. The gate's upgrade walks went from the candidate to a soak build of
+the same commit and back
+([8-hour final](qualification/2026-11-07-v0.2.7-job-qualification.md)), which
+proves the walk itself but not the two releases together. If a walk fails, a
+fresh cluster, as [from 0.2.0](#upgrading-from-020), still works.
+
 ## Signing identity
 
 Configure `RELIABURGER_RELEASE_KEY` as a secret of the `release` GitHub
@@ -619,8 +663,8 @@ trust list before signing. A missing key, wrong key, incomplete matrix or failed
 signing operation stops publication. Unit tests use fresh temporary keys and
 verify that a modified binary no longer passes signature verification.
 
-Each binary gets a schema-1 `.sig` envelope compatible with the existing
-upgrade verifier. `SHA256SUMS` supports download checks; it doesn't replace
+Each binary, and each `relish-<platform>.mcpb` bundle, gets a schema-1 `.sig`
+envelope compatible with the existing upgrade verifier. `SHA256SUMS` supports download checks; it doesn't replace
 signature verification. Public release signatures establish project provenance.
 Operators using the dual-signature upgrade policy still need to approve binaries
 with their configured external key.
@@ -826,10 +870,19 @@ per relish platform, `relish-<platform>.mcpb`
 `make agent-docs`, with the release's version and that platform's operating
 system filled in) and that platform's signed `relish` at `server/relish`. The
 zip entries have a fixed timestamp, so the same binary always makes the same
-bundle. The bundles are candidate assets like any other: `SHA256SUMS`,
-`candidate.json` and the build attestation cover them. They aren't signed
-with `mcpb sign`; that would need an X.509 signing certificate, which is the
-maintainer's decision.
+bundle. The bundles are candidate assets like any other: each gets a
+`relish-<platform>.mcpb.sig` from the release key, the same envelope as a
+binary's, and `SHA256SUMS`, `candidate.json` and the build attestation cover
+it.
+
+MCP clients still show the bundles as unsigned. `mcpb verify` and clients such
+as Claude Desktop only recognise a PKCS#7 signature made with an X.509
+code-signing certificate the operating system trusts, appended inside the
+`.mcpb` by `mcpb sign`. The release key is a bare Ed25519 key with no
+certificate, so the `.sig` beside the bundle is for people and scripts that
+check releases against the release key; clients don't read it. Signing that
+clients recognise (`mcpb sign` with the Apple Developer ID certificate) waits
+until Apple notarisation is set up.
 
 The [MCP Registry](https://registry.modelcontextprotocol.io) needs each
 bundle's SHA-256 as the package's `fileSha256`, which the committed
@@ -847,13 +900,41 @@ git show v0.2.8:server.json > tagged-server.json
 python3 scripts/release/mcp_registry.py --record candidate.json --server tagged-server.json
 ```
 
-The maintainer publishes it after each promotion, signed in to GitHub as an
-account that can publish for the `reliaburger` organisation:
+Publishing it is the maintainer's one release-time step, after each
+promotion:
 
-1. `brew install mcp-publisher`, once.
-2. `gh run download <promote run> --name mcp-registry-server-json --dir registry`.
-3. `cd registry && mcp-publisher login github && mcp-publisher publish`.
-4. Check it: `curl "https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.reliaburger/relish"`.
+```sh
+make mcp-registry-publish TAG=v0.2.8
+```
+
+[`mcp_registry_publish.py`](../scripts/release/mcp_registry_publish.py) finds
+the successful `promote.yml` run for the tag (runs are named
+`Promote <tag>`; pass `--run <id>` to the script for one that isn't),
+downloads its `mcp-registry-server-json` artefact into a temporary directory
+and checks the entry before anything is sent: its name is
+`io.github.reliaburger/relish`, its version is the tag's, and it has exactly
+one `mcpb` package per relish platform, each pointing at the tag's
+`relish-<platform>.mcpb` with the SHA-256 GitHub stores for that published
+asset. The release must be public, not a draft or pre-release. Then it runs
+`mcp-publisher login github`, only when there's no unexpired registry token in
+`~/.config/mcp-publisher/token.json`, and `mcp-publisher publish` in that
+directory. Any failed check publishes nothing. Its tests fake `gh` and
+`mcp-publisher` on `PATH`.
+
+Once, before the first publish:
+
+1. `brew install mcp-publisher`.
+2. Use a GitHub account that belongs to the `reliaburger` organisation:
+   the registry's `io.github.reliaburger/` namespace is proved by a GitHub
+   login. `mcp-publisher login github` opens GitHub's device sign-in. If
+   the publish is refused for the namespace, check that the registry can
+   see your membership of the organisation (a public membership, or the
+   registry's GitHub app allowed in the organisation).
+3. `gh auth login`, if `gh` isn't signed in already; the command uses it to
+   find the run and the release.
+
+After publishing, check it:
+`curl "https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.reliaburger/relish"`.
 
 The registry is in preview and may reset its data; publishing again is safe.
 
@@ -884,8 +965,28 @@ Anything else (no such run, a re-run, a failed, cancelled or skipped job,
 another commit, an API error) runs the full suite in `validate-release`, as every
 build did before 0.2.4. Reusing the run takes the candidate from about 2 hours
 to about 50 minutes, the macOS `relish` build's time; most of the hour saved
-was spent waiting for hosted macOS runners. The job summary's *Source CI*
-line names the run and attempt the candidate rests on.
+was spent waiting for hosted macOS runners.
+
+You don't have to wait for `main`'s CI before dispatching the build. If a
+push, merge-queue or nightly run on the commit is still queued or running,
+`find passing CI` waits for it, asking again every minute for up to two hours,
+and then applies the same rules
+([#1722](https://github.com/reliaburger/reliaburger/issues/1722)). Until 0.2.8
+it only looked at finished runs, so 0.2.6's and 0.2.7's candidates, each
+dispatched seconds after the gate PR merged, ran the whole suite again: 89
+minutes for 0.2.6 instead of about 53, plus three macOS jobs queued behind
+the push's own. The build jobs don't depend on the search and run meanwhile,
+so the wait costs nothing until it outlasts them. If the run fails, skips a
+job or is still going after two hours, the suite runs here. If no run exists
+yet (a build dispatched the moment a merge lands can ask before GitHub has
+created one), it keeps asking for three minutes first. Runs from a pull
+request are never waited for, because they could never be reused.
+
+The job summary's *Source CI* line names, and links, the run and attempt the
+candidate rests on, and how long the build waited for it. `candidate.json`
+records the same run as `source_ci` (`run_id` and `run_attempt`): the reused
+`ci.yml` run, or the build's own run when it ran the suite itself. Cite it in
+the qualification record.
 
 Only after those checks pass does it collect the two built guest images, sign
 all six binaries and both images' digests, and upload `candidate-<commit>-<attempt>` as an Actions artefact.
@@ -957,7 +1058,7 @@ and the [release asset digest fields](https://docs.github.com/en/rest/releases/r
 The website and installer are separate static assets under `docs/website`,
 published by `static.yml`. GitHub Pages cannot select a different response for
 curl and a browser at `/`; the shell endpoint is `/install.sh`. The bootstrap
-installs the version in its `RELIABURGER_VERSION` default (`v0.2.6` today), so
+installs the version in its `RELIABURGER_VERSION` default (`v0.2.7` today), so
 bump that default in the same change that announces a newer release. Both
 scripts need a mode, `--laptop` or `--install-only`; with none they explain the
 choices and exit 2. For a release from before 0.2.2 the bootstrap drops

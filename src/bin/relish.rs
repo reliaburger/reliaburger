@@ -3455,6 +3455,38 @@ mod tests {
         );
     }
 
+    /// The concept budget (#1681): resource kinds, commands and flags an
+    /// agent has to learn, held to `docs/testing/concept-budget.json`.
+    /// `relish agent guide`'s byte budget has its own test,
+    /// `the_agent_chapter_fits_the_guides_default_budget`.
+    #[test]
+    fn the_concept_counts_match_their_budget() {
+        use clap::CommandFactory;
+        use reliaburger::relish::concept_budget::{
+            BUDGET_FILE, ConceptBudget, ConceptCounts, count_commands, struct_field_names,
+        };
+
+        let kinds = struct_field_names::<reliaburger::config::Config>().unwrap();
+        let measured = ConceptCounts {
+            resource_kinds: kinds.len(),
+            commands: count_commands(&Cli::command()),
+        };
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(BUDGET_FILE);
+        let budget = ConceptBudget::parse(&std::fs::read_to_string(&path).unwrap())
+            .unwrap_or_else(|e| panic!("{BUDGET_FILE}: {e}"));
+        let problems = budget.compare(&measured);
+        assert!(
+            problems.is_empty(),
+            "the concept budget moved (kinds: {}; {} commands, {} hidden; {} flags, {} distinct):\n{}",
+            kinds.join(", "),
+            measured.commands.commands,
+            measured.commands.hidden_commands,
+            measured.commands.flags,
+            measured.commands.distinct_flags,
+            problems.join("\n")
+        );
+    }
+
     #[test]
     fn readme_command_list_matches_the_cli() {
         use clap::CommandFactory;

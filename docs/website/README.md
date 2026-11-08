@@ -26,15 +26,15 @@ Nothing is fetched from anywhere else. With scripts disabled a `<noscript>`
 note links the `.cast` file, and the written tour works as before.
 
 `assets/why-carousel.js` turns the "Built differently" section (`#why`), a
-plain list of six architectural differences, into a slideshow: one at a
-time, a new one every nine seconds, with previous, next, six dots and a Pause
+plain list of seven architectural differences, into a slideshow: one at a
+time, a new one every nine seconds, with previous, next, seven dots and a Pause
 and Play button. Pause and Play always take effect; it also stops while a
 mouse rests on it and when keyboard focus comes in (until Play), never because
 of a tap, and doesn't rotate at all for visitors who prefer reduced motion. It follows the WAI-ARIA
 carousel pattern, so the slide text is a polite live region only while it
 isn't rotating by itself. The drawings are inline SVG animated by CSS in
 `style.css`, so reduced motion stills them and nothing loads from elsewhere.
-Without JavaScript all six stay stacked.
+Without JavaScript all seven stay stacked.
 
 Don't add other scripts. The footer names all three, so change them together.
 
@@ -104,7 +104,7 @@ so it can't touch yours:
 
 ```sh
 RELIABURGER_HOME=~/.rbtour scripts/demo/tour.sh \
-  --record docs/website/assets/tour.cast --install v0.2.6
+  --record docs/website/assets/tour.cast --install v0.2.7
 RELIABURGER_HOME=~/.rbtour ~/.rbtour/bin/relish local destroy --yes
 RELIABURGER_HOME=~/.rbtour ~/.rbtour/bin/relish uninstall --yes
 rm -rf ~/.rbtour
@@ -141,11 +141,17 @@ published tarball holds exactly that directory. Until a promotion's site
 change deploys, the live tarball is the previous release's, so a re-record
 always shows the repository copy, and says so on screen. The build step runs in a scratch directory, so
 `burger/` never lands in the checkout. The published recording was made with
-`--install v0.2.6` on the default ports.
+`--install v0.2.7` on the default ports.
 `asciinema play docs/website/assets/tour.cast` plays the result in a terminal.
 
+After `relish wtf` the script adds one step the page's tour list doesn't
+have, "Ask your agent": `relish agent context`, `relish agent diagnose` and
+`relish agent guide` on the same cluster, each piped through `jq` so a person
+can read the JSON. They aren't `data-tour` commands, because the agent
+section has its own steps. Without `jq` the script skips the step.
+
 `--record` writes the installed version into the cast's title (`Reliaburger
-0.2.6: the five-minute tour`), and the caption under the player names it too.
+0.2.7: the five-minute tour`), and the caption under the player names it too.
 `tests/suite/website.rs` checks that both match `install.sh`'s default, so a
 promotion that forgets the re-record fails CI.
 
@@ -251,7 +257,7 @@ link when you promote a release. The source quickstart intentionally matches
 Both it and the generated installer are POSIX sh, so `curl … | sh` works where
 `sh` is dash or busybox, not only bash. `scripts/release/test_package.py` runs
 them under every POSIX shell it finds and under `shellcheck -s sh` when present.
-It installs `v0.2.6` unless `RELIABURGER_VERSION` names another release; bump
+It installs `v0.2.7` unless `RELIABURGER_VERSION` names another release; bump
 that default when you promote a newer one. Every line the site shows names a
 mode (`sh -s -- --laptop`): with no arguments both scripts only explain the
 choices and exit 2, and the bootstrap does it before downloading anything.

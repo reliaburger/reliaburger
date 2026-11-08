@@ -141,6 +141,76 @@ fn endpoint_environment_rejects_remote_plaintext_before_dispatch() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("must use HTTPS"));
 }
 
+/// #1695: the MCPB bundle passes its optional endpoint setting as
+/// `RELIABURGER_ENDPOINT`, empty when the user left it blank. Blank means
+/// "use the current context", not "an invalid URL".
+#[test]
+fn blank_endpoint_environment_falls_back_to_the_current_context() {
+    let home = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_relish"))
+        .arg("status")
+        .env("RELIABURGER_HOME", home.path())
+        .env("RELIABURGER_ENDPOINT", "  ")
+        .env("RELIABURGER_TOKEN", "")
+        .env_remove("RELIABURGER_CA_CERT")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("invalid endpoint URL"), "{stderr}");
+    assert!(!stderr.contains("endpoint URL must"), "{stderr}");
+}
+
+/// #1695: a blank `RELIABURGER_TOKEN` sends no bearer at all, the same as
+/// an unset one, rather than an empty `Bearer ` header.
+#[tokio::test]
+async fn blank_token_environment_sends_no_bearer() {
+    use axum::{Router, http::HeaderMap};
+    use std::sync::{Arc, Mutex};
+
+    let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
+    let record = seen.clone();
+    let app = Router::new().fallback(move |headers: HeaderMap| {
+        let record = record.clone();
+        async move {
+            record.lock().unwrap().push(
+                headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .map(|value| value.to_str().unwrap_or("<binary>").to_string()),
+            );
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    // Pay `relish`'s first launch before the 60 s bound starts (#1149).
+    crate::bun_process::first_launch_binaries();
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_relish"))
+            .arg("status")
+            .env("RELIABURGER_ENDPOINT", &endpoint)
+            .env("RELIABURGER_TOKEN", " ")
+            .env_remove("RELIABURGER_CA_CERT")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    server.abort();
+    let _ = server.await;
+
+    let seen = seen.lock().unwrap();
+    assert!(
+        !seen.is_empty(),
+        "relish never reached the stub: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(seen.iter().all(Option::is_none), "{seen:?}");
+}
+
 #[test]
 fn offline_log_export_refuses_an_unreadable_checkpoint_before_upload() {
     let dir = tempfile::tempdir().unwrap();

@@ -5,16 +5,16 @@ laptop, see the [quickstart guide](quickstart.md). For the architectural vision,
 see the [whitepaper](whitepaper.md); for status and what's next, see the
 [roadmap](roadmap.md).
 
-0.2.6 was released on 6 November 2026. Its signed binaries, guest images and
-installer are on the [GitHub release](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.6),
+0.2.7 was released on 7 November 2026. Its signed binaries, guest images and
+installer are on the [GitHub release](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.7),
 and `curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop` installs it
 and builds a laptop cluster; without a flag the installer explains the choices.
 Until 1.0.0 Reliaburger is good enough for home labs and dev clusters, not production. Every
 release follows the same [build, staging and promotion procedure](releasing.md#metadata-and-publication).
-From 0.2.7 (0.2.7, not in 0.2.6) every release file also carries a build provenance
+From 0.2.7, every release file also carries a build provenance
 attestation that anyone can check with `gh attestation verify`, and the macOS `relish` can be
 notarised ([checks a stranger can run](releasing.md#checks-a-stranger-can-run)).
-The limits below are the ones 0.2.6 ships with; the [roadmap](roadmap.md) tracks
+The limits below are the ones 0.2.7 ships with; the [roadmap](roadmap.md) tracks
 what comes after it.
 
 Found a bug? Open an issue with one of the
@@ -59,6 +59,17 @@ and trade-offs against other projects, with dated evidence and explicit release 
   Bun refuses their state, snapshots and backups, so create a new cluster.
   Rolling upgrades need matching protocol and state formats; see the
   [compatibility policy](releasing.md#cluster-compatibility).
+- **Three nodes are what's qualified.** Every release is soaked on three
+  nodes. The [hollow-node record](qualification/2026-10-28-hollow-nodes.md)
+  found the leader refusing report connections from 500 nodes up
+  ([#1411](https://github.com/reliaburger/reliaburger/issues/1411)), its API
+  slowing sharply between 500 and 1,000
+  ([#1412](https://github.com/reliaburger/reliaburger/issues/1412)), and gossip
+  at 1,000 not settling within six minutes
+  ([#1413](https://github.com/reliaburger/reliaburger/issues/1413)).
+- **Alerts are five built-in node rules.** CPU, memory and disk thresholds,
+  delivered by webhook; you can't define your own rules yet
+  ([manual](manual/04_observability.md#alerts)).
 - **One Bun per writable image store.** Registry startup claims exclusive
   ownership of the image store's upload directory.
 - **Test volumes have no snapshots.** Disposable test-volume snapshots aren't
@@ -153,9 +164,9 @@ lists which work.
 
 ### Jobs and cron
 
-Jobs arrived in 0.2.0. 0.2.6 changes the cluster's formats again, so a 0.2.5
-cluster can't roll to it: start a fresh cluster
-([upgrading from 0.2.5](releasing.md#upgrading-from-025)). The
+Jobs arrived in 0.2.0. 0.2.7 keeps 0.2.6's cluster formats, so a 0.2.6
+cluster can roll onto it with `relish upgrade`; a 0.2.5 or older cluster
+starts afresh ([upgrading from 0.2.6](releasing.md#upgrading-from-026)). The
 [job manual](manual/14_batch-jobs.md) covers jobs in full.
 
 Every job, cron occurrence, hook and task array runs on one lifecycle: a durable
@@ -330,7 +341,7 @@ xcode-select --install
 
 ## Container runtimes (optional)
 
-For 0.2.6, Bun selects Linux runc or the built-in process runtime. macOS containers run through managed Linux VMs. **ProcessGrill** (plain OS processes) is the built-in fallback that works everywhere without extra software — you don't need to install anything else to get started.
+For 0.2.7, Bun selects Linux runc or the built-in process runtime. macOS containers run through managed Linux VMs. **ProcessGrill** (plain OS processes) is the built-in fallback that works everywhere without extra software — you don't need to install anything else to get started.
 
 ### runc (Linux)
 
@@ -369,7 +380,7 @@ or operator firewall rules when diagnosing direct-host connectivity.
 
 ### macOS containers: managed Linux VMs
 
-For 0.2.6, run containers through the [managed laptop quickstart](quickstart.md):
+For 0.2.7, run containers through the [managed laptop quickstart](quickstart.md):
 
 ```sh
 relish setup --quickstart --nodes 3
@@ -380,7 +391,7 @@ foreground process workloads. Direct Apple Container selection is disabled,
 even when its CLI is installed: interrupted CLI requests can outlive Bun and
 mutate the Apple daemon, and their recovery guarantees are not yet complete.
 The adapter and its manual development tests remain in the repository for future
-work; they are outside the 0.2.6 runtime profile.
+work; they are outside the 0.2.7 runtime profile.
 
 ### ProcessGrill (built-in fallback)
 
@@ -400,7 +411,7 @@ sixteen concurrent exec requests, with a five-minute deadline, 64 KiB request
 limit and 1 MiB combined stdout/stderr response limit. Commands inherit the host
 environment and run without container isolation.
 
-**0.2.6 contract: foreground workloads only.** The main process stays under Bun's
+**0.2.7 contract: foreground workloads only.** The main process stays under Bun's
 supervision and children must remain in its supervised process group. A service
 can run unattended and spawn workers; foreground does not mean an open terminal.
 Use the application's foreground/no-daemon option. A shell wrapper should `exec`
@@ -457,6 +468,7 @@ cargo test
 ```sh
 make test                  # portable nextest suite
 make test-doc              # doctests (nextest does not run them)
+make test-macos            # what the macOS CI job runs: relish and the macOS-only tests
 make test-slow             # genuine wall-clock acceptance tests
 sudo make test-linux       # runc, netns, eBPF, Btrfs, Buildah and root-only tests
 make test-rootless-runc    # rootless runc port and replacement test (never sudo)
@@ -465,7 +477,8 @@ make test-hollow           # a three-member council and twenty hollow nodes (#14
 make test-gym              # the agent gym's scenarios on throwaway clusters, scored (#1086)
 make test-upgrade-node     # real single-node binary replacement
 make test-upgrade-cluster  # real rolling cluster replacement
-make coverage              # portable suite under line coverage (HTML and LCOV)
+make coverage              # portable suite under line coverage (LCOV) and the floor
+make coverage-html         # HTML report from the last make coverage run
 make audit                 # fail on new RustSec dependency findings
 ```
 
@@ -1662,7 +1675,7 @@ different name or namespace for the other kind.
 
 Release maintainers: see [the build, signing and publication procedure](releasing.md).
 
-Direct Apple Container is disabled for 0.2.6 while interrupted daemon-command
+Direct Apple Container is disabled for 0.2.7 while interrupted daemon-command
 recovery remains unfinished. Use the managed Linux/runc quickstart on macOS.
 
 Node chaos (kill, drain, pressure and council partitions) reserves one cluster-wide

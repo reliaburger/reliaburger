@@ -18,8 +18,8 @@ run it.
 | Integration suite | Real Bun and Relish processes over HTTP, TLS and the registry | [`tests/suite/`](../tests/suite) | `make test` |
 | Doctests | Examples in doc comments compile and run | `///` blocks | `make test-doc` |
 | Doc snippets | Every `relish` command and TOML block a reader copies from the manual, the READMEs and the whitepaper parses with the real code ([below](#doc-snippets)) | [`tests/suite/doc_snippets.rs`](../tests/suite/doc_snippets.rs) | `make test` |
-| Lint and format | Clippy with warnings as errors, all features and none; the macOS job runs the all-features pass only, because that one holds the macOS-only code | [`Makefile`](../Makefile) | `make lint`, `make lint-macos`, `make fmt-check` |
-| Coverage floor | Line coverage of the portable suite never drops below 78.65% | `COVERAGE_MIN_LINES` in the [`Makefile`](../Makefile) | `make coverage` |
+| Lint and format | Clippy with warnings as errors, all features and none, over every target; the macOS job runs the all-features pass only, because that one holds the macOS-only code, over the library, `relish` and `bun` ([what runs on macOS](#what-runs-on-macos-and-what-runs-on-linux)) | [`Makefile`](../Makefile) | `make lint`, `make lint-macos`, `make fmt-check` |
+| Coverage floor | Line coverage of the portable suite never drops below 78.65% | `COVERAGE_MIN_LINES` in the [`Makefile`](../Makefile) | `make coverage` (then `make coverage-html` for the HTML report) |
 | Dependency audit | No new RustSec advisory; every exception is dated | [`security.yml`](../.github/workflows/security.yml), [exceptions](qualification/2026-09-18-dependency-exceptions.md) ([12 Oct](qualification/2026-10-12-dependency-exceptions.md), [21 Oct](qualification/2026-10-21-dependency-exceptions.md), [24 Oct](qualification/2026-10-24-dependency-exceptions.md), [25 Oct](qualification/2026-10-25-dependency-exceptions.md), [26 Oct](qualification/2026-10-26-dependency-exceptions.md), [28 Oct](qualification/2026-10-28-dependency-exceptions.md) and [6 Nov](qualification/2026-11-06-dependency-exceptions.md) reviews) | `make audit` |
 | Dependency lag | Nothing: a report, never a failure. It lists what `cargo update` would move and every crate a major version behind, for the refresh at the start of each minor release ([`releasing.md`](releasing.md#refreshing-dependencies)); [Dependabot](../.github/dependabot.yml) opens the weekly compatible refresh | [`security.yml`](../.github/workflows/security.yml) prints it in the weekly job summary | `make outdated` |
 | CI scripts | Job selection, ignored-test owners, JUnit keeping, the benchmark baseline and the flakes register, against fixture repositories and the real workflow | [`scripts/ci/test_*.py`](../scripts/ci) | `make test-ci-scripts` |
@@ -27,9 +27,11 @@ run it.
 | Flakes register | Every open row of [`flakes.md`](flakes.md) links an issue that is still open | [`flakes_register.py`](../scripts/ci/flakes_register.py), run by [`flakes.yml`](../.github/workflows/flakes.yml) nightly and on pull requests that edit the register | `python3 scripts/ci/flakes_register.py check` (needs `gh`) |
 | Ignored-test owners | Every `#[ignore]` reason names who runs it ([below](#who-runs-an-ignored-test)) | [`ignored_owners.py`](../scripts/ci/ignored_owners.py) | `make check-ignored` |
 
-`make ci` runs the portable set locally, the same way CI does: formatting,
-lint, the portable suite, doctests, the CI scripts' tests and the ignored-test
-owner check. `make ci-bench` is `make ci` followed by `make bench`. Neither
+`make ci` runs the portable set locally, the same way CI does, quickest
+first: formatting, the ignored-test owner check and the CI scripts' tests
+take a minute or two between them, so a slip there fails before lint, the
+portable suite and the doctests compile anything. CI's lint job likewise
+checks formatting before it restores a cache. `make ci-bench` is `make ci` followed by `make bench`. Neither
 runs a privileged, cluster or upgrade suite; those have their own targets
 below, because they need root, a provisioned host or a lot of wall time.
 
@@ -406,12 +408,12 @@ jobs. What else runs depends on where the change is going:
 
 | Run | Jobs | Typical wall time |
 |---|---|---|
-| Pull request into a merge train (`release-*`, e.g. `release-0-2-4`) | The light set: CI policy, dependency audit, lint and format, minimum Rust, the demo app, the source bundle build, portable Linux (with coverage, doctests and the nightly-signing key test) and the optimised contract boundaries | about 25 minutes, set by portable Linux; up to 41 on a slow runner (#1421) |
+| Pull request into a merge train (`release-*`, e.g. `release-0-2-4`) | The light set: CI policy, dependency audit, lint and format, minimum Rust, the demo app, the source bundle build, portable Linux (with coverage), the doctests and the nightly-signing key test, and the optimised contract boundaries | about 17 minutes, set by portable Linux, down from 30 (#1723); more on a slow runner |
 | The same, labelled `full-ci` | The light set plus privileged Linux, the cluster, acceptance and upgrade suites, and the benchmarks the change touches | about 45 minutes |
 | The gate PR (a train into `main`) | The light set on each push; with `full-ci`, the heavy suites too | as above |
 | The gate PR labelled `release-gate` | Everything, portable macOS included; the evidence gate refuses less | about 45 minutes, plus any wait for macOS runners |
 | Any other pull request into `main` | The light set plus the heavy suites and the benchmarks the change touches | about 45 minutes |
-| Pull request stacked on any other branch | The light set; the heavy suites only with `full-ci` | about 25 minutes |
+| Pull request stacked on any other branch | The light set; the heavy suites only with `full-ci` | about 17 minutes |
 | Push to a train or to `main`, merge-queue group, nightly, manual, `build.yml`'s candidate build | Everything | about 45 minutes, plus any wait for macOS runners |
 
 **macOS only where it adds something**
@@ -450,6 +452,9 @@ evidence gate calls a heavy selection without macOS `train-full` and accepts
 it, like the light set, only on a `pull_request` event, and never on a
 `release-gate` PR. For macOS-only code the PR runs portable macOS itself; for
 anything else, check it on a Mac with `make test`, or add the `macos` label.
+Either way the job runs relish and the macOS-only tests, not the whole suite
+([what runs on macOS](#what-runs-on-macos-and-what-runs-on-linux)), so in CI a
+change to Bun, grill or the cluster code is tested on Linux only.
 
 Every train merges through the merge queue, with `gh pr merge --merge --auto`
 ([merging through the queue](releasing.md#merging-through-the-queue)).
@@ -495,14 +500,66 @@ an HTTP `Range` request, abandons an attempt after 60 s without a byte, logs
 its progress, checks the zip's digest and stops at 13 minutes, inside the
 step's 14.
 
+### What runs on macOS and what runs on Linux
+
+Bun ships for Linux only, and the quickstart runs it in a Lima VM on a Mac.
+What a Mac user runs natively is `relish`. So the macOS job builds and tests
+`relish` and the code only macOS compiles, and only compile-checks `bun`
+([#1720](https://github.com/reliaburger/reliaburger/issues/1720), maintainer
+decision of 7 November 2026):
+
+| | macOS (`portable macOS`) | Linux |
+|---|---|---|
+| Lint | `make lint-macos`: Clippy, all features, on the library, `relish` and `bun`. Linting `bun` is its compile check | `make lint`: every target, all features and none |
+| Tests | `make test-macos`: the `relish` binary's tests, `relish::` in the library (the quickstart preflight, the dashboard and the manual's web view among them) and the suite's `relish_*` modules, plus the tests only macOS compiles: `grill::apple::` (the Apple Container adapter against a fake CLI), `grill::records::tests::absolute_start_time*` (process start times off Linux), the suite's `user_directories::macos_*` and the `runtime_selection` binary | `make coverage` (portable Linux): every portable test, `relish`'s included, under line coverage |
+| Doctests | `relish::`'s, `cargo test --locked --doc -- relish::` | all of them, `make test-doc` |
+| Bun, grill, cluster, eBPF | not run; Cargo still links `bun` and `testapp`, because it builds every binary for an integration test | portable Linux, privileged Linux, cluster and acceptance |
+
+`make test-macos` runs the same selection on any machine. The filterset is in
+the [`Makefile`](../Makefile), and
+[`test_macos_selection.py`](../scripts/ci/test_macos_selection.py) pins it,
+with the lint and the doctest step, so widening or narrowing what macOS proves
+is a reviewed change. Test code only macOS compiles is built by `make
+test-macos` but linted only by `make lint` on a Mac.
+
+So Bun's macOS-only branches are compiled and linted in CI, but not tested
+there, because Bun ships only for Linux. They are the EPERM and reaping
+paths of `grill::process` and `process_owner`, `grill::capture`'s hole
+punching, `grill::volume::owned`'s mount listing and `mayo::collector`.
+`make test` on a Mac still runs their tests, so run it locally when you touch
+them. Bringing them back into CI is
+[#1741](https://github.com/reliaburger/reliaburger/issues/1741).
+
+The evidence manifest follows the same line. A finite case requires the
+`portable-darwin` gate only when the macOS filterset selects it, or the
+evidence gate would wait for a case the job never runs.
+[`macos_selection.py apply`](../scripts/ci/macos_selection.py) sets that,
+deterministically, in the manifest and the [qualification
+matrix](testing/qualification-matrix.md): a case that requires
+`portable-linux` keeps `portable-darwin` exactly when the filterset selects it.
+On 7 November 2026 that took `portable-darwin` off 231 of 250 cases, which
+all keep `portable-linux`; the 19 left are relish's. The test above fails
+when a manifest case, or a matrix row, disagrees with the filterset.
+
+Measured on [#1699](https://github.com/reliaburger/reliaburger/pull/1699): a
+relish-only macOS job took 31.2 minutes from a cold cache, 23.5 of them
+building the library, `relish` and suite test binaries, against a 66-minute
+median for the whole portable suite on macOS. relish's unit tests live in the
+library, so its test binary still compiles the whole crate; splitting `relish`
+into its own crate is planned in
+[#1725](https://github.com/reliaburger/reliaburger/issues/1725).
+
 ### Portable macOS in one job
 
-The portable suite on macOS runs as one job, `portable macOS`: it compiles
-the suite once, runs `make lint-macos`, runs every portable test with
-`make test` under `--partition hash:1/1` (`SHARDS` in
+The macOS tests run as one job, `portable macOS`
+([`scripts/release/ci_reuse.py`](../scripts/release/ci_reuse.py) waits for it
+by that name): it compiles once, runs `make lint-macos`, runs `make
+test-macos` ([above](#what-runs-on-macos-and-what-runs-on-linux)) under
+`--partition hash:1/1` (`SHARDS` in
 [`workflow_assembly.py`](../scripts/ci/workflow_assembly.py)), which nextest
-treats as the whole suite, and runs the doctests. It takes about 30 to 50
-minutes in one runner, depending on the compile.
+treats as the whole selection, and runs relish's doctests. Until #1720 it ran
+the whole portable suite: a 66-minute median over six runs on 6 and 7
+November 2026, 52 to 76 minutes depending on the compile.
 
 From 12 October to 6 November 2026 it ran as three shards, `portable macOS
 (1/3)` to `(3/3)`, each under `--partition hash:K/3`. They didn't pay. Each
@@ -534,6 +591,26 @@ ways to keep the merge honest.
 merge against what the pinned nextest really prints, on a throwaway crate.
 Coverage is unaffected: only the Linux portable job measures it.
 
+### Trimming the Actions caches
+
+GitHub keeps 10 GB of caches per repository and evicts the least recently
+used beyond that, so a cache nothing will restore pushes out one a job still
+needs. On 6 November 2026 we were at 9.57 GB. Every night,
+[`cache-trim.yml`](../.github/workflows/cache-trim.yml) runs
+[`trim_caches.py`](../scripts/ci/trim_caches.py), which deletes a cache when
+
+- its ref is a closed or merged pull request's;
+- its ref is a branch that no longer exists, such as a merge-queue group's;
+- or a newer cache of the same family was saved on the same ref. The family is
+  the key without its trailing hashes and run ids, so a lock-file change
+  supersedes `v0-rust-portable-Linux-x64-<env>-<lock>`, and a newer run
+  supersedes `task-array-bench-<run id>`.
+
+Everything else stays. `python3 scripts/ci/trim_caches.py --repository
+reliaburger/reliaburger` prints what it would delete; `--apply` deletes it.
+The rule can't shrink `main`'s current caches, which hold most of the quota
+(about 9 GB on 7 November), only stop stale ones from evicting them.
+
 ## Finite contracts and current evidence
 
 [`tests/contracts/manifest.json`](../tests/contracts/manifest.json) is the finite
@@ -546,11 +623,11 @@ Reading the source can't prove that a particular host/feature combination
 compiled or ran a case. Actual discovery
 must confirm the literal binary and full name before completion can qualify it.
 
-The workflow has eleven owners: Linux portable coverage, macOS portable tests,
-optimised cron boundaries, rootless Linux, privileged Linux storage/runtime,
-owned OCI interruptions, cluster, slow acceptance, node upgrade, cluster upgrade
-and standard registry clients. They keep their full existing selections and
-prerequisites. The finite cases are required observations within those commands,
+The workflow has eleven owners: Linux portable coverage, macOS relish and
+macOS-only tests (`make test-macos`), optimised cron boundaries, rootless Linux,
+privileged Linux storage/runtime, owned OCI interruptions, cluster, slow
+acceptance, node upgrade, cluster upgrade and standard registry clients. They
+keep their full existing selections and prerequisites. The finite cases are required observations within those commands,
 not permission to run a reduced replacement suite. The independent cron crate
 imports the actual production parser; its two required boundary oracles don't
 replace the owner's other imported tests.
@@ -593,7 +670,9 @@ a seal from another commit or run, a later attempt or an earlier attempt that a
 re-run replaced can't qualify.
 
 Linux coverage wraps the existing `make coverage` once, including its clean,
-instrumented nextest run, LCOV/HTML reports and unchanged line floor. Discovery
+instrumented nextest run and its one report, which writes the LCOV file and
+checks the unchanged line floor. The HTML report isn't evidence: the job writes
+it with `make coverage-html` on pushes to `main` and the nightly only. Discovery
 uses that run's instrumented environment, selectors and target directory.
 A separate ordinary test run doesn't validate the coverage run. The owner also
 checks actual compiler/tool bytes and the runtime parent/child context, so a
@@ -947,6 +1026,33 @@ verdicts for the same behaviour on both platforms
 ([`test_k8s.py`](../scripts/gym/test_k8s.py)). The website's
 [comparison page](website/compare/ai-agents.html) may state only numbers its
 record holds ([`test_compare.py`](../scripts/gym/test_compare.py)).
+
+### The concept budget
+
+How much does an agent have to learn before it can drive Reliaburger? We
+count it, and hold the count to
+[`testing/concept-budget.json`](testing/concept-budget.json)
+([#1681](https://github.com/reliaburger/reliaburger/issues/1681)). The test
+is `the_concept_counts_match_their_budget` in `src/bin/relish.rs`, and the
+counting lives in
+[`src/relish/concept_budget.rs`](../src/relish/concept_budget.rs).
+
+| Count | Read from | What counts |
+|---|---|---|
+| `resource_kinds` | serde's field list for `config::Config` | Every top-level table `relish apply` takes (`[app.*]`, `[job.*]`, ...). Kubernetes YAML imports into these, so it adds none |
+| `commands` | `Cli::command()`, clap's tree before it's built | Every subcommand at every depth, hidden ones too, so hiding a command is no way under the budget. Not `relish` itself, not clap's `help` |
+| `flags` | the same tree | Every flag with a long or short name on every command, hidden ones too. A global flag counts once, where it's declared. Not positionals, not `--help` or `--version` |
+| `distinct_flags` | the same tree | Distinct flag names: `--namespace` on thirty commands counts once |
+
+The test fails whenever a count differs from its budget. Over budget, it says
+to raise `budget` in the same pull request and give the reason in `reason`, so
+a reviewer sees every new concept as a diff. Under budget, it asks for the
+budget to come down to the new count, so it ratchets. An empty `reason`
+fails too.
+
+`relish agent guide` has a byte budget of its own, 64 KiB, held by
+`the_agent_chapter_fits_the_guides_default_budget` in
+`src/relish/agent/guide.rs`.
 
 ## Before a release
 

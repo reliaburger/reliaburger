@@ -149,6 +149,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: rustfmt, clippy
+      # rustfmt builds nothing, so it runs before the cache restore and the
+      # apt step: a format slip fails the job within a minute (#1724).
+      - name: Format
+        run: make fmt-check
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: lint
@@ -158,8 +162,6 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq clang libbpf-dev llvm
-      - name: Format
-        run: make fmt-check
       - name: Lint every target, with all features and with none
         run: make lint
 
@@ -260,13 +262,16 @@ jobs:
     outputs:
       portable_linux_sha256: ${{ steps.portable_linux.outputs.portable_linux_sha256 }}
     # The Linux portable suite runs once, instrumented: the same run is the
-    # test gate, the coverage gate and the JUnit source.
+    # test gate, the coverage gate and the JUnit source. It's every train
+    # PR's critical path, so it does nothing else: the doctests and the
+    # nightly-signing test run beside it, and the HTML report waits for main.
     name: portable Linux
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
-    # About 25 minutes, but 35 to 41 on a slow runner (#1421). nextest's
-    # per-test timeouts catch a hung test, so this only catches a stuck runner.
+    # About 25 minutes, but 35 to 41 on a slow runner (#1421), before the
+    # doctests and two report passes left it (#1723). nextest's per-test
+    # timeouts catch a hung test, so this only catches a stuck runner.
     timeout-minutes: 62
     steps:
       - uses: actions/checkout@v4
@@ -302,14 +307,12 @@ jobs:
           path: target/contracts/linux/portable-linux
           if-no-files-found: error
           retention-days: 14
-      - name: Doctests
-        run: make test-doc
-      # A train's nightly build trusts the nightly key instead of every
-      # release key (#1363). The test that says so only compiles with the
-      # feature, so no other run has it (#1442). The doctests have just
-      # built the dependencies for this profile; only the crate rebuilds.
-      - name: Nightly-signing key trust
-        run: 'cargo test --locked --lib --features nightly-signing upgrade::keys::'
+      # The evidence owner's one report wrote the lcov file and checked the
+      # floor. The HTML is for reading, so only main and the nightly write
+      # it (D5 in plan 2026-11-06), from the same profiles.
+      - name: HTML coverage report
+        if: github.ref == 'refs/heads/main'
+        run: make coverage-html
       - name: Upload coverage
         if: always()
         uses: actions/upload-artifact@v4
@@ -318,6 +321,32 @@ jobs:
           path: target/coverage
           if-no-files-found: warn
           retention-days: 14
+
+  doctests:
+    # Doctests and the nightly-signing key test build the crate without
+    # instrumentation, so they never shared the coverage run's build. On
+    # portable Linux they added about six minutes to every train PR's
+    # critical path; here they finish well inside it (#1723).
+    name: doctests and feature tests
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-debug
+          save-if: false
+      - name: Doctests
+        run: make test-doc
+      # A train's nightly build trusts the nightly key instead of every
+      # release key (#1363). The test that says so only compiles with the
+      # feature, so no other run has it (#1442). The doctests have just
+      # built the dependencies for this profile; only the crate rebuilds.
+      - name: Nightly-signing key trust
+        run: 'cargo test --locked --lib --features nightly-signing upgrade::keys::'
 
   linux:
     outputs:
@@ -765,7 +794,7 @@ jobs:
     # always reports, so a skipped owner can never stand in for a pass. A
     # closed PR's run has nothing to report.
     name: ignored-test evidence
-    needs: [changes, ci-policy, dependency-audit, lint, demo-app, minimum-rust, source-bundle, portable, linux, linux-next, build-tests, cluster, acceptance, contract-boundaries, macos, benchmarks, task-array-benchmarks, s3]
+    needs: [changes, ci-policy, dependency-audit, lint, demo-app, minimum-rust, source-bundle, portable, doctests, linux, linux-next, build-tests, cluster, acceptance, contract-boundaries, macos, benchmarks, task-array-benchmarks, s3]
     if: ${{ always() && github.event.action != 'closed' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -810,11 +839,15 @@ jobs:
   macos:
     outputs:
       portable_darwin_1_sha256: ${{ steps.portable_darwin.outputs.portable_darwin_1_sha256 }}
-    # The portable suite on macOS, in one job: one compile, the lint, every
-    # test (partition hash:1/1, SHARDS in scripts/ci/workflow_assembly.py)
-    # and the doctests. Three shards each compiled the same suite for 17-40
-    # minutes to test for about 3, and took three of the five macOS runners
-    # the organisation's plan allows (plan 2026-11-06, F1).
+    # Bun ships for Linux only, so macOS builds and tests relish and the
+    # code only macOS compiles (#1720): the lint compile-checks bun, `make
+    # test-macos` runs relish's tests and the macOS-only ones (partition
+    # hash:1/1, SHARDS in scripts/ci/workflow_assembly.py), and the doctests
+    # are relish's. Bun, grill, cluster and eBPF tests run on Linux. The whole
+    # portable suite took a 66-minute median here; relish alone took 31 from
+    # a cold cache (#1699). It's one job, not three shards that each compiled
+    # the same suite (plan 2026-11-06, F1). scripts/release/ci_reuse.py waits
+    # for this job by name.
     name: portable macOS
     needs: changes
     if: needs.changes.outputs.macos == 'true'
@@ -836,9 +869,9 @@ jobs:
         run: rm -rf -- target/contracts
       # One pass, all features: the macOS-only code is in it, and the lint
       # job runs the no-features pass on Linux (see lint-macos in Makefile).
-      - name: Lint every target, with all features
+      - name: Lint the library, relish and bun (bun's compile check), all features
         run: make lint-macos
-      - name: Portable tests
+      - name: Relish and macOS-only tests
         id: portable_darwin
         run: |
           python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate portable-darwin --shard "1/1" --host darwin --directory "target/contracts/darwin/portable-darwin-1" --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
@@ -850,8 +883,10 @@ jobs:
           path: target/contracts/darwin/portable-darwin-1
           if-no-files-found: error
           retention-days: 14
-      - name: Doctests
-        run: make test-doc
+      # Linux runs every doctest; this one compiles the crate's doctests and
+      # runs relish's.
+      - name: Relish's doctests
+        run: 'cargo test --locked --doc -- relish::'
   benchmarks:
     # Criterion output is uploaded, not gated, so pull requests only pay for
     # the release build when they touch the gossip protocol or its benches.

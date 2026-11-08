@@ -6,7 +6,7 @@
         "relish",
         "mcp"
       ],
-      "documentation": "https://github.com/reliaburger/reliaburger/blob/v0.2.7/docs/manual/16_working-with-an-ai-agent.md",
+      "documentation": "https://github.com/reliaburger/reliaburger/blob/v0.2.8/docs/manual/16_working-with-an-ai-agent.md",
       "install": "curl -fsSL https://reliaburger.com/install.sh | sh -s -- --install-only",
       "readOnly": true,
       "tools": [
@@ -34,6 +34,6 @@
     "url": "https://github.com/reliaburger/reliaburger"
   },
   "title": "Reliaburger relish",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "websiteUrl": "https://reliaburger.com/agents"
 }

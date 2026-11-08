@@ -75,6 +75,34 @@ class LocalGateTests(unittest.TestCase):
         self.assertTrue(any("unittest discover -s scripts/ci" in line for line in ci), ci)
         self.assertTrue(any("ignored_owners.py reasons" in line for line in ci), ci)
 
+    def test_make_ci_runs_the_quick_checks_before_any_build(self):
+        # A format slip or an unowned #[ignore] fails in seconds, not after
+        # Clippy and the suite have compiled (#1724).
+        prerequisites = re.search(r"^ci: ([^#\n]*)", (REPO / "Makefile").read_text(), re.M).group(1).split()
+        self.assertEqual(prerequisites[:3], ["fmt-check", "check-ignored", "test-ci-scripts"])
+        self.assertEqual(set(prerequisites[3:]), {"lint", "test", "test-doc"})
+
+    def test_coverage_writes_one_report_that_also_enforces_the_floor(self):
+        # Each `llvm-cov report` merges every profile and reads every
+        # binary's coverage map again, about two minutes each; one call
+        # writes the lcov file and checks the floor (plan 2026-11-06, F3).
+        status, lines = dry_run("coverage")
+        self.assertEqual(status, 0)
+        reports = [line for line in lines if "llvm-cov report" in line]
+        self.assertEqual(len(reports), 1, reports)
+        self.assertIn("--lcov --output-path target/coverage/lcov.info", reports[0])
+        floor = re.search(r"^COVERAGE_MIN_LINES \?= ([\d.]+)$", (REPO / "Makefile").read_text(), re.M)
+        self.assertIn("--fail-under-lines " + floor.group(1), reports[0])
+        self.assertNotIn("--html", " ".join(lines))
+
+    def test_the_html_coverage_report_has_its_own_target(self):
+        # Nobody opens the HTML on a pull request; CI writes it on main and
+        # the nightly only (D5), and `make coverage coverage-html` locally.
+        status, lines = dry_run("coverage-html")
+        self.assertEqual(status, 0)
+        self.assertEqual([line for line in lines if "llvm-cov" in line],
+                         ["cargo llvm-cov report --failure-mode all --html --output-dir target/coverage/html"])
+
 
 class EvidenceTests(unittest.TestCase):
     def setUp(self):
@@ -509,9 +537,10 @@ class TrainAndQueueTests(unittest.TestCase):
         # job doesn't hide whether the evidence was complete.
         self.assertIn("if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}", blocks[aggregate])
 
-    def test_macos_is_one_job_that_lints_and_runs_every_portable_test(self):
+    def test_macos_is_one_job_that_lints_and_runs_its_selection(self):
         # One job, not three shards that each compiled the whole suite to
-        # run a third of it (plan 2026-11-06, F1).
+        # run a third of it (plan 2026-11-06, F1). What it runs, relish and
+        # the macOS-only tests (#1720), is pinned in test_macos_selection.py.
         macos = self.jobs["macos"]
         portable = [name for name, job in self.jobs.items() if "--gate portable-darwin " in job]
         self.assertEqual(portable, ["macos"])
@@ -521,23 +550,34 @@ class TrainAndQueueTests(unittest.TestCase):
         self.assertNotIn("matrix", macos)
         self.assertEqual(SHARDS["portable-darwin"], 1)
         self.assertIn('--shard "1/1"', macos)
-        # The same profile and features as before: the ci nextest profile
-        # from the workflow env, the all-features lint, and the doctests,
-        # each unconditional.
+        # The ci nextest profile from the workflow env, the all-features
+        # lint, the tests and relish's doctests, each unconditional.
         self.assertIn("  NEXTEST_PROFILE: ci\n", self.ci)
-        for name, command in [("Lint every target, with all features", "run: make lint-macos"),
-                              ("Portable tests", "workflow_adapter.py produce"),
-                              ("Doctests", "run: make test-doc")]:
+        for name, command in [("Lint the library, relish and bun", "run: make lint-macos"),
+                              ("Relish and macOS-only tests", "workflow_adapter.py produce"),
+                              ("Relish's doctests", "cargo test --locked --doc -- relish::")]:
             block = next(step for step in steps(macos) if "name: " + name in step)
             self.assertIn(command, block)
             self.assertNotIn("if:", block)
         cache = next(step for step in steps(macos) if "Swatinem/rust-cache@" in step)
         self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' }}", cache)
 
+    def test_the_lint_job_checks_formatting_before_restoring_or_building_anything(self):
+        # rustfmt needs no build: run it before the cache restore and the
+        # apt step, so a format slip fails the job within a minute (#1724).
+        blocks = steps(self.jobs["lint"])
+        fmt = next(index for index, step in enumerate(blocks) if "make fmt-check" in step)
+        cache = next(index for index, step in enumerate(blocks) if "Swatinem/rust-cache@" in step)
+        apt = next(index for index, step in enumerate(blocks) if "apt-get" in step)
+        clippy = next(index for index, step in enumerate(blocks) if "make lint" in step and "fmt" not in step)
+        self.assertLess(fmt, cache)
+        self.assertLess(fmt, apt)
+        self.assertLess(fmt, clippy)
+
     def test_the_heavy_jobs_wait_for_their_own_selection(self):
         for name in ["linux", "linux-next", "build-tests", "cluster", "acceptance"]:
             self.assertIn("if: needs.changes.outputs.heavy == 'true'", self.jobs[name])
-        for name in ["lint", "minimum-rust", "portable", "contract-boundaries", "demo-app", "source-bundle"]:
+        for name in ["lint", "minimum-rust", "portable", "doctests", "contract-boundaries", "demo-app", "source-bundle"]:
             self.assertIn("if: needs.changes.outputs.code == 'true'", self.jobs[name])
 
     def test_the_embedded_source_builds_on_its_own(self):
@@ -579,12 +619,43 @@ class TrainAndQueueTests(unittest.TestCase):
         # The nightly build trusts the nightly key instead of every release
         # key, and only a build with the feature compiles the test that says
         # so (#1442).
-        portable = self.jobs["portable"]
-        block = next(step for step in steps(portable) if "--features nightly-signing" in step)
+        job = self.jobs["doctests"]
+        block = next(step for step in steps(job) if "--features nightly-signing" in step)
         self.assertIn("cargo test --locked --lib --features nightly-signing upgrade::keys::", block)
         self.assertNotIn("if:", block)
         keys = (REPO / "src" / "upgrade" / "keys.rs").read_text()
         self.assertIn('#[cfg(feature = "nightly-signing")]\n    #[test]', keys)
+
+    def test_doctests_and_the_feature_test_run_beside_the_coverage_run(self):
+        # Both build the crate without instrumentation, so they never shared
+        # the coverage run's build; on portable Linux they added about six
+        # minutes to the critical path (plan 2026-11-06, F2).
+        job = self.jobs["doctests"]
+        self.assertIn("    name: doctests and feature tests\n", job)
+        self.assertIn("    needs: changes\n", job)
+        block = next(step for step in steps(job) if "make test-doc" in step)
+        self.assertNotIn("if:", block)
+        self.assertLess(job.index("make test-doc"), job.index("--features nightly-signing"))
+        # It restores the uninstrumented debug cache and never competes to
+        # save it: build tests saves that key on main.
+        cache = next(step for step in steps(job) if "Swatinem/rust-cache@" in step)
+        self.assertIn("shared-key: linux-debug", cache)
+        self.assertIn("save-if: false", cache)
+        portable = self.jobs["portable"]
+        self.assertNotIn("make test-doc", portable)
+        self.assertNotIn("--features nightly-signing", portable)
+
+    def test_the_html_coverage_report_is_written_on_main_only(self):
+        # D5: the lcov file and the floor on every run, the HTML on pushes
+        # to main and the nightly, after the evidence owner's run.
+        portable = self.jobs["portable"]
+        blocks = steps(portable)
+        produce = next(index for index, step in enumerate(blocks) if "--gate portable-linux" in step)
+        html = next(index for index, step in enumerate(blocks) if "make coverage-html" in step)
+        upload = next(index for index, step in enumerate(blocks) if "name: coverage\n" in step)
+        self.assertLess(produce, html)
+        self.assertLess(html, upload)
+        self.assertIn("if: github.ref == 'refs/heads/main'", blocks[html])
 
 
 class BenchmarkTests(unittest.TestCase):
