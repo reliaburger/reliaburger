@@ -18,8 +18,9 @@ suggests a Linux host, or 0.2.1, the last release built for Intel Macs
 
 ```sh
 curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop
-relish nodes
 relish status
+relish nodes
+relish apps
 relish logs hello
 relish dashboard             # Ctrl-C stops the browser connection
 ```

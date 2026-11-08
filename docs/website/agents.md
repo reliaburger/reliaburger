@@ -158,7 +158,7 @@ clap's text on stderr. Only `--help` prints ordinary help.
 
 A command relish doesn't know is a usage error too, and its "did you mean"
 only ever names a command that reads. Type `statsu` and relish suggests
-`relish status`. Type `apps` and the closest name is `apply`, which writes,
+`relish status`. Type `deploys` and the closest name is `deploy`, which writes,
 so relish leaves it out and points at `relish status` instead; under
 `relish agent` it points at `relish agent context`, and the envelope's `hint`
 opens with the suggestion. A typo of a command that writes, such as `aply`,
@@ -815,10 +815,11 @@ refuse it, exit `2` and say they're interactive: `tui`, `dashboard`,
 `--ssh`, which asks its questions as it goes. Without a terminal, as in an
 agent's shell, `relish`, `relish manual` and `relish source` exit at once and
 name the command to use instead. The `reference` chapter lists what each
-command's JSON holds.
+command's JSON holds. `relish status -o json` answers in the `relish agent`
+envelope.
 
 Unlike `relish agent`, these commands keep their own exit codes: `relish wtf`
-exits `1` for a critical finding and `2` for warnings only, not because you
+exits `1` for a critical finding and `3` for warnings only, not because you
 typed it wrong.
 
 ## Plugging it into your agent

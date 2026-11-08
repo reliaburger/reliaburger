@@ -105,9 +105,11 @@ Leave it running. In a second terminal, also from the repository root:
 ```sh
 target/debug/relish apply examples/phase-1/proc-first-run.toml
 target/debug/relish status
+target/debug/relish apps
 ```
 
-You should see the `hello` workload in `Running` state. Open
+`relish status` should count one app running on its `apps` line, and
+`relish apps` lists `hello` as `running`. Open
 <http://127.0.0.1:9117/> for the web dashboard, or run `relish` with no
 arguments for the terminal one. The process runtime supervises real processes but
 doesn't isolate them, so keep it for trying things out.

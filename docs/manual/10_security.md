@@ -890,7 +890,7 @@ unplaced, and `relish wtf` says no node can run it.
 
 It fails closed. When the provider is missing, slow, killed, writes too much,
 exits unsuccessfully or answers with anything but the protocol, the instance
-doesn't start, and `relish status` and `relish wtf` give the reason:
+doesn't start, and `relish apps NAME` and `relish wtf` give the reason:
 
 ```text
 cannot resolve secret DB_PASSWORD: secret provider "vault" did not answer within 5s and was killed
