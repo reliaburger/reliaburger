@@ -922,6 +922,15 @@ links a successor. Re-running those loops for the register paid for itself strai
 one test whose old cause was fixed failed twice in a hundred runs for a new one, a stop that
 races the child's own exit on macOS.
 
+Some flakes are tests that quietly share the machine. The port allocator skips any port
+something on the host already listens on, so a published port never shadows a host daemon.
+Its bookkeeping tests built the allocator the same way, over the fixed range 10000 to 10003,
+and one failed on a macOS runner with the range "exhausted" after only two allocations
+(#1711): something else held one of those ports. Those tests now opt out of the probe with
+`without_host_probe()`, because they check counting, not the host. One test keeps the probe,
+and it binds an ephemeral port itself first, so the port the probe must refuse is one the test
+holds, whatever else the runner is doing.
+
 ### Light checks on the train, everything in the queue
 
 By 0.2.1 the waiting was back. Every pull request into a train got the whole of CI, and a
