@@ -689,6 +689,17 @@ impl LogStore {
         &self.data_dir
     }
 
+    /// When the newest line this store ingested arrived, Unix milliseconds:
+    /// proof that log ingestion is live. `None` before the first line.
+    ///
+    /// Each line's sequence is its ingest time in nanoseconds, bumped by
+    /// one when two lines share a clock reading, and the checkpoint keeps
+    /// it across restarts, so this costs no extra bookkeeping.
+    pub fn newest_line_unix_ms(&self) -> Option<u64> {
+        let sequence = self.ingested.last_sequence;
+        (sequence > 0).then_some(sequence / 1_000_000)
+    }
+
     /// Append a line the node itself wrote (not a workload's output).
     pub fn append(&mut self, app: &str, namespace: &str, stream: LogStream, line: &str) {
         let now = now_nanos();
@@ -1239,6 +1250,17 @@ mod tests {
             dir.path().to_path_buf(),
         )));
         assert!(!flush_shared(&store).await.unwrap(), "nothing to flush");
+    }
+
+    #[test]
+    fn the_newest_line_time_follows_ingestion() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = LogStore::new(dir.path().to_path_buf());
+        assert_eq!(store.newest_line_unix_ms(), None);
+        store.append_at(1_700_000_000, "web", "default", LogStream::Stdout, "one");
+        assert_eq!(store.newest_line_unix_ms(), Some(1_700_000_000_000));
+        store.append_at(1_700_000_005, "web", "default", LogStream::Stdout, "two");
+        assert_eq!(store.newest_line_unix_ms(), Some(1_700_000_005_000));
     }
 
     #[tokio::test]

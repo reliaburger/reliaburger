@@ -20,6 +20,8 @@ use super::source::{Answer, render_answer};
 use super::untrusted::{Origin, Untrusted};
 use crate::bun::cluster_view::ClusterEvents;
 use crate::bun::events::ClusterEvent;
+pub use crate::bun::summary::AppState;
+use crate::bun::summary::app_state;
 use crate::relish::RelishError;
 use crate::relish::client::BunClient;
 use crate::relish::wtf::{self, Evidence, WtfFinding, WtfInputs, WtfReport};
@@ -188,24 +190,6 @@ pub struct AppLine {
     pub findings: Vec<String>,
 }
 
-/// How an app is doing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum AppState {
-    /// It wants replicas and none run.
-    Down,
-    /// Some of its replicas run, not all.
-    Degraded,
-    /// Every replica runs, but a finding is about it.
-    Troubled,
-    /// Some nodes didn't answer, so what runs there isn't known.
-    Unknown,
-    /// Every replica runs and nothing is wrong with it.
-    Running,
-    /// It wants no replicas.
-    Stopped,
-}
-
 /// One cluster event.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct TimelineEntry {
@@ -319,7 +303,7 @@ pub fn context(
                 "relish agent diagnose --app {}",
                 super::shell_quote(&worst.app)
             ),
-            why: format!("why {} is {}", worst.app, state_word(worst.state)),
+            why: format!("why {} is {}", worst.app, worst.state.word()),
             read_only: true,
         });
     }
@@ -327,17 +311,6 @@ pub fn context(
         data,
         next,
         warnings: Vec::new(),
-    }
-}
-
-fn state_word(state: AppState) -> &'static str {
-    match state {
-        AppState::Down => "down",
-        AppState::Degraded => "degraded",
-        AppState::Troubled => "troubled",
-        AppState::Unknown => "unknown",
-        AppState::Running => "running",
-        AppState::Stopped => "stopped",
     }
 }
 
@@ -354,19 +327,12 @@ fn apps(inputs: &WtfInputs, report: &WtfReport) -> Section<AppLine> {
         let running: u32 = replica.running.values().sum();
         let resource = format!("app.{}/{}", replica.app, replica.namespace);
         let findings = about.get(resource.as_str()).cloned().unwrap_or_default();
-        let state = if replica.desired_replicas == 0 {
-            AppState::Stopped
-        } else if running == 0 && replica.unanswered.is_empty() {
-            AppState::Down
-        } else if running < replica.desired_replicas && replica.unanswered.is_empty() {
-            AppState::Degraded
-        } else if !findings.is_empty() {
-            AppState::Troubled
-        } else if !replica.unanswered.is_empty() {
-            AppState::Unknown
-        } else {
-            AppState::Running
-        };
+        let state = app_state(
+            replica.desired_replicas,
+            running,
+            !replica.unanswered.is_empty(),
+            !findings.is_empty(),
+        );
         AppLine {
             app: replica.app.clone(),
             namespace: replica.namespace.clone(),

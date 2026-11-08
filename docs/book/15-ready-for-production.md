@@ -7503,31 +7503,11 @@ the evidence fits it, but it fits any file-creating call on a worker.
 
 #### Catching the stall in the act
 
-The list got shorter, and 0.2.7's jobs final still found a turn that ran
-late (#1707):
-
-```
-14:04:12 bun: agent loop turn took 1215 ms in follow_up (consumer_sync/journal): journal write 1215 ms
-14:04:12 bun: a discovery journal write took 1219 ms; the agent loop went on meanwhile
-```
-
-Same shape as #1606: the write was handed off, so the deadline fired, but
-about 700 ms late. This time nothing else logged in that second. No prune,
-no export. Something held a worker, and the log can't say what, because by
-the time a turn ends and its line gets written, whatever held it has let
-go.
-
-The best theory has to do with how tokio schedules. Each worker thread has
-a LIFO slot, a one-task fast lane: when a task wakes another, the woken
-one goes there and runs next on the same worker. It's good for latency,
-since the task's data is still in the cache. But other workers can't steal
-from that slot. If the worker then blocks in a system call, say an
-`open` that waits for the ext4 journal commit a concurrent `fsync` forced,
-the task in its slot waits too, however idle the other workers are. #1742
-moved one such call, a control socket's `bind`, onto the blocking pool.
-Was that the one? A theory isn't evidence. We wanted the next soak to
-catch the stall while it was happening and say which thread held it, and
-in which call.
+So the bind is a suspect, not a culprit, and the node's log couldn't
+settle it, because by the time a turn ends and its line gets written,
+whatever held the worker has let go. We wanted the next soak to catch the
+stall while it was happening and say which thread held it, and in which
+call.
 
 So Bun now has a watchdog. The loop meter already marks the start and end
 of each turn; it now also stamps a `LoopHeartbeat`:

@@ -13,7 +13,7 @@ metrics, logs, GitOps, jobs and fault injection are compiled into that agent.
 There's no control plane to assemble and no add-ons to install. A Linux node
 needs a few distribution packages (`runc`, `nftables`, `iproute2` and friends,
 listed in the [Linux servers guide](docs/linux-servers.md)), and releases are
-glibc builds; static builds are planned, though no issue tracks them yet.
+glibc builds; static builds are planned ([#1774](https://github.com/reliaburger/reliaburger/issues/1774)).
 
 It applies most Kubernetes manifests directly and tells you what it had to
 change or drop (see [what converts](docs/manual/09_kubernetes.md)). The tour below
@@ -520,7 +520,7 @@ and its trade-offs; the [design docs](docs/design/) cover each subsystem.
 - **Ingress certificates don't come from ACME.** Use the cluster CA or supply
   your own files. ACME is planned for 0.4.0
   ([#1667](https://github.com/reliaburger/reliaburger/issues/1667)).
-- **Alerts are five built-in node rules.** You can't define your own yet.
+- **Alerts are five built-in node rules.** You can't define your own yet ([#1773](https://github.com/reliaburger/reliaburger/issues/1773)).
 - **No PromQL.** Metrics are read through `relish metrics`, the dashboards and
   the API.
 - **`fault bandwidth` is refused** until it's implemented

@@ -731,6 +731,8 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
         None => app,
     };
     let app = app.layer(axum::Extension(known_members));
+    // Gossip's own counters, read by `/v1/cluster/summary`, as `bun` wires them.
+    let app = app.layer(axum::Extension(cluster_runtime.gossip_stats.clone()));
     // Like `bun`, every node finds the leader through the gossip directory,
     // which also names it to workers outside Raft.
     let app = app.layer(axum::Extension(api::LeaderDirectory(directory_rx.clone())));

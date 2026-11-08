@@ -1079,6 +1079,176 @@ constant is defined exactly once under `src/`, and the last two that the
 manual mentions every id and that its new table of findings lists exactly the
 catalogue.
 
+## The whole cluster at a glance
+
+`context` answers "what's going on here?" for an agent. A person types
+`relish status` for the same reason, and until 0.2.8 it answered a different
+question: it printed one row per instance. On three nodes that's fine. On ten
+nodes and a hundred apps it's several hundred rows, and the line that matters
+(a voter down, an app that can't be placed) has scrolled off the top. The
+plan for 0.2.8
+([#1770](https://github.com/reliaburger/reliaburger/pull/1770))
+turns `status` into one screen of counts and verdicts, the same size on three
+nodes or three hundred, and moves the lists to `relish apps` and `relish
+nodes`.
+
+The first step is the data. Today `relish` would have to ask five endpoints
+and every node to fill that screen, and the TUI, Brioche's dashboard and
+`agent context` would each do the same, slightly differently. So the cluster
+answers it once: `GET /v1/cluster/summary`, served by any node, returning a
+`ClusterSummary` (`src/bun/summary.rs`).
+
+### Complete, partial or missing
+
+Every section of the summary is a `Section<T>`:
+
+```rust
+pub struct Section<T> {
+    pub source: Source,             // complete, partial or missing
+    pub reason: Option<String>,     // who didn't answer, or what failed
+    pub coverage: Option<Coverage>, // answered of asked, for fanned-out reads
+    pub value: Option<T>,
+}
+```
+
+It's the same idea as `context`'s `Section` earlier in this chapter, with one
+difference that matters for counts. A list can be empty and still be
+honest. A count of zero can't: "0 apps down" and "couldn't ask" have to look
+different. So `value` is an `Option`, and it's `None` exactly when the source
+is `missing`. `Section::from_nodes` decides all three cases from how many
+nodes answered:
+
+```rust
+pub fn from_coverage(answered: u32, asked: u32) -> Self {
+    if answered >= asked {
+        Source::Complete
+    } else if answered == 0 {
+        Source::Missing
+    } else {
+        Source::Partial
+    }
+}
+```
+
+A node that didn't answer makes the section "partial (11 of 12 nodes)", with
+the node's name and the error in `reason`, never a silently smaller number. A
+scoped token gets the same treatment: it can see its own apps and jobs, but it
+can't vouch for the whole cluster's capacity, usage, logs or alerts, so those
+come back `missing` with "needs an unscoped token" rather than zeros.
+
+### Three reads, one assembly
+
+The answering node gathers three things at once with `tokio::join!`, each
+under a 700 ms deadline so the whole answer fits in the 1 s `status` has:
+
+- every node's **share** (`GET /v1/cluster/summary/node`): its version, its
+  instances counted per app, the newest log line it ingested, its newest
+  metrics sample, its fullest data disk, its faults, firing alerts and
+  certificate expiry. Small, and it doesn't grow with the cluster;
+- the **leader's view** (`GET /v1/cluster/summary/leader`): desired apps, the
+  committed capacity per node, whether an upgrade runs, GitOps and the job
+  runs. A worker outside Raft has an empty desired state, so it asks the
+  leader, the way `relish status` already asked for desired apps;
+- gossip's **member list**, down members included.
+
+Then `summary::assemble` turns them into the answer. It's a pure function, no
+I/O, so its tests are fixtures: a healthy three-node cluster, one node that
+timed out, no leader, a scoped token, a lagging voter, a standalone node.
+
+One snag there is worth a sentence. The first version wrapped
+`Section::from_nodes` in a closure, `let fanned = |value|
+Section::from_nodes(value, coverage, &reasons);`, and called it for every
+section. It didn't compile: a Rust closure isn't generic. Its argument type is
+inferred from the first call (`NodesSection`) and fixed from then on, so the
+call with an `AppsSection` was a type error. A generic `fn` would work; we
+just called `from_nodes` directly.
+
+### The gaps it filled
+
+Four numbers the plan wanted had nowhere to come from.
+
+**Gossip's counters.** "Last membership change 4 m ago, 18,442 updates
+received" says gossip is alive. Mustard owns its membership table outright:
+one task drives it through `&mut self`, so nothing else can read it in place.
+The counters are the exception, in `src/mustard/stats.rs`:
+
+```rust
+#[derive(Debug, Clone, Default)]
+pub struct GossipStats {
+    inner: Arc<Counters>,
+}
+
+struct Counters {
+    updates_received: AtomicU64,
+    last_change_unix_ms: AtomicU64,
+}
+```
+
+`Arc` shares one `Counters` between the gossip task and the API, and an
+`AtomicU64` can be changed through a shared reference: `fetch_add` and `store`
+take `&self`, not `&mut self`. That's Rust's interior mutability, the same
+trick `Mutex` plays, without the lock. The `Ordering::Relaxed` argument says
+these values don't order any other memory: nobody reads the counter and then
+expects to see something else the gossip task wrote. A `watch` channel would
+work too, but every received datagram would publish a value that wakes
+nobody. The atomic can't hold an `Option`, so zero stands for "no change yet",
+and the accessor turns it back into `None` before anything outside sees it.
+
+**The newest log line.** The log store already gave every line a sequence
+number: its ingest time in nanoseconds, bumped by one when two lines share a
+clock reading, kept in the ingest checkpoint across restarts. So
+`LogStore::newest_line_unix_ms` is a division. (The plan's other option, a
+canary line every minute read back through the query path, would prove more
+and cost a write per node per minute. We took the free one, decision D4.)
+
+**The newest metrics sample.** `MayoStore` keeps the latest unlabelled
+`node_*` sample per name as it inserts, a handful of entries, so the share
+reads CPU, memory and disk without running a DataFusion query.
+
+**GPUs.** The state report's `ResourceUsage` had a `gpu_used: u8` that
+`build_report` always set to 0, and the leader's scheduler cache hard-coded
+`gpus: 0` for every node. Now each instance's snapshot carries its spec's
+`gpu` request, the report sums them over active instances into a `u32`, and a
+new `gpu_total` carries the cards the node detected (when `[resources]
+gpu_enabled` is set). The scheduler cache reads both. That changes a postcard
+frame, so it rides 0.2.8's one protocol bump (58).
+`relish apply` still refuses a GPU request (#359), so nothing schedules
+differently yet; the counts are right for when it doesn't.
+
+The capacity numbers also get a route of their own, `GET
+/v1/cluster/capacity`, one row per node, which the wider `relish nodes` in
+0.2.8 reads for its `ALLOCATED` column.
+
+### The app rollup, once
+
+`agent context` had the rule for "is this app down, degraded or fine?" inline
+in its own module. The summary needs the same rule, and two copies would
+drift. It's now `summary::app_state(desired, running, nodes_unanswered,
+has_findings)`, and `context` calls it. The summary passes `has_findings:
+false`, because only a reader that ran `wtf`'s checks knows about findings;
+`relish status` adds them on its side.
+
+### At a hundred nodes
+
+The plan's budget is one second at 100 nodes and 1,000 apps. Our biggest real
+cluster is three VMs, so the test runs on the hollow-node harness from
+[Ready for Production](15-ready-for-production.md): a three-member council in
+one process and a hundred hollow nodes in another, each now serving the API
+so it can answer for its share. The test applies a thousand one-replica apps,
+waits until the summary sees every one running, then times five summaries
+through the council's API. On a laptop each took 20 to 22 ms and came to
+2.1 KB, with every section the test checks complete: the hundred shares,
+fetched 32 at a time, are the bulk of it. The test fails past one second, and
+past 8 KiB, because a summary that grows with the cluster has stopped being a
+summary.
+
+Giving hollow nodes an API was the one change the harness needed. Before,
+nothing could ask them anything over HTTP, so a fan-out to a hollow node
+failed fast and would have measured nothing.
+
+It's one of `make test-hollow`'s two tests, beside the twenty-node check
+([docs/testing.md](../testing.md)).
+
 ## Logs and the manual
 
 An agent chasing a crash loop wants two more things before it opens the

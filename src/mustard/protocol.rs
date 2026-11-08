@@ -245,6 +245,8 @@ pub struct MustardNode<T: MustardTransport> {
     /// Whether we've already said that our directory extension is too big
     /// to send, so the line appears once rather than on every datagram.
     oversize_extension_logged: bool,
+    /// Updates received and the last membership change, for the API.
+    stats: super::stats::GossipStats,
 }
 
 impl<T: MustardTransport> MustardNode<T> {
@@ -305,7 +307,13 @@ impl<T: MustardTransport> MustardNode<T> {
             pending_relays: VecDeque::new(),
             send_failures: SendFailureLog::default(),
             oversize_extension_logged: false,
+            stats: super::stats::GossipStats::default(),
         }
+    }
+
+    /// A handle on this node's gossip counters, which the API reads.
+    pub fn stats(&self) -> super::stats::GossipStats {
+        self.stats.clone()
     }
 
     /// Share the Smoker node-kill switch that also gates this node's
@@ -649,6 +657,7 @@ impl<T: MustardTransport> MustardNode<T> {
         let snapshot = self.membership.snapshot();
         let digest = membership_digest(&snapshot);
         if digest != self.last_published_digest {
+            self.stats.record_change(super::stats::now_unix_ms());
             if let Some(tx) = &self.membership_watch {
                 let _ = tx.send(snapshot);
             }
@@ -925,6 +934,7 @@ impl<T: MustardTransport> MustardNode<T> {
         }
 
         // Process piggybacked updates
+        self.stats.record_updates(message.payload.updates().len());
         for update in message.payload.updates() {
             let changed = self.membership.apply_update(update, now);
             if changed {
@@ -1843,6 +1853,34 @@ mod tests {
 
         // n2 should now know about n3
         assert!(node2.membership.get(&NodeId::new("n3")).is_some());
+    }
+
+    #[tokio::test]
+    async fn received_updates_are_counted_and_a_membership_change_is_stamped() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let t2 = net.register(addr(2)).await;
+        let node1 = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        let mut node2 = MustardNode::new(NodeId::new("n2"), addr(2), fast_config(), t2);
+        let stats = node2.stats();
+        node2.publish_membership();
+        let first_change = stats.last_change_unix_ms();
+        assert!(first_change.is_some(), "joining is the first change");
+
+        let updates = vec![MembershipUpdate {
+            node_id: NodeId::new("n3"),
+            address: addr(3),
+            state: NodeState::Alive,
+            incarnation: 1,
+        }];
+        let ping = GossipMessage::new(NodeId::new("n1"), 1, GossipPayload::Ping { updates });
+        node1.transport.send(addr(2), &ping).await.unwrap();
+        let (from, message) = node2.transport.recv().await.unwrap();
+        node2.handle_message(from, message).await;
+        node2.publish_membership();
+
+        assert_eq!(stats.updates_received(), 1);
+        assert!(stats.last_change_unix_ms() >= first_change);
     }
 
     #[tokio::test(start_paused = true)]
