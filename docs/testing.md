@@ -1048,7 +1048,8 @@ a reviewer sees every new concept as a diff. Under budget, it asks for the
 budget to come down to the new count, so it ratchets. An empty `reason`
 fails too.
 
-`relish agent guide` has a byte budget of its own, 64 KiB, held by
+`relish agent guide` has a byte budget of its own, 80 KiB (raised from
+64 KiB by the maintainer on 8 November 2026), held by
 `the_agent_chapter_fits_the_guides_default_budget` in
 `src/relish/agent/guide.rs`.
 
