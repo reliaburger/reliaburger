@@ -890,7 +890,7 @@ It uses the same connection as every other `relish` command: `--endpoint`,
 `--token`, `--ca-cert`, their environment variables, or the saved local
 context. Put the flags before `mcp`, as in `relish --token "$TOKEN" mcp`.
 Give it a read-only token; `bun` decides what the token may read, and the
-server can't get round that.
+server can't get round that. Started with an admin token, it warns on stderr.
 
 Every `relish agent` command that only reads becomes a tool, named after it
 with `_` between the words: `version`, `schema`, `source_version`,

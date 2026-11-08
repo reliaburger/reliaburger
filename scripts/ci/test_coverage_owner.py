@@ -42,7 +42,7 @@ class Owner(unittest.TestCase):
         versions = {
             'cargo': 'cargo 1.98.0 (synthetic)\ncommit-hash: ' + 'a' * 40 + '\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.0',
             'rustc': 'rustc 1.98.0 (synthetic)\ncommit-hash: ' + 'a' * 40 + '\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.0\nLLVM version: 22',
-            'nextest': 'cargo-nextest 0.9.145',
+            'nextest': 'cargo-nextest 0.9.151',
             'coverage': 'cargo-llvm-cov 0.9.1',
         }
         self.versions = versions

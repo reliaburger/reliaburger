@@ -1937,6 +1937,30 @@ ignore list. The bundle carries no `.gitignore` (it's not in the build, test
 or read set), so without that second line the first build would put 10 GiB of
 `target/` into every diff.
 
+That one write cost us three flakes (#1726, #1738, #1748), all seen under
+load in a full `make ci` and never alone. One `git add` died with "cannot use
+.git/info/exclude as an exclude file", and once `git status` listed
+`.reliaburger-patch/` as untracked. The cause wasn't in our code but in
+`git init`. It copies a *template directory* into every new `.git`, and
+`init.templateDir` lets a user name their own. The maintainer's template held
+`info/exclude` as a symbolic link into a dotfiles repository, and git copies a
+link as a link. So every workspace's exclude file was the *same* file, and
+`std::fs::write`, which follows links, truncated and rewrote it from every
+test process at once. Git reading it mid-write saw a short file (the fatal
+error) or an empty one (no ignore rules). The dotfile had grown to 487 copies
+of our two lines and lost its own.
+
+The fix is two lines of defence. `extract` runs `git init --template=`, an
+empty template, so a workspace gets neither the user's exclude file nor their
+hooks (which here started a background `ctags` on every checkout and commit).
+And `ignore_patch_files` adds only the lines that are missing, writes them to
+a temporary file next to the exclude file and renames it into place. A
+rename replaces a symbolic link rather than following it, and a reader sees
+the old file or the new one, never half of one. The lesson: anything a
+process inherits (the environment, global config, templates) is shared state
+between test processes, so a test workspace should take as little of it as
+it can.
+
 The state `build`, `test` and `try` leave behind goes in
 `.reliaburger-patch/state.json`: the base commit, the last build per
 platform, the last twenty test runs, and the throwaway cluster if there is
@@ -3460,6 +3484,74 @@ because the client reads every byte there as protocol. rmcp logs through the
 `tracing` crate, which prints nothing unless a program installs a
 subscriber, and we never do; our own diagnostics already go to stderr. The
 integration test fails if any stdout line isn't JSON-RPC.
+
+### Saying so when the token is admin
+
+The bundle from #1695 asks for nothing, so out of the box it runs with the
+saved local context, and `relish setup` saves the cluster's admin token
+there. The maintainer's decision, option (d) on #1695, is to warn now and
+mint a read-only token for the agent next (#1730). The warning is the
+first half. When `relish mcp` starts with an admin token, it prints one line
+on stderr, the only place it may, saying the agent's connection carries admin
+credentials, giving the `relish token create --role read-only` command, and
+naming where the new token goes: the bundle's token setting, or
+`RELIABURGER_TOKEN` in the agent's MCP entry. The bundle's
+`long_description` carries the same advice in one line.
+
+How does `relish` know a token's role? There's no "who am I" route, and we
+didn't add one for this. Two cases are known without asking. With no
+`--token` and no `RELIABURGER_TOKEN`, the token is the context's, and that's
+admin by construction. With an `--endpoint` and no token there's no token at
+all. `client::token_origin()` sorts these out from the flags, the environment
+and the context file, and never touches the network:
+
+```rust
+pub enum TokenOrigin {
+    Explicit,
+    ContextAdmin,
+    Absent,
+}
+```
+
+Only an `Explicit` token needs the cluster's word, and there's a route that
+gives it for free: `GET /v1/token/list` is admin-only and changes nothing.
+2xx means admin, 403 a valid token with a lesser role, 401 one the cluster
+rejects. `BunClient::token_access` turns those into a `TokenAccess`, and the
+decision itself is a small function that takes the probe as a future:
+
+```rust
+pub async fn admin_warning(
+    origin: TokenOrigin,
+    probe: impl std::future::Future<Output = Option<TokenAccess>>,
+) -> Option<&'static str> {
+    let admin = match origin {
+        TokenOrigin::ContextAdmin => true,
+        TokenOrigin::Explicit => probe.await == Some(TokenAccess::Admin),
+        TokenOrigin::Absent => false,
+    };
+    admin.then_some(ADMIN_TOKEN_WARNING)
+}
+```
+
+`impl Future<Output = …>` in argument position means "any type that is a
+future producing this", chosen by the caller, much like a generic. Rust
+futures are lazy: building one runs nothing, and only `.await` drives it. So
+for the context and for no token the probe is built and dropped without a
+byte sent, and a unit test proves it by passing `std::future::pending()`, a
+future that never finishes, under a timeout. `bool::then_some` turns `true`
+into `Some(value)` and `false` into `None`.
+
+The probe mustn't slow the server down: an MCP client that waits too long for
+`initialize` gives up. So `run` hands it to `tokio::spawn` before serving, with
+a two-second `tokio::time::timeout` round the request, and awaits the
+`JoinHandle` only after the client hangs up, so even a short session gets its
+warning. Inside, `.ok()?` turns the timeout's `Result` into an `Option` and
+returns `None` early, the async block's answer for "don't know", and unknown
+stays quiet. Three tests in `tests/suite/relish_mcp.rs` run the real binary:
+an admin token against a stand-in API prints the warning exactly once on
+stderr, a read-only token prints nothing, and a context whose endpoint has
+nothing behind it still warns. All three check that every stdout line parses
+as JSON-RPC.
 
 ### The tests
 

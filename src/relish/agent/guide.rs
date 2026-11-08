@@ -104,6 +104,14 @@ pub const MCPB_ENTRY_POINT: &str = "server/relish";
 pub const READ_ONLY_TOKEN_COMMAND: &str =
     "relish token create --name agent --role read-only --ttl-days 1";
 
+/// The bundle description's one line on credentials (#1695, decision (d)):
+/// with the token setting empty, the bundle uses the current context, which
+/// may hold an admin token.
+pub const MCPB_ADMIN_ADVICE: &str = "With the token setting empty, relish uses its current \
+context, which may hold an admin token, and warns on stderr when it does; make a read-only \
+token with `relish token create --name agent --role read-only --ttl-days 1` and put it in \
+the token setting.";
+
 /// `relish mcp`'s name in the MCP Registry. The `io.github.reliaburger`
 /// namespace is the one a GitHub login to the organisation proves.
 pub const MCP_REGISTRY_NAME: &str = "io.github.reliaburger/relish";
@@ -982,6 +990,7 @@ fn mcpb_manifest_json(agent: &Command, version: &str) -> String {
         "display_name": "Reliaburger relish",
         "version": version,
         "description": MCP_DESCRIPTION,
+        "long_description": format!("{MCP_DESCRIPTION}\n\n{MCPB_ADMIN_ADVICE}"),
         "author": {"name": AUTHOR, "url": SITE},
         "repository": {"type": "git", "url": REPOSITORY},
         "homepage": format!("{SITE}/agents"),
@@ -1822,6 +1831,21 @@ Intro paragraph.\n\n## In brief\n\n\
                 "RELIABURGER_TOKEN": "${user_config.token}",
             })
         );
+    }
+
+    /// #1695, decision (d): an unconfigured bundle uses the current context,
+    /// which may hold an admin token, so the bundle's description says so in
+    /// one line and says how to make a read-only one instead.
+    #[test]
+    fn the_bundle_description_warns_that_an_empty_token_may_mean_admin() {
+        let value: serde_json::Value =
+            serde_json::from_str(&artefact(paths::MCPB_MANIFEST)).unwrap();
+        let long = value["long_description"].as_str().unwrap();
+        let advice = long.lines().last().unwrap();
+        assert!(advice.contains("admin"), "{advice}");
+        assert!(advice.contains(READ_ONLY_TOKEN_COMMAND), "{advice}");
+        assert!(advice.contains("token setting"), "{advice}");
+        assert!(long.starts_with(MCP_DESCRIPTION), "{long}");
     }
 
     #[test]
