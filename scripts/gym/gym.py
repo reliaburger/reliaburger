@@ -20,6 +20,9 @@ Subcommands:
   compare --out FILE RESULTS...
                               the comparison record (#1679): one table per
                               scenario, every solver on both platforms side by side
+  user --out DIR              test `relish gym run` (#1683) on a fresh local
+                              cluster: the baseline over every scenario, then a
+                              Ctrl-C mid-run, checking nothing is left behind
 
 `make test-gym` runs every scenario once with the scripted baseline. The
 0.2.7 exit test (#1093) runs `--solver command:...` with a real agent.
@@ -44,6 +47,7 @@ import scenario as scenario_module
 import score as score_module
 import shim
 import solvers
+import user_gym
 
 DEFAULT_PORT_BASE = 29400
 DEFAULT_TIMEOUT = 1800
@@ -431,6 +435,16 @@ def command_compare(args):
     return 0
 
 
+def command_user(args):
+    binaries = _binaries(args)
+    out = Path(args.out).resolve()
+    if out.exists() and any(out.iterdir()):
+        raise SystemExit(f"{out} isn't empty: name a new directory")
+    code, record_ = user_gym.run(binaries, out, args.port_base)
+    print(json.dumps(record_, indent=2))
+    return code
+
+
 def command_score(args):
     print(json.dumps(rescore(args.run_dir), indent=2))
     return 0
@@ -487,6 +501,13 @@ def main(argv=None):
     compare = sub.add_parser("compare", help="write the comparison record from results.json files")
     compare.add_argument("--out", required=True, help="the Markdown record to write")
     compare.add_argument("results", nargs="+", help="results.json files or the directories holding them")
+    user = sub.add_parser("user", help="test `relish gym run` on a fresh local cluster")
+    user.add_argument("--out", required=True, help="a new directory for the reports")
+    user.add_argument("--port-base", type=int, default=DEFAULT_PORT_BASE,
+                      help=f"first port of the cluster's block (default {DEFAULT_PORT_BASE})")
+    user.add_argument("--relish")
+    user.add_argument("--bun")
+    user.add_argument("--testapp")
     args = parser.parse_args(argv)
     if args.command == "run" and args.plant_target_dir is None:
         base = os.environ.get("CARGO_TARGET_DIR", str(scenario_module.GYM_DIR.parent.parent / "target"))
@@ -499,6 +520,7 @@ def main(argv=None):
         "score": command_score,
         "fixture": command_fixture,
         "compare": command_compare,
+        "user": command_user,
     }
     return commands[args.command](args)
 

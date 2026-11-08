@@ -161,7 +161,7 @@ pub const GROUPS: &[CommandGroup] = &[
             label: "chaos",
             path: "docs/manual/05_chaos.md",
         }],
-        commands: &["fault"],
+        commands: &["fault", "gym"],
     },
     CommandGroup {
         title: "Security and access",

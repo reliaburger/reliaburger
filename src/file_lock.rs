@@ -88,7 +88,7 @@ impl FileLock {
         loop {
             match file.try_lock() {
                 Ok(()) => return Ok(Self { file }),
-                Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                Err(std::fs::TryLockError::WouldBlock) if before(Instant::now(), deadline) => {
                     std::thread::sleep(RETRY_INTERVAL);
                 }
                 Err(std::fs::TryLockError::WouldBlock) => return Err(FileLockError::Busy),
@@ -126,11 +126,7 @@ impl FileLock {
     /// and retries against a fresh one.
     pub fn remove(self, path: &std::path::Path) -> io::Result<()> {
         if self.still_names(path)? {
-            match std::fs::remove_file(path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
+            remove_if_present(path)?;
         }
         drop(self);
         Ok(())
@@ -143,6 +139,28 @@ impl Drop for FileLock {
         // Nothing useful can be done with a failed unlock: closing the
         // descriptor straight after still releases the lock eventually.
         let _ = self.file.unlock();
+    }
+}
+
+/// Whether `now` is still before `deadline`. A wait that reaches its
+/// deadline exactly has used all its time and gives up.
+///
+/// Separate from [`FileLock::lock_within`] so a test can pin the boundary
+/// with instants it chooses rather than racing the clock.
+fn before(now: Instant, deadline: Instant) -> bool {
+    now < deadline
+}
+
+/// Delete the file at `path`, treating one that is already gone as deleted.
+///
+/// Separate from [`FileLock::remove`] because the file vanishing between its
+/// [`FileLock::still_names`] check and the delete is a race no test can
+/// arrange on demand.
+fn remove_if_present(path: &std::path::Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -274,6 +292,31 @@ mod tests {
         });
         let _taken = FileLock::lock_within(open(&path), Duration::from_secs(5)).unwrap();
         releaser.join().unwrap();
+    }
+
+    #[test]
+    fn a_wait_has_time_left_only_before_its_deadline() {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        assert!(before(deadline - Duration::from_nanos(1), deadline));
+        assert!(!before(deadline, deadline));
+        assert!(!before(deadline + Duration::from_nanos(1), deadline));
+    }
+
+    #[test]
+    fn removing_a_lock_file_that_is_already_gone_succeeds() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("gone.lock");
+        remove_if_present(&path).unwrap();
+    }
+
+    #[test]
+    fn removing_a_lock_file_reports_errors_other_than_not_found() {
+        let directory = tempfile::tempdir().unwrap();
+        // A regular file where a directory should be: ENOTDIR on every Unix.
+        let parent = directory.path().join("not-a-directory");
+        std::fs::write(&parent, b"").unwrap();
+        let error = remove_if_present(&parent.join("held.lock")).unwrap_err();
+        assert_ne!(error.kind(), io::ErrorKind::NotFound);
     }
 
     #[test]

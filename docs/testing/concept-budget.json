@@ -4,15 +4,15 @@
     "reason": "Measured on 8 November 2026 (#1681): app, job, namespace, permission, policy, build, template and use"
   },
   "commands": {
-    "budget": 179,
-    "reason": "Measured on 8 November 2026 (#1681): every relish command and subcommand at every depth, none of them hidden; 169 from #1686, which adds leases between agents: `relish lease` (list, take, renew, release, break) for people and `relish agent lease` (take, renew, release) for agents, as the 0.2.8 design specifies; 179 from #1682's proposals: `relish proposal` (list, show, approve, reject) and `relish undo` for people, and `relish agent propose`, `proposals`, `withdraw` and `undo` for agents, as the design specifies (propose takes the kind as an argument rather than five subcommands, to keep the count down)"
+    "budget": 184,
+    "reason": "Measured on 8 November 2026 (#1681) at 159: every relish command and subcommand at every depth, none of them hidden. Raised by 5 for #1683: `relish gym`, `gym run` and `gym list`, plus the hidden `gym record` and `gym baseline` that `gym run` starts for the solver. Raised by 10 for #1686, which adds leases between agents: `relish lease` (list, take, renew, release, break) for people and `relish agent lease` (take, renew, release) for agents, as the 0.2.8 design specifies. Raised by 10 for #1682's proposals: `relish proposal` (list, show, approve, reject) and `relish undo` for people, and `relish agent propose`, `proposals`, `withdraw` and `undo` for agents, as the design specifies (propose takes the kind as an argument rather than five subcommands, to keep the count down)"
   },
   "flags": {
-    "budget": 408,
-    "reason": "Measured on 8 November 2026 (#1681): named flags on every command, global ones once; 389 from #1686's lease commands (the target's --namespace, --purpose, --ttl/--for and --wait); 402 from #1682: `--yes` on `relish proposal approve` and `relish undo`, `--reason` on reject, `relish agent propose`'s --replicas, --namespace, --reason, --ttl, --idempotency-key and --dry-run, `relish agent undo`'s --reason and --ttl, and `relish token create`'s --agent and --ttl; 408 from #1686's enforcement half: --break-lease on apply, deploy, stop, delete, rollback and release"
+    "budget": 418,
+    "reason": "Measured on 8 November 2026 (#1681) at 375: named flags on every command, global ones once. Raised by 10 for #1683: `relish gym run`'s nine flags (the staging namespace, solver, scenarios, runs, timeout, output directory, image and the two consents) and `gym record`'s --log. Raised by 14 for #1686's lease commands (the target's --namespace, --purpose, --ttl/--for and --wait). Raised by 13 for #1682: `--yes` on `relish proposal approve` and `relish undo`, `--reason` on reject, `relish agent propose`'s --replicas, --namespace, --reason, --ttl, --idempotency-key and --dry-run, `relish agent undo`'s --reason and --ttl, and `relish token create`'s --agent and --ttl. Raised by 6 for #1686's enforcement half: --break-lease on apply, deploy, stop, delete, rollback and release"
   },
   "distinct_flags": {
-    "budget": 174,
-    "reason": "Measured on 8 November 2026 (#1681): distinct flag names across all commands; 171 from #1686: --purpose, and --for on `relish lease take` as the design's human story writes it; 173 from #1682: --agent (an agent token) and --idempotency-key (a retried proposal returns the one already made); 174 from #1686: --break-lease, a person taking over an agent's lease, as the design specifies"
+    "budget": 178,
+    "reason": "Measured on 8 November 2026 (#1681) at 169: distinct flag names across all commands. Raised by 4 for #1683: new flag names on `relish gym run` and `gym record`. Raised by 2 for #1686: --purpose, and --for on `relish lease take` as the design's human story writes it. Raised by 2 for #1682: --agent (an agent token) and --idempotency-key (a retried proposal returns the one already made). Raised by 1 for #1686: --break-lease, a person taking over an agent's lease, as the design specifies"
   }
 }
