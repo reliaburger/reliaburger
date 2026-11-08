@@ -10,7 +10,7 @@ The flags, variables, files and ports you'll reach for. `relish help COMMAND`
 | `--endpoint URL` | `RELIABURGER_ENDPOINT` | Bun API to talk to |
 | `--token TOKEN` | `RELIABURGER_TOKEN` | API bearer token |
 | `--ca-cert PATH` | `RELIABURGER_CA_CERT` | cluster root CA; switches the default to HTTPS |
-| `-o`, `--output FORMAT` | | `human` (default), `json` or `yaml`; every command takes it except the six interactive ones ([machine output](#machine-output)) |
+| `-o`, `--output FORMAT` | | `human` (default), `json` or `yaml`; every command takes it except the eight interactive ones ([machine output](#machine-output)) |
 
 A flag beats its variable. With neither, `relish` uses the laptop cluster's
 saved context, then `http://127.0.0.1:9117`.
@@ -97,10 +97,11 @@ would the token. Everything else names where a secret is (`init`'s
 `master_key`, `sign keygen`'s `path`), never the secret itself, and `secret
 encrypt` never echoes the plaintext.
 
-Six commands refuse `-o json`, exit `2` and say they're interactive: `tui`,
-`dashboard`, `manual` (the reader and `--web`), `source`, the guided `setup`
-and `dev shell`. They take over the terminal or a browser, or ask their questions as
-they go, so there's nothing to print as data. Bare `relish -o json` is
+Eight commands refuse `-o json`, exit `2` and say they're interactive: `tui`,
+`dashboard`, `manual` (the reader and `--web`), `source`, the guided `setup`,
+`dev shell`, `machines claim` and `netboot`. They take over the terminal or a
+browser, ask their questions as they go, or serve until stopped, so there's
+nothing to print as data. Bare `relish -o json` is
 `relish -o json tui`, so it refuses too. `setup --quickstart` and `setup
 --ssh` aren't among them: they never ask, so they print what they built, and
 an agent that ran them can quote it. `exec` isn't one of them either: it runs a

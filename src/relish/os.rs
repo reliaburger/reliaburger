@@ -2,13 +2,18 @@
 //! runs, the newest release, and the rollout the leader runs to move the
 //! fleet to a version (`crate::os::rollout`).
 
+use std::fmt;
+
+use serde::Serialize;
+
 use crate::os::rollout::{OsNodePhase, OsRollout, OsRolloutPhase, OsUpdateState};
 use crate::relish::RelishError;
 use crate::relish::client::BunClient;
 use crate::relish::image::ChannelTrust;
+use crate::relish::output::{OutputFormat, print_output, progress};
 
 /// One node's OS, as `relish os list` shows it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct NodeOs {
     pub node_id: String,
     /// `None` if the node isn't an appliance or didn't answer.
@@ -85,6 +90,69 @@ pub fn render_list(newest: Option<&str>, nodes: &[NodeOs]) -> String {
     out
 }
 
+/// What `relish os list` answers: the newest release and each node.
+#[derive(Debug, Clone, Serialize)]
+pub struct OsList {
+    /// `None` if the channel couldn't be read.
+    pub newest: Option<String>,
+    pub nodes: Vec<NodeOs>,
+}
+
+impl fmt::Display for OsList {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&render_list(self.newest.as_deref(), &self.nodes))
+    }
+}
+
+/// One rollout as `relish os upgrade` and `resume` answer it: the
+/// rollout's own record as data, the table for people.
+#[derive(Debug, Clone, Serialize)]
+#[serde(transparent)]
+pub struct RolloutReport(pub OsRollout);
+
+impl fmt::Display for RolloutReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&render_rollout(&self.0))
+    }
+}
+
+/// What `relish os status` answers: the rollout in progress, and the last
+/// one that finished.
+#[derive(Debug, Clone, Serialize)]
+pub struct OsStatus {
+    pub active: Option<OsRollout>,
+    pub last: Option<OsRollout>,
+}
+
+impl fmt::Display for OsStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (&self.active, &self.last) {
+            (Some(rollout), _) => f.write_str(&render_rollout(rollout)),
+            (None, Some(last)) => {
+                writeln!(f, "No OS rollout in progress. The last one:\n")?;
+                f.write_str(&render_rollout(last))
+            }
+            (None, None) => writeln!(f, "No OS rollout in progress, and none has run."),
+        }
+    }
+}
+
+/// What `relish os abort` answers: the rollout it stopped.
+#[derive(Debug, Clone, Serialize)]
+pub struct Aborted {
+    pub aborted: String,
+}
+
+impl fmt::Display for Aborted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "Aborted OS rollout {}. Nodes keep the version they're on.",
+            self.aborted
+        )
+    }
+}
+
 /// A rollout, as `relish os status` shows it.
 pub fn render_rollout(rollout: &OsRollout) -> String {
     let phase = match &rollout.phase {
@@ -119,7 +187,11 @@ pub fn render_rollout(rollout: &OsRollout) -> String {
 }
 
 /// `relish os list`.
-pub async fn list(channel_url: &str, trust: &ChannelTrust) -> Result<(), RelishError> {
+pub async fn list(
+    channel_url: &str,
+    trust: &ChannelTrust,
+    output: OutputFormat,
+) -> Result<(), RelishError> {
     let newest = match newest(channel_url, trust).await {
         Ok(version) => Some(version),
         Err(error) => {
@@ -128,8 +200,7 @@ pub async fn list(channel_url: &str, trust: &ChannelTrust) -> Result<(), RelishE
         }
     };
     let nodes = node_versions(&BunClient::default_local()).await?;
-    print!("{}", render_list(newest.as_deref(), &nodes));
-    Ok(())
+    print_output(&OsList { newest, nodes }, output)
 }
 
 /// `relish os upgrade [VERSION]`: the newest release unless named. Only
@@ -140,6 +211,7 @@ pub async fn upgrade(
     channel_url: &str,
     trust: &ChannelTrust,
     allow_downgrade: bool,
+    output: OutputFormat,
 ) -> Result<(), RelishError> {
     let version = match version {
         Some(version) => version,
@@ -150,46 +222,47 @@ pub async fn upgrade(
         .await?;
     let rollout: OsRollout =
         serde_json::from_value(answer).map_err(|e| failed(&format!("the answer: {e}")))?;
-    print!("{}", render_rollout(&rollout));
-    println!("\nFollow it with `relish os status`.");
+    print_output(&RolloutReport(rollout), output)?;
+    progress(output, "\nFollow it with `relish os status`.");
     Ok(())
 }
 
 /// `relish os status`.
-pub async fn status() -> Result<(), RelishError> {
+pub async fn status(output: OutputFormat) -> Result<(), RelishError> {
     let answer = BunClient::default_local().os_rollout().await?;
     let active: Option<OsRollout> = serde_json::from_value(answer["active"].clone())
         .map_err(|e| failed(&format!("the answer: {e}")))?;
     let history: Vec<OsRollout> =
         serde_json::from_value(answer["history"].clone()).unwrap_or_default();
-    match (active, history.last()) {
-        (Some(rollout), _) => print!("{}", render_rollout(&rollout)),
-        (None, Some(last)) => {
-            println!("No OS rollout in progress. The last one:\n");
-            print!("{}", render_rollout(last));
-        }
-        (None, None) => println!("No OS rollout in progress, and none has run."),
-    }
-    Ok(())
+    print_output(
+        &OsStatus {
+            active,
+            last: history.into_iter().last(),
+        },
+        output,
+    )
 }
 
 /// `relish os resume`.
-pub async fn resume() -> Result<(), RelishError> {
+pub async fn resume(output: OutputFormat) -> Result<(), RelishError> {
     let answer = BunClient::default_local().os_rollout_resume().await?;
     let rollout: OsRollout =
         serde_json::from_value(answer).map_err(|e| failed(&format!("the answer: {e}")))?;
-    print!("{}", render_rollout(&rollout));
-    Ok(())
+    print_output(&RolloutReport(rollout), output)
 }
 
 /// `relish os abort`.
-pub async fn abort() -> Result<(), RelishError> {
+pub async fn abort(output: OutputFormat) -> Result<(), RelishError> {
     let answer = BunClient::default_local().os_rollout_abort().await?;
-    println!(
-        "Aborted OS rollout {}. Nodes keep the version they're on.",
-        answer["aborted"].as_str().unwrap_or("?")
-    );
-    Ok(())
+    let aborted = answer["aborted"]
+        .as_str()
+        .ok_or_else(|| failed("the answer names no rollout"))?;
+    print_output(
+        &Aborted {
+            aborted: aborted.to_string(),
+        },
+        output,
+    )
 }
 
 fn failed(message: &str) -> RelishError {
@@ -234,6 +307,67 @@ mod tests {
              home-2               2026.41.0    update available\n\
              home-3               2026.41.0    staging 2026.42.0\n\
              laptop               -            not an appliance, or not answering\n"
+        );
+    }
+
+    #[test]
+    fn the_list_as_data_keeps_each_nodes_update() {
+        let list = OsList {
+            newest: None,
+            nodes: vec![NodeOs {
+                node_id: "home-3".into(),
+                version: Some("2026.41.0".into()),
+                update: OsUpdateState::Staging {
+                    target: "2026.42.0".into(),
+                },
+            }],
+        };
+        let json = serde_json::to_value(&list).unwrap();
+        assert_eq!(json["newest"], serde_json::Value::Null);
+        assert_eq!(json["nodes"][0]["node_id"], "home-3");
+        assert_eq!(json["nodes"][0]["version"], "2026.41.0");
+        assert_eq!(
+            json["nodes"][0]["update"],
+            serde_json::to_value(&list.nodes[0].update).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_status_with_no_rollout_is_two_nulls_as_data_and_a_sentence_for_people() {
+        let status = OsStatus {
+            active: None,
+            last: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&status).unwrap(),
+            serde_json::json!({"active": null, "last": null})
+        );
+        assert_eq!(
+            status.to_string(),
+            "No OS rollout in progress, and none has run.\n"
+        );
+    }
+
+    #[test]
+    fn a_rollout_report_is_the_rollouts_own_record() {
+        let rollout = crate::os::rollout::plan(
+            "os-1",
+            "2026.42.0",
+            "https://example/os-channel.json",
+            "home-1",
+            vec![("home-1".into(), "a".into(), true, "2026.41.0".into())],
+            0,
+        );
+        assert_eq!(
+            serde_json::to_value(RolloutReport(rollout.clone())).unwrap(),
+            serde_json::to_value(&rollout).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(Aborted {
+                aborted: "os-1".into()
+            })
+            .unwrap(),
+            serde_json::json!({"aborted": "os-1"})
         );
     }
 

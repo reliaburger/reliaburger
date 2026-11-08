@@ -3094,6 +3094,7 @@ async fn main() -> ExitCode {
                         reliaburger::relish::quickstart::security::root_backup_keys_in(&state_root),
                 },
                 yes,
+                cli.output,
             ),
         },
         Command::Image { action } => match action {
@@ -3106,12 +3107,15 @@ async fn main() -> ExitCode {
             } => match reliaburger::relish::image::ChannelTrust::from_key_file(key.as_deref()) {
                 Err(error) => Err(error),
                 Ok(trust) => {
-                    reliaburger::relish::image::download(&channel, &arches, &dir, all, &trust).await
+                    reliaburger::relish::image::download(
+                        &channel, &arches, &dir, all, &trust, cli.output,
+                    )
+                    .await
                 }
             },
             ImageAction::Write { image, device, yes } => {
-                reliaburger::relish::image::write(&image, &device, yes).map(|bytes| {
-                    println!("wrote {} MB to {}", bytes / 1_000_000, device.display());
+                reliaburger::relish::image::write(&image, &device, yes).and_then(|written| {
+                    reliaburger::relish::output::print_output(&written, cli.output)
                 })
             }
             ImageAction::Delete { reference } => {
@@ -3130,6 +3134,7 @@ async fn main() -> ExitCode {
                         &machines,
                         std::time::Duration::from_secs(ttl),
                         ssh_key,
+                        cli.output,
                     )
                     .await
                 }
@@ -3137,7 +3142,12 @@ async fn main() -> ExitCode {
         },
         Command::Machines { action, wait } => match action {
             None => reliaburger::relish::machines::browse(std::time::Duration::from_secs(wait))
-                .map(|machines| print!("{}", reliaburger::relish::machines::render(&machines))),
+                .and_then(|machines| {
+                    reliaburger::relish::output::print_output(
+                        &reliaburger::relish::machines::MachineList(machines),
+                        cli.output,
+                    )
+                }),
             Some(MachinesAction::Claim {
                 directory,
                 create,
@@ -3207,7 +3217,7 @@ async fn main() -> ExitCode {
             OsAction::List { channel, key } => {
                 match reliaburger::relish::image::ChannelTrust::from_key_file(key.as_deref()) {
                     Err(error) => Err(error),
-                    Ok(trust) => reliaburger::relish::os::list(&channel, &trust).await,
+                    Ok(trust) => reliaburger::relish::os::list(&channel, &trust, cli.output).await,
                 }
             }
             OsAction::Upgrade {
@@ -3218,13 +3228,19 @@ async fn main() -> ExitCode {
             } => match reliaburger::relish::image::ChannelTrust::from_key_file(key.as_deref()) {
                 Err(error) => Err(error),
                 Ok(trust) => {
-                    reliaburger::relish::os::upgrade(version, &channel, &trust, allow_downgrade)
-                        .await
+                    reliaburger::relish::os::upgrade(
+                        version,
+                        &channel,
+                        &trust,
+                        allow_downgrade,
+                        cli.output,
+                    )
+                    .await
                 }
             },
-            OsAction::Status => reliaburger::relish::os::status().await,
-            OsAction::Resume => reliaburger::relish::os::resume().await,
-            OsAction::Abort => reliaburger::relish::os::abort().await,
+            OsAction::Status => reliaburger::relish::os::status(cli.output).await,
+            OsAction::Resume => reliaburger::relish::os::resume(cli.output).await,
+            OsAction::Abort => reliaburger::relish::os::abort(cli.output).await,
         },
         Command::JoinToken { action } => match &action {
             JoinTokenAction::List => commands::join_token_list().await,
@@ -3634,9 +3650,6 @@ fn output_refusal(command: &Command, output: OutputFormat) -> Option<String> {
         OutputSupport::Interactive => Some(format!(
             "this command is interactive, so it has no {format} output; drop --output (or -o)"
         )),
-        OutputSupport::Pending => Some(format!(
-            "this command has no {format} output yet; drop --output (or -o)"
-        )),
     }
 }
 
@@ -3648,8 +3661,6 @@ enum OutputSupport {
     /// It takes over the terminal or a browser, or asks its questions as it
     /// goes, so there's no result to print as data.
     Interactive,
-    /// It doesn't print JSON yet, but should (#1709).
-    Pending,
 }
 
 /// Whether `command` prints JSON and YAML when asked. Every command is
@@ -3657,7 +3668,7 @@ enum OutputSupport {
 /// `every_command_prints_json_unless_listed_as_an_exception` holds the
 /// exceptions to a written list.
 fn output_support(command: &Command) -> OutputSupport {
-    use OutputSupport::{Interactive, Pending, Structured};
+    use OutputSupport::{Interactive, Structured};
     match command {
         // `manual examples` writes files; the rest is the reader, or the
         // browser with `--web`.
@@ -3671,6 +3682,13 @@ fn output_support(command: &Command) -> OutputSupport {
         // `--quickstart` and `--ssh` never ask anything, so an agent can run
         // them and quote what they built; the guided setup asks as it goes.
         Command::Setup(options) if options.quickstart || options.ssh.is_some() => Structured,
+        // A claim waits for a person to compare each machine's claim key
+        // with its console; netboot serves installs until it's stopped.
+        Command::Machines {
+            action: Some(MachinesAction::Claim { .. }),
+            ..
+        }
+        | Command::Netboot { .. } => Interactive,
         Command::Tui
         | Command::Dashboard { .. }
         | Command::Manual { .. }
@@ -3734,18 +3752,11 @@ fn output_support(command: &Command) -> OutputSupport {
         | Command::JoinToken { .. }
         | Command::Sign { .. }
         | Command::Dev { .. }
-        | Command::Uninstall { .. } => Structured,
-        // The same as `relish images delete`.
-        Command::Image {
-            action: ImageAction::Delete { .. },
-        } => Structured,
-        // TODO(#1709): the appliance commands predate the rule that every
-        // command prints JSON.
-        Command::Cluster { .. }
+        | Command::Uninstall { .. }
+        | Command::Cluster { .. }
         | Command::Image { .. }
         | Command::Machines { .. }
-        | Command::Netboot { .. }
-        | Command::Os { .. } => Pending,
+        | Command::Os { .. } => Structured,
         #[cfg(feature = "kubernetes")]
         Command::Import { .. } | Command::Export { .. } => Structured,
     }
@@ -5681,19 +5692,11 @@ mod tests {
         "setup",
         // A login shell on a VM.
         "dev shell",
-        // TODO(#1709): the appliance commands, until they print JSON.
-        "cluster create",
-        "image download",
-        "image write",
-        "image seed",
-        "machines",
+        // Compares each machine's claim key with its console, one
+        // question at a time.
         "machines claim",
+        // Serves installs until it's stopped.
         "netboot",
-        "os list",
-        "os upgrade",
-        "os status",
-        "os resume",
-        "os abort",
     ];
 
     /// The rule behind `output_support`: every command prints JSON unless
