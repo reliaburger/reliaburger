@@ -882,7 +882,7 @@ commands for that:
 
 | Command | Answers |
 |---|---|
-| `context` | `wtf`'s findings in one line each, what it couldn't see, faults, alerts, one line per app, the newest events |
+| `context` | `wtf`'s findings in one line each, what it couldn't see, faults, alerts, one line per app, the newest events (from 0.2.8, `relish status`'s screen in place of the faults, alerts and apps) |
 | `diagnose [--app APP]` | Every finding with its evidence, read-only next steps, and pointers into the manual and the source |
 | `explain [ID]` | What a finding means, the numbers that decide it, and the line of code that does |
 
@@ -1561,6 +1561,55 @@ The concept budget (#1681) grew by one command and seven flags, raised in
   `--unhealthy` and the JSON.
 - `status_says_how_old_each_instance_is` covers the new `age_seconds`;
   `a_split_council_names_its_other_leader` covers the summary's new field.
+
+## The other readers
+
+`relish status` was the summary's first reader. The plan names four more:
+`relish agent context` (and with it the MCP `context` tool, which is the
+same command), the TUI's dashboard and Brioche's. Each had its own fan-out
+before, and each answered "how many apps are down?" its own way.
+
+### `context` reads the summary
+
+`context` used to build its faults, alerts and apps from `wtf`'s evidence:
+every fault, every alert, one line per app. On two thousand apps that's
+most of the 24 KiB, and the budget had to cut it, which is what "Worst
+first, so the budget cuts the right end" earlier in this chapter was about.
+Now those three lists are gone, and `data.status` carries `relish status`'s
+screen instead: the verdict, one line per section, and the summary itself.
+The summary is the same size on three nodes or three hundred, so the only
+things left that grow with the cluster are `wtf`'s findings and the
+timeline.
+
+`status` is a `Section<StatusView>`, the summary's own `Section` type. When
+`GET /v1/cluster/summary` fails, it's `missing` with the error as `reason`,
+and the findings still come back. A context with no status is worth more
+than no context.
+
+The lines come from the same `assess` that `relish status` calls. That's
+why it moved out of `status_cmd.rs` into `src/bun/summary/verdict.rs`:
+Brioche runs inside Bun, and Bun mustn't depend on the CLI (the crate split
+planned for 0.2.8 makes that a compile error). `context` passes `wtf`'s
+counts in as the last line, through `status_cmd::wtf_check`, so its
+verdict is the one `relish status` would have printed at that moment.
+
+One question was the schema. `ContextData` derives `JsonSchema`, and with
+the summary typed in full, `relish agent schema context` would have grown by
+about 18 KB, past its budget, and so would every MCP client's tool list,
+which carries each tool's output schema. So the `summary` field
+describes itself by reference:
+
+```rust
+#[schemars(schema_with = "summary_schema")]
+pub summary: ClusterSummary,
+```
+
+`schema_with` names a function that returns the field's schema, in place of
+the one the type would derive: here an object whose description says
+"`relish agent schema status` describes every field". The value is the
+whole typed summary; only the schema points elsewhere. (In Go you'd reach
+for a struct tag, and the tag would be a string nothing checks. Here the
+attribute names a function, so a typo doesn't compile.)
 
 ## Logs and the manual
 

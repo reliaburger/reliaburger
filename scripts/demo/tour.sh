@@ -517,7 +517,9 @@ agent_step() {
     step_heading "Ask your agent"
     say "From 0.2.7 an AI agent asks relish the same questions and gets one line of"
     say "JSON back, within a byte budget. jq here only makes it readable for people."
-    show "relish agent context | jq -c '.data.apps.items[] | {app, state, running, desired}'"
+    # From 0.2.8 the apps come from the cluster summary, worst first; 0.2.7
+    # listed every app.
+    show "relish agent context | jq -c '(.data.status.value.summary.apps.value.worst // .data.apps.items)[] | {app, state, running, desired}'"
     show "relish agent diagnose | jq -c '.data.findings[] | {id, severity, title}'"
     say "The manual chapter an agent reads first, from the binary itself:"
     show "relish agent guide | jq -r '.data.sections[].heading' | head -n 8"
