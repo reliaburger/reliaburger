@@ -220,6 +220,9 @@ pub struct Compatibility {
 /// A state report's `ResourceUsage` carries `gpu_used` as a `u32` and a new
 /// `gpu_total`, so the leader counts GPUs instead of assuming none
 /// (`GET /v1/cluster/summary`).
+/// An instance status carries `age_seconds`, and the relay forwards
+/// `/v1/cluster/summary/node`, for `relish apps` and `relish nodes`.
+/// The summary's council section names `other_leaders`, a split brain.
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 58,
     state: 74,

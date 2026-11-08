@@ -816,9 +816,9 @@ fn check_replicas(inputs: &WtfInputs, report: &mut WtfReport) {
             details,
             suggestion: format!(
                 "the scheduler replaces replicas on a lost node within a minute or two; \
-                 if this persists, check `relish status` and `relish logs {}`, and bring a \
+                 if this persists, check `relish apps {}` and `relish logs {}`, and bring a \
                  stopped node back with `relish local start <node>` on a laptop cluster",
-                app.app
+                app.app, app.app
             ),
             correlated_events: Vec::new(),
             affected_resource: app_resource(&app.app, &app.namespace),

@@ -59,6 +59,11 @@ pub struct InstanceStatus {
     /// whose loop hasn't published for longer fails the request instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_age_ms: Option<u64>,
+    /// How long ago the node created this instance, in seconds, as of the
+    /// snapshot: `relish apps` shows an app's oldest as its AGE. `None` when
+    /// the source doesn't track it (a job run row).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_seconds: Option<u64>,
     /// Why a `failed` instance could not launch, such as
     /// `binary not found: /usr/local/bin/app` (#881).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -616,6 +621,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         pid: None,
                         runtime_unknown: false,
                         status_age_ms: None,
+                        age_seconds: Some(instance.created_at.elapsed().as_secs()),
                         reason: instance.launch_failure.clone(),
                     },
                     evidence,

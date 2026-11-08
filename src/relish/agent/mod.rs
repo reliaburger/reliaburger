@@ -288,6 +288,7 @@ pub fn data_schema(command: CommandName) -> Option<Value> {
         CommandName::PatchApply => Some(schema_of::<patch::ApplyData>()),
         CommandName::PatchDestroy => Some(schema_of::<patch::DestroyData>()),
         CommandName::Setup => Some(schema_of::<setup::SetupData>()),
+        CommandName::Status => Some(schema_of::<crate::relish::status_cmd::StatusData>()),
     }
 }
 

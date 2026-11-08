@@ -116,7 +116,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish join --node-id <NODE_ID> <ADDR>`: Join an existing cluster
 - `relish join-token`: Manage short-lived node-enrolment tokens
   - `relish join-token create --node-id <NODE_ID>`: Create a single-use token for enrolling one node
-- `relish nodes`: List cluster nodes and their gossip state
+- `relish nodes`: List cluster nodes: gossip state, version, usage and what's allocated
 - `relish council`: Show the council (Raft) on every node, or recover from full loss
   - `relish council status`: Show every node's view of the council (the default)
   - `relish council recover --data-dir <DATA_DIR>`: Recover a cluster whose entire council was lost
@@ -128,7 +128,8 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 **Deploy and manage apps** ([deploy an app](docs/manual/01_deploy-an-app.md), [writing a controller](docs/manual/15_writing-a-controller.md))
 
 - `relish apply [PATH_OR_URL]`: Apply a Reliaburger TOML or Kubernetes YAML manifest
-- `relish status`: Show cluster and app status
+- `relish status`: Is the cluster all right? One screen: a verdict, then one line per part of the cluster with the command that lists the detail
+- `relish apps [NAME]`: List apps with their state, problems first; with NAME, that app's instances *(0.2.8, not in 0.2.7)*
 - `relish inspect <NAME>`: Show every instance of an app across the cluster, with its node
 - `relish exec <APP> [COMMAND]...`: Run a command once inside a running instance and exit with its exit code. Not interactive: no stdin and no terminal
 - `relish deploy <PATH>`: Trigger a rolling deploy for an app
@@ -550,6 +551,7 @@ target/debug/bun --runtime process --config examples/node/process-runtime.toml
 # In another terminal
 target/debug/relish apply examples/phase-1/proc-first-run.toml
 target/debug/relish status
+target/debug/relish apps
 target/debug/relish            # terminal UI
 open http://127.0.0.1:9117/    # web dashboard
 ```

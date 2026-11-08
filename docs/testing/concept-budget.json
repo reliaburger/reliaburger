@@ -4,15 +4,15 @@
     "reason": "Measured on 8 November 2026 (#1681): app, job, namespace, permission, policy, build, template and use"
   },
   "commands": {
-    "budget": 159,
-    "reason": "Measured on 8 November 2026 (#1681): every relish command and subcommand at every depth, none of them hidden"
+    "budget": 160,
+    "reason": "Measured on 8 November 2026 (#1681): every relish command and subcommand at every depth, none of them hidden. Raised to 160 the same day for `relish apps` (#1777): the lists left `relish status`, which became one screen of counts"
   },
   "flags": {
-    "budget": 375,
-    "reason": "Measured on 8 November 2026 (#1681): named flags on every command, global ones once"
+    "budget": 382,
+    "reason": "Measured on 8 November 2026 (#1681): named flags on every command, global ones once. Raised to 382 the same day (#1777): `status --quick --check`, `apps --namespace --unhealthy --node --instances` and `nodes --unhealthy`, the filters a long list needs"
   },
   "distinct_flags": {
-    "budget": 169,
-    "reason": "Measured on 8 November 2026 (#1681): distinct flag names across all commands"
+    "budget": 171,
+    "reason": "Measured on 8 November 2026 (#1681): distinct flag names across all commands. Raised to 171 the same day (#1777): `--unhealthy` and `--instances` are new names; the other new flags reuse names agents already know"
   }
 }

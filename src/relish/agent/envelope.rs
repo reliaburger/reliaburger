@@ -105,10 +105,17 @@ pub enum CommandName {
     PatchDestroy,
     /// `relish agent setup`.
     Setup,
+    /// `relish status -o json`: not under `relish agent`, but it answers in
+    /// the same envelope. Its `data` schema (the whole cluster summary) is
+    /// bigger than `relish agent schema`'s budget, so the schema command
+    /// doesn't offer it.
+    #[value(skip)]
+    Status,
 }
 
 impl CommandName {
-    /// The command as a caller types it after `relish agent`.
+    /// The command as a caller types it after `relish agent`, or after
+    /// `relish` for `status`.
     pub fn as_str(self) -> &'static str {
         match self {
             CommandName::Agent => "agent",
@@ -136,6 +143,7 @@ impl CommandName {
             CommandName::PatchApply => "patch apply",
             CommandName::PatchDestroy => "patch destroy",
             CommandName::Setup => "setup",
+            CommandName::Status => "status",
         }
     }
 

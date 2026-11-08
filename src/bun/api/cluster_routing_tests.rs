@@ -78,6 +78,7 @@ fn instance(id: &str, app: &str, state: &str) -> InstanceStatus {
         pid: Some(4242),
         runtime_unknown: false,
         status_age_ms: None,
+        age_seconds: None,
         reason: None,
     }
 }
@@ -1280,4 +1281,17 @@ async fn a_forwarded_snapshot_request_is_never_forwarded_again() {
     assert!(response.status().is_success());
     assert_eq!(snapshot_log(&cluster, 0).await, ["list db"]);
     assert!(snapshot_log(&cluster, 1).await.is_empty());
+}
+
+/// `relish nodes` reads each node's own share of the summary (its version
+/// and usage) through the entry node, as `wtf` reads the rest.
+#[test]
+fn the_relay_forwards_each_nodes_summary_share_for_relish_nodes() {
+    let get = axum::http::Method::GET;
+    assert!(relay_allows(&get, "v1/cluster/summary/node"));
+    assert!(!relay_allows(&get, "v1/cluster/summary/leader"));
+    assert!(!relay_allows(
+        &axum::http::Method::POST,
+        "v1/cluster/summary/node"
+    ));
 }

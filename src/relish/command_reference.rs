@@ -85,6 +85,7 @@ pub const GROUPS: &[CommandGroup] = &[
         commands: &[
             "apply",
             "status",
+            "apps",
             "inspect",
             "exec",
             "deploy",
