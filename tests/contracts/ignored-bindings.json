@@ -307,6 +307,12 @@
   },
   {
     "source": "tests/cluster_failover.rs",
+    "function": "a_proposal_applied_before_a_leader_change_is_undone_on_the_new_leader",
+    "binary": "reliaburger::cluster_failover",
+    "test": "a_proposal_applied_before_a_leader_change_is_undone_on_the_new_leader"
+  },
+  {
+    "source": "tests/cluster_failover.rs",
     "function": "an_admin_removes_a_policy_that_denies_everything_through_any_node",
     "binary": "reliaburger::cluster_failover",
     "test": "an_admin_removes_a_policy_that_denies_everything_through_any_node"

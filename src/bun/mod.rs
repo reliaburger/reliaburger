@@ -33,6 +33,7 @@ pub mod loop_meter;
 pub mod loop_watchdog;
 pub mod namespace_keys;
 pub mod probe;
+pub mod proposals;
 pub mod readiness;
 pub mod restart;
 pub mod reusable_executor;

@@ -67,6 +67,8 @@ pub enum TokenLifetime {
     Days(u64),
     /// No expiry (`--no-expiry`).
     Never,
+    /// This many seconds (`--ttl`), for an agent token.
+    Seconds(u64),
 }
 
 /// A token for `relish token create` to ask for.
@@ -84,6 +86,8 @@ pub struct TokenRequest {
     pub lifetime: TokenLifetime,
     /// Take over the `[permission]` spec already keyed by this name.
     pub inherit_permissions: bool,
+    /// An agent token (#1682): read-only unless `deployer`, never `admin`.
+    pub agent: bool,
 }
 
 /// A secret the cluster just issued, shown once.
@@ -2741,16 +2745,18 @@ impl BunClient {
     /// Create an API token via the agent (persisted in Raft). Returns the
     /// plaintext, shown once, and when it expires.
     pub async fn token_create(&self, request: &TokenRequest) -> Result<IssuedToken, RelishError> {
-        let (ttl_days, no_expiry) = match request.lifetime {
-            TokenLifetime::Default => (None, false),
-            TokenLifetime::Days(days) => (Some(days), false),
-            TokenLifetime::Never => (None, true),
+        let (ttl_days, ttl_seconds, no_expiry) = match request.lifetime {
+            TokenLifetime::Default => (None, None, false),
+            TokenLifetime::Days(days) => (Some(days), None, false),
+            TokenLifetime::Never => (None, None, true),
+            TokenLifetime::Seconds(seconds) => (None, Some(seconds), false),
         };
         self.issue_token(
             "/v1/token/create",
             serde_json::json!({
                 "name": request.name, "role": request.role, "apps": request.apps,
                 "namespaces": request.namespaces, "ttl_days": ttl_days,
+                "ttl_seconds": ttl_seconds, "agent": request.agent,
                 "no_expiry": no_expiry, "inherit_permissions": request.inherit_permissions,
             }),
         )
@@ -3366,6 +3372,100 @@ impl BunClient {
         path: &str,
         request: &T,
     ) -> Result<crate::proposal::lease::LeaseAnswer, RelishError> {
+        let body = serde_json::to_string(request).map_err(|error| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to encode the request: {error}"),
+        })?;
+        let answer = self.post_json(path, body).await?;
+        serde_json::from_value(answer).map_err(|error| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse response: {error}"),
+        })
+    }
+
+    /// Propose a change (`POST /v1/proposals`, #1682). With `dry_run`, the
+    /// cluster answers the whole proposal without storing it. A refusal is
+    /// an `ApiError` whose body carries a `code`: `lease_held`, `stale`,
+    /// `guardrail`, `conflict` and so on.
+    pub async fn propose(
+        &self,
+        request: &crate::proposal::ProposalRequest,
+        dry_run: bool,
+    ) -> Result<crate::proposal::view::ProposalView, RelishError> {
+        let path = if dry_run {
+            "/v1/proposals?dry_run=true"
+        } else {
+            "/v1/proposals"
+        };
+        self.proposal_post(path, request).await
+    }
+
+    /// Every proposal this caller's scope reaches, newest first.
+    pub async fn proposals(&self) -> Result<crate::proposal::view::ProposalListing, RelishError> {
+        self.get_typed_json("/v1/proposals").await
+    }
+
+    /// One proposal.
+    pub async fn proposal(
+        &self,
+        id: u64,
+    ) -> Result<crate::proposal::view::ProposalView, RelishError> {
+        self.get_typed_json(&format!("/v1/proposals/{id}")).await
+    }
+
+    /// Withdraw a proposal this caller made.
+    pub async fn withdraw_proposal(
+        &self,
+        id: u64,
+    ) -> Result<crate::proposal::view::ProposalView, RelishError> {
+        self.proposal_post(
+            &format!("/v1/proposals/{id}/withdraw"),
+            &serde_json::json!({}),
+        )
+        .await
+    }
+
+    /// Approve a proposal, which applies it (a person's token only).
+    pub async fn approve_proposal(
+        &self,
+        id: u64,
+    ) -> Result<crate::proposal::view::ProposalView, RelishError> {
+        self.proposal_post(
+            &format!("/v1/proposals/{id}/approve"),
+            &serde_json::json!({}),
+        )
+        .await
+    }
+
+    /// Reject a proposal (a person's token only).
+    pub async fn reject_proposal(
+        &self,
+        id: u64,
+        reason: &str,
+    ) -> Result<crate::proposal::view::ProposalView, RelishError> {
+        self.proposal_post(
+            &format!("/v1/proposals/{id}/reject"),
+            &crate::proposal::view::RejectRequest {
+                reason: reason.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// Undo an applied proposal directly (a person's token only).
+    pub async fn undo_proposal(
+        &self,
+        id: u64,
+    ) -> Result<crate::proposal::view::ProposalView, RelishError> {
+        self.proposal_post(&format!("/v1/proposals/{id}/undo"), &serde_json::json!({}))
+            .await
+    }
+
+    async fn proposal_post<T: serde::Serialize>(
+        &self,
+        path: &str,
+        request: &T,
+    ) -> Result<crate::proposal::view::ProposalView, RelishError> {
         let body = serde_json::to_string(request).map_err(|error| RelishError::ApiError {
             status: 0,
             body: format!("failed to encode the request: {error}"),

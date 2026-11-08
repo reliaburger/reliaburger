@@ -71,5 +71,9 @@ If you're an agent operating or debugging a Reliaburger cluster:
 | `relish agent lease take` | Take a lease before changing an app or a namespace, or renew yours |
 | `relish agent lease renew` | Extend a lease you hold |
 | `relish agent lease release` | Give up a lease you hold |
+| `relish agent propose` | Propose a change for a person to approve: apply, scale, rollback, stop or delete. Shows the summary, blast radius and undo command |
+| `relish agent proposals` | Proposals you can see, newest first; one when given its number |
+| `relish agent withdraw` | Withdraw a pending proposal you made |
+| `relish agent undo` | Propose undoing an applied proposal, for a person to approve |
 
 `relish agent guide` prints the whole chapter this skill is made from, as the installed `relish` has it, and `relish agent schema` the shape of every answer.

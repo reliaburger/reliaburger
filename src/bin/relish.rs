@@ -954,6 +954,20 @@ enum Command {
         #[command(subcommand)]
         action: LeaseAction,
     },
+    /// List, show, approve or reject the changes agents propose. Approving
+    /// applies it; each shows its blast radius and undo command first.
+    Proposal {
+        #[command(subcommand)]
+        action: ProposalAction,
+    },
+    /// Put an applied proposal back, if nothing has changed its apps since.
+    Undo {
+        /// The proposal's number.
+        id: u64,
+        /// Don't ask first (required with -o json).
+        #[arg(long)]
+        yes: bool,
+    },
     /// List, audit or delete the cluster's policies, or test policies offline.
     Policy {
         #[command(subcommand)]
@@ -1263,6 +1277,13 @@ enum TokenAction {
         /// Without this, creating a token under such a name is refused.
         #[arg(long)]
         inherit_permissions: bool,
+        /// An agent's token: it proposes changes and never makes them.
+        /// Read-only unless --role deployer; never admin; 8h unless --ttl.
+        #[arg(long, conflicts_with_all = ["ttl_days", "no_expiry"])]
+        agent: bool,
+        /// How long the agent token lives, e.g. 8h (at most 168h).
+        #[arg(long, requires = "agent", value_parser = parse_agent_token_ttl)]
+        ttl: Option<std::time::Duration>,
     },
     /// List all API tokens with their scope, expiry and last use.
     List,
@@ -1443,6 +1464,35 @@ enum PolicyAction {
     },
 }
 
+/// `relish proposal`'s subcommands.
+#[derive(Subcommand)]
+enum ProposalAction {
+    /// Every proposal you can see, newest first.
+    List,
+    /// One proposal: summary, undo, findings, blast radius, diff, reason.
+    Show {
+        /// The proposal's number.
+        id: u64,
+    },
+    /// Approve a proposal, which applies it at once. You can't approve your
+    /// own, and need deployer rights over every app it touches.
+    Approve {
+        /// The proposal's number.
+        id: u64,
+        /// Don't ask first (required with -o json).
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Reject a pending proposal.
+    Reject {
+        /// The proposal's number.
+        id: u64,
+        /// Why, for the author and the audit log.
+        #[arg(long, default_value = "")]
+        reason: String,
+    },
+}
+
 /// `relish lease`'s subcommands.
 #[derive(Subcommand)]
 enum LeaseAction {
@@ -1477,6 +1527,15 @@ enum LeaseAction {
         #[command(flatten)]
         target: reliaburger::relish::agent::lease::TargetArgs,
     },
+}
+
+fn parse_agent_token_ttl(value: &str) -> Result<std::time::Duration, String> {
+    let ttl =
+        reliaburger::relish::fault::parse_duration(value).map_err(|error| error.to_string())?;
+    if ttl.is_zero() || ttl > std::time::Duration::from_secs(7 * 24 * 60 * 60) {
+        return Err(format!("{value} is outside 1s to 168h"));
+    }
+    Ok(ttl)
 }
 
 fn parse_lease_ttl(value: &str) -> Result<std::time::Duration, String> {
@@ -2604,6 +2663,22 @@ async fn main() -> ExitCode {
             GitopsAction::Set { path } => commands::gitops_set(path, cli.output).await,
             GitopsAction::Disable => commands::gitops_disable(cli.output).await,
         },
+        Command::Proposal { action } => {
+            use reliaburger::relish::proposal_cmd;
+            match action {
+                ProposalAction::List => proposal_cmd::proposal_list(cli.output).await,
+                ProposalAction::Show { id } => proposal_cmd::proposal_show(id, cli.output).await,
+                ProposalAction::Approve { id, yes } => {
+                    proposal_cmd::proposal_approve(id, yes, cli.output).await
+                }
+                ProposalAction::Reject { id, reason } => {
+                    proposal_cmd::proposal_reject(id, &reason, cli.output).await
+                }
+            }
+        }
+        Command::Undo { id, yes } => {
+            reliaburger::relish::proposal_cmd::undo(id, yes, cli.output).await
+        }
         Command::Lease { action } => {
             use reliaburger::relish::lease_cmd;
             match &action {
@@ -2736,16 +2811,19 @@ async fn main() -> ExitCode {
                 ttl_days,
                 no_expiry,
                 inherit_permissions,
+                agent,
+                ttl,
             } => {
                 use reliaburger::relish::client::{TokenLifetime, TokenRequest};
                 let split = |list: &Option<String>| {
                     list.as_ref()
                         .map(|list| list.split(',').map(|s| s.trim().to_string()).collect())
                 };
-                let lifetime = match (ttl_days, no_expiry) {
-                    (Some(days), _) => TokenLifetime::Days(*days),
-                    (None, true) => TokenLifetime::Never,
-                    (None, false) => TokenLifetime::Default,
+                let lifetime = match (ttl, ttl_days, no_expiry) {
+                    (Some(ttl), _, _) => TokenLifetime::Seconds(ttl.as_secs()),
+                    (None, Some(days), _) => TokenLifetime::Days(*days),
+                    (None, None, true) => TokenLifetime::Never,
+                    (None, None, false) => TokenLifetime::Default,
                 };
                 commands::token_create(
                     &TokenRequest {
@@ -2755,6 +2833,7 @@ async fn main() -> ExitCode {
                         namespaces: split(namespaces),
                         lifetime,
                         inherit_permissions: *inherit_permissions,
+                        agent: *agent,
                     },
                     cli.output,
                 )
@@ -3271,6 +3350,8 @@ fn output_support(command: &Command) -> OutputSupport {
         | Command::Gitops { .. }
         | Command::Policy { .. }
         | Command::Lease { .. }
+        | Command::Proposal { .. }
+        | Command::Undo { .. }
         | Command::Token { .. }
         | Command::Upgrade { .. }
         | Command::Verify(_)
@@ -3441,6 +3522,8 @@ mod tests {
     /// Every top-level command that changes the cluster or local files.
     const MUTATING: &[&str] = &[
         "apply",
+        "proposal",
+        "undo",
         "exec",
         "stop",
         "delete",

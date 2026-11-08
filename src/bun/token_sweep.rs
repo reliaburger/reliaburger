@@ -146,6 +146,7 @@ mod tests {
             name: name.to_string(),
             token_hash: name.as_bytes().to_vec(),
             role,
+            kind: crate::sesame::types::TokenKind::Human,
             scope: TokenScope::default(),
             expires_at,
             created_at: SystemTime::UNIX_EPOCH,

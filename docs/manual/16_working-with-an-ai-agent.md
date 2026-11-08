@@ -58,29 +58,26 @@ If you're an agent operating or debugging a Reliaburger cluster:
 
 ## A read-only token
 
-An agent works with whatever authority you hand it. Give it its own token,
-with the least it needs:
+An agent works with whatever authority you hand it. Give it its own token:
 
 ```sh
-relish token create --name agent --role read-only --ttl-days 1
+relish token create --name agent --agent --ttl 8h
 ```
 
-A `read-only` token reads status, logs, metrics and diagnostics, and the API
-refuses everything else. The agent sees that as a `forbidden` failure and
-exit code `4`. `--ttl-days 1` means a token you forget about stops working
-tomorrow, and `--namespaces` or `--apps` narrow it further (see `security`).
-Pass it as `RELIABURGER_TOKEN` in the agent's environment, and revoke it when
-you're done:
+It's read-only, or `--role deployer`, never admin, and lives 8h unless
+`--ttl` (up to 168h). The API refuses its every write as `forbidden`, exit
+`4`; a deployer one may propose changes and take leases. `--namespaces`
+narrows it. Pass it as `RELIABURGER_TOKEN`, and revoke it when you're done:
 
 ```sh
 relish token revoke agent
 ```
 
 Why make a fuss about it? No `relish agent` command changes a workload
-(`lease` writes only a lease record), and every `next` step says with
-`read_only` whether it would. But those are promises the agent chooses to
-keep. From a shell it can run any `relish` command with whatever token it
-holds: the token is the one control the cluster enforces. So don't give an agent your admin
+(`lease` and `propose` write only council records), and every `next` step
+says with `read_only` whether it would. But the agent chooses to keep those
+promises, and from a shell it can run any `relish` command with its token,
+the one control the cluster enforces. So don't give an agent your admin
 token, and don't tell your agent client to "always allow" `relish`.
 
 ## The contract
@@ -147,7 +144,7 @@ A failure carries `error` instead of `data`:
 `code` is one of a fixed list: `usage`, `no_endpoint`, `unreachable`, `dns`,
 `tls_untrusted`, `timeout`, `unauthenticated`, `forbidden`, `not_found`,
 `conflict`, `api`, `source_mismatch`, `build_failed`, `unsupported_platform`,
-`internal` and `lease_held`. `status` is the HTTP status when the API answered with one,
+`internal`, `lease_held`, `stale` and `guardrail`. `status` is the HTTP status when the API answered with one,
 and `endpoint` the address `relish` dialled when the connection failed. A
 connection failure splits by its cause: `dns` when the host name doesn't
 resolve, `tls_untrusted` when the server's certificate isn't one `relish`
@@ -171,7 +168,7 @@ agent`), first in the `hint`. A typo of a command that writes, such as
 | `0` | The command answered. Read `data`. |
 | `2` | Usage: a wrong command, flag or value (`usage`). |
 | `3` | Couldn't reach or authenticate to the cluster (`no_endpoint`, `unreachable`, `dns`, `tls_untrusted`, `timeout`, `unauthenticated`). |
-| `4` | The cluster refused: the token's role or a policy (`forbidden`), or someone's lease (`lease_held`). |
+| `4` | The cluster refused: the token's role (`forbidden`), a policy (`guardrail`), or someone's lease (`lease_held`). |
 | `5` | Anything else. |
 
 A command that finds three critical problems still exits `0`: it answered,
@@ -215,7 +212,7 @@ so that text never sits loose in `data`. It always arrives wrapped:
 ```
 
 `origin` says who wrote it: `workload_log`, `event_message`, `probe_body`,
-`release_metadata`, `github_issue` or `lease_purpose`. Before printing, `relish` strips ANSI
+`release_metadata`, `github_issue`, `lease_purpose` or `proposal_reason`. Before printing, `relish` strips ANSI
 escapes and control characters (tabs stay), redacts anything shaped like a
 secret (`rbrg_` tokens, `ENC[AGE:…]` values, age identities, PEM private
 keys, passwords in URLs, JWTs, and the value after any key that names a
@@ -259,6 +256,10 @@ net, not a promise: read what you share before you post it anywhere.
 | `relish agent lease take` | Take a lease before changing an app or a namespace, or renew yours |
 | `relish agent lease renew` | Extend a lease you hold |
 | `relish agent lease release` | Give up a lease you hold |
+| `relish agent propose` | Propose a change for a person to approve: apply, scale, rollback, stop or delete. Shows the summary, blast radius and undo command |
+| `relish agent proposals` | Proposals you can see, newest first; one when given its number |
+| `relish agent withdraw` | Withdraw a pending proposal you made |
+| `relish agent undo` | Propose undoing an applied proposal, for a person to approve |
 <!-- agent-commands:end -->
 
 The list comes from `relish`'s own command definitions, so it names exactly
@@ -271,11 +272,9 @@ relish agent guide
 ```
 
 `data.sections` holds it one section at a time, each with its `heading` and
-its `markdown`, and `data.commands` lists the commands above, read from the
-binary itself. Its default budget is 80 KiB, not 24, so the whole chapter
-comes back in one call, with nothing trimmed. Given a smaller `--max-bytes`,
-the last sections go first, and the `next` step asks for a `--max-bytes` that
-fits it all.
+its `markdown`, and `data.commands` lists the commands above. Given a
+`--max-bytes` under its 80 KiB default, the last sections go first, and the
+`next` step asks for a `--max-bytes` that fits it all.
 
 `relish agent schema` prints the JSON Schema of the envelope and every
 command's `data`. All together they're over the default budget, so name the
@@ -305,9 +304,9 @@ most 200.
 `faults`, `alerts`, `apps` and `timeline` each say how much they saw:
 `state` is `known`, `partial` (some nodes didn't answer; the list is a
 lower bound) or `unknown` (nothing could be read, with `reason` saying why).
-An empty list with `unknown` means "couldn't look", never "none". The same
-goes for `unknown` at the top: a check `wtf` couldn't make stays unknown
-here, and is never counted as OK. On a big cluster the byte budget trims the
+An empty list with `unknown` means "couldn't look", never "none". Likewise a
+check `wtf` couldn't make stays in the top-level `unknown`, never counted as
+OK. On a big cluster the byte budget trims the
 longest lists from the end and says what it cut, so the worst apps and the
 newest events survive.
 
@@ -353,6 +352,20 @@ relish agent lease take app web --namespace shop --purpose "rolling back" --wait
 Or `take namespace shop`. It lasts 2m (`--ttl`, up to 15m); `renew` and
 `release` it. Someone else's is `lease_held` (exit `4`), and `error.lease`
 names the holder. `--wait` retries; `context` lists `leases`.
+
+## Proposing a change
+
+An agent never changes the cluster. It proposes, and a person approves:
+
+```sh
+relish agent propose scale web --namespace shop --replicas 5 --reason "p99 over the SLO"
+```
+
+Also `apply FILE`, `rollback`, `stop`, `delete`; `--dry-run` stores nothing.
+The cluster writes the summary, diff, blast radius and `undo` command.
+Proposing leases each app until it's decided. `stale`: the app changed;
+propose again. `guardrail` (exit `4`): a policy refused it. `proposals`
+shows yours, `withdraw ID` takes one back, `undo ID` proposes the undo.
 
 ## Reading an app's logs
 
@@ -594,15 +607,11 @@ relish agent patch apply ./fix @fix.diff
 ```
 
 `apply` matches each hunk by its lines, not its `@@` counts, which a
-hand-written diff often gets wrong: a hunk applies where its context and `-`
-lines sit, nearest the line its header names. The answer lists each hunk's
-line, its offset from the header's, and `recounted: true` when the counts
-were wrong. It's all or nothing: if a hunk's lines aren't in the file,
-nothing is written, and the `usage` error names the hunk (`hunk 2 of
-src/relish/client.rs (@@ -28,6 +28,8 @@)`) and the first missing line.
-`--check` writes nothing. `apply` writes only inside the workspace: never
-`.git/` or `.reliaburger-patch/`, a path with `..`, or through a symbolic
-link. Afterwards `diff` prints the change as git writes it.
+hand-written diff often gets wrong; the answer says `recounted: true` when
+they were. It's all or nothing: if a hunk's lines aren't in the file, nothing
+is written, and the `usage` error names the hunk and the first missing line.
+`--check` writes nothing. It writes only inside the workspace: never `.git/`
+or `.reliaburger-patch/`, a path with `..`, or through a symbolic link.
 
 `test` runs the portable suite in the workspace, or only the tests whose name
 contains a filter:
@@ -613,8 +622,8 @@ relish agent patch test ./fix classify_error
 
 That's `cargo test`: unit tests, `tests/suite`, the doctests and every other
 test that isn't `#[ignore]`. The gated suites (`make test-cluster`,
-`test-linux`, `test-slow` and the rest) are ignored there, so they don't run,
-and `data.not_run` says so in every answer. A failing test or a compile error
+`test-linux`, `test-slow` and the rest) are ignored there, and `data.not_run`
+says so in every answer. A failing test or a compile error
 is still an answer, with exit code 0: `data.ok` is `false`, and `failures` or
 `errors` says why, with each test's output or each error's file and line.
 
@@ -625,20 +634,16 @@ relish agent patch build ./fix
 ```
 
 By default it builds both `relish` for this machine and what the nodes run,
-`bun` and a Linux `relish`, with eBPF, which a node's `bun` needs to start.
-`--relish` builds only the first and `--bun` only the second. On Linux it's one `cargo build`. On macOS `bun` builds in the
-Lima build VM that `relish dev` uses, which needs Lima and a workspace under
-your home directory, the part of the disk the VM can see. The answer has each binary's
-path, SHA-256 and size, how long each step took, and, when it didn't compile,
-the first 20 errors with their file and line. A first build compiles every
-dependency and takes several minutes; later ones take seconds.
+`bun` and a Linux `relish`, with eBPF; `--relish` or `--bun` builds one. On
+macOS `bun` builds in the Lima build VM `relish dev` uses, which needs Lima
+and a workspace under your home directory. The answer has each binary's
+path, SHA-256 and size, and, when it didn't compile, the first 20 errors with
+their file and line. A first build takes several minutes; later ones seconds.
 
-`build` and `test` check two things before they start. They want 15 GiB free
-on the workspace's disk, and they refuse a change to `build.rs`, a
-`Cargo.toml`, `Cargo.lock`, `.cargo/` or the toolchain file with a
-`forbidden` failure. A build script and a new dependency both run code on
-your machine while it builds, so read such a change before you pass
-`--allow-build-changes`.
+`build` and `test` want 15 GiB free, and refuse a change to `build.rs`, a
+`Cargo.toml`, `Cargo.lock`, `.cargo/` or the toolchain file (`forbidden`):
+those run code on your machine as it builds, so read such a change before
+you pass `--allow-build-changes`.
 
 Nothing `patch` builds is signed. `relish upgrade` and a real cluster's node
 upgrades only take binaries the release keys signed, so a patched binary can't
@@ -651,10 +656,9 @@ relish agent patch try ./fix
 ```
 
 It's `relish setup --quickstart --development-binaries` with its own
-`RELIABURGER_HOME` under `~/.reliaburger-patch/`, a name like `patch-1a2b3c4d`
-and ports from 39000 up, so its context, credentials and VMs never mix with
-yours. It has one node unless you pass `--nodes 3`. Setup is driven by the
-workspace's own `relish` when `build` made one. The answer has the cluster's
+`RELIABURGER_HOME` under `~/.reliaburger-patch/` and ports from 39000 up, so
+its context, credentials and VMs never mix with yours. It has one node unless
+you pass `--nodes 3`. The answer has the cluster's
 home and endpoints, and its first `next` step is a `status` against that
 cluster alone:
 
@@ -663,9 +667,7 @@ RELIABURGER_HOME=~/.reliaburger-patch/1a2b3c4d ./fix/.reliaburger-patch/bin/reli
 ```
 
 A setup that fails is an answer too: `data.ready` is `false` and `log_tail`
-has the end of setup's output, because a patched `bun` that doesn't boot is
-worth knowing. Throwaway clusters share one download cache, so only the first
-fetches the guest image.
+has the end of setup's output.
 
 `diff` shows the change against the extracted source, committed or not, with
 each file's line counts, any build changes, and every test run and build with
@@ -691,8 +693,8 @@ relish agent patch destroy --all
 
 When an agent decides it has found a Reliaburger bug, `relish agent report`
 turns what it found into an issue draft for you to read and post. It writes
-files and prints commands. It never posts anything, and it makes no network
-call at all: not to GitHub, not to the cluster.
+files and prints commands, and never posts anything or makes a network call,
+to GitHub or the cluster.
 
 ```sh
 relish agent report \
@@ -713,23 +715,20 @@ required; each text field can be up to 8 KiB.
 
 It writes three files into `--out`, which must not exist or be empty:
 
-- `issue.md`, the issue body. It has one `###` section per field of the
+- `issue.md`, the issue body, one `###` section per field of the
   repository's agent-drafted issue form (`.github/ISSUE_TEMPLATE/agent-bug.yml`),
-  in the same order: Fingerprint, Version, Fix status, What happened,
-  Reproducer, Evidence, Suspected source, Patch, What was not tested, How this
-  should have been caught, Redaction, AI assistance and Human review. The
-  version comes from the binary itself, the suspected source from `--site`
-  (with a GitHub permalink when the build is clean), and the evidence is
-  `bundle.json` quoted whole when it's under 32 KiB. Human review is three
-  boxes only you can tick: you read the whole report, you checked the
-  redaction, and you searched for the fingerprint.
+  in its order. The version comes from the binary, the suspected source from
+  `--site` (with a permalink when the build is clean), and the evidence is
+  `bundle.json`, quoted whole under 32 KiB. Human review is three boxes only
+  you can tick: you read it all, checked the redaction, and searched for the
+  fingerprint.
 - `bundle.json`, the redacted evidence: every `--evidence` file and the
   patch.
 - `MANIFEST.json`, every item that went in or was left out, its size, and how
   many times each redaction rule fired. Read this before you post.
 
-The title starts with `agent: `, as the form's does, and the suggested labels
-are `bug`, `agent-drafted`, and `has-reproducer` or `unverified`.
+The title starts with `agent: `; suggested labels are `bug`,
+`agent-drafted`, and `has-reproducer` or `unverified`.
 
 `data.post` is the command that posts it, and the last `next` step is the same
 command with `read_only: false`. Your agent should hand it to you, not run it.
@@ -755,8 +754,7 @@ The draft becomes a comment that adds your evidence to that issue, and
 untrusted text: anyone can write an issue.
 
 If the agent found the release that fixed it, `--fixed-in 0.2.8` makes the
-draft say so. A fix newer than your `relish` means upgrading may be all you
-need, and the answer warns you before you post.
+draft say so; if that's newer than your `relish`, the answer warns you.
 
 ### No reproducer, no verdict
 
@@ -769,13 +767,10 @@ first.
 
 Everything goes through the same rules as `untrusted` text: `rbrg_` tokens,
 `ENC[AGE:…]` values, age identities, PEM private keys, passwords in URLs,
-JWTs, and the value after any key that names a secret. A key names a secret
-when it ends in `password`, `passwd`, `passphrase`, `secret`, `token`,
-`apikey`, `api_key`, `access_key`, `private_key` or `secret_key` (any case,
-`-` or `_`), so `DB_PASSWORD=…`, `"api_key": "…"` and `x-api-key: …` lose
-their values whatever they are, even `password=changeme`, while
-`token_bucket=5` and `password_file=/etc/pw` stay. The same goes for a field
-of JSON evidence under such a key. Then a report goes further:
+JWTs, and the value after any key ending in a secret's name (`password`,
+`secret`, `token`, `api_key` and the like, any case), in text or JSON, so
+`DB_PASSWORD=…` loses its value while `token_bucket=5` stays. Then a report
+goes further:
 
 | What | Default | Change it with |
 |------|---------|----------------|
@@ -897,7 +892,7 @@ Some commands aren't tools, on purpose:
 | `upgrade-check` | Fetches release metadata from the internet, beyond the cluster API |
 | `verify` | Downloads release files from the internet |
 | `setup` | Writes your agents' configuration |
-| `lease` | Writes lease records; arrives with proposals |
+| `lease`, `propose`, `proposals`, `withdraw`, `undo` | Write council records; arrive in a proposing mode of `relish mcp` |
 
 Run those yourself, or let the agent run them in a shell where you approve
 each one. `relish mcp` reads private cluster state and text workloads wrote,

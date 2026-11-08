@@ -1,0 +1,7 @@
+---
+source: src/relish/proposal_cmd.rs
+expression: "render_proposal_list(&[approved, view()])"
+---
+  ID  STATE      KIND      AUTHOR  BY                        SUMMARY
+  18  applied    scale     holmes  policy:agents-scale-shop  Scale shop/web from 3 to 5 replicas.
+  17  pending    scale     holmes  -                         Scale shop/web from 3 to 5 replicas.

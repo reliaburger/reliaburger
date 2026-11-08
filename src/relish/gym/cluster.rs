@@ -274,6 +274,7 @@ impl GymCluster for LiveCluster {
                 namespaces: Some(vec![namespace.to_string()]),
                 lifetime: TokenLifetime::Days(SOLVER_TOKEN_DAYS),
                 inherit_permissions: false,
+                agent: false,
             })
             .await?;
         Ok(issued.token)

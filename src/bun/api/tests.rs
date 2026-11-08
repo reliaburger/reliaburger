@@ -43,6 +43,8 @@ fn desired_app_diagnostics_filter_to_the_token_scope() {
         token_name: "tenant-a".to_string(),
         principal_id: "token:test".to_string(),
         role: crate::sesame::types::ApiRole::ReadOnly,
+        kind: crate::sesame::types::TokenKind::Human,
+        granted_role: crate::sesame::types::ApiRole::ReadOnly,
         scoped_apps: Some(vec!["api".to_string()]),
         scoped_namespaces: Some(vec!["tenant-a".to_string()]),
     };
@@ -5094,6 +5096,8 @@ fn deployer_context() -> crate::sesame::auth::AuthContext {
         token_name: "ci".into(),
         principal_id: "ci-credential".into(),
         role: crate::sesame::types::ApiRole::Deployer,
+        kind: crate::sesame::types::TokenKind::Human,
+        granted_role: crate::sesame::types::ApiRole::Deployer,
         scoped_apps: None,
         scoped_namespaces: None,
     }
@@ -9308,6 +9312,8 @@ async fn dry_run_endpoint_preserves_namespace_identity_and_caller_scope() {
         token_name: "team-reader".into(),
         principal_id: "token:test".into(),
         role: crate::sesame::types::ApiRole::ReadOnly,
+        kind: crate::sesame::types::TokenKind::Human,
+        granted_role: crate::sesame::types::ApiRole::ReadOnly,
         scoped_apps: Some(vec!["web".into()]),
         scoped_namespaces: Some(vec!["team".into()]),
     };

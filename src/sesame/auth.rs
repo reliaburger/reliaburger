@@ -12,7 +12,7 @@ use axum::response::{IntoResponse, Response};
 use tokio::sync::RwLock;
 
 use super::token;
-use super::types::{ApiRole, ApiToken, TokenScope};
+use super::types::{ApiRole, ApiToken, TokenKind, TokenScope};
 
 /// Shared token store, readable by the auth middleware.
 ///
@@ -142,8 +142,16 @@ pub struct AuthContext {
     /// Stable identifier for this exact credential, independent of its
     /// human-readable name.
     pub principal_id: String,
-    /// The role granted by the token.
+    /// The role every route checks. For an agent token it's always
+    /// `ReadOnly`, whatever it was granted, so an agent can't change the
+    /// cluster directly through any route, old or new (#1682).
     pub role: ApiRole,
+    /// A person's token or an agent's.
+    pub kind: TokenKind,
+    /// The role the token was granted. Only the proposal and lease routes
+    /// read it ([`authorize_proposer`]): an agent token granted `Deployer`
+    /// may propose and take leases there.
+    pub granted_role: ApiRole,
     /// The scoped app names (if any).
     pub scoped_apps: Option<Vec<String>>,
     /// The scoped namespaces (if any).
@@ -204,10 +212,19 @@ pub fn authenticate(
         }
         _ => token_principal_id(stored),
     };
+    // Built-in rule 1 (#1682): an agent token proposes, it never mutates.
+    // Lowering its effective role here, in the one place every request is
+    // authenticated, means no route has to remember the rule.
+    let role = match stored.kind {
+        TokenKind::Human => stored.role,
+        TokenKind::Agent => ApiRole::ReadOnly,
+    };
     Ok(AuthContext {
         token_name: stored.name.clone(),
         principal_id,
-        role: stored.role,
+        role,
+        kind: stored.kind,
+        granted_role: stored.role,
         scoped_apps: stored.scope.apps.clone(),
         scoped_namespaces: stored.scope.namespaces.clone(),
     })
@@ -274,10 +291,43 @@ fn session_credential_is_live(
 /// Check that the authenticated context has sufficient role.
 pub fn require_role(ctx: &AuthContext, required: ApiRole) -> Result<(), (StatusCode, String)> {
     token::check_role(ctx.role, required).map_err(|_| {
+        if ctx.kind == TokenKind::Agent {
+            return (
+                StatusCode::FORBIDDEN,
+                format!(
+                    "an agent token can't change the cluster directly (this route requires the \
+                     {required} role); propose the change with `relish agent propose`"
+                ),
+            );
+        }
         (
             StatusCode::FORBIDDEN,
             format!("insufficient permissions: requires {} role", required),
         )
+    })
+}
+
+/// The role check for the proposal and lease write routes (#1682), which
+/// an agent token may call with the role it was granted. Refuses the
+/// internal system principal, like [`authorize_user`].
+#[allow(clippy::result_large_err)]
+pub fn authorize_proposer(ctx: Option<&AuthContext>, required: ApiRole) -> Result<(), Response> {
+    let Some(ctx) = ctx else {
+        return Ok(());
+    };
+    if ctx.token_name == SYSTEM_PRINCIPAL {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "the internal service principal may not propose changes",
+        )
+            .into_response());
+    }
+    token::check_role(ctx.granted_role, required).map_err(|_| {
+        (
+            StatusCode::FORBIDDEN,
+            format!("insufficient permissions: requires {required} role"),
+        )
+            .into_response()
     })
 }
 
@@ -287,6 +337,8 @@ pub(crate) fn system_context() -> AuthContext {
         token_name: SYSTEM_PRINCIPAL.to_string(),
         principal_id: SYSTEM_PRINCIPAL.to_string(),
         role: ApiRole::Admin,
+        kind: crate::sesame::types::TokenKind::Human,
+        granted_role: ApiRole::Admin,
         scoped_apps: None,
         scoped_namespaces: None,
     }
@@ -416,6 +468,8 @@ pub(crate) fn readonly_session_context(identity: &super::session::SessionIdentit
         token_name: identity.token_name.clone(),
         principal_id: format!("session:{}", identity.token_name),
         role: ApiRole::ReadOnly,
+        kind: crate::sesame::types::TokenKind::Human,
+        granted_role: ApiRole::ReadOnly,
         scoped_apps: identity.scope.apps.clone(),
         scoped_namespaces: identity.scope.namespaces.clone(),
     }
@@ -438,6 +492,8 @@ fn workload_context(claims: &super::types::WorkloadJwtClaims) -> AuthContext {
         token_name: format!("workload:{}/{}", claims.namespace, claims.app),
         principal_id: claims.sub.clone(),
         role: ApiRole::ReadOnly,
+        kind: crate::sesame::types::TokenKind::Human,
+        granted_role: ApiRole::ReadOnly,
         scoped_apps: Some(vec![claims.app.clone()]),
         scoped_namespaces: Some(vec![claims.namespace.clone()]),
     }
@@ -867,6 +923,8 @@ mod tests {
             token_name: "admin-token".to_string(),
             principal_id: "token:admin".to_string(),
             role: ApiRole::Admin,
+            kind: crate::sesame::types::TokenKind::Human,
+            granted_role: ApiRole::Admin,
             scoped_apps: None,
             scoped_namespaces: None,
         };
@@ -881,6 +939,8 @@ mod tests {
             token_name: "ro-token".to_string(),
             principal_id: "token:readonly".to_string(),
             role: ApiRole::ReadOnly,
+            kind: crate::sesame::types::TokenKind::Human,
+            granted_role: ApiRole::ReadOnly,
             scoped_apps: None,
             scoped_namespaces: None,
         };
@@ -912,6 +972,8 @@ mod tests {
             token_name: "dep".to_string(),
             principal_id: "token:deployer".to_string(),
             role: ApiRole::Deployer,
+            kind: crate::sesame::types::TokenKind::Human,
+            granted_role: ApiRole::Deployer,
             scoped_apps: None,
             scoped_namespaces: None,
         };
@@ -990,6 +1052,8 @@ mod tests {
             token_name: "scoped".to_string(),
             principal_id: "token:scoped".to_string(),
             role: ApiRole::Deployer,
+            kind: crate::sesame::types::TokenKind::Human,
+            granted_role: ApiRole::Deployer,
             scoped_apps: apps.map(|a| a.into_iter().map(String::from).collect()),
             scoped_namespaces: namespaces.map(|n| n.into_iter().map(String::from).collect()),
         }
@@ -1041,6 +1105,8 @@ mod tests {
             token_name: "alice".to_string(),
             principal_id: "token:alice".to_string(),
             role: ApiRole::Admin,
+            kind: crate::sesame::types::TokenKind::Human,
+            granted_role: ApiRole::Admin,
             scoped_apps: None,
             scoped_namespaces: None,
         };
@@ -1056,6 +1122,8 @@ mod tests {
             token_name: "alice".to_string(),
             principal_id: "token:alice".to_string(),
             role: ApiRole::Admin,
+            kind: crate::sesame::types::TokenKind::Human,
+            granted_role: ApiRole::Admin,
             scoped_apps: None,
             scoped_namespaces: None,
         };
@@ -1370,6 +1438,8 @@ mod tests {
             token_name: "ci".to_string(),
             principal_id: "token:ci".to_string(),
             role: ApiRole::Deployer,
+            kind: crate::sesame::types::TokenKind::Human,
+            granted_role: ApiRole::Deployer,
             scoped_apps: None,
             scoped_namespaces: None,
         };
@@ -1452,6 +1522,8 @@ mod tests {
             token_name: "ops".to_string(),
             principal_id: "token:ops".to_string(),
             role: ApiRole::Admin,
+            kind: crate::sesame::types::TokenKind::Human,
+            granted_role: ApiRole::Admin,
             scoped_apps: None,
             scoped_namespaces: None,
         };

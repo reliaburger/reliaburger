@@ -5835,6 +5835,17 @@
           "sources": [
             "tests/cluster_failover.rs"
           ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-cluster_failover-a_proposal_applied_before_a_leader_change_is_undone_on_the_new_leader",
+          "binary": "reliaburger::cluster_failover",
+          "test": "a_proposal_applied_before_a_leader_change_is_undone_on_the_new_leader",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_failover.rs"
+          ]
         }
       ]
     },

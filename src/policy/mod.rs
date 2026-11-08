@@ -67,6 +67,9 @@ pub enum Source {
     Apply,
     /// A GitOps sync.
     GitOps,
+    /// A proposal's `after` specs, judged when it's made and again when
+    /// it's approved (#1682).
+    Proposal,
 }
 
 impl Source {
@@ -75,6 +78,7 @@ impl Source {
         match self {
             Source::Apply => "apply",
             Source::GitOps => "gitops",
+            Source::Proposal => "proposal",
         }
     }
 }

@@ -110,6 +110,7 @@ async fn a_recovered_council_keeps_its_restored_tokens_over_the_bootstrap_file()
         name: "admin".into(),
         token_hash: vec![1],
         role: reliaburger::sesame::types::ApiRole::Admin,
+        kind: reliaburger::sesame::types::TokenKind::Human,
         scope: Default::default(),
         expires_at: None,
         created_at: std::time::SystemTime::UNIX_EPOCH,

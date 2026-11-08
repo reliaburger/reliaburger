@@ -1059,7 +1059,14 @@ for people, with `--metadata` for air-gapped clusters), `patch` (build, test and
 to read and post; it never posts, and makes no network call), `lease` (`take`,
 `renew` and `release` a short lease on an app or a namespace before changing
 it; someone else's is `lease_held`, naming them; `relish lease` is the
-people's side, with `list` and `break`, and `context` lists every lease) and
+people's side, with `list` and `break`, and `context` lists every lease),
+`propose` (`apply`, `scale`, `rollback`, `stop` or `delete`, for a person to
+approve: an agent token, `relish token create --agent`, can't change anything
+directly; the cluster writes the summary, diff, blast radius and undo
+command; `relish proposal list|show|approve|reject` and `relish undo` are the
+people's side, approval and application are one Raft entry, and a proposal
+whose apps changed in between fails as `stale`), `proposals`, `withdraw`,
+`undo` (which proposes the undo) and
 `setup`, which
 adds the `relish mcp` server to Claude Code, Codex, Cursor, VS Code, Goose and
 Gemini CLI: it shows the diff, writes only with `--yes`, never touches an entry

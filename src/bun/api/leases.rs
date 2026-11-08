@@ -205,6 +205,13 @@ pub(super) async fn lease_break_handler(
     Json(request): Json<LeaseTargetRequest>,
 ) -> Response {
     let auth = auth.as_deref();
+    // Breaking a lease is a person's call: an agent token's effective
+    // role is read-only, so this refuses it.
+    if let Err(response) =
+        crate::sesame::auth::authorize_user(auth, crate::sesame::types::ApiRole::Deployer)
+    {
+        return response;
+    }
     if let Err(response) = authorise_lease_write(
         &state,
         auth,
@@ -245,6 +252,9 @@ fn lease_holder(auth: Option<&crate::sesame::auth::AuthContext>) -> LeaseHolder 
 /// A deployer or above (never the internal service principal), whose
 /// scope and `[permission]` spec grant `action` on the target: on the app,
 /// or on every app (`*`) in the namespace for a namespace lease.
+///
+/// An agent token granted `Deployer` may take, renew and release a lease
+/// (#1682); only a person's token breaks one.
 #[allow(clippy::result_large_err)]
 async fn authorise_lease_write(
     state: &ApiState,
@@ -252,7 +262,7 @@ async fn authorise_lease_write(
     target: &LeaseTarget,
     action: crate::config::PermissionAction,
 ) -> Result<(), Response> {
-    crate::sesame::auth::authorize_user(auth, crate::sesame::types::ApiRole::Deployer)?;
+    crate::sesame::auth::authorize_proposer(auth, crate::sesame::types::ApiRole::Deployer)?;
     if let Err(refusal) = target.validate() {
         return Err(refusal_response(&refusal));
     }

@@ -223,6 +223,8 @@ pub struct Compatibility {
 /// A state report's `ResourceUsage` carries `gpu_used` as a `u32` and a new
 /// `gpu_total`, so the leader counts GPUs instead of assuming none
 /// (`GET /v1/cluster/summary`).
+/// Agent proposals (#1682): `DesiredState::proposals`, the `Proposal*` Raft
+/// requests, the `Proposal` council response, and `ApiToken::kind`.
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 58,
     state: 74,

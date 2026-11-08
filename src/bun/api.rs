@@ -60,6 +60,7 @@ mod metrics;
 mod node_info;
 mod nodes;
 pub(crate) mod policies;
+pub(crate) mod proposals;
 mod registry;
 mod secrets;
 mod snapshots;
@@ -126,6 +127,10 @@ use nodes::{
     nodes_handler,
 };
 use policies::{policies_handler, policy_audit_handler, policy_delete_handler};
+use proposals::{
+    proposal_approve_handler, proposal_create_handler, proposal_handler, proposal_reject_handler,
+    proposal_undo_handler, proposal_withdraw_handler, proposals_handler,
+};
 use registry::{
     images_handler, registry_proposal_deadline, registry_proposal_handler, registry_query_handler,
 };
@@ -817,6 +822,18 @@ pub fn router_with_upgrade(
         .route("/v1/leases/renew", post(lease_renew_handler))
         .route("/v1/leases/release", post(lease_release_handler))
         .route("/v1/leases/break", post(lease_break_handler))
+        .route(
+            "/v1/proposals",
+            get(proposals_handler).post(proposal_create_handler),
+        )
+        .route("/v1/proposals/{id}", get(proposal_handler))
+        .route("/v1/proposals/{id}/approve", post(proposal_approve_handler))
+        .route("/v1/proposals/{id}/reject", post(proposal_reject_handler))
+        .route(
+            "/v1/proposals/{id}/withdraw",
+            post(proposal_withdraw_handler),
+        )
+        .route("/v1/proposals/{id}/undo", post(proposal_undo_handler))
         .route("/v1/policies", get(policies_handler))
         .route("/v1/policies/audit", get(policy_audit_handler))
         .route("/v1/policies/{name}/delete", post(policy_delete_handler))
@@ -1392,6 +1409,8 @@ mod lease_tests;
 mod owner_tests;
 #[cfg(test)]
 mod policy_tests;
+#[cfg(test)]
+mod proposal_tests;
 
 #[cfg(test)]
 mod cluster_view_tests;
