@@ -5662,6 +5662,19 @@ finishes an approval the old one didn't. The audit record names the policy
 as the principal, with `principal_kind` `policy`, beside the author and the
 author's reason.
 
+Who is the `caller` when a policy approves? Our first answer was the
+cluster: a `system_principal()` with the admin role. That was wrong. An
+admin who later writes the app policy
+`deny = "caller.role != 'admin' && app.replicas > 4"` means it for agents,
+but the reaper judged the waiting proposal as an admin, so the deny never
+fired and the proposal applied. A person who approves is judged as
+themselves; nobody stands behind a policy approval except the author. So
+`bun::proposals::judged_as` picks the caller from the `Approval` itself,
+the person for `Approval::Human` and `proposal.author` for
+`Approval::Policy`, and `approve` no longer takes a caller at all, so no
+call site can pass the wrong one. The record still names the policy as the
+approver.
+
 Should a cluster auto-approve anything in the first release that has
 proposals at all? The AI SRE research said no, and the design leaves it to
 the maintainer. We ship it with no approve policy by default: on a new
@@ -5729,7 +5742,9 @@ an unknown blast radius, a refusal beating an approval, and the approver as
 `caller` at approval. The API tests apply an agent's scale at once under the
 example policies and read the audit record back; refuse an agent's delete
 but not a person's; hold a flagged scale through a reaper pass; and let a
-policy written later approve a waiting proposal on the next pass. The gym's
+policy written later approve a waiting proposal on the next pass; and check
+that a deny that judges by `caller`, written after the proposal, stops both
+the reaper and the approval itself. The gym's
 two bugs each have a test that failed first. The MCP tests check `--propose`
 adds exactly the proposing tools, annotated as council writes, without
 `apply`; that plain `relish mcp` refuses them and says how to get them; and

@@ -709,6 +709,73 @@ async fn the_reaper_approves_a_pending_proposal_a_later_policy_allows() {
     assert_eq!(applied[0].details["reason"], "p99 over the SLO");
 }
 
+/// An app policy that judges by who's asking, written after the proposal.
+const ONLY_ADMINS_GO_BIG: &str = "[policy.only-admins-go-big]\n\
+     deny = \"caller.role != 'admin' && app.replicas > 4\"\n\
+     message = 'only an admin runs more than four replicas'\n";
+
+/// A policy approval judges the proposal as its author: nobody else stands
+/// behind it. A caller-conditioned deny written after the proposal was
+/// made keeps the reaper from approving it, although the cluster itself
+/// would pass the deny.
+#[tokio::test]
+async fn the_reaper_judges_a_policy_approval_as_the_author() {
+    let cluster = cluster("proposal-reaper-as-author").await;
+    let (status, body) = cluster.scale(&cluster.holmes, "shop", "web", 5).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["state"], "pending");
+    cluster.write_policies(GUARDRAILS).await;
+    cluster.write_policies(ONLY_ADMINS_GO_BIG).await;
+    crate::bun::proposals::reap_once(
+        &cluster.council,
+        Some(&cluster.events),
+        "node-1",
+        crate::testkit::lease::now_unix_millis(),
+    )
+    .await
+    .unwrap();
+    let (_, body) = cluster.get("/v1/proposals/1", &cluster.bob).await;
+    assert_eq!(body["state"], "pending", "{body}");
+    assert_eq!(
+        cluster.replicas("web", "shop").await,
+        crate::config::Replicas::Fixed(3)
+    );
+}
+
+/// The approval itself judges a policy approval as the author too, so a
+/// deny that lands between the approve policy's match and the write
+/// still refuses it.
+#[tokio::test]
+async fn a_policy_approval_is_judged_as_the_author_not_the_cluster() {
+    let cluster = cluster("proposal-approve-as-author").await;
+    let (status, body) = cluster.scale(&cluster.holmes, "shop", "web", 5).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    cluster.write_policies(ONLY_ADMINS_GO_BIG).await;
+    let outcome = crate::bun::proposals::approve(
+        &cluster.council,
+        crate::proposal::ProposalId(1),
+        crate::proposal::Approval::Policy {
+            name: "agents-scale-shop".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    let crate::proposal::ProposalOutcome::Failed { proposal } = outcome else {
+        panic!("a caller-conditioned deny refuses the policy approval: {outcome:?}");
+    };
+    let crate::proposal::ProposalState::Failed { why, .. } = &proposal.state else {
+        panic!("{:?}", proposal.state);
+    };
+    assert!(
+        matches!(why, crate::proposal::FailedReason::Guardrail { rule, .. } if rule == "policy:only-admins-go-big"),
+        "{why:?}"
+    );
+    assert_eq!(
+        cluster.replicas("web", "shop").await,
+        crate::config::Replicas::Fixed(3)
+    );
+}
+
 /// The gym's finding (#1682): an agent's undo of a change a person has
 /// changed again since is refused when it's proposed, with the code
 /// `stale`, as a person's `relish undo` is. Approving it would have

@@ -304,14 +304,7 @@ pub(super) async fn proposal_create_handler(
     // A policy approved it on the spot.
     if let Some(name) = verdict.approve {
         let approval = Approval::Policy { name: name.clone() };
-        let outcome = match crate::bun::proposals::approve(
-            council,
-            created.id,
-            approval,
-            crate::bun::proposals::system_principal(),
-        )
-        .await
-        {
+        let outcome = match crate::bun::proposals::approve(council, created.id, approval).await {
             Ok(outcome) => outcome,
             Err(error) => return council_unavailable(error),
         };
@@ -406,7 +399,6 @@ pub(super) async fn proposal_approve_handler(
         council,
         id,
         Approval::Human(approver.clone()),
-        approver.clone(),
     )
     .await
     {
