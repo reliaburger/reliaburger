@@ -99,6 +99,16 @@ class StrangerChecksTests(unittest.TestCase):
         self.assertIn("python3 scripts/release/homebrew.py publish --formula relish.rb", self.tap)
         self.assertEqual(self.text.count("secrets.HOMEBREW_TAP_TOKEN"), 1)
 
+    def test_bottles_come_from_the_published_binaries_and_reach_the_tap_first(self):
+        # Without bottles Homebrew demands current Command Line Tools to "build"
+        # a formula that only copies a binary.
+        self.assertIn("--pattern 'relish-*'", self.tap)
+        self.assertIn("python3 scripts/release/homebrew.py bottles --record published/candidate.json", self.tap)
+        self.assertIn("--binaries published --output bottles", self.tap)
+        self.assertEqual(self.tap.count('--qualified-digest "$QUALIFIED_DIGEST"'), 2)
+        self.assertIn("--bottles bottles/bottles.json", self.tap)
+        self.assertIn("--bottles bottles", self.tap.split("homebrew.py publish", 1)[1])
+
 
 class RegistryEntryJobTests(unittest.TestCase):
     """Promotion writes the MCP Registry entry with the bundles' digests, and publishes nothing (#1695)."""

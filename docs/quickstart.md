@@ -1,7 +1,7 @@
 # A laptop cluster
 
-The command below installs the published, signed 0.2.6 release
-(6 November 2026) and builds a laptop cluster from it. A laptop cluster is a
+The command below installs the published, signed 0.2.7 release
+(7 November 2026) and builds a laptop cluster from it. A laptop cluster is a
 development cluster: until 1.0.0, Reliaburger is for developers and
 enthusiasts trying it out, not for production. The two cold installs of the
 0.1.0 release candidate on Apple silicon took 178 s and 282 s from the first `curl`
@@ -99,6 +99,10 @@ start it separately:
 ```sh
 relish setup --quickstart --nodes 3
 ```
+
+Homebrew installs the same CLI from 0.2.7: `brew install reliaburger/tap/relish`,
+then `relish setup --quickstart`. Homebrew owns that copy, so `brew upgrade
+relish` updates it and `relish uninstall` leaves it for `brew uninstall relish`.
 
 Use `/install.sh`: GitHub Pages serves the same static page to browsers and
 curl, so the site's root is HTML. The bootstrap downloads a complete,

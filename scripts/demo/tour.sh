@@ -59,7 +59,7 @@ BURGER_URL="https://reliaburger.com/demo/burger.tar.gz"
 BURGER_FETCH="curl -fsSL ${BURGER_URL} | tar xz"
 # The example policies, from the release's tag: the demo archive is
 # built from the tag too, so the tour never needs a file the release lacks.
-PLATFORM_FETCH="curl -fsSLO https://raw.githubusercontent.com/reliaburger/reliaburger/v0.2.6/examples/policies/platform.toml"
+PLATFORM_FETCH="curl -fsSLO https://raw.githubusercontent.com/reliaburger/reliaburger/v0.2.7/examples/policies/platform.toml"
 POLICY_TEST="relish policy test -f platform.toml -f burger/burger.toml"
 # The burger as the page shows it, on the default ingress port.
 BURGER="curl http://burger.localhost:18080"
@@ -500,6 +500,24 @@ run_dashboard() {
     sleep 0.5
 }
 
+# What an AI agent sees of the same cluster (0.2.7): the first call, the
+# findings and the chapter it reads first. The homepage's agent section has
+# its own steps, so these aren't data-tour commands; jq only makes the one-line
+# JSON readable for people. Without jq the tour skips this step.
+agent_step() {
+    if ! command -v jq >/dev/null; then
+        return 0
+    fi
+    step_heading "Ask your agent"
+    say "From 0.2.7 an AI agent asks relish the same questions and gets one line of"
+    say "JSON back, within a byte budget. jq here only makes it readable for people."
+    show "relish agent context | jq -c '.data.apps.items[] | {app, state, running, desired}'"
+    show "relish agent diagnose | jq -c '.data.findings[] | {id, severity, title}'"
+    say "The manual chapter an agent reads first, from the binary itself:"
+    show "relish agent guide | jq -r '.data.sections[].heading' | head -n 8"
+    resource_readout "the agent's questions"
+}
+
 say "The five-minute tour from reliaburger.com, on a real three-node laptop cluster,"
 say "run by scripts/demo/tour.sh. It waits on the cluster's real state where the tour"
 say "says to wait, and says how long each wait took."
@@ -686,6 +704,10 @@ while IFS= read -r command <&3; do
             say "--no-open so no browser pops up in the recording; without it, relish opens"
             say "this address for you. Ctrl-C closes it; the cluster keeps running."
             run_dashboard
+            ;;
+        "relish wtf")
+            show "${command}"
+            agent_step
             ;;
         "relish local destroy --yes" | "relish uninstall" | "relish manual tour")
             # Cleanup and the pointer to the manual end the tour; the

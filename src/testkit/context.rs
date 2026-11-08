@@ -604,6 +604,24 @@ impl TestContext {
             if self.deadline.remaining().is_zero() {
                 return Err(format!("timed out after {:?} {waiting}", self.timeout));
             }
+            // The listing shows a cron definition as a `scheduled` row, so no
+            // row at all means the definition is gone or has no `cron`: say
+            // which, so the next #1527 failure names its cause.
+            let waiting = if last.is_empty() {
+                let definitions = tokio::time::timeout(
+                    Duration::from_secs(2).min(self.deadline.remaining()),
+                    self.client.job_summaries(true),
+                )
+                .await;
+                let definition = match definitions {
+                    Ok(Ok(view)) => job_definition_note(&view, job, &self.namespace),
+                    Ok(Err(error)) => format!("definitions unreadable: {error}"),
+                    Err(_) => "definitions unreadable: timed out".to_string(),
+                };
+                format!("{waiting}; {definition}")
+            } else {
+                waiting
+            };
             self.wait_note.record(waiting).await;
             tokio::time::sleep(Duration::from_millis(500).min(self.deadline.remaining())).await;
         }
@@ -985,9 +1003,45 @@ impl TestContext {
     }
 }
 
+/// What `GET /v1/jobs/definitions` says about `namespace/job`: absent, or
+/// its revision and `cron`.
+fn job_definition_note(view: &serde_json::Value, job: &str, namespace: &str) -> String {
+    let found = view["definitions"].as_array().and_then(|rows| {
+        rows.iter()
+            .find(|row| row["name"] == job && row["namespace"] == namespace)
+    });
+    match found {
+        Some(row) => format!(
+            "definition {namespace}/{job} exists at revision {} with cron {}",
+            row["revision"], row["cron"]
+        ),
+        None => format!("definition {namespace}/{job} is absent"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_job_definition_note_tells_a_missing_definition_from_a_disabled_one() {
+        let view = serde_json::json!({"definitions": [
+            {"name": "cron", "namespace": "rbtest-node-a", "revision": 3, "cron": null},
+            {"name": "cron", "namespace": "rbtest-node-b", "revision": 1, "cron": "* * * * *"},
+        ]});
+        assert_eq!(
+            job_definition_note(&view, "cron", "rbtest-node-a"),
+            "definition rbtest-node-a/cron exists at revision 3 with cron null"
+        );
+        assert_eq!(
+            job_definition_note(&view, "cron", "rbtest-node-b"),
+            "definition rbtest-node-b/cron exists at revision 1 with cron \"* * * * *\""
+        );
+        assert_eq!(
+            job_definition_note(&view, "cron", "rbtest-node-c"),
+            "definition rbtest-node-c/cron is absent"
+        );
+    }
     use crate::config::Config;
 
     /// V02: the report said "within 30 s" long after the release budget
