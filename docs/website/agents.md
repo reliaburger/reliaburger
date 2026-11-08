@@ -375,8 +375,10 @@ relish agent propose scale web --namespace shop --replicas 5 --reason "p99 over 
 Also `apply FILE`, `rollback`, `stop`, `delete`; `--dry-run` stores nothing.
 The cluster writes the summary, diff, blast radius and `undo` command.
 Proposing leases each app until it's decided. `stale`: the app changed;
-propose again. `guardrail` (exit `4`): a policy refused it. `proposals`
-shows yours, `withdraw ID` takes one back, `undo ID` proposes the undo.
+propose again. `guardrail` (exit `4`): a policy refused it. A policy may
+approve it at once (`approval.approved_by` is `policy:<name>`). `proposals`
+shows yours, `withdraw ID` takes one back, `undo ID` proposes the undo,
+refused as `stale` if anyone changed the app since.
 
 ## Reading an app's logs
 
@@ -907,11 +909,20 @@ Some commands aren't tools, on purpose:
 | `patch` | Builds binaries and starts a throwaway cluster |
 | `upgrade-check` | Fetches release metadata from the internet, beyond the cluster API |
 | `setup` | Writes your agents' configuration |
-| `lease`, `propose`, `proposals`, `withdraw`, `undo` | Write council records; arrive in a proposing mode of `relish mcp` |
+| `lease`, `propose`, `proposals`, `withdraw`, `undo` | Write council records; only with `--propose` |
 
 Run those yourself, or let the agent run them in a shell where you approve
 each one. `relish mcp` reads private cluster state and text workloads wrote,
 so it must never also change anything or send anything out.
+
+`relish mcp --propose` adds the proposing tools: `propose`, `proposals`,
+`withdraw`, `undo` and `lease_take`, `_renew`, `_release`. They change no
+workload; a person or an admin's policy approves each proposal. There's no
+approve tool, and `propose` takes no `apply` (it reads a local file). Give it
+a deployer agent token,
+`relish token create --name holmes --agent --role deployer --namespaces shop`.
+From the saved admin context it makes one itself, confined to `--namespace`,
+in `mcp-propose-token.json`.
 
 Three flags narrow what it offers:
 

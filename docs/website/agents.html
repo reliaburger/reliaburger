@@ -372,8 +372,10 @@ names the holder. <code>--wait</code> retries; <code>context</code> lists <code>
 <p>Also <code>apply FILE</code>, <code>rollback</code>, <code>stop</code>, <code>delete</code>; <code>--dry-run</code> stores nothing.
 The cluster writes the summary, diff, blast radius and <code>undo</code> command.
 Proposing leases each app until it's decided. <code>stale</code>: the app changed;
-propose again. <code>guardrail</code> (exit <code>4</code>): a policy refused it. <code>proposals</code>
-shows yours, <code>withdraw ID</code> takes one back, <code>undo ID</code> proposes the undo.</p>
+propose again. <code>guardrail</code> (exit <code>4</code>): a policy refused it. A policy may
+approve it at once (<code>approval.approved_by</code> is <code>policy:&lt;name&gt;</code>). <code>proposals</code>
+shows yours, <code>withdraw ID</code> takes one back, <code>undo ID</code> proposes the undo,
+refused as <code>stale</code> if anyone changed the app since.</p>
 </section>
 <section class="agents-section" id="reading-an-apps-logs">
 <h2>Reading an app's logs <a class="permalink" href="#reading-an-apps-logs" aria-label="Link to this section">#</a></h2>
@@ -780,11 +782,19 @@ To see the list without a client:</p>
 <tr><td><code>patch</code></td><td>Builds binaries and starts a throwaway cluster</td></tr>
 <tr><td><code>upgrade-check</code></td><td>Fetches release metadata from the internet, beyond the cluster API</td></tr>
 <tr><td><code>setup</code></td><td>Writes your agents' configuration</td></tr>
-<tr><td><code>lease</code>, <code>propose</code>, <code>proposals</code>, <code>withdraw</code>, <code>undo</code></td><td>Write council records; arrive in a proposing mode of <code>relish mcp</code></td></tr>
+<tr><td><code>lease</code>, <code>propose</code>, <code>proposals</code>, <code>withdraw</code>, <code>undo</code></td><td>Write council records; only with <code>--propose</code></td></tr>
 </tbody></table>
 <p>Run those yourself, or let the agent run them in a shell where you approve
 each one. <code>relish mcp</code> reads private cluster state and text workloads wrote,
 so it must never also change anything or send anything out.</p>
+<p><code>relish mcp --propose</code> adds the proposing tools: <code>propose</code>, <code>proposals</code>,
+<code>withdraw</code>, <code>undo</code> and <code>lease_take</code>, <code>_renew</code>, <code>_release</code>. They change no
+workload; a person or an admin's policy approves each proposal. There's no
+approve tool, and <code>propose</code> takes no <code>apply</code> (it reads a local file). Give it
+a deployer agent token,
+<code>relish token create --name holmes --agent --role deployer --namespaces shop</code>.
+From the saved admin context it makes one itself, confined to <code>--namespace</code>,
+in <code>mcp-propose-token.json</code>.</p>
 <p>Three flags narrow what it offers:</p>
 <table><thead><tr><th>Flag</th><th>Meaning</th></tr></thead><tbody>
 <tr><td><code>--toolsets source,manual</code></td><td>Only the tools whose command starts with one of these words</td></tr>

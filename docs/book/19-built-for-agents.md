@@ -5499,24 +5499,12 @@ radius and outcome stay. The same reaper expires proposals nobody decided
 (an hour by default), ends their leases, and writes `proposal.expired`
 under `system`.
 
-### Seams for what comes next
+### The seam for the gym
 
-Three pieces of #1682 build on this in parallel, and each has one place to
-plug in:
-
-- **Guardrails and auto-approval**:
-  [`src/proposal/guard.rs`](../../src/proposal/guard.rs). The leader calls
-  `judge_proposal(&GuardInput) -> GuardVerdict` before `ProposalCreate` and
-  before `ProposalApply`. Today it runs the app policies on the changed
-  `after` specs; a verdict's `approve` field, once policies can set it,
-  applies the proposal with `Approval::Policy`, and the reaper's
-  `auto_approve_pending` judges every pending proposal while
-  `may_auto_approve` says a policy could.
-- **MCP**: `relish agent propose`, `proposals`, `withdraw` and `undo` are in
-  `relish mcp`'s exclusion list until `relish mcp --propose`.
-- **The gym**: the envelope's error codes `lease_held`, `stale` and
-  `guardrail`, and the audit actions, are what a scenario scores. The next
-  section is that.
+The gym scores a scenario from the CLI and the audit log alone: the
+envelope's error codes `lease_held`, `stale` and `guardrail`, exit `4` for a
+refusal and `5` for `stale`, the `proposal.*` audit actions, and `relish
+proposal approve ID --yes -o json` as the scripted person.
 
 ### Proving it in the gym
 
@@ -5631,6 +5619,217 @@ people scoped to other namespaces, and reads the audit log back. And
 `tests/cluster_failover.rs` proposes through one follower, approves through
 the other, kills the leader, and undoes on the new one, checking the app is
 back at its exact `before` revision.
+
+### What the gym found first
+
+The laptop ran the proposals on a real cluster through the gym before any of
+this merged, and found two bugs our tests had walked straight past.
+
+The first was in undo. An agent scaled `web` from one replica to two and a
+person approved it. The person then shipped `v1.1` by hand, scaling back to
+one. The agent ran `relish agent undo 1`, which made an undo proposal with
+the diff `env.VERSION: v1.1 -> v1`. Approving it would have quietly thrown
+the person's release away. The design said the opposite: an undo starts
+from the original's `after`, and refuses when anything has moved since. The
+code built the undo's `before` from the *current* state, so the revision
+check at approval compared the current state with itself and passed. A
+person's `relish undo 1` got this right, because the state machine checks it
+against `after`. Now `build`'s undo does the same check up front and answers
+`stale`:
+
+```rust
+for change in &original.changes {
+    if current_app(desired, &change.app).revision != change.after.revision {
+        return Err(ProposalRefusal::Stale { /* ... */ });
+    }
+    changes.push(AppChange {
+        app: change.app.clone(),
+        before: change.after.clone(),
+        after: change.after_undo(),
+    });
+}
+```
+
+The loop is a plain `for` with an early `return`, not the `.map().collect()`
+it replaced. A closure in `map` can't `return` from the function around it,
+and collecting into `Result<Vec<_>, _>` works but hides the one line that
+matters. Here it should stand out.
+
+The same run showed that an approval which wrote nothing answered `200` with
+`state: failed`. A script reading the status, or an agent reading `ok`,
+takes that for a yes. It now answers the refusal's own code (`stale`,
+`lease_held` or `guardrail`) and status, with the proposal beside it as
+`view`, and asking again answers the same.
+
+The second bug was in rollback. After a crash loop, `relish agent propose
+rollback web` said there was "no released spec that differs from the current
+one", while a person's `relish rollback web` worked. The proposal looked only
+at the council's released specs; the rollback route also falls back to
+every node's deploy history. They now share that fallback,
+`deploys::history_rollback_target`. Building a proposal is a pure function
+of desired state, and the history needs network calls, so the API looks the
+target up first and hands it in: `build_with_history(..., history_target:
+Option<&AppSpec>)`. `build` is that with `None`, so none of its callers
+changed.
+
+## Guardrails in policy
+
+Proposals put a person between an agent and the cluster. That's the right
+default, and a tiring one: nobody wants to approve "scale `web` from 3 to
+5" forty times a day. So #1682 asks for two more things. An admin should be
+able to say what agents may never do, and what they may do without asking.
+Both are policies, the same CEL rules chapter 18 built for apps.
+
+### A policy that judges a change
+
+A guardrail is a policy with `applies_to = "proposals"`. Where an app policy
+sees `app`, a guardrail sees `proposal` and `author`:
+
+```toml
+[policy.agents-never-delete]
+applies_to = "proposals"
+match = 'author.kind == "agent"'
+deny = 'proposal.kind == "delete"'
+message = "agents may scale and roll back, never delete"
+```
+
+`proposal` is a plain struct the leader fills from its own state,
+`policy::ProposalFacts`: the kind, the namespace, the app names, the nodes,
+how many instances it touches, a scale's replica counts, its reversibility,
+the changed field paths and the images. The agent claims none of it. It's
+serialised to JSON and turned into a CEL value exactly as an app is, by the
+`json_to_cel` chapter 18 wrote, so a guardrail compiles and runs on the same
+`PolicySet`, through the same `decide` and `matches` helpers. Those are
+private to `src/policy/mod.rs`, and the new code lives in a child module,
+`src/policy/proposal.rs`. In Rust a child module can see its parent's private
+items; a sibling or a parent can't see a child's. So the helpers stay
+private and the guardrail code still uses them.
+
+Two things aren't in `proposal`. The agent's `reason` is its own free text,
+and a guardrail that read it could be talked round by it ("this is urgent,
+the on-call said it's fine"). The checker refuses `proposal.reason` as an
+unknown field. And there's no clock, because policies are pure functions of
+their arguments; "only in office hours" can't be said, and the manual says
+so.
+
+The checker needed little. `workload_variables` gained a fourth arm,
+`PolicyTarget::Proposals => &["proposal", "author"]`, and the field lists
+gained `PROPOSAL_FIELDS` and `AUTHOR_FIELDS`. A test serialises a default
+`ProposalFacts` and compares its keys with `PROPOSAL_FIELDS`, so the list a
+policy author reads and the struct the leader fills can't drift. Adding a
+variant to `PolicyTarget` and `PolicyAction` also broke every `match` on
+them that had no `_` arm, which is the point of exhaustive matching: the
+compiler handed us the list of places to decide, `Verdict::push` and the
+report table among them.
+
+### Approve, and the rule a policy can't lift
+
+`action = "approve"` is the other half:
+
+```toml
+[policy.agents-scale-shop]
+applies_to = "proposals"
+action = "approve"
+match = 'author.kind == "agent" && proposal.kind == "scale" && proposal.namespace == "shop" && proposal.replicas_to <= 10'
+```
+
+An approve policy has a `match` and nothing else. A `deny` beside it would be
+ambiguous, so the checker refuses it, and a missing `match` would approve
+every proposal, so it refuses that too. The first approve policy by name
+whose `match` is true approves the proposal. Name order makes it
+deterministic, like every other policy decision.
+
+Then built-in rule 3 gets a veto, in `guard::held_for_a_person`. A policy
+never approves a change that can't be undone exactly, one a `warn` policy
+flagged (at creation or now), or one whose blast radius has an `unknown`
+entry. Those wait for a person whatever the policies say, and the
+`proposal.created` record says which policy matched and why it was held.
+That's the line between "an admin trusts agents to scale shop" and "an
+admin accidentally let agents delete a database". The second needs more than
+one bad policy.
+
+The plumbing was already there. The leader calls `judge_proposal` before it
+writes `ProposalCreate`; a verdict with `approve` set applies the proposal at
+once as `Approval::Policy`. The leader's reaper calls it again every second
+on each pending proposal, but only while `may_auto_approve` finds an approve
+policy, so a cluster without one does no extra work. That pass is also how a
+policy written after a proposal still approves it, and how a new leader
+finishes an approval the old one didn't. The audit record names the policy
+as the principal, with `principal_kind` `policy`, beside the author and the
+author's reason.
+
+Should a cluster auto-approve anything in the first release that has
+proposals at all? The AI SRE research said no, and the design leaves it to
+the maintainer. We ship it with no approve policy by default: on a new
+cluster every proposal waits for a person.
+
+### Testing a guardrail before trusting it
+
+`relish policy test --proposal proposal.json` judges a proposal's JSON by
+the guardrails in some files, offline. A guardrail is easy to get subtly
+wrong, and you'd rather find out on a laptop than when an agent's delete
+goes through. The JSON is what `relish proposal show 17 -o json` prints,
+which now carries `policy_input`: the exact `proposal` and `author` the
+guardrails saw. The command also reads an agent's envelope and takes its
+`data`. It can't run the app policies, because the JSON has no specs, and it
+says so.
+
+## MCP that can ask
+
+`relish mcp` was read-only on principle: it reads text workloads wrote, and
+a tool that could change something would turn a prompt injection in a log
+line into an action. Proposals change that sum. The worst an injected
+instruction can do now is make the agent *ask*, and a person or an admin's
+policy answers.
+
+So `relish mcp --propose` adds the commands in `tools::PROPOSING`: `propose`,
+`proposals`, `withdraw`, `undo` and the three lease commands. Without the
+flag, they're still refused, and the error and the server's instructions
+say what would offer them. The list is a sibling of `EXCLUDED` rather than a
+flag on it, so a reviewer sees in one place which commands write to the
+council. A test checks that `--propose` adds exactly those tools, so a new
+writing command can't slip in. Their annotations say what they are: not
+read-only, not destructive, since they write council records and never
+touch a workload.
+
+There's one argument MCP never passes: `propose apply FILE` reads a local
+TOML file, so through MCP it would read any file the server can, and a parse
+error can quote it back. `REFUSED_VALUES` takes `apply` out of the tool's
+`enum` and refuses it in `command_line`. The tools for approving don't exist
+to leave out: `relish proposal approve` and `relish undo` are top-level
+commands, outside the `relish agent` tree `relish mcp` derives from.
+
+The token was the delicate part. #1763 gave `relish mcp` a read-only token
+of its own, so an agent never carries the context's admin token. A read-only
+token can't propose. With `--propose`, the same machinery in
+`mcp/credentials.rs` makes a second token: an agent token with the deployer
+role, confined to `--namespace`, kept in `mcp-propose-token.json`. The
+cluster treats an agent token as read-only on every route but proposals and
+leases, so "deployer" here means "may ask", never "may do". Which token a
+server wants is one enum, `credentials::Purpose`, with the role and the file
+name as methods on it, so the two can't be mixed up. The read-only token is
+an agent token now too, so the audit log names everything an MCP connection
+does as an agent's.
+
+### The tests
+
+[`src/policy/proposal_tests.rs`](../../src/policy/proposal_tests.rs) checks
+what a guardrail may say: only `proposal`, `author`, `caller` and `source`,
+no `reason`, an approve policy with only a `match`, and the four example
+guardrails refusing and approving what they claim to.
+[`src/proposal/guard_tests.rs`](../../src/proposal/guard_tests.rs) builds
+real proposals and judges them: the facts a guardrail sees, a deny naming
+its policy, an exact scale approved, rule 3 holding a lossy delete, a warned
+scale (by a guardrail, an app policy, or a finding stored at creation) and
+an unknown blast radius, a refusal beating an approval, and the approver as
+`caller` at approval. The API tests apply an agent's scale at once under the
+example policies and read the audit record back; refuse an agent's delete
+but not a person's; hold a flagged scale through a reaper pass; and let a
+policy written later approve a waiting proposal on the next pass. The gym's
+two bugs each have a test that failed first. The MCP tests check `--propose`
+adds exactly the proposing tools, annotated as council writes, without
+`apply`; that plain `relish mcp` refuses them and says how to get them; and
+that a proposing server sends a deployer agent token from its own file.
 
 ## What we didn't do
 

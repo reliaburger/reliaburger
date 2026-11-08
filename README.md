@@ -51,7 +51,9 @@ In Claude Code it's `claude mcp add reliaburger -- relish mcp`, and
 `relish agent setup` wires up every agent on this machine, showing the diff
 before it writes anything. From an admin context, `relish mcp` makes and
 sends a read-only token of its own, so an agent never holds admin
-credentials.
+credentials. `relish mcp --propose` *(0.2.8, not in 0.2.7)* lets the agent
+propose changes for you or an admin's policy to approve, each with its undo
+command; guardrails written as policies say what an agent may never do.
 
 ```sh
 # Install relish and build a three-node cluster in Linux VMs on this laptop
