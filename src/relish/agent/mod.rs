@@ -165,7 +165,12 @@ impl AgentCommand {
             | AgentCommand::Diagnose(_)
             | AgentCommand::UpgradeCheck(_)
             | AgentCommand::Patch(_)
-            | AgentCommand::Setup(_) => ClusterUse::Required,
+            | AgentCommand::Setup(_)
+            | AgentCommand::Lease(_)
+            | AgentCommand::Propose(_)
+            | AgentCommand::Proposals(_)
+            | AgentCommand::Withdraw { .. }
+            | AgentCommand::Undo(_) => ClusterUse::Required,
         }
     }
 

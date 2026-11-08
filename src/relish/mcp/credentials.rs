@@ -353,6 +353,7 @@ pub async fn obtain(
         namespaces: scope.namespace.clone().map(|namespace| vec![namespace]),
         lifetime: TokenLifetime::Days(TOKEN_TTL_DAYS),
         inherit_permissions: false,
+        agent: false,
     };
     let issued = bounded(admin.token_create(&request)).await?;
     let fresh = StoredToken {
