@@ -764,7 +764,7 @@ mod tests {
                 ],
                 4,
             ),
-            call(&["relish", "apps"], 2),
+            call(&["relish", "deploys"], 2),
         ];
         let audit = vec![serde_json::json!({
             "action": "api.refused",

@@ -462,7 +462,7 @@ class Parity(unittest.TestCase):
     def test_a_typo_the_parser_refused_is_recorded_not_counted_on_both(self):
         theirs, ours = self.both(
             "crash-loop", CRASH_ANSWER,
-            [self.call(["relish", "apps"], 2)],
+            [self.call(["relish", "deploys"], 2)],
             [self.call(["kubectl", "apps"], 1, 'error: unknown command "apps" for "kubectl"')],
         )
         self.same(theirs, ours)

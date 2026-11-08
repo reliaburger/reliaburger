@@ -23,6 +23,7 @@ use serde_json::Value;
 /// is mutating until someone adds it here (and to `score.py`).
 pub const READ_ONLY_COMMANDS: &[&str] = &[
     "agent",
+    "apps",
     "audit",
     "batch-status",
     "compile",

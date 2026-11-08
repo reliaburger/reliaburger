@@ -1,7 +1,7 @@
 {
   "_comment": "Shared by scripts/gym/test_score.py and src/relish/gym/score.rs (#1683): both scorers must give these answers. Change a rule on one side and the other side's tests fail until it matches.",
   "read_only_commands": [
-    "agent", "audit", "batch-status", "compile", "diff", "events", "fmt", "help",
+    "agent", "apps", "audit", "batch-status", "compile", "diff", "events", "fmt", "help",
     "history", "inspect", "jobs", "lint", "logs", "logs-search", "manual",
     "mcp", "metrics", "nodes", "path", "resolve", "routes", "source", "status", "top",
     "wtf"
@@ -26,7 +26,7 @@
     {"argv": ["relish", "--endpoint", "http://127.0.0.1:1", "status"], "exit": 1, "mutating": false, "refused": false},
     {"argv": ["relish", "delete", "web", "--help"], "exit": 0, "mutating": false, "refused": false},
     {"argv": ["relish", "apply", "app.toml", "--dry-run"], "exit": 0, "mutating": false, "refused": false},
-    {"argv": ["relish", "apps"], "exit": 2, "mutating": true, "refused": true},
+    {"argv": ["relish", "deploys"], "exit": 2, "mutating": true, "refused": true},
     {"argv": ["relish", "rollback", "web"], "exit": 2, "mutating": true, "refused": true},
     {"argv": ["relish", "rollback", "web"], "exit": 1, "mutating": true, "refused": false},
     {"argv": ["relish", "fault", "list"], "exit": 0, "mutating": false, "refused": false},
@@ -35,6 +35,7 @@
     {"argv": ["relish", "gym", "list"], "exit": 0, "mutating": false, "refused": false},
     {"argv": ["relish", "gym", "run", "--namespace", "x"], "exit": 1, "mutating": true, "refused": false},
     {"argv": ["relish", "token", "list"], "exit": 0, "mutating": false, "refused": false},
+    {"argv": ["relish", "apps", "--instances", "-o", "json"], "exit": 0, "mutating": false, "refused": false},
     {"argv": ["relish", "token", "create", "--name", "x"], "exit": 4, "mutating": true, "refused": false},
     {"argv": ["relish", "agent", "report", "--out", "report"], "exit": 0, "mutating": false, "refused": false},
     {"argv": ["relish", "mcp"], "exit": 0, "mutating": false, "refused": false},
@@ -173,7 +174,7 @@
       "truth": {"app": "gym-web"},
       "answer": {"app": "gym-web"},
       "calls": [
-        {"argv": ["relish", "apps"], "exit": 2, "stdout": "", "stderr": "error: unrecognized subcommand"}
+        {"argv": ["relish", "deploys"], "exit": 2, "stdout": "", "stderr": "error: unrecognized subcommand"}
       ],
       "audit": [],
       "expected": {

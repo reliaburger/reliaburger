@@ -70,10 +70,10 @@ fn named_app(prompt: &str) -> Option<String> {
     Some(prompt[start..end].to_string())
 }
 
-/// Name the fault from `relish wtf`, `status` and `events`.
+/// Name the fault from `relish wtf`, `apps --instances` and `events`.
 async fn diagnose(namespace: &str) -> Result<Value, BaselineError> {
     let report = relish_json(&["wtf", "-o", "json"]).await;
-    let instances = relish_json(&["status", "-o", "json"]).await;
+    let instances = relish_json(&["apps", "--instances", "-o", "json"]).await;
     let events = relish_json(&["events", "-o", "json"]).await;
     let ours: Vec<&Value> = instances
         .as_array()
