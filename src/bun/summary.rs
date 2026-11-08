@@ -14,6 +14,8 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+pub mod verdict;
+
 /// The most entries any summary list carries (the worst apps, the busiest
 /// nodes). The summary is counts; `relish apps` and `relish nodes` list.
 pub const SUMMARY_LIST_MAX: usize = 5;
@@ -57,7 +59,10 @@ pub struct Coverage {
 }
 
 /// One section of the summary, with how much of the cluster it saw.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+///
+/// Its JSON Schema is written by hand, below: the derived one would repeat
+/// these four fields' descriptions for each of the fourteen sections.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Section<T> {
     /// Whether `value` covers the whole cluster.
     pub source: Source,
@@ -70,6 +75,54 @@ pub struct Section<T> {
     pub coverage: Option<Coverage>,
     /// What was seen. `None` exactly when `source` is `missing`.
     pub value: Option<T>,
+}
+
+/// What every section of the summary says about itself. Each section also
+/// has a `value`: what was seen, `null` exactly when `source` is `missing`.
+///
+/// For the schema only: each section's schema refers to this one
+/// definition and adds its own `value`. It mirrors `Section`'s fields and
+/// their serde attributes, and the doc comment above is what a reader of
+/// `relish agent schema` sees.
+#[derive(JsonSchema)]
+#[allow(dead_code)] // never built; schemars reads its shape
+struct SectionHeader {
+    /// Whether `value` covers the whole cluster.
+    source: Source,
+    /// Why the section is partial or missing: which nodes didn't answer,
+    /// or which read failed. `None` when it's complete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    /// For a section read from every node, how many answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    coverage: Option<Coverage>,
+}
+
+/// A section's schema: [`SectionHeader`] by reference, plus a `value` of
+/// `T` or `null`. Inlined where it's used, so there's no definition per
+/// section either.
+impl<T: JsonSchema> JsonSchema for Section<T> {
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        format!("Section_for_{}", T::schema_name()).into()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        format!("reliaburger::bun::summary::Section<{}>", T::schema_id()).into()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let header = generator.subschema_for::<SectionHeader>();
+        let value = generator.subschema_for::<Option<T>>();
+        schemars::json_schema!({
+            "allOf": [header],
+            "properties": { "value": value },
+            "required": ["value"],
+        })
+    }
 }
 
 impl<T> Section<T> {
@@ -1198,6 +1251,46 @@ mod tests {
     fn every_node_answering_is_complete() {
         assert_eq!(Source::from_coverage(12, 12), Source::Complete);
         assert_eq!(Source::from_coverage(0, 0), Source::Complete);
+    }
+
+    fn summary_schema() -> serde_json::Value {
+        schemars::generate::SchemaSettings::default()
+            .for_serialize()
+            .into_generator()
+            .into_root_schema_for::<ClusterSummary>()
+            .to_value()
+    }
+
+    #[test]
+    fn the_schema_describes_what_every_section_shares_once() {
+        let schema = summary_schema();
+        let definitions = schema["$defs"].as_object().unwrap();
+        let sections: Vec<&String> = definitions
+            .keys()
+            .filter(|name| name.starts_with("Section") && *name != "SectionHeader")
+            .collect();
+        assert!(
+            sections.is_empty(),
+            "one definition per section: {sections:?}"
+        );
+        let header = &definitions["SectionHeader"];
+        assert!(header["properties"]["source"].is_object(), "{header}");
+        assert!(header["properties"]["coverage"].is_object(), "{header}");
+        assert_eq!(header["required"], serde_json::json!(["source"]));
+
+        let nodes = &schema["properties"]["nodes"];
+        assert_eq!(
+            nodes["allOf"][0]["$ref"], "#/$defs/SectionHeader",
+            "{nodes}"
+        );
+        let value = nodes["properties"]["value"].to_string();
+        assert!(value.contains("#/$defs/NodesSection"), "{value}");
+        assert!(value.contains("null"), "absent never means zero: {value}");
+        assert_eq!(nodes["required"], serde_json::json!(["value"]), "{nodes}");
+        assert_eq!(
+            nodes["description"], "Gossip membership by state.",
+            "the field keeps its own description"
+        );
     }
 
     #[test]

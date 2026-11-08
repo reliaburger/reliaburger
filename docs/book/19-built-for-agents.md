@@ -1293,9 +1293,11 @@ which can grow filters for large clusters without making `status` any longer.
 
 ### Lines, marks and a verdict
 
-`src/relish/status_cmd.rs` splits the work in two. `assess` turns a
-`ClusterSummary` into a `Vec<Line>`, and `render` lays the lines out. Neither
-does any I/O, so the tests run them over fixtures.
+The work splits in two. `assess` turns a `ClusterSummary` into a
+`Vec<Line>`, and `render` in `src/relish/status_cmd.rs` lays the lines out.
+Neither does any I/O, so the tests run them over fixtures. `assess` lives
+beside the summary, in `src/bun/summary/verdict.rs`, because the TUI and
+Brioche print the same lines (more on that below).
 
 Every line carries a `Mark`:
 
@@ -1435,11 +1437,54 @@ reference. serde serialises a reference exactly as the value behind it, so
 the envelope borrows the data instead of copying the summary.
 
 One snag: `relish agent schema` prints each command's `data` schema within
-its 24 KiB budget, and the summary's schema is about 36 KiB. schemars writes
-a separate definition for each `Section<T>`, and there are fourteen. So
-`CommandName::Status` is in the envelope's list of commands but not in the
-list `relish agent schema` offers. `data_schema(Status)` still works, and a
-test holds it to that.
+a budget, and at first the summary's didn't fit. `schema status` came to
+about 29 KiB: the envelope's own schema (8 KiB, in every `schema` answer)
+plus 21 KiB of status, a third of it repeated. For a generic type,
+`#[derive(JsonSchema)]` writes one definition per instantiation, so
+`Section<NodesSection>`, `Section<CouncilSection>` and the other twelve each
+carried their own copy of `source`, `reason` and `coverage` with every
+description.
+
+So `Section<T>` writes its schema by hand. A trait implementation for a
+generic type looks like this:
+
+```rust
+impl<T: JsonSchema> JsonSchema for Section<T> {
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let header = generator.subschema_for::<SectionHeader>();
+        let value = generator.subschema_for::<Option<T>>();
+        schemars::json_schema!({
+            "allOf": [header],
+            "properties": { "value": value },
+            "required": ["value"],
+        })
+    }
+    // schema_name and schema_id: one name per T
+}
+```
+
+`impl<T: JsonSchema>` reads "for every `T` that has a schema itself". That
+bound is what lets the body call `subschema_for::<Option<T>>()`; without it
+the compiler wouldn't know `T` can describe itself. (Go's generics spell the
+same thing `[T JsonSchema]`.) The shared fields live in `SectionHeader`, a
+private struct that's never built: it exists so `#[derive(JsonSchema)]` can
+write their schema once, and every section points at it with a `$ref`.
+`inline_schema` returning `true` drops the per-section definition too, so
+`nodes` in the schema is just "a section header, plus a `value` that's a
+`NodesSection` or `null`".
+
+That took status's schema from 28.7 to 21.5 KB. With the envelope it's
+still 29.6 KB, over the 24 KiB every answer gets. We could have cut the
+descriptions until it fit, but they're the useful part. A schema is
+reference: an agent reads it once, not on every question, the way it reads
+the guide. So `schema` got a budget of its own, 32 KiB, beside the guide's
+64, and `relish agent schema status` is offered with the rest. A test holds
+every command's schema to its command's default, so the next one that
+outgrows it fails there, not in an agent's context window.
 
 ### `relish apps` and `relish nodes`
 

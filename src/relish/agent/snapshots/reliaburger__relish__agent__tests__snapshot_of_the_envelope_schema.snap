@@ -216,7 +216,7 @@ expression: "schema_of::<Envelope<Value>>()"
         },
         {
           "const": "status",
-          "description": "`relish status -o json`: not under `relish agent`, but it answers in\nthe same envelope. Its `data` schema (the whole cluster summary) is\nbigger than `relish agent schema`'s budget, so the schema command\ndoesn't offer it.",
+          "description": "`relish status -o json`: not under `relish agent`, but it answers in\nthe same envelope, so `relish agent schema status` describes it.",
           "type": "string"
         }
       ]
