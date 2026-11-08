@@ -16,13 +16,11 @@ import coverage_contract as k
 # Independent expected front door copied from the existing Makefile.
 EXPECTED_RECIPE = """COVERAGE_MIN_LINES ?= 78.65
 COVERAGE_REPORT = $(CARGO) llvm-cov report --failure-mode all
-coverage: ## Run the portable suite once under line coverage and enforce the floor
+coverage: ## Run the portable suite once under line coverage, write the lcov report and enforce the floor
 	$(CARGO) llvm-cov clean --workspace
 	$(CARGO) llvm-cov --no-report nextest --profile $(NEXTEST_PROFILE) --no-tests=fail
 	mkdir -p target/coverage
-	$(COVERAGE_REPORT) --lcov --output-path target/coverage/lcov.info
-	$(COVERAGE_REPORT) --html --output-dir target/coverage/html
-	$(COVERAGE_REPORT) --fail-under-lines $(COVERAGE_MIN_LINES)
+	$(COVERAGE_REPORT) --lcov --output-path target/coverage/lcov.info --fail-under-lines $(COVERAGE_MIN_LINES)
 """
 
 class Owner(unittest.TestCase):
@@ -208,6 +206,16 @@ class Owner(unittest.TestCase):
         self.assertEqual(len([x for x in self.calls if x[0] == 'make']), 1)
         self.assertTrue((self.directory / 'handshake.json').is_file())
 
+    def test_one_report_stage_writes_the_lcov_and_enforces_the_floor(self):
+        # Plan 2026-11-06, F3: each report stage merged every profile again;
+        # the HTML is make coverage-html's, outside the evidence owner (D5).
+        stages = self.o.recipe_stages('ci', '78.65')
+        self.assertEqual(stages[2:], [[
+            'report', '--failure-mode', 'all', '--lcov', '--output-path',
+            'target/coverage/lcov.info', '--fail-under-lines', '78.65',
+        ]])
+        self.assertFalse(any('--html' in stage for stage in stages))
+
     def test_disabled_overlay_cannot_supply_success_owner(self):
         self.mode = 'disabled'
         with self.assertRaisesRegex(c.Invalid, 'handshake|interception'):
@@ -299,7 +307,7 @@ class Owner(unittest.TestCase):
         with self.assertRaisesRegex(c.Invalid, r'failing tests: reliaburger cron::boundary'):
             self.execute()
 
-    def test_failed_lcov_stops_remaining_stages_without_repeating_tests(self):
+    def test_failed_lcov_report_fails_the_owner_without_repeating_tests(self):
         self.mode = 'lcov'
         with self.assertRaisesRegex(c.Invalid, 'failed'):
             self.execute()

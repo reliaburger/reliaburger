@@ -12,6 +12,10 @@ The record also names the source bundle every `relish` embeds (#1570) by its
 the release it came from (#1694). Each build job reads the digest from the
 `relish` it built (`bundle-digest`); the candidate job requires every platform
 to agree (`agreed-source-digest`) before recording it.
+
+It names, as `source_ci`, the `ci.yml` run whose pass the candidate rests on
+(#1722): the run `ci_reuse.py` found on main, or the build's own run when it
+ran the suite itself. Qualification cites it from the record.
 """
 import argparse
 import hashlib
@@ -48,7 +52,7 @@ def candidate_names(pins):
     return names | {name + ".sig" for name in names} | PDFS | {
         "metadata.json", "cli-metadata.json", "SHA256SUMS", "install.sh", GUEST_METADATA,
     } | {image["asset"] for image in pins["images"].values()} | {
-        mcpb_name(platform) for platform in PLATFORMS["relish"]
+        mcpb_name(platform) + suffix for platform in PLATFORMS["relish"] for suffix in ("", ".sig")
     }
 
 
@@ -83,6 +87,14 @@ def check_source_digest(value):
     if not isinstance(value, str) or not SOURCE_DIGEST.fullmatch(value):
         raise ValueError(f"source digest must be sha256:<64 lower-case hex digits>, not {value!r}")
     return value
+
+
+def check_source_ci(value):
+    """A record's `source_ci`: exactly a positive run id and attempt."""
+    if (type(value) is not dict or set(value) != {"run_id", "run_attempt"}
+            or any(type(value[key]) is not int or value[key] < 1 for key in value)):
+        raise ValueError("source CI must name a ci.yml run id and attempt")
+    return dict(value)
 
 
 def bundle_digest(answer):
@@ -145,14 +157,15 @@ def channel_fields(channel):
     return {} if channel == "release" else {"channel": channel}
 
 
-def record_candidate(directory, pins, channel="release", *, source_digest, **expected):
+def record_candidate(directory, pins, channel="release", *, source_digest, source_ci, **expected):
     expected = identity(**expected)
     source_digest = check_source_digest(source_digest)
+    source_ci = check_source_ci(source_ci)
     path = directory / RECORD
     if path.exists() or path.is_symlink():
         raise FileExistsError("candidate record already exists")
     document = dict(schema=1, **expected, **channel_fields(channel), source_digest=source_digest,
-                    assets=inventory(directory, pins))
+                    source_ci=source_ci, assets=inventory(directory, pins))
     encoded = (json.dumps(document, indent=2, sort_keys=True) + "\n").encode()
     with path.open("xb") as output:
         output.write(encoded)
@@ -161,11 +174,12 @@ def record_candidate(directory, pins, channel="release", *, source_digest, **exp
     return hashlib.sha256(encoded).hexdigest()
 
 
-def verify_candidate(directory, pins, qualified_digest, channel="release", source_digest=None, **expected):
-    """Verify the record and every asset; `source_digest`, when given, must be the recorded one.
+def verify_candidate(directory, pins, qualified_digest, channel="release", source_digest=None,
+                     source_ci=None, **expected):
+    """Verify the record and every asset; `source_digest` and `source_ci`, when given, must be the recorded ones.
 
-    Staging and promotion pass none: the record hashes to the qualified
-    digest, so the source digest it names is the one the build recorded.
+    Staging and promotion pass neither: the record hashes to the qualified
+    digest, so what it names is what the build recorded.
     """
     expected = identity(**expected)
     if not re.fullmatch(r"[0-9a-f]{64}", qualified_digest):
@@ -177,8 +191,11 @@ def verify_candidate(directory, pins, qualified_digest, channel="release", sourc
     recorded = check_source_digest(document.get("source_digest"))
     if source_digest is not None and recorded != source_digest:
         raise ValueError("candidate source digest differs from the build's")
+    recorded_ci = check_source_ci(document.get("source_ci"))
+    if source_ci is not None and recorded_ci != source_ci:
+        raise ValueError("candidate source CI run differs from the build's")
     if document != dict(schema=1, **expected, **channel_fields(channel), source_digest=recorded,
-                        assets=inventory(directory, pins, recorded=True)):
+                        source_ci=recorded_ci, assets=inventory(directory, pins, recorded=True)):
         raise ValueError("candidate identity or bytes differ from qualification")
     return document
 
@@ -403,6 +420,9 @@ def main():
                         help="release (a build of main) or nightly (a build of a release-* train)")
     parser.add_argument("--keep", type=int, default=7, help="prune-nightly: how many nightlies to keep")
     parser.add_argument("--source-digest", help="record and verify: the source bundle's sha256: digest")
+    parser.add_argument("--source-ci-run", type=int,
+                        help="record and verify: the ci.yml run the candidate's source CI rests on")
+    parser.add_argument("--source-ci-attempt", type=int, help="record and verify: that run's attempt")
     args = parser.parse_args()
 
     # The digest operations read only their input: no record, run or repository.
@@ -446,15 +466,19 @@ def main():
     if not args.version or not args.commit:
         parser.error(f"{args.operation} requires --version and --commit")
     expected = identity(args.version, args.repository, args.commit, args.run_id, args.run_attempt)
+    source_ci = None
+    if args.source_ci_run is not None or args.source_ci_attempt is not None:
+        source_ci = dict(run_id=args.source_ci_run, run_attempt=args.source_ci_attempt)
     if args.operation == "record":
-        if not args.source_digest:
-            parser.error("record requires --source-digest")
+        if not args.source_digest or source_ci is None:
+            parser.error("record requires --source-digest, --source-ci-run and --source-ci-attempt")
         print(record_candidate(args.directory, pins, args.channel, source_digest=args.source_digest,
-                               **expected))
+                               source_ci=source_ci, **expected))
         return
 
     if args.operation == "verify":
-        verify_candidate(args.directory, pins, digest, args.channel, args.source_digest, **expected)
+        verify_candidate(args.directory, pins, digest, args.channel, args.source_digest, source_ci,
+                         **expected)
         print(f"verified local candidate {args.commit}")
         return
 

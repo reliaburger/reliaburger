@@ -1,6 +1,6 @@
 // One of the site's three scripts: it turns the "Built differently" list into
 // a slideshow that shows one difference at a time. Without JavaScript the list
-// stays as it is, all six stacked. It moves on every nine seconds. Pause and
+// stays as it is, every slide stacked. It moves on every nine seconds. Pause and
 // Play always do what they say. Rotation also stops when keyboard focus comes
 // in from outside (it stays stopped until Play), while a mouse rests on it,
 // while the tab is hidden, and for anyone who prefers reduced motion. Touch

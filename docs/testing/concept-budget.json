@@ -1,0 +1,18 @@
+{
+  "resource_kinds": {
+    "budget": 8,
+    "reason": "Measured on 8 November 2026 (#1681): app, job, namespace, permission, policy, build, template and use"
+  },
+  "commands": {
+    "budget": 161,
+    "reason": "Measured on 8 November 2026 (#1681) at 159: every relish command and subcommand at every depth, none of them hidden. Raised to 161 for #1685: `relish timeline` for people and `relish agent timeline` for agents, the incident timeline"
+  },
+  "flags": {
+    "budget": 390,
+    "reason": "Measured on 8 November 2026 (#1681) at 375: named flags on every command, global ones once. Raised to 390 for #1685: the two timeline commands' window and scope flags, and `relish agent explain`'s --restart, --placement, --refusal and --rules, which ask why the cluster made a decision"
+  },
+  "distinct_flags": {
+    "budget": 173,
+    "reason": "Measured on 8 November 2026 (#1681) at 169: distinct flag names across all commands. Raised to 173 for #1685: `relish agent explain`'s --restart, --placement, --refusal and --rules"
+  }
+}

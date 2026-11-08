@@ -13,8 +13,7 @@ metrics, logs, GitOps, jobs and fault injection are compiled into that agent.
 There's no control plane to assemble and no add-ons to install. A Linux node
 needs a few distribution packages (`runc`, `nftables`, `iproute2` and friends,
 listed in the [Linux servers guide](docs/linux-servers.md)), and releases are
-glibc builds; static builds are planned for 0.3.0
-([#401](https://github.com/reliaburger/reliaburger/issues/401)).
+glibc builds; static builds are planned, though no issue tracks them yet.
 
 It applies most Kubernetes manifests directly and tells you what it had to
 change or drop (see [what converts](docs/manual/09_kubernetes.md)). The tour below
@@ -368,8 +367,9 @@ Push once and nodes pull layers from each other. It also caches upstream
 registries, and `relish build` builds images from your config straight into it.
 
 **Metrics, logs and alerts, nothing to install.** Each node scrapes its own
-workloads, including anything with `prometheus.io` annotations. Alert rules
-evaluate in the agent and call webhooks, optionally HMAC-signed. Logs are
+workloads, including anything with `prometheus.io` annotations. Five built-in
+alert rules on node CPU, memory and disk evaluate in the agent and call
+webhooks, optionally HMAC-signed; you can't write your own rules yet. Logs are
 captured on each node, streamed cluster-wide with `relish logs -f`, and
 exported as Parquet to disk or object storage, where SQL can query them.
 
@@ -488,7 +488,7 @@ Neither needs a network.
 | An ingress controller | Wrapper ingress |
 | Sealed Secrets | Secrets encrypted to the cluster key |
 | Harbor or another in-cluster registry | Pickle |
-| Prometheus, Alertmanager | Built-in scraping, alert rules and webhooks |
+| Prometheus, Alertmanager | Built-in scraping, five fixed node alert rules and webhooks (no custom rules yet) |
 | A log shipper and store | Built-in capture, streaming and Parquet export |
 | Argo CD or Flux | Built-in GitOps |
 | Kyverno or Gatekeeper (validation, defaults, audit) | `[policy.*]` deny, warn and audit rules for apps and jobs, fill-only defaults, `relish policy audit` |
@@ -507,7 +507,9 @@ and its trade-offs; the [design docs](docs/design/) cover each subsystem.
 - **Rootless runc is standalone only.** It gets host-port forwarding, but no eBPF
   policy, workload DNS or resource limits.
 - **Ingress certificates don't come from ACME.** Use the cluster CA or supply
-  your own files.
+  your own files. ACME is planned for 0.4.0
+  ([#1667](https://github.com/reliaburger/reliaburger/issues/1667)).
+- **Alerts are five built-in node rules.** You can't define your own yet.
 - **No PromQL.** Metrics are read through `relish metrics`, the dashboards and
   the API.
 - **`fault bandwidth` is refused** until it's implemented
@@ -519,7 +521,14 @@ and its trade-offs; the [design docs](docs/design/) cover each subsystem.
   upgrades need matching protocol and state formats (see the
   [compatibility policy](docs/releasing.md#cluster-compatibility)).
 - **Cron doesn't catch up.** It skips firings missed during a crash, and a job
-  whose outcome is unknown waits for `relish apply <file> --rerun-jobs`.
+  whose outcome is unknown waits until you acknowledge it with `relish batch
+  replay`; `relish apply --rerun-jobs` doesn't clear it.
+- **Three nodes are what's qualified.** Every release is soaked on three nodes.
+  Measurements with 500 and 1,000 simulated nodes found limits in the leader
+  and in gossip
+  ([#1411](https://github.com/reliaburger/reliaburger/issues/1411),
+  [#1412](https://github.com/reliaburger/reliaburger/issues/1412),
+  [#1413](https://github.com/reliaburger/reliaburger/issues/1413)).
 
 The [documentation](docs/README.md#scope-and-limits) has the full list.
 The [roadmap](docs/roadmap.md) has what's next and the known gaps, with the
