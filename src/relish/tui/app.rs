@@ -40,6 +40,13 @@ impl TuiApp {
             };
         }
         match update {
+            DataUpdate::Summary(result) => match result {
+                Ok(value) => {
+                    self.data.summary = Some(*value);
+                    self.mark_connected();
+                }
+                Err(error) => self.mark_disconnected(error.to_string()),
+            },
             DataUpdate::Status(result) => set_data!(result, instances),
             DataUpdate::Nodes(result) => set_data!(result, nodes),
             DataUpdate::Council(result) => match result {
@@ -168,6 +175,25 @@ mod tests {
         assert_eq!(app.view(), &View::Dashboard);
         app.update(key(KeyCode::Char('q')));
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn a_failed_summary_keeps_the_last_one() {
+        let mut app = TuiApp::with_test_data(super::super::fixtures::TestScenario::HealthyCluster);
+        let before = app.data.summary.clone();
+        app.update(Msg::Data(DataUpdate::Summary(Err(
+            ProviderError::Unreachable("gone".into()),
+        ))));
+        assert_eq!(app.data.summary, before);
+        assert!(matches!(app.connection, Connection::Disconnected { .. }));
+        let fresh = super::super::fixtures::TestScenario::NodeMissing
+            .data()
+            .summary;
+        app.update(Msg::Data(DataUpdate::Summary(Ok(Box::new(
+            fresh.clone().unwrap(),
+        )))));
+        assert_eq!(app.data.summary, fresh);
+        assert!(matches!(app.connection, Connection::Connected));
     }
 
     #[test]

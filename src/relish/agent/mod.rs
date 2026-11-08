@@ -46,8 +46,8 @@ pub use envelope::{AgentError, BuildInfo, CommandName, Envelope, ErrorCode, Exit
 #[derive(Debug, Clone, clap::Args)]
 pub struct AgentOptions {
     /// Largest answer to print, in bytes (at least 1024; by default 24576,
-    /// and 81920 for `guide`). A bigger answer is trimmed, marked
-    /// `truncated`, and says how to get the rest.
+    /// 81920 for `guide` and 40960 for `schema`). A bigger answer is
+    /// trimmed, marked `truncated`, and says how to get the rest.
     // No clap default: the default depends on the command, so `None` means
     // "not given" and [`AgentOptions::max_bytes`] picks the command's.
     #[arg(long, global = true, value_parser = parse_max_bytes)]
@@ -88,8 +88,8 @@ pub enum AgentCommand {
         #[command(subcommand)]
         command: manual::ManualCommand,
     },
-    /// The first call: findings, unknowns, faults, alerts, one line per app
-    /// and the newest events, in one bounded answer.
+    /// The first call: `relish status`'s screen and summary, findings,
+    /// unknowns, active faults and the newest events, in one bounded answer.
     Context(context::ContextArgs),
     /// Every finding with its evidence, read-only next steps, and pointers
     /// into the manual and the source.
@@ -576,20 +576,21 @@ mod tests {
     }
 
     #[test]
-    fn guide_defaults_to_80_kib_and_every_other_command_to_24_kib() {
+    fn guide_defaults_to_80_kib_schema_to_40_and_every_other_command_to_24() {
         use clap::ValueEnum;
         for &command in CommandName::value_variants() {
             let expected = match command {
                 CommandName::Guide => 80 * 1024,
+                CommandName::Schema => 40 * 1024,
                 _ => 24 * 1024,
             };
             assert_eq!(default_max_bytes(command), expected, "{command:?}");
         }
         assert_eq!(default_max_bytes(CommandName::Agent), 24 * 1024);
         assert_eq!(parse("agent guide").unwrap().max_bytes(), 80 * 1024);
+        assert_eq!(parse("agent schema status").unwrap().max_bytes(), 40 * 1024);
         for line in [
             "agent version",
-            "agent schema",
             "agent explain",
             "agent context",
             "agent logs payments",
@@ -696,7 +697,8 @@ mod tests {
                 "propose",
                 "proposals",
                 "withdraw",
-                "undo"
+                "undo",
+                "status"
             ]
         );
         let envelope = &value["data"]["envelope"];

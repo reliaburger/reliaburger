@@ -4,7 +4,8 @@
 //! 10,000 tokens gets a warning in Claude Code, so each command's output has
 //! a ceiling: 24 KiB by default, about 6,000 tokens. `relish agent guide` is
 //! the exception at 80 KiB: it is the one document an agent reads whole, so
-//! its default fits the whole manual chapter. When an answer is
+//! its default fits the whole manual chapter. `relish agent schema` gets
+//! 40 KiB, so `schema status` fits whole. When an answer is
 //! bigger, the budget trims `data` rather than cutting the text, so what
 //! comes out is still one valid JSON document in the same shape. Then it says
 //! so: `truncated` is `true`, a warning names each array or string it cut,
@@ -27,10 +28,24 @@ pub const DEFAULT_MAX_BYTES: usize = 24 * 1024;
 // than split. 80 KiB leaves room for the `relish status` work coming next.
 pub const GUIDE_MAX_BYTES: usize = 80 * 1024;
 
+/// `relish agent schema`'s budget when `--max-bytes` isn't given: 40 KiB.
+///
+/// Every `schema` answer carries the envelope's schema (about 8 KiB) beside
+/// the command's, and `relish status`'s is the biggest: the whole cluster
+/// summary, about 21 KiB even with its fourteen sections sharing one
+/// definition. An agent reads a schema once, as reference, not on every
+/// question, so it gets more room the way `guide` does; every other answer
+/// keeps 24 KiB.
+// From 32 KiB: the 0.2.8 integration (#1764, #1767) grew the envelope
+// by about 4 KiB of lease and proposal error codes and command names,
+// which took `schema status` to 33,617 bytes.
+pub const SCHEMA_MAX_BYTES: usize = 40 * 1024;
+
 /// The budget `command` gets when `--max-bytes` isn't given.
 pub fn default_max_bytes(command: CommandName) -> usize {
     match command {
         CommandName::Guide => GUIDE_MAX_BYTES,
+        CommandName::Schema => SCHEMA_MAX_BYTES,
         _ => DEFAULT_MAX_BYTES,
     }
 }

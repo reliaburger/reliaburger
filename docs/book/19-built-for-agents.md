@@ -886,7 +886,7 @@ commands for that:
 
 | Command | Answers |
 |---|---|
-| `context` | `wtf`'s findings in one line each, what it couldn't see, faults, alerts, one line per app, the newest events |
+| `context` | `wtf`'s findings in one line each, what it couldn't see, faults, alerts, one line per app, the newest events (from 0.2.8, `relish status`'s screen in place of the alerts and apps, and only the soonest faults) |
 | `diagnose [--app APP]` | Every finding with its evidence, read-only next steps, and pointers into the manual and the source |
 | `explain [ID]` | What a finding means, the numbers that decide it, and the line of code that does |
 
@@ -1308,9 +1308,11 @@ isn't the command the manual teaches; now it says `relish council status`.
 
 ### Lines, marks and a verdict
 
-`src/relish/status_cmd.rs` splits the work in two. `assess` turns a
-`ClusterSummary` into a `Vec<Line>`, and `render` lays the lines out. Neither
-does any I/O, so the tests run them over fixtures.
+The work splits in two. `assess` turns a `ClusterSummary` into a
+`Vec<Line>`, and `render` in `src/relish/status_cmd.rs` lays the lines out.
+Neither does any I/O, so the tests run them over fixtures. `assess` lives
+beside the summary, in `src/bun/summary/verdict.rs`, because the TUI and
+Brioche print the same lines (more on that below).
 
 Every line carries a `Mark`:
 
@@ -1450,11 +1452,57 @@ reference. serde serialises a reference exactly as the value behind it, so
 the envelope borrows the data instead of copying the summary.
 
 One snag: `relish agent schema` prints each command's `data` schema within
-its 24 KiB budget, and the summary's schema is about 36 KiB. schemars writes
-a separate definition for each `Section<T>`, and there are fourteen. So
-`CommandName::Status` is in the envelope's list of commands but not in the
-list `relish agent schema` offers. `data_schema(Status)` still works, and a
-test holds it to that.
+a budget, and at first the summary's didn't fit. `schema status` came to
+about 29 KiB: the envelope's own schema (8 KiB, in every `schema` answer)
+plus 21 KiB of status, a third of it repeated. For a generic type,
+`#[derive(JsonSchema)]` writes one definition per instantiation, so
+`Section<NodesSection>`, `Section<CouncilSection>` and the other twelve each
+carried their own copy of `source`, `reason` and `coverage` with every
+description.
+
+So `Section<T>` writes its schema by hand. A trait implementation for a
+generic type looks like this:
+
+```rust
+impl<T: JsonSchema> JsonSchema for Section<T> {
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let header = generator.subschema_for::<SectionHeader>();
+        let value = generator.subschema_for::<Option<T>>();
+        schemars::json_schema!({
+            "allOf": [header],
+            "properties": { "value": value },
+            "required": ["value"],
+        })
+    }
+    // schema_name and schema_id: one name per T
+}
+```
+
+`impl<T: JsonSchema>` reads "for every `T` that has a schema itself". That
+bound is what lets the body call `subschema_for::<Option<T>>()`; without it
+the compiler wouldn't know `T` can describe itself. (Go's generics spell the
+same thing `[T JsonSchema]`.) The shared fields live in `SectionHeader`, a
+private struct that's never built: it exists so `#[derive(JsonSchema)]` can
+write their schema once, and every section points at it with a `$ref`.
+`inline_schema` returning `true` drops the per-section definition too, so
+`nodes` in the schema is just "a section header, plus a `value` that's a
+`NodesSection` or `null`".
+
+That took status's schema from 28.7 to 21.5 KB. With the envelope it's
+still 29.6 KB, over the 24 KiB every answer gets. We could have cut the
+descriptions until it fit, but they're the useful part. A schema is
+reference: an agent reads it once, not on every question, the way it reads
+the guide. So `schema` got a budget of its own, 32 KiB, beside the guide's
+80, and `relish agent schema status` is offered with the rest. A test holds
+every command's schema to its command's default, so the next one that
+outgrows it fails there, not in an agent's context window. It did, the day
+it merged: leases and proposals added about 4 KiB of error codes and
+command names to the envelope, taking `schema status` to 33.6 KB, and the
+budget went to 40 KiB.
 
 ### `relish apps` and `relish nodes`
 
@@ -1535,6 +1583,158 @@ The concept budget (#1681) grew by one command and seven flags, raised in
   `--unhealthy` and the JSON.
 - `status_says_how_old_each_instance_is` covers the new `age_seconds`;
   `a_split_council_names_its_other_leader` covers the summary's new field.
+
+## The other readers
+
+`relish status` was the summary's first reader. The plan names four more:
+`relish agent context` (and with it the MCP `context` tool, which is the
+same command), the TUI's dashboard and Brioche's. Each had its own fan-out
+before, and each answered "how many apps are down?" its own way.
+
+### `context` reads the summary
+
+`context` used to build its faults, alerts and apps from `wtf`'s evidence:
+every fault, every alert, one line per app. On two thousand apps that's
+most of the 24 KiB, and the budget had to cut it, which is what "Worst
+first, so the budget cuts the right end" earlier in this chapter was about.
+Now `data.status` carries `relish status`'s screen instead: the verdict,
+one line per section, and the summary itself. The summary is the same size
+on three nodes or three hundred, so the alert and app lists went.
+
+The faults list stayed, bounded. The summary counts faults and names the
+soonest five by kind and target, but not who injected them, and that's the
+question an agent most needs answered before it calls something an outage:
+is this a drill? So `faults` keeps each fault's id and `injected_by`, lists
+at most `FAULTS_MAX` (ten) of them, the soonest to expire first, and counts
+every one in `active`, which is an `Option<usize>`. When the fault evidence
+couldn't be read it's `null`, never 0, for the same reason the summary's
+`value` is an `Option`. A context with any fault adds `relish fault list` to
+`next`. The only lists left that grow with the cluster are `wtf`'s findings
+and the timeline.
+
+`status` is a `Section<StatusView>`, the summary's own `Section` type. When
+`GET /v1/cluster/summary` fails, it's `missing` with the error as `reason`,
+and the findings still come back. A context with no status is worth more
+than no context.
+
+The lines come from the same `assess` that `relish status` calls. That's
+why it moved out of `status_cmd.rs` into `src/bun/summary/verdict.rs`:
+Brioche runs inside Bun, and Bun mustn't depend on the CLI (the crate split
+planned for 0.2.8 makes that a compile error). `context` passes `wtf`'s
+counts in as the last line, through `status_cmd::wtf_check`, so its
+verdict is the one `relish status` would have printed at that moment.
+
+One question was the schema. `ContextData` derives `JsonSchema`, and with
+the summary typed in full, `relish agent schema context` would have grown by
+about 18 KB, past its budget, and so would every MCP client's tool list,
+which carries each tool's output schema. So the `summary` field
+describes itself by reference:
+
+```rust
+#[schemars(schema_with = "summary_schema")]
+pub summary: ClusterSummary,
+```
+
+`schema_with` names a function that returns the field's schema, in place of
+the one the type would derive: here an object whose description says
+"`relish agent schema status` describes every field". The value is the
+whole typed summary; only the schema points elsewhere. (In Go you'd reach
+for a struct tag, and the tag would be a string nothing checks. Here the
+attribute names a function, so a typo doesn't compile.)
+
+### The TUI's dashboard
+
+The TUI's front page was three lists: every app with its instances, every
+node, and the last eight events. The header counted nodes from gossip's
+list and apps from the instance list, so a node that didn't answer simply
+made both numbers smaller.
+
+Now the dashboard prints `relish status`'s screen, then the events. The TUI
+fetches the summary in the same `tokio::join!` as everything else it polls,
+and the reducer stores it like any other result: on an error it keeps the
+last one and shows `DISCONNECTED`. The lines come from `assess`, so a node
+that timed out reads `2 alive, 0 suspect, 0 dead; partial (2 of 3 nodes)`
+in yellow, exactly as on the command line. The TUI doesn't run `wtf`'s
+checks, so it drops that line rather than print "skipped".
+
+The header reads the summary too. Its helper takes the section and a
+closure that picks the count:
+
+```rust
+fn counted<T>(section: &Section<T>, noun: &str, count: impl Fn(&T) -> u32) -> String {
+    let Some(value) = &section.value else {
+        return format!("{noun} unknown");
+    };
+```
+
+`let ... else` is a pattern with an escape hatch: if the pattern doesn't
+match, the `else` block runs, and it must leave the function (`return`,
+`break` or a panic). After it, `value` is in scope, unwrapped. It's the Rust
+spelling of Go's `if v == nil { return ... }` without the nil. A partial
+section comes out as `2 nodes, partial (2 of 3 nodes)`; a missing one as
+`nodes unknown`, never `0 nodes`.
+
+The apps, nodes and jobs views still read their lists. They're lists:
+that's what the summary isn't for.
+
+The snapshot tests cover a healthy cluster, a degraded app, an empty
+cluster and a new scenario, `NodeMissing`, where node-3 didn't answer.
+
+### Brioche's dashboard
+
+Brioche's front page had three big numbers at the top: nodes, apps and
+alerts. The node count was gossip's list, or 1 when there was no list; the
+app count was the length of the app table. The app table came from
+`/v1/status?cluster=true`, which fails outright when any node doesn't answer,
+so a node that timed out turned the whole page into a 503. That's the
+moment you most need a dashboard.
+
+Now the numbers are gone and a "Cluster" section takes their place: the
+verdict as a badge, then a table with one row per summary section, the rows
+that need attention coloured with the alert classes the stylesheet already
+had. It refreshes itself every five seconds from a new fragment,
+`/ui/fragment/summary`, the way the app and node tables do. No CSS or
+JavaScript changed: `brioche/dist/` holds hand-written files that
+`rust-embed` compiles into the binary, with no build step, and the existing
+classes were enough.
+
+Brioche runs inside Bun, so it doesn't fetch the summary over HTTP. The
+summary route's body became a function,
+
+```rust
+pub(super) async fn gather_cluster_summary(
+    state: &ApiState,
+    auth: Option<&AuthContext>,
+    sources: SummarySources<'_>,
+) -> ClusterSummary
+```
+
+and the route, the page and the fragment all call it. `SummarySources<'a>`
+bundles the four request extensions the summary reads (the known members,
+the leader directory, gossip's counters and the node's identity), each an
+`Option<&'a T>`. The `'a` is a lifetime parameter: it says the struct holds
+borrows that live no longer than the request it came from, so the compiler
+won't let one escape into a spawned task. Deriving `Copy` on it is fine for
+the same reason: copying a struct of references copies the pointers, never
+what they point at.
+
+The page also stopped failing when the app list can't be read. It renders
+the summary, which says `partial (1 of 2 nodes)`, and puts "Couldn't list
+every app" with the reason where the table would be. A test drives exactly
+that through the real router: a peer on a port nothing listens on, then `/`
+and `/ui/fragment/summary`, both expected to say `DEGRADED` and `partial`.
+
+The app table had its own rollup too, with words of its own: `pending`
+until every replica ran, `blocked` when the quota or a missing volume home
+held the app back, `unhealthy` when any instance had failed. So one app
+could be `degraded` in `relish apps` and `pending` on the page. Now
+`statuses_to_dashboard_apps` counts the running instances per app and asks
+`summary::app_state` for the word, the same call the summary and `relish
+apps` make. It passes `nodes_unanswered: false`, which is true here: the
+statuses come from every node or the call fails. A blocked app reads
+`down` in the table, as it does in `relish apps`, and its page still says
+`Not placed, blocked:` and why. The status dots learned the new words:
+amber for `degraded`, red for `down`.
 
 ## Logs and the manual
 

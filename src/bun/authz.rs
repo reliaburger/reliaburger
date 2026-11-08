@@ -161,6 +161,8 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Get, "/ui/fragment/apps", AnyToken),
     route(Get, "/ui/fragment/batches", AnyToken),
     route(Get, "/ui/fragment/nodes", AnyToken),
+    // The summary scopes itself, like `/v1/cluster/summary`.
+    route(Get, "/ui/fragment/summary", AnyToken),
     gated(Get, "/ui/fragment/alerts", AnyToken, Cluster(METRICS)),
     route(
         Get,

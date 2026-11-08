@@ -445,10 +445,10 @@ fn every_real_tool_is_read_only_closed_world_and_not_excluded() {
 fn each_tool_advertises_its_own_default_budget() {
     for spec in real_tools() {
         let schema = Value::Object((*spec.tool.input_schema).clone());
-        let expected = if spec.command == "guide" {
-            81920
-        } else {
-            24576
+        let expected = match spec.command.as_str() {
+            "guide" => 81920,
+            "schema" => 40960,
+            _ => 24576,
         };
         assert_eq!(
             schema["properties"]["max_bytes"]["default"], expected,

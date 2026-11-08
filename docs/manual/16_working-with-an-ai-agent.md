@@ -89,7 +89,7 @@ Every `relish agent` command:
 - never prompts, never opens a TUI and never reads stdin, so it runs the same
   in a script, a CI job or an agent's tool call;
 - stays within a byte budget, 24 KiB unless you pass `--max-bytes` (80 KiB
-  for `relish agent guide`, the one answer you read whole);
+  for `guide`, the one answer you read whole, and 40 for `schema`);
 - exits with a code that says whether it answered, not what the answer was.
 
 `-o` is accepted and ignored: there's only one format.
@@ -180,11 +180,12 @@ exit code is the verdict.
 ## Byte budgets
 
 Every command's default budget is 24 KiB, about 6,000 tokens, except
-`relish agent guide`'s 80 KiB, so this whole chapter comes back in one call.
-`--max-bytes` overrides either. An answer over budget is trimmed and stays
-valid JSON: items go from the end of the longest arrays in `data` first
-(commands put what matters most at the front), then long strings are
-shortened, ending in `…[cut]`. Then it says so:
+`guide`'s, 80 KiB so this whole chapter comes back in one call, and
+`schema`'s, 40. `--max-bytes` overrides any of them. When an answer is
+bigger than the budget, `relish agent` trims it and keeps the JSON valid. It
+drops items from the end of the longest arrays in `data` first (commands put
+what matters most at the front), then shortens long strings, which end in
+`…[cut]`. Then it says so:
 
 - `truncated` is `true`;
 - a warning names each cut, such as `/data/apps: kept 34 of 200 items`;
@@ -240,7 +241,7 @@ net, not a promise: read what you share before you post it anywhere.
 | `relish agent logs` | An app's recent log lines, newest kept, each wrapped as untrusted |
 | `relish agent manual search` | Up to ten sections that mention every word, best first, each with a short excerpt and the `show` command that prints it |
 | `relish agent manual show` | One chapter, or one section of it, as Markdown: `diagnostics` or `diagnostics#relish-path-can-a-reach-b` |
-| `relish agent context` | The first call: findings, unknowns, faults, alerts, one line per app and the newest events, in one bounded answer |
+| `relish agent context` | The first call: `relish status`'s screen and summary, findings, unknowns, active faults and the newest events, in one bounded answer |
 | `relish agent diagnose` | Every finding with its evidence, read-only next steps, and pointers into the manual and the source |
 | `relish agent explain` | What a finding means and where it's decided, or why the cluster made a decision: --restart, --placement, --refusal |
 | `relish agent timeline` | What changed in a window: events, audit and deploys, newest first |
@@ -295,22 +296,22 @@ with `context`, the way you'd start with `relish status`:
 relish agent context
 ```
 
-`data` has `wtf`'s summary and its findings in one line each (`critical`,
-`warnings`), the checks it couldn't make (`unknown`), the active Smoker
-`faults`, the firing `alerts`, one line per app (`apps`, the worst first:
-`down`, `degraded`, `troubled`, `unknown`, `running`, `stopped`), the
-`leases` held now and the newest cluster events (`timeline`, newest first, each message in an
-`untrusted` object). `--events` sets how many events, 20 by default and at
-most 200.
+`data` has `relish status`'s screen (`status`: its `verdict`, its `lines`
+and the cluster `summary` behind them), `wtf`'s findings in one line each
+(`critical`, `warnings`), the checks it couldn't make (`unknown`), the
+Smoker `faults` (how many are `active`, and the ten that expire soonest,
+each with who injected it), the `leases` held now, the open
+`proposals` and the newest cluster events (`timeline`, newest
+first, each message in an `untrusted` object). `--events` sets how many
+events, 20 by default and at most 200.
 
-`faults`, `alerts`, `apps` and `timeline` each say how much they saw:
-`state` is `known`, `partial` (some nodes didn't answer; the list is a
-lower bound) or `unknown` (nothing could be read, with `reason` saying why).
-An empty list with `unknown` means "couldn't look", never "none". Likewise a
-check `wtf` couldn't make stays in the top-level `unknown`, never counted as
-OK. On a big cluster the byte budget trims the
-longest lists from the end and says what it cut, so the worst apps and the
-newest events survive.
+Each summary section has a `source`: `complete`, `partial` (some nodes
+didn't answer; counts are lower bounds, and its line says `partial (2 of 3
+nodes)`) or `missing` (`value` is `null`, `reason` says why). `faults`,
+`leases`, `proposals` and `timeline` say the same with `state`: `known`,
+`partial` or `unknown`. Unknown never means zero or none. The answer stays bounded on any
+cluster (at most 50 leases and 20 proposals); on a big one the budget trims
+the oldest events.
 
 `diagnose` is `relish wtf` for an agent: the same checks, with the evidence
 behind each finding.

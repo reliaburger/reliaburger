@@ -130,10 +130,7 @@ pub enum CommandName {
     /// `relish agent undo`.
     Undo,
     /// `relish status -o json`: not under `relish agent`, but it answers in
-    /// the same envelope. Its `data` schema (the whole cluster summary) is
-    /// bigger than `relish agent schema`'s budget, so the schema command
-    /// doesn't offer it.
-    #[value(skip)]
+    /// the same envelope, so `relish agent schema status` describes it.
     Status,
 }
 
@@ -216,6 +213,7 @@ impl CommandName {
         CommandName::Proposals,
         CommandName::Withdraw,
         CommandName::Undo,
+        CommandName::Status,
     ];
 }
 

@@ -1,11 +1,15 @@
 //! Dashboard rendering.
 //!
-//! Produces a complete HTML page showing cluster overview: apps, nodes,
-//! and alerts. Uses HTMX for automatic partial-page refreshes instead
-//! of full-page reloads. Charts are initialised client-side by uPlot
-//! via `data-chart-config` attributes.
+//! Produces a complete HTML page showing cluster overview: `relish
+//! status`'s lines from the cluster summary, then apps, nodes and alerts.
+//! Uses HTMX for automatic partial-page refreshes instead of full-page
+//! reloads. Charts are initialised client-side by uPlot via
+//! `data-chart-config` attributes.
 
 use serde::{Deserialize, Serialize};
+
+use crate::bun::summary::ClusterSummary;
+use crate::bun::summary::verdict::{Mark, Verdict, problems, section_lines, verdict};
 
 use super::fragments::{
     render_alerts_table_fragment, render_apps_table_fragment, render_nodes_table_fragment,
@@ -15,9 +19,13 @@ use super::fragments::{
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DashboardData {
     pub cluster_name: String,
-    pub node_count: usize,
-    pub app_count: usize,
-    pub alert_count: usize,
+    /// The cluster at a glance, as `GET /v1/cluster/summary` answers it.
+    /// The counts at the top of the page come from here, not from the
+    /// lists below, so a node that didn't answer shows as partial.
+    pub summary: Option<ClusterSummary>,
+    /// Why the app list couldn't be read whole (a node didn't answer).
+    /// The page still renders, with the summary saying how much it saw.
+    pub apps_error: Option<String>,
     pub apps: Vec<DashboardApp>,
     pub nodes: Vec<DashboardNode>,
     pub alerts: Vec<DashboardAlert>,
@@ -88,33 +96,26 @@ pub fn render_dashboard(data: &DashboardData) -> String {
         ));
     }
 
-    html.push_str("<div class=\"summary\">\n");
-    html.push_str(&format!(
-        "<div class=\"stat\"><span class=\"num\">{}</span><span class=\"label\">Nodes</span></div>\n",
-        data.node_count
-    ));
-    html.push_str(&format!(
-        "<div class=\"stat\"><span class=\"num\">{}</span><span class=\"label\">Apps</span></div>\n",
-        data.app_count
-    ));
-
-    let alert_class = if data.alert_count > 0 {
-        "num alert"
-    } else {
-        "num"
-    };
-    html.push_str(&format!(
-        "<div class=\"stat\"><span class=\"{alert_class}\">{}</span><span class=\"label\">Alerts</span></div>\n",
-        data.alert_count
-    ));
-    html.push_str("</div>\n");
+    // The summary (HTMX-polled): the same lines `relish status` prints.
+    html.push_str("<section>\n<h2>Cluster</h2>\n");
+    html.push_str(
+        "<div hx-get=\"/ui/fragment/summary\" hx-trigger=\"every 5s\" hx-swap=\"innerHTML\">\n",
+    );
+    html.push_str(&render_summary_fragment(data.summary.as_ref()));
+    html.push_str("</div>\n</section>\n");
 
     // Apps table (HTMX-polled)
     html.push_str("<section>\n<h2>Apps</h2>\n");
     html.push_str(
         "<div hx-get=\"/ui/fragment/apps\" hx-trigger=\"every 5s\" hx-swap=\"innerHTML\">\n",
     );
-    html.push_str(&render_apps_table_fragment(&data.apps));
+    match &data.apps_error {
+        Some(error) => html.push_str(&format!(
+            "<p class=\"empty\">Couldn't list every app: {}</p>\n",
+            escape_html(error)
+        )),
+        None => html.push_str(&render_apps_table_fragment(&data.apps)),
+    }
     html.push_str("</div>\n</section>\n");
 
     html.push_str("<section><h2>Job runs and schedules</h2><div hx-get=\"/ui/fragment/batches\" hx-trigger=\"load, every 3s\" hx-swap=\"innerHTML\">Loading summaries…</div></section>\n");
@@ -139,12 +140,59 @@ pub fn render_dashboard(data: &DashboardData) -> String {
     html
 }
 
+/// The cluster summary as `relish status` reads it: the verdict, then one
+/// row per section, each that needs attention coloured and naming the
+/// command that shows the detail. A section that saw only some nodes says
+/// `partial (n of m nodes)` in its own text, from the shared `assess`.
+/// Brioche doesn't run `wtf`'s checks, so there's no `wtf` row.
+pub fn render_summary_fragment(summary: Option<&ClusterSummary>) -> String {
+    let Some(summary) = summary else {
+        return "<p class=\"empty\">The cluster summary couldn't be read.</p>\n".to_string();
+    };
+    let lines = section_lines(summary);
+    let badge = match verdict(&lines) {
+        Verdict::Healthy => "badge-green",
+        Verdict::Degraded => "badge-amber",
+        Verdict::Down => "badge-red",
+    };
+    let problems = match problems(&lines) {
+        0 => "no problems".to_string(),
+        1 => "1 problem".to_string(),
+        n => format!("{n} problems"),
+    };
+    let mut html = format!(
+        "<p><span class=\"badge {badge}\">{}</span> {problems} ({} answered)</p>\n",
+        verdict(&lines).word(),
+        escape_html(&summary.answered_by)
+    );
+    html.push_str("<table><tbody>\n");
+    for line in &lines {
+        let class = match line.mark {
+            Mark::Quiet => "",
+            Mark::Note | Mark::Problem => " class=\"alert-warning\"",
+            Mark::Down => " class=\"alert-critical\"",
+        };
+        let next = line
+            .next
+            .as_deref()
+            .map(|next| format!("<code>{}</code>", escape_html(next)))
+            .unwrap_or_default();
+        html.push_str(&format!(
+            "<tr{class}><td>{}</td><td>{}</td><td>{next}</td></tr>\n",
+            line.section,
+            escape_html(&line.text)
+        ));
+    }
+    html.push_str("</tbody></table>\n");
+    html
+}
+
 /// Return a coloured dot span based on state.
 pub fn status_dot(state: &str) -> &'static str {
     match state.to_lowercase().as_str() {
         "running" | "alive" | "healthy" => "<span class=\"dot-green\">●</span>",
-        "pending" | "preparing" => "<span class=\"dot-amber\">●</span>",
-        "failed" | "unhealthy" | "dead" | "blocked" => "<span class=\"dot-red\">●</span>",
+        "pending" | "preparing" | "degraded" | "troubled" => "<span class=\"dot-amber\">●</span>",
+        "failed" | "unhealthy" | "dead" | "blocked" | "down" => "<span class=\"dot-red\">●</span>",
         _ => "<span class=\"dot-grey\">●</span>",
     }
 }
@@ -268,9 +316,128 @@ mod tests {
     }
 
     #[test]
+    fn the_summary_says_partial_rather_than_a_smaller_number() {
+        let mut summary = summary_fixture();
+        summary.nodes = crate::bun::summary::Section::from_nodes(
+            crate::bun::summary::NodesSection {
+                alive: 2,
+                ..Default::default()
+            },
+            crate::bun::summary::Coverage {
+                answered: 2,
+                asked: 3,
+            },
+            &["node-3: timed out".to_string()],
+        );
+        let html = render_summary_fragment(Some(&summary));
+        assert!(html.contains("badge-amber\">DEGRADED"), "{html}");
+        assert!(
+            html.contains("<tr class=\"alert-warning\"><td>nodes</td><td>2 alive, 0 suspect, 0 dead; partial (2 of 3 nodes)</td><td><code>relish nodes --unhealthy</code></td></tr>"),
+            "{html}"
+        );
+        assert!(
+            !html.contains("<td>wtf</td>"),
+            "Brioche runs no checks: {html}"
+        );
+    }
+
+    #[test]
+    fn a_healthy_summary_is_quiet_and_text_is_escaped() {
+        let mut summary = summary_fixture();
+        summary.answered_by = "node<1>".to_string();
+        let html = render_summary_fragment(Some(&summary));
+        assert!(
+            html.contains("badge-green\">HEALTHY</span> no problems"),
+            "{html}"
+        );
+        assert!(html.contains("node&lt;1&gt;"), "{html}");
+        assert!(!html.contains("alert-warning"), "{html}");
+    }
+
+    #[test]
+    fn an_app_list_that_could_not_be_read_says_why() {
+        let html = render_dashboard(&DashboardData {
+            apps_error: Some("node-3 did not answer".to_string()),
+            ..Default::default()
+        });
+        assert!(
+            html.contains("Couldn't list every app: node-3 did not answer"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn no_summary_says_so_rather_than_showing_zeros() {
+        let html = render_dashboard(&DashboardData::default());
+        assert!(html.contains("couldn't be read"), "{html}");
+    }
+
+    /// A healthy three-node summary.
+    fn summary_fixture() -> ClusterSummary {
+        use crate::bun::summary::*;
+        ClusterSummary {
+            generated_at_unix_ms: 1_800_000_000_000,
+            answered_by: "node-1".to_string(),
+            version: "0.2.8".to_string(),
+            scoped: false,
+            nodes: Section::complete(NodesSection {
+                alive: 3,
+                ..Default::default()
+            }),
+            council: Section::complete(CouncilSection {
+                leader: Some("node-1".to_string()),
+                term: 2,
+                voters: 3,
+                voters_answering: 3,
+                quorum_ok: true,
+                lagging: 0,
+                other_leaders: Vec::new(),
+            }),
+            gossip: Section::complete(GossipSection {
+                members: 3,
+                updates_received: 10,
+                last_change_unix_ms: None,
+            }),
+            versions: Section::complete(VersionsSection {
+                versions: vec![VersionCount {
+                    version: "0.2.8".to_string(),
+                    nodes: 3,
+                }],
+                upgrade_in_progress: false,
+            }),
+            capacity: Section::complete(Default::default()),
+            usage: Section::complete(UsageSection {
+                cpu_percent: None,
+                memory_percent: None,
+                disk_percent: None,
+                busiest: Vec::new(),
+                newest_sample_unix_ms: None,
+            }),
+            apps: Section::complete(Default::default()),
+            instances: Section::complete(Default::default()),
+            jobs: Section::complete(Default::default()),
+            logs: Section::complete(LogsSection {
+                newest_unix_ms: None,
+                slowest: None,
+            }),
+            faults: Section::complete(Default::default()),
+            alerts: Section::complete(Default::default()),
+            certs: Section::complete(CertsSection {
+                count: 0,
+                soonest: None,
+            }),
+            gitops: Section::complete(GitOpsSection {
+                configured: false,
+                commit: None,
+                synced_at_unix_seconds: None,
+                error: None,
+            }),
+        }
+    }
+
+    #[test]
     fn render_with_apps() {
         let data = DashboardData {
-            app_count: 2,
             apps: vec![
                 DashboardApp {
                     name: "web".to_string(),
@@ -299,7 +466,6 @@ mod tests {
     #[test]
     fn render_with_nodes() {
         let data = DashboardData {
-            node_count: 2,
             nodes: vec![DashboardNode {
                 name: "node-01".to_string(),
                 state: "alive".to_string(),
@@ -315,7 +481,6 @@ mod tests {
     #[test]
     fn render_with_alerts() {
         let data = DashboardData {
-            alert_count: 1,
             alerts: vec![DashboardAlert {
                 labels: std::collections::BTreeMap::from([("node".into(), "hot-<a>".into())]),
                 name: "cpu_throttle".to_string(),
@@ -352,7 +517,6 @@ mod tests {
     #[test]
     fn dashboard_apps_link_to_detail() {
         let data = DashboardData {
-            app_count: 1,
             apps: vec![DashboardApp {
                 name: "web".to_string(),
                 namespace: "default".to_string(),
@@ -369,7 +533,6 @@ mod tests {
     #[test]
     fn dashboard_nodes_link_to_detail() {
         let data = DashboardData {
-            node_count: 1,
             nodes: vec![DashboardNode {
                 name: "node-01".to_string(),
                 state: "alive".to_string(),
@@ -408,6 +571,15 @@ mod tests {
     }
 
     #[test]
+    fn app_states_get_the_dots_their_words_deserve() {
+        assert!(status_dot("down").contains("dot-red"));
+        assert!(status_dot("degraded").contains("dot-amber"));
+        assert!(status_dot("troubled").contains("dot-amber"));
+        assert!(status_dot("stopped").contains("dot-grey"));
+        assert!(status_dot("unknown").contains("dot-grey"));
+    }
+
+    #[test]
     fn status_dot_colours() {
         assert!(status_dot("running").contains("dot-green"));
         assert!(status_dot("pending").contains("dot-amber"));
@@ -420,13 +592,11 @@ mod tests {
     fn dashboard_data_serialises() {
         let data = DashboardData {
             cluster_name: "prod".to_string(),
-            node_count: 3,
-            app_count: 5,
             ..Default::default()
         };
         let json = serde_json::to_string(&data).unwrap();
         assert!(json.contains("\"cluster_name\":\"prod\""));
-        assert!(json.contains("\"node_count\":3"));
+        assert!(json.contains("\"summary\":null"));
     }
 
     #[test]
