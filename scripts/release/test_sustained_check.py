@@ -2175,7 +2175,7 @@ class LoopStalls(Evidence):
 checker={release / 'sustained_check.py'}
 check() {{ python3 "$checker" "$@"; }}
 evidence={self.evidence}
-declare -A vm=([1]=rb-a-1 [2]=rb-a-2 [3]=rb-a-3)
+vm=([1]=rb-a-1 [2]=rb-a-2 [3]=rb-a-3)
 down=(0 0 0 1)
 gsh() {{ if [ "$1" = 1 ]; then cat {journal}; fi; }}
 api_get() {{ :; }}
