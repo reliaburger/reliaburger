@@ -54,7 +54,7 @@ If the repository's limit on open pull requests from accounts without write acce
 
 ## Development Setup
 
-You need a current `Rust` toolchain and Cargo. The project uses `Rust` edition 2024. On Linux, `build.rs` also compiles the static job executor helpers with `cc -static`, so install a C compiler and a static libc (`build-essential` on Debian and Ubuntu, `gcc glibc-static` on Fedora). Some ignored acceptance suites additionally require Linux, runc, Buildah, network namespaces, eBPF support, or Apple Container; portable checks should not depend on those tools.
+You need `Rust` 1.97 or later and Cargo. The project uses `Rust` edition 2024. On Linux, `build.rs` also compiles the static job executor helpers with `cc -static`, so install a C compiler and a static libc (`build-essential` on Debian and Ubuntu, `gcc glibc-static` on Fedora). Some ignored acceptance suites additionally require Linux, runc, Buildah, network namespaces, eBPF support, or Apple Container; portable checks should not depend on those tools.
 
 Build the binaries with:
 
@@ -65,6 +65,30 @@ cargo build --bins
 The repository's `Makefile` contains the supported development commands. Run `make help` to see them all.
 
 Or skip the set-up: [`.devcontainer/`](.devcontainer) builds an Ubuntu 24.04 environment with the Rust and nextest versions CI pins, the C compiler, static libc, clang, LLVM and libbpf the build needs, Python 3.12 and cargo-mutants. Open the repository in VS Code's Dev Containers, a GitHub Codespace or any tool that reads the [Dev Container spec](https://containers.dev/) and run `make ci`; give it 4 CPUs and 16 GB of memory. GitHub's Copilot coding agent gets the same toolchain from [`copilot-setup-steps.yml`](.github/workflows/copilot-setup-steps.yml). Only the portable suite runs in either: the gated targets need root, runc, eBPF or a Mac, so when you say tests passed there, say it was the portable set ([docs/testing.md](docs/testing.md#the-development-container)).
+
+### Run it from source
+
+This runs a process workload with no container runtime, on macOS or Linux. The
+process runtime runs host binaries the node allows, not images, so start Bun
+with the example node config that allows the `testapp` workload:
+
+```sh
+git clone https://github.com/reliaburger/reliaburger
+cd reliaburger
+cargo build --locked --bins
+target/debug/bun --runtime process --config examples/node/process-runtime.toml
+
+# In another terminal
+target/debug/relish apply examples/phase-1/proc-first-run.toml
+target/debug/relish status
+target/debug/relish            # terminal UI
+open http://127.0.0.1:9117/    # web dashboard
+```
+
+For real containers and secure multi-node clusters, read the
+[documentation](docs/README.md#running) or run `relish manual`. The manual's
+[reference](docs/manual/13_reference.md#every-relish-command) lists every
+`relish` command.
 
 ## Tests First
 

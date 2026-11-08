@@ -2830,8 +2830,8 @@ guide`. It can fetch `reliaburger.com/llms.txt` or `/agents`. Claude Code can
 load a skill from a plugin, Codex can load the same skill from a directory,
 and a coding agent opening the repository reads `AGENTS.md`. Write six
 documents by hand and they'll say six slightly different things within a
-release. It already happened to the README's command list, which is why
-`make readme-commands` exists.
+release. It already happened to the command list, which is why
+`make reference-commands` exists.
 
 So [#1090](https://github.com/reliaburger/reliaburger/issues/1090) makes the
 manual chapter "Working with an AI agent" the one source, and generates the

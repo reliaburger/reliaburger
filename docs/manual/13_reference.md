@@ -383,3 +383,235 @@ envelope on stdout, not text on stderr. See
 `relish exec` exits with the remote command's own exit code, so
 `relish exec web ls /ready` works in a shell `if`. It exits `1` when it
 can't run the command at all, with an `error:` line on stderr.
+
+## Every relish command
+
+<!-- relish-commands:start -->
+<!-- Generated from relish's own command definitions: run `make reference-commands` after changing them. -->
+
+Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--help` anywhere) lists every flag; the sections above cover [global flags](#relish-global-flags), [environment variables](#environment-variables) and [exit codes](#exit-codes).
+
+### Set up and run a cluster
+
+See [getting started](00_getting-started.md) and [cluster basics](02_cluster-basics.md).
+
+- `relish setup`: Guided setup: detect or install bun, then write a starter config
+- `relish local <status|start|stop|destroy> [NODE]`: Manage a laptop cluster created by setup --quickstart
+- `relish init [DIR]`: Initialise a new cluster (generates CAs, age keypair, node identity)
+- `relish join --node-id <NODE_ID> <ADDR>`: Join an existing cluster
+- `relish join-token`: Manage short-lived node-enrolment tokens
+  - `relish join-token create --node-id <NODE_ID>`: Create a single-use token for enrolling one node
+- `relish nodes`: List cluster nodes and their gossip state
+- `relish council`: Show the council (Raft) on every node, or recover from full loss
+  - `relish council status`: Show every node's view of the council (the default)
+  - `relish council recover --data-dir <DATA_DIR>`: Recover a cluster whose entire council was lost
+  - `relish council backups --from <FROM>`: List the sealed council backups at an object-store URL
+  - `relish council re-enrol --data-dir <DATA_DIR>`: Re-enrol a voter fenced out by `council recover`
+- `relish decommission-node --workloads-stopped --reason <REASON> <NODE_ID>`: Permanently retire a stopped or fenced node; return requires fresh enrolment
+- `relish uninstall`: Remove the CLI, its PATH link, the managed Lima tools and the image cache
+
+### Deploy and manage apps
+
+See [deploy an app](01_deploy-an-app.md) and [writing a controller](15_writing-a-controller.md).
+
+- `relish apply [PATH_OR_URL]`: Apply a Reliaburger TOML or Kubernetes YAML manifest
+- `relish status`: Show cluster and app status
+- `relish inspect <NAME>`: Show every instance of an app across the cluster, with its node
+- `relish exec <APP> [COMMAND]...`: Run a command once inside a running instance and exit with its exit code. Not interactive: no stdin and no terminal
+- `relish deploy <PATH>`: Trigger a rolling deploy for an app
+- `relish cancel-deploy <OPERATION_ID>`: Cancel a node-local deploy and wait for its current work to finish
+- `relish history <APP>`: Show deploy history for an app, from every node
+- `relish rollback <APP>`: Rollback an app to the previous version
+- `relish stop <APP>`: Scale an app to zero, keeping its configuration; `relish apply` starts it again
+- `relish delete <APP>`: Remove an app from the cluster; each node then stops its instances
+- `relish release <APP>`: Take an app back from the controller that owns it, so `relish apply` and GitOps manage it again (owner or admin)
+- `relish batch [PATH]`: Submit a batch of jobs, or manage a task array
+  - `relish batch submit <PATH>`: Submit a compact TOML manifest containing mixed resource profiles
+  - `relish batch replay --node <NODE> --grant-digest <GRANT_DIGEST> --acknowledge-side-effects <ID>`: Acknowledge repeating side effects for the exact unknown owner grants
+  - `relish batch watch <ID>`: Watch rates, bounded profile summaries and duration distributions
+  - `relish batch cancel <ID>`: Cancel an array or mixed manifest and retire its active attempts
+  - `relish batch results <ID>`: Read a bounded indexed page of accepted task outcomes
+  - `relish batch logs --index <INDEX> <ID>`: Print a task's retained output (the first and last 2 KiB): any singleton's, or a failed task's in a larger array
+- `relish run --batch <NAME> [ARGS]...`: Run a resource-aware task array from an image or allowlisted host binary
+- `relish batch-status <ID>`: Show the progress of a submitted batch
+- `relish jobs`: List bounded job run summaries and rates, or durable definitions with their last outcomes
+
+### Work with config files
+
+See [deploy an app](01_deploy-an-app.md) and [coming from Kubernetes](09_kubernetes.md).
+
+- `relish lint <PATH>`: Validate a config file without deploying
+- `relish fmt <PATH>`: Format a TOML config file with canonical ordering
+- `relish compile <PATH>`: Compile configs into a single resolved output
+- `relish diff <PATH_A> [PATH_B]`: Show structural diff between two configs
+- `relish import --file <FILES>...`: Convert Kubernetes YAML manifests to Reliaburger TOML
+- `relish export --file <FILE>`: Export Reliaburger TOML to Kubernetes YAML manifests
+
+### Networking
+
+See [networking and ingress](03_networking.md).
+
+- `relish resolve <NAME>`: Resolve a service name to its VIP and backends
+- `relish routes`: Show ingress routing table
+
+### Watch what's running
+
+See [observability](04_observability.md).
+
+- `relish tui`: Launch the interactive terminal UI
+- `relish dashboard`: Open a read-only web dashboard through the current authenticated context
+- `relish top`: Show every workload on every node, with its latest CPU and memory
+- `relish metrics <APP>`: Show an app's own Prometheus metrics, scraped by the nodes running it
+- `relish logs <NAME>`: Stream logs from an app or job
+- `relish logs-export --dest <DEST>`: Copy a node's Parquet log files here, or have it ship them to object storage
+- `relish logs-search <SOURCE> <SQL>`: Search exported Parquet log archives with SQL
+- `relish events`: Show the cluster's recent events: deploys, restarts, health, faults, tokens, secrets and audited operations, newest last
+
+### Diagnose and test
+
+See [diagnostics](07_diagnostics.md).
+
+- `relish wtf`: Diagnose cluster health and correlate likely causes
+- `relish path --to <TO> <SOURCE>`: Walk the network path from a workload to a destination, hop by hop
+- `relish test`: Run the built-in integration test suite against the cluster
+- `relish bench`: Run reproducible performance benchmarks against the real data plane
+
+### Work with an AI agent
+
+See [working with an AI agent](16_working-with-an-ai-agent.md).
+
+- `relish agent`: Commands for LLM agents: one JSON envelope, bounded, never interactive
+  - `relish agent guide`: How to use relish as an agent: the manual chapter, as Markdown sections
+  - `relish agent version`: This binary's version, commit, target and cluster formats
+  - `relish agent schema [guide|version|schema|source-version|source-tree|source-grep|source-show|source-extract|logs|manual-search|manual-show|context|diagnose|explain|upgrade-check|report|patch-init|patch-build|patch-test|patch-try|patch-diff|patch-apply|patch-destroy|setup]`: The JSON Schema of the envelope and of each command's data
+  - `relish agent source`: The source this binary was built from: search it, read it, extract it
+    - `relish agent source version`: This binary's source: version, commit, digest, file count, and the commit every node runs
+    - `relish agent source tree [PREFIX]`: Files with their size in bytes and their line count
+    - `relish agent source grep <PATTERN>`: Search the source with a regular expression, line by line
+    - `relish agent source show <TARGET>`: Print up to 400 numbered lines of one file: `path` or `path:from-to`
+    - `relish agent source extract <DIR>`: Write the source into a new or empty directory, as a git repository when git is installed
+  - `relish agent logs <APP>`: An app's recent log lines, newest kept, each wrapped as untrusted
+  - `relish agent manual`: The manual compiled into this binary: search it, show a section
+    - `relish agent manual search <WORDS>...`: Up to ten sections that mention every word, best first, each with a short excerpt and the `show` command that prints it
+    - `relish agent manual show <TARGET>`: One chapter, or one section of it, as Markdown: `diagnostics` or `diagnostics#relish-path-can-a-reach-b`
+  - `relish agent context`: The first call: findings, unknowns, faults, alerts, one line per app and the newest events, in one bounded answer
+  - `relish agent diagnose`: Every finding with its evidence, read-only next steps, and pointers into the manual and the source
+  - `relish agent explain [ID]`: What a finding means, its thresholds and where it's decided; every finding when no id is given. Reads only this binary
+  - `relish agent upgrade-check`: Whether the cluster can take the latest release: `ready`, `up_to_date`, `needs_fresh_cluster`, `blocked` or `unknown`
+  - `relish agent report --title <TITLE> --what-happened <WHAT_HAPPENED> --expected <EXPECTED> --not-tested <NOT_TESTED> --caught-by <CAUGHT_BY> --out <OUT>`: Draft a redacted bug report for a human to post. Never posts
+  - `relish agent patch`: Build, test and try a fix on a throwaway cluster
+    - `relish agent patch init <DIR>`: Extract this binary's source into a new workspace, on a `patch` branch
+    - `relish agent patch build <DIR>`: Build the workspace: `relish` for this machine, `bun` and a Linux `relish` for the nodes (in the build VM on macOS). Both by default
+    - `relish agent patch test <DIR> [FILTER]`: Run the portable test suite in the workspace, optionally filtered
+    - `relish agent patch try <DIR>`: Boot a throwaway cluster from the workspace's binaries, with its own `RELIABURGER_HOME`
+    - `relish agent patch diff <DIR>`: The change against the extracted source, and the tests that ran
+    - `relish agent patch apply <DIR> <DIFF>`: Apply a unified diff to the workspace, matching each hunk by its lines rather than its header's counts. All or nothing *(0.2.8, not in 0.2.7)*
+    - `relish agent patch destroy [DIR]`: Remove the workspace's throwaway cluster, or every one with `--all`. The workspace and its source stay
+  - `relish agent setup [claude-code|codex|cursor|vscode|goose|gemini]...`: Wire Reliaburger into the AI agents on this machine. Shows the diff; writes only with --yes
+- `relish mcp`: Serve the `relish agent` commands as read-only MCP tools over stdio
+
+### Break things on purpose
+
+See [chaos](05_chaos.md).
+
+- `relish fault`: Inject faults for chaos testing (Smoker)
+  - `relish fault delay <TARGET> <DELAY>`: Add latency to connections to a service
+  - `relish fault drop <TARGET> <PERCENTAGE>`: Fail a percentage of connections
+  - `relish fault dns <TARGET> <FAULT_TYPE>`: Return NXDOMAIN for DNS resolution
+  - `relish fault partition <TARGET>`: Block traffic between services
+  - `relish fault bandwidth <TARGET> <LIMIT>`: Throttle bandwidth to a service (not implemented yet: Bun refuses it, #366)
+  - `relish fault cpu <TARGET> <PERCENTAGE>`: Consume CPU in a service's cgroup
+  - `relish fault memory <TARGET> <VALUE>`: Push memory usage toward a service's limit
+  - `relish fault disk-io <TARGET> <LIMIT>`: Throttle disk I/O for a service
+  - `relish fault kill <TARGET>`: Kill instances of a service, or running attempts of a job (SIGKILL)
+  - `relish fault pause <TARGET>`: Freeze instances of a service, or running attempts of a job (SIGSTOP)
+  - `relish fault resume <TARGET>`: Resume (unfreeze) previously paused instances of a service
+  - `relish fault node-drain <TARGET>`: Simulate graceful node departure
+  - `relish fault node-kill <TARGET>`: Simulate abrupt node failure
+  - `relish fault node-pressure <TARGET>`: Consume bounded CPU and memory capacity on one node
+  - `relish fault list`: List all active faults
+  - `relish fault clear [TARGET]`: Clear faults — all, by numeric id, or by service name
+  - `relish fault scenario <PATH>`: Run a scripted chaos scenario from a TOML file
+
+### Security and access
+
+See [security and access](10_security.md).
+
+- `relish token`: Manage API tokens
+  - `relish token create --name <NAME>`: Create a new API token
+  - `relish token list`: List all API tokens with their scope, expiry and last use
+  - `relish token revoke <NAME>`: Revoke an API token by name
+  - `relish token rotate <NAME>`: Give a token a new secret under the same name. The old secret keeps working for the grace period, then stops
+- `relish secret`: Manage secrets (encrypt values for use in app configs)
+  - `relish secret pubkey [DIR]`: Print the cluster's age public key (for `relish secret encrypt`)
+  - `relish secret encrypt --pubkey <PUBKEY> <VALUE>`: Encrypt a plaintext value for use in app config ENC[AGE:...] fields
+  - `relish secret rotate`: Rotate the secret encryption key (start or finalise)
+- `relish ca`: Back up the cluster's root CA, check the backup, and rotate intermediates
+  - `relish ca backup --out <OUT>`: Write the root CA's key and certificate to a sealed file you keep
+  - `relish ca verify --fingerprint <FINGERPRINT> <FILE>`: Check a root CA backup offline
+  - `relish ca rotate --role <ROLE>`: Rotate an intermediate CA, signing the new one with your root backup
+- `relish sign --key <KEY> <IMAGE>`: Sign a Pickle-hosted image with your own key so `require_signatures` admits it
+  - `relish sign keygen --out <OUT>`: Generate an image signing key and print the public key line for `[images.trust_policy] keys`
+- `relish audit`: Show who did what: the durable audit log of applies, deletes, execs, upgrades, faults, tokens and the other changes to the cluster
+- `relish policy`: List, audit or delete the cluster's policies, or test policies offline
+  - `relish policy list`: List the cluster's policies, with their action and rule
+  - `relish policy delete <NAME>`: Delete a policy (admin only; audited). Policies never judge policies, so this works even when one refuses every app
+  - `relish policy audit`: List the committed apps and jobs the cluster's policies would now refuse, warn about or record. Changes nothing: a new policy never touches running work
+  - `relish policy test --file <FILES>...`: Judge the apps and jobs in some files by the policies in them, offline, the way the cluster would. Exits non-zero when an apply would be refused
+
+### Images and volumes
+
+See [images and volumes](11_images-and-volumes.md).
+
+- `relish images`: List images in the Pickle registry, or delete a tag
+  - `relish images delete <REFERENCE>`: Delete a tag (`repository:tag`). The image stays pullable by digest until it has been untagged for `[images] gc_retain_days`; then it expires, unless an app or job pins it, and GC reclaims its layers
+- `relish build <PATH>`: Build an OCI image and push to Pickle
+- `relish snapshot`: Manage volume snapshots (Btrfs-backed volumes only)
+  - `relish snapshot create <APP>`: Snapshot an app's managed volumes
+  - `relish snapshot list <APP>`: List an app's snapshots, newest first
+  - `relish snapshot restore <APP> <NAME>`: Restore a snapshot over its live volume (stop the app first)
+  - `relish snapshot delete <APP> <NAME>`: Delete a snapshot
+
+### Upgrades and GitOps
+
+See [operations](12_operations.md).
+
+- `relish upgrade`: Roll a new bun binary across the cluster, or back
+  - `relish upgrade check`: Check for available updates
+  - `relish upgrade start [VERSION]`: Start a rolling upgrade (network: pass a version; air-gapped: pass --binary)
+  - `relish upgrade plan <VERSION>`: Preview the rolling order and estimated duration
+  - `relish upgrade status`: Show upgrade progress
+  - `relish upgrade rollback [VERSION]`: Roll back to a previous version (cluster: version required)
+  - `relish upgrade resume`: Resume a paused upgrade
+  - `relish upgrade abort`: End a paused upgrade in which no node has moved. When some nodes already swapped, use `rollback <version>` instead
+- `relish gitops`: Show or change the cluster's GitOps configuration
+  - `relish gitops status`: Show the cluster's GitOps configuration, sync status and what GitOps owns. Credentials are never shown
+  - `relish gitops set <PATH>`: Replace the cluster's GitOps configuration from a TOML file holding a `[gitops]` section (admin only; audited). Credentials in it are sealed with the cluster master key before they reach Raft
+  - `relish gitops disable`: Turn GitOps off for the whole cluster (admin only; audited). What GitOps wrote stays in place
+
+### Learn
+
+See [under the hood](06_under-the-hood.md).
+
+- `relish manual [CHAPTER]`: Read the built-in manual (searchable TUI; --web for the browser)
+  - `relish manual examples`: Write the embedded example configs into a directory
+- `relish source [QUERY]`: Browse and fuzzy-search the source this binary was built from
+
+### Contributor tools
+
+See [dev cluster](../README.md#dev-cluster).
+
+- `relish dev`: Manage a local dev cluster (Lima VMs)
+  - `relish dev create [NAME]`: Create a new dev cluster
+  - `relish dev status [NAME]`: Show dev cluster status
+  - `relish dev shell <NODE>`: Open a shell on a node
+  - `relish dev stop [NAME]`: Stop a dev cluster (VMs stay on disk)
+  - `relish dev start [NAME]`: Start a stopped dev cluster
+  - `relish dev destroy [NAME]`: Destroy a dev cluster (delete all VMs)
+  - `relish dev test [FILTER]`: Run tests in a Linux VM (all Linux-gated tests enabled)
+  - `relish dev disk`: Show disk usage in the test VM
+  - `relish dev clean`: Clean cargo build artefacts in the test VM
+  - `relish dev keygen --out <OUT>`: Generate an Ed25519 release signing keypair
+  - `relish dev sign-binary --key <KEY> <BINARY>`: Sign a binary, producing a detached .sig envelope
+  - `relish dev countersign-binary --external-key <EXTERNAL_KEY> <BINARY>`: Add your external signature to a release binary's .sig envelope, keeping the release signature as it is (no release key needed)
+<!-- relish-commands:end -->
