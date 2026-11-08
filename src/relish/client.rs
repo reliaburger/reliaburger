@@ -781,6 +781,12 @@ impl BunClient {
         &self.base_url
     }
 
+    /// The cluster CA this client pins, PEM, when it has one. `relish gym
+    /// run` hands it to the solver, which never gets the user's token.
+    pub fn ca_pem(&self) -> Option<&[u8]> {
+        self.ca_pem.as_deref()
+    }
+
     /// Address another node with the same authenticated, CA-pinned HTTP
     /// client. Cluster fan-out must not silently lose the caller's bearer or
     /// replace its trust roots while changing only the authority.
