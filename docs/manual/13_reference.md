@@ -119,10 +119,10 @@ Three commands answer "is it all right?" at three depths:
 | Command | Flags | What it shows |
 |---|---|---|
 | `relish status` | `--quick` skips `wtf`'s checks (otherwise run with a 2 s budget); `--check` sets the exit code from the verdict | one screen: a verdict (`HEALTHY`, `DEGRADED` or `DOWN`), then one line per part of the cluster, each needing attention ending in the command that shows the detail |
-| `relish apps [NAME]` | `--namespace NS`, `--unhealthy` (not running and ready), `--node NODE`, `--instances` | one row per app, problems first, then why each isn't fully running; with `NAME` or `--instances`, one row per instance with its PID, restarts and age |
+| `relish apps [NAME]` *(0.2.8, not in 0.2.7)* | `--namespace NS`, `--unhealthy` (not running and ready), `--node NODE`, `--instances` | one row per app, problems first, then why each isn't fully running; with `NAME` or `--instances`, one row per instance with its PID, restarts and age |
 | `relish nodes` | `--unhealthy` (not alive, cordoned, under disk pressure or not answering) | one row per node: gossip state, council seat, leader, version, CPU, memory and disk use, and what the scheduler allocated |
 
-An app's state in `relish apps` is, worst first, `down` (it wants replicas
+An app's state in `relish apps` (0.2.8, not in 0.2.7) is, worst first, `down` (it wants replicas
 and none run), `degraded` (some run), `unknown` (a node didn't answer, so what runs there
 isn't known), `running` or `stopped` (it wants none). A node
 that didn't answer is a warning on stderr for `apps`, and a line under the
