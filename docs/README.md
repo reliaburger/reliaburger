@@ -457,6 +457,7 @@ cargo test
 ```sh
 make test                  # portable nextest suite
 make test-doc              # doctests (nextest does not run them)
+make test-macos            # what the macOS CI job runs: relish and the macOS-only tests
 make test-slow             # genuine wall-clock acceptance tests
 sudo make test-linux       # runc, netns, eBPF, Btrfs, Buildah and root-only tests
 make test-rootless-runc    # rootless runc port and replacement test (never sudo)

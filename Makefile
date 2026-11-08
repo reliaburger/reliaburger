@@ -1,4 +1,4 @@
-.PHONY: build test warm-executables test-cargo test-doc test-slow test-images test-linux test-rootless-runc test-cluster test-hollow test-upgrade test-upgrade-node test-upgrade-cluster test-apple test-standard-clients test-gym test-gpu test-s3 test-ci-scripts check-ignored coverage check fmt lint lint-macos audit outdated clean pdf loc help bench bench-large ci ci-bench rollout-demo gitops-demo observability-demo kubernetes-demo toml-demo readme-commands agent-docs mcp-registry-publish bench-task-arrays fuzz-tools fuzz-build fuzz-smoke fuzz-corpus-check fuzz-corpus-seed
+.PHONY: build test warm-executables test-cargo test-doc test-slow test-images test-linux test-rootless-runc test-cluster test-hollow test-upgrade test-upgrade-node test-upgrade-cluster test-apple test-standard-clients test-gym test-gpu test-s3 test-ci-scripts check-ignored coverage check fmt lint lint-macos test-macos audit outdated clean pdf loc help bench bench-large ci ci-bench rollout-demo gitops-demo observability-demo kubernetes-demo toml-demo readme-commands agent-docs mcp-registry-publish bench-task-arrays fuzz-tools fuzz-build fuzz-smoke fuzz-corpus-check fuzz-corpus-seed
 
 CARGO = cargo
 NEXTEST_PROFILE ?= default
@@ -35,6 +35,20 @@ test: warm-executables ## Run the portable suite with nextest (ignored suites ar
 warm-executables: ## Build the suite and its binaries, then run each binary once, so macOS assesses them before any test is timed
 	$(CARGO) test --no-run
 	python3 scripts/ci/warm_executables.py
+
+# The macOS CI job (#1720). Bun ships for Linux only, so on macOS CI tests
+# relish (its binary, `relish::` in the library and the suite's `relish_*`
+# modules) and the tests only macOS compiles: the Apple runtime, the
+# non-Linux process start times, the macOS home directories and runtime
+# selection. Bun, grill, cluster and eBPF tests run on Linux. Cargo still
+# links `bun` and `testapp`, because it builds every binary for an integration
+# test, but none of their tests run. scripts/ci/test_macos_selection.py pins
+# this filterset, and scripts/ci/macos_selection.py keeps the evidence
+# manifest's portable-darwin cases inside it.
+test-macos: ## Run relish's tests and the macOS-only tests (the macOS CI job; `test` runs everything)
+	$(CARGO) test --no-run --lib --bin relish --test suite --test runtime_selection
+	python3 scripts/ci/warm_executables.py
+	$(NEXTEST) --lib --bin relish --test suite --test runtime_selection -E 'binary_id(reliaburger::bin/relish) | (binary_id(reliaburger) & (test(/^relish::/) | test(/^grill::apple::/) | test(/^grill::records::tests::absolute_start_time/))) | (binary_id(reliaburger::suite) & (test(/^relish_/) | test(/^user_directories::macos_/))) | binary_id(reliaburger::runtime_selection)'
 
 test-cargo: ## Run the portable suite with Cargo's built-in runner
 	$(CARGO) test
@@ -112,13 +126,18 @@ lint: ## Run clippy for every target, with all features and with none, warnings 
 	$(CARGO) clippy --all-targets --no-default-features -- -D warnings
 
 # One Clippy pass for the macOS CI job. The `lint` job on Linux runs both
-# passes. What only macOS compiles is `cfg(target_os = "macos")` code and the
-# `not(all(feature = "ebpf", target_os = "linux"))` fallbacks, and every
-# feature leaves both in, so the all-features pass covers them. The code that
-# only the no-features pass reaches is gated on a feature alone, and that
-# compiles the same on Linux. A second pass here took about three minutes.
-lint-macos: ## Run clippy once, every target with all features (the macOS CI job; `lint` runs both)
-	$(CARGO) clippy --all-targets --all-features -- -D warnings
+# passes over every target. What only macOS compiles is `cfg(target_os =
+# "macos")` code and the `not(all(feature = "ebpf", target_os = "linux"))`
+# fallbacks, and every feature leaves both in, so the all-features pass
+# covers them. The code that only the no-features pass reaches is gated on a
+# feature alone, and that compiles the same on Linux. It lints the library
+# and the two binaries, not every target: Linux lints the test code, and
+# every target means compiling every Linux-only test binary on a Mac too.
+# Test code that only macOS compiles (the Apple runtime's tests, say) is
+# built by `test-macos` but linted only by `make lint` on a Mac. Linting
+# `bun` is its compile check on macOS; its tests run on Linux (#1720).
+lint-macos: ## Run clippy once on the library, relish and bun, with all features (the macOS CI job; `lint` runs both passes on every target)
+	$(CARGO) clippy --lib --bin relish --bin bun --all-features -- -D warnings
 
 audit: ## Fail on new RustSec findings or an expired advisory exception
 	@today=$$(date -u +%Y%m%d); expiry=20261118; \

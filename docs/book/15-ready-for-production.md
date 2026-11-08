@@ -1040,6 +1040,36 @@ suite, and the gate's merge checks one list the way it checked three: every list
 and the required cases are all there. The lesson? Parallel jobs only help when they split the
 expensive part. Ours was the compile, and every shard paid for it in full.
 
+One job still took a 66-minute median, and most of what it tested was Bun. But Bun ships for
+Linux only: on a Mac, the quickstart runs it inside a Lima VM. What a Mac user runs natively is
+`relish`. So since 0.2.8 the macOS job builds and tests `relish` and the code only macOS
+compiles, and nothing else
+([#1720](https://github.com/reliaburger/reliaburger/issues/1720)). The selection is one nextest
+filterset in `make test-macos`:
+
+```make
+$(NEXTEST) --lib --bin relish --test suite --test runtime_selection -E 'binary_id(reliaburger::bin/relish) | (binary_id(reliaburger) & (test(/^relish::/) | test(/^grill::apple::/) | test(/^grill::records::tests::absolute_start_time/))) | (binary_id(reliaburger::suite) & (test(/^relish_/) | test(/^user_directories::macos_/))) | binary_id(reliaburger::runtime_selection)'
+```
+
+`--lib --bin relish --test suite` tells Cargo which test binaries to build at all, which is
+where the time goes: the other 38 integration test binaries never compile. `-E` then picks
+tests inside them. `binary_id(...)` names a test binary exactly, `test(/regex/)` matches a
+test's full path, and `&` and `|` combine them. Besides relish, it keeps the tests that exist
+only on macOS, because nowhere else can run them: the Apple Container adapter, process start
+times off Linux, where `relish` keeps files under `~/Library` and how Bun picks a runtime on a
+Mac. Bun itself only gets a compile check, through the lint. A measurement run took 31 minutes
+from a cold cache, against the 66-minute median, and 23.5 of those minutes were still compiling,
+because relish's unit tests live in the library's test binary and that compiles the whole
+crate. Splitting `relish` into its own crate is the obvious next move.
+
+The evidence gate needed telling. Its manifest listed 250 finite cases as required on macOS,
+and the gate refuses a run where a required case didn't run. A relish-only job runs 19 of
+them. We didn't edit 231 entries by hand: `scripts/ci/macos_selection.py` parses the
+filterset, evaluates it against each case's binary and test name, and keeps `portable-darwin`
+exactly where the job will run the case. Every one keeps `portable-linux`. A test fails if the
+manifest or the qualification matrix ever disagrees with the filterset, so narrowing what
+macOS proves is a change somebody has to review, not something that happens by accident.
+
 ### A release gate that fits in a week
 
 Pull requests were quick by 0.2.3. The release wasn't. From code freeze to ready-to-tag took
@@ -1087,6 +1117,40 @@ another commit: all of them leave `reuse` false, or empty if the job itself died
 `validate-release` checks `!= 'true'` rather than `== 'false'` so that an empty answer runs
 the suite too. The signature still only ever covers a commit that passed everything; it just
 doesn't make it pass twice.
+
+It took two more releases to notice that the fast path never ran. 0.2.6's candidate took 89
+minutes and 0.2.7's about two hours, and both re-ran the whole suite. Why? Look at when they
+were dispatched: 0.2.6's three seconds after the gate PR merged, 0.2.7's two minutes after.
+The push to `main` had started its CI run, but that run had nowhere near finished, and the
+script asked the API for *completed* runs only. Nothing completed, so nothing to reuse, so
+run the suite. Every rule was right; the question was asked too early
+([#1722](https://github.com/reliaburger/reliaburger/issues/1722)).
+
+You could fix that in the runbook: "wait for `main`'s CI to go green before dispatching". But
+a rule a person has to remember at code freeze is a rule that gets forgotten at code freeze.
+So the script now waits. If a push, merge-queue or nightly run on the commit is still queued
+or in progress, and nothing on the commit has passed yet, it asks again every minute, for up
+to two hours, and then applies exactly the same rules as before. The waiting is free, or
+nearly: the build jobs don't depend on the search, and building the binaries takes about 40
+minutes anyway. For 0.2.6 the candidate would have been ready when the push's run finished,
+about 53 minutes in, instead of 89, and three macOS jobs would never have queued.
+
+Waiting adds new ways to be wrong, so each one is spelled out and tested with a fake clock
+that never sleeps. A run that fails while we wait ends the wait at once and runs the suite. A
+run still going after two hours runs the suite. A pull request's run is never waited for,
+since it could never be reused. An API error mid-wait runs the suite, just as it did before.
+The `find passing CI` job's own timeout is longer than the wait. A job killed by its timeout
+would still fall back safely, since an empty `reuse` runs the suite, but it would die without
+saying why; the script's own deadline writes the reason into the summary. And one race is the other way
+round: a build dispatched the moment a merge lands can ask before GitHub has even created the
+push's run, so with no run at all on the commit the script keeps asking for three minutes
+before giving up.
+
+The evidence also moved somewhere more durable. The job summary is a web page that expires
+with the run; `candidate.json` is the file qualification pins by its SHA-256. So the record
+now carries `source_ci`, the run id and attempt of the `ci.yml` run the candidate rests on:
+the reused run, or the build's own when it ran the suite itself. A qualification record can
+cite it, and because it's inside the digest, nobody can swap it afterwards.
 
 **Qualify the train every night.** The long tiers (power-cut and reboot runs, the V02 and jobs
 soaks) now run on the train's tip each night, one after another on the quiet host
