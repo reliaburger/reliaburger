@@ -466,7 +466,8 @@ make test-hollow           # a three-member council and twenty hollow nodes (#14
 make test-gym              # the agent gym's scenarios on throwaway clusters, scored (#1086)
 make test-upgrade-node     # real single-node binary replacement
 make test-upgrade-cluster  # real rolling cluster replacement
-make coverage              # portable suite under line coverage (HTML and LCOV)
+make coverage              # portable suite under line coverage (LCOV) and the floor
+make coverage-html         # HTML report from the last make coverage run
 make audit                 # fail on new RustSec dependency findings
 ```
 

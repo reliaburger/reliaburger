@@ -589,8 +589,8 @@ real world it touched.
 ## Coverage is a map, not a target
 
 `cargo-llvm-cov` instruments the compiled programme and records which source regions execute.
-Our `make coverage` runs the portable suite once under instrumentation and emits LCOV plus an
-HTML report. On Linux CI that same run is the test gate, so we don't pay for the suite twice. The first combined Linux CI measurement covered
+Our `make coverage` runs the portable suite once under instrumentation and writes an LCOV
+report; `make coverage-html` turns the same counters into HTML when someone wants to read them. On Linux CI that same run is the test gate, so we don't pay for the suite twice. The first combined Linux CI measurement covered
 79.65% of lines, so CI starts at 78.65%, one percentage point lower, and can ratchet upwards.
 
 Instrumented programmes write their counters to a `.profraw` file as they exit. Our
@@ -1078,6 +1078,52 @@ filterset, evaluates it against each case's binary and test name, and keeps `por
 exactly where the job will run the case. Every one keeps `portable-linux`. A test fails if the
 manifest or the qualification matrix ever disagrees with the filterset, so narrowing what
 macOS proves is a change somebody has to review, not something that happens by accident.
+
+With macOS off the light set, portable Linux was every train PR's critical path, at about 30
+minutes in the five green train PRs before
+[#1723](https://github.com/reliaburger/reliaburger/issues/1723). Only about 15 of those
+minutes were the build and the tests. The rest was three things the coverage run didn't need.
+
+The doctests and the nightly-signing key test ran after it, in the same job, and took about six
+minutes between them. Neither is instrumented, so neither could reuse the coverage build;
+they only waited for it. They now run in their own job, `doctests and feature tests`, which
+starts when portable Linux does and finishes long before it.
+
+The coverage run ended with three `cargo llvm-cov report` calls: LCOV, HTML and the floor. Each
+call merges every `.profraw` file into one profile and then reads every test binary's coverage
+map again, so each cost about two minutes. One call does both jobs that matter, because
+`--fail-under-lines` works with any output format: cargo-llvm-cov writes the LCOV file, then
+asks `llvm-cov` for a JSON summary and compares its line percentage with the floor.
+
+```make
+$(COVERAGE_REPORT) --lcov --output-path target/coverage/lcov.info --fail-under-lines $(COVERAGE_MIN_LINES)
+```
+
+Nobody opens the HTML on a pull request, so CI writes it only on pushes to `main` and the
+nightly, with `make coverage-html`, from the counters the run already left behind. The floor
+didn't move, and the evidence owner still checks it: `coverage_owner.py` pins the recipe stage
+by stage, so it now expects three stages instead of five, and the floor check is part of the
+last one.
+
+On the change's own pull request, portable Linux took 17.0 minutes, its coverage step 15.3
+against 23 to 27 before, and the new job 5.7. The light set's critical path went from about
+30 minutes to about 17.
+
+Two smaller fixes came with it
+([#1724](https://github.com/reliaburger/reliaburger/issues/1724)). `make ci` now runs its
+quick checks first: formatting, the ignored-test owners and the CI scripts' own tests take a
+minute or two, and a slip in one of them used to show only after Clippy and the whole suite
+had compiled. Make runs a target's prerequisites in the order they're listed (unless you pass
+`-j`), so the fix is the order of one line. The lint job in CI does the same, running `rustfmt`
+before it restores a cache.
+
+The other was the cache quota. GitHub keeps 10 GB of caches per repository and quietly evicts
+the least recently used beyond that, and we were at 9.57 GB. A cache saved on a pull request
+that has since merged can never be restored again, but it still counts, and it can push out
+`main`'s, which every train PR restores. A nightly workflow now deletes caches whose pull
+request is closed, whose branch is gone, or which a newer cache of the same family on the
+same ref has replaced. The rule is a pure function, `stale(caches, open_pulls, branches)`,
+tested on fixtures, with the `gh` calls kept at the edges so it can be tested without network access.
 
 ### A release gate that fits in a week
 
