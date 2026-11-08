@@ -117,10 +117,10 @@ narrows it. Pass it as <code>RELIABURGER_TOKEN</code>, and revoke it when you're
 <pre><code class="language-sh">relish token revoke agent
 </code></pre>
 <p>Why make a fuss about it? No <code>relish agent</code> command changes a workload
-(<code>lease</code> and <code>propose</code> write only council records), and every <code>next</code> step says with
-<code>read_only</code> whether it would. But those are promises the agent chooses to
-keep. From a shell it can run any <code>relish</code> command with whatever token it
-holds: the token is the one control the cluster enforces. So don't give an agent your admin
+(<code>lease</code> and <code>propose</code> write only council records), and every <code>next</code> step
+says with <code>read_only</code> whether it would. But the agent chooses to keep those
+promises, and from a shell it can run any <code>relish</code> command with its token,
+the one control the cluster enforces. So don't give an agent your admin
 token, and don't tell your agent client to "always allow" <code>relish</code>.</p>
 </section>
 <section class="agents-section" id="the-contract">
@@ -290,11 +290,9 @@ what this binary has; <code>relish agent --help</code> says the same.</p>
 <pre><code class="language-sh">relish agent guide
 </code></pre>
 <p><code>data.sections</code> holds it one section at a time, each with its <code>heading</code> and
-its <code>markdown</code>, and <code>data.commands</code> lists the commands above, read from the
-binary itself. Its default budget is 64 KiB, not 24, so the whole chapter
-comes back in one call, with nothing trimmed. Given a smaller <code>--max-bytes</code>,
-the last sections go first, and the <code>next</code> step asks for a <code>--max-bytes</code> that
-fits it all.</p>
+its <code>markdown</code>, and <code>data.commands</code> lists the commands above. Given a
+<code>--max-bytes</code> under its 64 KiB default, the last sections go first, and the
+<code>next</code> step asks for a <code>--max-bytes</code> that fits it all.</p>
 <p><code>relish agent version</code> prints the version, commit, target and cluster formats
 of this binary:</p>
 <pre><code class="language-sh">relish agent version
@@ -303,8 +301,8 @@ of this binary:</p>
 command's <code>data</code>; name a command to get only its schema:</p>
 <pre><code class="language-sh">relish agent schema version
 </code></pre>
-<p>All of them together are bigger than the default budget, so a bare <code>relish agent schema</code> comes back trimmed; name the command you need, as above. Each
-one fits on its own.</p>
+<p>A bare <code>relish agent schema</code> is over the default budget and comes back
+trimmed, so name the command you need, as above: each fits on its own.</p>
 </section>
 <section class="agents-section" id="reading-the-cluster">
 <h2>Reading the cluster <a class="permalink" href="#reading-the-cluster" aria-label="Link to this section">#</a></h2>
@@ -322,9 +320,9 @@ most 200.</p>
 <p><code>faults</code>, <code>alerts</code>, <code>apps</code> and <code>timeline</code> each say how much they saw:
 <code>state</code> is <code>known</code>, <code>partial</code> (some nodes didn't answer; the list is a
 lower bound) or <code>unknown</code> (nothing could be read, with <code>reason</code> saying why).
-An empty list with <code>unknown</code> means "couldn't look", never "none". The same
-goes for <code>unknown</code> at the top: a check <code>wtf</code> couldn't make stays unknown
-here, and is never counted as OK. On a big cluster the byte budget trims the
+An empty list with <code>unknown</code> means "couldn't look", never "none". Likewise a
+check <code>wtf</code> couldn't make stays in the top-level <code>unknown</code>, never counted as
+OK. On a big cluster the byte budget trims the
 longest lists from the end and says what it cut, so the worst apps and the
 newest events survive.</p>
 <p><code>diagnose</code> is <code>relish wtf</code> for an agent: the same checks, with the evidence
@@ -350,9 +348,9 @@ relish agent explain
 <p>You get the <code>meaning</code>, the <code>severities</code> it comes at, its <code>thresholds</code> (each
 with the constant's name, its <code>value</code> and <code>unit</code>, and where it's defined),
 <code>decided_in</code> (the line in <code>src/relish/wtf/diagnose.rs</code> that reports it, and
-the function around it) and the <code>manual</code> section. The thresholds are the very
-constants the check compares against, and the line is found by searching the
-embedded source for the id, so neither can drift from the code. With no id,
+the function around it) and the <code>manual</code> section. The thresholds are the
+constants the check compares against, and the line comes from searching the
+embedded source for the id, so neither can drift. With no id,
 <code>explain</code> lists every finding. An id <code>wtf</code> doesn't have is <code>not_found</code>, with
 the closest ids in the hint. The table under "Every finding" in
 <code>diagnostics</code> lists them all.</p>
@@ -573,8 +571,8 @@ contains a filter:</p>
 </code></pre>
 <p>That's <code>cargo test</code>: unit tests, <code>tests/suite</code>, the doctests and every other
 test that isn't <code>#[ignore]</code>. The gated suites (<code>make test-cluster</code>,
-<code>test-linux</code>, <code>test-slow</code> and the rest) are ignored there, so they don't run,
-and <code>data.not_run</code> says so in every answer. A failing test or a compile error
+<code>test-linux</code>, <code>test-slow</code> and the rest) are ignored there, and <code>data.not_run</code>
+says so in every answer. A failing test or a compile error
 is still an answer, with exit code 0: <code>data.ok</code> is <code>false</code>, and <code>failures</code> or
 <code>errors</code> says why, with each test's output or each error's file and line.</p>
 <p><code>build</code> compiles the workspace:</p>
@@ -624,8 +622,8 @@ relish agent patch destroy --all
 <h2>Drafting a bug report <a class="permalink" href="#drafting-a-bug-report" aria-label="Link to this section">#</a></h2>
 <p>When an agent decides it has found a Reliaburger bug, <code>relish agent report</code>
 turns what it found into an issue draft for you to read and post. It writes
-files and prints commands. It never posts anything, and it makes no network
-call at all: not to GitHub, not to the cluster.</p>
+files and prints commands, and never posts anything or makes a network call,
+to GitHub or the cluster.</p>
 <pre><code class="language-sh">relish agent report \
   --title "relish logs --since prints the whole capture for a quiet app" \
   --what-happened @what.md \

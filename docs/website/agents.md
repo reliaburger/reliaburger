@@ -72,10 +72,10 @@ relish token revoke agent
 ```
 
 Why make a fuss about it? No `relish agent` command changes a workload
-(`lease` and `propose` write only council records), and every `next` step says with
-`read_only` whether it would. But those are promises the agent chooses to
-keep. From a shell it can run any `relish` command with whatever token it
-holds: the token is the one control the cluster enforces. So don't give an agent your admin
+(`lease` and `propose` write only council records), and every `next` step
+says with `read_only` whether it would. But the agent chooses to keep those
+promises, and from a shell it can run any `relish` command with its token,
+the one control the cluster enforces. So don't give an agent your admin
 token, and don't tell your agent client to "always allow" `relish`.
 
 ## The contract
@@ -266,11 +266,9 @@ relish agent guide
 ```
 
 `data.sections` holds it one section at a time, each with its `heading` and
-its `markdown`, and `data.commands` lists the commands above, read from the
-binary itself. Its default budget is 64 KiB, not 24, so the whole chapter
-comes back in one call, with nothing trimmed. Given a smaller `--max-bytes`,
-the last sections go first, and the `next` step asks for a `--max-bytes` that
-fits it all.
+its `markdown`, and `data.commands` lists the commands above. Given a
+`--max-bytes` under its 64 KiB default, the last sections go first, and the
+`next` step asks for a `--max-bytes` that fits it all.
 
 `relish agent version` prints the version, commit, target and cluster formats
 of this binary:
@@ -286,9 +284,8 @@ command's `data`; name a command to get only its schema:
 relish agent schema version
 ```
 
-All of them together are bigger than the default budget, so a bare `relish
-agent schema` comes back trimmed; name the command you need, as above. Each
-one fits on its own.
+A bare `relish agent schema` is over the default budget and comes back
+trimmed, so name the command you need, as above: each fits on its own.
 
 ## Reading the cluster
 
@@ -310,9 +307,9 @@ most 200.
 `faults`, `alerts`, `apps` and `timeline` each say how much they saw:
 `state` is `known`, `partial` (some nodes didn't answer; the list is a
 lower bound) or `unknown` (nothing could be read, with `reason` saying why).
-An empty list with `unknown` means "couldn't look", never "none". The same
-goes for `unknown` at the top: a check `wtf` couldn't make stays unknown
-here, and is never counted as OK. On a big cluster the byte budget trims the
+An empty list with `unknown` means "couldn't look", never "none". Likewise a
+check `wtf` couldn't make stays in the top-level `unknown`, never counted as
+OK. On a big cluster the byte budget trims the
 longest lists from the end and says what it cut, so the worst apps and the
 newest events survive.
 
@@ -348,9 +345,9 @@ relish agent explain
 You get the `meaning`, the `severities` it comes at, its `thresholds` (each
 with the constant's name, its `value` and `unit`, and where it's defined),
 `decided_in` (the line in `src/relish/wtf/diagnose.rs` that reports it, and
-the function around it) and the `manual` section. The thresholds are the very
-constants the check compares against, and the line is found by searching the
-embedded source for the id, so neither can drift from the code. With no id,
+the function around it) and the `manual` section. The thresholds are the
+constants the check compares against, and the line comes from searching the
+embedded source for the id, so neither can drift. With no id,
 `explain` lists every finding. An id `wtf` doesn't have is `not_found`, with
 the closest ids in the hint. The table under "Every finding" in
 `diagnostics` lists them all.
@@ -641,8 +638,8 @@ relish agent patch test ./fix classify_error
 
 That's `cargo test`: unit tests, `tests/suite`, the doctests and every other
 test that isn't `#[ignore]`. The gated suites (`make test-cluster`,
-`test-linux`, `test-slow` and the rest) are ignored there, so they don't run,
-and `data.not_run` says so in every answer. A failing test or a compile error
+`test-linux`, `test-slow` and the rest) are ignored there, and `data.not_run`
+says so in every answer. A failing test or a compile error
 is still an answer, with exit code 0: `data.ok` is `false`, and `failures` or
 `errors` says why, with each test's output or each error's file and line.
 
@@ -712,8 +709,8 @@ relish agent patch destroy --all
 
 When an agent decides it has found a Reliaburger bug, `relish agent report`
 turns what it found into an issue draft for you to read and post. It writes
-files and prints commands. It never posts anything, and it makes no network
-call at all: not to GitHub, not to the cluster.
+files and prints commands, and never posts anything or makes a network call,
+to GitHub or the cluster.
 
 ```sh
 relish agent report \
