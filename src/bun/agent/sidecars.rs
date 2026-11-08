@@ -546,27 +546,35 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             return;
         };
         let (app, namespace) = (instance.app_name.clone(), instance.namespace.clone());
-        let (severity, message) = match result {
-            Ok(()) => (
-                crate::bun::events::EventSeverity::Warning,
-                format!(
-                    "sidecar {sidecar} of {parent} restarted (restart {})",
-                    self.sidecars.restarts(&sidecar)
-                ),
-            ),
-            Err(reason) => (
-                crate::bun::events::EventSeverity::Warning,
-                format!("sidecar {sidecar} of {parent} failed to restart: {reason}"),
-            ),
-        };
-        self.record_event(
-            crate::bun::events::EventKind::Restart,
-            severity,
-            Some(app),
-            Some(namespace),
-            message,
-        )
-        .await;
+        let severity = crate::bun::events::EventSeverity::Warning;
+        match result {
+            Ok(()) => {
+                let attempt = self.sidecars.restarts(&sidecar);
+                let decision = crate::bun::decisions::Decision::new("restart.sidecar_exited")
+                    .with("instance", &parent.0)
+                    .with("sidecar", &sidecar)
+                    .with("attempt", attempt);
+                self.record_decision(
+                    crate::bun::events::EventKind::Restart,
+                    severity,
+                    Some(app),
+                    Some(namespace),
+                    format!("sidecar {sidecar} of {parent} restarted (restart {attempt})"),
+                    decision,
+                )
+                .await;
+            }
+            Err(reason) => {
+                self.record_event(
+                    crate::bun::events::EventKind::Restart,
+                    severity,
+                    Some(app),
+                    Some(namespace),
+                    format!("sidecar {sidecar} of {parent} failed to restart: {reason}"),
+                )
+                .await;
+            }
+        }
     }
 
     /// Kill `parent`'s sidecars and forget them, after the instance itself

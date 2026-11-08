@@ -972,6 +972,33 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .record(timestamp, kind, severity, app, namespace, None, message);
     }
 
+    /// Record an event that carries a decision's rule and evidence.
+    async fn record_decision(
+        &self,
+        kind: crate::bun::events::EventKind,
+        severity: crate::bun::events::EventSeverity,
+        app: Option<String>,
+        namespace: Option<String>,
+        message: String,
+        decision: crate::bun::decisions::Decision,
+    ) {
+        let Some(events) = &self.events else { return };
+        let timestamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        events.write().await.record_with_details(
+            timestamp,
+            kind,
+            severity,
+            app,
+            namespace,
+            None,
+            message,
+            decision.into_details(),
+        );
+    }
+
     /// Create a new agent in single-node mode (no cluster).
     pub fn new(
         grill: G,

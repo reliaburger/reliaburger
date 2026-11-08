@@ -417,6 +417,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 identity,
                 identity_mount,
                 launch_failure: None,
+                restart_cause: None,
             };
             self.supervisor
                 .instances

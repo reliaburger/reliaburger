@@ -13,6 +13,7 @@ pub mod capabilities;
 pub mod cluster_view;
 pub mod consumer_owners;
 mod control_fence;
+pub mod decisions;
 pub mod deploy_operations;
 pub mod diagnostics;
 pub mod discovery_owners;

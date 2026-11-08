@@ -179,6 +179,32 @@ impl EventStore {
         node: Option<String>,
         message: String,
     ) -> u64 {
+        self.record_with_details(
+            timestamp,
+            kind,
+            severity,
+            app,
+            namespace,
+            node,
+            message,
+            BTreeMap::new(),
+        )
+    }
+
+    /// Record an event that carries machine-readable `details`, such as a
+    /// decision's rule and evidence ([`crate::bun::decisions`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_with_details(
+        &mut self,
+        timestamp: u64,
+        kind: EventKind,
+        severity: EventSeverity,
+        app: Option<String>,
+        namespace: Option<String>,
+        node: Option<String>,
+        message: String,
+        details: BTreeMap<String, String>,
+    ) -> u64 {
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.saturating_add(1);
         let event = ClusterEvent {
@@ -192,7 +218,7 @@ impl EventStore {
             action: None,
             principal: None,
             source_address: None,
-            details: BTreeMap::new(),
+            details,
             message,
         };
         if self.buffer.len() == EVENT_BUFFER_CAP {

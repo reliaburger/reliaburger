@@ -711,7 +711,10 @@ pub(super) async fn cluster_apply(
     let owner_notes =
         match skip_owned_apps(&council, &mut config, &owner_caller(auth.as_ref())).await {
             Ok(notes) => notes,
-            Err(error) => return owner_refusal(&error),
+            Err(error) => {
+                record_owner_refusal(&state, auth.as_ref(), &error).await;
+                return owner_refusal(&error);
+            }
         };
 
     if caller_headers.contains_key(CAPACITY_PROBE_HEADER) {
@@ -797,6 +800,8 @@ pub(super) async fn cluster_apply(
         .collect();
 
     let (event_tx, event_rx) = mpsc::channel::<ApplyEvent>(32);
+    let refusal_state = state.clone();
+    let refusal_auth = auth.clone();
     tokio::spawn(async move {
         let mut config = config;
         let filled = admission.filled.iter().map(ToString::to_string);
@@ -914,6 +919,14 @@ pub(super) async fn cluster_apply(
                 // error stops the apply instead of streaming "committed" and
                 // letting the case die later as Unknown(TimedOut).
                 Ok(crate::council::CouncilResponse::Refused { reason }) => {
+                    record_council_refusal(
+                        &refusal_state,
+                        refusal_auth.as_ref(),
+                        app_id.as_ref(),
+                        &describe,
+                        &reason,
+                    )
+                    .await;
                     let _ = event_tx
                         .send(ApplyEvent::Error {
                             message: format!("{describe}: refused by the cluster: {reason}"),
@@ -1069,6 +1082,78 @@ pub(crate) async fn skip_owned_apps(
     Ok(notes)
 }
 
+/// Audit an apply the resource owners refused, as a `deploy.refused.owner`
+/// decision. Nothing else records it: the caller gets the answer, and
+/// without this nobody else ever learns of it.
+pub(crate) async fn record_owner_refusal(
+    state: &ApiState,
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    error: &crate::council::owner::OwnerError,
+) {
+    use crate::council::owner::OwnerError;
+    let (app_id, reason) = match error {
+        OwnerError::NotTheCaller { app, .. } => (app, "not_the_caller"),
+        OwnerError::Claimed { app, .. } => (app, "claimed"),
+        OwnerError::NotOwner { app, .. } => (app, "not_owner"),
+        OwnerError::NotOwned { app } => (app, "not_owned"),
+    };
+    let decision = crate::bun::decisions::Decision::new("deploy.refused.owner")
+        .with(
+            "workloads",
+            crate::bun::decisions::workload(&app_id.name, &app_id.namespace),
+        )
+        .with("reason", reason);
+    super::record_caller_action(
+        state,
+        auth,
+        super::CallerAction {
+            kind: crate::bun::events::EventKind::Operation,
+            severity: crate::bun::events::EventSeverity::Warning,
+            action: "deploy.refused",
+            app: Some(app_id.name.clone()),
+            namespace: Some(app_id.namespace.clone()),
+            node: None,
+            details: decision.into_details(),
+            message: format!("apply refused: {error}"),
+        },
+    )
+    .await;
+}
+
+/// Audit a write of an apply the council's state machine refused, as a
+/// `deploy.refused.council` decision.
+async fn record_council_refusal(
+    state: &ApiState,
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    app_id: Option<&crate::meat::AppId>,
+    describe: &str,
+    reason: &str,
+) {
+    let mut decision =
+        crate::bun::decisions::Decision::new("deploy.refused.council").with("reason", reason);
+    if let Some(app_id) = app_id {
+        decision = decision.with(
+            "workloads",
+            crate::bun::decisions::workload(&app_id.name, &app_id.namespace),
+        );
+    }
+    super::record_caller_action(
+        state,
+        auth,
+        super::CallerAction {
+            kind: crate::bun::events::EventKind::Operation,
+            severity: crate::bun::events::EventSeverity::Warning,
+            action: "deploy.refused",
+            app: app_id.map(|app_id| app_id.name.clone()),
+            namespace: app_id.map(|app_id| app_id.namespace.clone()),
+            node: None,
+            details: decision.into_details(),
+            message: format!("{describe}: refused by the cluster: {reason}"),
+        },
+    )
+    .await;
+}
+
 /// The answer to a change resource owners refused: 403 or 409, with the
 /// reason.
 pub(crate) fn owner_refusal(error: &crate::council::owner::OwnerError) -> Response {
@@ -1205,11 +1290,30 @@ pub(crate) async fn policy_refusal(
         crate::policy::AdmitError::Broken { name, .. } => [name.as_str()].into(),
         crate::policy::AdmitError::Interrupted { .. } => std::collections::BTreeSet::new(),
     };
-    let mut details = std::collections::BTreeMap::new();
-    details.insert(
-        "policies".to_string(),
+    let denied: std::collections::BTreeSet<&crate::meat::AppId> = match error {
+        crate::policy::AdmitError::Denied(denied) => denied
+            .denials
+            .iter()
+            .map(|finding| &finding.workload)
+            .collect(),
+        _ => std::collections::BTreeSet::new(),
+    };
+    let workloads: Vec<String> = denied
+        .iter()
+        .map(|app_id| crate::bun::decisions::workload(&app_id.name, &app_id.namespace))
+        .collect();
+    let mut decision = crate::bun::decisions::Decision::new("deploy.refused.policy").with(
+        "policies",
         policies.into_iter().collect::<Vec<_>>().join(","),
     );
+    if !workloads.is_empty() {
+        decision = decision.with("workloads", workloads.join(","));
+    }
+    // One denied workload is the record's app, so `--app` finds it.
+    let (app, namespace) = match denied.iter().next() {
+        Some(only) if denied.len() == 1 => (Some(only.name.clone()), Some(only.namespace.clone())),
+        _ => (None, None),
+    };
     super::record_caller_action(
         state,
         auth,
@@ -1217,10 +1321,10 @@ pub(crate) async fn policy_refusal(
             kind: crate::bun::events::EventKind::Operation,
             severity: crate::bun::events::EventSeverity::Warning,
             action: "policy.denied",
-            app: None,
-            namespace: None,
+            app,
+            namespace,
             node: None,
-            details,
+            details: decision.into_details(),
             message: format!("apply refused by policy: {error}"),
         },
     )
