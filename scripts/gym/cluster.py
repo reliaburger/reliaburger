@@ -232,9 +232,14 @@ class LocalCluster:
             text = text.replace(placeholder, value)
         return text
 
-    def apply(self, relative):
+    def write_manifest(self, relative):
+        """Write a scenario manifest out for this cluster; its path."""
         path = self.work_dir / Path(relative).name
         path.write_text(self.manifest(relative))
+        return path
+
+    def apply(self, relative):
+        path = self.write_manifest(relative)
         completed = self.relish(["apply", str(path)])
         if completed.returncode != 0:
             raise ClusterError(f"relish apply {relative} failed: {completed.stderr.strip()}")
@@ -315,6 +320,17 @@ class LocalCluster:
             raise ClusterError(f"couldn't create the solver's token: {created.stderr.strip()}")
         return created.stdout.strip().splitlines()[-1].strip()
 
+    def create_agent_token(self, name):
+        """A deployer agent token (#1682): it proposes and takes leases, never writes."""
+        created = self.relish(["token", "create", "--name", name, "--agent", "--role", "deployer"])
+        if created.returncode != 0:
+            raise ClusterError(f"couldn't create the agent token {name}: {created.stderr.strip()}")
+        return created.stdout.strip().splitlines()[-1].strip()
+
+    def newest_proposal(self, author):
+        """The number of the newest proposal `author` made, or None."""
+        return newest_proposal(self.relish_json(["proposal", "list"]), author)
+
     def audit(self, principal):
         """Every audit record, on every node, whose principal is `principal`."""
         records = self.relish_json(["audit", "--principal", principal, "--cluster", "--limit", "10000"])
@@ -380,6 +396,13 @@ def council_leader(council):
 def council_voters(council):
     """The voters that answered `relish council status`."""
     return ((council or {}).get("summary") or {}).get("voters_answering") or []
+
+
+def newest_proposal(listing, author):
+    """The highest proposal id by `author` in `relish proposal list -o json`."""
+    rows = listing if isinstance(listing, list) else listing.get("proposals", [])
+    ids = [row["id"] for row in rows if row.get("author") == author]
+    return max(ids) if ids else None
 
 
 def audit_records(document):
