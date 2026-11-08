@@ -437,6 +437,69 @@ the Rust reader ("the fields are private so the only ways to build one
 are...") now explains Rust internals to an agent. Those notes moved into
 plain `//` comments, which schemars ignores.
 
+### A budget on concepts, too
+
+Bytes per answer are one cost. The other is everything an agent has to know
+before it asks a sensible question: which kinds of thing it can apply, which
+commands exist, which flags they take. Kubernetes' trouble here isn't any one
+command. It's the sheer number of resource kinds, and the add-ons that bring
+their own. So we count ours, and a test holds the count still (#1681).
+
+On 8 November 2026 the numbers were 8 resource kinds (`app`, `job`,
+`namespace`, `permission`, `policy`, `build`, `template` and `use`), 159
+`relish` commands and subcommands, none of them hidden, and 375 flags across
+them, 169 of them distinct. The budget lives in
+`docs/testing/concept-budget.json`, each number with the reason it is what it
+is, and the test fails when a count moves either way. Up, and the message
+says to raise the budget in the same pull request and say why: a new concept
+becomes a line a reviewer has to agree with. Down, and it asks for the budget
+to come down too, so it ratchets.
+
+Hidden commands count. Hiding one from `--help` doesn't stop an agent
+meeting it in a script, an error or the manual, and it mustn't be a way to
+sneak under the budget.
+
+Counting from the real definitions took two tricks. The commands come from
+clap's `CommandFactory::command()`, the same tree `relish` parses with, read
+*before* clap builds it: building copies every global flag into every
+subcommand and adds `help`, which would count `--token` 160 times.
+
+The resource kinds come from serde. `#[derive(Deserialize)]` on `Config`
+generates code that, when asked to deserialise, calls
+`deserializer.deserialize_struct(name, FIELDS, visitor)`, where `FIELDS` is
+the list of field names under their serde names (`use`, not the Rust field
+`uses`). So we wrote a deserialiser that reads no input at all:
+
+```rust
+impl<'de> Deserializer<'de> for &mut FieldProbe {
+    type Error = de::value::Error;
+
+    fn deserialize_struct<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        fields: &'static [&'static str],
+        _visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        self.fields = Some(fields);
+        Err(de::Error::custom("field names recorded"))
+    }
+    // every other deserialize_* method refuses
+}
+```
+
+It writes down the field list and refuses. `Deserializer` is the trait serde
+formats implement (serde_json and toml each have one), and serde's
+`forward_to_deserialize_any!` macro fills in the thirty-odd methods we don't
+care about. `&'static [&'static str]` is a slice of string slices that live
+for the whole program, because the derive baked them into the binary. In Go
+you'd reach for `reflect` and read struct tags; in Python, `dataclasses.fields`.
+Rust has no runtime reflection, but serde's derive already wrote the list
+down for us. Add a ninth table to `Config` and the count goes up on its own.
+
+What we left out: tokens and time per task against Kubernetes, which need
+the gym's comparison harness, and a budget on the fields inside each kind.
+`relish agent guide` already has its 64 KiB test.
+
 ### The rest of `relish`
 
 The contract covers `relish agent`, but an agent will run plain `relish`
@@ -3116,15 +3179,75 @@ SHA-256 is the qualified digest), and adds one `mcpb` package per platform
 with the digest the record holds, using `scripts/release/mcp_registry.py`.
 It never hashes a bundle itself, so it can't disagree with what was
 qualified. The job only writes the entry: publishing needs the maintainer's
-GitHub login to the organisation, so it keeps the file as an artefact for
-them to run `mcp-publisher publish` with.
+GitHub login to the organisation, so it keeps the file as an artefact.
 
-The bundles aren't signed with the format's own scheme. `mcpb sign` appends
-a PKCS#7 signature from an X.509 certificate, which would be a third
-signing identity beside the release key and Apple's Developer ID, and
-choosing one is the maintainer's call. What a bundle has today is the
-`fileSha256` clients check before installing, the build attestation every
-asset gets, and a signed, notarised binary inside.
+Publishing it is one command, `make mcp-registry-publish TAG=v0.2.8`, and
+it trusts the artefact no more than the job trusted its inputs. A
+dispatched workflow run doesn't list its inputs, so `promote.yml` now has a
+`run-name` of `Promote <tag>`, and `mcp_registry_publish.py` finds the run
+by that name. It downloads the entry and compares each package's
+`fileSha256` with the digest GitHub stores for the published asset, a
+second, independent source for the same bytes. Only when they agree does it
+run `mcp-publisher`, logging in first if the registry token it keeps is
+missing or expired. The token is a JWT, three base64url parts separated by
+dots, and the middle one is JSON with an `exp` time, so checking it needs no
+network. The tests put fake `gh` and `mcp-publisher` scripts first on
+`PATH`, the trick `test_homebrew.py` uses, so they never reach GitHub or the
+registry.
+
+A bundle installed from a desktop client has no shell to pass `--endpoint`
+from, so the manifest's `user_config` declares two settings the client
+asks for: an endpoint and a token, both `"required": false` with an empty
+`default`, and the token `"sensitive": true` so the client masks it and
+stores it as a secret. `mcp_config.env`
+hands them to `relish` as `"RELIABURGER_ENDPOINT": "${user_config.endpoint}"`
+and `RELIABURGER_TOKEN` the same way. The token's title says "Read-only",
+its description gives the `relish token create --role read-only` line and
+links to the manual's section on it, and a test fails if the word "admin"
+appears anywhere in either setting: an MCP server that reads workload text
+should never hold a token that can change the cluster.
+
+The catch is in "optional". A client fills in defaults before it substitutes
+the placeholders, so a setting nobody touched doesn't leave the variable
+unset: it sets it to `""`. Before 0.2.8 `relish` took any value it found,
+so an empty endpoint failed as an invalid URL, and worse, an empty token
+replaced the saved context's own token with an empty bearer. Both now go
+through one helper:
+
+```rust
+fn unless_blank(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.trim().is_empty())
+}
+```
+
+[`Option::filter`](https://doc.rust-lang.org/std/option/enum.Option.html#method.filter)
+keeps a `Some` only when the closure says `true`, and turns everything else
+into `None`, so an empty or all-whitespace variable is exactly an unset one.
+The `--token` and `--endpoint` flags don't go through it: a flag is
+something a person typed. A unit test feeds `pick_token` and `pick_endpoint`
+blank values, and two tests in `tests/suite/relish_cli.rs` run the real
+binary: one with a blank endpoint, which must not be refused, and one with a
+blank token against a stub server, which must receive no `Authorization`
+header at all.
+
+Each bundle is signed with the release key like every other release file:
+`package.py` writes `relish-<platform>.mcpb.sig`, the same `{schema, sha256,
+embedded, external}` envelope a binary gets, and `candidate.py` counts it
+among the assets a candidate must have, so staging and promotion refuse a
+release without one.
+
+That signature changes nothing a client shows. An MCP client still calls the
+bundle unsigned, because the format has its own scheme: `mcpb sign` appends a
+PKCS#7 signature made with an X.509 code-signing certificate, and `mcpb
+verify` and clients such as Claude Desktop accept it only when the operating
+system's trust store vouches for that certificate. Our release key is a bare
+Ed25519 key with no certificate, and a self-signed certificate wrapped round
+it would fail the same check. So the `.sig` is for people and scripts that
+already trust the release key, and the client relies on the `fileSha256` it
+checks before installing. Signing that clients recognise, with the Apple
+Developer ID certificate that will notarise the macOS `relish`, waits until
+that notarisation is set up; a third signing identity bought only for bundles
+wasn't worth it.
 
 ## Tools for any agent: `relish mcp`
 
@@ -3766,6 +3889,39 @@ Every one of those `relish agent` commands is new in 0.2.7, and the installer
 still fetches 0.2.6 until the release, so each place that names one says
 "0.2.7, not in 0.2.6", the label the release check already demands.
 
+### A first slide that only says what shipped
+
+0.2.8 puts a seventh slide at the front of the carousel (#1731): "Native to
+AI agents from day one, not bolted on." Is that true? Mostly it's old news
+told in one place. The first design doc, checked in on 4 March 2026, already
+promised `--output json` on every command a script could run, and the JSON
+formatter arrived two days later. The embedded source came in July, before
+0.1.0. `relish agent` and `relish mcp` are 0.2.7's. So every claim on the
+slide is one we could point at: the default role of `relish token create` is
+`read-only`, `relish agent report` redacts its draft, and Claude Code passed
+0.2.7's exit test in the gym holding a read-only token. The slide links that
+record and the gym's section on `/agents`.
+
+What it leaves out matters as much. The gym doesn't run on every release
+(it costs API money, and `make test-gym` is the maintainer's to run before a
+release that changes the agent commands), so the slide doesn't say it does.
+Proposals and guardrails (#1682) aren't built yet, so they aren't there either.
+
+There's a word problem too. The next slide calls `bun` "the one agent every
+node runs", and that came first. So the new slide never says plain "agent":
+it's an AI agent, your agent, or part of `relish agent`. A test reads every
+"agent" on the slide and fails on any other.
+
+The drawing is a terminal and a small robot holding a key. A dot leaves the
+robot, JSON lines type themselves into the terminal, a dot goes back, and the
+robot blinks. The lines "type" with a trick worth knowing: give a stroke a
+dash pattern longer than the line (`stroke-dasharray: 120`) and animate
+`stroke-dashoffset` from 120 to 0, and the dash slides into view. The
+resting state is offset 0, a fully drawn line, so when reduced motion turns
+the animation off, the lines are simply there. The carousel script counts
+its slides, so the seventh needed markup and CSS only. The footer and the
+site's README now say seven, and a test holds them to the count.
+
 ### A recording slot with nothing in it
 
 The section is meant to carry a recording of a real agent session. Recordings
@@ -3863,7 +4019,8 @@ Goose has no web form, so the README points at `/agents` for it.
   shows the rest.
 - `tests/suite/website.rs` checks that the agent line comes before the
   masthead and links three files the site publishes, that the hero carries
-  the headline, that there are six slides, that every command in the agent
+  the headline, that there are six slides (seven from 0.2.8, with the AI-agent
+  one first and every "agent" on it unambiguous), that every command in the agent
   section parses with the real CLI, that the recording slot is in one of its
   two honest states, that `/agents` and the README carry exactly the links
   `install_links()` makes and the command they start parses, that every
@@ -4520,9 +4677,10 @@ ones, command by command, each with the reason it lost.
   not images from a badge service: the site makes no third-party requests.
 - **Content negotiation on `Accept: text/markdown`.** GitHub Pages can't
   vary on headers.
-- **Publishing to the MCP Registry.** It needs the maintainer's GitHub
-  login, so it waits for them. 0.2.8 built the bundles and the entry it
-  publishes (#1695).
+- **Publishing to the MCP Registry from CI.** It needs the maintainer's
+  GitHub login to the organisation, so CI writes the entry and
+  `make mcp-registry-publish` checks and publishes it from their machine
+  (#1695).
 - **The manual as MCP resources.** `manual search` and `manual show` are
   tools already.
 - **An HTTP transport for MCP.** Remote MCP is #1092, with authentication of

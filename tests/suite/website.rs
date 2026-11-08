@@ -1491,12 +1491,22 @@ fn why_section(page: &str) -> &str {
     &page[start..start + page[start..].find("</section>").unwrap()]
 }
 
-/// The six differences sit between the hero and the install, each a short
+/// The slides of the "Built differently" carousel, in order, each from its
+/// `<li>` to the next.
+fn why_slides(section: &str) -> Vec<&str> {
+    section.split("<li class=\"why-slide\"").skip(1).collect()
+}
+
+/// The number of slides as the prose around the carousel spells it.
+const SLIDE_COUNT_WORD: &str = "seven";
+
+/// The seven differences sit between the hero and the install, each a short
 /// punchline, two sentences and a drawing. The list works without script;
-/// `assets/why-carousel.js` turns it into a slideshow. The sixth, from 0.2.7,
-/// is the one for agents (#1578).
+/// `assets/why-carousel.js` turns it into a slideshow. The first, from 0.2.8,
+/// says it was built for AI agents from the start (#1731); the last, from
+/// 0.2.7, is the one about reading the recipe (#1578).
 #[test]
-fn six_differences_come_just_before_the_install() {
+fn seven_differences_come_just_before_the_install() {
     let page = read("docs/website/index.html");
     let ids: Vec<String> = section_ids(&page).into_iter().flatten().collect();
     let position = |id: &str| ids.iter().position(|i| i == id).unwrap();
@@ -1504,11 +1514,15 @@ fn six_differences_come_just_before_the_install() {
 
     let section = why_section(&page);
     assert!(section.contains("data-carousel"));
-    let slides: Vec<&str> = section.split("<li class=\"why-slide\"").skip(1).collect();
-    assert_eq!(slides.len(), 6, "the section should show six differences");
+    let slides = why_slides(section);
+    assert_eq!(slides.len(), 7, "the section should show seven differences");
     assert!(
-        section.contains(">Your agent can read the recipe.</h3>"),
-        "the sixth difference is the agent one"
+        slides[0].starts_with(" id=\"why-ai-agents\""),
+        "the first difference is the AI-agent one"
+    );
+    assert!(
+        slides[6].contains(">Your agent can read the recipe.</h3>"),
+        "the last difference is the recipe one"
     );
     for slide in slides {
         assert_eq!(slide.matches("<h3 class=\"why-punchline\">").count(), 1);
@@ -1528,15 +1542,88 @@ fn six_differences_come_just_before_the_install() {
     }
 }
 
+/// The first difference (#1731): Reliaburger was built for AI agents from the
+/// start, not retrofitted. `bun` is already "the one agent every node runs"
+/// on the slide after it, so every "agent" here is an AI agent, your agent or
+/// part of a `relish agent` command. It links the page for agents and the
+/// gym's exit-test record, and claims nothing 0.2.8 hasn't shipped: no
+/// proposals or guardrails (#1682).
+#[test]
+fn the_first_difference_is_that_it_was_built_for_ai_agents() {
+    let page = read("docs/website/index.html");
+    let section = why_section(&page);
+    let slide = why_slides(section)[0];
+    assert!(
+        slide.contains(
+            "<h3 class=\"why-punchline\">Native to AI agents from day one, not bolted on.</h3>"
+        ),
+        "{slide}"
+    );
+    assert!(
+        why_slides(section)[1].contains("the one agent every node runs"),
+        "the slide after it still calls bun the agent every node runs"
+    );
+
+    let record = "docs/qualification/2026-11-06-v0.2.7-exit-test.md";
+    for href in [
+        "agents.html#measuring-an-agent-on-your-cluster".to_string(),
+        format!("https://github.com/reliaburger/reliaburger/blob/main/{record}"),
+    ] {
+        assert!(
+            slide.contains(&format!("<a href=\"{href}\">")),
+            "the slide doesn't link {href}"
+        );
+    }
+    assert!(repository().join(record).is_file(), "{record} is missing");
+    assert!(read(record).contains("**Verdict: the exit test passes.**"));
+
+    // The split leaves the rest of the `<li>` tag at the front.
+    let text = decode(&strip_tags(&slide[slide.find('>').unwrap() + 1..]));
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    for command in ["relish agent", "relish mcp"] {
+        assert!(text.contains(command), "the slide doesn't name {command}");
+    }
+    for (at, _) in text.match_indices("agent") {
+        let before = &text[..at];
+        assert!(
+            ["AI ", "your ", "relish "]
+                .iter()
+                .any(|word| before.ends_with(word)),
+            "an ambiguous \"agent\" after {:?}",
+            &before[before.len().saturating_sub(30)..]
+        );
+    }
+    let lower = text.to_lowercase();
+    for unshipped in ["proposal", "guardrail", "relish gym"] {
+        assert!(!lower.contains(unshipped), "the slide claims {unshipped:?}");
+    }
+}
+
 /// The drawings are inline and animated by the site's own CSS, so nothing in
-/// the section loads from anywhere else, and reduced motion stills them.
+/// the section loads from anywhere else, and reduced motion stills them. A
+/// slide may link out: a link loads nothing until it's followed.
 #[test]
 fn the_differences_load_nothing_and_respect_reduced_motion() {
     let page = read("docs/website/index.html");
     let section = why_section(&page);
-    for external in ["http:", "https:", "//", "<img", "<script", "<link", "<use"] {
+    let mut unlinked = String::new();
+    let mut rest = section;
+    while let Some(at) = rest.find("<a ") {
+        unlinked.push_str(&rest[..at]);
+        let tag = &rest[at..at + rest[at..].find('>').unwrap()];
+        let href = attribute(tag, "href").expect("a link with no href");
         assert!(
-            !section.contains(external),
+            href.starts_with("https://github.com/reliaburger/reliaburger/") || !href.contains(':'),
+            "a slide links outside the project: {href}"
+        );
+        rest = &rest[at + tag.len()..];
+    }
+    unlinked.push_str(rest);
+    for external in [
+        "http:", "https:", "//", "<img", "<script", "<link", "<use", "url(", "href=",
+    ] {
+        assert!(
+            !unlinked.contains(external),
             "the #why section contains {external:?}"
         );
     }
@@ -1549,7 +1636,20 @@ fn the_differences_load_nothing_and_respect_reduced_motion() {
     ] {
         assert!(script.contains(needle), "why-carousel.js lacks {needle:?}");
     }
+    // Every class a drawing animates with has its rule in the stylesheet. The
+    // `<svg>` element's own classes only name the drawing, so they're skipped.
     let style = read("docs/website/style.css");
+    for slide in why_slides(section) {
+        let svg = &slide[slide.find("<svg").unwrap()..slide.find("</svg>").unwrap()];
+        for classes in svg.split("class=\"").skip(2) {
+            for class in classes[..classes.find('"').unwrap()].split_whitespace() {
+                assert!(
+                    style.contains(&format!(".{class} ")) || style.contains(&format!(".{class},")),
+                    "style.css has no rule for .{class}"
+                );
+            }
+        }
+    }
     let reduced = style
         .split("@media (prefers-reduced-motion: reduce)")
         .skip(1)
@@ -1560,6 +1660,62 @@ fn the_differences_load_nothing_and_respect_reduced_motion() {
         reduced,
         "style.css should stop the drawings' animation for reduced motion"
     );
+}
+
+/// The carousel script counts the slides it finds, so a new one needs no
+/// script change, and its Pause and Play button stays (#1552). The footer and
+/// the site's README say how many differences there are, so they follow the
+/// count; the script and the section's comment don't name one to go stale.
+#[test]
+fn the_carousel_counts_its_slides_and_keeps_pause_and_play() {
+    let page = read("docs/website/index.html");
+    let slides = why_slides(why_section(&page)).len();
+    let words = ["", "one", "two", "three", "four", "five", "six", "seven"];
+    assert_eq!(words[slides], SLIDE_COUNT_WORD);
+
+    let script = read("docs/website/assets/why-carousel.js");
+    assert!(script.contains("var slides = Array.prototype.slice.call(list.children);"));
+    assert!(script.contains("index + 1 + \" of \" + slides.length"));
+    for needle in [
+        "button(\"why-toggle\", \"Pause\")",
+        "stopped ? \"Play\" : \"Pause\"",
+        "aria-pressed",
+        "event.pointerType !== \"mouse\"",
+    ] {
+        assert!(script.contains(needle), "why-carousel.js lacks {needle:?}");
+    }
+    let comment = &page[page.find("<!-- ").unwrap()..page.find("<section id=\"why\"").unwrap()];
+    let comment = &comment[comment.rfind("<!--").unwrap()..];
+    for (name, text) in [
+        ("why-carousel.js", script.as_str()),
+        ("the comment", comment),
+    ] {
+        let text = text.to_lowercase();
+        for word in &words[2..] {
+            assert!(
+                !text.contains(&format!("all {word} "))
+                    && !text.contains(&format!("{word} differences")),
+                "{name} names a slide count ({word})"
+            );
+        }
+    }
+
+    let footer = &page[page.find("<footer>").unwrap()..];
+    assert!(
+        footer.contains(&format!("the {SLIDE_COUNT_WORD} differences")),
+        "the footer miscounts the differences"
+    );
+    let readme = read("docs/website/README.md");
+    for phrase in [
+        format!("plain list of {SLIDE_COUNT_WORD} architectural differences"),
+        format!("{SLIDE_COUNT_WORD} dots"),
+        format!("all {SLIDE_COUNT_WORD} stay stacked"),
+    ] {
+        assert!(
+            readme.contains(&phrase),
+            "docs/website/README.md lacks {phrase:?}"
+        );
+    }
 }
 
 /// The install section has two tabs (#1579): the one-line install, and one

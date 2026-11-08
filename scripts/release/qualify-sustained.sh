@@ -1088,6 +1088,11 @@ echo "panics $(journalctl -u reliaburger --no-pager -q --cursor-file=/var/tmp/so
 # it takes since the last report is counted.
 echo "timesyncd $(systemctl is-active systemd-timesyncd.service 2>/dev/null)"
 echo "clock_steps $(journalctl -u lima-guestagent --no-pager -q --cursor-file=/var/tmp/soak-clock.cursor 2>/dev/null | grep -c 'SyncTime: system time synchronized')"
+# The agent loop stall watchdog's snapshots since the last report (#1707);
+# the checker cuts the blocks out and keeps them in loop-stalls.jsonl.
+section loop_stalls
+journalctl -u reliaburger --no-pager -q --cursor-file=/var/tmp/soak-stall.cursor 2>/dev/null \
+    | grep -F -e 'agent loop stalled' -e 'bun:   ' -e 'bun: end of thread snapshot' | head -n 5000
 section ingress
 echo | timeout 5 openssl s_client -connect 127.0.0.1:443 -servername podinfo.localhost 2>/dev/null | openssl x509 -noout -serial -enddate 2>/dev/null
 section api
@@ -1272,6 +1277,9 @@ PY
     for node in 1 2 3; do
         [ "${down[node]}" = 0 ] || continue
         gsh "$node" 'journalctl -u reliaburger --since "-15min" --no-pager' > "$directory/journal-${vm[node]}.txt" 2>&1 || true
+        # The stall watchdog's thread snapshots, cut out of that journal (#1707).
+        check loop-stalls "$directory/journal-${vm[node]}.txt" > "$directory/loop-stalls-${vm[node]}.txt" 2>/dev/null || true
+        [ -s "$directory/loop-stalls-${vm[node]}.txt" ] || rm -f "$directory/loop-stalls-${vm[node]}.txt"
         api_get "$node" /v1/diagnostics > "$directory/diagnostics-${vm[node]}.json" 2>/dev/null || true
         memory_report "$node" recent > "$directory/memory-${vm[node]}.txt" || true
     done
