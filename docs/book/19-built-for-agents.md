@@ -5493,6 +5493,18 @@ since, it refuses and says so: undoing would overwrite someone's change, and
 directly; `relish agent undo 17` *proposes* the undo, whose `before` is the
 original's `after`, and approving it marks the original `undone` too.
 
+A proposed undo names no app: `{"kind": "undo", "of": 17}`. Its apps are
+the original's, so the scope check on the request has nothing to check, and
+the first version checked them only after building the proposal. Building
+can refuse, and its refusals name the original's apps (`shop/web changed
+after proposal 17 applied`), so an agent scoped to `billing` could walk the
+proposal ids and learn app names in `shop`, and leave them in the audit
+log's `proposal.refused` records too. Now the create handler reads the
+original first, through the same `read_proposal` the `GET` route uses, and
+checks its apps against the caller's scope before it builds anything. An
+original out of scope answers `not_found`, exactly as a missing one does,
+so the answer doesn't even say the id exists.
+
 Undo lasts 24 hours and the newest 64 applied proposals. After that the
 leader's reaper compacts the record: the specs go, the summary, diff, blast
 radius and outcome stay. The same reaper expires proposals nobody decided

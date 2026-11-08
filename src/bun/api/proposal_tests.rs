@@ -824,6 +824,48 @@ async fn an_agents_undo_is_stale_once_a_person_changed_the_app_again() {
     assert_eq!(web.image.as_deref(), Some("web:1.5"));
 }
 
+/// Proposing an undo of a proposal outside the token's scope answers what
+/// a missing one does, `not_found`, and nothing in the answer or the
+/// refusal records names the original's apps.
+#[tokio::test]
+async fn an_undo_of_a_proposal_out_of_scope_is_not_found_and_names_nothing() {
+    let cluster = cluster("proposal-undo-scope").await;
+    cluster.scale(&cluster.holmes, "shop", "web", 5).await;
+    let (status, body) = cluster
+        .post("/v1/proposals/1/approve", &cluster.bob, String::new())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // A person changes web again, so building the undo would answer
+    // `stale`, naming shop/web.
+    cluster
+        .council
+        .write(crate::council::types::RaftRequest::AppSpec {
+            app_id: crate::meat::AppId::new("web", "shop"),
+            spec: web_spec(4),
+        })
+        .await
+        .unwrap();
+
+    let undo = |of: u64| {
+        serde_json::json!({
+            "kind": "undo", "namespace": "billing", "of": of, "reason": "probing",
+        })
+    };
+    let (status, out_of_scope) = cluster.propose(&cluster.billing_bot, undo(1)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{out_of_scope}");
+    assert_eq!(out_of_scope["code"], "not_found");
+    assert!(!out_of_scope.to_string().contains("web"), "{out_of_scope}");
+    assert!(!out_of_scope.to_string().contains("shop"), "{out_of_scope}");
+    let (status, missing) = cluster.propose(&cluster.billing_bot, undo(99)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{missing}");
+    assert_eq!(missing["code"], out_of_scope["code"]);
+
+    for record in cluster.records("proposal.refused").await {
+        let text = format!("{} {:?} {:?}", record.message, record.details, record.app);
+        assert!(!text.contains("web"), "a refusal names the app: {text}");
+    }
+}
+
 /// An agent's undo starts from exactly what the original left: its
 /// `before` is the original's `after`.
 #[tokio::test]

@@ -176,6 +176,20 @@ pub(super) async fn proposal_create_handler(
     if let Err(response) = authorise_apps(&state, auth, action, named.iter()).await {
         return response;
     }
+    // An undo names no app; its apps are the original's. Check them before
+    // building it, whose refusals name them, and answer an original out of
+    // scope as a missing one, as reading it would.
+    if request.kind == RequestKind::Undo
+        && let Some(of) = request.of
+    {
+        let original = match read_proposal(&state, auth, ProposalId(of)).await {
+            Ok(original) => original,
+            Err(response) => return response,
+        };
+        if let Err(response) = authorise_apps(&state, auth, action, original.apps()).await {
+            return response;
+        }
+    }
     let Some(council) = &state.council else {
         return standalone();
     };
