@@ -1937,6 +1937,30 @@ ignore list. The bundle carries no `.gitignore` (it's not in the build, test
 or read set), so without that second line the first build would put 10 GiB of
 `target/` into every diff.
 
+That one write cost us three flakes (#1726, #1738, #1748), all seen under
+load in a full `make ci` and never alone. One `git add` died with "cannot use
+.git/info/exclude as an exclude file", and once `git status` listed
+`.reliaburger-patch/` as untracked. The cause wasn't in our code but in
+`git init`. It copies a *template directory* into every new `.git`, and
+`init.templateDir` lets a user name their own. The maintainer's template held
+`info/exclude` as a symbolic link into a dotfiles repository, and git copies a
+link as a link. So every workspace's exclude file was the *same* file, and
+`std::fs::write`, which follows links, truncated and rewrote it from every
+test process at once. Git reading it mid-write saw a short file (the fatal
+error) or an empty one (no ignore rules). The dotfile had grown to 487 copies
+of our two lines and lost its own.
+
+The fix is two lines of defence. `extract` runs `git init --template=`, an
+empty template, so a workspace gets neither the user's exclude file nor their
+hooks (which here started a background `ctags` on every checkout and commit).
+And `ignore_patch_files` adds only the lines that are missing, writes them to
+a temporary file next to the exclude file and renames it into place. A
+rename replaces a symbolic link rather than following it, and a reader sees
+the old file or the new one, never half of one. The lesson: anything a
+process inherits (the environment, global config, templates) is shared state
+between test processes, so a test workspace should take as little of it as
+it can.
+
 The state `build`, `test` and `try` leave behind goes in
 `.reliaburger-patch/state.json`: the base commit, the last build per
 platform, the last twenty test runs, and the throwaway cluster if there is
