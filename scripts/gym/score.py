@@ -9,6 +9,10 @@ give the same score, so a recorded run can be scored again later
 import json
 import statistics
 
+# `relish gym run` (#1683) scores with a Rust port of this file. The two share
+# fixtures in fixtures/parity/scoring.json, and test_score.py and the Rust
+# tests both check them, so change a rule here and there together.
+
 from scenario import FAULT_KINDS
 
 # `relish` commands that only read. Anything else the solver runs counts as an
@@ -24,6 +28,7 @@ READ_ONLY_COMMANDS = {
 READ_ONLY_SUBCOMMANDS = {
     "council": {"status"},
     "fault": {"list"},
+    "gym": {"list"},
     "token": {"list"},
     "policy": {"list", "audit"},
     "upgrade": {"plan", "status"},

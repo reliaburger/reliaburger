@@ -46,6 +46,23 @@ pub enum Rule {
     SecretKeyValue,
 }
 
+impl Rule {
+    /// The rule's name in a report's manifest and the gym's report:
+    /// `reliaburger_token`, `secret_key_value` and so on.
+    pub fn name(self) -> &'static str {
+        match self {
+            Rule::ReliaburgerToken => "reliaburger_token",
+            Rule::EncryptedValue => "encrypted_value",
+            Rule::AgeIdentity => "age_identity",
+            Rule::PemPrivateKey => "pem_private_key",
+            Rule::UrlCredentials => "url_credentials",
+            Rule::EnvValue => "env_value",
+            Rule::Jwt => "jwt",
+            Rule::SecretKeyValue => "secret_key_value",
+        }
+    }
+}
+
 /// Whether `key` names a secret: it ends in `password`, `passwd`,
 /// `passphrase`, `secret`, `token`, `apikey`, or `api`, `access`, `private`
 /// or `secret` then `key` (with or without a `_` or `-`), in any case.

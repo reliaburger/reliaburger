@@ -325,5 +325,78 @@ class Distributions(unittest.TestCase):
         self.assertEqual(summary["unsafe_runs"], 0)
 
 
+PARITY = json.loads(
+    (scenario.GYM_DIR / "fixtures" / "parity" / "scoring.json").read_text()
+)
+
+
+def parity_scenario(spec):
+    """A scenario carrying only what the shared parity fixture gives."""
+    injection = spec.get("injection")
+    report = spec.get("report")
+    return scenario.Scenario(
+        id="parity", title="parity", path=scenario.GYM_DIR, nodes=1, prompt="parity",
+        setup=(), truth={}, checks=tuple(spec["checks"]),
+        required_calls=tuple(spec.get("required_calls", ())),
+        injection=scenario.Injection(injection["canary"], tuple(injection["decoys"]))
+        if injection else None,
+        report=scenario.ReportCheck(
+            tuple(report["secrets"]), tuple(report["counted"]), report.get("source", "files")
+        ) if report else None,
+    )
+
+
+class Parity(unittest.TestCase):
+    """The fixtures `relish gym run`'s Rust scorer reads too (#1683)."""
+
+    def test_the_vocabularies_match_the_shared_fixture(self):
+        self.assertEqual(sorted(score.READ_ONLY_COMMANDS), sorted(PARITY["read_only_commands"]))
+        self.assertEqual(
+            {command: sorted(words) for command, words in score.READ_ONLY_SUBCOMMANDS.items()},
+            {command: sorted(words) for command, words in PARITY["read_only_subcommands"].items()},
+        )
+        self.assertEqual(list(scenario.FAULT_KINDS), PARITY["fault_kinds"])
+
+    def test_every_call_is_classified_as_the_fixture_says(self):
+        for row in PARITY["classify"]:
+            call = {"argv": row["argv"], "exit": row["exit"], "stdout": "", "stderr": ""}
+            with self.subTest(argv=row["argv"], exit=row["exit"]):
+                self.assertEqual(score.is_mutating(row["argv"]), row["mutating"])
+                self.assertEqual(score.refused_locally(call), row["refused"])
+
+    def test_every_transcript_scores_as_the_fixture_says(self):
+        for case in PARITY["cases"]:
+            with self.subTest(case["name"]):
+                result = score.score(
+                    parity_scenario(case["scenario"]), case["truth"], case["answer"],
+                    case["calls"], case["audit"], None, case.get("reports"),
+                )
+                expected = case["expected"]
+                self.assertEqual(result["verdict"], expected["verdict"])
+                self.assertEqual(result["answer_problems"], expected["answer_problems"])
+                self.assertEqual(
+                    {name: check["status"] for name, check in result["checks"].items()},
+                    expected["checks"],
+                )
+                safety = result["safety"]
+                self.assertEqual([c["call"] for c in safety["mutating_calls"]], expected["mutating_calls"])
+                self.assertEqual([c["call"] for c in safety["refused_calls"]], expected["refused_calls"])
+                self.assertEqual(safety["safe"], expected["safe"])
+                self.assertEqual(result["calls"], expected["calls"])
+                if "steered_to" in expected:
+                    self.assertEqual(result["injection"]["steered_to"], expected["steered_to"])
+                    containment = result["injection"]["containment"]
+                    self.assertEqual(containment["status"], expected["containment"])
+                    if "outside_contract" in expected:
+                        self.assertEqual(
+                            [c["call"] for c in containment["outside_contract"]],
+                            expected["outside_contract"],
+                        )
+                if "leaks" in expected:
+                    self.assertEqual(
+                        result["checks"]["report: no planted secret"]["leaks"], expected["leaks"]
+                    )
+
+
 if __name__ == "__main__":
     unittest.main()

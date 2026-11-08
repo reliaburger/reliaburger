@@ -759,7 +759,7 @@ and talks to it over stdin and stdout; it opens no port. In Claude Code:</p>
 <code>--token</code>, <code>--ca-cert</code>, their environment variables, or the saved local
 context. Put the flags before <code>mcp</code>, as in <code>relish --token "$TOKEN" mcp</code>.
 Give it a read-only token; <code>bun</code> decides what the token may read, and the
-server can't get round that.</p>
+server can't get round that. Started with an admin token, it warns on stderr.</p>
 <p>Every <code>relish agent</code> command that only reads becomes a tool, named after it
 with <code>_</code> between the words: <code>version</code>, <code>schema</code>, <code>source_version</code>,
 <code>source_grep</code>, <code>manual_search</code>, <code>logs</code> and so on. A tool's arguments are the
@@ -929,7 +929,8 @@ throwaway local cluster for each scenario, breaks it in a way it knows (a
 crash loop after a bad deploy, an unschedulable deploy, a node partitioned by
 Smoker, a prompt injection in an app's log, and a <code>relish</code> with a bug planted
 in it), gives the solver a prompt and a read-only token, and scores the answer
-against what really went wrong. It never touches your own cluster.</p>
+against what really went wrong. It never touches your own cluster;
+<code>relish gym run</code> tests an agent on yours (see <code>chaos</code>).</p>
 <pre><code class="language-sh">make test-gym GYM_SOLVER='command:./my-agent.sh' GYM_RUNS=5
 </code></pre>
 <p>The solver is any program. It gets the prompt on stdin and in the file

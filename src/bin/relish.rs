@@ -276,6 +276,60 @@ struct TestOptions {
     namespace: Option<String>,
 }
 
+/// `relish gym`.
+#[derive(clap::Subcommand)]
+enum GymAction {
+    /// Deploy the gym's apps into a staging namespace, break them, run your agent, score it and clean up.
+    Run(Box<GymRunOptions>),
+    /// List the scenarios: what each deploys, breaks and scores.
+    List,
+    /// The recording `relish` a solver runs (used by `relish gym run`).
+    #[command(hide = true)]
+    Record {
+        /// The call log to append to.
+        #[arg(long)]
+        log: PathBuf,
+        /// The `relish` arguments to run.
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+    /// The built-in baseline solver (run by `relish gym run --solver baseline`).
+    #[command(hide = true)]
+    Baseline,
+}
+
+/// `relish gym run`, boxed to keep the generated `Command` parser small.
+#[derive(clap::Args)]
+struct GymRunOptions {
+    /// The staging namespace to work in. Required; never `default`.
+    #[arg(long)]
+    namespace: String,
+    /// `baseline` (a scripted playbook built in), or `command:PROGRAM ARGS` for your agent.
+    #[arg(long, default_value = "baseline")]
+    solver: String,
+    /// A scenario to run; repeat for more. Omit for all of them.
+    #[arg(long = "scenario")]
+    scenarios: Vec<String>,
+    /// Runs per scenario.
+    #[arg(long, default_value_t = 1)]
+    runs: u32,
+    /// The solver's budget per run, e.g. "10m".
+    #[arg(long, default_value = reliaburger::relish::gym::DEFAULT_TIMEOUT)]
+    timeout: String,
+    /// A new directory for report.md, report.json and each run's evidence.
+    #[arg(long)]
+    out: Option<PathBuf>,
+    /// The image the gym's apps run on a container runtime (default a pinned BusyBox).
+    #[arg(long)]
+    image: Option<String>,
+    /// Agree to deploy and break the gym's apps in an empty or gym-only namespace.
+    #[arg(long)]
+    yes: bool,
+    /// Agree to run in a namespace holding other workloads: the namespace name again.
+    #[arg(long, value_name = "NAMESPACE")]
+    confirm_namespace: Option<String>,
+}
+
 // `relish path`, boxed to keep the generated `Command` parser
 // small (see `AuditOptions`).
 #[derive(clap::Args)]
@@ -986,6 +1040,11 @@ enum Command {
     Setup(Box<SetupOptions>),
     /// Run the built-in integration test suite against the cluster.
     Test(Box<TestOptions>),
+    /// Test your own agent on your own cluster: break a staging namespace in known ways, run the agent, score it.
+    Gym {
+        #[command(subcommand)]
+        action: GymAction,
+    },
     /// Run reproducible performance benchmarks against the real data plane.
     Bench(Box<BenchOptions>),
     /// Diagnose cluster health and correlate likely causes.
@@ -2892,6 +2951,50 @@ async fn main() -> ExitCode {
                 .await
             }
         }
+        Command::Gym { action } => {
+            use reliaburger::relish::gym;
+            return match action {
+                GymAction::Run(options) => {
+                    let GymRunOptions {
+                        namespace,
+                        solver,
+                        scenarios,
+                        runs,
+                        timeout,
+                        out,
+                        image,
+                        yes,
+                        confirm_namespace,
+                    } = *options;
+                    finish_outcome(
+                        gym::run(gym::RunArgs {
+                            namespace,
+                            solver,
+                            scenarios,
+                            runs,
+                            timeout,
+                            out,
+                            image,
+                            yes,
+                            confirm_namespace,
+                            output: cli.output,
+                        })
+                        .await,
+                    )
+                }
+                GymAction::List => finish_outcome(
+                    gym::list(cli.output).map(|()| reliaburger::relish::CommandOutcome::Clean),
+                ),
+                GymAction::Record { log, args } => {
+                    finish_outcome(gym::record_call(log, args).await)
+                }
+                GymAction::Baseline => finish_outcome(
+                    gym::baseline()
+                        .await
+                        .map(|()| reliaburger::relish::CommandOutcome::Clean),
+                ),
+            };
+        }
         Command::Test(options) => {
             let TestOptions {
                 filter,
@@ -3112,6 +3215,7 @@ fn output_support(command: &Command) -> OutputSupport {
         | Command::Jobs { .. }
         | Command::BatchStatus { .. }
         | Command::Test(_)
+        | Command::Gym { .. }
         | Command::Bench(_)
         | Command::Wtf(_)
         | Command::Path(_)
@@ -3295,6 +3399,7 @@ mod tests {
         "local",
         "setup",
         "test",
+        "gym",
         "bench",
     ];
 
