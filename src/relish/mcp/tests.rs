@@ -445,7 +445,7 @@ fn each_tool_advertises_its_own_default_budget() {
     for spec in real_tools() {
         let schema = Value::Object((*spec.tool.input_schema).clone());
         let expected = if spec.command == "guide" {
-            65536
+            81920
         } else {
             24576
         };

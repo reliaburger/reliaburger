@@ -3,7 +3,7 @@
 //! An agent pays for every byte it reads, and a tool result over about
 //! 10,000 tokens gets a warning in Claude Code, so each command's output has
 //! a ceiling: 24 KiB by default, about 6,000 tokens. `relish agent guide` is
-//! the exception at 64 KiB: it is the one document an agent reads whole, so
+//! the exception at 80 KiB: it is the one document an agent reads whole, so
 //! its default fits the whole manual chapter. When an answer is
 //! bigger, the budget trims `data` rather than cutting the text, so what
 //! comes out is still one valid JSON document in the same shape. Then it says
@@ -20,9 +20,12 @@ use super::envelope::{AgentError, BuildInfo, CommandName, Envelope, ErrorCode, E
 /// but `guide`.
 pub const DEFAULT_MAX_BYTES: usize = 24 * 1024;
 
-/// `relish agent guide`'s budget when `--max-bytes` isn't given: 64 KiB,
+/// `relish agent guide`'s budget when `--max-bytes` isn't given: 80 KiB,
 /// enough for the whole agent chapter in one call.
-pub const GUIDE_MAX_BYTES: usize = 64 * 1024;
+// From 64 KiB: raised, maintainer 8 Nov 2026. Leases and proposals (#1767,
+// #1768) took the chapter past 64 KiB, and the chapter stays whole rather
+// than split. 80 KiB leaves room for the `relish status` work coming next.
+pub const GUIDE_MAX_BYTES: usize = 80 * 1024;
 
 /// The budget `command` gets when `--max-bytes` isn't given.
 pub fn default_max_bytes(command: CommandName) -> usize {

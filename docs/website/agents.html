@@ -131,7 +131,7 @@ token, and don't tell your agent client to "always allow" <code>relish</code>.</
 success or failure;</li>
 <li>never prompts, never opens a TUI and never reads stdin, so it runs the same
 in a script, a CI job or an agent's tool call;</li>
-<li>stays within a byte budget, 24 KiB unless you pass <code>--max-bytes</code> (64 KiB
+<li>stays within a byte budget, 24 KiB unless you pass <code>--max-bytes</code> (80 KiB
 for <code>relish agent guide</code>, the one answer you read whole);</li>
 <li>exits with a code that says whether it answered, not what the answer was.</li>
 </ul>
@@ -210,7 +210,7 @@ exit code is the verdict.</p>
 <section class="agents-section" id="byte-budgets">
 <h2>Byte budgets <a class="permalink" href="#byte-budgets" aria-label="Link to this section">#</a></h2>
 <p>Every command's default budget is 24 KiB, about 6,000 tokens, except
-<code>relish agent guide</code>'s 64 KiB, so this whole chapter comes back in one call.
+<code>relish agent guide</code>'s 80 KiB, so this whole chapter comes back in one call.
 <code>--max-bytes</code> overrides either. An answer over budget is trimmed and stays
 valid JSON: items go from the end of the longest arrays in <code>data</code> first
 (commands put what matters most at the front), then long strings are
@@ -291,7 +291,7 @@ what this binary has; <code>relish agent --help</code> says the same.</p>
 </code></pre>
 <p><code>data.sections</code> holds it one section at a time, each with its <code>heading</code> and
 its <code>markdown</code>, and <code>data.commands</code> lists the commands above. Given a
-<code>--max-bytes</code> under its 64 KiB default, the last sections go first, and the
+<code>--max-bytes</code> under its 80 KiB default, the last sections go first, and the
 <code>next</code> step asks for a <code>--max-bytes</code> that fits it all.</p>
 <p><code>relish agent version</code> prints the version, commit, target and cluster formats
 of this binary:</p>
