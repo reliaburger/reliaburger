@@ -1034,8 +1034,8 @@ Setup also installs the Reliaburger skill for Claude Code, at
 `~/.claude/skills/reliaburger/SKILL.md`, by the same rules.
 
 With an admin context, setup also makes `relish mcp` a read-only token
-(`data.mcp_token`), a day long and renewed as it runs out, in `mcp-token.json`
-beside the context, mode 0600. `--remove` revokes it.
+(`data.mcp_tokens`), a day long and renewed as it runs out, in `mcp-token.json`
+beside the context, mode 0600. `--remove` revokes them all.
 
 ## Sending us a bug or a fix
 

@@ -795,11 +795,15 @@ fn the_warning_says_how_to_make_a_read_only_token_and_where_it_goes() {
 
 const CONTEXT_ADMIN: &str = "rbrg_context_admin";
 
+/// A bearer the stand-in accepts everywhere but `/v1/events`.
+const PARTLY_REFUSED: &str = "rbrg_partly_refused";
+
 /// What the stand-in saw: path and bearer.
 type Seen = std::sync::Arc<tokio::sync::Mutex<Vec<(String, String)>>>;
 
 /// A cluster API with one admin bearer. It mints `rbrg_minted_<n>` unless
-/// told to refuse, and answers every other request 401 for a bearer in
+/// told to refuse, answers health to anyone, the admin probe 403 for any
+/// other bearer it accepts, and every other request 401 for a bearer in
 /// `revoked` and 404 otherwise.
 async fn token_cluster(refuse: bool, revoked: &'static [&'static str]) -> (String, Seen) {
     let seen: Seen = Seen::default();
@@ -822,9 +826,20 @@ async fn token_cluster(refuse: bool, revoked: &'static [&'static str]) -> (Strin
                     .await
                     .push((uri.path().to_string(), bearer.clone()));
                 let admin = bearer == CONTEXT_ADMIN;
+                let rejected = revoked.contains(&bearer.as_str());
                 match (method.as_str(), uri.path()) {
+                    // As a real node: health needs no token.
+                    ("GET", "/v1/health") => (StatusCode::OK, r#"{"status":"ok"}"#.to_string()),
                     ("GET", "/v1/token/list") if admin => {
                         (StatusCode::OK, r#"{"tokens":[]}"#.to_string())
+                    }
+                    ("GET", "/v1/token/list") if !rejected => {
+                        (StatusCode::FORBIDDEN, "requires admin role".to_string())
+                    }
+                    // A token the cluster accepts that one route still
+                    // turns away: an answer that mentions a 401 on its own.
+                    ("GET", "/v1/events") if bearer == PARTLY_REFUSED => {
+                        (StatusCode::UNAUTHORIZED, "invalid token".to_string())
                     }
                     ("POST", "/v1/token/create") if admin && refuse => (
                         StatusCode::FORBIDDEN,
@@ -840,9 +855,7 @@ async fn token_cluster(refuse: bool, revoked: &'static [&'static str]) -> (Strin
                     ("POST", "/v1/token/revoke") if admin => {
                         (StatusCode::OK, r#"{"message":"revoked"}"#.to_string())
                     }
-                    _ if revoked.contains(&bearer.as_str()) => {
-                        (StatusCode::UNAUTHORIZED, "invalid token".to_string())
-                    }
+                    _ if rejected => (StatusCode::UNAUTHORIZED, "invalid token".to_string()),
                     _ => (StatusCode::NOT_FOUND, "no such thing".to_string()),
                 }
             }
@@ -872,23 +885,33 @@ fn result_text(result: &CallToolResult) -> String {
     serde_json::to_string(&result.content).unwrap()
 }
 
+fn logs_arguments() -> serde_json::Map<String, Value> {
+    let mut arguments = serde_json::Map::new();
+    arguments.insert("app".to_string(), json!("web"));
+    arguments
+}
+
 #[tokio::test]
 async fn a_server_from_an_admin_context_sends_its_own_read_only_token() {
     let directory = tempfile::tempdir().unwrap();
-    let (url, _) = token_cluster(false, &[]).await;
+    let (url, seen) = token_cluster(false, &[]).await;
+    crate::relish::client::set_cli_endpoint(Some(url.clone())).unwrap();
     let server = Server::new(&Selection::default())
         .unwrap()
         .with_managed(managed(directory.path(), &url));
-    let result = server
-        .call("version", &serde_json::Map::new())
-        .await
-        .unwrap();
-    assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+    server.call("logs", &logs_arguments()).await.unwrap();
     assert_eq!(
         crate::relish::client::resolve_token().as_deref(),
         Some("rbrg_minted_0")
     );
     assert!(directory.path().join("mcp-token.json").exists());
+    let seen = seen.lock().await.clone();
+    assert!(
+        seen.iter()
+            .filter(|(path, _)| !path.starts_with("/v1/token/"))
+            .all(|(_, bearer)| bearer == "rbrg_minted_0"),
+        "{seen:?}"
+    );
 }
 
 #[tokio::test]
@@ -898,10 +921,7 @@ async fn a_cluster_that_refuses_the_token_fails_the_tool_and_never_falls_back_to
     let server = Server::new(&Selection::default())
         .unwrap()
         .with_managed(managed(directory.path(), &url));
-    let result = server
-        .call("version", &serde_json::Map::new())
-        .await
-        .unwrap();
+    let result = server.call("logs", &logs_arguments()).await.unwrap();
     assert_eq!(result.is_error, Some(true));
     let text = result_text(&result);
     assert!(
@@ -965,4 +985,176 @@ async fn a_revoked_stored_token_is_replaced_and_the_call_retried() {
     assert!(tool_bearers.contains(&"rbrg_revoked"), "{seen:?}");
     assert!(tool_bearers.contains(&"rbrg_minted_0"), "{seen:?}");
     assert!(!tool_bearers.contains(&CONTEXT_ADMIN), "{seen:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Follow-ups from the live-cluster review of #1763.
+
+/// An endpoint nothing listens on.
+fn nowhere() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    format!("http://{address}")
+}
+
+fn stored_token(directory: &std::path::Path, token: &str) {
+    credentials::StoredToken {
+        schema: 1,
+        owner: "laptop".to_string(),
+        endpoint: "https://127.0.0.1:19117".to_string(),
+        namespace: None,
+        name: "relish-mcp-old".to_string(),
+        token: token.to_string(),
+        expires_at: None,
+    }
+    .save(&directory.join("mcp-token.json"))
+    .unwrap();
+}
+
+/// The bearers the stand-in saw on requests other than the token routes.
+async fn tool_bearers(seen: &Seen) -> Vec<String> {
+    seen.lock()
+        .await
+        .iter()
+        .filter(|(path, _)| !path.starts_with("/v1/token/"))
+        .map(|(_, bearer)| bearer.clone())
+        .collect()
+}
+
+/// #1763 review: `context` and `diagnose` don't fail on a dead token, they
+/// answer with every section unknown (401). That answer must renew the
+/// token too, not only a top-level `unauthenticated`.
+#[tokio::test]
+async fn a_revoked_stored_token_is_renewed_when_context_or_diagnose_answer_with_401s() {
+    let (url, seen) = token_cluster(false, &["rbrg_revoked"]).await;
+    crate::relish::client::set_cli_endpoint(Some(url.clone())).unwrap();
+    for tool in ["context", "diagnose"] {
+        let directory = tempfile::tempdir().unwrap();
+        stored_token(directory.path(), "rbrg_revoked");
+        seen.lock().await.clear();
+        let server = Server::new(&Selection::default())
+            .unwrap()
+            .with_managed(managed(directory.path(), &url));
+        let result = server.call(tool, &serde_json::Map::new()).await.unwrap();
+        let token = crate::relish::client::resolve_token().unwrap_or_default();
+        assert!(
+            token.starts_with("rbrg_minted_"),
+            "{tool}: {token} {}",
+            result_text(&result)
+        );
+        let bearers = tool_bearers(&seen).await;
+        assert!(bearers.contains(&"rbrg_revoked".to_string()), "{bearers:?}");
+        assert!(bearers.contains(&token), "{tool} retried: {bearers:?}");
+        assert!(!bearers.contains(&CONTEXT_ADMIN.to_string()), "{bearers:?}");
+        let saved =
+            credentials::StoredToken::load(&directory.path().join("mcp-token.json")).unwrap();
+        assert_eq!(saved.unwrap().token, token, "{tool}");
+    }
+}
+
+/// A token that still works isn't replaced just because an answer mentions
+/// a 401: the cluster is asked first.
+#[tokio::test]
+async fn a_token_the_cluster_still_accepts_is_kept() {
+    let (url, seen) = token_cluster(false, &[]).await;
+    crate::relish::client::set_cli_endpoint(Some(url.clone())).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    stored_token(directory.path(), PARTLY_REFUSED);
+    let server = Server::new(&Selection::default())
+        .unwrap()
+        .with_managed(managed(directory.path(), &url));
+    server
+        .call("context", &serde_json::Map::new())
+        .await
+        .unwrap();
+    let seen = seen.lock().await.clone();
+    assert!(
+        seen.iter()
+            .any(|(path, bearer)| path == "/v1/token/list" && bearer == PARTLY_REFUSED),
+        "the cluster was asked about the token: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|(path, _)| path == "/v1/token/create"),
+        "{seen:?}"
+    );
+    assert_eq!(
+        crate::relish::client::resolve_token().as_deref(),
+        Some(PARTLY_REFUSED)
+    );
+}
+
+/// #1763 review: `version`, `guide`, `schema`, `explain` and the manual
+/// read only this binary, so they answer with the cluster down and no
+/// token stored, and make none.
+#[tokio::test]
+async fn offline_tools_answer_with_the_cluster_down_and_no_token_stored() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = Server::new(&Selection::default())
+        .unwrap()
+        .with_managed(managed(directory.path(), &nowhere()));
+    let calls = [
+        ("version", json!({})),
+        ("guide", json!({})),
+        ("schema", json!({"command": "version"})),
+        ("explain", json!({"id": "crashloop"})),
+        ("manual_search", json!({"words": ["token"]})),
+    ];
+    for (tool, arguments) in calls {
+        let arguments = arguments.as_object().unwrap().clone();
+        let result = server.call(tool, &arguments).await.unwrap();
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "{tool}: {}",
+            result_text(&result)
+        );
+    }
+    assert!(!directory.path().join("mcp-token.json").exists());
+}
+
+/// The source tools ask the cluster which commit its nodes run, as an
+/// extra. With no read-only token to ask with, they answer offline rather
+/// than fail, and never ask with the admin token.
+#[tokio::test]
+async fn source_tools_answer_offline_when_no_read_only_token_can_be_made() {
+    let directory = tempfile::tempdir().unwrap();
+    let (url, seen) = token_cluster(true, &[]).await;
+    crate::relish::client::set_cli_endpoint(Some(url.clone())).unwrap();
+    let server = Server::new(&Selection::default())
+        .unwrap()
+        .with_managed(managed(directory.path(), &url));
+    let result = server
+        .call("source_version", &serde_json::Map::new())
+        .await
+        .unwrap();
+    assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+    assert!(tool_bearers(&seen).await.is_empty(), "nothing else asked");
+}
+
+/// #1763 review: a refused create was asked again on every tool call, two
+/// admin requests each time. A refusal is remembered for a while.
+#[tokio::test]
+async fn a_refusal_is_remembered_and_asked_again_only_after_a_while() {
+    let directory = tempfile::tempdir().unwrap();
+    let (url, seen) = token_cluster(true, &[]).await;
+    let server = Server::new(&Selection::default())
+        .unwrap()
+        .with_managed(managed(directory.path(), &url));
+    for _ in 0..3 {
+        let result = server.call("logs", &logs_arguments()).await.unwrap();
+        assert_eq!(result.is_error, Some(true));
+        let text = result_text(&result);
+        assert!(text.contains("token creation is switched off"), "{text}");
+    }
+    assert_eq!(seen.lock().await.len(), 2, "one probe and one create");
+
+    server
+        .managed
+        .as_ref()
+        .unwrap()
+        .age_refusal(REFUSAL_BACKOFF)
+        .await;
+    server.call("logs", &logs_arguments()).await.unwrap();
+    assert_eq!(seen.lock().await.len(), 4, "asked again after the backoff");
 }

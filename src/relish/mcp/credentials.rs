@@ -11,6 +11,10 @@
 //! it, a new one is made. Nothing here ever hands the admin token to a tool:
 //! a cluster that won't make a read-only token is an error, not a reason to
 //! fall back.
+//!
+//! Making a token happens under a file lock beside the token file
+//! (`mcp-token.lock`), so several `relish mcp` processes starting together
+//! make one token between them: the first makes it, the rest find it saved.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -18,6 +22,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::file_lock::{FileLock, FileLockError};
 use crate::relish::RelishError;
 use crate::relish::client::{BunClient, TokenAccess, TokenLifetime, TokenRequest};
 
@@ -34,8 +39,26 @@ const CLUSTER_TIMEOUT: Duration = Duration::from_secs(10);
 /// Largest token file `load` reads.
 const MAX_FILE_BYTES: u64 = 16 * 1024;
 
-/// Why `relish mcp` has no read-only token to send.
-#[derive(Debug, thiserror::Error)]
+/// How long a server waits for another one that's making the token: longer
+/// than that one's probe, create and revoke together.
+const LOCK_TIMEOUT: Duration = Duration::from_secs(4 * CLUSTER_TIMEOUT.as_secs());
+
+/// How every token `relish mcp` makes is named: this, then the time and the
+/// process id. `relish token list`, `relish wtf` and `relish agent
+/// diagnose` know them by it and don't warn that they expire, because
+/// `relish mcp` renews them itself.
+pub const TOKEN_NAME_PREFIX: &str = "relish-mcp-";
+
+/// Whether `name` is one of the tokens `relish mcp` makes. The name is the
+/// only mark a token carries; a token someone else names this way is
+/// treated the same.
+pub fn made_by_relish_mcp(name: &str) -> bool {
+    name.starts_with(TOKEN_NAME_PREFIX)
+}
+
+/// Why `relish mcp` has no read-only token to send. `Clone`, so `relish
+/// mcp` can answer with a refusal it remembers.
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum CredentialError {
     /// The cluster answered the token request with an error.
     #[error(
@@ -56,7 +79,11 @@ pub enum CredentialError {
     )]
     ContextRejected,
     /// No answer from the cluster.
-    #[error("couldn't reach the cluster to get a read-only token for relish mcp: {0}")]
+    #[error(
+        "couldn't reach the cluster to get a read-only token for relish mcp: {0}; to use one \
+         you made yourself, make it with `relish token create --name agent --role read-only \
+         --ttl-days 1` and pass it as RELIABURGER_TOKEN"
+    )]
     Unreachable(String),
     /// The stored token file couldn't be read or written.
     #[error("relish mcp's read-only token at {path}: {reason}")]
@@ -161,22 +188,84 @@ impl StoredToken {
             path: path.to_path_buf(),
             reason,
         };
-        if let Some(parent) = path.parent() {
-            let mut directory = std::fs::DirBuilder::new();
-            directory.recursive(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                directory.mode(0o700);
-            }
-            directory
-                .create(parent)
-                .map_err(|error| storage(error.to_string()))?;
-        }
+        create_directory(path).map_err(|error| storage(error.to_string()))?;
         let bytes = serde_json::to_vec_pretty(self).map_err(|error| storage(error.to_string()))?;
         crate::sesame::identity::atomic_write_mode(path, &bytes, Some(0o600))
             .map_err(|error| storage(error.to_string()))
     }
+}
+
+/// Make the directory `path` goes in, 0700 like the context's.
+fn create_directory(path: &Path) -> std::io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let mut directory = std::fs::DirBuilder::new();
+    directory.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        directory.mode(0o700);
+    }
+    directory.create(parent)
+}
+
+/// The JSON a token file holds, as `relish agent setup` previews it: the
+/// stored token's, or the one a new token would get at `now`, with the
+/// secret replaced by [`crate::redact::REDACTED`].
+pub fn shape(scope: &Scope, stored: Option<&StoredToken>, now: u64) -> String {
+    let mut preview = stored.cloned().unwrap_or_else(|| StoredToken {
+        schema: 1,
+        owner: scope.owner.clone(),
+        endpoint: scope.endpoint.clone(),
+        namespace: scope.namespace.clone(),
+        name: token_name(now),
+        token: String::new(),
+        expires_at: Some(now.saturating_add(TOKEN_TTL_DAYS * 24 * 60 * 60)),
+    });
+    preview.token = crate::redact::REDACTED.to_string();
+    // Strings, numbers and options only: serialising it can't fail.
+    serde_json::to_string_pretty(&preview).unwrap_or_default()
+}
+
+/// The name for a token made at `now` by this process.
+fn token_name(now: u64) -> String {
+    format!("{TOKEN_NAME_PREFIX}{now}-{}", std::process::id())
+}
+
+/// Every token file beside `context`: `mcp-token.json` and each
+/// `mcp-token-<namespace>.json`, sorted by name. None when the directory
+/// isn't there.
+pub fn files_beside(context: &Path) -> Result<Vec<PathBuf>, CredentialError> {
+    let Some(directory) = context.parent() else {
+        return Ok(Vec::new());
+    };
+    let storage = |error: std::io::Error| CredentialError::Storage {
+        path: directory.to_path_buf(),
+        reason: error.to_string(),
+    };
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(storage(error)),
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let name = entry.map_err(storage)?.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let token_file = name == "mcp-token.json"
+            || name
+                .strip_prefix("mcp-token-")
+                .and_then(|rest| rest.strip_suffix(".json"))
+                .is_some_and(valid_namespace);
+        if token_file {
+            files.push(context.with_file_name(name));
+        }
+    }
+    files.sort();
+    Ok(files)
 }
 
 /// Where the token for `namespace` lives, beside `context`.
@@ -225,18 +314,30 @@ pub enum Obtained {
 /// The read-only token for `scope`: the stored one while it's usable,
 /// otherwise a new one made with `admin`, the context's own client.
 ///
-/// `renew` skips the stored token, for when the cluster has just rejected
-/// it (revoked, or expired early). A replaced token is revoked, best effort,
-/// so they don't pile up in `relish token list`.
+/// `rejected` is a token the cluster has just turned away (revoked, or
+/// expired early): a stored token that's this one isn't used. A replaced
+/// token is revoked, best effort, so they don't pile up in `relish token
+/// list`.
+///
+/// Reusing a stored token reads only the file. Making one takes the lock
+/// beside it first and looks again, so a server that waited for another
+/// uses the token that one made.
 pub async fn obtain(
     path: &Path,
     scope: &Scope,
     admin: &BunClient,
     now: u64,
-    renew: bool,
+    rejected: Option<&str>,
 ) -> Result<(Credential, Obtained), CredentialError> {
+    let reusable = |stored: &StoredToken| {
+        stored.usable(scope, now) && rejected.is_none_or(|rejected| stored.token != rejected)
+    };
+    if let Some(stored) = StoredToken::load(path)?.filter(reusable) {
+        return Ok((Credential::ReadOnly(stored.token), Obtained::Reused));
+    }
+    let _lock = lock(path).await?;
     let stored = StoredToken::load(path)?;
-    if !renew && let Some(stored) = stored.as_ref().filter(|stored| stored.usable(scope, now)) {
+    if let Some(stored) = stored.as_ref().filter(|stored| reusable(stored)) {
         return Ok((Credential::ReadOnly(stored.token.clone()), Obtained::Reused));
     }
     match bounded(admin.token_access()).await? {
@@ -244,7 +345,7 @@ pub async fn obtain(
         TokenAccess::Lesser => return Ok((Credential::ContextNotAdmin, Obtained::NotNeeded)),
         TokenAccess::Rejected => return Err(CredentialError::ContextRejected),
     }
-    let name = format!("relish-mcp-{now}-{}", std::process::id());
+    let name = token_name(now);
     let request = TokenRequest {
         name: name.clone(),
         role: "read-only".to_string(),
@@ -264,24 +365,94 @@ pub async fn obtain(
         expires_at: issued.expires_at,
     };
     fresh.save(path)?;
-    if let Some(old) = stored.filter(|old| old.owner == scope.owner && old.name != fresh.name) {
+    // Revoked by name, so only a token made at this cluster: a name from
+    // another one could be someone else's here.
+    let replaced = stored.filter(|old| {
+        old.owner == scope.owner && old.endpoint == scope.endpoint && old.name != fresh.name
+    });
+    if let Some(old) = replaced {
         let _ = tokio::time::timeout(CLUSTER_TIMEOUT, admin.token_revoke(&old.name)).await;
     }
     Ok((Credential::ReadOnly(issued.token), Obtained::Minted))
 }
 
-/// Take the stored token out: revoke it, best effort, and delete the file.
-/// Returns whether there was one.
+/// Whether the cluster still accepts `token`, asked with the same cheap
+/// admin-only read as the role probe: `Some(false)` for a 401, `Some(true)`
+/// for any other verdict, `None` when there's no answer.
+pub async fn accepted(admin: &BunClient, token: &str) -> Option<bool> {
+    let probe = admin.with_token(token);
+    match tokio::time::timeout(CLUSTER_TIMEOUT, probe.token_access()).await {
+        Ok(Ok(TokenAccess::Rejected)) => Some(false),
+        Ok(Ok(TokenAccess::Admin | TokenAccess::Lesser)) => Some(true),
+        Ok(Err(_)) | Err(_) => None,
+    }
+}
+
+/// Take the stored token out: revoke it, best effort, and delete the file
+/// and its lock. Returns whether there was one.
 pub async fn remove(path: &Path, admin: &BunClient) -> Result<bool, CredentialError> {
+    let lock = lock(path).await?;
     let Some(stored) = StoredToken::load(path)? else {
         return Ok(false);
     };
     let _ = tokio::time::timeout(CLUSTER_TIMEOUT, admin.token_revoke(&stored.name)).await;
-    std::fs::remove_file(path).map_err(|error| CredentialError::Storage {
+    let storage = |path: &Path, error: std::io::Error| CredentialError::Storage {
         path: path.to_path_buf(),
         reason: error.to_string(),
-    })?;
+    };
+    std::fs::remove_file(path).map_err(|error| storage(path, error))?;
+    let lock_path = lock_path(path);
+    lock.remove(&lock_path)
+        .map_err(|error| storage(&lock_path, error))?;
     Ok(true)
+}
+
+/// The lock file beside the token file `path`.
+fn lock_path(path: &Path) -> PathBuf {
+    path.with_extension("lock")
+}
+
+/// Take the lock beside `path`, waiting for another server holding it.
+async fn lock(path: &Path) -> Result<FileLock, CredentialError> {
+    let lock_path = lock_path(path);
+    let storage = {
+        let lock_path = lock_path.clone();
+        move |reason: String| CredentialError::Storage {
+            path: lock_path.clone(),
+            reason,
+        }
+    };
+    let waiting = storage.clone();
+    // `lock_within` waits by polling on its thread, so not on a worker.
+    tokio::task::spawn_blocking(move || lock_blocking(&lock_path))
+        .await
+        .map_err(|error| storage(error.to_string()))?
+        .map_err(|error| match error {
+            FileLockError::Busy => waiting(format!(
+                "another relish mcp has held it for {} s",
+                LOCK_TIMEOUT.as_secs()
+            )),
+            FileLockError::Io(error) => waiting(error.to_string()),
+        })
+}
+
+fn lock_blocking(lock_path: &Path) -> Result<FileLock, FileLockError> {
+    create_directory(lock_path)?;
+    // `remove` deletes the lock file while holding it; a waiter that had
+    // opened the old one then finds it unlinked and opens the new one.
+    loop {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let lock = FileLock::lock_within(options.open(lock_path)?, LOCK_TIMEOUT)?;
+        if lock.still_names(lock_path)? {
+            return Ok(lock);
+        }
+    }
 }
 
 /// One cluster request, bounded, with its failure sorted into a refusal

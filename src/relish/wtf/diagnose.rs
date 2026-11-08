@@ -1221,7 +1221,8 @@ fn check_certificates(inputs: &WtfInputs, report: &mut WtfReport) {
 /// Tokens about to stop working, and Admin tokens old enough to rotate.
 ///
 /// Admin tokens are exempt from the default lifetime (F05 decision 6), so
-/// age is the only nudge they get.
+/// age is the only nudge they get. The tokens `relish mcp` makes are left
+/// out: they live a day and it renews them itself.
 fn check_tokens(inputs: &WtfInputs, report: &mut WtfReport) {
     let Some(tokens) = inputs.cluster.tokens.value() else {
         return;
@@ -1230,6 +1231,9 @@ fn check_tokens(inputs: &WtfInputs, report: &mut WtfReport) {
     let horizon = now.saturating_add(crate::sesame::token::TOKEN_EXPIRY_WARNING.as_secs());
     let admin_age = crate::sesame::token::ADMIN_TOKEN_AGE_WARNING.as_secs();
     let mut found = false;
+    let tokens = tokens
+        .iter()
+        .filter(|token| !crate::relish::mcp::credentials::made_by_relish_mcp(&token.name));
     for token in tokens {
         let resource = format!("token.{}", token.name);
         let finding = match token.expires_at {
@@ -1748,6 +1752,30 @@ pub(super) mod tests {
             ]
         );
         assert!(!report.ok.iter().any(|ok| ok.id == "tokens"));
+    }
+
+    /// `relish mcp` makes day-long tokens and renews them itself: not a
+    /// `[token-expiring]` per token (#1763 review).
+    #[test]
+    fn the_tokens_relish_mcp_makes_are_not_expiry_warnings() {
+        let mut inputs = healthy_inputs();
+        inputs.cluster.tokens = available(vec![
+            token(
+                "relish-mcp-1-42",
+                "read-only",
+                NOW - 3_600,
+                Some(NOW + DAY - 3_600),
+            ),
+            token(
+                "relish-mcp-2-43",
+                "read-only",
+                NOW - 2 * DAY,
+                Some(NOW - 60),
+            ),
+            token("agent", "read-only", NOW - 3_600, Some(NOW + DAY - 3_600)),
+        ]);
+        let report = diagnose(&inputs);
+        assert_eq!(warning_ids(&report), [("token-expiring", "token.agent")]);
     }
 
     #[test]
