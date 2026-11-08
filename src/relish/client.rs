@@ -1556,6 +1556,17 @@ impl BunClient {
         parse_typed_response(response).await
     }
 
+    /// Fetch a test resource lease as its owner sees it: its state and its
+    /// server-side expiry. A lease whose cleanup has finished is gone, and
+    /// the server answers 404.
+    pub async fn test_lease(
+        &self,
+        lease_id: &str,
+    ) -> Result<crate::testkit::lease::TestLease, RelishError> {
+        self.get_typed_json(&format!("/v1/test/leases/{lease_id}"))
+            .await
+    }
+
     /// Renew an active test resource lease as its authenticated owner.
     ///
     /// The node-local job recovery integration test uses this endpoint. The
