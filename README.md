@@ -101,7 +101,7 @@ before it writes anything.
 - **Tenants kept apart:** namespaces can't reach each other unless you let them, and egress has allowlists.
 - **An audit log:** who applied, deleted, exec'd, upgraded or broke what, and from where.
 - **A registry on every node:** Pickle stores, caches and builds OCI images inside the cluster.
-- **Metrics, logs and alerts:** scraped, captured and exported by the agent, with nothing else to install.
+- **Metrics, logs and alerts:** scraped, captured and exported by the agent, with nothing else to install. Alerts are five built-in node rules for now.
 - **Batch jobs:** one-off jobs, cron, deploy hooks and task arrays of millions, beside your apps.
 - **Deploys and GitOps:** health-gated rolling deploys with rollback, blue-green, autoscaling and Git sync.
 - **Policies and templates:** CEL rules that refuse, warn or fill in defaults, and typed templates instead of CRDs.

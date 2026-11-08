@@ -26,15 +26,15 @@ Nothing is fetched from anywhere else. With scripts disabled a `<noscript>`
 note links the `.cast` file, and the written tour works as before.
 
 `assets/why-carousel.js` turns the "Built differently" section (`#why`), a
-plain list of six architectural differences, into a slideshow: one at a
-time, a new one every nine seconds, with previous, next, six dots and a Pause
+plain list of seven architectural differences, into a slideshow: one at a
+time, a new one every nine seconds, with previous, next, seven dots and a Pause
 and Play button. Pause and Play always take effect; it also stops while a
 mouse rests on it and when keyboard focus comes in (until Play), never because
 of a tap, and doesn't rotate at all for visitors who prefer reduced motion. It follows the WAI-ARIA
 carousel pattern, so the slide text is a polite live region only while it
 isn't rotating by itself. The drawings are inline SVG animated by CSS in
 `style.css`, so reduced motion stills them and nothing loads from elsewhere.
-Without JavaScript all six stay stacked.
+Without JavaScript all seven stay stacked.
 
 Don't add other scripts. The footer names all three, so change them together.
 

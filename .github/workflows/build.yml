@@ -62,12 +62,15 @@ jobs:
     # commit passed every job, ignored-test evidence included, on its first
     # attempt (a run re-run until it went green doesn't count, #1436), the
     # build reuses it instead of running the suite again, saving about an hour,
-    # most of it spent waiting for hosted macOS runners. Any doubt, an API
-    # error included, says reuse=false and the suite runs below.
+    # most of it spent waiting for hosted macOS runners. A candidate is
+    # usually dispatched while that push's run is still going, so the search
+    # waits for it, up to two hours (#1722); the build jobs don't need this
+    # one and run meanwhile. Any doubt, an API error included, says
+    # reuse=false and the suite runs below.
     name: find passing CI
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 130
     permissions:
       contents: read
       actions: read
@@ -84,7 +87,7 @@ jobs:
           RELEASE_REPOSITORY: ${{ github.repository }}
           CANDIDATE_COMMIT: ${{ github.sha }}
         run: >-
-          python3 scripts/release/ci_reuse.py
+          python3 scripts/release/ci_reuse.py --wait-minutes 120
           --repository "$RELEASE_REPOSITORY" --commit "$CANDIDATE_COMMIT"
 
   validate-release:
@@ -446,12 +449,22 @@ jobs:
           RELEASE_REPOSITORY: ${{ github.repository }}
           CI_RUN: ${{ needs.ci-evidence.outputs.ci_run }}
           CI_RUN_ATTEMPT: ${{ needs.ci-evidence.outputs.ci_run_attempt }}
+          VALIDATE_RESULT: ${{ needs.validate-release.result }}
         run: |
+          # The ci.yml run this candidate rests on, recorded as source_ci:
+          # this build's own when validate-release ran, else the reused one.
+          if [ "$VALIDATE_RESULT" = success ]; then
+            ci_run=$CANDIDATE_RUN ci_attempt=$CANDIDATE_ATTEMPT
+          else
+            ci_run=$CI_RUN ci_attempt=$CI_RUN_ATTEMPT
+          fi
+          { echo "SOURCE_CI_RUN=$ci_run"; echo "SOURCE_CI_ATTEMPT=$ci_attempt"; } >> "$GITHUB_ENV"
           digest=$(python3 scripts/release/candidate.py record --directory dist \
             --version "$RELEASE_TAG" --repository "$RELEASE_REPOSITORY" \
             --commit "$CANDIDATE_COMMIT" --run-id "$CANDIDATE_RUN" \
             --run-attempt "$CANDIDATE_ATTEMPT" --channel "$CHANNEL" \
-            --source-digest "$SOURCE_DIGEST")
+            --source-digest "$SOURCE_DIGEST" \
+            --source-ci-run "$ci_run" --source-ci-attempt "$ci_attempt")
           # The log line is what `gh run view --log` finds; the summary is
           # for people reading the run page.
           echo "Qualification manifest SHA-256: $digest"
@@ -486,6 +499,7 @@ jobs:
           --commit "$CANDIDATE_COMMIT" --run-id "$CANDIDATE_RUN"
           --run-attempt "$CANDIDATE_ATTEMPT" --channel "$CHANNEL"
           --qualified-digest "$QUALIFIED_DIGEST" --source-digest "$SOURCE_DIGEST"
+          --source-ci-run "$SOURCE_CI_RUN" --source-ci-attempt "$SOURCE_CI_ATTEMPT"
       - name: Preserve the qualification manifest on its own
         # A few kilobytes that hash to the digest above, so qualification
         # can read it without the whole candidate. Staging and promotion

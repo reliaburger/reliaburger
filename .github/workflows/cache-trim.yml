@@ -1,0 +1,33 @@
+name: Trim Actions caches
+
+# GitHub keeps 10 GB of caches per repository and evicts the least recently
+# used beyond that; on 6 November we were at 9.57 GB (#1724). This deletes
+# the caches nothing can restore again: a closed pull request's, a deleted
+# branch's (merge-queue groups included) and any superseded by a newer cache
+# of the same family on the same ref. scripts/ci/trim_caches.py has the rule;
+# run it without --apply to see what it would delete.
+#
+# It is its own workflow because deleting a cache needs `actions: write`,
+# which ci.yml's callers don't grant.
+
+on:
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+  pull-requests: read
+
+jobs:
+  trim:
+    name: delete stale caches
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Delete the caches nothing restores any more
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci/trim_caches.py --repository "$GITHUB_REPOSITORY" --apply
