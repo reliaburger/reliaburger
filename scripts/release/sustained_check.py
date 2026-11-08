@@ -72,6 +72,17 @@ UNGATED_ALERTS = {"cpu_throttle"}
 NO_LEADER_LIMIT = 30
 RSS_WARMUP = 3600
 RSS_GROWTH = 1.25
+# leak-rss's warm sample outside a final (#1417). Bun's malloc grows with
+# its log and metrics stores, and a store the soak fills slowly (node 2's
+# volume writer took 15 hours in the 0.2.7 memory run) makes the hour too
+# early a baseline. So it's the first heavy check where each store is at
+# RSS_WARM_STORE_SHARE of SOAK_STORE_CAP_KB, never before RSS_WARMUP and at
+# RSS_WARM_LATEST at the latest. A final keeps the hour: #1062 needs leak-rss
+# armed for an hour of its eight.
+RSS_WARM_LATEST = 6 * 3600
+RSS_WARM_STORE_SHARE = 0.9
+# `logs.max_storage_mb` and `metrics.max_storage_mb` in qualify-sustained.sh.
+SOAK_STORE_CAP_KB = 8 * 1024
 # Recorded job-cost targets for a soak (maintainer decision, 15 October 2026,
 # #668). A Bun process's steady-state RSS is the median of the samples taken
 # once it has been seen for BUN_STEADY_AFTER seconds.
@@ -88,9 +99,11 @@ FD_RISES = 3
 FD_STEP = 10
 FD_GROWTH = 1.25
 REPEAT_WINDOW = 1800
-# When each leak checker can first judge a process (#1062): leak-rss after
-# its warm-up, leak-fd once it has the warm-up and FD_RISES + 1 full windows.
-CHECKER_ARMED_AFTER = (("leak-rss", "rss_kb", RSS_WARMUP), ("leak-fd", "fd", FD_WARMUP + (FD_RISES + 1) * FD_BUCKET))
+# The leak checkers whose exposure the record reports (#1062). leak-rss can
+# judge a process once it has its warm sample, leak-fd once it has the
+# warm-up and FD_RISES + 1 full windows.
+LEAK_CHECKERS = ("leak-rss", "leak-fd")
+FD_ARMED_AFTER = FD_WARMUP + (FD_RISES + 1) * FD_BUCKET
 # Snapshot kinds that collect the guest inventories (collect in qualify-sustained.sh).
 INVENTORY_KINDS = ("settle", "heavy")
 LEAK_KINDS = ("runc", "netns", "lease", "veth", "cgroup", "bpf", "listen")
@@ -387,11 +400,16 @@ def fd_findings(samples, started, now):
     return []
 
 
-def rss_findings(node_state, rss, ts, started):
-    """After a one-hour warm-up, RSS must stay within 25% of its first warm sample."""
+def rss_findings(node_state, rss, ts, started, take_warm=True):
+    """RSS must stay within 25% of its warm sample: the first sample at least
+    RSS_WARMUP into the process for which `take_warm` holds."""
     if rss is None or ts - started < RSS_WARMUP:
         return []
-    warm = node_state.setdefault("rss_warm_kb", rss)
+    if "rss_warm_kb" not in node_state:
+        if not take_warm:
+            return []
+        node_state.update(rss_warm_kb=rss, rss_warm_at=ts)
+    warm = node_state["rss_warm_kb"]
     if rss > warm * RSS_GROWTH:
         return [finding("leak-rss", "fail", f"bun RSS {rss} kB is over 125% of the warm {warm} kB")]
     return []
@@ -895,7 +913,8 @@ def evaluate(evidence, snapshot):
     by_node = instances_by_node(status) if isinstance(status, list) else None
     baseline = state.get("baseline", {})
     leaks = []
-    jobs_enabled=(read_json(evidence,"metadata.json") or {}).get("job_soak") is True
+    metadata = read_json(evidence, "metadata.json") or {}
+    jobs_enabled = metadata.get("job_soak") is True
     job_found=job_findings(evidence,snapshot,now,fault_window,state)
     findings += job_found
     # An error reported by an earlier check doesn't hold back this settle.
@@ -918,7 +937,7 @@ def evaluate(evidence, snapshot):
         if text is not None:
             inventory = parse_inventory(text)
             findings += restart_findings(state, node, inventory, restart_expectations(evidence, node), now)
-            findings += resource_trend_findings(state, node, inventory, now)
+            findings += resource_trend_findings(state, node, inventory, now, meta.get("kind"), metadata.get("tier") == "final")
             memory = bun_memory.sample(inventory, node, now)
             if memory is not None:
                 bun_memory.append(evidence, memory)
@@ -1219,7 +1238,19 @@ def clock_findings(state, node, inventory, fault_window):
     return findings
 
 
-def resource_trend_findings(state, node, inventory, now):
+def rss_warm_ready(inventory, kind, age, final):
+    """Whether this sample may be leak-rss's warm sample (see RSS_WARM_LATEST)."""
+    if final:
+        return True
+    if kind != "heavy":
+        return False
+    sizes = dict(line.partition(" ")[::2] for line in inventory.get("disk", []))
+    full = all(sizes.get(store, "").isdigit() and int(sizes[store]) >= RSS_WARM_STORE_SHARE * SOAK_STORE_CAP_KB
+               for store in ("logs", "metrics"))
+    return full or age >= RSS_WARM_LATEST
+
+
+def resource_trend_findings(state, node, inventory, now, kind="heavy", final=False):
     node_state = state.setdefault("resources", {}).setdefault(node, {})
     pid = inventory_number(inventory, "bun_pid")
     image = (inventory.get("bun_image") or [None])[0]
@@ -1231,7 +1262,8 @@ def resource_trend_findings(state, node, inventory, now):
     if changed:
         node_state.update(pid=pid, image=image, fd_samples=[], started=now)
         node_state.pop("rss_warm_kb", None)
-    record_exposure(state, node, changed, dict(rss_kb=rss, fd=fd), now - node_state["started"], now)
+        node_state.pop("rss_warm_at", None)
+    age = now - node_state["started"]
     if fd is not None:
         node_state["fd_samples"] = [sample for sample in node_state["fd_samples"] if sample[0] >= now - (FD_RISES + 3) * FD_BUCKET] + [[now, fd]]
     trend = state.setdefault("trends", {}).setdefault(node, {})
@@ -1250,24 +1282,27 @@ def resource_trend_findings(state, node, inventory, now):
             entry["last"] = int(size)
             entry["max"] = max(entry["max"], int(size))
     findings = [dict(item, target=node) for item in fd_findings(node_state["fd_samples"], node_state["started"], now)]
-    findings += [dict(item, target=node) for item in rss_findings(node_state, rss, now, node_state["started"])]
+    take_warm = rss_warm_ready(inventory, kind, age, final)
+    findings += [dict(item, target=node) for item in rss_findings(node_state, rss, now, node_state["started"], take_warm)]
+    record_exposure(state, node, changed, {"leak-rss": rss is not None and "rss_warm_kb" in node_state,
+                                           "leak-fd": fd is not None and age >= FD_ARMED_AFTER}, now)
     return findings
 
 
-def record_exposure(state, node, changed, values, age, now):
+def record_exposure(state, node, changed, armed, now):
     """How long each leak checker could judge this node (#1062).
 
-    A checker is armed once the Bun process it watches has lived past the
-    checker's warm-up; a new pid or image starts the warm-up again. The
+    `armed` says which checkers can judge this sample of the Bun process
+    they watch; a new pid or image starts their warm-up again. The
     time between two armed samples of one process counts as armed; the
     record reports the total, the longest unbroken window, the samples
     judged and how many processes ever armed it. Reported only."""
-    for check, key, armed_after in CHECKER_ARMED_AFTER:
+    for check in LEAK_CHECKERS:
         entry = state.setdefault("exposure", {}).setdefault(node, {}).setdefault(check, dict(
             armed_seconds=0, longest_seconds=0, samples=0, processes_armed=0, window_seconds=0, last=None))
         if changed:
             entry.update(last=None, window_seconds=0)
-        if values[key] is None or age < armed_after:
+        if not armed[check]:
             continue
         if entry["last"] is None:
             entry["processes_armed"] += 1
@@ -1284,20 +1319,29 @@ def exposure_lines(state, gated):
     tier gates on it, other tiers record it."""
     short = set(exposure_shortfalls(state))
     lines = [f"## Leak-checker exposure ({'gated' if gated else 'recorded, not gated'})", "",
-             "How long each leak checker could judge each node's Bun. `leak-rss` arms after "
-             f"{RSS_WARMUP // 60} minutes in one process and `leak-fd` after "
-             f"{(FD_WARMUP + (FD_RISES + 1) * FD_BUCKET) // 60}; a restart, kill or upgrade exec starts the warm-up "
+             "How long each leak checker could judge each node's Bun. `leak-rss` arms at its warm sample: "
+             f"{RSS_WARMUP // 60} minutes into one process in a final, and otherwise at the first heavy check where "
+             f"the log and metrics stores are each {RSS_WARM_STORE_SHARE:.0%} full, between {RSS_WARMUP // 60} "
+             f"minutes and {RSS_WARM_LATEST // 3600} hours in (#1417). `leak-fd` arms after "
+             f"{FD_ARMED_AFTER // 60} minutes; a restart, kill or upgrade exec starts the warm-up "
              f"again. A final needs each armed for {EXPOSURE_ARMED_SECONDS // 60} minutes on every node, with one "
              f"unbroken window of {EXPOSURE_WINDOW_SECONDS // 60} (#1062); its quiet tail gives them that.", "",
              "| Node | Checker | Armed | Longest armed window | Evaluated samples | Processes armed | Verdict |",
              "|---|---|---|---|---|---|---|"]
     for node in state.get("nodes", []):
-        for check, _, _ in CHECKER_ARMED_AFTER:
+        for check in LEAK_CHECKERS:
             entry = state.get("exposure", {}).get(node, {}).get(check, {})
             verdict = ("SHORT" if gated else "short") if (node, check) in short else "ok"
             lines.append(f"| {node} | {check} | {entry.get('armed_seconds', 0) // 60} min | "
                          f"{entry.get('longest_seconds', 0) // 60} min | {entry.get('samples', 0)} | "
                          f"{entry.get('processes_armed', 0)} | {verdict} |")
+    lines.append("")
+    for node in state.get("nodes", []):
+        resources = state.get("resources", {}).get(node, {})
+        if "rss_warm_at" in resources:
+            into = resources["rss_warm_at"] - resources["started"]
+            lines.append(f"- {node}: the last Bun process's `leak-rss` warm sample was {resources['rss_warm_kb']:,} kB, "
+                         f"{into // 3600}:{into % 3600 // 60:02d} h:mm in.")
     return lines + [""]
 
 
@@ -1761,7 +1805,7 @@ def exposure_shortfalls(state):
     """(node, checker) pairs armed too briefly, or never for one unbroken window."""
     short = []
     for node in state.get("nodes", []):
-        for check, _, _ in CHECKER_ARMED_AFTER:
+        for check in LEAK_CHECKERS:
             entry = state.get("exposure", {}).get(node, {}).get(check, {})
             if (entry.get("armed_seconds", 0) < EXPOSURE_ARMED_SECONDS
                     or entry.get("longest_seconds", 0) < EXPOSURE_WINDOW_SECONDS):
