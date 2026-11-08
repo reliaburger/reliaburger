@@ -2033,6 +2033,14 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             node_name.clone(),
             shutdown.clone(),
         );
+        // Leader-only: expire, compact and auto-approve agent proposals
+        // (#1682), with their audit records.
+        reliaburger::bun::proposals::spawn_proposal_reaper(
+            Arc::clone(council),
+            Some(Arc::clone(&event_store)),
+            node_name.clone(),
+            shutdown.clone(),
+        );
         // Leader-only: drop tokens a day past their expiry, never the last
         // Admin (F05 I2). Followers tick too, and do nothing.
         tokio::spawn(reliaburger::bun::token_sweep::run_token_sweep_loop(

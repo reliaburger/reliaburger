@@ -77,8 +77,10 @@ didn't do.
   second. `relish mcp` offers no tool that writes or reaches past the cluster
   API. Agents that may change things, through proposals a human approves,
   were the other half of the AI SRE milestone; 0.2.8 pulls them forward
-  (#1682). Its first piece is in this chapter: [leases](#taking-turns-leases),
-  which change a council record and never a workload.
+  (#1682). They're in this chapter too: [leases](#taking-turns-leases) and
+  [proposals](#asking-instead-of-doing-proposals), which change council
+  records and never a workload. Only a person's approval turns a proposal
+  into a change.
 - **Nothing posts.** `relish agent report` writes files and prints the `gh`
   command that would post them. A human reads the draft and runs it. Patched
   binaries stay unsigned, so they can't reach a real cluster either.
@@ -4730,6 +4732,233 @@ drives the routes through the real router and reads the audit log back.
 leader, and checks that the new leader still refuses a second holder and
 then expires the lease on time.
 
+## Asking instead of doing: proposals
+
+An agent with a token that may deploy is one prompt injection away from
+deploying. Leases keep two changers apart; they don't stop either from
+changing the wrong thing. So from 0.2.8 an agent doesn't change anything. It
+**proposes**, and a person approves, through
+[`src/proposal/`](../../src/proposal/) and the routes in
+[`src/bun/api/proposals.rs`](../../src/bun/api/proposals.rs). The design is
+[`docs/plans/2026-11-08-design-agent-proposals.md`](../plans/2026-11-08-design-agent-proposals.md).
+
+```sh
+relish agent propose scale web --namespace shop --replicas 5 --reason "p99 over the SLO"
+relish proposal show 1          # a person reads it
+relish proposal approve 1       # and it applies
+relish undo 1                   # or puts it back
+```
+
+### The token is the boundary
+
+None of this matters if the agent holds an admin token, so the first piece
+is an **agent token**: `relish token create --agent`. `ApiToken` gains a
+`kind` field, `TokenKind::Human` or `TokenKind::Agent`, and authentication
+does one thing with it:
+
+```rust
+let role = match stored.kind {
+    TokenKind::Human => stored.role,
+    TokenKind::Agent => ApiRole::ReadOnly,
+};
+```
+
+An agent token's *effective* role is read-only, everywhere. Every route that
+checks for `Deployer` refuses it, the routes written before this release and
+the ones written after, with no list of mutating routes to keep up to date.
+The role it was granted is kept beside it, in `AuthContext::granted_role`,
+and exactly two places read it: the proposal routes and the lease routes,
+through `authorize_proposer`. A rule enforced where the request is
+authenticated can't be forgotten by a handler. The refusal message points at
+`relish agent propose`, so an agent that tries learns what to do instead.
+
+### Before and after, nothing else
+
+A proposal could have been seven kinds of change, each with its own apply
+and undo code. Instead every kind becomes the same thing: a list of touched
+apps, each with a `before` and an `after`.
+
+```rust
+pub struct AppRevision {
+    pub spec: Option<Box<AppSpec>>, // None: the app doesn't exist
+    pub stopped: bool,
+    pub revision: String,           // SHA-256 of (spec, stopped)
+}
+```
+
+A scale is an `after` with a different replica count; a stop is the same
+spec with `stopped: true`; a delete is an `after` with no spec. Applying a
+proposal writes every `after`; undoing it writes every `before`; and
+checking whether someone else got there first compares hashes. The kind
+survives only for the words a person reads and for policies.
+
+The revision is a SHA-256 over the stored spec and the stopped flag,
+serialised with `serde_json`. That's only deterministic because every map
+inside `AppSpec` is a `BTreeMap`, which iterates in key order; a `HashMap`
+iterates in an order that differs from process to process, and two nodes
+would hash the same spec differently. We didn't add a version counter to
+each app, because a hash of what's stored needs no change to the dozen write
+paths that already exist.
+
+### A state machine as an enum that carries data
+
+```rust
+pub enum ProposalState {
+    Pending,
+    Applied { approval: Approval, at_unix_ms: u64, log_index: u64 },
+    Rejected { by: Principal, reason: String, at_unix_ms: u64 },
+    Expired { at_unix_ms: u64 },
+    Withdrawn { at_unix_ms: u64 },
+    Failed { approval: Approval, why: FailedReason, at_unix_ms: u64 },
+    Undone { approval: Approval, applied_at_unix_ms: u64, undone_by: Approval,
+             at_unix_ms: u64, undo_proposal: Option<ProposalId> },
+}
+```
+
+In C you'd have a `state` integer and a struct with every field any state
+might need, half of them meaningless at any moment. In Rust each variant
+carries exactly its own data: a `Failed` proposal has a reason, a `Pending`
+one has nothing to read. `match` has to handle every variant, so adding a
+state breaks the build in every place that has to decide about it.
+
+There's no `Approved` state. Approval and application are **one Raft
+entry**, `ProposalApply`: the state machine checks, writes every `after`,
+and records `Applied`, or writes nothing and records `Failed`. A leader that
+dies between "approved" and "applied" can't exist, so neither can a
+proposal that was approved and never ran, nor one that runs twice when a
+retried approval reaches a new leader. The retry finds the outcome.
+
+The checks are the ones a state machine can make deterministically, from
+its own state and numbers in the entry: the proposal is still pending and
+not past its expiry by the stamped clock; the approver isn't an agent and
+isn't the author, by token name, so a rotated token is still its own
+author; every app is still at its `before` revision; nobody else holds a
+lease on one. The leader judged the policies before it wrote the entry, and
+the entry carries the generation it judged at, the same fence as
+`PolicyFenced` in chapter 18: if a policy changed in between, the entry
+answers `PolicyGenerationMoved` and the leader judges again.
+
+### All or nothing, on a copy
+
+A proposal that touches three apps must change three apps or none. The
+state machine already knows how to write one app safely: `AppSpec` checks
+job identities, owners and test leases; `AppDelete` cleans up everything an
+app leaves behind. We reuse those, on a copy:
+
+```rust
+let mut staged = StateMachineInner { state: self.state.clone(), ..Default::default() };
+for (app, target) in targets {
+    staged.write_revision(app, target, position)?;
+    if current_revision(&staged.state, app) != target.revision {
+        return Err(format!("{app} would end at a different revision than the proposal showed"));
+    }
+}
+self.state = staged.state;
+```
+
+If any write is refused, `?` returns early, `staged` is dropped, and
+`self.state` was never touched. Cloning the whole desired state costs
+memory, but proposals arrive at human speed, and the alternative is undo
+code for every write path. The last check proves the invariant undo relies
+on: after applying, each app is at exactly the revision the person saw.
+
+### Two mutable borrows at once
+
+Creating a proposal changes the proposal store and the lease store in the
+same entry:
+
+```rust
+let state = &mut self.state;
+state.proposals.create(&mut state.agent_leases, proposal, revision, now);
+```
+
+Rust won't let you hold two `&mut` borrows of the same value, but it tracks
+borrows of a struct's *fields* separately, so `&mut state.proposals` and
+`&mut state.agent_leases` can coexist. Inside `create`, the leases are taken
+on a clone and swapped in only if every one is granted, so a refusal on the
+third app doesn't leave the first two leased. `revision` is a closure that
+answers each app's current revision; the caller computes those into a map
+first, because a closure borrowing `self.state` couldn't sit beside the
+mutable borrows.
+
+### Words the cluster writes
+
+Everything a person reads before approving is computed by the leader from
+its own state, in [`build.rs`](../../src/proposal/build.rs): the summary,
+the field diff (through `relish diff`'s flattening, with secret values shown
+as `(secret)`), the blast radius (apps, current nodes, instances replaced,
+started and stopped, ingress routes, service names) and the undo command.
+The agent supplies a request and a reason. An agent can't describe a
+smaller change than the one it makes, because it doesn't describe it at
+all.
+
+```text
+Scale shop/web from 3 to 5 replicas.
+Touches 1 app on 2 nodes (node-a, node-b); starts 2 instances (the scheduler places them when it applies).
+Serves https://shop.example.com/ and the service web.shop.
+Undo: `relish undo 17` puts web back to 3 replicas.
+```
+
+The reason comes last in `relish proposal show`, under "The agent's reason
+(its own words, unverified)", and an agent reading another agent's proposal
+gets it wrapped as untrusted text, origin `proposal_reason`. The agent's
+answer is its own, smaller struct, `AgentProposal`, rather than the API's
+view with a different type for one field: we first made the view generic
+over the reason's type, and the JSON Schema of every command that returns a
+proposal grew past the budget `relish agent schema` holds each command to.
+One flat struct, with the diff as one line per field, fits.
+
+### Undo, and when it refuses
+
+A person's `relish undo 17` writes every `before` back, in one entry, if
+every app is still at its `after` revision. If something changed an app
+since, it refuses and says so: undoing would overwrite someone's change, and
+`relish rollback` or an apply show their own diff. An agent can't undo
+directly; `relish agent undo 17` *proposes* the undo, whose `before` is the
+original's `after`, and approving it marks the original `undone` too.
+
+Undo lasts 24 hours and the newest 64 applied proposals. After that the
+leader's reaper compacts the record: the specs go, the summary, diff, blast
+radius and outcome stay. The same reaper expires proposals nobody decided
+(an hour by default), ends their leases, and writes `proposal.expired`
+under `system`.
+
+### Seams for what comes next
+
+Three pieces of #1682 build on this in parallel, and each has one place to
+plug in:
+
+- **Guardrails and auto-approval**:
+  [`src/proposal/guard.rs`](../../src/proposal/guard.rs). The leader calls
+  `judge_proposal(&GuardInput) -> GuardVerdict` before `ProposalCreate` and
+  before `ProposalApply`. Today it runs the app policies on the changed
+  `after` specs; a verdict's `approve` field, once policies can set it,
+  applies the proposal with `Approval::Policy`, and the reaper's
+  `auto_approve_pending` judges every pending proposal while
+  `may_auto_approve` says a policy could.
+- **MCP**: `relish agent propose`, `proposals`, `withdraw` and `undo` are in
+  `relish mcp`'s exclusion list until `relish mcp --propose`.
+- **The gym**: the envelope's error codes `lease_held`, `stale` and
+  `guardrail`, and the audit actions, are what a scenario scores.
+
+### The tests
+
+[`src/proposal/machine_tests.rs`](../../src/proposal/machine_tests.rs) walks
+every transition and refusal: approve, reject, withdraw, expire, undo; an
+agent approving, self-approval after a rotation, deciding something already
+decided; a stale revision and someone else's lease failing an approval; one
+pending proposal per app, eight per author, idempotency keys; the undo window
+and compaction; an agent's undo proposal marking the original. The build
+tests snapshot the summary for each kind and check every refusal names its
+rule. The council tests apply the entries to two state machines and compare
+them, and round-trip a snapshot.
+[`src/bun/api/proposal_tests.rs`](../../src/bun/api/proposal_tests.rs)
+drives the routes as a deployer agent token, a read-only one, agents and
+people scoped to other namespaces, and reads the audit log back. And
+`tests/cluster_failover.rs` proposes through one follower, approves through
+the other, kills the leader, and undoes on the new one, checking the app is
+back at its exact `before` revision.
+
 ## What we didn't do
 
 The three big refusals are at the start of the chapter. These are the smaller
@@ -4918,6 +5147,20 @@ ones, command by command, each with the reason it lost.
   code, where a missing test is cheapest to add.
 - **Make the job required.** A sample of 12 can miss what another sample
   would catch, so it informs a review rather than gating it.
+
+**Proposals.**
+
+- **An `approved` state between pending and applied.** It's the state a
+  leader change strands. Approval and application are one entry instead.
+- **A version counter on every app.** A hash of what's stored needs no
+  change to the write paths that already exist.
+- **An approve button in the dashboard.** The dashboard is read-only; a
+  button means the first browser-originated write, with CSRF protection and
+  a session tied to a human token. The maintainer's call, after 0.2.8.
+- **`restart` in this first cut.** It needs a `restarted_at` field on every
+  app spec and a rollout change, so it comes separately.
+- **A scheduler forecast in the blast radius.** New instances are placed
+  when the proposal applies, and the summary says so rather than guessing.
 
 ## Lessons learned
 

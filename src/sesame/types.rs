@@ -294,6 +294,33 @@ pub struct WorkloadJwtClaims {
 // API tokens
 // ---------------------------------------------------------------------------
 
+/// Whose token it is: a person's, or an agent's (#1682).
+///
+/// An agent token authenticates with the read-only role on every route
+/// except the proposal and lease routes, which read its granted role, so
+/// it can propose a change but never make one. "Human" describes the
+/// token, not who's typing: an agent using a person's token is that
+/// person, as far as the cluster can tell.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenKind {
+    /// A person's token, and every token made without `--agent`.
+    #[default]
+    Human,
+    /// An agent's token, made with `relish token create --agent`.
+    Agent,
+}
+
+impl TokenKind {
+    /// `human` or `agent`, as audit records and listings spell it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TokenKind::Human => "human",
+            TokenKind::Agent => "agent",
+        }
+    }
+}
+
 /// The role granted to an API token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ApiRole {
@@ -348,6 +375,9 @@ pub struct ApiToken {
     pub token_hash: Vec<u8>,
     /// The role granted to this token.
     pub role: ApiRole,
+    /// A person's token or an agent's (#1682).
+    #[serde(default)]
+    pub kind: TokenKind,
     /// Optional scope restrictions.
     pub scope: TokenScope,
     /// When the token expires.

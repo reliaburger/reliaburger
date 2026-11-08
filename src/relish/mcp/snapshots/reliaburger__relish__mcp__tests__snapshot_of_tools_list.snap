@@ -178,7 +178,11 @@ expression: listed_for_snapshot(server.tools())
             "setup",
             "lease-take",
             "lease-renew",
-            "lease-release"
+            "lease-release",
+            "propose",
+            "proposals",
+            "withdraw",
+            "undo"
           ],
           "type": "string"
         },

@@ -25,6 +25,7 @@ pub mod lease;
 pub mod logs;
 pub mod manual;
 pub mod patch;
+pub mod propose;
 pub mod report;
 pub mod setup;
 pub mod source;
@@ -108,6 +109,18 @@ pub enum AgentCommand {
     Setup(setup::SetupOptions),
     /// Take, renew or release a lease on an app or a namespace.
     Lease(lease::LeaseOptions),
+    /// Propose a change for a person to approve: apply, scale, rollback,
+    /// stop or delete. Shows the summary, blast radius and undo command.
+    Propose(propose::ProposeArgs),
+    /// Proposals you can see, newest first; one when given its number.
+    Proposals(propose::ProposalsArgs),
+    /// Withdraw a pending proposal you made.
+    Withdraw {
+        /// The proposal's number.
+        id: u64,
+    },
+    /// Propose undoing an applied proposal, for a person to approve.
+    Undo(propose::UndoArgs),
 }
 
 impl AgentOptions {
@@ -137,6 +150,10 @@ impl AgentCommand {
             AgentCommand::Patch(options) => options.command.name(),
             AgentCommand::Setup(_) => CommandName::Setup,
             AgentCommand::Lease(options) => options.command.name(),
+            AgentCommand::Propose(_) => CommandName::Propose,
+            AgentCommand::Proposals(_) => CommandName::Proposals,
+            AgentCommand::Withdraw { .. } => CommandName::Withdraw,
+            AgentCommand::Undo(_) => CommandName::Undo,
         }
     }
 }
@@ -189,6 +206,10 @@ pub async fn run(options: &AgentOptions, rerun: &str) -> Rendered {
         AgentCommand::Patch(patch) => patch::run(patch, max_bytes, rerun).await,
         AgentCommand::Setup(setup) => setup::run(setup, max_bytes, rerun).await,
         AgentCommand::Lease(lease) => lease::run(lease, max_bytes, rerun).await,
+        AgentCommand::Propose(args) => propose::run_propose(args, max_bytes, rerun).await,
+        AgentCommand::Proposals(args) => propose::run_proposals(args, max_bytes, rerun).await,
+        AgentCommand::Withdraw { id } => propose::run_withdraw(*id, max_bytes, rerun).await,
+        AgentCommand::Undo(args) => propose::run_undo(args, max_bytes, rerun).await,
     }
 }
 
@@ -296,6 +317,10 @@ pub fn data_schema(command: CommandName) -> Option<Value> {
         CommandName::LeaseTake | CommandName::LeaseRenew | CommandName::LeaseRelease => {
             Some(schema_of::<lease::LeaseData>())
         }
+        CommandName::Propose | CommandName::Withdraw | CommandName::Undo => {
+            Some(schema_of::<propose::ProposalData>())
+        }
+        CommandName::Proposals => Some(schema_of::<propose::ProposalsData>()),
     }
 }
 
@@ -593,7 +618,11 @@ mod tests {
                 "setup",
                 "lease take",
                 "lease renew",
-                "lease release"
+                "lease release",
+                "propose",
+                "proposals",
+                "withdraw",
+                "undo"
             ]
         );
         let envelope = &value["data"]["envelope"];

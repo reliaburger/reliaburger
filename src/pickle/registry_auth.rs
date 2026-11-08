@@ -576,6 +576,8 @@ mod tests {
             token_name: "ci".into(),
             principal_id: "ci-1".into(),
             role,
+            kind: crate::sesame::types::TokenKind::Human,
+            granted_role: role,
             scoped_apps: apps.map(owned),
             scoped_namespaces: namespaces.map(owned),
         }

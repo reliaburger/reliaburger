@@ -2311,3 +2311,142 @@ async fn an_agent_lease_survives_a_leader_change_and_the_new_leader_expires_it()
     assert_eq!(record["details"]["target"], "app:shop/web");
     fixture.root.cancel();
 }
+
+// --- Agent proposals across a leader change (#1682) -------------------------
+
+/// #1682: an agent's proposal, made through a follower and approved by a
+/// person through the other follower, applies in the same Raft entry as
+/// its approval. It survives the leader's death as `applied`, and the
+/// undo command, run against the new leader, puts the `before` revision
+/// back exactly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host; run with make test-cluster"]
+async fn a_proposal_applied_before_a_leader_change_is_undone_on_the_new_leader() {
+    assert!(cluster_tests_enabled());
+    let operator = admin_token("operator");
+    let mut fixture = Fixture::new();
+    let mut nodes = vec![
+        fixture
+            .start_node(710, vec![], false, Some(operator.token.clone()))
+            .await,
+    ];
+    for index in 711..713 {
+        let seed = fixture.gossip(710);
+        nodes.push(
+            fixture
+                .start_node(index, vec![seed], false, Some(operator.token.clone()))
+                .await,
+        );
+    }
+    let (leader, followers) = settled_roles(&nodes).await;
+    let mut holmes = reliaburger::sesame::token::create_token(
+        "holmes",
+        reliaburger::sesame::types::ApiRole::Deployer,
+        reliaburger::sesame::types::TokenScope {
+            apps: None,
+            namespaces: Some(vec!["shop".to_string()]),
+        },
+        None,
+    )
+    .unwrap();
+    holmes.token.kind = reliaburger::sesame::types::TokenKind::Agent;
+    grant(&nodes, &holmes.token).await;
+
+    let web = reliaburger::meat::AppId::new("web", "shop");
+    let spec: reliaburger::config::app::AppSpec =
+        toml::from_str("image = \"web:v1\"\nreplicas = 1\nnamespace = \"shop\"").unwrap();
+    nodes[leader]
+        .council
+        .write(reliaburger::council::types::RaftRequest::AppSpec {
+            app_id: web.clone(),
+            spec: Box::new(spec),
+        })
+        .await
+        .unwrap();
+    let before = reliaburger::proposal::revision::current_revision(
+        &nodes[leader].council.desired_state().await,
+        &web,
+    );
+
+    // The agent proposes through one follower; it changes nothing yet.
+    let (status, body) = post_json(
+        &nodes[followers[0]],
+        &holmes.plaintext,
+        "/v1/proposals",
+        r#"{"kind":"scale","namespace":"shop","app":"web","replicas":2,"reason":"failover drill"}"#,
+    )
+    .await
+    .expect("the follower answers");
+    assert_eq!(status, 201, "{body}");
+    let id = body["id"].as_u64().unwrap();
+    assert_eq!(body["undo"]["command"], format!("relish undo {id}"));
+    // An agent token can't approve, even through the leader.
+    let (status, _) = post_json(
+        &nodes[leader],
+        &holmes.plaintext,
+        &format!("/v1/proposals/{id}/approve"),
+        "",
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, 403);
+
+    // A person approves through the other follower: one entry applies it.
+    let (status, body) = post_json(
+        &nodes[followers[1]],
+        &operator.plaintext,
+        &format!("/v1/proposals/{id}/approve"),
+        "",
+    )
+    .await
+    .expect("the follower answers");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["state"], "applied");
+    let applied = nodes[leader].council.desired_state().await;
+    assert_eq!(
+        applied.apps[&web].replicas,
+        reliaburger::config::Replicas::Fixed(2)
+    );
+
+    kill(&nodes[leader]).await;
+    let successor = wait_for_leader(&nodes, &followers, Duration::from_secs(90)).await;
+    let state = nodes[successor].council.desired_state().await;
+    let proposal = state
+        .proposals
+        .get(reliaburger::proposal::ProposalId(id))
+        .unwrap();
+    assert_eq!(proposal.state.name(), "applied");
+    assert_eq!(
+        state.apps[&web].replicas,
+        reliaburger::config::Replicas::Fixed(2)
+    );
+
+    // The undo command, against whichever node leads now.
+    let mut undone = None;
+    wait_until(
+        "the new leader undoes the proposal",
+        Duration::from_secs(60),
+        async || {
+            let leader = wait_for_leader(&nodes, &followers, Duration::from_secs(30)).await;
+            undone = post_json(
+                &nodes[leader],
+                &operator.plaintext,
+                &format!("/v1/proposals/{id}/undo"),
+                "",
+            )
+            .await;
+            undone.as_ref().is_some_and(|(status, _)| *status != 503)
+        },
+    )
+    .await;
+    let (status, body) = undone.unwrap();
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["state"], "undone");
+    let leader = wait_for_leader(&nodes, &followers, Duration::from_secs(30)).await;
+    let state = nodes[leader].council.desired_state().await;
+    assert_eq!(
+        reliaburger::proposal::revision::current_revision(&state, &web),
+        before
+    );
+    fixture.root.cancel();
+}

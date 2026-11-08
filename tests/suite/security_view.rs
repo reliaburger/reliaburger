@@ -83,6 +83,7 @@ fn token(name: &str) -> ApiToken {
         name: name.into(),
         token_hash: name.as_bytes().to_vec(),
         role: ApiRole::Admin,
+        kind: reliaburger::sesame::types::TokenKind::Human,
         scope: TokenScope::default(),
         expires_at: None,
         created_at: std::time::SystemTime::now(),

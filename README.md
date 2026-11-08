@@ -186,7 +186,7 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
 - `relish agent`: Commands for LLM agents: one JSON envelope, bounded, never interactive
   - `relish agent guide`: How to use relish as an agent: the manual chapter, as Markdown sections
   - `relish agent version`: This binary's version, commit, target and cluster formats
-  - `relish agent schema [guide|version|schema|source-version|source-tree|source-grep|source-show|source-extract|logs|manual-search|manual-show|context|diagnose|explain|upgrade-check|report|patch-init|patch-build|patch-test|patch-try|patch-diff|patch-apply|patch-destroy|setup|lease-take|lease-renew|lease-release]`: The JSON Schema of the envelope and of each command's data
+  - `relish agent schema [guide|version|schema|source-version|source-tree|source-grep|source-show|source-extract|logs|manual-search|manual-show|context|diagnose|explain|upgrade-check|report|patch-init|patch-build|patch-test|patch-try|patch-diff|patch-apply|patch-destroy|setup|lease-take|lease-renew|lease-release|propose|proposals|withdraw|undo]`: The JSON Schema of the envelope and of each command's data
   - `relish agent source`: The source this binary was built from: search it, read it, extract it
     - `relish agent source version`: This binary's source: version, commit, digest, file count, and the commit every node runs
     - `relish agent source tree [PREFIX]`: Files with their size in bytes and their line count
@@ -215,6 +215,10 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
     - `relish agent lease take <app|namespace> <NAME>`: Take a lease before changing an app or a namespace, or renew yours *(0.2.8, not in 0.2.7)*
     - `relish agent lease renew <app|namespace> <NAME>`: Extend a lease you hold *(0.2.8, not in 0.2.7)*
     - `relish agent lease release <app|namespace> <NAME>`: Give up a lease you hold *(0.2.8, not in 0.2.7)*
+  - `relish agent propose --reason <REASON> <apply|scale|rollback|stop|delete> <TARGET>`: Propose a change for a person to approve: apply, scale, rollback, stop or delete. Shows the summary, blast radius and undo command *(0.2.8, not in 0.2.7)*
+  - `relish agent proposals [ID]`: Proposals you can see, newest first; one when given its number *(0.2.8, not in 0.2.7)*
+  - `relish agent withdraw <ID>`: Withdraw a pending proposal you made *(0.2.8, not in 0.2.7)*
+  - `relish agent undo --reason <REASON> <ID>`: Propose undoing an applied proposal, for a person to approve *(0.2.8, not in 0.2.7)*
 - `relish mcp`: Serve the `relish agent` commands as read-only MCP tools over stdio
 - `relish lease`: List, take, renew, release or break leases on apps and namespaces, which keep agents and people from changing the same thing at once *(0.2.8, not in 0.2.7)*
   - `relish lease list`: List the leases held now: target, holder, time left and purpose *(0.2.8, not in 0.2.7)*
@@ -222,6 +226,12 @@ Run `relish` with no command for the terminal UI. `relish help COMMAND` (or `--h
   - `relish lease renew <app|namespace> <NAME>`: Extend a lease you hold *(0.2.8, not in 0.2.7)*
   - `relish lease release <app|namespace> <NAME>`: Give up a lease you hold *(0.2.8, not in 0.2.7)*
   - `relish lease break <app|namespace> <NAME>`: End someone else's lease (deployer or above over the target; audited) *(0.2.8, not in 0.2.7)*
+- `relish proposal`: List, show, approve or reject the changes agents propose. Approving applies it; each shows its blast radius and undo command first *(0.2.8, not in 0.2.7)*
+  - `relish proposal list`: Every proposal you can see, newest first *(0.2.8, not in 0.2.7)*
+  - `relish proposal show <ID>`: One proposal: summary, undo, findings, blast radius, diff, reason *(0.2.8, not in 0.2.7)*
+  - `relish proposal approve <ID>`: Approve a proposal, which applies it at once. You can't approve your own, and need deployer rights over every app it touches *(0.2.8, not in 0.2.7)*
+  - `relish proposal reject <ID>`: Reject a pending proposal *(0.2.8, not in 0.2.7)*
+- `relish undo <ID>`: Put an applied proposal back, if nothing has changed its apps since *(0.2.8, not in 0.2.7)*
 
 **Break things on purpose** ([chaos](docs/manual/05_chaos.md))
 

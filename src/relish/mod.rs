@@ -46,6 +46,7 @@ pub mod output;
 pub mod path_cmd;
 pub mod plan;
 pub mod policy_cmd;
+pub mod proposal_cmd;
 pub mod quickstart;
 pub mod reader;
 pub mod readiness;

@@ -117,6 +117,14 @@ pub enum CommandName {
     #[serde(rename = "lease release")]
     #[value(name = "lease-release")]
     LeaseRelease,
+    /// `relish agent propose`.
+    Propose,
+    /// `relish agent proposals`.
+    Proposals,
+    /// `relish agent withdraw`.
+    Withdraw,
+    /// `relish agent undo`.
+    Undo,
 }
 
 impl CommandName {
@@ -151,6 +159,10 @@ impl CommandName {
             CommandName::LeaseTake => "lease take",
             CommandName::LeaseRenew => "lease renew",
             CommandName::LeaseRelease => "lease release",
+            CommandName::Propose => "propose",
+            CommandName::Proposals => "proposals",
+            CommandName::Withdraw => "withdraw",
+            CommandName::Undo => "undo",
         }
     }
 
@@ -184,6 +196,10 @@ impl CommandName {
         CommandName::LeaseTake,
         CommandName::LeaseRenew,
         CommandName::LeaseRelease,
+        CommandName::Propose,
+        CommandName::Proposals,
+        CommandName::Withdraw,
+        CommandName::Undo,
     ];
 }
 
@@ -274,6 +290,10 @@ pub enum ErrorCode {
     /// Someone else holds a lease on what you asked for; `lease` says who,
     /// why and for how long.
     LeaseHeld,
+    /// An app changed since the proposal saw it.
+    Stale,
+    /// A policy or built-in rule refused the proposal.
+    Guardrail,
 }
 
 /// The process exit status of a `relish agent` command.
@@ -319,9 +339,12 @@ impl ErrorCode {
             | ErrorCode::TlsUntrusted
             | ErrorCode::Timeout
             | ErrorCode::Unauthenticated => ExitStatus::Unreachable,
-            ErrorCode::Forbidden | ErrorCode::LeaseHeld => ExitStatus::Refused,
+            ErrorCode::Forbidden | ErrorCode::LeaseHeld | ErrorCode::Guardrail => {
+                ExitStatus::Refused
+            }
             ErrorCode::NotFound
             | ErrorCode::Conflict
+            | ErrorCode::Stale
             | ErrorCode::Api
             | ErrorCode::SourceMismatch
             | ErrorCode::BuildFailed

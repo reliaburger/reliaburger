@@ -265,6 +265,63 @@ which is less than an anonymous caller can already do in that window. The
 moment the cluster has a master key or a first token, both need the service
 token again.
 
+## Agent tokens and proposals
+
+An AI agent should have its own token, never yours. Make one with `--agent`:
+
+```sh
+relish token create --name holmes --agent --role deployer --namespaces shop --ttl 8h
+```
+
+An agent token is `read-only` unless you say `--role deployer`, can't be
+`admin`, and lives 8 hours unless `--ttl` says otherwise (at most 168h). The
+cluster treats it as read-only on every route but two: a deployer agent token
+may **propose** a change, and take a lease (see `working-with-an-ai-agent`).
+It can't apply, stop, delete or roll back anything itself. That's the
+boundary the cluster enforces: an agent using your admin token is you, as far
+as the cluster can tell.
+
+A proposal is a question for a person. The cluster writes everything you read
+about it from its own state, not the agent's words: a plain-language summary,
+the field diff, the blast radius (apps, nodes, instances replaced, started
+and stopped, ingress routes and service names), and the one command that
+undoes it. The agent's reason comes last, labelled as its own words.
+
+```sh
+relish proposal list            # newest first; BY shows who decided
+relish proposal show 17
+relish proposal approve 17      # applies it at once; asks first
+relish proposal reject 17 --reason "not during the sale"
+relish undo 17                  # puts it back, if nothing changed since
+```
+
+`approve` asks before it applies, and for a change that's lossy to undo (a
+delete of an app with managed volumes) asks you to type the app's name. `-o
+json` asks nothing, so it needs `--yes`. Approving and applying are one step
+in the council: a leader change can't leave a proposal approved but not run,
+or run it twice. To approve, you need a human token with the deployer role or
+above whose scope and `[permission]` spec cover every app the proposal
+touches, and you can't approve a proposal made under your own token's name.
+
+A proposal **fails**, and changes nothing, if any app it touches has changed
+since it was made, or someone other than its author holds a lease on one.
+The agent proposes again. `relish undo` refuses in the same way when
+something changed the app after the proposal applied, because undoing would
+overwrite that change; use `relish rollback` or an apply, which show their
+own diff. Undo works for 24 hours and the newest 64 applied proposals; after
+that, use `relish rollback`. A proposal nobody decides expires after an hour
+(the agent may ask for 5 minutes to 24 hours). At most 64 wait at once, 8
+per author and one per app.
+
+Proposals are judged by your policies like any apply: the `after` specs go
+through every app policy with `source = "proposal"`, a deny refuses the
+proposal (the agent sees `guardrail`), and warnings are shown first to
+whoever approves. Approving judges it again under the policies in force then.
+
+Each step is in the audit log: `proposal.created`, `.refused`, `.applied`,
+`.failed`, `.rejected`, `.withdrawn`, `.expired` and `.undone`, with the
+author, `author_kind` (`human` or `agent`), the reason and who approved.
+
 ## Policies
 
 A policy is a rule every app applied to the cluster must pass, such as "apps

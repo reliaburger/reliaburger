@@ -32,7 +32,7 @@ impl TestIdentity {
     fn caller(&self) -> Caller {
         match self.source {
             Source::GitOps => Caller::gitops(),
-            Source::Apply => Caller::token(&self.caller, self.role),
+            Source::Apply | Source::Proposal => Caller::token(&self.caller, self.role),
         }
     }
 }

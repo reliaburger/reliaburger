@@ -116,6 +116,11 @@ expression: value
       "reason": null,
       "state": "known"
     },
+    "proposals": {
+      "items": [],
+      "reason": null,
+      "state": "known"
+    },
     "summary": {
       "critical": 1,
       "ok": 9,

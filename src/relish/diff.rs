@@ -162,6 +162,15 @@ fn diff_resource_map<T: Serialize>(
     }
 }
 
+/// The fields that differ between two app specs, by dotted path, in path
+/// order. A proposal's field diff (#1682) is built from this.
+pub fn diff_app_specs(
+    old: &crate::config::app::AppSpec,
+    new: &crate::config::app::AppSpec,
+) -> Vec<FieldDiff> {
+    diff_values(old, new)
+}
+
 /// Diff two serialisable values by comparing their TOML representations.
 ///
 /// Serialises both to TOML tables and compares field by field. This is
