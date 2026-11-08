@@ -1,0 +1,75 @@
+---
+source: src/relish/agent/verify.rs
+expression: rendered(&stable(verified()))
+---
+{
+  "command": "verify",
+  "data": {
+    "metadata": [
+      "https://github.com/reliaburger/reliaburger/releases/download/v0.2.7/metadata.json",
+      "https://github.com/reliaburger/reliaburger/releases/download/v0.2.7/cli-metadata.json"
+    ],
+    "nodes": [
+      {
+        "hash": "pass",
+        "node": "node-1",
+        "platform": "linux-x86_64",
+        "published_sha256": "16b0f4bd879682d7bebdc4688032b95c3933673b922a5d358673a3da95850970",
+        "role": "leader",
+        "sha256": "16b0f4bd879682d7bebdc4688032b95c3933673b922a5d358673a3da95850970",
+        "signature": "pass",
+        "state": "alive",
+        "version": "v0.2.7"
+      },
+      {
+        "hash": "pass",
+        "node": "node-2",
+        "platform": "linux-x86_64",
+        "published_sha256": "16b0f4bd879682d7bebdc4688032b95c3933673b922a5d358673a3da95850970",
+        "role": "council",
+        "sha256": "16b0f4bd879682d7bebdc4688032b95c3933673b922a5d358673a3da95850970",
+        "signature": "pass",
+        "state": "alive",
+        "version": "v0.2.7"
+      },
+      {
+        "hash": "pass",
+        "node": "node-3",
+        "platform": "linux-x86_64",
+        "published_sha256": "16b0f4bd879682d7bebdc4688032b95c3933673b922a5d358673a3da95850970",
+        "role": "council",
+        "sha256": "16b0f4bd879682d7bebdc4688032b95c3933673b922a5d358673a3da95850970",
+        "signature": "pass",
+        "state": "alive",
+        "version": "v0.2.7"
+      }
+    ],
+    "reasons": [],
+    "relish": {
+      "hash": "pass",
+      "node": "relish",
+      "platform": "linux-aarch64",
+      "published_sha256": "98f2fe8a0255efaf7d94c75dbb351aab48daf99f5706fec929fe5e03af2a0427",
+      "role": null,
+      "sha256": "98f2fe8a0255efaf7d94c75dbb351aab48daf99f5706fec929fe5e03af2a0427",
+      "signature": "pass",
+      "state": null,
+      "version": "v0.2.7"
+    },
+    "trusted_keys": [
+      "ed25519:a-throwaway-test-key"
+    ],
+    "verdict": "verified"
+  },
+  "next": [],
+  "ok": true,
+  "relish": {
+    "commit": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+    "dirty": null,
+    "source_digest": null,
+    "version": "0.2.7"
+  },
+  "schema": "relish.agent/v1",
+  "truncated": false,
+  "warnings": []
+}

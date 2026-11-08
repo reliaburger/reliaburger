@@ -29,6 +29,7 @@ pub mod setup;
 pub mod source;
 pub mod untrusted;
 pub mod upgrade_check;
+pub mod verify;
 
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -98,6 +99,9 @@ pub enum AgentCommand {
     /// Whether the cluster can take the latest release: `ready`,
     /// `up_to_date`, `needs_fresh_cluster`, `blocked` or `unknown`.
     UpgradeCheck(upgrade_check::UpgradeCheckArgs),
+    /// Whether the cluster runs the published release, byte for byte:
+    /// `verified`, `mismatch` or `unknown`.
+    Verify(verify::VerifyArgs),
     /// Draft a redacted bug report for a human to post. Never posts.
     Report(Box<report::ReportArgs>),
     /// Build, test and try a fix on a throwaway cluster.
@@ -130,6 +134,7 @@ impl AgentCommand {
             AgentCommand::Diagnose(_) => CommandName::Diagnose,
             AgentCommand::Explain { .. } => CommandName::Explain,
             AgentCommand::UpgradeCheck(_) => CommandName::UpgradeCheck,
+            AgentCommand::Verify(_) => CommandName::Verify,
             AgentCommand::Report(_) => CommandName::Report,
             AgentCommand::Patch(options) => options.command.name(),
             AgentCommand::Setup(_) => CommandName::Setup,
@@ -181,6 +186,7 @@ pub async fn run(options: &AgentOptions, rerun: &str) -> Rendered {
         AgentCommand::Diagnose(args) => diagnose::run_diagnose(args, max_bytes, rerun).await,
         AgentCommand::Explain { id } => diagnose::run_explain(id.as_deref(), max_bytes, rerun),
         AgentCommand::UpgradeCheck(args) => upgrade_check::run(args, max_bytes, rerun).await,
+        AgentCommand::Verify(args) => verify::run(args, max_bytes, rerun).await,
         AgentCommand::Report(args) => report::run(args, max_bytes, rerun),
         AgentCommand::Patch(patch) => patch::run(patch, max_bytes, rerun).await,
         AgentCommand::Setup(setup) => setup::run(setup, max_bytes, rerun).await,
@@ -279,6 +285,7 @@ pub fn data_schema(command: CommandName) -> Option<Value> {
         CommandName::Diagnose => Some(schema_of::<diagnose::DiagnoseData>()),
         CommandName::Explain => Some(schema_of::<diagnose::ExplainData>()),
         CommandName::UpgradeCheck => Some(schema_of::<upgrade_check::UpgradeCheckData>()),
+        CommandName::Verify => Some(schema_of::<verify::VerifyData>()),
         CommandName::Report => Some(schema_of::<report::ReportData>()),
         CommandName::PatchInit => Some(schema_of::<patch::InitData>()),
         CommandName::PatchBuild => Some(schema_of::<patch::BuildData>()),
@@ -574,6 +581,7 @@ mod tests {
                 "diagnose",
                 "explain",
                 "upgrade-check",
+                "verify",
                 "report",
                 "patch init",
                 "patch build",

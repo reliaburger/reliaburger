@@ -178,6 +178,7 @@ fn the_exclusions_are_the_commands_that_write_build_or_reach_past_the_cluster() 
             "report",
             "patch",
             "upgrade-check",
+            "verify",
             "setup"
         ]
     );

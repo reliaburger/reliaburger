@@ -57,6 +57,7 @@ If you're an agent operating or debugging a Reliaburger cluster:
 | `relish agent diagnose` | Every finding with its evidence, read-only next steps, and pointers into the manual and the source |
 | `relish agent explain` | What a finding means, its thresholds and where it's decided; every finding when no id is given. Reads only this binary |
 | `relish agent upgrade-check` | Whether the cluster can take the latest release: `ready`, `up_to_date`, `needs_fresh_cluster`, `blocked` or `unknown` |
+| `relish agent verify` | Whether the cluster runs the published release, byte for byte: `verified`, `mismatch` or `unknown` |
 | `relish agent report` | Draft a redacted bug report for a human to post. Never posts |
 | `relish agent patch init` | Extract this binary's source into a new workspace, on a `patch` branch |
 | `relish agent patch build` | Build the workspace: `relish` for this machine, `bun` and a Linux `relish` for the nodes (in the build VM on macOS). Both by default |

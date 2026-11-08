@@ -31,6 +31,7 @@ FAULT_KINDS = (
     "unschedulable",
     "node_partitioned",
     "relish_bug",
+    "binary_drift",
     # A Smoker fault someone injected (`relish gym run`'s paused-app and
     # killed-instance scenarios, #1683).
     "injected_fault",
@@ -57,6 +58,13 @@ FAULT_STEPS = {
     "reliaburger": {"council_partition": "@follower"},
     "k8s": {"node_partition": "@worker"},
 }
+
+# What the runner can hand the solver as the release's published files, in
+# `release/` of its working directory, for an offline `relish agent verify`.
+# `drifted`: a metadata.json for the version and platform the cluster runs,
+# naming other bytes than the gym built, as if a node's binary had been
+# swapped after the release.
+RELEASES = ("drifted",)
 
 DURATION_PATTERN = re.compile(r"^([0-9]+)(ms|s|m)$")
 
@@ -155,6 +163,8 @@ class Scenario:
     platform: str = "reliaburger"
     # For a port: what differs from the Reliaburger scenario, in a sentence.
     ported: str | None = None
+    # The release files the runner writes for the solver; see RELEASES.
+    release: str | None = None
 
     def facts_needed(self):
         """The `@` facts this scenario's truth refers to."""
@@ -226,7 +236,7 @@ def load(path):
         _fail(path, f"isn't valid TOML: {error}")
     known = {
         "id", "title", "nodes", "prompt", "setup", "truth", "score", "plant",
-        "injection", "report", "platform", "ported",
+        "injection", "report", "platform", "ported", "release",
     }
     unknown = set(raw) - known
     if unknown:
@@ -325,6 +335,10 @@ def load(path):
                   f"{list(REPORT_RULES)} for a files draft, and none for an answer draft")
         report = ReportCheck(secrets=secrets, counted=counted, source=source)
 
+    release = raw.get("release")
+    if release is not None and (platform != "reliaburger" or release not in RELEASES):
+        _fail(path, f"`release` must be one of {list(RELEASES)}, on a reliaburger scenario")
+
     return Scenario(
         id=raw["id"],
         title=raw["title"],
@@ -340,6 +354,7 @@ def load(path):
         report=report,
         platform=platform,
         ported=ported.strip() if isinstance(ported, str) else None,
+        release=release,
     )
 
 

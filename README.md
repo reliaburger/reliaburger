@@ -107,7 +107,7 @@ before it writes anything.
 - **Policies and templates:** CEL rules that refuse, warn or fill in defaults, and typed templates instead of CRDs.
 - **Your own controllers:** an ordinary app with a scoped token, no operator SDK.
 - **Chaos as a command:** `relish fault` injects latency, partitions, kills and pressure, and cleans up after itself.
-- **Self-upgrade:** `relish upgrade` rolls a signed `bun` across the cluster without restarting workloads.
+- **Self-upgrade:** `relish upgrade` rolls a signed `bun` across the cluster without restarting workloads, and `relish verify` (0.2.8, not in 0.2.7) checks every node runs the published release, byte for byte.
 - **Diagnostics for incidents:** `relish wtf` and `relish path` say what's wrong and where.
 - **Built for agents:** `relish agent` answers in bounded JSON, and `relish mcp` serves it over MCP.
 - **A terminal UI and a web dashboard:** run `relish` with no arguments, or `relish dashboard`.

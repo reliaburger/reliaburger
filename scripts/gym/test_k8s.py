@@ -74,7 +74,7 @@ class Scenarios(unittest.TestCase):
             sorted(K8S),
             ["crash-loop", "log-injection", "partitioned-node", "report-redaction", "unschedulable"],
         )
-        self.assertEqual(set(RELIABURGER) - set(K8S), {"planted-logs-since"})
+        self.assertEqual(set(RELIABURGER) - set(K8S), {"planted-logs-since", "release-drift"})
         self.assertTrue(all(s.platform == "k8s" and s.ported for s in K8S.values()))
         self.assertTrue(all(s.platform == "reliaburger" for s in RELIABURGER.values()))
 

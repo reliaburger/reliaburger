@@ -249,6 +249,7 @@ net, not a promise: read what you share before you post it anywhere.
 | `relish agent diagnose` | Every finding with its evidence, read-only next steps, and pointers into the manual and the source |
 | `relish agent explain` | What a finding means, its thresholds and where it's decided; every finding when no id is given. Reads only this binary |
 | `relish agent upgrade-check` | Whether the cluster can take the latest release: `ready`, `up_to_date`, `needs_fresh_cluster`, `blocked` or `unknown` |
+| `relish agent verify` | Whether the cluster runs the published release, byte for byte: `verified`, `mismatch` or `unknown` |
 | `relish agent report` | Draft a redacted bug report for a human to post. Never posts |
 | `relish agent patch init` | Extract this binary's source into a new workspace, on a `patch` branch |
 | `relish agent patch build` | Build the workspace: `relish` for this machine, `bun` and a Linux `relish` for the nodes (in the build VM on macOS). Both by default |
@@ -551,37 +552,32 @@ relish agent upgrade-check
 
 `data.reasons` says why, blockers first. Each reason has a `code`, a `kind`
 (`blocker`, `format_change` or `missing_evidence`), the `node` it's about when
-there is one, and a one-line `message`. The blockers are a `wtf` critical
-(`wtf_critical`), a council that would lose quorum restarting one member at a
-time (`quorum_risk`) or has no leader (`no_leader`), a node whose platform the
-release has no build for (`missing_artefact`), nodes already on different
-versions (`version_skew`), an upgrade already under way
-(`upgrade_in_progress`) and a dead node that would miss the roll
-(`node_down`). Missing evidence is the cluster or the metadata not answering,
-a node that didn't say its build, platform or formats, a version `relish`
-can't read, or `wtf` failing. It's never read as good news: `ready` needs
-every live node to have answered every question.
+there is one, and a one-line `message`. Blockers include a `wtf` critical
+(`wtf_critical`), a quorum a restart would lose (`quorum_risk`), a platform
+without a build (`missing_artefact`) and `version_skew`; `relish agent schema
+upgrade-check` lists every code. Missing evidence is never read as good news:
+`ready` needs every live node to have answered every question.
 
-`data.nodes` lists every node with its role, state, version, commit, platform
-and formats, and `artefact`, whether the release has a build for it.
-`data.latest` is the release: its version, formats and platforms.
-
-The release metadata is the only thing the command fetches from the network.
-`--url` points at another metadata host, and `--metadata` reads a file
-instead, for an air-gapped cluster or a test:
+`data.nodes` lists every node's build and whether the release has one for it
+(`artefact`); `data.latest` is the release. The metadata is the only thing
+fetched from the network: `--url` names another host, and `--metadata` reads
+a file instead, for an air-gapped cluster:
 
 ```sh
 relish agent upgrade-check --metadata ./metadata.json
 ```
 
-Notes the metadata publishes with the release arrive in `data.release_notes`,
-inside an `untrusted` envelope with origin `release_metadata`: the metadata
-host wrote them, not your cluster.
+Release notes arrive in `data.release_notes`, wrapped as `untrusted` (origin
+`release_metadata`): the metadata host wrote them, not your cluster.
 
-The command answers with exit `0` whatever the verdict, and a cluster it
-couldn't reach is `unknown` with a `cluster_unreachable` reason, not an
-error. `relish upgrade check` is the same question for a person; this one
-adds the `wtf`, quorum and skew checks.
+An unreachable cluster is `unknown`, not an error. `relish upgrade check` asks
+a person the same question, without the `wtf`, quorum and skew checks.
+
+## Is this the release?
+
+`relish agent verify` checks that every node's `bun`, and this `relish`, is
+the published, signed build of one version: `verified`, `mismatch` or
+`unknown`. Offline, pass the release's files ([how](12_operations.md#is-this-the-release)).
 
 ## Proving a fix
 
@@ -822,7 +818,7 @@ name the command to use instead. The `reference` chapter lists what each
 command's JSON holds.
 
 Unlike `relish agent`, these commands keep their own exit codes: `relish wtf`
-exits `1` for a critical finding and `2` for warnings only, not because you
+exits `1` for a critical finding and `3` for warnings only, not because you
 typed it wrong.
 
 ## Plugging it into your agent
@@ -913,6 +909,7 @@ Some commands aren't tools, on purpose:
 | `report` | Writes a report bundle into local files, for a human to post |
 | `patch` | Builds binaries and starts a throwaway cluster |
 | `upgrade-check` | Fetches release metadata from the internet, beyond the cluster API |
+| `verify` | Downloads release files from the internet |
 | `setup` | Writes your agents' configuration |
 
 Run those yourself, or let the agent run them in a shell where you approve

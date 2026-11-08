@@ -58,6 +58,7 @@ set a cluster up for you, which is where <code>reliaburger.com/agents</code> sen
 <li><a href="#searching-the-manual">Searching the manual</a></li>
 <li><a href="#reading-the-source">Reading the source</a></li>
 <li><a href="#before-an-upgrade">Before an upgrade</a></li>
+<li><a href="#is-this-the-release">Is this the release?</a></li>
 <li><a href="#proving-a-fix">Proving a fix</a></li>
 <li><a href="#drafting-a-bug-report">Drafting a bug report</a></li>
 <li><a href="#every-other-command">Every other command</a></li>
@@ -273,6 +274,7 @@ net, not a promise: read what you share before you post it anywhere.</p>
 <tr><td><code>relish agent diagnose</code></td><td>Every finding with its evidence, read-only next steps, and pointers into the manual and the source</td></tr>
 <tr><td><code>relish agent explain</code></td><td>What a finding means, its thresholds and where it's decided; every finding when no id is given. Reads only this binary</td></tr>
 <tr><td><code>relish agent upgrade-check</code></td><td>Whether the cluster can take the latest release: <code>ready</code>, <code>up_to_date</code>, <code>needs_fresh_cluster</code>, <code>blocked</code> or <code>unknown</code></td></tr>
+<tr><td><code>relish agent verify</code></td><td>Whether the cluster runs the published release, byte for byte: <code>verified</code>, <code>mismatch</code> or <code>unknown</code></td></tr>
 <tr><td><code>relish agent report</code></td><td>Draft a redacted bug report for a human to post. Never posts</td></tr>
 <tr><td><code>relish agent patch init</code></td><td>Extract this binary's source into a new workspace, on a <code>patch</code> branch</td></tr>
 <tr><td><code>relish agent patch build</code></td><td>Build the workspace: <code>relish</code> for this machine, <code>bun</code> and a Linux <code>relish</code> for the nodes (in the build VM on macOS). Both by default</td></tr>
@@ -503,31 +505,26 @@ latest release now? It reads the cluster and the release metadata, asks
 </tbody></table>
 <p><code>data.reasons</code> says why, blockers first. Each reason has a <code>code</code>, a <code>kind</code>
 (<code>blocker</code>, <code>format_change</code> or <code>missing_evidence</code>), the <code>node</code> it's about when
-there is one, and a one-line <code>message</code>. The blockers are a <code>wtf</code> critical
-(<code>wtf_critical</code>), a council that would lose quorum restarting one member at a
-time (<code>quorum_risk</code>) or has no leader (<code>no_leader</code>), a node whose platform the
-release has no build for (<code>missing_artefact</code>), nodes already on different
-versions (<code>version_skew</code>), an upgrade already under way
-(<code>upgrade_in_progress</code>) and a dead node that would miss the roll
-(<code>node_down</code>). Missing evidence is the cluster or the metadata not answering,
-a node that didn't say its build, platform or formats, a version <code>relish</code>
-can't read, or <code>wtf</code> failing. It's never read as good news: <code>ready</code> needs
-every live node to have answered every question.</p>
-<p><code>data.nodes</code> lists every node with its role, state, version, commit, platform
-and formats, and <code>artefact</code>, whether the release has a build for it.
-<code>data.latest</code> is the release: its version, formats and platforms.</p>
-<p>The release metadata is the only thing the command fetches from the network.
-<code>--url</code> points at another metadata host, and <code>--metadata</code> reads a file
-instead, for an air-gapped cluster or a test:</p>
+there is one, and a one-line <code>message</code>. Blockers include a <code>wtf</code> critical
+(<code>wtf_critical</code>), a quorum a restart would lose (<code>quorum_risk</code>), a platform
+without a build (<code>missing_artefact</code>) and <code>version_skew</code>; <code>relish agent schema upgrade-check</code> lists every code. Missing evidence is never read as good news:
+<code>ready</code> needs every live node to have answered every question.</p>
+<p><code>data.nodes</code> lists every node's build and whether the release has one for it
+(<code>artefact</code>); <code>data.latest</code> is the release. The metadata is the only thing
+fetched from the network: <code>--url</code> names another host, and <code>--metadata</code> reads
+a file instead, for an air-gapped cluster:</p>
 <pre><code class="language-sh">relish agent upgrade-check --metadata ./metadata.json
 </code></pre>
-<p>Notes the metadata publishes with the release arrive in <code>data.release_notes</code>,
-inside an <code>untrusted</code> envelope with origin <code>release_metadata</code>: the metadata
-host wrote them, not your cluster.</p>
-<p>The command answers with exit <code>0</code> whatever the verdict, and a cluster it
-couldn't reach is <code>unknown</code> with a <code>cluster_unreachable</code> reason, not an
-error. <code>relish upgrade check</code> is the same question for a person; this one
-adds the <code>wtf</code>, quorum and skew checks.</p>
+<p>Release notes arrive in <code>data.release_notes</code>, wrapped as <code>untrusted</code> (origin
+<code>release_metadata</code>): the metadata host wrote them, not your cluster.</p>
+<p>An unreachable cluster is <code>unknown</code>, not an error. <code>relish upgrade check</code> asks
+a person the same question, without the <code>wtf</code>, quorum and skew checks.</p>
+</section>
+<section class="agents-section" id="is-this-the-release">
+<h2>Is this the release? <a class="permalink" href="#is-this-the-release" aria-label="Link to this section">#</a></h2>
+<p><code>relish agent verify</code> checks that every node's <code>bun</code>, and this <code>relish</code>, is
+the published, signed build of one version: <code>verified</code>, <code>mismatch</code> or
+<code>unknown</code>. Offline, pass the release's files (<a href="12_operations.md#is-this-the-release">how</a>).</p>
 </section>
 <section class="agents-section" id="proving-a-fix">
 <h2>Proving a fix <a class="permalink" href="#proving-a-fix" aria-label="Link to this section">#</a></h2>
@@ -715,7 +712,7 @@ agent's shell, <code>relish</code>, <code>relish manual</code> and <code>relish 
 name the command to use instead. The <code>reference</code> chapter lists what each
 command's JSON holds.</p>
 <p>Unlike <code>relish agent</code>, these commands keep their own exit codes: <code>relish wtf</code>
-exits <code>1</code> for a critical finding and <code>2</code> for warnings only, not because you
+exits <code>1</code> for a critical finding and <code>3</code> for warnings only, not because you
 typed it wrong.</p>
 </section>
 <section class="agents-section" id="plugging-it-into-your-agent">
@@ -786,6 +783,7 @@ To see the list without a client:</p>
 <tr><td><code>report</code></td><td>Writes a report bundle into local files, for a human to post</td></tr>
 <tr><td><code>patch</code></td><td>Builds binaries and starts a throwaway cluster</td></tr>
 <tr><td><code>upgrade-check</code></td><td>Fetches release metadata from the internet, beyond the cluster API</td></tr>
+<tr><td><code>verify</code></td><td>Downloads release files from the internet</td></tr>
 <tr><td><code>setup</code></td><td>Writes your agents' configuration</td></tr>
 </tbody></table>
 <p>Run those yourself, or let the agent run them in a shell where you approve

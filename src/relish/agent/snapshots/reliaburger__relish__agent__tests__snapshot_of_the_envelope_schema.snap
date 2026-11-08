@@ -170,6 +170,11 @@ expression: "schema_of::<Envelope<Value>>()"
           "type": "string"
         },
         {
+          "const": "verify",
+          "description": "`relish agent verify`.",
+          "type": "string"
+        },
+        {
           "const": "report",
           "description": "`relish agent report`.",
           "type": "string"

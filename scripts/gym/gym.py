@@ -169,6 +169,8 @@ def run_once(scenario, run_dir, make_cluster, solver, relish, planted=None, time
         token = cluster.create_token(token_name)
         solver_dir = run_dir / "solver"
         solver_dir.mkdir(exist_ok=True)
+        if scenario.release:
+            result["release"] = cluster.write_release(solver_dir / "release", scenario.release)
         call_log = run_dir / "calls.jsonl"
         answer_path = run_dir / "answer.json"
         prompt = solvers.full_prompt(scenario.prompt, scenario.platform)

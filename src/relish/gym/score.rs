@@ -76,6 +76,7 @@ pub const FAULT_KINDS: &[&str] = &[
     "unschedulable",
     "node_partitioned",
     "relish_bug",
+    "binary_drift",
     "injected_fault",
     "none",
     "other",

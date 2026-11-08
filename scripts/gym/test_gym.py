@@ -59,6 +59,9 @@ class FakeCluster:
     def inject(self, fault):
         self.injected.append(fault)
 
+    def write_release(self, directory, kind):
+        return cluster_module.write_release(directory, kind, "v0.2.7", "macos-aarch64")
+
     def facts(self, needed):
         return {fact: self.facts_known[fact] for fact in needed}
 
@@ -118,6 +121,24 @@ class Runs(unittest.TestCase):
         result = self.run_scenario("partitioned-node", fake)
         self.assertEqual(fake.injected[0]["kind"], "council_partition")
         self.assertEqual(result["score"]["verdict"], "correct", json.dumps(result, indent=2))
+
+    def test_the_baseline_finds_the_recorded_drift_with_agent_verify(self):
+        fake = FakeCluster({"leader": "gym-1"}, FIXTURES / "release-drift.json")
+        result = self.run_scenario("release-drift", fake)
+        self.assertEqual(result["score"]["verdict"], "correct", json.dumps(result, indent=2))
+        self.assertEqual(result["score"]["checks"]["used: agent verify"]["status"], "pass")
+        written = json.loads(Path(result["release"]["metadata"]).read_text())
+        published = written["releases"][0]["platforms"]["macos-aarch64"]["sha256"]
+        self.assertEqual(published, result["release"]["published_sha256"])
+
+    def test_the_drifted_release_names_the_running_version_and_other_bytes(self):
+        release = cluster_module.write_release(self.directory / "release", "drifted", "v0.2.7", "linux-x86_64")
+        document = json.loads(Path(release["metadata"]).read_text())
+        self.assertEqual(document["latest"], "v0.2.7")
+        artefact = document["releases"][0]["platforms"]["linux-x86_64"]
+        self.assertEqual(len(artefact["sha256"]), 64)
+        with self.assertRaises(cluster_module.ClusterError):
+            cluster_module.write_release(self.directory / "other", "tampered", "v0.2.7", "linux-x86_64")
 
     def test_the_recorded_injection_reaches_only_commands_outside_the_contract(self):
         fake = FakeCluster({"instance:web": "gym-1"}, FIXTURES / "log-injection.json")

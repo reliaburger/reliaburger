@@ -38,6 +38,7 @@ Reading the cluster:
 | `upgrade check` | `running`, `latest`, each node's `platform`, a `verdict` (`up_to_date`, `available`, `needs_fresh_cluster`, `no_artefact_for_node`, `no_artefacts`), the `reason` behind a verdict that blocks, and the `command` to run when one is available |
 | `upgrade plan` | the `stages` in order, with `estimated_secs` |
 | `upgrade status` | `scope` (`cluster` or `node`) and the run record as the node keeps it, under `state` |
+| `verify` | the `verdict` (`verified`, `mismatch`, `unknown`), the `reasons`, each node's and `relish`'s `sha256`, `published_sha256`, `hash` and `signature` checks, the `metadata` sources and the `trusted_keys` |
 | `secret pubkey` | `public_key`, and the `namespace` it belongs to |
 | `exec` | `exit_code` and the command's `output`; relish still exits with that code |
 
@@ -370,8 +371,9 @@ Most commands exit `0` on success and `1` on error. A usage error (an
 unknown flag, a missing argument, or `--output json` on an interactive
 command) exits `2`.
 
-`wtf`, `path`, `test` and `bench` exit `1` when they find a failure, and `wtf`
-and `path` exit `3` for warnings, degraded paths or incomplete evidence. Before
+`wtf`, `path`, `test`, `bench` and `verify` exit `1` when they find a failure,
+and `wtf`, `path` and `verify` exit `3` for warnings, degraded paths or
+incomplete evidence. Before
 0.2.2 that was `2`, which a script couldn't tell from a usage error.
 
 `relish agent` commands use their own codes, which say only whether the
