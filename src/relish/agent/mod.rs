@@ -147,17 +147,27 @@ impl AgentCommand {
             | AgentCommand::Version
             | AgentCommand::Schema { .. }
             | AgentCommand::Manual { .. }
-            | AgentCommand::Explain { .. }
             | AgentCommand::Report(_) => ClusterUse::None,
+            // A finding id or `--rules` reads only this binary; a decision
+            // question reads the cluster's records.
+            AgentCommand::Explain(args)
+                if args.restart.is_none() && args.placement.is_none() && args.refusal.is_none() =>
+            {
+                ClusterUse::None
+            }
             AgentCommand::Source(options) if options.offline => ClusterUse::None,
             // Which commit the nodes run, beside the bundle's own.
             AgentCommand::Source(_) => ClusterUse::Optional,
             AgentCommand::Logs(_)
             | AgentCommand::Context(_)
             | AgentCommand::Diagnose(_)
+            | AgentCommand::Explain(_)
+            | AgentCommand::Timeline(_)
             | AgentCommand::UpgradeCheck(_)
+            | AgentCommand::Verify(_)
             | AgentCommand::Patch(_)
-            | AgentCommand::Setup(_) => ClusterUse::Required,
+            | AgentCommand::Setup(_)
+            | AgentCommand::Lease(_) => ClusterUse::Required,
         }
     }
 
