@@ -3179,15 +3179,75 @@ SHA-256 is the qualified digest), and adds one `mcpb` package per platform
 with the digest the record holds, using `scripts/release/mcp_registry.py`.
 It never hashes a bundle itself, so it can't disagree with what was
 qualified. The job only writes the entry: publishing needs the maintainer's
-GitHub login to the organisation, so it keeps the file as an artefact for
-them to run `mcp-publisher publish` with.
+GitHub login to the organisation, so it keeps the file as an artefact.
 
-The bundles aren't signed with the format's own scheme. `mcpb sign` appends
-a PKCS#7 signature from an X.509 certificate, which would be a third
-signing identity beside the release key and Apple's Developer ID, and
-choosing one is the maintainer's call. What a bundle has today is the
-`fileSha256` clients check before installing, the build attestation every
-asset gets, and a signed, notarised binary inside.
+Publishing it is one command, `make mcp-registry-publish TAG=v0.2.8`, and
+it trusts the artefact no more than the job trusted its inputs. A
+dispatched workflow run doesn't list its inputs, so `promote.yml` now has a
+`run-name` of `Promote <tag>`, and `mcp_registry_publish.py` finds the run
+by that name. It downloads the entry and compares each package's
+`fileSha256` with the digest GitHub stores for the published asset, a
+second, independent source for the same bytes. Only when they agree does it
+run `mcp-publisher`, logging in first if the registry token it keeps is
+missing or expired. The token is a JWT, three base64url parts separated by
+dots, and the middle one is JSON with an `exp` time, so checking it needs no
+network. The tests put fake `gh` and `mcp-publisher` scripts first on
+`PATH`, the trick `test_homebrew.py` uses, so they never reach GitHub or the
+registry.
+
+A bundle installed from a desktop client has no shell to pass `--endpoint`
+from, so the manifest's `user_config` declares two settings the client
+asks for: an endpoint and a token, both `"required": false` with an empty
+`default`, and the token `"sensitive": true` so the client masks it and
+stores it as a secret. `mcp_config.env`
+hands them to `relish` as `"RELIABURGER_ENDPOINT": "${user_config.endpoint}"`
+and `RELIABURGER_TOKEN` the same way. The token's title says "Read-only",
+its description gives the `relish token create --role read-only` line and
+links to the manual's section on it, and a test fails if the word "admin"
+appears anywhere in either setting: an MCP server that reads workload text
+should never hold a token that can change the cluster.
+
+The catch is in "optional". A client fills in defaults before it substitutes
+the placeholders, so a setting nobody touched doesn't leave the variable
+unset: it sets it to `""`. Before 0.2.8 `relish` took any value it found,
+so an empty endpoint failed as an invalid URL, and worse, an empty token
+replaced the saved context's own token with an empty bearer. Both now go
+through one helper:
+
+```rust
+fn unless_blank(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.trim().is_empty())
+}
+```
+
+[`Option::filter`](https://doc.rust-lang.org/std/option/enum.Option.html#method.filter)
+keeps a `Some` only when the closure says `true`, and turns everything else
+into `None`, so an empty or all-whitespace variable is exactly an unset one.
+The `--token` and `--endpoint` flags don't go through it: a flag is
+something a person typed. A unit test feeds `pick_token` and `pick_endpoint`
+blank values, and two tests in `tests/suite/relish_cli.rs` run the real
+binary: one with a blank endpoint, which must not be refused, and one with a
+blank token against a stub server, which must receive no `Authorization`
+header at all.
+
+Each bundle is signed with the release key like every other release file:
+`package.py` writes `relish-<platform>.mcpb.sig`, the same `{schema, sha256,
+embedded, external}` envelope a binary gets, and `candidate.py` counts it
+among the assets a candidate must have, so staging and promotion refuse a
+release without one.
+
+That signature changes nothing a client shows. An MCP client still calls the
+bundle unsigned, because the format has its own scheme: `mcpb sign` appends a
+PKCS#7 signature made with an X.509 code-signing certificate, and `mcpb
+verify` and clients such as Claude Desktop accept it only when the operating
+system's trust store vouches for that certificate. Our release key is a bare
+Ed25519 key with no certificate, and a self-signed certificate wrapped round
+it would fail the same check. So the `.sig` is for people and scripts that
+already trust the release key, and the client relies on the `fileSha256` it
+checks before installing. Signing that clients recognise, with the Apple
+Developer ID certificate that will notarise the macOS `relish`, waits until
+that notarisation is set up; a third signing identity bought only for bundles
+wasn't worth it.
 
 ## Tools for any agent: `relish mcp`
 
@@ -4617,9 +4677,10 @@ ones, command by command, each with the reason it lost.
   not images from a badge service: the site makes no third-party requests.
 - **Content negotiation on `Accept: text/markdown`.** GitHub Pages can't
   vary on headers.
-- **Publishing to the MCP Registry.** It needs the maintainer's GitHub
-  login, so it waits for them. 0.2.8 built the bundles and the entry it
-  publishes (#1695).
+- **Publishing to the MCP Registry from CI.** It needs the maintainer's
+  GitHub login to the organisation, so CI writes the entry and
+  `make mcp-registry-publish` checks and publishes it from their machine
+  (#1695).
 - **The manual as MCP resources.** `manual search` and `manual show` are
   tools already.
 - **An HTTP transport for MCP.** Remote MCP is #1092, with authentication of

@@ -1,4 +1,6 @@
 name: Promote qualified release
+# Named for the tag, so `make mcp-registry-publish` can find a release's run.
+run-name: Promote ${{ inputs.tag }}
 
 on:
   workflow_dispatch:
@@ -138,8 +140,8 @@ jobs:
     # plus one `mcpb` package per relish platform, each with the SHA-256 the
     # published candidate.json records for its bundle. Publishing it needs
     # the maintainer's GitHub login to the organisation, so this job only
-    # writes it, to the run summary and as an artefact; the maintainer runs
-    # `mcp-publisher publish` with it (docs/releasing.md).
+    # writes it, to the run summary and as an artefact; the maintainer
+    # publishes it with `make mcp-registry-publish TAG=<tag>` (docs/releasing.md).
     needs: promote
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04

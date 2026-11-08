@@ -802,17 +802,16 @@ so it must never also be able to change anything or send anything out.</p>
 <p><code>--namespace</code> narrows what the agent asks for. It isn't a permission: a
 token scoped to the namespace is.</p>
 <p>The repository's <a href="https://github.com/reliaburger/reliaburger/blob/main/server.json"><code>server.json</code></a>
-describes <code>relish mcp</code> for the <a href="https://registry.modelcontextprotocol.io">MCP Registry</a>,
-as <code>io.github.reliaburger/relish</code>: stdio, read-only and the tools above.
-From 0.2.8, every release also carries an
-<a href="https://github.com/modelcontextprotocol/mcpb">MCP Bundle</a> for each platform
-<code>relish</code> runs on, <code>relish-linux-x86_64.mcpb</code>, <code>relish-linux-aarch64.mcpb</code> and
-<code>relish-macos-aarch64.mcpb</code>, and the published registry entry lists them with
-their SHA-256s. A client that installs MCP Bundles, such as Claude Desktop,
-can install one and run the <code>relish</code> inside it, with no <code>install.sh</code>. That
-<code>relish</code> has no flags, so it uses the default local address or the saved
-local context. To connect it to anything else, or to use the <code>relish</code> you
-installed yourself, point your client at <code>relish mcp</code> as above.</p>
+describes <code>relish mcp</code> for the <a href="https://registry.modelcontextprotocol.io">MCP Registry</a>
+as <code>io.github.reliaburger/relish</code>. From 0.2.8 each release carries an
+<a href="https://github.com/modelcontextprotocol/mcpb">MCP Bundle</a> per platform,
+<code>relish-&lt;platform&gt;.mcpb</code>, and the registry entry lists them with their
+SHA-256s. A client that installs bundles, such as Claude Desktop, runs the
+<code>relish</code> inside, with no <code>install.sh</code>. It asks for nothing and uses the
+saved local context. Two optional settings point it elsewhere: a cluster API
+endpoint and a <a href="#a-read-only-token">read-only token</a>, passed as
+<code>RELIABURGER_ENDPOINT</code> and <code>RELIABURGER_TOKEN</code>. Left empty, they count as
+unset. For other flags, or your own <code>relish</code>, use <code>relish mcp</code> as above.</p>
 </section>
 <section class="agents-section" id="wiring-up-your-agent">
 <h2>Wiring up your agent <a class="permalink" href="#wiring-up-your-agent" aria-label="Link to this section">#</a></h2>

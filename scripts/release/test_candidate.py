@@ -61,6 +61,25 @@ class CandidateTests(unittest.TestCase):
         self.assertNotIn("relish-macos-x86_64", names)
         self.assertNotIn("relish-macos-x86_64.sig", names)
 
+    def test_each_bundle_and_its_signature_are_candidate_assets(self):
+        # Like every binary, each MCP Bundle ships with its release-key `.sig`
+        # (#1695), so staging and promotion refuse a release without one.
+        names = candidate_names(self.pins)
+        for platform in PLATFORMS["relish"]:
+            self.assertIn(f"relish-{platform}.mcpb", names)
+            self.assertIn(f"relish-{platform}.mcpb.sig", names)
+
+    def test_an_upload_without_a_bundle_signature_is_refused(self):
+        digest = self.record()
+        document = json.loads((self.directory / "candidate.json").read_text())
+        assets = [{"name": path.name, "size": path.stat().st_size,
+                   "digest": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest(),
+                   "state": "uploaded"} for path in self.directory.iterdir()
+                  if path.name != "relish-linux-x86_64.mcpb.sig"]
+        release = dict(tag_name="v0.1.0", draft=True, prerelease=False, assets=assets)
+        with self.assertRaisesRegex(ValueError, "inventory"):
+            verify_uploaded_assets(release, document, digest, (self.directory / "candidate.json").stat().st_size)
+
     def test_staging_notes_install_the_candidate_as_a_laptop_cluster(self):
         # Without a mode the installer only explains the choices (#670).
         notes = staging_notes(self.identity, "v0.1.0-staging-123-2", "b" * 64)
