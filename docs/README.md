@@ -32,6 +32,205 @@ The [platform comparisons](website/compare/index.html) and
 [competitive research writeup](research/2026-10-15-competitor-review.md) compare installation, operations
 and trade-offs against other projects, with dated evidence and explicit release boundaries.
 
+## What's in the binary
+
+This is what 0.2.7, the release the installer fetches, does. Each node runs
+one agent, `bun`; you drive the cluster with one CLI, `relish`. Scheduling,
+clustering, service discovery, ingress, PKI, secrets, an image registry,
+metrics, logs, GitOps, jobs and fault injection are compiled into that agent,
+so there's no control plane to assemble and no add-ons to install. A Linux node
+needs a few distribution packages (`runc`, `nftables`, `iproute2` and friends,
+listed in the [Linux servers guide](linux-servers.md)), and releases are glibc
+builds; static builds are planned for 0.3.0
+([#401](https://github.com/reliaburger/reliaburger/issues/401)). Every
+command is listed in the manual's
+[reference](manual/13_reference.md#every-relish-command).
+
+**Runs Kubernetes YAML.** `relish apply -f` converts Deployments, StatefulSets,
+DaemonSets, Services, Ingresses, Jobs, CronJobs, HPAs and Namespaces on the
+way in and tells you everything it had to approximate or drop
+([what converts](manual/09_kubernetes.md)). Services attach
+to workloads by label selector, as they do in Kubernetes. A ConfigMap that a
+workload reads with `envFrom` is copied into its `env`; any other ConfigMap,
+and every Secret, only gets a warning, so those values move into `env` or
+`config_file` by hand.
+`relish import` writes the equivalent TOML if you'd rather keep that, and
+`--strict` fails a CI run on anything it couldn't convert exactly.
+
+**Clustering without etcd.** Nodes find each other and detect failure with SWIM
+gossip. A small Raft council, embedded in the agent, holds cluster state. It
+always has an odd number of voters, so two nodes run one voter and high
+availability starts at three. Lose a node and the scheduler moves its
+workloads to the survivors. Lose the whole
+council and `relish council recover` rebuilds it from a backup, fencing off the
+old voters if they return; `relish council status` shows every node's view.
+
+**Service discovery in the kernel.** Every app gets a stable virtual IP and,
+with DNS enabled, a `.internal` name. An eBPF connect hook sends each
+connection straight to a healthy backend, and per-app firewall rules decide
+who may connect at all.
+
+**Ingress with TLS.** Host-based HTTP and HTTPS routing, with certificates signed
+by the cluster's own ingress CA or files you provide. WebSockets and streaming
+pass through, and connections drain before an instance stops. Each app can
+pick its stop signal, its grace and a pre-stop command, and run sidecars
+that share its network and start before it and stop after it.
+
+**Security on by default.** A generated cluster requires mTLS between nodes.
+Nodes join with single-use tokens and certificate signing requests.
+Certificates renew themselves. Secrets live in your config encrypted to the
+cluster's public key. Workloads get SPIFFE certificates, API tokens carry
+roles and namespace scopes, and the registry can refuse unsigned images.
+Every apply binds image tags to digests, so a moved tag can't change what runs,
+and node config can limit which upstream registries images may come from.
+An app that needs an extra capability, a namespaced sysctl or a host device
+gets it only where the node allows it and the token carries `host-exec`.
+
+**Tenants kept apart.** Namespaces can't reach each other, at a virtual IP or
+at a real address, unless an app or job's `allow_from` lets a named caller
+in, and egress allowlists hold apps and jobs to the hosts they list.
+
+**An audit log.** Each node keeps a durable, bounded log of who applied,
+deleted, exec'd, upgraded or broke what, and from where. `relish audit` reads
+it.
+
+**A registry on every node.** Pickle is an OCI registry built into the cluster.
+Push once and nodes pull layers from each other. It also caches upstream
+registries, and `relish build` builds images from your config straight into it.
+
+**Metrics, logs and alerts, nothing to install.** Each node scrapes its own
+workloads, including anything with `prometheus.io` annotations. Alert rules
+evaluate in the agent and call webhooks, optionally HMAC-signed. Logs are
+captured on each node, streamed cluster-wide with `relish logs -f`, and
+exported as Parquet to disk or object storage, where SQL can query them.
+
+**Chaos as a first-class command.** `relish fault` injects latency, dropped
+connections, DNS failures, partitions, CPU, memory and disk-I/O pressure,
+killed or frozen instances, and drained or failed nodes. Every fault has a
+duration and cleans up after itself. Injection needs `--acknowledge`, a
+Deployer credential and an operator opt-in on each node, and it's refused when
+it would take out every replica or put the council's quorum at risk.
+`relish test --chaos` runs scripted recovery scenarios.
+
+**Deploys and GitOps.** Health-gated rolling deploys with automatic rollback,
+blue-green switches and autoscaling on metrics. Point the cluster at a Git
+repository and the leader keeps it in sync, verifying commit signatures if you
+ask it to. `scripts/demo/rollout.sh` and `scripts/demo/gitops.sh` show both on
+a one-node cluster from a checkout, with
+[`examples/phase-1/proc-rollout.toml`](../examples/phase-1/proc-rollout.toml) and
+[`examples/gitops/repository`](../examples/gitops/repository), and measure Bun's
+memory and CPU as they go.
+
+**Policies.** `[policy.*]` rules in CEL, such as "apps in `prod` need a memory
+limit", are kept in the council and checked on the leader before an app is
+written, for `relish apply` and GitOps alike. A rule refuses the apply or only
+warns, every denial names its policy, and `relish policy test` runs the same
+check offline in CI. A policy can also fill in fields an app leaves out, such
+as a team label, without ever overwriting one you wrote, and GitOps doesn't
+mistake a filled-in field for a change. Policies can judge jobs too, an
+`audit` policy only records what it finds, and `relish policy audit` and
+`relish wtf` list the running apps and jobs a new policy would refuse. See [security and access](manual/10_security.md#policies).
+
+**Your own controllers, without an operator SDK.** A controller is an ordinary
+app holding a token scoped to its namespace. It reads the API and the event
+stream, and claims the apps it manages with an `owner`, after which
+`relish apply` and GitOps leave them alone. The JSON it reads and writes is
+documented and pinned by tests. See
+[writing a controller](manual/15_writing-a-controller.md) and the example
+in [`examples/controller`](../examples/controller).
+
+**Templates, not CRDs.** A `[template.*]` has typed parameters and a body of
+ordinary apps and jobs; each `[use.*]` stamps it out with its own values.
+Expansion is substitution only, done when the config is read, so `relish
+apply --dry-run` and GitOps show the expanded apps, policies judge them, and
+the cluster stores plain apps with a note of the template that made them.
+See [deploy an app](manual/01_deploy-an-app.md#templates) and
+[`examples/templates/container-postgres.toml`](../examples/templates/container-postgres.toml).
+
+**A million jobs.** Every kind of job runs on one lifecycle: a one-off job, a
+cron schedule, a hook that runs before a deploy, and a task array that runs the
+same command thousands or millions of times (`relish run --batch`, or a
+manifest with `relish batch submit`). An array is stored as a template and a
+count, not a record per task. Jobs share CPU and memory admission with your
+apps, namespace quotas and per-namespace caps keep one team from starving the
+rest, and an outcome the cluster accepted survives a leader change. A job picks
+how it runs: a fresh container for every attempt (the default), a reused
+container with each command in its own process under its own limits, or an
+allowlisted host command. `relish jobs` shows runs and their rates, and each
+definition's recent outcomes; each run raises one event, and a failed run pages
+through the alert webhooks. The [job manual](manual/14_batch-jobs.md)
+explains it all. The [throughput demo](https://reliaburger.com/#job-throughput)
+and its [qualification record](qualification/2026-10-09-timed-job-scenarios/README.md)
+show what each kind of isolation costs per job; `relish bench --scenario
+jobs-shared-containers` and its siblings rerun them on your own cluster, and
+`--compare OLD.json` fails on a drop against an earlier report. Before
+release, 0.2.0 ran 12 hours on a three-VM laptop cluster with apps, faults
+and upgrades at 4,600 accepted jobs a second, against 1,158 for 100 million a
+day ([record](qualification/2026-10-17-v0.2.0-job-qualification.md), [#668](https://github.com/reliaburger/reliaburger/issues/668)).
+0.2.3 ran host jobs for one real 24-hour day on three 4-vCPU VMs and counted
+1,807,742,226, 20,920 a second, with no failed tasks: 1.81 billion against
+the 2 billion it aimed for
+([record](qualification/2026-10-28-v0.2.3-day-run.md)).
+
+**Self-upgrade.** `relish upgrade start` rolls a new `bun` across the cluster:
+workers first, then council members one at a time, leader last. The new binary
+adopts running workloads without restarting them, and a crash-looping upgrade
+reverts itself. Network upgrades need two Ed25519 signatures: the release's
+and your own, which `--external-key` adds as relish downloads the build for
+each node's platform. Until 1.0 it works only between builds with the same
+cluster formats. 0.2.3 kept 0.2.2's, and a 0.2.2 cluster rolled onto it in
+place ([record](qualification/2026-10-29-rolling-walk-0.2.2-to-0.2.3.md));
+0.2.4, 0.2.5 and 0.2.6 each change them again, and 0.2.7 keeps 0.2.6's, so a
+0.2.6 cluster can roll onto 0.2.7 in place. A release with other cluster formats, or a
+rollback to a version some node doesn't hold, is refused before anything is
+recorded.
+
+**Diagnostics built for incidents.** `relish wtf` correlates cluster health into
+one screen of problems and next steps. `relish path` walks the network path
+between two apps and labels each step observed, inferred or unavailable.
+`relish test` runs a live-cluster test catalogue, and `relish bench` measures
+the data plane.
+
+**Tested like it has to survive a bad day.** Unit, property and snapshot tests
+cover the logic. On top of them sit crash-recovery suites that kill the agent at every
+awkward moment, multi-node failover and council-loss tests, power-cut fixtures
+that pull the plug on a VM mid-write, a live-cluster test runner you can point
+at your own cluster (`relish test`), and a soak that installs the signed
+release the way you would and then breaks it for hours. An agent gym breaks
+throwaway clusters in ways it knows and scores whatever diagnoses them, an AI
+agent included, against the ground truth (`make test-gym`, from 0.2.7; Claude Code plugs in with `scripts/gym/claude_code.py`). CI
+never retries a failure. See [how Reliaburger is tested](testing.md).
+
+**A terminal UI and a web dashboard.** Run `relish` with no arguments for the
+TUI; `relish dashboard` opens the web UI through your authenticated CLI session.
+
+**The manual ships in the binary.** `relish manual` is a searchable reader with
+runnable examples, and `relish source` fuzzy-searches the exact source the
+binary was built from: everything it takes to build it again, its tests and
+its design docs, which CI proves by building from the copy inside the binary.
+Neither needs a network.
+
+### What you don't install
+
+| On Kubernetes you'd add | In Reliaburger |
+|---|---|
+| etcd | Raft council inside `bun` |
+| kube-proxy, CoreDNS | eBPF service map and `.internal` DNS |
+| An ingress controller | Wrapper ingress |
+| Sealed Secrets | Secrets encrypted to the cluster key |
+| Harbor or another in-cluster registry | Pickle |
+| Prometheus, Alertmanager | Built-in scraping, alert rules and webhooks |
+| A log shipper and store | Built-in capture, streaming and Parquet export |
+| Argo CD or Flux | Built-in GitOps |
+| Kyverno or Gatekeeper (validation, defaults, audit) | `[policy.*]` deny, warn and audit rules for apps and jobs, fill-only defaults, `relish policy audit` |
+| Helm charts or a CRD and its operator (the expansion half) | `[template.*]` and `[use.*]` |
+| Argo Workflows, Kueue or a Celery-style queue | Built-in jobs, cron, hooks and task arrays |
+| Chaos Mesh or Litmus | `relish fault` |
+| Grafana (for the basics) | TUI and web dashboard |
+
+Config is TOML. The [whitepaper](whitepaper.md) explains the architecture
+and its trade-offs; the [design docs](design/) cover each subsystem.
+
 ## Scope and limits
 
 - **Container clusters run on rootful Linux Runc with eBPF.** Set
@@ -65,6 +264,17 @@ and trade-offs against other projects, with dated evidence and explicit release 
   ownership of the image store's upload directory.
 - **Test volumes have no snapshots.** Disposable test-volume snapshots aren't
   supported.
+- **Ingress certificates don't come from ACME.** Use the cluster CA or supply
+  your own files.
+- **No PromQL.** Metrics are read through `relish metrics`, the dashboards and
+  the API.
+- **`fault bandwidth` is refused** until it's implemented
+  ([#366](https://github.com/reliaburger/reliaburger/issues/366)), and `fault
+  delay` needs runc containers.
+- **Kubernetes import covers the kinds listed [above](#whats-in-the-binary).**
+  Anything else is reported, not applied.
+- **Cron doesn't catch up.** It skips firings missed during a crash, and a job
+  whose outcome is unknown waits for `relish apply <file> --rerun-jobs`.
 
 ## Operating notes
 
@@ -797,7 +1007,7 @@ cargo run --bin relish -- status    # or any other command
 ```
 
 Every command, grouped by task with a link to the manual chapter that explains
-it, is under *Everything relish can do* in the [top-level README](../README.md).
+it, is in the manual's [reference](manual/13_reference.md#every-relish-command).
 That list is generated from relish's own command definitions, so it matches
 the binary. `relish help COMMAND` (or `--help` on any command) shows every
 flag.

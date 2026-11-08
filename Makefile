@@ -1,4 +1,4 @@
-.PHONY: build test warm-executables test-cargo test-doc test-slow test-images test-linux test-rootless-runc test-cluster test-hollow test-upgrade test-upgrade-node test-upgrade-cluster test-apple test-standard-clients test-gym test-gpu test-s3 test-ci-scripts check-ignored coverage check fmt lint lint-macos audit outdated clean pdf loc help bench bench-large ci ci-bench rollout-demo gitops-demo observability-demo kubernetes-demo toml-demo readme-commands features-page agent-docs bench-task-arrays fuzz-tools fuzz-build fuzz-smoke fuzz-corpus-check fuzz-corpus-seed
+.PHONY: build test warm-executables test-cargo test-doc test-slow test-images test-linux test-rootless-runc test-cluster test-hollow test-upgrade test-upgrade-node test-upgrade-cluster test-apple test-standard-clients test-gym test-gpu test-s3 test-ci-scripts check-ignored coverage check fmt lint lint-macos audit outdated clean pdf loc help bench bench-large ci ci-bench rollout-demo gitops-demo observability-demo kubernetes-demo toml-demo reference-commands agent-docs bench-task-arrays fuzz-tools fuzz-build fuzz-smoke fuzz-corpus-check fuzz-corpus-seed features-page
 
 CARGO = cargo
 NEXTEST_PROFILE ?= default
@@ -180,8 +180,8 @@ ci: fmt-check lint test test-doc test-ci-scripts check-ignored ## Run the portab
 
 ci-bench: ci bench ## Run the portable CI checks, then the 5-250 node gossip benchmarks (no privileged, cluster or upgrade suites)
 
-readme-commands: ## Regenerate the relish command list in README.md from the CLI definition
-	RELIABURGER_UPDATE_README=1 $(CARGO) test --bin relish readme_command_list_matches_the_cli
+reference-commands: ## Regenerate the relish command list in docs/manual/13_reference.md from the CLI definition
+	RELIABURGER_UPDATE_REFERENCE=1 $(CARGO) test --bin relish reference_command_list_matches_the_cli
 
 features-page: ## Regenerate the website's feature status page (docs/website/features.html) from docs/features.toml
 	python3 scripts/ci/features_page.py write
