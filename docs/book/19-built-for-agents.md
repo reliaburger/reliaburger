@@ -3465,6 +3465,74 @@ because the client reads every byte there as protocol. rmcp logs through the
 subscriber, and we never do; our own diagnostics already go to stderr. The
 integration test fails if any stdout line isn't JSON-RPC.
 
+### Saying so when the token is admin
+
+The bundle from #1695 asks for nothing, so out of the box it runs with the
+saved local context, and `relish setup` saves the cluster's admin token
+there. The maintainer's decision, option (d) on #1695, is to warn now and
+mint a read-only token for the agent next (#1730). The warning is the
+first half. When `relish mcp` starts with an admin token, it prints one line
+on stderr, the only place it may, saying the agent's connection carries admin
+credentials, giving the `relish token create --role read-only` command, and
+naming where the new token goes: the bundle's token setting, or
+`RELIABURGER_TOKEN` in the agent's MCP entry. The bundle's
+`long_description` carries the same advice in one line.
+
+How does `relish` know a token's role? There's no "who am I" route, and we
+didn't add one for this. Two cases are known without asking. With no
+`--token` and no `RELIABURGER_TOKEN`, the token is the context's, and that's
+admin by construction. With an `--endpoint` and no token there's no token at
+all. `client::token_origin()` sorts these out from the flags, the environment
+and the context file, and never touches the network:
+
+```rust
+pub enum TokenOrigin {
+    Explicit,
+    ContextAdmin,
+    Absent,
+}
+```
+
+Only an `Explicit` token needs the cluster's word, and there's a route that
+gives it for free: `GET /v1/token/list` is admin-only and changes nothing.
+2xx means admin, 403 a valid token with a lesser role, 401 one the cluster
+rejects. `BunClient::token_access` turns those into a `TokenAccess`, and the
+decision itself is a small function that takes the probe as a future:
+
+```rust
+pub async fn admin_warning(
+    origin: TokenOrigin,
+    probe: impl std::future::Future<Output = Option<TokenAccess>>,
+) -> Option<&'static str> {
+    let admin = match origin {
+        TokenOrigin::ContextAdmin => true,
+        TokenOrigin::Explicit => probe.await == Some(TokenAccess::Admin),
+        TokenOrigin::Absent => false,
+    };
+    admin.then_some(ADMIN_TOKEN_WARNING)
+}
+```
+
+`impl Future<Output = …>` in argument position means "any type that is a
+future producing this", chosen by the caller, much like a generic. Rust
+futures are lazy: building one runs nothing, and only `.await` drives it. So
+for the context and for no token the probe is built and dropped without a
+byte sent, and a unit test proves it by passing `std::future::pending()`, a
+future that never finishes, under a timeout. `bool::then_some` turns `true`
+into `Some(value)` and `false` into `None`.
+
+The probe mustn't slow the server down: an MCP client that waits too long for
+`initialize` gives up. So `run` hands it to `tokio::spawn` before serving, with
+a two-second `tokio::time::timeout` round the request, and awaits the
+`JoinHandle` only after the client hangs up, so even a short session gets its
+warning. Inside, `.ok()?` turns the timeout's `Result` into an `Option` and
+returns `None` early, the async block's answer for "don't know", and unknown
+stays quiet. Three tests in `tests/suite/relish_mcp.rs` run the real binary:
+an admin token against a stand-in API prints the warning exactly once on
+stderr, a read-only token prints nothing, and a context whose endpoint has
+nothing behind it still warns. All three check that every stdout line parses
+as JSON-RPC.
+
 ### The tests
 
 `src/relish/mcp/tests.rs` drives the server over `tokio::io::duplex`, an

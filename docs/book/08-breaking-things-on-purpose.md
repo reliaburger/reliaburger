@@ -1546,6 +1546,89 @@ task runner's own kills: it decides "timed out" or "cancelled" before it kills
 anything and never reads an exit code afterwards. A kill from somewhere else
 while a task ran on a Mac, though, could have been read as a success.
 
+### A pause is not an exit
+
+The gym's first run against `relish gym run` (Chapter 19) found the next one.
+On a one-node process-runtime cluster on a Mac, it paused one instance with
+`relish fault pause`, cleared the pause, then deleted the app. From the pause
+on, `relish status` showed that instance as `pid: null, runtime_unknown: true`,
+and clearing the pause didn't bring the pid back. The delete then left it
+`stopping` for good, with its owner and its `sleep` still running. Stop Bun,
+and the `sleep` carried on under PID 1.
+
+Three things went wrong, one after the other. The owner asks the kernel about
+its workload every 10 ms with `waitid(P_PID, pid, …, WEXITED | WNOHANG |
+WNOWAIT)`. `WEXITED` asks for exits and nothing else, and on Linux that's what
+you get. XNU also reports a *stopped* child, with `si_code = CLD_STOPPED`. A
+ten-line C program shows it: before the SIGSTOP `si_pid` is 0, after it
+`si_pid` is the child, and after SIGCONT it's 0 again. The owner took any
+event for an exit, and since the code wasn't `CLD_EXITED`, for a death by
+signal.
+
+That's how the evidence went. Believing the root had exited, the owner went
+on to retire it. On macOS retirement lists the process group and, finding
+only the root, calls `Child::wait()`, which blocks until the child really
+exits. A paused `sleep 86400` doesn't. The owner runs on one thread, so while
+it waited it stopped answering its control socket. Every status read Bun made
+timed out after two seconds, which is exactly what `runtime_unknown` means.
+
+It never came back because the owner records an exit once and never looks
+again, and it was still blocked in `wait()`. SIGCONT woke the `sleep`, not the
+owner. And the stop gave up because every stop and kill of a process workload
+goes through its owner: only the owner may signal the workload, since only
+the owner holds it unreaped and so knows its PID still means that process
+(see "Surviving the agent" above). A stop request to an owner that never
+answers times out, the force-kill request times out the same way, and the
+instance stays `stopping`. Bun's shutdown asks the same owner, with the same
+result.
+
+The fix is to say what counts as an exit:
+
+```rust
+let code = match info.si_code {
+    nix::libc::CLD_EXITED => Some(unsafe { info.si_status() }),
+    nix::libc::CLD_KILLED | nix::libc::CLD_DUMPED => None,
+    // A stop or a continue is not an exit, whatever XNU reports.
+    _ => return Ok(None),
+};
+```
+
+`match` on an integer works like C's `switch`, except there's no fall-through
+and the `_` arm, the default, is required: the compiler won't accept a
+`match` that leaves a value unhandled. The `unsafe` block is there because
+`si_status` reads a field of a C union, which Rust can't check for us; the
+`// SAFETY:` comment above it in the source says why it's sound.
+
+Then the owner must never block on its child. Retirement on macOS now calls
+`try_wait()`, the non-blocking form, and comes back on the next tick if the
+root hasn't been reaped yet, so a mistake like the first one costs a few
+ticks, not the owner.
+
+A pause that's still in force when you delete the app was the last case. A
+signal with no handler kills a stopped process anyway, but a workload that
+traps SIGTERM to shut down cleanly can't run its handler while it's stopped.
+It would sit out its whole grace and die by SIGKILL. So a stop now sends the
+app's stop signal, then SIGCONT to the root and its group: a paused workload
+takes its signal at once, and one that isn't paused ignores the SIGCONT. The
+in-memory process runtime that tests use does the same, so both paths agree.
+
+Runc and Apple Container don't share the bug. Smoker's pause is SIGSTOP on
+every runtime, but runc's container process isn't watched through `waitid` on
+macOS (runc only runs on Linux, where `WEXITED` means exits), and runc
+reports a stopped process as running. The Apple runtime never names a pid, so
+Smoker can't pause an Apple container at all.
+
+The lesson is an old one with a new face. A status the kernel hands back is
+only what you asked for if you check that it is. And a supervisor that's the
+only thing allowed to stop a workload must never block, because when it does,
+nothing else can stop the workload either. The regression tests are
+`a_stopped_child_has_not_exited` and
+`stopping_a_paused_child_continues_it_to_take_the_signal` in the owner,
+`stop_lets_a_paused_workload_run_its_handler` in the in-memory runtime, and
+`tests/suite/paused_workloads.rs`, which pauses and resumes a real owned
+workload and checks the reads `relish status` makes, then stops it, once after
+the pause is cleared and once while it's still in force.
+
 ### A signal is not proof of exit
 
 The same idea runs through the agent's stop path. A runtime can accept a kill
