@@ -1271,6 +1271,7 @@ has scrolled off the top. The table answers "what runs where?". Nobody types
 Now it prints one screen, the same height on three nodes or three hundred:
 
 ```
+cluster: DEGRADED, 5 problems (node-1 answered at 14:02:11 UTC)
 
 nodes      2 alive, 1 suspect, 0 dead                                relish nodes --unhealthy
 council    leader node-1 (term 41), 3/3 voters, quorum ok, 0 lagging
