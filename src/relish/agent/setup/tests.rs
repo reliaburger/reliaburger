@@ -142,11 +142,37 @@ fn run_with_token(
     skill: Option<&str>,
     token: Option<TokenPlan>,
 ) -> Value {
+    use crate::relish::client::TokenOrigin;
+    let origin = if token.is_some() {
+        TokenOrigin::ContextAdmin
+    } else {
+        TokenOrigin::Absent
+    };
+    run_with_facts(
+        home,
+        line,
+        skill,
+        token,
+        TokenFacts {
+            origin,
+            access: None,
+        },
+    )
+}
+
+fn run_with_facts(
+    home: &TestHome,
+    line: &str,
+    skill: Option<&str>,
+    token: Option<TokenPlan>,
+    facts: TokenFacts,
+) -> Value {
     let envelope = answer(
         &options(line),
         &home.home,
         skill,
         token,
+        facts,
         build(),
         format!("relish agent setup {line}").trim_end(),
     );
@@ -466,7 +492,13 @@ fn the_preview_offers_the_same_command_with_yes() {
 fn a_file_changed_after_setup_read_it_is_not_overwritten() {
     let home = TestHome::new();
     home.write(".gemini/settings.json", "{}\n");
-    let mut planned = plan_server(Client::Gemini, &home.home, Action::Install, false);
+    let mut planned = plan_server(
+        Client::Gemini,
+        &home.home,
+        &Mode::Read,
+        Action::Install,
+        false,
+    );
     home.write(".gemini/settings.json", "{\"theme\": \"new\"}\n");
     apply(&mut planned);
     assert!(!planned.change.written);
@@ -764,4 +796,201 @@ fn remove_takes_every_namespace_token_out_too() {
             home.path(".reliaburger/mcp-token-payments.json")
         ]
     );
+}
+
+// ---------------------------------------------------------------------------
+// relish agent setup --propose (#1682).
+
+fn explicit(access: Option<crate::relish::client::TokenAccess>) -> TokenFacts {
+    TokenFacts {
+        origin: crate::relish::client::TokenOrigin::Explicit,
+        access,
+    }
+}
+
+#[test]
+fn propose_without_a_namespace_is_refused_and_writes_nothing() {
+    let home = TestHome::with_every_agent();
+    let before = home.files();
+    let (plan, calls) = token_plan(&home, false, Ok(true));
+    let answer = run_with_token(&home, "--propose --yes", Some(SKILL), Some(plan));
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert_eq!(answer["error"]["code"], "usage", "{answer}");
+    let message = answer["error"]["message"].as_str().unwrap();
+    assert!(message.contains("--propose needs --namespace"), "{message}");
+    assert!(message.contains("every namespace"), "{message}");
+    assert_eq!(home.files(), before, "a refusal writes nothing");
+    assert!(calls.lock().unwrap().is_empty(), "nor makes a token");
+}
+
+#[test]
+fn a_namespace_needs_propose_and_propose_doesnt_remove() {
+    assert!(TestCli::try_parse_from(["setup", "--namespace", "shop"]).is_err());
+    assert!(
+        TestCli::try_parse_from(["setup", "--propose", "--namespace", "shop", "--remove"]).is_err()
+    );
+    let parsed = options("--propose --namespace shop");
+    assert_eq!(
+        parsed.mode().unwrap(),
+        Mode::Propose {
+            namespace: "shop".to_string()
+        }
+    );
+    let bad = options("--propose --namespace ../etc");
+    assert_eq!(bad.mode().unwrap_err().code, ErrorCode::Usage);
+}
+
+#[test]
+fn propose_wires_relish_mcp_propose_in_one_namespace() {
+    let home = TestHome::with_every_agent();
+    let answer = run_in(&home, "--propose --namespace shop --yes", Some(SKILL));
+    assert_eq!(answer["ok"], true, "{answer}");
+    assert_eq!(
+        answer["data"]["server"]["command"],
+        json!(["relish", "mcp", "--propose", "--namespace", "shop"])
+    );
+    let claude: Value = serde_json::from_str(&home.read(".claude.json")).unwrap();
+    assert_eq!(
+        claude["mcpServers"]["reliaburger"]["args"],
+        json!(["mcp", "--propose", "--namespace", "shop"])
+    );
+    let codex = home.read(".codex/config.toml");
+    assert!(
+        codex.contains(r#"args = ["mcp", "--propose", "--namespace", "shop"]"#),
+        "{codex}"
+    );
+    // Running it again changes nothing.
+    let again = run_in(&home, "--propose --namespace shop --yes", Some(SKILL));
+    assert!(
+        statuses(&again)
+            .iter()
+            .all(|(_, _, status)| status == "unchanged"),
+        "{again}"
+    );
+}
+
+#[test]
+fn switching_to_and_from_propose_replaces_setups_own_entry_without_force() {
+    let home = TestHome::with_every_agent();
+    run_in(&home, "--yes", Some(SKILL));
+    let answer = run_in(&home, "--propose --namespace shop --yes", Some(SKILL));
+    let servers: Vec<String> = statuses(&answer)
+        .into_iter()
+        .filter(|(_, kind, _)| kind == "mcp_server")
+        .map(|(_, _, status)| status)
+        .collect();
+    assert!(!servers.is_empty());
+    assert!(servers.iter().all(|status| status == "replace"), "{answer}");
+    // Another namespace, and back to read-only, are setup's own too.
+    let answer = run_in(&home, "--propose --namespace payments --yes", Some(SKILL));
+    assert!(
+        !statuses(&answer)
+            .iter()
+            .any(|(_, _, status)| status == "conflict"),
+        "{answer}"
+    );
+    let answer = run_in(&home, "--yes", Some(SKILL));
+    assert!(
+        !statuses(&answer)
+            .iter()
+            .any(|(_, _, status)| status == "conflict"),
+        "{answer}"
+    );
+    let claude: Value = serde_json::from_str(&home.read(".claude.json")).unwrap();
+    assert_eq!(claude["mcpServers"]["reliaburger"]["args"], json!(["mcp"]));
+}
+
+#[test]
+fn remove_takes_a_proposing_entry_out() {
+    let home = TestHome::with_every_agent();
+    let before = home.read(".claude.json");
+    run_in(&home, "--propose --namespace shop --yes", Some(SKILL));
+    let answer = run_in(&home, "--remove --yes", Some(SKILL));
+    assert!(
+        !statuses(&answer)
+            .iter()
+            .any(|(_, _, status)| status == "conflict"),
+        "{answer}"
+    );
+    assert_eq!(home.read(".claude.json"), before);
+}
+
+#[test]
+fn propose_makes_the_deployer_agent_token_through_the_plan() {
+    let home = TestHome::with_every_agent();
+    let (plan, calls) = token_plan_over(
+        vec![token_file(&home, "mcp-propose-token-shop.json", false)],
+        Ok(true),
+    );
+    let answer = run_with_token(
+        &home,
+        "--propose --namespace shop --yes",
+        Some(SKILL),
+        Some(plan),
+    );
+    let token = &answer["data"]["mcp_tokens"][0];
+    assert_eq!(token["written"], true, "{answer}");
+    assert!(
+        token["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("mcp-propose-token-shop.json")
+    );
+    assert_eq!(actions(&calls), [Action::Install]);
+}
+
+#[test]
+fn propose_with_a_token_setup_didnt_make_warns_it_may_be_a_persons() {
+    let home = TestHome::with_every_agent();
+    let answer = run_with_facts(
+        &home,
+        "--propose --namespace shop",
+        Some(SKILL),
+        None,
+        explicit(Some(crate::relish::client::TokenAccess::Lesser)),
+    );
+    let warnings = answer["warnings"].to_string();
+    assert!(warnings.contains("can't tell whether"), "{warnings}");
+    assert!(
+        warnings.contains("--agent --role deployer --namespaces shop"),
+        "{warnings}"
+    );
+    assert!(!warnings.contains("admin one"), "{warnings}");
+}
+
+#[test]
+fn an_admin_token_given_to_setup_is_warned_about() {
+    let home = TestHome::with_every_agent();
+    let admin = explicit(Some(crate::relish::client::TokenAccess::Admin));
+    let answer = run_with_facts(
+        &home,
+        "--propose --namespace shop",
+        Some(SKILL),
+        None,
+        admin,
+    );
+    let warnings = answer["warnings"].to_string();
+    assert!(warnings.contains("is an admin one"), "{warnings}");
+    let answer = run_with_facts(&home, "", Some(SKILL), None, admin);
+    let warnings = answer["warnings"].to_string();
+    assert!(warnings.contains("is an admin one"), "{warnings}");
+    assert!(warnings.contains("--role read-only"), "{warnings}");
+}
+
+#[test]
+fn propose_from_a_context_that_isnt_admin_warns_the_proposals_are_a_persons() {
+    let home = TestHome::with_every_agent();
+    let (plan, _) = token_plan_over(
+        vec![token_file(&home, "mcp-propose-token-shop.json", false)],
+        Ok(false),
+    );
+    let answer = run_with_token(
+        &home,
+        "--propose --namespace shop --yes",
+        Some(SKILL),
+        Some(plan),
+    );
+    let warnings = answer["warnings"].to_string();
+    assert!(warnings.contains("isn't an admin one"), "{warnings}");
+    assert!(warnings.contains("that person's"), "{warnings}");
 }

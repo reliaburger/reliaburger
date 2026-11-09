@@ -66,6 +66,9 @@ pub enum Existing {
     Absent,
     /// Exactly the entry setup would write.
     Same,
+    /// An entry setup wrote, but for the other mode: `relish mcp` when
+    /// setup now writes `relish mcp --propose`, or the reverse.
+    Own,
     /// Something else by that name, which setup didn't write.
     Different,
 }
@@ -80,16 +83,27 @@ pub fn existing(
     name: &str,
     entry: &Value,
 ) -> Result<Existing, EditError> {
-    let current = match format {
-        Format::Json => json::get(text, parent, name)?,
-        Format::Toml => toml_format::get(text, parent, name)?,
-        Format::Yaml => yaml::get(text, parent, name)?,
-    };
-    Ok(match current {
+    Ok(match current(format, text, parent, name)? {
         None => Existing::Absent,
         Some(value) if value == *entry => Existing::Same,
         Some(_) => Existing::Different,
     })
+}
+
+/// The entry the file holds at `parent.name`, if any.
+///
+/// Empty text is a file that doesn't exist yet.
+pub fn current(
+    format: Format,
+    text: &str,
+    parent: &str,
+    name: &str,
+) -> Result<Option<Value>, EditError> {
+    match format {
+        Format::Json => json::get(text, parent, name),
+        Format::Toml => toml_format::get(text, parent, name),
+        Format::Yaml => yaml::get(text, parent, name),
+    }
 }
 
 /// `text` with `entry` at `parent.name`, replacing whatever was there.

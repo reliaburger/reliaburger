@@ -344,7 +344,7 @@ pub fn path_for(
 /// A namespace name as Reliaburger accepts one: lowercase letters, digits
 /// and `-`, starting with a letter or digit. Anything else could escape the
 /// directory as part of a file name.
-fn valid_namespace(namespace: &str) -> bool {
+pub fn valid_namespace(namespace: &str) -> bool {
     !namespace.is_empty()
         && namespace.len() <= 63
         && namespace
