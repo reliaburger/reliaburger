@@ -5727,6 +5727,17 @@
           ]
         },
         {
+          "id": "legacy-ci-reliaburger-placement-brioche_says_why_a_quota_blocked_app_isnt_placed_on_every_node",
+          "binary": "reliaburger::placement",
+          "test": "brioche_says_why_a_quota_blocked_app_isnt_placed_on_every_node",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/placement.rs"
+          ]
+        },
+        {
           "id": "legacy-ci-reliaburger-placement-ingress_reaches_nodes_without_local_replicas",
           "binary": "reliaburger::placement",
           "test": "ingress_reaches_nodes_without_local_replicas",
