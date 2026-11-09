@@ -44,14 +44,31 @@ fn main() {
 /// Set `gym_scenarios` when `scripts/gym/relish-scenarios.rs` is there, so
 /// `src/relish/gym/catalogue.rs` includes it. It's the gym's answer key and
 /// stays out of the source bundle (#1687), so a build from the bundle alone
-/// has no scenarios.
+/// has no scenarios. A release build (`RELIABURGER_REQUIRE_CLEAN_SOURCE=1`)
+/// fails without them rather than ship a `relish gym run` with nothing to
+/// run.
 fn find_gym_scenarios() {
     println!("cargo:rustc-check-cfg=cfg(gym_scenarios)");
+    println!("cargo:rerun-if-env-changed=RELIABURGER_REQUIRE_CLEAN_SOURCE");
     let root = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("Cargo manifest dir"));
-    let scenarios = root.join("scripts/gym/relish-scenarios.rs");
+    let gym = root.join("scripts/gym");
+    let scenarios = gym.join("relish-scenarios.rs");
     if scenarios.is_file() {
         println!("cargo:rerun-if-changed={}", scenarios.display());
         println!("cargo:rustc-cfg=gym_scenarios");
+        return;
+    }
+    // A file added to the directory changes its modification time, so a
+    // checkout that gains the scenarios sets the cfg on the next build.
+    if gym.is_dir() {
+        println!("cargo:rerun-if-changed={}", gym.display());
+    }
+    if std::env::var("RELIABURGER_REQUIRE_CLEAN_SOURCE").as_deref() == Ok("1") {
+        panic!(
+            "RELIABURGER_REQUIRE_CLEAN_SOURCE is set, but {} is missing: this relish would \
+             have no gym scenarios",
+            scenarios.display()
+        );
     }
 }
 

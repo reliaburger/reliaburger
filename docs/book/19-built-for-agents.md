@@ -5765,7 +5765,9 @@ pub fn all() -> Vec<Scenario> {
 
 `build.rs` sets `gym_scenarios` only when the file exists, the same
 `rustc-cfg` trick as `source_bundle_embedded`. A release is built from a
-checkout, so it has the scenarios. A `relish` built from its own extracted
+checkout, so it has the scenarios, and a release build
+(`RELIABURGER_REQUIRE_CLEAN_SOURCE=1`) fails if the file is missing rather
+than ship a `relish gym run` with nothing to run. A `relish` built from its own extracted
 source, as the CI job above does, still compiles, but it has none, and `relish
 gym run` says why. The test `the_source_bundle_carries_no_gym_answer_text`
 collects every prompt, every line the gym's apps print, the canary and the
