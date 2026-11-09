@@ -1531,6 +1531,7 @@ mod tests {
                 rlimits: Vec::new(),
                 args,
                 env: vec!["TEST_VAR=hello".to_string()],
+                provider_env: Vec::new(),
                 cwd: "/".to_string(),
                 user: OciUser { uid: 0, gid: 0 },
                 capabilities: None,

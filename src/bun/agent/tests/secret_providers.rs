@@ -316,3 +316,74 @@ async fn a_node_advertises_the_providers_it_runs() {
         .collect();
     assert_eq!(names, ["vault"]);
 }
+
+/// #1819: only a reference the app declares reaches a provider. An `ENC`
+/// secret whose plaintext happens to start with `PROVIDER[` skipped the
+/// apply-time checks a declared reference gets, because it can't be read
+/// then, and the launch used to find it by scanning the decrypted env. It
+/// must reach the workload unchanged, and no provider may be called.
+#[tokio::test]
+async fn an_encrypted_secret_that_looks_like_a_reference_reaches_the_workload_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let called = dir.path().join("called");
+    let provider = provider_script(
+        dir.path(),
+        &format!(
+            "touch {}\nhead -n 1 > /dev/null\nprintf '{{\"version\":1,\"value\":\"{SECRET}\"}}'",
+            called.display()
+        ),
+    );
+    let providers = vault(&provider, PATIENT);
+    let identity = age::x25519::Identity::generate();
+    let lookalike = "PROVIDER[vault:secret/db#password]";
+    let sealed =
+        crate::sesame::secret::encrypt_secret(lookalike, &identity.to_public().to_string())
+            .unwrap();
+    let config = Config::parse(&format!(
+        "[app.api]\nimage = \"api:v1\"\n[app.api.env]\nDB_PASSWORD = \"{sealed}\"\nMODE = \"plain\"\n"
+    ))
+    .unwrap();
+    let spec = config.app["api"].clone();
+    let oci = BunAgent::<MockGrill>::oci_spec_with_secrets(
+        "api",
+        "default",
+        &spec,
+        "api-0",
+        None,
+        "/sys/fs/cgroup/test",
+        None,
+        None,
+        vec![identity],
+    )
+    .unwrap();
+    // The decryption itself worked: the env holds the plaintext.
+    assert_eq!(env_value(&oci, "DB_PASSWORD").as_deref(), Some(lookalike));
+
+    let grill = MockGrill::new();
+    let instance = InstanceId("api-0".to_string());
+    super::super::launch::create_with_secrets(
+        &grill,
+        &providers,
+        super::super::launch::LaunchTarget {
+            instance_id: &instance,
+            app_name: "api",
+            namespace: "default",
+        },
+        &oci,
+    )
+    .await
+    .expect("nothing here needs a provider");
+
+    let created = grill
+        .created_spec(&instance)
+        .expect("the runtime created it");
+    assert_eq!(
+        env_value(&created, "DB_PASSWORD").as_deref(),
+        Some(lookalike)
+    );
+    assert_eq!(env_value(&created, "MODE").as_deref(), Some("plain"));
+    assert!(
+        !called.exists(),
+        "a provider was called for an encrypted secret"
+    );
+}

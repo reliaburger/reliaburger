@@ -976,6 +976,11 @@ it's asked for. What the path means is up to the provider. A value that starts
 with `PROVIDER[` but doesn't parse is refused at apply. Jobs can't use
 providers yet: a job with one is refused at apply too.
 
+Only a reference written in the config is one. An encrypted secret whose
+value happens to start with `PROVIDER[` reaches the workload as it is, and no
+provider is asked for it: the node can't read an encrypted value when you
+apply it, so it never treats one as a reference.
+
 A provider is a binary on the node, named in `node.toml`. Nothing else runs:
 the table is the allowlist.
 
