@@ -2450,3 +2450,200 @@ async fn a_proposal_applied_before_a_leader_change_is_undone_on_the_new_leader()
     );
     fixture.root.cancel();
 }
+
+/// A browser's request to one node: the status, the page, and the session
+/// cookie it set, if any. Redirects aren't followed, so a decision's 303
+/// is visible.
+async fn browse(
+    node: &WiredNode,
+    method: reqwest::Method,
+    path: &str,
+    cookie: Option<&str>,
+    form: &[(&str, &str)],
+) -> (u16, String, Option<String>) {
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let mut body = url::form_urlencoded::Serializer::new(String::new());
+    for (name, value) in form {
+        body.append_pair(name, value);
+    }
+    let mut request = client
+        .request(method, format!("http://127.0.0.1:{}{path}", node.api_port))
+        .header("accept", "text/html")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(body.finish())
+        .timeout(Duration::from_secs(30));
+    if let Some(cookie) = cookie {
+        request = request.header("cookie", cookie);
+    }
+    let response = request.send().await.expect("the node answers");
+    let status = response.status().as_u16();
+    let set = response
+        .headers()
+        .get("set-cookie")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::to_string);
+    (status, response.text().await.unwrap_or_default(), set)
+}
+
+/// #1682: the dashboard's approve button acts only on the council leader.
+/// A browser session lives on the node that issued it, so a follower can't
+/// forward one: its page says to decide on the leader and shows no form,
+/// and a form posted there anyway changes nothing. On the leader the form
+/// applies the proposal, as the person whose token the session came from.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host; run with make test-cluster"]
+async fn the_dashboard_decides_a_proposal_on_the_leader_only() {
+    assert!(cluster_tests_enabled());
+    let operator = admin_token("operator");
+    let mut fixture = Fixture::new();
+    let mut nodes = vec![
+        fixture
+            .start_node(720, vec![], false, Some(operator.token.clone()))
+            .await,
+    ];
+    for index in 721..723 {
+        let seed = fixture.gossip(720);
+        nodes.push(
+            fixture
+                .start_node(index, vec![seed], false, Some(operator.token.clone()))
+                .await,
+        );
+    }
+    let (leader, followers) = settled_roles(&nodes).await;
+    let mut holmes = reliaburger::sesame::token::create_token(
+        "holmes",
+        reliaburger::sesame::types::ApiRole::Deployer,
+        reliaburger::sesame::types::TokenScope {
+            apps: None,
+            namespaces: Some(vec!["shop".to_string()]),
+        },
+        None,
+    )
+    .unwrap();
+    holmes.token.kind = reliaburger::sesame::types::TokenKind::Agent;
+    grant(&nodes, &holmes.token).await;
+    let bob = reliaburger::sesame::token::create_token(
+        "bob",
+        reliaburger::sesame::types::ApiRole::Deployer,
+        Default::default(),
+        None,
+    )
+    .unwrap();
+    grant(&nodes, &bob.token).await;
+
+    let web = reliaburger::meat::AppId::new("web", "shop");
+    let spec: reliaburger::config::app::AppSpec =
+        toml::from_str("image = \"web:v1\"\nreplicas = 1\nnamespace = \"shop\"").unwrap();
+    nodes[leader]
+        .council
+        .write(RaftRequest::AppSpec {
+            app_id: web.clone(),
+            spec: Box::new(spec),
+        })
+        .await
+        .unwrap();
+    let (status, body) = post_json(
+        &nodes[leader],
+        &holmes.plaintext,
+        "/v1/proposals",
+        r#"{"kind":"scale","namespace":"shop","app":"web","replicas":2,"reason":"dashboard drill"}"#,
+    )
+    .await
+    .expect("the leader answers");
+    assert_eq!(status, 201, "{body}");
+    let id = body["id"].as_u64().unwrap();
+    let page = format!("/ui/proposal/{id}");
+    let approve = format!("/ui/proposal/{id}/approve");
+
+    // Bob logs in on a follower: the page says where to decide, and a form
+    // posted there anyway changes nothing.
+    let follower = &nodes[followers[0]];
+    let (status, _, cookie) = browse(
+        follower,
+        reqwest::Method::POST,
+        "/ui/session",
+        None,
+        &[("token", &bob.plaintext)],
+    )
+    .await;
+    assert_eq!(status, 303);
+    let cookie = cookie.expect("a session cookie");
+    let mut html = String::new();
+    wait_until(
+        "the follower serves the proposal",
+        Duration::from_secs(30),
+        async || {
+            let (status, text, _) =
+                browse(follower, reqwest::Method::GET, &page, Some(&cookie), &[]).await;
+            html = text;
+            status == 200
+        },
+    )
+    .await;
+    assert!(html.contains("isn't the council leader"), "{html}");
+    assert!(!html.contains("<form"), "{html}");
+    let session = reliaburger::sesame::session::session_id_from_cookie_header(&cookie).unwrap();
+    let csrf = reliaburger::sesame::session::csrf_token_for(session);
+    let (status, html, _) = browse(
+        follower,
+        reqwest::Method::POST,
+        &approve,
+        Some(&cookie),
+        &[("csrf", &csrf)],
+    )
+    .await;
+    assert_eq!(status, 409, "{html}");
+    let pending = nodes[leader].council.desired_state().await;
+    assert_eq!(
+        pending.apps[&web].replicas,
+        reliaburger::config::Replicas::Fixed(1)
+    );
+
+    // On the leader the same person's form applies it.
+    let (status, _, cookie) = browse(
+        &nodes[leader],
+        reqwest::Method::POST,
+        "/ui/session",
+        None,
+        &[("token", &bob.plaintext)],
+    )
+    .await;
+    assert_eq!(status, 303);
+    let cookie = cookie.expect("a session cookie");
+    let (status, html, _) = browse(
+        &nodes[leader],
+        reqwest::Method::GET,
+        &page,
+        Some(&cookie),
+        &[],
+    )
+    .await;
+    assert_eq!(status, 200, "{html}");
+    assert!(html.contains(&format!("action=\"{approve}\"")), "{html}");
+    let session = reliaburger::sesame::session::session_id_from_cookie_header(&cookie).unwrap();
+    let csrf = reliaburger::sesame::session::csrf_token_for(session);
+    let (status, html, _) = browse(
+        &nodes[leader],
+        reqwest::Method::POST,
+        &approve,
+        Some(&cookie),
+        &[("csrf", &csrf)],
+    )
+    .await;
+    assert_eq!(status, 303, "{html}");
+    let applied = nodes[leader].council.desired_state().await;
+    assert_eq!(
+        applied.apps[&web].replicas,
+        reliaburger::config::Replicas::Fixed(2)
+    );
+    let proposal = applied
+        .proposals
+        .get(reliaburger::proposal::ProposalId(id))
+        .unwrap();
+    assert_eq!(proposal.state.name(), "applied");
+    fixture.root.cancel();
+}

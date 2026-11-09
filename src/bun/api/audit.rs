@@ -189,6 +189,11 @@ pub(crate) const HANDLER_AUDITED_ROUTES: &[(RouteMethod, &str)] = &[
     (Post, "/v1/proposals/{id}/reject"),
     (Post, "/v1/proposals/{id}/withdraw"),
     (Post, "/v1/proposals/{id}/undo"),
+    // The dashboard's decision forms call the three handlers above, which
+    // write the same records under the session's token.
+    (Post, "/ui/proposal/{id}/approve"),
+    (Post, "/ui/proposal/{id}/reject"),
+    (Post, "/ui/proposal/{id}/undo"),
 ];
 
 /// Mutating routes that are not audited, and why. A new `POST` or `DELETE`
