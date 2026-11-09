@@ -367,6 +367,7 @@ async fn path_parameters(parts: &mut axum::http::request::Parts) -> Vec<(String,
 #[derive(Debug, Clone)]
 struct RefusedCaller {
     principal: String,
+    principal_kind: crate::sesame::types::PrincipalKind,
     token_name: String,
     app: Option<String>,
     namespace: Option<String>,
@@ -387,6 +388,7 @@ fn mark_refusal(
     let (principal, token_name) = audit_principal(auth);
     response.extensions_mut().insert(RefusedCaller {
         principal,
+        principal_kind: super::audit_principal_kind(auth),
         token_name,
         app: note.app,
         namespace: note.namespace,
@@ -525,20 +527,24 @@ async fn record_refusal(state: &ApiState, refusal: Refusal) {
     if let Some(attempted) = route.attempted {
         details.insert("attempted".to_string(), attempted.to_string());
     }
-    let principal = match refused {
+    let (principal, principal_kind) = match refused {
         Some(refused) => {
             app = refused.app.or(app);
             namespace = refused.namespace.or(namespace);
             details.insert("token_name".to_string(), refused.token_name);
-            refused.principal
+            (refused.principal, refused.principal_kind)
         }
-        None => ANONYMOUS.to_string(),
+        None => (
+            ANONYMOUS.to_string(),
+            crate::sesame::types::PrincipalKind::Unknown,
+        ),
     };
     let now = unix_now_seconds();
     let verdict = state.refusals.lock().await.admit(
         crate::bun::audit::refusals::RefusalSource::Caller {
             address: caller.map(|address| address.ip()),
             principal: principal.clone(),
+            principal_kind,
         },
         now,
     );
@@ -559,6 +565,7 @@ async fn record_refusal(state: &ApiState, refusal: Refusal) {
             severity: crate::bun::events::EventSeverity::Warning,
             action: "api.refused".to_string(),
             principal,
+            principal_kind,
             app,
             namespace,
             node: Some(local_node_name(state)),
@@ -585,8 +592,12 @@ pub(super) fn suppressed_refusals_event(
         "window_seconds".to_string(),
         REFUSAL_WINDOW_SECONDS.to_string(),
     );
-    let (principal, from) = match summary.source {
-        RefusalSource::Caller { address, principal } => {
+    let (principal, principal_kind, from) = match summary.source {
+        RefusalSource::Caller {
+            address,
+            principal,
+            principal_kind,
+        } => {
             let from = match address {
                 Some(address) => {
                     details.insert("source".to_string(), address.to_string());
@@ -594,9 +605,14 @@ pub(super) fn suppressed_refusals_event(
                 }
                 None => principal.clone(),
             };
-            (principal, from)
+            (principal, principal_kind, from)
         }
-        RefusalSource::Overflow => ("*".to_string(), "other sources".to_string()),
+        // Many callers, of any kind.
+        RefusalSource::Overflow => (
+            "*".to_string(),
+            crate::sesame::types::PrincipalKind::Unknown,
+            "other sources".to_string(),
+        ),
     };
     crate::bun::events::AuditEvent {
         timestamp: now,
@@ -604,6 +620,7 @@ pub(super) fn suppressed_refusals_event(
         severity: crate::bun::events::EventSeverity::Warning,
         action: "api.refusals_suppressed".to_string(),
         principal,
+        principal_kind,
         app: None,
         namespace: None,
         node: Some(node),
@@ -785,6 +802,10 @@ pub(super) struct AuditQuery {
     #[serde(default)]
     namespace: Option<String>,
     #[serde(default)]
+    principal_kind: Option<crate::sesame::types::PrincipalKind>,
+    #[serde(default)]
+    proposal: Option<u64>,
+    #[serde(default)]
     limit: Option<usize>,
     /// Merge every live node's log, not just this node's.
     #[serde(default)]
@@ -800,6 +821,8 @@ impl AuditQuery {
             principal: self.principal.clone(),
             app: self.app.clone(),
             namespace: self.namespace.clone(),
+            principal_kind: self.principal_kind,
+            proposal: self.proposal,
             limit: self.limit,
         }
     }
@@ -904,6 +927,12 @@ pub(super) fn peer_audit_path(filter: &AuditFilter) -> String {
     }
     if let Some(namespace) = &filter.namespace {
         params.append_pair("namespace", namespace);
+    }
+    if let Some(kind) = filter.principal_kind {
+        params.append_pair("principal_kind", kind.as_str());
+    }
+    if let Some(proposal) = filter.proposal {
+        params.append_pair("proposal", &proposal.to_string());
     }
     params.append_pair("limit", &filter.effective_limit().to_string());
     format!("/v1/audit?{}", params.finish())

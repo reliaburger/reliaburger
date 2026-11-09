@@ -276,7 +276,10 @@ async fn an_agent_proposes_a_person_approves_and_undo_puts_it_back() {
     assert_eq!(applied.len(), 1);
     assert_eq!(applied[0].details["approved_by"], "bob");
     assert_eq!(applied[0].details["token_name"], "bob");
-    assert_eq!(applied[0].details["principal_kind"], "human");
+    assert_eq!(
+        applied[0].principal_kind,
+        crate::sesame::types::PrincipalKind::Human
+    );
     assert_eq!(cluster.records("proposal.undone").await.len(), 1);
 }
 
@@ -542,7 +545,10 @@ async fn an_app_policy_refuses_a_proposal_as_a_guardrail() {
     assert_eq!(body["rule"], "policy:small");
     let refused = cluster.records("proposal.refused").await;
     assert_eq!(refused[0].details["rule"], "policy:small");
-    assert_eq!(refused[0].details["principal_kind"], "agent");
+    assert_eq!(
+        refused[0].principal_kind,
+        crate::sesame::types::PrincipalKind::Agent
+    );
 }
 
 /// An agent token's lifetime and role are bounded when it's made.
@@ -596,7 +602,19 @@ async fn an_approve_policy_applies_an_agents_small_scale_at_once() {
     let applied = cluster.records("proposal.applied").await;
     assert_eq!(applied.len(), 1);
     assert_eq!(applied[0].principal, "policy:agents-scale-shop");
-    assert_eq!(applied[0].details["principal_kind"], "policy");
+    assert_eq!(
+        applied[0].principal_kind,
+        crate::sesame::types::PrincipalKind::Policy
+    );
+    let app_applied = cluster.records("app.applied").await;
+    assert_eq!(app_applied.len(), 1, "{app_applied:?}");
+    assert_eq!(app_applied[0].principal, "policy:agents-scale-shop");
+    assert_eq!(
+        app_applied[0].principal_kind,
+        crate::sesame::types::PrincipalKind::Policy
+    );
+    assert_eq!(app_applied[0].details["author"], "holmes");
+    assert_eq!(app_applied[0].details["proposal"], "1");
     assert_eq!(applied[0].details["author"], "holmes");
     assert_eq!(applied[0].details["author_kind"], "agent");
     assert_eq!(applied[0].details["reason"], "p99 over the SLO");
@@ -944,4 +962,106 @@ async fn the_cluster_summary_counts_leases_and_waiting_proposals() {
         agents["first_proposals"][0]["stale"],
         "shop/web changed after it was made"
     );
+}
+
+/// #1682's design: every audit record says what kind of principal acted,
+/// and the app records a proposal's apply writes name the proposal, its
+/// author and the author's reason, so "which agent made which change, and
+/// why" is answered from the change's own record.
+#[tokio::test]
+async fn a_proposals_app_records_name_the_agent_author_and_every_record_its_principal_kind() {
+    let cluster = cluster("proposal-app-records").await;
+    let (status, body) = cluster.scale(&cluster.holmes, "shop", "web", 5).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = cluster
+        .post("/v1/proposals/1/approve", &cluster.bob, String::new())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // The person approved it, so the app record is theirs; the proposal,
+    // its agent author and the agent's reason ride along.
+    let applied = cluster.records("app.applied").await;
+    assert_eq!(applied.len(), 1, "{applied:?}");
+    let record = &applied[0];
+    assert_eq!(record.app.as_deref(), Some("web"));
+    assert_eq!(record.namespace.as_deref(), Some("shop"));
+    assert_eq!(
+        record.principal_kind,
+        crate::sesame::types::PrincipalKind::Human
+    );
+    assert_eq!(record.details["token_name"], "bob");
+    assert_eq!(record.details["proposal"], "1");
+    assert_eq!(record.details["author"], "holmes");
+    assert_eq!(record.details["author_kind"], "agent");
+    assert_eq!(record.details["reason"], "p99 over the SLO");
+    assert_eq!(record.details["approved_by"], "bob");
+
+    // The proposal's own records say who acted too, as a field.
+    let created = cluster.records("proposal.created").await;
+    assert_eq!(
+        created[0].principal_kind,
+        crate::sesame::types::PrincipalKind::Agent
+    );
+    let approved = cluster.records("proposal.applied").await;
+    assert_eq!(
+        approved[0].principal_kind,
+        crate::sesame::types::PrincipalKind::Human
+    );
+
+    // A stop writes app.stopped, also naming the proposal.
+    let (status, body) = cluster
+        .propose(
+            &cluster.holmes,
+            serde_json::json!({
+                "kind": "stop", "namespace": "shop", "app": "api", "reason": "leaking memory",
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = cluster
+        .post("/v1/proposals/2/approve", &cluster.bob, String::new())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let stopped = cluster.records("app.stopped").await;
+    assert_eq!(stopped.len(), 1, "{stopped:?}");
+    assert_eq!(stopped[0].app.as_deref(), Some("api"));
+    assert_eq!(stopped[0].details["proposal"], "2");
+    assert_eq!(stopped[0].details["reason"], "leaking memory");
+
+    // `relish audit --principal-kind agent` and `--proposal 1`, through
+    // the real route.
+    let (status, body) = cluster
+        .get("/v1/audit?principal_kind=agent", &cluster.alice)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let records = body["records"].as_array().unwrap();
+    assert!(!records.is_empty(), "{body}");
+    assert!(
+        records
+            .iter()
+            .all(|record| record["principal_kind"] == "agent"),
+        "{body}"
+    );
+    assert!(
+        records
+            .iter()
+            .any(|record| record["action"] == "proposal.created"),
+        "{body}"
+    );
+    let (status, body) = cluster.get("/v1/audit?proposal=1", &cluster.alice).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let actions: Vec<&str> = body["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|record| record["action"].as_str().unwrap())
+        .collect();
+    assert!(actions.contains(&"proposal.created"), "{actions:?}");
+    assert!(actions.contains(&"proposal.applied"), "{actions:?}");
+    assert!(actions.contains(&"app.applied"), "{actions:?}");
+    assert!(!actions.contains(&"app.stopped"), "{actions:?}");
+    let (status, _) = cluster
+        .get("/v1/audit?principal_kind=robot", &cluster.alice)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }

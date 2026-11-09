@@ -783,6 +783,7 @@ mod tests {
             severity: EventSeverity::Warning,
             action: "policy.denied".to_string(),
             principal: "token:ci".to_string(),
+            principal_kind: crate::sesame::types::PrincipalKind::Human,
             app: Some("web".to_string()),
             namespace: Some("default".to_string()),
             node: Some("node-1".to_string()),

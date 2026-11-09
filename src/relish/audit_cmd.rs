@@ -29,6 +29,11 @@ pub struct AuditFlags {
     pub app: Option<String>,
     /// A namespace.
     pub namespace: Option<String>,
+    /// A kind of principal: human, agent, workload, system, policy or
+    /// unknown.
+    pub principal_kind: Option<crate::sesame::types::PrincipalKind>,
+    /// A proposal id.
+    pub proposal: Option<u64>,
     /// How many of the newest records to show.
     pub limit: Option<usize>,
     /// Ask every live node, not just this one.
@@ -52,6 +57,8 @@ impl AuditFlags {
             principal: self.principal.clone(),
             app: self.app.clone(),
             namespace: self.namespace.clone(),
+            principal_kind: self.principal_kind,
+            proposal: self.proposal,
             limit: self.limit,
         })
     }
@@ -95,16 +102,17 @@ impl fmt::Display for AuditReport {
         }
         write!(
             f,
-            "{:<20}  {:<12}  {:<16}  {:<26}  {:<24}  SOURCE",
-            "TIME (UTC)", "NODE", "WHO", "ACTION", "TARGET"
+            "{:<20}  {:<12}  {:<16}  {:<8}  {:<26}  {:<24}  SOURCE",
+            "TIME (UTC)", "NODE", "WHO", "KIND", "ACTION", "TARGET"
         )?;
         for record in &self.0.records {
             write!(
                 f,
-                "\n{:<20}  {:<12}  {:<16}  {:<26}  {:<24}  {}",
+                "\n{:<20}  {:<12}  {:<16}  {:<8}  {:<26}  {:<24}  {}",
                 format_time(record.timestamp),
                 record.node.as_deref().unwrap_or("-"),
                 who(record),
+                record.principal_kind.as_str(),
                 record.action,
                 target(
                     record.app.as_deref(),
@@ -113,9 +121,30 @@ impl fmt::Display for AuditReport {
                 ),
                 record.source_address.as_deref().unwrap_or("-"),
             )?;
+            if let Some(note) = proposal_note(&record.details) {
+                write!(f, "\n    {note}")?;
+            }
         }
         Ok(())
     }
+}
+
+/// The line under a record about a proposal: which one, whose, and its
+/// author's reason, marked as the author's own words because nothing has
+/// checked it (#1682).
+fn proposal_note(details: &BTreeMap<String, String>) -> Option<String> {
+    let proposal = details.get("proposal")?;
+    let author = details.get("author")?;
+    let kind = details
+        .get("author_kind")
+        .map(|kind| format!(" ({kind})"))
+        .unwrap_or_default();
+    let reason = details
+        .get("reason")
+        .filter(|reason| !reason.is_empty())
+        .map(|reason| format!(". Its reason (its own words, unverified): {reason}"))
+        .unwrap_or_default();
+    Some(format!("proposal {proposal} by {author}{kind}{reason}"))
 }
 
 /// The token name a record was made under, or its principal.
@@ -204,6 +233,7 @@ mod tests {
             severity: EventSeverity::Info,
             action: "app.deleted".to_string(),
             principal: "token-7f3a".to_string(),
+            principal_kind: crate::sesame::types::PrincipalKind::Human,
             app: Some("web".to_string()),
             namespace: Some("team-a".to_string()),
             node: Some("node-2".to_string()),
@@ -242,6 +272,36 @@ mod tests {
         })
         .to_string();
         insta::assert_snapshot!(table);
+    }
+
+    /// #1682's design: an app record a proposal's apply wrote says which
+    /// proposal, whose, and why, with the reason marked as the author's own
+    /// words, as `relish proposal show` marks it.
+    #[test]
+    fn a_proposals_record_names_it_and_marks_the_reason_as_the_authors_words() {
+        let mut applied = record();
+        applied.action = "app.applied".to_string();
+        applied.details.extend([
+            ("proposal".to_string(), "17".to_string()),
+            ("author".to_string(), "holmes".to_string()),
+            ("author_kind".to_string(), "agent".to_string()),
+            ("reason".to_string(), "p99 over the SLO".to_string()),
+        ]);
+        let mut by_agent = record();
+        by_agent.action = "proposal.created".to_string();
+        by_agent.principal_kind = crate::sesame::types::PrincipalKind::Agent;
+        let table = AuditReport(AuditListing {
+            records: vec![applied, by_agent],
+            warnings: Vec::new(),
+        })
+        .to_string();
+        insta::assert_snapshot!(table);
+        assert!(
+            table.contains(
+                "proposal 17 by holmes (agent). Its reason (its own words, unverified): p99 over the SLO"
+            ),
+            "{table}"
+        );
     }
 
     /// The record a two-app apply in one namespace makes: no single app,

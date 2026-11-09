@@ -322,7 +322,7 @@ pub(super) async fn proposal_create_handler(
             Ok(outcome) => outcome,
             Err(error) => return council_unavailable(error),
         };
-        if let Some(event) = crate::bun::proposals::outcome_event(
+        for event in crate::bun::proposals::policy_outcome_events(
             &outcome,
             &format!("policy:{name}"),
             &local_node_name(&state),
@@ -658,6 +658,14 @@ async fn answer_outcome(
     };
     let message = message.replace("{}", &proposal.id.to_string());
     record_proposal(state, auth, action, &proposal, message).await;
+    let direction = match action {
+        "proposal.applied" => Some(crate::bun::proposals::AppChangeDirection::Apply),
+        "proposal.undone" => Some(crate::bun::proposals::AppChangeDirection::Undo),
+        _ => None,
+    };
+    if let Some(direction) = direction {
+        record_app_changes(state, auth, &proposal, direction).await;
+    }
     if matches!(
         proposal.state,
         crate::proposal::ProposalState::Failed { .. }
@@ -697,6 +705,43 @@ fn answer_decided(proposal: &Proposal) -> Response {
     refusal_response(&refusal, Some(view))
 }
 
+/// The app records a person's approval or undo of `proposal` wrote, one
+/// per app it changed, attributed to that person and naming the proposal,
+/// its author and the author's reason.
+async fn record_app_changes(
+    state: &ApiState,
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    proposal: &Proposal,
+    direction: crate::bun::proposals::AppChangeDirection,
+) {
+    let (principal, _) = audit_principal(auth);
+    let events = crate::bun::proposals::app_change_events(
+        proposal,
+        direction,
+        &principal,
+        super::audit_principal_kind(auth),
+        &local_node_name(state),
+        crate::testkit::lease::now_unix_millis(),
+    );
+    for event in events {
+        record_caller_action(
+            state,
+            auth,
+            CallerAction {
+                kind: event.kind,
+                severity: event.severity,
+                action: &event.action,
+                app: event.app,
+                namespace: event.namespace,
+                node: None,
+                details: event.details,
+                message: event.message,
+            },
+        )
+        .await;
+    }
+}
+
 /// The audit record for `action` on `proposal`, by the caller.
 async fn record_proposal(
     state: &ApiState,
@@ -705,19 +750,17 @@ async fn record_proposal(
     proposal: &Proposal,
     message: String,
 ) {
+    // The principal and its kind come from the caller, below.
     let event = crate::bun::proposals::proposal_event(
         action,
         "",
+        crate::sesame::types::PrincipalKind::Unknown,
         proposal,
         &local_node_name(state),
         crate::testkit::lease::now_unix_millis(),
         message,
     );
-    let mut details = event.details;
-    details.insert(
-        "principal_kind".to_string(),
-        auth.map_or("human", |auth| auth.kind.as_str()).to_string(),
-    );
+    let details = event.details;
     record_caller_action(
         state,
         auth,
@@ -757,10 +800,6 @@ async fn record_refusal(
         (
             "reason".to_string(),
             crate::proposal::build::clean_reason(&request.reason),
-        ),
-        (
-            "principal_kind".to_string(),
-            auth.map_or("human", |auth| auth.kind.as_str()).to_string(),
         ),
     ]);
     if let ProposalRefusal::Guardrail { rule, .. } = refusal {

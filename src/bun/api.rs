@@ -1217,6 +1217,18 @@ pub(super) fn audit_principal(auth: Option<&crate::sesame::auth::AuthContext>) -
     }
 }
 
+/// The kind of principal an audit record names for the caller. With no
+/// credential at all, the cluster has no tokens yet, and whoever asks is
+/// the person setting it up (`local-bootstrap`).
+pub(super) fn audit_principal_kind(
+    auth: Option<&crate::sesame::auth::AuthContext>,
+) -> crate::sesame::types::PrincipalKind {
+    auth.map_or(
+        crate::sesame::types::PrincipalKind::Human,
+        crate::sesame::auth::AuthContext::principal_kind,
+    )
+}
+
 /// Record `action`, attributed to the caller and to the address the request
 /// came from, in the event ring and this node's durable audit log. Returns
 /// once the log has the record on disk, or has given up; a failed write is
@@ -1237,6 +1249,7 @@ pub(super) async fn record_caller_action(
             severity: action.severity,
             action: action.action.to_string(),
             principal,
+            principal_kind: audit_principal_kind(auth),
             app: action.app,
             namespace: action.namespace,
             node: Some(action.node.unwrap_or_else(|| local_node_name(state))),
