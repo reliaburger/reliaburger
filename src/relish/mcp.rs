@@ -133,6 +133,21 @@ pub fn person_token_warning(origin: TokenOrigin, propose: bool) -> Option<&'stat
     (propose && origin == TokenOrigin::Explicit).then_some(PERSON_TOKEN_WARNING)
 }
 
+/// What `relish mcp --propose` prints on stderr, once, when the saved
+/// context's token turns out not to be admin, so it sends that token, a
+/// person's, instead of an agent token of its own.
+pub const CONTEXT_TOKEN_WARNING: &str = "relish mcp: warning: the saved context's token isn't an admin one, so --propose can't make an agent token and is sending the context's own. The agent's proposals are that person's: a guardrail that matches author.kind == \"agent\" doesn't see them, and the token's scope, not --namespace, decides where it may propose. Give it an agent token, made with `relish token create --name holmes --agent --role deployer --namespaces shop`, in RELIABURGER_TOKEN.";
+
+/// The warning to print when the cluster has just said the context's token
+/// isn't admin, for a server with `purpose`; `already_known` when it said
+/// so before. Only a proposing server warns, and only the first time.
+pub fn context_token_warning(
+    purpose: credentials::Purpose,
+    already_known: bool,
+) -> Option<&'static str> {
+    (purpose == credentials::Purpose::Propose && !already_known).then_some(CONTEXT_TOKEN_WARNING)
+}
+
 /// Why `relish mcp` won't serve with `options` and a token from `origin`,
 /// if it won't. From the saved admin context `--propose` makes a deployer
 /// agent token, and without `--namespace` that token could propose, and
@@ -340,6 +355,11 @@ impl Managed {
                 state.current = Some(token);
             }
             Credential::ContextNotAdmin => {
+                if let Some(warning) =
+                    context_token_warning(self.scope.purpose, state.context_not_admin)
+                {
+                    eprintln!("{warning}");
+                }
                 state.context_not_admin = true;
                 state.current = None;
                 crate::relish::client::set_mcp_token(None);

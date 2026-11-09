@@ -6881,6 +6881,16 @@ not a person from an agent. So `person_token_warning` warns on stderr for
 every token `relish mcp` didn't make itself. It's noisy for someone who did
 hand it an agent token, and honest: relish can't tell, so it says so.
 
+The same probe closes one case relish *can* tell. A saved context whose
+token isn't admin gets a 403 from `/v1/token/list`, so `obtain` answers
+`Credential::ContextNotAdmin` and relish mcp sends the context's own token,
+which is a person's. `context_token_warning` takes the server's `Purpose`
+and whether the cluster had already said so, and a proposing server warns
+the first time only. A read-only server stays quiet, because it proposes
+nothing. The check sits in `Managed::obtain`, where the answer arrives,
+rather than in `run`: the probe happens on the first tool call, not at
+start-up.
+
 ### The tests
 
 [`src/policy/proposal_tests.rs`](../../src/policy/proposal_tests.rs) checks
