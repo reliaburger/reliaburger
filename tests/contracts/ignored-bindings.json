@@ -1429,6 +1429,12 @@
   },
   {
     "source": "tests/placement.rs",
+    "function": "brioche_says_why_a_quota_blocked_app_isnt_placed_on_every_node",
+    "binary": "reliaburger::placement",
+    "test": "brioche_says_why_a_quota_blocked_app_isnt_placed_on_every_node"
+  },
+  {
+    "source": "tests/placement.rs",
     "function": "ingress_reaches_nodes_without_local_replicas",
     "binary": "reliaburger::placement",
     "test": "ingress_reaches_nodes_without_local_replicas"

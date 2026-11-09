@@ -1726,8 +1726,13 @@ could be `degraded` in `relish apps` and `pending` on the page. Now
 apps` make. It passes `nodes_unanswered: false`, which is true here: the
 statuses come from every node or the call fails. A blocked app reads
 `down` in the table, as it does in `relish apps`, and its page still says
-`Not placed, blocked:` and why. The status dots learned the new words:
-amber for `degraded`, red for `down`.
+`Not placed, blocked:` and why. That reason comes from the council's desired
+state, not from the rollup, and
+`brioche_says_why_a_quota_blocked_app_isnt_placed_on_every_node` in
+[`tests/placement.rs`](../../tests/placement.rs) holds it there: three real
+nodes, a namespace with one CPU, and an app asking for two, whose page on
+every node must say it's blocked by the quota. The status dots learned the
+new words: amber for `degraded`, red for `down`.
 
 ## Logs and the manual
 
