@@ -308,6 +308,11 @@ footer { display: flex; flex-wrap: wrap; gap: 12px 24px; margin-top: 20px; paddi
 .recording-pending { background: var(--ink); color: #e4e9e3; border-radius: 4px; padding: 16px; margin: 0; font-size: .9375rem; }
 .recording-pending a { color: #f49463; }
 .agent-steps code { overflow-wrap: anywhere; }
+/* A result we haven't measured yet (#1690): a dashed box that names its
+   issue, never a number. */
+.measure-pending { border: 1px dashed var(--line); border-radius: 4px; padding: 12px 16px; margin: 16px 0; font-size: .9375rem; color: var(--muted); }
+.measure-pending strong { color: var(--ink); }
+.measure-pending p { margin: 4px 0 0; }
 /* /agents, generated from the manual chapter by src/relish/agent/guide.rs.
    The chapter's prose keeps a readable measure; its tables scroll on their
    own on a phone instead of widening the page. */

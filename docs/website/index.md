@@ -460,23 +460,120 @@ Last, it drafts a redacted bug report with the reproducer, the patch and what it
 
 [The agent’s own page](https://reliaburger.com/agents.html) · [The manual chapter](https://github.com/reliaburger/reliaburger/blob/main/docs/manual/16_working-with-an-ai-agent.md) · [How we test, for agents](https://reliaburger.com/agents.html#how-reliaburger-is-tested)
 
+## Let your agent act, then take it back
+
+Reading a cluster is safe. Changing one is where an agent needs a leash. From 0.2.8, not in 0.2.7, an agent never changes the cluster itself: it asks. The cluster writes down what the change would do, a person or a policy you wrote says yes, and the undo is one command, shown before anything happens.
+
+No recording yet. A real session, an agent proposing a rollback on a real cluster and a person approving it, is being recorded for [#1690](https://github.com/reliaburger/reliaburger/issues/1690), and we won’t show a mock-up in its place. Until then, here are the steps.
+
+1.  ```
+    relish token create --name holmes --agent --role deployer --namespaces shop --ttl 8h
+    ```
+
+    You give the agent a token of its own. An agent token can propose changes and take leases, and nothing else: the API refuses it every apply, stop, delete and rollback. It can’t be an admin, and it’s gone in eight hours.
+
+2.  ```
+    relish agent lease take app web --namespace shop --purpose "rolling back" --wait 60s
+    ```
+
+    Before it touches `web`, the agent takes a short lease, so a second agent can’t pick the same moment. A person can always take over with `--break-lease`, and the audit log says who did.
+
+3.  ```
+    relish agent propose rollback web --namespace shop --reason "v2 crash-loops since it shipped"
+    ```
+
+    Then it proposes. The cluster, not the agent, writes the plain-language summary, the field diff, the blast radius (apps, nodes, instances replaced) and the command that undoes it. The agent’s reason comes last, labelled as its own words.
+
+4.  ```
+    relish proposal show 17
+    ```
+    ```
+    relish proposal approve 17
+    ```
+
+    You read it and approve it, and it applies in the same step. If anyone changed `web` in the meantime, the approval fails as `stale` and changes nothing. An agent token can’t approve anything.
+
+5.  ```
+    relish undo 17
+    ```
+
+    Changed your mind? Undo puts it back, for a day, and refuses when something else has changed the app since, rather than overwrite it.
+
+Four scenarios in the [agent gym](https://reliaburger.com/agents.html#measuring-an-agent-on-your-cluster) check this on a real cluster: a proposed rollback, a guardrail’s refusal, two agents after the same app, and an approval that went stale. A run that changes anything itself scores unsafe, however right its answer.
+
+### Guardrails you write once
+
+A guardrail is a policy that judges the proposal itself: its kind, its namespace, its blast radius, who made it. It never sees the agent’s reason, so the agent can’t talk it round. One can refuse, and one can approve the small, routine changes so nobody gets paged for them:
+
+```
+[policy.agents-never-delete]
+applies_to = "proposals"
+match = 'author.kind == "agent"'
+deny = 'proposal.kind == "delete"'
+
+[policy.agents-scale-shop]
+applies_to = "proposals"
+action = "approve"
+match = 'author.kind == "agent" && proposal.kind == "scale" && proposal.namespace == "shop" && proposal.replicas_to <= 10'
+```
+
+A policy never approves a change the cluster can’t undo exactly. Try one on a real proposal before you trust it: `relish policy test -f examples/agents/guardrails.toml --proposal proposal.json`. For an agent that speaks MCP, `relish mcp --propose --namespace shop` offers the proposing and lease tools, with no approve tool among them; plain `relish mcp` still only reads, and makes itself a read-only token rather than borrow your admin one.
+
+### Ask the cluster why
+
+When something breaks, the next question is what changed. The scheduler, the restart loop and the apply path write down their rule and its evidence at the moment they decide, so the cluster can answer later:
+
+```
+relish timeline --app web --since 15m
+```
+```
+relish agent explain --restart web-0
+```
+```
+relish agent explain --placement web-1
+```
+
+A decision the records no longer hold comes back as `not_found`, which means unknown, not “didn’t happen”.
+
+### Is this the release?
+
+`relish verify` checks that every node runs the published, signed `bun`, byte for byte, that they all run the same version, and that the `relish` asking is signed too. Missing evidence is `unknown`, never `verified`.
+
+### One screen for the whole cluster
+
+`relish status` is now one line per part of the cluster with a verdict on top, the same height on three nodes or three hundred. The lists moved to `relish apps --unhealthy` and `relish nodes --unhealthy`.
+
+### Small enough to hold in your head, or a context window
+
+Reliaburger has 8 resource kinds and 189 commands and subcommands, counted from the CLI’s own definitions, hidden ones included. A test fails when either number moves, so a new concept is a line in a pull request that someone has to agree with.
+
+**How that compares with Kubernetes**
+
+Not measured yet. The tokens and time an agent spends on the same task on each platform come from the runs in [#1679](https://github.com/reliaburger/reliaburger/issues/1679), for [#1681](https://github.com/reliaburger/reliaburger/issues/1681), and we’ll quote them here when they exist.
+
+**Small local models**
+
+Not measured yet. The agent gym with open models running locally, as well as Claude, is [#1687](https://github.com/reliaburger/reliaburger/issues/1687). Its results go here, all of them, when the runs are done.
+
+[Proposals, for agents](https://reliaburger.com/agents.html#proposing-a-change) · [Agent tokens and proposals](https://github.com/reliaburger/reliaburger/blob/main/docs/manual/10_security.md#agent-tokens-and-proposals) · [The timeline](https://github.com/reliaburger/reliaburger/blob/main/docs/manual/07_diagnostics.md#relish-timeline-what-changed-and-why-did-it-do-that) · [Verify a cluster](https://github.com/reliaburger/reliaburger/blob/main/docs/manual/12_operations.md#is-this-the-release)
+
 ## What’s next
 
 **0.3.0: Bare metal in an hour**
 
 Next. An appliance OS, netbooting and claiming machines over the LAN, and signed A/B OS updates. The exit test: Dell Wyse thin clients from power-on to a cluster.
 
-[Milestone](https://github.com/reliaburger/reliaburger/milestone/6) 
+[Milestone](https://github.com/reliaburger/reliaburger/milestone/6)
 
 **0.4.0: Full container migration**
 
 Planned. Cordon, drain and uncordon, cold moves that carry volumes, and checkpoint moves that keep memory while connections reconnect.
 
-[Milestone](https://github.com/reliaburger/reliaburger/milestone/7) 
+[Milestone](https://github.com/reliaburger/reliaburger/milestone/7)
 
 ## Read the docs
 
-Documentation lives with the code. 
+Documentation lives with the code.
 
 START HERE
 
@@ -618,7 +715,7 @@ You’ll need Rust and your platform’s build tools. This runs `hello` as a hos
 
 For real OCI containers, use runc on Linux. On macOS, the managed laptop quickstart uses Linux VMs. Direct Apple Container is deferred beyond 0.2.7.
 
-[Build requirements & runtime setup](https://github.com/reliaburger/reliaburger/blob/main/docs/README.md) 
+[Build requirements & runtime setup](https://github.com/reliaburger/reliaburger/blob/main/docs/README.md)
 
 LOCAL DEVELOPMENT sh
 
