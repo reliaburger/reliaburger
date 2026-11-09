@@ -146,6 +146,12 @@ expression: value
             "text": "none tracked"
           },
           {
+            "mark": "note",
+            "next": "relish lease list",
+            "section": "agents",
+            "text": "1 lease held: app:default/web by holmes"
+          },
+          {
             "mark": "problem",
             "next": "relish wtf",
             "section": "wtf",
@@ -154,6 +160,22 @@ expression: value
         ],
         "problems": 9,
         "summary": {
+          "agents": {
+            "source": "complete",
+            "value": {
+              "first_leases": [
+                {
+                  "expires_in_seconds": 87,
+                  "holder": "holmes",
+                  "target": "app:default/web"
+                }
+              ],
+              "first_proposals": [],
+              "leases": 1,
+              "stale": 0,
+              "waiting": 0
+            }
+          },
           "alerts": {
             "source": "complete",
             "value": {

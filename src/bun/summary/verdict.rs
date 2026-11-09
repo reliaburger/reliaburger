@@ -30,6 +30,8 @@ pub const APP_LIST_HINT: &str = "relish apps";
 pub const JOBS_HINT: &str = "relish jobs";
 pub const FAULTS_HINT: &str = "relish fault list";
 pub const GITOPS_HINT: &str = "relish gitops status";
+pub const PROPOSALS_HINT: &str = "relish proposal list";
+pub const LEASES_HINT: &str = "relish lease list";
 pub const WTF_HINT: &str = "relish wtf";
 
 /// Every command `relish status` can suggest, on a line or as a `next`
@@ -43,6 +45,8 @@ pub const HINTS: &[&str] = &[
     JOBS_HINT,
     FAULTS_HINT,
     GITOPS_HINT,
+    PROPOSALS_HINT,
+    LEASES_HINT,
     WTF_HINT,
 ];
 
@@ -224,8 +228,12 @@ pub fn section_lines(summary: &ClusterSummary) -> Vec<Line> {
             |gitops| gitops_line(gitops, now / 1000),
         ));
     }
-    // TODO(#1682): an `agents` line (leases held, proposals waiting for
-    // approval) once the lease and proposal client APIs exist.
+    lines.push(section_line(
+        "agents",
+        &summary.agents,
+        summary.scoped,
+        agents_line,
+    ));
     lines
 }
 
@@ -594,6 +602,63 @@ fn gitops_line(gitops: &crate::bun::summary::GitOpsSection, now_seconds: u64) ->
         (None, _) => "configured, not synced yet".to_string(),
     };
     quiet("gitops", text)
+}
+
+/// Leases and waiting proposals are worth knowing, not a problem: a
+/// person is meant to read and decide them. A stale proposal is a problem,
+/// because approving it fails and its leases keep everyone else off its
+/// apps until someone withdraws or rejects it.
+pub(crate) fn agents_line(agents: &crate::bun::summary::AgentsSection) -> Line {
+    let mut parts = Vec::new();
+    if let Some(first) = agents.first_leases.first() {
+        let mut text = format!(
+            "{} held: {} by {}",
+            counted(agents.leases, "lease", "leases"),
+            first.target,
+            first.holder
+        );
+        if agents.leases > 1 {
+            let _ = write!(text, ", and {} more", agents.leases - 1);
+        }
+        parts.push(text);
+    }
+    if agents.waiting > 0 {
+        let mut text = format!(
+            "{} waiting for approval",
+            counted(agents.waiting, "proposal", "proposals")
+        );
+        match agents.first_proposals.first() {
+            Some(first) if agents.stale > 0 => {
+                let why = first.stale.as_deref().unwrap_or("it can't apply");
+                let _ = write!(text, ", {} stale (#{}: {why})", agents.stale, first.id);
+            }
+            Some(first) => {
+                let _ = write!(text, " (#{} by {})", first.id, first.author);
+            }
+            None => {}
+        }
+        parts.push(text);
+    }
+    if parts.is_empty() {
+        return quiet("agents", "no leases held, no proposals waiting");
+    }
+    let text = parts.join("; ");
+    if agents.stale > 0 {
+        flagged("agents", text, Mark::Problem, Some(PROPOSALS_HINT))
+    } else if agents.waiting > 0 {
+        flagged("agents", text, Mark::Note, Some(PROPOSALS_HINT))
+    } else {
+        flagged("agents", text, Mark::Note, Some(LEASES_HINT))
+    }
+}
+
+/// `count` with the noun that agrees with it.
+fn counted(count: u32, one: &str, many: &str) -> String {
+    if count == 1 {
+        format!("1 {one}")
+    } else {
+        format!("{} {many}", grouped(count.into()))
+    }
 }
 
 fn short_commit(commit: &str) -> &str {

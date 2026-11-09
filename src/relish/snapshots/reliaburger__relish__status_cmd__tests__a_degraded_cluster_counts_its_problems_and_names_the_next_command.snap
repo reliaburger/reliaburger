@@ -18,4 +18,5 @@ logs       newest line 2 s old, slowest node 9 s (node-3)
 faults     1 active: latency on api (default), 6 m left              relish fault list
 alerts     1 firing: disk_high on node-3                             relish wtf
 certs      soonest expiry 61 days (node-2)
+agents     no leases held, no proposals waiting
 wtf        1 critical, 1 warning: app web is down                    relish wtf

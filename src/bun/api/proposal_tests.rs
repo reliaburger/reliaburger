@@ -890,3 +890,58 @@ async fn an_agents_undo_starts_from_what_the_original_left() {
         "{body}"
     );
 }
+
+/// `relish status`'s agents line reads the summary: the lease a proposal
+/// pins and the proposal waiting, within the caller's scope, and the
+/// proposal turns stale once a person changes its app.
+#[tokio::test]
+async fn the_cluster_summary_counts_leases_and_waiting_proposals() {
+    let cluster = cluster("proposal-summary").await;
+    let (status, body) = cluster.scale(&cluster.holmes, "shop", "web", 5).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = cluster
+        .scale(&cluster.billing_bot, "billing", "ledger", 5)
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, summary) = cluster.get("/v1/cluster/summary", &cluster.watcher).await;
+    assert_eq!(status, StatusCode::OK, "{summary}");
+    let agents = &summary["agents"];
+    assert_eq!(agents["source"], "complete", "{agents}");
+    assert_eq!(agents["value"]["leases"], 2, "{agents}");
+    assert_eq!(agents["value"]["waiting"], 2, "{agents}");
+    assert_eq!(agents["value"]["stale"], 0, "{agents}");
+    let targets: Vec<&str> = agents["value"]["first_leases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|lease| lease["target"].as_str().unwrap())
+        .collect();
+    assert_eq!(targets, ["app:billing/ledger", "app:shop/web"]);
+    assert_eq!(agents["value"]["first_leases"][1]["holder"], "holmes");
+
+    // Holmes's scope reaches shop only, as `GET /v1/proposals` does.
+    let (_, summary) = cluster.get("/v1/cluster/summary", &cluster.holmes).await;
+    let agents = &summary["agents"]["value"];
+    assert_eq!(agents["leases"], 1, "{agents}");
+    assert_eq!(agents["waiting"], 1, "{agents}");
+    assert_eq!(agents["first_proposals"][0]["author"], "holmes");
+    assert_eq!(agents["first_proposals"][0]["apps"][0], "web");
+
+    // A person writes web in between: approving would fail, so it's stale.
+    cluster
+        .council
+        .write(crate::council::types::RaftRequest::AppSpec {
+            app_id: crate::meat::AppId::new("web", "shop"),
+            spec: web_spec(4),
+        })
+        .await
+        .unwrap();
+    let (_, summary) = cluster.get("/v1/cluster/summary", &cluster.watcher).await;
+    let agents = &summary["agents"]["value"];
+    assert_eq!(agents["stale"], 1, "{agents}");
+    assert_eq!(
+        agents["first_proposals"][0]["stale"],
+        "shop/web changed after it was made"
+    );
+}

@@ -101,8 +101,8 @@ relish council status   # every node's view of the council
 
 `relish status` gives a verdict (`HEALTHY`, `DEGRADED`, or `DOWN` when the
 council has lost its quorum or its leader), then one line each for nodes, the
-council, gossip, versions, capacity, apps, jobs, logs, faults, alerts and
-certificates. It's the same size on three nodes or three hundred: a line that
+council, gossip, versions, capacity, apps, jobs, logs, faults, alerts,
+certificates and agents (leases held, proposals waiting for approval). It's the same size on three nodes or three hundred: a line that
 needs attention ends in the command that shows the detail, such as
 `relish nodes --unhealthy` or `relish apps --unhealthy`.
 

@@ -273,7 +273,13 @@ inside for keys. Its dashboard, the first screen, and the top of the web
 dashboard show what `relish status` shows: the verdict and one line per
 part of the cluster, read from the same cluster summary (`GET
 /v1/cluster/summary`). Neither runs `wtf`'s checks, so neither has a `wtf`
-line; `relish status` does. It needs a terminal of at least 80×24. With no terminal on
+line; `relish status` does. All three show an `agents` line: the agent
+leases held, naming the first holder and target (`1 lease held:
+app:shop/web by holmes`), and the proposals waiting for approval. Those are
+a note, pointing at `relish proposal list` or `relish lease list`, and the
+cluster stays `HEALTHY`. A stale proposal, one whose app changed after it
+was made so approving it would fail, makes the cluster `DEGRADED` until
+someone withdraws or rejects it. The TUI needs a terminal of at least 80×24. With no terminal on
 stdin or stdout (a pipe, a cron job, an AI agent's shell), `relish`, `relish
 manual` and `relish source` exit at once with an error that names the plain
 output command to use instead: `relish agent guide`, `relish agent manual` or

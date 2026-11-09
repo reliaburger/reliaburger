@@ -354,6 +354,42 @@ mod tests {
         assert!(!html.contains("alert-warning"), "{html}");
     }
 
+    /// A proposal waiting for a person is worth a look, not a problem; one
+    /// that can't apply any more is.
+    #[test]
+    fn the_cluster_card_shows_proposals_waiting_and_stale_ones_degrade() {
+        use crate::bun::summary::{AgentsSection, ProposalBrief, Section};
+        let brief = |stale: Option<&str>| ProposalBrief {
+            id: 17,
+            kind: "scale".to_string(),
+            author: "holmes".to_string(),
+            namespace: "shop".to_string(),
+            apps: vec!["web".to_string()],
+            created_at_unix_ms: 1_800_000_000_000,
+            stale: stale.map(str::to_string),
+        };
+        let mut summary = summary_fixture();
+        summary.agents = Section::complete(AgentsSection {
+            waiting: 1,
+            first_proposals: vec![brief(None)],
+            ..AgentsSection::default()
+        });
+        let html = render_summary_fragment(Some(&summary));
+        assert!(html.contains("badge-green\">HEALTHY"), "{html}");
+        assert!(
+            html.contains("<tr class=\"alert-warning\"><td>agents</td><td>1 proposal waiting for approval (#17 by holmes)</td><td><code>relish proposal list</code></td></tr>"),
+            "{html}"
+        );
+        summary.agents = Section::complete(AgentsSection {
+            waiting: 1,
+            stale: 1,
+            first_proposals: vec![brief(Some("shop/web changed after it was made"))],
+            ..AgentsSection::default()
+        });
+        let html = render_summary_fragment(Some(&summary));
+        assert!(html.contains("badge-amber\">DEGRADED"), "{html}");
+    }
+
     #[test]
     fn an_app_list_that_could_not_be_read_says_why() {
         let html = render_dashboard(&DashboardData {
@@ -432,6 +468,7 @@ mod tests {
                 synced_at_unix_seconds: None,
                 error: None,
             }),
+            agents: Section::complete(AgentsSection::default()),
         }
     }
 

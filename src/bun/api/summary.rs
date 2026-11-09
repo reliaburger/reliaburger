@@ -460,6 +460,8 @@ async fn local_leader_view(state: &ApiState) -> Result<LeaderView, String> {
                 error: None,
             },
             jobs: job_runs(state).await,
+            leases: Vec::new(),
+            proposals: Vec::new(),
         });
     };
     if !confirmed_lease_leader(council).await {
@@ -499,12 +501,19 @@ async fn local_leader_view(state: &ApiState) -> Result<LeaderView, String> {
             .as_ref()
             .and_then(|sync| sync.last_error.clone()),
     };
+    let now = crate::testkit::lease::now_unix_millis();
     Ok(LeaderView {
         capacity,
         apps,
         upgrade_in_progress: desired.active_upgrade.is_some(),
         gitops,
         jobs: job_runs(state).await,
+        leases: desired
+            .agent_leases
+            .live(now)
+            .map(|lease| lease.view(now))
+            .collect(),
+        proposals: crate::bun::summary::waiting_proposals(&desired, now),
     })
 }
 
@@ -599,6 +608,20 @@ fn scope_leader_view(
     };
     view.apps = super::node_info::filter_desired_apps_for_scope(view.apps, auth);
     view.jobs.retain(|run| visible(&run.name, &run.namespace));
+    // The same reach `GET /v1/leases` and `GET /v1/proposals` give.
+    view.leases.retain(|lease| {
+        let target = match &lease.app {
+            Some(app) => crate::proposal::lease::LeaseTarget::app(&lease.namespace, app),
+            None => crate::proposal::lease::LeaseTarget::namespace(&lease.namespace),
+        };
+        super::leases::lease_visible(auth, &target)
+    });
+    view.proposals.retain(|proposal| {
+        proposal
+            .apps
+            .iter()
+            .all(|app| visible(app, &proposal.namespace))
+    });
     view
 }
 

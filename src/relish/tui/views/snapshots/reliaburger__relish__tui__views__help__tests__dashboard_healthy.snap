@@ -20,6 +20,7 @@ expression: "render_to_string(&app, 120, 40)"
 │faults     none active                                                                                                │
 │alerts     none firing                                                                                                │
 │certs      none tracked                                                                                               │
+│agents     no leases held, no proposals waiting                                                                       │
 │                                                                                                                      │
 │Recent events                                                                                                         │
 │15:05:40  Health  fixture event 1                                                                                     │
@@ -28,7 +29,6 @@ expression: "render_to_string(&app, 120, 40)"
 │15:06:10  Health  fixture event 4                                                                                     │
 │15:06:20  Health  fixture event 5                                                                                     │
 │15:06:30  Deploy  fixture event 6                                                                                     │
-│                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │

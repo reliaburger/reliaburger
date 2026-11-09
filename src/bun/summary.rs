@@ -215,6 +215,8 @@ pub struct ClusterSummary {
     pub certs: Section<CertsSection>,
     /// GitOps sync, `None` when GitOps isn't configured.
     pub gitops: Section<GitOpsSection>,
+    /// Agent leases held and proposals waiting for a person.
+    pub agents: Section<AgentsSection>,
 }
 
 /// Gossip membership by state.
@@ -553,6 +555,55 @@ pub struct GitOpsSection {
     pub error: Option<String>,
 }
 
+/// Agent leases held and proposals waiting for a person, as far as the
+/// caller's scope reaches.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AgentsSection {
+    /// Live leases.
+    pub leases: u32,
+    /// The first few, in target order, at most [`SUMMARY_LIST_MAX`].
+    pub first_leases: Vec<LeaseBrief>,
+    /// Proposals waiting for approval.
+    pub waiting: u32,
+    /// Waiting proposals that can't apply as they stand: an app they touch
+    /// changed after they were made, or they outlived their TTL.
+    pub stale: u32,
+    /// The waiting proposals, stale ones first, then oldest first, at most
+    /// [`SUMMARY_LIST_MAX`].
+    pub first_proposals: Vec<ProposalBrief>,
+}
+
+/// One lease in a line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct LeaseBrief {
+    /// `app:shop/web` or `namespace:shop`.
+    pub target: String,
+    /// The holder's token name.
+    pub holder: String,
+    /// Whole seconds left when the leader answered.
+    pub expires_in_seconds: u64,
+}
+
+/// One waiting proposal in a line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ProposalBrief {
+    /// Its number, for `relish proposal show`.
+    pub id: u64,
+    /// `apply`, `scale`, `rollback`, `stop`, `delete` or `undo`.
+    pub kind: String,
+    /// The author's token name.
+    pub author: String,
+    /// The namespace every touched app is in.
+    pub namespace: String,
+    /// The touched apps' names.
+    pub apps: Vec<String>,
+    /// When it was made, Unix milliseconds on the leader's clock.
+    pub created_at_unix_ms: u64,
+    /// Why it can't apply as it stands; `None` while it still can.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale: Option<String>,
+}
+
 /// `GET /v1/cluster/capacity`: what the scheduler has committed on each
 /// node, from the leader's view of their state reports.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -694,6 +745,10 @@ pub struct LeaderView {
     pub gitops: GitOpsSection,
     /// Job runs.
     pub jobs: Vec<JobRun>,
+    /// Every live agent lease.
+    pub leases: Vec<crate::proposal::lease::LeaseView>,
+    /// Every proposal waiting for approval.
+    pub proposals: Vec<ProposalBrief>,
 }
 
 /// One job run or schedule, as the leader holds it.
@@ -888,6 +943,10 @@ pub fn assemble(inputs: &SummaryInputs) -> ClusterSummary {
         gitops: match leader {
             Ok(view) => Section::complete(view.gitops.clone()),
             Err(_) => Section::missing(leader_missing("GitOps")),
+        },
+        agents: match leader {
+            Ok(view) => Section::complete(agents_section(&view.leases, &view.proposals)),
+            Err(_) => Section::missing(leader_missing("the list of leases and proposals")),
         },
     }
 }
@@ -1243,6 +1302,70 @@ fn certs_section(shares: &[NodeSummary]) -> CertsSection {
     }
 }
 
+fn agents_section(
+    leases: &[crate::proposal::lease::LeaseView],
+    proposals: &[ProposalBrief],
+) -> AgentsSection {
+    let mut waiting: Vec<ProposalBrief> = proposals.to_vec();
+    waiting.sort_by_key(|proposal| (proposal.stale.is_none(), proposal.id));
+    let stale = count(waiting.iter().filter(|p| p.stale.is_some()).count());
+    waiting.truncate(SUMMARY_LIST_MAX);
+    AgentsSection {
+        leases: count(leases.len()),
+        first_leases: leases
+            .iter()
+            .take(SUMMARY_LIST_MAX)
+            .map(|lease| LeaseBrief {
+                target: lease.target.clone(),
+                holder: lease.holder.clone(),
+                expires_in_seconds: lease.expires_in_seconds,
+            })
+            .collect(),
+        waiting: count(proposals.len()),
+        stale,
+        first_proposals: waiting,
+    }
+}
+
+/// Every proposal in `desired` waiting for approval at `now_unix_ms`, each
+/// saying whether it's stale, for the leader's view.
+pub fn waiting_proposals(
+    desired: &crate::council::types::DesiredState,
+    now_unix_ms: u64,
+) -> Vec<ProposalBrief> {
+    desired
+        .proposals
+        .pending()
+        .map(|proposal| ProposalBrief {
+            id: proposal.id.0,
+            kind: proposal.kind.name().to_string(),
+            author: proposal.author.name.clone(),
+            namespace: proposal.namespace.clone(),
+            apps: proposal.apps().map(|app| app.name.clone()).collect(),
+            created_at_unix_ms: proposal.created_at_unix_ms,
+            stale: staleness(desired, proposal, now_unix_ms),
+        })
+        .collect()
+}
+
+/// Why a waiting proposal can't apply as it stands, or `None` while it
+/// still can. It applies only while every touched app's revision still
+/// equals the one it saw, so approving a stale one fails; one past its TTL
+/// should already have been expired by the reaper.
+fn staleness(
+    desired: &crate::council::types::DesiredState,
+    proposal: &crate::proposal::Proposal,
+    now_unix_ms: u64,
+) -> Option<String> {
+    if let Some(change) = proposal.changes.iter().find(|change| {
+        crate::proposal::revision::current_revision(desired, &change.app) != change.before.revision
+    }) {
+        return Some(format!("{} changed after it was made", change.app));
+    }
+    (proposal.expires_at_unix_ms <= now_unix_ms)
+        .then(|| "past its TTL, and the reaper hasn't expired it".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1547,6 +1670,8 @@ mod tests {
                 error: None,
             },
             jobs: Vec::new(),
+            leases: Vec::new(),
+            proposals: Vec::new(),
         }
     }
 
@@ -1594,6 +1719,7 @@ mod tests {
             ("alerts", summary.alerts.source),
             ("certs", summary.certs.source),
             ("gitops", summary.gitops.source),
+            ("agents", summary.agents.source),
         ]
     }
 
@@ -1687,6 +1813,7 @@ mod tests {
             summary.instances.source,
             summary.jobs.source,
             summary.gitops.source,
+            summary.agents.source,
         ] {
             assert_eq!(section, Source::Missing);
         }
@@ -1890,6 +2017,196 @@ mod tests {
         assert_eq!(faults.soonest[0].target, "svc-7");
         let alerts = summary.alerts.value.unwrap();
         assert_eq!((alerts.firing, alerts.first.len()), (7, SUMMARY_LIST_MAX));
+    }
+
+    // -- agents -----------------------------------------------------------
+
+    fn lease_view(app: &str, holder: &str) -> crate::proposal::lease::LeaseView {
+        crate::proposal::lease::LeaseView {
+            target: format!("app:shop/{app}"),
+            kind: crate::proposal::lease::LeaseKind::App,
+            namespace: "shop".to_string(),
+            app: Some(app.to_string()),
+            holder: holder.to_string(),
+            purpose: "p99 over the SLO".to_string(),
+            proposal: None,
+            acquired_at_unix_ms: NOW_MS - 10_000,
+            expires_at_unix_ms: NOW_MS + 110_000,
+            expires_in_seconds: 110,
+        }
+    }
+
+    fn proposal_brief(id: u64, stale: Option<&str>) -> ProposalBrief {
+        ProposalBrief {
+            id,
+            kind: "scale".to_string(),
+            author: "holmes".to_string(),
+            namespace: "shop".to_string(),
+            apps: vec!["web".to_string()],
+            created_at_unix_ms: NOW_MS - 60_000,
+            stale: stale.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn agents_count_leases_and_waiting_proposals_and_list_the_stale_first() {
+        let mut inputs = healthy();
+        if let Ok(view) = &mut inputs.leader {
+            view.leases = (0..7)
+                .map(|index| lease_view(&format!("app-{index}"), "holmes"))
+                .collect();
+            view.proposals = vec![
+                proposal_brief(3, None),
+                proposal_brief(5, Some("shop/web changed after it was made")),
+                proposal_brief(4, None),
+            ];
+        }
+        let summary = assemble(&inputs);
+        assert_eq!(summary.agents.source, Source::Complete);
+        let agents = summary.agents.value.unwrap();
+        assert_eq!((agents.leases, agents.waiting, agents.stale), (7, 3, 1));
+        assert_eq!(agents.first_leases.len(), SUMMARY_LIST_MAX);
+        assert_eq!(
+            agents.first_leases[0],
+            LeaseBrief {
+                target: "app:shop/app-0".to_string(),
+                holder: "holmes".to_string(),
+                expires_in_seconds: 110,
+            }
+        );
+        let order: Vec<u64> = agents.first_proposals.iter().map(|p| p.id).collect();
+        assert_eq!(order, [5, 3, 4], "stale first, then oldest");
+    }
+
+    #[test]
+    fn no_leases_and_no_proposals_is_a_complete_zero() {
+        let agents = assemble(&healthy()).agents;
+        assert_eq!(agents.source, Source::Complete);
+        assert_eq!(agents.value, Some(AgentsSection::default()));
+    }
+
+    /// The summary carries what a person needs at a glance, never the
+    /// holder's own words: a lease's purpose is untrusted text.
+    #[test]
+    fn the_agents_section_never_carries_a_lease_purpose() {
+        let mut inputs = healthy();
+        if let Ok(view) = &mut inputs.leader {
+            view.leases = vec![lease_view("web", "holmes")];
+        }
+        let json = serde_json::to_string(&assemble(&inputs).agents).unwrap();
+        assert!(!json.contains("p99 over the SLO"), "{json}");
+    }
+
+    fn proposal_desired() -> crate::council::types::DesiredState {
+        let spec: crate::config::app::AppSpec =
+            toml::from_str("image = \"web:1\"\nreplicas = 3\nnamespace = \"shop\"").unwrap();
+        let mut desired = crate::council::types::DesiredState::default();
+        desired
+            .apps
+            .insert(crate::meat::AppId::new("web", "shop"), spec);
+        let author = crate::proposal::Principal {
+            name: "holmes".to_string(),
+            principal_id: "token:holmes".to_string(),
+            kind: crate::sesame::types::TokenKind::Agent,
+            role: crate::sesame::types::ApiRole::Deployer,
+        };
+        let request = crate::proposal::ProposalRequest {
+            kind: crate::proposal::RequestKind::Scale,
+            namespace: Some("shop".to_string()),
+            app: Some("web".to_string()),
+            replicas: Some(5),
+            config: None,
+            of: None,
+            reason: "p99 over the SLO".to_string(),
+            ttl_seconds: None,
+            idempotency_key: None,
+        };
+        let proposal = crate::proposal::build::build(
+            &desired,
+            &request,
+            &author,
+            NOW_MS,
+            crate::proposal::build::as_declared,
+        )
+        .unwrap();
+        let snapshot = desired.clone();
+        let outcome = desired.proposals.create(
+            &mut desired.agent_leases,
+            proposal,
+            |app| crate::proposal::revision::current_revision(&snapshot, app),
+            NOW_MS,
+        );
+        assert!(
+            matches!(outcome, crate::proposal::ProposalOutcome::Created { .. }),
+            "{outcome:?}"
+        );
+        desired
+    }
+
+    #[test]
+    fn a_fresh_waiting_proposal_is_not_stale() {
+        let waiting = waiting_proposals(&proposal_desired(), NOW_MS + 1_000);
+        assert_eq!(waiting.len(), 1);
+        let brief = &waiting[0];
+        assert_eq!(
+            (
+                brief.kind.as_str(),
+                brief.author.as_str(),
+                brief.namespace.as_str()
+            ),
+            ("scale", "holmes", "shop")
+        );
+        assert_eq!(brief.apps, ["web"]);
+        assert_eq!(brief.stale, None);
+    }
+
+    /// Approving a proposal whose app moved fails, so the summary says so
+    /// before anyone tries.
+    #[test]
+    fn a_proposal_whose_app_changed_since_is_stale() {
+        let mut desired = proposal_desired();
+        let web = crate::meat::AppId::new("web", "shop");
+        desired.apps.get_mut(&web).unwrap().image = Some("web:2".to_string());
+        let waiting = waiting_proposals(&desired, NOW_MS + 1_000);
+        assert_eq!(
+            waiting[0].stale.as_deref(),
+            Some("shop/web changed after it was made")
+        );
+    }
+
+    #[test]
+    fn a_proposal_past_its_ttl_that_is_still_waiting_is_stale() {
+        let desired = proposal_desired();
+        let expires = desired
+            .proposals
+            .pending()
+            .next()
+            .unwrap()
+            .expires_at_unix_ms;
+        let waiting = waiting_proposals(&desired, expires);
+        assert_eq!(
+            waiting[0].stale.as_deref(),
+            Some("past its TTL, and the reaper hasn't expired it")
+        );
+    }
+
+    #[test]
+    fn only_pending_proposals_are_waiting() {
+        let mut desired = proposal_desired();
+        let id = desired.proposals.pending().next().unwrap().id;
+        let author = desired.proposals.get(id).unwrap().author.clone();
+        let desired_ref = &mut desired;
+        let outcome = desired_ref.proposals.withdraw(
+            &mut desired_ref.agent_leases,
+            id,
+            &author,
+            NOW_MS + 1_000,
+        );
+        assert!(
+            matches!(outcome, crate::proposal::ProposalOutcome::Withdrawn { .. }),
+            "{outcome:?}"
+        );
+        assert!(waiting_proposals(&desired, NOW_MS + 2_000).is_empty());
     }
 
     #[test]

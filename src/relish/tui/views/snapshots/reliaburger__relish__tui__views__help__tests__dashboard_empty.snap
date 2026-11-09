@@ -20,9 +20,9 @@ expression: "render_to_string(&app, 120, 40)"
 │faults     none active                                                                                                │
 │alerts     none firing                                                                                                │
 │certs      none tracked                                                                                               │
+│agents     no leases held, no proposals waiting                                                                       │
 │                                                                                                                      │
 │Recent events                                                                                                         │
-│                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │

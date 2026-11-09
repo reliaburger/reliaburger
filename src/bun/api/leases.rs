@@ -50,7 +50,10 @@ pub(super) async fn leases_handler(
 }
 
 /// Whether `auth`'s token scope reaches `target`.
-fn lease_visible(auth: Option<&crate::sesame::auth::AuthContext>, target: &LeaseTarget) -> bool {
+pub(super) fn lease_visible(
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    target: &LeaseTarget,
+) -> bool {
     match target {
         LeaseTarget::App { namespace, app } => {
             crate::sesame::auth::authorize_scoped(auth, app, namespace).is_ok()

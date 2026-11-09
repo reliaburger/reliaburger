@@ -65,7 +65,7 @@ sections print one quiet line each. A section with a problem is coloured
 | alerts | `/v1/alerts` | Nothing |
 | certs | `/v1/diagnostics` `certificates` | Nothing |
 | gitops | `/v1/gitops` | Nothing; one line, hidden when GitOps isn't configured |
-| agents | Leases (#1686) and proposals (#1682) | Counts, once those merge |
+| agents | Leases (#1686) and proposals (#1682), in the leader's view | Done: counts, the first few holders and targets, and stale proposals (D5) |
 | wtf | Client-side only (`relish/wtf/collect.rs`) | See decision D1 |
 
 ### One summary, served by the cluster
@@ -168,3 +168,17 @@ Each has a default, so the build doesn't wait:
   costs nothing. The alternative, a canary line Bun writes every minute and
   reads back through the log query path, proves more but costs a write per
   node per minute.
+- **D5, agents and the verdict.** Decided (9 November 2026): leases held
+  and proposals waiting for approval are a note, never a problem. They're
+  the system working as designed: an agent at work, and a change waiting
+  for the person it's meant to wait for. The line names `relish proposal
+  list` while a proposal waits, else `relish lease list`, and the cluster
+  stays `HEALTHY`. A **stale** proposal is a problem and makes the cluster
+  `DEGRADED`. Stale means approving it would fail: an app it touches
+  changed after it was made (its revision no longer matches), or it's past
+  its TTL and the reaper hasn't expired it. Either way it pins a lease on
+  its apps that keeps everyone else off them until someone withdraws or
+  rejects it. The leader works out staleness when it builds its view, so
+  every reader sees the same answer. The section never carries a lease's
+  purpose or a proposal's reason: both are an agent's own words, and
+  `relish agent context` already lists them as untrusted text.
