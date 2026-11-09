@@ -409,7 +409,7 @@ jobs. What else runs depends on where the change is going:
 
 | Run | Jobs | Typical wall time |
 |---|---|---|
-| Pull request into a merge train (`release-*`, e.g. `release-0-2-4`) | The light set: CI policy, dependency audit, lint and format, minimum Rust, the demo app, the source bundle build, portable Linux (with coverage), the doctests and the nightly-signing key test, and the optimised contract boundaries | about 17 minutes, set by portable Linux, down from 30 (#1723); more on a slow runner |
+| Pull request into a merge train (`release-*`, e.g. `release-0-2-4`) | The light set: CI policy, dependency audit, lint and format, minimum Rust, the demo app, the source bundle build, portable Linux (with coverage), the doctests and the nightly-signing key test, and the optimised contract boundaries | about 19 minutes of running, set by portable Linux, down from 30 (#1723, [measured](qualification/2026-11-09-v0.2.8-train-pr-timings.md)), plus however long the runners queue |
 | The same, labelled `full-ci` | The light set plus privileged Linux, the cluster, acceptance and upgrade suites, and the benchmarks the change touches | about 45 minutes |
 | The gate PR (a train into `main`) | The light set on each push; with `full-ci`, the heavy suites too | as above |
 | The gate PR labelled `release-gate` | Everything, portable macOS included; the evidence gate refuses less | about 45 minutes, plus any wait for macOS runners |
