@@ -483,8 +483,8 @@ migration and no feature gate
   ([record](qualification/2026-11-06-v0.2.7-exit-test.md)). Candidate 1
   passed the full gate but for one 1,215 ms journal turn in the 8-hour final,
   which the maintainer accepted as a known issue
-  ([#1707](https://github.com/reliaburger/reliaburger/issues/1707), fixed in
-  0.2.8; [closure](qualification/2026-11-07-v0.2.7-release-closure.md),
+  ([#1707](https://github.com/reliaburger/reliaburger/issues/1707), still
+  open in 0.2.8; [closure](qualification/2026-11-07-v0.2.7-release-closure.md),
   [release log](release-log.md#027-built-for-humans-and-their-agents)). The
   agent debugging recording
   ([#1678](https://github.com/reliaburger/reliaburger/issues/1678)) follows
@@ -492,17 +492,15 @@ migration and no feature gate
   onto it in place
   ([upgrading from 0.2.6](releasing.md#upgrading-from-026)).
 - [ ] **0.2.8: "Agents you can trust, built faster"**
-  ([milestone](https://github.com/reliaburger/reliaburger/milestone/30)).
-  Two halves: what sets Reliaburger apart when people work through AI agents
-  (agent changes as reviewable proposals with undo, trying a change on a copy
-  of production, decision provenance, locks between agents and more,
-  [#1681](https://github.com/reliaburger/reliaburger/issues/1681)–[#1690](https://github.com/reliaburger/reliaburger/issues/1690)),
-  and a faster loop for building, testing and releasing Reliaburger itself,
-  starting with macOS CI that builds only `relish`. The brainstorm after
-  0.2.7 settles the scope
-  ([#1673](https://github.com/reliaburger/reliaburger/issues/1673),
-  [faster-feedback plan](plans/2026-11-06-plan-faster-feedback.md)).
-  In progress.
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/30),
+  [plan](plans/2026-11-07-plan-0.2.8.md)). Agent changes become proposals a
+  person or a policy approves and can undo, behind short leases
+  ([#1682](https://github.com/reliaburger/reliaburger/issues/1682),
+  [#1686](https://github.com/reliaburger/reliaburger/issues/1686)), with
+  `relish verify`, `relish timeline`, a one-screen `relish status` and
+  `relish gym run` beside them; and a faster loop for us, from macOS CI that
+  builds only `relish` to candidates that reuse `main`'s CI. In progress; it
+  changes the cluster formats, so it needs a fresh cluster.
 - [ ] **0.3.0: "Bare metal in an hour"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/6),
   research and spikes in [#218](https://github.com/reliaburger/reliaburger/pull/218)

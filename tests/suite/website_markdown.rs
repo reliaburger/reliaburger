@@ -305,6 +305,34 @@ fn copy_on_disk(page: &str) -> PathBuf {
     repository().join(WEBSITE).join(copy_path(page))
 }
 
+/// The first few lines where a page's fresh copy and the copy on disk
+/// differ, so a failure says what changed even where `make agent-docs`
+/// can't run.
+fn differences(fresh: &str, on_disk: &str) -> String {
+    let mut fresh_lines = fresh.lines();
+    let mut disk_lines = on_disk.lines();
+    let mut found = Vec::new();
+    let mut number = 1;
+    while found.len() < 3 {
+        let (expected, actual) = (fresh_lines.next(), disk_lines.next());
+        if expected.is_none() && actual.is_none() {
+            break;
+        }
+        if expected != actual {
+            found.push(format!(
+                "line {number}: the page makes {:?}, the file has {:?}",
+                expected.unwrap_or("<end>"),
+                actual.unwrap_or("<end>")
+            ));
+        }
+        number += 1;
+    }
+    if found.is_empty() {
+        return "they differ only in line endings".to_string();
+    }
+    found.join("; ")
+}
+
 #[test]
 fn every_page_has_a_current_markdown_copy() {
     let update = std::env::var_os("RELIABURGER_UPDATE_AGENT_DOCS").is_some();
@@ -314,8 +342,15 @@ fn every_page_has_a_current_markdown_copy() {
         let path = copy_on_disk(&page);
         if update {
             std::fs::write(&path, &fresh).unwrap();
-        } else if std::fs::read_to_string(&path).ok().as_deref() != Some(fresh.as_str()) {
-            stale.push(copy_path(&page));
+            continue;
+        }
+        match std::fs::read_to_string(&path) {
+            Ok(on_disk) if on_disk == fresh => {}
+            Ok(on_disk) => {
+                let difference = differences(&fresh, &on_disk);
+                stale.push(format!("{} ({difference})", copy_path(&page)));
+            }
+            Err(_) => stale.push(format!("{} (missing)", copy_path(&page))),
         }
     }
     assert!(
