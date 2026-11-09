@@ -200,11 +200,12 @@ kubernetes-demo: build ## Demo Kubernetes YAML import/export round-trip
 toml-demo: build ## Demo config tooling (lint, fmt, compile, diff)
 	./scripts/relish-toml-demo.sh
 
-test-ci-scripts: ## Test the CI scripts: job selection, ignored-test owners and JUnit keeping, and the agent gym's scorer and runner
+test-ci-scripts: ## Test the CI scripts: job selection, ignored-test owners and JUnit keeping, the agent gym's scorer and runner, and the website's agent recordings
 	python3 scripts/release/require_python.py
 	python3 -m unittest discover -s scripts/ci -p 'test_*.py'
 	python3 -m unittest discover -s scripts/release -p 'test_*.py'
 	python3 -m unittest discover -s scripts/gym -p 'test_*.py'
+	python3 -m unittest discover -s scripts/record -p 'test_*.py'
 
 check-ignored: ## Fail when an #[ignore] reason names no gate, script, fixture parent or issue
 	python3 scripts/ci/ignored_owners.py reasons
