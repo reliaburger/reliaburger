@@ -1180,7 +1180,7 @@ tokio::spawn(async move {
 });
 ```
 
-The `select!` is the idiom for "do this on a timer, but drop everything the moment we're told to shut down": whichever branch's future finishes first wins, and a cancelled `CancellationToken` resolves immediately. The five-second lag between creating a token and it being enforced is real, and deliberate — a poll is far simpler than threading a change-notification out of the Raft state machine, and five seconds is nothing for an operation you do by hand.
+The `select!` is the idiom for "do this on a timer, but drop everything the moment we're told to shut down": whichever branch's future finishes first wins, and a cancelled `CancellationToken` resolves immediately. The five-second lag between creating a token and it being enforced is real, and deliberate — a poll is far simpler than threading a change-notification out of the Raft state machine, and five seconds is nothing for an operation you do by hand. That last part stopped being true once agents arrived. An agent's token is created and used within the same second, and Chapter 10's "Every node at once" threads the notification out after all.
 
 Three problems, none of them the crypto. Attaching a middleware is trivial; deciding what happens during bootstrap, how the system talks to itself once locked, and how the lock learns about new keys is the actual work. Same lesson as before, one layer up: the wiring is the system.
 

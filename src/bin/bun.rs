@@ -466,12 +466,31 @@ fn node_capacity(config: &NodeConfig) -> (u32, u32) {
     )
 }
 
+/// How often the security refresh runs when nothing wakes it sooner: the
+/// leader's view for a node with no Raft seat, the CRL and the trust set.
+const SECURITY_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Wait for the next security refresh: the tick, or a change to the API
+/// tokens this node's replica applied, whichever comes first. Before the
+/// wake-up, a token created on the leader was refused here as "invalid
+/// token" for up to one interval. A closed channel leaves only the tick:
+/// `select!` skips a branch whose pattern doesn't match, so it can't spin.
+async fn next_security_refresh(
+    ticker: &mut tokio::time::Interval,
+    token_updates: &mut tokio::sync::watch::Receiver<Vec<reliaburger::sesame::types::ApiToken>>,
+) {
+    tokio::select! {
+        _ = ticker.tick() => {}
+        Ok(()) = token_updates.changed() => {}
+    }
+}
+
 /// Overwrite the auth token store with the current API tokens from Raft.
 ///
-/// Called on startup and every few seconds after, so a token created via
-/// `relish token create` reaches this node without restarting the agent. The
-/// node that answered a create, rotate or revoke has already changed its
-/// store itself.
+/// Called on startup, whenever the replica's tokens change, and every few
+/// seconds, so a token created via `relish token create` reaches this node
+/// without restarting the agent. The node that answered a create, rotate or
+/// revoke has already changed its store itself.
 async fn refresh_token_store(
     store: &reliaburger::sesame::auth::TokenStore,
     council: &reliaburger::council::CouncilNode,
@@ -1973,6 +1992,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 async move {
                     let mut trust_error = None;
                     let mut view_error = None;
+                    // Subscribed before the first refresh, so a token applied
+                    // between the two still wakes the loop.
+                    let mut token_updates = refresh_council.api_token_updates();
                     refresh_leader_security_view(
                         &refresh_council,
                         refresh_view_client.as_deref(),
@@ -1988,12 +2010,12 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                         &mut trust_error,
                     )
                     .await;
-                    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+                    let mut ticker = tokio::time::interval(SECURITY_REFRESH_INTERVAL);
                     ready.ready();
                     loop {
                         tokio::select! {
                             _ = attempt_shutdown.cancelled() => break,
-                            _ = ticker.tick() => {
+                            _ = next_security_refresh(&mut ticker, &mut token_updates) => {
                                 refresh_leader_security_view(
                                     &refresh_council,
                                     refresh_view_client.as_deref(),
@@ -4807,6 +4829,34 @@ mod tests {
         let tokens = store.read().await;
         assert_eq!(tokens.len(), 1);
         assert_eq!(tokens[0].name, "ci");
+    }
+
+    /// A token created on the leader was refused by every other node until
+    /// its next 5 s refresh (the gym's partitioned-node runs, 9 Nov). A change
+    /// to the replica's tokens now wakes the refresh at once; the tick stays
+    /// for what the replica doesn't announce, and carries on alone if the
+    /// announcements stop.
+    #[tokio::test(start_paused = true)]
+    async fn a_token_change_wakes_the_security_refresh_before_its_tick() {
+        let created =
+            create_token("agent", ApiRole::ReadOnly, TokenScope::default(), None).unwrap();
+        let (sender, mut updates) = tokio::sync::watch::channel(Vec::new());
+        let mut ticker = tokio::time::interval(SECURITY_REFRESH_INTERVAL);
+        ticker.tick().await;
+        let started = tokio::time::Instant::now();
+
+        sender.send_replace(vec![created.token]);
+        next_security_refresh(&mut ticker, &mut updates).await;
+        assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+
+        // Nothing changed since: the tick.
+        next_security_refresh(&mut ticker, &mut updates).await;
+        assert_eq!(started.elapsed(), SECURITY_REFRESH_INTERVAL);
+
+        // A closed channel neither spins nor stops the tick.
+        drop(sender);
+        next_security_refresh(&mut ticker, &mut updates).await;
+        assert_eq!(started.elapsed(), SECURITY_REFRESH_INTERVAL * 2);
     }
 
     /// #1506: a refresh reads the replica first and writes the store second.
