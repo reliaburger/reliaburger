@@ -1106,8 +1106,12 @@ by stage, so it now expects three stages instead of five, and the floor check is
 last one.
 
 On the change's own pull request, portable Linux took 17.0 minutes, its coverage step 15.3
-against 23 to 27 before, and the new job 5.7. The light set's critical path went from about
-30 minutes to about 17.
+against 23 to 27 before, and the new job 5.7. Over every green train PR on the light path,
+the run without runner queueing went from a median of 30.0 minutes to 19.5
+([measurements](../qualification/2026-11-09-v0.2.8-train-pr-timings.md)). What an author waits
+didn't fall with it: in the same days the runs queued for a median of 56.6 minutes, against
+7.6 before. Timing a run's jobs from when they started, not from when it was created, is what
+separates the two, and the extra job is one more runner each PR asks for when they're short.
 
 Two smaller fixes came with it
 ([#1724](https://github.com/reliaburger/reliaburger/issues/1724)). `make ci` now runs its
