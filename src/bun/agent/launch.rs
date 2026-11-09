@@ -1001,14 +1001,14 @@ pub(super) async fn create_with_secrets<'s, G: Grill>(
     target: LaunchTarget<'_>,
     spec: &'s crate::grill::oci::OciSpec,
 ) -> Result<std::borrow::Cow<'s, crate::grill::oci::OciSpec>, crate::grill::GrillError> {
-    let launch = if crate::sesame::secret_provider::needs_resolution(&spec.process.env) {
+    let launch = if crate::sesame::secret_provider::needs_resolution(&spec.process.provider_env) {
         let context = crate::sesame::secret_provider::LaunchContext {
             namespace: target.namespace,
             app: target.app_name,
             instance: &target.instance_id.0,
         };
         let env = providers
-            .resolve_env(&spec.process.env, context)
+            .resolve_env(&spec.process.env, &spec.process.provider_env, context)
             .await
             .map_err(|error| crate::grill::GrillError::LaunchRefused {
                 instance: target.instance_id.clone(),
@@ -1016,6 +1016,8 @@ pub(super) async fn create_with_secrets<'s, G: Grill>(
             })?;
         let mut resolved = spec.clone();
         resolved.process.env = env;
+        // The runtime gets secrets, not references.
+        resolved.process.provider_env.clear();
         std::borrow::Cow::Owned(resolved)
     } else {
         std::borrow::Cow::Borrowed(spec)

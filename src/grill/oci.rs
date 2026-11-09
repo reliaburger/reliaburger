@@ -141,6 +141,17 @@ pub struct OciProcess {
     pub rlimits: Vec<OciRlimit>,
     pub args: Vec<String>,
     pub env: Vec<String>,
+    /// The variables in `env` that the workload's config declared as a
+    /// `PROVIDER[...]` reference ([`EnvValue::Provider`]), which a launch
+    /// resolves just before the runtime creates the instance (#1123).
+    ///
+    /// Not part of the OCI runtime spec. Only these are resolved: `env`
+    /// also holds decrypted secrets, and one whose plaintext happens to
+    /// start with `PROVIDER[` was never checked at apply, so it must reach
+    /// the workload as it is (#1819). The resolved copy a runtime gets has
+    /// none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_env: Vec<String>,
     pub cwd: String,
     pub user: OciUser,
     /// Linux capability sets. `None` gives the process no capabilities.
@@ -444,6 +455,7 @@ pub fn generate_oci_spec_with_decryptor(
     decryptor: Option<&SecretDecryptor>,
 ) -> Result<OciSpec, String> {
     let env = build_env_with_decryptor(spec, decryptor)?;
+    let provider_env = declared_provider_env(&spec.env);
     let args = build_args(app_name, spec);
     let mounts = build_mounts(
         spec,
@@ -479,6 +491,7 @@ pub fn generate_oci_spec_with_decryptor(
             rlimits: Vec::new(),
             args,
             env,
+            provider_env,
             cwd: spec
                 .working_dir
                 .as_ref()
@@ -553,6 +566,15 @@ pub fn build_env_with_decryptor(
         }
     }
     Ok(env)
+}
+
+/// The names of the variables `env` declares as `PROVIDER[...]` references,
+/// in order: the only ones a launch may send to a provider (#1819).
+pub fn declared_provider_env(env: &BTreeMap<String, EnvValue>) -> Vec<String> {
+    env.iter()
+        .filter(|(_, value)| value.is_provider())
+        .map(|(key, _)| key.clone())
+        .collect()
 }
 
 /// Build the process arguments from an app spec.
@@ -949,6 +971,9 @@ pub fn job_process(spec: &JobSpec) -> OciProcess {
         rlimits: Vec::new(),
         args,
         env,
+        // Validation refuses provider values in jobs, and no job launch
+        // resolves one (#1123).
+        provider_env: Vec::new(),
         cwd: "/".to_string(),
         user: OciUser {
             uid: 65534,
@@ -998,6 +1023,7 @@ pub fn generate_init_oci_spec(
             rlimits: Vec::new(),
             args: init.command.clone(),
             env: layered_env(&app.process.env, &init.env),
+            provider_env: layered_provider_env(&app.process.provider_env, &init.env),
             cwd: "/".to_string(),
             user: OciUser {
                 uid: 65534,
@@ -1094,6 +1120,7 @@ pub fn generate_sidecar_oci_spec(
                 .cloned()
                 .collect(),
             env: layered_env(&app.process.env, &sidecar.env),
+            provider_env: layered_provider_env(&app.process.provider_env, &sidecar.env),
             cwd: "/".to_string(),
             user: OciUser {
                 uid: 65534,
@@ -1135,6 +1162,16 @@ pub fn generate_sidecar_oci_spec(
 /// reference passes through for the launch to resolve. Encrypted values
 /// never reach here (validation refuses them in a sidecar's or an init's
 /// `env`), so one is left out rather than passed on as ciphertext.
+/// The declared provider variables of [`layered_env`]'s result: the app's,
+/// except those the container's own env replaces, and the container's own.
+fn layered_provider_env(app: &[String], own: &BTreeMap<String, EnvValue>) -> Vec<String> {
+    app.iter()
+        .filter(|name| !own.contains_key(name.as_str()))
+        .cloned()
+        .chain(declared_provider_env(own))
+        .collect()
+}
+
 fn layered_env(app: &[String], own: &BTreeMap<String, EnvValue>) -> Vec<String> {
     let inherited = app.iter().filter(|entry| {
         let name = entry
