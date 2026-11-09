@@ -98,7 +98,7 @@ expression: render(answer)
     {
       "read_only": true,
       "run": "relish agent source show src/bun/agent/health_checks.rs:1-40",
-      "why": "the code that decides it"
+      "why": "optional: the code that decides it, only if you think relish got this wrong"
     }
   ],
   "ok": true,

@@ -42,7 +42,8 @@ Settings, all optional but the model:
 - `GYM_LOCAL_MAX_TURNS`: default 30;
 - `GYM_LOCAL_MAX_BYTES`: a budget for every MCP tool that takes
   `max_bytes`: the default its schema advertises (models copy it) and the
-  value sent when the model names none. Default: none, so each command's own;
+  value sent when the model names none. Default: none, so `relish mcp`'s
+  own, which since the first record's tuning is 8192 for every tool;
 - `GYM_LOCAL_TOOL_BYTES`: the cut for the `relish` tool's output and any
   answer the MCP server sends, default 24576, `relish agent`'s own default;
 - `GYM_LOCAL_TOOLS`: `mcp,relish` (default), `mcp` or `relish`;

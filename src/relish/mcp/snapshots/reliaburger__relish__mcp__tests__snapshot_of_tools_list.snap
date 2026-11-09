@@ -16,8 +16,10 @@ expression: listed_for_snapshot(server.tools())
       "additionalProperties": false,
       "properties": {
         "max_bytes": {
-          "default": 81920,
+          "default": 8192,
           "description": "Largest answer to print, in bytes (at least 1024; by default 24576, 81920 for `guide` and 40960 for `schema`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
+          "maximum": 131072,
+          "minimum": 1024,
           "type": "integer"
         }
       },
@@ -83,8 +85,10 @@ expression: listed_for_snapshot(server.tools())
       "additionalProperties": false,
       "properties": {
         "max_bytes": {
-          "default": 24576,
+          "default": 8192,
           "description": "Largest answer to print, in bytes (at least 1024; by default 24576, 81920 for `guide` and 40960 for `schema`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
+          "maximum": 131072,
+          "minimum": 1024,
           "type": "integer"
         }
       },
@@ -190,8 +194,10 @@ expression: listed_for_snapshot(server.tools())
           "type": "string"
         },
         "max_bytes": {
-          "default": 40960,
+          "default": 8192,
           "description": "Largest answer to print, in bytes (at least 1024; by default 24576, 81920 for `guide` and 40960 for `schema`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
+          "maximum": 131072,
+          "minimum": 1024,
           "type": "integer"
         }
       },
@@ -257,8 +263,10 @@ expression: listed_for_snapshot(server.tools())
       "additionalProperties": false,
       "properties": {
         "max_bytes": {
-          "default": 24576,
+          "default": 8192,
           "description": "Largest answer to print, in bytes (at least 1024; by default 24576, 81920 for `guide` and 40960 for `schema`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
+          "maximum": 131072,
+          "minimum": 1024,
           "type": "integer"
         },
         "offline": {
@@ -332,8 +340,10 @@ expression: listed_for_snapshot(server.tools())
           "type": "integer"
         },
         "max_bytes": {
-          "default": 24576,
+          "default": 8192,
           "description": "Largest answer to print, in bytes (at least 1024; by default 24576, 81920 for `guide` and 40960 for `schema`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
+          "maximum": 131072,
+          "minimum": 1024,
           "type": "integer"
         },
         "offline": {
@@ -416,8 +426,10 @@ expression: listed_for_snapshot(server.tools())
           "type": "boolean"
         },
         "max_bytes": {
-          "default": 24576,
+          "default": 8192,
           "description": "Largest answer to print, in bytes (at least 1024; by default 24576, 81920 for `guide` and 40960 for `schema`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
+          "maximum": 131072,
+          "minimum": 1024,
           "type": "integer"
         },
         "max_matches": {
@@ -503,8 +515,10 @@ expression: listed_for_snapshot(server.tools())
       "additionalProperties": false,
       "properties": {
         "max_bytes": {
-          "default": 24576,
+          "default": 8192,
           "description": "Largest answer to print, in bytes (at least 1024; by default 24576, 81920 for `guide` and 40960 for `schema`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
+          "maximum": 131072,
+          "minimum": 1024,
           "type": "integer"
         },
         "offline": {
@@ -598,8 +612,10 @@ expression: listed_for_snapshot(server.tools())
           "type": "integer"
         },
         "max_bytes": {
-          "default": 24576,
+          "default": 8192,
           "description": "Largest answer to print, in bytes (at least 1024; by default 24576, 81920 for `guide` and 40960 for `schema`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
+          "maximum": 131072,
+          "minimum": 1024,
           "type": "integer"
         },
         "namespace": {
@@ -695,8 +711,10 @@ expression: listed_for_snapshot(server.tools())
       "additionalProperties": false,
       "properties": {
         "max_bytes": {
-          "default": 24576,
+          "default": 8192,
           "description": "Largest answer to print, in bytes (at least 1024; by default 24576, 81920 for `guide` and 40960 for `schema`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
+          "maximum": 131072,
+          "minimum": 1024,
           "type": "integer"
         },
         "words": {
@@ -772,8 +790,10 @@ expression: listed_for_snapshot(server.tools())
       "additionalProperties": false,
       "properties": {
         "max_bytes": {
-          "default": 24576,
+          "default": 8192,
           "description": "Largest answer to print, in bytes (at least 1024; by default 24576, 81920 for `guide` and 40960 for `schema`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
+          "maximum": 131072,
+          "minimum": 1024,
           "type": "integer"
         },
         "target": {
@@ -851,8 +871,10 @@ expression: listed_for_snapshot(server.tools())
           "type": "integer"
         },
         "max_bytes": {
-          "default": 24576,
+          "default": 8192,
           "description": "Largest answer to print, in bytes (at least 1024; by default 24576, 81920 for `guide` and 40960 for `schema`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
+          "maximum": 131072,
+          "minimum": 1024,
           "type": "integer"
         }
       },
@@ -922,8 +944,10 @@ expression: listed_for_snapshot(server.tools())
           "type": "string"
         },
         "max_bytes": {
-          "default": 24576,
+          "default": 8192,
           "description": "Largest answer to print, in bytes (at least 1024; by default 24576, 81920 for `guide` and 40960 for `schema`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
+          "maximum": 131072,
+          "minimum": 1024,
           "type": "integer"
         }
       },
@@ -993,8 +1017,10 @@ expression: listed_for_snapshot(server.tools())
           "type": "string"
         },
         "max_bytes": {
-          "default": 24576,
+          "default": 8192,
           "description": "Largest answer to print, in bytes (at least 1024; by default 24576, 81920 for `guide` and 40960 for `schema`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
+          "maximum": 131072,
+          "minimum": 1024,
           "type": "integer"
         },
         "namespace": {
@@ -1090,8 +1116,10 @@ expression: listed_for_snapshot(server.tools())
           "type": "integer"
         },
         "max_bytes": {
-          "default": 24576,
+          "default": 8192,
           "description": "Largest answer to print, in bytes (at least 1024; by default 24576, 81920 for `guide` and 40960 for `schema`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest",
+          "maximum": 131072,
+          "minimum": 1024,
           "type": "integer"
         },
         "namespace": {

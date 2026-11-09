@@ -187,6 +187,63 @@ The [first record](../qualification/2026-11-09-gym-local-models.md) (Qwen3
 5. **The task as a system message** cost nothing and keeps the task when
    Ollama trims; the manual recommends it to anyone writing their own loop.
 
+### Decisions: the first tuning pass
+
+Items 1 and 2, made 9 November, each with its tests first. The gym rerun
+is run C's settings without `GYM_LOCAL_MAX_BYTES`, so the budget comes from
+`relish mcp` itself.
+
+**The server-wide budget.**
+
+- `relish mcp` holds every tool's answer to **8,192 bytes** unless the call
+  names a `max_bytes`. That's the number run C measured, and about 2,000
+  tokens, so three answers and the tool list still fit an 8K window.
+- The same number is the `default` each tool's input schema advertises,
+  with `minimum` 1,024 and `maximum` 131,072 beside it. The advertised
+  default is what moved the model in run C; a fallback for calls that name
+  no budget wouldn't have.
+- It's one number for every tool, `guide` and `schema` included. Their
+  bigger CLI defaults (80 KiB and 40 KiB) were what the model copied into
+  `logs` and `source_show` calls. A cut guide says so and names the rerun,
+  and a client with a big window sets `--max-bytes`.
+- `relish mcp --max-bytes N` sets it, from 1,024 to 131,072.
+- **The ceiling is 131,072 bytes (128 KiB)** for every call, whatever it
+  asks for. It's held, not refused: a refusal costs a small model a turn and
+  teaches it nothing it can act on, while a held answer that doesn't fit
+  says it was cut. 128 KiB fits the whole guide in one answer, so no client
+  loses anything it could do before. A fixed ceiling, not one relative to
+  `--max-bytes`, so it's one number to document.
+- The `relish agent` commands keep their own defaults (24 KiB, 80 for
+  `guide`, 40 for `schema`). Their callers are people and Claude Code's
+  shell, with large windows; nothing in the record argues for a change there.
+  Claude Code reaches `relish mcp` through the plugin too, and reads a cut
+  answer's `next` as before.
+
+**`next` steps that lead into the source.** Three hints did it, one after
+another:
+
+- `diagnose` gave every finding a `source show` of the code that decides
+  it. Removed: a finding names the fault. Its `next` keeps `explain` (the
+  health-restart scenario requires it) and the scoped diagnosis, and the
+  location stays in the finding's `source` field.
+- `explain` offered the code first, the manual second. Now the manual
+  first, and the code last with the `why` "optional: the code that decides
+  it, only if you think relish got this wrong". A restart decision's code
+  step says the same.
+- `source show` always offered "the lines after these", which is how one
+  40-line step became 3,300 lines. Now only when the caller asked for more
+  than it got: a line with no end, or a range cut at 400 lines.
+- `context`'s step to `diagnose` no longer promises "the code that decides
+  it".
+
+We chose wording over a new `optional` field on `NextStep`: the field would
+change the envelope's schema for every client, and a small model reads the
+`why` it's given either way. If the gym shows the wording isn't enough, the
+field is the next step.
+
+Items 3 to 5 above, the guide's table of contents and the shorter
+descriptions are still to do.
+
 ## How results are published
 
 - **The record:** `docs/qualification/2026-11-09-gym-local-models.md`, with the

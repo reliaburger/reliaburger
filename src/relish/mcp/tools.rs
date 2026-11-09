@@ -188,6 +188,9 @@ pub struct ToolSpec {
     /// Arguments `relish mcp` fixed, such as `--namespace`'s; the caller
     /// can't pass them and the input schema doesn't list them.
     pub pinned: JsonObject,
+    /// The budget a call gets when it names none, set by [`select`] for a
+    /// tool that takes `max_bytes`. `None` leaves the command's own.
+    pub budget: Option<usize>,
     /// The tool as `tools/list` describes it.
     pub tool: Tool,
 }
@@ -300,6 +303,7 @@ fn tool_spec(words: &[String], command: &clap::Command, data: Value) -> ToolSpec
         returns_workload_text,
         arguments,
         pinned: JsonObject::new(),
+        budget: None,
         tool,
     }
 }
@@ -511,7 +515,29 @@ pub struct Selection {
     pub namespace: Option<String>,
     /// Offer the [`PROPOSING`] tools too: `relish mcp --propose`.
     pub propose: bool,
+    /// Every tool's budget when a call names none: `relish mcp
+    /// --max-bytes`. [`DEFAULT_MAX_BYTES`] when `None`.
+    pub max_bytes: Option<usize>,
 }
+
+/// `relish mcp`'s budget when `--max-bytes` isn't given: 8 KiB, about 2,000
+/// tokens, for every tool.
+///
+/// The `relish agent` commands default to 24 KiB (80 KiB for `guide`), which
+/// a large model reads easily. A small local model copies a schema's
+/// `default` into its calls, and the largest it has seen, so the default is
+/// the budget it sends; at 24 KiB three answers fill an 8K-token window.
+/// An answer that doesn't fit says so and names the rerun that would, so a
+/// client with room asks for more (#1687).
+pub const DEFAULT_MAX_BYTES: usize = 8 * 1024;
+
+/// The most a `relish mcp` call gets, whatever it asks for: 128 KiB, room
+/// for the whole guide (80 KiB) or the biggest schema (40 KiB), and an
+/// eighth of the megabyte a small model was seen asking for.
+pub const MAX_BYTES_CEILING: usize = 128 * 1024;
+
+/// The argument that carries a call's budget.
+const MAX_BYTES: &str = "max_bytes";
 
 /// Why a [`Selection`] can't be served.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -558,6 +584,7 @@ pub fn select(
             Some(namespace) => tool.pin(NAMESPACE, namespace),
             None => tool,
         })
+        .map(|tool| tool.with_budget(selection.max_bytes.unwrap_or(DEFAULT_MAX_BYTES)))
         .collect())
 }
 
@@ -565,6 +592,49 @@ pub fn select(
 const NAMESPACE: &str = "namespace";
 
 impl ToolSpec {
+    /// The same tool with `budget` as the default `max_bytes`, advertised
+    /// in its input schema with the floor and [`MAX_BYTES_CEILING`] as
+    /// bounds, when it takes one.
+    fn with_budget(mut self, budget: usize) -> Self {
+        if !self.arguments.iter().any(|spec| spec.property == MAX_BYTES) {
+            return self;
+        }
+        self.budget = Some(budget);
+        let mut schema = (*self.tool.input_schema).clone();
+        if let Some(Value::Object(properties)) = schema.get_mut("properties")
+            && let Some(Value::Object(property)) = properties.get_mut(MAX_BYTES)
+        {
+            property.insert("default".into(), json!(budget));
+            property.insert("minimum".into(), json!(agent::MIN_MAX_BYTES));
+            property.insert("maximum".into(), json!(MAX_BYTES_CEILING));
+        }
+        self.tool.input_schema = Arc::new(schema);
+        self
+    }
+
+    /// `arguments` with this tool's budget filled in when they name none,
+    /// and held to [`MAX_BYTES_CEILING`] when they name more.
+    fn budgeted(&self, arguments: &JsonObject) -> JsonObject {
+        let mut arguments = arguments.clone();
+        let Some(budget) = self.budget else {
+            return arguments;
+        };
+        match arguments.get(MAX_BYTES) {
+            None | Some(Value::Null) => {
+                arguments.insert(MAX_BYTES.into(), json!(budget));
+            }
+            Some(Value::Number(asked))
+                if asked
+                    .as_u64()
+                    .is_some_and(|asked| asked > MAX_BYTES_CEILING as u64) =>
+            {
+                arguments.insert(MAX_BYTES.into(), json!(MAX_BYTES_CEILING));
+            }
+            Some(_) => {}
+        }
+        arguments
+    }
+
     /// The same tool with `property` fixed to `value`, when it takes it.
     fn pin(mut self, property: &str, value: &str) -> Self {
         if !self.arguments.iter().any(|spec| spec.property == property) {
@@ -615,6 +685,7 @@ impl ToolSpec {
                 ));
             }
         }
+        let arguments = &self.budgeted(arguments);
         let mut line: Vec<String> = std::iter::once("agent".to_string())
             .chain(self.command.split(' ').map(str::to_string))
             .collect();
