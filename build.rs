@@ -46,7 +46,10 @@ fn main() {
 /// stays out of the source bundle (#1687), so a build from the bundle alone
 /// has no scenarios. A release build (`RELIABURGER_REQUIRE_CLEAN_SOURCE=1`)
 /// fails without them rather than ship a `relish gym run` with nothing to
-/// run.
+/// run. The cfg also gates the scorer's parity tests, whose shared fixture
+/// is under `scripts/gym/` too: it marks a checkout that has the gym's
+/// files, and `every_included_file_is_in_the_bundle_or_behind_its_cfg`
+/// holds every other include to the bundle (#1691).
 fn find_gym_scenarios() {
     println!("cargo:rustc-check-cfg=cfg(gym_scenarios)");
     println!("cargo:rerun-if-env-changed=RELIABURGER_REQUIRE_CLEAN_SOURCE");
