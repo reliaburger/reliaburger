@@ -4,14 +4,22 @@
     python3 scripts/gym/gym.py run --solver command:scripts/gym/local_model.py ...
 
 The runner starts this with the prompt on stdin (and in `GYM_PROMPT`), the
-recording `relish` first on PATH and a read-only token in
-`RELIABURGER_TOKEN`, as it starts claude_code.py. Nothing here leaves the
-machine: the model runs in [Ollama](https://ollama.com) on this host, and
-this script is the agent loop around it, stdlib only.
+recording `relish` first on PATH and the scenario's token in
+`RELIABURGER_TOKEN`, as it starts claude_code.py: a read-only token, or for a
+proposal scenario (`solver_token = "agent"`) a deployer agent token, which
+proposes changes and takes leases but changes nothing itself (#1682).
+Nothing here leaves the machine: the model runs in
+[Ollama](https://ollama.com) on this host, and this script is the agent loop
+around it, stdlib only.
 
 It starts `relish mcp` through the recording `relish`, as Claude Code starts
 the plugin's server, and offers the model two kinds of tool, matching what
-the Claude Code solver has:
+the Claude Code solver has. With an agent token (`GYM_SOLVER_TOKEN=agent`,
+which the runner sets from the scenario) the server is `relish mcp --propose
+--namespace default`, so the propose and lease tools are there too. The
+token is the same one Claude Code gets, so this adds no power Claude lacks:
+Claude reaches the same commands as `relish agent propose` through Bash, and
+`--namespace` only narrows what the tools ask for. The tools:
 
 - every tool `relish mcp` lists, with its input schema as the function's
   parameters;
@@ -47,6 +55,9 @@ Settings, all optional but the model:
   answer the MCP server sends, default 24576, `relish agent`'s own default;
 - `GYM_LOCAL_TOOLS`: `mcp,relish` (default), `mcp` or `relish`;
 - `GYM_LOCAL_TIMEOUT`: seconds for the whole session, default 1500;
+- `GYM_LOCAL_NAMESPACE`: the namespace `relish mcp --propose` pins its
+  tools to, with an agent token; default `default`, where every proposal
+  scenario's app runs;
 - `GYM_LOCAL_TASK_ROLE`: `system` sends the task as a system message, which
   Ollama keeps when it trims a long conversation to the window; default
   `user`, the first user message, which it drops first.
@@ -70,6 +81,8 @@ DEFAULT_NUM_CTX = 32768
 DEFAULT_MAX_TURNS = 30
 DEFAULT_TOOL_BYTES = 24 * 1024
 DEFAULT_TIMEOUT = 1500
+# Where every proposal scenario's app runs.
+DEFAULT_NAMESPACE = "default"
 # One `relish` command, and one MCP tool call, never take longer than this.
 CALL_TIMEOUT = 120
 # A turn whose prompt came within this many tokens of the window filled it.
@@ -92,25 +105,50 @@ ASK_FOR_ANSWER = (
     "using what you found. Use null for any field you can't name."
 )
 
-RELISH_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "relish",
-        "description": (
-            "Run one `relish` command against the cluster, with a read-only token, and "
-            "get its output. Pass the arguments after `relish`, one per array item, "
-            'such as ["agent", "diagnose"] or ["logs", "web", "--tail", "20"]. No shell.'
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "args": {"type": "array", "items": {"type": "string"},
-                         "description": "the arguments after `relish`"},
-            },
-            "required": ["args"],
-        },
-    },
+# What the `relish` tool says its token is, by the scenario's `solver_token`.
+TOKEN_WORDS = {
+    "read-only": "a read-only token",
+    "agent": "an agent token, which can't change the cluster but can propose a change "
+             "with `relish agent propose` and take leases",
 }
+
+
+def relish_tool(solver_token="read-only"):
+    """The `relish` tool, described with the token its commands carry."""
+    token = TOKEN_WORDS.get(solver_token, TOKEN_WORDS["read-only"])
+    return {
+        "type": "function",
+        "function": {
+            "name": "relish",
+            "description": (
+                f"Run one `relish` command against the cluster, with {token}, and "
+                "get its output. Pass the arguments after `relish`, one per array item, "
+                'such as ["agent", "diagnose"] or ["logs", "web", "--tail", "20"]. No shell.'
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "args": {"type": "array", "items": {"type": "string"},
+                             "description": "the arguments after `relish`"},
+                },
+                "required": ["args"],
+            },
+        },
+    }
+
+
+def mcp_argv(environ):
+    """The `relish mcp` command line for the scenario's token.
+
+    An agent token gets the proposing tools, pinned to one namespace; any
+    other token the read-only server. The token itself is the gym's, in
+    `RELIABURGER_TOKEN`, so the server never holds more than Claude Code's
+    session does.
+    """
+    if environ.get("GYM_SOLVER_TOKEN") != "agent":
+        return ["mcp"]
+    namespace = environ.get("GYM_LOCAL_NAMESPACE") or DEFAULT_NAMESPACE
+    return ["mcp", "--propose", "--namespace", namespace]
 
 # What the Claude Code solver denies too (claude_code.DISALLOWED_TOOLS): these
 # build the crate or boot a cluster on the host.
@@ -303,7 +341,7 @@ class Session:
         self.work_dir = work_dir
         self.tools = [ollama_tool(tool, settings["max_bytes"]) for tool in mcp_tools] if mcp else []
         if "relish" in settings["tools"]:
-            self.tools.append(RELISH_TOOL)
+            self.tools.append(relish_tool(settings["solver_token"]))
         self.messages = []
         self.turns = 0
         self.prompt_tokens = 0
@@ -442,6 +480,8 @@ def settings_from(environ):
         "tools": tools,
         "timeout": int(environ.get("GYM_LOCAL_TIMEOUT", DEFAULT_TIMEOUT)),
         "task_role": "system" if environ.get("GYM_LOCAL_TASK_ROLE") == "system" else "user",
+        "solver_token": environ.get("GYM_SOLVER_TOKEN") or "read-only",
+        "mcp_argv": mcp_argv(environ),
     }
 
 
@@ -464,7 +504,7 @@ def main():
     answer, stop, error = None, None, None
     try:
         if "mcp" in settings["tools"]:
-            mcp = McpClient(["relish", "mcp"], env)
+            mcp = McpClient(["relish", *settings["mcp_argv"]], env)
             mcp_tools = mcp.start()
         session = Session(ollama, mcp, mcp_tools, settings, env, os.getcwd(),
                           described.get("capabilities"))
@@ -502,6 +542,8 @@ def main():
             "max_bytes": settings["max_bytes"],
             "tool_bytes": settings["tool_bytes"],
             "task_role": settings["task_role"],
+            "solver_token": settings["solver_token"],
+            "mcp_argv": settings["mcp_argv"] if "mcp" in settings["tools"] else None,
             "cost_usd": 0,
             "cost_note": "a local model: no API spend",
             **session.meta(),

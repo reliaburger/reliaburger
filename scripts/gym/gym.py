@@ -243,7 +243,7 @@ def run_once(scenario, run_dir, make_cluster, solver, relish, planted=None, time
         meta_path = run_dir / "solver-meta.json"
         env = solvers.environment(
             cluster.solver_env(token), run_dir / "bin", call_log, answer_path, prompt_path, extra,
-            meta_path, scenario.platform,
+            meta_path, scenario.platform, scenario.solver_token,
         )
         attempt = solver.solve(prompt, env, solver_dir, timeout, scenario)
         (run_dir / "solver.stdout").write_text(attempt.stdout)
