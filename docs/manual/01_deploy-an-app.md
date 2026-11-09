@@ -75,7 +75,7 @@ image = "ghcr.io/example/api:1.4.2"
 path = "/healthz"
 port = 8081               # default: the app's `port`
 interval = 10             # seconds between probes (default 10)
-timeout = 5               # seconds per probe (default 5), at most interval
+timeout = 5               # seconds per probe, at most interval (default 5, or interval if shorter)
 threshold_unhealthy = 3   # failed probes before Unhealthy (default 3)
 threshold_healthy = 1     # passing probes before Running (default 1)
 initial_delay = 0         # seconds before the first probe (default 0)
@@ -84,7 +84,8 @@ initial_delay = 0         # seconds before the first probe (default 0)
 `health.port` works without an app `port`, so an app can probe a separate
 admin listener. `relish apply` refuses a health check with neither, a zero
 interval, timeout or threshold, and a `timeout` longer than the
-`interval`. A new instance that never passes is given up after 60 failed
+`interval`. Leave `timeout` out and it's 5 seconds or the interval,
+whichever is shorter, so `interval = 2` on its own is fine. A new instance that never passes is given up after 60 failed
 probes (about ten minutes at the default interval) and restarted.
 
 ## Init containers

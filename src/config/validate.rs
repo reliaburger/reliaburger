@@ -712,11 +712,11 @@ fn validate_app_honoured_fields(name: &str, app: &super::app::AppSpec) -> Result
     let interval = health
         .interval
         .unwrap_or(crate::bun::health::DEFAULT_HEALTH_INTERVAL_SECS);
-    let timeout = health
-        .timeout
-        .unwrap_or(crate::bun::health::DEFAULT_HEALTH_TIMEOUT_SECS);
+    let timeout = crate::bun::health::timeout_secs(health.timeout, interval);
     // A probe that may outlast the interval overlaps the next one. Equal is
     // allowed: seconds are whole, so a 1 s interval needs a 1 s timeout.
+    // Only a timeout the user wrote can fail this: the default is cut to the
+    // interval.
     if timeout > interval {
         return Err(refuse(
             "health.timeout",
@@ -2789,6 +2789,21 @@ exec = "/usr/bin/python3""#,
         assert_app_refused(&format!("{health}\ntimeout = 11"), "timeout");
         // Seconds are whole, so a 1 s interval must allow a 1 s timeout.
         validate_app_toml(&format!("{health}\ninterval = 1\ntimeout = 1")).unwrap();
+    }
+
+    #[test]
+    fn health_interval_alone_is_accepted_at_any_length() {
+        // The default timeout is 5 s or the interval, whichever is shorter,
+        // so an interval shorter than 5 s needs no timeout of its own. The
+        // gym's health-restart scenario set only `interval = 2` and was
+        // refused over a timeout it never wrote.
+        let health = "image = \"web:v1\"\nport = 8080\n[app.web.health]\npath = \"/healthz\"";
+        for interval in [1, 2, 5, 10] {
+            validate_app_toml(&format!("{health}\ninterval = {interval}"))
+                .unwrap_or_else(|error| panic!("interval {interval}: {error}"));
+        }
+        // A timeout the user wrote still may not outlast the interval.
+        assert_app_refused(&format!("{health}\ninterval = 2\ntimeout = 3"), "timeout");
     }
 
     #[test]
