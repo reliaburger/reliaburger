@@ -232,6 +232,8 @@ pub struct Compatibility {
 /// The summary's council section names `other_leaders`, a split brain.
 /// Guardrails (#1682): a policy's `applies_to = "proposals"` and `action =
 /// "approve"`, and a finding's `kind = "proposal"`.
+/// The summary's leader view carries the live leases and the waiting
+/// proposals, and the summary an `agents` section (#1682).
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 58,
     state: 74,

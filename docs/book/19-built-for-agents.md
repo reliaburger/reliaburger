@@ -1286,6 +1286,7 @@ logs       newest line 2 s old, slowest node 9 s (node-3)
 faults     1 active: latency on api (default), 6 m left              relish fault list
 alerts     1 firing: disk_high on node-3                             relish wtf
 certs      soonest expiry 61 days (node-2)
+agents     no leases held, no proposals waiting
 wtf        1 critical, 1 warning: app web is down                    relish wtf
 ```
 
@@ -1398,6 +1399,68 @@ council as healthy. So the summary's council section gained
 `SPLIT: leader node-1 AND node-3` and marks it a problem, pointing at
 `relish council status`, which shows each node's view. `wtf`'s council check, which
 runs by default, reports a real split as critical.
+
+### Agents on the screen
+
+The first version of the screen had a `TODO(#1682)` where its last section
+should be: leases and proposals hadn't merged yet. Once they had, the
+`agents` line took two questions. Is an agent working on something? Is a
+change waiting for me?
+
+```
+agents     2 leases held: app:shop/web by holmes, and 1 more;        relish proposal list
+           1 proposal waiting for approval (#17 by holmes)
+```
+
+Both live in the council's desired state, so they come from the leader's
+view, like the app list and the jobs. The leader sends every live lease and
+every waiting proposal; the assembling node trims them to the caller's
+scope (the same reach `GET /v1/leases` and `GET /v1/proposals` give), then
+counts them and keeps the first five of each. A leader that didn't answer
+makes the section `missing`, never "no leases held".
+
+Should a waiting proposal make the cluster `DEGRADED`? We said no. A
+proposal waiting for a person is the system doing exactly what it was built
+to do, and a screen that turns yellow-and-degraded every time an agent asks
+permission teaches people to ignore it. So it's a `Note`, like an upgrade in
+progress: worth a command (`relish proposal list`, or `relish lease list`
+when only leases are held), not a problem.
+
+A **stale** proposal is different. It can't apply any more: an app it
+touches changed after it was made, so its revision (a SHA-256 over the
+stored spec) no longer matches, and approving it would fail. Or it's past
+its TTL and the reaper hasn't expired it yet. Either way it still pins a
+lease on its apps, keeping every other agent off them until somebody
+withdraws or rejects it. That's a problem, and the line says which one and
+why:
+
+```
+agents     2 leases held: app:shop/web by holmes, and 1 more;        relish proposal list
+           2 proposals waiting for approval,
+           1 stale (#12: shop/web changed after it was made)
+```
+
+The leader works out staleness when it builds its view, with the same
+`current_revision` the approval checks against, so the screen can't
+disagree with what approving would do. The summary lists stale proposals
+first, then the oldest:
+
+```rust
+waiting.sort_by_key(|proposal| (proposal.stale.is_none(), proposal.id));
+```
+
+`sort_by_key` sorts by whatever the closure returns, and Rust orders tuples
+field by field, like comparing strings letter by letter. `bool` orders
+`false` before `true`, so `is_none()` puts the stale ones (`false`) first,
+and the id breaks the tie. Python's `sorted(key=lambda p: (p.stale is None,
+p.id))` reads the same.
+
+One thing the section leaves out on purpose: a lease's purpose and a
+proposal's reason. Both are an agent's own words, and an agent can write
+anything. `relish agent context` already lists them, wrapped as untrusted
+text. The summary is for a glance, so it carries the holder's token name
+and the target, which the cluster wrote, and a test checks that no purpose
+leaks into it.
 
 ### `wtf` in the same call
 

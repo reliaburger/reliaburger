@@ -17,4 +17,5 @@ logs       newest line 2 s old, slowest node 9 s (node-3)
 faults     none active
 alerts     none firing
 certs      soonest expiry 61 days (node-2)
+agents     no leases held, no proposals waiting
 wtf        0 critical, 0 warnings

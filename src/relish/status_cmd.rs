@@ -323,7 +323,7 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bun::summary::verdict::{apps_line, jobs_line};
+    use crate::bun::summary::verdict::{agents_line, apps_line, jobs_line};
     use crate::bun::summary::*;
 
     /// 8 November 2026, 14:02:11 UTC.
@@ -422,7 +422,109 @@ mod tests {
                 synced_at_unix_seconds: None,
                 error: None,
             }),
+            agents: Section::complete(AgentsSection::default()),
         }
+    }
+
+    fn lease(target: &str, holder: &str) -> LeaseBrief {
+        LeaseBrief {
+            target: target.to_string(),
+            holder: holder.to_string(),
+            expires_in_seconds: 90,
+        }
+    }
+
+    fn waiting(id: u64, stale: Option<&str>) -> ProposalBrief {
+        ProposalBrief {
+            id,
+            kind: "scale".to_string(),
+            author: "holmes".to_string(),
+            namespace: "shop".to_string(),
+            apps: vec!["web".to_string()],
+            created_at_unix_ms: NOW_MS - 600_000,
+            stale: stale.map(str::to_string),
+        }
+    }
+
+    /// Two agents at work: two leases, one proposal waiting for a person.
+    fn agents_at_work() -> AgentsSection {
+        AgentsSection {
+            leases: 2,
+            first_leases: vec![
+                lease("app:shop/web", "holmes"),
+                lease("namespace:billing", "capacity-bot"),
+            ],
+            waiting: 1,
+            stale: 0,
+            first_proposals: vec![waiting(17, None)],
+        }
+    }
+
+    /// Waiting proposals are a person's to decide, so they're a note that
+    /// names `relish proposal list`, and the cluster stays healthy.
+    #[test]
+    fn agents_at_work_are_a_note_and_keep_the_cluster_healthy() {
+        let mut summary = healthy();
+        summary.agents = Section::complete(agents_at_work());
+        let data = status_data(summary, checked(0, 0));
+        assert_eq!(data.verdict, Verdict::Healthy);
+        let agents = data.lines.iter().find(|l| l.section == "agents").unwrap();
+        assert_eq!(agents.mark, Mark::Note);
+        assert_eq!(agents.next.as_deref(), Some("relish proposal list"));
+        insta::assert_snapshot!(render(&data, false));
+    }
+
+    /// A stale proposal can't apply, and its leases keep everyone else off
+    /// its apps until someone withdraws or rejects it: that's a problem.
+    #[test]
+    fn a_stale_proposal_degrades_the_cluster_and_says_why() {
+        let mut summary = healthy();
+        let mut agents = agents_at_work();
+        agents.waiting = 2;
+        agents.stale = 1;
+        agents.first_proposals = vec![
+            waiting(12, Some("shop/web changed after it was made")),
+            waiting(17, None),
+        ];
+        summary.agents = Section::complete(agents);
+        let data = status_data(summary, checked(0, 0));
+        assert_eq!(data.verdict, Verdict::Degraded);
+        assert_eq!(data.problems, 1);
+        insta::assert_snapshot!(render(&data, false));
+    }
+
+    #[test]
+    fn the_agents_line_names_what_it_sees() {
+        assert_eq!(
+            agents_line(&AgentsSection::default()).text,
+            "no leases held, no proposals waiting"
+        );
+        assert_eq!(agents_line(&AgentsSection::default()).mark, Mark::Quiet);
+        let leases_only = agents_line(&AgentsSection {
+            leases: 1,
+            first_leases: vec![lease("app:shop/web", "holmes")],
+            ..AgentsSection::default()
+        });
+        assert_eq!(leases_only.text, "1 lease held: app:shop/web by holmes");
+        assert_eq!(leases_only.mark, Mark::Note);
+        assert_eq!(leases_only.next.as_deref(), Some("relish lease list"));
+        let both = agents_line(&agents_at_work());
+        assert_eq!(
+            both.text,
+            "2 leases held: app:shop/web by holmes, and 1 more; \
+             1 proposal waiting for approval (#17 by holmes)"
+        );
+    }
+
+    #[test]
+    fn agents_the_leader_could_not_say_are_unknown_not_none() {
+        let mut summary = healthy();
+        summary.agents =
+            Section::missing("the list of leases and proposals comes from the leader: timed out");
+        let data = status_data(summary, WtfCheck::Skipped);
+        let agents = data.lines.iter().find(|l| l.section == "agents").unwrap();
+        assert_eq!(agents.mark, Mark::Problem);
+        assert!(agents.text.starts_with("unknown: "), "{}", agents.text);
     }
 
     fn checked(critical: usize, warning: usize) -> WtfCheck {
@@ -1018,7 +1120,16 @@ mod tests {
             synced_at_unix_seconds: None,
             error: Some("fetch failed: connection refused".to_string()),
         });
+        let mut agents = agents_at_work();
+        agents.stale = 1;
+        agents.first_proposals = vec![waiting(12, Some("shop/web changed after it was made"))];
+        problems.agents = Section::complete(agents);
         let mut stale = healthy();
+        stale.agents = Section::complete(AgentsSection {
+            leases: 1,
+            first_leases: vec![lease("app:shop/web", "holmes")],
+            ..AgentsSection::default()
+        });
         stale.usage.value.as_mut().unwrap().newest_sample_unix_ms = Some(NOW_MS - 600_000);
         stale.certs.value.as_mut().unwrap().soonest = Some(CertBrief {
             subject: "node-2".to_string(),

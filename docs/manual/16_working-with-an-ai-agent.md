@@ -378,6 +378,11 @@ approve it at once (`approval.approved_by` is `policy:<name>`). `proposals`
 shows yours, `withdraw ID` takes one back, `undo ID` proposes the undo,
 refused as `stale` if anyone changed the app since.
 
+`relish status`'s `agents` line (in `context`'s `data.status` too) counts
+the leases held and the proposals waiting. Waiting is a `note`, not a
+problem. A waiting proposal that's stale, its app changed so approving it
+fails, makes the verdict `degraded`: withdraw it and propose again.
+
 ## Reading an app's logs
 
 `relish agent logs` prints an app's recent lines, every one of them inside an

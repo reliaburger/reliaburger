@@ -556,8 +556,8 @@ mod tests {
     use super::*;
     use crate::bun::events::{EventKind, EventSeverity};
     use crate::bun::summary::{
-        AlertsSection, AppBrief, AppsSection, CertsSection, Coverage, FaultBrief, FaultsSection,
-        GitOpsSection, InstancesSection, JobsSection, NodesSection,
+        AgentsSection, AlertsSection, AppBrief, AppsSection, CertsSection, Coverage, FaultBrief,
+        FaultsSection, GitOpsSection, InstancesSection, JobsSection, LeaseBrief, NodesSection,
     };
     use crate::relish::agent::{BuildInfo, DEFAULT_MAX_BYTES, Rendered};
     use crate::relish::wtf::{
@@ -741,6 +741,15 @@ mod tests {
                 commit: None,
                 synced_at_unix_seconds: None,
                 error: None,
+            }),
+            agents: SummarySection::complete(AgentsSection {
+                leases: 1,
+                first_leases: vec![LeaseBrief {
+                    target: "app:default/web".to_string(),
+                    holder: "holmes".to_string(),
+                    expires_in_seconds: 87,
+                }],
+                ..AgentsSection::default()
             }),
         }
     }
@@ -941,6 +950,11 @@ mod tests {
         );
         assert_eq!(line("apps")["next"], "relish apps --unhealthy");
         assert_eq!(line("faults")["mark"], "note");
+        assert_eq!(
+            line("agents")["text"],
+            "1 lease held: app:default/web by holmes"
+        );
+        assert_eq!(line("agents")["next"], "relish lease list");
         // wtf's line counts the report this same call diagnosed.
         assert!(
             line("wtf")["text"].as_str().unwrap().contains("critical"),

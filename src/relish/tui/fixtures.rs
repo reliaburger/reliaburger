@@ -8,9 +8,10 @@ use crate::bun::agent::{
 use crate::bun::cluster_view::NodeTagged;
 use crate::bun::events::{ClusterEvent, EventKind, EventSeverity};
 use crate::bun::summary::{
-    AlertsSection, AppBrief, AppState, AppsSection, CapacitySection, CertsSection, ClusterSummary,
-    CouncilSection, Coverage, FaultsSection, GitOpsSection, GossipSection, InstancesSection,
-    JobsSection, LogsSection, NodesSection, Section, UsageSection, VersionCount, VersionsSection,
+    AgentsSection, AlertsSection, AppBrief, AppState, AppsSection, CapacitySection, CertsSection,
+    ClusterSummary, CouncilSection, Coverage, FaultsSection, GitOpsSection, GossipSection,
+    InstancesSection, JobsSection, LogsSection, NodesSection, Section, UsageSection, VersionCount,
+    VersionsSection,
 };
 use crate::mayo::rollup::{MetricsQueryResult, MetricsQueryRow};
 use crate::wrapper::types::RouteInfo;
@@ -294,6 +295,7 @@ impl TestScenario {
                 synced_at_unix_seconds: None,
                 error: None,
             }),
+            agents: Section::complete(AgentsSection::default()),
         }
     }
 }
