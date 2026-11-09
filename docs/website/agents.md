@@ -1053,6 +1053,56 @@ in `mcp-token.json`; `data.mcp_tokens` lists that change. With `--remove`,
 `--namespace` and `--propose` too, and setup revokes their tokens and
 deletes the files.
 
+## With a local model
+
+If your cluster's logs and state mustn't reach a model API, run the model on
+your own machine. `relish mcp` opens no port and talks only to your cluster,
+so with a local model nothing leaves the building.
+
+[Ollama](https://ollama.com) runs open models on a laptop. Pull one that
+calls tools, and give it a window bigger than Ollama's default:
+
+```sh
+ollama pull qwen3:8b
+OLLAMA_CONTEXT_LENGTH=32768 ollama serve
+```
+
+Then point an MCP client that can use Ollama at `relish mcp`, with a
+read-only token as always. Goose is one; `relish agent setup goose --yes`
+adds the server to it, and `goose configure` picks Ollama and the model.
+
+A small model has a small window, and Reliaburger's answers are sized for a
+large one. Three habits keep it working:
+
+- **Don't read the whole guide.** `relish agent guide` is about 68 KB, some
+  17,000 tokens, which fills a 16K window on its own. Use `manual_search`
+  and `manual_show` for the section you need.
+- **Ask for less.** Every answer's default budget is 24 KiB, about 6,000
+  tokens, and the conversation is sent again on every turn. Pass a smaller
+  `max_bytes`, such as 8192, and follow `next` when an answer says it was cut.
+- **Offer fewer tools.** The 14 tools' descriptions and schemas cost about
+  3,000 tokens on every turn. `--toolsets context,diagnose,explain,logs,manual`
+  keeps the six a diagnosis needs, for about 1,300:
+
+```sh
+relish mcp --toolsets context,diagnose,explain,logs,manual
+```
+
+A small model also keeps to its tool list. It rarely types a command it
+isn't offered as a tool, so if it should propose changes, start the server
+with `--propose` (see [Through MCP](#through-mcp)) rather than expecting it
+to run `relish agent propose` itself. Writing your own loop? Send the task as
+a system message: Ollama drops the oldest messages to fit the window, and
+keeps system ones.
+
+We measure local models in the gym, with Qwen3 8B first. On 9 November it
+made no change in any run, found a crash loop every time at a 32K window,
+and missed nearly everything that needed a typed command or a long session.
+The loop we used, `scripts/gym/local_model.py`, is a plain one: the model,
+`relish mcp`'s tools and a `relish` command, and nothing else. The [record](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-09-gym-local-models.md)
+has the numbers. We haven't measured Goose or any other client with a local
+model.
+
 ## Sending us a bug or a fix
 
 When your agent decides the bug is in Reliaburger rather than in your app, it

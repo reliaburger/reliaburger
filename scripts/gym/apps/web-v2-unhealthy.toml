@@ -12,4 +12,6 @@ env = { VERSION = "v2" }
 [app.web.health]
 path = "/healthz"
 interval = 2
+# The default timeout is 5 s, and Bun refuses one longer than the interval.
+timeout = 1
 threshold_unhealthy = 2

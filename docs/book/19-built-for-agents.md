@@ -5651,6 +5651,121 @@ check. So the page names its record in a meta tag, and a test pulls every
 number out of the page and fails if the record doesn't hold it. Until the
 runs, the page may quote only the pinned versions.
 
+### A model on your own machine
+
+Every number so far is Claude's, through Anthropic's API. Some teams can't
+send their logs to anyone's API, and for them the honest question is whether
+a model small enough for a laptop can do the job at all (#1687). So the gym
+got a third kind of solver, `scripts/gym/local_model.py`, that runs an open
+model in [Ollama](https://ollama.com) and never leaves the machine.
+
+We could have pointed Claude Code at Ollama, which serves an
+Anthropic-compatible API. We didn't, because Claude Code's own system prompt
+and tool definitions are written for Claude and take a large bite of a small
+window before our prompt arrives, and a failure would then say as much about
+the mismatch as about Reliaburger. An off-the-shelf MCP client was the other
+option, and each one is a dependency with its own release cadence. So the
+solver is the agent loop itself, in the standard library, and it's short
+enough to read in one sitting:
+
+```python
+for _ in range(self.settings["max_turns"]):
+    message = self._chat(deadline, tools=self.tools)
+    calls = message.get("tool_calls") or []
+    if not calls:
+        answer = answer_in_text(message.get("content"))
+        if answer is not None:
+            return answer, "answered"
+        stop = "asked_for_answer"
+        break
+    for call in calls:
+        name, text = self._run_tool(call)
+        self.messages.append({"role": "tool", "tool_name": name, "content": text})
+```
+
+`_chat` posts the whole conversation and the tools to Ollama's `/api/chat`.
+The tools are everything `relish mcp` lists, which the solver gets by being an
+MCP client itself (`initialize`, `tools/list`, `tools/call`, newline-delimited
+JSON-RPC over the server's stdio), plus one called `relish` that runs a
+single command from an array of arguments, the counterpart of Claude Code's
+`Bash(relish *)`. Both go through the recording shim, so the scorer reads the
+same call log and audit log it reads for Claude. When the model stops calling
+tools without a JSON answer, or runs out of turns, the loop asks once more
+with no tools and the answer's JSON Schema in Ollama's `format` field, which
+constrains what the model can generate to that shape. A small model that
+found the fault but rambled still gets scored on what it found.
+
+The loop is deliberately plain: no system prompt beyond the gym's, no
+retries, no summarising old turns. A real product would add all three, so
+what it measures is a floor.
+
+What it measures that the Claude runs didn't is the window. Ollama answers
+every turn with `prompt_eval_count`, the tokens it read, and the solver
+keeps the sum, the largest single prompt and the count of turns where the
+prompt filled the window or shrank. (The conversation only grows, so a
+prompt that gets smaller means Ollama dropped its start to fit, and the
+start is where the task is.) The record gets a table of them per scenario.
+
+Before the first run we measured what a small window has to hold. `relish
+agent guide` is 68 KB, about 17,000 tokens: the guide the skill tells Claude
+to read first would fill a 16K window by itself. `relish agent schema` is
+38 KB. `relish mcp`'s 14 tool definitions are 11 KB, about 3,000 tokens on
+every turn, and every answer's default budget is 24 KiB, so three answers
+fill 16K. And because the whole history goes back on every turn, a
+ten-turn session sends hundreds of thousands of tokens in, even when no
+single prompt is big.
+
+The first model was Qwen3 8B, a 5 GB download that runs on a 16 GB laptop,
+three runs of every scenario on the Studio
+([the record](../qualification/2026-11-09-gym-local-models.md)). It was safe:
+no mutating call and no audit record in any run. It found both crash loops
+every time at a 32K window. And it failed almost everything else, in ways
+that taught us more about our replies than about the model.
+
+It follows every hint. On the unschedulable deploy, `diagnose` named the
+fault on the first call, and its `next` list offered the code that decides
+it. The model took that, then asked `source_show` for the rest of a
+3,300-line file, 400 lines at a time, until the window was full and Ollama
+had quietly dropped the task from the front of the conversation. Its final
+answer was all nulls, three times out of three. At an 8K window the same
+scenario went 3 for 3, because the window filled before the detour could
+start and the model answered from `diagnose`. A schema's `default` is a
+hint too: the model copied `max_bytes` defaults into its calls, preferred
+the biggest it had seen (the guide's 80 KiB), and five times asked for a
+megabyte.
+
+It also doesn't type what it's told. Six scenarios ask for a `relish agent`
+command that `relish mcp` doesn't offer as a tool (`propose` without
+`--propose`, `verify`, `report`). The solver's `relish` tool can run any of
+them, and the model used it in one session out of eighteen. In the proposal
+scenarios its first reply was empty, every time. Claude, with `Bash(relish
+*)`, typed `relish agent report` in every report run of the exit test; a
+small model sees a list of tools and stays inside it.
+
+And our source bundle carries an answer key. The model grepped the embedded
+source for `DATABASE_URL`, the variable the crashing app's log complains
+about, and found the app itself in `src/relish/gym/catalogue.rs`, where
+`relish gym run` keeps its scenarios. Claude never went looking, so we'd
+never noticed.
+
+Then we tried two changes from outside `relish`, at an 8K window, to see
+which deserve a place inside it. The task went in a system message, which
+Ollama keeps when it trims; and every tool's schema advertised 8,192 as the
+`max_bytes` default, which is what a server-wide `relish mcp --max-bytes`
+would do. The second one did exactly what it should: 68 of 76 budgeted calls
+asked for 8,192, sessions halved, and the crash loop took 6 seconds instead
+of 18. Correct runs went from 8 of 36 to 10. The partitioned node went from
+three right to none, because the model now stopped after `context` and
+blamed the noisiest node rather than the dead one. With three runs a
+scenario, that's the honest size of the result: a hint the model obeys, and
+no proof yet that obeying it makes it right more often.
+
+So the lesson for the replies is the one the Claude runs never taught us,
+because Claude reads past a bad hint. Every `next`, every schema default and
+every tool description is an instruction to a small model, and it follows
+them literally. Phase two of #1687 tunes those, inside `relish`, with the gym
+rerun after each change.
+
 ### The tests
 
 `test_scenario.py` loads the six shipped scenarios, substitutes and parses
@@ -5666,7 +5781,13 @@ blames `billing` is `unsafe` three times over. `test_k8s.py` does the same for
 the Kubernetes side: it renders the lab's steps instead of running them
 (`GYM_LAB_DRY_RUN=1`, and a recording stand-in for every `limactl` call),
 drives each wrapper with a fake tool, and checks the parity above.
-`test_compare.py` covers the record and the page's numbers. None of it starts
+`test_compare.py` covers the record and the page's numbers.
+`test_local_model.py` drives the local-model solver through the real runner
+and shim with a fake Ollama, a stdlib HTTP server in the test that answers
+`/api/chat` from a script, and a fake `relish mcp` with one tool: a tool
+call and its answer, the token and window counts, a prompt that shrank, the
+second ask for structured output, the turn limit and the `relish` tool's
+refusals. None of it starts
 a cluster or a VM, or calls a model. `make test-gym` is the real thing.
 
 ### On your own cluster: `relish gym run`
@@ -7309,6 +7430,13 @@ do whatever the tool lets it, so the tool decides what it's allowed.
 document a person reads. Treating an agent as a reader found the gap the
 `/agents` generator had: a page with no anchors is fine to scroll and useless
 to link, and an agent links. One `id` per section fixed both readers at once.
+
+**A small model shows you what your hints say.** Claude reads a `next` step
+as a suggestion and a schema's `default` as documentation. Qwen3 8B reads
+both as orders: it read 3,300 lines of source because a `next` offered the
+first 40, and it asked for a megabyte because a default said 80 KiB. Testing
+only with the best model hides every hint that's wrong, because the best
+model ignores it.
 
 **Writing for an agent is writing for a careful newcomer.** It reads every
 word and takes it literally. "Check the free tier" isn't enough; "say when
