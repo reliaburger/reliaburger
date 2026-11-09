@@ -427,7 +427,7 @@ expression: value
     {
       "read_only": true,
       "run": "relish agent diagnose",
-      "why": "the evidence behind every finding, with the code that decides it"
+      "why": "the evidence behind every finding"
     },
     {
       "read_only": true,

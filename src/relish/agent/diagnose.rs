@@ -34,6 +34,14 @@ const MANUAL_PREFIX: &str = "docs/manual/";
 /// How many lines a `source show` next step asks for.
 const SHOW_LINES: usize = 40;
 
+/// Why a step into the code that decides an answer is offered. The answer
+/// already names the fault or the rule, so the code is only for checking
+/// relish's own reasoning; a small model follows every step it's given, and
+/// one that read this as the way forward spent its whole window paging
+/// through the source (#1687).
+pub(crate) const CODE_STEP_WHY: &str =
+    "optional: the code that decides it, only if you think relish got this wrong";
+
 /// What replaces an app's log line where `wtf` quoted it inside our own words.
 pub const LOG_LINE_PLACEHOLDER: &str = "<the app's log line, in events as untrusted text>";
 
@@ -346,9 +354,12 @@ fn reshape(
         .collect();
     let source = bundle.and_then(|bundle| decided_in(bundle, &finding.id));
     let manual = bundle.and_then(|bundle| manual_pointer(bundle, &finding.id));
+    // The finding names the fault. The steps here say more about it; none
+    // leads into the source, whose pointer stays in `source` (#1687).
     let mut next = vec![NextStep {
         run: format!("relish agent explain {}", super::shell_quote(&finding.id)),
-        why: "what this finding means, its thresholds and where it's decided".to_string(),
+        why: "what this finding means and its thresholds, if the title and details aren't enough"
+            .to_string(),
         read_only: true,
     }];
     if let (Some((name, _)), None) = (app, scope) {
@@ -357,13 +368,6 @@ fn reshape(
             why: "the same checks for this app alone".to_string(),
             read_only: true,
         });
-    }
-    if let Some(site) = &source {
-        next.push(show_step(
-            &site.path,
-            site.function_line.unwrap_or(site.line),
-            "the code that decides it",
-        ));
     }
     Finding {
         id: finding.id.clone(),
@@ -585,22 +589,23 @@ pub fn explain(
         .into_iter()
         .map(|kind| explanation(kind, bundle))
         .collect();
+    // The manual first; the code last, and optional.
     let next = match explained.as_slice() {
         [only] => only
-            .decided_in
+            .manual
             .as_ref()
-            .map(|site| {
-                show_step(
-                    &site.path,
-                    site.function_line.unwrap_or(site.line),
-                    "the code that decides it",
-                )
-            })
-            .into_iter()
-            .chain(only.manual.as_ref().map(|manual| NextStep {
+            .map(|manual| NextStep {
                 run: manual.read.clone(),
                 why: "the manual's section on it".to_string(),
                 read_only: true,
+            })
+            .into_iter()
+            .chain(only.decided_in.as_ref().map(|site| {
+                show_step(
+                    &site.path,
+                    site.function_line.unwrap_or(site.line),
+                    CODE_STEP_WHY,
+                )
             }))
             .collect(),
         _ => Vec::new(),
@@ -1049,6 +1054,42 @@ mod tests {
         );
         assert_eq!(exit, 0);
         insta::assert_json_snapshot!(value);
+    }
+
+    /// A finding already names the fault, so its next steps never send the
+    /// agent into the source: a small model follows every step it's given
+    /// and, on the unschedulable deploy, paged through 3,300 lines of the
+    /// deciding file after `diagnose` had answered (#1687). The pointer
+    /// stays in `source` for an agent that wants it.
+    #[test]
+    fn a_findings_next_steps_stay_out_of_the_source() {
+        let bundle = fixture::bundle();
+        let value = diagnosed(Some(&bundle));
+        let findings = value["data"]["findings"].as_array().unwrap();
+        assert!(!findings.is_empty());
+        for finding in findings {
+            assert!(finding["source"]["path"].is_string(), "{finding}");
+            for step in finding["next"].as_array().unwrap() {
+                let run = step["run"].as_str().unwrap();
+                assert!(!run.contains("agent source"), "{run}");
+            }
+        }
+    }
+
+    /// `explain` offers the manual's section first and the code last,
+    /// marked optional: it's for checking relish's own reasoning.
+    #[test]
+    fn an_explanation_offers_the_manual_first_and_the_code_as_optional() {
+        let bundle = fixture::bundle();
+        let answer = explain(Some("crashloop"), Some(&bundle)).unwrap();
+        let next = &answer.next;
+        assert_eq!(next.len(), 2);
+        assert_eq!(
+            next[0].run,
+            "relish agent source show docs/manual/07_diagnostics.md:3-11"
+        );
+        assert!(next[1].run.contains(DECIDING_FILE), "{}", next[1].run);
+        assert!(next[1].why.starts_with("optional"), "{}", next[1].why);
     }
 
     #[test]

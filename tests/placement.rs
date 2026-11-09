@@ -1617,6 +1617,11 @@ fn peer_state(observer: &Node, target: &str) -> Option<reliaburger::mustard::sta
 /// probes and its peers mark it Dead. Healing clears the blocklists and
 /// the node rejoins. This drives the binary path: a council partition fault
 /// on the isolated node, membership observed through the peers' watch.
+///
+/// The partition must hold in both directions on Raft as well (#1810). The
+/// blocklists only stopped the isolated node's own RPCs, so the leader's
+/// AppendEntries still reached it and it kept applying the log. A write
+/// made on the leader during the partition must not reach q3 until the heal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 #[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
 async fn partition_isolates_a_node_for_real() {
@@ -1685,11 +1690,82 @@ async fn partition_isolates_a_node_for_real() {
         peer_state(&n1, "q3")
     );
 
+    // A write on the leader, which q1 and q2 elect between them if q3 led.
+    let marker = reliaburger::sesame::token::create_token(
+        "written-during-partition",
+        reliaburger::sesame::types::ApiRole::ReadOnly,
+        reliaburger::sesame::types::TokenScope::default(),
+        None,
+    )
+    .unwrap()
+    .token;
+    let holds_marker = |node: &Node| {
+        let council = node.handle.council.clone();
+        async move {
+            let council = council.expect("every test node holds a council seat");
+            council
+                .api_tokens()
+                .await
+                .iter()
+                .any(|token| token.name == "written-during-partition")
+        }
+    };
+    let mut written = false;
+    for _ in 0..60 {
+        for node in [&n1, &n2] {
+            let council = node.handle.council.as_ref().expect("council seat");
+            if !written
+                && council
+                    .write(reliaburger::council::types::RaftRequest::CreateApiToken(
+                        marker.clone(),
+                    ))
+                    .await
+                    .is_ok()
+            {
+                written = true;
+            }
+        }
+        if written {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(
+        written,
+        "neither q1 nor q2 accepted a write during the partition"
+    );
+    for _ in 0..40 {
+        if holds_marker(&n1).await && holds_marker(&n2).await {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(holds_marker(&n1).await && holds_marker(&n2).await);
+    // Five seconds is many heartbeats: a leader still reaching q3 would have
+    // replicated the entry long before.
+    for _ in 0..50 {
+        assert!(
+            !holds_marker(&n3).await,
+            "the partitioned q3 applied a write made on the leader during its partition"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
     // Heal: clear q3's blocklists and it should rejoin and be Alive again.
     n3.client
         .clear_fault(fault.id, Some("q3"), true)
         .await
         .expect("heal should succeed");
+
+    let mut caught_up = false;
+    for _ in 0..300 {
+        if holds_marker(&n3).await {
+            caught_up = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(caught_up, "q3 never applied the write after the heal");
 
     let recovered = wait_until(Duration::from_secs(30), || {
         peer_state(&n1, "q3") == Some(NodeState::Alive)

@@ -76,13 +76,13 @@ expression: value
   "next": [
     {
       "read_only": true,
-      "run": "relish agent source show src/relish/wtf/diagnose.rs:3-42",
-      "why": "the code that decides it"
+      "run": "relish agent source show docs/manual/07_diagnostics.md:3-11",
+      "why": "the manual's section on it"
     },
     {
       "read_only": true,
-      "run": "relish agent source show docs/manual/07_diagnostics.md:3-11",
-      "why": "the manual's section on it"
+      "run": "relish agent source show src/relish/wtf/diagnose.rs:3-42",
+      "why": "optional: the code that decides it, only if you think relish got this wrong"
     }
   ],
   "ok": true,

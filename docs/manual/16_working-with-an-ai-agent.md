@@ -204,6 +204,9 @@ relish agent schema --max-bytes 4096
 (it's mostly fields, not lists) becomes a `usage` failure whose hint names
 the budget that would fit.
 
+Through `relish mcp` the default is smaller: 8 KiB for every tool, `guide`
+and `schema` included (see [Through MCP](#through-mcp)).
+
 ## Text the cluster didn't write
 
 Some answers quote text that Reliaburger didn't write: an app's log lines,
@@ -963,6 +966,17 @@ Three flags narrow what it offers:
 relish mcp --toolsets source,manual --no-logs
 ```
 
+Every tool's answer is held to 8 KiB, about 2,000 tokens, unless the call
+passes `max_bytes`. That's also the default each tool's schema advertises,
+because a model tends to send whatever default it reads there. `--max-bytes`
+sets it for every tool, from 1024 to 131072. No call gets more than 131072
+bytes (128 KiB), whatever it asks for, which still fits the whole guide in
+one answer. A cut answer says so, as on the command line.
+
+```sh
+relish mcp --max-bytes 24576
+```
+
 `--namespace` narrows what the agent asks for. It isn't a permission: a
 token scoped to the namespace is.
 
@@ -1088,9 +1102,10 @@ large one. Three habits keep it working:
 - **Don't read the whole guide.** `relish agent guide` is about 68 KB, some
   17,000 tokens, which fills a 16K window on its own. Use `manual_search`
   and `manual_show` for the section you need.
-- **Ask for less.** Every answer's default budget is 24 KiB, about 6,000
-  tokens, and the conversation is sent again on every turn. Pass a smaller
-  `max_bytes`, such as 8192, and follow `next` when an answer says it was cut.
+- **Keep answers small.** `relish mcp` holds every answer to 8 KiB, about
+  2,000 tokens, unless the model asks for more, and the conversation is
+  sent again on every turn. At an 8K window, start it with `--max-bytes
+  4096`.
 - **Offer fewer tools.** The 14 tools' descriptions and schemas cost about
   3,000 tokens on every turn. `--toolsets context,diagnose,explain,logs,manual`
   keeps the six a diagnosis needs, for about 1,300:
@@ -1098,6 +1113,12 @@ large one. Three habits keep it working:
 ```sh
 relish mcp --toolsets context,diagnose,explain,logs,manual
 ```
+
+A small model follows every `next` step it's given. A finding already names
+the fault, so `diagnose`'s steps say more about it without leading into the
+source, and a step into the code that decides an answer starts its `why`
+with `optional`. Tell your model it can answer once a finding names the
+fault.
 
 A small model also keeps to its tool list. It rarely types a command it
 isn't offered as a tool, so if it should propose changes, start the server

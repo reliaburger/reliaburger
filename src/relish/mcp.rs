@@ -77,6 +77,33 @@ pub struct McpOptions {
     /// which it then needs.
     #[arg(long)]
     pub propose: bool,
+
+    /// Every tool's budget in bytes when a call names none, and the default
+    /// its schema advertises: 8192 when left out, at least 1024 and at most
+    /// 131072. No call gets more than 131072, whatever it asks for.
+    #[arg(long, value_name = "BYTES", value_parser = parse_server_max_bytes)]
+    pub max_bytes: Option<usize>,
+}
+
+/// `relish mcp --max-bytes`: a whole number from the floor every answer
+/// needs to the ceiling every call is held to.
+fn parse_server_max_bytes(value: &str) -> Result<usize, String> {
+    let bytes: usize = value
+        .parse()
+        .map_err(|_| format!("{value:?} isn't a number of bytes"))?;
+    if bytes < agent::MIN_MAX_BYTES {
+        return Err(format!(
+            "{bytes} is below the minimum of {}",
+            agent::MIN_MAX_BYTES
+        ));
+    }
+    if bytes > tools::MAX_BYTES_CEILING {
+        return Err(format!(
+            "{bytes} is above relish mcp's ceiling of {}",
+            tools::MAX_BYTES_CEILING
+        ));
+    }
+    Ok(bytes)
 }
 
 impl McpOptions {
@@ -87,6 +114,7 @@ impl McpOptions {
             no_logs: self.no_logs,
             namespace: self.namespace.clone(),
             propose: self.propose,
+            max_bytes: self.max_bytes,
         }
     }
 }

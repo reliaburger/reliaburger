@@ -499,6 +499,10 @@ pub async fn start(
     // The listener re-checks each open connection's peer against the live
     // CRL before every request (#928).
     let rpc_crl = crl_handle.clone();
+    // A council partition refuses the blocked peers' RPCs here as well as
+    // sending none to them, or the leader keeps replicating to a
+    // "partitioned" node over the connections it opens (#1810).
+    let rpc_blocklist = raft_blocklist.clone();
     spawn_supervised("cluster:raft-rpc", supervision.clone(), async move {
         serve_raft_rpc_with_node_gate(
             raft_listener,
@@ -508,6 +512,7 @@ pub async fn start(
             rpc_fence,
             rpc_node_gate,
             Some(rpc_crl),
+            rpc_blocklist,
         )
         .await;
     });
