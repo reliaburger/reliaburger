@@ -96,3 +96,23 @@ Fixes #1777
 #    merged (#1771, #1788, #1789). Tick them before the gate closes it.
 # 4. The 0.2.7 release log and roadmap said #1707 was "fixed in 0.2.8". It
 #    isn't proven fixed and stays open; the roadmap now says so.
+
+# --- Release-day edits, once install.sh's default moves to v0.2.8 ---
+#
+# These belong with step 10 of docs/releasing.md, not before the tag:
+#
+# - The homepage's #act section from #1797 (the showcase) says
+#   "0.2.8, not in 0.2.7". Take that label off when install.sh moves to
+#   v0.2.8, or the stale-label check in tests/suite/website.rs flags it.
+#   Every other "0.2.8, not in 0.2.7" label (README, the reference chapter)
+#   goes the same way: regenerate scripts/release/released-cli.tsv and run
+#   `make reference-commands`.
+# - docs/features.toml: move it to 0.2.8, and unlink the issues the gate
+#   closes from the rows Homebrew install (#1712), Cron (#1527),
+#   `relish mcp` (#1730), Bug reports an agent drafts (#1717), Proving a fix
+#   on a throwaway cluster (#1691, #1726), Agent gym (#1683) and Incident
+#   timeline and decision provenance (#1685). Until then the nightly
+#   features.yml fails on them.
+# - The tour (docs/manual/08_five-minute-tour.md, scripts/demo/tour.sh) and
+#   the README's quick start still run `relish status` as 0.2.7 does, where
+#   it lists the counter's instances. In 0.2.8 that's `relish apps`.
