@@ -199,7 +199,10 @@ that pull the plug on a VM mid-write, a live-cluster test runner you can point
 at your own cluster (`relish test`), and a soak that installs the signed
 release the way you would and then breaks it for hours. An agent gym breaks
 throwaway clusters in ways it knows and scores whatever diagnoses them, an AI
-agent included, against the ground truth (`make test-gym`, from 0.2.7; Claude Code plugs in with `scripts/gym/claude_code.py`). CI
+agent included, against the ground truth (`make test-gym`, from 0.2.7; Claude Code plugs in with `scripts/gym/claude_code.py`).
+`relish gym run` (0.2.8, not in 0.2.7) runs the same scenarios against your
+own agent in a staging namespace of your own cluster, and cleans up after
+itself ([testing your agent](manual/05_chaos.md#testing-your-agent-on-your-cluster)). CI
 never retries a failure. See [how Reliaburger is tested](testing.md).
 
 **A terminal UI and a web dashboard.** Run `relish` with no arguments for the
@@ -1054,8 +1057,9 @@ envelope. The lists live in `relish apps` (one row per app, problems first;
 `relish agent` is the family for LLM agents: every command prints one
 `relish.agent/v1` JSON envelope within a byte budget, never prompts, and exits
 `0` whenever it answered. It has `guide` (the manual's agent chapter),
-`version`, `schema`, `context` (the first call: findings, unknowns, faults,
-alerts, one line per app and the newest events), `diagnose` (`wtf`'s findings
+`version`, `schema`, `context` (the first call: `relish status`'s screen and
+summary, findings, unknowns, the soonest faults with who injected them,
+leases, proposals and the newest events), `diagnose` (`wtf`'s findings
 with their evidence and pointers into the manual and the source), `explain`
 (what a finding id means and the constants and code that decide it, or why the
 cluster restarted an instance, placed it or refused a deploy: the rule, the

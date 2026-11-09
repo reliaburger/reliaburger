@@ -414,6 +414,7 @@ def render(catalogue, repo=REPO):
     </main>
     <footer><span>Reliaburger · by Miko Pawlikowski</span><a href="#statuses">Feature status for {release} · reviewed {html.escape(catalogue.reviewed)}</a><span class="footer-note">Static HTML and CSS, generated from docs/features.toml. No tracking or third-party requests.</span></footer>
   </div>
+  <script src="assets/copy.js" defer></script>
 </body>
 </html>
 """

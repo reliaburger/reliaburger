@@ -105,10 +105,17 @@ make up for that:
 
 - **The train's commits say it too.** A PR into a train carries `Fixes #N`
   in its body and in its commit messages, one line per issue. The commits
-  reach `main` with the gate PR, and GitHub closes the issue then.
+  reach `main` with the gate PR, and GitHub closes the issue then. That
+  cuts both ways: "close", "closes", "fix", "fixes", "resolve" or
+  "resolves" before `#N` closes the issue wherever it stands in the
+  message, even after "doesn't", so write "`#N` stays open" instead.
 - **The gate PR names every issue.** Before the gate PR merges into `main`,
   rebuild its body with a `Fixes #N` line for every issue the train
-  resolves: list the train's merged PRs and collect their lines.
+  resolves: list the train's merged PRs and commits, collect their lines,
+  check each issue on GitHub, and keep the list in
+  `docs/qualification/DATE-vX.Y.Z-freeze-fixes.txt` with the issues that
+  stay open and why
+  ([0.2.8's](qualification/2026-11-09-v0.2.8-freeze-fixes.txt)).
 - **Unfinished issues move at freeze.** An issue the train only partly
   resolves is split, the done part closed by the train and the rest filed
   for the next release, or moved to the next milestone whole, with the
@@ -1657,7 +1664,11 @@ the real `curl … | sh` install against it on every host we advertise.
 8. **Promote** as described above, with the same run ID and digest. The
    staging tag can't be promoted: it doesn't match `v1.2.3`, `candidate.py`
    refuses it as a version, and `promote.yml` refuses any tag containing
-   `staging`.
+   `staging`. `promote.yml` publishes the release with GitHub's generated
+   list of PRs. Put the release notes, drafted at freeze in
+   `docs/qualification/DATE-vX.Y.Z-release-notes.md`, above that list:
+   `gh release edit vX.Y.Z --notes-file NOTES` with the draft followed by
+   the generated list ([0.2.8's draft](qualification/2026-11-09-v0.2.8-release-notes.md)).
 
 9. **Publish the performance records**, after the tag
    ([why](#performance-records-after-the-tag)). They don't block the release;
