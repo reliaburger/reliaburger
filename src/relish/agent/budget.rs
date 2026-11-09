@@ -57,6 +57,34 @@ pub const MIN_MAX_BYTES: usize = 1024;
 /// What a shortened string ends with.
 pub const STRING_CUT_MARKER: &str = "…[cut]";
 
+tokio::task_local! {
+    /// The most bytes any answer may have, when a caller holds every budget
+    /// to one: `relish mcp` does (#1687). The command line has none.
+    static CEILING: usize;
+}
+
+/// Run `future` with every answer it renders held to `ceiling`: a trimmed
+/// answer's hint never asks for more, because asking can't get it.
+///
+/// A task-local rather than a parameter, so the twenty commands between
+/// `relish mcp` and [`render`] needn't carry a value only one caller sets.
+pub async fn within_ceiling<F: std::future::Future>(ceiling: usize, future: F) -> F::Output {
+    CEILING.scope(ceiling, future).await
+}
+
+/// The ceiling the current task renders under, if any.
+fn ceiling() -> Option<usize> {
+    CEILING.try_with(|ceiling| *ceiling).ok()
+}
+
+/// Why an answer bigger than the ceiling can't be had whole.
+fn narrow_why(whole: usize, ceiling: usize) -> String {
+    format!(
+        "the whole answer is {whole} bytes, more than the {ceiling} this server returns; \
+         narrow the request instead: a filter, a time range or a section"
+    )
+}
+
 /// Render `envelope` as one line of JSON, newline included, in at most
 /// `max_bytes` bytes.
 ///
@@ -96,10 +124,10 @@ pub fn render<T: Serialize>(envelope: &Envelope<T>, max_bytes: usize, rerun: &st
                 ErrorCode::Usage,
                 format!("the answer is {whole} bytes and doesn't fit in {max_bytes}, even trimmed"),
             )
-            .with_hint(format!(
-                "run it again with --max-bytes {}",
-                round_up_to_kib(whole)
-            ));
+            .with_hint(match ceiling() {
+                Some(ceiling) if whole > ceiling => narrow_why(whole, ceiling),
+                _ => format!("run it again with --max-bytes {}", round_up_to_kib(whole)),
+            });
             failure_that_fits(envelope.command(), envelope.relish(), error, max_bytes)
         }
     }
@@ -152,13 +180,27 @@ fn trim_answer(value: Value, max_bytes: usize, whole: usize, rerun: &str) -> Opt
     };
     let mut data = top.remove("data").unwrap_or(Value::Null);
     let own_next = take_array(&mut top, "next");
-    let own_warnings = take_array(&mut top, "warnings");
+    let mut own_warnings = take_array(&mut top, "warnings");
     top.insert("truncated".to_string(), Value::Bool(true));
-    let hint = json!({
-        "run": format!("{rerun} --max-bytes {}", round_up_to_kib(whole)),
-        "why": format!("the whole answer is {whole} bytes and this budget was {max_bytes}"),
-        "read_only": true,
-    });
+    // Under a ceiling the whole answer may be out of reach: ask for the
+    // ceiling once, and at the ceiling ask for nothing more, only for a
+    // narrower question.
+    let hint = match ceiling() {
+        Some(ceiling) if whole > ceiling && max_bytes >= ceiling => {
+            own_warnings.insert(0, Value::String(narrow_why(whole, ceiling)));
+            None
+        }
+        Some(ceiling) if whole > ceiling => Some(json!({
+            "run": format!("{rerun} --max-bytes {ceiling}"),
+            "why": narrow_why(whole, ceiling),
+            "read_only": true,
+        })),
+        _ => Some(json!({
+            "run": format!("{rerun} --max-bytes {}", round_up_to_kib(whole)),
+            "why": format!("the whole answer is {whole} bytes and this budget was {max_bytes}"),
+            "read_only": true,
+        })),
+    };
 
     let mut cuts: Vec<Cut> = Vec::new();
     let mut keep_next = own_next.len();
@@ -167,7 +209,7 @@ fn trim_answer(value: Value, max_bytes: usize, whole: usize, rerun: &str) -> Opt
         // Measure the envelope with `data` as `null`, then swap in the size
         // of the real `data`, so the loop never copies a big answer.
         let mut shell = top.clone();
-        let mut next = vec![hint.clone()];
+        let mut next: Vec<Value> = hint.iter().cloned().collect();
         next.extend_from_slice(&own_next[..keep_next]);
         let mut warnings = own_warnings[..keep_warnings].to_vec();
         warnings.extend(cut_notes(&cuts, &data).into_iter().map(Value::String));
@@ -544,6 +586,69 @@ mod tests {
         assert!(asked >= whole, "asked {asked}, whole answer {whole}");
         let again = render_json(&envelope, asked, "relish agent version");
         assert_eq!(parse(&again)["truncated"], json!(false));
+    }
+
+    /// Through `relish mcp` no answer is bigger than its ceiling, so a hint
+    /// asking for the whole answer sent a model round in circles: it asked,
+    /// got the ceiling, and was told to ask again (#1687).
+    #[tokio::test]
+    async fn under_a_ceiling_the_hint_asks_for_the_ceiling_and_says_to_narrow() {
+        let apps: Vec<Value> = (0..2000).map(|index| json!(index)).collect();
+        let envelope = answered(json!({ "apps": apps }));
+        let text = within_ceiling(4096, async {
+            render_json(&envelope, 2048, "relish agent version")
+        })
+        .await;
+        let value = parse(&text);
+        assert!(text.len() <= 2048, "{} bytes", text.len());
+        let hint = &value["next"][0];
+        assert_eq!(hint["run"], json!("relish agent version --max-bytes 4096"));
+        assert!(hint["why"].as_str().unwrap().contains("narrow"), "{hint}");
+    }
+
+    #[tokio::test]
+    async fn at_the_ceiling_no_step_asks_for_more_and_a_warning_says_to_narrow() {
+        let apps: Vec<Value> = (0..2000).map(|index| json!(index)).collect();
+        let envelope = answered(json!({ "apps": apps }));
+        let text = within_ceiling(4096, async {
+            render_json(&envelope, 4096, "relish agent version")
+        })
+        .await;
+        let value = parse(&text);
+        assert_eq!(value["truncated"], json!(true));
+        for step in value["next"].as_array().unwrap() {
+            assert!(
+                !step["run"].as_str().unwrap().contains("--max-bytes"),
+                "{step}"
+            );
+        }
+        let warnings = value["warnings"].as_array().unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.as_str().unwrap().contains("narrow")),
+            "{warnings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn under_a_ceiling_an_answer_that_fits_it_keeps_the_usual_hint() {
+        let apps: Vec<Value> = (0..500).map(|index| json!(index)).collect();
+        let envelope = answered(json!({ "apps": apps }));
+        let whole = render_json(&envelope, usize::MAX, "relish agent version").len();
+        let text = within_ceiling(64 * 1024, async {
+            render_json(&envelope, 1024, "relish agent version")
+        })
+        .await;
+        let hint = &parse(&text)["next"][0];
+        assert_eq!(
+            hint["run"],
+            json!(format!(
+                "relish agent version --max-bytes {}",
+                round_up_to_kib(whole)
+            ))
+        );
+        assert!(!hint["why"].as_str().unwrap().contains("narrow"), "{hint}");
     }
 
     #[test]

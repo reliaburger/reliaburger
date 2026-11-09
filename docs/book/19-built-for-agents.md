@@ -5831,8 +5831,38 @@ whole guide in one answer, so no client loses anything it could do before.
 We kept the `relish agent` commands' own defaults. On the command line the
 caller is Claude Code or a person, with a large window, and 24 KiB costs
 them nothing; the 8 KiB default is only where small models connect. Claude
-Code reaches `relish mcp` too, through the plugin, and reads a cut answer's
-`next` the way it always has: one more call with a bigger budget.
+Code reaches `relish mcp` too, through the plugin, so the plugin starts it
+with `--max-bytes 24576`, the command line's default.
+
+A review of the ceiling found a loop in it. A cut answer's first `next` asks
+for the whole answer: `--max-bytes` and its size. A 2 MB `source_grep` asked
+for 2,189,312 bytes, the server held the call to 128 KiB, and the answer came
+back cut with the same hint. A model that follows every hint goes round
+until its turns run out. So the hint has to know the ceiling, and the
+ceiling is known only to `relish mcp`, twenty function calls above the
+`render` that writes the hint. Threading a parameter through every command
+for one caller seemed worse than the alternative, a task-local:
+
+```rust
+tokio::task_local! {
+    static CEILING: usize;
+}
+
+pub async fn within_ceiling<F: std::future::Future>(ceiling: usize, future: F) -> F::Output {
+    CEILING.scope(ceiling, future).await
+}
+```
+
+A task-local is a value that belongs to one async task, the way a
+`thread_local!` belongs to one thread, and a task can move between threads,
+so a thread-local would be wrong here. `scope` sets it for as long as the
+future runs, and `CEILING.try_with(|c| *c)` reads it, failing outside any
+scope. `relish mcp` runs each tool call inside `within_ceiling`, and `render`
+asks: with no ceiling (the command line), the hint is what it was; under one,
+an answer bigger than the ceiling gets a hint for the ceiling itself, and at
+the ceiling no hint at all, only a warning to narrow the request. Python's
+`contextvars` and Go's `context.Context` carry values the same way, though
+Go passes its context explicitly.
 
 **`next` that leads into the source.** `diagnose` gave each finding three
 next steps: `explain` it, scope the diagnosis to the app, and show the 40

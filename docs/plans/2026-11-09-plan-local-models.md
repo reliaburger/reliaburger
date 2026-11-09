@@ -216,8 +216,18 @@ is run C's settings without `GYM_LOCAL_MAX_BYTES`, so the budget comes from
 - The `relish agent` commands keep their own defaults (24 KiB, 80 for
   `guide`, 40 for `schema`). Their callers are people and Claude Code's
   shell, with large windows; nothing in the record argues for a change there.
-  Claude Code reaches `relish mcp` through the plugin too, and reads a cut
-  answer's `next` as before.
+  Claude Code reaches `relish mcp` through the plugin too, so the plugin's
+  `.mcp.json` starts it with `--max-bytes 24576`, the command line's
+  default (decided 10 November, from a review of #1813). `relish agent
+  setup` keeps plain `relish mcp`, since its clients include Goose, which
+  runs small local models.
+- **A cut answer never asks for more than the ceiling.** The first version
+  of the hint asked for the whole answer, so a 2 MB `source_grep` said
+  "`--max-bytes 2189312`", was held to 128 KiB, and said it again: a loop
+  for a model that follows every hint. Under `relish mcp` the hint asks for
+  the ceiling once, and at the ceiling there's no hint, only a warning to
+  narrow the request with a filter, a time range or a section. The command
+  line has no ceiling, so its hint is unchanged.
 
 **`next` steps that lead into the source.** Three hints did it, one after
 another:

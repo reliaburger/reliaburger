@@ -964,7 +964,10 @@ passes `max_bytes`. That's also the default each tool's schema advertises,
 because a model tends to send whatever default it reads there. `--max-bytes`
 sets it for every tool, from 1024 to 131072. No call gets more than 131072
 bytes (128 KiB), whatever it asks for, which still fits the whole guide in
-one answer. A cut answer says so, as on the command line.
+one answer. A cut answer says so, as on the command line, and when even
+128 KiB can't hold all of it, it says to narrow the request: a filter, a
+time range or a section. The Claude Code plugin starts the server with
+`--max-bytes 24576`, the command line's default.
 
 ```sh
 relish mcp --max-bytes 24576
