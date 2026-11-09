@@ -562,7 +562,7 @@ relish agent upgrade-check
 |---------|---------|
 | `ready` | A newer release exists and nothing stands in its way. `next` has the plan and the start command. |
 | `up_to_date` | Every node already runs the latest release or newer. |
-| `needs_fresh_cluster` | The release changes a cluster format, so it can't roll onto this cluster ([cluster compatibility](12_operations.md)). |
+| `needs_fresh_cluster` | The release changes a cluster format, so it can't roll onto this cluster ([cluster compatibility](https://github.com/reliaburger/reliaburger/blob/v0.2.8/docs/manual/12_operations.md)). |
 | `blocked` | Something has to be fixed first. |
 | `unknown` | A question went unanswered, so no verdict is safe. |
 
@@ -593,7 +593,7 @@ a person the same question, without the `wtf`, quorum and skew checks.
 
 `relish agent verify` checks that every node's `bun`, and this `relish`, is
 the published, signed build of one version: `verified`, `mismatch` or
-`unknown`. Offline, pass the release's files ([how](12_operations.md#is-this-the-release)).
+`unknown`. Offline, pass the release's files ([how](https://github.com/reliaburger/reliaburger/blob/v0.2.8/docs/manual/12_operations.md#is-this-the-release)).
 
 ## Proving a fix
 

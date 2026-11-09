@@ -57,8 +57,8 @@ recording still plays.
 ### For agents
 
 The page opens with one line for AI agents, "Are you an AI agent? Start
-here", above the masthead: it links `/agents` (as `agents.html`, which also
-works from a local preview), `agents.md` and `llms.txt`. Those three files,
+here", above the masthead: it links `/agents` (as the relative `agents`, so it
+also works under a project-site path), `agents.md` and `llms.txt`. Those three files,
 the skill and the plugin are generated from the manual chapter
 `docs/manual/16_working-with-an-ai-agent.md` by `src/relish/agent/guide.rs`;
 `make agent-docs` rewrites them, and `tests/suite/agent_docs.rs` fails while
@@ -180,11 +180,32 @@ at deploy time, both taken from the tag `install.sh` installs. Someone running t
 Preview from the repository root:
 
 ```sh
-python3 -m http.server 8080 --bind 127.0.0.1 --directory docs/website
+python3 - <<'EOF'
+import http.server, os
+
+class Handler(http.server.SimpleHTTPRequestHandler):
+    # Serve agents.html at /agents, as GitHub Pages does.
+    def translate_path(self, path):
+        local = super().translate_path(path)
+        if not os.path.exists(local) and os.path.isfile(local + ".html"):
+            return local + ".html"
+        return local
+
+http.server.ThreadingHTTPServer(
+    ("127.0.0.1", 8080),
+    lambda *args: Handler(*args, directory="docs/website"),
+).serve_forever()
+EOF
 ```
 
-Open `http://127.0.0.1:8080/`. Asset paths are relative so the page also works
-under a GitHub project-site path.
+Open `http://127.0.0.1:8080/`. Pages link each other bare, as `agents` and
+`./compare/nomad` rather than `agents.html`: GitHub Pages serves `NAME.html`
+at `/NAME` and `DIR/index.html` at `DIR/`, and the bare address is the one
+people share. Plain `python3 -m http.server` doesn't do that mapping, so the
+preview above adds it. `tests/suite/website.rs` fails while a page links
+another as `NAME.html`, or links one that isn't there. Asset links (`.css`,
+`.js`, `.md`, `.cast`) keep their extension. Every path is relative, so the
+pages also work under a GitHub project-site path.
 
 GitHub is the source of truth for documentation. The whitepaper PDF link points
 at `https://github.com/reliaburger/reliaburger/releases/latest/download/reliaburger-whitepaper.pdf`:
@@ -387,8 +408,9 @@ packaging.
 
 ### Markdown copies, the skills index and `llms.txt`
 
-Every page has a Markdown copy beside it, at its path with `.md` for `.html`
-(`index.md`, `compare/nomad.md`, `feedback/index.md`), and names it in its
+Every page has a Markdown copy beside it, at its bare path with `.md` added
+(`/compare/nomad.md` for `/compare/nomad`; `index.md` for `/`, and
+`feedback/index.md` for `/feedback/`), and names it in its
 `<head>` with `<link rel="alternate" type="text/markdown" href="….md">`. Don't
 edit a copy: `make agent-docs` writes them from the pages
 (`tests/suite/website_markdown.rs`). It keeps each page's `<main>`, drops
@@ -446,6 +468,6 @@ that record doesn't hold. Until the real runs the tag is empty, the page says
 `noindex`. The index doesn't link it until then.
 
 Serve the directory with the preview command above and open `/compare/` or
-`/compare/methodology.html`. Check all local links and fragments, desktop and narrow
+`/compare/methodology`. Check all local links and fragments, desktop and narrow
 layouts, and the command examples with the current CLI's `RELISH_PARSE_ONLY=1`.
 The comparison pages use only `assets/copy.js`; they don't load the tour player.

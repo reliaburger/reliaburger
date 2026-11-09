@@ -1645,7 +1645,7 @@ fn the_first_difference_is_that_it_was_built_for_ai_agents() {
 
     let record = "docs/qualification/2026-11-06-v0.2.7-exit-test.md";
     for href in [
-        "agents.html#measuring-an-agent-on-your-cluster".to_string(),
+        "agents#measuring-an-agent-on-your-cluster".to_string(),
         format!("https://github.com/reliaburger/reliaburger/blob/main/{record}"),
     ] {
         assert!(
@@ -1878,18 +1878,18 @@ fn the_homepage_opens_with_a_line_for_agents() {
         text.starts_with("Are you an AI agent? Start here"),
         "{text:?}"
     );
-    for href in ["agents.html", "agents.md", "llms.txt"] {
+    for href in ["agents", "agents.md", "llms.txt"] {
         assert!(
             banner.contains(&format!("href=\"{href}\"")),
             "the banner doesn't link {href}"
         );
         assert!(
-            repository().join("docs/website").join(href).is_file(),
+            published_file("index.html", href).is_some_and(|file| file.is_file()),
             "{href} isn't published"
         );
     }
     assert!(
-        banner.contains("<a href=\"agents.html\">Start here</a>"),
+        banner.contains("<a href=\"agents\">Start here</a>"),
         "\"Start here\" goes to /agents"
     );
     assert!(read("docs/website/llms.txt").starts_with("# Reliaburger\n"));
@@ -2124,7 +2124,7 @@ fn every_link_into_the_agents_page_lands() {
         );
     }
     let page = read("docs/website/index.html");
-    for rest in page.split("href=\"agents.html#").skip(1) {
+    for rest in page.split("href=\"agents#").skip(1) {
         let fragment = &rest[..rest.find('"').unwrap()];
         assert!(
             lands(fragment),
@@ -2144,6 +2144,91 @@ fn every_link_into_the_agents_page_lands() {
     ] {
         assert!(section.contains(needle), "how-we-test lacks {needle:?}");
     }
+}
+
+/// The file under `docs/website` that `href`, a link on `page`, lands on,
+/// or `None` when it leaves the site or stays on the page. GitHub Pages
+/// serves `NAME.html` at the bare `NAME` and `DIR/index.html` at `DIR/`,
+/// which is how the site links its pages.
+fn published_file(page: &str, href: &str) -> Option<PathBuf> {
+    let site = url::Url::parse("https://reliaburger.com/").unwrap();
+    let base = super::website_markdown::page_url(page);
+    let target = base.join(href).ok()?;
+    if target.origin() != site.origin() || href.starts_with('#') {
+        return None;
+    }
+    let path = target.path().trim_start_matches('/');
+    let path = if path.is_empty() || path.ends_with('/') {
+        format!("{path}index.html")
+    } else if Path::new(path).extension().is_some() {
+        path.to_string()
+    } else {
+        format!("{path}.html")
+    };
+    Some(repository().join("docs/website").join(path))
+}
+
+/// The `href` of every link and stylesheet in `html`.
+fn hrefs(html: &str) -> Vec<&str> {
+    html.split("href=\"")
+        .skip(1)
+        .map(|rest| &rest[..rest.find('"').unwrap()])
+        .collect()
+}
+
+/// Every link from one page of the site to another is bare (`agents`,
+/// `./compare/nomad`, `./compare/`), never `NAME.html`, and lands on a page
+/// that exists. Assets (`style.css`, `agents.md`) keep their extension.
+#[test]
+fn every_link_between_pages_is_bare_and_lands() {
+    let mut checked = 0;
+    for page in super::website_markdown::pages() {
+        let html = read(&format!("docs/website/{page}"));
+        for href in hrefs(&html) {
+            let href = href.replace("&amp;", "&");
+            let Some(file) = published_file(&page, &href) else {
+                continue;
+            };
+            let path = href.split(['#', '?']).next().unwrap_or_default();
+            assert!(
+                !path.ends_with(".html"),
+                "{page} links {href}; link the bare page instead"
+            );
+            assert!(file.is_file(), "{page} links {href}, which isn't there");
+            checked += 1;
+        }
+    }
+    assert!(checked > 100, "too few links checked: {checked}");
+}
+
+#[test]
+fn published_file_maps_bare_links_to_their_html() {
+    let site = repository().join("docs/website");
+    assert_eq!(
+        published_file("index.html", "agents#x"),
+        Some(site.join("agents.html"))
+    );
+    assert_eq!(
+        published_file("index.html", "./compare/"),
+        Some(site.join("compare/index.html"))
+    );
+    assert_eq!(
+        published_file("compare/nomad.html", "../"),
+        Some(site.join("index.html"))
+    );
+    assert_eq!(
+        published_file("compare/nomad.html", "./methodology"),
+        Some(site.join("compare/methodology.html"))
+    );
+    assert_eq!(
+        published_file("compare/nomad.html", "../style.css"),
+        Some(site.join("style.css"))
+    );
+    assert_eq!(published_file("index.html", "#install"), None);
+    assert_eq!(
+        published_file("index.html", "https://github.com/reliaburger"),
+        None
+    );
 }
 
 /// `/agents` loads the site's stylesheet and copy script and nothing else.

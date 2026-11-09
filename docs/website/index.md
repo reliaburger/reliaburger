@@ -16,7 +16,7 @@ Kubernetes hands you the ingredients. Reliaburger hands you the burger: app sche
 
 1.  ### Native to AI agents from day one, not bolted on.
 
-    JSON from every command a script can run was in the first design doc, and `relish agent` and `relish mcp` give your agent bounded answers, read-only MCP tools and the exact source its binary was built from. A new token is read-only unless you ask for more, the bug reports your agent drafts come out redacted, and Claude Code, holding a read-only token, passed [0.2.7’s exit test](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-06-v0.2.7-exit-test.md) in [a gym for AI agents](https://reliaburger.com/agents.html#measuring-an-agent-on-your-cluster).
+    JSON from every command a script can run was in the first design doc, and `relish agent` and `relish mcp` give your agent bounded answers, read-only MCP tools and the exact source its binary was built from. A new token is read-only unless you ask for more, the bug reports your agent drafts come out redacted, and Claude Code, holding a read-only token, passed [0.2.7’s exit test](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-06-v0.2.7-exit-test.md) in [a gym for AI agents](https://reliaburger.com/agents#measuring-an-agent-on-your-cluster).
 
 2.  ### One agent instead of a dozen add-ons.
 
@@ -68,7 +68,7 @@ Paste that into Claude Code, Codex or any agent with a shell. The page it reads 
 
 You still make the decisions; it does the typing. Give it a read-only token afterwards, and it can help you run the cluster too.
 
-[Read the playbook](https://reliaburger.com/agents.html) · [As Markdown](https://reliaburger.com/agents.md) · [Add Reliaburger to your agent](https://reliaburger.com/agents.html#add-to-your-agent)
+[Read the playbook](https://reliaburger.com/agents) · [As Markdown](https://reliaburger.com/agents.md) · [Add Reliaburger to your agent](https://reliaburger.com/agents#add-to-your-agent)
 
 INSTALL Homebrew
 
@@ -409,7 +409,7 @@ Open file descriptors per node.
 
 Bun CPU per node, as a percentage of one core.
 
-What the soaks don't prove: they run three small VMs on one laptop, so they say nothing about large clusters, real networks between machines or hardware failing. A VM forced off isn't a real power loss, the fault rates are a schedule, not production traffic, and zero failures in 25 runs only rules out failure rates above about 12%. [How each gate works](https://github.com/reliaburger/reliaburger/blob/main/docs/testing.md#before-a-release), and [how it compares with Kubernetes' release testing](https://reliaburger.com/compare/kubernetes.html#testing).
+What the soaks don't prove: they run three small VMs on one laptop, so they say nothing about large clusters, real networks between machines or hardware failing. A VM forced off isn't a real power loss, the fault rates are a schedule, not production traffic, and zero failures in 25 runs only rules out failure rates above about 12%. [How each gate works](https://github.com/reliaburger/reliaburger/blob/main/docs/testing.md#before-a-release), and [how it compares with Kubernetes' release testing](https://reliaburger.com/compare/kubernetes#testing).
 
 ## Debug the platform, not just your app
 
@@ -458,7 +458,7 @@ No recording yet. A real session, an agent with a read-only token on a real clus
 
 Last, it drafts a redacted bug report with the reproducer, the patch and what it didn’t test, for you to read and post. Nothing goes to GitHub on its own.
 
-[The agent’s own page](https://reliaburger.com/agents.html) · [The manual chapter](https://github.com/reliaburger/reliaburger/blob/main/docs/manual/16_working-with-an-ai-agent.md) · [How we test, for agents](https://reliaburger.com/agents.html#how-reliaburger-is-tested)
+[The agent’s own page](https://reliaburger.com/agents) · [The manual chapter](https://github.com/reliaburger/reliaburger/blob/main/docs/manual/16_working-with-an-ai-agent.md) · [How we test, for agents](https://reliaburger.com/agents#how-reliaburger-is-tested)
 
 ## Let your agent act, then take it back
 
@@ -499,7 +499,7 @@ No recording yet. A real session, an agent proposing a rollback on a real cluste
 
     Changed your mind? Undo puts it back, for a day, and refuses when something else has changed the app since, rather than overwrite it.
 
-Four scenarios in the [agent gym](https://reliaburger.com/agents.html#measuring-an-agent-on-your-cluster) check this on a real cluster: a proposed rollback, a guardrail’s refusal, two agents after the same app, and an approval that went stale. A run that changes anything itself scores unsafe, however right its answer.
+Four scenarios in the [agent gym](https://reliaburger.com/agents#measuring-an-agent-on-your-cluster) check this on a real cluster: a proposed rollback, a guardrail’s refusal, two agents after the same app, and an approval that went stale. A run that changes anything itself scores unsafe, however right its answer.
 
 ### Guardrails you write once
 
@@ -555,7 +555,7 @@ Not measured yet. The tokens and time an agent spends on the same task on each p
 
 Not measured yet. The agent gym with open models running locally, as well as Claude, is [#1687](https://github.com/reliaburger/reliaburger/issues/1687). Its results go here, all of them, when the runs are done.
 
-[Proposals, for agents](https://reliaburger.com/agents.html#proposing-a-change) · [Agent tokens and proposals](https://github.com/reliaburger/reliaburger/blob/main/docs/manual/10_security.md#agent-tokens-and-proposals) · [The timeline](https://github.com/reliaburger/reliaburger/blob/main/docs/manual/07_diagnostics.md#relish-timeline-what-changed-and-why-did-it-do-that) · [Verify a cluster](https://github.com/reliaburger/reliaburger/blob/main/docs/manual/12_operations.md#is-this-the-release)
+[Proposals, for agents](https://reliaburger.com/agents#proposing-a-change) · [Agent tokens and proposals](https://github.com/reliaburger/reliaburger/blob/main/docs/manual/10_security.md#agent-tokens-and-proposals) · [The timeline](https://github.com/reliaburger/reliaburger/blob/main/docs/manual/07_diagnostics.md#relish-timeline-what-changed-and-why-did-it-do-that) · [Verify a cluster](https://github.com/reliaburger/reliaburger/blob/main/docs/manual/12_operations.md#is-this-the-release)
 
 ## What’s next
 
@@ -619,41 +619,41 @@ How Reliaburger compares, with commands and sources beside the claims. These pag
 
 THE PLATFORM API
 
-### [Reliaburger vs Kubernetes](https://reliaburger.com/compare/kubernetes.html)
+### [Reliaburger vs Kubernetes](https://reliaburger.com/compare/kubernetes)
 
 Pods, controllers, storage and extensibility; installation with kubeadm and the cost of operating the platform.
 
 THE WORKLOAD SCHEDULER
 
-### [Reliaburger vs Nomad](https://reliaburger.com/compare/nomad.html)
+### [Reliaburger vs Nomad](https://reliaburger.com/compare/nomad)
 
 Jobs, groups, allocations and service discovery; what comes with the scheduler and what you integrate.
 
 KUBERNETES, PACKAGED
 
-### [Reliaburger vs k3s](https://reliaburger.com/compare/k3s.html)
+### [Reliaburger vs k3s](https://reliaburger.com/compare/k3s)
 
 What its bundled runtime, networking and ingress simplify, and which Kubernetes concepts remain.
 
 THE SINGLE-HOST BASELINE
 
-### [Reliaburger vs Docker Compose](https://reliaburger.com/compare/docker-compose.html)
+### [Reliaburger vs Docker Compose](https://reliaburger.com/compare/docker-compose)
 
 Services, networks and volumes; where a single Docker host is enough and what changes when you need a cluster.
 
 THE APPLICATION PLATFORM
 
-### [Reliaburger vs Coolify](https://reliaburger.com/compare/coolify.html)
+### [Reliaburger vs Coolify](https://reliaburger.com/compare/coolify)
 
 Git deployments, preview environments, domains and backups; the difference between deployment to servers and cluster reconciliation.
 
 THE SMALL-CLUSTER ALTERNATIVE
 
-### [Reliaburger vs Uncloud](https://reliaburger.com/compare/uncloud.html)
+### [Reliaburger vs Uncloud](https://reliaburger.com/compare/uncloud)
 
 Compose, WireGuard and Caddy; straightforward deployment across machines and the limits of automatic recovery.
 
-[All comparisons](https://reliaburger.com/compare/index.html) · [Evidence and comparison method](https://reliaburger.com/compare/methodology.html)
+[All comparisons](https://reliaburger.com/compare/) · [Evidence and comparison method](https://reliaburger.com/compare/methodology)
 
 ## Follow a subsystem
 

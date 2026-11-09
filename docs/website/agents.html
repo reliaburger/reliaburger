@@ -519,7 +519,7 @@ latest release now? It reads the cluster and the release metadata, asks
 <table><thead><tr><th>Verdict</th><th>Meaning</th></tr></thead><tbody>
 <tr><td><code>ready</code></td><td>A newer release exists and nothing stands in its way. <code>next</code> has the plan and the start command.</td></tr>
 <tr><td><code>up_to_date</code></td><td>Every node already runs the latest release or newer.</td></tr>
-<tr><td><code>needs_fresh_cluster</code></td><td>The release changes a cluster format, so it can't roll onto this cluster (<a href="12_operations.md">cluster compatibility</a>).</td></tr>
+<tr><td><code>needs_fresh_cluster</code></td><td>The release changes a cluster format, so it can't roll onto this cluster (<a href="https://github.com/reliaburger/reliaburger/blob/v0.2.8/docs/manual/12_operations.md">cluster compatibility</a>).</td></tr>
 <tr><td><code>blocked</code></td><td>Something has to be fixed first.</td></tr>
 <tr><td><code>unknown</code></td><td>A question went unanswered, so no verdict is safe.</td></tr>
 </tbody></table>
@@ -544,7 +544,7 @@ a person the same question, without the <code>wtf</code>, quorum and skew checks
 <h2>Is this the release? <a class="permalink" href="#is-this-the-release" aria-label="Link to this section">#</a></h2>
 <p><code>relish agent verify</code> checks that every node's <code>bun</code>, and this <code>relish</code>, is
 the published, signed build of one version: <code>verified</code>, <code>mismatch</code> or
-<code>unknown</code>. Offline, pass the release's files (<a href="12_operations.md#is-this-the-release">how</a>).</p>
+<code>unknown</code>. Offline, pass the release's files (<a href="https://github.com/reliaburger/reliaburger/blob/v0.2.8/docs/manual/12_operations.md#is-this-the-release">how</a>).</p>
 </section>
 <section class="agents-section" id="proving-a-fix">
 <h2>Proving a fix <a class="permalink" href="#proving-a-fix" aria-label="Link to this section">#</a></h2>

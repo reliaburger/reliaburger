@@ -1,9 +1,9 @@
 //! Every website page has a Markdown copy beside it (#1582).
 //!
-//! An agent reading `https://reliaburger.com/compare/nomad.html` gets a page
+//! An agent reading `https://reliaburger.com/compare/nomad` gets a page
 //! built for eyes: navigation, inline SVG, buttons, a carousel. Beside each
 //! page the site serves the same words as Markdown, at the same path with
-//! `.md` in place of `.html` (`index.md` for `/`), and each page names its
+//! `.md` added (`/compare/nomad.md`, and `index.md` for `/`), and each page names its
 //! copy with `<link rel="alternate" type="text/markdown">`. `llms.txt` lists
 //! them all.
 //!
@@ -76,9 +76,14 @@ pub(crate) fn copy_path(page: &str) -> String {
 }
 
 /// Where `page` is published, which its relative links resolve against.
-fn page_url(page: &str) -> url::Url {
+/// GitHub Pages serves `compare/nomad.html` at the bare `/compare/nomad` and
+/// `compare/index.html` at `/compare/`, and the site links those forms.
+pub(crate) fn page_url(page: &str) -> url::Url {
     let base = url::Url::parse(SITE).unwrap();
-    let path = page.strip_suffix("index.html").unwrap_or(page);
+    let path = page
+        .strip_suffix("index.html")
+        .or_else(|| page.strip_suffix(".html"))
+        .unwrap_or(page);
     base.join(path).unwrap()
 }
 
@@ -334,6 +339,37 @@ fn every_page_names_its_markdown_copy() {
     }
 }
 
+/// `copy.js` resolves the alternate link against the page's own address,
+/// and the site links pages bare (`/compare/nomad`, `/`). A relative
+/// alternate link still lands on the copy from there: `/compare/nomad`
+/// gives `/compare/nomad.md`, and `/` gives `/index.md`.
+#[test]
+fn the_markdown_copy_resolves_from_the_bare_address() {
+    let script = read(BUTTON_SCRIPT);
+    assert!(
+        script.contains(r#"new URL(alternate.getAttribute("href"), document.baseURI)"#),
+        "copy.js no longer resolves the alternate link against the page"
+    );
+    assert_eq!(page_url("index.html").as_str(), "https://reliaburger.com/");
+    assert_eq!(
+        page_url("compare/nomad.html").as_str(),
+        "https://reliaburger.com/compare/nomad"
+    );
+    for page in pages() {
+        let file = Path::new(&copy_path(&page))
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let copy = page_url(&page).join(&file).unwrap();
+        assert_eq!(
+            copy.as_str(),
+            format!("{SITE}{}", copy_path(&page)),
+            "{page}'s copy doesn't resolve from its bare address"
+        );
+    }
+}
+
 /// The site's one shared script, which adds the "Copy as Markdown" and
 /// "Open in Claude" buttons (#1695) beside the copy buttons on snippets.
 const BUTTON_SCRIPT: &str = "docs/website/assets/copy.js";
@@ -519,14 +555,14 @@ fn a_copy_keeps_the_words_and_drops_the_furniture() {
 
 #[test]
 fn links_in_a_subdirectory_resolve_against_that_page() {
-    let html = r#"<main><p><a href="../#install">Install</a> <a href="./methodology.html#method">method</a></p></main>"#;
+    let html = r#"<main><p><a href="../#install">Install</a> <a href="./methodology#method">method</a></p></main>"#;
     let copy = markdown_copy("compare/nomad.html", html);
     assert!(
         copy.contains("(https://reliaburger.com/#install)"),
         "{copy}"
     );
-    assert!(copy.contains("(https://reliaburger.com/compare/methodology.html#method)"));
-    assert!(copy.contains("<https://reliaburger.com/compare/nomad.html>"));
+    assert!(copy.contains("(https://reliaburger.com/compare/methodology#method)"));
+    assert!(copy.contains("<https://reliaburger.com/compare/nomad>"));
 }
 
 #[test]
