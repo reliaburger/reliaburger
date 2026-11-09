@@ -289,7 +289,8 @@ pub struct HealthSpec {
     pub protocol: HealthProtocol,
     /// Probe interval in seconds. Default: 10.
     pub interval: Option<u64>,
-    /// Probe timeout in seconds. Default: 5.
+    /// Probe timeout in seconds, at most `interval`. Default: 5, or the
+    /// interval when that's shorter.
     pub timeout: Option<u64>,
     /// Consecutive failures before marking unhealthy. Default: 3.
     pub threshold_unhealthy: Option<u32>,
