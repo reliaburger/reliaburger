@@ -68,6 +68,7 @@ mod status;
 mod summary;
 mod test_leases;
 mod ui;
+mod ui_proposals;
 mod upgrade;
 
 pub(crate) use apply::{
@@ -157,6 +158,10 @@ use ui::{
     fragment_apps_handler, fragment_batches_handler, fragment_instances_handler,
     fragment_nodes_handler, fragment_summary_handler, gitops_handler, login_handler,
     node_detail_handler, ui_logout_handler, ui_session_handler,
+};
+use ui_proposals::{
+    ui_proposal_approve_handler, ui_proposal_handler, ui_proposal_reject_handler,
+    ui_proposal_undo_handler, ui_proposals_handler,
 };
 use upgrade::{
     upgrade_abort_handler, upgrade_apply_handler, upgrade_cluster_handler,
@@ -665,6 +670,14 @@ pub fn router_with_upgrade(
             get(fragment_instances_handler),
         )
         .route("/ui/app/{app}/{namespace}/env", get(app_env_handler))
+        .route("/ui/proposals", get(ui_proposals_handler))
+        .route("/ui/proposal/{id}", get(ui_proposal_handler))
+        .route(
+            "/ui/proposal/{id}/approve",
+            post(ui_proposal_approve_handler),
+        )
+        .route("/ui/proposal/{id}/reject", post(ui_proposal_reject_handler))
+        .route("/ui/proposal/{id}/undo", post(ui_proposal_undo_handler))
         .route("/v1/apply", post(apply_handler))
         .route("/v1/status", get(status_handler))
         .route("/v1/apps", get(current_apps_handler))

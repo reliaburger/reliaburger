@@ -225,10 +225,24 @@ anyone, so it needs `deploy` granted the same way, and a build that sets
 one app still shows that app's charts on its dashboard page, but the dashboard
 leaves out the alert panel, and `relish top` shows only that app's rows.
 
-A browser session keeps its token's permissions, and it's always read-only:
-a cookie can read the dashboard but never change anything. That holds for a
-session opened with the cluster's service token too. It reads everything, but
-it isn't a node, so the node-to-node routes refuse it. Nodes talking to each other
+A browser session keeps its token's permissions, and it's read-only: a
+cookie can read the dashboard but change nothing, with one exception. On the
+Proposals page a person may approve, reject or undo an agent's proposal. Those
+forms appear only when the token the session came from may make that decision
+(a person's token, deployer or above, covering every app the proposal touches,
+and not its author), and the server checks again when one is posted: it reads
+that token from the store at that moment, so a token revoked since login
+decides nothing. Each form carries an anti-forgery token tied to the session,
+and the server refuses a post that the browser marks as cross-site or whose
+`Origin` is another host. The session cookie is `SameSite=Strict` as well.
+A decision acts as the token and lands in the audit log under its name, as
+`relish proposal approve` does. Only the council leader can apply one, so on
+another node the page says so and shows the command instead. `relish
+dashboard`'s proxy forwards no writes at all, so it shows the commands too.
+
+A session opened with the cluster's service token reads everything and
+decides nothing. It isn't a node either, so the node-to-node routes refuse
+it. Nodes talking to each other
 use the cluster's internal identity, which no block can restrict, so
 `relish logs` and `relish top` still gather every node's answer; the
 node you asked filters it. `relish wtf` reads health, membership and

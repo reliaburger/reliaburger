@@ -197,6 +197,46 @@ a.row-link:hover { text-decoration: underline; }
     color: #e74c3c;
 }
 
+/* Proposals (#1682). The author's reason is an agent's text, not the
+   cluster's: it sits in a dashed box that says so. */
+.notice {
+    background: var(--panel);
+    border-left: 3px solid #4ecca3;
+    padding: 0.5rem 0.75rem;
+    margin-bottom: 1rem;
+}
+.notice-error { border-left-color: #e74c3c; color: #f39c12; }
+.summary-lines { margin-left: 1.2rem; line-height: 1.6; }
+section.untrusted {
+    border: 1px dashed #f39c12;
+    border-radius: 4px;
+    padding: 0.75rem;
+}
+.untrusted-note { color: var(--fg-muted); font-size: 0.85rem; margin-bottom: 0.5rem; }
+blockquote.untrusted {
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: 'Menlo', 'Consolas', monospace;
+    font-size: 0.85rem;
+}
+q.untrusted { color: var(--fg-muted); font-style: italic; }
+form.decision { margin: 0.5rem 0; display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+form.decision input {
+    background: var(--bg);
+    color: var(--fg);
+    border: 1px solid #333;
+    padding: 0.3rem 0.5rem;
+}
+form.decision button {
+    border: none;
+    border-radius: 3px;
+    padding: 0.35rem 0.8rem;
+    font-weight: bold;
+    cursor: pointer;
+}
+button.approve { background: #4ecca3; color: #10131f; }
+button.reject { background: #3a1a1a; color: #e74c3c; border: 1px solid #e74c3c; }
+
 /* Responsive: horizontal scroll for tables on narrow viewports */
 @media (max-width: 768px) {
     /* uPlot's legend is a table, so undo the dashboard's table styles. */

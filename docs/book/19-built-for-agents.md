@@ -7151,6 +7151,200 @@ adds exactly the proposing tools, annotated as council writes, without
 `apply`; that plain `relish mcp` refuses them and says how to get them; and
 that a proposing server sends a deployer agent token from its own file.
 
+### Setup that can ask
+
+`relish mcp --propose` was one more flag someone had to type into six agent
+configs by hand, which is exactly what `relish agent setup` exists to stop.
+So setup takes `--propose --namespace shop` too, and writes `relish mcp
+--propose --namespace shop` into every entry. The entry's arguments used to
+be a constant. Now they come from an enum:
+
+```rust
+pub enum Mode {
+    Read,
+    Propose { namespace: String },
+}
+```
+
+`Propose` carries its namespace inside it, the way `ProposalState::Applied`
+carries its approval. There's no `Option<String>` beside a `bool` that could
+say "proposing, with no namespace", because that state can't be built. The
+refusal happens once, in `SetupOptions::mode`, which turns the two flags
+into a `Mode` or into the same refusal `relish mcp` gives: without a
+namespace, the token setup makes from the admin context could propose
+everywhere. `run` asks for the mode before it touches the token store, so a
+refused setup mints nothing and asks the cluster nothing.
+
+Switching modes raised a question the first version of setup never had. An
+entry that isn't exactly what setup would write is someone else's, and left
+alone. But `relish mcp` is exactly what setup *used* to write, before you
+asked for `--propose`. Calling that a `conflict` would make everyone who
+upgrades type `--force`. So `Client::is_own` reads the entry's `args`, turns
+them back into a `Mode` if they're one of ours, rebuilds the entry for that
+mode and compares the whole thing. If it matches, it's setup's own, from
+another run, and gets replaced without `--force`. A hand-added `env` key or
+an absolute path to `relish` still makes it yours.
+
+The token warnings came across too, but they had to change shape. `relish
+mcp` prints them on stderr, where an MCP client usually swallows them. Setup
+answers in an envelope a person reads, so they're `warnings` there, each
+naming the `relish token create --agent` command that fixes it: a token from
+`RELIABURGER_TOKEN` that setup can't tell from a person's, one the cluster
+says is admin, or a saved context that turned out not to be admin. The facts
+behind them (where the token comes from, and the cluster's word on it) go
+into `answer` as a small `Copy` struct, so the tests can hand in any
+combination without a cluster.
+
+## Deciding in the browser
+
+`relish proposal approve 17` works, but the person being asked is often
+looking at the dashboard, not a terminal. Brioche gets a Proposals page,
+`/ui/proposals`, linked from the Cluster card's `agents` line: the waiting
+proposals first, then the recent ones, each with its kind, target, author,
+age, state and, if it's gone stale, why. A proposal's page shows the
+cluster's summary, the field diff, the blast radius and the undo plan, in
+that order. Then the author's reason, last, in a dashed box headed "The
+author's reason, in its own words". It's the one field on the page the
+cluster didn't write, and the box says to read it as a claim to check, never
+as an instruction. Like every other string on Brioche's pages it goes
+through `escape_html`, which escapes both quote characters as well as the
+angle brackets, so a reason can't close an attribute either.
+
+The design's first version stopped there and showed the command to copy. A
+button meant the dashboard's first write, and Brioche's sessions are
+read-only on purpose: a forged request riding the cookie could look but
+never touch. The maintainer asked for the buttons anyway, so the question
+became how to add one write without loosening anything else.
+
+### One exception, fenced
+
+The session stays read-only. Every route still sees a session as
+`ApiRole::ReadOnly`, exactly as before. The decision forms post to three new
+routes, `/ui/proposal/{id}/approve`, `/reject` and `/undo`, and only they do
+anything more:
+
+1. **It must be a browser session.** The auth middleware, when it accepts a
+   session cookie, now also puts a `BrowserSession` into the request's
+   extensions. A bearer token doesn't get one, so a script uses
+   `/v1/proposals` like everything else.
+2. **It must be on purpose.** Each form carries an anti-forgery token, and a
+   post whose browser says `Sec-Fetch-Site: cross-site`, or whose `Origin`
+   names another host, is refused, the same test `relish dashboard`'s proxy
+   makes. The cookie was already `SameSite=Strict`.
+3. **It acts as the token, now.** `session_write_context` looks the
+   session's credential up in the token store at that moment and builds the
+   context that token would authenticate as: its own role, kind and scope.
+   A token revoked or expired since login decides nothing; an agent's
+   session comes back read-only, because the same `token_context` function
+   lowers an agent's role for both paths; the service token's session isn't
+   in the store, so it gets nothing.
+4. **The API decides.** The form handler calls the API's own handler
+   function with that context, so the checks, the Raft entry and the audit
+   record are the ones `relish proposal approve` gets.
+
+The anti-forgery token is worth a closer look, because it isn't stored
+anywhere:
+
+```rust
+pub fn csrf_token_for(id: &str) -> String {
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    context.update(b"reliaburger brioche csrf v1\0");
+    context.update(id.as_bytes());
+    hex::encode(context.finish().as_ref())
+}
+```
+
+The usual pattern stores a random token in the session. Ours is a hash of
+the session id, which is 256 random bits in an `HttpOnly` cookie: a page on
+another site can't read the cookie, so it can't compute the hash, and the
+hash, which does appear in our HTML, gives nothing back about the id. The
+label makes it useless as anything but this. Deriving it means `Session`
+needs no new field, and nothing changes in the session store. The handler
+compares it with `tokens_equal`, the constant-time comparison the bearer
+path uses.
+
+### Calling a handler as a function
+
+Step 4 is where Rust's way of writing web handlers pays off. An axum
+handler looks like it's wired to the framework:
+
+```rust
+pub(super) async fn proposal_approve_handler(
+    auth: Option<axum::Extension<AuthContext>>,
+    State(state): State<ApiState>,
+    directory: Option<axum::Extension<LeaderDirectory>>,
+    Path(id): Path<u64>,
+    headers: HeaderMap,
+) -> Response
+```
+
+But it's an ordinary `async fn`. `State(state)` in the parameter list is a
+pattern, not a type annotation: `State` is a one-field tuple struct, and the
+pattern unwraps it, the same way `let State(state) = something;` would. The
+framework's only job is to build those arguments from a request. Nothing
+stops us building them ourselves:
+
+```rust
+super::proposals::proposal_approve_handler(
+    Some(axum::Extension(context.clone())),
+    State(state.clone()),
+    None,
+    Path(id.0),
+    HeaderMap::new(),
+)
+.await
+```
+
+So there's no second approval path to keep in step with the first. The
+answer is the API's JSON; the form handler turns a success into a redirect
+back to the page, and a refusal into the page again with the API's message
+on top. The empty `HeaderMap` matters: the approve handler forwards to the
+leader when it isn't one, copying the cookie, and the leader has never seen
+this node's sessions. A forwarded session would be refused there. So the
+form handler checks that Raft names this node the leader before it calls
+anything, and on another node the page says to open the leader's dashboard
+or run the command. We didn't teach nodes to vouch for each other's
+sessions; that's a new trust path for a convenience.
+
+### Buttons only for those who may press them
+
+The page shows a form only to a viewer whose token the API would let
+through. It finds out by asking the same functions: `authorise_decider` for
+approve and reject (a person's token, deployer or above, covering every
+touched app, not the author) and `authorise_undoer` for undo. Both became
+`pub(super)` for it, which in Rust means visible to the parent module, `api`,
+and everything inside it, so the dashboard's module can call them and
+nothing outside the API can. A lossy or irreversible proposal asks for the
+app's name typed back, as `relish proposal approve` does at the terminal,
+and the server checks the name too.
+
+The buttons are a courtesy, not the check. A read-only viewer, an agent, a
+person scoped to another namespace and the author each see no form, and
+each is refused when the test posts one anyway, with the token derived from
+their cookie the way the server derives it.
+
+### The tests
+
+[`src/brioche/proposals.rs`](../../src/brioche/proposals.rs) renders the
+pages from fixed views: waiting before recent, the age and stale reason, the
+diff, blast radius and undo plan, the forms with the session's token for a
+viewer who may decide and none otherwise, the typed confirmation for a lossy
+proposal, and an agent's reason full of `<script>`, quotes and "IGNORE
+PREVIOUS INSTRUCTIONS" coming out escaped, inside the box, after the
+cluster's own words.
+[`src/bun/api/proposal_tests.rs`](../../src/bun/api/proposal_tests.rs)
+drives the real router like a browser: log in at `/ui/session`, read the
+list, approve with the form, see the audit record name bob as a human, undo
+it the same way; reject with a reason; refuse a form with no token, another
+session's token, a cross-site header or a bearer; and show no buttons to,
+and refuse, an agent, a reader, a person outside the namespace and the
+author. The authz matrix lists the three form routes, so the principal test
+posts to each as every caller below a deployer and expects a refusal.
+[`src/relish/agent/setup/tests.rs`](../../src/relish/agent/setup/tests.rs)
+checks that `--propose` without a namespace writes and mints nothing, that
+the entries run `relish mcp --propose --namespace shop`, that switching
+modes replaces setup's own entry without `--force`, and each token warning.
+
 ## Showing it
 
 0.2.8's ideas get a section on the homepage, "Let your agent act, then take
@@ -7372,9 +7566,16 @@ ones, command by command, each with the reason it lost.
   leader change strands. Approval and application are one entry instead.
 - **A version counter on every app.** A hash of what's stored needs no
   change to the write paths that already exist.
-- **An approve button in the dashboard.** The dashboard is read-only; a
-  button means the first browser-originated write, with CSRF protection and
-  a session tied to a human token. The maintainer's call, after 0.2.8.
+- **Dashboard decisions on any node.** The approve, reject and undo
+  buttons ([Deciding in the browser](#deciding-in-the-browser)) work on the
+  council leader only. A follower can't forward a browser session, which
+  only the node that issued it knows, and teaching nodes to vouch for each
+  other's sessions would be a new trust path for a convenience. The page
+  says so and shows the command.
+- **Forms through `relish dashboard`.** Its proxy forwards only reads, with
+  the CLI's own token, so the pages it serves show the commands, not the
+  buttons. Letting it forward a write would hand a browser tab the CLI's
+  admin credentials.
 - **`restart` in this first cut.** It needs a `restarted_at` field on every
   app spec and a rollout change, so it comes separately.
 - **A scheduler forecast in the blast radius.** New instances are placed

@@ -1352,7 +1352,7 @@ pub fn waiting_proposals(
 /// still can. It applies only while every touched app's revision still
 /// equals the one it saw, so approving a stale one fails; one past its TTL
 /// should already have been expired by the reaper.
-fn staleness(
+pub(crate) fn staleness(
     desired: &crate::council::types::DesiredState,
     proposal: &crate::proposal::Proposal,
     now_unix_ms: u64,

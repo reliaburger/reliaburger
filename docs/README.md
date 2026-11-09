@@ -1075,7 +1075,9 @@ people's side, with `list` and `break`, and `context` lists every lease),
 approve: an agent token, `relish token create --agent`, can't change anything
 directly; the cluster writes the summary, diff, blast radius and undo
 command; `relish proposal list|show|approve|reject` and `relish undo` are the
-people's side, approval and application are one Raft entry, and a proposal
+people's side, as is the web dashboard's Proposals page, whose approve,
+reject and undo buttons appear only for a token that may decide;
+approval and application are one Raft entry, and a proposal
 whose apps changed in between fails as `stale`; guardrails are policies
 with `applies_to = "proposals"`, which may refuse a proposal or, with `action
 = "approve"`, approve it without a person, never one that can't be undone
@@ -1085,7 +1087,8 @@ changed since) and
 `setup`, which
 adds the `relish mcp` server to Claude Code, Codex, Cursor, VS Code, Goose and
 Gemini CLI: it shows the diff, writes only with `--yes`, never touches an entry
-it didn't write, and approves no tools. `relish mcp` serves the read-only
+it didn't write, and approves no tools (`--propose --namespace NAME` wires
+`relish mcp --propose` instead). `relish mcp` serves the read-only
 commands as MCP tools over stdio (`claude mcp add reliaburger -- relish mcp`),
 sending a read-only token it makes for itself when the context's is admin,
 derived from the same definitions, with `--toolsets`, `--no-logs` and

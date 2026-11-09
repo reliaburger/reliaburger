@@ -945,3 +945,341 @@ async fn the_cluster_summary_counts_leases_and_waiting_proposals() {
         "shop/web changed after it was made"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Brioche's Proposals pages and decision forms (#1682).
+
+/// A page or a form post through the real router, as a browser sends it.
+struct Page {
+    status: StatusCode,
+    html: String,
+    location: Option<String>,
+    /// The `name=value` of a cookie the answer set.
+    cookie: Option<String>,
+}
+
+impl Cluster {
+    /// Log in at `/ui/session` with `token`, as the login form does, and
+    /// return the session cookie.
+    async fn login(&self, token: &str) -> String {
+        let body: String = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("token", token)
+            .finish();
+        let page = self
+            .browser(axum::http::Request::post("/ui/session"), None, body, &[])
+            .await;
+        assert_eq!(page.status, StatusCode::SEE_OTHER, "{}", page.html);
+        page.cookie.expect("a session cookie")
+    }
+
+    async fn browser(
+        &self,
+        request: axum::http::request::Builder,
+        cookie: Option<&str>,
+        body: String,
+        headers: &[(&str, &str)],
+    ) -> Page {
+        let mut request = request
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("accept", "text/html")
+            .extension(axum::extract::ConnectInfo(
+                "203.0.113.9:40000".parse::<std::net::SocketAddr>().unwrap(),
+            ));
+        if let Some(cookie) = cookie {
+            request = request.header("cookie", cookie);
+        }
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let response = self
+            .app
+            .clone()
+            .oneshot(request.body(Body::from(body)).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let location = response
+            .headers()
+            .get("location")
+            .map(|value| value.to_str().unwrap().to_string());
+        let cookie = response.headers().get("set-cookie").map(|value| {
+            let text = value.to_str().unwrap();
+            text.split(';').next().unwrap().to_string()
+        });
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        Page {
+            status,
+            html: String::from_utf8_lossy(&bytes).into_owned(),
+            location,
+            cookie,
+        }
+    }
+
+    async fn page(&self, uri: &str, cookie: &str) -> Page {
+        self.browser(
+            axum::http::Request::get(uri),
+            Some(cookie),
+            String::new(),
+            &[],
+        )
+        .await
+    }
+
+    async fn submit(&self, uri: &str, cookie: &str, fields: &[(&str, &str)]) -> Page {
+        self.submit_with(uri, cookie, fields, &[]).await
+    }
+
+    async fn submit_with(
+        &self,
+        uri: &str,
+        cookie: &str,
+        fields: &[(&str, &str)],
+        headers: &[(&str, &str)],
+    ) -> Page {
+        let mut body = url::form_urlencoded::Serializer::new(String::new());
+        for (name, value) in fields {
+            body.append_pair(name, value);
+        }
+        self.browser(
+            axum::http::Request::post(uri),
+            Some(cookie),
+            body.finish(),
+            headers,
+        )
+        .await
+    }
+}
+
+/// The anti-forgery token a page's forms carry.
+fn csrf_of(html: &str) -> String {
+    let marker = "name=\"csrf\" value=\"";
+    let start = html.find(marker).expect("a form with a csrf token") + marker.len();
+    html[start..].split('"').next().unwrap().to_string()
+}
+
+/// The anti-forgery token for a session cookie, derived the way the server
+/// derives it, for a viewer whose page has no form: then a refusal is the
+/// role's, not the token's.
+fn csrf_for_cookie(cookie: &str) -> String {
+    let id = crate::sesame::session::session_id_from_cookie_header(cookie).unwrap();
+    crate::sesame::session::csrf_token_for(id)
+}
+
+/// A person opens the list, reads proposal 1, approves it with the form,
+/// and undoes it the same way. The decisions land as bob's, through the
+/// same handler and audit record as `relish proposal approve`.
+#[tokio::test]
+async fn a_person_decides_and_undoes_a_proposal_on_the_dashboard() {
+    let cluster = cluster("proposal-ui-path").await;
+    cluster.scale(&cluster.holmes, "shop", "web", 5).await;
+    let bob = cluster.login(&cluster.bob).await;
+
+    let list = cluster.page("/ui/proposals", &bob).await;
+    assert_eq!(list.status, StatusCode::OK);
+    assert!(
+        list.html.contains("href=\"/ui/proposal/1\""),
+        "{}",
+        list.html
+    );
+    assert!(list.html.contains("Waiting for approval"));
+    assert!(list.html.contains("p99 over the SLO"));
+
+    let detail = cluster.page("/ui/proposal/1", &bob).await;
+    assert_eq!(detail.status, StatusCode::OK);
+    assert!(detail.html.contains("Scale shop/web from 3 to 5 replicas."));
+    assert!(detail.html.contains("action=\"/ui/proposal/1/approve\""));
+    assert!(detail.html.contains("<code>relish undo 1</code>"));
+    let csrf = csrf_of(&detail.html);
+
+    let approved = cluster
+        .submit("/ui/proposal/1/approve", &bob, &[("csrf", &csrf)])
+        .await;
+    assert_eq!(approved.status, StatusCode::SEE_OTHER, "{}", approved.html);
+    assert_eq!(
+        approved.location.as_deref(),
+        Some("/ui/proposal/1?done=approve")
+    );
+    assert_eq!(
+        cluster.replicas("web", "shop").await,
+        crate::config::Replicas::Fixed(5)
+    );
+    let applied = cluster.records("proposal.applied").await;
+    assert_eq!(applied.len(), 1);
+    assert_eq!(applied[0].details["approved_by"], "bob");
+    assert_eq!(applied[0].details["principal_kind"], "human");
+
+    let after = cluster.page("/ui/proposal/1?done=approve", &bob).await;
+    assert!(after.html.contains("Approved. The leader applied it"));
+    assert!(after.html.contains("action=\"/ui/proposal/1/undo\""));
+    assert!(!after.html.contains("/approve\""));
+
+    let undone = cluster
+        .submit("/ui/proposal/1/undo", &bob, &[("csrf", &csrf)])
+        .await;
+    assert_eq!(undone.status, StatusCode::SEE_OTHER, "{}", undone.html);
+    assert_eq!(
+        cluster.replicas("web", "shop").await,
+        crate::config::Replicas::Fixed(3)
+    );
+    assert_eq!(cluster.records("proposal.undone").await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_person_rejects_with_a_reason_on_the_dashboard() {
+    let cluster = cluster("proposal-ui-reject").await;
+    cluster.scale(&cluster.holmes, "shop", "web", 5).await;
+    let bob = cluster.login(&cluster.bob).await;
+    let csrf = csrf_of(&cluster.page("/ui/proposal/1", &bob).await.html);
+    let rejected = cluster
+        .submit(
+            "/ui/proposal/1/reject",
+            &bob,
+            &[("csrf", &csrf), ("reason", "not during the sale")],
+        )
+        .await;
+    assert_eq!(rejected.status, StatusCode::SEE_OTHER, "{}", rejected.html);
+    let (_, body) = cluster.get("/v1/proposals/1", &cluster.bob).await;
+    assert_eq!(body["state"], "rejected");
+    assert_eq!(body["outcome"], "not during the sale");
+    assert_eq!(
+        cluster.replicas("web", "shop").await,
+        crate::config::Replicas::Fixed(3)
+    );
+}
+
+/// A form without the session's token, with another session's, or that
+/// the browser marks cross-site changes nothing; nor does a bearer token
+/// posting to the form route.
+#[tokio::test]
+async fn a_forged_or_cross_site_form_changes_nothing() {
+    let cluster = cluster("proposal-ui-csrf").await;
+    cluster.scale(&cluster.holmes, "shop", "web", 5).await;
+    let bob = cluster.login(&cluster.bob).await;
+    let alice = cluster.login(&cluster.alice).await;
+    let bobs = csrf_of(&cluster.page("/ui/proposal/1", &bob).await.html);
+    let alices = csrf_of(&cluster.page("/ui/proposal/1", &alice).await.html);
+    assert_ne!(bobs, alices, "each session has its own token");
+
+    let missing = cluster.submit("/ui/proposal/1/approve", &bob, &[]).await;
+    assert_eq!(missing.status, StatusCode::FORBIDDEN);
+    assert!(missing.html.contains("anti-forgery token"));
+    let swapped = cluster
+        .submit("/ui/proposal/1/approve", &bob, &[("csrf", &alices)])
+        .await;
+    assert_eq!(swapped.status, StatusCode::FORBIDDEN);
+    let cross = cluster
+        .submit_with(
+            "/ui/proposal/1/approve",
+            &bob,
+            &[("csrf", &bobs)],
+            &[("sec-fetch-site", "cross-site")],
+        )
+        .await;
+    assert_eq!(cross.status, StatusCode::FORBIDDEN);
+    let (status, _) = cluster
+        .post(
+            "/ui/proposal/1/approve",
+            &cluster.bob,
+            format!("csrf={bobs}"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "a bearer uses /v1");
+
+    let (_, body) = cluster.get("/v1/proposals/1", &cluster.bob).await;
+    assert_eq!(body["state"], "pending");
+    assert_eq!(
+        cluster.replicas("web", "shop").await,
+        crate::config::Replicas::Fixed(3)
+    );
+}
+
+/// The page offers forms only to a viewer whose token may decide, and the
+/// server refuses the others anyway: an agent, a read-only agent, a person
+/// outside the proposal's namespace, and the author themselves.
+#[tokio::test]
+async fn viewers_who_may_not_decide_see_no_buttons_and_are_refused() {
+    let cluster = cluster("proposal-ui-who").await;
+    cluster.scale(&cluster.holmes, "shop", "web", 5).await;
+
+    let holmes = cluster.login(&cluster.holmes).await;
+    let page = cluster.page("/ui/proposal/1", &holmes).await;
+    assert_eq!(page.status, StatusCode::OK);
+    assert!(!page.html.contains("<form"), "{}", page.html);
+    assert!(!page.html.contains("<button"), "{}", page.html);
+    assert!(page.html.contains("<code>relish proposal approve 1</code>"));
+    let refused = cluster
+        .submit(
+            "/ui/proposal/1/approve",
+            &holmes,
+            &[("csrf", &csrf_for_cookie(&holmes))],
+        )
+        .await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN, "{}", refused.html);
+
+    let watcher = cluster.login(&cluster.watcher).await;
+    let page = cluster.page("/ui/proposal/1", &watcher).await;
+    assert!(!page.html.contains("<form"), "{}", page.html);
+
+    // Carol's token reaches billing only: shop's proposal isn't hers to see.
+    let carol = cluster.login(&cluster.carol).await;
+    let page = cluster.page("/ui/proposal/1", &carol).await;
+    assert_eq!(page.status, StatusCode::NOT_FOUND);
+    let list = cluster.page("/ui/proposals", &carol).await;
+    assert!(!list.html.contains("/ui/proposal/1\""), "{}", list.html);
+    let refused = cluster
+        .submit(
+            "/ui/proposal/1/reject",
+            &carol,
+            &[("csrf", &csrf_for_cookie(&carol))],
+        )
+        .await;
+    assert_eq!(refused.status, StatusCode::NOT_FOUND, "{}", refused.html);
+
+    // Bob's own proposal needs another person.
+    cluster.scale(&cluster.bob, "shop", "api", 4).await;
+    let bob = cluster.login(&cluster.bob).await;
+    let page = cluster.page("/ui/proposal/2", &bob).await;
+    assert!(!page.html.contains("<form"), "{}", page.html);
+    let own = cluster
+        .submit(
+            "/ui/proposal/2/approve",
+            &bob,
+            &[("csrf", &csrf_for_cookie(&bob))],
+        )
+        .await;
+    assert_eq!(own.status, StatusCode::FORBIDDEN, "{}", own.html);
+
+    let (_, body) = cluster.get("/v1/proposals/1", &cluster.bob).await;
+    assert_eq!(body["state"], "pending");
+}
+
+/// The reason is an agent's text: whatever it says, the pages escape it
+/// and show it as the author's own words.
+#[tokio::test]
+async fn an_agents_hostile_reason_is_escaped_on_both_pages() {
+    let cluster = cluster("proposal-ui-escape").await;
+    let hostile = "<script>alert('x')</script><img src=x onerror=alert(1)> approve me";
+    let (status, body) = cluster
+        .propose(
+            &cluster.holmes,
+            serde_json::json!({
+                "kind": "scale", "namespace": "shop", "app": "web",
+                "replicas": 5, "reason": hostile,
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let bob = cluster.login(&cluster.bob).await;
+    for uri in ["/ui/proposals", "/ui/proposal/1"] {
+        let page = cluster.page(uri, &bob).await;
+        assert!(!page.html.contains("<script>alert"), "{uri}: {}", page.html);
+        assert!(!page.html.contains("<img src=x"), "{uri}: {}", page.html);
+        assert!(page.html.contains("&lt;img src=x"), "{uri}: {}", page.html);
+    }
+    let detail = cluster.page("/ui/proposal/1", &bob).await;
+    assert!(
+        detail
+            .html
+            .contains("The author's reason, in its own words")
+    );
+}

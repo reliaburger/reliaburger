@@ -321,3 +321,12 @@ a node's API address in a browser directly (<http://127.0.0.1:9117/> on a
 source build): once the cluster has tokens, it asks you to paste one and gives
 you a read-only session for 12 hours, or until the token expires or is revoked
 if that comes first.
+
+The dashboard's Proposals page (`/ui/proposals`, also linked from the Cluster
+card's `agents` line) lists what agents have asked to change: waiting ones
+first, then recent ones, each with its kind, target, author, age, state and,
+if it's gone stale, why. A proposal's own page shows the cluster's summary,
+the field diff, the blast radius and the undo plan, then the author's reason
+in a box that marks it as the author's own words. A person whose token may
+decide gets approve, reject and undo buttons there; see the dashboard
+sessions part of `security`.
