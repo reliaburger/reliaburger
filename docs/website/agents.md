@@ -61,13 +61,15 @@ If you're an agent operating or debugging a Reliaburger cluster:
 An agent works with whatever authority you hand it. Give it its own token:
 
 ```sh
-relish token create --name agent --agent --ttl 8h
+relish token create --name agent --role read-only --ttl-days 1
 ```
 
-It's read-only, or `--role deployer`, never admin, and lives 8h unless
-`--ttl` (up to 168h). The API refuses its every write as `forbidden`, exit
-`4`; a deployer one may propose changes and take leases. `--namespaces`
-narrows it. Pass it as `RELIABURGER_TOKEN`, and revoke it when you're done:
+The API refuses its every write as `forbidden`, exit `4`. An agent that
+should propose changes and take leases needs an agent token instead,
+`relish token create --name agent --agent --role deployer --namespaces shop`.
+That one changes nothing directly either, is never admin, and lives 8h
+unless `--ttl` (up to 168h); `--namespaces` narrows it. Pass either as
+`RELIABURGER_TOKEN`, and revoke it when you're done:
 
 ```sh
 relish token revoke agent
