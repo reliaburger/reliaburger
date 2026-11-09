@@ -62,8 +62,11 @@ pub struct WorkloadInstance {
     /// Bind-mounted into the container at `/run/reliaburger/identity/`.
     pub identity_mount: Option<std::path::PathBuf>,
     /// Why the runtime refused to launch this instance (#881), shown by
-    /// `relish status` and `relish wtf`. Set only on a `Failed` instance.
+    /// `relish apps` and `relish wtf`. Set only on a `Failed` instance.
     pub launch_failure: Option<String>,
+    /// Why it's waiting to restart, set when it stops and cleared when the
+    /// restart records its decision.
+    pub restart_cause: Option<crate::bun::restart::RestartCause>,
 }
 
 impl WorkloadInstance {
@@ -809,6 +812,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
                 identity: None,
                 identity_mount: None,
                 launch_failure: None,
+                restart_cause: None,
             });
         }
 

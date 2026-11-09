@@ -178,9 +178,19 @@ fn the_exclusions_are_the_commands_that_write_build_or_reach_past_the_cluster() 
             "report",
             "patch",
             "upgrade-check",
+            "verify",
             "setup"
         ]
     );
+    // A lease is a write to the council: only `--propose` offers it.
+    for command in ["lease take", "lease renew", "lease release"] {
+        assert!(tools::exclusion(command).is_none(), "{command}");
+        assert_eq!(
+            tools::proposing(command).map(|p| p.command),
+            Some("lease"),
+            "{command}"
+        );
+    }
     for exclusion in tools::EXCLUDED {
         assert!(!exclusion.why.is_empty(), "{exclusion:?}");
     }
@@ -431,10 +441,10 @@ fn every_real_tool_is_read_only_closed_world_and_not_excluded() {
 fn each_tool_advertises_its_own_default_budget() {
     for spec in real_tools() {
         let schema = Value::Object((*spec.tool.input_schema).clone());
-        let expected = if spec.command == "guide" {
-            65536
-        } else {
-            24576
+        let expected = match spec.command.as_str() {
+            "guide" => 81920,
+            "schema" => 40960,
+            _ => 24576,
         };
         assert_eq!(
             schema["properties"]["max_bytes"]["default"], expected,
@@ -746,15 +756,17 @@ fn never() -> std::future::Pending<Option<crate::relish::client::TokenAccess>> {
 }
 
 #[tokio::test]
-async fn the_context_admin_token_warns_without_asking_the_cluster() {
+async fn the_context_admin_token_no_longer_warns_because_relish_mcp_swaps_it_out() {
     use crate::relish::client::TokenOrigin;
+    // #1730: from an admin context relish mcp sends its own read-only token,
+    // so there's nothing to warn about, and nothing to ask the cluster.
     let warning = tokio::time::timeout(
         Duration::from_secs(5),
         admin_warning(TokenOrigin::ContextAdmin, never()),
     )
     .await
     .expect("a role known locally needs no network");
-    assert_eq!(warning, Some(ADMIN_TOKEN_WARNING));
+    assert_eq!(warning, None);
 }
 
 #[tokio::test]
@@ -785,5 +797,626 @@ fn the_warning_says_how_to_make_a_read_only_token_and_where_it_goes() {
     );
     assert!(warning.contains("RELIABURGER_TOKEN"), "{warning}");
     assert!(warning.contains("token setting"), "{warning}");
+    assert!(!warning.contains('\n'), "one line: {warning}");
+}
+
+// ---------------------------------------------------------------------------
+// relish mcp's own read-only token (#1730).
+
+const CONTEXT_ADMIN: &str = "rbrg_context_admin";
+
+/// A bearer the stand-in accepts everywhere but `/v1/events`.
+const PARTLY_REFUSED: &str = "rbrg_partly_refused";
+
+/// What the stand-in saw: path and bearer.
+type Seen = std::sync::Arc<tokio::sync::Mutex<Vec<(String, String)>>>;
+
+/// A cluster API with one admin bearer. It mints `rbrg_minted_<n>` unless
+/// told to refuse, answers health to anyone, the admin probe 403 for any
+/// other bearer it accepts, and every other request 401 for a bearer in
+/// `revoked` and 404 otherwise.
+async fn token_cluster(refuse: bool, revoked: &'static [&'static str]) -> (String, Seen) {
+    let seen: Seen = Seen::default();
+    let minted = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let record = seen.clone();
+    let app = axum::Router::new().fallback(
+        move |method: axum::http::Method, uri: axum::http::Uri, headers: axum::http::HeaderMap| {
+            let record = record.clone();
+            let minted = minted.clone();
+            async move {
+                use axum::http::StatusCode;
+                let bearer = headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.strip_prefix("Bearer "))
+                    .unwrap_or_default()
+                    .to_string();
+                record
+                    .lock()
+                    .await
+                    .push((uri.path().to_string(), bearer.clone()));
+                let admin = bearer == CONTEXT_ADMIN;
+                let rejected = revoked.contains(&bearer.as_str());
+                match (method.as_str(), uri.path()) {
+                    // As a real node: health needs no token.
+                    ("GET", "/v1/health") => (StatusCode::OK, r#"{"status":"ok"}"#.to_string()),
+                    ("GET", "/v1/token/list") if admin => {
+                        (StatusCode::OK, r#"{"tokens":[]}"#.to_string())
+                    }
+                    ("GET", "/v1/token/list") if !rejected => {
+                        (StatusCode::FORBIDDEN, "requires admin role".to_string())
+                    }
+                    // A token the cluster accepts that one route still
+                    // turns away: an answer that mentions a 401 on its own.
+                    ("GET", "/v1/events") if bearer == PARTLY_REFUSED => {
+                        (StatusCode::UNAUTHORIZED, "invalid token".to_string())
+                    }
+                    ("POST", "/v1/token/create") if admin && refuse => (
+                        StatusCode::FORBIDDEN,
+                        "token creation is switched off".to_string(),
+                    ),
+                    ("POST", "/v1/token/create") if admin => {
+                        let n = minted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        (
+                            StatusCode::OK,
+                            format!(r#"{{"token":"rbrg_minted_{n}","expires_at":null}}"#),
+                        )
+                    }
+                    ("POST", "/v1/token/revoke") if admin => {
+                        (StatusCode::OK, r#"{"message":"revoked"}"#.to_string())
+                    }
+                    _ if rejected => (StatusCode::UNAUTHORIZED, "invalid token".to_string()),
+                    _ => (StatusCode::NOT_FOUND, "no such thing".to_string()),
+                }
+            }
+        },
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{address}"), seen)
+}
+
+fn managed(directory: &std::path::Path, url: &str) -> Managed {
+    Managed::new(
+        directory.join("mcp-token.json"),
+        credentials::Scope {
+            owner: "laptop".to_string(),
+            endpoint: "https://127.0.0.1:19117".to_string(),
+            namespace: None,
+            purpose: credentials::Purpose::Read,
+        },
+        crate::relish::client::BunClient::new_with_token(url, Some(CONTEXT_ADMIN)),
+    )
+}
+
+fn result_text(result: &CallToolResult) -> String {
+    serde_json::to_string(&result.content).unwrap()
+}
+
+fn logs_arguments() -> serde_json::Map<String, Value> {
+    let mut arguments = serde_json::Map::new();
+    arguments.insert("app".to_string(), json!("web"));
+    arguments
+}
+
+#[tokio::test]
+async fn a_server_from_an_admin_context_sends_its_own_read_only_token() {
+    let directory = tempfile::tempdir().unwrap();
+    let (url, seen) = token_cluster(false, &[]).await;
+    crate::relish::client::set_cli_endpoint(Some(url.clone())).unwrap();
+    let server = Server::new(&Selection::default())
+        .unwrap()
+        .with_managed(managed(directory.path(), &url));
+    server.call("logs", &logs_arguments()).await.unwrap();
+    assert_eq!(
+        crate::relish::client::resolve_token().as_deref(),
+        Some("rbrg_minted_0")
+    );
+    assert!(directory.path().join("mcp-token.json").exists());
+    let seen = seen.lock().await.clone();
+    assert!(
+        seen.iter()
+            .filter(|(path, _)| !path.starts_with("/v1/token/"))
+            .all(|(_, bearer)| bearer == "rbrg_minted_0"),
+        "{seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_cluster_that_refuses_the_token_fails_the_tool_and_never_falls_back_to_admin() {
+    let directory = tempfile::tempdir().unwrap();
+    let (url, seen) = token_cluster(true, &[]).await;
+    let server = Server::new(&Selection::default())
+        .unwrap()
+        .with_managed(managed(directory.path(), &url));
+    let result = server.call("logs", &logs_arguments()).await.unwrap();
+    assert_eq!(result.is_error, Some(true));
+    let text = result_text(&result);
+    assert!(
+        text.contains("refused to create a read-only token"),
+        "{text}"
+    );
+    assert!(text.contains("token creation is switched off"), "{text}");
+    assert_ne!(
+        crate::relish::client::resolve_token().as_deref(),
+        Some(CONTEXT_ADMIN)
+    );
+    let paths: Vec<String> = seen
+        .lock()
+        .await
+        .iter()
+        .map(|(path, _)| path.clone())
+        .collect();
+    assert_eq!(
+        paths,
+        ["/v1/token/list", "/v1/token/create"],
+        "nothing else"
+    );
+}
+
+/// A stored token the cluster has revoked gets a 401; relish mcp makes a new
+/// read-only one and asks again, and never with the admin token.
+#[tokio::test]
+async fn a_revoked_stored_token_is_replaced_and_the_call_retried() {
+    let directory = tempfile::tempdir().unwrap();
+    let (url, seen) = token_cluster(false, &["rbrg_revoked"]).await;
+    crate::relish::client::set_cli_endpoint(Some(url.clone())).unwrap();
+    credentials::StoredToken {
+        schema: 1,
+        owner: "laptop".to_string(),
+        endpoint: "https://127.0.0.1:19117".to_string(),
+        namespace: None,
+        name: "relish-mcp-old".to_string(),
+        token: "rbrg_revoked".to_string(),
+        expires_at: None,
+    }
+    .save(&directory.path().join("mcp-token.json"))
+    .unwrap();
+    let server = Server::new(&Selection::default())
+        .unwrap()
+        .with_managed(managed(directory.path(), &url));
+    let mut arguments = serde_json::Map::new();
+    arguments.insert("app".to_string(), json!("web"));
+    let result = server.call("logs", &arguments).await.unwrap();
+    let text = result_text(&result);
+    assert!(!text.contains("unauthenticated"), "{text}");
+    assert_eq!(
+        crate::relish::client::resolve_token().as_deref(),
+        Some("rbrg_minted_0")
+    );
+    let seen = seen.lock().await.clone();
+    let tool_bearers: Vec<&str> = seen
+        .iter()
+        .filter(|(path, _)| !path.starts_with("/v1/token/"))
+        .map(|(_, bearer)| bearer.as_str())
+        .collect();
+    assert!(tool_bearers.contains(&"rbrg_revoked"), "{seen:?}");
+    assert!(tool_bearers.contains(&"rbrg_minted_0"), "{seen:?}");
+    assert!(!tool_bearers.contains(&CONTEXT_ADMIN), "{seen:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Follow-ups from the live-cluster review of #1763.
+
+/// An endpoint nothing listens on.
+fn nowhere() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    format!("http://{address}")
+}
+
+fn stored_token(directory: &std::path::Path, token: &str) {
+    credentials::StoredToken {
+        schema: 1,
+        owner: "laptop".to_string(),
+        endpoint: "https://127.0.0.1:19117".to_string(),
+        namespace: None,
+        name: "relish-mcp-old".to_string(),
+        token: token.to_string(),
+        expires_at: None,
+    }
+    .save(&directory.join("mcp-token.json"))
+    .unwrap();
+}
+
+/// The bearers the stand-in saw on requests other than the token routes.
+async fn tool_bearers(seen: &Seen) -> Vec<String> {
+    seen.lock()
+        .await
+        .iter()
+        .filter(|(path, _)| !path.starts_with("/v1/token/"))
+        .map(|(_, bearer)| bearer.clone())
+        .collect()
+}
+
+/// #1763 review: `context` and `diagnose` don't fail on a dead token, they
+/// answer with every section unknown (401). That answer must renew the
+/// token too, not only a top-level `unauthenticated`.
+#[tokio::test]
+async fn a_revoked_stored_token_is_renewed_when_context_or_diagnose_answer_with_401s() {
+    let (url, seen) = token_cluster(false, &["rbrg_revoked"]).await;
+    crate::relish::client::set_cli_endpoint(Some(url.clone())).unwrap();
+    for tool in ["context", "diagnose"] {
+        let directory = tempfile::tempdir().unwrap();
+        stored_token(directory.path(), "rbrg_revoked");
+        seen.lock().await.clear();
+        let server = Server::new(&Selection::default())
+            .unwrap()
+            .with_managed(managed(directory.path(), &url));
+        let result = server.call(tool, &serde_json::Map::new()).await.unwrap();
+        let token = crate::relish::client::resolve_token().unwrap_or_default();
+        assert!(
+            token.starts_with("rbrg_minted_"),
+            "{tool}: {token} {}",
+            result_text(&result)
+        );
+        let bearers = tool_bearers(&seen).await;
+        assert!(bearers.contains(&"rbrg_revoked".to_string()), "{bearers:?}");
+        assert!(bearers.contains(&token), "{tool} retried: {bearers:?}");
+        assert!(!bearers.contains(&CONTEXT_ADMIN.to_string()), "{bearers:?}");
+        let saved =
+            credentials::StoredToken::load(&directory.path().join("mcp-token.json")).unwrap();
+        assert_eq!(saved.unwrap().token, token, "{tool}");
+    }
+}
+
+/// A token that still works isn't replaced just because an answer mentions
+/// a 401: the cluster is asked first.
+#[tokio::test]
+async fn a_token_the_cluster_still_accepts_is_kept() {
+    let (url, seen) = token_cluster(false, &[]).await;
+    crate::relish::client::set_cli_endpoint(Some(url.clone())).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    stored_token(directory.path(), PARTLY_REFUSED);
+    let server = Server::new(&Selection::default())
+        .unwrap()
+        .with_managed(managed(directory.path(), &url));
+    server
+        .call("context", &serde_json::Map::new())
+        .await
+        .unwrap();
+    let seen = seen.lock().await.clone();
+    assert!(
+        seen.iter()
+            .any(|(path, bearer)| path == "/v1/token/list" && bearer == PARTLY_REFUSED),
+        "the cluster was asked about the token: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|(path, _)| path == "/v1/token/create"),
+        "{seen:?}"
+    );
+    assert_eq!(
+        crate::relish::client::resolve_token().as_deref(),
+        Some(PARTLY_REFUSED)
+    );
+}
+
+/// #1763 review: `version`, `guide`, `schema`, `explain` and the manual
+/// read only this binary, so they answer with the cluster down and no
+/// token stored, and make none.
+#[tokio::test]
+async fn offline_tools_answer_with_the_cluster_down_and_no_token_stored() {
+    let directory = tempfile::tempdir().unwrap();
+    let server = Server::new(&Selection::default())
+        .unwrap()
+        .with_managed(managed(directory.path(), &nowhere()));
+    let calls = [
+        ("version", json!({})),
+        ("guide", json!({})),
+        ("schema", json!({"command": "version"})),
+        ("explain", json!({"id": "crashloop"})),
+        ("manual_search", json!({"words": ["token"]})),
+    ];
+    for (tool, arguments) in calls {
+        let arguments = arguments.as_object().unwrap().clone();
+        let result = server.call(tool, &arguments).await.unwrap();
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "{tool}: {}",
+            result_text(&result)
+        );
+    }
+    assert!(!directory.path().join("mcp-token.json").exists());
+}
+
+/// The source tools ask the cluster which commit its nodes run, as an
+/// extra. With no read-only token to ask with, they answer offline rather
+/// than fail, and never ask with the admin token.
+#[tokio::test]
+async fn source_tools_answer_offline_when_no_read_only_token_can_be_made() {
+    let directory = tempfile::tempdir().unwrap();
+    let (url, seen) = token_cluster(true, &[]).await;
+    crate::relish::client::set_cli_endpoint(Some(url.clone())).unwrap();
+    let server = Server::new(&Selection::default())
+        .unwrap()
+        .with_managed(managed(directory.path(), &url));
+    let result = server
+        .call("source_version", &serde_json::Map::new())
+        .await
+        .unwrap();
+    assert_ne!(result.is_error, Some(true), "{}", result_text(&result));
+    assert!(tool_bearers(&seen).await.is_empty(), "nothing else asked");
+}
+
+/// #1763 review: a refused create was asked again on every tool call, two
+/// admin requests each time. A refusal is remembered for a while.
+#[tokio::test]
+async fn a_refusal_is_remembered_and_asked_again_only_after_a_while() {
+    let directory = tempfile::tempdir().unwrap();
+    let (url, seen) = token_cluster(true, &[]).await;
+    let server = Server::new(&Selection::default())
+        .unwrap()
+        .with_managed(managed(directory.path(), &url));
+    for _ in 0..3 {
+        let result = server.call("logs", &logs_arguments()).await.unwrap();
+        assert_eq!(result.is_error, Some(true));
+        let text = result_text(&result);
+        assert!(text.contains("token creation is switched off"), "{text}");
+    }
+    assert_eq!(seen.lock().await.len(), 2, "one probe and one create");
+
+    server
+        .managed
+        .as_ref()
+        .unwrap()
+        .age_refusal(REFUSAL_BACKOFF)
+        .await;
+    server.call("logs", &logs_arguments()).await.unwrap();
+    assert_eq!(seen.lock().await.len(), 4, "asked again after the backoff");
+}
+
+// ---------------------------------------------------------------------------
+// `relish mcp --propose` (#1682).
+
+fn proposing_tools() -> Vec<ToolSpec> {
+    tools::derive_with(
+        crate::relish::agent::agent_command(),
+        &tools::data_schema,
+        true,
+    )
+}
+
+/// The tools `--propose` adds, and nothing else: a new command that writes
+/// to the council must be named in `PROPOSING` or `EXCLUDED`.
+#[test]
+fn propose_adds_exactly_the_proposing_tools() {
+    let plain = names(&real_tools());
+    let proposing = names(&proposing_tools());
+    let added: Vec<&String> = proposing
+        .iter()
+        .filter(|name| !plain.contains(name))
+        .collect();
+    assert_eq!(
+        added,
+        [
+            "lease_take",
+            "lease_renew",
+            "lease_release",
+            "propose",
+            "proposals",
+            "withdraw",
+            "undo"
+        ]
+    );
+    let listed: Vec<&str> = tools::PROPOSING.iter().map(|p| p.command).collect();
+    assert_eq!(
+        listed,
+        ["lease", "propose", "proposals", "withdraw", "undo"]
+    );
+    // No tool approves, rejects or undoes directly: those are a person's
+    // top-level commands, outside `relish agent`.
+    for name in &proposing {
+        for word in ["approve", "reject", "break"] {
+            assert!(!name.contains(word), "{name}");
+        }
+    }
+    // The rest stay out.
+    for excluded in [
+        "patch_init",
+        "setup",
+        "report",
+        "source_extract",
+        "upgrade_check",
+    ] {
+        assert!(!proposing.iter().any(|name| name == excluded), "{excluded}");
+    }
+}
+
+/// A proposing tool writes a council record, never a workload: not
+/// read-only, not destructive. Reading proposals is read-only.
+#[test]
+fn proposing_tools_are_annotated_as_council_writes() {
+    for spec in proposing_tools() {
+        let annotations = spec.tool.annotations.as_ref().unwrap();
+        let writes = tools::proposing(&spec.command).is_some_and(|p| !p.read_only);
+        assert_eq!(
+            annotations.read_only_hint,
+            Some(!writes),
+            "{}",
+            spec.command
+        );
+        assert_eq!(
+            annotations.destructive_hint,
+            Some(false),
+            "{}",
+            spec.command
+        );
+        assert_eq!(annotations.open_world_hint, Some(false), "{}", spec.command);
+        if writes {
+            assert_eq!(annotations.idempotent_hint, Some(false), "{}", spec.command);
+        }
+    }
+}
+
+/// `propose apply` reads a local TOML file, so through MCP it would read
+/// any file the server can: it isn't offered.
+#[test]
+fn propose_through_mcp_offers_no_apply_from_a_local_file() {
+    let tools = proposing_tools();
+    let propose = find(&tools, "propose");
+    let schema = Value::Object((*propose.tool.input_schema).clone());
+    let kinds = schema["properties"]["kind"]["enum"].as_array().unwrap();
+    assert!(!kinds.contains(&json!("apply")), "{kinds:?}");
+    assert!(kinds.contains(&json!("scale")), "{kinds:?}");
+    let error = propose
+        .command_line(&object(json!({
+            "kind": "apply", "target": "/etc/passwd", "reason": "r"
+        })))
+        .unwrap_err();
+    assert!(error.contains("reads a local file"), "{error}");
+    let line = propose
+        .command_line(&object(json!({
+            "kind": "scale", "target": "web", "replicas": 5, "reason": "p99"
+        })))
+        .unwrap();
+    assert!(line.contains(&"--replicas=5".to_string()), "{line:?}");
+}
+
+#[tokio::test]
+async fn without_propose_the_proposing_tools_are_refused_and_named_in_the_instructions() {
+    let (mut client, answer) = Client::initialised(default_server()).await;
+    let instructions = answer["result"]["instructions"].as_str().unwrap();
+    assert!(
+        instructions.contains("relish mcp --propose"),
+        "{instructions}"
+    );
+    assert!(
+        instructions.contains("deployer agent token"),
+        "{instructions}"
+    );
+    let answer = client
+        .call(
+            "propose",
+            json!({"kind": "scale", "target": "web", "reason": "r"}),
+        )
+        .await;
+    let message = answer["error"]["message"].as_str().unwrap();
+    assert!(message.contains("relish mcp --propose"), "{message}");
+    let answer = client.call("lease_take", json!({})).await;
+    let message = answer["error"]["message"].as_str().unwrap();
+    assert!(message.contains("relish mcp --propose"), "{message}");
+}
+
+#[tokio::test]
+async fn with_propose_the_server_lists_them_and_says_a_person_approves() {
+    let server = Server::new(&Selection {
+        propose: true,
+        ..Selection::default()
+    })
+    .unwrap();
+    let (mut client, answer) = Client::initialised(server).await;
+    let instructions = answer["result"]["instructions"].as_str().unwrap();
+    assert!(
+        instructions.contains("a person or an admin's policy approves"),
+        "{instructions}"
+    );
+    let listed = client.request("tools/list", json!({})).await;
+    let names: Vec<&str> = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"propose"), "{names:?}");
+    assert!(names.contains(&"lease_take"), "{names:?}");
+}
+
+/// From an admin context, `--propose` sends a deployer agent token of its
+/// own, kept apart from the read-only one.
+#[tokio::test]
+async fn a_proposing_server_from_an_admin_context_sends_its_own_proposing_token() {
+    let directory = tempfile::tempdir().unwrap();
+    let (url, seen) = token_cluster(false, &[]).await;
+    crate::relish::client::set_cli_endpoint(Some(url.clone())).unwrap();
+    let managed = Managed::new(
+        directory.path().join("mcp-propose-token.json"),
+        credentials::Scope {
+            owner: "laptop".to_string(),
+            endpoint: "https://127.0.0.1:19117".to_string(),
+            namespace: None,
+            purpose: credentials::Purpose::Propose,
+        },
+        crate::relish::client::BunClient::new_with_token(&url, Some(CONTEXT_ADMIN)),
+    );
+    let server = Server::new(&Selection {
+        propose: true,
+        ..Selection::default()
+    })
+    .unwrap()
+    .with_managed(managed);
+    server
+        .call("proposals", &serde_json::Map::new())
+        .await
+        .unwrap();
+    assert!(directory.path().join("mcp-propose-token.json").exists());
+    assert!(!directory.path().join("mcp-token.json").exists());
+    let seen = seen.lock().await.clone();
+    assert!(
+        seen.iter()
+            .any(|(path, bearer)| path == "/v1/proposals" && bearer == "rbrg_minted_0"),
+        "{seen:?}"
+    );
+}
+
+fn propose_options(namespace: Option<&str>) -> McpOptions {
+    McpOptions {
+        toolsets: Vec::new(),
+        no_logs: false,
+        namespace: namespace.map(str::to_string),
+        list: false,
+        propose: true,
+    }
+}
+
+/// From the saved admin context, `--propose` without `--namespace` would
+/// mint a deployer agent token for every namespace. It's refused, and the
+/// refusal says to pass `--namespace`.
+#[test]
+fn propose_from_the_admin_context_needs_a_namespace() {
+    use crate::relish::client::TokenOrigin;
+    let refusal = propose_scope_refusal(TokenOrigin::ContextAdmin, &propose_options(None))
+        .expect("an unscoped proposing token is refused");
+    let message = refusal.to_string();
+    assert!(message.contains("--namespace"), "{message}");
+    assert!(
+        propose_scope_refusal(TokenOrigin::ContextAdmin, &propose_options(Some("shop"))).is_none()
+    );
+    // A token someone gave it carries its own scope; plain relish mcp
+    // mints a read-only one, which may read every namespace.
+    assert!(propose_scope_refusal(TokenOrigin::Explicit, &propose_options(None)).is_none());
+    let mut reading = propose_options(None);
+    reading.propose = false;
+    assert!(propose_scope_refusal(TokenOrigin::ContextAdmin, &reading).is_none());
+}
+
+/// `--propose` with a token relish mcp didn't make warns: relish can't
+/// tell a person's token from an agent's, and a person's proposals slip
+/// past guardrails that match agents.
+#[test]
+fn propose_with_a_token_relish_mcp_didnt_make_warns() {
+    use crate::relish::client::TokenOrigin;
+    assert_eq!(
+        person_token_warning(TokenOrigin::Explicit, true),
+        Some(PERSON_TOKEN_WARNING)
+    );
+    for (origin, propose) in [
+        (TokenOrigin::Explicit, false),
+        (TokenOrigin::ContextAdmin, true),
+        (TokenOrigin::Absent, true),
+    ] {
+        assert_eq!(
+            person_token_warning(origin, propose),
+            None,
+            "{origin:?} {propose}"
+        );
+    }
+    let warning = PERSON_TOKEN_WARNING;
+    assert!(warning.contains("author.kind"), "{warning}");
+    assert!(warning.contains("--agent"), "{warning}");
     assert!(!warning.contains('\n'), "one line: {warning}");
 }

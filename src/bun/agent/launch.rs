@@ -499,7 +499,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
     /// The runtime refused to launch `instance_id` because its binary can't
     /// run here (#881). Launching it again fails the same way, so the
-    /// instance is `Failed` at once, keeping the reason for `relish status`
+    /// instance is `Failed` at once, keeping the reason for `relish apps`
     /// and `relish wtf`, instead of waiting in `Starting`.
     pub(super) async fn record_launch_failure(&mut self, instance_id: &InstanceId, reason: String) {
         let Some(instance) = self.supervisor.get_instance_mut(instance_id) else {
@@ -642,6 +642,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 identity: None,
                 identity_mount: None,
                 launch_failure: None,
+                restart_cause: None,
             },
         );
         self.supervisor
@@ -862,6 +863,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     identity,
                     identity_mount,
                     launch_failure: None,
+                    restart_cause: None,
                 },
             );
         }
@@ -992,7 +994,7 @@ pub(super) struct LaunchTarget<'a> {
 /// A provider that fails refuses the launch with
 /// [`LaunchProblem::SecretUnavailable`](crate::grill::LaunchProblem), the
 /// same way a missing binary does (#881), so the instance fails closed with
-/// the reason in `relish status` and `relish wtf`.
+/// the reason in `relish apps` and `relish wtf`.
 pub(super) async fn create_with_secrets<'s, G: Grill>(
     grill: &G,
     providers: &crate::sesame::secret_provider::SecretProviders,

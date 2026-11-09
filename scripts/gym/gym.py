@@ -64,8 +64,12 @@ def resolve_truth(truth, facts):
     return resolved
 
 
-def run_setup(scenario, cluster, sleep=time.sleep):
-    """Run the scenario's setup steps against `cluster`, as admin."""
+def run_setup(scenario, cluster, sleep=time.sleep, tokens=None):
+    """Run the scenario's setup steps against `cluster`, as admin.
+
+    A `run` step runs as its actor, with the token `tokens` maps it to (None
+    for the person, who is admin), and must succeed.
+    """
     for step in scenario.setup:
         if step.apply:
             cluster.apply(step.apply)
@@ -75,6 +79,52 @@ def run_setup(scenario, cluster, sleep=time.sleep):
             cluster.inject(step.fault)
         elif step.settle_seconds:
             sleep(step.settle_seconds)
+        elif step.run:
+            args = step_arguments(step.run, cluster, None)
+            completed = cluster.relish(args, token=(tokens or {}).get(step.actor))
+            if completed.returncode != 0:
+                raise cluster_module.ClusterError(
+                    f"setup `relish {' '.join(step.run)}` as {step.actor} failed: "
+                    f"{(completed.stderr or completed.stdout).strip()}"
+                )
+
+
+def step_arguments(run, cluster, proposal):
+    """A step's `relish` arguments with its placeholders filled in, or None.
+
+    None means the step names the solver's proposal and the solver made none.
+    """
+    args = []
+    for argument in run:
+        if argument == scenario_module.PROPOSAL_PLACEHOLDER:
+            if proposal is None:
+                return None
+            args.append(str(proposal))
+        elif argument.startswith(scenario_module.FILE_PLACEHOLDER):
+            args.append(str(cluster.write_manifest(argument[len(scenario_module.FILE_PLACEHOLDER):])))
+        else:
+            args.append(argument)
+    return args
+
+
+def run_after(scenario, cluster, tokens, proposal):
+    """Run the scenario's after steps; each one's record, for the scorer.
+
+    Every step runs whatever the one before it answered, so one wrong answer
+    fails its own outcome and not the rest. A step that needs the solver's
+    proposal when there's none is recorded with no exit and not run.
+    """
+    records = []
+    for step in scenario.after:
+        args = step_arguments(step.run, cluster, proposal)
+        if args is None:
+            records.append({"as": step.actor, "argv": ["relish", *step.run], "exit": None,
+                            "stdout": "", "stderr": "not run: the solver made no proposal"})
+            continue
+        completed = cluster.relish(args, token=tokens.get(step.actor))
+        records.append({"as": step.actor, "argv": ["relish", *args], "exit": completed.returncode,
+                        "stdout": completed.stdout, "stderr": completed.stderr})
+    return records
 
 
 def symptom_control(cluster, plant, planted_relish):
@@ -152,7 +202,11 @@ def run_once(scenario, run_dir, make_cluster, solver, relish, planted=None, time
     cluster = make_cluster(scenario.nodes, run_dir / "cluster")
     try:
         cluster.start()
-        run_setup(scenario, cluster, sleep)
+        # The person is admin; the other agent gets its own agent token.
+        tokens = {"person": None}
+        if "other-agent" in scenario.actors():
+            tokens["other-agent"] = cluster.create_agent_token(scenario_module.OTHER_AGENT)
+        run_setup(scenario, cluster, sleep, tokens)
         truth = resolve_truth(scenario.truth, cluster.facts(scenario.facts_needed()))
         result["truth"] = truth
         solver_relish = relish
@@ -166,12 +220,18 @@ def run_once(scenario, run_dir, make_cluster, solver, relish, planted=None, time
                 )
 
         token_name = f"gym-solver-{run_dir.name}"
-        token = cluster.create_token(token_name)
+        if scenario.solver_token == "agent":
+            token = cluster.create_agent_token(token_name)
+        else:
+            token = cluster.create_token(token_name)
+        tokens["solver-token"] = token
         solver_dir = run_dir / "solver"
         solver_dir.mkdir(exist_ok=True)
+        if scenario.release:
+            result["release"] = cluster.write_release(solver_dir / "release", scenario.release)
         call_log = run_dir / "calls.jsonl"
         answer_path = run_dir / "answer.json"
-        prompt = solvers.full_prompt(scenario.prompt, scenario.platform)
+        prompt = solvers.full_prompt(scenario.prompt, scenario.platform, scenario.solver_token)
         prompt_path = run_dir / "prompt.md"
         prompt_path.write_text(prompt)
         if tools is None:
@@ -193,6 +253,14 @@ def run_once(scenario, run_dir, make_cluster, solver, relish, planted=None, time
             result["solver_meta"] = meta
         answer, answer_error = solvers.read_answer(answer_path)
         calls = shim.read_log(call_log)
+        steps = []
+        if scenario.after:
+            # The solver's own proposal, found once, before any step can
+            # make another under its token.
+            proposal = cluster.newest_proposal(token_name)
+            result["proposal"] = proposal
+            steps = run_after(scenario, cluster, tokens, proposal)
+            write_steps(run_dir / "steps.jsonl", steps)
         audit = cluster.audit(token_name)
         (run_dir / "audit.json").write_text(json.dumps(audit, indent=2) + "\n")
 
@@ -211,7 +279,7 @@ def run_once(scenario, run_dir, make_cluster, solver, relish, planted=None, time
             result["patch_reason"] = reason
         scored = score_module.score(
             scenario, truth, answer, calls, audit, patch_result,
-            find_reports(solver_dir) + answer_reports(scenario, answer),
+            find_reports(solver_dir) + answer_reports(scenario, answer), steps,
         )
         if answer_error:
             scored["answer_problems"].insert(0, answer_error)
@@ -233,6 +301,13 @@ def run_once(scenario, run_dir, make_cluster, solver, relish, planted=None, time
     return result
 
 
+def write_steps(path, steps):
+    """The after steps' records, one JSON line each, as the shim writes calls."""
+    with open(path, "w", encoding="utf-8") as log:
+        for step in steps:
+            log.write(json.dumps(step) + "\n")
+
+
 def rescore(run_dir):
     """Score a recorded run again from its files (deterministic)."""
     run_dir = Path(run_dir)
@@ -245,6 +320,7 @@ def rescore(run_dir):
         scenario, result["truth"], answer, shim.read_log(run_dir / "calls.jsonl"), audit,
         result.get("patch_result"),
         find_reports(run_dir / "solver") + answer_reports(scenario, answer),
+        shim.read_log(run_dir / "steps.jsonl"),
     )
     if answer_error:
         scored["answer_problems"].insert(0, answer_error)

@@ -21,14 +21,19 @@ pub mod diagnose;
 pub mod envelope;
 pub mod fit;
 pub mod guide;
+pub mod lease;
 pub mod logs;
 pub mod manual;
 pub mod patch;
+pub mod propose;
 pub mod report;
 pub mod setup;
 pub mod source;
+pub mod timeline;
 pub mod untrusted;
 pub mod upgrade_check;
+pub mod verify;
+pub mod why;
 
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -41,8 +46,8 @@ pub use envelope::{AgentError, BuildInfo, CommandName, Envelope, ErrorCode, Exit
 #[derive(Debug, Clone, clap::Args)]
 pub struct AgentOptions {
     /// Largest answer to print, in bytes (at least 1024; by default 24576,
-    /// and 65536 for `guide`). A bigger answer is trimmed, marked
-    /// `truncated`, and says how to get the rest.
+    /// 81920 for `guide` and 40960 for `schema`). A bigger answer is
+    /// trimmed, marked `truncated`, and says how to get the rest.
     // No clap default: the default depends on the command, so `None` means
     // "not given" and [`AgentOptions::max_bytes`] picks the command's.
     #[arg(long, global = true, value_parser = parse_max_bytes)]
@@ -83,21 +88,23 @@ pub enum AgentCommand {
         #[command(subcommand)]
         command: manual::ManualCommand,
     },
-    /// The first call: findings, unknowns, faults, alerts, one line per app
-    /// and the newest events, in one bounded answer.
+    /// The first call: `relish status`'s screen and summary, findings,
+    /// unknowns, active faults and the newest events, in one bounded answer.
     Context(context::ContextArgs),
     /// Every finding with its evidence, read-only next steps, and pointers
     /// into the manual and the source.
     Diagnose(diagnose::DiagnoseArgs),
-    /// What a finding means, its thresholds and where it's decided; every
-    /// finding when no id is given. Reads only this binary.
-    Explain {
-        /// A finding id, e.g. `crashloop`.
-        id: Option<String>,
-    },
+    /// What a finding means and where it's decided, or why the cluster
+    /// made a decision: --restart, --placement, --refusal
+    Explain(why::ExplainArgs),
+    /// What changed in a window: events, audit and deploys, newest first
+    Timeline(timeline::TimelineArgs),
     /// Whether the cluster can take the latest release: `ready`,
     /// `up_to_date`, `needs_fresh_cluster`, `blocked` or `unknown`.
     UpgradeCheck(upgrade_check::UpgradeCheckArgs),
+    /// Whether the cluster runs the published release, byte for byte:
+    /// `verified`, `mismatch` or `unknown`.
+    Verify(verify::VerifyArgs),
     /// Draft a redacted bug report for a human to post. Never posts.
     Report(Box<report::ReportArgs>),
     /// Build, test and try a fix on a throwaway cluster.
@@ -105,6 +112,20 @@ pub enum AgentCommand {
     /// Wire Reliaburger into the AI agents on this machine. Shows the diff;
     /// writes only with --yes.
     Setup(setup::SetupOptions),
+    /// Take, renew or release a lease on an app or a namespace.
+    Lease(lease::LeaseOptions),
+    /// Propose a change for a person to approve: apply, scale, rollback,
+    /// stop or delete. Shows the summary, blast radius and undo command.
+    Propose(propose::ProposeArgs),
+    /// Proposals you can see, newest first; one when given its number.
+    Proposals(propose::ProposalsArgs),
+    /// Withdraw a pending proposal you made.
+    Withdraw {
+        /// The proposal's number.
+        id: u64,
+    },
+    /// Propose undoing an applied proposal, for a person to approve.
+    Undo(propose::UndoArgs),
 }
 
 impl AgentOptions {
@@ -116,7 +137,65 @@ impl AgentOptions {
     }
 }
 
+/// Whether a command talks to the cluster. `relish mcp` asks, because a
+/// command that does needs its read-only token first, and one that doesn't
+/// should answer with the cluster down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterUse {
+    /// It reads only this binary: its build, manual, schemas or source.
+    None,
+    /// It answers from this binary and asks the cluster only to add to
+    /// that, which [`AgentCommand::answer_offline`] turns off.
+    Optional,
+    /// It needs the cluster to answer.
+    Required,
+}
+
 impl AgentCommand {
+    /// Whether this command talks to the cluster. A new command has to say,
+    /// because this `match` names every one.
+    pub fn cluster_use(&self) -> ClusterUse {
+        match self {
+            AgentCommand::Guide
+            | AgentCommand::Version
+            | AgentCommand::Schema { .. }
+            | AgentCommand::Manual { .. }
+            | AgentCommand::Report(_) => ClusterUse::None,
+            // A finding id or `--rules` reads only this binary; a decision
+            // question reads the cluster's records.
+            AgentCommand::Explain(args)
+                if args.restart.is_none() && args.placement.is_none() && args.refusal.is_none() =>
+            {
+                ClusterUse::None
+            }
+            AgentCommand::Source(options) if options.offline => ClusterUse::None,
+            // Which commit the nodes run, beside the bundle's own.
+            AgentCommand::Source(_) => ClusterUse::Optional,
+            AgentCommand::Logs(_)
+            | AgentCommand::Context(_)
+            | AgentCommand::Diagnose(_)
+            | AgentCommand::Explain(_)
+            | AgentCommand::Timeline(_)
+            | AgentCommand::UpgradeCheck(_)
+            | AgentCommand::Verify(_)
+            | AgentCommand::Patch(_)
+            | AgentCommand::Setup(_)
+            | AgentCommand::Lease(_)
+            | AgentCommand::Propose(_)
+            | AgentCommand::Proposals(_)
+            | AgentCommand::Withdraw { .. }
+            | AgentCommand::Undo(_) => ClusterUse::Required,
+        }
+    }
+
+    /// Answer without asking the cluster, for a [`ClusterUse::Optional`]
+    /// command. Any other is left as it is.
+    pub fn answer_offline(&mut self) {
+        if let AgentCommand::Source(options) = self {
+            options.offline = true;
+        }
+    }
+
     /// The name the envelope's `command` field carries.
     pub fn name(&self) -> CommandName {
         match self {
@@ -128,11 +207,18 @@ impl AgentCommand {
             AgentCommand::Manual { command } => command.name(),
             AgentCommand::Context(_) => CommandName::Context,
             AgentCommand::Diagnose(_) => CommandName::Diagnose,
-            AgentCommand::Explain { .. } => CommandName::Explain,
+            AgentCommand::Explain(_) => CommandName::Explain,
+            AgentCommand::Timeline(_) => CommandName::Timeline,
             AgentCommand::UpgradeCheck(_) => CommandName::UpgradeCheck,
+            AgentCommand::Verify(_) => CommandName::Verify,
             AgentCommand::Report(_) => CommandName::Report,
             AgentCommand::Patch(options) => options.command.name(),
             AgentCommand::Setup(_) => CommandName::Setup,
+            AgentCommand::Lease(options) => options.command.name(),
+            AgentCommand::Propose(_) => CommandName::Propose,
+            AgentCommand::Proposals(_) => CommandName::Proposals,
+            AgentCommand::Withdraw { .. } => CommandName::Withdraw,
+            AgentCommand::Undo(_) => CommandName::Undo,
         }
     }
 }
@@ -179,11 +265,18 @@ pub async fn run(options: &AgentOptions, rerun: &str) -> Rendered {
         AgentCommand::Manual { command } => manual::run(command, max_bytes, rerun),
         AgentCommand::Context(args) => context::run(args, max_bytes, rerun).await,
         AgentCommand::Diagnose(args) => diagnose::run_diagnose(args, max_bytes, rerun).await,
-        AgentCommand::Explain { id } => diagnose::run_explain(id.as_deref(), max_bytes, rerun),
+        AgentCommand::Explain(args) => why::run(args, max_bytes, rerun).await,
+        AgentCommand::Timeline(args) => timeline::run(args, max_bytes, rerun).await,
         AgentCommand::UpgradeCheck(args) => upgrade_check::run(args, max_bytes, rerun).await,
+        AgentCommand::Verify(args) => verify::run(args, max_bytes, rerun).await,
         AgentCommand::Report(args) => report::run(args, max_bytes, rerun),
         AgentCommand::Patch(patch) => patch::run(patch, max_bytes, rerun).await,
         AgentCommand::Setup(setup) => setup::run(setup, max_bytes, rerun).await,
+        AgentCommand::Lease(lease) => lease::run(lease, max_bytes, rerun).await,
+        AgentCommand::Propose(args) => propose::run_propose(args, max_bytes, rerun).await,
+        AgentCommand::Proposals(args) => propose::run_proposals(args, max_bytes, rerun).await,
+        AgentCommand::Withdraw { id } => propose::run_withdraw(*id, max_bytes, rerun).await,
+        AgentCommand::Undo(args) => propose::run_undo(args, max_bytes, rerun).await,
     }
 }
 
@@ -278,7 +371,9 @@ pub fn data_schema(command: CommandName) -> Option<Value> {
         CommandName::Context => Some(schema_of::<context::ContextData>()),
         CommandName::Diagnose => Some(schema_of::<diagnose::DiagnoseData>()),
         CommandName::Explain => Some(schema_of::<diagnose::ExplainData>()),
+        CommandName::Timeline => Some(schema_of::<timeline::TimelineData>()),
         CommandName::UpgradeCheck => Some(schema_of::<upgrade_check::UpgradeCheckData>()),
+        CommandName::Verify => Some(schema_of::<verify::VerifyData>()),
         CommandName::Report => Some(schema_of::<report::ReportData>()),
         CommandName::PatchInit => Some(schema_of::<patch::InitData>()),
         CommandName::PatchBuild => Some(schema_of::<patch::BuildData>()),
@@ -288,6 +383,14 @@ pub fn data_schema(command: CommandName) -> Option<Value> {
         CommandName::PatchApply => Some(schema_of::<patch::ApplyData>()),
         CommandName::PatchDestroy => Some(schema_of::<patch::DestroyData>()),
         CommandName::Setup => Some(schema_of::<setup::SetupData>()),
+        CommandName::LeaseTake | CommandName::LeaseRenew | CommandName::LeaseRelease => {
+            Some(schema_of::<lease::LeaseData>())
+        }
+        CommandName::Propose | CommandName::Withdraw | CommandName::Undo => {
+            Some(schema_of::<propose::ProposalData>())
+        }
+        CommandName::Proposals => Some(schema_of::<propose::ProposalsData>()),
+        CommandName::Status => Some(schema_of::<crate::relish::status_cmd::StatusData>()),
     }
 }
 
@@ -404,7 +507,7 @@ pub fn rerun_command(args: &[String]) -> String {
 }
 
 /// `word` as a POSIX shell reads it back unchanged.
-fn shell_quote(word: &str) -> String {
+pub(crate) fn shell_quote(word: &str) -> String {
     let plain = !word.is_empty()
         && word
             .chars()
@@ -473,20 +576,21 @@ mod tests {
     }
 
     #[test]
-    fn guide_defaults_to_64_kib_and_every_other_command_to_24_kib() {
+    fn guide_defaults_to_80_kib_schema_to_40_and_every_other_command_to_24() {
         use clap::ValueEnum;
         for &command in CommandName::value_variants() {
             let expected = match command {
-                CommandName::Guide => 64 * 1024,
+                CommandName::Guide => 80 * 1024,
+                CommandName::Schema => 40 * 1024,
                 _ => 24 * 1024,
             };
             assert_eq!(default_max_bytes(command), expected, "{command:?}");
         }
         assert_eq!(default_max_bytes(CommandName::Agent), 24 * 1024);
-        assert_eq!(parse("agent guide").unwrap().max_bytes(), 64 * 1024);
+        assert_eq!(parse("agent guide").unwrap().max_bytes(), 80 * 1024);
+        assert_eq!(parse("agent schema status").unwrap().max_bytes(), 40 * 1024);
         for line in [
             "agent version",
-            "agent schema",
             "agent explain",
             "agent context",
             "agent logs payments",
@@ -542,14 +646,16 @@ mod tests {
         // Every command's schema together outgrew the default budget once
         // `context` and `diagnose` arrived; `schema <command>` is the
         // bounded call, and the test below holds each one to the default.
+        // The whole schema passed 128 KiB when 0.2.8's timeline, verify,
+        // leases and proposals met on the train.
         let rendered = run(
-            &parse("agent schema --max-bytes 131072").unwrap(),
+            &parse("agent schema --max-bytes 196608").unwrap(),
             "relish agent schema",
         )
         .await;
         assert_eq!(rendered.exit, ExitStatus::Answered);
         let value = json_of(&rendered);
-        assert_eq!(value["truncated"], false, "the whole schema fits 128 KiB");
+        assert_eq!(value["truncated"], false, "the whole schema fits 192 KiB");
         let names: Vec<&str> = value["data"]["commands"]
             .as_array()
             .unwrap()
@@ -573,7 +679,9 @@ mod tests {
                 "context",
                 "diagnose",
                 "explain",
+                "timeline",
                 "upgrade-check",
+                "verify",
                 "report",
                 "patch init",
                 "patch build",
@@ -582,7 +690,15 @@ mod tests {
                 "patch diff",
                 "patch apply",
                 "patch destroy",
-                "setup"
+                "setup",
+                "lease take",
+                "lease renew",
+                "lease release",
+                "propose",
+                "proposals",
+                "withdraw",
+                "undo",
+                "status"
             ]
         );
         let envelope = &value["data"]["envelope"];
@@ -715,12 +831,21 @@ mod tests {
         assert_eq!(diagnose.app.as_deref(), Some("web"));
         let options = parse("agent explain crashloop").unwrap();
         assert!(
-            matches!(&options.command, AgentCommand::Explain { id: Some(id) } if id == "crashloop")
+            matches!(&options.command, AgentCommand::Explain(explain) if explain.id.as_deref() == Some("crashloop"))
         );
         assert!(matches!(
             parse("agent explain").unwrap().command,
-            AgentCommand::Explain { id: None }
+            AgentCommand::Explain(explain) if explain.id.is_none() && !explain.rules
         ));
+        let options = parse("agent explain --restart web-0 --namespace payments").unwrap();
+        assert!(matches!(
+            &options.command,
+            AgentCommand::Explain(explain)
+                if explain.restart.as_deref() == Some("web-0") && explain.namespace == "payments"
+        ));
+        let options = parse("agent timeline --app web --since 10m --limit 50").unwrap();
+        assert_eq!(options.command.name(), CommandName::Timeline);
+        assert!(parse("agent timeline --limit 501").is_err());
         assert_eq!(
             command_named(&args("agent explain --bogus")),
             CommandName::Explain

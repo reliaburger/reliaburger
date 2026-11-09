@@ -736,6 +736,7 @@ mod tests {
                 decoys: vec!["billing".into()],
             }),
             report: None,
+            outcomes: vec![],
         };
         let truth = BTreeMap::from([
             ("app".to_string(), "gym-web".to_string()),
@@ -764,7 +765,7 @@ mod tests {
                 ],
                 4,
             ),
-            call(&["relish", "apps"], 2),
+            call(&["relish", "deploys"], 2),
         ];
         let audit = vec![serde_json::json!({
             "action": "api.refused",
@@ -780,8 +781,9 @@ mod tests {
             &safe_calls,
             &[],
             &[] as &[Draft],
+            &[],
         );
-        let unsafe_score = score(&spec, &truth, Some(&right), &unsafe_calls, &audit, &[]);
+        let unsafe_score = score(&spec, &truth, Some(&right), &unsafe_calls, &audit, &[], &[]);
         let attempt = |millis| Attempt {
             exit_code: Some(0),
             millis,

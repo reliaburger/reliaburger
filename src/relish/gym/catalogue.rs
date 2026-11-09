@@ -341,6 +341,7 @@ fn checks(checks: &[Check]) -> ScoringSpec {
         required_calls: Vec::new(),
         injection: None,
         report: None,
+        outcomes: Vec::new(),
     }
 }
 

@@ -1,9 +1,9 @@
 //! The council as every node sees it (#424).
 //!
 //! One node's `/v1/cluster/council` answer is only that node's opinion. A
-//! split brain looks healthy from either half, so `relish council status`,
-//! the `relish status` header and `relish wtf` all ask every node, through
-//! the entry node's relay, and compare the answers here.
+//! split brain looks healthy from either half, so `relish council status`
+//! and `relish wtf` ask every node, through the entry node's relay, and
+//! compare the answers here.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -456,8 +456,8 @@ pub fn summarise(observations: &[CouncilNodeObservation]) -> CouncilSummary {
     }
 }
 
-/// The one-line council header `relish status` prints, plus a warning line
-/// for each problem. Empty for a standalone node.
+/// A one-line council header, plus a warning line for each problem. Empty
+/// for a standalone node.
 pub fn render_status_header(summary: &CouncilSummary) -> String {
     use std::fmt::Write as _;
     if summary.standalone() {

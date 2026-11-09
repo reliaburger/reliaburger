@@ -85,7 +85,7 @@
       "name": "manual_show"
     },
     {
-      "description": "The first call: findings, unknowns, faults, alerts, one line per app and the newest events, in one bounded answer",
+      "description": "The first call: `relish status`'s screen and summary, findings, unknowns, active faults and the newest events, in one bounded answer",
       "name": "context"
     },
     {
@@ -93,8 +93,12 @@
       "name": "diagnose"
     },
     {
-      "description": "What a finding means, its thresholds and where it's decided; every finding when no id is given. Reads only this binary",
+      "description": "What a finding means and where it's decided, or why the cluster made a decision: --restart, --placement, --refusal",
       "name": "explain"
+    },
+    {
+      "description": "What changed in a window: events, audit and deploys, newest first",
+      "name": "timeline"
     }
   ],
   "user_config": {

@@ -7,6 +7,11 @@ use crate::bun::agent::{
 };
 use crate::bun::cluster_view::NodeTagged;
 use crate::bun::events::{ClusterEvent, EventKind, EventSeverity};
+use crate::bun::summary::{
+    AlertsSection, AppBrief, AppState, AppsSection, CapacitySection, CertsSection, ClusterSummary,
+    CouncilSection, Coverage, FaultsSection, GitOpsSection, GossipSection, InstancesSection,
+    JobsSection, LogsSection, NodesSection, Section, UsageSection, VersionCount, VersionsSection,
+};
 use crate::mayo::rollup::{MetricsQueryResult, MetricsQueryRow};
 use crate::wrapper::types::RouteInfo;
 
@@ -21,6 +26,8 @@ pub enum TestScenario {
     HealthyCluster,
     DegradedApp,
     ManyApps,
+    /// Healthy, but node-3 didn't answer the summary in time.
+    NodeMissing,
 }
 
 impl TestScenario {
@@ -55,6 +62,7 @@ impl TestScenario {
                         pid: Some(1000 + app_index as u32 * 2 + replica),
                         runtime_unknown: false,
                         status_age_ms: None,
+                        age_seconds: None,
                         reason: None,
                     },
                 });
@@ -152,8 +160,141 @@ impl TestScenario {
                 });
             }
         }
+        data.summary = Some(self.summary(count));
         data.last_updated = Some(FIXTURE_NOW);
         data
+    }
+
+    /// The summary of this scenario's cluster: `apps` apps of two replicas
+    /// on three nodes.
+    fn summary(self, apps: usize) -> ClusterSummary {
+        let now_ms = FIXTURE_NOW * 1000;
+        let apps = u32::try_from(apps).unwrap_or(u32::MAX);
+        let (asked, answered) = match self {
+            Self::NodeMissing => (3, 2),
+            _ => (3, 3),
+        };
+        let coverage = Coverage { answered, asked };
+        let reasons = match self {
+            Self::NodeMissing => vec!["node-3: timed out".to_string()],
+            _ => Vec::new(),
+        };
+        let degraded = u32::from(matches!(self, Self::DegradedApp));
+        let worst = if degraded > 0 {
+            vec![AppBrief {
+                app: "web".into(),
+                namespace: "default".into(),
+                state: AppState::Degraded,
+                desired: 2,
+                running: 1,
+            }]
+        } else {
+            Vec::new()
+        };
+        ClusterSummary {
+            generated_at_unix_ms: now_ms,
+            answered_by: "node-1".into(),
+            version: "0.2.8".into(),
+            scoped: false,
+            nodes: Section::from_nodes(
+                NodesSection {
+                    alive: answered,
+                    ..NodesSection::default()
+                },
+                coverage,
+                &reasons,
+            ),
+            council: Section::complete(CouncilSection {
+                leader: Some("node-1".into()),
+                term: 4,
+                voters: 3,
+                voters_answering: 3,
+                quorum_ok: true,
+                lagging: 0,
+                other_leaders: Vec::new(),
+            }),
+            gossip: Section::complete(GossipSection {
+                members: 3,
+                updates_received: 1_204,
+                last_change_unix_ms: Some(now_ms - 600_000),
+            }),
+            versions: Section::from_nodes(
+                VersionsSection {
+                    versions: vec![VersionCount {
+                        version: "0.2.8".into(),
+                        nodes: answered,
+                    }],
+                    upgrade_in_progress: false,
+                },
+                coverage,
+                &reasons,
+            ),
+            capacity: Section::complete(CapacitySection {
+                nodes_reporting: 3,
+                cpu_allocated_millicores: 2_000 * u64::from(apps),
+                cpu_total_millicores: 24_000,
+                memory_allocated_mb: 512 * u64::from(apps),
+                memory_total_mb: 48_000,
+                gpu_allocated: 0,
+                gpu_total: 0,
+            }),
+            usage: Section::from_nodes(
+                UsageSection {
+                    cpu_percent: Some(21.0),
+                    memory_percent: Some(40.0),
+                    disk_percent: Some(30.0),
+                    busiest: Vec::new(),
+                    newest_sample_unix_ms: Some(now_ms - 5_000),
+                },
+                coverage,
+                &reasons,
+            ),
+            apps: Section::from_nodes(
+                AppsSection {
+                    total: apps,
+                    running: apps - degraded,
+                    degraded,
+                    worst,
+                    ..AppsSection::default()
+                },
+                coverage,
+                &reasons,
+            ),
+            instances: Section::from_nodes(
+                InstancesSection {
+                    running: apps * 2 - degraded,
+                    desired: apps * 2,
+                    not_running: degraded,
+                },
+                coverage,
+                &reasons,
+            ),
+            jobs: Section::complete(JobsSection::default()),
+            logs: Section::from_nodes(
+                LogsSection {
+                    newest_unix_ms: Some(now_ms - 2_000),
+                    slowest: None,
+                },
+                coverage,
+                &reasons,
+            ),
+            faults: Section::from_nodes(FaultsSection::default(), coverage, &reasons),
+            alerts: Section::complete(AlertsSection::default()),
+            certs: Section::from_nodes(
+                CertsSection {
+                    count: 3,
+                    soonest: None,
+                },
+                coverage,
+                &reasons,
+            ),
+            gitops: Section::complete(GitOpsSection {
+                configured: false,
+                commit: None,
+                synced_at_unix_seconds: None,
+                error: None,
+            }),
+        }
     }
 }
 

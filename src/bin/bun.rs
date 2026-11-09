@@ -2028,6 +2028,22 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             .await?;
         }
 
+        // Leader-only: remove agent leases whose time has passed, with a
+        // `lease.expired` audit record each (#1686).
+        reliaburger::bun::lease_reaper::spawn_lease_reaper(
+            Arc::clone(council),
+            Some(Arc::clone(&event_store)),
+            node_name.clone(),
+            shutdown.clone(),
+        );
+        // Leader-only: expire, compact and auto-approve agent proposals
+        // (#1682), with their audit records.
+        reliaburger::bun::proposals::spawn_proposal_reaper(
+            Arc::clone(council),
+            Some(Arc::clone(&event_store)),
+            node_name.clone(),
+            shutdown.clone(),
+        );
         // Leader-only: drop tokens a day past their expiry, never the last
         // Admin (F05 I2). Followers tick too, and do nothing.
         tokio::spawn(reliaburger::bun::token_sweep::run_token_sweep_loop(
@@ -3095,7 +3111,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     };
     // The leader's registry endpoints accept only mTLS node certificates, so
     // a plaintext cluster's registry can't forward or replicate (#792). Say
-    // so once here; the reaper, `relish status` and `relish wtf` carry it on.
+    // so once here; the reaper and `relish wtf` carry it on.
     let registry_needs_mtls = registry_forwarder
         .as_ref()
         .is_some_and(|forwarder| forwarder.requires_mtls());

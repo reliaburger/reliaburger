@@ -116,7 +116,7 @@ step() {
 # diner and one of each burger layer.
 burger_apps='counter diner top-bun lettuce tomato cheese patty bottom-bun'
 burgers_running() {
-    "$relish" status 2>/dev/null | awk -v apps="$burger_apps" '
+    "$relish" apps --instances 2>/dev/null | awk -v apps="$burger_apps" '
         $1 == "NODE" { rows = 1; next }
         rows && $5 == "running" { n[$3]++ }
         END {
@@ -133,7 +133,7 @@ ingress_origin() {
 
 # Every instance running, with at least one of each tour app.
 apps_running() {
-    "$relish" status 2>/dev/null | awk '
+    "$relish" apps --instances 2>/dev/null | awk '
         $1 == "NODE" { rows = 1; next }
         rows && NF >= 5 { seen[$3] = 1; if ($5 != "running") pending = 1 }
         END { exit !(!pending && seen["frontend"] && seen["backend"] && seen["redis"] && seen["loadgen"]) }'

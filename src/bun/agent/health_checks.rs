@@ -252,19 +252,34 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
     /// Restart an unhealthy instance whose withdrawal is published.
     async fn restart_published_unhealthy(&mut self, instance_id: &InstanceId, now: Instant) {
+        // The probe evidence is read before the restart, which resets the
+        // counters.
+        let Some(probe) = self
+            .supervisor
+            .get_instance(instance_id)
+            .filter(|instance| instance.state == ContainerState::Unhealthy)
+            .map(health_evidence)
+        else {
+            return;
+        };
         // LOOP-INLINE: in-memory lock, no I/O
         if self
             .supervisor
-            .get_instance(instance_id)
-            .is_some_and(|instance| instance.state == ContainerState::Unhealthy)
-            && self
-                .supervisor
-                .maybe_restart(instance_id, now)
-                .await
-                .unwrap_or(false)
+            .maybe_restart(instance_id, now)
+            .await
+            .unwrap_or(false)
             && let Some(instance) = self.supervisor.get_instance(instance_id)
         {
-            self.record_event(
+            let mut decision = crate::bun::restart::restart_decision(
+                "restart.health_failed",
+                &instance_id.0,
+                instance.restart_count,
+                &instance.restart_policy,
+            );
+            for (key, value) in probe {
+                decision = decision.with(key, value);
+            }
+            self.record_decision(
                 crate::bun::events::EventKind::Restart,
                 crate::bun::events::EventSeverity::Warning,
                 Some(instance.app_name.clone()),
@@ -273,6 +288,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     "instance {} restarted (attempt {})",
                     instance_id.0, instance.restart_count
                 ),
+                decision,
             )
             .await;
         }
@@ -411,6 +427,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.sidecars.cancel_relaunches(id);
         if let Some(instance) = self.supervisor.get_instance_mut(id) {
             instance.retry_pending = true;
+            instance.restart_cause = Some(crate::bun::restart::RestartCause::ProcessExited);
             if let Ok(s) = instance.state.transition_to(ContainerState::Stopping) {
                 instance.state = s;
             }
@@ -430,4 +447,27 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let sweep = state_sweep::sweep_states(grill, reads).await;
         self.apply_state_sweep(Ok(sweep)).await;
     }
+}
+
+/// The health-check evidence a `restart.health_failed` decision carries:
+/// the failures in a row, the threshold, the probe and its interval.
+pub(super) fn health_evidence(
+    instance: &crate::bun::supervisor::WorkloadInstance,
+) -> Vec<(&'static str, String)> {
+    let mut evidence = vec![(
+        "consecutive_failures",
+        instance.health_counters.consecutive_unhealthy.to_string(),
+    )];
+    if let Some(config) = &instance.health_config {
+        evidence.push(("threshold", config.threshold_unhealthy.to_string()));
+        evidence.push((
+            "probe",
+            format!(
+                "{} port {} path {}",
+                config.protocol, config.port, config.path
+            ),
+        ));
+        evidence.push(("interval_seconds", config.interval.as_secs().to_string()));
+    }
+    evidence
 }

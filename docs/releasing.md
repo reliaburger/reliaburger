@@ -1775,7 +1775,7 @@ the real `curl … | sh` install against it on every host we advertise.
     under it name the installed version, and `tests/suite/website.rs` fails
     until they match the bootstrap's default. Regenerate the released-CLI
     snapshot with `scripts/release/released_cli.py vX.Y.Z >
-    scripts/release/released-cli.tsv` and run `make readme-commands`: commands
+    scripts/release/released-cli.tsv` and run `make reference-commands`: commands
     labelled "X.Y.Z, not in" the old release lose their labels, and the same test
     flags any label the docs no longer need
     ([how](website/README.md#commands-the-installed-release-doesnt-have)). The

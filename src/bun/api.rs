@@ -54,11 +54,13 @@ mod gitops;
 mod identity;
 mod internal;
 mod join;
+pub(crate) mod leases;
 mod logs;
 mod metrics;
 mod node_info;
 mod nodes;
 pub(crate) mod policies;
+pub(crate) mod proposals;
 mod registry;
 mod secrets;
 mod snapshots;
@@ -102,6 +104,10 @@ use join::{
     cluster_ca_handler, join_handler, node_renewal_handler, node_security_view_handler,
     node_trust_ack_handler,
 };
+use leases::{
+    lease_break_handler, lease_release_handler, lease_renew_handler, lease_take_handler,
+    leases_handler,
+};
 use logs::{
     logs_archive_file_handler, logs_archive_handler, logs_cross_node_handler, logs_entries_handler,
     logs_export_handler, logs_handler, logs_sql_handler, ws_logs_handler,
@@ -121,6 +127,10 @@ use nodes::{
     nodes_handler,
 };
 use policies::{policies_handler, policy_audit_handler, policy_delete_handler};
+use proposals::{
+    proposal_approve_handler, proposal_create_handler, proposal_handler, proposal_reject_handler,
+    proposal_undo_handler, proposal_withdraw_handler, proposals_handler,
+};
 use registry::{
     images_handler, registry_proposal_deadline, registry_proposal_handler, registry_query_handler,
 };
@@ -145,8 +155,8 @@ use test_leases::{
 use ui::{
     app_detail_handler, app_env_handler, dashboard_handler, fragment_alerts_handler,
     fragment_apps_handler, fragment_batches_handler, fragment_instances_handler,
-    fragment_nodes_handler, gitops_handler, login_handler, node_detail_handler, ui_logout_handler,
-    ui_session_handler,
+    fragment_nodes_handler, fragment_summary_handler, gitops_handler, login_handler,
+    node_detail_handler, ui_logout_handler, ui_session_handler,
 };
 use upgrade::{
     upgrade_abort_handler, upgrade_apply_handler, upgrade_cluster_handler,
@@ -648,6 +658,7 @@ pub fn router_with_upgrade(
         .route("/ui/fragment/apps", get(fragment_apps_handler))
         .route("/ui/fragment/batches", get(fragment_batches_handler))
         .route("/ui/fragment/nodes", get(fragment_nodes_handler))
+        .route("/ui/fragment/summary", get(fragment_summary_handler))
         .route("/ui/fragment/alerts", get(fragment_alerts_handler))
         .route(
             "/ui/fragment/app/{app}/{namespace}/instances",
@@ -808,6 +819,22 @@ pub fn router_with_upgrade(
         .route("/v1/rollback/{app}/{namespace}", post(rollback_handler))
         .route("/v1/gitops", get(gitops_status_handler))
         .route("/v1/gitops/config", post(gitops_config_handler))
+        .route("/v1/leases", get(leases_handler).post(lease_take_handler))
+        .route("/v1/leases/renew", post(lease_renew_handler))
+        .route("/v1/leases/release", post(lease_release_handler))
+        .route("/v1/leases/break", post(lease_break_handler))
+        .route(
+            "/v1/proposals",
+            get(proposals_handler).post(proposal_create_handler),
+        )
+        .route("/v1/proposals/{id}", get(proposal_handler))
+        .route("/v1/proposals/{id}/approve", post(proposal_approve_handler))
+        .route("/v1/proposals/{id}/reject", post(proposal_reject_handler))
+        .route(
+            "/v1/proposals/{id}/withdraw",
+            post(proposal_withdraw_handler),
+        )
+        .route("/v1/proposals/{id}/undo", post(proposal_undo_handler))
         .route("/v1/policies", get(policies_handler))
         .route("/v1/policies/audit", get(policy_audit_handler))
         .route("/v1/policies/{name}/delete", post(policy_delete_handler))
@@ -1358,6 +1385,14 @@ pub(crate) fn copy_forwarded_auth(
             request = request.header(name.as_str(), value.as_bytes());
         }
     }
+    // A person's `--break-lease` travels with their credential, so the
+    // leader, which checks the leases, sees it (#1686).
+    if let Some(value) = headers.get(crate::bun::lease_fence::BREAK_LEASE_HEADER) {
+        request = request.header(
+            crate::bun::lease_fence::BREAK_LEASE_HEADER,
+            value.as_bytes(),
+        );
+    }
     request
 }
 
@@ -1378,9 +1413,13 @@ mod permission_tests;
 #[cfg(test)]
 mod contract_tests;
 #[cfg(test)]
+mod lease_tests;
+#[cfg(test)]
 mod owner_tests;
 #[cfg(test)]
 mod policy_tests;
+#[cfg(test)]
+mod proposal_tests;
 
 #[cfg(test)]
 mod cluster_view_tests;

@@ -258,7 +258,7 @@ pub async fn run_diagnose(args: &DiagnoseArgs, max_bytes: usize, rerun: &str) ->
 
 /// This binary's source bundle, or a warning saying why the pointers into it
 /// are missing.
-fn load_bundle() -> (Option<Bundle>, Vec<String>) {
+pub(crate) fn load_bundle() -> (Option<Bundle>, Vec<String>) {
     match Bundle::load() {
         Ok(bundle) => (Some(bundle), Vec::new()),
         Err(error) => (
@@ -396,7 +396,7 @@ fn event_text(kind: &str, message: &str, app: Option<(&str, &str)>) -> EventText
 }
 
 /// A read-only `source show` of `SHOW_LINES` lines from `line`.
-fn show_step(path: &str, line: usize, why: &str) -> NextStep {
+pub(crate) fn show_step(path: &str, line: usize, why: &str) -> NextStep {
     NextStep {
         run: format!(
             "relish agent source show {}:{line}-{}",
@@ -409,7 +409,7 @@ fn show_step(path: &str, line: usize, why: &str) -> NextStep {
 }
 
 /// The lines of `text` before its test module.
-fn non_test_lines(text: &str) -> Vec<&str> {
+pub(crate) fn non_test_lines(text: &str) -> Vec<&str> {
     text.lines()
         .take_while(|line| line.trim() != "#[cfg(test)]")
         .collect()
@@ -500,11 +500,23 @@ fn headings(lines: &[&str]) -> Vec<(usize, String)> {
     found
 }
 
-/// `data` for `relish agent explain`.
-#[derive(Debug, Clone, Serialize, JsonSchema)]
+/// `data` for `relish agent explain`. A finding question fills `findings`,
+/// a decision question `decisions`, `sources` and `not_found`, and
+/// `--rules` fills `rules`; the rest stay empty.
+#[derive(Debug, Clone, Default, Serialize, JsonSchema)]
 pub struct ExplainData {
     /// The finding asked about, or every finding when no id was given.
     pub findings: Vec<Explanation>,
+    /// The decisions asked about, newest first, at most 10.
+    pub decisions: Vec<super::why::DecisionData>,
+    /// How much of each record the decision answer read. Read these before
+    /// concluding a decision wasn't made.
+    pub sources: Vec<super::timeline::SourceState>,
+    /// Why no decision was found, when none was: what was read and how far
+    /// back it reaches. A missing decision is unknown, not denied.
+    pub not_found: Option<String>,
+    /// Every decision rule, for `--rules`.
+    pub rules: Vec<super::why::RuleData>,
 }
 
 /// What one finding means and what decides it.
@@ -596,6 +608,7 @@ pub fn explain(
     Ok(Answer {
         data: ExplainData {
             findings: explained,
+            ..ExplainData::default()
         },
         next,
         warnings: Vec::new(),
@@ -749,11 +762,19 @@ Nothing about findings here.
 
     /// The fixture bundle, built clean.
     pub fn bundle() -> Bundle {
+        bundle_with(&[])
+    }
+
+    /// The fixture bundle with `extra` files, each a path and its text.
+    pub fn bundle_with(extra: &[(&str, &str)]) -> Bundle {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         write(root, DECIDING_FILE, DIAGNOSE_RS);
         write(root, "src/relish/wtf/findings.rs", FINDINGS_RS);
         write(root, "docs/manual/07_diagnostics.md", MANUAL_MD);
+        for (path, text) in extra {
+            write(root, path, text);
+        }
         let files = pack::list_files(root, &["src", "docs"]).unwrap();
         let tar = pack::write_tar(root, &files).unwrap();
         let build = SourceBuild {

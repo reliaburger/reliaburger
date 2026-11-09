@@ -225,6 +225,7 @@ fn paused_scenario() -> Scenario {
             required_calls: vec![],
             injection: None,
             report: None,
+            outcomes: vec![],
         },
     }
 }
@@ -247,6 +248,7 @@ fn web_scenario() -> Scenario {
             required_calls: vec![],
             injection: None,
             report: None,
+            outcomes: vec![],
         },
     }
 }

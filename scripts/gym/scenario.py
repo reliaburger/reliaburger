@@ -28,9 +28,11 @@ PLATFORMS = ("reliaburger", "k8s")
 # scoring compares two words instead of judging prose.
 FAULT_KINDS = (
     "crash_loop",
+    "health_check_failing",
     "unschedulable",
     "node_partitioned",
     "relish_bug",
+    "binary_drift",
     # A Smoker fault someone injected (`relish gym run`'s paused-app and
     # killed-instance scenarios, #1683).
     "injected_fault",
@@ -58,7 +60,33 @@ FAULT_STEPS = {
     "k8s": {"node_partition": "@worker"},
 }
 
+# What the runner can hand the solver as the release's published files, in
+# `release/` of its working directory, for an offline `relish agent verify`.
+# `drifted`: a metadata.json for the version and platform the cluster runs,
+# naming other bytes than the gym built, as if a node's binary had been
+# swapped after the release.
+RELEASES = ("drifted",)
+
 DURATION_PATTERN = re.compile(r"^([0-9]+)(ms|s|m)$")
+
+# The token a solver gets. `read-only` investigates; `agent` is a deployer
+# agent token (#1682), which can't change the cluster but can propose a change
+# for a person to approve and take leases.
+SOLVER_TOKENS = ("read-only", "agent")
+
+# Who runs a scripted `run` step: a person (the runner's admin token), a
+# second agent with its own deployer agent token, or the solver's own token,
+# scripted after the solver has finished. A proposal scenario needs all three:
+# the person approves and undoes, the other agent holds a lease, and the
+# solver's token shows a lease handed over or an undo gone stale.
+ACTORS = ("person", "other-agent", "solver-token")
+# The other agent's token name, which a lease holder check can name.
+OTHER_AGENT = "gym-other-agent"
+# What a step's arguments may hold, which the runner fills in: the newest
+# proposal the solver made, and a scenario manifest written out for this
+# cluster.
+PROPOSAL_PLACEHOLDER = "@proposal"
+FILE_PLACEHOLDER = "@file:"
 
 
 class ScenarioError(ValueError):
@@ -69,14 +97,55 @@ class ScenarioError(ValueError):
 class SetupStep:
     """One thing the runner does, as admin, before the solver starts.
 
-    Exactly one of `apply`, `fault` or `settle` is set. `wait_running`
-    names an app whose instances must all run before the next step.
+    Exactly one of `apply`, `fault`, `settle` or `run` is set. `wait_running`
+    names an app whose instances must all run before the next step. `run` is
+    a `relish` command `actor` runs, which must succeed.
     """
 
     apply: str | None = None
     wait_running: str | None = None
     fault: dict | None = None
     settle_seconds: float | None = None
+    run: tuple[str, ...] | None = None
+    actor: str | None = None
+
+
+@dataclass(frozen=True)
+class Step:
+    """A `relish` command the runner runs after the solver, as `actor`.
+
+    Its answer isn't checked here: an `[[outcome]]` says what it should be,
+    and the scorer reads the recorded call.
+    """
+
+    actor: str
+    run: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class Outcome:
+    """What one command should have answered, read from the recorded calls.
+
+    `by` is `solver` (the solver's own calls) or one of ACTORS. It passes
+    when any of those calls whose command words start with `command` exited
+    with `exit` and, where given, carried the envelope error `code`, a lease
+    `holder` in that error, or a proposal in `state`.
+    """
+
+    by: str
+    command: str
+    exit: int
+    code: str | None = None
+    holder: str | None = None
+    state: str | None = None
+
+    def name(self):
+        """The check's name in a score: the command, its exit and what else it expects."""
+        text = f"{self.by} {self.command}: exit {self.exit}"
+        for label, value in (("", self.code), ("held by ", self.holder), ("state ", self.state)):
+            if value is not None:
+                text += f", {label}{value}"
+        return text
 
 
 @dataclass(frozen=True)
@@ -155,6 +224,15 @@ class Scenario:
     platform: str = "reliaburger"
     # For a port: what differs from the Reliaburger scenario, in a sentence.
     ported: str | None = None
+    # The release files the runner writes for the solver; see RELEASES.
+    release: str | None = None
+    solver_token: str = "read-only"
+    after: tuple[Step, ...] = ()
+    outcomes: tuple[Outcome, ...] = ()
+
+    def actors(self):
+        """Every actor a `run` step uses, before or after the solver."""
+        return {step.actor for step in (*self.setup, *self.after) if step.actor}
 
     def facts_needed(self):
         """The `@` facts this scenario's truth refers to."""
@@ -178,13 +256,42 @@ def _fail(path, message):
     raise ScenarioError(f"{path.name}: {message}")
 
 
+def _run_step(path, where, raw, actors):
+    """A `run` step's actor and arguments, checked."""
+    unknown = set(raw) - {"run", "as"}
+    if unknown:
+        _fail(path, f"{where} has unknown keys {sorted(unknown)}")
+    actor = raw.get("as")
+    if actor not in actors:
+        _fail(path, f"{where}: `as` must be one of {list(actors)}")
+    run = raw.get("run")
+    if not isinstance(run, list) or not run or not all(isinstance(a, str) and a for a in run):
+        _fail(path, f"{where}: `run` must be a list of the relish arguments")
+    for argument in run:
+        if argument.startswith(FILE_PLACEHOLDER):
+            manifest = GYM_DIR / argument[len(FILE_PLACEHOLDER):]
+            if not manifest.is_file() or manifest.suffix != ".toml":
+                _fail(path, f"{where} names {argument}, which isn't a .toml file in the gym")
+        elif argument.startswith("@") and argument != PROPOSAL_PLACEHOLDER:
+            _fail(path, f"{where}: {argument} isn't {PROPOSAL_PLACEHOLDER} or {FILE_PLACEHOLDER}PATH")
+    return actor, tuple(run)
+
+
 def _setup_step(path, index, raw, platform="reliaburger"):
     where = f"setup step {index + 1}"
     if not isinstance(raw, dict):
         _fail(path, f"{where} isn't a table")
-    actions = [key for key in ("apply", "fault", "settle") if key in raw]
+    actions = [key for key in ("apply", "fault", "settle", "run") if key in raw]
     if len(actions) != 1:
-        _fail(path, f"{where} needs exactly one of apply, fault or settle, got {actions or 'none'}")
+        _fail(path, f"{where} needs exactly one of apply, fault, settle or run, got {actions or 'none'}")
+    if "run" in raw:
+        if platform != "reliaburger":
+            _fail(path, f"{where}: a run step is a relish command, for a reliaburger scenario")
+        # Before the solver starts there's no solver token and no proposal.
+        actor, run = _run_step(path, where, raw, ("person", "other-agent"))
+        if PROPOSAL_PLACEHOLDER in run:
+            _fail(path, f"{where}: there's no {PROPOSAL_PLACEHOLDER} before the solver runs")
+        return SetupStep(run=run, actor=actor)
     unknown = set(raw) - {"apply", "fault", "settle", "wait_running"}
     if unknown:
         _fail(path, f"{where} has unknown keys {sorted(unknown)}")
@@ -226,7 +333,8 @@ def load(path):
         _fail(path, f"isn't valid TOML: {error}")
     known = {
         "id", "title", "nodes", "prompt", "setup", "truth", "score", "plant",
-        "injection", "report", "platform", "ported",
+        "injection", "report", "platform", "ported", "release", "solver_token", "after",
+        "outcome",
     }
     unknown = set(raw) - known
     if unknown:
@@ -325,6 +433,54 @@ def load(path):
                   f"{list(REPORT_RULES)} for a files draft, and none for an answer draft")
         report = ReportCheck(secrets=secrets, counted=counted, source=source)
 
+    release = raw.get("release")
+    if release is not None and (platform != "reliaburger" or release not in RELEASES):
+        _fail(path, f"`release` must be one of {list(RELEASES)}, on a reliaburger scenario")
+
+    solver_token = raw.get("solver_token", "read-only")
+    if solver_token not in SOLVER_TOKENS:
+        _fail(path, f"`solver_token` must be one of {list(SOLVER_TOKENS)}")
+    if platform != "reliaburger" and ("after" in raw or "outcome" in raw or solver_token != "read-only"):
+        # Proposals, leases and agent tokens are Reliaburger's (#1682).
+        _fail(path, "agent tokens, after steps and outcomes are for a reliaburger scenario")
+    after = []
+    for index, raw_step in enumerate(raw.get("after", [])):
+        where = f"after step {index + 1}"
+        if not isinstance(raw_step, dict):
+            _fail(path, f"{where} isn't a table")
+        actor, run = _run_step(path, where, raw_step, ACTORS)
+        if actor == "solver-token" and solver_token != "agent":
+            _fail(path, f"{where}: the solver-token actor needs solver_token = \"agent\"")
+        after.append(Step(actor=actor, run=run))
+    outcomes = []
+    for index, raw_outcome in enumerate(raw.get("outcome", [])):
+        where = f"outcome {index + 1}"
+        if not isinstance(raw_outcome, dict):
+            _fail(path, f"{where} isn't a table")
+        unknown = set(raw_outcome) - {"by", "command", "exit", "code", "holder", "state"}
+        if unknown:
+            _fail(path, f"{where} has unknown keys {sorted(unknown)}")
+        by = raw_outcome.get("by")
+        if by not in ("solver", *ACTORS):
+            _fail(path, f"{where}: `by` must be solver or one of {list(ACTORS)}")
+        command = raw_outcome.get("command")
+        if not isinstance(command, str) or not command.strip():
+            _fail(path, f"{where}: `command` must name the relish command, like \"agent propose\"")
+        exit_code = raw_outcome.get("exit")
+        if not isinstance(exit_code, int) or isinstance(exit_code, bool):
+            _fail(path, f"{where}: `exit` must be the exit code")
+        for name in ("code", "holder", "state"):
+            if name in raw_outcome and not isinstance(raw_outcome[name], str):
+                _fail(path, f"{where}: `{name}` must be a string")
+        if by != "solver" and not any(
+            step.actor == by and " ".join(step.run).startswith(command) for step in after
+        ):
+            _fail(path, f"{where}: no after step runs `{command}` as {by}")
+        outcomes.append(Outcome(
+            by=by, command=command, exit=exit_code, code=raw_outcome.get("code"),
+            holder=raw_outcome.get("holder"), state=raw_outcome.get("state"),
+        ))
+
     return Scenario(
         id=raw["id"],
         title=raw["title"],
@@ -340,6 +496,10 @@ def load(path):
         report=report,
         platform=platform,
         ported=ported.strip() if isinstance(ported, str) else None,
+        release=release,
+        solver_token=solver_token,
+        after=tuple(after),
+        outcomes=tuple(outcomes),
     )
 
 

@@ -161,6 +161,8 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Get, "/ui/fragment/apps", AnyToken),
     route(Get, "/ui/fragment/batches", AnyToken),
     route(Get, "/ui/fragment/nodes", AnyToken),
+    // The summary scopes itself, like `/v1/cluster/summary`.
+    route(Get, "/ui/fragment/summary", AnyToken),
     gated(Get, "/ui/fragment/alerts", AnyToken, Cluster(METRICS)),
     route(
         Get,
@@ -259,6 +261,25 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Get, "/v1/policies", AnyToken),
     route(Get, "/v1/policies/audit", AnyToken),
     gated(Post, "/v1/policies/{name}/delete", Admin, Cluster(ADMIN)),
+    // Agent leases (#1686): anyone may read them, filtered by scope;
+    // taking, renewing, releasing or breaking one needs `deploy` on the app,
+    // or on every app in the namespace, named in the body.
+    route(Get, "/v1/leases", AnyToken),
+    gated(Post, "/v1/leases", Deployer, Body(DEPLOY)),
+    gated(Post, "/v1/leases/renew", Deployer, Body(DEPLOY)),
+    gated(Post, "/v1/leases/release", Deployer, Body(DEPLOY)),
+    gated(Post, "/v1/leases/break", Deployer, Body(DEPLOY)),
+    // Agent proposals (#1682): anyone may read them, filtered by scope. A
+    // deployer of either kind proposes, with `deploy` (or `scale`) on every
+    // app; a person who covers every touched app approves, rejects or
+    // undoes; the author withdraws, which needs no `[permission]` action.
+    route(Get, "/v1/proposals", AnyToken),
+    gated(Post, "/v1/proposals", Deployer, Body(DEPLOY)),
+    route(Get, "/v1/proposals/{id}", AnyToken),
+    gated(Post, "/v1/proposals/{id}/approve", Deployer, Body(DEPLOY)),
+    gated(Post, "/v1/proposals/{id}/reject", Deployer, Body(DEPLOY)),
+    route(Post, "/v1/proposals/{id}/withdraw", Deployer),
+    gated(Post, "/v1/proposals/{id}/undo", Deployer, Body(DEPLOY)),
     // Chaos.
     route(Post, "/v1/chaos/reserve", System),
     route(Post, "/v1/chaos/fence", System),
@@ -670,6 +691,8 @@ mod tests {
         include_str!("api/identity.rs"),
         include_str!("api/internal.rs"),
         include_str!("api/join.rs"),
+        include_str!("api/leases.rs"),
+        include_str!("api/proposals.rs"),
         include_str!("api/logs.rs"),
         include_str!("api/metrics.rs"),
         include_str!("api/node_info.rs"),

@@ -406,6 +406,8 @@ async fn run_body(
         &progress.calls,
         &audit,
         &drafts,
+        // `relish gym run`'s scenarios script no one after the solver.
+        &[],
     );
     if let Some(problem) = &progress.answer_error {
         scored.answer_problems.insert(0, problem.clone());

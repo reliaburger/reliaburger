@@ -74,7 +74,16 @@ class Scenarios(unittest.TestCase):
             sorted(K8S),
             ["crash-loop", "log-injection", "partitioned-node", "report-redaction", "unschedulable"],
         )
-        self.assertEqual(set(RELIABURGER) - set(K8S), {"planted-logs-since"})
+        # Not ported: the planted bug is in Reliaburger's own source, the
+        # health restart asks for a decision record, which a kubelet keeps
+        # only as a pod event (#1685), the release drift checks Reliaburger's
+        # own published release (#1689), and proposals, leases and agent
+        # tokens are Reliaburger's (#1682).
+        self.assertEqual(
+            set(RELIABURGER) - set(K8S),
+            {"health-restart", "planted-logs-since", "release-drift", "propose-rollback",
+             "proposal-guardrail", "two-agents", "stale-proposal"},
+        )
         self.assertTrue(all(s.platform == "k8s" and s.ported for s in K8S.values()))
         self.assertTrue(all(s.platform == "reliaburger" for s in RELIABURGER.values()))
 
@@ -462,7 +471,7 @@ class Parity(unittest.TestCase):
     def test_a_typo_the_parser_refused_is_recorded_not_counted_on_both(self):
         theirs, ours = self.both(
             "crash-loop", CRASH_ANSWER,
-            [self.call(["relish", "apps"], 2)],
+            [self.call(["relish", "deploys"], 2)],
             [self.call(["kubectl", "apps"], 1, 'error: unknown command "apps" for "kubectl"')],
         )
         self.same(theirs, ours)

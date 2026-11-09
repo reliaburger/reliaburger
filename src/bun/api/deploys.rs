@@ -372,6 +372,27 @@ pub(super) async fn deploys_history_handler(
 ///
 /// An app GitOps manages is refused without `?force=true`: the next sync
 /// would put back what git declares (#693).
+/// The spec a rollback goes back to when the council has no released one
+/// (after a crash loop, say): the newest successful deploy in every node's
+/// history that differs from `current`. `relish rollback` and a proposed
+/// rollback (#1682) both fall back to it, so they pick the same spec.
+pub(super) async fn history_rollback_target(
+    state: &ApiState,
+    app: &str,
+    namespace: &str,
+    current: Option<&crate::config::app::AppSpec>,
+) -> Option<crate::config::app::AppSpec> {
+    // Every node's records, not just this one's: the node asked may never
+    // have run the app.
+    let history: Vec<DeployHistoryEntry> = cluster_deploy_history(state, app, namespace, false)
+        .await
+        .history
+        .into_iter()
+        .map(|tagged| tagged.row)
+        .collect();
+    crate::bun::cluster_view::rollback_target(&history, current)
+}
+
 pub(super) async fn rollback_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     binder: Option<axum::Extension<crate::pickle::binding::ImageBinder>>,
@@ -445,18 +466,7 @@ pub(super) async fn rollback_handler(
     };
     let target_spec = match released {
         Some(target) => Some(target),
-        None => {
-            // Every node's records, not just this one's: the node asked may
-            // never have run the app.
-            let history: Vec<DeployHistoryEntry> =
-                cluster_deploy_history(&state, &app, &namespace, false)
-                    .await
-                    .history
-                    .into_iter()
-                    .map(|tagged| tagged.row)
-                    .collect();
-            crate::bun::cluster_view::rollback_target(&history, current.as_ref())
-        }
+        None => history_rollback_target(&state, &app, &namespace, current.as_ref()).await,
     };
 
     let Some(mut spec) = target_spec else {

@@ -1,11 +1,12 @@
-//! The README's "Everything relish can do" section, rendered from the CLI.
+//! The manual's "Every relish command" section, rendered from the CLI.
 //!
 //! The clap definitions in `src/bin/relish.rs` are the one source of truth
 //! for relish's commands and their one-line help. This module walks that
 //! command tree and writes it out as Markdown, grouped by what an operator is
 //! trying to do, with each group linking to the manual chapter that explains
 //! it properly. A test in the relish binary compares the result with the
-//! marked region of `README.md`, so the list can't drift from the CLI.
+//! marked region of [`REFERENCE_CHAPTER`], so the list can't drift from the
+//! CLI.
 
 use std::fmt::Write as _;
 
@@ -13,25 +14,28 @@ use clap::{Arg, ArgAction, Command};
 
 use super::released_cli::ReleasedCli;
 
-/// Opens the generated region of `README.md`.
+/// The manual chapter that holds the generated list, from the repository root.
+pub const REFERENCE_CHAPTER: &str = "docs/manual/13_reference.md";
+
+/// Opens the generated region of [`REFERENCE_CHAPTER`].
 pub const START_MARKER: &str = "<!-- relish-commands:start -->";
 
-/// Closes the generated region of `README.md`.
+/// Closes the generated region of [`REFERENCE_CHAPTER`].
 pub const END_MARKER: &str = "<!-- relish-commands:end -->";
 
 /// The command that rewrites the region, quoted in every staleness failure.
-pub const REGENERATE_COMMAND: &str = "make readme-commands";
+pub const REGENERATE_COMMAND: &str = "make reference-commands";
 
 /// A manual chapter a group of commands links to.
 #[derive(Debug, Clone, Copy)]
 pub struct Guide {
     /// Link text.
     pub label: &'static str,
-    /// Path relative to the repository root.
+    /// Path relative to [`REFERENCE_CHAPTER`]'s directory, `docs/manual`.
     pub path: &'static str,
 }
 
-/// A set of top-level commands that belong together in the README.
+/// A set of top-level commands that belong together in the reference.
 #[derive(Debug, Clone, Copy)]
 pub struct CommandGroup {
     /// Heading shown above the commands.
@@ -42,20 +46,20 @@ pub struct CommandGroup {
     pub commands: &'static [&'static str],
 }
 
-/// Every visible top-level relish command, grouped for the README.
+/// Every visible top-level relish command, grouped for the reference.
 ///
-/// A new command must be added here, or the README test fails and says so.
+/// A new command must be added here, or the reference test fails and says so.
 pub const GROUPS: &[CommandGroup] = &[
     CommandGroup {
         title: "Set up and run a cluster",
         guides: &[
             Guide {
                 label: "getting started",
-                path: "docs/manual/00_getting-started.md",
+                path: "00_getting-started.md",
             },
             Guide {
                 label: "cluster basics",
-                path: "docs/manual/02_cluster-basics.md",
+                path: "02_cluster-basics.md",
             },
         ],
         commands: &[
@@ -75,16 +79,17 @@ pub const GROUPS: &[CommandGroup] = &[
         guides: &[
             Guide {
                 label: "deploy an app",
-                path: "docs/manual/01_deploy-an-app.md",
+                path: "01_deploy-an-app.md",
             },
             Guide {
                 label: "writing a controller",
-                path: "docs/manual/15_writing-a-controller.md",
+                path: "15_writing-a-controller.md",
             },
         ],
         commands: &[
             "apply",
             "status",
+            "apps",
             "inspect",
             "exec",
             "deploy",
@@ -105,11 +110,11 @@ pub const GROUPS: &[CommandGroup] = &[
         guides: &[
             Guide {
                 label: "deploy an app",
-                path: "docs/manual/01_deploy-an-app.md",
+                path: "01_deploy-an-app.md",
             },
             Guide {
                 label: "coming from Kubernetes",
-                path: "docs/manual/09_kubernetes.md",
+                path: "09_kubernetes.md",
             },
         ],
         commands: &["lint", "fmt", "compile", "diff", "import", "export"],
@@ -118,7 +123,7 @@ pub const GROUPS: &[CommandGroup] = &[
         title: "Networking",
         guides: &[Guide {
             label: "networking and ingress",
-            path: "docs/manual/03_networking.md",
+            path: "03_networking.md",
         }],
         commands: &["resolve", "routes"],
     },
@@ -126,7 +131,7 @@ pub const GROUPS: &[CommandGroup] = &[
         title: "Watch what's running",
         guides: &[Guide {
             label: "observability",
-            path: "docs/manual/04_observability.md",
+            path: "04_observability.md",
         }],
         commands: &[
             "tui",
@@ -137,13 +142,14 @@ pub const GROUPS: &[CommandGroup] = &[
             "logs-export",
             "logs-search",
             "events",
+            "timeline",
         ],
     },
     CommandGroup {
         title: "Diagnose and test",
         guides: &[Guide {
             label: "diagnostics",
-            path: "docs/manual/07_diagnostics.md",
+            path: "07_diagnostics.md",
         }],
         commands: &["wtf", "path", "test", "bench"],
     },
@@ -151,15 +157,15 @@ pub const GROUPS: &[CommandGroup] = &[
         title: "Work with an AI agent",
         guides: &[Guide {
             label: "working with an AI agent",
-            path: "docs/manual/16_working-with-an-ai-agent.md",
+            path: "16_working-with-an-ai-agent.md",
         }],
-        commands: &["agent", "mcp"],
+        commands: &["agent", "mcp", "lease", "proposal", "undo"],
     },
     CommandGroup {
         title: "Break things on purpose",
         guides: &[Guide {
             label: "chaos",
-            path: "docs/manual/05_chaos.md",
+            path: "05_chaos.md",
         }],
         commands: &["fault", "gym"],
     },
@@ -167,7 +173,7 @@ pub const GROUPS: &[CommandGroup] = &[
         title: "Security and access",
         guides: &[Guide {
             label: "security and access",
-            path: "docs/manual/10_security.md",
+            path: "10_security.md",
         }],
         commands: &["token", "secret", "ca", "sign", "audit", "policy"],
     },
@@ -175,7 +181,7 @@ pub const GROUPS: &[CommandGroup] = &[
         title: "Images and volumes",
         guides: &[Guide {
             label: "images and volumes",
-            path: "docs/manual/11_images-and-volumes.md",
+            path: "11_images-and-volumes.md",
         }],
         commands: &["images", "build", "snapshot"],
     },
@@ -183,15 +189,15 @@ pub const GROUPS: &[CommandGroup] = &[
         title: "Upgrades and GitOps",
         guides: &[Guide {
             label: "operations",
-            path: "docs/manual/12_operations.md",
+            path: "12_operations.md",
         }],
-        commands: &["upgrade", "gitops"],
+        commands: &["upgrade", "verify", "gitops"],
     },
     CommandGroup {
         title: "Learn",
         guides: &[Guide {
             label: "under the hood",
-            path: "docs/manual/06_under-the-hood.md",
+            path: "06_under-the-hood.md",
         }],
         commands: &["manual", "source"],
     },
@@ -199,14 +205,14 @@ pub const GROUPS: &[CommandGroup] = &[
         title: "Contributor tools",
         guides: &[Guide {
             label: "dev cluster",
-            path: "docs/README.md#dev-cluster",
+            path: "../README.md#dev-cluster",
         }],
         commands: &["dev"],
     },
 ];
 
 /// The published release the installer fetches, and how to label commands it
-/// lacks. The README is written on the development branch, so without labels
+/// lacks. The manual is written on the development branch, so without labels
 /// it would offer commands a fresh install rejects.
 #[derive(Debug, Clone)]
 pub struct Availability<'a> {
@@ -220,11 +226,11 @@ pub struct Availability<'a> {
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum CommandReferenceError {
     #[error(
-        "relish command {0:?} is in no README group; add it to GROUPS in src/relish/command_reference.rs"
+        "relish command {0:?} is in no reference group; add it to GROUPS in src/relish/command_reference.rs"
     )]
     Ungrouped(String),
     #[error(
-        "README group {group:?} lists {command:?}, which relish does not have; remove it from GROUPS"
+        "reference group {group:?} lists {command:?}, which relish does not have; remove it from GROUPS"
     )]
     UnknownCommand {
         group: &'static str,
@@ -234,7 +240,8 @@ pub enum CommandReferenceError {
     MissingMarkers,
 }
 
-/// Renders the collapsible command reference for `cli`, grouped by `groups`.
+/// Renders the command reference for `cli`, grouped by `groups`, one `###`
+/// heading per group.
 ///
 /// Hidden commands and clap's built-in `help` are left out. Every other
 /// top-level command must appear in exactly one group. With `availability`,
@@ -257,16 +264,20 @@ pub fn render(
     }
 
     let mut out = String::new();
-    out.push_str("<details>\n<summary><strong>Everything relish can do</strong></summary>\n\n");
+    // An HTML comment: GitHub and `relish manual` both leave it out, so the
+    // note reaches contributors editing the file and no one else.
+    let _ = writeln!(
+        out,
+        "<!-- Generated from relish's own command definitions: \
+         run `{REGENERATE_COMMAND}` after changing them. -->\n"
+    );
     out.push_str(
         "Run `relish` with no command for the terminal UI. `relish help COMMAND` \
-         (or `--help` anywhere) lists every flag, and the \
-         [reference](docs/manual/13_reference.md) covers global flags, \
-         environment variables and exit codes. This list is generated from \
-         relish's own command definitions; run `",
+         (or `--help` anywhere) lists every flag; the sections above cover \
+         [global flags](#relish-global-flags), \
+         [environment variables](#environment-variables) and \
+         [exit codes](#exit-codes).\n",
     );
-    out.push_str(REGENERATE_COMMAND);
-    out.push_str("` after changing them.\n");
 
     for group in groups {
         let links: Vec<String> = group
@@ -275,7 +286,15 @@ pub fn render(
             .map(|guide| format!("[{}]({})", guide.label, guide.path))
             .collect();
         // Writing to a String can't fail.
-        let _ = write!(out, "\n**{}** ({})\n\n", group.title, links.join(", "));
+        let _ = write!(out, "\n### {}\n\n", group.title);
+        if let Some((last, rest)) = links.split_last() {
+            let list = if rest.is_empty() {
+                last.clone()
+            } else {
+                format!("{} and {last}", rest.join(", "))
+            };
+            let _ = write!(out, "See {list}.\n\n");
+        }
         for &name in group.commands {
             let command = visible
                 .iter()
@@ -294,7 +313,6 @@ pub fn render(
         }
     }
 
-    out.push_str("\n</details>\n");
     Ok(out)
 }
 
@@ -421,7 +439,7 @@ mod tests {
             title: "Apps",
             guides: &[Guide {
                 label: "deploy an app",
-                path: "docs/manual/01_deploy-an-app.md",
+                path: "01_deploy-an-app.md",
             }],
             commands: &["status", "exec"],
         },
@@ -429,7 +447,7 @@ mod tests {
             title: "Chaos",
             guides: &[Guide {
                 label: "chaos",
-                path: "docs/manual/05_chaos.md",
+                path: "05_chaos.md",
             }],
             commands: &["fault"],
         },
@@ -478,17 +496,56 @@ mod tests {
     #[test]
     fn each_group_is_headed_and_links_to_its_manual_chapter() {
         let out = render(&cli(), TEST_GROUPS, None).unwrap();
-        assert!(out.contains("\n**Apps** ([deploy an app](docs/manual/01_deploy-an-app.md))\n"));
-        assert!(out.contains("\n**Chaos** ([chaos](docs/manual/05_chaos.md))\n"));
-        assert!(out.find("**Apps**").unwrap() < out.find("**Chaos**").unwrap());
+        assert!(out.contains("\n### Apps\n\nSee [deploy an app](01_deploy-an-app.md).\n\n"));
+        assert!(out.contains("\n### Chaos\n\nSee [chaos](05_chaos.md).\n\n"));
+        assert!(out.find("### Apps").unwrap() < out.find("### Chaos").unwrap());
     }
 
     #[test]
-    fn the_section_collapses_behind_a_summary() {
+    fn the_regenerate_command_is_only_in_a_comment_readers_dont_see() {
         let out = render(&cli(), TEST_GROUPS, None).unwrap();
-        assert!(out.starts_with("<details>\n<summary>"));
-        assert!(out.ends_with("</details>\n"));
-        assert!(out.contains(REGENERATE_COMMAND));
+        let comment_end = out.find("-->").unwrap();
+        assert!(out.starts_with("<!-- "));
+        assert!(out[..comment_end].contains(REGENERATE_COMMAND));
+        assert!(!out[comment_end..].contains(REGENERATE_COMMAND));
+        assert!(
+            !out.contains("<details>"),
+            "the manual's reader can't fold HTML"
+        );
+    }
+
+    #[test]
+    fn a_group_without_guides_links_nothing() {
+        let groups = &[CommandGroup {
+            title: "Everything",
+            guides: &[],
+            commands: &["status", "exec", "fault"],
+        }];
+        let out = render(&cli(), groups, None).unwrap();
+        assert!(out.contains("\n### Everything\n\n- `relish status`"));
+        assert!(!out.contains("See ."));
+    }
+
+    #[test]
+    fn two_guides_read_as_a_sentence() {
+        let groups = &[CommandGroup {
+            title: "Apps",
+            guides: &[
+                Guide {
+                    label: "deploy an app",
+                    path: "01_deploy-an-app.md",
+                },
+                Guide {
+                    label: "chaos",
+                    path: "05_chaos.md",
+                },
+            ],
+            commands: &["status", "exec", "fault"],
+        }];
+        let out = render(&cli(), groups, None).unwrap();
+        assert!(
+            out.contains("See [deploy an app](01_deploy-an-app.md) and [chaos](05_chaos.md).\n")
+        );
     }
 
     #[test]
