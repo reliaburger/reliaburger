@@ -1420,3 +1420,56 @@ fn propose_with_a_token_relish_mcp_didnt_make_warns() {
     assert!(warning.contains("--agent"), "{warning}");
     assert!(!warning.contains('\n'), "one line: {warning}");
 }
+
+/// When the saved context's token turns out not to be admin, `--propose`
+/// has no agent token to make and sends the context's own, a person's. It
+/// says so once, the first time the cluster answers, and never for a
+/// read-only server, which proposes nothing.
+#[test]
+fn propose_from_a_context_that_isnt_admin_warns_once() {
+    assert_eq!(
+        context_token_warning(credentials::Purpose::Propose, false),
+        Some(CONTEXT_TOKEN_WARNING)
+    );
+    assert_eq!(
+        context_token_warning(credentials::Purpose::Propose, true),
+        None,
+        "already said"
+    );
+    for known in [false, true] {
+        assert_eq!(
+            context_token_warning(credentials::Purpose::Read, known),
+            None
+        );
+    }
+    let warning = CONTEXT_TOKEN_WARNING;
+    assert!(warning.contains("author.kind"), "{warning}");
+    assert!(warning.contains("--agent"), "{warning}");
+    assert!(!warning.contains('\n'), "one line: {warning}");
+}
+
+/// A `--propose` server whose context token gets a 403 from the admin-only
+/// probe sends that token, makes none, and knows it's the context's own.
+#[tokio::test]
+async fn a_propose_server_whose_context_isnt_admin_sends_the_contexts_token() {
+    let directory = tempfile::tempdir().unwrap();
+    let (url, _seen) = token_cluster(false, &[]).await;
+    let managed = Managed::new(
+        directory.path().join("mcp-propose-token-shop.json"),
+        credentials::Scope {
+            owner: "laptop".to_string(),
+            endpoint: "https://127.0.0.1:19117".to_string(),
+            namespace: Some("shop".to_string()),
+            purpose: credentials::Purpose::Propose,
+        },
+        crate::relish::client::BunClient::new_with_token(&url, Some("rbrg_a_person")),
+    );
+    assert_eq!(managed.ensure().await.unwrap(), None);
+    assert!(managed.state.lock().await.context_not_admin);
+    assert!(
+        !directory
+            .path()
+            .join("mcp-propose-token-shop.json")
+            .exists()
+    );
+}

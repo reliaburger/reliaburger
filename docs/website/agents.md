@@ -928,8 +928,10 @@ From the saved admin context it makes one itself, confined to `--namespace`,
 in `mcp-propose-token-<namespace>.json`, and refuses to start without
 `--namespace`: an unscoped one could propose in every namespace. Given a
 token by `--token` or `RELIABURGER_TOKEN`, it warns on stderr that it can't
-tell a person's token from an agent's. A person's proposals are that
-person's, and a guardrail matching `author.kind == "agent"` doesn't see them.
+tell a person's token from an agent's. It warns too when the saved context's
+token turns out not to be admin, since it then sends that token. A person's
+proposals are that person's, and a guardrail matching `author.kind ==
+"agent"` doesn't see them.
 
 Three flags narrow what it offers:
 

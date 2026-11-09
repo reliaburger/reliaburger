@@ -804,8 +804,9 @@ From the saved admin context it makes one itself, confined to <code>--namespace<
 in <code>mcp-propose-token-&lt;namespace&gt;.json</code>, and refuses to start without
 <code>--namespace</code>: an unscoped one could propose in every namespace. Given a
 token by <code>--token</code> or <code>RELIABURGER_TOKEN</code>, it warns on stderr that it can't
-tell a person's token from an agent's. A person's proposals are that
-person's, and a guardrail matching <code>author.kind == "agent"</code> doesn't see them.</p>
+tell a person's token from an agent's. It warns too when the saved context's
+token turns out not to be admin, since it then sends that token. A person's
+proposals are that person's, and a guardrail matching <code>author.kind == "agent"</code> doesn't see them.</p>
 <p>Three flags narrow what it offers:</p>
 <table><thead><tr><th>Flag</th><th>Meaning</th></tr></thead><tbody>
 <tr><td><code>--toolsets source,manual</code></td><td>Only the tools whose command starts with one of these words</td></tr>

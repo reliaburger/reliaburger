@@ -1733,8 +1733,13 @@ could be `degraded` in `relish apps` and `pending` on the page. Now
 apps` make. It passes `nodes_unanswered: false`, which is true here: the
 statuses come from every node or the call fails. A blocked app reads
 `down` in the table, as it does in `relish apps`, and its page still says
-`Not placed, blocked:` and why. The status dots learned the new words:
-amber for `degraded`, red for `down`.
+`Not placed, blocked:` and why. That reason comes from the council's desired
+state, not from the rollup, and
+`brioche_says_why_a_quota_blocked_app_isnt_placed_on_every_node` in
+[`tests/placement.rs`](../../tests/placement.rs) holds it there: three real
+nodes, a namespace with one CPU, and an app asking for two, whose page on
+every node must say it's blocked by the quota. The status dots learned the
+new words: amber for `degraded`, red for `down`.
 
 ## Logs and the manual
 
@@ -6882,6 +6887,16 @@ relish mcp already uses (`GET /v1/token/list`) tells admin from not-admin,
 not a person from an agent. So `person_token_warning` warns on stderr for
 every token `relish mcp` didn't make itself. It's noisy for someone who did
 hand it an agent token, and honest: relish can't tell, so it says so.
+
+The same probe closes one case relish *can* tell. A saved context whose
+token isn't admin gets a 403 from `/v1/token/list`, so `obtain` answers
+`Credential::ContextNotAdmin` and relish mcp sends the context's own token,
+which is a person's. `context_token_warning` takes the server's `Purpose`
+and whether the cluster had already said so, and a proposing server warns
+the first time only. A read-only server stays quiet, because it proposes
+nothing. The check sits in `Managed::obtain`, where the answer arrives,
+rather than in `run`: the probe happens on the first tool call, not at
+start-up.
 
 ### The tests
 
