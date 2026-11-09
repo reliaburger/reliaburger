@@ -205,6 +205,17 @@ the budget that would fit.
 Through `relish mcp` the default is smaller: 8 KiB for every tool, `guide`
 and `schema` included (see [Through MCP](#through-mcp)).
 
+`guide` doesn't trim like the rest. When the whole chapter doesn't fit,
+it answers with an outline: `data.scope` is `outline`, `data.contents`
+lists every section's id, heading and size, and `data.sections` holds the
+sections to read first, whole. `--section ID` reads one section; one too
+big for its budget is cut between paragraphs and marked `truncated`.
+
+```sh
+relish agent guide --max-bytes 8192
+relish agent guide --section the-envelope
+```
+
 ## Text the cluster didn't write
 
 Some answers quote text that Reliaburger didn't write: an app's log lines,
@@ -277,10 +288,11 @@ what this binary has; `relish agent --help` says the same.
 relish agent guide
 ```
 
-`data.sections` holds it one section at a time, each with its `heading` and
-its `markdown`, and `data.commands` lists the commands above. Given a
-`--max-bytes` under its 80 KiB default, the last sections go first, and the
-`next` step asks for a `--max-bytes` that fits it all.
+`data.sections` holds it one section at a time, each with its `id`,
+`heading` and `markdown`, and `data.commands` lists the commands above.
+Given a `--max-bytes` too small for all of it, it answers with an outline
+instead: the contents and the sections to read first (see [Byte
+budgets](#byte-budgets)). `--section ID` prints one section.
 
 `relish agent schema` prints the JSON Schema of the envelope and every
 command's `data`. All together they're over the default budget, so name the
@@ -960,7 +972,9 @@ passes `max_bytes`. That's also the default each tool's schema advertises,
 because a model tends to send whatever default it reads there. `--max-bytes`
 sets it for every tool, from 1024 to 131072. No call gets more than 131072
 bytes (128 KiB), whatever it asks for, which still fits the whole guide in
-one answer. A cut answer says so, as on the command line.
+one answer. A cut answer says so, as on the command line. At 8 KiB the
+`guide` tool answers with its outline, and its `section` argument reads one
+section at a time.
 
 ```sh
 relish mcp --max-bytes 24576
@@ -1088,16 +1102,22 @@ adds the server to it, and `goose configure` picks Ollama and the model.
 A small model has a small window, and Reliaburger's answers are sized for a
 large one. Three habits keep it working:
 
-- **Don't read the whole guide.** `relish agent guide` is about 68 KB, some
-  17,000 tokens, which fills a 16K window on its own. Use `manual_search`
-  and `manual_show` for the section you need.
+- **Read the guide a section at a time.** The whole guide is about 75 KB,
+  some 18,000 tokens, which fills a 16K window on its own. When it doesn't
+  fit the budget, the `guide` tool answers with an outline instead: the
+  contents, each section with its size, and the two sections to read first
+  ("In brief" and "The contract"), whole. Its `next` names the section to
+  read after them, and `relish agent guide --section ID` (the tool's
+  `section`) reads any other. A section that doesn't fit is cut between
+  paragraphs, marked `truncated`, and says so.
 - **Keep answers small.** `relish mcp` holds every answer to 8 KiB, about
   2,000 tokens, unless the model asks for more, and the conversation is
   sent again on every turn. At an 8K window, start it with `--max-bytes
   4096`.
-- **Offer fewer tools.** The 14 tools' descriptions and schemas cost about
-  3,000 tokens on every turn. `--toolsets context,diagnose,explain,logs,manual`
-  keeps the six a diagnosis needs, for about 1,300:
+- **Offer fewer tools.** The 14 tools' names, descriptions and input
+  schemas are about 9,900 bytes, some 2,500 tokens, on every turn.
+  `--toolsets context,diagnose,explain,logs,manual` keeps the six a
+  diagnosis needs, for about 1,100:
 
 ```sh
 relish mcp --toolsets context,diagnose,explain,logs,manual

@@ -237,6 +237,14 @@ enough for the whole answer.</li>
 the budget that would fit.</p>
 <p>Through <code>relish mcp</code> the default is smaller: 8 KiB for every tool, <code>guide</code>
 and <code>schema</code> included (see <a href="#through-mcp">Through MCP</a>).</p>
+<p><code>guide</code> doesn't trim like the rest. When the whole chapter doesn't fit,
+it answers with an outline: <code>data.scope</code> is <code>outline</code>, <code>data.contents</code>
+lists every section's id, heading and size, and <code>data.sections</code> holds the
+sections to read first, whole. <code>--section ID</code> reads one section; one too
+big for its budget is cut between paragraphs and marked <code>truncated</code>.</p>
+<pre><code class="language-sh">relish agent guide --max-bytes 8192
+relish agent guide --section the-envelope
+</code></pre>
 </section>
 <section class="agents-section" id="text-the-cluster-didnt-write">
 <h2>Text the cluster didn't write <a class="permalink" href="#text-the-cluster-didnt-write" aria-label="Link to this section">#</a></h2>
@@ -302,10 +310,11 @@ what this binary has; <code>relish agent --help</code> says the same.</p>
 <p><code>relish agent guide</code> prints this chapter:</p>
 <pre><code class="language-sh">relish agent guide
 </code></pre>
-<p><code>data.sections</code> holds it one section at a time, each with its <code>heading</code> and
-its <code>markdown</code>, and <code>data.commands</code> lists the commands above. Given a
-<code>--max-bytes</code> under its 80 KiB default, the last sections go first, and the
-<code>next</code> step asks for a <code>--max-bytes</code> that fits it all.</p>
+<p><code>data.sections</code> holds it one section at a time, each with its <code>id</code>,
+<code>heading</code> and <code>markdown</code>, and <code>data.commands</code> lists the commands above.
+Given a <code>--max-bytes</code> too small for all of it, it answers with an outline
+instead: the contents and the sections to read first (see <a href="#byte-budgets">Byte
+budgets</a>). <code>--section ID</code> prints one section.</p>
 <p><code>relish agent schema</code> prints the JSON Schema of the envelope and every
 command's <code>data</code>. All together they're over the default budget, so name the
 command you need; each fits on its own:</p>
@@ -829,7 +838,9 @@ passes <code>max_bytes</code>. That's also the default each tool's schema advert
 because a model tends to send whatever default it reads there. <code>--max-bytes</code>
 sets it for every tool, from 1024 to 131072. No call gets more than 131072
 bytes (128 KiB), whatever it asks for, which still fits the whole guide in
-one answer. A cut answer says so, as on the command line.</p>
+one answer. A cut answer says so, as on the command line. At 8 KiB the
+<code>guide</code> tool answers with its outline, and its <code>section</code> argument reads one
+section at a time.</p>
 <pre><code class="language-sh">relish mcp --max-bytes 24576
 </code></pre>
 <p><code>--namespace</code> narrows what the agent asks for. It isn't a permission: a
@@ -928,15 +939,21 @@ adds the server to it, and <code>goose configure</code> picks Ollama and the mod
 <p>A small model has a small window, and Reliaburger's answers are sized for a
 large one. Three habits keep it working:</p>
 <ul>
-<li><strong>Don't read the whole guide.</strong> <code>relish agent guide</code> is about 68 KB, some
-17,000 tokens, which fills a 16K window on its own. Use <code>manual_search</code>
-and <code>manual_show</code> for the section you need.</li>
+<li><strong>Read the guide a section at a time.</strong> The whole guide is about 75 KB,
+some 18,000 tokens, which fills a 16K window on its own. When it doesn't
+fit the budget, the <code>guide</code> tool answers with an outline instead: the
+contents, each section with its size, and the two sections to read first
+("In brief" and "The contract"), whole. Its <code>next</code> names the section to
+read after them, and <code>relish agent guide --section ID</code> (the tool's
+<code>section</code>) reads any other. A section that doesn't fit is cut between
+paragraphs, marked <code>truncated</code>, and says so.</li>
 <li><strong>Keep answers small.</strong> <code>relish mcp</code> holds every answer to 8 KiB, about
 2,000 tokens, unless the model asks for more, and the conversation is
 sent again on every turn. At an 8K window, start it with <code>--max-bytes 4096</code>.</li>
-<li><strong>Offer fewer tools.</strong> The 14 tools' descriptions and schemas cost about
-3,000 tokens on every turn. <code>--toolsets context,diagnose,explain,logs,manual</code>
-keeps the six a diagnosis needs, for about 1,300:</li>
+<li><strong>Offer fewer tools.</strong> The 14 tools' names, descriptions and input
+schemas are about 9,900 bytes, some 2,500 tokens, on every turn.
+<code>--toolsets context,diagnose,explain,logs,manual</code> keeps the six a
+diagnosis needs, for about 1,100:</li>
 </ul>
 <pre><code class="language-sh">relish mcp --toolsets context,diagnose,explain,logs,manual
 </code></pre>

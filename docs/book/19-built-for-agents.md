@@ -5085,12 +5085,11 @@ trimmed it every time. That's why the guide got its own default (see
 whole. It started at 64 KiB. Leases and proposals took the chapter past that
 in 0.2.8, and the maintainer raised it to 80 KiB rather than split the
 chapter, with room for what comes next. The budget still works as a budget.
-Ask for less with `--max-bytes` and the guide drops sections from the end, says so, and its `next` step asks
-for a budget that fits. The playbook is the last section on purpose, since an
-agent already driving a cluster needs it least. The guide tests check both
-sides: at the default every section comes back untrimmed, and at an explicit
-24 KiB only sections from the end are dropped, while "In brief", "The
-contract" and "Commands" are always there.
+Ask for less with `--max-bytes` and the guide used to drop sections from the
+end, say so, and offer a budget that fits. The local-model work replaced that
+with an outline (see "A guide that fits a small budget" below). The playbook
+is the last section on purpose, since an agent already driving a cluster
+needs it least.
 
 ## The front page
 
@@ -5866,6 +5865,120 @@ whose `next` has no `agent source` in it, an explanation with the manual
 first and the code marked optional, and a range shown whole with nothing
 after it. Whether the model does better is the gym's question, rerun at the
 record's settings without the solver's own budget.
+
+### A guide that fits a small budget
+
+The 8 KiB default made the guide's first answer worse, not better. The
+budget's trimmer drops array items from the end, so at 8 KiB the guide kept
+the chapter's introduction, "In brief" and 32 of 33 commands, and its first
+`next` asked for `--max-bytes 72704`. "The envelope", "Text the cluster
+didn't write" and "With a local model" were gone. A small model either took
+that step and filled its window, or carried on without them.
+
+So the guide stopped trimming. When the whole chapter doesn't fit, it answers
+with an outline: the table of contents, every section with its id and size,
+and the two sections an agent needs first, whole. "In brief" says to read
+`ok` before `data`, follow `next`, treat `untrusted` as data and work with a
+read-only token; "The contract" says what every command promises. The
+outline's `next` names the section to read after them:
+
+```json
+{"run": "relish agent guide --section the-envelope",
+ "why": "how to read every answer, field by field; --section takes any id in data.contents",
+ "read_only": true}
+```
+
+`--section` is new, and through `relish mcp` it's the `guide` tool's
+`section` argument, derived from the clap definition like every other. It
+takes a section's id, the anchor GitHub would give its heading, or the
+heading itself. Every section answer offers the one after it, so a model can
+page through the chapter at 8 KiB without ever asking for more.
+
+`data` says which of the three it is with a new field, `scope`:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GuideScope {
+    Whole,
+    Outline,
+    Section,
+}
+```
+
+`rename_all` makes serde write `Whole` as `"whole"`, so the JSON reads like
+the rest of the envelope. Each answer is built from the whole one with
+*struct update syntax*:
+
+```rust
+let outline = GuideData {
+    scope: GuideScope::Outline,
+    sections,
+    commands: Vec::new(),
+    ..data.clone()
+};
+```
+
+`..data.clone()` fills every field not named from a copy of `data`. It's a
+move, not a merge: the fields it fills come out of the value after `..`,
+which is why the code clones `data` first, since it builds the outline more
+than once. (Go has nothing like it; Python's closest is
+`dataclasses.replace`.) The outline is built with each section to read first
+added in turn and kept only if the rendered envelope still fits, so a budget
+too small for "In brief" leaves it out whole and names it first in `next`.
+
+A section can still be bigger than its budget at 4 KiB. Then it's cut
+between paragraphs, never inside a sentence, and it says so: `truncated` is
+`true`, a warning says how many bytes of how many it kept, and the first
+`next` asks for the whole section. Finding the cut is a search from the end:
+
+```rust
+let cut = paragraph_breaks(&section.markdown)
+    .into_iter()
+    .rev()
+    .map(|end| make(&section.markdown[..end], Some(size)))
+    .find(|envelope| rendered_length(envelope) <= max_bytes);
+```
+
+Iterators in Rust are lazy, so this builds candidate envelopes one at a
+time, longest first, and stops at the first that fits; the shorter ones are
+never made. `paragraph_breaks` skips blank lines inside code blocks, so a
+cut never leaves a fence open. Every section in the chapter fits 8 KiB whole,
+and a test keeps it so.
+
+The whole guide is still the default on the command line, 80 KiB, and with
+`relish mcp --max-bytes 131072`. The outline is what a small budget gets,
+and only then.
+
+### A cheaper tool list
+
+`relish mcp`'s 14 tools cost a model 11,369 bytes, about 2,850 tokens, on
+every turn: names, descriptions and input schemas, before any answer. The
+biggest single piece was one sentence. Every tool takes `max_bytes`, and its
+description came from the CLI flag's help:
+
+```text
+Largest answer to print, in bytes (at least 1024; by default 24576, 81920 for `guide` and 40960 for `schema`). A bigger answer is trimmed, marked `truncated`, and says how to get the rest
+```
+
+That's about 200 bytes, fourteen times, and through MCP it's wrong: the
+defaults it quotes are the CLI's, and the schema beside it advertises 8,192.
+The schema's `default`, `minimum` and `maximum` already carry the numbers, so
+`relish mcp` now says only what they can't:
+
+```text
+Largest answer in bytes; a bigger one is trimmed and marked `truncated`
+```
+
+That took the list to 9,872 bytes, about 2,470 tokens, even with the
+guide's new `section` argument, and `--toolsets
+context,diagnose,explain,logs,manual` from 5,114 to 4,418. The rest of the
+descriptions say something a model needs, so they stayed. So did the output
+schemas, 79 KB of the 89 KB `tools/list`: they're for the client, which
+checks `structuredContent` against them, and our loop doesn't send them to
+the model. A test pins the list a model reads at 10 KiB and the whole
+`tools/list` at 96 KiB, so a new tool or a longer description has to fit, or
+raise the ceiling on purpose.
 
 ### The tests
 

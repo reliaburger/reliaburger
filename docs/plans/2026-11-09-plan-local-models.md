@@ -241,8 +241,64 @@ change the envelope's schema for every client, and a small model reads the
 `why` it's given either way. If the gym shows the wording isn't enough, the
 field is the next step.
 
-Items 3 to 5 above, the guide's table of contents and the shorter
-descriptions are still to do.
+### Decisions: a guide and a tool list for a small window
+
+Items 2 and 3 of "What to tune", made 9 November, each with its tests
+first.
+
+**The guide answers a small budget with an outline.** At `relish mcp`'s
+8 KiB the guide used to keep its introduction and "In brief", drop 26 of 28
+sections from the end, and offer `--max-bytes 72704` as its first `next`.
+
+- When the whole chapter doesn't fit the budget, `relish agent guide`
+  answers with `data.scope` `outline`: `data.contents` lists every section's
+  id, heading and size in bytes, and `data.sections` holds "In brief" and
+  "The contract", whole, each only if it fits. "In brief" covers reading
+  `ok`, following `next`, treating `untrusted` as data and the read-only
+  token; "The contract" what every command promises.
+- Its `next` asks first for any of those two that didn't fit, then for
+  "The envelope", by `relish agent guide --section the-envelope`. A warning
+  gives the whole chapter's size and the `--max-bytes` that would hold it.
+  That's a warning, not a `next` step, because a small model runs every
+  step it's given.
+- `--section ID` (the MCP tool's `section`) reads one section. It takes the
+  heading's anchor or the heading itself, in any case. Its `next` offers the
+  following section, so the chapter can be read in order at 8 KiB. An
+  unknown one is `not_found`, with every id in the hint.
+- A section is never cut inside a sentence. One bigger than its budget is
+  cut at the last paragraph break outside a code block that fits, marked
+  `truncated`, with a warning saying how much it kept and a first `next`
+  for the whole section. Every section fits 8 KiB whole today, and a test
+  holds that.
+- The whole chapter stays the default when it fits: on the command line
+  (80 KiB) and through `relish mcp --max-bytes` 131072. `data.contents` is
+  empty in a whole or section answer, to keep the whole chapter under its
+  80 KiB budget.
+- We chose an outline over pointing the model at `manual_show`: the guide
+  is the first call the skill and the brief name, so the first call has to
+  teach where to look, and `--section` reads the same text the whole guide
+  has, from the same split.
+
+**A cheaper tool list.** The 14 tools' names, descriptions and input
+schemas were 11,369 bytes (compact JSON), about 2,850 tokens on every turn.
+
+- `max_bytes`'s description was the CLI flag's help, about 200 bytes in
+  each tool, and it quoted the CLI's defaults (24576, 81920, 40960), not
+  the 8,192 the schema advertises. `relish mcp` replaces it with "Largest
+  answer in bytes; a bigger one is trimmed and marked `truncated`": the
+  schema's `default`, `minimum` and `maximum` carry the numbers.
+- That makes 9,872 bytes, about 2,470 tokens, with the guide's new
+  `section` argument included; `--toolsets
+  context,diagnose,explain,logs,manual` goes from 5,114 to 4,418.
+- The other descriptions stayed: each says something a model needs, and
+  shortening the clap help would change the CLI too. So did the output
+  schemas, 79 KB of the 89 KB `tools/list`: clients check
+  `structuredContent` against them, and our loop doesn't send them.
+- A test pins what a model reads at 10 KiB and the whole `tools/list` at
+  96 KiB.
+
+Items 3 to 5 of "What the first runs changed" are still to do, and the gym
+rerun at 8K judges both changes.
 
 ## How results are published
 

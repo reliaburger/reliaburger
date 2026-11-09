@@ -309,11 +309,37 @@ fn one_line(text: &str) -> String {
 /// One `## ` section of the chapter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct GuideSection {
+    /// What `--section` takes: the heading's anchor, such as `through-mcp`.
+    pub id: String,
     /// The heading, without `## `. The first section has the chapter's
     /// title.
     pub heading: String,
     /// Everything under the heading, as Markdown.
     pub markdown: String,
+}
+
+/// One line of the chapter's table of contents.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct ContentsEntry {
+    /// What `--section` takes: the heading's anchor, such as `through-mcp`.
+    pub id: String,
+    /// The heading, without `## `.
+    pub heading: String,
+    /// The size of the section's Markdown, in bytes.
+    pub bytes: usize,
+}
+
+/// How much of the chapter an answer holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GuideScope {
+    /// Every section: the whole chapter fitted the budget.
+    Whole,
+    /// The contents and the sections to read first: the whole chapter
+    /// didn't fit the budget, and `next` says how to read the rest.
+    Outline,
+    /// The one section `--section` asked for.
+    Section,
 }
 
 /// `data` for `relish agent guide`.
@@ -323,13 +349,39 @@ pub struct GuideData {
     pub chapter: String,
     /// The chapter's title.
     pub title: String,
-    /// The chapter, one section at a time and in order. A trimmed answer
-    /// drops sections from the end.
+    /// Whether `sections` is the whole chapter, an outline's first
+    /// sections, or the one section asked for.
+    pub scope: GuideScope,
+    /// An outline's table of contents: every section of the chapter, in
+    /// order, with its id and size. Empty otherwise: the whole chapter has
+    /// every section, and a `section` answer follows an outline.
+    pub contents: Vec<ContentsEntry>,
+    /// The sections this answer holds, in order. Only a `truncated`
+    /// section answer cuts one, at a paragraph break.
     pub sections: Vec<GuideSection>,
     /// Every `relish agent` command this binary has, from its own CLI
-    /// definition.
+    /// definition. Empty unless `scope` is `whole`: the `commands` section
+    /// has the same table.
     pub commands: Vec<CommandSummary>,
 }
+
+/// `relish agent guide`'s arguments.
+#[derive(Debug, Clone, clap::Args)]
+pub struct GuideArgs {
+    /// Only this section, by its id in `contents` (such as `the-envelope`)
+    /// or its heading.
+    #[arg(long)]
+    pub section: Option<String>,
+}
+
+/// The sections an outline holds, in order, when they fit: how to read an
+/// answer, follow `next`, treat `untrusted` text as data and work
+/// read-only, then the promises every command keeps.
+pub const READ_FIRST: &[&str] = &["in-brief", "the-contract"];
+
+/// The section an outline's `next` offers after [`READ_FIRST`]: every
+/// field of the envelope.
+pub const READ_NEXT: &str = "the-envelope";
 
 /// The chapter split at its `## ` headings, outside code fences, with the
 /// marker comments taken out.
@@ -350,8 +402,10 @@ pub fn sections(chapter: &str) -> (String, Vec<GuideSection>) {
             continue;
         }
         if !in_fence && let Some(next) = line.strip_prefix("## ") {
+            let heading = std::mem::replace(&mut heading, next.trim().to_string());
             sections.push(GuideSection {
-                heading: std::mem::replace(&mut heading, next.trim().to_string()),
+                id: slug(&heading),
+                heading,
                 markdown: std::mem::take(&mut body).trim().to_string(),
             });
             continue;
@@ -360,34 +414,266 @@ pub fn sections(chapter: &str) -> (String, Vec<GuideSection>) {
         body.push('\n');
     }
     sections.push(GuideSection {
+        id: slug(&heading),
         heading,
         markdown: body.trim().to_string(),
     });
     (title, sections)
 }
 
-/// `data` for `relish agent guide` from a chapter and the CLI definition.
+/// `data` for `relish agent guide` from a chapter and the CLI definition:
+/// the whole chapter.
 pub fn guide_data(chapter: &str, agent: &Command) -> GuideData {
     let (title, sections) = sections(chapter);
     GuideData {
         chapter: CHAPTER_FILE.to_string(),
         title,
+        scope: GuideScope::Whole,
+        contents: sections
+            .iter()
+            .map(|section| ContentsEntry {
+                id: section.id.clone(),
+                heading: section.heading.clone(),
+                bytes: section.markdown.len(),
+            })
+            .collect(),
         sections,
         commands: commands(agent),
     }
 }
 
-/// The envelope `relish agent guide` prints for `chapter`.
+/// The envelope `relish agent guide` prints for the whole of `chapter`.
 pub fn guide_envelope(chapter: &str, agent: &Command, relish: BuildInfo) -> Envelope<GuideData> {
-    Envelope::answered(CommandName::Guide, relish, guide_data(chapter, agent)).with_next(NextStep {
+    let data = GuideData {
+        contents: Vec::new(),
+        ..guide_data(chapter, agent)
+    };
+    Envelope::answered(CommandName::Guide, relish, data).with_next(NextStep {
         run: "relish agent source version".to_string(),
         why: "which source this relish carries, and whether the nodes run it".to_string(),
         read_only: true,
     })
 }
 
+/// Where in `sections` the one `wanted` names is, by id or heading, in any
+/// case, with or without a leading `#`.
+fn find_section(sections: &[GuideSection], wanted: &str) -> Option<usize> {
+    let wanted = slug(wanted.trim().trim_start_matches('#'));
+    sections.iter().position(|section| section.id == wanted)
+}
+
+/// A `next` step that reads the section `id`.
+fn read_section(id: &str, why: String) -> NextStep {
+    NextStep {
+        run: format!("relish agent guide --section {id}"),
+        why,
+        read_only: true,
+    }
+}
+
+/// The envelope for `relish agent guide --section wanted`, or why there's
+/// no such section.
+///
+/// A section bigger than `max_bytes` is cut at the last paragraph break
+/// that fits, outside code blocks, never inside a sentence: the answer is
+/// marked `truncated`, a warning says how much it kept, and the first
+/// `next` step asks for the whole section.
+fn section_envelope(
+    data: GuideData,
+    wanted: &str,
+    relish: BuildInfo,
+    max_bytes: usize,
+) -> Result<Envelope<GuideData>, AgentError> {
+    let Some(index) = find_section(&data.sections, wanted) else {
+        let ids: Vec<&str> = data
+            .contents
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect();
+        return Err(AgentError::new(
+            ErrorCode::NotFound,
+            format!("the guide has no section {wanted:?}"),
+        )
+        .with_hint(format!("sections: {}", ids.join(", "))));
+    };
+    let following = data.contents.get(index + 1).cloned();
+    let section = data.sections[index].clone();
+    // The contents came with the outline; a section answer leaves them out
+    // so the section has the budget to itself.
+    let make = |markdown: &str, whole: Option<usize>| {
+        let one = GuideData {
+            chapter: data.chapter.clone(),
+            title: data.title.clone(),
+            scope: GuideScope::Section,
+            contents: Vec::new(),
+            sections: vec![GuideSection {
+                markdown: markdown.to_string(),
+                ..section.clone()
+            }],
+            commands: Vec::new(),
+        };
+        let mut envelope = Envelope::answered(CommandName::Guide, relish.clone(), one);
+        if let Some(whole) = whole {
+            envelope = envelope
+                .mark_truncated()
+                .with_warning(format!(
+                    "guide_section_cut: {} is {} bytes and this is its first {}, up to a \
+                     paragraph break",
+                    section.id,
+                    section.markdown.len(),
+                    markdown.len()
+                ))
+                .with_next(NextStep {
+                    run: format!(
+                        "relish agent guide --section {} --max-bytes {}",
+                        section.id,
+                        whole.div_ceil(1024) * 1024
+                    ),
+                    why: format!("the whole section, {whole} bytes"),
+                    read_only: true,
+                });
+        }
+        if let Some(entry) = &following {
+            envelope = envelope.with_next(read_section(
+                &entry.id,
+                format!(
+                    "the next section, {:?}, {} bytes",
+                    entry.heading, entry.bytes
+                ),
+            ));
+        }
+        envelope
+    };
+    let whole = make(&section.markdown, None);
+    let size = rendered_length(&whole);
+    if size <= max_bytes {
+        return Ok(whole);
+    }
+    let cut = paragraph_breaks(&section.markdown)
+        .into_iter()
+        .rev()
+        .map(|end| make(&section.markdown[..end], Some(size)))
+        .find(|envelope| rendered_length(envelope) <= max_bytes);
+    Ok(cut.unwrap_or_else(|| make("", Some(size))))
+}
+
+/// The byte offsets of the blank lines in `markdown` outside code blocks:
+/// the places a section can be cut between paragraphs.
+fn paragraph_breaks(markdown: &str) -> Vec<usize> {
+    let mut breaks = Vec::new();
+    let mut offset: usize = 0;
+    let mut in_fence = false;
+    for line in markdown.split_inclusive('\n') {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+        }
+        if !in_fence && line.trim().is_empty() {
+            // Cut before the blank line, so the kept part ends with text.
+            breaks.push(offset.saturating_sub(1));
+        }
+        offset += line.len();
+    }
+    breaks
+}
+
+/// One line of JSON's length, newline included, as [`render`] counts it.
+fn rendered_length<T: Serialize>(envelope: &Envelope<T>) -> usize {
+    serde_json::to_vec(envelope).map_or(usize::MAX, |json| json.len() + 1)
+}
+
+/// The outline of the chapter, for a budget too small for all of it: the
+/// contents, as many of [`READ_FIRST`] as fit whole, and `next` steps to
+/// the ones that didn't and to [`READ_NEXT`]. `whole` is the whole
+/// answer's size in bytes.
+fn outline_envelope(
+    data: GuideData,
+    relish: BuildInfo,
+    whole: usize,
+    max_bytes: usize,
+) -> Envelope<GuideData> {
+    let warning = format!(
+        "guide_outline: the whole chapter is {whole} bytes, more than this budget of \
+         {max_bytes}, so this is its contents and the sections to read first, each whole; \
+         read another with --section ID, or all of it with --max-bytes {}",
+        whole.div_ceil(1024) * 1024
+    );
+    let build = |sections: Vec<GuideSection>| {
+        let mut steps = Vec::new();
+        for id in READ_FIRST {
+            let kept = sections.iter().any(|section| section.id == *id);
+            if let (false, Some(entry)) = (kept, data.contents.iter().find(|e| e.id == *id)) {
+                steps.push(read_section(
+                    id,
+                    format!(
+                        "read this first, {} bytes; it didn't fit this budget",
+                        entry.bytes
+                    ),
+                ));
+            }
+        }
+        steps.push(read_section(
+            READ_NEXT,
+            "how to read every answer, field by field; --section takes any id in data.contents"
+                .to_string(),
+        ));
+        let outline = GuideData {
+            scope: GuideScope::Outline,
+            sections,
+            commands: Vec::new(),
+            ..data.clone()
+        };
+        let envelope = Envelope::answered(CommandName::Guide, relish.clone(), outline)
+            .with_warning(warning.clone());
+        steps.into_iter().fold(envelope, Envelope::with_next)
+    };
+    let mut kept: Vec<GuideSection> = Vec::new();
+    for id in READ_FIRST {
+        let Some(section) = data.sections.iter().find(|section| section.id == *id) else {
+            continue;
+        };
+        let mut tried = kept.clone();
+        tried.push(section.clone());
+        if rendered_length(&build(tried.clone())) <= max_bytes {
+            kept = tried;
+        }
+    }
+    build(kept)
+}
+
+/// The answer to `relish agent guide` over `chapter`: the one section
+/// `section` names; else the whole chapter when it fits `max_bytes`; else
+/// its outline, which holds only whole sections.
+pub fn answer(
+    chapter: &str,
+    agent: &Command,
+    relish: BuildInfo,
+    section: Option<&str>,
+    max_bytes: usize,
+    rerun: &str,
+) -> Rendered {
+    let max_bytes = max_bytes.max(super::MIN_MAX_BYTES);
+    if let Some(wanted) = section {
+        let data = guide_data(chapter, agent);
+        return match section_envelope(data, wanted, relish.clone(), max_bytes) {
+            Ok(envelope) => render(&envelope, max_bytes, rerun),
+            Err(error) => render(
+                &Envelope::<()>::failed(CommandName::Guide, relish, error),
+                max_bytes,
+                rerun,
+            ),
+        };
+    }
+    let whole = guide_envelope(chapter, agent, relish.clone());
+    let size = rendered_length(&whole);
+    if size <= max_bytes {
+        return render(&whole, max_bytes, rerun);
+    }
+    let outline = outline_envelope(guide_data(chapter, agent), relish, size, max_bytes);
+    render(&outline, max_bytes, rerun)
+}
+
 /// Run `relish agent guide` against the chapter embedded in this binary.
-pub fn run(max_bytes: usize, rerun: &str) -> Rendered {
+pub fn run(max_bytes: usize, section: Option<&str>, rerun: &str) -> Rendered {
     let Some(asset) = crate::relish::manual::assets::ManualAssets::get(CHAPTER_FILE) else {
         let error = AgentError::new(
             ErrorCode::Internal,
@@ -396,8 +682,11 @@ pub fn run(max_bytes: usize, rerun: &str) -> Rendered {
         return super::failure(CommandName::Guide, error, max_bytes, rerun);
     };
     let chapter = String::from_utf8_lossy(asset.data.as_ref());
-    render(
-        &guide_envelope(&chapter, &agent_command(), BuildInfo::current()),
+    answer(
+        &chapter,
+        &agent_command(),
+        BuildInfo::current(),
+        section,
         max_bytes,
         rerun,
     )
@@ -1319,7 +1608,7 @@ Intro paragraph.\n\n## In brief\n\n\
     /// The headings `relish agent guide` answers with at `max_bytes`, and
     /// whether it said it trimmed any.
     fn guide_headings(max_bytes: usize) -> (Vec<String>, serde_json::Value) {
-        let rendered = run(max_bytes, "relish agent guide");
+        let rendered = run(max_bytes, None, "relish agent guide");
         assert_eq!(rendered.exit, super::super::ExitStatus::Answered);
         let value: serde_json::Value = serde_json::from_str(&rendered.json).unwrap();
         assert_eq!(value["command"], "guide");
@@ -1364,7 +1653,7 @@ Intro paragraph.\n\n## In brief\n\n\
     /// Outgrowing that is the same choice again, made deliberately.
     #[test]
     fn the_agent_chapter_fits_the_guides_default_budget() {
-        let rendered = run(1024 * 1024, "relish agent guide");
+        let rendered = run(1024 * 1024, None, "relish agent guide");
         let whole = rendered.json.len();
         assert!(
             whole <= super::super::GUIDE_MAX_BYTES,
@@ -1374,27 +1663,211 @@ Intro paragraph.\n\n## In brief\n\n\
         );
     }
 
-    /// An explicit `--max-bytes` still wins. At the 24 KiB every other
-    /// command defaults to, the chapter doesn't fit, so the budget keeps the
-    /// front (the brief, the contract, the command table), drops sections
-    /// only from the end, and says how to get the rest.
+    /// The guide answered at `max_bytes`, for `section` if given, as JSON.
+    fn guide_at(max_bytes: usize, section: Option<&str>) -> serde_json::Value {
+        let rendered = run(max_bytes, section, "relish agent guide");
+        serde_json::from_str(&rendered.json).unwrap()
+    }
+
+    /// Every section's Markdown in the embedded chapter, by id.
+    fn embedded_sections() -> Vec<GuideSection> {
+        let asset = crate::relish::manual::assets::ManualAssets::get(CHAPTER_FILE).unwrap();
+        sections(&String::from_utf8_lossy(asset.data.as_ref())).1
+    }
+
+    /// A budget smaller than the chapter used to drop sections from the
+    /// end, which at MCP's 8 KiB left a small model the introduction and
+    /// half the brief. Now it answers with the contents, each section with
+    /// its size, and the sections to read first, each whole, and `next`
+    /// names the section after them (#1687).
     #[test]
-    fn an_explicit_smaller_budget_drops_trailing_sections() {
-        let (headings, value) = guide_headings(super::super::DEFAULT_MAX_BYTES);
-        let (whole, _) = guide_headings(super::super::GUIDE_MAX_BYTES);
-        assert_eq!(value["truncated"], true);
-        assert!(
-            headings.len() < whole.len() && headings[..] == whole[..headings.len()],
-            "only sections from the end go: {headings:?}"
-        );
-        for kept in ["In brief", "The contract", "Commands"] {
-            assert!(headings.iter().any(|h| h == kept), "{kept}: {headings:?}");
+    fn a_budget_smaller_than_the_chapter_answers_with_its_outline() {
+        let whole = guide_at(1024 * 1024, None);
+        assert_eq!(whole["data"]["scope"], "whole");
+        assert_eq!(whole["data"]["contents"], serde_json::json!([]));
+        let all = embedded_sections();
+        for budget in [8 * 1024, super::super::DEFAULT_MAX_BYTES] {
+            let value = guide_at(budget, None);
+            assert_eq!(value["ok"], true);
+            assert_eq!(value["data"]["scope"], "outline", "{budget}");
+            assert_eq!(value["truncated"], false, "nothing is cut: {budget}");
+            let kept: Vec<&str> = value["data"]["sections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|section| section["id"].as_str().unwrap())
+                .collect();
+            assert_eq!(kept, READ_FIRST, "{budget}");
+            for section in value["data"]["sections"].as_array().unwrap() {
+                let id = section["id"].as_str().unwrap();
+                let original = all.iter().find(|s| s.id == id).unwrap();
+                assert_eq!(
+                    section["markdown"],
+                    original.markdown.as_str(),
+                    "whole: {id}"
+                );
+            }
+            assert_eq!(
+                value["next"][0]["run"],
+                format!("relish agent guide --section {READ_NEXT}")
+            );
+            let warning = value["warnings"][0].as_str().unwrap();
+            assert!(warning.starts_with("guide_outline: "), "{warning}");
+            assert!(value.to_string().len() < budget);
         }
-        let rerun = value["next"][0]["run"].as_str().unwrap();
-        assert!(
-            rerun.starts_with("relish agent guide --max-bytes "),
-            "{rerun}"
+    }
+
+    /// The table of contents lists every section once, in order, with the
+    /// size of its Markdown.
+    #[test]
+    fn the_contents_list_every_section_with_its_size() {
+        let value = guide_at(8 * 1024, None);
+        let contents = value["data"]["contents"].as_array().unwrap();
+        let all = embedded_sections();
+        assert_eq!(contents.len(), all.len());
+        for (entry, section) in contents.iter().zip(&all) {
+            assert_eq!(entry["id"], section.id.as_str());
+            assert_eq!(entry["heading"], section.heading.as_str());
+            assert_eq!(entry["bytes"], section.markdown.len());
+        }
+        let ids: Vec<&str> = all.iter().map(|section| section.id.as_str()).collect();
+        for id in READ_FIRST.iter().chain([&READ_NEXT]) {
+            assert!(ids.contains(id), "{id} isn't a section: {ids:?}");
+        }
+        let unique: std::collections::BTreeSet<&str> = ids.iter().copied().collect();
+        assert_eq!(unique.len(), ids.len(), "section ids repeat: {ids:?}");
+    }
+
+    /// When a budget is too small for a section to read first, the outline
+    /// leaves it out whole, keeps any later one that fits, and its `next`
+    /// asks for the one left out, by name, rather than cutting it.
+    #[test]
+    fn a_section_to_read_first_that_doesnt_fit_is_named_in_next() {
+        let value = guide_at(4 * 1024, None);
+        assert_eq!(value["data"]["scope"], "outline");
+        assert_eq!(value["truncated"], false);
+        let kept: Vec<&str> = value["data"]["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|section| section["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(kept, ["the-contract"]);
+        let runs: Vec<&str> = value["next"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|step| step["run"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            runs,
+            [
+                "relish agent guide --section in-brief",
+                "relish agent guide --section the-envelope",
+            ]
         );
+    }
+
+    /// `--section` takes an id or a heading, in any case, answers with that
+    /// one section whole, and offers the next one.
+    #[test]
+    fn a_section_is_found_by_id_or_heading_and_offers_the_next() {
+        for wanted in ["through-mcp", "Through MCP", "#through-mcp"] {
+            let value = guide_at(8 * 1024, Some(wanted));
+            assert_eq!(value["ok"], true, "{wanted}");
+            assert_eq!(value["data"]["scope"], "section");
+            assert_eq!(value["data"]["commands"], serde_json::json!([]));
+            let sections = value["data"]["sections"].as_array().unwrap();
+            assert_eq!(sections.len(), 1);
+            assert_eq!(sections[0]["heading"], "Through MCP");
+            assert_eq!(
+                value["next"][0]["run"],
+                "relish agent guide --section wiring-up-your-agent"
+            );
+        }
+    }
+
+    /// The last section has no next one to offer.
+    #[test]
+    fn the_last_section_offers_no_next_section() {
+        let last = embedded_sections().pop().unwrap();
+        let value = guide_at(8 * 1024, Some(&last.id));
+        assert_eq!(value["data"]["sections"][0]["id"], last.id.as_str());
+        assert_eq!(value["next"], serde_json::json!([]));
+    }
+
+    /// An unknown section is `not_found`, and the hint lists every id.
+    #[test]
+    fn an_unknown_section_is_not_found_and_lists_the_ids() {
+        let rendered = run(8 * 1024, Some("no-such-section"), "relish agent guide");
+        assert_ne!(rendered.exit, super::super::ExitStatus::Answered);
+        let value: serde_json::Value = serde_json::from_str(&rendered.json).unwrap();
+        assert_eq!(value["error"]["code"], "not_found");
+        let hint = value["error"]["hint"].as_str().unwrap();
+        assert!(
+            hint.contains("in-brief") && hint.contains("through-mcp"),
+            "{hint}"
+        );
+    }
+
+    /// A section bigger than its budget is cut between paragraphs, never
+    /// inside a sentence, and says so: `truncated`, a warning with what it
+    /// kept, and a first `next` step that asks for the whole section.
+    #[test]
+    fn a_section_bigger_than_its_budget_is_cut_between_paragraphs_and_says_so() {
+        let original = embedded_sections()
+            .into_iter()
+            .find(|section| section.id == "through-mcp")
+            .unwrap()
+            .markdown;
+        for budget in [1024, 2048, 4096] {
+            let value = guide_at(budget, Some("through-mcp"));
+            assert!(value.to_string().len() < budget, "{budget}");
+            assert_eq!(value["truncated"], true, "{budget}");
+            let kept = value["data"]["sections"][0]["markdown"].as_str().unwrap();
+            assert!(original.starts_with(kept), "{budget}: a prefix");
+            assert!(
+                kept.is_empty() || original[kept.len()..].starts_with("\n\n"),
+                "{budget}: cut at a paragraph break: {kept:?}"
+            );
+            let warning = value["warnings"][0].as_str().unwrap();
+            assert!(
+                warning.starts_with("guide_section_cut: through-mcp is "),
+                "{warning}"
+            );
+            assert!(
+                value["next"][0]["run"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("relish agent guide --section through-mcp --max-bytes "),
+                "{}",
+                value["next"]
+            );
+        }
+        let kept = guide_at(4096, Some("through-mcp"))["data"]["sections"][0]["markdown"]
+            .as_str()
+            .unwrap()
+            .len();
+        assert!(kept > 1024, "4 KiB keeps most of what fits: {kept}");
+    }
+
+    /// A blank line inside a code block isn't a paragraph break.
+    #[test]
+    fn paragraph_breaks_skip_code_blocks() {
+        let markdown = "One.\n\n```sh\na\n\nb\n```\n\nTwo.";
+        let breaks = paragraph_breaks(markdown);
+        let cuts: Vec<&str> = breaks.iter().map(|&end| &markdown[..end]).collect();
+        assert_eq!(cuts, ["One.", "One.\n\n```sh\na\n\nb\n```"]);
+    }
+
+    /// Every section of the chapter fits MCP's 8 KiB default whole, so
+    /// following an outline's `next` never meets a cut section.
+    #[test]
+    fn every_section_fits_mcps_default_budget_whole() {
+        for section in embedded_sections() {
+            let value = guide_at(8 * 1024, Some(&section.id));
+            assert_eq!(value["truncated"], false, "{} is cut at 8 KiB", section.id);
+        }
     }
 
     #[test]
