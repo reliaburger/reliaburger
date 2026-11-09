@@ -545,7 +545,7 @@ See [working with an AI agent](16_working-with-an-ai-agent.md).
     - `relish agent lease take <app|namespace> <NAME>`: Take a lease before changing an app or a namespace, or renew yours *(0.2.8, not in 0.2.7)*
     - `relish agent lease renew <app|namespace> <NAME>`: Extend a lease you hold *(0.2.8, not in 0.2.7)*
     - `relish agent lease release <app|namespace> <NAME>`: Give up a lease you hold *(0.2.8, not in 0.2.7)*
-  - `relish agent propose --reason <REASON> <apply|scale|rollback|stop|delete> <TARGET>`: Propose a change for a person to approve: apply, scale, rollback, stop or delete. Shows the summary, blast radius and undo command *(0.2.8, not in 0.2.7)*
+  - `relish agent propose --reason <REASON> <apply|scale|rollback|stop|delete|restart|cancel-deploy|clear-fault> <TARGET>`: Propose a change for a person to approve: apply, scale, rollback, stop or delete. Shows the summary, blast radius and undo command *(0.2.8, not in 0.2.7)*
   - `relish agent proposals [ID]`: Proposals you can see, newest first; one when given its number *(0.2.8, not in 0.2.7)*
   - `relish agent withdraw <ID>`: Withdraw a pending proposal you made *(0.2.8, not in 0.2.7)*
   - `relish agent undo --reason <REASON> <ID>`: Propose undoing an applied proposal, for a person to approve *(0.2.8, not in 0.2.7)*

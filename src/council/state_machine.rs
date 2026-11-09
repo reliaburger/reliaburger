@@ -105,6 +105,10 @@ struct StateMachineInner {
     /// When set, snapshots are persisted here so applied state survives a
     /// restart (the durable log replays only the post-snapshot tail).
     db: Option<Arc<Database>>,
+    /// Set while a proposal writes its apps (#1682): each app ends at
+    /// exactly the spec the proposal showed, restart stamp and all, so an
+    /// AppSpec write doesn't keep the stored stamp.
+    exact_app_writes: bool,
 }
 
 // Manual Debug: `redb::Database` isn't `Debug`, and its contents aren't useful
@@ -2875,6 +2879,15 @@ impl StateMachineInner {
             Err(ApplyBlock::Fail(why)) => return failed(self, why),
             Ok(targets) => targets,
         };
+        // The blast radius again, from this state: an approver was shown
+        // the one computed when it was made, and approves only that much
+        // (#1682). Every node computes the same answer from the same state.
+        let grew = self.state.proposals.get(id).and_then(|proposal| {
+            crate::proposal::build::blast_radius_growth(&self.state, proposal)
+        });
+        if let Some(what) = grew {
+            return failed(self, FailedReason::BlastRadiusGrew { what });
+        }
         if let Some(why) = refusal {
             return failed(self, why.clone());
         }
@@ -2959,6 +2972,7 @@ impl StateMachineInner {
     ) -> Result<(), String> {
         let mut staged = StateMachineInner {
             state: self.state.clone(),
+            exact_app_writes: true,
             ..Default::default()
         };
         for (app, target) in targets {
@@ -3089,6 +3103,23 @@ impl StateMachineInner {
         app_id: &crate::meat::types::AppId,
         spec: &crate::config::app::AppSpec,
     ) {
+        // A write without a restart stamp keeps the stored one (#1682): a
+        // file never carries it, and applying the same file after a
+        // restart mustn't restart every instance again. A proposal writes
+        // exactly what it showed, so cancelling a restart's rollout can put
+        // the unstamped spec back.
+        let carried;
+        let stored_stamp = self.state.apps.get(app_id).and_then(|old| old.restarted_at);
+        let spec = match (spec.restarted_at, stored_stamp) {
+            (None, Some(at)) if !self.exact_app_writes => {
+                carried = crate::config::app::AppSpec {
+                    restarted_at: Some(at),
+                    ..spec.clone()
+                };
+                &carried
+            }
+            _ => spec,
+        };
         // A redeploy that changes the replica baseline invalidates any
         // autoscale override: the operator has re-declared the desired count.
         let baseline_changed = self
@@ -11848,6 +11879,8 @@ mod tests {
             replicas: Some(replicas),
             config: None,
             of: None,
+            fault: None,
+            node: None,
             reason: "p99 over the SLO".to_string(),
             ttl_seconds: None,
             idempotency_key: None,
@@ -11888,6 +11921,106 @@ mod tests {
 
     fn web_app() -> AppId {
         AppId::new("web", "shop")
+    }
+
+    /// #1682: an app write without a restart stamp keeps the stored one,
+    /// so applying the same file after a restart restarts nothing. A
+    /// proposal writes exactly what it showed, so cancelling the rollout
+    /// of a first restart can put the unstamped spec back.
+    #[test]
+    fn a_write_keeps_the_restart_stamp_but_a_proposal_writes_exactly() {
+        use crate::proposal::ProposalOutcome;
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::AppSpec {
+            app_id: web_app(),
+            spec: shop_web(3),
+        });
+        inner.apply_request(&RaftRequest::RolloutReleased {
+            app_id: web_app(),
+            spec: shop_web(3),
+        });
+        let mut stamped = shop_web(3);
+        stamped.restarted_at = Some(500);
+        inner.apply_request(&RaftRequest::AppSpec {
+            app_id: web_app(),
+            spec: stamped,
+        });
+        inner.apply_request(&RaftRequest::AppSpec {
+            app_id: web_app(),
+            spec: shop_web(3),
+        });
+        assert_eq!(inner.state.apps[&web_app()].restarted_at, Some(500));
+
+        let request = crate::proposal::ProposalRequest {
+            kind: crate::proposal::RequestKind::CancelDeploy,
+            namespace: Some("shop".to_string()),
+            app: Some("web".to_string()),
+            replicas: None,
+            config: None,
+            of: None,
+            fault: None,
+            node: None,
+            reason: "the restart is failing".to_string(),
+            ttl_seconds: None,
+            idempotency_key: None,
+        };
+        let proposal = crate::proposal::build::build(
+            &inner.state,
+            &request,
+            &proposer("holmes", crate::sesame::types::TokenKind::Agent),
+            1_000,
+            crate::proposal::build::as_declared,
+        )
+        .unwrap();
+        assert!(matches!(
+            proposal_outcome(inner.apply_request(&RaftRequest::ProposalCreate {
+                proposal: Box::new(proposal),
+                observed_at_unix_ms: 1_000,
+            })),
+            ProposalOutcome::Created { .. }
+        ));
+        match proposal_outcome(inner.apply_request(&approve_entry(1, 0, 2_000))) {
+            ProposalOutcome::Applied { .. } => {}
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(inner.state.apps[&web_app()].restarted_at, None);
+    }
+
+    /// The state machine computes the blast radius again from its own
+    /// state when a proposal is approved. Placed on a node it didn't show,
+    /// the proposal fails and nothing is written.
+    #[test]
+    fn approval_fails_when_the_blast_radius_grew() {
+        use crate::proposal::{FailedReason, ProposalOutcome, ProposalState};
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::AppSpec {
+            app_id: web_app(),
+            spec: shop_web(3),
+        });
+        let create = scale_proposal(&inner.state, 5, 1_000);
+        inner.apply_request(&create);
+        inner.state.scheduling.insert(
+            web_app(),
+            vec![crate::meat::types::Placement {
+                node_id: crate::meat::types::NodeId::new("node-c"),
+                resources: crate::meat::types::Resources::default(),
+                ordinal: 0,
+            }],
+        );
+        match proposal_outcome(inner.apply_request(&approve_entry(1, 0, 2_000))) {
+            ProposalOutcome::Failed { proposal } => match &proposal.state {
+                ProposalState::Failed {
+                    why: FailedReason::BlastRadiusGrew { what },
+                    ..
+                } => assert!(what.contains("node-c"), "{what}"),
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            inner.state.apps[&web_app()].replicas,
+            crate::config::Replicas::Fixed(3)
+        );
     }
 
     /// Approval and application are one entry: it writes `after` and

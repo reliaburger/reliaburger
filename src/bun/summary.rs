@@ -589,7 +589,8 @@ pub struct LeaseBrief {
 pub struct ProposalBrief {
     /// Its number, for `relish proposal show`.
     pub id: u64,
-    /// `apply`, `scale`, `rollback`, `stop`, `delete` or `undo`.
+    /// `apply`, `scale`, `rollback`, `stop`, `delete`, `restart`, `cancel_deploy`,
+    /// `clear_fault` or `undo`.
     pub kind: String,
     /// The author's token name.
     pub author: String,
@@ -1362,6 +1363,10 @@ fn staleness(
     }) {
         return Some(format!("{} changed after it was made", change.app));
     }
+    // Approving it would fail too: it touches more than it showed (#1682).
+    if let Some(grew) = crate::proposal::build::blast_radius_growth(desired, proposal) {
+        return Some(grew);
+    }
     (proposal.expires_at_unix_ms <= now_unix_ms)
         .then(|| "past its TTL, and the reaper hasn't expired it".to_string())
 }
@@ -2117,6 +2122,8 @@ mod tests {
             replicas: Some(5),
             config: None,
             of: None,
+            fault: None,
+            node: None,
             reason: "p99 over the SLO".to_string(),
             ttl_seconds: None,
             idempotency_key: None,

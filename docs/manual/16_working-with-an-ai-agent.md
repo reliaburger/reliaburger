@@ -372,10 +372,17 @@ An agent never changes the cluster. It proposes, and a person approves:
 relish agent propose scale web --namespace shop --replicas 5 --reason "p99 over the SLO"
 ```
 
-Also `apply FILE`, `rollback`, `stop`, `delete`; `--dry-run` stores nothing.
-The cluster writes the summary, diff, blast radius and `undo` command.
-Proposing leases each app until it's decided. `stale`: the app changed;
-propose again. `guardrail` (exit `4`): a policy refused it. A policy may
+Also `apply FILE`, `rollback`, `stop`, `delete`, `restart APP` (replaces
+every instance through its health checks; can't be undone),
+`cancel-deploy APP` (back to the last spec that finished rolling out) and
+`clear-fault ID` (a Smoker fault on an app, from `relish fault list`, with
+`--node` if two nodes hold that id; can't be undone). `--dry-run` stores
+nothing. The cluster writes the summary, diff, blast radius and `undo`
+command; for instances it starts, the blast radius has the scheduler's
+forecast (`new_nodes_forecast`, and `unplaced_forecast` it can't place).
+Proposing leases each app until it's decided. `stale`: the app changed, or
+the blast radius grew (a new node) before approval; propose again.
+`guardrail` (exit `4`): a policy refused it. A policy may
 approve it at once (`approval.approved_by` is `policy:<name>`). `proposals`
 shows yours, `withdraw ID` takes one back, `undo ID` proposes the undo,
 refused as `stale` if anyone changed the app since.

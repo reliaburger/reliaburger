@@ -127,8 +127,9 @@ const REFUSED_VALUES: &[(&str, &str, &str, &str)] = &[(
     "propose",
     "kind",
     "apply",
-    "reads a local file, so relish mcp doesn't offer it; propose scale, rollback, stop or \
-     delete, or run `relish agent propose apply` yourself",
+    "reads a local file, so relish mcp doesn't offer it; propose scale, rollback, stop, \
+     delete, restart, cancel-deploy or clear-fault, or run `relish agent propose apply` \
+     yourself",
 )];
 
 fn covers(group: &str, command: &str) -> bool {

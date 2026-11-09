@@ -118,7 +118,11 @@ pub struct AppRevision {
     pub revision: [u8; 32],      // SHA-256 of (spec, stopped) as stored
 }
 
-pub enum ProposalKind { Apply, Scale, Restart, Rollback, Stop, Delete, Undo { of: ProposalId } }
+pub enum ProposalKind {
+    Apply, Scale, Restart, Rollback, Stop, Delete,
+    CancelDeploy, ClearFault,   // added while building, see below
+    Undo { of: ProposalId },
+}
 
 pub enum ProposalState {
     Pending,
@@ -219,7 +223,7 @@ and prints the `relish rollback` command.
 
 ## What an agent may propose
 
-Six kinds, all on apps, all in one namespace:
+Eight kinds, all on apps, all in one namespace:
 
 | Kind | `after` | Undo |
 |---|---|---|
@@ -229,6 +233,8 @@ Six kinds, all on apps, all in one namespace:
 | `rollback APP` | The newest released spec that differs from the current one, resolved at proposal time and shown | Exact: the spec it replaced |
 | `stop APP` | The current spec, stopped | Exact: started again with the same spec |
 | `delete APP` | No app | **Lossy**: the spec comes back, data on managed volumes doesn't |
+| `cancel-deploy APP` | The newest spec that finished rolling out everywhere (`AppRollouts`), at the current replica count. Refused when nothing is rolling out, or nothing ever finished | Exact: the new spec comes back, and its rollout starts again |
+| `clear-fault ID` | No spec changes: the Smoker fault `ID` on an app, found in every node's fault list (`--node` when two nodes hold the id). A node fault is refused (`node_fault`): it changes a node, not an app | **None**: a person injects it again if they want it |
 
 Every proposal carries `reversibility`: `exact`, `lossy` or `none`. A lossy
 or irreversible proposal says so in its first summary line, in capitals that
@@ -247,6 +253,47 @@ replaces its newest rollback target instead of pushing a new one when the
 only difference is `restarted_at`, so restarts don't push real versions out
 of the ten-entry rollback history.
 
+Decided while building (9 November 2026):
+
+- **Restart stamps persist.** A file never carries `restarted_at`, so an
+  `AppSpec` write without one keeps the stored stamp (in the state
+  machine's `apply_app_spec`, which every writer goes through); applying
+  the same file after a restart restarts nothing. A proposal's own writes
+  are exact (`exact_app_writes`), so cancelling the rollout of a first
+  restart can put the unstamped spec back, and a proposed `apply` carries
+  the stored stamp into its `after`. Rollback targets and the rollback
+  history compare `version_fingerprint`, the rollout fingerprint without the
+  stamp, so a rollback never picks "the same spec, restarted earlier".
+- **No single-instance restart.** Nothing in the cluster restarts one
+  instance on purpose, and doing it would need per-instance state on the
+  nodes. A restart is of the whole app.
+- **`cancel-deploy` is a council change.** The cluster's rollout state is
+  `AppRollouts`; an app is mid-rollout when its spec isn't the newest
+  released one. Cancelling is a spec change back to that one, so it's an
+  ordinary before and after with an exact undo. The node-local deploy
+  operations `relish cancel-deploy OPERATION` cancels are a standalone
+  node's, not a cluster rollout's, and aren't a proposal kind.
+- **`clear-fault` happens outside the council.** A fault lives on the node
+  that holds it. On approval the leader clears it there first, as the
+  approver, through the handler `relish fault clear --node` uses, with its
+  checks (the approver's `fault` permission and the cluster's reversal
+  grant, the owning node's refusal, the wait for a node-chaos reservation's
+  release), and only once the read-only versions of the state machine's
+  checks pass; then `ProposalApply` records `applied`, or `failed` with
+  what the node said (`FailedReason::Fault`). The clear runs at most once
+  per approval (`approve_with` takes it as an `FnOnce`), and its result
+  stands even if the policies move and the leader judges again. A
+  `clear_fault` approved without the clear (the reaper's path) is recorded
+  `failed`, never `applied`. If quorum is lost between the clear and its
+  record, the proposal stays pending; approving again finds the fault gone
+  and records that. The issue asked for Smoker's safety pre-checks
+  (`smoker::safety`) at approval: those rails judge injections (quorum,
+  the last replica, the leader, half the nodes), each stopping a fault
+  from taking capacity away; clearing gives capacity back, so none
+  applies, and approval runs the clear route's own checks instead.
+  `fault.cleared` is written by that route, as the approver;
+  `proposal.applied` names the fault (`fault`, `fault_node`).
+
 What's refused, at proposal time, with the reason in the error:
 
 - **Jobs, batches, namespaces, quotas, permissions, policies, tokens,
@@ -264,9 +311,20 @@ What's refused, at proposal time, with the reason in the error:
 ## Blast radius
 
 The leader computes it, from its own desired state, at proposal time, and
-again at approval time if the proposal is older than a minute (the stored
-one is replaced, and the CLI says "blast radius recomputed"). It's never the
+the state machine again in the `ProposalApply` entry. It's never the
 agent's claim.
+
+Decided while building (9 November 2026): the approval-time check fails
+the proposal, rather than replacing the stored blast radius. If the one
+recomputed from the state machine's own state reaches a node the stored
+one didn't, or touches more instances, the proposal is `failed` with
+`blast_radius_grew` (error code `stale`, as for a moved revision: the cure
+is to propose again), because the approver approved what they were shown.
+One that shrank applies. It's the same pure function (`build::
+blast_radius`) over replicated state, so every node agrees, and
+`relish status` calls such a pending proposal stale beforehand in the same
+words (`build::blast_radius_growth`). The forecast isn't part of the check:
+it's a forecast.
 
 ```rust
 pub struct BlastRadius {
@@ -295,8 +353,23 @@ pub struct BlastRadius {
   inside. We don't try to follow dependencies further than the name; a
   caller of `web.shop` will notice, and the list tells you who that could be.
 - **Unknown** is never silent, in the spirit of `wtf`: a node whose
-  placements the leader can't vouch for, or a scheduler forecast that
-  couldn't run, is listed with its reason.
+  placements the leader can't vouch for is listed with its reason.
+
+Decided while building the forecast (9 November 2026): the leader asks its
+own scheduling loop, over the bounded channel capacity admission already
+uses (`SchedulerRequest::Forecast`), to run `plan_pass` over a copy of
+desired state with the `after` specs, from a copy of the cache the real
+pass starts from. New placements' nodes become `new_nodes_forecast`;
+replicas it can't place, beyond any the app was already short of, become
+`unplaced_forecast`, with the scheduler's reason in `forecast_note`, and the
+summary says "the scheduler can't place 2 (reason)". Built-in rule 3 gains a
+clause: a policy never approves a proposal with `unplaced_forecast > 0`. A
+forecast that couldn't run (a leader still learning placements, a node with
+no scheduler) is **not** listed under `unknown`, unlike the paragraph above
+first said: it would hold every scale for a person whenever a new leader is
+settling, for no safety gain, since the scheduler decides at apply time
+anyway. Its reason goes in `forecast_note` and the summary ("no forecast:
+...") instead.
 
 The plain-language summary is built from these numbers and the field diff by
 code, never by the agent:
@@ -359,7 +432,7 @@ gets `applies_to = "proposals"`, and the set of actions gains `approve`.
 
 | Variable | Fields |
 |---|---|
-| `proposal` | `kind` (`apply`, `scale`, `restart`, `rollback`, `stop`, `delete`, `undo`), `namespace`, `apps` (names), `nodes`, `instances` (replaced + started + stopped), `replicas_from`, `replicas_to` (scale only, else 0), `reversibility`, `fields` (changed field paths), `images` (images in the `after` specs) |
+| `proposal` | `kind` (`apply`, `scale`, `restart`, `rollback`, `stop`, `delete`, `cancel_deploy`, `clear_fault`, `undo`), `namespace`, `apps` (names), `nodes`, `instances` (replaced + started + stopped), `replicas_from`, `replicas_to` (scale only, else 0), `reversibility`, `fields` (changed field paths), `images` (images in the `after` specs) |
 | `author` | `name`, `kind` (`agent` or `human`), `role` |
 | `caller` | As today: who's asking now. The author at proposal time, the approver at approval time |
 | `source` | `proposal` |
@@ -394,7 +467,8 @@ work.
    or undoes anything directly.
 3. A policy never approves a `lossy` or `none`-reversibility proposal,
    except `restart`, nor one with a `warn` finding, nor one whose blast
-   radius has an `unknown` entry. A human looks at those.
+   radius has an `unknown` entry, nor one that starts instances the
+   scheduler forecasts it can't place. A human looks at those.
 4. Only an admin can write a policy, so only an admin can grant
    auto-approval. (This is already true; it's listed because the security
    argument rests on it.)

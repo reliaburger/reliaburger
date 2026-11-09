@@ -237,9 +237,13 @@ pub struct Compatibility {
 /// Every audit record carries `principal_kind` (#1682): a node's audit log
 /// and `GET /v1/audit`, which `--cluster` asks every peer for, so an older
 /// node's records or answer don't parse.
+/// More proposal kinds (#1682): `restart`, `cancel_deploy` and
+/// `clear_fault`, a proposal's `fault`, `AppSpec::restarted_at`, the
+/// blast radius's forecast fields, and a failed proposal's
+/// `blast_radius_grew` and `fault` reasons.
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 58,
-    state: 74,
+    protocol: 59,
+    state: 75,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

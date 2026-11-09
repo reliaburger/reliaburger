@@ -145,7 +145,7 @@ impl Proposals {
         now_unix_ms: u64,
     ) -> Result<(), ProposalRefusal> {
         let invalid = |reason: String| Err(ProposalRefusal::Invalid { reason });
-        if proposal.changes.is_empty() {
+        if proposal.changes.is_empty() && proposal.fault.is_none() {
             return invalid("a proposal changes at least one app".to_string());
         }
         if proposal.changes.len() > MAX_APPS_PER_PROPOSAL {

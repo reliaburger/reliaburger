@@ -1626,6 +1626,7 @@ fn empty_app_spec() -> AppSpec {
         pre_stop_timeout: None,
         runtime: None,
         owner: None,
+        restarted_at: None,
         firewall: None,
         egress: None,
         autoscale: None,

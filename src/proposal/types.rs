@@ -118,6 +118,16 @@ pub enum ProposalKind {
     Stop,
     /// Delete one app.
     Delete,
+    /// Replace every instance of one app, node by node through its health
+    /// checks, by stamping `restarted_at` on its spec. Can't be undone.
+    Restart,
+    /// Cancel one app's rollout in progress: its spec goes back to the
+    /// newest one that finished rolling out everywhere.
+    CancelDeploy,
+    /// Clear one active Smoker fault on an app. It changes no spec: the
+    /// leader clears the fault when the proposal is approved, and records
+    /// the outcome in the same Raft entry. Can't be undone.
+    ClearFault,
     /// Undo an applied proposal: its `after` back to its `before`.
     Undo {
         /// The proposal being undone.
@@ -134,6 +144,9 @@ impl ProposalKind {
             ProposalKind::Rollback => "rollback",
             ProposalKind::Stop => "stop",
             ProposalKind::Delete => "delete",
+            ProposalKind::Restart => "restart",
+            ProposalKind::CancelDeploy => "cancel_deploy",
+            ProposalKind::ClearFault => "clear_fault",
             ProposalKind::Undo { .. } => "undo",
         }
     }
@@ -234,9 +247,17 @@ pub struct BlastRadius {
     pub apps: Vec<String>,
     /// The nodes those apps are placed on now.
     pub nodes: Vec<String>,
-    /// Where the scheduler would put new instances. Empty in this version:
-    /// the scheduler places them when the proposal applies.
+    /// Where the scheduler's dry run, against the capacity the nodes last
+    /// reported, would put the instances the proposal starts. A forecast:
+    /// the real placement happens when it applies, and can differ.
     pub new_nodes_forecast: Vec<String>,
+    /// How many of the instances it starts the dry run couldn't place.
+    #[serde(default)]
+    pub unplaced_forecast: u32,
+    /// Why the dry run couldn't place them, or why there's no forecast at
+    /// all; `None` when it placed every new instance or nothing starts.
+    #[serde(default)]
+    pub forecast_note: Option<String>,
     /// Instances a new spec replaces.
     pub instances_replaced: u32,
     /// Instances it starts.
@@ -318,6 +339,18 @@ pub enum FailedReason {
         /// Its message.
         message: String,
     },
+    /// The blast radius, recomputed when it was approved, had grown: it
+    /// touches nodes or instances the approver wasn't shown.
+    BlastRadiusGrew {
+        /// What grew, in words.
+        what: String,
+    },
+    /// The fault a `clear_fault` proposal names couldn't be cleared: it's
+    /// gone, or the node refused.
+    Fault {
+        /// What happened.
+        reason: String,
+    },
     /// One of the app writes was refused, so none were made.
     Refused {
         /// What refused it.
@@ -337,6 +370,8 @@ impl std::fmt::Display for FailedReason {
                 lease.target, lease.holder.name, lease.purpose
             ),
             FailedReason::Guardrail { rule, message } => write!(f, "{rule}: {message}"),
+            FailedReason::BlastRadiusGrew { what } => write!(f, "{what}"),
+            FailedReason::Fault { reason } => write!(f, "{reason}"),
             FailedReason::Refused { reason } => write!(f, "{reason}"),
         }
     }
@@ -463,12 +498,39 @@ pub struct Proposal {
     /// undo doesn't.
     #[serde(default)]
     pub compacted: bool,
+    /// The fault a `clear_fault` proposal clears, as the leader found it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fault: Option<FaultTarget>,
+}
+
+/// The fault a `clear_fault` proposal names, as the leader found it when
+/// the proposal was made.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FaultTarget {
+    /// The fault's id on its node.
+    pub id: u64,
+    /// The node that holds it.
+    pub node: String,
+    /// The app it targets.
+    pub app: AppId,
+    /// What kind of fault, as `relish fault list` names it.
+    pub fault_type: String,
+    /// The instance it's scoped to, if any.
+    pub instance: Option<String>,
+    /// Seconds it had left when the proposal was made.
+    pub remaining_secs: u64,
+    /// Who injected it.
+    pub injected_by: String,
 }
 
 impl Proposal {
-    /// The touched apps.
+    /// The touched apps: each changed app, or a `clear_fault`'s target.
+    /// Leases, conflicts and scope all follow these.
     pub fn apps(&self) -> impl Iterator<Item = &AppId> {
-        self.changes.iter().map(|change| &change.app)
+        self.changes
+            .iter()
+            .map(|change| &change.app)
+            .chain(self.fault.iter().map(|fault| &fault.app))
     }
 
     /// The facts its audit records carry.
@@ -516,6 +578,10 @@ impl Proposal {
         if let ProposalKind::Undo { of } = self.kind {
             details.insert("undo_of".to_string(), of.to_string());
         }
+        if let Some(fault) = &self.fault {
+            details.insert("fault".to_string(), fault.id.to_string());
+            details.insert("fault_node".to_string(), fault.node.clone());
+        }
         details
     }
 }
@@ -554,6 +620,9 @@ pub enum ProposalRefusal {
     /// A guardrail, app policy or built-in rule refused it.
     #[error("{rule}: {message}")]
     Guardrail { rule: String, message: String },
+    /// Its blast radius grew after it was made.
+    #[error("{what}; propose again, so whoever approves sees what it touches now")]
+    BlastRadiusGrew { what: String },
     /// It can't be undone: irreversible, compacted, or out of the window.
     #[error("{reason}")]
     NoUndo { reason: String },
@@ -573,7 +642,7 @@ impl ProposalRefusal {
             | ProposalRefusal::AgentDecides { .. } => "forbidden",
             ProposalRefusal::Limit { .. } => "proposal_limit",
             ProposalRefusal::LeaseHeld { .. } => "lease_held",
-            ProposalRefusal::Stale { .. } => "stale",
+            ProposalRefusal::Stale { .. } | ProposalRefusal::BlastRadiusGrew { .. } => "stale",
             ProposalRefusal::Guardrail { .. } => "guardrail",
             ProposalRefusal::NoUndo { .. } => "no_undo",
             ProposalRefusal::Invalid { .. } => "invalid",

@@ -81,17 +81,51 @@ pub async fn approve(
     id: ProposalId,
     approval: Approval,
 ) -> Result<ProposalOutcome, CouncilError> {
+    approve_with(council, id, approval, NO_ACTION).await
+}
+
+/// What a proposal's approval does outside the council, before the Raft
+/// entry records it: clearing a fault (#1682). `None` when it worked, or
+/// why it didn't, which the entry records as `Failed`.
+pub type ActionResult = Option<FailedReason>;
+
+/// [`approve_with`] for a proposal whose whole change is in the council.
+pub const NO_ACTION: Option<fn() -> std::future::Ready<ActionResult>> = None;
+
+/// [`approve`], running `act` first when the proposal's change happens
+/// outside the council (a `clear_fault`). `act` runs at most once, and
+/// only once the proposal would apply: pending, not the approver's own,
+/// no one else's lease in the way, its blast radius no bigger, and no
+/// guardrail refusing it. Its result is what the `ProposalApply` entry
+/// records, even if the policies move and the leader judges again: what
+/// it did is done.
+pub async fn approve_with<F, Fut>(
+    council: &CouncilNode,
+    id: ProposalId,
+    approval: Approval,
+    mut act: Option<F>,
+) -> Result<ProposalOutcome, CouncilError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ActionResult>,
+{
+    let mut acted: Option<ActionResult> = None;
     for _ in 0..MAX_JUDGEMENTS {
-        let (proposal, policies, generation) = council
+        let now = crate::testkit::lease::now_unix_millis();
+        let (proposal, policies, generation, would_apply) = council
             .read_desired(|desired| {
                 (
                     desired.proposals.get(id).cloned(),
                     desired.policies.clone(),
                     desired.policy_generation,
+                    would_apply(desired, id, &approval, now),
                 )
             })
             .await;
-        let refusal = match proposal {
+        let outside = proposal
+            .as_ref()
+            .is_some_and(|proposal| proposal.kind == crate::proposal::ProposalKind::ClearFault);
+        let mut refusal = match proposal {
             Some(proposal) if proposal.state.is_pending() => {
                 let caller = judged_as(&proposal, &approval);
                 judge(proposal, caller, GuardStage::Approve, policies)
@@ -105,6 +139,25 @@ pub async fn approve(
             // The state machine answers a missing or decided proposal.
             _ => None,
         };
+        if acted.is_none()
+            && refusal.is_none()
+            && would_apply
+            && let Some(act) = act.take()
+        {
+            acted = Some(act().await);
+        }
+        if let Some(result) = &acted {
+            refusal = result.clone();
+        } else if outside && refusal.is_none() {
+            // Recording a fault cleared that nobody cleared would be a lie.
+            // When the state machine has its own reason (stale, a lease),
+            // it records that instead.
+            refusal = Some(FailedReason::Fault {
+                reason: "the fault wasn't cleared: a fault is cleared only when a person \
+                         approves it through the API, and only while the proposal would apply"
+                    .to_string(),
+            });
+        }
         let request = RaftRequest::ProposalApply {
             id,
             approval: approval.clone(),
@@ -123,6 +176,28 @@ pub async fn approve(
             reason: "the policies kept changing while the approval was judged; try again"
                 .to_string(),
         },
+    })
+}
+
+/// Whether the state machine would apply proposal `id` approved by
+/// `approval` at `now_unix_ms`, as `desired` stands: the checks it makes,
+/// read-only, so an action outside the council runs only when the entry
+/// recording it would apply.
+fn would_apply(
+    desired: &crate::council::types::DesiredState,
+    id: ProposalId,
+    approval: &Approval,
+    now_unix_ms: u64,
+) -> bool {
+    let checked = desired.proposals.check_apply(
+        id,
+        approval,
+        &desired.agent_leases,
+        |app| crate::proposal::revision::current_revision(desired, app),
+        now_unix_ms,
+    );
+    checked.is_ok_and(|proposal| {
+        crate::proposal::build::blast_radius_growth(desired, proposal).is_none()
     })
 }
 

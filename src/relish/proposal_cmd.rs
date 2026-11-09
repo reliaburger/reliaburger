@@ -294,6 +294,26 @@ pub fn render_proposal(view: &ProposalView) -> String {
         "  instances: {} replaced, {} started, {} stopped\n",
         radius.instances_replaced, radius.instances_started, radius.instances_stopped
     ));
+    // The scheduler's dry run, for the instances it starts (#1682).
+    if !radius.new_nodes_forecast.is_empty() {
+        out.push_str(&format!(
+            "  forecast: new instances on {}\n",
+            radius.new_nodes_forecast.join(", ")
+        ));
+    }
+    if radius.unplaced_forecast > 0 {
+        out.push_str(&format!(
+            "  forecast: can't place {}{}\n",
+            radius.unplaced_forecast,
+            radius
+                .forecast_note
+                .as_deref()
+                .map(|note| format!(" ({note})"))
+                .unwrap_or_default()
+        ));
+    } else if let Some(note) = &radius.forecast_note {
+        out.push_str(&format!("  forecast: none ({note})\n"));
+    }
     if !radius.routes.is_empty() {
         out.push_str(&format!("  routes: {}\n", radius.routes.join(", ")));
     }
@@ -337,7 +357,7 @@ mod tests {
             "namespace": "shop", "author": "holmes", "author_kind": "agent",
             "summary": [
                 "Scale shop/web from 3 to 5 replicas.",
-                "Touches 1 app on 2 nodes (node-a, node-b); starts 2 instances (the scheduler places them when it applies).",
+                "Touches 1 app on 2 nodes (node-a, node-b); starts 2 instances, forecast on node-c.",
                 "Serves https://shop.example.com/ and the service web.shop.",
                 "Undo: `relish undo 17` puts web back to 3 replicas."
             ],
@@ -345,7 +365,7 @@ mod tests {
             "undo": {"command": "relish undo 17", "effect": "puts web back to 3 replicas"},
             "findings": ["policy limits warns about app shop/web: no memory limit"],
             "blast_radius": {"apps": ["shop/web"], "nodes": ["node-a", "node-b"],
-                "new_nodes_forecast": [], "instances_replaced": 0, "instances_started": 2,
+                "new_nodes_forecast": ["node-c"], "instances_replaced": 0, "instances_started": 2,
                 "instances_stopped": 0, "routes": ["shop.example.com/"],
                 "services": ["web.shop"], "unknown": []},
             "diff": [{"app": "shop/web", "field": "replicas", "from": "3", "to": "5"}],

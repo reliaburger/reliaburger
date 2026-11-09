@@ -471,6 +471,13 @@ pub fn spawn_leader_scheduler(
                 continue;
             }
             crate::meat::filter::apply_upgrade_cordon(&mut cache, desired.active_upgrade.as_ref());
+            // A forecast plans from the same view the real pass starts
+            // from, before the real pass reserves into it.
+            let forecast_cache = matches!(
+                capacity_request,
+                Some(super::capacity::SchedulerRequest::Forecast(_))
+            )
+            .then(|| cache.clone());
 
             // Quotas come from desired-state namespaces (12b.2 T6). A
             // cluster with no declared namespace budgets gets an empty
@@ -498,6 +505,21 @@ pub fn spawn_leader_scheduler(
                 dns_required,
             );
 
+            let capacity_request = match capacity_request {
+                Some(super::capacity::SchedulerRequest::Forecast(request)) => {
+                    let forecast = forecast_pass(
+                        forecast_cache.unwrap_or_default(),
+                        &desired,
+                        &pass_members,
+                        dns_required,
+                        &request.apps,
+                    );
+                    let _ = request.response.send(Ok(forecast));
+                    continue;
+                }
+                Some(super::capacity::SchedulerRequest::Admit(request)) => Some(*request),
+                None => None,
+            };
             if let Some(request) = capacity_request {
                 use super::capacity::CapacityAdmissionError;
                 use crate::meat::scheduler::{ScheduleError, Scheduler};
@@ -611,6 +633,88 @@ pub fn spawn_leader_scheduler(
         }
     });
     admission
+}
+
+/// The scheduler's dry run for a proposal (#1682): the placement pass run
+/// over a copy of `desired` with `apps` as the proposal would leave them,
+/// from `cache` as the real pass starts from it. For each app, the nodes
+/// its new placements would go to, and how many instances it couldn't
+/// place beyond any it was already short of. Nothing is reserved or
+/// committed; this is the same pure function the real pass is, so the
+/// forecast and the placement agree unless the cluster changes between
+/// them.
+pub fn forecast_pass(
+    mut cache: ClusterStateCache,
+    desired: &crate::council::types::DesiredState,
+    members: &PassMembers,
+    dns_required: bool,
+    apps: &[super::capacity::ForecastApp],
+) -> Vec<(crate::meat::types::AppId, super::capacity::AppForecast)> {
+    let mut changed = desired.clone();
+    for app in apps {
+        match &app.spec {
+            Some(spec) => {
+                changed.apps.insert(app.app_id.clone(), spec.clone());
+            }
+            None => {
+                changed.apps.remove(&app.app_id);
+                changed.scheduling.remove(&app.app_id);
+            }
+        }
+        if app.stopped {
+            changed.stopped_apps.insert(app.app_id.clone());
+        } else {
+            changed.stopped_apps.remove(&app.app_id);
+        }
+    }
+    let mut quotas = crate::meat::quota::ledger_from_namespaces(&changed.namespaces);
+    let plan = plan_pass(&mut cache, &changed, members, &mut quotas, dns_required);
+    apps.iter()
+        .map(|app| {
+            let id = &app.app_id;
+            let previous = desired.scheduling.get(id);
+            let previous_ordinals: HashSet<u32> = previous
+                .into_iter()
+                .flatten()
+                .map(|placement| placement.ordinal)
+                .collect();
+            let nodes = plan
+                .decisions
+                .iter()
+                .filter(|decision| &decision.app_id == id)
+                .flat_map(|decision| &decision.placements)
+                .filter(|placement| !previous_ordinals.contains(&placement.ordinal))
+                .map(|placement| placement.node_id.clone())
+                .collect();
+            let already_short = desired
+                .unschedulable
+                .get(id)
+                .map_or(0, |short| short.wanted.saturating_sub(short.placed));
+            let mut forecast = super::capacity::AppForecast {
+                nodes,
+                ..Default::default()
+            };
+            if let Some(blocked) = plan.quota_blocked.get(id) {
+                let wanted = match app.spec.as_ref().map(|spec| spec.replicas) {
+                    Some(Replicas::Fixed(count)) if !app.stopped => count,
+                    _ => 0,
+                };
+                let placed = u32::try_from(previous.map_or(0, Vec::len)).unwrap_or(u32::MAX);
+                forecast.unplaced = wanted.saturating_sub(placed);
+                forecast.reason = Some(blocked.to_string());
+            } else if let Some(short) = plan.unschedulable.get(id) {
+                forecast.unplaced = short
+                    .wanted
+                    .saturating_sub(short.placed)
+                    .saturating_sub(already_short);
+                forecast.reason = Some(short.reason.to_string());
+            }
+            if forecast.unplaced == 0 {
+                forecast.reason = None;
+            }
+            (id.clone(), forecast)
+        })
+        .collect()
 }
 
 /// Plan placements for one scheduling tick against a single mutable
@@ -5961,6 +6065,48 @@ image = "busybox:latest"
             "second app must not double-book: {decisions:?}"
         );
         assert_eq!(decisions[0].app_id, a);
+    }
+
+    /// #1682: a proposal's forecast is the placement pass run over its
+    /// `after` specs. A scale from 1 to 3 on three nodes places its two new
+    /// instances on the two nodes the app isn't on; a scale past the
+    /// cluster's room says how many it can't place, and why; nothing is
+    /// committed.
+    #[test]
+    fn a_forecast_places_new_instances_and_counts_what_wont_fit() {
+        let web = AppId::new("web", "shop");
+        let mut desired = DesiredState::default();
+        desired.apps.insert(web.clone(), app_spec(1000, 1));
+        desired
+            .scheduling
+            .insert(web.clone(), placed_as(&app_spec(1000, 1), &[("n1", 0)]));
+        let (cache, alive) = three_node_cache();
+        let members = PassMembers {
+            alive,
+            ..PassMembers::default()
+        };
+        let scaled = |replicas| super::super::capacity::ForecastApp {
+            app_id: web.clone(),
+            spec: Some(app_spec(1000, replicas)),
+            stopped: false,
+        };
+
+        let forecast = forecast_pass(cache.clone(), &desired, &members, false, &[scaled(3)]);
+        let (app, three) = &forecast[0];
+        assert_eq!(app, &web);
+        let mut nodes: Vec<&str> = three.nodes.iter().map(|node| node.0.as_str()).collect();
+        nodes.sort_unstable();
+        assert_eq!(nodes, ["n2", "n3"]);
+        assert_eq!(three.unplaced, 0);
+        assert_eq!(three.reason, None);
+
+        // Three nodes of 4000m hold twelve 1000m replicas, no more.
+        let forecast = forecast_pass(cache, &desired, &members, false, &[scaled(14)]);
+        let fourteen = &forecast[0].1;
+        assert_eq!(fourteen.nodes.len(), 11);
+        assert_eq!(fourteen.unplaced, 2);
+        assert!(fourteen.reason.is_some());
+        assert_eq!(desired.apps[&web].replicas, Replicas::Fixed(1));
     }
 
     fn placed_on(names: &[&str]) -> Vec<crate::meat::types::Placement> {
