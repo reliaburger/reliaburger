@@ -110,12 +110,14 @@ your human" at <a href="https://reliaburger.com/agents">https://reliaburger.com/
 <section class="agents-section" id="a-read-only-token">
 <h2>A read-only token <a class="permalink" href="#a-read-only-token" aria-label="Link to this section">#</a></h2>
 <p>An agent works with whatever authority you hand it. Give it its own token:</p>
-<pre><code class="language-sh">relish token create --name agent --agent --ttl 8h
+<pre><code class="language-sh">relish token create --name agent --role read-only --ttl-days 1
 </code></pre>
-<p>It's read-only, or <code>--role deployer</code>, never admin, and lives 8h unless
-<code>--ttl</code> (up to 168h). The API refuses its every write as <code>forbidden</code>, exit
-<code>4</code>; a deployer one may propose changes and take leases. <code>--namespaces</code>
-narrows it. Pass it as <code>RELIABURGER_TOKEN</code>, and revoke it when you're done:</p>
+<p>The API refuses its every write as <code>forbidden</code>, exit <code>4</code>. An agent that
+should propose changes and take leases needs an agent token instead,
+<code>relish token create --name agent --agent --role deployer --namespaces shop</code>.
+That one changes nothing directly either, is never admin, and lives 8h
+unless <code>--ttl</code> (up to 168h); <code>--namespaces</code> narrows it. Pass either as
+<code>RELIABURGER_TOKEN</code>, and revoke it when you're done:</p>
 <pre><code class="language-sh">relish token revoke agent
 </code></pre>
 <p>Why make a fuss about it? No <code>relish agent</code> command changes a workload
