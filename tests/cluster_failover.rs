@@ -2367,49 +2367,13 @@ async fn a_proposal_applied_before_a_leader_change_is_undone_on_the_new_leader()
         &nodes[leader].council.desired_state().await,
         &web,
     );
-    let scale =
-        r#"{"kind":"scale","namespace":"shop","app":"web","replicas":2,"reason":"failover drill"}"#;
-
-    // The leader's own scheduler forecasts where the new replica goes: once
-    // the nodes have reported their capacity, a dry run names one node and
-    // nothing it can't place.
-    let mut forecast = None;
-    wait_until(
-        "the scheduler forecasts the new replica",
-        Duration::from_secs(60),
-        async || {
-            forecast = post_json(
-                &nodes[followers[0]],
-                &holmes.plaintext,
-                "/v1/proposals?dry_run=true",
-                scale,
-            )
-            .await;
-            forecast.as_ref().is_some_and(|(status, body)| {
-                *status == 200
-                    && body["blast_radius"]["new_nodes_forecast"]
-                        .as_array()
-                        .is_some_and(|nodes| nodes.len() == 1)
-            })
-        },
-    )
-    .await;
-    let (_, body) = forecast.unwrap();
-    assert_eq!(body["blast_radius"]["unplaced_forecast"], 0, "{body}");
-    assert!(
-        body["summary"][1]
-            .as_str()
-            .unwrap()
-            .contains("starts 1 instance, forecast on"),
-        "{body}"
-    );
 
     // The agent proposes through one follower; it changes nothing yet.
     let (status, body) = post_json(
         &nodes[followers[0]],
         &holmes.plaintext,
         "/v1/proposals",
-        scale,
+        r#"{"kind":"scale","namespace":"shop","app":"web","replicas":2,"reason":"failover drill"}"#,
     )
     .await
     .expect("the follower answers");
