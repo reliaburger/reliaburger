@@ -699,10 +699,20 @@ fn the_jobs_section_shows_the_day_run_s_memory_chart_from_its_record() {
     }
     assert_eq!(
         read("docs/website/assets/day-run/rss.svg"),
-        read("docs/qualification/2026-10-28-v0.2.3-day-run-charts/rss.svg"),
+        read(&format!(
+            "docs/qualification/{DAY_RUN_RECORD}-charts/rss.svg"
+        )),
         "the day run's chart differs from its record; copy it again"
     );
+    assert!(
+        section.contains(&format!("docs/qualification/{DAY_RUN_RECORD}.md")),
+        "the jobs section doesn't link the day run's record"
+    );
 }
+
+/// The newest whole day of jobs the page leads with: the published 0.2.7's
+/// 24-hour run on the Mac Studio (#1417).
+const DAY_RUN_RECORD: &str = "2026-11-08-v0.2.7-memory-run";
 
 /// The page a new cluster serves tells people what to type next, so every
 /// command on it has to parse.

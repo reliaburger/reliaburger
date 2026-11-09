@@ -116,7 +116,9 @@ a read-only token of its own, so an agent never holds admin credentials.
 
 [Everything 0.2.7 does](docs/README.md#whats-in-the-binary), what you
 don't have to install, and its [limits](docs/README.md#scope-and-limits) are
-in the documentation.
+in the documentation. The
+[feature status page](https://reliaburger.com/features.html) rates every
+feature Ready, Beta, Alpha or Planned.
 
 ## Where to go next
 

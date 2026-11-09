@@ -74,14 +74,16 @@ changed=$(git diff --no-renames --name-only "${BASE_SHA}...${HEAD_SHA:-HEAD}")
 # roadmap, the quickstart and the release runbook. tests/suite/issue_forms.rs
 # checks the contributing guide, SECURITY.md and AGENTS.md, and
 # tests/suite/agent_docs.rs checks the skill under plugins/ against the
-# manual's agent chapter.
+# manual's agent chapter. scripts/ci/test_features_page.py checks
+# docs/features.toml against the website's feature status page.
 is_docs_only() {
     case "$1" in
         docs/manual/* | README.md | docs/README.md | docs/whitepaper.md | \
             docs/design/cli-relish.md | docs/linux-servers.md | \
             CONTRIBUTING.md | SECURITY.md | AGENTS.md | plugins/* | \
             docs/book/02-* | docs/book/04-* | \
-            docs/website/* | docs/roadmap.md | docs/quickstart.md | docs/releasing.md)
+            docs/website/* | docs/roadmap.md | docs/quickstart.md | docs/releasing.md | \
+            docs/features.toml)
             return 1 ;;
         docs/* | website/* | *.md) return 0 ;;
         *) return 1 ;;
