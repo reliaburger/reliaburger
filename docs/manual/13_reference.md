@@ -260,6 +260,7 @@ is a field the node can't honour; nothing is silently dropped.
 | `firewall` | `allow_from`: apps (or `namespace/app`) allowed to connect |
 | `egress` | `allow`: outside destinations the app may reach. `allow_franchise` is refused |
 | `metrics` | `port` (default: the app's) and `path` (default `/metrics`) to scrape |
+| `restarted_at` | When an approved `restart` proposal last asked for every instance to be replaced, in Unix milliseconds (see `security`). The cluster sets it; an apply without it keeps the stored stamp, so applying the same file again restarts nothing. Setting it by hand restarts the app; a policy `default` can't set it |
 | `provenance` | `template` and `use`: the template and `[use.*]` that made the app. Template expansion writes it, and `relish compile` keeps it in its output; changing it alone restarts nothing, and a policy `default` can't set it. A label, not a credential: anyone who can apply can set it, so a policy shouldn't exempt on it |
 
 ## Template fields
