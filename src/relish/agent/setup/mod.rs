@@ -87,7 +87,9 @@ pub struct SetupData {
     pub agents: Vec<AgentPlan>,
     /// `relish mcp`'s own read-only tokens, made from the context's admin
     /// one so no agent carries admin credentials: `mcp-token.json` to make,
-    /// or with `--remove` it and every `mcp-token-<namespace>.json`. Empty
+    /// or with `--remove` every token file beside the context
+    /// (`mcp-token*.json` and `mcp-propose-token*.json`), each one's token
+    /// revoked and the file deleted. Empty
     /// when the context isn't an admin one (or there's none), so there's
     /// nothing to do.
     pub mcp_tokens: Vec<Change>,

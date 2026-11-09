@@ -114,7 +114,9 @@ default_ttl = "90d"   # or "12h", or "none" for no default
 `relish token list` warns on stderr about every token that has expired or
 expires within 14 days, with the `rotate` command to run. `relish wtf` raises
 the same warning, and also warns about an admin token whose secret is more
-than 90 days old.
+than 90 days old. Neither warns about a `relish-mcp-` token: `relish mcp`
+makes those for a day and renews them itself, so revoke one rather than
+rotate it ([why](16_working-with-an-ai-agent.md#through-mcp)).
 
 ### Rotation
 

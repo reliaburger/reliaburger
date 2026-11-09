@@ -4594,9 +4594,11 @@ A token carries no "made by" field, and adding one would change the state
 format for a warning, so the name prefix is the mark:
 `credentials::made_by_relish_mcp` checks it, and both warnings skip those
 tokens. A token you name `relish-mcp-something` yourself is skipped too.
-The manual's agent chapter is at its 64 KiB guide budget, so it says only
-that `--remove` revokes them all; the doc comment on `TOKEN_NAME_PREFIX`
-carries the rest.
+The manual's agent chapter was at its 64 KiB guide budget then, so it said
+only that `--remove` revokes them all. Once the budget went up to 80 KiB, the
+chapter's "Through MCP" section got a paragraph on the token's life: its
+name, the renewal, the minute's backoff, which tools answer with the cluster
+down, and why you revoke one rather than rotate it.
 
 **Small things.** The `Unreachable` error now names the same by-hand
 fallback as the `Refused` one. A refusal is remembered for a minute

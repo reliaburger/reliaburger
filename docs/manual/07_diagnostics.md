@@ -147,8 +147,8 @@ means, the numbers that decide it and the line of code that does (see
 | `registry-lost-images` | critical | No live node holds every layer of an image |
 | `registry-needs-mtls` | warning | A plaintext cluster's registry can't replicate |
 | `registry-redundancy` | warning | A node's registry is down, unreachable or under-replicated |
-| `token-expired` | warning | An API token has expired |
-| `token-expiring` | warning | An API token expires within 14 days |
+| `token-expired` | warning | An API token has expired (not one `relish mcp` made) |
+| `token-expiring` | warning | An API token expires within 14 days (not one `relish mcp` made) |
 | `admin-token-old` | warning | An admin token's secret is over 90 days old |
 | `namespace-isolation` | warning | A node can't keep namespaces apart |
 | `gitops-plaintext-secret` | warning | A secret is plaintext in the GitOps repository |

@@ -25,10 +25,12 @@ If you're an agent operating or debugging a Reliaburger cluster:
   with an AI agent" as the installed `relish` has it, so it always matches
   the binary you're driving. No `relish`? Ask your human to install it
   with `curl -fsSL https://reliaburger.com/install.sh | sh -s -- --install-only`.
-- **Work with a read-only token.** Ask your human to run
+- **Work with a read-only token.** To debug, ask your human to run
   `relish token create --name agent --role read-only --ttl-days 1` and give
-  you the token in `RELIABURGER_TOKEN`. The token's role is what stops you
-  changing the cluster; these rules don't.
+  you the token in `RELIABURGER_TOKEN`. Only if you should propose changes,
+  ask for `relish token create --name agent --agent --role deployer
+  --namespaces NS` instead. The token's role is what stops you changing the
+  cluster; these rules don't.
 - **Read `ok`, then `data` or `error.code`.** Exit `0` means the command
   answered, not that all is well: the verdict is in `data`.
 - **Follow `next`, and ask your human before any step whose `read_only` is

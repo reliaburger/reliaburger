@@ -81,10 +81,11 @@ set a cluster up for you, which is where <code>reliaburger.com/agents</code> sen
 with an AI agent" as the installed <code>relish</code> has it, so it always matches
 the binary you're driving. No <code>relish</code>? Ask your human to install it
 with <code>curl -fsSL https://reliaburger.com/install.sh | sh -s -- --install-only</code>.</li>
-<li><strong>Work with a read-only token.</strong> Ask your human to run
+<li><strong>Work with a read-only token.</strong> To debug, ask your human to run
 <code>relish token create --name agent --role read-only --ttl-days 1</code> and give
-you the token in <code>RELIABURGER_TOKEN</code>. The token's role is what stops you
-changing the cluster; these rules don't.</li>
+you the token in <code>RELIABURGER_TOKEN</code>. Only if you should propose changes,
+ask for <code>relish token create --name agent --agent --role deployer --namespaces NS</code> instead. The token's role is what stops you changing the
+cluster; these rules don't.</li>
 <li><strong>Read <code>ok</code>, then <code>data</code> or <code>error.code</code>.</strong> Exit <code>0</code> means the command
 answered, not that all is well: the verdict is in <code>data</code>.</li>
 <li><strong>Follow <code>next</code>, and ask your human before any step whose <code>read_only</code> is
@@ -757,7 +758,19 @@ and talks to it over stdin and stdout; it opens no port. In Claude Code:</p>
 context. Put the flags before <code>mcp</code>, as in <code>relish --token "$TOKEN" mcp</code>.
 Give it a read-only token; <code>bun</code> decides what the token may read, and the
 server can't get round that. Given the saved context's admin token, it uses
-its own read-only token (see below); any other admin token gets a warning.</p>
+its own read-only token; any other admin token gets a warning.</p>
+<p>That token is named <code>relish-mcp-</code> and a number, lives a day, and is kept in
+<code>mcp-token.json</code> beside the context (<code>mcp-token-&lt;namespace&gt;.json</code> with
+<code>--namespace</code>), mode 0600. <code>relish mcp</code> makes a new one
+five minutes before it runs out, or when the cluster turns it away, and then
+asks again once. If the cluster won't make one, it remembers that for a
+minute and gives every tool that needs the cluster the same error, rather
+than asking on every call. Tools that read only the binary need no token, so
+<code>version</code>, <code>guide</code>, <code>schema</code>, <code>manual_*</code> and <code>explain</code> of a finding answer
+with the cluster down, and <code>source_*</code> answers without the nodes' commits.
+<code>relish token list</code>, <code>relish wtf</code> and <code>relish agent diagnose</code> don't warn
+that a <code>relish-mcp-</code> token is about to expire. Don't rotate one: <code>relish mcp</code>
+never sees the new secret. Revoke it, and the next call makes another.</p>
 <p>Every <code>relish agent</code> command that only reads becomes a tool, named after it
 with <code>_</code> between the words: <code>version</code>, <code>schema</code>, <code>source_version</code>,
 <code>source_grep</code>, <code>manual_search</code>, <code>logs</code> and so on. A tool's arguments are the
@@ -875,9 +888,11 @@ macOS Dock can't find it, put <code>command -v relish</code>'s output in the ent
 <code>command</code>; setup then calls it a <code>conflict</code>, as it's yours now.</p>
 <p>Setup also installs the Reliaburger skill for Claude Code, at
 <code>~/.claude/skills/reliaburger/SKILL.md</code>, by the same rules. With an admin
-context, it also makes <code>relish mcp</code> a read-only token
-(<code>data.mcp_tokens</code>), a day long and renewed as it runs out, in <code>mcp-token.json</code>
-beside the context, mode 0600. <code>--remove</code> revokes them all.</p>
+context, it also makes <code>relish mcp</code>'s <a href="#through-mcp">read-only token</a> now,
+in <code>mcp-token.json</code>; <code>data.mcp_tokens</code> lists that change. With <code>--remove</code>,
+<code>data.mcp_tokens</code> lists every token file beside the context, from
+<code>--namespace</code> and <code>--propose</code> too, and setup revokes their tokens and
+deletes the files.</p>
 </section>
 <section class="agents-section" id="sending-us-a-bug-or-a-fix">
 <h2>Sending us a bug or a fix <a class="permalink" href="#sending-us-a-bug-or-a-fix" aria-label="Link to this section">#</a></h2>
