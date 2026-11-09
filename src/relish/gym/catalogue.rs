@@ -347,7 +347,7 @@ fn checks(checks: &[Check]) -> ScoringSpec {
 
 /// Every scenario, in the order `relish gym run` runs them. `paused-app`
 /// goes last: a pause that can't be undone (as on the process runtime
-/// today) stops the gym, and the others have run by then.
+/// before #1772) stops the gym, and the others have run by then.
 pub fn all() -> Vec<Scenario> {
     let crash_prompt = "Someone deployed a new version of the `gym-web` app in the namespace\n`{namespace}` a minute ago, and since then users get connection errors.\nFind out what is wrong: which app, in which namespace, on which node, and\nwhat kind of fault.";
     let crash_truth = vec![

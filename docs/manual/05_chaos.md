@@ -394,7 +394,6 @@ answer and output sit beside the report in `<scenario>/run-<n>/`.
 and 1 otherwise. A scenario whose fault the cluster refuses (Smoker isn't
 allowed there) is listed as skipped, not failed.
 
-On the process runtime, `paused-app` can't clean up yet: a paused instance
-there won't stop after the pause is cleared, so the gym reports the cleanup
-as not verified, prints the commands to finish it, and stops. It runs last
-for that reason; leave it out with `--scenario` for the others.
+A run whose cleanup the gym can't verify stops the gym: it prints the
+commands to finish the cleanup and runs nothing more, so no scenario starts
+on another's leftovers. `paused-app` runs last.
