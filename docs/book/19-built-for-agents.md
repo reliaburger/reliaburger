@@ -6920,6 +6920,32 @@ adds exactly the proposing tools, annotated as council writes, without
 `apply`; that plain `relish mcp` refuses them and says how to get them; and
 that a proposing server sends a deployer agent token from its own file.
 
+## Showing it
+
+0.2.8's ideas get a section on the homepage, "Let your agent act, then take
+it back", right after the one on debugging. It walks through a proposal the
+way you'd meet one: the agent's own token, a lease, the proposal, your
+approval, the undo. Then guardrails, the timeline, `relish verify`, the
+one-screen `status` and the concept budget, a paragraph each. Every command
+on it carries `data-act-command`, and `tests/suite/website.rs` parses each
+one with the real CLI, the same check the debugging section's commands get.
+
+Two things aren't there yet, and the page says so rather than fill the gap.
+The recording slot says "No recording yet" until the Studio records a real
+session, as the debugging section's does. And two results haven't been
+measured: how much context an agent spends here against Kubernetes (#1679,
+for #1681), and how small local models fare in the gym (#1687). Each has a
+dashed box that names its issue. A test fails if either box quotes a number,
+so a guess can't slip in before the runs do. The concept budget's own counts
+are the opposite case: they're measured on every build, so another test
+reads them from `docs/testing/concept-budget.json` and fails if the page
+quotes anything else.
+
+The commands aren't in the release the installer fetches yet, so the section
+says "0.2.8, not in 0.2.7", which the installed-release check asks for. When
+0.2.8 ships, that check fails until the label goes, so the page can't keep
+calling a released feature new.
+
 ## What we didn't do
 
 The three big refusals are at the start of the chapter. These are the smaller

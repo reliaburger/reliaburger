@@ -1011,9 +1011,137 @@ relish setup --quickstart</code></pre>
         </div>
       </section>
 
-      <section id="next" class="section" aria-labelledby="next-title">
+      <!-- 0.2.8's showcase (#1690). The recording slot stays empty until the
+           Studio records a real session, and the measured-results slots stay
+           empty until their runs exist: no mock-ups, no numbers we haven't
+           measured. Every command here carries data-act-command, and
+           tests/suite/website.rs parses each with the real CLI. -->
+      <section id="act" class="section" aria-labelledby="act-title">
         <div class="section-heading">
           <span class="section-number" aria-hidden="true">07 /</span>
+          <h2 id="act-title">Let your agent act, then take it back
+            <a class="permalink" href="#act" aria-label="Link to letting your agent act">#</a></h2>
+        </div>
+        <div class="tour">
+          <p class="tour-note">Reading a cluster is safe. Changing one is where an agent
+            needs a leash. From 0.2.8, not in 0.2.7, an agent never changes the cluster
+            itself: it asks. The cluster writes down what the change would do, a person or
+            a policy you wrote says yes, and the undo is one command, shown before anything
+            happens.</p>
+          <figure id="act-recording" class="recording">
+            <p class="recording-pending">No recording yet. A real session, an agent proposing
+              a rollback on a real cluster and a person approving it, is being recorded for
+              <a href="https://github.com/reliaburger/reliaburger/issues/1690">#1690</a>, and
+              we won’t show a mock-up in its place. Until then, here are the steps.</p>
+          </figure>
+          <ol class="tour-steps agent-steps">
+            <li>
+              <pre><code data-act-command>relish token create --name holmes --agent --role deployer --namespaces shop --ttl 8h</code></pre>
+              <p>You give the agent a token of its own. An agent token can propose changes
+                and take leases, and nothing else: the API refuses it every apply, stop,
+                delete and rollback. It can’t be an admin, and it’s gone in eight hours.</p>
+            </li>
+            <li>
+              <pre><code data-act-command>relish agent lease take app web --namespace shop --purpose "rolling back" --wait 60s</code></pre>
+              <p>Before it touches <code>web</code>, the agent takes a short lease, so a
+                second agent can’t pick the same moment. A person can always take over with
+                <code>--break-lease</code>, and the audit log says who did.</p>
+            </li>
+            <li>
+              <pre><code data-act-command>relish agent propose rollback web --namespace shop --reason "v2 crash-loops since it shipped"</code></pre>
+              <p>Then it proposes. The cluster, not the agent, writes the plain-language
+                summary, the field diff, the blast radius (apps, nodes, instances replaced)
+                and the command that undoes it. The agent’s reason comes last, labelled as
+                its own words.</p>
+            </li>
+            <li>
+              <pre><code data-act-command>relish proposal show 17</code>
+<code data-act-command>relish proposal approve 17</code></pre>
+              <p>You read it and approve it, and it applies in the same step. If anyone
+                changed <code>web</code> in the meantime, the approval fails as
+                <code>stale</code> and changes nothing. An agent token can’t approve anything.</p>
+            </li>
+            <li>
+              <pre><code data-act-command>relish undo 17</code></pre>
+              <p>Changed your mind? Undo puts it back, for a day, and refuses when something
+                else has changed the app since, rather than overwrite it.</p>
+            </li>
+          </ol>
+          <p>Four scenarios in the <a href="agents.html#measuring-an-agent-on-your-cluster">agent
+            gym</a> check this on a real cluster: a proposed rollback, a guardrail’s refusal,
+            two agents after the same app, and an approval that went stale. A run that
+            changes anything itself scores unsafe, however right its answer.</p>
+          <h3 id="act-guardrails">Guardrails you write once</h3>
+          <p>A guardrail is a policy that judges the proposal itself: its kind, its
+            namespace, its blast radius, who made it. It never sees the agent’s reason, so
+            the agent can’t talk it round. One can refuse, and one can approve the small,
+            routine changes so nobody gets paged for them:</p>
+          <pre><code>[policy.agents-never-delete]
+applies_to = "proposals"
+match = 'author.kind == "agent"'
+deny = 'proposal.kind == "delete"'
+
+[policy.agents-scale-shop]
+applies_to = "proposals"
+action = "approve"
+match = 'author.kind == "agent" &amp;&amp; proposal.kind == "scale" &amp;&amp; proposal.namespace == "shop" &amp;&amp; proposal.replicas_to &lt;= 10'</code></pre>
+          <p>A policy never approves a change the cluster can’t undo exactly. Try one on a
+            real proposal before you trust it:
+            <code data-act-command>relish policy test -f examples/agents/guardrails.toml --proposal proposal.json</code>.
+            For an agent that speaks MCP,
+            <code data-act-command>relish mcp --propose --namespace shop</code> offers the
+            proposing and lease tools, with no approve tool among them; plain
+            <code>relish mcp</code> still only reads, and makes itself a read-only token
+            rather than borrow your admin one.</p>
+          <h3 id="act-why">Ask the cluster why</h3>
+          <p>When something breaks, the next question is what changed. The scheduler, the
+            restart loop and the apply path write down their rule and its evidence at the
+            moment they decide, so the cluster can answer later:</p>
+          <pre><code data-act-command>relish timeline --app web --since 15m</code>
+<code data-act-command>relish agent explain --restart web-0</code>
+<code data-act-command>relish agent explain --placement web-1</code></pre>
+          <p>A decision the records no longer hold comes back as <code>not_found</code>,
+            which means unknown, not “didn’t happen”.</p>
+          <h3 id="act-verify">Is this the release?</h3>
+          <p><code data-act-command>relish verify</code> checks that every node runs the
+            published, signed <code>bun</code>, byte for byte, that they all run the same
+            version, and that the <code>relish</code> asking is signed too. Missing evidence
+            is <code>unknown</code>, never <code>verified</code>.</p>
+          <h3 id="act-status">One screen for the whole cluster</h3>
+          <p><code data-act-command>relish status</code> is now one line per part of the
+            cluster with a verdict on top, the same height on three nodes or three hundred.
+            The lists moved to <code data-act-command>relish apps --unhealthy</code> and
+            <code data-act-command>relish nodes --unhealthy</code>.</p>
+          <h3 id="act-context">Small enough to hold in your head, or a context window</h3>
+          <p>Reliaburger has 8 resource kinds and 189 commands and subcommands, counted from
+            the CLI’s own definitions, hidden ones included. A test fails when either number
+            moves, so a new concept is a line in a pull request that someone has to agree
+            with.</p>
+          <aside class="measure-pending" aria-label="Not measured yet: the Kubernetes comparison">
+            <strong>How that compares with Kubernetes</strong>
+            <p>Not measured yet. The tokens and time an agent spends on the same task on
+              each platform come from the runs in
+              <a href="https://github.com/reliaburger/reliaburger/issues/1679">#1679</a>,
+              for <a href="https://github.com/reliaburger/reliaburger/issues/1681">#1681</a>,
+              and we’ll quote them here when they exist.</p>
+          </aside>
+          <aside class="measure-pending" aria-label="Not measured yet: small local models">
+            <strong>Small local models</strong>
+            <p>Not measured yet. The agent gym with open models running locally, as well as
+              Claude, is
+              <a href="https://github.com/reliaburger/reliaburger/issues/1687">#1687</a>. Its
+              results go here, all of them, when the runs are done.</p>
+          </aside>
+          <p class="tour-links"><a href="agents.html#proposing-a-change">Proposals, for agents</a>
+            · <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/manual/10_security.md#agent-tokens-and-proposals">Agent tokens and proposals</a>
+            · <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/manual/07_diagnostics.md#relish-timeline-what-changed-and-why-did-it-do-that">The timeline</a>
+            · <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/manual/12_operations.md#is-this-the-release">Verify a cluster</a></p>
+        </div>
+      </section>
+
+      <section id="next" class="section" aria-labelledby="next-title">
+        <div class="section-heading">
+          <span class="section-number" aria-hidden="true">08 /</span>
           <h2 id="next-title">What’s next <a class="permalink" href="#next" aria-label="Link to what's next">#</a></h2>
         </div>
       <aside class="status" aria-label="Release status: next">
@@ -1034,7 +1162,7 @@ relish setup --quickstart</code></pre>
 
       <section id="docs" class="section" aria-labelledby="docs-title">
         <div class="section-heading">
-          <span class="section-number" aria-hidden="true">08 /</span>
+          <span class="section-number" aria-hidden="true">09 /</span>
           <h2 id="docs-title">Read the docs <a class="permalink" href="#docs" aria-label="Link to the documentation section">#</a></h2>
           <span class="section-note">Documentation lives with the code.</span>
         </div>
@@ -1079,7 +1207,7 @@ relish setup --quickstart</code></pre>
       </section>
 
       <section id="compare" class="section" aria-labelledby="compare-title">
-        <div class="section-heading"><span class="section-number" aria-hidden="true">09 /</span><h2 id="compare-title">Compare the alternatives <a class="permalink" href="#compare" aria-label="Link to the comparisons">#</a></h2></div>
+        <div class="section-heading"><span class="section-number" aria-hidden="true">10 /</span><h2 id="compare-title">Compare the alternatives <a class="permalink" href="#compare" aria-label="Link to the comparisons">#</a></h2></div>
         <p class="section-intro">How Reliaburger compares, with commands and sources beside the claims.
           These pages were last re-checked on 21 October 2026, against 0.2.2; the policies, templates and sidecars 0.2.4 added aren’t in them yet.</p>
         <div class="reading-list">
@@ -1119,7 +1247,7 @@ relish setup --quickstart</code></pre>
 
       <section id="internals" class="section" aria-labelledby="internals-title">
         <div class="section-heading">
-          <span class="section-number" aria-hidden="true">10 /</span>
+          <span class="section-number" aria-hidden="true">11 /</span>
           <h2 id="internals-title">Follow a subsystem <a class="permalink" href="#internals" aria-label="Link to the subsystems section">#</a></h2>
         </div>
         <p class="section-intro"><code>bun</code> runs on each node. <code>relish</code> talks to its API.
@@ -1142,7 +1270,7 @@ relish setup --quickstart</code></pre>
 
       <section id="start" class="section start" aria-labelledby="start-title">
         <div class="section-heading">
-          <span class="section-number" aria-hidden="true">11 /</span>
+          <span class="section-number" aria-hidden="true">12 /</span>
           <h2 id="start-title">Build it from source <a class="permalink" href="#start" aria-label="Link to the build-from-source section">#</a></h2>
         </div>
         <div class="start-grid">

@@ -106,8 +106,31 @@ fn relish_lines(commands: &[String]) -> Vec<String> {
     lines
 }
 
+/// A command line split into words as a shell would for the commands the
+/// site shows: on whitespace, with a double-quoted string as one word.
+fn shell_words(command: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quoted = false;
+    for c in command.chars() {
+        match c {
+            '"' => quoted = !quoted,
+            c if c.is_whitespace() && !quoted => {
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+            }
+            c => word.push(c),
+        }
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words
+}
+
 fn parses(command: &str) -> Result<(), String> {
-    let arguments: Vec<&str> = command.split_whitespace().skip(1).collect();
+    let arguments: Vec<String> = shell_words(command).into_iter().skip(1).collect();
     let output = Command::new(env!("CARGO_BIN_EXE_relish"))
         .args(&arguments)
         .env("RELISH_PARSE_ONLY", "1")
@@ -638,6 +661,7 @@ fn every_section_can_be_linked_to() {
         "install",
         "tour",
         "debug",
+        "act",
         "start",
         "docs",
         "internals",
@@ -1935,6 +1959,110 @@ fn the_agent_recording_slot_says_plainly_whether_there_is_a_recording() {
         let text = decode(&strip_tags(figure));
         assert!(text.contains("No recording yet"), "{text:?}");
         assert!(figure.contains("https://github.com/reliaburger/reliaburger/issues/1579"));
+    }
+}
+
+/// The `#act` section of the homepage: what 0.2.8 lets an agent do (#1690).
+fn act_section(page: &str) -> &str {
+    let start = page.find("<section id=\"act\"").expect("no #act section");
+    &page[start..start + page[start..].find("</section>").unwrap()]
+}
+
+/// 0.2.8's showcase sits right after the agent debugging section, which it
+/// builds on, and every command it shows parses with the real CLI.
+#[test]
+fn every_act_section_command_parses_with_the_real_cli() {
+    let page = read("docs/website/index.html");
+    let ids: Vec<String> = section_ids(&page).into_iter().flatten().collect();
+    let debug = ids.iter().position(|id| id == "debug").unwrap();
+    assert_eq!(
+        ids.get(debug + 1).map(String::as_str),
+        Some("act"),
+        "#act should follow #debug: {ids:?}"
+    );
+    let section = act_section(&page);
+    let commands = marked_commands(section, "data-act-command");
+    assert!(commands.len() >= 10, "too few commands: {commands:?}");
+    assert_eq!(
+        commands.len(),
+        marked_commands(&page, "data-act-command").len(),
+        "data-act-command belongs to the #act section"
+    );
+    for command in &commands {
+        assert!(command.starts_with("relish "), "{command:?}");
+        parses(command).unwrap_or_else(|error| panic!("{command:?}: {error}"));
+    }
+}
+
+/// Like the debugging section's, the showcase's recording slot says so
+/// while there's no recording, and gives the player nothing to load.
+#[test]
+fn the_act_recording_slot_says_plainly_whether_there_is_a_recording() {
+    let page = read("docs/website/index.html");
+    let section = act_section(&page);
+    let start = section
+        .find("<figure id=\"act-recording\"")
+        .expect("no #act recording slot");
+    let figure = &section[start..start + section[start..].find("</figure>").unwrap()];
+    let tag = &figure[..figure.find('>').unwrap()];
+    if tag.contains("data-cast=") {
+        assert!(figure.contains("<div class=\"recording-screen\"></div>"));
+        assert!(!figure.contains("recording-pending"));
+    } else {
+        assert!(!figure.contains("recording-screen"));
+        assert!(figure.contains("class=\"recording-pending\""));
+        let text = decode(&strip_tags(figure));
+        assert!(text.contains("No recording yet"), "{text:?}");
+        assert!(figure.contains("https://github.com/reliaburger/reliaburger/issues/1690"));
+    }
+}
+
+/// What 0.2.8 hasn't measured yet has a slot that names its issue and quotes
+/// no number: the local-model runs (#1687) and the Kubernetes context
+/// comparison (#1679, for #1681).
+#[test]
+fn unmeasured_results_have_slots_that_claim_nothing() {
+    let page = read("docs/website/index.html");
+    let section = act_section(&page);
+    let slots: Vec<&str> = section
+        .split("<aside class=\"measure-pending\"")
+        .skip(1)
+        .map(|rest| &rest[..rest.find("</aside>").unwrap()])
+        .collect();
+    for issue in ["1687", "1679"] {
+        let link = format!("https://github.com/reliaburger/reliaburger/issues/{issue}");
+        let slot = slots
+            .iter()
+            .find(|slot| slot.contains(&link))
+            .unwrap_or_else(|| panic!("no pending slot for #{issue}"));
+        let text = decode(&strip_tags(slot));
+        assert!(text.contains("Not measured yet"), "{text:?}");
+        let without_issues = text.replace(&format!("#{issue}"), "").replace("#1681", "");
+        assert!(
+            !without_issues.chars().any(|c| c.is_ascii_digit()),
+            "the #{issue} slot quotes a number: {text:?}"
+        );
+    }
+}
+
+/// The concept counts the showcase quotes are the budget the test in
+/// `src/bin/relish.rs` holds the CLI to, so the page can't drift from it.
+#[test]
+fn the_act_section_quotes_the_concept_budget() {
+    let budget: serde_json::Value =
+        serde_json::from_str(&read("docs/testing/concept-budget.json")).unwrap();
+    let page = read("docs/website/index.html");
+    let text = decode(&strip_tags(act_section(&page)));
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    for (key, words) in [
+        ("resource_kinds", "resource kinds"),
+        ("commands", "commands"),
+    ] {
+        let count = budget[key]["budget"].as_u64().unwrap();
+        assert!(
+            text.contains(&format!("{count} {words}")),
+            "the #act section should say \"{count} {words}\""
+        );
     }
 }
 
