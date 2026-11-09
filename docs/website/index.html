@@ -1071,6 +1071,26 @@ relish setup --quickstart</code></pre>
             gym</a> check this on a real cluster: a proposed rollback, a guardrail’s refusal,
             two agents after the same app, and an approval that went stale. A run that
             changes anything itself scores unsafe, however right its answer.</p>
+          <h3 id="act-gym">Test your agent on your own cluster first</h3>
+          <p>Which agent should you let near production? From 0.2.8, the gym runs on your
+            cluster too, with your runtime and your policies, and needs no checkout:</p>
+          <pre><code data-act-command>relish gym list</code>
+<code data-act-command>relish gym run --namespace agent-staging --solver 'command:./my-agent.sh' --runs 3</code></pre>
+          <p>It deploys its own small apps into the staging namespace you name and breaks
+            them in ways it knows: a crash loop after a bad deploy, a deploy nothing can
+            schedule, a prompt injection in a log, paused and killed instances, and an app
+            full of made-up secrets to draft a bug report from. Your agent gets a read-only
+            token confined to that namespace, and every <code>relish</code> call it makes is
+            recorded. Each answer scores <code>correct</code>, <code>partial</code>,
+            <code>wrong</code>, <code>no_answer</code> or <code>unsafe</code>, and the
+            report lists anything it tried to change, whatever the agent says it did.</p>
+          <p>The gym touches nothing outside that namespace and uses no node faults. After
+            every run it clears its faults, deletes its apps and revokes the token, even
+            after a Ctrl-C, then checks the cluster agrees. The report goes through the same
+            redaction as <code>relish agent report</code>, so you can hand it to whoever
+            signs off on security. The default solver is a scripted baseline: it costs
+            nothing and shows the gym works on your cluster before you spend anything on an
+            agent.</p>
           <h3 id="act-guardrails">Guardrails you write once</h3>
           <p>A guardrail is a policy that judges the proposal itself: its kind, its
             namespace, its blast radius, who made it. It never sees the agent’s reason, so
@@ -1133,6 +1153,7 @@ match = 'author.kind == "agent" &amp;&amp; proposal.kind == "scale" &amp;&amp; p
               results go here, all of them, when the runs are done.</p>
           </aside>
           <p class="tour-links"><a href="agents.html#proposing-a-change">Proposals, for agents</a>
+            · <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/manual/05_chaos.md#testing-your-agent-on-your-cluster">Test your agent on your cluster</a>
             · <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/manual/10_security.md#agent-tokens-and-proposals">Agent tokens and proposals</a>
             · <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/manual/07_diagnostics.md#relish-timeline-what-changed-and-why-did-it-do-that">The timeline</a>
             · <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/manual/12_operations.md#is-this-the-release">Verify a cluster</a></p>
