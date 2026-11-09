@@ -3328,18 +3328,50 @@ impl StateMachineInner {
 pub struct CouncilStateMachine {
     inner: Arc<RwLock<StateMachineInner>>,
     gitops_triggers: Arc<tokio::sync::watch::Sender<(u64, u64)>>,
+    api_tokens: Arc<tokio::sync::watch::Sender<Vec<crate::sesame::types::ApiToken>>>,
 }
 
 impl Default for CouncilStateMachine {
     fn default() -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(StateMachineInner::default())),
-            gitops_triggers: Self::trigger_sender(&DesiredState::default()),
-        }
+        Self::around(StateMachineInner::default())
     }
 }
 
 impl CouncilStateMachine {
+    /// Wrap `inner`, with each watch starting from what it holds.
+    fn around(inner: StateMachineInner) -> Self {
+        Self {
+            gitops_triggers: Self::trigger_sender(&inner.state),
+            api_tokens: Arc::new(
+                tokio::sync::watch::channel(inner.state.security_state.api_tokens.clone()).0,
+            ),
+            inner: Arc::new(RwLock::new(inner)),
+        }
+    }
+
+    /// Observe the applied API tokens. A receiver sees a change as soon as an
+    /// entry or a snapshot changes them, so a node's API can take a new token
+    /// at once rather than at its next timed refresh.
+    pub fn api_token_updates(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Vec<crate::sesame::types::ApiToken>> {
+        self.api_tokens.subscribe()
+    }
+
+    /// Compare once per applied batch, and copy only when they changed: a
+    /// cluster has tens of tokens, so this costs nothing next to the batch.
+    fn publish_api_tokens(&self, state: &DesiredState) {
+        let tokens = &state.security_state.api_tokens;
+        self.api_tokens.send_if_modified(|current| {
+            if current == tokens {
+                false
+            } else {
+                current.clone_from(tokens);
+                true
+            }
+        });
+    }
+
     fn trigger_sender(state: &DesiredState) -> Arc<tokio::sync::watch::Sender<(u64, u64)>> {
         let generations = state.gitops_sync_state.as_ref().map_or((0, 0), |sync| {
             (sync.requested_generation, sync.completed_generation)
@@ -3456,10 +3488,7 @@ impl CouncilStateMachine {
             }
         }
         inner.db = Some(db);
-        Ok(Self {
-            gitops_triggers: Self::trigger_sender(&inner.state),
-            inner: Arc::new(RwLock::new(inner)),
-        })
+        Ok(Self::around(inner))
     }
 
     /// Build an in-memory state machine seeded with a restored `DesiredState`
@@ -3477,14 +3506,10 @@ impl CouncilStateMachine {
         // `initialize` establish a fresh term line and voter set.
         state.enter_recovery_epoch(0);
 
-        let inner = StateMachineInner {
+        Self::around(StateMachineInner {
             state,
             ..StateMachineInner::default()
-        };
-        Self {
-            gitops_triggers: Self::trigger_sender(&inner.state),
-            inner: Arc::new(RwLock::new(inner)),
-        }
+        })
     }
 
     /// Offline disaster recovery (12b.2 D21/CP12): stamp a restored
@@ -3612,6 +3637,7 @@ impl RaftStateMachine<TypeConfig> for CouncilStateMachine {
             }
         }
         self.publish_gitops_triggers(&guard.state);
+        self.publish_api_tokens(&guard.state);
         Ok(responses)
     }
 
@@ -3642,6 +3668,7 @@ impl RaftStateMachine<TypeConfig> for CouncilStateMachine {
             guard.state.last_applied_log = meta.last_log_id;
             guard.state.last_membership = meta.last_membership.clone();
             self.publish_gitops_triggers(&guard.state);
+            self.publish_api_tokens(&guard.state);
             guard.snapshot_index += 1;
             guard.snapshot_data = Some(data.clone());
             guard.snapshot_last_log_id = meta.last_log_id;
@@ -10917,6 +10944,61 @@ mod tests {
                 .webhook_receipts,
             std::collections::VecDeque::from([[7; 32]])
         );
+    }
+
+    /// A follower's API refreshed its tokens every 5 s, so a token created on
+    /// the leader was refused as "invalid token" by every other node for up
+    /// to 5 s (the gym's partitioned-node runs, 9 Nov). The state machine now
+    /// says when the tokens change, so a node can refresh at once.
+    #[tokio::test]
+    async fn token_changes_are_published_on_apply_and_snapshot_install() {
+        let token = crate::sesame::types::ApiToken {
+            name: "agent".to_string(),
+            token_hash: vec![1, 2, 3],
+            role: crate::sesame::types::ApiRole::ReadOnly,
+            kind: crate::sesame::types::TokenKind::Human,
+            scope: crate::sesame::types::TokenScope::default(),
+            expires_at: None,
+            created_at: std::time::SystemTime::now(),
+            previous_secret: None,
+        };
+        let mut machine = CouncilStateMachine::new();
+        let mut updates = machine.api_token_updates();
+        assert!(updates.borrow_and_update().is_empty());
+
+        // An entry that doesn't touch the tokens wakes nobody.
+        machine
+            .apply(vec![normal_entry(1, 1, RaftRequest::AllocateSerial)])
+            .await
+            .unwrap();
+        assert!(!updates.has_changed().unwrap());
+
+        machine
+            .apply(vec![normal_entry(
+                1,
+                2,
+                RaftRequest::CreateApiToken(token.clone()),
+            )])
+            .await
+            .unwrap();
+        assert!(updates.has_changed().unwrap());
+        assert_eq!(*updates.borrow_and_update(), vec![token.clone()]);
+
+        // A follower that catches up by snapshot hears about them too.
+        let snapshot = machine
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+        let mut follower = CouncilStateMachine::new();
+        let mut followed = follower.api_token_updates();
+        follower
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        assert!(followed.has_changed().unwrap());
+        assert_eq!(*followed.borrow_and_update(), vec![token]);
     }
 
     #[test]
