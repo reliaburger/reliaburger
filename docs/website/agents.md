@@ -30,10 +30,12 @@ If you're an agent operating or debugging a Reliaburger cluster:
   with an AI agent" as the installed `relish` has it, so it always matches
   the binary you're driving. No `relish`? Ask your human to install it
   with `curl -fsSL https://reliaburger.com/install.sh | sh -s -- --install-only`.
-- **Work with a read-only token.** Ask your human to run
+- **Work with a read-only token.** To debug, ask your human to run
   `relish token create --name agent --role read-only --ttl-days 1` and give
-  you the token in `RELIABURGER_TOKEN`. The token's role is what stops you
-  changing the cluster; these rules don't.
+  you the token in `RELIABURGER_TOKEN`. Only if you should propose changes,
+  ask for `relish token create --name agent --agent --role deployer
+  --namespaces NS` instead. The token's role is what stops you changing the
+  cluster; these rules don't.
 - **Read `ok`, then `data` or `error.code`.** Exit `0` means the command
   answered, not that all is well: the verdict is in `data`.
 - **Follow `next`, and ask your human before any step whose `read_only` is
@@ -872,7 +874,20 @@ It uses the same connection as every other `relish` command: `--endpoint`,
 context. Put the flags before `mcp`, as in `relish --token "$TOKEN" mcp`.
 Give it a read-only token; `bun` decides what the token may read, and the
 server can't get round that. Given the saved context's admin token, it uses
-its own read-only token (see below); any other admin token gets a warning.
+its own read-only token; any other admin token gets a warning.
+
+That token is named `relish-mcp-` and a number, lives a day, and is kept in
+`mcp-token.json` beside the context (`mcp-token-<namespace>.json` with
+`--namespace`), mode 0600. `relish mcp` makes a new one
+five minutes before it runs out, or when the cluster turns it away, and then
+asks again once. If the cluster won't make one, it remembers that for a
+minute and gives every tool that needs the cluster the same error, rather
+than asking on every call. Tools that read only the binary need no token, so
+`version`, `guide`, `schema`, `manual_*` and `explain` of a finding answer
+with the cluster down, and `source_*` answers without the nodes' commits.
+`relish token list`, `relish wtf` and `relish agent diagnose` don't warn
+that a `relish-mcp-` token is about to expire. Don't rotate one: `relish mcp`
+never sees the new secret. Revoke it, and the next call makes another.
 
 Every `relish agent` command that only reads becomes a tool, named after it
 with `_` between the words: `version`, `schema`, `source_version`,
@@ -1023,9 +1038,11 @@ macOS Dock can't find it, put `command -v relish`'s output in the entry's
 
 Setup also installs the Reliaburger skill for Claude Code, at
 `~/.claude/skills/reliaburger/SKILL.md`, by the same rules. With an admin
-context, it also makes `relish mcp` a read-only token
-(`data.mcp_tokens`), a day long and renewed as it runs out, in `mcp-token.json`
-beside the context, mode 0600. `--remove` revokes them all.
+context, it also makes `relish mcp`'s [read-only token](#through-mcp) now,
+in `mcp-token.json`; `data.mcp_tokens` lists that change. With `--remove`,
+`data.mcp_tokens` lists every token file beside the context, from
+`--namespace` and `--propose` too, and setup revokes their tokens and
+deletes the files.
 
 ## Sending us a bug or a fix
 
