@@ -23,7 +23,6 @@ use crate::proposal::guard::{GuardInput, GuardStage, GuardVerdict, judge_proposa
 use crate::proposal::{
     Approval, FailedReason, Principal, Proposal, ProposalId, ProposalOutcome, ProposalRefusal,
 };
-use crate::sesame::types::{ApiRole, TokenKind};
 
 /// How often the leader looks for proposals to expire, compact or
 /// auto-approve. The shortest TTL is five minutes, so a second is noise.
@@ -36,13 +35,14 @@ const MAX_JUDGEMENTS: usize = 5;
 /// The principal the reaper's records name: the cluster itself.
 pub const REAPER_PRINCIPAL: &str = "system";
 
-/// The caller a policy approval is judged as: the cluster.
-pub fn system_principal() -> Principal {
-    Principal {
-        name: REAPER_PRINCIPAL.to_string(),
-        principal_id: REAPER_PRINCIPAL.to_string(),
-        kind: TokenKind::Human,
-        role: ApiRole::Admin,
+/// Who an approval of `proposal` is judged as: the person who approves,
+/// or, for a policy approval, the proposal's author. Nobody stands behind
+/// a policy approval but the author, so a policy that judges by `caller`
+/// sees the agent that asked, not an admin.
+pub fn judged_as(proposal: &Proposal, approval: &Approval) -> Principal {
+    match approval {
+        Approval::Human(by) => by.clone(),
+        Approval::Policy { .. } => proposal.author.clone(),
     }
 }
 
@@ -71,13 +71,13 @@ pub async fn judge(
     })
 }
 
-/// Approve proposal `id` as `approval`, judging it as `caller` first, on
-/// this node, which must lead. Answers what the `ProposalApply` entry did.
+/// Approve proposal `id` as `approval`, judging it first as
+/// [`judged_as`] says, on this node, which must lead. Answers what the
+/// `ProposalApply` entry did.
 pub async fn approve(
     council: &CouncilNode,
     id: ProposalId,
     approval: Approval,
-    caller: Principal,
 ) -> Result<ProposalOutcome, CouncilError> {
     for _ in 0..MAX_JUDGEMENTS {
         let (proposal, policies, generation) = council
@@ -91,7 +91,8 @@ pub async fn approve(
             .await;
         let refusal = match proposal {
             Some(proposal) if proposal.state.is_pending() => {
-                judge(proposal, caller.clone(), GuardStage::Approve, policies)
+                let caller = judged_as(&proposal, &approval);
+                judge(proposal, caller, GuardStage::Approve, policies)
                     .await
                     .refusal
                     .map(|refusal| FailedReason::Guardrail {
@@ -319,9 +320,10 @@ pub async fn auto_approve_pending(
         })
         .await;
     for proposal in pending {
+        // Judged as its author: a policy approval has nobody else behind it.
         let verdict = judge(
             proposal.clone(),
-            system_principal(),
+            proposal.author.clone(),
             GuardStage::Approve,
             policies.clone(),
         )
@@ -333,7 +335,6 @@ pub async fn auto_approve_pending(
             council,
             proposal.id,
             Approval::Policy { name: name.clone() },
-            system_principal(),
         )
         .await?;
         let principal = format!("policy:{name}");

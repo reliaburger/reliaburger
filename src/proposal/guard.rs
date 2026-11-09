@@ -4,9 +4,11 @@
 //! The leader calls [`judge_proposal`] twice in a proposal's life: before
 //! it writes `ProposalCreate` ([`GuardStage::Create`], the caller is the
 //! author) and before it writes `ProposalApply` ([`GuardStage::Approve`],
-//! the caller is the approver). It reads the policies and their generation
-//! together, judges on a blocking thread, and the Raft entry carries that
-//! generation, so a policy written in between makes the leader judge again.
+//! the caller is the person who approves, or the author for a policy
+//! approval, since nobody else stands behind one). It reads the policies
+//! and their generation together, judges on a blocking thread, and the
+//! Raft entry carries that generation, so a policy written in between
+//! makes the leader judge again.
 //! The state machine never runs a policy.
 //!
 //! A judgement runs, in order:
@@ -45,8 +47,8 @@ use crate::policy::{
 pub enum GuardStage {
     /// Before it's stored; the caller is its author.
     Create,
-    /// Before it's applied; the caller is the approver, or the cluster for
-    /// a policy approval.
+    /// Before it's applied; the caller is the person who approves, or the
+    /// author for a policy approval.
     Approve,
 }
 

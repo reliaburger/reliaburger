@@ -6141,6 +6141,12 @@ What we kept is the shape:
   `principal_id`, so only that exact credential renews or releases.
 - **No reviving.** A renewal after the expiry is refused: the caller takes
   the lease again, and anyone else may have taken it first.
+- **No cap on renewals.** A lease lasts at most 15 minutes per take, but its
+  holder may renew it as often as it likes. That's the design (#1682): an
+  agent halfway through a fix shouldn't lose its claim. The cost is that an
+  agent's namespace lease, renewed in a loop, blocks every person's write in
+  that namespace until someone repeats the write with `--break-lease`. The
+  manual says so where it explains leases.
 - **A leader-only reaper**, `src/bun/lease_reaper.rs`, which checks its own
   copy before it writes, so a quiet cluster writes nothing, and resumes on a
   new leader because the leases live in Raft.
@@ -6415,12 +6421,23 @@ retried approval reaches a new leader. The retry finds the outcome.
 The checks are the ones a state machine can make deterministically, from
 its own state and numbers in the entry: the proposal is still pending and
 not past its expiry by the stamped clock; the approver isn't an agent and
-isn't the author, by token name, so a rotated token is still its own
-author; every app is still at its `before` revision; nobody else holds a
+isn't the author, by credential or by token name, so a rotated token is
+still its own author; every app is still at its `before` revision; nobody else holds a
 lease on one. The leader judged the policies before it wrote the entry, and
 the entry carries the generation it judged at, the same fence as
 `PolicyFenced` in chapter 18: if a policy changed in between, the entry
 answers `PolicyGenerationMoved` and the leader judges again.
+
+The author's own rights go the other way. Revoking a token deletes it, and
+`relish token create` accepts the name again, so a name isn't a credential.
+Withdrawing a proposal and answering a retry by its idempotency key
+compare `principal_id`, the digest of the exact secret, through
+`Principal::is_credential`; a token made later under the name gets
+neither. Refusing self-approval and counting the eight pending proposals
+an author may have use `Principal::may_be`, credential *or* name, so a new
+token can't approve its old self's proposal or buy eight more. Two
+methods with two names, rather than one `==` in four places, make each
+call site say which question it's asking.
 
 ### All or nothing, on a copy
 
@@ -6500,6 +6517,18 @@ since, it refuses and says so: undoing would overwrite someone's change, and
 `relish rollback` or an apply show their own diff. An agent can't undo
 directly; `relish agent undo 17` *proposes* the undo, whose `before` is the
 original's `after`, and approving it marks the original `undone` too.
+
+A proposed undo names no app: `{"kind": "undo", "of": 17}`. Its apps are
+the original's, so the scope check on the request has nothing to check, and
+the first version checked them only after building the proposal. Building
+can refuse, and its refusals name the original's apps (`shop/web changed
+after proposal 17 applied`), so an agent scoped to `billing` could walk the
+proposal ids and learn app names in `shop`, and leave them in the audit
+log's `proposal.refused` records too. Now the create handler reads the
+original first, through the same `read_proposal` the `GET` route uses, and
+checks its apps against the caller's scope before it builds anything. An
+original out of scope answers `not_found`, exactly as a missing one does,
+so the answer doesn't even say the id exists.
 
 Undo lasts 24 hours and the newest 64 applied proposals. After that the
 leader's reaper compacts the record: the specs go, the summary, diff, blast
@@ -6766,6 +6795,19 @@ finishes an approval the old one didn't. The audit record names the policy
 as the principal, with `principal_kind` `policy`, beside the author and the
 author's reason.
 
+Who is the `caller` when a policy approves? Our first answer was the
+cluster: a `system_principal()` with the admin role. That was wrong. An
+admin who later writes the app policy
+`deny = "caller.role != 'admin' && app.replicas > 4"` means it for agents,
+but the reaper judged the waiting proposal as an admin, so the deny never
+fired and the proposal applied. A person who approves is judged as
+themselves; nobody stands behind a policy approval except the author. So
+`bun::proposals::judged_as` picks the caller from the `Approval` itself,
+the person for `Approval::Human` and `proposal.author` for
+`Approval::Policy`, and `approve` no longer takes a caller at all, so no
+call site can pass the wrong one. The record still names the policy as the
+approver.
+
 Should a cluster auto-approve anything in the first release that has
 proposals at all? The AI SRE research said no, and the design leaves it to
 the maintainer. We ship it with no approve policy by default: on a new
@@ -6819,6 +6861,26 @@ name as methods on it, so the two can't be mixed up. The read-only token is
 an agent token now too, so the audit log names everything an MCP connection
 does as an agent's.
 
+"Confined to `--namespace`" was a promise the first version didn't keep.
+`--namespace` is optional, and without it `obtain` asked for a token with
+no namespaces at all, so the help said one thing and the token did another:
+it could propose, and take namespace leases, everywhere. With a broad
+approve policy that's an agent auto-applying cluster-wide. Now
+`propose_scope_refusal` refuses `--propose` from the saved admin context
+without `--namespace`, before anything is minted, and says to pass it. We
+didn't add a flag for a cluster-wide proposing token. Someone who wants one
+can make it with `relish token create --agent` and hand it over, which is a
+choice they make on purpose rather than by leaving a flag out.
+
+The other way round there's a gap relish can't close. Give `relish mcp
+--propose` a person's deployer token in `RELIABURGER_TOKEN` and it proposes
+as that person, so a guardrail written as `author.kind == "agent"` never
+sees the agent's proposals. There's no "who am I" route, and the role probe
+relish mcp already uses (`GET /v1/token/list`) tells admin from not-admin,
+not a person from an agent. So `person_token_warning` warns on stderr for
+every token `relish mcp` didn't make itself. It's noisy for someone who did
+hand it an agent token, and honest: relish can't tell, so it says so.
+
 ### The tests
 
 [`src/policy/proposal_tests.rs`](../../src/policy/proposal_tests.rs) checks
@@ -6833,7 +6895,9 @@ an unknown blast radius, a refusal beating an approval, and the approver as
 `caller` at approval. The API tests apply an agent's scale at once under the
 example policies and read the audit record back; refuse an agent's delete
 but not a person's; hold a flagged scale through a reaper pass; and let a
-policy written later approve a waiting proposal on the next pass. The gym's
+policy written later approve a waiting proposal on the next pass; and check
+that a deny that judges by `caller`, written after the proposal, stops both
+the reaper and the approval itself. The gym's
 two bugs each have a test that failed first. The MCP tests check `--propose`
 adds exactly the proposing tools, annotated as council writes, without
 `apply`; that plain `relish mcp` refuses them and says how to get them; and

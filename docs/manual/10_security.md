@@ -340,8 +340,9 @@ whoever approves. Approving judges it again under the policies in force then.
 
 A **guardrail** is a policy that judges the proposed change itself rather
 than an app. Give it `applies_to = "proposals"`. It sees `proposal` and
-`author`, plus `caller` (the author when it's made, the approver when it's
-approved) and `source`, which is `proposal`:
+`author`, plus `caller` (the author when it's made, the person who approves
+it, or the author again when a policy approves it) and `source`, which is
+`proposal`:
 
 | Variable | Fields |
 |----------|--------|

@@ -176,6 +176,20 @@ pub(super) async fn proposal_create_handler(
     if let Err(response) = authorise_apps(&state, auth, action, named.iter()).await {
         return response;
     }
+    // An undo names no app; its apps are the original's. Check them before
+    // building it, whose refusals name them, and answer an original out of
+    // scope as a missing one, as reading it would.
+    if request.kind == RequestKind::Undo
+        && let Some(of) = request.of
+    {
+        let original = match read_proposal(&state, auth, ProposalId(of)).await {
+            Ok(original) => original,
+            Err(response) => return response,
+        };
+        if let Err(response) = authorise_apps(&state, auth, action, original.apps()).await {
+            return response;
+        }
+    }
     let Some(council) = &state.council else {
         return standalone();
     };
@@ -304,14 +318,7 @@ pub(super) async fn proposal_create_handler(
     // A policy approved it on the spot.
     if let Some(name) = verdict.approve {
         let approval = Approval::Policy { name: name.clone() };
-        let outcome = match crate::bun::proposals::approve(
-            council,
-            created.id,
-            approval,
-            crate::bun::proposals::system_principal(),
-        )
-        .await
-        {
+        let outcome = match crate::bun::proposals::approve(council, created.id, approval).await {
             Ok(outcome) => outcome,
             Err(error) => return council_unavailable(error),
         };
@@ -383,7 +390,7 @@ pub(super) async fn proposal_approve_handler(
         approval: Approval::Human(by),
         ..
     } = &proposal.state
-        && by.name == approver.name
+        && by.is_credential(&approver)
     {
         return answer_decided(&proposal);
     }
@@ -406,7 +413,6 @@ pub(super) async fn proposal_approve_handler(
         council,
         id,
         Approval::Human(approver.clone()),
-        approver.clone(),
     )
     .await
     {
@@ -566,7 +572,9 @@ async fn authorise_decider(
     crate::sesame::auth::authorize_user(auth, crate::sesame::types::ApiRole::Deployer)?;
     let proposal = read_proposal(state, auth, id).await?;
     authorise_apps(state, auth, action, proposal.apps()).await?;
-    if auth.is_some_and(|auth| auth.token_name == proposal.author.name) {
+    // By name too: a rotated token, or one made again under the same
+    // name, is still its author here.
+    if auth.is_some() && proposal.author.may_be(&principal_of(auth)) {
         return Err(refusal_response(
             &ProposalRefusal::SelfApproval {
                 id,

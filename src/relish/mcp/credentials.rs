@@ -356,8 +356,9 @@ fn valid_namespace(namespace: &str) -> bool {
 /// What `relish mcp` should send.
 #[derive(Clone, PartialEq, Eq)]
 pub enum Credential {
-    /// This read-only token.
-    ReadOnly(String),
+    /// This token, which `relish mcp` made: a read-only agent token, or a
+    /// deployer one for `--propose`.
+    Minted(String),
     /// The context's own token, which the cluster says isn't admin: nothing
     /// to mint.
     ContextNotAdmin,
@@ -374,7 +375,7 @@ pub enum Obtained {
     NotNeeded,
 }
 
-/// The read-only token for `scope`: the stored one while it's usable,
+/// The token for `scope`: the stored one while it's usable,
 /// otherwise a new one made with `admin`, the context's own client.
 ///
 /// `rejected` is a token the cluster has just turned away (revoked, or
@@ -396,12 +397,12 @@ pub async fn obtain(
         stored.usable(scope, now) && rejected.is_none_or(|rejected| stored.token != rejected)
     };
     if let Some(stored) = StoredToken::load(path)?.filter(reusable) {
-        return Ok((Credential::ReadOnly(stored.token), Obtained::Reused));
+        return Ok((Credential::Minted(stored.token), Obtained::Reused));
     }
     let _lock = lock(path).await?;
     let stored = StoredToken::load(path)?;
     if let Some(stored) = stored.as_ref().filter(|stored| reusable(stored)) {
-        return Ok((Credential::ReadOnly(stored.token.clone()), Obtained::Reused));
+        return Ok((Credential::Minted(stored.token.clone()), Obtained::Reused));
     }
     match bounded(admin.token_access()).await? {
         TokenAccess::Admin => {}
@@ -439,7 +440,7 @@ pub async fn obtain(
     if let Some(old) = replaced {
         let _ = tokio::time::timeout(CLUSTER_TIMEOUT, admin.token_revoke(&old.name)).await;
     }
-    Ok((Credential::ReadOnly(issued.token), Obtained::Minted))
+    Ok((Credential::Minted(issued.token), Obtained::Minted))
 }
 
 /// Whether the cluster still accepts `token`, asked with the same cheap

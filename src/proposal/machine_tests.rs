@@ -495,6 +495,63 @@ fn a_retry_with_the_same_key_returns_the_proposal_already_made() {
     assert_eq!(world.desired.proposals.last_id, 1);
 }
 
+/// A token name can be reused once its token is revoked. The new token is
+/// another credential, so it isn't the author of the old one's proposals:
+/// it can't withdraw them or answer with them for an idempotency key.
+#[test]
+fn a_new_token_under_a_reused_name_isnt_the_author() {
+    let mut world = World::new();
+    let mut request = scale("web", 5);
+    request.idempotency_key = Some("holmes-7c1e".to_string());
+    let id = world.created(&request, &holmes());
+    let mut reissued = holmes();
+    reissued.principal_id = "token:holmes-reissued".to_string();
+
+    let mut elsewhere = scale("api", 4);
+    elsewhere.idempotency_key = request.idempotency_key.clone();
+    match world.propose(&elsewhere, &reissued, NOW + 5) {
+        ProposalOutcome::Created { proposal } => assert_ne!(proposal.id, id),
+        other => panic!("the old proposal answered another credential's key: {other:?}"),
+    }
+    let desired = &mut world.desired;
+    assert!(matches!(
+        desired
+            .proposals
+            .withdraw(&mut desired.agent_leases, id, &reissued, NOW),
+        ProposalOutcome::Refused {
+            refusal: ProposalRefusal::NotAuthor { .. }
+        }
+    ));
+    assert_eq!(world.state(id), "pending");
+}
+
+/// The per-author limit counts a rotated token's proposals as its own:
+/// rotating doesn't buy eight more.
+#[test]
+fn a_rotated_token_shares_its_authors_limit() {
+    let mut world = World::new();
+    for index in 0..MAX_PENDING_PER_AUTHOR {
+        let name = format!("app{index}");
+        world
+            .desired
+            .apps
+            .insert(AppId::new(&name, "shop"), spec("x:1", 1));
+        world.created(&scale(&name, 2), &holmes());
+    }
+    world
+        .desired
+        .apps
+        .insert(AppId::new("one-more", "shop"), spec("x:1", 1));
+    let mut rotated = holmes();
+    rotated.principal_id = "token:holmes-rotated".to_string();
+    assert!(matches!(
+        world.propose(&scale("one-more", 2), &rotated, NOW),
+        ProposalOutcome::Refused {
+            refusal: ProposalRefusal::Limit { .. }
+        }
+    ));
+}
+
 #[test]
 fn a_proposal_past_its_ttl_expires_and_cant_be_approved() {
     let mut world = World::new();

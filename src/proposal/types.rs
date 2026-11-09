@@ -72,9 +72,9 @@ impl std::fmt::Display for ProposalId {
 /// and the exact credential.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Principal {
-    /// The token's name. "Never the author" compares this, so a rotated
-    /// token, or one deleted and made again under the same name, is still
-    /// its author.
+    /// The token's name. "Never the author" compares this as well as the
+    /// credential ([`Principal::may_be`]), so a rotated token, or one
+    /// deleted and made again under the same name, still can't approve.
     pub name: String,
     /// The exact credential (`AuthContext::principal_id`), which leases
     /// are held under.
@@ -83,6 +83,23 @@ pub struct Principal {
     pub kind: TokenKind,
     /// The role the token was granted.
     pub role: ApiRole,
+}
+
+impl Principal {
+    /// Whether `other` is this exact credential. An author's own rights,
+    /// withdrawing and an idempotency key, need this: a token made later
+    /// under a revoked token's name is someone else.
+    pub fn is_credential(&self, other: &Principal) -> bool {
+        self.principal_id == other.principal_id
+    }
+
+    /// Whether `other` may be this principal: the same credential, or a
+    /// token under the same name, which may be this one rotated or made
+    /// again. "Never the author" and the per-author limit compare this, so
+    /// a new token dodges neither.
+    pub fn may_be(&self, other: &Principal) -> bool {
+        self.is_credential(other) || self.name == other.name
+    }
 }
 
 /// What kind of change a proposal makes. Every kind becomes "these apps go

@@ -86,7 +86,7 @@ impl Proposals {
     ) -> ProposalOutcome {
         if let Some(key) = &proposal.idempotency_key
             && let Some(existing) = self.proposals.values().find(|existing| {
-                existing.author.name == proposal.author.name
+                existing.author.is_credential(&proposal.author)
                     && existing.idempotency_key.as_ref() == Some(key)
             })
         {
@@ -192,7 +192,7 @@ impl Proposals {
         }
         let by_author = self
             .pending()
-            .filter(|pending| pending.author.name == proposal.author.name)
+            .filter(|pending| pending.author.may_be(&proposal.author))
             .count();
         if by_author >= MAX_PENDING_PER_AUTHOR {
             return Err(ProposalRefusal::Limit {
@@ -362,7 +362,7 @@ impl Proposals {
         now_unix_ms: u64,
     ) -> ProposalOutcome {
         let checked = self.pending_proposal(id, now_unix_ms).and_then(|proposal| {
-            if proposal.author.name == by.name {
+            if proposal.author.is_credential(by) {
                 Ok(())
             } else {
                 Err(ProposalRefusal::NotAuthor {
@@ -615,7 +615,7 @@ fn check_decider(proposal: &Proposal, by: &Principal, action: &str) -> Result<()
             action: action.to_string(),
         });
     }
-    if by.name == proposal.author.name {
+    if proposal.author.may_be(by) {
         return Err(ProposalRefusal::SelfApproval {
             id: proposal.id,
             name: by.name.clone(),
