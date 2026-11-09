@@ -5767,6 +5767,106 @@ every tool description is an instruction to a small model, and it follows
 them literally. Phase two of #1687 tunes those, inside `relish`, with the gym
 rerun after each change.
 
+### Tuning the hints
+
+The first two changes are the cheapest, and the record already pointed at
+both.
+
+**The budget a model copies.** `relish mcp` now has a budget of its own,
+8 KiB unless `--max-bytes` says otherwise, and it does two things with it.
+Every tool's input schema advertises it as the `max_bytes` default, with the
+bounds beside it, so a model that copies defaults copies a small one:
+
+```json
+"max_bytes": {"type": "integer", "default": 8192, "minimum": 1024, "maximum": 131072}
+```
+
+And a call that names no budget gets it, so a client that never sends
+`max_bytes` gets a small answer too. Both live on `ToolSpec`, the struct that
+turns a tool call into a `relish agent` command line, as a new field:
+
+```rust
+pub budget: Option<usize>,
+```
+
+`Option<usize>` is Rust's way of saying "maybe a number". There's no null
+and no sentinel such as 0: a tool that takes no `max_bytes`, such as one
+derived for a test, has `None`, and the compiler makes every reader say what
+happens then. `select`, which already pins `--namespace`, sets it for every
+tool that takes a budget. When the call is turned into a command line, the
+arguments go through one more step first:
+
+```rust
+match arguments.get(MAX_BYTES) {
+    None | Some(Value::Null) => {
+        arguments.insert(MAX_BYTES.into(), json!(budget));
+    }
+    Some(Value::Number(asked))
+        if asked
+            .as_u64()
+            .is_some_and(|asked| asked > MAX_BYTES_CEILING as u64) =>
+    {
+        arguments.insert(MAX_BYTES.into(), json!(MAX_BYTES_CEILING));
+    }
+    Some(_) => {}
+}
+```
+
+A `match` arm can carry a guard, the `if` after the pattern: the arm only
+matches when the pattern fits *and* the guard is true. `None | Some(Value::Null)`
+is two patterns sharing one arm, since JSON's `null` and a missing key mean the
+same here. In the guard, `as_u64()` returns another `Option`, `None` for a
+negative or fractional number, and `is_some_and` is true only for a `Some`
+whose value passes the closure, so no `unwrap` is needed. The last arm, `Some(_)`, leaves everything else alone: a budget
+under the ceiling, and anything that isn't a number, which the next step turns
+into a usage error the model can read.
+
+That second arm is the ceiling: 128 KiB, whatever the call asks for. Without
+one, nothing stopped the megabyte requests the record counted. We hold the
+call to the ceiling rather than refuse it, because a refusal costs a small
+model a whole turn and teaches it nothing it can act on, while a held answer
+that doesn't fit says so and names what was cut. 128 KiB is room for the
+whole guide in one answer, so no client loses anything it could do before.
+
+We kept the `relish agent` commands' own defaults. On the command line the
+caller is Claude Code or a person, with a large window, and 24 KiB costs
+them nothing; the 8 KiB default is only where small models connect. Claude
+Code reaches `relish mcp` too, through the plugin, and reads a cut answer's
+`next` the way it always has: one more call with a bigger budget.
+
+**`next` that leads into the source.** `diagnose` gave each finding three
+next steps: `explain` it, scope the diagnosis to the app, and show the 40
+lines of `src/relish/wtf/diagnose.rs` that decide it. `explain` offered the
+code first and the manual second. And `source show` always offered "the
+lines after these", so a model that took the first step was handed the
+second, and the third, until the file ran out. Claude treated that chain as
+a reference shelf; Qwen3 8B treated it as a to-do list.
+
+A finding already names the fault, so the steps now say more about it and
+stop there. The finding's `next` has `explain` and the scoped diagnosis, and
+the code's location stays in the finding's `source` field for an agent that
+wants it. `explain` offers the manual first and the code last, and that step
+says why it's there:
+
+```text
+optional: the code that decides it, only if you think relish got this wrong
+```
+
+The restart decisions `explain --restart` gives carry the same wording.
+`source show` offers the lines after a range only when the caller asked for
+more than it got: a line with no end, or a range cut at 400 lines. A range
+shown whole is what was asked for. The gym's Claude scenarios still have
+every step they used: the health-restart scenario's required `explain` is
+still a finding's first `next`, and the planted bug's path through
+`source grep` and `source show` doesn't start from `diagnose` at all.
+
+Each change came with its test first: the advertised default and its bounds,
+a call with no budget, a call over the ceiling, the flag's range, a finding
+whose `next` has no `agent source` in it, an explanation with the manual
+first and the code marked optional, and a range shown whole with nothing
+after it. Whether the model does better is the gym's question, rerun at the
+record's settings without the solver's own budget.
+
 ### The tests
 
 `test_scenario.py` loads the six shipped scenarios, substitutes and parses

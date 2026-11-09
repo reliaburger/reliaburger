@@ -383,7 +383,7 @@ pub fn decisions(
             next.push(show_step(
                 &site.path,
                 site.function_line.unwrap_or(site.line),
-                "the code that decides it",
+                super::diagnose::CODE_STEP_WHY,
             ));
         }
     } else {
@@ -712,6 +712,10 @@ mod tests {
                 .run
                 .starts_with("relish agent timeline --app web")
         );
+        // The decision already names the rule: the code is for checking it.
+        let code = answer.next.last().unwrap();
+        assert!(code.run.starts_with("relish agent source show"));
+        assert!(code.why.starts_with("optional"), "{}", code.why);
     }
 
     #[test]

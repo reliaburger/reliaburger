@@ -352,7 +352,7 @@ pub fn context(
     };
     let mut next = vec![NextStep {
         run: "relish agent diagnose".to_string(),
-        why: "the evidence behind every finding, with the code that decides it".to_string(),
+        why: "the evidence behind every finding".to_string(),
         read_only: true,
     }];
     if let Some(first) = report.critical.first().or(report.warnings.first()) {

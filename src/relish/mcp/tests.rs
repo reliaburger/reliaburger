@@ -313,7 +313,14 @@ fn namespace_pins_the_argument_and_hides_it_from_the_schema() {
     assert!(schema["properties"].get("namespace").is_none(), "{schema}");
     assert_eq!(
         logs.command_line(&object(json!({"app": "web"}))).unwrap(),
-        ["agent", "logs", "--namespace=payments", "--", "web"]
+        [
+            "agent",
+            "logs",
+            "--namespace=payments",
+            "--max-bytes=8192",
+            "--",
+            "web"
+        ]
     );
     let error = logs
         .command_line(&object(json!({"app": "web", "namespace": "other"})))
@@ -1370,6 +1377,7 @@ fn propose_options(namespace: Option<&str>) -> McpOptions {
         namespace: namespace.map(str::to_string),
         list: false,
         propose: true,
+        max_bytes: None,
     }
 }
 
@@ -1472,4 +1480,88 @@ async fn a_propose_server_whose_context_isnt_admin_sends_the_contexts_token() {
             .join("mcp-propose-token-shop.json")
             .exists()
     );
+}
+
+// ---------------------------------------------------------------------------
+// The server-wide budget (#1687): small by default, one flag to change it,
+// and a ceiling no call goes past.
+
+/// Every tool that takes `max_bytes` advertises the server's budget, 8 KiB
+/// by default, with the floor and the ceiling as its bounds. A small model
+/// copies a schema's default, so the default is what it sends.
+#[test]
+fn the_server_advertises_eight_kib_to_every_tool_by_default() {
+    let server = default_server();
+    let mut budgeted = 0;
+    for tool in server.tools() {
+        let Some(budget) = tool.input_schema["properties"].get("max_bytes") else {
+            continue;
+        };
+        budgeted += 1;
+        assert_eq!(budget["default"], 8192, "{}", tool.name);
+        assert_eq!(budget["minimum"], 1024, "{}", tool.name);
+        assert_eq!(budget["maximum"], 131072, "{}", tool.name);
+    }
+    assert!(budgeted > 0);
+}
+
+#[test]
+fn max_bytes_sets_the_advertised_default() {
+    let server = Server::new(&Selection {
+        max_bytes: Some(4096),
+        ..Selection::default()
+    })
+    .unwrap();
+    for tool in server.tools() {
+        if let Some(budget) = tool.input_schema["properties"].get("max_bytes") {
+            assert_eq!(budget["default"], 4096, "{}", tool.name);
+        }
+    }
+}
+
+/// A call that names no budget gets the server's, so a client that never
+/// sends `max_bytes` still gets a small answer.
+#[test]
+fn a_call_without_a_budget_gets_the_servers() {
+    let tools = tools::select(fake_tools(), &Selection::default()).unwrap();
+    let line = find(&tools, "logs")
+        .command_line(&object(json!({"app": "web"})))
+        .unwrap();
+    assert!(line.contains(&"--max-bytes=8192".to_string()), "{line:?}");
+    // One that names a budget keeps it.
+    let line = find(&tools, "logs")
+        .command_line(&object(json!({"app": "web", "max_bytes": 20000})))
+        .unwrap();
+    assert!(line.contains(&"--max-bytes=20000".to_string()), "{line:?}");
+}
+
+/// Nothing else stops a model asking for a megabyte, so the server holds
+/// every call to the ceiling, rather than refusing it and costing the model
+/// a turn.
+#[test]
+fn a_budget_above_the_ceiling_is_held_to_it() {
+    let tools = tools::select(fake_tools(), &Selection::default()).unwrap();
+    let line = find(&tools, "logs")
+        .command_line(&object(json!({"app": "web", "max_bytes": 1_048_576})))
+        .unwrap();
+    assert!(line.contains(&"--max-bytes=131072".to_string()), "{line:?}");
+}
+
+#[test]
+fn the_max_bytes_flag_takes_the_floor_to_the_ceiling() {
+    assert_eq!(parse_server_max_bytes("1024"), Ok(1024));
+    assert_eq!(parse_server_max_bytes("131072"), Ok(131072));
+    assert!(parse_server_max_bytes("1023").is_err());
+    assert!(parse_server_max_bytes("131073").is_err());
+    assert!(parse_server_max_bytes("lots").is_err());
+}
+
+#[tokio::test]
+async fn a_tool_answers_within_the_servers_budget_over_the_wire() {
+    let (mut client, _) = Client::initialised(default_server()).await;
+    // `schema` with no command describes every command: far more than 8 KiB.
+    let answer = client.call("schema", json!({})).await;
+    let text = answer["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.len() <= 8192, "{} bytes", text.len());
+    assert_eq!(answer["result"]["structuredContent"]["truncated"], true);
 }
