@@ -501,6 +501,21 @@ No recording yet. A real session, an agent proposing a rollback on a real cluste
 
 Four scenarios in the [agent gym](https://reliaburger.com/agents.html#measuring-an-agent-on-your-cluster) check this on a real cluster: a proposed rollback, a guardrail’s refusal, two agents after the same app, and an approval that went stale. A run that changes anything itself scores unsafe, however right its answer.
 
+### Test your agent on your own cluster first
+
+Which agent should you let near production? From 0.2.8, the gym runs on your cluster too, with your runtime and your policies, and needs no checkout:
+
+```
+relish gym list
+```
+```
+relish gym run --namespace agent-staging --solver 'command:./my-agent.sh' --runs 3
+```
+
+It deploys its own small apps into the staging namespace you name and breaks them in ways it knows: a crash loop after a bad deploy, a deploy nothing can schedule, a prompt injection in a log, paused and killed instances, and an app full of made-up secrets to draft a bug report from. Your agent gets a read-only token confined to that namespace, and every `relish` call it makes is recorded. Each answer scores `correct`, `partial`, `wrong`, `no_answer` or `unsafe`, and the report lists anything it tried to change, whatever the agent says it did.
+
+The gym touches nothing outside that namespace and uses no node faults. After every run it clears its faults, deletes its apps and revokes the token, even after a Ctrl-C, then checks the cluster agrees. The report goes through the same redaction as `relish agent report`, so you can hand it to whoever signs off on security. The default solver is a scripted baseline: it costs nothing and shows the gym works on your cluster before you spend anything on an agent.
+
 ### Guardrails you write once
 
 A guardrail is a policy that judges the proposal itself: its kind, its namespace, its blast radius, who made it. It never sees the agent’s reason, so the agent can’t talk it round. One can refuse, and one can approve the small, routine changes so nobody gets paged for them:
@@ -555,7 +570,7 @@ Not measured yet. The tokens and time an agent spends on the same task on each p
 
 Not measured yet. The agent gym with open models running locally, as well as Claude, is [#1687](https://github.com/reliaburger/reliaburger/issues/1687). Its results go here, all of them, when the runs are done.
 
-[Proposals, for agents](https://reliaburger.com/agents.html#proposing-a-change) · [Agent tokens and proposals](https://github.com/reliaburger/reliaburger/blob/main/docs/manual/10_security.md#agent-tokens-and-proposals) · [The timeline](https://github.com/reliaburger/reliaburger/blob/main/docs/manual/07_diagnostics.md#relish-timeline-what-changed-and-why-did-it-do-that) · [Verify a cluster](https://github.com/reliaburger/reliaburger/blob/main/docs/manual/12_operations.md#is-this-the-release)
+[Proposals, for agents](https://reliaburger.com/agents.html#proposing-a-change) · [Test your agent on your cluster](https://github.com/reliaburger/reliaburger/blob/main/docs/manual/05_chaos.md#testing-your-agent-on-your-cluster) · [Agent tokens and proposals](https://github.com/reliaburger/reliaburger/blob/main/docs/manual/10_security.md#agent-tokens-and-proposals) · [The timeline](https://github.com/reliaburger/reliaburger/blob/main/docs/manual/07_diagnostics.md#relish-timeline-what-changed-and-why-did-it-do-that) · [Verify a cluster](https://github.com/reliaburger/reliaburger/blob/main/docs/manual/12_operations.md#is-this-the-release)
 
 ## What’s next
 
