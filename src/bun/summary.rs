@@ -566,7 +566,8 @@ pub struct AgentsSection {
     /// Proposals waiting for approval.
     pub waiting: u32,
     /// Waiting proposals that can't apply as they stand: an app they touch
-    /// changed after they were made, or they outlived their TTL.
+    /// changed after they were made, someone else's lease covers one, or
+    /// they outlived their TTL.
     pub stale: u32,
     /// The waiting proposals, stale ones first, then oldest first, at most
     /// [`SUMMARY_LIST_MAX`].
@@ -1349,9 +1350,10 @@ pub fn waiting_proposals(
 }
 
 /// Why a waiting proposal can't apply as it stands, or `None` while it
-/// still can. It applies only while every touched app's revision still
-/// equals the one it saw, so approving a stale one fails; one past its TTL
-/// should already have been expired by the reaper.
+/// still can: the same three causes that make approving it fail. It
+/// applies only while every touched app's revision still equals the one it
+/// saw and no one else's lease covers one of them; one past its TTL should
+/// already have been expired by the reaper.
 fn staleness(
     desired: &crate::council::types::DesiredState,
     proposal: &crate::proposal::Proposal,
@@ -1361,6 +1363,15 @@ fn staleness(
         crate::proposal::revision::current_revision(desired, &change.app) != change.before.revision
     }) {
         return Some(format!("{} changed after it was made", change.app));
+    }
+    // Its own pinned lease keeps others off, until a person breaks it.
+    if let Some((app, lease)) = proposal.apps().find_map(|app| {
+        desired
+            .agent_leases
+            .blocker(app, &proposal.author.principal_id, now_unix_ms)
+            .map(|lease| (app, lease))
+    }) {
+        return Some(format!("{app} is leased by {}", lease.holder.name));
     }
     (proposal.expires_at_unix_ms <= now_unix_ms)
         .then(|| "past its TTL, and the reaper hasn't expired it".to_string())
@@ -2187,6 +2198,40 @@ mod tests {
         assert_eq!(
             waiting[0].stale.as_deref(),
             Some("past its TTL, and the reaper hasn't expired it")
+        );
+    }
+
+    /// Approving fails while someone else's lease covers an app the
+    /// proposal touches, so the summary says so before anyone tries. Its
+    /// own pinned lease keeps others off until a person breaks it.
+    #[test]
+    fn a_proposal_another_holders_lease_blocks_is_stale() {
+        use crate::proposal::lease::{LeaseHolder, LeaseRequest, LeaseTarget};
+        let mut desired = proposal_desired();
+        let now = NOW_MS + 1_000;
+        desired
+            .agent_leases
+            .break_lease(&LeaseTarget::app("shop", "web"), now)
+            .unwrap();
+        desired
+            .agent_leases
+            .take(
+                &LeaseRequest {
+                    target: LeaseTarget::namespace("shop"),
+                    holder: LeaseHolder {
+                        name: "capacity-bot".to_string(),
+                        principal_id: "token:capacity-bot".to_string(),
+                    },
+                    purpose: "rebalancing".to_string(),
+                    ttl_ms: crate::proposal::lease::DEFAULT_LEASE_TTL_MS,
+                },
+                now,
+            )
+            .unwrap();
+        let waiting = waiting_proposals(&desired, now + 1_000);
+        assert_eq!(
+            waiting[0].stale.as_deref(),
+            Some("shop/web is leased by capacity-bot")
         );
     }
 
