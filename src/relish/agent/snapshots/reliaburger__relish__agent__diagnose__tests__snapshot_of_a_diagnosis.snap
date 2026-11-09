@@ -70,17 +70,12 @@ expression: value
           {
             "read_only": true,
             "run": "relish agent explain crashloop",
-            "why": "what this finding means, its thresholds and where it's decided"
+            "why": "what this finding means and its thresholds, if the title and details aren't enough"
           },
           {
             "read_only": true,
             "run": "relish agent diagnose --app web",
             "why": "the same checks for this app alone"
-          },
-          {
-            "read_only": true,
-            "run": "relish agent source show src/relish/wtf/diagnose.rs:3-42",
-            "why": "the code that decides it"
           }
         ],
         "resource": "app.web/default",
@@ -106,12 +101,7 @@ expression: value
           {
             "read_only": true,
             "run": "relish agent explain disk-high",
-            "why": "what this finding means, its thresholds and where it's decided"
-          },
-          {
-            "read_only": true,
-            "run": "relish agent source show src/relish/wtf/diagnose.rs:12-51",
-            "why": "the code that decides it"
+            "why": "what this finding means and its thresholds, if the title and details aren't enough"
           }
         ],
         "resource": "node.node-2",

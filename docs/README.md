@@ -1093,7 +1093,9 @@ commands as MCP tools over stdio (`claude mcp add reliaburger -- relish mcp`),
 sending a read-only token it makes for itself when the context's is admin,
 derived from the same definitions, with `--toolsets`, `--no-logs` and
 `--namespace` to narrow them; commands that write, build or reach past the
-cluster API aren't tools. `relish mcp --propose` adds the proposing and lease
+cluster API aren't tools. Its answers are 8 KiB unless a call asks for more,
+up to 128 KiB, so a small local model's window holds them; `--max-bytes`
+changes the default. `relish mcp --propose` adds the proposing and lease
 tools, with a deployer agent token it makes for itself, confined to
 `--namespace`. See [Working with an AI
 agent](manual/16_working-with-an-ai-agent.md). That chapter is the one source

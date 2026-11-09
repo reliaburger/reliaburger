@@ -235,6 +235,8 @@ enough for the whole answer.</li>
 <p><code>--max-bytes</code> takes at least 1024. An answer that can't be trimmed to fit
 (it's mostly fields, not lists) becomes a <code>usage</code> failure whose hint names
 the budget that would fit.</p>
+<p>Through <code>relish mcp</code> the default is smaller: 8 KiB for every tool, <code>guide</code>
+and <code>schema</code> included (see <a href="#through-mcp">Through MCP</a>).</p>
 </section>
 <section class="agents-section" id="text-the-cluster-didnt-write">
 <h2>Text the cluster didn't write <a class="permalink" href="#text-the-cluster-didnt-write" aria-label="Link to this section">#</a></h2>
@@ -828,6 +830,14 @@ proposals are that person's, and a guardrail matching <code>author.kind == "agen
 </tbody></table>
 <pre><code class="language-sh">relish mcp --toolsets source,manual --no-logs
 </code></pre>
+<p>Every tool's answer is held to 8 KiB, about 2,000 tokens, unless the call
+passes <code>max_bytes</code>. That's also the default each tool's schema advertises,
+because a model tends to send whatever default it reads there. <code>--max-bytes</code>
+sets it for every tool, from 1024 to 131072. No call gets more than 131072
+bytes (128 KiB), whatever it asks for, which still fits the whole guide in
+one answer. A cut answer says so, as on the command line.</p>
+<pre><code class="language-sh">relish mcp --max-bytes 24576
+</code></pre>
 <p><code>--namespace</code> narrows what the agent asks for. It isn't a permission: a
 token scoped to the namespace is.</p>
 <p>The repository's <a href="https://github.com/reliaburger/reliaburger/blob/main/server.json"><code>server.json</code></a>
@@ -942,15 +952,20 @@ large one. Three habits keep it working:</p>
 <li><strong>Don't read the whole guide.</strong> <code>relish agent guide</code> is about 68 KB, some
 17,000 tokens, which fills a 16K window on its own. Use <code>manual_search</code>
 and <code>manual_show</code> for the section you need.</li>
-<li><strong>Ask for less.</strong> Every answer's default budget is 24 KiB, about 6,000
-tokens, and the conversation is sent again on every turn. Pass a smaller
-<code>max_bytes</code>, such as 8192, and follow <code>next</code> when an answer says it was cut.</li>
+<li><strong>Keep answers small.</strong> <code>relish mcp</code> holds every answer to 8 KiB, about
+2,000 tokens, unless the model asks for more, and the conversation is
+sent again on every turn. At an 8K window, start it with <code>--max-bytes 4096</code>.</li>
 <li><strong>Offer fewer tools.</strong> The 14 tools' descriptions and schemas cost about
 3,000 tokens on every turn. <code>--toolsets context,diagnose,explain,logs,manual</code>
 keeps the six a diagnosis needs, for about 1,300:</li>
 </ul>
 <pre><code class="language-sh">relish mcp --toolsets context,diagnose,explain,logs,manual
 </code></pre>
+<p>A small model follows every <code>next</code> step it's given. A finding already names
+the fault, so <code>diagnose</code>'s steps say more about it without leading into the
+source, and a step into the code that decides an answer starts its <code>why</code>
+with <code>optional</code>. Tell your model it can answer once a finding names the
+fault.</p>
 <p>A small model also keeps to its tool list. It rarely types a command it
 isn't offered as a tool, so if it should propose changes, start the server
 with <code>--propose</code> (see <a href="#through-mcp">Through MCP</a>) rather than expecting it
