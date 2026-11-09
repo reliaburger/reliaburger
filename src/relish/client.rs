@@ -484,10 +484,14 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// The `--endpoint` CLI override, set once from `main` before dispatch.
 static CLI_ENDPOINT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 
-/// The read-only token `relish mcp` made for itself from an admin context
-/// (#1730), sent in place of the context's own token. A `std` lock, not a
-/// tokio one, because [`resolve_token`] is synchronous and holds it only to
-/// clone the string, never across an `.await`.
+/// The token `relish mcp` made for itself from an admin context (#1730),
+/// read-only or, with `--propose`, a deployer agent one, sent in place of
+/// the context's own token. A `std` lock, not a tokio one, because
+/// [`resolve_token`] is synchronous and holds it only to clone the string,
+/// never across an `.await`.
+// One per process, like the CLI_* statics above, so the `relish::mcp`
+// tests that set it rely on nextest running each test in its own process.
+// Under plain `cargo test` they share it across threads and fail.
 static MCP_TOKEN: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
 
 /// Send `token` in place of the managed context's admin token from now on,
