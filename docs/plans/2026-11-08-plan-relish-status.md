@@ -174,11 +174,13 @@ Each has a default, so the build doesn't wait:
   for the person it's meant to wait for. The line names `relish proposal
   list` while a proposal waits, else `relish lease list`, and the cluster
   stays `HEALTHY`. A **stale** proposal is a problem and makes the cluster
-  `DEGRADED`. Stale means approving it would fail: an app it touches
-  changed after it was made (its revision no longer matches), or it's past
-  its TTL and the reaper hasn't expired it. Either way it pins a lease on
-  its apps that keeps everyone else off them until someone withdraws or
-  rejects it. The leader works out staleness when it builds its view, so
+  `DEGRADED`. Stale means approving it would fail, for any of the three
+  reasons approval checks: an app it touches changed after it was made (its
+  revision no longer matches); someone else's lease covers one of its apps
+  (possible only once a person has broken the lease the proposal pinned);
+  or it's past its TTL and the reaper hasn't expired it. In the first and
+  the last, it also still pins a lease on its apps that keeps everyone else
+  off them until someone withdraws or rejects it. The leader works out staleness when it builds its view, so
   every reader sees the same answer. The section never carries a lease's
   purpose or a proposal's reason: both are an agent's own words, and
   `relish agent context` already lists them as untrusted text.

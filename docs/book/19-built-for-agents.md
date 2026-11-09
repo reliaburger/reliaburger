@@ -1429,10 +1429,13 @@ when only leases are held), not a problem.
 
 A **stale** proposal is different. It can't apply any more: an app it
 touches changed after it was made, so its revision (a SHA-256 over the
-stored spec) no longer matches, and approving it would fail. Or it's past
-its TTL and the reaper hasn't expired it yet. Either way it still pins a
-lease on its apps, keeping every other agent off them until somebody
-withdraws or rejects it. That's a problem, and the line says which one and
+stored spec) no longer matches, and approving it would fail. Or someone
+else's lease covers one of its apps, which can only happen after a person
+breaks the lease the proposal pinned with `--break-lease`, and approving
+fails on that lease. Or it's past its TTL and the reaper hasn't expired it
+yet. Any of the three means approving would fail. In the first and the
+last, the proposal also still pins a lease on its apps, keeping every other
+agent off them until somebody withdraws or rejects it. That's a problem, and the line says which one and
 why:
 
 ```
