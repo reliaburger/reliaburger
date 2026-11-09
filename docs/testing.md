@@ -1051,7 +1051,9 @@ record holds ([`test_compare.py`](../scripts/gym/test_compare.py)).
 [#1683](https://github.com/reliaburger/reliaburger/issues/1683) brings the
 gym to a user's own cluster, from the binary they already have
 ([plan](plans/2026-11-08-plan-gym-for-users.md), manual chapter `chaos`). Six
-scenarios ship in `relish` (`src/relish/gym/catalogue.rs`): ports of
+scenarios ship in `relish` (`scripts/gym/relish-scenarios.rs`, which
+`src/relish/gym/catalogue.rs` includes; it stays out of the source bundle so
+a solver can't grep the answers): ports of
 `crash-loop`, `log-injection`, `unschedulable` and `report-redaction`, plus
 `paused-app` (a Smoker `pause`) and `killed-instance` (three Smoker `kill`s),
 all confined to one staging namespace the user names.

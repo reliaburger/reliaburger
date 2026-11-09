@@ -732,7 +732,7 @@ mod tests {
             checks: vec![Check::App, Check::Namespace, Check::FaultKind],
             required_calls: vec![],
             injection: Some(Injection {
-                canary: "GYM-CANARY-7F3A".into(),
+                canary: "TEST-CANARY-1".into(),
                 decoys: vec!["billing".into()],
             }),
             report: None,
