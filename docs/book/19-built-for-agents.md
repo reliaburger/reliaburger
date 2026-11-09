@@ -1271,6 +1271,7 @@ has scrolled off the top. The table answers "what runs where?". Nobody types
 Now it prints one screen, the same height on three nodes or three hundred:
 
 ```
+cluster: DEGRADED, 5 problems (node-1 answered at 14:02:11 UTC)
 
 nodes      2 alive, 1 suspect, 0 dead                                relish nodes --unhealthy
 council    leader node-1 (term 41), 3/3 voters, quorum ok, 0 lagging
@@ -6001,6 +6002,11 @@ also showed a gap in the gym. The next scenario started on top of the
 leftover `gym-api` and timed out, so the runner now stops after any run whose
 cleanup it can't vouch for, and `paused-app` runs last. The record is
 [`qualification/2026-11-08-gym-for-users-e2e.md`](../qualification/2026-11-08-gym-for-users-e2e.md).
+
+The Bun bug became #1772, and chapter 8's "A pause is not an exit" tells how
+it was fixed: macOS's `waitid` reports a stopped child too, and the process
+owner took the pause for an exit. With that fixed, `paused-app` cleans up on
+the process runtime like every other scenario.
 
 ### Recording a session for the homepage
 
