@@ -151,8 +151,16 @@ def k8s_mcp_config(directory, kubeconfig):
 
 
 def claude_argv(claude, model=None, budget=DEFAULT_BUDGET_USD, plugin=PLUGIN, platform="reliaburger",
-                mcp_config=None):
-    """The `claude` command line for one gym session."""
+                mcp_config=None, tools="Bash,Skill", allowed=None, disallowed=None):
+    """The `claude` command line for one gym session.
+
+    `tools`, `allowed` and `disallowed` replace the Reliaburger side's tool
+    set, its permissions and its refusals: the website recordings
+    (scripts/record/) let the session build and try its patch and write its
+    report's files.
+    """
+    allowed = ALLOWED_TOOLS if allowed is None else allowed
+    disallowed = DISALLOWED_TOOLS if disallowed is None else disallowed
     if platform == "k8s":
         argv = [
             claude, "-p",
@@ -179,9 +187,9 @@ def claude_argv(claude, model=None, budget=DEFAULT_BUDGET_USD, plugin=PLUGIN, pl
         "--strict-mcp-config",
         "--mcp-config", str(plugin / ".mcp.json"),
         "--plugin-dir", str(plugin),
-        "--tools", "Bash,Skill",
-        "--allowedTools", *ALLOWED_TOOLS,
-        "--disallowedTools", *DISALLOWED_TOOLS,
+        "--tools", tools,
+        "--allowedTools", *allowed,
+        *(["--disallowedTools", *disallowed] if disallowed else []),
         "--permission-mode", "dontAsk",
         "--json-schema", json.dumps(answer_schema()),
         "--max-budget-usd", budget,

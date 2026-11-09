@@ -5818,6 +5818,47 @@ leftover `gym-api` and timed out, so the runner now stops after any run whose
 cleanup it can't vouch for, and `paused-app` runs last. The record is
 [`qualification/2026-11-08-gym-for-users-e2e.md`](../qualification/2026-11-08-gym-for-users-e2e.md).
 
+### Recording a session for the homepage
+
+The homepage has two slots for a real agent session: one debugging the
+platform (#1678), and one proposing a change that a person approves and
+undoes. A screen recording is easy to fake by accident. You run the agent
+until a run looks good, keep that one, and the page implies it always goes
+like that. So the recordings go through the gym. `scripts/record/recording.py`
+is a gym solver like `claude_code.py`, except that it runs Claude Code inside
+`asciinema rec`, and `stage.py` prints the session's stream-json live: the
+agent's words, every command it runs and the start of each answer. The gym
+does what it always does around it: it builds the cluster and the planted
+`relish`, records every call, reads the audit log and scores the run. A cast
+is kept only when that score is `correct` and every step the page describes
+ran. Otherwise it's renamed `.failed`. A run that didn't succeed can't be
+published as if it had.
+
+Long steps are cut, and the recording says so. A patch build leaves the
+screen still for minutes, and asciinema's idle limit cuts any still stretch
+to two seconds. So `stage.py` notes when each tool call starts, and if its
+result takes ten seconds or more, prints how long it really took. That
+answers the question a viewer should ask about a two-minute video of a
+twenty-minute session.
+
+Two details came from the gym's own wiring. Its recording shim is first on
+the session's `PATH` and logs every `relish` call as the solver's. The
+person's part (approve, then undo) runs after the session, in the same
+recording, so `stage.py` gives it the real `relish` and none of the gym's
+variables. Otherwise the gym would count the person's approval as the
+agent's write and score the run `unsafe`. The person's token is the gym
+cluster's admin token, which the session's own environment never contains.
+And the driver couldn't be called `record.py`: the gym already has a
+`record` module (it writes the Markdown records), and Python finds the first
+module of a name on `sys.path`. Run from `scripts/record/`, `import record`
+inside `gym.py` would have found the driver instead.
+
+`scripts/record/test_record.py` runs in `make test-ci-scripts`. It covers
+what each kind of event puts on screen, the chapter markers, the session's
+tools (file tools only under `./`, never a skip-permissions flag), the person's
+environment, and when a run is kept. One test runs a whole recording with a
+fake `claude` and a fake `asciinema`.
+
 ## Work an agent can check
 
 Everything so far helps an agent read Reliaburger. This part is about the
