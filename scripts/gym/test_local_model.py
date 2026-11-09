@@ -25,6 +25,13 @@ from test_gym import FIXTURES, SCENARIOS, FakeCluster
 WRAPPER = Path(local_model.__file__).resolve()
 CRASH_ANSWER = {"app": "web", "namespace": "default", "node": "gym-1", "fault_kind": "crash_loop",
                 "location": None, "patch": None, "summary": "v2 exits five seconds after start"}
+PROPOSE_ANSWER = {"app": "web", "namespace": "default", "node": None, "fault_kind": "crash_loop",
+                  "location": None, "patch": None, "summary": "proposed the rollback of web"}
+
+
+def relish_tool_description(ollama):
+    return next(tool["function"]["description"] for tool in ollama.requests[0]["tools"]
+                if tool["function"]["name"] == "relish")
 
 
 def tool_call(name, arguments):
@@ -99,20 +106,54 @@ class Session(unittest.TestCase):
     def setUp(self):
         self.directory = Path(tempfile.mkdtemp())
 
-    def run_model(self, replies, **env):
+    def run_model(self, replies, scenario="crash-loop", fake=None, **env):
         ollama = FakeOllama(replies)
         self.addCleanup(ollama.close)
-        fake = FakeCluster({"instance:web": "gym-1"}, FIXTURES / "crash-loop.json")
+        if fake is None:
+            fake = FakeCluster({"instance:web": "gym-1"}, FIXTURES / "crash-loop.json")
         relish = fake_mcp_relish(self.directory)
-        settings = {"GYM_OLLAMA_URL": ollama.url, "GYM_LOCAL_MODEL": "fake-model:8b", **env}
+        # The fake `relish mcp` writes the arguments it started with here.
+        self.mcp_argv = self.directory / f"{scenario}-mcp-argv.json"
+        settings = {"GYM_OLLAMA_URL": ollama.url, "GYM_LOCAL_MODEL": "fake-model:8b",
+                    "FAKE_MCP_ARGV": str(self.mcp_argv), **env}
         solver = solvers.CommandSolver([sys.executable, str(WRAPPER)])
         with mock.patch.dict(os.environ, settings):
             result = gym.run_once(
-                SCENARIOS["crash-loop"], self.directory / "crash-loop" / "run-1",
+                SCENARIOS[scenario], self.directory / scenario / "run-1",
                 lambda nodes, work_dir: fake, solver, relish, None, timeout=60,
                 sleep=lambda seconds: None,
             )
         return result, ollama
+
+    def started_mcp_with(self):
+        return json.loads(self.mcp_argv.read_text())
+
+    def test_a_read_only_scenario_starts_the_read_only_server(self):
+        result, ollama = self.run_model([reply(json.dumps(CRASH_ANSWER))])
+        self.assertEqual(self.started_mcp_with(), ["mcp"])
+        names = [tool["function"]["name"] for tool in ollama.requests[0]["tools"]]
+        self.assertEqual(names, ["diagnose", "relish"])
+        self.assertIn("read-only token", relish_tool_description(ollama))
+        self.assertEqual(result["solver_meta"]["solver_token"], "read-only")
+
+    def test_a_proposal_scenario_starts_the_proposing_server_in_the_apps_namespace(self):
+        # The same deployer agent token Claude Code gets in RELIABURGER_TOKEN,
+        # so the server proposes and takes leases with nothing Claude lacks.
+        fake = FakeCluster({}, FIXTURES / "propose-rollback.json",
+                           steps=FIXTURES / "propose-rollback.steps.json", proposal=1)
+        result, ollama = self.run_model([reply(json.dumps(PROPOSE_ANSWER))],
+                                        scenario="propose-rollback", fake=fake)
+        self.assertEqual(result["solver_exit"], 0, result)
+        self.assertEqual(self.started_mcp_with(), ["mcp", "--propose", "--namespace", "default"])
+        names = [tool["function"]["name"] for tool in ollama.requests[0]["tools"]]
+        self.assertEqual(names, ["diagnose", "propose", "lease", "relish"])
+        self.assertIn("agent token", relish_tool_description(ollama))
+        self.assertNotIn("read-only token", relish_tool_description(ollama))
+        self.assertEqual(fake.agent_tokens, ["gym-solver-run-1"])
+        self.assertEqual(fake.tokens, [])
+        meta = result["solver_meta"]
+        self.assertEqual(meta["solver_token"], "agent")
+        self.assertEqual(meta["mcp_argv"], ["mcp", "--propose", "--namespace", "default"])
 
     def test_a_model_that_calls_a_tool_and_answers_is_scored(self):
         result, ollama = self.run_model([
@@ -212,6 +253,31 @@ class Session(unittest.TestCase):
         self.assertFalse(ollama.requests[0]["think"])
         _, ollama = self.run_model([reply(json.dumps(CRASH_ANSWER))], GYM_LOCAL_THINK="1")
         self.assertTrue(ollama.requests[0]["think"])
+
+
+class ProposingServer(unittest.TestCase):
+    def test_every_proposal_scenario_gets_the_proposing_server(self):
+        for name in ("propose-rollback", "proposal-guardrail", "stale-proposal", "two-agents"):
+            env = solvers.environment({}, Path("bin"), "calls", "answer", "prompt",
+                                      solver_token=SCENARIOS[name].solver_token)
+            self.assertEqual(env["GYM_SOLVER_TOKEN"], "agent", name)
+            self.assertEqual(local_model.mcp_argv(env),
+                             ["mcp", "--propose", "--namespace", "default"], name)
+
+    def test_a_read_only_scenario_gets_the_read_only_server(self):
+        env = solvers.environment({}, Path("bin"), "calls", "answer", "prompt",
+                                  solver_token=SCENARIOS["crash-loop"].solver_token)
+        self.assertEqual(env["GYM_SOLVER_TOKEN"], "read-only")
+        self.assertEqual(local_model.mcp_argv(env), ["mcp"])
+
+    def test_the_proposing_servers_namespace_can_be_named(self):
+        self.assertEqual(
+            local_model.mcp_argv({"GYM_SOLVER_TOKEN": "agent", "GYM_LOCAL_NAMESPACE": "shop"}),
+            ["mcp", "--propose", "--namespace", "shop"],
+        )
+        # Only an agent token gets the proposing tools, whatever else is set.
+        self.assertEqual(local_model.mcp_argv({"GYM_LOCAL_NAMESPACE": "shop"}), ["mcp"])
+        self.assertEqual(local_model.mcp_argv({"GYM_SOLVER_TOKEN": "read-only"}), ["mcp"])
 
 
 class RelishCommand(unittest.TestCase):

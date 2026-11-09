@@ -5746,6 +5746,16 @@ scenarios its first reply was empty, every time. Claude, with `Bash(relish
 *)`, typed `relish agent report` in every report run of the exit test; a
 small model sees a list of tools and stays inside it.
 
+So for the proposal scenarios the tools have to be on the list. The runner
+now tells every solver which token it handed over, in `GYM_SOLVER_TOKEN`
+(the scenario's `solver_token`), and with an agent token the local solver
+starts `relish mcp --propose --namespace default` instead of the plain
+server. That's no more power than Claude gets. The token is the same deployer
+agent token in `RELIABURGER_TOKEN`, which can propose and take leases but
+change nothing, and Claude reaches the same commands through Bash. Pinning
+the namespace only narrows what the tools ask for. What changes is the shape:
+a model that stays inside its tool list now finds `propose` and `lease` in it.
+
 And our source bundle carries an answer key. The model grepped the embedded
 source for `DATABASE_URL`, the variable the crashing app's log complains
 about, and found the app itself in `src/relish/gym/catalogue.rs`, where
@@ -5891,7 +5901,9 @@ and shim with a fake Ollama, a stdlib HTTP server in the test that answers
 `/api/chat` from a script, and a fake `relish mcp` with one tool: a tool
 call and its answer, the token and window counts, a prompt that shrank, the
 second ask for structured output, the turn limit and the `relish` tool's
-refusals. None of it starts
+refusals. It also runs a proposal scenario and checks the server started as
+`relish mcp --propose --namespace default` and offered `propose` and `lease`,
+while a read-only scenario still gets the plain server. None of it starts
 a cluster or a VM, or calls a model. `make test-gym` is the real thing.
 
 ### On your own cluster: `relish gym run`

@@ -183,7 +183,8 @@ The [first record](../qualification/2026-11-09-gym-local-models.md) (Qwen3
 4. **The commands a small model won't type.** It used the `relish` tool once
    in 18 sessions that needed it. Proposals are MCP tools under `relish mcp
    --propose`; a later pass runs the proposal scenarios with it, and the
-   manual says so for small models.
+   manual says so for small models. The solver starts `relish mcp --propose
+   --namespace default` when the runner's `GYM_SOLVER_TOKEN` is `agent`.
 5. **The task as a system message** cost nothing and keeps the task when
    Ollama trims; the manual recommends it to anyone writing their own loop.
 
