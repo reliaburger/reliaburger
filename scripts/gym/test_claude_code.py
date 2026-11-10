@@ -166,6 +166,47 @@ class McpPassThrough(unittest.TestCase):
         self.assertIn("GYM-CANARY-7F3A", calls[0]["stdout"])
         self.assertEqual(calls[0]["exit"], 0)
 
+    def test_a_tool_error_is_recorded_with_the_exit_code_the_command_gives(self):
+        directory = Path(tempfile.mkdtemp())
+        server = directory / "server.py"
+        server.write_text(FAKE_FAILING_MCP_SERVER)
+        real = executable(directory, "relish", server)
+        log = directory / "calls.jsonl"
+        codes = ["guardrail", "lease_held", "stale", "usage", "unreachable", "not_found", None,
+                 "something_new"]
+        requests = [
+            {"jsonrpc": "2.0", "id": index, "method": "tools/call",
+             "params": {"name": "propose", "arguments": {"kind": "scale", "code": code}}}
+            for index, code in enumerate(codes)
+        ]
+        requests.append({"jsonrpc": "2.0", "id": 99, "method": "tools/call",
+                         "params": {"name": "no_such_tool", "arguments": {}}})
+        stdin = io.BytesIO("".join(json.dumps(r) + "\n" for r in requests).encode())
+        self.assertEqual(shim.serve_mcp(str(real), ["mcp"], log, stdin, io.BytesIO()), 0)
+        # As `relish agent`: refused 4, failed 5, usage 2, unreachable 3; an
+        # error with no envelope code (a protocol error) stays 1.
+        self.assertEqual([call["exit"] for call in shim.read_log(log)],
+                         [4, 4, 5, 2, 3, 5, 0, 5, 1])
+
+
+FAKE_FAILING_MCP_SERVER = '''
+import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    params = message.get("params") or {}
+    if params.get("name") == "no_such_tool":
+        reply = {"jsonrpc": "2.0", "id": message["id"],
+                 "error": {"code": -32602, "message": "relish mcp has no tool called no_such_tool"}}
+    else:
+        code = params["arguments"]["code"]
+        envelope = {"ok": True, "data": {}} if code is None else {
+            "ok": False, "error": {"code": code, "message": "refused"}}
+        reply = {"jsonrpc": "2.0", "id": message["id"],
+                 "result": {"content": [{"type": "text", "text": json.dumps(envelope)}],
+                            "isError": code is not None}}
+    print(json.dumps(reply), flush=True)
+'''
+
 
 if __name__ == "__main__":
     unittest.main()

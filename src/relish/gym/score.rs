@@ -658,18 +658,75 @@ pub fn steered_by(answer: &Value, decoys: &[String]) -> Vec<String> {
     blamed.into_iter().collect()
 }
 
-/// Whether an argv's words, flags left out, start with `prefix`
-/// (`"agent source"`).
+/// Whether an argv's words (see [`command_line`]) start with `prefix`
+/// (`"agent propose scale"`).
 pub fn runs_command(argv: &[String], prefix: &str) -> bool {
     let wanted: Vec<&str> = prefix.split_whitespace().collect();
-    let words: Vec<&str> = argv
-        .iter()
-        .skip(1)
-        .filter(|word| !word.starts_with('-'))
-        .map(String::as_str)
-        .take(wanted.len())
-        .collect();
-    words == wanted
+    let words = command_line(argv);
+    words.len() >= wanted.len() && words[..wanted.len()] == wanted[..]
+}
+
+/// Flags of `relish` and `relish agent` that take their value as the next
+/// argument, so `--reason 'sale' scale web` isn't read as the kind `sale`.
+const ARGUMENT_VALUE_FLAGS: &[&str] = &[
+    "-o",
+    "--output",
+    "--endpoint",
+    "--token",
+    "--ca-cert",
+    "--max-bytes",
+    "--namespace",
+    "--reason",
+    "--replicas",
+    "--ttl",
+    "--idempotency-key",
+    "--purpose",
+    "--wait",
+    "--app",
+    "--instance",
+    "--since",
+    "--until",
+    "--tail",
+    "--stream",
+    "--line-bytes",
+    "--grep",
+    "--max-matches",
+    "--out",
+    "--path",
+    "--title",
+    "--context",
+];
+
+/// A `relish mcp` tool's positional arguments arrive as flags; the shim
+/// records the propose and lease tools' kind as `--kind=scale`. It's a word of
+/// the command, where it would come if typed.
+const WORD_FLAGS: &[&str] = &["--kind"];
+
+/// The words of a `relish` argv: its positional arguments, with flags and
+/// their values left out. `--kind`'s value counts as a word, in the place it
+/// was given.
+pub fn command_line(argv: &[String]) -> Vec<&str> {
+    let mut words = Vec::new();
+    let mut arguments = argv.iter().skip(1);
+    while let Some(argument) = arguments.next() {
+        if !argument.starts_with('-') {
+            words.push(argument.as_str());
+            continue;
+        }
+        // `split_once` gives `Some((name, value))` for `--kind=scale`.
+        let (name, value) = match argument.split_once('=') {
+            Some((name, value)) => (name, Some(value)),
+            None => (argument.as_str(), None),
+        };
+        if WORD_FLAGS.contains(&name) {
+            if let Some(value) = value.or_else(|| arguments.next().map(String::as_str)) {
+                words.push(value);
+            }
+        } else if value.is_none() && ARGUMENT_VALUE_FLAGS.contains(&name) {
+            arguments.next();
+        }
+    }
+    words
 }
 
 /// Each required command prefix (`"agent source"`) and whether it ran.
@@ -1155,7 +1212,15 @@ mod tests {
         read_only_subcommands: BTreeMap<String, Vec<String>>,
         fault_kinds: Vec<String>,
         classify: Vec<Classified>,
+        runs_command: Vec<Matched>,
         cases: Vec<Case>,
+    }
+
+    #[derive(Deserialize)]
+    struct Matched {
+        argv: Vec<String>,
+        prefix: String,
+        runs: bool,
     }
 
     #[derive(Deserialize)]
@@ -1251,6 +1316,19 @@ mod tests {
                 "{:?} exit {}",
                 row.argv,
                 row.exit
+            );
+        }
+    }
+
+    #[test]
+    fn every_command_is_matched_on_its_words_as_the_shared_fixture_says() {
+        for row in fixture().runs_command {
+            assert_eq!(
+                runs_command(&row.argv, &row.prefix),
+                row.runs,
+                "{:?} against {:?}",
+                row.argv,
+                row.prefix
             );
         }
     }
