@@ -1,6 +1,7 @@
 ---
 source: src/relish/audit_cmd.rs
+assertion_line: 274
 expression: table
 ---
-TIME (UTC)            NODE          WHO               ACTION                      TARGET                    SOURCE
-2026-10-11 12:00:00   node-2        alice             app.deleted                 web@team-a                10.0.0.9:51000
+TIME (UTC)            NODE          WHO               KIND      ACTION                      TARGET                    SOURCE
+2026-10-11 12:00:00   node-2        alice             human     app.deleted                 web@team-a                10.0.0.9:51000

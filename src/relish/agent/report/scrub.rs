@@ -100,16 +100,7 @@ impl AddressKind {
 
 /// A shared secret rule's name in the manifest.
 fn rule_name(rule: Rule) -> &'static str {
-    match rule {
-        Rule::ReliaburgerToken => "reliaburger_token",
-        Rule::EncryptedValue => "encrypted_value",
-        Rule::AgeIdentity => "age_identity",
-        Rule::PemPrivateKey => "pem_private_key",
-        Rule::UrlCredentials => "url_credentials",
-        Rule::EnvValue => "env_value",
-        Rule::Jwt => "jwt",
-        Rule::SecretKeyValue => "secret_key_value",
-    }
+    rule.name()
 }
 
 /// What redaction did to one item of the report.

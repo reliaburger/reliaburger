@@ -59,6 +59,11 @@ pub struct InstanceStatus {
     /// whose loop hasn't published for longer fails the request instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_age_ms: Option<u64>,
+    /// How long ago the node created this instance, in seconds, as of the
+    /// snapshot: `relish apps` shows an app's oldest as its AGE. `None` when
+    /// the source doesn't track it (a job run row).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub age_seconds: Option<u64>,
     /// Why a `failed` instance could not launch, such as
     /// `binary not found: /usr/local/bin/app` (#881).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -392,6 +397,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         .and_then(|s| s.memory.as_ref())
                         .map(|r| (r.request / (1024 * 1024)) as u32)
                         .unwrap_or(0);
+                    let gpu_request = spec.and_then(|s| s.gpu).unwrap_or(0);
                     let has_egress = spec
                         .and_then(|s| s.egress.as_ref())
                         .is_some_and(|e| !e.allow.is_empty() || !e.allow_franchise.is_empty());
@@ -428,6 +434,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         uptime: inst.created_at.elapsed(),
                         cpu_request_millicores,
                         memory_request_mb,
+                        gpu_request,
                         egress_enforcement,
                     }
                 })
@@ -447,6 +454,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .collect(),
             capacity_cpu_millicores: self.capacity_cpu_millicores,
             capacity_memory_mb: self.capacity_memory_mb,
+            capacity_gpus: self.supervisor.schedulable_gpus(),
             capabilities,
             readiness: match &self.readiness {
                 Some(readiness) => Some(readiness.snapshot().await),
@@ -613,6 +621,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         pid: None,
                         runtime_unknown: false,
                         status_age_ms: None,
+                        age_seconds: Some(instance.created_at.elapsed().as_secs()),
                         reason: instance.launch_failure.clone(),
                     },
                     evidence,

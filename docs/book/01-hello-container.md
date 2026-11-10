@@ -1449,6 +1449,20 @@ The `match` uses Rust's pattern matching with guards (the `if` clauses). The tup
 
 Making this a free function rather than a method on `HealthChecker` or `WorkloadInstance` is a deliberate choice. It has no hidden state, no side effects, and it's trivially testable. You can write a dozen test cases for it without setting up a supervisor, a mock runtime, or an instance. Just call the function with different inputs and check the output.
 
+### A default that depends on another field
+
+Every field of `[health]` is optional, so `HealthCheckConfig::from_spec` fills in defaults: probe every 10 seconds, give each probe 5. `relish apply` also refuses a timeout longer than the interval, because a probe that may outlast the interval overlaps the next one. Those two rules met in the gym's health-restart scenario, which set only `interval = 2` and was refused with "timeout (5s) must not be longer than interval (2s)", about a timeout it never wrote.
+
+So the default timeout now depends on the interval: 5 seconds, or the interval if that's shorter. One function in `src/bun/health.rs` says so, and both validation and the running health checker call it:
+
+```rust
+pub fn timeout_secs(timeout: Option<u64>, interval_secs: u64) -> u64 {
+    timeout.unwrap_or(DEFAULT_HEALTH_TIMEOUT_SECS.min(interval_secs))
+}
+```
+
+`unwrap_or` returns what's inside the `Option` when it's `Some`, and its argument when it's `None`. `min` is a method on `u64` itself; integers in Rust have methods, as every type can. A timeout the user wrote is kept as written, so `interval = 2` with `timeout = 3` is still refused: we'd rather tell the user than quietly change a number they chose. Why not just check the default separately in validation? Because then the checker could probe with a timeout validation never saw. With one function, what `relish apply` accepts is exactly what runs. `an_interval_alone_caps_the_default_timeout_at_the_interval` pins the resolved timeout for intervals of 1, 2, 5 and 10 seconds, and `health_interval_alone_is_accepted_at_any_length` in `src/config/validate.rs` pins that apply accepts them.
+
 ## Restart backoff
 
 When a container fails, you want to restart it. But you don't want to restart it immediately, because if it's crashing due to a configuration error or a missing dependency, it'll just crash again. And again. And again. Each failed start consumes CPU, writes logs, and might even make things worse (imagine a container that corrupts a database on startup before crashing).

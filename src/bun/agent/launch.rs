@@ -499,7 +499,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
     /// The runtime refused to launch `instance_id` because its binary can't
     /// run here (#881). Launching it again fails the same way, so the
-    /// instance is `Failed` at once, keeping the reason for `relish status`
+    /// instance is `Failed` at once, keeping the reason for `relish apps`
     /// and `relish wtf`, instead of waiting in `Starting`.
     pub(super) async fn record_launch_failure(&mut self, instance_id: &InstanceId, reason: String) {
         let Some(instance) = self.supervisor.get_instance_mut(instance_id) else {
@@ -642,6 +642,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 identity: None,
                 identity_mount: None,
                 launch_failure: None,
+                restart_cause: None,
             },
         );
         self.supervisor
@@ -862,6 +863,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     identity,
                     identity_mount,
                     launch_failure: None,
+                    restart_cause: None,
                 },
             );
         }
@@ -992,21 +994,21 @@ pub(super) struct LaunchTarget<'a> {
 /// A provider that fails refuses the launch with
 /// [`LaunchProblem::SecretUnavailable`](crate::grill::LaunchProblem), the
 /// same way a missing binary does (#881), so the instance fails closed with
-/// the reason in `relish status` and `relish wtf`.
+/// the reason in `relish apps` and `relish wtf`.
 pub(super) async fn create_with_secrets<'s, G: Grill>(
     grill: &G,
     providers: &crate::sesame::secret_provider::SecretProviders,
     target: LaunchTarget<'_>,
     spec: &'s crate::grill::oci::OciSpec,
 ) -> Result<std::borrow::Cow<'s, crate::grill::oci::OciSpec>, crate::grill::GrillError> {
-    let launch = if crate::sesame::secret_provider::needs_resolution(&spec.process.env) {
+    let launch = if crate::sesame::secret_provider::needs_resolution(&spec.process.provider_env) {
         let context = crate::sesame::secret_provider::LaunchContext {
             namespace: target.namespace,
             app: target.app_name,
             instance: &target.instance_id.0,
         };
         let env = providers
-            .resolve_env(&spec.process.env, context)
+            .resolve_env(&spec.process.env, &spec.process.provider_env, context)
             .await
             .map_err(|error| crate::grill::GrillError::LaunchRefused {
                 instance: target.instance_id.clone(),
@@ -1014,6 +1016,8 @@ pub(super) async fn create_with_secrets<'s, G: Grill>(
             })?;
         let mut resolved = spec.clone();
         resolved.process.env = env;
+        // The runtime gets secrets, not references.
+        resolved.process.provider_env.clear();
         std::borrow::Cow::Owned(resolved)
     } else {
         std::borrow::Cow::Borrowed(spec)

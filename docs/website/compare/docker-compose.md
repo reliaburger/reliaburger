@@ -119,4 +119,4 @@ This comparison uses Docker's official command references and operational guides
 
 ---
 
-The Markdown copy of <https://reliaburger.com/compare/docker-compose.html>.
+The Markdown copy of <https://reliaburger.com/compare/docker-compose>.

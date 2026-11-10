@@ -351,6 +351,11 @@ async fn write_frame<S: AsyncWrite + Unpin>(stream: &mut S, data: &[u8]) -> Resu
 /// When `tls` is `Some`, every connection must complete an mTLS handshake
 /// (the peer presents a client certificate) before its first frame is read.
 /// Runs until `shutdown` is cancelled.
+/// The Raft addresses a council partition cuts this node off from. The
+/// network factory refuses to send to them, and the RPC server refuses what
+/// they send, so the partition holds in both directions (#1810).
+pub type RaftBlocklist = std::sync::Arc<tokio::sync::RwLock<std::collections::HashSet<SocketAddr>>>;
+
 pub async fn serve_raft_rpc(
     listener: tokio::net::TcpListener,
     raft: Raft<TypeConfig>,
@@ -367,6 +372,7 @@ pub async fn serve_raft_rpc(
         MAX_RAFT_CONNECTIONS,
         crate::smoker::node_fault::NodeTransportGate::new(),
         None,
+        RaftBlocklist::default(),
     )
     .await
 }
@@ -377,6 +383,11 @@ pub async fn serve_raft_rpc(
 /// each request on an open connection re-checks the peer's certificate, so
 /// a revocation takes effect at the peer's next RPC rather than when its
 /// connection closes.
+///
+/// `blocklist` is the network factory's partition blocklist
+/// ([`TcpRaftNetworkFactory::blocklist`]): an RPC from a node whose Raft
+/// address it holds is refused, so a council partition cuts both ways.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_raft_rpc_with_node_gate(
     listener: tokio::net::TcpListener,
     raft: Raft<TypeConfig>,
@@ -385,6 +396,7 @@ pub async fn serve_raft_rpc_with_node_gate(
     fence: RecoveryFence,
     node_gate: crate::smoker::node_fault::NodeTransportGate,
     crl: Option<crate::sesame::mtls::CrlHandle>,
+    blocklist: RaftBlocklist,
 ) {
     serve_raft_rpc_with_limit_and_node_gate(
         listener,
@@ -395,6 +407,7 @@ pub async fn serve_raft_rpc_with_node_gate(
         MAX_RAFT_CONNECTIONS,
         node_gate,
         crl,
+        blocklist,
     )
     .await
 }
@@ -418,6 +431,7 @@ pub async fn serve_raft_rpc_with_limit(
         max_connections,
         crate::smoker::node_fault::NodeTransportGate::new(),
         None,
+        RaftBlocklist::default(),
     )
     .await
 }
@@ -434,6 +448,7 @@ pub async fn serve_raft_rpc_with_limit_and_node_gate(
     max_connections: usize,
     node_gate: crate::smoker::node_fault::NodeTransportGate,
     crl: Option<crate::sesame::mtls::CrlHandle>,
+    blocklist: RaftBlocklist,
 ) {
     // O6: hold a permit for the whole lifetime of a connection. Acquiring
     // *before* accepting means excess peers queue in the kernel's backlog
@@ -468,6 +483,7 @@ pub async fn serve_raft_rpc_with_limit_and_node_gate(
                         let raft = raft.clone();
                         let fence = fence.clone();
                         let connection_gate = node_gate.clone();
+                        let connection_blocklist = blocklist.clone();
                         match tls.clone() {
                             Some(acceptor) => {
                                 let crl = crl.clone();
@@ -503,6 +519,7 @@ pub async fn serve_raft_rpc_with_limit_and_node_gate(
                                         raft,
                                         fence,
                                         connection_gate,
+                                        connection_blocklist,
                                         still_admitted,
                                     )
                                     .await;
@@ -511,8 +528,15 @@ pub async fn serve_raft_rpc_with_limit_and_node_gate(
                             None => {
                                 tokio::spawn(async move {
                                     let _permit = permit;
-                                    serve_connection(stream, raft, fence, connection_gate, |_| true)
-                                        .await;
+                                    serve_connection(
+                                        stream,
+                                        raft,
+                                        fence,
+                                        connection_gate,
+                                        connection_blocklist,
+                                        |_| true,
+                                    )
+                                    .await;
                                 });
                             }
                         }
@@ -523,6 +547,46 @@ pub async fn serve_raft_rpc_with_limit_and_node_gate(
                 }
             }
         }
+    }
+}
+
+/// Whether `rpc` comes from a node this node's council partition blocks.
+///
+/// The connection's source port is ephemeral, so the sender is named by the
+/// RPC itself: every Raft RPC carries the vote of the leader or candidate
+/// that sent it. The membership gives that node's Raft address, which is
+/// what the blocklist holds. A sender outside the membership isn't blocked:
+/// the partition names peers by their place in the council.
+async fn sent_by_blocked_peer(
+    rpc: &RaftRpc,
+    raft: &Raft<TypeConfig>,
+    blocklist: &RaftBlocklist,
+) -> bool {
+    // With no partition, which is nearly always, every RPC stops here: no
+    // borrow of the metrics channel, whose writer is the Raft core itself.
+    if blocklist.read().await.is_empty() {
+        return false;
+    }
+    let vote = match rpc {
+        RaftRpc::AppendEntries(request) => &request.vote,
+        RaftRpc::Vote(request) => &request.vote,
+        RaftRpc::InstallSnapshot(request) => &request.vote,
+    };
+    let Some(sender) = vote.leader_id().voted_for() else {
+        return false;
+    };
+    // Copy the address out in one statement: the borrow holds the metrics
+    // channel's read lock, and must not live across the `.await` below.
+    let address = raft
+        .metrics()
+        .borrow()
+        .membership_config
+        .membership()
+        .get_node(&sender)
+        .map(|node| node.addr);
+    match address {
+        Some(address) => blocklist.read().await.contains(&address),
+        None => false,
     }
 }
 
@@ -543,6 +607,7 @@ async fn serve_connection<S, F>(
     raft: Raft<TypeConfig>,
     fence: RecoveryFence,
     node_gate: crate::smoker::node_fault::NodeTransportGate,
+    blocklist: RaftBlocklist,
     admitted: F,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -560,7 +625,7 @@ async fn serve_connection<S, F>(
         }
         let served = tokio::time::timeout(
             RAFT_ACCEPT_DEADLINE,
-            handle_raft_frame(&mut stream, &payload, &raft, &fence),
+            handle_raft_frame(&mut stream, &payload, &raft, &fence, &blocklist),
         )
         .await;
         if !matches!(served, Ok(true)) || opened.elapsed() >= SERVER_CONNECTION_MAX_AGE {
@@ -576,6 +641,7 @@ async fn handle_raft_frame<S: AsyncWrite + Unpin>(
     payload: &[u8],
     raft: &Raft<TypeConfig>,
     fence: &RecoveryFence,
+    blocklist: &RaftBlocklist,
 ) -> bool {
     // JSON, not a binary format: AppendEntries carries log entries whose
     // `AppSpec` payload uses `deserialize_any` config types (see
@@ -589,6 +655,11 @@ async fn handle_raft_frame<S: AsyncWrite + Unpin>(
     let Some((admission, rpc)) = decode_and_admit(payload, fence) else {
         return false;
     };
+    // A partitioned peer gets no answer at all, as if the packets were lost:
+    // closing the connection makes its client report the peer unreachable.
+    if sent_by_blocked_peer(&rpc, raft, blocklist).await {
+        return false;
+    }
     match admission {
         Admission::Serve => {}
         Admission::Adopted => {

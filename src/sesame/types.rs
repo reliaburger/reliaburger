@@ -294,6 +294,111 @@ pub struct WorkloadJwtClaims {
 // API tokens
 // ---------------------------------------------------------------------------
 
+/// Whose token it is: a person's, or an agent's (#1682).
+///
+/// An agent token authenticates with the read-only role on every route
+/// except the proposal and lease routes, which read its granted role, so
+/// it can propose a change but never make one. "Human" describes the
+/// token, not who's typing: an agent using a person's token is that
+/// person, as far as the cluster can tell.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenKind {
+    /// A person's token, and every token made without `--agent`.
+    #[default]
+    Human,
+    /// An agent's token, made with `relish token create --agent`.
+    Agent,
+}
+
+impl TokenKind {
+    /// `human` or `agent`, as audit records and listings spell it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TokenKind::Human => "human",
+            TokenKind::Agent => "agent",
+        }
+    }
+}
+
+/// What kind of principal an audit record names (#1682's design), so
+/// `relish audit --principal-kind agent` lists everything agents did.
+///
+/// It comes from what the API knows about the caller, never from a name:
+/// a token's [`TokenKind`], the node's own service principal, or a
+/// workload's verified identity. Like the token kind, it's a label for the
+/// audit, not a security boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrincipalKind {
+    /// A person's token, a browser session, or a node with no tokens yet.
+    Human,
+    /// An agent's token.
+    Agent,
+    /// A workload's identity token.
+    Workload,
+    /// The cluster itself: the nodes' service principal, and background
+    /// work such as expiry and sweeps.
+    System,
+    /// A guardrail policy that approved a proposal.
+    Policy,
+    /// No valid credential, or a summary of many callers.
+    Unknown,
+}
+
+impl PrincipalKind {
+    /// Every kind, in the order `relish audit --help` lists them.
+    pub const ALL: [PrincipalKind; 6] = [
+        PrincipalKind::Human,
+        PrincipalKind::Agent,
+        PrincipalKind::Workload,
+        PrincipalKind::System,
+        PrincipalKind::Policy,
+        PrincipalKind::Unknown,
+    ];
+
+    /// The kind as audit records spell it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PrincipalKind::Human => "human",
+            PrincipalKind::Agent => "agent",
+            PrincipalKind::Workload => "workload",
+            PrincipalKind::System => "system",
+            PrincipalKind::Policy => "policy",
+            PrincipalKind::Unknown => "unknown",
+        }
+    }
+}
+
+impl From<TokenKind> for PrincipalKind {
+    fn from(kind: TokenKind) -> Self {
+        match kind {
+            TokenKind::Human => PrincipalKind::Human,
+            TokenKind::Agent => PrincipalKind::Agent,
+        }
+    }
+}
+
+impl std::str::FromStr for PrincipalKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        PrincipalKind::ALL
+            .into_iter()
+            .find(|kind| kind.as_str() == value)
+            .ok_or_else(|| {
+                let names: Vec<&str> = PrincipalKind::ALL
+                    .iter()
+                    .map(|kind| kind.as_str())
+                    .collect();
+                format!(
+                    "unknown principal kind {value:?}: use one of {}",
+                    names.join(", ")
+                )
+            })
+    }
+}
+
 /// The role granted to an API token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ApiRole {
@@ -348,6 +453,9 @@ pub struct ApiToken {
     pub token_hash: Vec<u8>,
     /// The role granted to this token.
     pub role: ApiRole,
+    /// A person's token or an agent's (#1682).
+    #[serde(default)]
+    pub kind: TokenKind,
     /// Optional scope restrictions.
     pub scope: TokenScope,
     /// When the token expires.

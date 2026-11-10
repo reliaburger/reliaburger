@@ -657,7 +657,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
             Ok(socket)
         })
         .await?;
-        let listener = UnixListener::bind(&socket)?;
+        let listener = bind_control_socket(socket.clone()).await?;
         context.socket_path = Some(socket.clone());
         let owned = socket.clone();
         blocking(move || {
@@ -829,7 +829,7 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         // A /proc/fd alias keeps AF_UNIX's address bounded, independent of the
         // configured data-directory length. The source descriptor stays open.
         let socket_path = format!("/proc/self/fd/{}/control", source.as_raw_fd());
-        let listener = UnixListener::bind(&socket_path)?;
+        let listener = bind_control_socket(PathBuf::from(socket_path)).await?;
         let control = context.directory.join("control");
         blocking(move || {
             use std::os::unix::fs::PermissionsExt;
@@ -1582,6 +1582,19 @@ async fn blocking<T: Send + 'static>(
         .map_err(|error| ExecutorError::Protocol(error.to_string()))??)
 }
 
+/// Listen on a new control socket at `path`. Binding creates the socket's
+/// inode, and on a journalling filesystem busy with another fsync that can
+/// wait for the journal commit, so it runs on the blocking pool (#1707).
+async fn bind_control_socket(path: PathBuf) -> Result<UnixListener, ExecutorError> {
+    let listener = blocking(move || {
+        let listener = std::os::unix::net::UnixListener::bind(&path)?;
+        listener.set_nonblocking(true)?;
+        Ok(listener)
+    })
+    .await?;
+    Ok(UnixListener::from_std(listener)?)
+}
+
 /// Write an executor helper binary and make it and its directory entry
 /// durable. The write and both fsyncs are blocking file I/O, so they run on
 /// the blocking pool, not an async worker thread.
@@ -1872,6 +1885,20 @@ mod tests {
     use crate::meat::Resources;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// #1707: the agent loop's 500 ms turn deadline fired about 700 ms
+    /// late in the 0.2.7 jobs final, while a discovery fsync held the data
+    /// disk. Binding a control socket creates an inode on that disk, and on
+    /// a journalling filesystem that can wait for the commit the fsync
+    /// forced. It must not wait on a runtime worker.
+    #[test]
+    fn a_control_socket_is_bound_off_the_runtime() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("control");
+        crate::off_runtime::assert_runs_on_blocking_pool(bind_control_socket(path.clone()))
+            .unwrap();
+        assert!(path.exists(), "the socket was not bound");
+    }
+
     /// A runtime whose `kill` never returns, as when it waits on a task in
     /// uninterruptible sleep.
     #[derive(Clone, Default)]
@@ -2044,6 +2071,7 @@ mod tests {
                 rlimits: Vec::new(),
                 args: vec!["sleep".into(), "60".into()],
                 env: vec![],
+                provider_env: Vec::new(),
                 cwd: "/".into(),
                 user: OciUser { uid: 0, gid: 0 },
                 capabilities: None,

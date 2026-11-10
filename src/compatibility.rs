@@ -213,9 +213,37 @@ pub struct Compatibility {
 /// A node with no Raft seat fetches the leader's view of the security state
 /// from `/v1/cluster/security-view` (#1477), which a 0.2.5 leader doesn't
 /// serve, so such a node would wait for API tokens that never come.
+///
+/// 0.2.8, agents you can trust (58/74): one bump for the whole release,
+/// made by its first wire or state change. Each later 0.2.8 change adds its
+/// line below this one, not another bump.
+/// Agent leases (#1686): `DesiredState::agent_leases`, the `LeaseTake`,
+/// `LeaseRenew`, `LeaseRelease`, `LeaseBreak` and `LeaseExpire` Raft
+/// requests and the `AgentLease` council response.
+/// A state report's `ResourceUsage` carries `gpu_used` as a `u32` and a new
+/// `gpu_total`, so the leader counts GPUs instead of assuming none
+/// (`GET /v1/cluster/summary`).
+/// Agent proposals (#1682): `DesiredState::proposals`, the `Proposal*` Raft
+/// requests, the `Proposal` council response, and `ApiToken::kind`.
+/// Lease fences (#1686): the `LeaseFenced` Raft request and the
+/// `LeaseGenerationMoved` council response.
+/// An instance status carries `age_seconds`, and the relay forwards
+/// `/v1/cluster/summary/node`, for `relish apps` and `relish nodes`.
+/// The summary's council section names `other_leaders`, a split brain.
+/// Guardrails (#1682): a policy's `applies_to = "proposals"` and `action =
+/// "approve"`, and a finding's `kind = "proposal"`.
+/// The summary's leader view carries the live leases and the waiting
+/// proposals, and the summary an `agents` section (#1682).
+/// Every audit record carries `principal_kind` (#1682): a node's audit log
+/// and `GET /v1/audit`, which `--cluster` asks every peer for, so an older
+/// node's records or answer don't parse.
+/// More proposal kinds (#1682): `restart`, `cancel_deploy` and
+/// `clear_fault`, a proposal's `fault`, `AppSpec::restarted_at`, the
+/// blast radius's forecast fields, and a failed proposal's
+/// `blast_radius_grew` and `fault` reasons.
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 57,
-    state: 73,
+    protocol: 58,
+    state: 74,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

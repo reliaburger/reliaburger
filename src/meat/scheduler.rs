@@ -43,6 +43,51 @@ pub struct Placed {
     pub decision: SchedulingDecision,
     /// The replicas that found no node. `None` when every one did.
     pub unplaced: Option<Unplaced>,
+    /// Why each scored placement went where it did, in the order of
+    /// `decision.placements`. Empty for a daemon set, which isn't scored.
+    pub choices: Vec<ReplicaChoice>,
+}
+
+/// Why the scheduler put one replica on its node: the evidence a
+/// `placement.scored` decision records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicaChoice {
+    /// The node chosen.
+    pub node: super::types::NodeId,
+    /// Replicas of the app the node already had, the first sort key.
+    pub replicas_there: u32,
+    /// Its score, by part.
+    pub score: super::score::ScoreParts,
+    /// How many nodes passed the filter.
+    pub candidates: usize,
+    /// The next node in line, with its replicas and score.
+    pub runner_up: Option<(super::types::NodeId, u32, u32)>,
+}
+
+impl std::fmt::Display for ReplicaChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let score = &self.score;
+        write!(
+            f,
+            "{}: {} of its replicas there, score {} (bin-pack {}, labels {}, image {}, uptime {}); \
+             {} nodes passed the filter",
+            self.node,
+            self.replicas_there,
+            score.total(),
+            score.bin_pack,
+            score.preferred,
+            score.image,
+            score.stability,
+            self.candidates,
+        )?;
+        match &self.runner_up {
+            Some((node, replicas, total)) => write!(
+                f,
+                "; runner-up {node} ({replicas} of its replicas there, score {total})"
+            ),
+            None => write!(f, "; no runner-up"),
+        }
+    }
 }
 
 /// Replicas the scheduler couldn't place.
@@ -170,6 +215,7 @@ impl Scheduler {
         image: Option<&str>,
     ) -> Placed {
         let mut placements = Vec::with_capacity(replica_count as usize);
+        let mut choices = Vec::with_capacity(replica_count as usize);
         let mut unplaced = None;
 
         for ordinal in 0..replica_count {
@@ -196,6 +242,26 @@ impl Scheduler {
                 });
                 break;
             };
+            let replicas_of = |node: &super::types::NodeId| {
+                self.cluster
+                    .get_node(node)
+                    .map_or(0, |state| state.replicas_of(app_id))
+            };
+            choices.push(ReplicaChoice {
+                node: selected_node.clone(),
+                replicas_there: replicas_of(selected_node),
+                score: super::score::score_parts(
+                    selected_node,
+                    &requirements.resources,
+                    preferred_labels,
+                    &self.cluster,
+                    image,
+                ),
+                candidates: candidates.len(),
+                runner_up: scored
+                    .get(1)
+                    .map(|(node, total)| (node.clone(), replicas_of(node), *total)),
+            });
 
             // Phase 4: Commit (reserve in the cluster state cache)
             self.cluster
@@ -214,6 +280,7 @@ impl Scheduler {
                 placements,
             },
             unplaced,
+            choices,
         }
     }
 
@@ -247,6 +314,7 @@ impl Scheduler {
                 placements,
             },
             unplaced: None,
+            choices: Vec::new(),
         }
     }
 }
@@ -515,6 +583,53 @@ mod tests {
             "replicas must spread across distinct nodes; got {:?}",
             decision.placements
         );
+    }
+
+    #[test]
+    fn each_scored_placement_says_why_it_went_there() {
+        let mut cluster = cluster_3_nodes();
+        // n3 already has the image, so it wins the first replica on score.
+        let mut cached = node_state("n3", 2000, 4096, BTreeMap::new());
+        cached.cached_images.insert("test:v1".to_string());
+        cluster.set_node(cached);
+        let mut scheduler = Scheduler::new(cluster);
+        let mut spec = default_spec();
+        spec.replicas = Replicas::Fixed(2);
+
+        let placed = scheduler.place_app(&AppId::new("web", "prod"), &spec);
+
+        assert_eq!(placed.choices.len(), placed.decision.placements.len());
+        let first = &placed.choices[0];
+        assert_eq!(first.node, NodeId::new("n3"));
+        assert_eq!(first.node, placed.decision.placements[0].node_id);
+        assert_eq!(first.replicas_there, 0);
+        assert_eq!(first.score.image, 100);
+        assert_eq!(first.candidates, 3);
+        let (runner_up, replicas, total) = first.runner_up.clone().unwrap();
+        assert_eq!((runner_up.0.as_str(), replicas), ("n1", 0));
+        assert!(total < first.score.total());
+        // The second replica spreads: n3 now runs one, so it ranks last.
+        assert_ne!(placed.choices[1].node, NodeId::new("n3"));
+        let line = first.to_string();
+        assert!(
+            line.starts_with("n3: 0 of its replicas there, score "),
+            "{line}"
+        );
+        assert!(line.contains("image 100"), "{line}");
+        assert!(
+            line.contains("; runner-up n1 (0 of its replicas there, score "),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn a_daemon_set_records_no_scored_choices() {
+        let mut scheduler = Scheduler::new(cluster_3_nodes());
+        let mut spec = default_spec();
+        spec.replicas = Replicas::DaemonSet;
+        let placed = scheduler.place_app(&AppId::new("agent", "prod"), &spec);
+        assert_eq!(placed.decision.placements.len(), 3);
+        assert!(placed.choices.is_empty());
     }
 
     #[test]

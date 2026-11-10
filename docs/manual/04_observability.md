@@ -24,7 +24,7 @@ asked. `--since` and `--until` take epoch seconds or a duration before now
 (`30s`, `5m`, `2h`, `1d`); `--until` can't be combined with `-f`, since a
 followed stream has no end. A window prints only lines inside it, so an app
 that's been quiet for the last five minutes prints nothing for `--since 5m`. `--stream` takes `stdout` or `stderr` and,
-for now, isn't offered with `-f` either. `--instance` takes an id as `relish status`
+for now, isn't offered with `-f` either. `--instance` takes an id as `relish apps web`
 shows it, and works with `-f` too. With `-f` on a cluster, each line arrives
 as `[node instance] line`, and `--grep` sees that prefix, so anchor a
 pattern with `$` rather than `^`.
@@ -230,7 +230,7 @@ exporter, list fixed URLs as `[[metrics.scrape_targets]]` with a `job` and a
 Each node evaluates five built-in rules against its own metrics every 30
 seconds: CPU above 90% for 5 minutes and memory above 85% for 2 minutes
 (critical); memory above 70% for 10 minutes, disk above 80% for 5 minutes and
-CPU below 5% for 30 minutes (warning). You can't define your own rules yet.
+CPU below 5% for 30 minutes (warning). You can't define your own rules yet ([#1773](https://github.com/reliaburger/reliaburger/issues/1773)).
 Webhooks deliver them, optionally signed with HMAC-SHA256:
 
 ```toml
@@ -269,7 +269,17 @@ token scoped to some apps or namespaces sees only the events about them, and
 none that name no namespace (see `writing-a-controller`).
 
 The TUI shows apps, nodes, jobs, routes, live logs and events; press `?`
-inside for keys. It needs a terminal of at least 80×24. With no terminal on
+inside for keys. Its dashboard, the first screen, and the top of the web
+dashboard show what `relish status` shows: the verdict and one line per
+part of the cluster, read from the same cluster summary (`GET
+/v1/cluster/summary`). Neither runs `wtf`'s checks, so neither has a `wtf`
+line; `relish status` does. All three show an `agents` line: the agent
+leases held, naming the first holder and target (`1 lease held:
+app:shop/web by holmes`), and the proposals waiting for approval. Those are
+a note, pointing at `relish proposal list` or `relish lease list`, and the
+cluster stays `HEALTHY`. A stale proposal, one whose app changed after it
+was made so approving it would fail, makes the cluster `DEGRADED` until
+someone withdraws or rejects it. The TUI needs a terminal of at least 80×24. With no terminal on
 stdin or stdout (a pipe, a cron job, an AI agent's shell), `relish`, `relish
 manual` and `relish source` exit at once with an error that names the plain
 output command to use instead: `relish agent guide`, `relish agent manual` or
@@ -281,7 +291,10 @@ that leaves shows as a `warning │` line where it happened. The jobs and events
 tables have a NODE column, and an app's Deploys tab lists one row per node
 that rolled each deploy out. When a node doesn't answer, the view keeps what
 the others sent and adds a yellow `incomplete: node … timed out` line, so a
-short list never passes for a complete one. On the web dashboard, a node's
+short list never passes for a complete one. The summary lines do the same
+in their own words: `2 alive, 0 suspect, 0 dead; partial (2 of 3 nodes)`,
+and the header's counts say `partial` too. If the web dashboard can't list
+every app, it says so above the table and still shows the summary. On the web dashboard, a node's
 page lists that node's apps (or says it didn't answer) and charts CPU and
 memory only on the node's own dashboard.
 
@@ -308,3 +321,13 @@ a node's API address in a browser directly (<http://127.0.0.1:9117/> on a
 source build): once the cluster has tokens, it asks you to paste one and gives
 you a read-only session for 12 hours, or until the token expires or is revoked
 if that comes first.
+
+The dashboard's Proposals page (`/ui/proposals`, also linked from the Cluster
+card's `agents` line) lists what agents have asked to change: waiting ones
+first, then recent ones, each with its kind, target, author, age, state and,
+if it's gone stale, why. A proposal's own page shows the cluster's summary,
+the field diff, the blast radius and the undo plan, then the author's reason
+in a box that marks it as the author's own words. A person whose token may
+decide gets approve, reject and undo buttons there, each asking for their
+API token, since the session cookie alone only reads; see the dashboard
+sessions part of `security`.

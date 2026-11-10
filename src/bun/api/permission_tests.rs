@@ -131,6 +131,8 @@ fn bearer(name: &str, role: ApiRole) -> AuthContext {
         token_name: name.to_string(),
         principal_id: format!("token:{name}"),
         role,
+        kind: crate::sesame::types::TokenKind::Human,
+        granted_role: role,
         scoped_apps: None,
         scoped_namespaces: None,
     }
@@ -475,6 +477,7 @@ fn instance(app: &str) -> InstanceStatus {
         pid: Some(4242),
         runtime_unknown: false,
         status_age_ms: None,
+        age_seconds: None,
         reason: None,
     }
 }
@@ -1417,6 +1420,13 @@ fn principal_body(path: &str) -> Option<&'static str> {
         "/v1/exec/{app}/{namespace}" => r#"{"command":["true"]}"#,
         "/v1/test/leases" | "/v1/test/leases/{id}/renew" => r#"{"ttl_seconds":60}"#,
         "/v1/snapshots/{namespace}/{app}/restore" => r#"{"name":"nightly"}"#,
+        "/v1/leases" | "/v1/leases/renew" | "/v1/leases/release" | "/v1/leases/break" => {
+            r#"{"target":{"kind":"app","namespace":"default","app":"web"}}"#
+        }
+        "/v1/proposals" => {
+            r#"{"kind":"scale","namespace":"default","app":"web","replicas":2,"reason":"probe"}"#
+        }
+        "/v1/proposals/{id}/reject" => r#"{"reason":"probe"}"#,
         "/v1/fault" => {
             r#"{"fault_type":{"type":"Pause"},"target_service":"api","namespace":"default","duration":{"secs":1,"nanos":0},"injected_by":""}"#
         }

@@ -6,6 +6,7 @@ class Relish < Formula
   homepage "https://reliaburger.com"
   version "@VERSION@"
   license "Apache-2.0"
+@BOTTLE@
 
   on_macos do
     # Apple silicon only: 0.2.1 was the last Intel macOS build.

@@ -81,8 +81,8 @@ mirror, `mirrors` now covers every image you apply.
   not answer`). The registry gets 20 seconds to answer.
 - **Pickle images** bind to the digest the cluster's registry holds for the
   tag, without asking anyone else.
-- **Where you see it:** `relish history` and `relish inspect` show the bound
-  reference, as does each instance's image in `relish status`. `relish rollback`
+- **Where you see it:** `relish history` shows the bound reference in its
+  `IMAGE` column, one row per version. `relish rollback`
   restores the bound reference of the version before, so it runs the bytes
   that ran then, even if the tag has moved since.
 - **GitOps** binds the same way when it writes an app. Git keeps the tag, and
@@ -94,7 +94,7 @@ speaks for every node.
 
 An app that names an `image` needs a container runtime. The process runtime
 (`bun --runtime process`) runs host workloads only, `exec` and `script` apps,
-so it refuses an image app: `relish apply`, `relish status` and `relish wtf`
+so it refuses an image app: `relish apply`, `relish apps` and `relish wtf`
 say it `needs a container runtime to run image ...`. It doesn't run the app's
 `command` on the host instead, or start a placeholder. In a cluster, the
 scheduler places an image app only on nodes that run containers, and reports
@@ -167,9 +167,9 @@ every push and pull got a 413.
 
 An image is *lost* when some layer it needs has no live copy left, for
 example when the only node that held it died before heal copied it. Pickle
-can't rebuild it. `relish status` prints a line naming each lost image,
-`relish wtf` reports it as an error, and a deploy that needs it fails with
-`image … is lost: … re-push it`. Push it again, or bring the node that held it
+can't rebuild it. `relish wtf` reports each lost image as an error, naming
+it (so `relish status` counts it on its `wtf` line), and a deploy that needs
+it fails with `image … is lost: … re-push it`. Push it again, or bring the node that held it
 back.
 
 ### The cluster registry needs mTLS
@@ -194,9 +194,9 @@ each node)
 ```
 
 Each node logs it once at start-up and once from its cleanup loop, not every
-second. `relish status` prints `registry: needs mTLS`, and `relish wtf` warns
-`registry-needs-mtls`, naming the nodes. An image with an explicit registry
-host (`ghcr.io/org/app:v1`) still pulls straight from that registry. A short
+second. `relish wtf` warns `registry-needs-mtls`, naming the nodes, and
+`relish status` counts the warning on its `wtf` line. An image with an
+explicit registry host (`ghcr.io/org/app:v1`) still pulls straight from that registry. A short
 name never falls back to a direct Docker Hub pull: Pickle is the only way to
 Docker Hub, so short-name images need mTLS. To use Pickle, start the cluster
 with TLS, which is the default: `relish init`, `relish setup --quickstart` and
@@ -329,7 +329,7 @@ Unscoped tokens push and pull anything, as before.
 ### Trusting the cluster CA
 
 The registry serves the node's certificate, which names the node rather than
-its address, so `NODE` has to be the node's name (`relish status` lists them),
+its address, so `NODE` has to be the node's name (`relish nodes` lists them),
 your machine has to resolve it, and the client has to trust the cluster's root
 CA: `~/.reliaburger/clusters/NAME/security/identity/root-ca.crt`. Put it where
 your client looks, under the registry's `host:port`:
@@ -415,7 +415,7 @@ its volume, and waits there if that node is short of room, not ready, or in the
 middle of an upgrade. A running app stays put for the same reasons, and also
 while its node is out of the cluster: restarting Bun, rebooting or a crash all
 look the same to gossip, and the data is usually still there. While it waits,
-`relish status` and `relish inspect` say which node it's waiting for, and
+`relish apps` and `relish inspect` say which node it's waiting for, and
 `relish wtf` reports it as critical. Only two things move it: decommissioning
 the node with `relish decommission-node <node> --workloads-stopped --reason
 <why>`, which writes its volumes off, or changing the app's

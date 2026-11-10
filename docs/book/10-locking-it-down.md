@@ -647,7 +647,7 @@ Response::from_parts(parts, axum::body::Body::from(bytes))
 
 `into_parts` consumes the response and hands back its status and headers separately from its body, and `to_bytes` reads the body into memory, up to a limit. A response body is a stream you can read once, so reading it means building a new response. The ownership rules make that obvious: after `into_parts` the original `answer` is gone, and using it again is a compile error.
 
-The other nodes still catch up on their five-second refresh, so a client behind a load balancer can land on a third node and get a `401` for a moment. The issue asked for the node you spoke to, and that's what the fix promises.
+The other nodes still caught up on their five-second refresh, so a client behind a load balancer could land on a third node and get a `401` for a moment. The issue asked for the node you spoke to, and that's what the fix promised. "Every node at once" below closes the rest of the gap.
 
 ### The other three writes
 
@@ -682,6 +682,48 @@ What if the replica is more than two seconds behind? We can't wait for ever, and
 The other timeout is the leader not answering at all, and here each route loses something different, so each caller of `forward_token_write` passes its own error. After 10 seconds the write may or may not have committed. A revoke loses nothing: revoking again is safe, because revoking a name that's gone is a no-op. A create or a rotation may have lost the only copy of a secret. A rotation is the nasty one, because the obvious reaction is wrong. A second rotation replaces the previous secret, so the secret your clients still hold stops at once, grace period or no grace period, and they get an outage instead of an overlap. The error tells you to look at the token's created time in `relish token list` first (a rotation moves it). And a join token may leave a hash behind that nobody has the plaintext for. Nothing can use it, and it expires by itself.
 
 Writing the join-token test turned up one more. `join_token_create_handler` matched `Ok(_)` and answered `200` with a plaintext, even when the state machine had refused the entry because the node is retired. The caller got a credential that existed nowhere. Now a refusal is a `409`, like everywhere else. `Ok` from `council.write` means "the entry applied", not "the state machine agreed", and `CouncilResponse::Refused` is the second question. The compiler can't ask it for you past a wildcard arm.
+
+### Every node at once
+
+The moment a token is created and the moment it's first used used to be minutes apart, with a human in between. Then agents arrived. The agent gym creates a read-only token for each run and hands it to the solver, which calls `relish agent context` straight away. `context` asks every node for its own diagnostics, events and faults, with the solver's token. On a local model's runs of the partitioned-node scenario, the answer listed sixteen `401: invalid token` errors from the two followers, and the model stopped there and blamed the wrong node.
+
+The partition looked like the obvious suspect, since a node cut off from the council can't apply a token created after the cut. But the healthy follower answered `401` too. Timing a fresh token on a healthy three-node cluster showed why: the leader accepted it at once, and both followers turned it away for between 2.5 and 4.8 seconds, until their next refresh. The partition had nothing to do with it. With the fix below, the same scenario's `context` shows no `401` from any node.
+
+So the state machine now says when the tokens change. Next to the GitOps trigger watch, `CouncilStateMachine` keeps a `watch::Sender<Vec<ApiToken>>`, and after each applied batch and each installed snapshot it does this:
+
+```rust
+fn publish_api_tokens(&self, state: &DesiredState) {
+    let tokens = &state.security_state.api_tokens;
+    self.api_tokens.send_if_modified(|current| {
+        if current == tokens {
+            false
+        } else {
+            current.clone_from(tokens);
+            true
+        }
+    });
+}
+```
+
+`send_if_modified` hands the closure a mutable borrow of the channel's value, and wakes the receivers only if the closure returns `true`. So an entry that doesn't touch the tokens costs one comparison of a list of tens of tokens and wakes nobody. `clone_from` copies into the existing `Vec`, reusing its allocation where it can. Why compare the lists, rather than match on the requests that change tokens? There are at least six today, counting the test-lease ones and a lease's cleanup, and the next one added next year would leave its change unannounced. The comparison can't miss one.
+
+Bun's refresh loop then waits for whichever comes first:
+
+```rust
+async fn next_security_refresh(
+    ticker: &mut tokio::time::Interval,
+    token_updates: &mut tokio::sync::watch::Receiver<Vec<ApiToken>>,
+) {
+    tokio::select! {
+        _ = ticker.tick() => {}
+        Ok(()) = token_updates.changed() => {}
+    }
+}
+```
+
+The `Ok(())` pattern matters. `changed()` returns an error once the sender is gone, and it returns it at once, every time. In `select!`, a branch whose result doesn't match its pattern is disabled for that call, and the other branches carry on. So a closed channel leaves the loop on its five-second tick, instead of spinning through refreshes as fast as the CPU allows. The test drives this with paused time: a change wakes the loop with no time passed, the next wait takes exactly one interval, and after the sender is dropped the one after that does too.
+
+The tick stays for what the replica doesn't announce. A node with no Raft seat reads the leader's view, and the CRL and trust set still ride the same tick. With the fix, the same timing shows a fresh token accepted on both followers within milliseconds of the leader. It closes the revoke gap on every other node too. A revoked token used to keep working on them for up to five seconds after `relish token revoke` said it was gone.
 
 ### A default lifetime, except for Admins
 

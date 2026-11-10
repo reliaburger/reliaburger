@@ -24,6 +24,8 @@ binaries, which you can check with `gh attestation verify`
 a development cluster on this computer. Without a flag the installer only
 explains the choices, including clusters on Linux machines you already have
 (`--install-only`, then the [Linux servers guide](docs/linux-servers.md)).
+With Homebrew, from 0.2.7: `brew install reliaburger/tap/relish`, then
+`relish setup --quickstart` (or `relish setup --ssh user@host,...`).
 
 ```sh
 # Install relish and build a three-node cluster in Linux VMs on this laptop
@@ -87,7 +89,8 @@ your yes. To give an agent you already use the read-only MCP server,
 (Goose's button is on [the agents page](https://reliaburger.com/agents#add-to-your-agent)),
 or run `claude mcp add reliaburger -- relish mcp` for Claude Code.
 `relish agent setup` wires up every agent on this machine, and shows the diff
-before it writes anything.
+before it writes anything. From an admin context, `relish mcp` makes and sends
+a read-only token of its own, so an agent never holds admin credentials.
 
 ## What's in it
 
@@ -99,22 +102,22 @@ before it writes anything.
 - **Tenants kept apart:** namespaces can't reach each other unless you let them, and egress has allowlists.
 - **An audit log:** who applied, deleted, exec'd, upgraded or broke what, and from where.
 - **A registry on every node:** Pickle stores, caches and builds OCI images inside the cluster.
-- **Metrics, logs and alerts:** scraped, captured and exported by the agent, with nothing else to install.
+- **Metrics, logs and alerts:** scraped, captured and exported by the agent, with nothing else to install. Alerts are five built-in node rules for now ([#1773](https://github.com/reliaburger/reliaburger/issues/1773)).
 - **Batch jobs:** one-off jobs, cron, deploy hooks and task arrays of millions, beside your apps.
 - **Deploys and GitOps:** health-gated rolling deploys with rollback, blue-green, autoscaling and Git sync.
 - **Policies and templates:** CEL rules that refuse, warn or fill in defaults, and typed templates instead of CRDs.
 - **Your own controllers:** an ordinary app with a scoped token, no operator SDK.
 - **Chaos as a command:** `relish fault` injects latency, partitions, kills and pressure, and cleans up after itself.
-- **Self-upgrade:** `relish upgrade` rolls a signed `bun` across the cluster without restarting workloads.
-- **Diagnostics for incidents:** `relish wtf` and `relish path` say what's wrong and where.
-- **Built for agents:** `relish agent` answers in bounded JSON, and `relish mcp` serves it over MCP.
+- **Self-upgrade:** `relish upgrade` rolls a signed `bun` across the cluster without restarting workloads, and `relish verify` (0.2.8, not in 0.2.7) checks every node runs the published release, byte for byte.
+- **Diagnostics for incidents:** `relish wtf` and `relish path` say what's wrong and where. New in 0.2.8, not in 0.2.7: `relish status` sums up the whole cluster on one screen, `relish apps` lists the apps, and `relish timeline` shows what changed before a failure, with the rule and evidence behind each decision.
+- **Built for agents:** `relish agent` answers in bounded JSON, and `relish mcp` serves it over MCP. New in 0.2.8, not in 0.2.7: an agent proposes a change, a person or a policy approves it with `relish proposal approve` or the web dashboard's buttons, `relish undo` puts it back, `relish lease` keeps two of them off the same app, and `relish gym run` tests your own agent on your own cluster.
 - **A terminal UI and a web dashboard:** run `relish` with no arguments, or `relish dashboard`.
 - **The manual and the source in the binary:** `relish manual` and `relish source` work offline.
 
 [Everything 0.2.7 does](docs/README.md#whats-in-the-binary), what you
 don't have to install, and its [limits](docs/README.md#scope-and-limits) are
 in the documentation. The
-[feature status page](https://reliaburger.com/features.html) rates every
+[feature status page](https://reliaburger.com/features) rates every
 feature Ready, Beta, Alpha or Planned.
 
 ## Where to go next
@@ -137,6 +140,9 @@ with tests and a matching update to the book. Report a bug through an
 welcome to use AI tools if you say so and a human answers for every line;
 agents start with [AGENTS.md](AGENTS.md). Vulnerabilities go privately, as
 [SECURITY.md](SECURITY.md) describes, and there's no bounty.
+[`.devcontainer/`](.devcontainer) gives you CI's toolchain in one step for
+`make ci` (the portable suite only), and issues labelled `missed-mutant` are
+self-checking first tasks.
 
 ## Licence
 

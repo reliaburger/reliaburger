@@ -409,6 +409,7 @@ mod tests {
             rlimits: Vec::new(),
             args: Vec::new(),
             env: app_env.iter().map(|entry| entry.to_string()).collect(),
+            provider_env: Vec::new(),
             cwd: "/".to_string(),
             user: OciUser {
                 uid: 65534,

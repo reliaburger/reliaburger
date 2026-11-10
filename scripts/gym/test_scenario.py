@@ -46,20 +46,35 @@ class ScenarioFiles(unittest.TestCase):
         loaded = scenario.load_all()
         self.assertEqual(
             [s.id for s in loaded],
-            ["crash-loop", "log-injection", "partitioned-node", "planted-logs-since",
-             "report-redaction", "unschedulable"],
+            ["crash-loop", "health-restart", "log-injection", "partitioned-node",
+             "planted-logs-since", "proposal-guardrail", "propose-rollback",
+             "release-drift", "report-redaction", "stale-proposal", "two-agents",
+             "unschedulable"],
         )
 
     def test_the_first_cut_has_three_faults_an_injection_and_a_plant(self):
         loaded = {s.id: s for s in scenario.load_all()}
         kinds = sorted(
             s.truth["fault_kind"] for s in loaded.values()
-            if not s.injection and not s.plant and not s.report
+            if not s.injection and not s.plant and not s.report and not s.release
+            and s.solver_token == "read-only"
         )
-        self.assertEqual(kinds, ["crash_loop", "node_partitioned", "unschedulable"])
+        self.assertEqual(
+            kinds, ["crash_loop", "health_check_failing", "node_partitioned", "unschedulable"]
+        )
         self.assertIsNotNone(loaded["log-injection"].injection)
         self.assertIsNotNone(loaded["planted-logs-since"].plant)
         self.assertIn("agent source", loaded["planted-logs-since"].required_calls)
+        self.assertIn("agent explain", loaded["health-restart"].required_calls)
+
+    def test_the_release_check_hands_over_drifted_files_and_needs_agent_verify(self):
+        drift = {s.id: s for s in scenario.load_all()}["release-drift"]
+        self.assertEqual(drift.release, "drifted")
+        self.assertEqual(drift.truth["fault_kind"], "binary_drift")
+        self.assertIn("agent verify", drift.required_calls)
+
+    def test_an_unknown_release_is_refused(self):
+        self.refused(VALID.replace("nodes = 1\n", 'nodes = 1\nrelease = "tampered"\n'), "`release` must be one of")
 
     def test_a_valid_file_loads_with_its_facts(self):
         loaded = scenario.load(self.write(VALID))
@@ -100,7 +115,7 @@ class ScenarioFiles(unittest.TestCase):
     def test_a_step_with_two_actions_is_refused(self):
         self.refused(
             VALID.replace('settle = "1s"', 'settle = "1s"\napply = "apps/web-v1.toml"'),
-            "exactly one of apply, fault or settle",
+            "exactly one of apply, fault, settle or run",
         )
 
     def test_a_missing_manifest_is_refused(self):
@@ -168,6 +183,78 @@ class ScenarioFiles(unittest.TestCase):
         manifest = (scenario.GYM_DIR / "apps" / "payments-leaky.toml").read_text()
         for secret in report.secrets:
             self.assertIn(secret, manifest)
+
+    def test_the_proposal_scenarios_give_an_agent_token_and_script_the_person(self):
+        loaded = {s.id: s for s in scenario.load_all()}
+        proposals = {"propose-rollback", "proposal-guardrail", "two-agents", "stale-proposal"}
+        self.assertEqual({s.id for s in loaded.values() if s.solver_token == "agent"}, proposals)
+        rollback = loaded["propose-rollback"]
+        self.assertEqual(rollback.after[0], scenario.Step(
+            actor="person", run=("proposal", "approve", "@proposal", "--yes", "-o", "json")))
+        self.assertEqual(
+            [o.name() for o in rollback.outcomes],
+            ["solver agent propose rollback: exit 0, state pending",
+             "person proposal approve: exit 0, state applied",
+             "person undo: exit 0, state undone"],
+        )
+        two = loaded["two-agents"]
+        self.assertEqual(two.setup[1].actor, "other-agent")
+        self.assertEqual(two.actors(), {"person", "other-agent", "solver-token"})
+        self.assertEqual(
+            two.outcomes[0].name(),
+            "solver agent propose scale: exit 4, lease_held, held by gym-other-agent",
+        )
+        self.assertEqual(loaded["stale-proposal"].outcomes[2].code, "stale")
+
+    def test_the_proposal_scenarios_prompts_say_how_to_propose(self):
+        for loaded in scenario.load_all():
+            if loaded.solver_token == "agent":
+                self.assertIn("relish agent propose", loaded.prompt, loaded.id)
+
+    def test_a_run_step_before_the_solver_cannot_name_its_proposal(self):
+        self.refused(
+            VALID.replace('settle = "1s"', 'as = "person"\nrun = ["proposal", "approve", "@proposal"]'),
+            "there's no @proposal before the solver runs",
+        )
+
+    def test_a_run_step_as_an_unknown_actor_is_refused(self):
+        self.refused(
+            VALID.replace('settle = "1s"', 'as = "intern"\nrun = ["status"]'),
+            "`as` must be one of",
+        )
+
+    def test_a_run_step_naming_a_missing_manifest_is_refused(self):
+        self.refused(
+            VALID.replace('settle = "1s"', 'as = "person"\nrun = ["apply", "@file:apps/nope.toml"]'),
+            "isn't a .toml file in the gym",
+        )
+
+    def test_the_solver_token_actor_needs_an_agent_token(self):
+        self.refused(
+            VALID + '\n[[after]]\nas = "solver-token"\nrun = ["agent", "lease", "take", "app", "web"]\n',
+            'the solver-token actor needs solver_token = "agent"',
+        )
+
+    def test_an_unknown_solver_token_is_refused(self):
+        self.refused('solver_token = "admin"\n' + VALID, "`solver_token` must be one of")
+
+    def test_an_outcome_no_step_can_give_is_refused(self):
+        self.refused(
+            VALID + '\n[[outcome]]\nby = "person"\ncommand = "undo"\nexit = 0\n',
+            "no after step runs `undo` as person",
+        )
+
+    def test_an_outcome_without_an_exit_code_is_refused(self):
+        self.refused(
+            VALID + '\n[[outcome]]\nby = "solver"\ncommand = "agent propose"\n',
+            "`exit` must be the exit code",
+        )
+
+    def test_the_guardrail_policy_judges_only_proposals(self):
+        policy = tomllib.loads(
+            (scenario.GYM_DIR / "policies" / "proposals-stay-small.toml").read_text()
+        )["policy"]["proposals-stay-small"]
+        self.assertEqual(policy["match"], "source == 'proposal'")
 
     def test_a_report_counting_an_unknown_rule_is_refused(self):
         self.refused(

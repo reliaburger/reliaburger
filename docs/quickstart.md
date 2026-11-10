@@ -18,8 +18,9 @@ suggests a Linux host, or 0.2.1, the last release built for Intel Macs
 
 ```sh
 curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop
-relish nodes
 relish status
+relish nodes
+relish apps
 relish logs hello
 relish dashboard             # Ctrl-C stops the browser connection
 ```
@@ -99,6 +100,10 @@ start it separately:
 ```sh
 relish setup --quickstart --nodes 3
 ```
+
+Homebrew installs the same CLI from 0.2.7: `brew install reliaburger/tap/relish`,
+then `relish setup --quickstart`. Homebrew owns that copy, so `brew upgrade
+relish` updates it and `relish uninstall` leaves it for `brew uninstall relish`.
 
 Use `/install.sh`: GitHub Pages serves the same static page to browsers and
 curl, so the site's root is HTML. The bootstrap downloads a complete,

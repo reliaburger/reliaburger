@@ -24,8 +24,8 @@ Competitor versions and evidence limits are listed on each comparison page. Kube
 
 ## Keep the evidence useful
 
-If a comparison is wrong or a capability changes, [open an issue](https://github.com/reliaburger/reliaburger/issues) with the page, affected version and primary source. [Return to the comparisons](https://reliaburger.com/compare/index.html).
+If a comparison is wrong or a capability changes, [open an issue](https://github.com/reliaburger/reliaburger/issues) with the page, affected version and primary source. [Return to the comparisons](https://reliaburger.com/compare/).
 
 ---
 
-The Markdown copy of <https://reliaburger.com/compare/methodology.html>.
+The Markdown copy of <https://reliaburger.com/compare/methodology>.

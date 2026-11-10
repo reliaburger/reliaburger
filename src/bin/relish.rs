@@ -276,6 +276,60 @@ struct TestOptions {
     namespace: Option<String>,
 }
 
+/// `relish gym`.
+#[derive(clap::Subcommand)]
+enum GymAction {
+    /// Deploy the gym's apps into a staging namespace, break them, run your agent, score it and clean up.
+    Run(Box<GymRunOptions>),
+    /// List the scenarios: what each deploys, breaks and scores.
+    List,
+    /// The recording `relish` a solver runs (used by `relish gym run`).
+    #[command(hide = true)]
+    Record {
+        /// The call log to append to.
+        #[arg(long)]
+        log: PathBuf,
+        /// The `relish` arguments to run.
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+    /// The built-in baseline solver (run by `relish gym run --solver baseline`).
+    #[command(hide = true)]
+    Baseline,
+}
+
+/// `relish gym run`, boxed to keep the generated `Command` parser small.
+#[derive(clap::Args)]
+struct GymRunOptions {
+    /// The staging namespace to work in. Required; never `default`.
+    #[arg(long)]
+    namespace: String,
+    /// `baseline` (a scripted playbook built in), or `command:PROGRAM ARGS` for your agent.
+    #[arg(long, default_value = "baseline")]
+    solver: String,
+    /// A scenario to run; repeat for more. Omit for all of them.
+    #[arg(long = "scenario")]
+    scenarios: Vec<String>,
+    /// Runs per scenario.
+    #[arg(long, default_value_t = 1)]
+    runs: u32,
+    /// The solver's budget per run, e.g. "10m".
+    #[arg(long, default_value = reliaburger::relish::gym::DEFAULT_TIMEOUT)]
+    timeout: String,
+    /// A new directory for report.md, report.json and each run's evidence.
+    #[arg(long)]
+    out: Option<PathBuf>,
+    /// The image the gym's apps run on a container runtime (default a pinned BusyBox).
+    #[arg(long)]
+    image: Option<String>,
+    /// Agree to deploy and break the gym's apps in an empty or gym-only namespace.
+    #[arg(long)]
+    yes: bool,
+    /// Agree to run in a namespace holding other workloads: the namespace name again.
+    #[arg(long, value_name = "NAMESPACE")]
+    confirm_namespace: Option<String>,
+}
+
 // `relish path`, boxed to keep the generated `Command` parser
 // small (see `AuditOptions`).
 #[derive(clap::Args)]
@@ -554,6 +608,14 @@ struct AuditOptions {
     /// Only actions on this namespace.
     #[arg(long)]
     namespace: Option<String>,
+    /// Only actions by this kind of principal: human, agent, workload,
+    /// system, policy or unknown.
+    #[arg(long)]
+    principal_kind: Option<reliaburger::sesame::types::PrincipalKind>,
+    /// Only records about this proposal: its own, and the app records its
+    /// apply or undo wrote.
+    #[arg(long)]
+    proposal: Option<u64>,
     /// How many of the newest records to show (default 100, at most 10000).
     #[arg(long)]
     limit: Option<usize>,
@@ -598,9 +660,40 @@ enum Command {
         /// Request another job run; unresolved outcomes require grant-specific replay.
         #[arg(long, conflicts_with = "dry_run")]
         rerun_jobs: bool,
+        /// Break any agent lease on the app in your way (audited); without
+        /// it, someone else's lease refuses the change, naming them.
+        #[arg(long)]
+        break_lease: bool,
     },
-    /// Show cluster and app status.
-    Status,
+    /// Is the cluster all right? One screen: a verdict, then one line per part
+    /// of the cluster with the command that lists the detail.
+    Status {
+        /// Skip `relish wtf`'s checks, which otherwise run with a 2 s budget.
+        #[arg(long)]
+        quick: bool,
+        /// Exit 1 when the cluster is DEGRADED and 2 when it's DOWN, for
+        /// scripts and monitoring.
+        #[arg(long)]
+        check: bool,
+    },
+    /// List apps with their state, problems first; with NAME, that app's
+    /// instances.
+    Apps {
+        /// List this app's instances instead.
+        name: Option<String>,
+        /// Only apps in this namespace.
+        #[arg(long)]
+        namespace: Option<String>,
+        /// Only apps that aren't running and ready.
+        #[arg(long)]
+        unhealthy: bool,
+        /// Only apps with an instance on this node.
+        #[arg(long)]
+        node: Option<String>,
+        /// List every instance of every app, one row each.
+        #[arg(long, conflicts_with = "name")]
+        instances: bool,
+    },
     /// Stream logs from an app or job.
     Logs(Box<LogsOptions>),
     /// Copy a node's Parquet log files here, or have it ship them to object storage.
@@ -660,6 +753,10 @@ enum Command {
         /// directory). Defaults to "default".
         #[arg(long, default_value = "default")]
         namespace: String,
+        /// Break any agent lease on the app in your way (audited); without
+        /// it, someone else's lease refuses the change, naming them.
+        #[arg(long)]
+        break_lease: bool,
     },
     /// Remove an app from the cluster; each node then stops its instances.
     Delete {
@@ -672,6 +769,10 @@ enum Command {
         /// the repository declares it.
         #[arg(long)]
         force: bool,
+        /// Break any agent lease on the app in your way (audited); without
+        /// it, someone else's lease refuses the change, naming them.
+        #[arg(long)]
+        break_lease: bool,
     },
     /// Take an app back from the controller that owns it, so `relish apply` and GitOps manage it again (owner or admin).
     Release {
@@ -680,11 +781,20 @@ enum Command {
         /// Namespace the app lives in. Defaults to "default".
         #[arg(long, default_value = "default")]
         namespace: String,
+        /// Break any agent lease on the app in your way (audited); without
+        /// it, someone else's lease refuses the change, naming them.
+        #[arg(long)]
+        break_lease: bool,
     },
     /// Initialise a new cluster (generates CAs, age keypair, node identity).
     Init(Box<InitOptions>),
-    /// List cluster nodes and their gossip state.
-    Nodes,
+    /// List cluster nodes: gossip state, version, usage and what's allocated.
+    Nodes {
+        /// Only nodes that aren't alive, are cordoned or are under disk
+        /// pressure.
+        #[arg(long)]
+        unhealthy: bool,
+    },
     /// Permanently retire a stopped or fenced node; return requires fresh enrolment.
     DecommissionNode {
         /// Old cluster identity to retire permanently.
@@ -725,6 +835,9 @@ enum Command {
     /// Show the cluster's recent events: deploys, restarts, health, faults,
     /// tokens, secrets and audited operations, newest last.
     Events(Box<EventsOptions>),
+    /// What changed in a window, newest first: events (with the decisions
+    /// they record), the audit log and an app's deploys.
+    Timeline(Box<reliaburger::relish::agent::timeline::TimelineArgs>),
     /// Manage volume snapshots (Btrfs-backed volumes only).
     Snapshot {
         #[command(subcommand)]
@@ -737,6 +850,10 @@ enum Command {
         /// Show the plan without deploying (exits 0 even with no agent).
         #[arg(long)]
         dry_run: bool,
+        /// Break any agent lease on the app in your way (audited); without
+        /// it, someone else's lease refuses the change, naming them.
+        #[arg(long)]
+        break_lease: bool,
     },
     /// Cancel a node-local deploy and wait for its current work to finish.
     CancelDeploy {
@@ -763,6 +880,10 @@ enum Command {
         /// the repository declares.
         #[arg(long)]
         force: bool,
+        /// Break any agent lease on the app in your way (audited); without
+        /// it, someone else's lease refuses the change, naming them.
+        #[arg(long)]
+        break_lease: bool,
     },
     /// Validate a config file without deploying.
     Lint {
@@ -891,6 +1012,26 @@ enum Command {
         #[command(subcommand)]
         action: GitopsAction,
     },
+    /// List, take, renew, release or break leases on apps and namespaces,
+    /// which keep agents and people from changing the same thing at once.
+    Lease {
+        #[command(subcommand)]
+        action: LeaseAction,
+    },
+    /// List, show, approve or reject the changes agents propose. Approving
+    /// applies it; each shows its blast radius and undo command first.
+    Proposal {
+        #[command(subcommand)]
+        action: ProposalAction,
+    },
+    /// Put an applied proposal back, if nothing has changed its apps since.
+    Undo {
+        /// The proposal's number.
+        id: u64,
+        /// Don't ask first (required with -o json).
+        #[arg(long)]
+        yes: bool,
+    },
     /// List, audit or delete the cluster's policies, or test policies offline.
     Policy {
         #[command(subcommand)]
@@ -940,6 +1081,9 @@ enum Command {
         #[command(subcommand)]
         action: UpgradeAction,
     },
+    /// Check the cluster runs exactly the published release: each node's bun
+    /// and this relish, by SHA-256 and release signature.
+    Verify(Box<reliaburger::relish::agent::verify::VerifyArgs>),
     /// Read the built-in manual (searchable TUI; --web for the browser).
     Manual {
         /// Serve the manual as one HTML page and open the browser.
@@ -983,6 +1127,11 @@ enum Command {
     Setup(Box<SetupOptions>),
     /// Run the built-in integration test suite against the cluster.
     Test(Box<TestOptions>),
+    /// Test your own agent on your own cluster: break a staging namespace in known ways, run the agent, score it.
+    Gym {
+        #[command(subcommand)]
+        action: GymAction,
+    },
     /// Run reproducible performance benchmarks against the real data plane.
     Bench(Box<BenchOptions>),
     /// Diagnose cluster health and correlate likely causes.
@@ -1192,6 +1341,13 @@ enum TokenAction {
         /// Without this, creating a token under such a name is refused.
         #[arg(long)]
         inherit_permissions: bool,
+        /// An agent's token: it proposes changes and never makes them.
+        /// Read-only unless --role deployer; never admin; 8h unless --ttl.
+        #[arg(long, conflicts_with_all = ["ttl_days", "no_expiry"])]
+        agent: bool,
+        /// How long the agent token lives, e.g. 8h (at most 168h).
+        #[arg(long, requires = "agent", value_parser = parse_agent_token_ttl)]
+        ttl: Option<std::time::Duration>,
     },
     /// List all API tokens with their scope, expiry and last use.
     List,
@@ -1369,7 +1525,89 @@ enum PolicyAction {
         /// The role a policy sees in `caller.role`.
         #[arg(long, value_enum, default_value_t = PolicyRoleArg::Deployer)]
         role: PolicyRoleArg,
+        /// Judge this proposal's JSON (`relish proposal show ID -o json`)
+        /// by the guardrails in the files, instead of their apps and jobs.
+        #[arg(long, value_name = "FILE")]
+        proposal: Option<PathBuf>,
     },
+}
+
+/// `relish proposal`'s subcommands.
+#[derive(Subcommand)]
+enum ProposalAction {
+    /// Every proposal you can see, newest first.
+    List,
+    /// One proposal: summary, undo, findings, blast radius, diff, reason.
+    Show {
+        /// The proposal's number.
+        id: u64,
+    },
+    /// Approve a proposal, which applies it at once. You can't approve your
+    /// own, and need deployer rights over every app it touches.
+    Approve {
+        /// The proposal's number.
+        id: u64,
+        /// Don't ask first (required with -o json).
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Reject a pending proposal.
+    Reject {
+        /// The proposal's number.
+        id: u64,
+        /// Why, for the author and the audit log.
+        #[arg(long, default_value = "")]
+        reason: String,
+    },
+}
+
+/// `relish lease`'s subcommands.
+#[derive(Subcommand)]
+enum LeaseAction {
+    /// List the leases held now: target, holder, time left and purpose.
+    List,
+    /// Take a lease to keep agents out while you work; renews one you hold.
+    Take {
+        #[command(flatten)]
+        target: reliaburger::relish::agent::lease::TargetArgs,
+        /// What you're doing, for whoever finds it held.
+        #[arg(long, default_value = "")]
+        purpose: String,
+        /// How long to hold it: 30s to 15m; 2m when left out.
+        #[arg(long = "for", value_parser = parse_lease_ttl)]
+        ttl: Option<std::time::Duration>,
+    },
+    /// Extend a lease you hold.
+    Renew {
+        #[command(flatten)]
+        target: reliaburger::relish::agent::lease::TargetArgs,
+        /// The new lifetime from now: 30s to 15m; 2m when left out.
+        #[arg(long = "for", value_parser = parse_lease_ttl)]
+        ttl: Option<std::time::Duration>,
+    },
+    /// Give up a lease you hold.
+    Release {
+        #[command(flatten)]
+        target: reliaburger::relish::agent::lease::TargetArgs,
+    },
+    /// End someone else's lease (deployer or above over the target; audited).
+    Break {
+        #[command(flatten)]
+        target: reliaburger::relish::agent::lease::TargetArgs,
+    },
+}
+
+fn parse_agent_token_ttl(value: &str) -> Result<std::time::Duration, String> {
+    let ttl =
+        reliaburger::relish::fault::parse_duration(value).map_err(|error| error.to_string())?;
+    if ttl.is_zero() || ttl > std::time::Duration::from_secs(7 * 24 * 60 * 60) {
+        return Err(format!("{value} is outside 1s to 168h"));
+    }
+    Ok(ttl)
+}
+
+fn parse_lease_ttl(value: &str) -> Result<std::time::Duration, String> {
+    reliaburger::relish::agent::lease::parse_ttl(value)
 }
 
 /// `relish policy test --source`.
@@ -1880,15 +2118,44 @@ async fn main() -> ExitCode {
             ref file,
             dry_run,
             rerun_jobs,
+            break_lease,
         } => match reliaburger::relish::manifest::ManifestSource::parse(
             // The ArgGroup makes exactly one of the two present.
             path.as_deref().or(file.as_deref()).unwrap_or_default(),
         ) {
             Err(error) => Err(error),
             Ok(source) if rerun_jobs => commands::rerun_jobs(&source, cli.output).await,
-            Ok(source) => commands::apply(&source, cli.output, dry_run).await,
+            Ok(source) => commands::apply(&source, cli.output, dry_run, break_lease).await,
         },
-        Command::Status => commands::status(cli.output).await,
+        Command::Status { quick, check } => {
+            return finish_outcome(
+                reliaburger::relish::status_cmd::run(reliaburger::relish::status_cmd::StatusArgs {
+                    quick,
+                    check,
+                    output: cli.output,
+                })
+                .await,
+            );
+        }
+        Command::Apps {
+            ref name,
+            ref namespace,
+            unhealthy,
+            ref node,
+            instances,
+        } => {
+            reliaburger::relish::apps_cmd::run(
+                reliaburger::relish::apps_cmd::AppsArgs {
+                    name: name.clone(),
+                    namespace: namespace.clone(),
+                    unhealthy,
+                    node: node.clone(),
+                    instances,
+                },
+                cli.output,
+            )
+            .await
+        }
         Command::Dashboard { port, no_open } => {
             reliaburger::relish::dashboard::run(port, no_open).await
         }
@@ -1957,16 +2224,19 @@ async fn main() -> ExitCode {
         Command::Stop {
             ref app,
             ref namespace,
-        } => commands::stop(app, namespace, cli.output).await,
+            break_lease,
+        } => commands::stop(app, namespace, break_lease, cli.output).await,
         Command::Delete {
             ref app,
             ref namespace,
             force,
-        } => commands::delete(app, namespace, force, cli.output).await,
+            break_lease,
+        } => commands::delete(app, namespace, force, break_lease, cli.output).await,
         Command::Release {
             ref app,
             ref namespace,
-        } => commands::release(app, namespace, cli.output).await,
+            break_lease,
+        } => commands::release(app, namespace, break_lease, cli.output).await,
         Command::Init(options) => commands::init_with_security(
             &options.dir,
             &options.cluster_name,
@@ -1978,7 +2248,9 @@ async fn main() -> ExitCode {
             },
             cli.output,
         ),
-        Command::Nodes => commands::nodes(cli.output).await,
+        Command::Nodes { unhealthy } => {
+            reliaburger::relish::nodes_cmd::run(unhealthy, cli.output).await
+        }
         Command::DecommissionNode {
             node_id,
             workloads_stopped,
@@ -2093,6 +2365,8 @@ async fn main() -> ExitCode {
                 principal,
                 app,
                 namespace,
+                principal_kind,
+                proposal,
                 limit,
                 cluster,
             } = *options;
@@ -2104,6 +2378,8 @@ async fn main() -> ExitCode {
                     principal,
                     app,
                     namespace,
+                    principal_kind,
+                    proposal,
                     limit,
                     cluster,
                 },
@@ -2126,6 +2402,9 @@ async fn main() -> ExitCode {
                 cli.output,
             )
             .await
+        }
+        Command::Timeline(args) => {
+            reliaburger::relish::agent::timeline::human(&args, cli.output).await
         }
         Command::Fault { ref action } => match action {
             FaultAction::Delay(options) => {
@@ -2345,7 +2624,11 @@ async fn main() -> ExitCode {
                 .await
             }
         },
-        Command::Deploy { ref path, dry_run } => commands::deploy(path, cli.output, dry_run).await,
+        Command::Deploy {
+            ref path,
+            dry_run,
+            break_lease,
+        } => commands::deploy(path, cli.output, dry_run, break_lease).await,
         Command::CancelDeploy { ref operation_id } => {
             commands::cancel_deploy(operation_id, cli.output).await
         }
@@ -2357,7 +2640,8 @@ async fn main() -> ExitCode {
             ref app,
             ref namespace,
             force,
-        } => commands::rollback(app, namespace, force, cli.output).await,
+            break_lease,
+        } => commands::rollback(app, namespace, force, break_lease, cli.output).await,
         Command::Lint { ref path } => commands::lint(path, cli.output),
         Command::Compile { ref path } => commands::compile(path, cli.output),
         Command::Diff {
@@ -2490,6 +2774,40 @@ async fn main() -> ExitCode {
             GitopsAction::Set { path } => commands::gitops_set(path, cli.output).await,
             GitopsAction::Disable => commands::gitops_disable(cli.output).await,
         },
+        Command::Proposal { action } => {
+            use reliaburger::relish::proposal_cmd;
+            match action {
+                ProposalAction::List => proposal_cmd::proposal_list(cli.output).await,
+                ProposalAction::Show { id } => proposal_cmd::proposal_show(id, cli.output).await,
+                ProposalAction::Approve { id, yes } => {
+                    proposal_cmd::proposal_approve(id, yes, cli.output).await
+                }
+                ProposalAction::Reject { id, reason } => {
+                    proposal_cmd::proposal_reject(id, &reason, cli.output).await
+                }
+            }
+        }
+        Command::Undo { id, yes } => {
+            reliaburger::relish::proposal_cmd::undo(id, yes, cli.output).await
+        }
+        Command::Lease { action } => {
+            use reliaburger::relish::lease_cmd;
+            match &action {
+                LeaseAction::List => lease_cmd::lease_list(cli.output).await,
+                LeaseAction::Take {
+                    target,
+                    purpose,
+                    ttl,
+                } => lease_cmd::lease_take(target, purpose, *ttl, cli.output).await,
+                LeaseAction::Renew { target, ttl } => {
+                    lease_cmd::lease_renew(target, *ttl, cli.output).await
+                }
+                LeaseAction::Release { target } => {
+                    lease_cmd::lease_release(target, cli.output).await
+                }
+                LeaseAction::Break { target } => lease_cmd::lease_break(target, cli.output).await,
+            }
+        }
         Command::Policy { action } => match &action {
             PolicyAction::List => reliaburger::relish::policy_cmd::policy_list(cli.output).await,
             PolicyAction::Audit => reliaburger::relish::policy_cmd::policy_audit(cli.output).await,
@@ -2501,22 +2819,30 @@ async fn main() -> ExitCode {
                 source,
                 caller,
                 role,
-            } => reliaburger::relish::policy_cmd::policy_test(
-                files,
-                &reliaburger::relish::policy_cmd::TestIdentity {
+                proposal,
+            } => {
+                let identity = reliaburger::relish::policy_cmd::TestIdentity {
                     caller: caller.clone(),
                     role: match role {
                         PolicyRoleArg::Admin => reliaburger::sesame::types::ApiRole::Admin,
                         PolicyRoleArg::Deployer => reliaburger::sesame::types::ApiRole::Deployer,
                         PolicyRoleArg::ReadOnly => reliaburger::sesame::types::ApiRole::ReadOnly,
                     },
-                    source: match source {
-                        PolicySourceArg::Apply => reliaburger::policy::Source::Apply,
-                        PolicySourceArg::Gitops => reliaburger::policy::Source::GitOps,
+                    source: match (proposal, source) {
+                        (Some(_), _) => reliaburger::policy::Source::Proposal,
+                        (None, PolicySourceArg::Apply) => reliaburger::policy::Source::Apply,
+                        (None, PolicySourceArg::Gitops) => reliaburger::policy::Source::GitOps,
                     },
-                },
-                cli.output,
-            ),
+                };
+                match proposal {
+                    Some(proposal) => reliaburger::relish::policy_cmd::policy_test_proposal(
+                        files, proposal, &identity, cli.output,
+                    ),
+                    None => {
+                        reliaburger::relish::policy_cmd::policy_test(files, &identity, cli.output)
+                    }
+                }
+            }
         },
         Command::Ca { action } => match &action {
             CaAction::Backup {
@@ -2604,16 +2930,19 @@ async fn main() -> ExitCode {
                 ttl_days,
                 no_expiry,
                 inherit_permissions,
+                agent,
+                ttl,
             } => {
                 use reliaburger::relish::client::{TokenLifetime, TokenRequest};
                 let split = |list: &Option<String>| {
                     list.as_ref()
                         .map(|list| list.split(',').map(|s| s.trim().to_string()).collect())
                 };
-                let lifetime = match (ttl_days, no_expiry) {
-                    (Some(days), _) => TokenLifetime::Days(*days),
-                    (None, true) => TokenLifetime::Never,
-                    (None, false) => TokenLifetime::Default,
+                let lifetime = match (ttl, ttl_days, no_expiry) {
+                    (Some(ttl), _, _) => TokenLifetime::Seconds(ttl.as_secs()),
+                    (None, Some(days), _) => TokenLifetime::Days(*days),
+                    (None, None, true) => TokenLifetime::Never,
+                    (None, None, false) => TokenLifetime::Default,
                 };
                 commands::token_create(
                     &TokenRequest {
@@ -2623,6 +2952,7 @@ async fn main() -> ExitCode {
                         namespaces: split(namespaces),
                         lifetime,
                         inherit_permissions: *inherit_permissions,
+                        agent: *agent,
                     },
                     cli.output,
                 )
@@ -2886,6 +3216,50 @@ async fn main() -> ExitCode {
                 .await
             }
         }
+        Command::Gym { action } => {
+            use reliaburger::relish::gym;
+            return match action {
+                GymAction::Run(options) => {
+                    let GymRunOptions {
+                        namespace,
+                        solver,
+                        scenarios,
+                        runs,
+                        timeout,
+                        out,
+                        image,
+                        yes,
+                        confirm_namespace,
+                    } = *options;
+                    finish_outcome(
+                        gym::run(gym::RunArgs {
+                            namespace,
+                            solver,
+                            scenarios,
+                            runs,
+                            timeout,
+                            out,
+                            image,
+                            yes,
+                            confirm_namespace,
+                            output: cli.output,
+                        })
+                        .await,
+                    )
+                }
+                GymAction::List => finish_outcome(
+                    gym::list(cli.output).map(|()| reliaburger::relish::CommandOutcome::Clean),
+                ),
+                GymAction::Record { log, args } => {
+                    finish_outcome(gym::record_call(log, args).await)
+                }
+                GymAction::Baseline => finish_outcome(
+                    gym::baseline()
+                        .await
+                        .map(|()| reliaburger::relish::CommandOutcome::Clean),
+                ),
+            };
+        }
         Command::Test(options) => {
             let TestOptions {
                 filter,
@@ -2959,6 +3333,11 @@ async fn main() -> ExitCode {
                     output: cli.output,
                 })
                 .await,
+            );
+        }
+        Command::Verify(args) => {
+            return finish_outcome(
+                reliaburger::relish::agent::verify::run_human(&args, cli.output).await,
             );
         }
         Command::Wtf(options) => {
@@ -3089,22 +3468,29 @@ fn output_support(command: &Command) -> OutputSupport {
         | Command::Batch { .. }
         | Command::Gitops { .. }
         | Command::Policy { .. }
+        | Command::Lease { .. }
+        | Command::Proposal { .. }
+        | Command::Undo { .. }
         | Command::Token { .. }
         | Command::Upgrade { .. }
-        | Command::Status
+        | Command::Verify(_)
+        | Command::Status { .. }
+        | Command::Apps { .. }
         | Command::Top
         | Command::Metrics(_)
-        | Command::Nodes
+        | Command::Nodes { .. }
         | Command::DecommissionNode { .. }
         | Command::Resolve { .. }
         | Command::Audit(_)
         | Command::Events(_)
+        | Command::Timeline(_)
         | Command::Deploy { .. }
         | Command::CancelDeploy { .. }
         | Command::History { .. }
         | Command::Jobs { .. }
         | Command::BatchStatus { .. }
         | Command::Test(_)
+        | Command::Gym { .. }
         | Command::Bench(_)
         | Command::Wtf(_)
         | Command::Path(_)
@@ -3256,6 +3642,8 @@ mod tests {
     /// Every top-level command that changes the cluster or local files.
     const MUTATING: &[&str] = &[
         "apply",
+        "proposal",
+        "undo",
         "exec",
         "stop",
         "delete",
@@ -3278,6 +3666,7 @@ mod tests {
         "secret",
         "gitops",
         "policy",
+        "lease",
         "ca",
         "token",
         "join-token",
@@ -3288,12 +3677,15 @@ mod tests {
         "local",
         "setup",
         "test",
+        "gym",
         "bench",
     ];
 
+    /// `deploys` is closest to `deploy`, a write. (`apps` was, before it became
+    /// a command of its own, #1093.)
     #[test]
-    fn relish_apps_never_suggests_a_mutating_command() {
-        for line in ["apps", "apps show", "-o json apps"] {
+    fn a_word_closest_to_a_write_never_suggests_a_mutating_command() {
+        for line in ["deploys", "deploys show", "-o json deploys"] {
             let (text, lead) = answer_unknown(line);
             for mutating in MUTATING {
                 assert!(!text.contains(&format!("'{mutating}'")), "{line}: {text}");
@@ -3382,7 +3774,7 @@ mod tests {
                 "agent {name} isn't a command"
             );
         }
-        for name in ["report", "patch", "setup"] {
+        for name in ["report", "patch", "setup", "lease"] {
             assert!(!READ_ONLY_AGENT_COMMANDS.contains(&name));
         }
     }
@@ -3437,6 +3829,38 @@ mod tests {
                 "digest"
             ])
             .is_err()
+        );
+    }
+
+    /// The concept budget (#1681): resource kinds, commands and flags an
+    /// agent has to learn, held to `docs/testing/concept-budget.json`.
+    /// `relish agent guide`'s byte budget has its own test,
+    /// `the_agent_chapter_fits_the_guides_default_budget`.
+    #[test]
+    fn the_concept_counts_match_their_budget() {
+        use clap::CommandFactory;
+        use reliaburger::relish::concept_budget::{
+            BUDGET_FILE, ConceptBudget, ConceptCounts, count_commands, struct_field_names,
+        };
+
+        let kinds = struct_field_names::<reliaburger::config::Config>().unwrap();
+        let measured = ConceptCounts {
+            resource_kinds: kinds.len(),
+            commands: count_commands(&Cli::command()),
+        };
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(BUDGET_FILE);
+        let budget = ConceptBudget::parse(&std::fs::read_to_string(&path).unwrap())
+            .unwrap_or_else(|e| panic!("{BUDGET_FILE}: {e}"));
+        let problems = budget.compare(&measured);
+        assert!(
+            problems.is_empty(),
+            "the concept budget moved (kinds: {}; {} commands, {} hidden; {} flags, {} distinct):\n{}",
+            kinds.join(", "),
+            measured.commands.commands,
+            measured.commands.hidden_commands,
+            measured.commands.flags,
+            measured.commands.distinct_flags,
+            problems.join("\n")
         );
     }
 
@@ -3786,6 +4210,36 @@ mod tests {
         assert_eq!(namespace.as_deref(), Some("team-a"));
         assert_eq!(limit, Some(50));
         assert!(cluster);
+    }
+
+    /// #1682's design: what agents did, and everything one proposal wrote.
+    #[test]
+    fn audit_filters_by_principal_kind_and_proposal() {
+        let cli = parse(&[
+            "relish",
+            "audit",
+            "--principal-kind",
+            "agent",
+            "--proposal",
+            "17",
+        ])
+        .unwrap();
+        let Command::Audit(options) = cli.command else {
+            panic!("expected relish audit");
+        };
+        assert_eq!(
+            options.principal_kind,
+            Some(reliaburger::sesame::types::PrincipalKind::Agent)
+        );
+        assert_eq!(options.proposal, Some(17));
+        let refused = parse(&["relish", "audit", "--principal-kind", "robot"])
+            .err()
+            .expect("an unknown kind is refused")
+            .to_string();
+        assert!(
+            refused.contains("human, agent, workload, system, policy, unknown"),
+            "{refused}"
+        );
     }
 
     #[test]
@@ -4149,7 +4603,7 @@ mod tests {
     fn parse_apply_command() {
         let cli = parse(&["relish", "apply", "config.toml"]).unwrap();
         assert!(
-            matches!(cli.command, Command::Apply { ref path, file: None, dry_run: false, rerun_jobs: false } if path.as_deref() == Some("config.toml"))
+            matches!(cli.command, Command::Apply { ref path, file: None, dry_run: false, rerun_jobs: false, break_lease: false } if path.as_deref() == Some("config.toml"))
         );
     }
 
@@ -4207,10 +4661,29 @@ mod tests {
         ));
     }
 
+    /// Every command a `relish status` line can point at is one this CLI
+    /// parses, so a hint can't name a command that doesn't exist.
+    #[test]
+    fn every_status_hint_is_a_real_command() {
+        for hint in reliaburger::relish::status_cmd::HINTS {
+            let words: Vec<&str> = hint.split_whitespace().collect();
+            assert_eq!(words[0], "relish", "{hint}");
+            if let Err(error) = Cli::try_parse_from(&words) {
+                panic!("`{hint}` doesn't parse: {error}");
+            }
+        }
+    }
+
     #[test]
     fn parse_status_command() {
         let cli = parse(&["relish", "status"]).unwrap();
-        assert!(matches!(cli.command, Command::Status));
+        assert!(matches!(
+            cli.command,
+            Command::Status {
+                quick: false,
+                check: false
+            }
+        ));
     }
 
     #[test]
@@ -4218,7 +4691,7 @@ mod tests {
         let cli = parse(&["relish", "delete", "web", "--namespace", "team-a"]).unwrap();
         assert!(matches!(
             cli.command,
-            Command::Delete { ref app, ref namespace, force: false } if app == "web" && namespace == "team-a"
+            Command::Delete { ref app, ref namespace, force: false, break_lease: false } if app == "web" && namespace == "team-a"
         ));
     }
 
@@ -4366,7 +4839,7 @@ mod tests {
     #[test]
     fn parse_nodes_command() {
         let cli = parse(&["relish", "nodes"]).unwrap();
-        assert!(matches!(cli.command, Command::Nodes));
+        assert!(matches!(cli.command, Command::Nodes { unhealthy: false }));
     }
 
     #[test]

@@ -54,6 +54,32 @@ pub fn score_nodes(
         .collect()
 }
 
+/// A node's score and the four parts it's made of, each 0-100 before its
+/// weight. `relish agent explain --placement` shows them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ScoreParts {
+    /// How full the node is after placement, evenly (weight 50).
+    pub bin_pack: u32,
+    /// The share of preferred labels it carries; 100 with none asked for
+    /// (weight 20).
+    pub preferred: u32,
+    /// 100 when it has the image cached (weight 15).
+    pub image: u32,
+    /// Its uptime, 100 at 24 hours or more (weight 5).
+    pub stability: u32,
+}
+
+impl ScoreParts {
+    /// The weighted total `score_nodes` sorts by, 0-90.
+    pub fn total(&self) -> u32 {
+        (self.bin_pack * WEIGHT_BIN_PACK
+            + self.preferred * WEIGHT_PREFERRED
+            + self.image * WEIGHT_IMAGE
+            + self.stability * WEIGHT_STABILITY)
+            / 100
+    }
+}
+
 /// Compute the weighted score for a single node.
 fn compute_score(
     node_id: &NodeId,
@@ -62,9 +88,20 @@ fn compute_score(
     cluster: &ClusterStateCache,
     image: Option<&str>,
 ) -> u32 {
+    score_parts(node_id, resources, preferred_labels, cluster, image).total()
+}
+
+/// The parts of a node's score; all zero for a node the cache doesn't have.
+pub fn score_parts(
+    node_id: &NodeId,
+    resources: &Resources,
+    preferred_labels: &BTreeMap<String, String>,
+    cluster: &ClusterStateCache,
+    image: Option<&str>,
+) -> ScoreParts {
     let node = match cluster.get_node(node_id) {
         Some(n) => n,
-        None => return 0,
+        None => return ScoreParts::default(),
     };
 
     let bin_pack = bin_packing_score(node, resources);
@@ -94,13 +131,12 @@ fn compute_score(
         0
     };
 
-    // Weighted sum
-    let total = bin_pack * WEIGHT_BIN_PACK
-        + preferred * WEIGHT_PREFERRED
-        + image_locality * WEIGHT_IMAGE
-        + stability * WEIGHT_STABILITY;
-
-    total / 100
+    ScoreParts {
+        bin_pack,
+        preferred,
+        image: image_locality,
+        stability,
+    }
 }
 
 /// Bin-packing (D30): prefer the node that is fuller in both CPU and memory
@@ -205,6 +241,43 @@ mod tests {
         // "full" should score higher due to bin-packing preference
         assert_eq!(scored[0].0, NodeId::new("full"));
         assert!(scored[0].1 > scored[1].1);
+    }
+
+    proptest::proptest! {
+        /// The parts `explain --placement` shows add up to the score the
+        /// scheduler sorted by, on any node.
+        #[test]
+        fn score_parts_add_up_to_the_score_nodes_sort_by(
+            cpu_alloc in 1u64..10_000,
+            cpu_used in 0u64..10_000,
+            uptime in 0u64..200_000,
+            cached in proptest::bool::ANY,
+            labelled in proptest::bool::ANY,
+            request in 0u64..2_000,
+        ) {
+            let node_labels = if labelled { labels(&[("zone", "a")]) } else { BTreeMap::new() };
+            let mut node = node_state("n", cpu_alloc, cpu_used, node_labels);
+            node.uptime_secs = uptime;
+            if cached {
+                node.cached_images.insert("web:v1".to_string());
+            }
+            let mut cluster = ClusterStateCache::new();
+            cluster.set_node(node);
+            let id = NodeId::new("n");
+            let resources = Resources::new(request, 64, 0);
+            let preferred = labels(&[("zone", "a"), ("disk", "ssd")]);
+            let scored = score_nodes(
+                std::slice::from_ref(&id),
+                &AppId::new("web", "default"),
+                &resources,
+                &preferred,
+                &cluster,
+                Some("web:v1"),
+            );
+            let parts = score_parts(&id, &resources, &preferred, &cluster, Some("web:v1"));
+            proptest::prop_assert_eq!(scored[0].1, parts.total());
+            proptest::prop_assert!(parts.total() <= 90);
+        }
     }
 
     const GIB: u64 = 1024 * 1024 * 1024;

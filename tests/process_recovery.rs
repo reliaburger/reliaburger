@@ -36,6 +36,7 @@ fn spec(script: &str) -> OciSpec {
             rlimits: Vec::new(),
             args: vec!["/bin/sh".into(), "-c".into(), script.into()],
             env: vec!["OWNER_TEST=preserved".into()],
+            provider_env: Vec::new(),
             cwd: "/".into(),
             user: OciUser { uid: 0, gid: 0 },
             capabilities: None,

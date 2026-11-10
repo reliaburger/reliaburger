@@ -11,8 +11,8 @@ evidence, and prints a categorised report: CRITICAL, WARNING, UNKNOWN and OK.
 It doesn't just list problems. It links a crashloop to the recent deploy and
 the error log line behind it. A crashloop is three `restart` events for one
 app inside 15 minutes; Bun records one for every restart, so `relish events`
-shows the same history `wtf` read. A high lifetime `restart_count` in
-`relish status` on its own isn't one.
+shows the same history `wtf` read. A high lifetime restart count in
+`relish apps` on its own isn't one.
 
 You only need to reach one node. `wtf`, `inspect` and `path` send every
 per-node request through the node you're connected to (`/v1/nodes/<node>/relay/...`), carrying
@@ -28,6 +28,10 @@ relish wtf --watch               # re-run every 30s until Ctrl-C (human output o
 relish wtf --watch --interval 5  # re-run every 5s instead
 relish --output json wtf         # one exact report for machines
 ```
+
+`relish status` runs the same checks with a 2 s budget and counts what they
+find on its `wtf` line, naming the worst finding, so a glance at status tells
+you whether `wtf` is worth running. `relish status --quick` skips them.
 
 An OK row always rests on an observed, timestamped fact; a missing or
 inherently incomplete source becomes UNKNOWN, never a green pass. The exit code
@@ -99,20 +103,20 @@ rather than a generic under-replication.
 An app the scheduler could place only in part gets an `Unplaced:` line saying
 how many of its replicas found a node and why the rest didn't: no ready node,
 no node with its required labels, none that can enforce its needs or run its
-host binary, or no room. `relish status` prints the same line, and `wtf`
+host binary, or no room. `relish apps` prints the same reason, and `wtf`
 reports it as an `unschedulable` warning with that reason (see
 `deploy-an-app`).
 
 An app whose current spec failed to roll out on a node is marked
 `RolloutFailed`: the leader holds its other nodes on the previous version and
 won't try the failed spec again. `wtf` reports it as a `rollout-failed`
-warning naming the node and the reason, and `relish status` prints the same
+warning naming the node and the reason, and `relish apps` prints the same
 line. Applying a different spec (a scale change counts), or `relish rollback`,
 clears it; applying the same spec again doesn't (see `deploy-an-app`).
 
 An instance whose binary isn't on its node, or isn't executable, is `failed`
 with the reason, such as `binary not found: /usr/local/bin/ghost-server`.
-`relish status` prints it under the table, and `wtf` reports a critical
+`relish apps NAME` prints it under the instance table, and `wtf` reports a critical
 `launch-failed` finding naming each instance, its node and the reason, in place
 of a generic under-replication (see `deploy-an-app`).
 
@@ -143,8 +147,8 @@ means, the numbers that decide it and the line of code that does (see
 | `registry-lost-images` | critical | No live node holds every layer of an image |
 | `registry-needs-mtls` | warning | A plaintext cluster's registry can't replicate |
 | `registry-redundancy` | warning | A node's registry is down, unreachable or under-replicated |
-| `token-expired` | warning | An API token has expired |
-| `token-expiring` | warning | An API token expires within 14 days |
+| `token-expired` | warning | An API token has expired (not one `relish mcp` made) |
+| `token-expiring` | warning | An API token expires within 14 days (not one `relish mcp` made) |
 | `admin-token-old` | warning | An admin token's secret is over 90 days old |
 | `namespace-isolation` | warning | A node can't keep namespaces apart |
 | `gitops-plaintext-secret` | warning | A secret is plaintext in the GitOps repository |
@@ -164,6 +168,75 @@ means, the numbers that decide it and the line of code that does (see
 | `deploy-stuck` | warning | A deploy has been active for over 15 minutes |
 | `alerts-firing` | warning | An alert is firing |
 | `cpu-throttling` | warning | An app was CPU throttled |
+
+## `relish timeline`: what changed, and why did it do that?
+
+A finding tells you what's wrong now. In an incident you also want to know
+what changed just before, and why the cluster did what it did. `relish
+timeline` answers the first:
+
+```sh
+relish timeline --app web --since 15m
+relish timeline --since 10m --until 1762560000
+```
+
+It merges three sources into one list, newest first: each node's events
+(deploys, restarts, health, placement, alerts, faults, audited operations),
+the audit log (applies, policy changes, refused deploys, faults, tokens,
+including the ones that have left the events ring) and, with `--app`, the
+app's deploy history. `--since` and `--until` take a duration or epoch
+seconds, and a window covers at most a day; `--limit` (100 by default, at most
+500) keeps the newest. Set `--until` to when it broke to see the minutes
+before.
+
+Above the list, each source says how much of it was seen. Events live in
+memory, the newest 1,024 per node, so on a busy node the start of a long
+window may be gone, and the timeline says so instead of showing a quiet hour.
+A node that didn't answer is named, and a token that may not read the audit
+log gets the rest of the timeline with the audit source marked unknown. `-o
+json` prints the same data `relish agent timeline` returns.
+
+### Decisions and their rules
+
+Some entries are decisions, with a `rule` and the evidence it compared. The
+scheduler, a node's restart loop and the apply path record them at the moment
+they decide, because a moment later the evidence is gone: the scores, the
+failed probes, the policy that said no. `relish agent explain` reads them
+back:
+
+```sh
+relish agent explain --restart web-0
+relish agent explain --placement web-1 --namespace payments
+relish agent explain --refusal web
+relish agent explain --rules
+```
+
+Each answer gives the rule, what it means, the evidence, the line of code
+that decides it and what happened on the same node in the two minutes before.
+A decision the records no longer hold comes back with `not_found`, saying how
+far back the records reach: unknown, not "it didn't happen".
+
+| Rule | Means |
+|------|-------|
+| `placement.scored` | The scheduler put a new replica on the node running fewest of the app's replicas, then the highest score; the evidence has the score's parts, how many nodes passed the filter and the runner-up |
+| `placement.daemon` | A daemon set runs on every node that passes the filter |
+| `placement.volume_home` | An app with managed volumes went back to the nodes that hold them |
+| `placement.short` | Some replicas found no node, and why: the first constraint none met |
+| `placement.quota_blocked` | The namespace quota has no room for the app |
+| `restart.process_exited` | The process stopped, so the node restarted it within the restart budget, after the backoff |
+| `restart.start_failed` | The runtime couldn't start the instance, so the node cleaned up and tried again |
+| `restart.health_failed` | The instance failed `threshold` health probes in a row, so the node restarted it |
+| `restart.budget_exhausted` | The instance used its whole restart budget, so the node gave up and marked it failed |
+| `restart.sidecar_exited` | A sidecar exited and was restarted on its own |
+| `deploy.refused.policy` | An enforcing policy denied the apply |
+| `deploy.refused.owner` | The apply named an owner the caller can't speak for |
+| `deploy.refused.council` | The council refused the write: a lease, an owner elsewhere, a quota |
+
+The leader records one placement decision per app per change; a pass that
+changes nothing records nothing. Jobs and task arrays don't record
+placements: at a million runs they'd flush every other event out of the
+ring. Restart and placement records live in the events ring, so they don't
+survive a node restart. Refused deploys also go to the audit log, which does.
 
 ## `relish path`: can A reach B?
 

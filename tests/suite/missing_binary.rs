@@ -62,7 +62,14 @@ fn a_process_app_with_a_missing_binary_fails_fast_with_binary_not_found() {
     // The instance is failed, with the reason, not stuck in `starting`.
     let status = wait_for_relish_output(
         &mut bun,
-        &["--endpoint", &endpoint, "--output", "json", "status"],
+        &[
+            "--endpoint",
+            &endpoint,
+            "--output",
+            "json",
+            "apps",
+            "--instances",
+        ],
         &reason,
     );
     let instances: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
@@ -75,9 +82,9 @@ fn a_process_app_with_a_missing_binary_fails_fast_with_binary_not_found() {
     assert_eq!(ghost["state"], "failed", "{ghost}");
     assert_eq!(ghost["reason"], reason.as_str(), "{ghost}");
 
-    let table = run_relish(&["--endpoint", &endpoint, "status"]);
+    let table = run_relish(&["--endpoint", &endpoint, "apps", "--instances"]);
     let table = String::from_utf8_lossy(&table.stdout);
-    assert!(table.contains(&reason), "relish status: {table}");
+    assert!(table.contains(&reason), "relish apps --instances: {table}");
 
     let wtf = run_relish(&["--endpoint", &endpoint, "wtf"]);
     let wtf = String::from_utf8_lossy(&wtf.stdout);

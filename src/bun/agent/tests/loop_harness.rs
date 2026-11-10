@@ -731,6 +731,45 @@ async fn a_stop_waits_out_a_network_reference_release_slower_than_the_turn() {
         .await;
 }
 
+/// The test above failed under load with two release calls (#1620): once
+/// the release landed, the journal write that forgets the hold outlasted
+/// the turn, and the retry found the hold no longer recorded and handed it
+/// back again. Holding every journal write past the turn's deadline makes
+/// that the path every run takes. The runtime confirmed the first release,
+/// so the retry only finishes the bookkeeping.
+#[tokio::test]
+async fn a_stop_whose_forget_write_outlasts_the_turn_releases_the_reference_once() {
+    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+    let root = tempfile::tempdir().unwrap();
+    agent
+        .enable_fresh_discovery_ownership(&root.path().join("discovery"))
+        .await
+        .unwrap();
+    let reference = original_test_network_reference();
+    grill.set_network_reference(reference.clone()).await;
+    expect_complete(&drain_deploy(&mut agent, replicated("web", 1)).await);
+    let running = RunningAgent::start(agent, tx, shutdown);
+    running
+        .stalls
+        .set(LoopStall::Persist, OUTLASTS_THE_TURN_DEADLINE);
+    let (response, stopped) = oneshot::channel();
+    running
+        .tx
+        .send(AgentCommand::Stop {
+            app_name: "web".into(),
+            namespace: "default".into(),
+            response,
+        })
+        .await
+        .unwrap();
+    let stopped = tokio::time::timeout(std::time::Duration::from_secs(30), stopped)
+        .await
+        .expect("the stop was never answered")
+        .expect("the stop's waiter was dropped");
+    assert!(stopped.is_ok(), "{stopped:?}");
+    assert_eq!(calls_of(&grill, "release_network_reference"), 1);
+}
+
 /// When a stop the egress fence relies on fails, the fence force-kills the
 /// app, but only once the runtime confirms each instance still holds its
 /// original address (#357). On runc that read waits for the lifecycle lock,
@@ -1709,6 +1748,51 @@ async fn a_consumer_compaction_hands_a_slow_journal_write_off_at_the_turn_deadli
     );
 }
 
+/// The 0.2.7 jobs final (#1707): a `consumer_sync/journal` turn took
+/// 1,215 ms, all of it journal write. A recovered consumer's first answer
+/// takes the journal step's other branch, which journals `Withdrawing`
+/// before anything publishes. Its write, and every later one, is that
+/// slow here, and each turn still hands off within the budget.
+#[tokio::test]
+async fn a_recovered_consumers_journal_step_hands_a_slow_write_off_at_the_turn_deadline() {
+    let (mut agent, _root, catalog, ingress) = recovered_consumer().await;
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
+    let (response, reply) = oneshot::channel();
+    agent
+        .request_consumer_sync(crate::bun::agent::consumer::ConsumerRequest {
+            generation: 1,
+            catalog,
+            ingress,
+            withdrawals: vec![],
+            answer: Some(crate::bun::agent::consumer::ConsumerAnswer {
+                requested_at_ns: crate::onion::lease::boot_clock_ns(),
+                response,
+            }),
+        })
+        .await;
+    let mut journal_steps = 0;
+    while !agent.consumer_syncs.is_idle() || agent.discovery_write_in_flight() {
+        let turn = one_consumer_sync_turn(&mut agent).await;
+        if turn.detail == Some("consumer_sync/journal") {
+            journal_steps += 1;
+            assert!(
+                agent.discovery_write_in_flight(),
+                "the journal step wrote nothing to hand off: {turn}"
+            );
+        }
+        assert!(
+            turn.took < TURN_BUDGET,
+            "{turn} waited for a {STALLED_JOURNAL_WRITE:?} journal write: {:?}",
+            turn.part(TurnPart::JournalWrite)
+        );
+    }
+    assert_eq!(journal_steps, 1, "the synchronisation never journalled");
+    assert!(reply.await.unwrap().unwrap().published);
+    assert_eq!(installed_remote_port(&agent), Some(30001));
+}
+
 /// A journal write that fails after the turn moved on fences discovery as
 /// a failed inline write does: ownership becomes uncertain, readiness says
 /// so, the view it would have recorded never reaches the kernel, and the
@@ -2574,7 +2658,6 @@ async fn web_with_a_discovery_write_in_flight() -> (
     agent
         .loop_stalls
         .set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
-    let reached = agent.loop_stalls.reached(LoopStall::Persist);
     let landing = agent
         .write_discovery_inventory(
             &service,
@@ -2588,14 +2671,46 @@ async fn web_with_a_discovery_write_in_flight() -> (
         landing,
         crate::bun::agent::discovery_ownership::Landing::InFlight
     ));
-    // Only the write in flight is slow: wait until it has read its stall.
-    while agent.loop_stalls.reached(LoopStall::Persist) == reached {
-        tokio::task::yield_now().await;
-    }
+    // Only the write in flight is slow: it took its stall when it started.
     agent
         .loop_stalls
         .set(LoopStall::Persist, std::time::Duration::ZERO);
     (agent, root, id, service)
+}
+
+/// The writes-per-tick scenarios count a journal write in the tick that
+/// starts it. The write runs in a task, and a tick past its deadline gives
+/// that task no chance to run before the tick ends; the count used to be
+/// taken inside the task, so such a write landed in the gap between ticks
+/// uncounted, and a finished retirement added up to three writes, not four
+/// (#1625). The write is counted where it starts.
+#[tokio::test]
+async fn a_journal_write_started_past_the_turns_deadline_is_counted_where_it_starts() {
+    let (mut agent, _root, _id, service) = web_journalling_discovery().await;
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, OUTLASTS_THE_TURN_DEADLINE);
+    let reached = agent.loop_stalls.reached(LoopStall::Persist);
+    // A deadline the runtime's timer has already moved past, as it has when
+    // a tick's earlier write woke the loop late: the write's timeout fires
+    // as it's registered, and the tick never yields to the write's task.
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let deadline = tokio::time::Instant::now() - std::time::Duration::from_millis(10);
+    let landing = agent
+        .write_discovery_inventory(
+            &service,
+            |_| {},
+            Some(deadline),
+            crate::bun::agent::discovery_ownership::WriteOwner::ConsumerStep,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        landing,
+        crate::bun::agent::discovery_ownership::Landing::InFlight
+    ));
+    assert_eq!(agent.loop_stalls.reached(LoopStall::Persist), reached + 1);
+    agent.settle_discovery_write().await;
 }
 
 /// The 0.2.1 candidate 5 soak: a node restarted on a busy disk, a consumer

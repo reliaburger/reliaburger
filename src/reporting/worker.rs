@@ -50,6 +50,8 @@ pub struct InstanceSnapshot {
     pub cpu_request_millicores: u32,
     /// Memory requested by the instance's spec (MB).
     pub memory_request_mb: u32,
+    /// GPUs requested by the instance's spec.
+    pub gpu_request: u32,
     /// Live egress policy evidence for this instance.
     pub egress_enforcement: EgressEnforcementStatus,
 }
@@ -65,6 +67,8 @@ pub struct AgentSnapshot {
     pub capacity_cpu_millicores: u32,
     /// Schedulable memory capacity (system total minus reserved).
     pub capacity_memory_mb: u32,
+    /// GPUs the node offers: detected cards, when GPUs are enabled.
+    pub capacity_gpus: u32,
     /// Live capabilities used by the scheduler for placement.
     pub capabilities: crate::meat::cluster_state::NodeCapabilities,
     /// Critical long-lived-task evidence, absent on pre-M1 nodes.
@@ -391,6 +395,7 @@ impl<T: ReportingTransport> ReportWorker<T> {
         // commitments the scheduler must respect, not measured load.
         let cpu_used: u32 = active.iter().map(|i| i.cpu_request_millicores).sum();
         let memory_used: u32 = active.iter().map(|i| i.memory_request_mb).sum();
+        let gpu_used: u32 = active.iter().map(|i| i.gpu_request).sum();
 
         StateReport {
             node_id: self.node_id.clone(),
@@ -402,7 +407,8 @@ impl<T: ReportingTransport> ReportWorker<T> {
                 cpu_used_millicores: cpu_used,
                 memory_used_mb: memory_used,
                 disk_used_mb: 0,
-                gpu_used: 0,
+                gpu_used,
+                gpu_total: snapshot.capacity_gpus,
                 allocated_ports: snapshot.allocated_ports,
                 cpu_total_millicores: snapshot.capacity_cpu_millicores,
                 memory_total_mb: snapshot.capacity_memory_mb,
@@ -503,11 +509,13 @@ mod tests {
                 uptime: Duration::from_secs(120),
                 cpu_request_millicores: 250,
                 memory_request_mb: 128,
+                gpu_request: 0,
                 egress_enforcement: Default::default(),
             }],
             allocated_ports: vec![8080],
             capacity_cpu_millicores: 7500,
             capacity_memory_mb: 15_872,
+            capacity_gpus: 0,
             job_reservations: Default::default(),
             capacity_refusals: Vec::new(),
             rollouts: Vec::new(),
@@ -807,6 +815,7 @@ mod tests {
             uptime: Duration::from_secs(10),
             cpu_request_millicores: cpu,
             memory_request_mb: memory,
+            gpu_request: 0,
             egress_enforcement: Default::default(),
         }
     }
@@ -840,11 +849,49 @@ mod tests {
             allocated_ports: vec![],
             capacity_cpu_millicores: 8000,
             capacity_memory_mb: 16384,
+            capacity_gpus: 0,
             job_reservations: Default::default(),
             capacity_refusals: Vec::new(),
             rollouts: Vec::new(),
         });
         assert_eq!(report.running_apps[0].execution, Some(execution));
+    }
+
+    #[tokio::test]
+    async fn state_report_counts_the_gpus_running_instances_request() {
+        let net = InMemoryReportingNetwork::new();
+        let transport = net.register(addr(1)).await;
+        let (snapshot_tx, _) = mpsc::channel(1);
+        let (_, council_rx) = watch::channel(Vec::new());
+        let worker = ReportWorker::new(
+            NodeId::new("w1"),
+            transport,
+            test_config(),
+            snapshot_tx,
+            council_rx,
+            CancellationToken::new(),
+        );
+        let mut training = instance("train", ContainerState::Running, 250, 128);
+        training.gpu_request = 2;
+        let mut finished = instance("old", ContainerState::Stopped, 250, 128);
+        finished.gpu_request = 4;
+        let report = worker.build_report(AgentSnapshot {
+            instances: vec![training, finished],
+            capabilities: Default::default(),
+            readiness: None,
+            egress_degraded: false,
+            egress_affected_workloads: vec![],
+            allocated_ports: vec![],
+            capacity_cpu_millicores: 8000,
+            capacity_memory_mb: 16384,
+            capacity_gpus: 8,
+            job_reservations: Default::default(),
+            capacity_refusals: Vec::new(),
+            rollouts: Vec::new(),
+        });
+        // A stopped instance holds no card.
+        assert_eq!(report.resource_usage.gpu_used, 2);
+        assert_eq!(report.resource_usage.gpu_total, 8);
     }
 
     #[tokio::test]
@@ -880,6 +927,7 @@ mod tests {
             allocated_ports: vec![],
             capacity_cpu_millicores: 8000,
             capacity_memory_mb: 16384,
+            capacity_gpus: 0,
             job_reservations: jobs,
             capacity_refusals: vec![refusal.clone()],
             rollouts: Vec::new(),
@@ -926,6 +974,7 @@ mod tests {
             allocated_ports: vec![],
             capacity_cpu_millicores: 8000,
             capacity_memory_mb: 16384,
+            capacity_gpus: 0,
             job_reservations: Default::default(),
             capacity_refusals: Vec::new(),
             rollouts: Vec::new(),
@@ -969,6 +1018,7 @@ mod tests {
             allocated_ports: vec![],
             capacity_cpu_millicores: 8000,
             capacity_memory_mb: 16384,
+            capacity_gpus: 0,
             job_reservations: Default::default(),
             capacity_refusals: Vec::new(),
             rollouts: Vec::new(),

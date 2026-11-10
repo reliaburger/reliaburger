@@ -14,10 +14,12 @@ If you're an agent operating or debugging a Reliaburger cluster:
   with an AI agent" as the installed `relish` has it, so it always matches
   the binary you're driving. No `relish`? Ask your human to install it
   with `curl -fsSL https://reliaburger.com/install.sh | sh -s -- --install-only`.
-- **Work with a read-only token.** Ask your human to run
+- **Work with a read-only token.** To debug, ask your human to run
   `relish token create --name agent --role read-only --ttl-days 1` and give
-  you the token in `RELIABURGER_TOKEN`. The token's role is what stops you
-  changing the cluster; these rules don't.
+  you the token in `RELIABURGER_TOKEN`. Only if you should propose changes,
+  ask for `relish token create --name agent --agent --role deployer
+  --namespaces NS` instead. The token's role is what stops you changing the
+  cluster; these rules don't.
 - **Read `ok`, then `data` or `error.code`.** Exit `0` means the command
   answered, not that all is well: the verdict is in `data`.
 - **Follow `next`, and ask your human before any step whose `read_only` is
@@ -53,17 +55,27 @@ If you're an agent operating or debugging a Reliaburger cluster:
 | `relish agent logs` | An app's recent log lines, newest kept, each wrapped as untrusted |
 | `relish agent manual search` | Up to ten sections that mention every word, best first, each with a short excerpt and the `show` command that prints it |
 | `relish agent manual show` | One chapter, or one section of it, as Markdown: `diagnostics` or `diagnostics#relish-path-can-a-reach-b` |
-| `relish agent context` | The first call: findings, unknowns, faults, alerts, one line per app and the newest events, in one bounded answer |
+| `relish agent context` | The first call: `relish status`'s screen and summary, findings, unknowns, active faults and the newest events, in one bounded answer |
 | `relish agent diagnose` | Every finding with its evidence, read-only next steps, and pointers into the manual and the source |
-| `relish agent explain` | What a finding means, its thresholds and where it's decided; every finding when no id is given. Reads only this binary |
+| `relish agent explain` | What a finding means and where it's decided, or why the cluster made a decision: --restart, --placement, --refusal |
+| `relish agent timeline` | What changed in a window: events, audit and deploys, newest first |
 | `relish agent upgrade-check` | Whether the cluster can take the latest release: `ready`, `up_to_date`, `needs_fresh_cluster`, `blocked` or `unknown` |
+| `relish agent verify` | Whether the cluster runs the published release, byte for byte: `verified`, `mismatch` or `unknown` |
 | `relish agent report` | Draft a redacted bug report for a human to post. Never posts |
 | `relish agent patch init` | Extract this binary's source into a new workspace, on a `patch` branch |
 | `relish agent patch build` | Build the workspace: `relish` for this machine, `bun` and a Linux `relish` for the nodes (in the build VM on macOS). Both by default |
 | `relish agent patch test` | Run the portable test suite in the workspace, optionally filtered |
 | `relish agent patch try` | Boot a throwaway cluster from the workspace's binaries, with its own `RELIABURGER_HOME` |
 | `relish agent patch diff` | The change against the extracted source, and the tests that ran |
+| `relish agent patch apply` | Apply a unified diff to the workspace, matching each hunk by its lines rather than its header's counts. All or nothing |
 | `relish agent patch destroy` | Remove the workspace's throwaway cluster, or every one with `--all`. The workspace and its source stay |
 | `relish agent setup` | Wire Reliaburger into the AI agents on this machine. Shows the diff; writes only with --yes |
+| `relish agent lease take` | Take a lease before changing an app or a namespace, or renew yours |
+| `relish agent lease renew` | Extend a lease you hold |
+| `relish agent lease release` | Give up a lease you hold |
+| `relish agent propose` | Propose a change for a person to approve: apply, scale, rollback, stop or delete. Shows the summary, blast radius and undo command |
+| `relish agent proposals` | Proposals you can see, newest first; one when given its number |
+| `relish agent withdraw` | Withdraw a pending proposal you made |
+| `relish agent undo` | Propose undoing an applied proposal, for a person to approve |
 
 `relish agent guide` prints the whole chapter this skill is made from, as the installed `relish` has it, and `relish agent schema` the shape of every answer.

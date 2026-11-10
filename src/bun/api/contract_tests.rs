@@ -107,6 +107,7 @@ fn cluster_instance_status() {
             pid: Some(4242),
             runtime_unknown: false,
             status_age_ms: Some(120),
+            age_seconds: None,
             reason: None,
         },
     }];

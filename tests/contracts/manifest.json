@@ -24,7 +24,7 @@
       ],
       "command": [
         "make",
-        "test"
+        "test-macos"
       ],
       "required_in": [
         "portable",
@@ -180,8 +180,7 @@
           "binary": "reliaburger",
           "test": "bun::agent::tests::overlapping_volume_layout_is_refused_before_any_directory_is_provisioned",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/agent/tests/mod.rs"
@@ -192,8 +191,7 @@
           "binary": "reliaburger",
           "test": "config::validate::tests::dotted_managed_volume_paths_remain_distinct",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/config/validate.rs"
@@ -204,8 +202,7 @@
           "binary": "reliaburger",
           "test": "config::validate::tests::managed_volume_artifact_overlaps_are_rejected",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/config/validate.rs"
@@ -227,8 +224,7 @@
           "binary": "reliaburger",
           "test": "grill::volume::owned::tests::dotted_owned_volume_names_are_independent",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/grill/volume/owned.rs"
@@ -255,8 +251,7 @@
           "binary": "reliaburger",
           "test": "bun::build_runner::tests::cached_build_signers_are_replaced_before_or_after_expiry",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/build_runner.rs"
@@ -267,8 +262,7 @@
           "binary": "reliaburger",
           "test": "pickle::signing::tests::cluster_artifact_signature_remains_valid_after_two_hours",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/pickle/signing.rs"
@@ -279,8 +273,7 @@
           "binary": "reliaburger",
           "test": "sesame::identity::tests::code_signing_certificate_never_outlives_its_issuing_ca",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/sesame/identity.rs"
@@ -307,8 +300,7 @@
           "binary": "reliaburger::suite",
           "test": "api_tokens::batch_submission_checks_every_job_against_token_scope_before_dispatch",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "tests/suite/api_tokens.rs"
@@ -319,8 +311,7 @@
           "binary": "reliaburger::suite",
           "test": "api_tokens::batch_submission_enforces_deploy_and_host_execution_permissions",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "tests/suite/api_tokens.rs"
@@ -331,8 +322,7 @@
           "binary": "reliaburger::suite",
           "test": "api_tokens::batch_submission_refuses_unowned_test_namespaces_and_images",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "tests/suite/api_tokens.rs"
@@ -343,8 +333,7 @@
           "binary": "reliaburger::suite",
           "test": "api_tokens::batch_submission_validates_every_spec_before_registering_or_dispatching",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "tests/suite/api_tokens.rs"
@@ -355,8 +344,7 @@
           "binary": "reliaburger::suite",
           "test": "api_tokens::follower_batch_submission_preserves_the_callers_credential_for_leader_admission",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "tests/suite/api_tokens.rs"
@@ -384,8 +372,7 @@
           "binary": "reliaburger",
           "test": "pickle::api::tests::scoped_blob_probe_does_not_skip_a_required_repository_upload",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/pickle/api.rs"
@@ -396,8 +383,7 @@
           "binary": "reliaburger",
           "test": "pickle::api::tests::scoped_layer_and_index_publication_need_destination_authority",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/pickle/api.rs"
@@ -408,8 +394,7 @@
           "binary": "reliaburger",
           "test": "pickle::api::tests::scoped_publication_requires_authority_for_every_descriptor",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/pickle/api.rs"
@@ -420,8 +405,7 @@
           "binary": "reliaburger",
           "test": "pickle::store::tests::collection_and_corruption_remove_repository_upload_evidence",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/pickle/store.rs"
@@ -432,8 +416,7 @@
           "binary": "reliaburger",
           "test": "pickle::store::tests::failed_digest_completion_never_grants_existing_blob_authority",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/pickle/store.rs"
@@ -444,8 +427,7 @@
           "binary": "reliaburger",
           "test": "pickle::store::tests::repository_evidence_failure_prevents_successful_upload_acknowledgement",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/pickle/store.rs"
@@ -456,8 +438,7 @@
           "binary": "reliaburger",
           "test": "pickle::store::tests::repository_upload_evidence_survives_restart_and_is_not_global",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/pickle/store.rs"
@@ -468,8 +449,7 @@
           "binary": "reliaburger",
           "test": "pickle::store::tests::retirement_forgets_only_the_exact_repository_generation",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/pickle/store.rs"
@@ -496,8 +476,7 @@
           "binary": "reliaburger",
           "test": "grill::process::tests::file_follow_rescans_after_eof_before_actual_child_exit",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/grill/process.rs"
@@ -508,8 +487,7 @@
           "binary": "reliaburger",
           "test": "grill::process::tests::resumed_file_follow_keeps_offsets_across_eof_before_actual_child_exit",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/grill/process.rs"
@@ -520,8 +498,7 @@
           "binary": "reliaburger",
           "test": "ketchup::log_store::tests::failed_direct_flush_preserves_rows_until_data_and_checkpoint_are_durable",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/ketchup/log_store.rs"
@@ -532,8 +509,7 @@
           "binary": "reliaburger",
           "test": "ketchup::log_store::tests::failed_shared_flush_preserves_rows_until_data_and_checkpoint_are_durable",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/ketchup/log_store.rs"
@@ -544,8 +520,7 @@
           "binary": "reliaburger",
           "test": "ketchup::log_store::tests::canceling_an_inflight_log_flush_keeps_rows_queryable_and_retryable",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/ketchup/log_store.rs"
@@ -572,8 +547,7 @@
           "binary": "reliaburger::bin/bun",
           "test": "tests::metrics_archive_owners_survive_restarts_and_plaintext_label_changes",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bin/bun.rs"
@@ -584,8 +558,7 @@
           "binary": "reliaburger::bin/bun",
           "test": "tests::metrics_archive_owner_refuses_corruption_and_failed_persistence",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bin/bun.rs"
@@ -596,8 +569,7 @@
           "binary": "reliaburger::bin/bun",
           "test": "tests::remote_plaintext_owners_refuse_configured_paths_that_would_share_a_fallback",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bin/bun.rs"
@@ -608,8 +580,7 @@
           "binary": "reliaburger::bin/bun",
           "test": "tests::enrolled_metrics_archive_owner_uses_the_root_and_certificate_node_id",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bin/bun.rs"
@@ -620,8 +591,7 @@
           "binary": "reliaburger::bin/bun",
           "test": "tests::enrolled_metrics_archive_owner_survives_leaf_renewal_and_uses_certificate_node_id",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bin/bun.rs"
@@ -632,8 +602,7 @@
           "binary": "reliaburger",
           "test": "mayo::store::tests::simultaneous_object_store_writers_keep_both_nodes_history",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/mayo/store.rs"
@@ -644,8 +613,7 @@
           "binary": "reliaburger",
           "test": "mayo::store::tests::node_archives_are_scoped_but_generic_queries_read_all_owners",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/mayo/store.rs"
@@ -656,8 +624,7 @@
           "binary": "reliaburger",
           "test": "mayo::store::tests::create_only_remote_chunks_refuse_collisions_without_replacing_history",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/mayo/store.rs"
@@ -684,8 +651,7 @@
           "binary": "reliaburger",
           "test": "bun::api::tests::an_admitted_job_only_apply_owns_its_name_before_executor_dispatch",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/api/tests.rs",
@@ -697,8 +663,7 @@
           "binary": "reliaburger",
           "test": "bun::api::tests::cluster_scheduled_apply_commits_apps_and_a_definition_without_an_immediate_run",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/api/tests.rs",
@@ -710,8 +675,7 @@
           "binary": "reliaburger",
           "test": "bun::api::tests::hung_cancel_after_a_failed_hook_preserves_the_exact_failure_and_app_gate",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/api/tests.rs",
@@ -723,8 +687,7 @@
           "binary": "reliaburger",
           "test": "bun::api::tests::hung_common_begin_returns_bounded_unavailability_without_publication",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/api/tests.rs",
@@ -736,8 +699,7 @@
           "binary": "reliaburger",
           "test": "bun::api::tests::hung_cancel_after_a_successful_hook_preserves_the_exact_intent_and_app_gate",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/api/tests.rs",
@@ -749,8 +711,7 @@
           "binary": "reliaburger",
           "test": "bun::api::tests::hung_common_commit_is_bounded_and_preserves_the_exact_successful_hook_and_app_gate",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/api/tests.rs",
@@ -763,8 +724,7 @@
           "binary": "reliaburger",
           "test": "bun::api::tests::hung_failed_hook_settlement_is_bounded_and_preserves_the_exact_failure_and_app_gate",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/api/tests.rs",
@@ -777,8 +737,7 @@
           "binary": "reliaburger",
           "test": "config::validate::tests::prerequisites_require_an_app_in_the_same_apply_and_namespace",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/config/validate.rs"
@@ -789,8 +748,7 @@
           "binary": "reliaburger",
           "test": "config::validate::tests::same_namespace_prerequisites_are_valid",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/config/validate.rs"
@@ -801,8 +759,7 @@
           "binary": "reliaburger::suite",
           "test": "batch::a_blocked_cluster_prerequisite_owns_its_app_until_desired_writes_finish",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "tests/suite/batch.rs"
@@ -813,7 +770,6 @@
           "binary": "reliaburger::suite",
           "test": "batch::a_new_leader_cannot_repeat_an_uncertain_prerequisite_attempt",
           "requires": [
-            "portable-darwin",
             "portable-linux"
           ],
           "sources": [
@@ -826,8 +782,7 @@
           "binary": "reliaburger",
           "test": "bun::execution_budget::tests::mixed_requests_and_apps_share_all_dimensions",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/execution_budget.rs"
@@ -838,8 +793,7 @@
           "binary": "reliaburger::suite",
           "test": "batch::an_ordinary_app_apply_cannot_bypass_its_prerequisite_claim_after_handover",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "tests/suite/batch.rs"
@@ -850,8 +804,7 @@
           "binary": "reliaburger::suite",
           "test": "batch::an_ordinary_job_apply_cannot_take_over_a_prerequisite_claim_after_handover",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "tests/suite/batch.rs"
@@ -862,8 +815,7 @@
           "binary": "reliaburger::suite",
           "test": "batch::cancelling_a_running_cluster_migration_never_publishes_its_app_revision",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "tests/suite/batch.rs"
@@ -874,8 +826,7 @@
           "binary": "reliaburger::suite",
           "test": "batch::changing_a_prerequisite_spec_cannot_bypass_its_handover_claim",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "tests/suite/batch.rs"
@@ -886,8 +837,7 @@
           "binary": "reliaburger::suite",
           "test": "batch::changing_a_prerequisite_target_cannot_bypass_its_handover_claim",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "tests/suite/batch.rs"
@@ -898,8 +848,7 @@
           "binary": "reliaburger::suite",
           "test": "batch::cluster_apply_refuses_a_failed_prerequisite_without_committing_an_app_revision",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "tests/suite/batch.rs"
@@ -910,8 +859,7 @@
           "binary": "reliaburger::suite",
           "test": "batch::cluster_apply_waits_for_prerequisite_success_before_committing_an_app_revision",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "tests/suite/batch.rs"
@@ -922,8 +870,7 @@
           "binary": "reliaburger::suite",
           "test": "batch::follower_forwarding_cannot_bypass_a_failed_cluster_prerequisite",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "tests/suite/batch.rs"
@@ -934,8 +881,7 @@
           "binary": "reliaburger::suite",
           "test": "batch::invalid_cluster_prerequisites_are_refused_before_any_app_commit",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "tests/suite/batch.rs"
@@ -968,8 +914,7 @@
           "binary": "reliaburger",
           "test": "bun::api::tests::common_apply_refuses_missing_durable_storage_before_agent_work",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/api/tests.rs",
@@ -981,8 +926,7 @@
           "binary": "reliaburger",
           "test": "bun::api::tests::owned_log_metadata_refuses_a_stalled_agent_within_a_bounded_wait",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/api/tests.rs"
@@ -993,8 +937,7 @@
           "binary": "reliaburger::suite",
           "test": "batch::a_maximum_length_batch_label_gets_a_valid_independent_execution_name",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "tests/suite/batch.rs"
@@ -1005,8 +948,7 @@
           "binary": "reliaburger::suite",
           "test": "batch::a_previous_named_run_cannot_complete_a_new_batch_before_dispatch_acknowledges",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "tests/suite/batch.rs"
@@ -1017,8 +959,7 @@
           "binary": "reliaburger::suite",
           "test": "batch::concurrent_batches_with_the_same_label_run_independent_jobs",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "tests/suite/batch.rs"
@@ -1029,8 +970,7 @@
           "binary": "reliaburger::suite",
           "test": "batch::public_apply_cannot_supply_a_batch_execution_label",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "tests/suite/batch.rs"
@@ -1041,8 +981,7 @@
           "binary": "reliaburger::suite",
           "test": "batch::public_batch_refuses_a_cron_schedule_before_registration",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "tests/suite/batch.rs"
@@ -1053,8 +992,7 @@
           "binary": "reliaburger::suite",
           "test": "batch::public_batch_refuses_run_before_without_an_app_submission",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "tests/suite/batch.rs"
@@ -1081,8 +1019,7 @@
           "binary": "reliaburger",
           "test": "wrapper::routing::tests::rebuilding_routes_preserves_failed_health_for_unchanged_endpoints",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/wrapper/routing.rs"
@@ -1093,8 +1030,7 @@
           "binary": "reliaburger",
           "test": "wrapper::routing::tests::continued_failed_probes_exclude_a_backend_after_table_replacement_and_allow_recovery",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/wrapper/routing.rs"
@@ -1105,8 +1041,7 @@
           "binary": "reliaburger",
           "test": "wrapper::routing::tests::a_probe_of_an_old_address_cannot_mark_its_replacement_unhealthy",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/wrapper/routing.rs"
@@ -1133,8 +1068,7 @@
           "binary": "reliaburger",
           "test": "wrapper::proxy::tests::backend_redirects_reach_the_client_without_following_either_upstream_client",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/wrapper/proxy.rs"
@@ -1162,8 +1096,7 @@
           "binary": "reliaburger",
           "test": "bun::agent::tests::deployment_publishes_thirty_three_backends_and_retains_runtime_owners",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/agent/tests/mod.rs"
@@ -1196,8 +1129,7 @@
           "binary": "reliaburger",
           "test": "onion::service_map::tests::the_full_catalogue_can_exceed_kernel_backend_pool_capacity",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/onion/service_map.rs"
@@ -1208,8 +1140,7 @@
           "binary": "reliaburger",
           "test": "onion::service_map::tests::thirty_three_local_replicas_survive_snapshot_validation",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/onion/service_map.rs"
@@ -1220,8 +1151,7 @@
           "binary": "reliaburger",
           "test": "onion::service_map::tests::thirty_three_remote_replicas_do_not_poison_an_unrelated_service_snapshot",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/onion/service_map.rs"
@@ -1249,8 +1179,7 @@
           "binary": "reliaburger",
           "test": "pickle::api::tests::malformed_registry_credentials_are_refused_before_hashing",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/pickle/api.rs"
@@ -1261,8 +1190,7 @@
           "binary": "reliaburger",
           "test": "pickle::api::tests::registry_reads_and_writes_authenticate_bearer_and_basic_credentials",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/pickle/api.rs"
@@ -1273,8 +1201,7 @@
           "binary": "reliaburger",
           "test": "sesame::connection::tests::a_connection_opened_before_renewal_never_presents_the_expired_leaf",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/sesame/connection.rs"
@@ -1285,8 +1212,7 @@
           "binary": "reliaburger",
           "test": "sesame::connection::tests::pooled_renewal_fixture_detects_disabled_connection_retirement",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/sesame/connection.rs"
@@ -1316,8 +1242,7 @@
           "binary": "reliaburger",
           "test": "grill::image::tests::runtime_pull_shares_the_registry_physical_storage_ceiling",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/grill/image.rs"
@@ -1328,8 +1253,7 @@
           "binary": "reliaburger",
           "test": "pickle::api::tests::physical_quota_counts_bare_blobs_without_a_manifest",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/pickle/api.rs"
@@ -1340,8 +1264,7 @@
           "binary": "reliaburger",
           "test": "pickle::api::tests::physical_quota_refuses_an_oversized_chunk_before_disk_growth",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/pickle/api.rs"
@@ -1352,8 +1275,7 @@
           "binary": "reliaburger",
           "test": "pickle::api::tests::physical_quota_counts_distinct_repository_receipts_for_one_shared_blob",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/pickle/api.rs"
@@ -1364,8 +1286,7 @@
           "binary": "reliaburger",
           "test": "pickle::store::tests::physical_budget_reserves_concurrent_uploads_and_releases_confirmed_cancellation",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/pickle/store.rs"
@@ -1376,8 +1297,7 @@
           "binary": "reliaburger",
           "test": "pickle::store::tests::physical_budget_moves_upload_capacity_and_deduplicates_direct_writes",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/pickle/store.rs"
@@ -1388,8 +1308,7 @@
           "binary": "reliaburger",
           "test": "pickle::store::tests::physical_budget_reconstructs_committed_and_temporary_bytes_after_restart",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/pickle/store.rs"
@@ -1400,8 +1319,7 @@
           "binary": "reliaburger",
           "test": "pickle::store::tests::failed_upload_removal_does_not_release_payload_capacity",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/pickle/store.rs"
@@ -1412,8 +1330,7 @@
           "binary": "reliaburger",
           "test": "pickle::store::tests::peer_commit_path_cannot_create_unbudgeted_bytes",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/pickle/store.rs"
@@ -1424,8 +1341,7 @@
           "binary": "reliaburger",
           "test": "pickle::store::tests::empty_upload_file_admission_is_bounded_and_cancel_restores_capacity",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/pickle/store.rs"
@@ -1436,8 +1352,7 @@
           "binary": "reliaburger",
           "test": "pickle::store::tests::receipt_replacement_and_retirement_account_exact_payload_bytes",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/pickle/store.rs"
@@ -1448,8 +1363,7 @@
           "binary": "reliaburger",
           "test": "pickle::store::tests::collection_returns_receipt_byte_and_file_capacity",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/pickle/store.rs"
@@ -1460,8 +1374,7 @@
           "binary": "reliaburger",
           "test": "pickle::store::tests::refused_direct_blob_admission_creates_no_empty_cas_directory",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/pickle/store.rs"
@@ -1472,8 +1385,7 @@
           "binary": "reliaburger",
           "test": "pickle::store::tests::startup_counts_receipts_and_their_atomic_write_leftovers",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/pickle/store.rs"
@@ -1484,8 +1396,7 @@
           "binary": "reliaburger::suite",
           "test": "registry_upload::failed_upload_cleanup_stays_fenced_and_retries_without_blocking_other_uploads",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "tests/suite/registry_upload.rs"
@@ -1512,8 +1423,7 @@
           "binary": "reliaburger",
           "test": "config::validate::tests::invalid_cron_schedule_is_rejected_during_config_validation",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/config/validate.rs"
@@ -1524,8 +1434,7 @@
           "binary": "reliaburger",
           "test": "meat::cron::tests::large_steps_do_not_wrap_into_other_minutes",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/meat/cron.rs"
@@ -1582,8 +1491,7 @@
           "binary": "reliaburger",
           "test": "bun::batch::tests::duplicate_names_are_refused_even_across_namespaces",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/batch.rs"
@@ -1594,8 +1502,7 @@
           "binary": "reliaburger",
           "test": "bun::batch::tests::duplicate_submission_never_registers_or_dispatches_jobs",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/batch.rs"
@@ -1624,8 +1531,7 @@
           "binary": "reliaburger",
           "test": "cluster::orchestrate::revalidation_in_place::ordinary_app_exact_complete_report_is_counted_once",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/cluster/orchestrate.rs"
@@ -1636,8 +1542,7 @@
           "binary": "reliaburger",
           "test": "cluster::orchestrate::revalidation_in_place::ordinary_app_other_ordinal_cannot_credit_the_committed_instance",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/cluster/orchestrate.rs"
@@ -1648,8 +1553,7 @@
           "binary": "reliaburger",
           "test": "cluster::orchestrate::revalidation_in_place::ordinary_app_partial_request_cannot_credit_the_full_placement",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/cluster/orchestrate.rs"
@@ -1660,8 +1564,7 @@
           "binary": "reliaburger",
           "test": "council::state_machine::tests::unguarded_app_placement_cannot_race_shared_capacity_admission",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/council/state_machine.rs"
@@ -1672,8 +1575,7 @@
           "binary": "reliaburger",
           "test": "council::state_machine::tests::whole_placement_pass_has_one_revision_and_no_partial_invalid_writes",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/council/state_machine.rs"
@@ -1684,8 +1586,7 @@
           "binary": "reliaburger::suite",
           "test": "batch::common_jobs_execute_with_worker_evidence_independent_of_global_capacity_reports",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "tests/suite/batch.rs",
@@ -1697,8 +1598,7 @@
           "binary": "reliaburger",
           "test": "bun::task_array_node::tests::an_unfinished_conservative_grant_cannot_restart_without_replay",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/task_array_node.rs"
@@ -1709,8 +1609,7 @@
           "binary": "reliaburger",
           "test": "bun::task_array_leader::tests::the_first_sync_grants_by_slots_and_skips_nodes_that_cant_run",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/task_array_leader.rs"
@@ -1721,8 +1620,7 @@
           "binary": "reliaburger",
           "test": "meat::task_array_store::tests::sync_retires_results_before_granting",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/meat/task_array_store.rs"
@@ -1733,8 +1631,7 @@
           "binary": "reliaburger",
           "test": "bun::task_runtime::tests::task_runtime_uncertain_exit_holds_the_slot_until_positive_retirement",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/task_runtime.rs"
@@ -1745,8 +1642,7 @@
           "binary": "reliaburger",
           "test": "bun::execution_budget::tests::reducing_capacity_does_not_erase_owned_resources",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/execution_budget.rs"
@@ -1757,8 +1653,7 @@
           "binary": "reliaburger",
           "test": "bun::execution_budget::tests::large_waiter_is_not_overtaken_by_a_smaller_request",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/execution_budget.rs"
@@ -1769,8 +1664,7 @@
           "binary": "reliaburger",
           "test": "bun::execution_budget::tests::waits_cancel_without_leaking_or_losing_release_notification",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/execution_budget.rs"
@@ -1781,8 +1675,7 @@
           "binary": "reliaburger",
           "test": "bun::execution_budget::tests::abandoned_attempt_keeps_its_capacity_and_adoption_never_forgives_an_owner",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/execution_budget.rs"
@@ -1793,8 +1686,7 @@
           "binary": "reliaburger::suite",
           "test": "batch::simultaneous_api_admission_deduplicates_the_same_durable_batch_request",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "tests/suite/batch.rs",
@@ -1823,8 +1715,7 @@
           "binary": "reliaburger",
           "test": "grill::process::tests::a_deadline_abort_waits_for_actual_reader_termination_acknowledgement",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/grill/process.rs"
@@ -1835,8 +1726,7 @@
           "binary": "reliaburger",
           "test": "grill::process::tests::canceling_a_final_snapshot_waiter_does_not_cancel_owned_capture",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/grill/process.rs"
@@ -1847,8 +1737,7 @@
           "binary": "reliaburger",
           "test": "grill::process::tests::descendant_held_pipes_are_bounded_after_exit_even_without_a_logs_waiter",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/grill/process.rs"
@@ -1859,8 +1748,7 @@
           "binary": "reliaburger",
           "test": "grill::process::tests::dropping_the_last_process_owner_aborts_gated_pipe_readers",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/grill/process.rs"
@@ -1871,8 +1759,7 @@
           "binary": "reliaburger",
           "test": "grill::process::tests::every_child_exit_observer_starts_the_owned_capture_drain",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/grill/process.rs"
@@ -1883,8 +1770,7 @@
           "binary": "reliaburger",
           "test": "grill::process::tests::final_log_snapshot_waits_for_reader_publication_after_child_exit",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/grill/process.rs"
@@ -1895,8 +1781,7 @@
           "binary": "reliaburger",
           "test": "grill::process::tests::following_logs_waits_for_reader_publication_after_child_exit",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/grill/process.rs"
@@ -1907,8 +1792,7 @@
           "binary": "reliaburger",
           "test": "wrapper::proxy::tests::active_response_outlives_thirty_seconds_on_the_fresh_client",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/wrapper/proxy.rs"
@@ -1919,8 +1803,7 @@
           "binary": "reliaburger",
           "test": "wrapper::proxy::tests::active_response_outlives_thirty_seconds_on_the_pooled_client",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/wrapper/proxy.rs"
@@ -1931,8 +1814,7 @@
           "binary": "reliaburger",
           "test": "wrapper::proxy::tests::fresh_upstream_waits_for_headers_and_stalled_body_reads_remain_bounded",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/wrapper/proxy.rs"
@@ -1943,8 +1825,7 @@
           "binary": "reliaburger",
           "test": "wrapper::proxy::tests::pooled_upstream_waits_for_headers_and_stalled_body_reads_remain_bounded",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/wrapper/proxy.rs"
@@ -1975,8 +1856,7 @@
           "binary": "reliaburger",
           "test": "onion::dns::tests::external_tcp_dns_relays_direct_queries_and_truncated_udp_retries",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/onion/dns.rs"
@@ -1987,8 +1867,7 @@
           "binary": "reliaburger",
           "test": "onion::dns::tests::external_tcp_dns_times_out_with_servfail_and_internal_names_stay_local",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/onion/dns.rs"
@@ -2119,8 +1998,7 @@
           "binary": "reliaburger",
           "test": "lettuce::sync::tests::gitops_verified_commit_uses_the_watched_tree_defaults_and_namespaces",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/lettuce/sync.rs"
@@ -2131,8 +2009,7 @@
           "binary": "reliaburger",
           "test": "lettuce::sync::tests::gitops_tree_matches_cli_defaults_and_directory_namespaces",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/lettuce/sync.rs"
@@ -2143,8 +2020,7 @@
           "binary": "reliaburger",
           "test": "lettuce::sync::tests::gitops_directory_namespace_is_used_without_defaults",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/lettuce/sync.rs"
@@ -2171,20 +2047,40 @@
           "binary": "reliaburger",
           "test": "lettuce::sync::tests::gitops_refuses_jobs_before_reporting_a_successful_app_sync",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/lettuce/sync.rs"
           ]
         },
         {
-          "id": "issue-549-gitops_refuses_migration_prerequisites_and_standalone_jobs",
+          "id": "issue-549-gitops_refuses_a_standalone_job",
           "binary": "reliaburger",
-          "test": "lettuce::sync::tests::gitops_refuses_migration_prerequisites_and_standalone_jobs",
+          "test": "lettuce::sync::tests::gitops_refuses_a_standalone_job",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
+          ],
+          "sources": [
+            "src/lettuce/sync.rs"
+          ]
+        },
+        {
+          "id": "issue-549-gitops_refuses_a_migration_prerequisite",
+          "binary": "reliaburger",
+          "test": "lettuce::sync::tests::gitops_refuses_a_migration_prerequisite",
+          "requires": [
+            "portable-linux"
+          ],
+          "sources": [
+            "src/lettuce/sync.rs"
+          ]
+        },
+        {
+          "id": "issue-549-gitops_refuses_a_scheduled_job",
+          "binary": "reliaburger",
+          "test": "lettuce::sync::tests::gitops_refuses_a_scheduled_job",
+          "requires": [
+            "portable-linux"
           ],
           "sources": [
             "src/lettuce/sync.rs"
@@ -2195,8 +2091,7 @@
           "binary": "reliaburger::suite",
           "test": "gitops::sync_loop_applies_every_supported_declarative_kind",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "tests/suite/gitops.rs"
@@ -2207,8 +2102,7 @@
           "binary": "reliaburger::suite",
           "test": "gitops::job_refusal_keeps_the_last_applied_commit_and_all_desired_resources",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "tests/suite/gitops.rs"
@@ -2237,8 +2131,7 @@
           "binary": "reliaburger",
           "test": "bun::api::tests::dry_run_endpoint_preserves_namespace_identity_and_caller_scope",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/api/tests.rs"
@@ -2249,8 +2142,7 @@
           "binary": "reliaburger",
           "test": "bun::api::tests::dry_run_endpoint_refuses_unavailable_agent_evidence",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/api/tests.rs"
@@ -2261,8 +2153,7 @@
           "binary": "reliaburger",
           "test": "config::fingerprint::tests::placement_ordinals_and_implicit_default_do_not_change_desired_spec",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/config/fingerprint.rs"
@@ -2273,8 +2164,7 @@
           "binary": "reliaburger",
           "test": "config::fingerprint::tests::same_image_changes_to_workload_settings_change_the_fingerprint",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/config/fingerprint.rs"
@@ -2361,8 +2251,7 @@
           "binary": "reliaburger",
           "test": "bun::api::tests::apply_uses_committed_namespace_context_before_any_resource_write",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/api/tests.rs"
@@ -2373,8 +2262,7 @@
           "binary": "reliaburger",
           "test": "bun::api::tests::follower_apply_defers_namespace_existence_to_the_authoritative_leader",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/api/tests.rs"
@@ -2514,8 +2402,7 @@
           "binary": "reliaburger",
           "test": "bun::api::tests::a_follower_forwards_the_signed_webhook_and_handover_keeps_its_admitted_trigger",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/api/tests.rs"
@@ -2526,8 +2413,7 @@
           "binary": "reliaburger",
           "test": "bun::api::tests::cluster_webhook_202_waits_for_replicated_trigger_admission",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/api/tests.rs"
@@ -2538,8 +2424,7 @@
           "binary": "reliaburger",
           "test": "bun::api::tests::cluster_webhook_without_a_leader_is_never_accepted_and_remains_retryable",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/api/tests.rs"
@@ -2550,8 +2435,7 @@
           "binary": "reliaburger",
           "test": "bun::api::tests::whole_webhook_budget_bounds_a_held_validator_and_exact_id_remains_retryable",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/api/tests.rs"
@@ -2562,8 +2446,7 @@
           "binary": "reliaburger",
           "test": "bun::api::tests::whole_webhook_budget_bounds_held_follower_metadata_and_restores_reservations",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/api/tests.rs"
@@ -2574,8 +2457,7 @@
           "binary": "reliaburger",
           "test": "council::state_machine::tests::a_stale_sync_completion_cannot_consume_a_newer_admitted_webhook",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/council/state_machine.rs"
@@ -2586,8 +2468,7 @@
           "binary": "reliaburger",
           "test": "council::state_machine::tests::admitted_webhooks_and_their_watch_survive_snapshot_install_and_restart",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/council/state_machine.rs"
@@ -2598,8 +2479,7 @@
           "binary": "reliaburger",
           "test": "council::state_machine::tests::webhook_receipts_are_bounded_and_generation_exhaustion_refuses_admission",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/council/state_machine.rs"
@@ -2610,8 +2490,7 @@
           "binary": "reliaburger",
           "test": "lettuce::runner::tests::an_unchanged_commit_still_records_completion_of_a_pending_generation",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/lettuce/runner.rs"
@@ -2622,8 +2501,7 @@
           "binary": "reliaburger",
           "test": "lettuce::webhook::tests::canceled_admission_restores_both_delivery_and_rate_reservations",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/lettuce/webhook.rs"
@@ -2650,8 +2528,7 @@
           "binary": "reliaburger",
           "test": "config::validate::tests::autoscale_admission_refuses_nonpositive_and_nonfinite_targets",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/config/validate.rs"
@@ -2662,8 +2539,7 @@
           "binary": "reliaburger",
           "test": "meat::autoscaler::tests::nonfinite_metrics_never_change_the_replica_count",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/meat/autoscaler.rs"
@@ -2674,8 +2550,7 @@
           "binary": "reliaburger",
           "test": "meat::autoscaler::tests::nonpositive_and_nonfinite_targets_are_refused",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/meat/autoscaler.rs"
@@ -2686,8 +2561,7 @@
           "binary": "reliaburger",
           "test": "meat::autoscaler::tests::targets_above_one_request_are_supported",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/meat/autoscaler.rs"
@@ -2714,8 +2588,7 @@
           "binary": "reliaburger",
           "test": "mayo::store::tests::canceled_local_mayo_error_retains_owned_rows_for_retry",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/mayo/store.rs"
@@ -2726,8 +2599,7 @@
           "binary": "reliaburger",
           "test": "mayo::store::tests::canceled_local_mayo_publication_is_visible_once_while_writer_is_owned",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/mayo/store.rs"
@@ -2738,8 +2610,7 @@
           "binary": "reliaburger",
           "test": "mayo::store::tests::canceled_remote_mayo_before_commit_keeps_rows_queryable",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/mayo/store.rs"
@@ -2750,8 +2621,7 @@
           "binary": "reliaburger",
           "test": "mayo::store::tests::canceled_remote_mayo_after_commit_retries_the_same_verified_chunk",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/mayo/store.rs"
@@ -2762,8 +2632,7 @@
           "binary": "reliaburger",
           "test": "mayo::store::tests::errored_remote_mayo_after_commit_neither_duplicates_nor_rekeys_its_rows",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/mayo/store.rs"
@@ -2774,8 +2643,7 @@
           "binary": "reliaburger",
           "test": "mayo::store::tests::a_foreign_identical_sample_chunk_is_kept_and_the_pending_publication_is_rekeyed",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/mayo/store.rs"
@@ -2786,8 +2654,7 @@
           "binary": "reliaburger",
           "test": "mayo::store::tests::failed_mayo_backlog_is_bounded_without_discarding_the_owned_publication",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/mayo/store.rs"
@@ -2798,8 +2665,7 @@
           "binary": "reliaburger",
           "test": "mayo::store::tests::unknown_remote_mayo_ownership_read_retains_the_same_publication",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/mayo/store.rs"
@@ -2810,8 +2676,7 @@
           "binary": "reliaburger",
           "test": "mayo::store::tests::local_mayo_parent_confirmation_failure_retries_the_owned_creation_chain",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/mayo/store.rs"
@@ -2822,8 +2687,7 @@
           "binary": "reliaburger",
           "test": "mayo::store::tests::reopened_mayo_reconfirms_a_visible_owned_directory_entry_before_ack",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/mayo/store.rs"
@@ -2834,8 +2698,7 @@
           "binary": "reliaburger",
           "test": "mayo::store::tests::missing_mayo_ancestor_is_confirmed_before_descendants_or_publication",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/mayo/store.rs"
@@ -2846,8 +2709,7 @@
           "binary": "reliaburger",
           "test": "mayo::store::tests::fresh_mayo_store_reconfirms_visible_outer_entry_before_descent",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/mayo/store.rs"
@@ -2875,8 +2737,7 @@
           "binary": "reliaburger",
           "test": "ketchup::log_store::tests::restart_recovers_capture_offsets_after_parquet_before_checkpoint_failure",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/ketchup/log_store.rs"
@@ -2887,8 +2748,7 @@
           "binary": "reliaburger",
           "test": "ketchup::log_store::tests::replacement_after_capture_read_before_flush_does_not_skip_the_replacement",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/ketchup/log_store.rs"
@@ -2899,8 +2759,7 @@
           "binary": "reliaburger",
           "test": "ketchup::log_store::tests::replacement_after_parquet_publication_before_checkpoint_does_not_skip_the_replacement",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/ketchup/log_store.rs"
@@ -2911,8 +2770,7 @@
           "binary": "reliaburger",
           "test": "ketchup::log_store::tests::missing_json_checkpoint_recovers_capture_and_sequence_from_parquet_footer",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/ketchup/log_store.rs"
@@ -2923,8 +2781,7 @@
           "binary": "reliaburger",
           "test": "ketchup::log_store::tests::corrupt_json_checkpoint_recovers_capture_and_sequence_from_parquet_footer",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/ketchup/log_store.rs"
@@ -2935,8 +2792,7 @@
           "binary": "reliaburger",
           "test": "ketchup::log_store::tests::replacement_between_checkpoint_load_and_reader_resume_starts_at_byte_zero",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/ketchup/log_store.rs"
@@ -2947,8 +2803,7 @@
           "binary": "reliaburger",
           "test": "ketchup::log_store::tests::directory_sync_failure_keeps_log_batch_owned_and_retryable",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/ketchup/log_store.rs"
@@ -2959,8 +2814,7 @@
           "binary": "reliaburger",
           "test": "grill::capture::tests::capture_identity_is_observed_on_the_descriptor_that_supplied_the_bytes",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/grill/capture.rs"
@@ -2971,8 +2825,7 @@
           "binary": "reliaburger",
           "test": "grill::capture::tests::canceling_a_capture_read_preserves_partial_bytes_and_identity_until_retry",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/grill/capture.rs"
@@ -2983,8 +2836,7 @@
           "binary": "reliaburger",
           "test": "ketchup::log_store::tests::missing_log_ancestor_confirmation_fails_before_child_creation_and_retries",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/ketchup/log_store.rs"
@@ -2995,8 +2847,7 @@
           "binary": "reliaburger",
           "test": "ketchup::log_store::tests::fresh_log_store_reconfirms_a_visible_directory_entry_before_publication",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/ketchup/log_store.rs"
@@ -3024,8 +2875,7 @@
           "binary": "reliaburger",
           "test": "pickle::store::tests::new_blob_publication_syncs_each_parent_entry_before_success",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/pickle/store.rs"
@@ -3036,8 +2886,7 @@
           "binary": "reliaburger",
           "test": "pickle::store::tests::failed_new_digest_parent_sync_keeps_upload_reserved_and_retry_resyncs_visible_entry",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/pickle/store.rs"
@@ -3048,8 +2897,7 @@
           "binary": "reliaburger",
           "test": "pickle::store::tests::verified_reuse_refuses_an_uncertain_containing_directory_sync",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/pickle/store.rs"
@@ -3060,8 +2908,7 @@
           "binary": "reliaburger",
           "test": "pickle::store::tests::all_upload_publication_paths_sync_new_payload_ancestor_entries",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/pickle/store.rs"
@@ -3072,8 +2919,7 @@
           "binary": "reliaburger",
           "test": "pickle::store::tests::repository_receipt_parent_entry_is_synced_after_the_directory_exists",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/pickle/store.rs"
@@ -3084,8 +2930,7 @@
           "binary": "reliaburger",
           "test": "pickle::store::tests::failed_removal_directory_sync_retains_capacity_until_confirmed_retry",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/pickle/store.rs"
@@ -3096,8 +2941,7 @@
           "binary": "reliaburger",
           "test": "grill::image::tests::same_sized_corrupt_cached_layer_is_refetched_before_unpack",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/grill/image.rs"
@@ -3154,8 +2998,7 @@
           "binary": "reliaburger::documentation_first_run",
           "test": "listener_readiness_reports_missing_log_for_an_exited_owned_child",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "tests/documentation_first_run.rs",
@@ -3167,8 +3010,7 @@
           "binary": "reliaburger::documentation_first_run",
           "test": "listener_readiness_reports_invalid_utf8_log_for_an_exited_owned_child",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "tests/documentation_first_run.rs",
@@ -3180,8 +3022,7 @@
           "binary": "reliaburger::documentation_first_run",
           "test": "running_check_reports_missing_log_for_an_exited_owned_child",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "tests/documentation_first_run.rs",
@@ -3193,8 +3034,7 @@
           "binary": "reliaburger::documentation_first_run",
           "test": "running_check_reports_invalid_utf8_log_for_an_exited_owned_child",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "tests/documentation_first_run.rs",
@@ -3222,8 +3062,7 @@
           "binary": "reliaburger::suite",
           "test": "api_tokens::same_scoped_bearer_has_matching_leader_apply_and_follower_batch_authority",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "tests/suite/api_tokens.rs",
@@ -3257,8 +3096,7 @@
           "binary": "reliaburger",
           "test": "bun::authz::tests::every_gated_route_checks_its_permission_action",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/authz.rs",
@@ -3271,8 +3109,7 @@
           "binary": "reliaburger",
           "test": "bun::authz::tests::permission_guardian_accepts_actual_shared_deploy_check",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/authz.rs",
@@ -3285,8 +3122,7 @@
           "binary": "reliaburger",
           "test": "bun::authz::tests::permission_guardian_requires_exact_error_returning_shared_call",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/authz.rs",
@@ -3299,8 +3135,7 @@
           "binary": "reliaburger",
           "test": "bun::authz::tests::permission_guardian_requires_real_unconditional_shared_deploy_permission",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/authz.rs",
@@ -3313,8 +3148,7 @@
           "binary": "reliaburger",
           "test": "bun::authz::tests::permission_guardian_does_not_credit_optional_host_execution_or_other_actions",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/authz.rs",
@@ -3327,8 +3161,7 @@
           "binary": "reliaburger",
           "test": "bun::authz::tests::permission_guardian_retains_direct_action_and_cluster_admin_checks",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/authz.rs",
@@ -5894,6 +5727,17 @@
           ]
         },
         {
+          "id": "legacy-ci-reliaburger-placement-brioche_says_why_a_quota_blocked_app_isnt_placed_on_every_node",
+          "binary": "reliaburger::placement",
+          "test": "brioche_says_why_a_quota_blocked_app_isnt_placed_on_every_node",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/placement.rs"
+          ]
+        },
+        {
           "id": "legacy-ci-reliaburger-placement-ingress_reaches_nodes_without_local_replicas",
           "binary": "reliaburger::placement",
           "test": "ingress_reaches_nodes_without_local_replicas",
@@ -5985,6 +5829,50 @@
           "id": "legacy-ci-reliaburger-cluster_failover-a_lease_history_through_a_leader_kill_is_linearizable",
           "binary": "reliaburger::cluster_failover",
           "test": "a_lease_history_through_a_leader_kill_is_linearizable",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_failover.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-cluster_failover-an_agent_lease_survives_a_leader_change_and_the_new_leader_expires_it",
+          "binary": "reliaburger::cluster_failover",
+          "test": "an_agent_lease_survives_a_leader_change_and_the_new_leader_expires_it",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_failover.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-cluster_failover-a_proposal_applied_before_a_leader_change_is_undone_on_the_new_leader",
+          "binary": "reliaburger::cluster_failover",
+          "test": "a_proposal_applied_before_a_leader_change_is_undone_on_the_new_leader",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_failover.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-cluster_failover-the_dashboard_decides_a_proposal_on_the_leader_only",
+          "binary": "reliaburger::cluster_failover",
+          "test": "the_dashboard_decides_a_proposal_on_the_leader_only",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_failover.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-cluster_failover-the_dashboard_clears_a_fault_another_node_holds",
+          "binary": "reliaburger::cluster_failover",
+          "test": "the_dashboard_clears_a_fault_another_node_holds",
           "requires": [
             "cluster-tests"
           ],
@@ -6770,8 +6658,7 @@
             "src/file_lock.rs"
           ],
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ]
         }
       ]
@@ -7142,8 +7029,7 @@
           "binary": "reliaburger",
           "test": "bun::execution_budget::tests::job_reservations_count_task_and_executor_leases_but_not_apps",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/execution_budget.rs"
@@ -7154,8 +7040,7 @@
           "binary": "reliaburger",
           "test": "reporting::worker::tests::state_report_carries_task_and_executor_reservations",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/reporting/worker.rs",
@@ -7167,8 +7052,7 @@
           "binary": "reliaburger",
           "test": "bun::agent::tests::capacity_refusal_and_job_reservations_reach_the_state_snapshot",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/agent/status.rs",
@@ -7180,8 +7064,7 @@
           "binary": "reliaburger",
           "test": "cluster::orchestrate::tests::app_replica_avoids_a_node_whose_budget_is_held_by_job_leases",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/cluster/orchestrate.rs"
@@ -7192,8 +7075,7 @@
           "binary": "reliaburger",
           "test": "cluster::orchestrate::tests::capacity_refusal_from_the_agent_moves_the_replica",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/cluster/orchestrate.rs",
@@ -7205,8 +7087,7 @@
           "binary": "reliaburger",
           "test": "bun::api::tests::leased_apply_with_jobs_uses_the_common_job_lifecycle",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/api/apply.rs",
@@ -7219,8 +7100,7 @@
           "binary": "reliaburger",
           "test": "bun::api::tests::standalone_job_lease_owns_its_jobs_and_cleanup_forgets_them",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/job_apply.rs",
@@ -7232,8 +7112,7 @@
           "binary": "reliaburger",
           "test": "bun::api::tests::legacy_batch_routes_are_gone",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/api.rs",
@@ -7245,8 +7124,7 @@
           "binary": "reliaburger",
           "test": "council::state_machine::tests::leased_job_apply_survives_leader_change_without_reserving_capacity",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/council/state_machine.rs",
@@ -7258,8 +7136,7 @@
           "binary": "reliaburger",
           "test": "council::state_machine::tests::a_job_in_a_lease_namespace_needs_the_lease_to_own_it",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/council/state_machine.rs"
@@ -7270,8 +7147,7 @@
           "binary": "reliaburger::suite",
           "test": "agent_cluster::an_app_deploys_beside_a_job_filled_node_on_another_node",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "tests/suite/agent_cluster.rs",
@@ -7701,8 +7577,7 @@
           "binary": "reliaburger::suite",
           "test": "task_arrays::host_runs_under_mount_isolation_are_refused_with_the_reason",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "tests/suite/task_arrays.rs"
@@ -7713,8 +7588,7 @@
           "binary": "reliaburger::suite",
           "test": "task_arrays::a_run_no_node_may_run_fails_with_the_nodes_reason",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "tests/suite/task_arrays.rs"
@@ -7725,8 +7599,7 @@
           "binary": "reliaburger",
           "test": "bun::task_array_leader::tests::a_run_every_eligible_node_refuses_for_good_fails_with_the_reason",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/task_array_leader.rs"
@@ -7737,8 +7610,7 @@
           "binary": "reliaburger",
           "test": "bun::task_array_leader::tests::a_run_waits_while_any_eligible_node_could_still_take_it",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/task_array_leader.rs"
@@ -7765,8 +7637,7 @@
           "binary": "reliaburger::suite",
           "test": "task_arrays::a_cluster_refuses_a_run_no_live_node_can_take_at_submission",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "tests/suite/task_arrays.rs"
@@ -7777,8 +7648,7 @@
           "binary": "reliaburger",
           "test": "bun::task_array_leader::tests::admission_refuses_a_run_every_live_node_advertises_it_cannot_take",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/task_array_leader.rs"
@@ -7789,8 +7659,7 @@
           "binary": "reliaburger",
           "test": "bun::task_array_leader::tests::admission_quotes_the_reasons_the_tick_would",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/task_array_leader.rs"
@@ -7801,8 +7670,7 @@
           "binary": "reliaburger",
           "test": "bun::task_array_leader::tests::admission_admits_a_run_any_live_node_might_take",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/task_array_leader.rs"
@@ -7813,8 +7681,7 @@
           "binary": "reliaburger",
           "test": "bun::task_array_node::tests::what_a_node_advertises_reaches_its_own_verdict_on_every_run",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/task_array_node.rs"
@@ -7825,8 +7692,7 @@
           "binary": "reliaburger",
           "test": "mustard::protocol::tests::probes_from_a_maximally_labelled_node_with_job_capabilities_fit_the_datagram",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/mustard/protocol.rs"
@@ -7837,8 +7703,7 @@
           "binary": "reliaburger",
           "test": "mustard::protocol::tests::advertised_job_capabilities_reach_a_remote_member_via_gossip",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/mustard/protocol.rs"
@@ -8259,8 +8124,7 @@
           "binary": "reliaburger",
           "test": "grill::oci::tests::init_spec_uses_its_own_image",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/grill/oci.rs"
@@ -8271,8 +8135,7 @@
           "binary": "reliaburger",
           "test": "grill::oci::tests::init_spec_gets_app_env_and_volume_mounts",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/grill/oci.rs"
@@ -8283,8 +8146,7 @@
           "binary": "reliaburger",
           "test": "bun::agent::tests::init_container_runs_its_own_image_with_the_app_env_and_mounts",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/agent/deploy_worker.rs"
@@ -8295,8 +8157,7 @@
           "binary": "reliaburger",
           "test": "grill::oci::tests::inline_config_files_with_same_basename_do_not_collide",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/grill/oci.rs"
@@ -8307,8 +8168,7 @@
           "binary": "reliaburger",
           "test": "bun::agent::tests::stop_removes_each_instances_inline_config_files",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/agent/retirement.rs"
@@ -8319,8 +8179,7 @@
           "binary": "reliaburger",
           "test": "config::validate::tests::process_app_with_volume_is_refused",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/config/validate.rs"
@@ -8331,8 +8190,7 @@
           "binary": "reliaburger",
           "test": "config::validate::tests::process_app_with_config_file_is_refused",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/config/validate.rs"
@@ -8343,8 +8201,7 @@
           "binary": "reliaburger",
           "test": "config::validate::tests::process_app_with_run_as_user_is_refused",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/config/validate.rs"
@@ -8355,8 +8212,7 @@
           "binary": "reliaburger",
           "test": "council::state_machine::tests::removing_autoscale_clears_the_override",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/council/state_machine.rs"
@@ -8367,8 +8223,7 @@
           "binary": "reliaburger",
           "test": "council::state_machine::tests::narrowing_autoscale_bounds_clamps_the_override",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/council/state_machine.rs"
@@ -8379,8 +8234,7 @@
           "binary": "reliaburger",
           "test": "config::validate::tests::health_port_without_app_port_is_valid",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/config/validate.rs"
@@ -8391,8 +8245,7 @@
           "binary": "reliaburger",
           "test": "config::validate::tests::zero_health_timeout_is_refused",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/config/validate.rs"
@@ -8403,8 +8256,7 @@
           "binary": "reliaburger",
           "test": "bun::agent::tests::rollout_gate_probes_health_port_without_app_port",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/bun/agent/health_checks.rs"
@@ -8415,8 +8267,7 @@
           "binary": "reliaburger",
           "test": "grill::volume::tests::changing_size_of_existing_volume_is_refused",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/grill/volume.rs"
@@ -8427,8 +8278,7 @@
           "binary": "reliaburger",
           "test": "grill::volume::tests::unenforceable_size_is_refused",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/grill/volume.rs"
@@ -8439,8 +8289,7 @@
           "binary": "reliaburger",
           "test": "config::validate::tests::gpu_request_is_refused",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/config/validate.rs"
@@ -8451,8 +8300,7 @@
           "binary": "reliaburger",
           "test": "config::validate::tests::allow_franchise_is_refused",
           "requires": [
-            "portable-linux",
-            "portable-darwin"
+            "portable-linux"
           ],
           "sources": [
             "src/config/validate.rs"

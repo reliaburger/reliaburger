@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod apps_cmd;
 pub mod audit_cmd;
 pub mod bench_cmd;
 pub mod bench_jobs;
@@ -12,6 +13,7 @@ pub mod client;
 pub mod command_reference;
 pub mod commands;
 pub mod compile;
+pub mod concept_budget;
 pub mod council_view;
 pub mod dashboard;
 pub mod dev;
@@ -19,6 +21,7 @@ pub mod diff;
 pub mod events_cmd;
 pub mod fault;
 pub mod fmt;
+pub mod gym;
 pub mod inspect;
 pub mod install;
 #[cfg(feature = "kubernetes")]
@@ -35,15 +38,18 @@ pub mod k8s_export;
     clippy::single_match
 )]
 pub mod k8s_import;
+pub mod lease_cmd;
 pub mod local_context;
 pub mod manifest;
 pub mod manual;
 pub mod mcp;
 pub mod metrics_cmd;
+pub mod nodes_cmd;
 pub mod output;
 pub mod path_cmd;
 pub mod plan;
 pub mod policy_cmd;
+pub mod proposal_cmd;
 pub mod quickstart;
 pub mod reader;
 pub mod readiness;
@@ -52,6 +58,7 @@ pub mod released_cli;
 pub mod setup;
 pub mod source;
 pub mod source_bundle;
+pub mod status_cmd;
 pub mod test_cmd;
 mod tls;
 pub mod tui;
@@ -84,8 +91,8 @@ pub enum CommandOutcome {
     /// Ran fine, found only warnings. Exit 3: clap already uses 2 for a
     /// usage error, and a script must be able to tell the two apart.
     Warnings,
-    /// `relish exec` ran a command that exited with this code; relish exits
-    /// with it too.
+    /// Exit with this code: the code of the command `relish exec` ran, or
+    /// the verdict of `relish status --check`, or an agent envelope's own.
     Exited(u8),
 }
 

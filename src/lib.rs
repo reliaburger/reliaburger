@@ -35,6 +35,7 @@ pub(crate) mod off_runtime;
 pub mod onion;
 pub mod pickle;
 pub mod policy;
+pub mod proposal;
 pub mod reconstruction;
 pub mod redact;
 pub mod relish;

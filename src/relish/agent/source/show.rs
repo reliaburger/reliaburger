@@ -174,7 +174,12 @@ pub(super) fn show(bundle: &Bundle, target: &str) -> Result<Answer<ShowData>, Ag
             "showing {MAX_SHOW_LINES} lines, the most one show prints"
         ));
     }
-    if to < total {
+    // More is offered only when the caller asked for more than it got: a
+    // line with no end (the file from there), or a range cut at the limit.
+    // A range shown whole is what was asked for, and an offer to page on
+    // leads a small model through the whole file (#1687).
+    let asked_for_more = target.to.is_none() || to < asked_to;
+    if to < total && asked_for_more {
         let next_to = (to + MAX_SHOW_LINES).min(total);
         answer = answer.with_next(
             format!(
@@ -385,6 +390,34 @@ mod tests {
         assert_eq!(value["data"]["to"], 1);
         assert_eq!(value["data"]["lines"][0]["text"], "pub mod client;");
         assert_eq!(value["next"], serde_json::json!([]));
+    }
+
+    /// A range shown whole is what was asked for, so nothing invites the
+    /// agent to page on through the file (#1687).
+    #[test]
+    fn a_range_shown_whole_offers_no_more() {
+        let (value, _) = run("src/client.rs:20-23");
+        assert_eq!(value["data"]["to"], 23);
+        assert_eq!(value["next"], serde_json::json!([]));
+    }
+
+    /// A line with no end asks for the file from there, so the lines after
+    /// the first screenful are still offered.
+    #[test]
+    fn a_line_with_no_end_offers_the_lines_after() {
+        let long: String = (1..=1000).map(|line| format!("// line {line}\n")).collect();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("long.rs"), long).unwrap();
+        let files =
+            crate::relish::source_bundle::pack::list_files(dir.path(), &["long.rs"]).unwrap();
+        let tar = crate::relish::source_bundle::pack::write_tar(dir.path(), &files).unwrap();
+        let bundle = Bundle::from_tar(tar, build(Some(false))).unwrap();
+        let answer = show(&bundle, "long.rs:10").unwrap();
+        assert_eq!(answer.data.to, 409);
+        assert_eq!(
+            answer.next[0].run,
+            "relish agent source show long.rs:410-809"
+        );
     }
 
     #[test]

@@ -178,6 +178,49 @@ fn the_vendored_registry_schema_is_the_recorded_one() {
     );
 }
 
+/// The MCP Bundle manifest release packaging puts in every `.mcpb` passes
+/// the bundle format's own schema, vendored in `tests/fixtures/mcpb/` from
+/// the version its `manifest_version` names, so the check needs no network.
+#[test]
+fn the_bundle_manifest_passes_the_mcpb_schema() {
+    let schema: serde_json::Value = serde_json::from_str(&read(&format!(
+        "tests/fixtures/mcpb/mcpb-manifest-v{}.schema.json",
+        guide::MCPB_MANIFEST_VERSION
+    )))
+    .unwrap();
+    let manifest: serde_json::Value =
+        serde_json::from_str(&read(guide::paths::MCPB_MANIFEST)).unwrap();
+    assert_eq!(manifest["manifest_version"], guide::MCPB_MANIFEST_VERSION);
+    let validator = jsonschema::options()
+        .should_validate_formats(true)
+        .build(&schema)
+        .unwrap();
+    let errors: Vec<String> = validator
+        .iter_errors(&manifest)
+        .map(|error| format!("{}: {error}", error.instance_path()))
+        .collect();
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(manifest["version"], env!("CARGO_PKG_VERSION"));
+}
+
+/// The vendored bundle schema is byte for byte the one its README records.
+#[test]
+fn the_vendored_mcpb_schema_is_the_recorded_one() {
+    use sha2::{Digest, Sha256};
+    let path = format!(
+        "tests/fixtures/mcpb/mcpb-manifest-v{}.schema.json",
+        guide::MCPB_MANIFEST_VERSION
+    );
+    let digest = hex::encode(Sha256::digest(
+        std::fs::read(repository().join(&path)).unwrap(),
+    ));
+    let readme = read("tests/fixtures/mcpb/README.md");
+    assert!(
+        readme.contains(&digest),
+        "README.md doesn't record {digest}"
+    );
+}
+
 /// GitHub Pages publishes `docs/website` as `upload-pages-artifact` packs it.
 /// Version 3 packs dot-directories; version 4 leaves them out unless told
 /// to, which would drop `/.well-known/agent-skills/` without an error.

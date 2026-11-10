@@ -693,6 +693,23 @@ fn next_steps(verdict: Verdict, reasons: &[Reason], latest: &BinaryVersion) -> V
 
 /// Ask the cluster behind `client` everything [`assess`] needs. Reads only.
 pub async fn collect_cluster(client: &BunClient) -> Result<ClusterEvidence, String> {
+    let (builds, wtf) = tokio::join!(collect_builds(client), wtf_criticals(client));
+    let (active_upgrade, nodes) = builds?;
+    Ok(ClusterEvidence {
+        active_upgrade,
+        nodes,
+        wtf,
+    })
+}
+
+/// Every node the cluster lists, with what each said about its build, and
+/// the target of a rolling upgrade under way, if one is. A node without a
+/// council is one node, `this node`, asked directly; a council's nodes are
+/// asked through the relay, and a dead or departed one isn't asked at all.
+/// Reads only. `relish agent verify` reads the same.
+pub async fn collect_builds(
+    client: &BunClient,
+) -> Result<(Option<String>, Vec<NodeEvidence>), String> {
     // `topology` reads the error itself (a 503 saying "no council" means a
     // single node), so only the timeout is turned into a string here.
     let answer = tokio::time::timeout(CLUSTER_TIMEOUT, client.upgrade_cluster())
@@ -701,17 +718,13 @@ pub async fn collect_cluster(client: &BunClient) -> Result<ClusterEvidence, Stri
     let state = match topology(answer).map_err(|error| error.to_string())? {
         Topology::SingleNode => {
             let build = bounded(client.version()).await;
-            let wtf = wtf_criticals(client).await;
-            return Ok(ClusterEvidence {
-                active_upgrade: None,
-                nodes: vec![NodeEvidence {
-                    node: "this node".to_string(),
-                    role: NodeRole::Standalone,
-                    state: "alive".to_string(),
-                    build,
-                }],
-                wtf,
-            });
+            let node = NodeEvidence {
+                node: "this node".to_string(),
+                role: NodeRole::Standalone,
+                state: "alive".to_string(),
+                build,
+            };
+            return Ok((None, vec![node]));
         }
         Topology::Cluster(state) => state,
     };
@@ -731,8 +744,8 @@ pub async fn collect_cluster(client: &BunClient) -> Result<ClusterEvidence, Stri
         }
         let relay = client.via_node(&node.node_id).map_err(|e| e.to_string())?;
         bounded(relay.version()).await
-    }));
-    let (builds, wtf) = tokio::join!(builds, wtf_criticals(client));
+    }))
+    .await;
     let nodes = listed
         .iter()
         .zip(builds)
@@ -749,11 +762,7 @@ pub async fn collect_cluster(client: &BunClient) -> Result<ClusterEvidence, Stri
             build,
         })
         .collect();
-    Ok(ClusterEvidence {
-        active_upgrade,
-        nodes,
-        wtf,
-    })
+    Ok((active_upgrade, nodes))
 }
 
 async fn bounded<T>(

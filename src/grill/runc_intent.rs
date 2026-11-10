@@ -717,6 +717,7 @@ mod inventory_tests {
                 rlimits: Vec::new(),
                 args: vec!["sleep".into(), "60".into()],
                 env: vec![],
+                provider_env: Vec::new(),
                 cwd: "/".into(),
                 user: OciUser { uid: 0, gid: 0 },
                 capabilities: None,

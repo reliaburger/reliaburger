@@ -190,7 +190,7 @@ const STATUS_RUNTIME_READ_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// meets a slow runtime many times still ends well inside the 1 s turn
 /// budget. What doesn't finish in time fails the step, and the tick, the
 /// deploy worker or the caller tries again.
-const TURN_RUNTIME_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+pub(crate) const TURN_RUNTIME_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// How long a runtime read may take when no turn is running: during startup
 /// adoption, which already gives each runtime inspection 10 s.
@@ -563,6 +563,19 @@ impl LoopStalls {
 
     /// Wait out `stall`'s delay, if the test set one; `true` when it did.
     async fn hold(&self, stall: LoopStall) -> bool {
+        let delay = self.reach(stall);
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        delay.is_some()
+    }
+
+    /// Count `stall`'s await as reached now, and return the delay it is to
+    /// wait out. Work the loop starts in a task is counted here, where the
+    /// turn starts it: a turn past its deadline ends before the task first
+    /// runs, and a count taken inside the task would land after the turn
+    /// (#1625).
+    fn reach(&self, stall: LoopStall) -> Option<std::time::Duration> {
         if let Ok(mut reached) = self.reached.lock() {
             *reached.entry(stall).or_default() += 1;
         }
@@ -575,15 +588,10 @@ impl LoopStalls {
             let most = per_turn.most.entry(stall).or_default();
             *most = (*most).max(this_turn);
         }
-        let delay = self
-            .delays
+        self.delays
             .lock()
             .ok()
-            .and_then(|stalls| stalls.get(&stall).copied());
-        if let Some(delay) = delay {
-            tokio::time::sleep(delay).await;
-        }
-        delay.is_some()
+            .and_then(|stalls| stalls.get(&stall).copied())
     }
 }
 
@@ -804,6 +812,11 @@ pub struct BunAgent<G: Grill> {
     startup_cleanup_pending: bool,
     network_references:
         std::collections::HashMap<InstanceId, crate::grill::runc_intent::NetworkReference>,
+    /// References the runtime has confirmed released whose retirement hasn't
+    /// finished yet: the journal write that forgets one can outlast its turn,
+    /// and the retirement's next ask mustn't release it again (#1620).
+    released_network_references:
+        std::collections::HashMap<InstanceId, crate::grill::runc_intent::NetworkReference>,
     /// The generation each local instance's launch ran, for the discovery
     /// journal, as whoever started it read it from the runtime (#419).
     /// Launches that hold their address have none.
@@ -959,6 +972,33 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .record(timestamp, kind, severity, app, namespace, None, message);
     }
 
+    /// Record an event that carries a decision's rule and evidence.
+    async fn record_decision(
+        &self,
+        kind: crate::bun::events::EventKind,
+        severity: crate::bun::events::EventSeverity,
+        app: Option<String>,
+        namespace: Option<String>,
+        message: String,
+        decision: crate::bun::decisions::Decision,
+    ) {
+        let Some(events) = &self.events else { return };
+        let timestamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        events.write().await.record_with_details(
+            timestamp,
+            kind,
+            severity,
+            app,
+            namespace,
+            None,
+            message,
+            decision.into_details(),
+        );
+    }
+
     /// Create a new agent in single-node mode (no cluster).
     pub fn new(
         grill: G,
@@ -1069,6 +1109,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             startup_retirements: Default::default(),
             startup_cleanup_pending: false,
             network_references: std::collections::HashMap::new(),
+            released_network_references: std::collections::HashMap::new(),
             launch_executions: std::collections::HashMap::new(),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
@@ -1238,6 +1279,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             startup_retirements: Default::default(),
             startup_cleanup_pending: false,
             network_references: std::collections::HashMap::new(),
+            released_network_references: std::collections::HashMap::new(),
             launch_executions: std::collections::HashMap::new(),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),

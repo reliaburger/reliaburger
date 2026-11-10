@@ -82,6 +82,9 @@ pub struct ClusterRuntime {
     /// reaped. For reporting on the cluster only: placement, the council and
     /// the registry read the live-only `ClusterHandle::membership_rx`.
     pub roster_rx: watch::Receiver<Vec<MembershipSnapshot>>,
+    /// This node's gossip counters: updates received and the last
+    /// membership change, read by `GET /v1/cluster/summary`.
+    pub gossip_stats: crate::mustard::stats::GossipStats,
 }
 
 /// Configuration for starting the cluster runtime, derived from node config.
@@ -310,6 +313,7 @@ pub async fn start(
     }
     let (directory_tx, directory_rx) = watch::channel(NodeDirectory::default());
     node.set_directory_watch(directory_tx);
+    let gossip_stats = node.stats();
     // The gossip node is spawned *after* the council is built, so a restarted
     // node can seed gossip from its restored Raft membership (see below).
 
@@ -495,6 +499,10 @@ pub async fn start(
     // The listener re-checks each open connection's peer against the live
     // CRL before every request (#928).
     let rpc_crl = crl_handle.clone();
+    // A council partition refuses the blocked peers' RPCs here as well as
+    // sending none to them, or the leader keeps replicating to a
+    // "partitioned" node over the connections it opens (#1810).
+    let rpc_blocklist = raft_blocklist.clone();
     spawn_supervised("cluster:raft-rpc", supervision.clone(), async move {
         serve_raft_rpc_with_node_gate(
             raft_listener,
@@ -504,6 +512,7 @@ pub async fn start(
             rpc_fence,
             rpc_node_gate,
             Some(rpc_crl),
+            rpc_blocklist,
         )
         .await;
     });
@@ -737,6 +746,7 @@ pub async fn start(
             rollup_store,
             directory_rx,
             roster_rx,
+            gossip_stats,
         },
     ))
 }

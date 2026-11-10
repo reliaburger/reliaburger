@@ -1469,6 +1469,7 @@ mod tests {
                 pid: None,
                 runtime_unknown: false,
                 status_age_ms: None,
+                age_seconds: None,
                 reason: None,
             }]),
             version: Err("unused".into()),

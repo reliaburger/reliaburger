@@ -141,7 +141,7 @@ def inventory(row, root):
 
 
 def selected(discovery):
-    """Parse pinned nextest0.9.145 lists; fail closed on missing selections."""
+    """Parse pinned nextest0.9.151 lists; fail closed on missing selections."""
     require(
         isinstance(discovery, dict) and isinstance(discovery.get('rust-build-meta'), dict),
         'missing discovery build metadata',

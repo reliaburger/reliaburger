@@ -54,7 +54,7 @@ journal turn on node 1 took 1,215 ms against the 1 s budget, the same family
 as 0.2.6's #1606
 ([#1707](https://github.com/reliaburger/reliaburger/issues/1707)). The
 maintainer accepted it as a known issue rather than build a second
-candidate; the fix is in 0.2.8. It ships with the `zstd` 0.13 advisories
+candidate; 0.2.8 works on it. It ships with the `zstd` 0.13 advisories
 under the exception that expires on 18 November 2026
 ([#1366](https://github.com/reliaburger/reliaburger/issues/1366)). 0.2.7
 keeps 0.2.6's cluster formats, so a 0.2.6 cluster can roll onto it in place

@@ -1,6 +1,6 @@
 # What's ready in Reliaburger, feature by feature.
 #
-# This file is the source of truth for https://reliaburger.com/features.html.
+# This file is the source of truth for https://reliaburger.com/features.
 # `make features-page` (scripts/ci/features_page.py) writes the page from it,
 # and `make agent-docs` then refreshes the page's Markdown copy.
 # scripts/ci/test_features_page.py checks this file and the page against each

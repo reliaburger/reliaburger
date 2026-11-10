@@ -539,6 +539,21 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
         ));
     }
 
+    // Bun's leader-only agent lease reaper (#1686), with its audit records.
+    tasks.push(reliaburger::bun::lease_reaper::spawn_lease_reaper(
+        Arc::clone(&council),
+        Some(Arc::clone(&event_store)),
+        name.clone(),
+        shutdown.clone(),
+    ));
+    // Bun's leader-only proposal reaper (#1682).
+    tasks.push(reliaburger::bun::proposals::spawn_proposal_reaper(
+        Arc::clone(&council),
+        Some(Arc::clone(&event_store)),
+        name.clone(),
+        shutdown.clone(),
+    ));
+
     let membership_table: Arc<RwLock<Vec<NodeMembershipInfo>>> = Arc::new(RwLock::new(Vec::new()));
     // Every member gossip has shown, so the relay and node-fault reversal
     // reach a node-killed peer as `bun` wires them.
@@ -731,6 +746,8 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
         None => app,
     };
     let app = app.layer(axum::Extension(known_members));
+    // Gossip's own counters, read by `/v1/cluster/summary`, as `bun` wires them.
+    let app = app.layer(axum::Extension(cluster_runtime.gossip_stats.clone()));
     // Like `bun`, every node finds the leader through the gossip directory,
     // which also names it to workers outside Raft.
     let app = app.layer(axum::Extension(api::LeaderDirectory(directory_rx.clone())));

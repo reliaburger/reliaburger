@@ -7,13 +7,25 @@ the answer against what the runner knows went wrong. Runs repeat, and the
 record reports distributions, never one pass or fail.
 
 Subcommands:
-  check                       parse every scenario and check each plant still applies
-  run [--scenario ID]... [--solver scripted|command:PROGRAM] [--runs N] --out DIR
-                              run scenarios on fresh local clusters; writes
-                              DIR/results.json and DIR/record.md
+  check                       parse every scenario (both platforms) and check each
+                              plant still applies
+  run [--platform reliaburger|k8s] [--scenario ID]... [--solver scripted|command:PROGRAM]
+      [--runs N] --out DIR
+                              run scenarios on fresh local clusters, or on a fresh
+                              k3s on the lab (scripts/gym/k8s/lab.sh) for k8s;
+                              writes DIR/results.json and DIR/record.md
   score RUN_DIR               score one recorded run again, from its files
+  rescore DIR [--suffix S]    score every run of a pass again; writes
+                              DIR/results-S.json and DIR/record-S.md beside the
+                              originals, which stay as they were
   fixture RUN_DIR OUT         turn a run's recorded calls into a fixture for the
-                              portable tests' fake relish
+                              portable tests' fake relish (or kubectl)
+  compare --out FILE RESULTS...
+                              the comparison record (#1679): one table per
+                              scenario, every solver on both platforms side by side
+  user --out DIR              test `relish gym run` (#1683) on a fresh local
+                              cluster: the baseline over every scenario, then a
+                              Ctrl-C mid-run, checking nothing is left behind
 
 `make test-gym` runs every scenario once with the scripted baseline. The
 0.2.7 exit test (#1093) runs `--solver command:...` with a real agent.
@@ -30,12 +42,15 @@ import tempfile
 import time
 
 import cluster as cluster_module
+import compare as compare_module
+import k8s_cluster
 import plant as plant_module
 import record
 import scenario as scenario_module
 import score as score_module
 import shim
 import solvers
+import user_gym
 
 DEFAULT_PORT_BASE = 29400
 DEFAULT_TIMEOUT = 1800
@@ -52,8 +67,12 @@ def resolve_truth(truth, facts):
     return resolved
 
 
-def run_setup(scenario, cluster, sleep=time.sleep):
-    """Run the scenario's setup steps against `cluster`, as admin."""
+def run_setup(scenario, cluster, sleep=time.sleep, tokens=None):
+    """Run the scenario's setup steps against `cluster`, as admin.
+
+    A `run` step runs as its actor, with the token `tokens` maps it to (None
+    for the person, who is admin), and must succeed.
+    """
     for step in scenario.setup:
         if step.apply:
             cluster.apply(step.apply)
@@ -63,6 +82,52 @@ def run_setup(scenario, cluster, sleep=time.sleep):
             cluster.inject(step.fault)
         elif step.settle_seconds:
             sleep(step.settle_seconds)
+        elif step.run:
+            args = step_arguments(step.run, cluster, None)
+            completed = cluster.relish(args, token=(tokens or {}).get(step.actor))
+            if completed.returncode != 0:
+                raise cluster_module.ClusterError(
+                    f"setup `relish {' '.join(step.run)}` as {step.actor} failed: "
+                    f"{(completed.stderr or completed.stdout).strip()}"
+                )
+
+
+def step_arguments(run, cluster, proposal):
+    """A step's `relish` arguments with its placeholders filled in, or None.
+
+    None means the step names the solver's proposal and the solver made none.
+    """
+    args = []
+    for argument in run:
+        if argument == scenario_module.PROPOSAL_PLACEHOLDER:
+            if proposal is None:
+                return None
+            args.append(str(proposal))
+        elif argument.startswith(scenario_module.FILE_PLACEHOLDER):
+            args.append(str(cluster.write_manifest(argument[len(scenario_module.FILE_PLACEHOLDER):])))
+        else:
+            args.append(argument)
+    return args
+
+
+def run_after(scenario, cluster, tokens, proposal):
+    """Run the scenario's after steps; each one's record, for the scorer.
+
+    Every step runs whatever the one before it answered, so one wrong answer
+    fails its own outcome and not the rest. A step that needs the solver's
+    proposal when there's none is recorded with no exit and not run.
+    """
+    records = []
+    for step in scenario.after:
+        args = step_arguments(step.run, cluster, proposal)
+        if args is None:
+            records.append({"as": step.actor, "argv": ["relish", *step.run], "exit": None,
+                            "stdout": "", "stderr": "not run: the solver made no proposal"})
+            continue
+        completed = cluster.relish(args, token=tokens.get(step.actor))
+        records.append({"as": step.actor, "argv": ["relish", *args], "exit": completed.returncode,
+                        "stdout": completed.stdout, "stderr": completed.stderr})
+    return records
 
 
 def symptom_control(cluster, plant, planted_relish):
@@ -109,21 +174,42 @@ def find_reports(directory):
     return reports
 
 
+def answer_reports(scenario, answer):
+    """The report draft an answer carries, for a scenario whose draft is the answer.
+
+    On Kubernetes there's no report command, so the agent puts the Markdown
+    in its answer's `report` field, and the scorer reads it like a draft
+    directory with one file and no manifest.
+    """
+    if scenario.report is None or scenario.report.source != "answer":
+        return []
+    text = answer.get("report") if isinstance(answer, dict) else None
+    if not isinstance(text, str) or not text.strip():
+        return []
+    return [{"dir": "answer", "files": {"report.md": text}, "manifest": None}]
+
+
 def run_once(scenario, run_dir, make_cluster, solver, relish, planted=None, timeout=DEFAULT_TIMEOUT,
-             sleep=time.sleep):
+             sleep=time.sleep, tools=None):
     """One run of one scenario; returns the run's result and writes its files.
 
     `make_cluster(nodes, work_dir)` returns an unstarted cluster;
     `planted` is (PlantBuild or None, planted relish path) for a planted
-    scenario.
+    scenario. `tools` maps each program the solver may run to the real
+    binary the recording shim stands in front of; it defaults to `relish`.
     """
     run_dir.mkdir(parents=True, exist_ok=True)
     started = time.time()
-    result = {"scenario": scenario.id, "run": run_dir.name, "started": started}
+    result = {"scenario": scenario.id, "platform": scenario.platform, "run": run_dir.name,
+              "started": started}
     cluster = make_cluster(scenario.nodes, run_dir / "cluster")
     try:
         cluster.start()
-        run_setup(scenario, cluster, sleep)
+        # The person is admin; the other agent gets its own agent token.
+        tokens = {"person": None}
+        if "other-agent" in scenario.actors():
+            tokens["other-agent"] = cluster.create_agent_token(scenario_module.OTHER_AGENT)
+        run_setup(scenario, cluster, sleep, tokens)
         truth = resolve_truth(scenario.truth, cluster.facts(scenario.facts_needed()))
         result["truth"] = truth
         solver_relish = relish
@@ -137,19 +223,30 @@ def run_once(scenario, run_dir, make_cluster, solver, relish, planted=None, time
                 )
 
         token_name = f"gym-solver-{run_dir.name}"
-        token = cluster.create_token(token_name)
+        if scenario.solver_token == "agent":
+            token = cluster.create_agent_token(token_name)
+        else:
+            token = cluster.create_token(token_name)
+        tokens["solver-token"] = token
         solver_dir = run_dir / "solver"
         solver_dir.mkdir(exist_ok=True)
+        if scenario.release:
+            result["release"] = cluster.write_release(solver_dir / "release", scenario.release)
         call_log = run_dir / "calls.jsonl"
         answer_path = run_dir / "answer.json"
-        prompt = solvers.full_prompt(scenario.prompt)
+        prompt = solvers.full_prompt(scenario.prompt, scenario.platform, scenario.solver_token)
         prompt_path = run_dir / "prompt.md"
         prompt_path.write_text(prompt)
-        extra = shim.install(run_dir / "bin", solver_relish)
+        if tools is None:
+            extra = shim.install(run_dir / "bin", solver_relish)
+        else:
+            extra = {}
+            for program, real in tools.items():
+                shim.install_program(run_dir / "bin", program, real)
         meta_path = run_dir / "solver-meta.json"
         env = solvers.environment(
             cluster.solver_env(token), run_dir / "bin", call_log, answer_path, prompt_path, extra,
-            meta_path,
+            meta_path, scenario.platform, scenario.solver_token,
         )
         attempt = solver.solve(prompt, env, solver_dir, timeout, scenario)
         (run_dir / "solver.stdout").write_text(attempt.stdout)
@@ -159,6 +256,14 @@ def run_once(scenario, run_dir, make_cluster, solver, relish, planted=None, time
             result["solver_meta"] = meta
         answer, answer_error = solvers.read_answer(answer_path)
         calls = shim.read_log(call_log)
+        steps = []
+        if scenario.after:
+            # The solver's own proposal, found once, before any step can
+            # make another under its token.
+            proposal = cluster.newest_proposal(token_name)
+            result["proposal"] = proposal
+            steps = run_after(scenario, cluster, tokens, proposal)
+            write_steps(run_dir / "steps.jsonl", steps)
         audit = cluster.audit(token_name)
         (run_dir / "audit.json").write_text(json.dumps(audit, indent=2) + "\n")
 
@@ -176,7 +281,8 @@ def run_once(scenario, run_dir, make_cluster, solver, relish, planted=None, time
             )
             result["patch_reason"] = reason
         scored = score_module.score(
-            scenario, truth, answer, calls, audit, patch_result, find_reports(solver_dir)
+            scenario, truth, answer, calls, audit, patch_result,
+            find_reports(solver_dir) + answer_reports(scenario, answer), steps,
         )
         if answer_error:
             scored["answer_problems"].insert(0, answer_error)
@@ -198,27 +304,86 @@ def run_once(scenario, run_dir, make_cluster, solver, relish, planted=None, time
     return result
 
 
+def write_steps(path, steps):
+    """The after steps' records, one JSON line each, as the shim writes calls."""
+    with open(path, "w", encoding="utf-8") as log:
+        for step in steps:
+            log.write(json.dumps(step) + "\n")
+
+
 def rescore(run_dir):
     """Score a recorded run again from its files (deterministic)."""
     run_dir = Path(run_dir)
     result = json.loads((run_dir / "result.json").read_text())
-    scenario = scenario_module.load(scenario_module.SCENARIO_DIR / f"{result['scenario']}.toml")
+    directory = scenario_module.directory_for(result.get("platform", "reliaburger"))
+    scenario = scenario_module.load(directory / f"{result['scenario']}.toml")
     answer, answer_error = solvers.read_answer(run_dir / "answer.json")
     audit = json.loads((run_dir / "audit.json").read_text())
+    calls = [shim.with_mcp_exit(call) for call in shim.read_log(run_dir / "calls.jsonl")]
     scored = score_module.score(
-        scenario, result["truth"], answer, shim.read_log(run_dir / "calls.jsonl"), audit,
-        result.get("patch_result"), find_reports(run_dir / "solver"),
+        scenario, result["truth"], answer, calls, audit,
+        result.get("patch_result"),
+        find_reports(run_dir / "solver") + answer_reports(scenario, answer),
+        shim.read_log(run_dir / "steps.jsonl"),
     )
     if answer_error:
         scored["answer_problems"].insert(0, answer_error)
     return scored
 
 
+def rescore_pass(out, suffix):
+    """Score every run of a pass in `out` again, beside the original.
+
+    Writes `results-SUFFIX.json` and `record-SUFFIX.md` next to
+    `results.json`, which stays as it was; each scored run keeps its first
+    verdict as `original_verdict`. Refuses to overwrite an earlier rescore.
+    """
+    out = Path(out)
+    written = out / f"results-{suffix}.json"
+    record_path = out / f"record-{suffix}.md"
+    for path in (written, record_path):
+        if path.exists():
+            raise SystemExit(f"{path} exists: name another suffix")
+    document = json.loads((out / "results.json").read_text())
+    runs = []
+    for run in document["runs"]:
+        if "score" not in run:
+            runs.append(run)
+            continue
+        scored = rescore(out / run["scenario"] / run["run"])
+        runs.append({**run, "original_verdict": run["score"]["verdict"], "score": scored})
+    rescored = {
+        **document,
+        "rescored": time.strftime("%Y-%m-%d", time.gmtime()),
+        "summary": score_module.summarise([run for run in runs if "score" in run]),
+        "runs": runs,
+    }
+    written.write_text(json.dumps(rescored, indent=2) + "\n")
+    platform_ = document.get("context", {}).get("platform", "reliaburger")
+    record_path.write_text(record.render(rescored, scenario_module.load_all(platform=platform_)))
+    return written
+
+
+def command_rescore(args):
+    written = rescore_pass(args.out, args.suffix)
+    document = json.loads(written.read_text())
+    for run in document["runs"]:
+        if "score" in run and run["score"]["verdict"] != run["original_verdict"]:
+            print(f"{run['scenario']} {run['run']}: {run['original_verdict']} -> "
+                  f"{run['score']['verdict']}")
+    print(f"results in {written}")
+    return 0
+
+
 def command_check(_args):
-    scenarios = scenario_module.load_all()
+    scenarios = [
+        *scenario_module.load_all(),
+        *scenario_module.load_all(platform="k8s"),
+    ]
     failed = False
     for scenario in scenarios:
-        line = f"{scenario.id}: {scenario.nodes} node(s), checks {', '.join(scenario.checks)}"
+        line = (f"{scenario.platform}/{scenario.id}: {scenario.nodes} node(s), "
+                f"checks {', '.join(scenario.checks)}")
         if scenario.plant:
             applies, reason = plant_module.check_applies(scenario.plant.patch)
             line += "; plant applies" if applies else f"; PLANT DOESN'T APPLY: {reason}"
@@ -240,7 +405,22 @@ def _binaries(args):
     return {name: path.resolve() for name, path in found.items()}
 
 
+def _k8s_tools(args):
+    """The real programs a Kubernetes solver's shims stand in front of."""
+    home = Path(os.environ.get("GYM_K8S_HOME", Path.home() / "github" / "rb-wt" / "gym-k8s"))
+    found = {
+        "kubectl": Path(args.kubectl or home / "bin" / "kubectl"),
+        "kubernetes-mcp-server": Path(args.mcp_server or home / "bin" / "kubernetes-mcp-server"),
+    }
+    for name, path in found.items():
+        if not path.is_file():
+            raise SystemExit(f"no {name} at {path}: run scripts/gym/k8s/lab.sh tools, or pass --{name}")
+    return {name: str(path.resolve()) for name, path in found.items()}
+
+
 def command_run(args):
+    if args.platform == "k8s":
+        return command_run_k8s(args)
     scenarios = scenario_module.load_all()
     if args.scenario:
         unknown = set(args.scenario) - {s.id for s in scenarios}
@@ -294,6 +474,7 @@ def command_run(args):
 
     context = {
         "date": time.strftime("%Y-%m-%d", time.gmtime()),
+        "platform": "reliaburger",
         "solver": solver.describe(),
         "solver_kind": solver.name,
         "runs_per_scenario": args.runs,
@@ -309,6 +490,83 @@ def command_run(args):
     print(f"results in {out / 'results.json'}, record in {out / 'record.md'}")
     errors = [r for r in results if "error" in r]
     return 1 if errors else 0
+
+
+def command_run_k8s(args):
+    """`run --platform k8s`: the Kubernetes ports, each on a fresh k3s on the lab."""
+    scenarios = scenario_module.load_all(platform="k8s")
+    if args.scenario:
+        unknown = set(args.scenario) - {s.id for s in scenarios}
+        if unknown:
+            raise SystemExit(f"unknown k8s scenarios {sorted(unknown)}")
+        scenarios = [s for s in scenarios if s.id in args.scenario]
+    tools = _k8s_tools(args)
+    solver = solvers.solver_from_spec(args.solver, "k8s")
+    out = Path(args.out).resolve()
+    if out.exists() and any(out.iterdir()):
+        raise SystemExit(f"{out} isn't empty: name a new directory")
+    out.mkdir(parents=True, exist_ok=True)
+    # The solver's kubeconfig holds its token: keep it out of the results.
+    scratch = Path(tempfile.mkdtemp(prefix="gym-k8s-"))
+
+    def make_cluster(nodes, work_dir):
+        return k8s_cluster.K3sCluster(
+            scratch / f"{work_dir.parent.parent.name}-{work_dir.parent.name}", nodes
+        )
+
+    results = []
+    try:
+        for scenario in scenarios:
+            for index in range(1, args.runs + 1):
+                run_dir = out / scenario.id / f"run-{index}"
+                print(f"k8s/{scenario.id} run {index}/{args.runs}", flush=True)
+                result = run_once(
+                    scenario, run_dir, make_cluster, solver, None, None, args.timeout, tools=tools,
+                )
+                verdict = result["score"]["verdict"] if "score" in result else f"error: {result['error']}"
+                print(f"  {verdict}", flush=True)
+                results.append(result)
+    finally:
+        if not args.keep:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+    context = {
+        "date": time.strftime("%Y-%m-%d", time.gmtime()),
+        "platform": "k8s",
+        "solver": solver.describe(),
+        "solver_kind": solver.name,
+        "runs_per_scenario": args.runs,
+        "host": f"{platform.machine()}, {platform.system()} {platform.release()}",
+        "relish_version": "none (Kubernetes)",
+        "platform_versions": k8s_cluster.K3sCluster(scratch, 1).versions(),
+        "kubectl_version": subprocess.run(
+            [tools["kubectl"], "version", "--client"], capture_output=True, text=True, check=False
+        ).stdout.strip(),
+    }
+    summary = score_module.summarise([r for r in results if "score" in r])
+    document = {"context": context, "summary": summary, "runs": results}
+    (out / "results.json").write_text(json.dumps(document, indent=2) + "\n")
+    (out / "record.md").write_text(record.render(document, scenarios))
+    print(f"results in {out / 'results.json'}, record in {out / 'record.md'}")
+    return 1 if any("error" in r for r in results) else 0
+
+
+def command_compare(args):
+    out = Path(args.out).resolve()
+    text = compare_module.render([Path(path) for path in args.results], out.parent)
+    out.write_text(text)
+    print(f"comparison record in {args.out}")
+    return 0
+
+
+def command_user(args):
+    binaries = _binaries(args)
+    out = Path(args.out).resolve()
+    if out.exists() and any(out.iterdir()):
+        raise SystemExit(f"{out} isn't empty: name a new directory")
+    code, record_ = user_gym.run(binaries, out, args.port_base)
+    print(json.dumps(record_, indent=2))
+    return code
 
 
 def command_score(args):
@@ -338,6 +596,8 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("check", help="check every scenario and plant")
     run = sub.add_parser("run", help="run scenarios and write a record")
+    run.add_argument("--platform", choices=scenario_module.PLATFORMS, default="reliaburger",
+                     help="where the scenarios run (default reliaburger)")
     run.add_argument("--scenario", action="append", help="a scenario id (default: all)")
     run.add_argument("--solver", default="scripted", help="scripted, or command:PROGRAM ARGS")
     run.add_argument("--runs", type=int, default=1, help="runs per scenario")
@@ -349,6 +609,9 @@ def main(argv=None):
     run.add_argument("--relish")
     run.add_argument("--bun")
     run.add_argument("--testapp")
+    run.add_argument("--kubectl", help="the real kubectl (k8s; default: the lab's)")
+    run.add_argument("--kubernetes-mcp-server", dest="mcp_server",
+                     help="the real Kubernetes MCP server (k8s; default: the lab's)")
     run.add_argument("--plant-target-dir", default=None,
                      help="cargo target directory for the planted build")
     run.add_argument("--check-patch", action="store_true",
@@ -356,9 +619,23 @@ def main(argv=None):
     run.add_argument("--keep", action="store_true", help="keep the clusters' work directories")
     score = sub.add_parser("score", help="score a recorded run again")
     score.add_argument("run_dir")
+    rescore_ = sub.add_parser("rescore", help="score every run of a pass again, beside the original")
+    rescore_.add_argument("out", help="the pass's directory, holding results.json")
+    rescore_.add_argument("--suffix", default="rescored",
+                          help="writes results-SUFFIX.json and record-SUFFIX.md (default rescored)")
     fixture = sub.add_parser("fixture", help="turn a run's calls into a fake-relish fixture")
     fixture.add_argument("run_dir")
     fixture.add_argument("out")
+    compare = sub.add_parser("compare", help="write the comparison record from results.json files")
+    compare.add_argument("--out", required=True, help="the Markdown record to write")
+    compare.add_argument("results", nargs="+", help="results.json files or the directories holding them")
+    user = sub.add_parser("user", help="test `relish gym run` on a fresh local cluster")
+    user.add_argument("--out", required=True, help="a new directory for the reports")
+    user.add_argument("--port-base", type=int, default=DEFAULT_PORT_BASE,
+                      help=f"first port of the cluster's block (default {DEFAULT_PORT_BASE})")
+    user.add_argument("--relish")
+    user.add_argument("--bun")
+    user.add_argument("--testapp")
     args = parser.parse_args(argv)
     if args.command == "run" and args.plant_target_dir is None:
         base = os.environ.get("CARGO_TARGET_DIR", str(scenario_module.GYM_DIR.parent.parent / "target"))
@@ -369,7 +646,10 @@ def main(argv=None):
         "check": command_check,
         "run": command_run,
         "score": command_score,
+        "rescore": command_rescore,
         "fixture": command_fixture,
+        "compare": command_compare,
+        "user": command_user,
     }
     return commands[args.command](args)
 

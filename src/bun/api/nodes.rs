@@ -162,45 +162,9 @@ pub(super) async fn nodes_handler(
     State(state): State<ApiState>,
     known: Option<axum::Extension<KnownMembers>>,
 ) -> Response {
-    let down = match known {
-        Some(known) => known
-            .down()
-            .await
-            .into_iter()
-            .map(|member| crate::bun::agent::NodeStatus {
-                node_id: member.info.node_id.0.clone(),
-                address: member.gossip_address.to_string(),
-                api_address: member.info.api_advertised.then_some(member.info.address),
-                state: member.state.to_string(),
-                incarnation: member.incarnation,
-                is_council: false,
-                is_leader: false,
-                labels: member.labels,
-            })
-            .collect(),
-        None => Vec::new(),
-    };
-    match ask_agent(&state.cmd_tx, |response| AgentCommand::Nodes {
-        down,
-        response,
-    })
-    .await
-    {
-        Ok(mut nodes) => {
-            if let Some(membership) = &state.membership {
-                let members = membership.read().await;
-                // A down row already carries its last advertised address,
-                // and the live table has none for it.
-                for node in nodes.iter_mut().filter(|n| n.api_address.is_none()) {
-                    node.api_address = members
-                        .iter()
-                        .find(|member| member.node_id.0 == node.node_id && member.api_advertised)
-                        .map(|member| member.address);
-                }
-            }
-            Json(nodes).into_response()
-        }
-        Err(response) => response,
+    match super::summary::cluster_members(&state, known.as_deref()).await {
+        Ok(nodes) => Json(nodes).into_response(),
+        Err(error) => unavailable_response(error),
     }
 }
 
@@ -236,6 +200,8 @@ pub(super) fn relay_allows(method: &axum::http::Method, path: &str) -> bool {
         "v1/version",
         // Each node knows whether its own `[gitops]` drifts (#1286).
         "v1/gitops",
+        // `relish nodes` shows each node's version and usage.
+        "v1/cluster/summary/node",
     ];
     match *method {
         // `relish test` compares each node's own deploy history.

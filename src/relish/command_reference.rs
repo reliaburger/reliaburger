@@ -89,6 +89,7 @@ pub const GROUPS: &[CommandGroup] = &[
         commands: &[
             "apply",
             "status",
+            "apps",
             "inspect",
             "exec",
             "deploy",
@@ -141,6 +142,7 @@ pub const GROUPS: &[CommandGroup] = &[
             "logs-export",
             "logs-search",
             "events",
+            "timeline",
         ],
     },
     CommandGroup {
@@ -157,7 +159,7 @@ pub const GROUPS: &[CommandGroup] = &[
             label: "working with an AI agent",
             path: "16_working-with-an-ai-agent.md",
         }],
-        commands: &["agent", "mcp"],
+        commands: &["agent", "mcp", "lease", "proposal", "undo"],
     },
     CommandGroup {
         title: "Break things on purpose",
@@ -165,7 +167,7 @@ pub const GROUPS: &[CommandGroup] = &[
             label: "chaos",
             path: "05_chaos.md",
         }],
-        commands: &["fault"],
+        commands: &["fault", "gym"],
     },
     CommandGroup {
         title: "Security and access",
@@ -189,7 +191,7 @@ pub const GROUPS: &[CommandGroup] = &[
             label: "operations",
             path: "12_operations.md",
         }],
-        commands: &["upgrade", "gitops"],
+        commands: &["upgrade", "verify", "gitops"],
     },
     CommandGroup {
         title: "Learn",

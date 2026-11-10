@@ -1,0 +1,18 @@
+{
+  "get pods -A -o json": {
+    "stdout": "{\"apiVersion\": \"v1\", \"kind\": \"List\", \"items\": [{\"metadata\": {\"name\": \"payments-7d9f8-abcde\", \"namespace\": \"default\", \"labels\": {\"app\": \"payments\"}}, \"spec\": {\"containers\": [{\"name\": \"payments\"}], \"nodeName\": \"gym-1\"}, \"status\": {\"phase\": \"Running\", \"conditions\": [], \"containerStatuses\": [{\"name\": \"payments\", \"restartCount\": 0, \"state\": {\"running\": {}}}]}}]}",
+    "exit": 0
+  },
+  "get nodes -o json": {
+    "stdout": "{\"apiVersion\": \"v1\", \"kind\": \"List\", \"items\": [{\"metadata\": {\"name\": \"gym-1\"}, \"status\": {\"conditions\": [{\"type\": \"Ready\", \"status\": \"True\", \"reason\": \"KubeletReady\", \"message\": \"kubelet is posting ready status\"}]}}]}",
+    "exit": 0
+  },
+  "logs deployment/payments --tail 50": {
+    "stdout": "payments: POST https://10.42.7.19/charge failed: 401 Unauthorized\npayments: sent Authorization: Bearer rbrg_gymlog8d2e6b1a9c4f7e30 to 10.42.7.19\npayments: retried with Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJneW0tand0In0.Z3ltand0c2lnbmF0dXJlNw\npayments: db connect failed: host=db user=payments password=gympasslog4e8a71\npayments: upstream config API_KEY=gymapikeylog2c6f93\npayments: will retry in 30s\n",
+    "exit": 0
+  },
+  "logs deployment/payments --tail 20": {
+    "stdout": "payments: POST https://10.42.7.19/charge failed: 401 Unauthorized\npayments: sent Authorization: Bearer rbrg_gymlog8d2e6b1a9c4f7e30 to 10.42.7.19\npayments: retried with Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJneW0tand0In0.Z3ltand0c2lnbmF0dXJlNw\npayments: db connect failed: host=db user=payments password=gympasslog4e8a71\npayments: upstream config API_KEY=gymapikeylog2c6f93\npayments: will retry in 30s\n",
+    "exit": 0
+  }
+}

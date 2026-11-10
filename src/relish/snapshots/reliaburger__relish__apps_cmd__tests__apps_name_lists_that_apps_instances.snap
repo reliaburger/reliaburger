@@ -1,0 +1,7 @@
+---
+source: src/relish/apps_cmd.rs
+expression: "render_instances(&rows, &[])"
+---
+NODE                     INSTANCE             APP             NAMESPACE    STATE      PID        RESTARTS AGE
+node-1                   prod__api-0          api             prod         running    100        0        1h
+node-2                   prod__api-1          api             prod         failed     101        1        2h

@@ -180,6 +180,7 @@ mod tests {
                 pid: Some(1234),
                 runtime_unknown: false,
                 status_age_ms: None,
+                age_seconds: None,
                 reason: None,
             },
             InstanceStatus {
@@ -193,6 +194,7 @@ mod tests {
                 pid: None,
                 runtime_unknown: false,
                 status_age_ms: None,
+                age_seconds: None,
                 reason: None,
             },
         ];

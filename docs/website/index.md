@@ -14,33 +14,37 @@ Kubernetes hands you the ingredients. Reliaburger hands you the burger: app sche
 
 ## Built differently
 
-1.  ### One agent instead of a dozen add-ons.
+1.  ### Native to AI agents from day one, not bolted on.
+
+    JSON from every command a script can run was in the first design doc, and `relish agent` and `relish mcp` give your agent bounded answers, read-only MCP tools and the exact source its binary was built from. A new token is read-only unless you ask for more, the bug reports your agent drafts come out redacted, and Claude Code, holding a read-only token, passed [0.2.7’s exit test](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-06-v0.2.7-exit-test.md) in [a gym for AI agents](https://reliaburger.com/agents#measuring-an-agent-on-your-cluster).
+
+2.  ### One agent instead of a dozen add-ons.
 
     App scheduling, batch jobs, metrics, logs, service discovery, ingress, PKI, a Docker registry, consensus, GitOps and fault injection are compiled into `bun`, the one agent every node runs. There’s no Prometheus, CoreDNS, ingress controller, etcd or Argo CD to install, upgrade and keep in step with each other.
 
-2.  ### Seven voters at most. Everyone else gossips.
+3.  ### Seven voters at most. Everyone else gossips.
 
     A Raft council inside the agent holds the cluster’s state, and the cluster picks its voters from your ordinary nodes, never more than seven. Every node finds the others and notices failures through SWIM gossip, so a bigger cluster doesn’t mean a bigger quorum or a separate etcd to run.
 
-3.  ### Service discovery in the kernel, with no proxy in the path.
+4.  ### Service discovery in the kernel, with no proxy in the path.
 
     Every app gets a stable virtual IP, and an eBPF hook on `connect()` sends each connection straight to a healthy backend before its first packet leaves. There’s no kube-proxy and no sidecar on the hop, and the same hook decides who may connect at all.
 
-4.  ### A million tasks, stored as one.
+5.  ### A million tasks, stored as one.
 
     Batch jobs run beside your apps under the same CPU and memory admission, and a task array is stored as a template and a count, not a record per task. Each job picks its isolation: a fresh container, a shared container with a process per task, or an allowlisted host command.
 
-5.  ### Chaos is a command, not an install.
+6.  ### Chaos is a command, not an install.
 
     `relish fault` adds latency, partitions, DNS failures, kills and CPU, memory or disk pressure from inside the agent, so there’s no chaos operator to deploy. Every fault ends on its own, and the cluster refuses one that would take out every replica or put the council’s quorum at risk.
 
-6.  ### Your agent can read the recipe.
+7.  ### Your agent can read the recipe.
 
     New in 0.2.7, `relish agent` answers an AI agent in one line of JSON within a byte budget, and carries the manual and the exact source its binary was built from. Your agent reads how a finding is decided instead of guessing, and with a read-only token it can read the cluster and change nothing.
 
 ## Install it
 
-Kick the tyres With your agent
+Kick the tyres With your agent Homebrew
 
 INSTALL sh
 
@@ -64,11 +68,24 @@ Paste that into Claude Code, Codex or any agent with a shell. The page it reads 
 
 You still make the decisions; it does the typing. Give it a read-only token afterwards, and it can help you run the cluster too.
 
-[Read the playbook](https://reliaburger.com/agents.html) · [As Markdown](https://reliaburger.com/agents.md) · [Add Reliaburger to your agent](https://reliaburger.com/agents.html#add-to-your-agent)
+[Read the playbook](https://reliaburger.com/agents) · [As Markdown](https://reliaburger.com/agents.md) · [Add Reliaburger to your agent](https://reliaburger.com/agents#add-to-your-agent)
+
+INSTALL Homebrew
+
+```
+brew install reliaburger/tap/relish
+relish setup --quickstart
+```
+
+From 0.2.7, Homebrew installs `relish` on a Mac with Apple silicon or on Linux, and `brew upgrade relish` keeps it current. The second line builds the same laptop cluster as the one-line install. Got Linux machines already? Run `relish setup --ssh user@host,user@host` instead.
+
+Homebrew manages only the CLI. A cluster’s nodes still upgrade with `relish upgrade`, and `relish uninstall` leaves the Homebrew copy for `brew uninstall relish` to remove.
+
+[The tap](https://github.com/reliaburger/homebrew-tap) · [One node, CLI only, cleanup](https://github.com/reliaburger/reliaburger/blob/main/docs/quickstart.md)
 
 **Where it stands**
 
-Good enough for home labs and dev clusters. Not for production until 1.0.0, expected in January 2027. Until then, an upgrade can mean starting a fresh cluster. [What’s ready, feature by feature](https://reliaburger.com/features.html).
+Good enough for home labs and dev clusters. Not for production until 1.0.0, expected in January 2027. Until then, an upgrade can mean starting a fresh cluster. [What’s ready, feature by feature](https://reliaburger.com/features).
 
 [Roadmap](https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md)
 
@@ -259,7 +276,7 @@ Bun’s memory ended the day at 265.8, 265.4 and 225.4 MiB, against targets of 5
 
 Bun memory per node over the day run, with the 512 and 384 MiB targets. The ✕ marks are node 2’s leak check flagging its growth, not failed job tasks.
 
-A million in one go? 0.2.7’s 8-hour release soak ran 64 arrays of 1,048,576 tasks each while it broke things: the median took 140 seconds, the slowest 417. [Soak record](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-07-v0.2.7-job-qualification.md) · [What’s ready in jobs](https://reliaburger.com/features.html#jobs)
+A million in one go? 0.2.7’s 8-hour release soak ran 64 arrays of 1,048,576 tasks each while it broke things: the median took 140 seconds, the slowest 417. [Soak record](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-07-v0.2.7-job-qualification.md) · [What’s ready in jobs](https://reliaburger.com/features#jobs)
 
 What does each kind of isolation cost? Here’s the same command, run four ways on the same VM with the same concurrency.
 
@@ -398,7 +415,7 @@ Open file descriptors per node.
 
 Bun CPU per node, as a percentage of one core.
 
-What the soaks don't prove: they run three small VMs on one machine, so they say nothing about large clusters, real networks between machines or hardware failing. A VM forced off isn't a real power loss, the fault rates are a schedule, not production traffic, and zero failures in 25 runs only rules out failure rates above about 12%. [How each gate works](https://github.com/reliaburger/reliaburger/blob/main/docs/testing.md#before-a-release), and [how it compares with Kubernetes' release testing](https://reliaburger.com/compare/kubernetes.html#testing).
+What the soaks don't prove: they run three small VMs on one machine, so they say nothing about large clusters, real networks between machines or hardware failing. A VM forced off isn't a real power loss, the fault rates are a schedule, not production traffic, and zero failures in 25 runs only rules out failure rates above about 12%. [How each gate works](https://github.com/reliaburger/reliaburger/blob/main/docs/testing.md#before-a-release), and [how it compares with Kubernetes' release testing](https://reliaburger.com/compare/kubernetes#testing).
 
 ## Debug the platform, not just your app
 
@@ -447,7 +464,121 @@ No recording yet. A real session, an agent with a read-only token on a real clus
 
 Last, it drafts a redacted bug report with the reproducer, the patch and what it didn’t test, for you to read and post. Nothing goes to GitHub on its own.
 
-[The agent’s own page](https://reliaburger.com/agents.html) · [The manual chapter](https://github.com/reliaburger/reliaburger/blob/main/docs/manual/16_working-with-an-ai-agent.md) · [How we test, for agents](https://reliaburger.com/agents.html#how-reliaburger-is-tested)
+[The agent’s own page](https://reliaburger.com/agents) · [The manual chapter](https://github.com/reliaburger/reliaburger/blob/main/docs/manual/16_working-with-an-ai-agent.md) · [How we test, for agents](https://reliaburger.com/agents#how-reliaburger-is-tested)
+
+## Let your agent act, then take it back
+
+Reading a cluster is safe. Changing one is where an agent needs a leash. From 0.2.8, not in 0.2.7, an agent never changes the cluster itself: it asks. The cluster writes down what the change would do, a person or a policy you wrote says yes, and the undo is one command, shown before anything happens.
+
+No recording yet. A real session, an agent proposing a rollback on a real cluster and a person approving it, is being recorded for [#1690](https://github.com/reliaburger/reliaburger/issues/1690), and we won’t show a mock-up in its place. Until then, here are the steps.
+
+1.  ```
+    relish token create --name holmes --agent --role deployer --namespaces shop --ttl 8h
+    ```
+
+    You give the agent a token of its own. An agent token can propose changes and take leases, and nothing else: the API refuses it every apply, stop, delete and rollback. It can’t be an admin, and it’s gone in eight hours.
+
+2.  ```
+    relish agent lease take app web --namespace shop --purpose "rolling back" --wait 60s
+    ```
+
+    Before it touches `web`, the agent takes a short lease, so a second agent can’t pick the same moment. A person can always take over with `--break-lease`, and the audit log says who did.
+
+3.  ```
+    relish agent propose rollback web --namespace shop --reason "v2 crash-loops since it shipped"
+    ```
+
+    Then it proposes. The cluster, not the agent, writes the plain-language summary, the field diff, the blast radius (apps, nodes, instances replaced) and the command that undoes it. The agent’s reason comes last, labelled as its own words.
+
+4.  ```
+    relish proposal show 17
+    ```
+    ```
+    relish proposal approve 17
+    ```
+
+    You read it and approve it, and it applies in the same step. If anyone changed `web` in the meantime, the approval fails as `stale` and changes nothing. An agent token can’t approve anything.
+
+5.  ```
+    relish undo 17
+    ```
+
+    Changed your mind? Undo puts it back, for a day, and refuses when something else has changed the app since, rather than overwrite it.
+
+Four scenarios in the [agent gym](https://reliaburger.com/agents#measuring-an-agent-on-your-cluster) check this on a real cluster: a proposed rollback, a guardrail’s refusal, two agents after the same app, and an approval that went stale. A run that changes anything itself scores unsafe, however right its answer.
+
+### Test your agent on your own cluster first
+
+Which agent should you let near production? From 0.2.8, the gym runs on your cluster too, with your runtime and your policies, and needs no checkout:
+
+```
+relish gym list
+```
+```
+relish gym run --namespace agent-staging --solver 'command:./my-agent.sh' --runs 3
+```
+
+It deploys its own small apps into the staging namespace you name and breaks them in ways it knows: a crash loop after a bad deploy, a deploy nothing can schedule, a prompt injection in a log, paused and killed instances, and an app full of made-up secrets to draft a bug report from. Your agent gets a read-only token confined to that namespace, and every `relish` call it makes is recorded. Each answer scores `correct`, `partial`, `wrong`, `no_answer` or `unsafe`, and the report lists anything it tried to change, whatever the agent says it did.
+
+The gym touches nothing outside that namespace and uses no node faults. After every run it clears its faults, deletes its apps and revokes the token, even after a Ctrl-C, then checks the cluster agrees. The report goes through the same redaction as `relish agent report`, so you can hand it to whoever signs off on security. The default solver is a scripted baseline: it costs nothing and shows the gym works on your cluster before you spend anything on an agent.
+
+### Guardrails you write once
+
+A guardrail is a policy that judges the proposal itself: its kind, its namespace, its blast radius, who made it. It never sees the agent’s reason, so the agent can’t talk it round. One can refuse, and one can approve the small, routine changes so nobody gets paged for them:
+
+```
+[policy.agents-never-delete]
+applies_to = "proposals"
+match = 'author.kind == "agent"'
+deny = 'proposal.kind == "delete"'
+
+[policy.agents-scale-shop]
+applies_to = "proposals"
+action = "approve"
+match = 'author.kind == "agent" && proposal.kind == "scale" && proposal.namespace == "shop" && proposal.replicas_to <= 10'
+```
+
+A policy never approves a change the cluster can’t undo exactly. Try one on a real proposal before you trust it: `relish policy test -f examples/agents/guardrails.toml --proposal proposal.json`. For an agent that speaks MCP, `relish mcp --propose --namespace shop` offers the proposing and lease tools, with no approve tool among them; plain `relish mcp` still only reads, and makes itself a read-only token rather than borrow your admin one.
+
+### Ask the cluster why
+
+When something breaks, the next question is what changed. The scheduler, the restart loop and the apply path write down their rule and its evidence at the moment they decide, so the cluster can answer later:
+
+```
+relish timeline --app web --since 15m
+```
+```
+relish agent explain --restart web-0
+```
+```
+relish agent explain --placement web-1
+```
+
+A decision the records no longer hold comes back as `not_found`, which means unknown, not “didn’t happen”.
+
+### Is this the release?
+
+`relish verify` checks that every node runs the published, signed `bun`, byte for byte, that they all run the same version, and that the `relish` asking is signed too. Missing evidence is `unknown`, never `verified`.
+
+### One screen for the whole cluster
+
+`relish status` is now one line per part of the cluster with a verdict on top, the same height on three nodes or three hundred. The lists moved to `relish apps --unhealthy` and `relish nodes --unhealthy`.
+
+### Small enough to hold in your head, or a context window
+
+Reliaburger has 8 resource kinds and 189 commands and subcommands, counted from the CLI’s own definitions, hidden ones included. A test fails when either number moves, so a new concept is a line in a pull request that someone has to agree with.
+
+**How that compares with Kubernetes**
+
+Not measured yet. The tokens and time an agent spends on the same task on each platform come from the runs in [#1679](https://github.com/reliaburger/reliaburger/issues/1679), for [#1681](https://github.com/reliaburger/reliaburger/issues/1681), and we’ll quote them here when they exist.
+
+**Small local models**
+
+Four open models ran the agent gym in Ollama on our Mac Studio, at an 8K window, with a plain loop and three runs a scenario. Qwen3 8B and Qwen3 14B each got 12 of 36 runs right, Llama 3.1 8B 7 and gpt-oss 20B 6. They're good at the simple diagnoses: both Qwen3 models found the crash loops and the unschedulable app every time. They aren't good at anything that needs a step of their own. None fixed the planted bug in `relish`'s source, Qwen3 8B lost the partitioned node all three times, and even with the proposing tools the Qwen3 models proposed in 7 of 24 runs. None changed the cluster. Claude, five runs each on 0.2.7, got 29 of 30 on the six scenarios it ran.
+
+[The record](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-10-gym-local-models-second-pass.md) · [Running a local model](https://reliaburger.com/agents#with-a-local-model) · [#1687](https://github.com/reliaburger/reliaburger/issues/1687)
+
+[Proposals, for agents](https://reliaburger.com/agents#proposing-a-change) · [Test your agent on your cluster](https://github.com/reliaburger/reliaburger/blob/main/docs/manual/05_chaos.md#testing-your-agent-on-your-cluster) · [Agent tokens and proposals](https://github.com/reliaburger/reliaburger/blob/main/docs/manual/10_security.md#agent-tokens-and-proposals) · [The timeline](https://github.com/reliaburger/reliaburger/blob/main/docs/manual/07_diagnostics.md#relish-timeline-what-changed-and-why-did-it-do-that) · [Verify a cluster](https://github.com/reliaburger/reliaburger/blob/main/docs/manual/12_operations.md#is-this-the-release)
 
 ## What’s next
 
@@ -455,23 +586,23 @@ Last, it drafts a redacted bug report with the reproducer, the patch and what it
 
 In progress, with its scope still being settled. Agent changes as proposals you review and can undo, trying a change on a copy of production, and a record of why an agent did what it did. Alongside them, a faster loop for building and releasing Reliaburger itself.
 
-[Milestone](https://github.com/reliaburger/reliaburger/milestone/30) 
+[Milestone](https://github.com/reliaburger/reliaburger/milestone/30)
 
 **0.3.0: Bare metal in an hour**
 
 After 0.2.8. An appliance OS, netbooting and claiming machines over the LAN, and signed A/B OS updates. The exit test: Dell Wyse thin clients from power-on to a cluster.
 
-[Milestone](https://github.com/reliaburger/reliaburger/milestone/6) 
+[Milestone](https://github.com/reliaburger/reliaburger/milestone/6)
 
 **0.4.0: Full container migration**
 
 Planned. Cordon, drain and uncordon, cold moves that carry volumes, and checkpoint moves that keep memory while connections reconnect.
 
-[Milestone](https://github.com/reliaburger/reliaburger/milestone/7) 
+[Milestone](https://github.com/reliaburger/reliaburger/milestone/7)
 
 ## Read the docs
 
-Documentation lives with the code. 
+Documentation lives with the code.
 
 START HERE
 
@@ -517,41 +648,41 @@ How Reliaburger compares, with commands and sources beside the claims. These pag
 
 THE PLATFORM API
 
-### [Reliaburger vs Kubernetes](https://reliaburger.com/compare/kubernetes.html)
+### [Reliaburger vs Kubernetes](https://reliaburger.com/compare/kubernetes)
 
 Pods, controllers, storage and extensibility; installation with kubeadm and the cost of operating the platform.
 
 THE WORKLOAD SCHEDULER
 
-### [Reliaburger vs Nomad](https://reliaburger.com/compare/nomad.html)
+### [Reliaburger vs Nomad](https://reliaburger.com/compare/nomad)
 
 Jobs, groups, allocations and service discovery; what comes with the scheduler and what you integrate.
 
 KUBERNETES, PACKAGED
 
-### [Reliaburger vs k3s](https://reliaburger.com/compare/k3s.html)
+### [Reliaburger vs k3s](https://reliaburger.com/compare/k3s)
 
 What its bundled runtime, networking and ingress simplify, and which Kubernetes concepts remain.
 
 THE SINGLE-HOST BASELINE
 
-### [Reliaburger vs Docker Compose](https://reliaburger.com/compare/docker-compose.html)
+### [Reliaburger vs Docker Compose](https://reliaburger.com/compare/docker-compose)
 
 Services, networks and volumes; where a single Docker host is enough and what changes when you need a cluster.
 
 THE APPLICATION PLATFORM
 
-### [Reliaburger vs Coolify](https://reliaburger.com/compare/coolify.html)
+### [Reliaburger vs Coolify](https://reliaburger.com/compare/coolify)
 
 Git deployments, preview environments, domains and backups; the difference between deployment to servers and cluster reconciliation.
 
 THE SMALL-CLUSTER ALTERNATIVE
 
-### [Reliaburger vs Uncloud](https://reliaburger.com/compare/uncloud.html)
+### [Reliaburger vs Uncloud](https://reliaburger.com/compare/uncloud)
 
 Compose, WireGuard and Caddy; straightforward deployment across machines and the limits of automatic recovery.
 
-[All comparisons](https://reliaburger.com/compare/index.html) · [Evidence and comparison method](https://reliaburger.com/compare/methodology.html)
+[All comparisons](https://reliaburger.com/compare/) · [Evidence and comparison method](https://reliaburger.com/compare/methodology)
 
 ## Follow a subsystem
 
@@ -613,7 +744,7 @@ You’ll need Rust and your platform’s build tools. This runs `hello` as a hos
 
 For real OCI containers, use runc on Linux. On macOS, the managed laptop quickstart uses Linux VMs. Direct Apple Container is deferred beyond 0.2.7.
 
-[Build requirements & runtime setup](https://github.com/reliaburger/reliaburger/blob/main/docs/README.md) 
+[Build requirements & runtime setup](https://github.com/reliaburger/reliaburger/blob/main/docs/README.md)
 
 LOCAL DEVELOPMENT sh
 
@@ -629,6 +760,7 @@ target/debug/bun --runtime process \
 target/debug/relish apply \
   examples/phase-1/proc-first-run.toml
 target/debug/relish status
+target/debug/relish apps
 target/debug/relish
 ```
 

@@ -109,8 +109,10 @@ fn only_values_starting_with_the_prefix_are_references() {
     assert!(SecretReference::is_reference("PROVIDER[vault:x]"));
     assert!(!SecretReference::is_reference("provider[vault:x]"));
     assert!(!SecretReference::is_reference("x PROVIDER[vault:x]"));
-    assert!(needs_resolution(&["A=1".into(), "B=PROVIDER[v:x]".into()]));
-    assert!(!needs_resolution(&["A=1".into(), "B=ENC[AGE:x]".into()]));
+    // A launch needs resolving when its config declared a reference, and
+    // only then: what the built env holds doesn't count (#1819).
+    assert!(needs_resolution(&["B".into()]));
+    assert!(!needs_resolution(&[]));
 }
 
 // ---------------------------------------------------------------------------
@@ -447,9 +449,12 @@ async fn resolving_an_environment_replaces_only_provider_entries() {
         "MODE=plain".to_string(),
         "DB_PASSWORD=PROVIDER[vault:secret/db#password]".to_string(),
         "EMPTY=".to_string(),
+        // A decrypted secret that looks like a reference, declared as
+        // nothing: it stays as it is (#1819).
+        "LOOKALIKE=PROVIDER[vault:secret/other]".to_string(),
     ];
     let resolved = providers(&binary, |_| {})
-        .resolve_env(&env, context())
+        .resolve_env(&env, &["DB_PASSWORD".to_string()], context())
         .await
         .unwrap();
     assert_eq!(
@@ -458,6 +463,7 @@ async fn resolving_an_environment_replaces_only_provider_entries() {
             "MODE=plain".to_string(),
             format!("DB_PASSWORD={SECRET}"),
             "EMPTY=".to_string(),
+            "LOOKALIKE=PROVIDER[vault:secret/other]".to_string(),
         ]
     );
 }
@@ -475,7 +481,11 @@ async fn a_failed_entry_names_its_variable_and_never_a_secret() {
         "API_KEY=PROVIDER[aws:prod/api]".to_string(),
     ];
     let error = providers(&binary, |_| {})
-        .resolve_env(&env, context())
+        .resolve_env(
+            &env,
+            &["DB_PASSWORD".to_string(), "API_KEY".to_string()],
+            context(),
+        )
         .await
         .unwrap_err();
     assert_eq!(

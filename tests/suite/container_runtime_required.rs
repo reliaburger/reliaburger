@@ -52,7 +52,14 @@ fn an_image_app_is_refused_on_the_process_runtime_and_a_host_app_still_runs() {
 
     let status = wait_for_relish_output(
         &mut bun,
-        &["--endpoint", &endpoint, "--output", "json", "status"],
+        &[
+            "--endpoint",
+            &endpoint,
+            "--output",
+            "json",
+            "apps",
+            "--instances",
+        ],
         REASON,
     );
     let instances: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
@@ -84,7 +91,14 @@ fn an_image_app_is_refused_on_the_process_runtime_and_a_host_app_still_runs() {
         String::from_utf8_lossy(&apply.stderr),
         bun_process::bun_log_diagnostic(&bun.log_path)
     );
-    let status = run_relish(&["--endpoint", &endpoint, "--output", "json", "status"]);
+    let status = run_relish(&[
+        "--endpoint",
+        &endpoint,
+        "--output",
+        "json",
+        "apps",
+        "--instances",
+    ]);
     let instances: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
     let tool = instances
         .as_array()
