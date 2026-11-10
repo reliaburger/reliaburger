@@ -128,6 +128,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 work: off_loop_work::WorkKey::PersistRecord(instance_id.clone()).to_string(),
             });
         }
+        self.forget_landed_record_write(instance_id);
         let key = off_loop_work::WorkKey::RemoveRestartRecord(instance_id.clone());
         let incarnation = self.incarnation_of(instance_id);
         #[cfg(test)]
@@ -204,6 +205,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 work: format!("writing {instance_id}'s adoption record or identity"),
             });
         }
+        self.forget_landed_record_write(instance_id);
         let key = off_loop_work::WorkKey::RetireArtifacts(instance_id.clone());
         let incarnation = self.incarnation_of(instance_id);
         if !self.off_loop_work.started(&key, incarnation) {

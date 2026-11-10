@@ -140,6 +140,17 @@ impl<T: Send + 'static> OffLoopWork<T> {
             .is_some_and(|work| !work.task.is_finished())
     }
 
+    /// Drop `key`'s work if it has finished and was never collected.
+    pub(super) fn forget_finished(&mut self, key: &WorkKey) {
+        if self
+            .in_flight
+            .get(key)
+            .is_some_and(|work| work.task.is_finished())
+        {
+            self.in_flight.remove(key);
+        }
+    }
+
     /// Whether `namespace/app`'s volumes are being provisioned, so a restore
     /// must not swap them meanwhile.
     pub(super) fn provisioning(&self, namespace: &str, app: &str) -> bool {

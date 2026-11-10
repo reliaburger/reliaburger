@@ -7695,6 +7695,20 @@ it. Two more tests crash Bun at each side of the write: before it lands
 the next Bun has nothing to adopt, and after it lands the next Bun adopts
 the instance.
 
+Review found one more. `off_loop_work` tells one piece of work from the
+next by an *incarnation*, and for an instance that had always been its
+`created_at`. But a restart keeps `created_at`, so every launch of an
+instance shared one incarnation. Say a restart's write outlasted its turn,
+and the instance crashed again before the recheck: nothing collected the
+write, the next restart removed the record, and its own write found the
+earlier one "started", took that result and wrote nothing. The instance
+ran with no record. So the write is keyed by the launch now:
+`LaunchEvidence`, read once when a launch starts, carries the moment it
+was read, and every ask about that launch passes the same evidence. And,
+belt and braces, removing a record first drops any write of it that
+landed uncollected. `a_restart_writes_its_own_record_after_an_earlier_write_landed_uncollected`
+and its twin with a failed earlier write pin both.
+
 The remaining `LOOP-INLINE` tags on durable writes now say why they're
 bounded rather than citing decision 2: a discovery journal write with no
 deadline happens only in startup recovery, outside any turn, and every

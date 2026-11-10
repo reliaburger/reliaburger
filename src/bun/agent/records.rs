@@ -48,7 +48,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             BunError::AdoptionState(format!("cannot record {instance_id}: {reason}"))
         };
         let key = off_loop_work::WorkKey::PersistRecord(instance_id.clone());
-        let incarnation = self.incarnation_of(instance_id);
+        // This launch's write, not the instance's: a restart keeps
+        // `created_at`, and must never collect an earlier launch's write.
+        let incarnation = evidence.read_at;
         // An ask after `StillRunning` only collects the write it started.
         let record = if self.off_loop_work.started(&key, incarnation) {
             None
@@ -168,6 +170,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .is_running(&off_loop_work::WorkKey::PersistRecord(id.clone()))
     }
 
+    /// Before removing `id`'s record, drop a write of it that landed but
+    /// was never collected (its instance left `Starting` first), so no
+    /// later ask can mistake that result for its own.
+    pub(super) fn forget_landed_record_write(&mut self, id: &InstanceId) {
+        self.off_loop_work
+            .forget_finished(&off_loop_work::WorkKey::PersistRecord(id.clone()));
+    }
+
     /// Persist launch evidence while the replacement is still owned by its
     /// rolling worker, before health wait or traffic publication. Like
     /// [`Self::persist_instance_record`], the write holds the turn only until
@@ -184,7 +194,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             reason,
         };
         let key = off_loop_work::WorkKey::PersistRecord(instance.instance_id.clone());
-        let incarnation = self.incarnation_of(&instance.instance_id);
+        let incarnation = instance.launch.read_at;
         let record = if self.off_loop_work.started(&key, incarnation) {
             None
         } else {

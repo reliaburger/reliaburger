@@ -5371,3 +5371,69 @@ async fn a_signed_identity_is_stored_off_the_loop() {
     let instance = agent.supervisor.get_instance(&id).unwrap();
     assert_eq!(instance.identity.as_ref().unwrap().jwt_token, "jwt");
 }
+
+/// Review of #1854: a restart keeps its instance's `created_at`, so keying
+/// the record write by it let one launch collect another's. A restart's
+/// write outlasts its turn; the instance leaves `Starting` before the
+/// recheck, so nobody collects it; the next restart removes the record;
+/// and its own write found the earlier one "started", collected that
+/// result and wrote nothing. The instance ran with no record, and the next
+/// Bun would have killed it as an unacknowledged launch. Each launch now
+/// gets its own write.
+async fn a_later_launch_writes_its_own_record(earlier_fails: bool) {
+    let (mut agent, _tx, _shutdown, grill, root) = recording_agent();
+    expect_complete(&drain_deploy(&mut agent, replicated("web", 1)).await);
+    let id = InstanceId("default__web-0".into());
+    let records = root.path().join("records");
+
+    // The earlier restart's write, left in flight past its turn.
+    if earlier_fails {
+        // A directory under a regular file can't be created, by root either.
+        let blocker = root.path().join("not-a-directory");
+        std::fs::write(&blocker, "").unwrap();
+        agent.set_records_dir(blocker.join("records"));
+    }
+    agent
+        .loop_stalls
+        .set(LoopStall::RecordWrite, SLOW_RECORD_WRITE);
+    let earlier = crate::bun::agent::launch_evidence::LaunchEvidence::read(&grill, &id).await;
+    agent.turn_deadline = Some(tokio::time::Instant::now() + TURN_RUNTIME_BUDGET);
+    let in_flight = agent.persist_instance_record(&id, &earlier).await;
+    assert!(
+        matches!(in_flight, Err(BunError::StillRunning { .. })),
+        "{in_flight:?}"
+    );
+    // The instance leaves `Starting`; nothing collects the write, which
+    // lands on its own.
+    tokio::time::sleep(SLOW_RECORD_WRITE + std::time::Duration::from_millis(300)).await;
+    agent.turn_deadline = None;
+    agent.set_records_dir(records.clone());
+    agent
+        .loop_stalls
+        .set(LoopStall::RecordWrite, std::time::Duration::ZERO);
+
+    // The next restart removes the predecessor's record, then writes its own.
+    agent.retire_restart_artifacts(&id).await.unwrap();
+    let path = crate::grill::records::record_path(&records, &id.0);
+    assert!(!path.exists());
+    let later = crate::bun::agent::launch_evidence::LaunchEvidence::read(&grill, &id).await;
+    let written = agent.persist_instance_record(&id, &later).await;
+    assert!(
+        written.is_ok(),
+        "the earlier launch's result was reported against this one: {written:?}"
+    );
+    assert!(
+        path.exists(),
+        "a later launch collected an earlier launch's write and wrote nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_restart_writes_its_own_record_after_an_earlier_write_landed_uncollected() {
+    a_later_launch_writes_its_own_record(false).await;
+}
+
+#[tokio::test]
+async fn an_earlier_launchs_failed_record_write_is_not_reported_against_a_later_one() {
+    a_later_launch_writes_its_own_record(true).await;
+}
