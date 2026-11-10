@@ -1179,12 +1179,19 @@ to run `relish agent propose` itself. Writing your own loop? Send the task as
 a system message: Ollama drops the oldest messages to fit the window, and
 keeps system ones.
 
-We measure local models in the gym, with Qwen3 8B first. On 9 November it
-made no change in any run, found a crash loop every time at a 32K window,
-and missed nearly everything that needed a typed command or a long session.
-The loop we used, `scripts/gym/local_model.py`, is a plain one: the model,
-`relish mcp`'s tools and a `relish` command, and nothing else. The [record](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-09-gym-local-models.md)
-has the numbers. We haven't measured Goose or any other client with a local
+We measure local models in the gym. On 9 November four of them ran every
+scenario three times at an 8K window, with `relish mcp`'s 8 KiB default
+and all its tools: Qwen3 8B and
+Qwen3 14B got 12 of 36 runs right, Llama 3.1 8B 7 and gpt-oss 20B 6. None
+changed the cluster. The best of them find crash loops and apps that can't
+be placed, and they miss what needs a step of their own: a fix in the
+source, a report, the partitioned node (Qwen3 8B every time), and most
+proposals, even with `--propose` (Qwen3 proposed in 7 of 24 runs). The loop
+we used, `scripts/gym/local_model.py`, is a plain one: the model, `relish
+mcp`'s tools and a `relish` command, and nothing else. The [first
+record](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-09-gym-local-models.md)
+and the [second](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-10-gym-local-models-second-pass.md)
+have the numbers. We haven't measured Goose or any other client with a local
 model.
 
 ## Sending us a bug or a fix

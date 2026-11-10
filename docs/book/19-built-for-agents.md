@@ -5979,6 +5979,30 @@ first and the code marked optional, and a range shown whole with nothing
 after it. Whether the model does better is the gym's question, rerun at the
 record's settings without the solver's own budget.
 
+We reran it the same evening ([the second
+record](../qualification/2026-11-10-gym-local-models-second-pass.md)), and
+added three models. Qwen3 8B went from 10 correct runs of 36 to 12, which
+with three runs a scenario is noise. The budget held, though. The model
+named one in 4 of 99 calls, where 76 had named the solver's advertised one,
+and on the unschedulable deploy it took `explain`'s optional step into the
+source once and stopped, instead of paging through the file. Qwen3 14B also
+got 12, Llama 3.1 8B 7 and gpt-oss 20B 6. The biggest model did worst,
+typing `kubectl`-shaped commands `relish` doesn't have (`relish app show
+reports`, `relish node gym-1`) and often answering the last request with
+nothing at all. Both Qwen3 models found the crash loops and the
+unschedulable deploy every time, and no model fixed the planted bug: the
+patches that came back were to files Reliaburger doesn't have, mostly Go,
+mostly written without calling a tool. The proposal re-run, with `relish mcp
+--propose`, found a gap in the gym rather than in the model. Qwen3 proposed in 7 of 24 runs, the
+guardrail refused the ones it should, and the scorer counted none of them,
+because the shim logs an MCP call as `agent propose --kind=scale` and the
+check looks for the words `agent propose scale`. A scorer is code too, and
+its tests only knew the shape Claude types. With the scorer fixed
+([#1834](https://github.com/reliaburger/reliaburger/pull/1834)) we scored the
+saved runs again without running a model: 6 of the 7 proposing runs did
+everything their scenario checks, and one more of gpt-oss 20B's typed
+proposals counted, which is where its 6 comes from.
+
 ### A guide that fits a small budget
 
 The 8 KiB default made the guide's first answer worse, not better. The
