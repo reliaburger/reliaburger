@@ -26,6 +26,73 @@ pub const MCP_COMMAND_LINE: &[&str] = &["relish", "mcp"];
 /// One line for the agents whose entries carry a description.
 pub const MCP_DESCRIPTION: &str = "Reliaburger: read-only cluster status, diagnosis and logs";
 
+/// The same line for a proposing entry, `relish agent setup --propose`.
+pub const MCP_PROPOSE_DESCRIPTION: &str =
+    "Reliaburger: cluster status, diagnosis and logs, and changes proposed for a person to approve";
+
+/// What an entry's `relish mcp` offers: the read-only tools, or those and
+/// the proposing ones (#1682).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Mode {
+    /// `relish mcp`: read-only.
+    Read,
+    /// `relish mcp --propose --namespace NAME`: it may also propose
+    /// changes in `namespace`, each one approved by a person or a policy.
+    Propose {
+        /// The one namespace its deployer agent token is confined to.
+        namespace: String,
+    },
+}
+
+impl Mode {
+    /// The arguments after `relish`.
+    pub fn args(&self) -> Vec<String> {
+        let mut args: Vec<String> = command_and_args()
+            .1
+            .iter()
+            .map(|word| word.to_string())
+            .collect();
+        if let Mode::Propose { namespace } = self {
+            args.extend([
+                "--propose".to_string(),
+                "--namespace".to_string(),
+                namespace.clone(),
+            ]);
+        }
+        args
+    }
+
+    /// The whole command line, as setup reports it.
+    pub fn command_line(&self) -> Vec<String> {
+        let mut line = vec![command_and_args().0.to_string()];
+        line.extend(self.args());
+        line
+    }
+
+    /// The mode whose arguments are `args`, if they're one of setup's.
+    fn of_args(args: &Value) -> Option<Mode> {
+        let words: Vec<&str> = args
+            .as_array()?
+            .iter()
+            .map(Value::as_str)
+            .collect::<Option<_>>()?;
+        match words.as_slice() {
+            ["mcp"] => Some(Mode::Read),
+            ["mcp", "--propose", "--namespace", namespace] => Some(Mode::Propose {
+                namespace: namespace.to_string(),
+            }),
+            _ => None,
+        }
+    }
+
+    fn description(&self) -> &'static str {
+        match self {
+            Mode::Read => MCP_DESCRIPTION,
+            Mode::Propose { .. } => MCP_PROPOSE_DESCRIPTION,
+        }
+    }
+}
+
 /// An agent `relish agent setup` can wire up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, JsonSchema, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
@@ -154,9 +221,15 @@ impl Client {
         }
     }
 
-    /// The entry this agent gets under [`MCP_SERVER_NAME`].
+    /// The read-only entry this agent gets under [`MCP_SERVER_NAME`].
     pub fn entry(self) -> Value {
-        let (command, args) = command_and_args();
+        self.entry_for(&Mode::Read)
+    }
+
+    /// The entry this agent gets under [`MCP_SERVER_NAME`] for `mode`.
+    pub fn entry_for(self, mode: &Mode) -> Value {
+        let command = command_and_args().0;
+        let args = mode.args();
         match self {
             Client::ClaudeCode => {
                 json!({"type": "stdio", "command": command, "args": args, "env": {}})
@@ -171,13 +244,23 @@ impl Client {
                 "enabled": true,
                 "type": "stdio",
                 "name": MCP_SERVER_NAME,
-                "description": MCP_DESCRIPTION,
+                "description": mode.description(),
                 "cmd": command,
                 "args": args,
                 "envs": {},
                 "timeout": 300,
             }),
         }
+    }
+
+    /// Whether `value` is an entry setup writes for this agent, in either
+    /// mode, so switching between `relish mcp` and `relish mcp --propose`
+    /// replaces setup's own entry without `--force`.
+    pub fn is_own(self, value: &Value) -> bool {
+        value
+            .get("args")
+            .and_then(Mode::of_args)
+            .is_some_and(|mode| self.entry_for(&mode) == *value)
     }
 
     /// Where this agent's personal skills go, for the agents that read
@@ -283,6 +366,51 @@ mod tests {
                 .and_then(Value::as_str);
             assert_eq!(command, Some("relish"), "{client:?}");
             assert_eq!(entry["args"], json!(["mcp"]), "{client:?}");
+        }
+    }
+
+    #[test]
+    fn a_proposing_entry_starts_relish_mcp_propose_in_one_namespace() {
+        let mode = Mode::Propose {
+            namespace: "shop".to_string(),
+        };
+        assert_eq!(
+            mode.command_line(),
+            ["relish", "mcp", "--propose", "--namespace", "shop"]
+        );
+        for client in Client::ALL {
+            let entry = client.entry_for(&mode);
+            assert_eq!(
+                entry["args"],
+                json!(["mcp", "--propose", "--namespace", "shop"]),
+                "{client:?}"
+            );
+            let mut found = Vec::new();
+            keys(&entry, &mut found);
+            assert!(
+                !found.iter().any(|key| APPROVAL_KEYS
+                    .iter()
+                    .any(|bad| bad.eq_ignore_ascii_case(key))),
+                "{client:?} approves something: {entry}"
+            );
+        }
+    }
+
+    #[test]
+    fn setup_knows_its_own_entries_in_either_mode_and_nothing_else() {
+        let propose = Mode::Propose {
+            namespace: "shop".to_string(),
+        };
+        for client in Client::ALL {
+            assert!(client.is_own(&client.entry()), "{client:?}");
+            assert!(client.is_own(&client.entry_for(&propose)), "{client:?}");
+            let mut edited = client.entry_for(&propose);
+            edited["args"] = json!(["mcp", "--propose"]);
+            assert!(!client.is_own(&edited), "{client:?}: {edited}");
+            let mut extra = client.entry();
+            extra["env"] = json!({"RELIABURGER_TOKEN": "rbrg_someone"});
+            assert!(!client.is_own(&extra), "{client:?}: {extra}");
+            assert!(!client.is_own(&json!({"command": "other-mcp"})));
         }
     }
 

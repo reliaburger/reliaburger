@@ -170,6 +170,14 @@ pub const ROUTE_MATRIX: &[Route] = &[
         AnyToken,
     ),
     route(Get, "/ui/app/{app}/{namespace}/env", AnyToken),
+    // The Proposals pages (#1682) filter by scope like `/v1/proposals`. The
+    // decision forms take a browser session whose token may decide, plus
+    // its anti-forgery token, and make the same checks as the API.
+    route(Get, "/ui/proposals", AnyToken),
+    route(Get, "/ui/proposal/{id}", AnyToken),
+    gated(Post, "/ui/proposal/{id}/approve", Deployer, Body(DEPLOY)),
+    gated(Post, "/ui/proposal/{id}/reject", Deployer, Body(DEPLOY)),
+    gated(Post, "/ui/proposal/{id}/undo", Deployer, Body(DEPLOY)),
     // Workload lifecycle.
     gated(Post, "/v1/apply", Deployer, Body(DEPLOY)),
     route(Get, "/v1/status", AnyToken),
@@ -704,6 +712,7 @@ mod tests {
         include_str!("api/status.rs"),
         include_str!("api/test_leases.rs"),
         include_str!("api/ui.rs"),
+        include_str!("api/ui_proposals.rs"),
         include_str!("api/upgrade.rs"),
     ];
 

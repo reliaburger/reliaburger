@@ -177,10 +177,19 @@ pub fn render_summary_fragment(summary: Option<&ClusterSummary>) -> String {
             .as_deref()
             .map(|next| format!("<code>{}</code>", escape_html(next)))
             .unwrap_or_default();
-        html.push_str(&format!(
-            "<tr{class}><td>{}</td><td>{}</td><td>{next}</td></tr>\n",
-            line.section,
+        // The agents line opens the Proposals page, where a person reads
+        // and decides what agents asked for.
+        let text = if line.section == "agents" {
+            format!(
+                "<a class=\"row-link\" href=\"/ui/proposals\">{}</a>",
+                escape_html(&line.text)
+            )
+        } else {
             escape_html(&line.text)
+        };
+        html.push_str(&format!(
+            "<tr{class}><td>{}</td><td>{text}</td><td>{next}</td></tr>\n",
+            line.section,
         ));
     }
     html.push_str("</tbody></table>\n");
@@ -377,7 +386,7 @@ mod tests {
         let html = render_summary_fragment(Some(&summary));
         assert!(html.contains("badge-green\">HEALTHY"), "{html}");
         assert!(
-            html.contains("<tr class=\"alert-warning\"><td>agents</td><td>1 proposal waiting for approval (#17 by holmes)</td><td><code>relish proposal list</code></td></tr>"),
+            html.contains("<tr class=\"alert-warning\"><td>agents</td><td><a class=\"row-link\" href=\"/ui/proposals\">1 proposal waiting for approval (#17 by holmes)</a></td><td><code>relish proposal list</code></td></tr>"),
             "{html}"
         );
         summary.agents = Section::complete(AgentsSection {

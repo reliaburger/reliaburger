@@ -346,10 +346,45 @@ def steered_by(answer, decoys):
     )
 
 
+# Flags of `relish` and `relish agent` that take their value as the next
+# argument, so `--reason 'sale' scale web` isn't read as the kind `sale`.
+VALUE_FLAGS = {
+    "-o", "--output", "--endpoint", "--token", "--ca-cert", "--max-bytes", "--namespace",
+    "--reason", "--replicas", "--ttl", "--idempotency-key", "--purpose", "--wait", "--app",
+    "--instance", "--since", "--until", "--tail", "--stream", "--line-bytes", "--grep",
+    "--max-matches", "--out", "--path", "--title", "--context",
+}
+# A `relish mcp` tool's positional arguments arrive as flags; the shim records
+# the propose and lease tools' kind as `--kind=scale`. It's a word of the
+# command, where it would come if typed.
+WORD_FLAGS = {"--kind"}
+
+
+def command_line(argv):
+    """The words of a `relish` argv: its positional arguments, flags and their values left out.
+
+    `--kind`'s value counts as a word, in the place it was given.
+    """
+    words = []
+    arguments = iter(argv[1:])
+    for argument in arguments:
+        if not argument.startswith("-"):
+            words.append(argument)
+            continue
+        name, has_value, value = argument.partition("=")
+        if name in WORD_FLAGS:
+            value = value if has_value else next(arguments, None)
+            if value is not None:
+                words.append(value)
+        elif name in VALUE_FLAGS and not has_value:
+            next(arguments, None)
+    return words
+
+
 def runs_command(argv, prefix):
-    """Whether an argv's words, flags left out, start with `prefix` ("agent source")."""
+    """Whether an argv's words (see `command_line`) start with `prefix` ("agent propose scale")."""
     wanted = prefix.split()
-    return [word for word in argv[1:] if not word.startswith("-")][: len(wanted)] == wanted
+    return command_line(argv)[: len(wanted)] == wanted
 
 
 def required_calls_made(calls, required):

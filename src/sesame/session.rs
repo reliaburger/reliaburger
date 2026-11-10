@@ -5,10 +5,16 @@
 //! putting a CLI token in page JavaScript is a poor idea. Instead the browser
 //! exchanges a token once for an opaque, `HttpOnly` session cookie.
 //!
-//! Sessions are deliberately **read-only** regardless of the token's role.
-//! The dashboard only reads, and a read-only cookie contains the blast radius
-//! of any cross-site request forgery: a forged request riding the cookie can
-//! look but never mutate.
+//! Sessions are deliberately **read-only** regardless of the token's role,
+//! and a read-only cookie contains the blast radius of a forged request or a
+//! stolen cookie: whoever holds only the cookie can look but never mutate.
+//!
+//! The dashboard has one kind of write (#1682): a person deciding an agent's
+//! proposal. The cookie alone still can't make it. Those forms post to
+//! routes of their own with the session's [`csrf_token_for`] token *and*
+//! the person's API token pasted in, which must be the very credential the
+//! session was opened with; the decision acts as that pasted token. Every
+//! route still sees a session as read-only.
 //!
 //! A session is also never worth more than the token it came from. It records
 //! which exact credential created it (the token's principal id) and cannot
@@ -139,6 +145,35 @@ impl SessionStore {
     }
 }
 
+/// A request that came in on a browser session cookie, as the auth
+/// middleware found it. Only the proposal decision forms read it: they're
+/// the dashboard's one kind of write (#1682), and they need to know the
+/// request rode a session, which credential made it, and the session's
+/// anti-forgery token.
+#[derive(Debug, Clone)]
+pub struct BrowserSession {
+    /// The exact credential the session was made from.
+    pub principal_id: String,
+    /// The token that, sent back in a form, proves the form came from a
+    /// page this session loaded: [`csrf_token_for`] the session id.
+    pub csrf_token: String,
+}
+
+/// The anti-forgery token for session `id`: a SHA-256 of the id under a
+/// fixed label, hex-encoded.
+///
+/// The session id is 256 random bits in an `HttpOnly` cookie, which a page
+/// on another site can neither read nor guess, so it can't compute this
+/// either; and the token, which does appear in our pages, gives nothing
+/// back about the id. Deriving it rather than storing it means a session
+/// needs no new field and a node restart loses nothing.
+pub fn csrf_token_for(id: &str) -> String {
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    context.update(b"reliaburger brioche csrf v1\0");
+    context.update(id.as_bytes());
+    hex::encode(context.finish().as_ref())
+}
+
 /// Extract the `rb_session` value from a `Cookie` header, if present.
 pub fn session_id_from_cookie_header(header: &str) -> Option<&str> {
     // A Cookie header is `name=value; name2=value2`. Values here are hex, so
@@ -253,6 +288,15 @@ mod tests {
     fn parses_the_session_cookie_among_others() {
         let header = "theme=dark; rb_session=abc123; other=1";
         assert_eq!(session_id_from_cookie_header(header), Some("abc123"));
+    }
+
+    #[test]
+    fn a_csrf_token_is_fixed_per_session_and_differs_between_them() {
+        let token = csrf_token_for("abc123");
+        assert_eq!(token, csrf_token_for("abc123"));
+        assert_ne!(token, csrf_token_for("abc124"));
+        assert_eq!(token.len(), 64);
+        assert!(!token.contains("abc123"));
     }
 
     #[test]

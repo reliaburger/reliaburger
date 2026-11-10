@@ -14,7 +14,8 @@ scenarios needs to follow.
 `relish mcp` is the exception. It's a server that talks JSON-RPC over stdin
 and stdout for as long as its client runs, so the shim streams it line by line
 and records each `tools/call` as the `relish agent` command the tool is, with
-the envelope it answered as the output. A Claude Code solver that uses the
+the envelope it answered as the output and the exit code that command would
+have given. A Claude Code solver that uses the
 plugin's MCP server is then scored from the same log as one that types the
 commands into a shell. The server process itself isn't a call.
 
@@ -92,15 +93,72 @@ def k8s_tool_argv(name, arguments):
     return argv
 
 
+# The exit code `relish agent` ends with for each envelope error code
+# (`ErrorCode::exit_status` in src/relish/agent/envelope.rs): usage 2,
+# unreachable 3, refused 4, anything else 5. A tool error is recorded with the
+# code the typed command would have given, so a scenario's outcome (a
+# guardrail refusal is exit 4, a stale undo exit 5) reads the same either way.
+USAGE_CODES = {"usage"}
+UNREACHABLE_CODES = {
+    "no_endpoint", "unreachable", "dns", "tls_untrusted", "timeout", "unauthenticated",
+}
+REFUSED_CODES = {"forbidden", "lease_held", "guardrail"}
+
+
+def exit_for_error_code(code):
+    """The exit code `relish agent` gives a failure with envelope error `code`."""
+    if code in USAGE_CODES:
+        return 2
+    if code in UNREACHABLE_CODES:
+        return 3
+    if code in REFUSED_CODES:
+        return 4
+    return 5
+
+
+def _envelope_error_code(text):
+    try:
+        envelope = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    error = envelope.get("error") if isinstance(envelope, dict) else None
+    code = error.get("code") if isinstance(error, dict) else None
+    return code if isinstance(code, str) else None
+
+
 def _tool_output(message):
-    """The text a tool answered with, and the exit code it stands for."""
+    """The text a tool answered with, and the exit code it stands for.
+
+    A protocol error (an unknown tool, arguments that don't fit its schema)
+    has no envelope and no command behind it, so it's recorded as exit 1.
+    """
     if "error" in message:
         return json.dumps(message["error"]), 1
     result = message.get("result") or {}
     text = "".join(
         block.get("text", "") for block in result.get("content", []) if isinstance(block, dict)
     )
-    return text, 1 if result.get("isError") else 0
+    if not result.get("isError"):
+        return text, 0
+    code = _envelope_error_code(text)
+    return text, 1 if code is None else exit_for_error_code(code)
+
+
+def with_mcp_exit(call):
+    """`call` with a `relish mcp` tool error's exit read from its envelope.
+
+    Logs written before the shim read the envelope's code recorded every tool
+    error as exit 1; scoring such a log again reads the code it answered. A
+    call that isn't a `relish mcp` tool error comes back unchanged.
+    """
+    if call.get("via") != "mcp" or call.get("argv", ["relish"])[:1] != ["relish"]:
+        return call
+    if call.get("exit") in (0, None):
+        return call
+    code = _envelope_error_code(call.get("stdout", ""))
+    if code is None:
+        return call
+    return {**call, "exit": exit_for_error_code(code)}
 
 
 def _parse(line):

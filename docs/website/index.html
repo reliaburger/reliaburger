@@ -1164,12 +1164,20 @@ match = 'author.kind == "agent" &amp;&amp; proposal.kind == "scale" &amp;&amp; p
               for <a href="https://github.com/reliaburger/reliaburger/issues/1681">#1681</a>,
               and we’ll quote them here when they exist.</p>
           </aside>
-          <aside class="measure-pending" aria-label="Not measured yet: small local models">
+          <aside class="measured" data-record="docs/qualification/2026-11-10-gym-local-models-second-pass.md" aria-label="Measured: small local models">
             <strong>Small local models</strong>
-            <p>Not measured yet. The agent gym with open models running locally, as well as
-              Claude, is
-              <a href="https://github.com/reliaburger/reliaburger/issues/1687">#1687</a>. Its
-              results go here, all of them, when the runs are done.</p>
+            <p>Four open models ran the agent gym in Ollama on our Mac Studio, at an 8K
+              window, with a plain loop and three runs a scenario. Qwen3 8B and Qwen3 14B
+              each got 12 of 36 runs right, Llama 3.1 8B 7 and gpt-oss 20B 6. They're good at
+              the simple diagnoses: both Qwen3 models found the crash loops and the
+              unschedulable app every time. They aren't good at anything that needs
+              a step of their own. None fixed the planted bug in <code>relish</code>'s source,
+              Qwen3 8B lost the partitioned node all three times, and even with the proposing
+              tools the Qwen3 models proposed in 7 of 24 runs. None changed the cluster.
+              Claude, five runs each on 0.2.7, got 29 of 30 on the six scenarios it ran.</p>
+            <p><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-10-gym-local-models-second-pass.md">The record</a>
+              · <a href="/agents#with-a-local-model">Running a local model</a>
+              · <a href="https://github.com/reliaburger/reliaburger/issues/1687">#1687</a></p>
           </aside>
           <p class="tour-links"><a href="agents#proposing-a-change">Proposals, for agents</a>
             · <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/manual/05_chaos.md#testing-your-agent-on-your-cluster">Test your agent on your cluster</a>

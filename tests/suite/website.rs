@@ -2028,8 +2028,7 @@ fn the_act_recording_slot_says_plainly_whether_there_is_a_recording() {
 }
 
 /// What 0.2.8 hasn't measured yet has a slot that names its issue and quotes
-/// no number: the local-model runs (#1687) and the Kubernetes context
-/// comparison (#1679, for #1681).
+/// no number: the Kubernetes context comparison (#1679, for #1681).
 #[test]
 fn unmeasured_results_have_slots_that_claim_nothing() {
     let page = read("docs/website/index.html");
@@ -2039,18 +2038,86 @@ fn unmeasured_results_have_slots_that_claim_nothing() {
         .skip(1)
         .map(|rest| &rest[..rest.find("</aside>").unwrap()])
         .collect();
-    for issue in ["1687", "1679"] {
-        let link = format!("https://github.com/reliaburger/reliaburger/issues/{issue}");
-        let slot = slots
-            .iter()
-            .find(|slot| slot.contains(&link))
-            .unwrap_or_else(|| panic!("no pending slot for #{issue}"));
-        let text = decode(&strip_tags(slot));
-        assert!(text.contains("Not measured yet"), "{text:?}");
-        let without_issues = text.replace(&format!("#{issue}"), "").replace("#1681", "");
+    let link = "https://github.com/reliaburger/reliaburger/issues/1679";
+    let slot = slots
+        .iter()
+        .find(|slot| slot.contains(link))
+        .expect("no pending slot for #1679");
+    let text = decode(&strip_tags(slot));
+    assert!(text.contains("Not measured yet"), "{text:?}");
+    let without_issues = text.replace("#1679", "").replace("#1681", "");
+    assert!(
+        !without_issues.chars().any(|c| c.is_ascii_digit()),
+        "the #1679 slot quotes a number: {text:?}"
+    );
+}
+
+/// Every number in a piece of text, as written: digits, with any `.` or `,`
+/// that sits between two digits (`3.1`, `12,000`).
+fn numbers_in(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut numbers = Vec::new();
+    let mut current = String::new();
+    for (index, &c) in chars.iter().enumerate() {
+        let joins_digits = (c == '.' || c == ',')
+            && !current.is_empty()
+            && chars.get(index + 1).is_some_and(char::is_ascii_digit);
+        if c.is_ascii_digit() || joins_digits {
+            current.push(c);
+        } else if !current.is_empty() {
+            numbers.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        numbers.push(current);
+    }
+    numbers
+}
+
+#[test]
+fn numbers_in_keeps_decimals_and_thousands_together() {
+    assert_eq!(
+        numbers_in("Llama 3.1 8B got 7 of 36, 12,000 tokens. Done 9."),
+        ["3.1", "8", "7", "36", "12,000", "9"]
+    );
+}
+
+/// The local-model runs (#1687) are measured. Their slot names the record it
+/// quotes in `data-record` and links it, and every number it states is one
+/// that record holds, as the Kubernetes comparison page does with its record.
+#[test]
+fn the_local_model_slot_quotes_only_its_record() {
+    let page = read("docs/website/index.html");
+    let section = act_section(&page);
+    let start = section
+        .find("<aside class=\"measured\"")
+        .expect("no measured slot in #act");
+    let slot = &section[start..start + section[start..].find("</aside>").unwrap()];
+    assert!(slot.contains("https://github.com/reliaburger/reliaburger/issues/1687"));
+    let tag = &slot[..slot.find('>').unwrap()];
+    let record = attribute(tag, "data-record").expect("the slot names no data-record");
+    assert!(
+        record.starts_with("docs/qualification/") && record.ends_with(".md"),
+        "{record:?}"
+    );
+    assert!(
+        slot.contains(&format!(
+            "https://github.com/reliaburger/reliaburger/blob/main/{record}"
+        )),
+        "the slot should link {record}"
+    );
+    let held: std::collections::BTreeSet<String> = numbers_in(&read(record)).into_iter().collect();
+    let text = decode(&strip_tags(slot)).replace("#1687", "");
+    assert!(!text.contains("Not measured yet"), "{text:?}");
+    let quoted = numbers_in(&text);
+    assert!(
+        !quoted.is_empty(),
+        "a measured slot with no numbers: {text:?}"
+    );
+    for number in quoted {
         assert!(
-            !without_issues.chars().any(|c| c.is_ascii_digit()),
-            "the #{issue} slot quotes a number: {text:?}"
+            held.contains(&number),
+            "the slot says {number}, which {record} doesn't: {text:?}"
         );
     }
 }

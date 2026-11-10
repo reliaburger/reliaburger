@@ -400,6 +400,13 @@ refused as <code>stale</code> if anyone changed the app since.</p>
 the leases held and the proposals waiting. Waiting is a <code>note</code>, not a
 problem. A waiting proposal that's stale, its app changed so approving it
 fails, makes the verdict <code>degraded</code>: withdraw it and propose again.</p>
+<p>Your human decides with <code>relish proposal approve ID</code>, or on the web
+dashboard's Proposals page (<code>/ui/proposals</code>, linked from the Cluster card's
+<code>agents</code> line). The page shows your <code>reason</code> in a box marked as your own
+words, below the cluster's summary, diff, blast radius and undo plan. Its
+approve, reject and undo buttons appear only for a person's token that may
+decide, and each asks that person to paste their API token; yours sees the
+command to copy.</p>
 </section>
 <section class="agents-section" id="reading-an-apps-logs">
 <h2>Reading an app's logs <a class="permalink" href="#reading-an-apps-logs" aria-label="Link to this section">#</a></h2>
@@ -934,6 +941,21 @@ in <code>mcp-token.json</code>; <code>data.mcp_tokens</code> lists that change. 
 <code>data.mcp_tokens</code> lists every token file beside the context, from
 <code>--namespace</code> and <code>--propose</code> too, and setup revokes their tokens and
 deletes the files.</p>
+<p>To let your agents propose changes as well, name the one namespace they
+may change:</p>
+<pre><code class="language-sh">relish agent setup --propose --namespace shop --yes
+</code></pre>
+<p>Each entry then runs <code>relish mcp --propose --namespace shop</code>, and with an
+admin context setup makes <a href="#through-mcp">its deployer agent token</a> now, in
+<code>mcp-propose-token-shop.json</code>. Setup keeps <code>relish mcp --propose</code>'s rules:
+<code>--propose</code> without <code>--namespace</code> is refused (exit <code>2</code>, <code>usage</code>), because
+the token could otherwise propose in every namespace. Given a token by
+<code>--token</code> or <code>RELIABURGER_TOKEN</code>, setup makes none, and warns that it can't
+tell whether that token is a person's; it warns too if the token is an
+admin one, or if the saved context's token turns out not to be admin. Each
+warning names the <code>relish token create --agent</code> command to run instead.
+Switching between plain setup and <code>--propose</code>, or to another namespace,
+replaces setup's own entry with no <code>--force</code>; <code>--remove</code> takes either out.</p>
 </section>
 <section class="agents-section" id="with-a-local-model">
 <h2>With a local model <a class="permalink" href="#with-a-local-model" aria-label="Link to this section">#</a></h2>
@@ -980,12 +1002,18 @@ with <code>--propose</code> (see <a href="#through-mcp">Through MCP</a>) rather 
 to run <code>relish agent propose</code> itself. Writing your own loop? Send the task as
 a system message: Ollama drops the oldest messages to fit the window, and
 keeps system ones.</p>
-<p>We measure local models in the gym, with Qwen3 8B first. On 9 November it
-made no change in any run, found a crash loop every time at a 32K window,
-and missed nearly everything that needed a typed command or a long session.
-The loop we used, <code>scripts/gym/local_model.py</code>, is a plain one: the model,
-<code>relish mcp</code>'s tools and a <code>relish</code> command, and nothing else. The <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-09-gym-local-models.md">record</a>
-has the numbers. We haven't measured Goose or any other client with a local
+<p>We measure local models in the gym. On 9 November four of them ran every
+scenario three times at an 8K window, with <code>relish mcp</code>'s 8 KiB default
+and all its tools: Qwen3 8B and
+Qwen3 14B got 12 of 36 runs right, Llama 3.1 8B 7 and gpt-oss 20B 6. None
+changed the cluster. The best of them find crash loops and apps that can't
+be placed, and they miss what needs a step of their own: a fix in the
+source, a report, the partitioned node (Qwen3 8B every time), and most
+proposals, even with <code>--propose</code> (Qwen3 proposed in 7 of 24 runs). The loop
+we used, <code>scripts/gym/local_model.py</code>, is a plain one: the model, <code>relish mcp</code>'s tools and a <code>relish</code> command, and nothing else. The <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-09-gym-local-models.md">first
+record</a>
+and the <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-10-gym-local-models-second-pass.md">second</a>
+have the numbers. We haven't measured Goose or any other client with a local
 model.</p>
 </section>
 <section class="agents-section" id="sending-us-a-bug-or-a-fix">
