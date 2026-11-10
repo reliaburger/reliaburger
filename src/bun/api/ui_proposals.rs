@@ -128,6 +128,7 @@ impl Decision {
 /// `POST /ui/proposal/{id}/approve`.
 pub(super) async fn ui_proposal_approve_handler(
     session: Option<axum::Extension<BrowserSession>>,
+    known: Option<axum::Extension<KnownMembers>>,
     State(state): State<ApiState>,
     headers: HeaderMap,
     Path(id): Path<u64>,
@@ -139,6 +140,7 @@ pub(super) async fn ui_proposal_approve_handler(
     decide(
         &state,
         session.as_deref(),
+        known,
         &headers,
         ProposalId(id),
         decision,
@@ -161,6 +163,7 @@ pub(super) async fn ui_proposal_reject_handler(
     decide(
         &state,
         session.as_deref(),
+        None,
         &headers,
         ProposalId(id),
         decision,
@@ -183,12 +186,21 @@ pub(super) async fn ui_proposal_undo_handler(
     decide(
         &state,
         session.as_deref(),
+        None,
         &headers,
         ProposalId(id),
         decision,
         form,
     )
     .await
+}
+
+/// `Authorization: Bearer TOKEN`, marked sensitive so it's never printed
+/// with the headers. `None` if the token holds a byte a header can't.
+fn bearer_header(token: &str) -> Option<axum::http::HeaderValue> {
+    let mut value = axum::http::HeaderValue::from_str(&format!("Bearer {}", token.trim())).ok()?;
+    value.set_sensitive(true);
+    Some(value)
 }
 
 /// The fields a decision form posts. No `Debug`, so the pasted token can't
@@ -267,6 +279,7 @@ impl DecisionForm {
 async fn decide(
     state: &ApiState,
     session: Option<&BrowserSession>,
+    known: Option<axum::Extension<KnownMembers>>,
     headers: &HeaderMap,
     id: ProposalId,
     (decision, action): (Decision, crate::config::PermissionAction),
@@ -338,19 +351,35 @@ async fn decide(
         .await;
     }
 
-    // No headers: the decision runs here, on the leader, and a session
-    // cookie forwarded anywhere else would mean nothing there.
+    // The decision runs here, on the leader, and a session cookie
+    // forwarded anywhere else would mean nothing there, so none is passed.
     let extension = Some(axum::Extension(context.clone()));
     let path = Path(id.0);
     let response = match decision {
         Decision::Approve => {
+            // A `clear_fault` is cleared on the node that holds the fault,
+            // as the approver, so the forwarded request needs the approver's
+            // credential, as `relish proposal approve` sends it: the pasted
+            // token, just shown to be the session's own.
+            let mut forwarded = HeaderMap::new();
+            match bearer_header(&form.token) {
+                Some(value) => {
+                    forwarded.insert(axum::http::header::AUTHORIZATION, value);
+                }
+                None => {
+                    return refused(
+                        StatusCode::UNAUTHORIZED,
+                        "that token can't be sent as a header; paste your API token again",
+                    );
+                }
+            }
             super::proposals::proposal_approve_handler(
                 extension,
                 State(state.clone()),
                 None,
-                None,
+                known,
                 path,
-                HeaderMap::new(),
+                forwarded,
             )
             .await
         }

@@ -7864,6 +7864,19 @@ anything more:
    the session the request rode in on: `audit::refused_as` names the
    caller on the response, and the audit layer keeps it.
 
+Calling the handler directly left one gap, and review found it before the
+train merged. Approving a `clear_fault` clears the fault on the node that
+holds it, and when that isn't the leader, the leader forwards the clear
+there with the caller's `Authorization` header. The form handler passed an
+empty `HeaderMap`, so the other node answered 401, the proposal was
+recorded as failed, and the fault stayed. Now an approval passes the pasted
+token as `Authorization: Bearer`, the same credential `relish proposal
+approve` sends. It's built with `HeaderValue::set_sensitive`, so a `Debug`
+print of the headers shows `Sensitive` in its place. The approval also
+passes the members the node knows, so a node that gossip says is dead can
+still be reached to clear a fault. A cluster test approves a fault that a
+follower holds, through the dashboard, and watches it go.
+
 Those five are the browser path's defences, and each has a test that
 attacks it. Paste-the-token is the one that costs something: a person
 deciding from the dashboard needs their token to hand. We chose it over

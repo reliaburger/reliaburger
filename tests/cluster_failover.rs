@@ -2647,3 +2647,172 @@ async fn the_dashboard_decides_a_proposal_on_the_leader_only() {
     assert_eq!(proposal.state.name(), "applied");
     fixture.root.cancel();
 }
+
+/// The faults one node holds, as its own `GET /v1/fault` lists them.
+async fn local_fault_ids(node: &WiredNode, bearer: &str) -> Vec<u64> {
+    let response = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{}/v1/fault", node.api_port))
+        .bearer_auth(bearer)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .expect("the node answers");
+    let faults: Vec<reliaburger::smoker::types::FaultSummary> =
+        response.json().await.expect("a fault list");
+    faults.iter().map(|fault| fault.id).collect()
+}
+
+/// #1682: a `clear_fault` approved on the dashboard clears a fault that
+/// another node holds. The leader clears it there as the approver, so the
+/// forwarded request carries the token the person pasted into the form,
+/// as `relish proposal approve` would send its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host; run with make test-cluster"]
+async fn the_dashboard_clears_a_fault_another_node_holds() {
+    assert!(cluster_tests_enabled());
+    let operator = admin_token("operator");
+    let mut fixture = Fixture::new();
+    let faults = || NodePlacement {
+        test_operations: true,
+        ..NodePlacement::default()
+    };
+    let mut nodes = vec![
+        fixture
+            .start_node_with(730, vec![], false, Some(operator.token.clone()), faults())
+            .await,
+    ];
+    for index in 731..733 {
+        let seed = fixture.gossip(730);
+        nodes.push(
+            fixture
+                .start_node_with(
+                    index,
+                    vec![seed],
+                    false,
+                    Some(operator.token.clone()),
+                    faults(),
+                )
+                .await,
+        );
+    }
+    let (leader, followers) = settled_roles(&nodes).await;
+    let holder = &nodes[followers[0]];
+    let mut holmes = reliaburger::sesame::token::create_token(
+        "holmes",
+        reliaburger::sesame::types::ApiRole::Deployer,
+        reliaburger::sesame::types::TokenScope {
+            apps: None,
+            namespaces: Some(vec!["shop".to_string()]),
+        },
+        None,
+    )
+    .unwrap();
+    holmes.token.kind = reliaburger::sesame::types::TokenKind::Agent;
+    grant(&nodes, &holmes.token).await;
+
+    let web = AppId::new("web", "shop");
+    let spec: reliaburger::config::app::AppSpec =
+        toml::from_str("image = \"web:v1\"\nreplicas = 1\nnamespace = \"shop\"").unwrap();
+    nodes[leader]
+        .council
+        .write(RaftRequest::AppSpec {
+            app_id: web.clone(),
+            spec: Box::new(spec),
+        })
+        .await
+        .unwrap();
+
+    // A fault on web that the follower holds.
+    let request = reliaburger::smoker::types::FaultRequest {
+        workload: Default::default(),
+        task_index: None,
+        fault_type: reliaburger::smoker::types::FaultType::DnsNxdomain,
+        target_service: "web".to_string(),
+        namespace: Some("shop".to_string()),
+        target_instance: None,
+        target_node: Some(holder.name.clone()),
+        duration: Duration::from_secs(300),
+        injected_by: String::new(),
+        reason: Some("dashboard clear drill".to_string()),
+        include_leader: false,
+        override_safety: false,
+        acknowledged: true,
+    };
+    let (status, injected) = post_json(
+        holder,
+        &operator.plaintext,
+        "/v1/fault",
+        &serde_json::to_string(&request).unwrap(),
+    )
+    .await
+    .expect("the follower answers");
+    assert!((200..300).contains(&status), "{status}: {injected}");
+    let mut ids = Vec::new();
+    wait_until(
+        "the follower lists its fault",
+        Duration::from_secs(30),
+        async || {
+            ids = local_fault_ids(holder, &operator.plaintext).await;
+            !ids.is_empty()
+        },
+    )
+    .await;
+    let fault = ids[0];
+
+    let (status, body) = post_json(
+        &nodes[leader],
+        &holmes.plaintext,
+        "/v1/proposals",
+        &serde_json::json!({
+            "kind": "clear_fault",
+            "fault": fault,
+            "node": holder.name,
+            "reason": "the drill is over",
+        })
+        .to_string(),
+    )
+    .await
+    .expect("the leader answers");
+    assert_eq!(status, 201, "{body}");
+    let id = body["id"].as_u64().unwrap();
+
+    // The operator approves it in the leader's dashboard.
+    let (status, _, cookie) = browse(
+        &nodes[leader],
+        reqwest::Method::POST,
+        "/ui/session",
+        None,
+        &[("token", &operator.plaintext)],
+    )
+    .await;
+    assert_eq!(status, 303);
+    let cookie = cookie.expect("a session cookie");
+    let session = reliaburger::sesame::session::session_id_from_cookie_header(&cookie).unwrap();
+    let csrf = reliaburger::sesame::session::csrf_token_for(session);
+    let (status, html, _) = browse(
+        &nodes[leader],
+        reqwest::Method::POST,
+        &format!("/ui/proposal/{id}/approve"),
+        Some(&cookie),
+        &[
+            ("csrf", &csrf),
+            ("token", &operator.plaintext),
+            ("confirm", "web"),
+        ],
+    )
+    .await;
+    assert_eq!(status, 303, "{html}");
+    let state = nodes[leader].council.desired_state().await;
+    let proposal = state
+        .proposals
+        .get(reliaburger::proposal::ProposalId(id))
+        .unwrap();
+    assert_eq!(proposal.state.name(), "applied", "{proposal:?}");
+    assert!(
+        !local_fault_ids(holder, &operator.plaintext)
+            .await
+            .contains(&fault),
+        "the follower still holds fault {fault}"
+    );
+    fixture.root.cancel();
+}
