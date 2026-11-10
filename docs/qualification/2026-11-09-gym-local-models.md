@@ -32,6 +32,11 @@ runs. No change made it type a command, propose a change or draft a report.
 These are single-model runs on one machine, three per scenario, and a plain
 loop: read them as a sketch of where a small model breaks, not a score.
 
+The [second pass](2026-11-10-gym-local-models-second-pass.md), the same
+evening, reran run C's settings on the tuned `relish` (#1813) with Qwen3 8B,
+Qwen3 14B, Llama 3.1 8B and gpt-oss 20B, and the proposal scenarios with
+`relish mcp --propose` (#1825).
+
 ## Setup
 
 - Host: the Mac Studio (Apple M5 Max, 128 GiB, macOS 27.2). The gym and
