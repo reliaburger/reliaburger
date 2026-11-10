@@ -5925,7 +5925,9 @@ they could still ask for more than it. Now `budget.rs` is the only place
 that writes the step. A command hands it an `Overflow { whole, max_bytes }`
 and gets back the budget to ask for, or `None` when nothing bigger can be
 had, and a test scans `src/relish` for any other `--max-bytes {` and fails
-if it finds one.
+if it finds one. The test earned its keep at once: the guide's outline and
+its cut sections, built in parallel on another branch, each wrote their own
+step too, and it caught both the first time the two branches met.
 
 **`next` that leads into the source.** `diagnose` gave each finding three
 next steps: `explain` it, scope the diagnosis to the app, and show the 40
@@ -6024,13 +6026,15 @@ too small for "In brief" leaves it out whole and names it first in `next`.
 A section can still be bigger than its budget at 4 KiB. Then it's cut
 between paragraphs, never inside a sentence, and it says so: `truncated` is
 `true`, a warning says how many bytes of how many it kept, and the first
-`next` asks for the whole section. Finding the cut is a search from the end:
+`next` asks for the whole section, unless `relish mcp`'s ceiling puts it out
+of reach. That step's budget comes from `budget::Overflow`, like every
+other. Finding the cut is a search from the end:
 
 ```rust
 let cut = paragraph_breaks(&section.markdown)
     .into_iter()
     .rev()
-    .map(|end| make(&section.markdown[..end], Some(size)))
+    .map(|end| make(&section.markdown[..end], Some(overflow)))
     .find(|envelope| rendered_length(envelope) <= max_bytes);
 ```
 

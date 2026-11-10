@@ -26,7 +26,9 @@ use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::json;
 
-use super::{AgentError, BuildInfo, CommandName, Envelope, ErrorCode, NextStep, agent_command};
+use super::{
+    AgentError, BuildInfo, CommandName, Envelope, ErrorCode, NextStep, agent_command, budget,
+};
 use super::{Rendered, render};
 
 /// The chapter's file name inside `docs/manual/`.
@@ -500,7 +502,7 @@ fn section_envelope(
     let section = data.sections[index].clone();
     // The contents came with the outline; a section answer leaves them out
     // so the section has the budget to itself.
-    let make = |markdown: &str, whole: Option<usize>| {
+    let make = |markdown: &str, overflow: Option<budget::Overflow>| {
         let one = GuideData {
             chapter: data.chapter.clone(),
             title: data.title.clone(),
@@ -513,25 +515,28 @@ fn section_envelope(
             commands: Vec::new(),
         };
         let mut envelope = Envelope::answered(CommandName::Guide, relish.clone(), one);
-        if let Some(whole) = whole {
-            envelope = envelope
-                .mark_truncated()
-                .with_warning(format!(
-                    "guide_section_cut: {} is {} bytes and this is its first {}, up to a \
-                     paragraph break",
-                    section.id,
-                    section.markdown.len(),
-                    markdown.len()
-                ))
-                .with_next(NextStep {
-                    run: format!(
-                        "relish agent guide --section {} --max-bytes {}",
-                        section.id,
-                        whole.div_ceil(1024) * 1024
+        if let Some(overflow) = overflow {
+            envelope = envelope.mark_truncated().with_warning(format!(
+                "guide_section_cut: {} is {} bytes and this is its first {}, up to a \
+                 paragraph break",
+                section.id,
+                section.markdown.len(),
+                markdown.len()
+            ));
+            // Under `relish mcp`'s ceiling the whole section may be out of
+            // reach, and then no step asks for it (#1829).
+            if let Some(rerun) = overflow.rerun_budget() {
+                envelope = envelope.with_next(NextStep {
+                    run: budget::rerun_with(
+                        &format!("relish agent guide --section {}", section.id),
+                        rerun,
                     ),
-                    why: format!("the whole section, {whole} bytes"),
+                    why: overflow
+                        .out_of_reach()
+                        .unwrap_or_else(|| format!("the whole section, {} bytes", overflow.whole)),
                     read_only: true,
                 });
+            }
         }
         if let Some(entry) = &following {
             envelope = envelope.with_next(read_section(
@@ -549,12 +554,16 @@ fn section_envelope(
     if size <= max_bytes {
         return Ok(whole);
     }
+    let overflow = budget::Overflow {
+        whole: size,
+        max_bytes,
+    };
     let cut = paragraph_breaks(&section.markdown)
         .into_iter()
         .rev()
-        .map(|end| make(&section.markdown[..end], Some(size)))
+        .map(|end| make(&section.markdown[..end], Some(overflow)))
         .find(|envelope| rendered_length(envelope) <= max_bytes);
-    Ok(cut.unwrap_or_else(|| make("", Some(size))))
+    Ok(cut.unwrap_or_else(|| make("", Some(overflow))))
 }
 
 /// The byte offsets of the blank lines in `markdown` outside code blocks:
@@ -591,11 +600,19 @@ fn outline_envelope(
     whole: usize,
     max_bytes: usize,
 ) -> Envelope<GuideData> {
+    // Under `relish mcp`'s ceiling the whole chapter may be out of reach,
+    // and then the warning doesn't offer it (#1829).
+    let all_of_it = match (budget::Overflow { whole, max_bytes }).rerun_budget() {
+        Some(rerun) => format!(
+            ", or all of it with `{}`",
+            budget::rerun_with("relish agent guide", rerun)
+        ),
+        None => String::new(),
+    };
     let warning = format!(
         "guide_outline: the whole chapter is {whole} bytes, more than this budget of \
          {max_bytes}, so this is its contents and the sections to read first, each whole; \
-         read another with --section ID, or all of it with --max-bytes {}",
-        whole.div_ceil(1024) * 1024
+         read another with --section ID{all_of_it}"
     );
     let build = |sections: Vec<GuideSection>| {
         let mut steps = Vec::new();
@@ -1916,6 +1933,52 @@ Intro paragraph.\n\n## In brief\n\n\
             .unwrap()
             .len();
         assert!(kept > 1024, "4 KiB keeps most of what fits: {kept}");
+    }
+
+    /// Every `--max-bytes N` an answer names, in its `next` steps and its
+    /// warnings.
+    fn budgets_named(value: &serde_json::Value) -> Vec<usize> {
+        let mut texts: Vec<String> = Vec::new();
+        for step in value["next"].as_array().into_iter().flatten() {
+            texts.push(step["run"].as_str().unwrap_or_default().to_string());
+        }
+        for warning in value["warnings"].as_array().into_iter().flatten() {
+            texts.push(warning.as_str().unwrap_or_default().to_string());
+        }
+        texts
+            .iter()
+            .flat_map(|text| text.split("--max-bytes ").skip(1))
+            .filter_map(|rest| {
+                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                digits.parse().ok()
+            })
+            .collect()
+    }
+
+    /// The outline (#1826) and a cut section name a bigger budget, so under
+    /// the ceiling `relish mcp` sets (#1829) they never name more than it,
+    /// and at the ceiling they name none: asking can't get more.
+    #[tokio::test]
+    async fn under_a_ceiling_the_guide_never_asks_for_more_than_it() {
+        let section = super::super::budget::within_ceiling(2048, async {
+            guide_at(1024, Some("through-mcp"))
+        })
+        .await;
+        assert_eq!(budgets_named(&section), [2048], "{section}");
+        let section_at = super::super::budget::within_ceiling(2048, async {
+            guide_at(2048, Some("through-mcp"))
+        })
+        .await;
+        assert!(budgets_named(&section_at).is_empty(), "{section_at}");
+
+        let outline =
+            super::super::budget::within_ceiling(16 * 1024, async { guide_at(8 * 1024, None) })
+                .await;
+        assert_eq!(budgets_named(&outline), [16 * 1024], "{outline}");
+        let outline_at =
+            super::super::budget::within_ceiling(8 * 1024, async { guide_at(8 * 1024, None) })
+                .await;
+        assert!(budgets_named(&outline_at).is_empty(), "{outline_at}");
     }
 
     /// A blank line inside a code block isn't a paragraph break.
