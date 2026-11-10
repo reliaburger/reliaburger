@@ -377,7 +377,23 @@ struct RefusedCaller {
     namespace: Option<String>,
 }
 
-/// Attach a [`RefusedCaller`] to `response` if it refuses the request.
+/// Say that `response` refuses on behalf of `auth`, a credential the
+/// handler checked itself, rather than the one the request authenticated
+/// with. The dashboard's decision forms use it (#1682): the request rides
+/// a read-only session, but the person pasted an API token, and the
+/// refusal is that token's.
+pub(super) fn refused_as(response: &mut Response, auth: &crate::sesame::auth::AuthContext) {
+    let (principal, token_name) = audit_principal(Some(auth));
+    response.extensions_mut().insert(RefusedCaller {
+        principal,
+        token_name,
+        app: None,
+        namespace: None,
+    });
+}
+
+/// Attach a [`RefusedCaller`] to `response` if it refuses the request,
+/// unless the handler already named the caller ([`refused_as`]).
 fn mark_refusal(
     response: &mut Response,
     auth: Option<&crate::sesame::auth::AuthContext>,
@@ -387,6 +403,11 @@ fn mark_refusal(
         response.status(),
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
     ) {
+        return;
+    }
+    if let Some(named) = response.extensions_mut().get_mut::<RefusedCaller>() {
+        named.app = named.app.take().or(note.app);
+        named.namespace = named.namespace.take().or(note.namespace);
         return;
     }
     let (principal, token_name) = audit_principal(auth);

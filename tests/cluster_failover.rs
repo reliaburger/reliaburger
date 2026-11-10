@@ -2593,7 +2593,7 @@ async fn the_dashboard_decides_a_proposal_on_the_leader_only() {
         reqwest::Method::POST,
         &approve,
         Some(&cookie),
-        &[("csrf", &csrf)],
+        &[("csrf", &csrf), ("token", &bob.plaintext)],
     )
     .await;
     assert_eq!(status, 409, "{html}");
@@ -2631,7 +2631,7 @@ async fn the_dashboard_decides_a_proposal_on_the_leader_only() {
         reqwest::Method::POST,
         &approve,
         Some(&cookie),
-        &[("csrf", &csrf)],
+        &[("csrf", &csrf), ("token", &bob.plaintext)],
     )
     .await;
     assert_eq!(status, 303, "{html}");

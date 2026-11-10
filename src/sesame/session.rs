@@ -5,16 +5,16 @@
 //! putting a CLI token in page JavaScript is a poor idea. Instead the browser
 //! exchanges a token once for an opaque, `HttpOnly` session cookie.
 //!
-//! Sessions are deliberately **read-only** regardless of the token's role.
-//! The dashboard only reads, and a read-only cookie contains the blast radius
-//! of any cross-site request forgery: a forged request riding the cookie can
-//! look but never mutate.
+//! Sessions are deliberately **read-only** regardless of the token's role,
+//! and a read-only cookie contains the blast radius of a forged request or a
+//! stolen cookie: whoever holds only the cookie can look but never mutate.
 //!
-//! There's one exception (#1682): a person deciding an agent's proposal.
-//! Those forms post to their own routes, which check the session's
-//! [`csrf_token_for`] token and act with the role of the token the session
-//! came from, looked up afresh; every other route still sees a read-only
-//! session.
+//! The dashboard has one kind of write (#1682): a person deciding an agent's
+//! proposal. The cookie alone still can't make it. Those forms post to
+//! routes of their own with the session's [`csrf_token_for`] token *and*
+//! the person's API token pasted in, which must be the very credential the
+//! session was opened with; the decision acts as that pasted token. Every
+//! route still sees a session as read-only.
 //!
 //! A session is also never worth more than the token it came from. It records
 //! which exact credential created it (the token's principal id) and cannot

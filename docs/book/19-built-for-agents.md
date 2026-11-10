@@ -7331,16 +7331,40 @@ anything more:
    post whose browser says `Sec-Fetch-Site: cross-site`, or whose `Origin`
    names another host, is refused, the same test `relish dashboard`'s proxy
    makes. The cookie was already `SameSite=Strict`.
-3. **It acts as the token, now.** `session_write_context` looks the
-   session's credential up in the token store at that moment and builds the
-   context that token would authenticate as: its own role, kind and scope.
-   A token revoked or expired since login decides nothing; an agent's
-   session comes back read-only, because the same `token_context` function
-   lowers an agent's role for both paths; the service token's session isn't
-   in the store, so it gets nothing.
-4. **The API decides.** The form handler calls the API's own handler
-   function with that context, so the checks, the Raft entry and the audit
-   record are the ones `relish proposal approve` gets.
+3. **It must not be framed.** `SameSite` lets the cookie into a frame on the
+   same *site*, and a site is wider than you'd think: another port on the
+   node, an app behind its ingress, a sibling subdomain. A page there could
+   lay our approve button under an innocent one of its own and catch the
+   click, and the post that results is `same-origin` with a matching
+   `Origin`. So every HTML page the API serves says it may not be framed,
+   `X-Frame-Options: DENY` for old browsers and `Content-Security-Policy:
+   frame-ancestors 'none'` for current ones, added by one `map_response`
+   layer over the whole router so a new page can't forget. And a decision
+   whose `Sec-Fetch-Dest` says it came from anything but a top-level
+   `document` is refused.
+4. **It takes the person's token, not just their cookie.** Each form asks
+   for the API token, pasted in. It must authenticate, and it must be the
+   very credential the session was opened with (the principal ids match);
+   the decision acts as that token. The cookie alone stays what it always
+   was, a read credential: whoever lifts it off a laptop, or catches it in
+   an app's logs, can read the dashboard and nothing more. The ingress
+   helps there too: a browser sends cookies by host, not by port, so it
+   takes `rb_session` out of every request before an app sees it.
+5. **The API decides.** The form handler calls the API's own handler
+   function with the pasted token's context, so the checks, the Raft entry
+   and the audit record are the ones `relish proposal approve` gets. A
+   refusal is audited as that token, with the API's reason, rather than as
+   the session the request rode in on: `audit::refused_as` names the
+   caller on the response, and the audit layer keeps it.
+
+Those five are the browser path's defences, and each has a test that
+attacks it. Paste-the-token is the one that costs something: a person
+deciding from the dashboard needs their token to hand. We chose it over
+re-entering it once per session because a decision is rare and a cookie
+lives twelve hours. Which forms to *show* still comes from
+`session_write_context`, which reads the session's token from the store
+and builds the context it would authenticate as, so a token revoked since
+login sees no buttons; that context is never used to write.
 
 The anti-forgery token is worth a closer look, because it isn't stored
 anywhere:
@@ -7362,6 +7386,11 @@ label makes it useless as anything but this. Deriving it means `Session`
 needs no new field, and nothing changes in the session store. The handler
 compares it with `tokens_equal`, the constant-time comparison the bearer
 path uses.
+
+Notice what it doesn't protect against: someone who already has the
+cookie can compute it too. That's the point of step 4. Our first version
+let cookie plus derived token decide, which quietly turned a read
+credential into a write one; asking for the API token put it back.
 
 ### Calling a handler as a function
 
@@ -7420,8 +7449,9 @@ and the server checks the name too.
 
 The buttons are a courtesy, not the check. A read-only viewer, an agent, a
 person scoped to another namespace and the author each see no form, and
-each is refused when the test posts one anyway, with the token derived from
-their cookie the way the server derives it.
+each is refused when the test posts one anyway, with their own API token
+and the anti-forgery token derived from their cookie the way the server
+derives it.
 
 ### The tests
 
@@ -7438,8 +7468,15 @@ list, approve with the form, see the audit record name bob as a human, undo
 it the same way; reject with a reason; refuse a form with no token, another
 session's token, a cross-site header or a bearer; and show no buttons to,
 and refuse, an agent, a reader, a person outside the namespace and the
-author. The authz matrix lists the three form routes, so the principal test
-posts to each as every caller below a deployer and expects a refusal.
+author. The `sec_` tests attack the defences one by one: a page that must
+carry both anti-framing headers, a post marked `Sec-Fetch-Dest: iframe`
+that must change nothing, a replayed cookie with its derived token and no
+API token (or someone else's) that must not approve, and a refused
+decision that must be audited as the pasted token with the API's reason.
+The ingress tests send `rb_session` beside an app's own cookie and check
+the backend sees only the app's. The authz matrix lists the three form
+routes, so the principal test posts to each as every caller below a
+deployer and expects a refusal.
 [`src/relish/agent/setup/tests.rs`](../../src/relish/agent/setup/tests.rs)
 checks that `--propose` without a namespace writes and mints nothing, that
 the entries run `relish mcp --propose --namespace shop`, that switching

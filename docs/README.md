@@ -1076,7 +1076,7 @@ approve: an agent token, `relish token create --agent`, can't change anything
 directly; the cluster writes the summary, diff, blast radius and undo
 command; `relish proposal list|show|approve|reject` and `relish undo` are the
 people's side, as is the web dashboard's Proposals page, whose approve,
-reject and undo buttons appear only for a token that may decide;
+reject and undo buttons appear only for a token that may decide and ask for that token;
 approval and application are one Raft entry, and a proposal
 whose apps changed in between fails as `stale`; guardrails are policies
 with `applies_to = "proposals"`, which may refuse a proposal or, with `action

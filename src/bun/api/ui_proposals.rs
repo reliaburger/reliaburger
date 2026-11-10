@@ -9,13 +9,15 @@
 //!   `SameSite=Strict`, so a page on another site can't send it at all.
 //! - Each form carries the session's anti-forgery token
 //!   ([`crate::sesame::session::csrf_token_for`]), compared in constant
-//!   time, and a browser that says the request is cross-site is refused.
-//! - The session itself stays read-only. A decision acts with the role and
-//!   scope of the token the session was made from, read from the store at
-//!   that moment ([`crate::sesame::auth::session_write_context`]), and goes
-//!   through the same handler, checks and audit record as `relish proposal
-//!   approve`. An agent's session, the service token's, or a token since
-//!   revoked decides nothing.
+//!   time, and a browser that says the request is cross-site, or comes from
+//!   inside a frame, is refused. Every page refuses to be framed at all
+//!   (`ui::forbid_framing`).
+//! - The session cookie stays read-only. Each form asks the person to paste
+//!   their API token; it must be the very credential the session was opened
+//!   with, still valid, and the decision acts as that token, through the
+//!   same handler, checks and audit record as `relish proposal approve`.
+//!   Someone holding only the cookie decides nothing, and an agent's token,
+//!   the service token, or one since revoked decides nothing either.
 //! - A node that isn't the council leader can't forward a session (the
 //!   leader has never seen the cookie), so it says where to go instead.
 //!
@@ -189,12 +191,56 @@ pub(super) async fn ui_proposal_undo_handler(
     .await
 }
 
-/// The fields a decision form posts.
-#[derive(Debug, Default)]
+/// The fields a decision form posts. No `Debug`, so the pasted token can't
+/// be printed by accident.
+#[derive(Default)]
 struct DecisionForm {
     csrf: String,
+    /// The person's API token, pasted for this one decision.
+    token: String,
     reason: String,
     confirm: String,
+}
+
+/// The context of the API token pasted into a decision form, once it's
+/// shown to be the very credential the session was opened with, still
+/// valid. The cookie alone is a read credential: whoever holds only the
+/// cookie can't produce the token.
+#[allow(clippy::result_large_err)]
+async fn pasted_token_context(
+    state: &ApiState,
+    session: &BrowserSession,
+    token: &str,
+) -> Result<crate::sesame::auth::AuthContext, Response> {
+    if token.trim().is_empty() {
+        return Err(refused(
+            StatusCode::UNAUTHORIZED,
+            "to decide, paste your API token into the form: the session cookie only reads",
+        ));
+    }
+    let Some(store) = state.token_store.as_ref() else {
+        return Err(refused(
+            StatusCode::UNAUTHORIZED,
+            "this node has no token store, so it can't check the token",
+        ));
+    };
+    let tokens = store.read().await.clone();
+    let Ok(context) = crate::sesame::auth::authenticate(token.trim(), &tokens) else {
+        return Err(refused(
+            StatusCode::UNAUTHORIZED,
+            "that token isn't valid (unknown, expired or rotated); paste your API token again",
+        ));
+    };
+    if !crate::sesame::auth::tokens_equal(&context.principal_id, &session.principal_id) {
+        // A real token, but not the one this session was opened with.
+        let mut response = refused(
+            StatusCode::FORBIDDEN,
+            "that isn't the token you logged in with; paste that one, or log in with this one",
+        );
+        super::audit::refused_as(&mut response, &context);
+        return Err(response);
+    }
+    Ok(context)
 }
 
 impl DecisionForm {
@@ -205,6 +251,7 @@ impl DecisionForm {
         for (key, value) in url::form_urlencoded::parse(body.as_bytes()) {
             match key.as_ref() {
                 "csrf" => form.csrf = value.into_owned(),
+                "token" => form.token = value.into_owned(),
                 "reason" => form.reason = value.into_owned(),
                 "confirm" => form.confirm = value.into_owned(),
                 _ => {}
@@ -241,11 +288,9 @@ async fn decide(
             "refused: the form's anti-forgery token doesn't match this session; reload the page",
         );
     }
-    let Some(context) = write_context(state, session).await else {
-        return refused(
-            StatusCode::FORBIDDEN,
-            "the token this session was made from is gone or can't decide; log in again",
-        );
+    let context = match pasted_token_context(state, session, &form.token).await {
+        Ok(context) => context,
+        Err(response) => return response,
     };
     // The same checks the API makes, here before anything else, so a
     // viewer the page offered no form gets the API's refusal.
@@ -355,6 +400,12 @@ async fn answer_refusal(
     response: Response,
 ) -> Response {
     let status = response.status();
+    // Why the API refused, for the audit record, which this new page
+    // would otherwise lose with the API's response.
+    let reason = response
+        .extensions()
+        .get::<crate::sesame::auth::RefusalReason>()
+        .copied();
     let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
         .await
         .unwrap_or_default();
@@ -363,7 +414,7 @@ async fn answer_refusal(
         .and_then(|body| body["error"].as_str().map(str::to_string))
         .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
     let notice = Notice::Refused(format!("refused ({}): {message}", status.as_u16()));
-    render_detail(
+    let mut page = render_detail(
         state,
         Some(context),
         Some(session),
@@ -371,7 +422,13 @@ async fn answer_refusal(
         Some(notice),
         status,
     )
-    .await
+    .await;
+    // Audited as the token that asked, not the session it rode in on.
+    super::audit::refused_as(&mut page, context);
+    if let Some(reason) = reason {
+        page.extensions_mut().insert(reason);
+    }
+    page
 }
 
 /// A plain refusal page, for a post that never got as far as a proposal.
@@ -387,12 +444,13 @@ fn refused(status: StatusCode, message: &str) -> Response {
     response
 }
 
-/// Whether the browser says this request came from another site, the way
-/// `relish dashboard`'s proxy asks: a `Sec-Fetch-Site` other than
-/// `same-origin` (or `none`, a typed navigation), or an `Origin` whose
-/// host isn't the one the request was sent to. A client that sends
-/// neither (an old browser, a script holding the cookie) still needs the
-/// form's token.
+/// Whether the browser says this request came from another site or from
+/// inside a frame: a `Sec-Fetch-Site` other than `same-origin` (or `none`,
+/// a typed navigation), as `relish dashboard`'s proxy asks, an `Origin`
+/// whose host isn't the one the request was sent to, or a `Sec-Fetch-Dest`
+/// other than `document`. A client that sends none of these (an old
+/// browser, a script) still needs the form's anti-forgery token and the
+/// person's own API token.
 fn cross_site(headers: &HeaderMap) -> bool {
     let header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
     let fetch_site =
@@ -401,7 +459,10 @@ fn cross_site(headers: &HeaderMap) -> bool {
         let authority = origin.split_once("://").map_or(origin, |(_, rest)| rest);
         Some(authority) != header("host")
     });
-    fetch_site || origin
+    // A form submitted from inside a frame is a clickjack even when it's
+    // same-origin: the browser marks it `iframe` (or `frame`, `embed`).
+    let framed = header("sec-fetch-dest").is_some_and(|dest| dest != "document");
+    fetch_site || origin || framed
 }
 
 /// What the session's token may do now, from the store.
@@ -522,8 +583,10 @@ mod tests {
 
     #[test]
     fn a_form_body_parses_and_ignores_the_unknown() {
-        let form = DecisionForm::parse("csrf=abc&reason=too+risky%21&confirm=web&extra=1");
+        let form =
+            DecisionForm::parse("csrf=abc&token=rbrg_x&reason=too+risky%21&confirm=web&extra=1");
         assert_eq!(form.csrf, "abc");
+        assert_eq!(form.token, "rbrg_x");
         assert_eq!(form.reason, "too risky!");
         assert_eq!(form.confirm, "web");
         assert_eq!(DecisionForm::parse("").csrf, "");
@@ -553,5 +616,8 @@ mod tests {
             ("origin", "https://evil.example")
         ])));
         assert!(cross_site(&with(&[("origin", "https://node-a:9117")])));
+        assert!(!cross_site(&with(&[("sec-fetch-dest", "document")])));
+        assert!(cross_site(&with(&[("sec-fetch-dest", "iframe")])));
+        assert!(cross_site(&with(&[("sec-fetch-dest", "empty")])));
     }
 }

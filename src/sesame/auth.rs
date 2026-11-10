@@ -235,12 +235,15 @@ fn token_context(stored: &ApiToken, principal_id: String) -> AuthContext {
     }
 }
 
-/// What a browser session may do when a person decides a proposal on the
-/// dashboard (#1682): the context of the token it was made from, with that
+/// The context of the token a browser session was made from, with that
 /// token's own role and scope, read from the store now, so a token revoked,
 /// expired, rotated past its grace period or changed since login counts as
 /// it stands. `None` when the credential is gone, and for a session made
 /// from the internal service token, which is no person.
+///
+/// The Proposals page (#1682) uses it only to decide which decision forms
+/// to show. Making a decision takes the API token itself, pasted into the
+/// form: this context is never a write credential.
 pub(crate) fn session_write_context(
     principal_id: &str,
     tokens: &[ApiToken],
@@ -499,6 +502,8 @@ pub async fn auth_middleware(
 
 /// The `AuthContext` for a browser session: always read-only, so a request
 /// riding a stolen or forged cookie can read the dashboard but never mutate.
+/// The dashboard's proposal decisions (#1682) aren't an exception: they act
+/// as an API token the person pastes into the form, never as the cookie.
 ///
 /// The originating token's **scope** is preserved (C3): a token confined to one
 /// app/namespace stays confined when it rides a session cookie, so exchanging
@@ -1295,10 +1300,10 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
     }
 
-    /// The dashboard's proposal forms act with the token's own role, read
-    /// from the store at the time, never the session's read-only one.
+    /// The Proposals page shows forms by the token's own role, read from the
+    /// store at the time, never the session's read-only one.
     #[tokio::test]
-    async fn a_session_decides_with_its_tokens_own_role_while_it_stands() {
+    async fn a_session_reports_its_tokens_own_role_while_it_stands() {
         let scope = TokenScope {
             apps: None,
             namespaces: Some(vec!["shop".to_string()]),

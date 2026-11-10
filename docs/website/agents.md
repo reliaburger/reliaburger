@@ -389,7 +389,8 @@ dashboard's Proposals page (`/ui/proposals`, linked from the Cluster card's
 `agents` line). The page shows your `reason` in a box marked as your own
 words, below the cluster's summary, diff, blast radius and undo plan. Its
 approve, reject and undo buttons appear only for a person's token that may
-decide; yours sees the command to copy.
+decide, and each asks that person to paste their API token; yours sees the
+command to copy.
 
 ## Reading an app's logs
 

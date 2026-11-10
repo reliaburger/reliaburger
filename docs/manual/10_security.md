@@ -226,19 +226,36 @@ one app still shows that app's charts on its dashboard page, but the dashboard
 leaves out the alert panel, and `relish top` shows only that app's rows.
 
 A browser session keeps its token's permissions, and it's read-only: a
-cookie can read the dashboard but change nothing, with one exception. On the
-Proposals page a person may approve, reject or undo an agent's proposal. Those
-forms appear only when the token the session came from may make that decision
-(a person's token, deployer or above, covering every app the proposal touches,
-and not its author), and the server checks again when one is posted: it reads
-that token from the store at that moment, so a token revoked since login
-decides nothing. Each form carries an anti-forgery token tied to the session,
-and the server refuses a post that the browser marks as cross-site or whose
-`Origin` is another host. The session cookie is `SameSite=Strict` as well.
-A decision acts as the token and lands in the audit log under its name, as
-`relish proposal approve` does. Only the council leader can apply one, so on
-another node the page says so and shows the command instead. `relish
-dashboard`'s proxy forwards no writes at all, so it shows the commands too.
+cookie can read the dashboard but never change anything. The Proposals page
+lets a person approve, reject or undo an agent's proposal, but the cookie
+can't do that on its own. These are the browser path's defences:
+
+- **Your token, every time.** Each decision form asks you to paste your API
+  token. It must be the token you logged in with, still valid, and the
+  decision acts as that token: the same checks, and the same audit record
+  under its name, as `relish proposal approve`. Someone holding only your
+  session cookie can read, never decide.
+- **Forms only for those who may decide.** The forms appear only when your
+  token may make that decision (a person's token, deployer or above,
+  covering every app the proposal touches, and not its author), and the
+  server checks again when one is posted.
+- **No forged or framed posts.** Each form carries an anti-forgery token
+  tied to the session. The server refuses a post the browser marks as
+  cross-site, as sent from inside a frame (`Sec-Fetch-Dest`), or whose
+  `Origin` is another host. Every dashboard page also refuses to be framed
+  (`X-Frame-Options: DENY` and `Content-Security-Policy: frame-ancestors
+  'none'`), and the session cookie is `SameSite=Strict`.
+- **The cookie stays on the node.** A browser sends cookies by host, not
+  port, so a request to an app served through this node's ingress could
+  carry the dashboard's `rb_session` cookie. The ingress takes it out
+  before the request reaches the app.
+- **The leader decides.** Only the council leader can apply a decision, so
+  on another node the page says so and shows the command instead.
+  `relish dashboard`'s proxy forwards no writes at all, so it shows the
+  commands too.
+
+A refused decision is audited as the token that was pasted, with the
+reason the API gave.
 
 A session opened with the cluster's service token reads everything and
 decides nothing. It isn't a node either, so the node-to-node routes refuse

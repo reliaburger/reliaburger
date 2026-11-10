@@ -328,5 +328,6 @@ first, then recent ones, each with its kind, target, author, age, state and,
 if it's gone stale, why. A proposal's own page shows the cluster's summary,
 the field diff, the blast radius and the undo plan, then the author's reason
 in a box that marks it as the author's own words. A person whose token may
-decide gets approve, reject and undo buttons there; see the dashboard
+decide gets approve, reject and undo buttons there, each asking for their
+API token, since the session cookie alone only reads; see the dashboard
 sessions part of `security`.

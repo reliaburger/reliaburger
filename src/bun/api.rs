@@ -956,6 +956,7 @@ pub fn router_with_upgrade(
     public
         .merge(auth_routes)
         .merge(protected)
+        .layer(axum::middleware::map_response(ui::forbid_framing))
         .layer(axum::middleware::from_fn_with_state(
             state,
             refuse_retired_tls_peer,

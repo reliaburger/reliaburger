@@ -379,13 +379,27 @@ fn render_actions(view: &ProposalView, actions: &Actions) -> String {
             String::new()
         }
     };
+    // Every form carries the session's anti-forgery token and asks for the
+    // person's API token: the cookie alone only reads.
     let csrf = actions.csrf_token.as_deref().map(|token| {
         format!(
-            "<input type=\"hidden\" name=\"csrf\" value=\"{}\">",
+            "<input type=\"hidden\" name=\"csrf\" value=\"{}\">\
+             <label>Your API token: <input type=\"password\" name=\"token\" required \
+             autocomplete=\"off\"></label> ",
             escape_html(token)
         )
     });
     let mut offered = false;
+    let forms = csrf.is_some()
+        && !actions.not_leader
+        && ((view.state == "pending" && actions.decide)
+            || (view.state == "applied" && actions.undo && view.undo.command.is_some()));
+    if forms {
+        html.push_str(
+            "<p class=\"untrusted-note\">Paste your API token to decide: the session alone \
+             can't decide, so a stolen cookie can only read.</p>\n",
+        );
+    }
     if view.state == "pending" {
         match (&csrf, actions.decide, actions.not_leader) {
             (Some(csrf), true, false) => {
@@ -684,6 +698,13 @@ mod tests {
                 .count(),
             2
         );
+        assert_eq!(
+            html.matches("<input type=\"password\" name=\"token\" required")
+                .count(),
+            2,
+            "each form asks for the person's API token"
+        );
+        assert!(html.contains("the session alone can't decide"));
         assert!(!html.contains("name=\"confirm\""), "exact needs no typing");
         assert!(!html.contains("/undo\""), "nothing to undo while pending");
     }
