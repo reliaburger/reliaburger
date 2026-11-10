@@ -117,6 +117,7 @@ mod tests {
                 rlimits: Vec::new(),
                 args: vec!["sh".to_string()],
                 env: vec![],
+                provider_env: Vec::new(),
                 cwd: "/".to_string(),
                 user: OciUser {
                     uid: 65534,

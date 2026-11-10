@@ -30,6 +30,7 @@ fn spec() -> OciSpec {
             rlimits: Vec::new(),
             args: vec!["hollow".into()],
             env: Vec::new(),
+            provider_env: Vec::new(),
             cwd: "/".into(),
             user: OciUser { uid: 0, gid: 0 },
             capabilities: None,

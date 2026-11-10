@@ -457,20 +457,25 @@ def solver_from_spec(spec, platform="reliaburger"):
     raise ValueError(f"unknown solver {spec!r}: use scripted or command:PROGRAM")
 
 
-def environment(base_env, shim_bin, call_log, answer_path, prompt_path, extra, meta_path=None,
-                platform="reliaburger"):
+def environment(base_env, shim_bin, call_log, answer_path, prompt_path, extra=None,
+                meta_path=None, platform="reliaburger", solver_token="read-only"):
     """The solver's environment: the shim first on PATH, and the gym's files.
 
     `GYM_SOLVER_META` names a file the solver may write a JSON object to
     (its model, client version, cost); the runner keeps it in the result.
+    `GYM_SOLVER_TOKEN` says which token `RELIABURGER_TOKEN` holds, the
+    scenario's `solver_token`: `read-only`, or `agent`, which proposes and
+    takes leases (#1682). A solver that starts its own `relish mcp`
+    (local_model.py) reads it to offer the tools that token allows.
     """
     env = dict(base_env)
-    env.update(extra)
+    env.update(extra or {})
     env["PATH"] = f"{shim_bin}{os.pathsep}{base_env.get('PATH', '')}"
     env["GYM_CALL_LOG"] = str(call_log)
     env["GYM_ANSWER"] = str(answer_path)
     env["GYM_PROMPT"] = str(prompt_path)
     env["GYM_PLATFORM"] = platform
+    env["GYM_SOLVER_TOKEN"] = solver_token
     if meta_path is not None:
         env["GYM_SOLVER_META"] = str(meta_path)
     return env

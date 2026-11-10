@@ -1650,6 +1650,30 @@ caller's spec back, borrowed, with no copy. One with provider values gets an
 owned copy with the secrets filled in. The caller uses either through `&*`
 without caring which.
 
+**Which values are references.** The first version found them by scanning
+the built environment for strings that start with `PROVIDER[`. By then that
+environment held more than references: the decrypted plaintext of every
+`ENC[AGE:...]` secret. So an encrypted value whose
+plaintext started with `PROVIDER[` was sent to a provider (#1819). The
+apply-time checks never saw it, because nobody can read an encrypted value
+at apply. It took someone who could set the app's secrets, and it could only
+reach a provider an admin had installed on the node, but it meant those
+checks didn't hold.
+
+The type knew all along. `EnvValue::Provider` is a different variant from
+`EnvValue::Encrypted`, and the information was lost only when the env was
+flattened into `KEY=value` strings. So the flattening keeps it: `OciProcess`
+gains `provider_env`, the names of the variables the config declared as
+references, and `resolve_env` resolves those names and nothing else. Every
+other entry passes through, whatever it looks like. An init container or a
+sidecar inherits the app's names, minus any its own `env` replaces, plus its
+own references. Jobs and task arrays never resolve anything: validation
+refuses a provider value there, so their `provider_env` stays empty. The
+test seals a real `ENC[AGE:...]` value whose plaintext is
+`PROVIDER[vault:secret/db#password]`, builds the spec with the key, launches
+it through a provider script that records any call, and checks the workload
+gets the plaintext and the provider is never run.
+
 That copy is the only place the resolved environment lives. The supervisor
 keeps the original, references and all, so a restart asks the provider again.
 That means a secret rotated at the source reaches the next restart, and Bun's

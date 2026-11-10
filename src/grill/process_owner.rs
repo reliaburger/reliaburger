@@ -965,6 +965,7 @@ mod tests {
                         rlimits: Vec::new(),
                         args: vec!["true".into()],
                         env: vec![],
+                        provider_env: Vec::new(),
                         cwd: "/".into(),
                         user: OciUser { uid: 0, gid: 0 },
                         capabilities: None,
