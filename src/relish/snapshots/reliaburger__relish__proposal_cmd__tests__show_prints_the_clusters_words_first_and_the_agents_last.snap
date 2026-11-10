@@ -6,7 +6,7 @@ Proposal 17 (scale, pending) by holmes (agent)
 Expires in 3540s.
 
 Scale shop/web from 3 to 5 replicas.
-Touches 1 app on 2 nodes (node-a, node-b); starts 2 instances (the scheduler places them when it applies).
+Touches 1 app on 2 nodes (node-a, node-b); starts 2 instances, forecast on node-c.
 Serves https://shop.example.com/ and the service web.shop.
 Undo: `relish undo 17` puts web back to 3 replicas.
 
@@ -19,6 +19,7 @@ Blast radius:
   apps: shop/web
   nodes: node-a, node-b
   instances: 0 replaced, 2 started, 0 stopped
+  forecast: new instances on node-c
   routes: shop.example.com/
   services: web.shop
 

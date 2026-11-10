@@ -7068,7 +7068,7 @@ all.
 
 ```text
 Scale shop/web from 3 to 5 replicas.
-Touches 1 app on 2 nodes (node-a, node-b); starts 2 instances (the scheduler places them when it applies).
+Touches 1 app on 2 nodes (node-a, node-b); starts 2 instances, forecast on node-c.
 Serves https://shop.example.com/ and the service web.shop.
 Undo: `relish undo 17` puts web back to 3 replicas.
 ```
@@ -7108,6 +7108,156 @@ leader's reaper compacts the record: the specs go, the summary, diff, blast
 radius and outcome stay. The same reaper expires proposals nobody decided
 (an hour by default), ends their leases, and writes `proposal.expired`
 under `system`.
+
+### A blast radius that's checked twice
+
+The blast radius a person reads was computed when the proposal was made.
+Approval can come an hour later, and by then the scheduler may have moved
+the app: a stop that touched `node-a` and `node-b` might now stop an
+instance on `node-c` too. Approving it would approve more than the person
+was shown. So the state machine computes the blast radius again, in the
+`ProposalApply` entry, from its own state, and fails the proposal if it
+reaches a node it didn't, or more instances:
+
+```rust
+let grew = self
+    .state
+    .proposals
+    .get(id)
+    .and_then(|proposal| blast_radius_growth(&self.state, proposal));
+if let Some(what) = grew {
+    return failed(self, FailedReason::BlastRadiusGrew { what });
+}
+```
+
+It's the same pure function the leader used to build the proposal, run
+over the same replicated state, so every node reaches the same verdict, as
+the revision check does. A blast radius that shrank isn't refused: a person
+who approved stopping three instances has approved stopping two. The answer
+is `stale`, like an app that changed, because the cure is the same: propose
+again. `relish status` calls such a proposal stale beforehand, in the same
+words, because both call `blast_radius_growth`.
+
+### Where the new instances would go
+
+A scale from three to five says it starts two instances. Where? The
+scheduler decides when the change applies, from the capacity the nodes
+report then. We didn't want a second scheduler that guesses, so the leader
+asks the real one: the scheduling loop already answered "would this new
+app fit?" for capacity admission, over a bounded channel. We turned the
+channel's message into an enum, `SchedulerRequest::{Admit, Forecast}`, and
+a forecast runs `plan_pass`, the function every scheduling tick runs, over
+a copy of desired state with the proposal's `after` specs, from a copy of
+the cache the real pass starts from. Nothing is reserved or written. The new
+placements' nodes become `new_nodes_forecast`; replicas it couldn't place,
+beyond any the app was already short of, become `unplaced_forecast`, with
+the scheduler's reason:
+
+```text
+Touches 1 app on 2 nodes (node-a, node-b); starts 3 instances, forecast on node-c; the scheduler can't place 2 (no node has enough free memory).
+```
+
+The design said a forecast that couldn't run goes into `unknown`, which
+holds a proposal for a person. We changed that. A new leader spends its
+first seconds learning what runs where, and a test cluster may have no
+scheduler at all; holding every scale for a person then would make
+approval policies flaky for no gain. A forecast that couldn't run says why
+in the summary ("no forecast: the leader is still learning what runs
+where") and blocks nothing. A forecast that ran and couldn't place
+everything does: built-in rule 3 gained a fourth clause, so a policy never
+approves a change the scheduler says won't fit.
+
+### Restart, cancel a rollout, clear a fault
+
+Three more kinds arrived after the first five.
+
+**`restart`** stamps the spec, as `kubectl rollout restart` stamps an
+annotation: `AppSpec::restarted_at`, in milliseconds on the leader's clock.
+The rollout fingerprint includes it, so the node-by-node rollout replaces
+every instance through its health checks, and a failed restart is a failed
+rollout like any other. Two things had to learn that a stamp isn't a
+version. `AppRollouts::release` and the rollback targets compare a
+`version_fingerprint` with the stamp set aside, so restarts don't push real
+versions out of the ten-entry history, and a rollback never picks "the same
+spec, restarted earlier". And `relish apply` of a file, which never carries
+the stamp, keeps the stored one, so applying the same file after a restart
+doesn't restart the app again. That last rule lives in the state machine's
+`apply_app_spec`, which every writer goes through, and uses a Rust pattern
+worth knowing, a deferred initialisation:
+
+```rust
+let carried;
+let spec = match (spec.restarted_at, stored_stamp) {
+    (None, Some(at)) if !self.exact_app_writes => {
+        carried = AppSpec { restarted_at: Some(at), ..spec.clone() };
+        &carried
+    }
+    _ => spec,
+};
+```
+
+`spec` is a borrow. In one arm we need to borrow a new value, which must
+live somewhere for as long as the borrow does. `let carried;` declares the
+place without filling it; the compiler checks it's assigned before it's
+read, and it lives to the end of the function, so `&carried` is fine. No
+`Box`, no `Cow`, no clone in the common arm. The `exact_app_writes` flag is
+set only while a proposal writes its apps: a proposal writes exactly what it
+showed, so cancelling the rollout of a first restart can put the unstamped
+spec back.
+
+A restart can't be undone, and says so. But it's the one irreversible change
+built-in rule 3 lets a policy approve: it changes nothing but the stamp, so
+`examples/agents/guardrails.toml` approves restarting one small app.
+
+**`cancel_deploy`** cancels a rollout in progress. The cluster's rollout
+state is already in the council: an app is mid-rollout when its spec isn't
+the newest one `AppRollouts` records as rolled out everywhere. Cancelling
+is a spec change back to that one, so it's an ordinary before and after,
+with an exact undo that starts the rollout again. With nothing rolling out,
+or nothing that ever finished, the proposal is refused with which.
+
+**`clear_fault`** is the first kind whose change isn't in the council at
+all: a Smoker fault lives on the node that holds it. So approval does two
+things. Before the `ProposalApply` entry, the leader clears the fault on its
+node, as the approver, through the same handler `relish fault clear` uses,
+with its checks (the approver's fault permission and reversal grant, the
+owning node's own refusal, the wait for a node-chaos reservation to be
+released); then the entry records `applied`, or `failed` with what the node
+said. `approve_with` takes the clear as a closure that returns a future:
+
+```rust
+pub async fn approve_with<F, Fut>(council: &CouncilNode, id: ProposalId,
+    approval: Approval, mut act: Option<F>) -> Result<ProposalOutcome, CouncilError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Option<FailedReason>>,
+```
+
+`FnOnce` because it runs at most once: `act.take()` moves the closure out of
+the `Option`, and calling it consumes it, so the compiler, not a flag,
+guarantees a fault isn't cleared twice by one approval. The plain `approve`
+passes `NO_ACTION`, a `None` with a concrete function-pointer type, because
+a bare `None` gives the compiler no `F` to infer. The clear runs only once
+the read-only versions of the state machine's checks pass, so it doesn't
+clear a fault for a proposal the entry would then fail. A `clear_fault`
+approved any other way, by the reaper say, is recorded `failed`: recording
+a fault as cleared that nobody cleared would be a lie. The review of this
+code caught a sharper one: a node's fault registry lives in memory, and its
+ids start again at 1 when its bun restarts, so by approval "fault 7" could be
+someone else's experiment on another app. The leader lists the node's faults
+again first and clears only if id, app, instance and kind still match. And a node fault isn't
+an agent's to propose: it changes a node, not an app.
+
+The issue asked for Smoker's safety pre-checks at approval. We looked, and
+`smoker::safety` judges *injections*: quorum, the last replica, the leader,
+half the nodes. Each rail stops a fault from taking capacity away; clearing
+gives it back, so no rail applies. What does apply is what `relish fault
+clear` already checks, and approval runs exactly that.
+
+We didn't build restarting one instance. Nothing in the cluster restarts a
+single instance on purpose today, and doing it would mean per-instance
+state on the nodes. An agent that wants one instance gone has `relish fault`
+with a person, or a restart of the app.
 
 ### The seam for the gym
 

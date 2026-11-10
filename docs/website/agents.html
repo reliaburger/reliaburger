@@ -382,10 +382,17 @@ person's write there, so if an agent sits on one, repeat your command with
 <p>An agent never changes the cluster. It proposes, and a person approves:</p>
 <pre><code class="language-sh">relish agent propose scale web --namespace shop --replicas 5 --reason "p99 over the SLO"
 </code></pre>
-<p>Also <code>apply FILE</code>, <code>rollback</code>, <code>stop</code>, <code>delete</code>; <code>--dry-run</code> stores nothing.
-The cluster writes the summary, diff, blast radius and <code>undo</code> command.
-Proposing leases each app until it's decided. <code>stale</code>: the app changed;
-propose again. <code>guardrail</code> (exit <code>4</code>): a policy refused it. A policy may
+<p>Also <code>apply FILE</code>, <code>rollback</code>, <code>stop</code>, <code>delete</code>, <code>restart APP</code> (replaces
+every instance through its health checks; can't be undone),
+<code>cancel-deploy APP</code> (back to the last spec that finished rolling out) and
+<code>clear-fault ID</code> (a Smoker fault on an app, from <code>relish fault list</code>, with
+<code>--node</code> if two nodes hold that id; can't be undone). <code>--dry-run</code> stores
+nothing. The cluster writes the summary, diff, blast radius and <code>undo</code>
+command; for instances it starts, the blast radius has the scheduler's
+forecast (<code>new_nodes_forecast</code>, and <code>unplaced_forecast</code> it can't place).
+Proposing leases each app until it's decided. <code>stale</code>: the app changed, or
+the blast radius grew (a new node) before approval; propose again.
+<code>guardrail</code> (exit <code>4</code>): a policy refused it. A policy may
 approve it at once (<code>approval.approved_by</code> is <code>policy:&lt;name&gt;</code>). <code>proposals</code>
 shows yours, <code>withdraw ID</code> takes one back, <code>undo ID</code> proposes the undo,
 refused as <code>stale</code> if anyone changed the app since.</p>

@@ -1,4 +1,4 @@
-# Guardrails for agent proposals (#1682): four policies that judge a
+# Guardrails for agent proposals (#1682): five policies that judge a
 # proposed change rather than an app. Apply them with an admin token,
 # `relish apply -f examples/agents/guardrails.toml`, and try them first
 # with `relish policy test -f examples/agents/guardrails.toml --proposal
@@ -31,3 +31,11 @@ match = 'author.kind == "agent" && proposal.kind == "scale" && proposal.namespac
 applies_to = "proposals"
 action = "approve"
 match = 'proposal.kind == "rollback" && size(proposal.apps) == 1 && proposal.instances <= 5'
+
+# Approve restarting one small app. A restart can't be undone, but it's the
+# one such change a policy may approve: it replaces instances through their
+# health checks and changes nothing else.
+[policy.agents-restart-small-apps]
+applies_to = "proposals"
+action = "approve"
+match = 'proposal.kind == "restart" && size(proposal.apps) == 1 && proposal.instances <= 5'

@@ -128,38 +128,60 @@ pub fn judge_proposal(input: &GuardInput<'_>) -> GuardVerdict {
         .iter()
         .chain(&input.proposal.findings)
         .any(|finding| finding.action == PolicyAction::Warn);
-    match held_for_a_person(
-        input.proposal.reversibility,
-        &input.proposal.blast_radius.unknown,
+    match held_for_a_person(&Hold {
+        kind: input.proposal.kind.name(),
+        reversibility: input.proposal.reversibility,
+        unknown: &input.proposal.blast_radius.unknown,
+        unplaced: input.proposal.blast_radius.unplaced_forecast,
         warned,
-    ) {
+    }) {
         Some(why) => verdict.held = Some(format!("policy {name} matched, but {why}")),
         None => verdict.approve = Some(name),
     }
     verdict
 }
 
+/// What built-in rule 3 reads of a proposal.
+#[derive(Debug, Clone, Copy)]
+pub struct Hold<'a> {
+    /// The kind's name: `restart` is the one exception to the
+    /// reversibility rule.
+    pub kind: &'a str,
+    /// How completely it can be undone.
+    pub reversibility: Reversibility,
+    /// What the leader couldn't see of its blast radius.
+    pub unknown: &'a [String],
+    /// New instances the scheduler's dry run couldn't place.
+    pub unplaced: u32,
+    /// Whether a `warn` policy flagged it.
+    pub warned: bool,
+}
+
 /// Built-in rule 3, which no policy can lift: why a person must approve
 /// this proposal even though an `approve` policy matched it, or `None`
 /// when a policy may. A policy never approves a change that can't be put
-/// back exactly, one a `warn` policy flagged, or one whose blast radius
-/// the leader couldn't fully see.
-pub fn held_for_a_person(
-    reversibility: Reversibility,
-    unknown: &[String],
-    warned: bool,
-) -> Option<&'static str> {
-    // `restart` will be the exception to the reversibility rule when it
-    // arrives (#1682): it changes no spec, so there's nothing to lose.
-    if reversibility != Reversibility::Exact {
+/// back exactly (a restart excepted), one a `warn` policy flagged, one
+/// whose blast radius the leader couldn't fully see, or one that starts
+/// instances the scheduler forecasts it can't place.
+pub fn held_for_a_person(hold: &Hold<'_>) -> Option<&'static str> {
+    // A restart changes nothing but the restart stamp, so there's nothing
+    // to lose; the rollout replaces instances through their health checks.
+    let restart = hold.kind == ProposalKind::Restart.name();
+    if hold.reversibility != Reversibility::Exact && !restart {
         return Some("it can't be undone exactly, so a person must approve it");
     }
-    if warned {
+    if hold.warned {
         return Some("a warn policy flagged it, so a person must approve it");
     }
-    if !unknown.is_empty() {
+    if !hold.unknown.is_empty() {
         return Some(
             "the leader couldn't see all of its blast radius, so a person must approve it",
+        );
+    }
+    if hold.unplaced > 0 {
+        return Some(
+            "the scheduler forecasts it can't place every instance it starts, so a person must \
+             approve it",
         );
     }
     None

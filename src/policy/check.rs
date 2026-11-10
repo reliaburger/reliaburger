@@ -40,7 +40,7 @@ pub const MAX_MESSAGE_BYTES: usize = 512;
 pub const MAX_DEFAULT_BYTES: usize = 4096;
 
 /// App fields a `default` can never fill, and why.
-pub const UNFILLABLE_FIELDS: [(&str, &str); 13] = [
+pub const UNFILLABLE_FIELDS: [(&str, &str); 14] = [
     ("name", "is the app's table name, not a field"),
     (
         "namespace",
@@ -75,6 +75,10 @@ pub const UNFILLABLE_FIELDS: [(&str, &str); 13] = [
     (
         "provenance",
         "says which template made the app, and only template expansion writes it",
+    ),
+    (
+        "restarted_at",
+        "restarts every matching app, and only an approved restart proposal stamps it",
     ),
 ];
 
@@ -170,7 +174,7 @@ const GATED_BY_THE_CALLER: &str = "can need host access or a runtime knob, which
 ///
 /// `namespace` is always present, resolved to `default` when the spec
 /// doesn't name one. A test checks this list against `AppSpec` itself.
-pub const APP_FIELDS: [&str; 36] = [
+pub const APP_FIELDS: [&str; 37] = [
     "name",
     "image",
     "command",
@@ -207,6 +211,7 @@ pub const APP_FIELDS: [&str; 36] = [
     "namespace",
     "provenance",
     "owner",
+    "restarted_at",
 ];
 
 /// The fields of `caller`.

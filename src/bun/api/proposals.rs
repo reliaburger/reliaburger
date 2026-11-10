@@ -151,10 +151,12 @@ async fn authorise_apps<'a>(
 
 /// `POST /v1/proposals`: propose a change. `?dry_run=true` answers the
 /// whole proposal without storing it.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn proposal_create_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     directory: Option<axum::Extension<LeaderDirectory>>,
+    capacity: Option<axum::Extension<crate::cluster::capacity::CapacityAdmission>>,
     Query(query): Query<ProposeQuery>,
     headers: HeaderMap,
     Json(request): Json<ProposalRequest>,
@@ -167,6 +169,7 @@ pub(super) async fn proposal_create_handler(
     }
     let action = match request.kind {
         RequestKind::Scale => crate::config::PermissionAction::Scale,
+        RequestKind::ClearFault => crate::config::PermissionAction::Fault,
         _ => crate::config::PermissionAction::Deploy,
     };
     let named = match crate::proposal::build::requested_apps(&request) {
@@ -214,19 +217,32 @@ pub(super) async fn proposal_create_handler(
     let author = principal_of(auth);
     let now = crate::testkit::lease::now_unix_millis();
     let desired = council.desired_state().await;
-    let history_target = rollback_history_target(&state, &desired, &request).await;
+    let fault = match request.kind {
+        RequestKind::ClearFault => match find_fault(&state, &request).await {
+            Ok(fault) => Some(fault),
+            Err(refusal) => {
+                record_refusal(&state, auth, &request, &refusal).await;
+                return refusal_response(&refusal, None);
+            }
+        },
+        _ => None,
+    };
+    let context = crate::proposal::build::BuildContext {
+        history_target: rollback_history_target(&state, &desired, &request).await,
+        fault,
+    };
     let built = {
         let author = author.clone();
         let request = request.clone();
         tokio::task::spawn_blocking(move || {
             let policies = desired.policies.clone();
-            let built = crate::proposal::build::build_with_history(
+            let built = crate::proposal::build::build_with_context(
                 &desired,
                 &request,
                 &author,
                 now,
                 |app, spec| crate::proposal::guard::fill_defaults(&policies, &author, app, spec),
-                history_target.as_ref(),
+                &context,
             );
             (built, policies)
         })
@@ -250,9 +266,13 @@ pub(super) async fn proposal_create_handler(
             return refusal_response(&refusal, None);
         }
     };
-    // An undo's apps come from the original; the caller must cover them.
+    // An undo's apps come from the original, and a clear_fault's from the
+    // fault; the caller must cover them.
     if let Err(response) = authorise_apps(&state, auth, action, proposal.apps()).await {
         return response;
+    }
+    if let Some(forecast) = forecast(capacity.as_deref(), &proposal).await {
+        crate::proposal::build::with_forecast(&mut proposal, forecast);
     }
     let verdict = crate::bun::proposals::judge(
         proposal.clone(),
@@ -370,9 +390,11 @@ pub(super) async fn proposal_approve_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     directory: Option<axum::Extension<LeaderDirectory>>,
+    known: Option<axum::Extension<KnownMembers>>,
     Path(id): Path<u64>,
     headers: HeaderMap,
 ) -> Response {
+    let auth_extension = auth.clone();
     let auth = auth.as_deref();
     let id = ProposalId(id);
     let proposal =
@@ -409,17 +431,259 @@ pub(super) async fn proposal_approve_handler(
     {
         return forwarded;
     }
-    let outcome = match crate::bun::proposals::approve(
-        council,
-        id,
-        Approval::Human(approver.clone()),
-    )
-    .await
-    {
+    let approval = Approval::Human(approver.clone());
+    let outcome = match &proposal.fault {
+        // The fault is cleared on its node, as the approver, with the
+        // checks `relish fault clear` makes, before the entry records it.
+        Some(fault) => {
+            let clear = clear_fault_action(
+                state.clone(),
+                auth_extension,
+                known,
+                headers.clone(),
+                fault.clone(),
+            );
+            crate::bun::proposals::approve_with(council, id, approval, Some(clear)).await
+        }
+        None => crate::bun::proposals::approve(council, id, approval).await,
+    };
+    let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(error) => return council_unavailable(error),
     };
     answer_outcome(&state, auth, outcome, &approver).await
+}
+
+/// Clear `fault` on its node as the approver, through the same handler as
+/// `relish fault clear ID --node NODE`: the approver's reversal grant,
+/// scope and `[permission]`, the owning node's own checks, and, for a fault
+/// that reserved node-chaos capacity, the wait for the council to release
+/// it. `None` when it's cleared; otherwise why not.
+fn clear_fault_action(
+    state: ApiState,
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    known: Option<axum::Extension<KnownMembers>>,
+    headers: HeaderMap,
+    fault: crate::proposal::FaultTarget,
+) -> impl FnOnce() -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = crate::bun::proposals::ActionResult> + Send>,
+> {
+    move || {
+        Box::pin(async move {
+            // A node's fault ids restart at 1 when its bun restarts, so the
+            // id may now name another fault. Clear it only if it's still
+            // the one the proposal showed.
+            let (listed, _) =
+                super::faults::collect_cluster_faults(&state, CLUSTER_STATUS_TIMEOUT).await;
+            if let Err(reason) = fault_still_matches(&fault, &listed) {
+                return Some(crate::proposal::FailedReason::Fault { reason });
+            }
+            let response = super::faults::fault_clear_handler(
+                auth,
+                State(state),
+                known,
+                headers,
+                Path(fault.id),
+                Query(super::faults::FaultClearQuery {
+                    node: Some(fault.node.clone()),
+                    acknowledged: false,
+                }),
+            )
+            .await;
+            if response.status().is_success() {
+                return None;
+            }
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap_or_default();
+            let said = serde_json::from_slice::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|value| value["error"].as_str().map(str::to_string))
+                .unwrap_or_else(|| String::from_utf8_lossy(&body).trim().to_string());
+            Some(crate::proposal::FailedReason::Fault {
+                reason: format!(
+                    "fault {} on node {} wasn't cleared ({status}): {said}",
+                    fault.id, fault.node
+                ),
+            })
+        })
+    }
+}
+
+/// Whether `listed` still holds the fault a `clear_fault` proposal
+/// recorded: the same id on the same node, on the same app, instance and
+/// kind of fault. A node's fault registry isn't persisted and its ids
+/// restart at 1, so after a restart the id can name a fault nobody
+/// proposed clearing; that one stays active.
+pub(crate) fn fault_still_matches(
+    recorded: &crate::proposal::FaultTarget,
+    listed: &[crate::smoker::types::FaultSummary],
+) -> Result<(), String> {
+    let Some(found) = listed.iter().find(|fault| {
+        fault.id == recorded.id
+            && fault
+                .node
+                .as_deref()
+                .is_none_or(|node| node == recorded.node)
+    }) else {
+        return Err(format!(
+            "fault {} on node {} is gone: it expired, or someone cleared it",
+            recorded.id, recorded.node
+        ));
+    };
+    let same = found.target_service == recorded.app.name
+        && found.namespace.as_deref() == Some(recorded.app.namespace.as_str())
+        && found.target_instance == recorded.instance
+        && found.fault_type == recorded.fault_type;
+    if same {
+        return Ok(());
+    }
+    Err(format!(
+        "fault {} on node {} is now {} on {}, not the {} on {} the proposal showed; it wasn't \
+         cleared (the node's fault ids restart after it restarts)",
+        recorded.id,
+        recorded.node,
+        found.fault_type,
+        found.namespace.as_deref().map_or_else(
+            || found.target_service.clone(),
+            |namespace| { format!("{namespace}/{}", found.target_service) }
+        ),
+        recorded.fault_type,
+        recorded.app
+    ))
+}
+
+/// The fault `request` names, found in every node's list: by id, and by
+/// node when two nodes hold the same id. Only a fault on an app may be
+/// proposed; a node fault changes a node, and a person clears it.
+async fn find_fault(
+    state: &ApiState,
+    request: &ProposalRequest,
+) -> Result<crate::proposal::FaultTarget, ProposalRefusal> {
+    let invalid = |reason: String| ProposalRefusal::Invalid { reason };
+    let Some(id) = request.fault else {
+        return Err(invalid(
+            "a clear_fault names the fault in `fault`, its id in `relish fault list`".to_string(),
+        ));
+    };
+    let (faults, warnings) =
+        super::faults::collect_cluster_faults(state, CLUSTER_STATUS_TIMEOUT).await;
+    let matching: Vec<_> = faults
+        .into_iter()
+        .filter(|fault| fault.id == id)
+        .filter(|fault| {
+            request
+                .node
+                .as_deref()
+                .is_none_or(|node| fault.node.as_deref() == Some(node))
+        })
+        .collect();
+    let fault = match matching.as_slice() {
+        [fault] => fault,
+        [] => {
+            let unread = if warnings.is_empty() {
+                String::new()
+            } else {
+                format!(" (some nodes didn't answer: {})", warnings.join("; "))
+            };
+            return Err(invalid(format!(
+                "there's no active fault {id}{}{unread}",
+                request
+                    .node
+                    .as_deref()
+                    .map(|node| format!(" on node {node}"))
+                    .unwrap_or_default()
+            )));
+        }
+        several => {
+            let nodes: Vec<&str> = several
+                .iter()
+                .filter_map(|fault| fault.node.as_deref())
+                .collect();
+            return Err(invalid(format!(
+                "nodes {} each hold a fault {id}; name one with `node`",
+                nodes.join(", ")
+            )));
+        }
+    };
+    let (Some(namespace), false) = (fault.namespace.as_deref(), fault.target_service.is_empty())
+    else {
+        return Err(ProposalRefusal::Guardrail {
+            rule: "node_fault".to_string(),
+            message: format!(
+                "fault {id} is a node fault; it changes a node, not an app, so a person clears \
+                 it with `relish fault clear {id}`"
+            ),
+        });
+    };
+    Ok(crate::proposal::FaultTarget {
+        id,
+        node: fault.node.clone().unwrap_or_else(|| local_node_name(state)),
+        app: crate::meat::AppId::new(&fault.target_service, namespace),
+        fault_type: fault.fault_type.clone(),
+        instance: fault.target_instance.clone(),
+        remaining_secs: fault.remaining_secs,
+        injected_by: fault.injected_by.clone(),
+    })
+}
+
+/// The scheduler's dry run for `proposal`, when it starts instances
+/// (#1682): asked of this node's scheduling loop, which runs on the
+/// leader. With no scheduler here, or one that can't answer yet, the
+/// forecast says why instead.
+async fn forecast(
+    capacity: Option<&crate::cluster::capacity::CapacityAdmission>,
+    proposal: &Proposal,
+) -> Option<crate::proposal::build::Forecast> {
+    if proposal.blast_radius.instances_started == 0 {
+        return None;
+    }
+    let Some(capacity) = capacity else {
+        return Some(crate::proposal::build::Forecast {
+            note: Some("this node runs no scheduler".to_string()),
+            ..Default::default()
+        });
+    };
+    let apps = proposal
+        .changes
+        .iter()
+        .map(|change| crate::cluster::capacity::ForecastApp {
+            app_id: change.app.clone(),
+            spec: change.after.spec.as_deref().cloned(),
+            stopped: change.after.stopped,
+        })
+        .collect();
+    match capacity.forecast(apps).await {
+        Ok(apps) => {
+            let mut forecast = crate::proposal::build::Forecast::default();
+            let mut reasons = Vec::new();
+            for (app, placed) in apps {
+                forecast
+                    .nodes
+                    .extend(placed.nodes.into_iter().map(|node| node.0));
+                forecast.unplaced += placed.unplaced;
+                if let Some(reason) = placed.reason {
+                    reasons.push(if proposal.changes.len() == 1 {
+                        reason
+                    } else {
+                        format!("{app}: {reason}")
+                    });
+                }
+            }
+            if !reasons.is_empty() {
+                forecast.note = Some(reasons.join("; "));
+            }
+            Some(forecast)
+        }
+        Err(error) => Some(crate::proposal::build::Forecast {
+            note: Some(match error {
+                crate::cluster::capacity::CapacityAdmissionError::Unavailable(why) => why,
+                other => other.to_string(),
+            }),
+            ..Default::default()
+        }),
+    }
 }
 
 /// `POST /v1/proposals/{id}/reject`: a person says no.
@@ -571,6 +835,11 @@ async fn authorise_decider(
     }
     crate::sesame::auth::authorize_user(auth, crate::sesame::types::ApiRole::Deployer)?;
     let proposal = read_proposal(state, auth, id).await?;
+    // Clearing a fault is a fault permission, as `relish fault clear` is.
+    let action = match proposal.kind {
+        crate::proposal::ProposalKind::ClearFault => crate::config::PermissionAction::Fault,
+        _ => action,
+    };
     authorise_apps(state, auth, action, proposal.apps()).await?;
     // By name too: a rotated token, or one made again under the same
     // name, is still its author here.
@@ -697,7 +966,11 @@ fn answer_decided(proposal: &Proposal) -> Response {
             rule: rule.clone(),
             message: message.clone(),
         },
-        crate::proposal::FailedReason::Refused { reason } => ProposalRefusal::WrongState {
+        crate::proposal::FailedReason::BlastRadiusGrew { what } => {
+            ProposalRefusal::BlastRadiusGrew { what: what.clone() }
+        }
+        crate::proposal::FailedReason::Refused { reason }
+        | crate::proposal::FailedReason::Fault { reason } => ProposalRefusal::WrongState {
             id: proposal.id,
             state: format!("failed: {reason}"),
         },
@@ -840,6 +1113,7 @@ fn refusal_response(refusal: &ProposalRefusal, view: Option<ProposalView>) -> Re
         | ProposalRefusal::Conflict { .. }
         | ProposalRefusal::LeaseHeld { .. }
         | ProposalRefusal::Stale { .. }
+        | ProposalRefusal::BlastRadiusGrew { .. }
         | ProposalRefusal::NoUndo { .. }
         | ProposalRefusal::Limit { .. } => StatusCode::CONFLICT,
     };

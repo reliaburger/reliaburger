@@ -156,6 +156,15 @@ pub struct AppSpec {
     /// or an admin changes it (`council::owner` has the rules).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
+    /// When an approved `restart` proposal last asked for every instance
+    /// to be replaced, in Unix milliseconds on the leader's clock (#1682),
+    /// as `kubectl rollout restart` stamps an annotation. It's part of the
+    /// rollout fingerprint, so a new stamp rolls every instance node by
+    /// node through the app's health checks. A write without one keeps the
+    /// stored stamp, so applying the same file after a restart doesn't
+    /// restart the app again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restarted_at: Option<u64>,
 }
 
 impl AppSpec {

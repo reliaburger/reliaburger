@@ -287,7 +287,30 @@ A proposal is a question for a person. The cluster writes everything you read
 about it from its own state, not the agent's words: a plain-language summary,
 the field diff, the blast radius (apps, nodes, instances replaced, started
 and stopped, ingress routes and service names), and the one command that
-undoes it. The agent's reason comes last, labelled as its own words.
+undoes it. For instances it starts, the blast radius has the scheduler's
+forecast: the nodes a dry run of its placement would use, against the
+capacity the nodes last reported, and how many it couldn't place, and why
+("the scheduler can't place 2"). It's a forecast; the scheduler places them
+when the change applies. The agent's reason comes last, labelled as its own
+words.
+
+An agent may propose `apply`, `scale`, `rollback`, `stop` and `delete`, and
+three more:
+
+- **`restart`** replaces every instance of one app, node by node through
+  its health checks, by stamping the spec's `restarted_at`. It can't be
+  undone, and says so. Applying the same file afterwards keeps the stamp,
+  so it doesn't restart the app again.
+- **`cancel_deploy`** cancels a rollout in progress: the app goes back to
+  the newest spec that finished rolling out everywhere, and nodes already on
+  the new one roll back. `relish undo` puts the new spec back, and its
+  rollout starts again.
+- **`clear_fault`** clears one Smoker fault on an app (`relish fault list`
+  gives its id). Approving it clears the fault on its node as you, with the
+  checks `relish fault clear` makes, so you need the fault permission and
+  the cluster's reversal grant; the proposal is recorded `failed` with what
+  the node said if it isn't cleared. It can't be undone. A node fault isn't
+  an agent's to clear: a person runs `relish fault clear`.
 
 ```sh
 relish proposal list            # newest first; BY shows who decided
@@ -306,8 +329,10 @@ above whose scope and `[permission]` spec cover every app the proposal
 touches, and you can't approve a proposal made under your own token's name.
 
 A proposal **fails**, and changes nothing, if any app it touches has changed
-since it was made, or someone other than its author holds a lease on one.
-`approve` then answers with why (`stale` or `lease_held`) and exits non-zero,
+since it was made, if someone other than its author holds a lease on one, or
+if its blast radius grew: approving computes it again, and a node it didn't
+touch before means you'd approve more than you were shown. `approve` then
+answers with why (`stale` or `lease_held`) and exits non-zero,
 and the agent proposes again. An agent's `relish agent undo` is refused
 straight away when the app has changed since the proposal applied.
 `relish undo` refuses in the same way when
@@ -364,12 +389,12 @@ it, or the author again when a policy approves it) and `source`, which is
 
 | Variable | Fields |
 |----------|--------|
-| `proposal` | `kind` (`apply`, `scale`, `rollback`, `stop`, `delete`, `undo`), `namespace`, `apps` (names), `nodes`, `instances` (replaced, started and stopped), `replicas_from` and `replicas_to` (a scale's, else 0), `reversibility` (`exact`, `lossy`, `none`), `fields` (the changed field paths) and `images` (in the new specs) |
+| `proposal` | `kind` (`apply`, `scale`, `rollback`, `stop`, `delete`, `restart`, `cancel_deploy`, `clear_fault`, `undo`), `namespace`, `apps` (names), `nodes`, `instances` (replaced, started and stopped), `replicas_from` and `replicas_to` (a scale's, else 0), `reversibility` (`exact`, `lossy`, `none`), `fields` (the changed field paths) and `images` (in the new specs) |
 | `author` | `name`, `kind` (`agent` or `human`) and `role` |
 
 The agent's reason isn't a variable: a guardrail that read it could be
 talked round by it. There's no clock either, so "only in office hours"
-can't be said. `examples/agents/guardrails.toml` has four:
+can't be said. `examples/agents/guardrails.toml` has five:
 
 ```toml
 [policy.agents-never-delete]
@@ -389,9 +414,12 @@ A `deny`, `warn` or `audit` guardrail works as it does for an app. `action =
 first approve policy, by name, whose `match` is true approves the proposal
 with no person, as soon as it's made, or within a second for one already
 waiting. The cluster never lets a policy approve a change it can't undo
-exactly (a delete of an app with managed volumes), one a `warn` policy
-flagged, or one whose blast radius it couldn't fully see; those wait for a
-person, and the `proposal.created` record says why. Only an admin writes
+exactly (a delete of an app with managed volumes, a cleared fault), one a
+`warn` policy flagged, one whose blast radius it couldn't fully see, or one
+that starts instances the scheduler forecasts it can't place; those wait
+for a person, and the `proposal.created` record says why. A `restart` is the
+one exception to the first rule: it changes nothing but the restart stamp,
+so a policy may approve it. Only an admin writes
 policies, so only an admin grants approval. A new cluster has none: every
 proposal waits for a person.
 
