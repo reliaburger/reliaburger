@@ -574,7 +574,9 @@ Not measured yet. The tokens and time an agent spends on the same task on each p
 
 **Small local models**
 
-Not measured yet. The agent gym with open models running locally, as well as Claude, is [#1687](https://github.com/reliaburger/reliaburger/issues/1687). Its results go here, all of them, when the runs are done.
+Four open models ran the agent gym in Ollama on our Mac Studio, at an 8K window, with a plain loop and three runs a scenario. Qwen3 8B and Qwen3 14B each got 12 of 36 runs right, Llama 3.1 8B 7 and gpt-oss 20B 6. They're good at the simple diagnoses: both Qwen3 models found the crash loops and the unschedulable app every time. They aren't good at anything that needs a step of their own. None fixed the planted bug in `relish`'s source, Qwen3 8B lost the partitioned node all three times, and even with the proposing tools the Qwen3 models proposed in 7 of 24 runs. None changed the cluster. Claude, five runs each on 0.2.7, got 29 of 30 on the six scenarios it ran.
+
+[The record](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-10-gym-local-models-second-pass.md) · [Running a local model](https://reliaburger.com/agents#with-a-local-model) · [#1687](https://github.com/reliaburger/reliaburger/issues/1687)
 
 [Proposals, for agents](https://reliaburger.com/agents#proposing-a-change) · [Test your agent on your cluster](https://github.com/reliaburger/reliaburger/blob/main/docs/manual/05_chaos.md#testing-your-agent-on-your-cluster) · [Agent tokens and proposals](https://github.com/reliaburger/reliaburger/blob/main/docs/manual/10_security.md#agent-tokens-and-proposals) · [The timeline](https://github.com/reliaburger/reliaburger/blob/main/docs/manual/07_diagnostics.md#relish-timeline-what-changed-and-why-did-it-do-that) · [Verify a cluster](https://github.com/reliaburger/reliaburger/blob/main/docs/manual/12_operations.md#is-this-the-release)
 

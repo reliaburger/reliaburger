@@ -631,6 +631,13 @@ async fn do_proxy(
         {
             continue;
         }
+        if name == axum::http::header::COOKIE {
+            let kept = value.to_str().ok().and_then(without_session_cookie);
+            if let Some(Ok(kept)) = kept.map(|kept| axum::http::HeaderValue::from_str(&kept)) {
+                forward_headers.push((name.clone(), kept));
+            }
+            continue;
+        }
         forward_headers.push((name.clone(), value.clone()));
     }
     let upstream = UpstreamRequest {
@@ -908,6 +915,26 @@ pub(super) fn is_forwarded_header(name: &str) -> bool {
         || name.eq_ignore_ascii_case("forwarded")
 }
 
+/// A client's `Cookie` header without the dashboard's session cookie, or
+/// `None` when nothing else is left in it.
+///
+/// A browser sends cookies by host, not by port, so a request to an app
+/// served on the same host as a node's API carries the node's dashboard
+/// session too. That cookie is the node's, not the app's: the proxy never
+/// hands it to a backend.
+pub(super) fn without_session_cookie(value: &str) -> Option<String> {
+    let kept: Vec<&str> = value
+        .split(';')
+        .map(str::trim)
+        .filter(|pair| !pair.is_empty())
+        .filter(|pair| {
+            pair.split_once('=').map_or(*pair, |(name, _)| name.trim())
+                != crate::sesame::session::SESSION_COOKIE
+        })
+        .collect();
+    (!kept.is_empty()).then(|| kept.join("; "))
+}
+
 /// The `X-Forwarded-*` headers the proxy sets from its own view of the
 /// connection. A client cannot influence these — we already stripped any it
 /// sent — so a backend can trust them (ING5).
@@ -987,6 +1014,20 @@ mod tests {
         let req_uri: Uri = "/".parse().unwrap();
         let upstream = build_upstream_uri(&addr, &req_uri).unwrap();
         assert_eq!(upstream.to_string(), "http://10.0.2.2:30001/");
+    }
+
+    #[test]
+    fn the_dashboard_session_cookie_is_taken_out_and_the_rest_kept() {
+        assert_eq!(
+            without_session_cookie("theme=dark; rb_session=abc; lang=en").as_deref(),
+            Some("theme=dark; lang=en")
+        );
+        assert_eq!(without_session_cookie("rb_session=abc"), None);
+        assert_eq!(without_session_cookie(" rb_session = abc ;"), None);
+        assert_eq!(
+            without_session_cookie("rb_session_other=1").as_deref(),
+            Some("rb_session_other=1")
+        );
     }
 
     #[test]
@@ -1172,7 +1213,9 @@ mod tests {
     /// ING5: a client that supplies its own `X-Forwarded-For`/`-Proto` has
     /// them replaced with the proxy's view, so a backend can't be lied to.
     /// A backend echoes the headers it received; the proxy must show the real
-    /// client IP and the scheme it terminated, not the client's claims.
+    /// client IP and the scheme it terminated, not the client's claims. The
+    /// dashboard's session cookie, which a browser sends to every port on
+    /// the host, is taken out too.
     #[tokio::test]
     async fn proxy_replaces_client_forwarded_headers() {
         use crate::onion::types::BackendInstance;
@@ -1253,10 +1296,16 @@ mod tests {
             .header("host", "web.test")
             .header("x-forwarded-for", "1.2.3.4")
             .header("x-forwarded-proto", "https")
+            .header("cookie", "rb_session=nodesecret0; theme=dark")
             .send()
             .await
             .unwrap();
         let echoed = resp.text().await.unwrap().to_lowercase();
+
+        // The node's dashboard session never reaches an app; its own
+        // cookies do.
+        assert!(!echoed.contains("nodesecret0"), "{echoed}");
+        assert!(echoed.contains("cookie: theme=dark"), "{echoed}");
 
         // The client's lie is gone; the proxy's real view is present.
         assert!(

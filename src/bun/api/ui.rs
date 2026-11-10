@@ -257,6 +257,34 @@ pub(super) async fn gather_dashboard_nodes(
 }
 
 /// Return an HTML response.
+/// Forbid framing on every HTML page the API serves (#1682).
+///
+/// The Proposals page carries approve buttons, and a page on the same site
+/// (an app behind this node's ingress, another port on the host) could
+/// frame it invisibly and steer a click. `X-Frame-Options` is the old
+/// browsers' spelling, `frame-ancestors` the current one; both say never.
+/// A layer over the whole router rather than a line per page, so a new
+/// page can't forget.
+pub(super) async fn forbid_framing(mut response: Response) -> Response {
+    let html = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/html"));
+    if html {
+        let headers = response.headers_mut();
+        headers.insert(
+            axum::http::header::X_FRAME_OPTIONS,
+            axum::http::HeaderValue::from_static("DENY"),
+        );
+        headers.insert(
+            axum::http::header::CONTENT_SECURITY_POLICY,
+            axum::http::HeaderValue::from_static("frame-ancestors 'none'"),
+        );
+    }
+    response
+}
+
 pub(super) fn html_response(html: String) -> Response {
     let mut headers = HeaderMap::new();
     headers.insert("content-type", "text/html; charset=utf-8".parse().unwrap());

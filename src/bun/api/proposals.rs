@@ -48,7 +48,10 @@ pub(crate) fn principal_of(auth: Option<&crate::sesame::auth::AuthContext>) -> P
 }
 
 /// Whether `auth`'s scope reaches every app `proposal` touches.
-fn visible(auth: Option<&crate::sesame::auth::AuthContext>, proposal: &Proposal) -> bool {
+pub(super) fn visible(
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    proposal: &Proposal,
+) -> bool {
     proposal
         .apps()
         .all(|app| crate::sesame::auth::authorize_scoped(auth, &app.name, &app.namespace).is_ok())
@@ -106,7 +109,7 @@ pub(super) async fn proposal_handler(
 }
 
 #[allow(clippy::result_large_err)]
-async fn read_proposal(
+pub(super) async fn read_proposal(
     state: &ApiState,
     auth: Option<&crate::sesame::auth::AuthContext>,
     id: ProposalId,
@@ -769,24 +772,9 @@ pub(super) async fn proposal_undo_handler(
     headers: HeaderMap,
 ) -> Response {
     let auth = auth.as_deref();
-    if let Err(response) =
-        crate::sesame::auth::authorize_user(auth, crate::sesame::types::ApiRole::Deployer)
-    {
-        return response;
-    }
     let id = ProposalId(id);
-    let proposal = match read_proposal(&state, auth, id).await {
-        Ok(proposal) => proposal,
-        Err(response) => return response,
-    };
-    if let Err(response) = authorise_apps(
-        &state,
-        auth,
-        crate::config::PermissionAction::Deploy,
-        proposal.apps(),
-    )
-    .await
-    {
+    let action = crate::config::PermissionAction::Deploy;
+    if let Err(response) = authorise_undoer(&state, auth, id, action).await {
         return response;
     }
     let Some(council) = &state.council else {
@@ -812,12 +800,27 @@ pub(super) async fn proposal_undo_handler(
     answer_outcome(&state, auth, outcome, &by).await
 }
 
+/// A person who may undo proposal `id` directly: a human token, deployer
+/// or above, covering every touched app. Agents propose an undo instead.
+#[allow(clippy::result_large_err)]
+pub(super) async fn authorise_undoer(
+    state: &ApiState,
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    id: ProposalId,
+    action: crate::config::PermissionAction,
+) -> Result<Proposal, Response> {
+    crate::sesame::auth::authorize_user(auth, crate::sesame::types::ApiRole::Deployer)?;
+    let proposal = read_proposal(state, auth, id).await?;
+    authorise_apps(state, auth, action, proposal.apps()).await?;
+    Ok(proposal)
+}
+
 /// A person who may decide proposal `id`: a human token (an agent's
 /// effective role is read-only, so the role check refuses it), deployer
 /// or above, covering every touched app. The state machine checks again
 /// that it isn't the author.
 #[allow(clippy::result_large_err)]
-async fn authorise_decider(
+pub(super) async fn authorise_decider(
     state: &ApiState,
     auth: Option<&crate::sesame::auth::AuthContext>,
     id: ProposalId,
