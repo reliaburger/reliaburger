@@ -498,6 +498,14 @@ enum LoopStall {
     /// Committing a verified upgrade: appending its history entry, pruning
     /// old binaries and removing the marker (#1381).
     UpgradeCommit,
+    /// Writing an instance's adoption record, or removing a restarted
+    /// instance's old one: an fsync each (#1853).
+    RecordWrite,
+    /// Writing a signed workload identity to its mount, an fsync per file.
+    IdentityWrite,
+    /// Starting an instance's log forwarder. Only counted: a step asked
+    /// again must start one forwarder, not two.
+    LogForwarder,
 }
 
 /// How long each [`LoopStall`] takes. Shared with the test through an `Arc`
@@ -917,7 +925,7 @@ pub struct BunAgent<G: Grill> {
     identity_signings: identity_signing::IdentitySignings,
     /// Those tasks. A follower's CSR waits on the leader for up to ten
     /// seconds, which must not stall every other command.
-    identity_signing_tasks: tokio::task::JoinSet<identity_signing::SignedIdentity>,
+    identity_signing_tasks: tokio::task::JoinSet<identity_signing::IdentityTaskOutput>,
     /// Apps adopted at startup and the spec their instances were launched
     /// from, until this agent deploys them again.
     adopted_apps: adopted_placements::AdoptedApps,
@@ -1666,6 +1674,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Runs off the event loop (the grill handle is cloned into the task), so
     /// following logs never blocks the agent.
     fn spawn_log_forwarder(&self, instance_id: &InstanceId, app_name: &str, namespace: &str) {
+        #[cfg(test)]
+        let _ = self.loop_stalls.reach(LoopStall::LogForwarder);
         let Some(log_tx) = self.log_tx.clone() else {
             return;
         };

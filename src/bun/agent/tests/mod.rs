@@ -13839,12 +13839,10 @@ async fn signed_identity_is_stored_only_for_a_live_instance() {
             task,
             super::identity_signing::IdentitySigning::for_test(id.clone()),
         );
-        let outcome = agent
-            .identity_signing_tasks
-            .join_next_with_id()
-            .await
-            .unwrap();
-        agent.finish_identity_provision(outcome).await;
+        // The signature, then the write of its files (#1853).
+        while let Some(outcome) = agent.identity_signing_tasks.join_next_with_id().await {
+            agent.finish_identity_provision(outcome).await;
+        }
     }
 
     let instance = agent.supervisor.get_instance(&live).unwrap();

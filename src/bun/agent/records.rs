@@ -30,14 +30,42 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Write (or refresh) the instance record used for adoption after a bun
     /// restart or self-upgrade exec. Application acknowledgement requires this
     /// metadata.
+    ///
+    /// The write runs in a task ([`off_loop_work`]) and holds the turn only
+    /// until its deadline (#1853): `StillRunning` means ask again, and the
+    /// ask that finds it landed carries on. Nothing may treat the instance
+    /// as running before then, because the record is what a restarted Bun
+    /// adopts it by.
     pub(super) async fn persist_instance_record(
-        &self,
+        &mut self,
         instance_id: &InstanceId,
         evidence: &launch_evidence::LaunchEvidence,
     ) -> Result<(), BunError> {
         let Some(dir) = self.records_dir.clone() else {
             return Ok(());
         };
+        let fail = |reason: &str| {
+            BunError::AdoptionState(format!("cannot record {instance_id}: {reason}"))
+        };
+        let key = off_loop_work::WorkKey::PersistRecord(instance_id.clone());
+        let incarnation = self.incarnation_of(instance_id);
+        // An ask after `StillRunning` only collects the write it started.
+        let record = if self.off_loop_work.started(&key, incarnation) {
+            None
+        } else {
+            Some(self.instance_record(instance_id, evidence)?)
+        };
+        self.write_record_within_turn(key, incarnation, dir, record)
+            .await?
+            .map_err(|reason| fail(&reason))
+    }
+
+    /// The adoption record for a fresh or restarted instance.
+    fn instance_record(
+        &self,
+        instance_id: &InstanceId,
+        evidence: &launch_evidence::LaunchEvidence,
+    ) -> Result<crate::grill::records::InstanceRecord, BunError> {
         let fail = |reason: &str| {
             BunError::AdoptionState(format!("cannot record {instance_id}: {reason}"))
         };
@@ -95,24 +123,83 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             oci_spec,
             rootless_network: evidence.rootless_network.clone(),
         };
+        Ok(record)
+    }
+
+    /// Write `record` under `key` from a task, waiting for it only until the
+    /// turn's deadline. `None` collects a write an earlier ask started.
+    async fn write_record_within_turn(
+        &mut self,
+        key: off_loop_work::WorkKey,
+        incarnation: Option<Instant>,
+        directory: PathBuf,
+        record: Option<crate::grill::records::InstanceRecord>,
+    ) -> Result<Result<(), String>, BunError> {
+        // Counted where the turn starts the write, not on each ask (#1625).
         #[cfg(test)]
-        self.loop_stalls.hold(LoopStall::Persist).await;
-        // LOOP-INLINE: fsync'd persist (#351 decision 2); the slow-disk scenario bounds it
-        tokio::task::spawn_blocking(move || crate::grill::records::write_record(&dir, &record))
+        let delay = record
+            .as_ref()
+            .and_then(|_| self.loop_stalls.reach(LoopStall::RecordWrite));
+        let write = async move {
+            // Only reached when no task exists for this incarnation, which
+            // `started` ruled out before passing `None`.
+            let Some(record) = record else {
+                return Err("the record write was never started".to_string());
+            };
+            #[cfg(test)]
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            tokio::task::spawn_blocking(move || {
+                crate::grill::records::write_record(&directory, &record)
+            })
             .await
-            .map_err(|error| fail(&error.to_string()))?
-            .map_err(|error| fail(&error.to_string()))
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())
+        };
+        self.finish_off_loop_work(key, incarnation, write).await
+    }
+
+    /// Whether `id`'s adoption record is being written right now. Removing
+    /// the record meanwhile would let the write land after it and leave a
+    /// record for an instance that no longer exists.
+    pub(super) fn record_write_in_flight(&self, id: &InstanceId) -> bool {
+        self.off_loop_work
+            .is_running(&off_loop_work::WorkKey::PersistRecord(id.clone()))
     }
 
     /// Persist launch evidence while the replacement is still owned by its
-    /// rolling worker, before health wait or traffic publication.
+    /// rolling worker, before health wait or traffic publication. Like
+    /// [`Self::persist_instance_record`], the write holds the turn only until
+    /// its deadline: `StillRunning` means ask again.
     pub(super) async fn persist_rolling_instance(
-        &self,
+        &mut self,
         instance: &RollingInstance,
     ) -> Result<(), BunError> {
         let Some(directory) = self.records_dir.clone() else {
             return Ok(());
         };
+        let fail = |reason: String| BunError::DeployFailed {
+            app_name: instance.app_name.clone(),
+            reason,
+        };
+        let key = off_loop_work::WorkKey::PersistRecord(instance.instance_id.clone());
+        let incarnation = self.incarnation_of(&instance.instance_id);
+        let record = if self.off_loop_work.started(&key, incarnation) {
+            None
+        } else {
+            Some(self.rolling_record(instance)?)
+        };
+        self.write_record_within_turn(key, incarnation, directory, record)
+            .await?
+            .map_err(|reason| fail(format!("persist replacement record: {reason}")))
+    }
+
+    /// The adoption record for a rolling replacement.
+    fn rolling_record(
+        &self,
+        instance: &RollingInstance,
+    ) -> Result<crate::grill::records::InstanceRecord, BunError> {
         let fail = |reason: String| BunError::DeployFailed {
             app_name: instance.app_name.clone(),
             reason,
@@ -152,13 +239,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             oci_spec: instance.oci_spec.clone(),
             rootless_network: instance.launch.rootless_network.clone(),
         };
-        // LOOP-INLINE: fsync'd persist (#351 decision 2); the slow-disk scenario bounds it
-        tokio::task::spawn_blocking(move || {
-            crate::grill::records::write_record(&directory, &record)
-        })
-        .await
-        .map_err(|error| fail(format!("persist replacement record: {error}")))?
-        .map_err(|error| fail(format!("persist replacement record: {error}")))
+        Ok(record)
     }
 
     /// Reconcile launches that reached the runtime before agent adoption was durable.

@@ -69,6 +69,11 @@ pub(super) enum WorkKey {
     FenceNetworkReference(InstanceId),
     /// Handing a retiring instance's network reference back to the runtime.
     ReleaseNetworkReference(InstanceId),
+    /// Writing an instance's adoption record, an fsync a slow disk can make
+    /// take seconds (#1853).
+    PersistRecord(InstanceId),
+    /// Removing a restarted instance's previous adoption record.
+    RemoveRestartRecord(InstanceId),
 }
 
 impl std::fmt::Display for WorkKey {
@@ -95,6 +100,10 @@ impl std::fmt::Display for WorkKey {
             }
             WorkKey::ReleaseNetworkReference(id) => {
                 write!(f, "releasing {id}'s network reference")
+            }
+            WorkKey::PersistRecord(id) => write!(f, "writing {id}'s adoption record"),
+            WorkKey::RemoveRestartRecord(id) => {
+                write!(f, "removing {id}'s previous adoption record")
             }
         }
     }
@@ -125,7 +134,6 @@ impl<T> Default for OffLoopWork<T> {
 
 impl<T: Send + 'static> OffLoopWork<T> {
     /// Whether work for `key` is still running.
-    #[cfg(test)]
     pub(super) fn is_running(&self, key: &WorkKey) -> bool {
         self.in_flight
             .get(key)
