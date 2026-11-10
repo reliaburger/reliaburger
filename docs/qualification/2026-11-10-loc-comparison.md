@@ -16,8 +16,8 @@ times. These are code lines, not bugs, and the caveats below matter.
 ## What was counted
 
 Each project's latest GitHub release on 10 November 2026, downloaded as the
-tag's source tarball (the same files as a `--depth 1` clone of the tag) into
-`~/github/rb-wt/loc-compare/`. Nothing was built.
+tag's source tarball (the same files as a `--depth 1` clone of the tag) into a
+scratch directory, with [`scripts/loc_compare/fetch.py`](../../scripts/loc_compare/fetch.py). Nothing was built.
 
 | Project | Tag | Commit | Released |
 |---|---|---|---|
@@ -147,5 +147,6 @@ lines of JavaScript and CSS.
   `--no-gen` drops only generated files that say so. Both cut the Kubernetes
   count, not Reliaburger's.
 - **One day, one tag each.** Re-run the commands above before quoting the
-  numbers again; the scripts are in this session's scratchpad and are short
-  enough to rewrite from this method.
+  numbers again. The scripts are in [`scripts/loc_compare/`](../../scripts/loc_compare/):
+  `fetch.py` downloads each tag, `strip_tests.py` removes Rust's `#[cfg(test)]`
+  tails by `make loc`'s rules, and `count.py` runs scc with the rules above.
