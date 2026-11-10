@@ -115,4 +115,4 @@ Reviewed [Coolify's deployment implementation](https://github.com/coollabsio/coo
 
 ---
 
-The Markdown copy of <https://reliaburger.com/compare/coolify.html>.
+The Markdown copy of <https://reliaburger.com/compare/coolify>.

@@ -15,7 +15,7 @@ From 0.2.7, every release file also carries a build provenance
 attestation that anyone can check with `gh attestation verify`, and the macOS `relish` can be
 notarised ([checks a stranger can run](releasing.md#checks-a-stranger-can-run)).
 The limits below are the ones 0.2.7 ships with; the [roadmap](roadmap.md) tracks
-what comes after it. The [feature status page](https://reliaburger.com/features.html)
+what comes after it. The [feature status page](https://reliaburger.com/features)
 rates every feature Ready, Beta, Alpha or Planned, with its restrictions and open
 issues; its source is [features.toml](features.toml).
 

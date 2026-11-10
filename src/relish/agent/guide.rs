@@ -758,7 +758,7 @@ pub fn generate(inputs: &Inputs<'_>, agent: &Command) -> Result<Vec<Artefact>, G
     let brief = region(paths::CHAPTER, &chapter, Region::Brief)?.to_string();
     let rules = region(paths::CHAPTER, &chapter, Region::Rules)?.to_string();
     let (title, _) = sections(&chapter);
-    let page = without_markers(&chapter);
+    let page = manual_links_absolute(&without_markers(&chapter), inputs.version);
     let skill = skill_md(&summary, &brief, &table)?;
 
     let agents_md = replace_region(
@@ -822,6 +822,26 @@ pub fn generate(inputs: &Inputs<'_>, agent: &Command) -> Result<Vec<Artefact>, G
             contents: mcpb_manifest_json(agent, inputs.version),
         },
     ])
+}
+
+/// `markdown` with every link to another manual chapter (`12_operations.md`,
+/// relative to `docs/manual/`) pointed at that chapter in the release tag.
+/// `/agents` and `/agents.md` live on the website, where a relative chapter
+/// link would land on nothing.
+fn manual_links_absolute(markdown: &str, version: &str) -> String {
+    let base = format!("{REPOSITORY}/blob/v{version}/docs/manual/");
+    let mut out = String::with_capacity(markdown.len());
+    let mut rest = markdown;
+    while let Some(at) = rest.find("](") {
+        let (head, tail) = rest.split_at(at + 2);
+        out.push_str(head);
+        if tail.starts_with(|c: char| c.is_ascii_digit()) {
+            out.push_str(&base);
+        }
+        rest = tail;
+    }
+    out.push_str(rest);
+    out
 }
 
 /// The paths among `artefacts` whose file on disk differs, or is missing.
@@ -1406,6 +1426,47 @@ Intro paragraph.\n\n## In brief\n\n\
             .find(|artefact| artefact.path == path)
             .unwrap()
             .contents
+    }
+
+    #[test]
+    fn links_to_other_manual_chapters_leave_the_website_for_the_release_tag() {
+        let markdown = "See [operations](12_operations.md#is-this-the-release), \
+                        [below](#in-brief) and [the site](https://reliaburger.com/).";
+        assert_eq!(
+            manual_links_absolute(markdown, "0.2.7"),
+            "See [operations](https://github.com/reliaburger/reliaburger/blob/v0.2.7/docs/manual/\
+             12_operations.md#is-this-the-release), [below](#in-brief) and \
+             [the site](https://reliaburger.com/)."
+        );
+    }
+
+    #[test]
+    fn the_agents_page_links_no_manual_chapter_by_a_relative_path() {
+        let chapter = FIXTURE_CHAPTER.replace(
+            "Intro paragraph.",
+            "Intro paragraph, see [operations](12_operations.md).",
+        );
+        let manual = fixture_manual();
+        let inputs = Inputs {
+            chapter: &chapter,
+            agents_md: FIXTURE_AGENTS_MD,
+            manual: &manual,
+            version: "0.2.7",
+            site: &fixture_site(),
+        };
+        let generated = generate(&inputs, &fixture_agent()).unwrap();
+        for path in [paths::AGENTS_PAGE_HTML, paths::AGENTS_PAGE_MARKDOWN] {
+            let page = &generated
+                .iter()
+                .find(|artefact| artefact.path == path)
+                .unwrap()
+                .contents;
+            assert!(
+                page.contains("blob/v0.2.7/docs/manual/12_operations.md"),
+                "{path}: {page}"
+            );
+            assert!(!page.contains("(12_operations.md") && !page.contains("\"12_operations.md"));
+        }
     }
 
     #[test]

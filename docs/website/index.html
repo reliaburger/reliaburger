@@ -17,14 +17,14 @@
          tests/suite/website.rs checks it links /agents, its Markdown and llms.txt. -->
     <aside class="agent-banner" aria-label="For AI agents">
       <strong>Are you an AI agent?</strong>
-      <a href="agents.html">Start here</a>
+      <a href="agents">Start here</a>
       <span>with the page written for you, also <a href="agents.md">as Markdown</a>, and the manual’s <a href="llms.txt">llms.txt</a>.</span>
     </aside>
     <header class="masthead">
       <a class="wordmark" href="./" aria-label="Reliaburger home"><span class="mark" aria-hidden="true">r/</span>reliaburger</a>
       <nav aria-label="Main navigation">
         <a href="#install">Install</a>
-        <a href="features.html">What’s ready?</a>
+        <a href="features">What’s ready?</a>
         <a href="#tour">Try it</a>
         <a href="#job-throughput">Batch jobs</a>
         <a href="#release-testing">Testing</a>
@@ -129,7 +129,7 @@
                   new token is read-only unless you ask for more, the bug reports your agent
                   drafts come out redacted, and Claude Code, holding a read-only token, passed
                   <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-06-v0.2.7-exit-test.md">0.2.7’s
-                  exit test</a> in <a href="agents.html#measuring-an-agent-on-your-cluster">a gym
+                  exit test</a> in <a href="agents#measuring-an-agent-on-your-cluster">a gym
                   for AI agents</a>.</p>
               </div>
             </li>
@@ -434,9 +434,9 @@
               with the way to remove it.</p>
             <p>You still make the decisions; it does the typing. Give it a read-only token
               afterwards, and it can help you run the cluster too.</p>
-            <p class="install-links"><a href="agents.html">Read the playbook</a>
+            <p class="install-links"><a href="agents">Read the playbook</a>
               · <a href="agents.md">As Markdown</a>
-              · <a href="agents.html#add-to-your-agent">Add Reliaburger to your agent</a></p>
+              · <a href="agents#add-to-your-agent">Add Reliaburger to your agent</a></p>
           </div>
         </div>
         <div class="install-grid install-panel install-panel-homebrew">
@@ -466,7 +466,7 @@ relish setup --quickstart</code></pre>
         <strong>Where it stands</strong>
         <p>Good enough for home labs and dev clusters. Not for production until 1.0.0,
           expected in January 2027. Until then, an upgrade can mean starting a fresh cluster.
-          <a href="features.html">What’s ready, feature by feature</a>.</p>
+          <a href="features">What’s ready, feature by feature</a>.</p>
         <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md">Roadmap <span aria-hidden="true">↗</span></a>
       </aside>
 
@@ -708,7 +708,7 @@ relish setup --quickstart</code></pre>
         <p>A million in one go? 0.2.7’s 8-hour release soak ran 64 arrays of 1,048,576
           tasks each while it broke things: the median took 140 seconds, the slowest 417.
           <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-07-v0.2.7-job-qualification.md">Soak record</a> ·
-          <a href="features.html#jobs">What’s ready in jobs</a></p>
+          <a href="features#jobs">What’s ready in jobs</a></p>
         <p class="tour-note">What does each kind of isolation cost? Here’s the same command, run
           four ways on the same VM with the same concurrency.</p>
         <figure id="throughput-recording" class="recording" data-cast="./assets/job-throughput.cast" data-poster="npt:257.7">
@@ -963,7 +963,7 @@ relish setup --quickstart</code></pre>
           production traffic, and zero failures in 25 runs only rules out failure rates above
           about 12%.
           <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/testing.md#before-a-release">How each gate works</a>, and
-          <a href="./compare/kubernetes.html#testing">how it compares with Kubernetes' release testing</a>.</p>
+          <a href="./compare/kubernetes#testing">how it compares with Kubernetes' release testing</a>.</p>
         </div>
       </section>
 
@@ -1024,9 +1024,9 @@ relish setup --quickstart</code></pre>
           </ol>
           <p>Last, it drafts a redacted bug report with the reproducer, the patch and what it
             didn’t test, for you to read and post. Nothing goes to GitHub on its own.</p>
-          <p class="tour-links"><a href="agents.html">The agent’s own page</a>
+          <p class="tour-links"><a href="agents">The agent’s own page</a>
             · <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/manual/16_working-with-an-ai-agent.md">The manual chapter</a>
-            · <a href="agents.html#how-reliaburger-is-tested">How we test, for agents</a></p>
+            · <a href="agents#how-reliaburger-is-tested">How we test, for agents</a></p>
         </div>
       </section>
 
@@ -1086,7 +1086,7 @@ relish setup --quickstart</code></pre>
                 else has changed the app since, rather than overwrite it.</p>
             </li>
           </ol>
-          <p>Four scenarios in the <a href="agents.html#measuring-an-agent-on-your-cluster">agent
+          <p>Four scenarios in the <a href="agents#measuring-an-agent-on-your-cluster">agent
             gym</a> check this on a real cluster: a proposed rollback, a guardrail’s refusal,
             two agents after the same app, and an approval that went stale. A run that
             changes anything itself scores unsafe, however right its answer.</p>
@@ -1171,7 +1171,7 @@ match = 'author.kind == "agent" &amp;&amp; proposal.kind == "scale" &amp;&amp; p
               <a href="https://github.com/reliaburger/reliaburger/issues/1687">#1687</a>. Its
               results go here, all of them, when the runs are done.</p>
           </aside>
-          <p class="tour-links"><a href="agents.html#proposing-a-change">Proposals, for agents</a>
+          <p class="tour-links"><a href="agents#proposing-a-change">Proposals, for agents</a>
             · <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/manual/05_chaos.md#testing-your-agent-on-your-cluster">Test your agent on your cluster</a>
             · <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/manual/10_security.md#agent-tokens-and-proposals">Agent tokens and proposals</a>
             · <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/manual/07_diagnostics.md#relish-timeline-what-changed-and-why-did-it-do-that">The timeline</a>
@@ -1262,36 +1262,36 @@ match = 'author.kind == "agent" &amp;&amp; proposal.kind == "scale" &amp;&amp; p
         <div class="reading-list">
           <article class="reading-item">
             <span class="filetype">THE PLATFORM API</span>
-            <h3><a href="./compare/kubernetes.html">Reliaburger vs Kubernetes <span aria-hidden="true">↗</span></a></h3>
+            <h3><a href="./compare/kubernetes">Reliaburger vs Kubernetes <span aria-hidden="true">↗</span></a></h3>
             <p>Pods, controllers, storage and extensibility; installation with kubeadm and the cost of operating the platform.</p>
           </article>
           <article class="reading-item">
             <span class="filetype">THE WORKLOAD SCHEDULER</span>
-            <h3><a href="./compare/nomad.html">Reliaburger vs Nomad <span aria-hidden="true">↗</span></a></h3>
+            <h3><a href="./compare/nomad">Reliaburger vs Nomad <span aria-hidden="true">↗</span></a></h3>
             <p>Jobs, groups, allocations and service discovery; what comes with the scheduler and what you integrate.</p>
           </article>
           <article class="reading-item">
             <span class="filetype">KUBERNETES, PACKAGED</span>
-            <h3><a href="./compare/k3s.html">Reliaburger vs k3s <span aria-hidden="true">↗</span></a></h3>
+            <h3><a href="./compare/k3s">Reliaburger vs k3s <span aria-hidden="true">↗</span></a></h3>
             <p>What its bundled runtime, networking and ingress simplify, and which Kubernetes concepts remain.</p>
           </article>
           <article class="reading-item">
             <span class="filetype">THE SINGLE-HOST BASELINE</span>
-            <h3><a href="./compare/docker-compose.html">Reliaburger vs Docker Compose <span aria-hidden="true">↗</span></a></h3>
+            <h3><a href="./compare/docker-compose">Reliaburger vs Docker Compose <span aria-hidden="true">↗</span></a></h3>
             <p>Services, networks and volumes; where a single Docker host is enough and what changes when you need a cluster.</p>
           </article>
           <article class="reading-item">
             <span class="filetype">THE APPLICATION PLATFORM</span>
-            <h3><a href="./compare/coolify.html">Reliaburger vs Coolify <span aria-hidden="true">↗</span></a></h3>
+            <h3><a href="./compare/coolify">Reliaburger vs Coolify <span aria-hidden="true">↗</span></a></h3>
             <p>Git deployments, preview environments, domains and backups; the difference between deployment to servers and cluster reconciliation.</p>
           </article>
           <article class="reading-item">
             <span class="filetype">THE SMALL-CLUSTER ALTERNATIVE</span>
-            <h3><a href="./compare/uncloud.html">Reliaburger vs Uncloud <span aria-hidden="true">↗</span></a></h3>
+            <h3><a href="./compare/uncloud">Reliaburger vs Uncloud <span aria-hidden="true">↗</span></a></h3>
             <p>Compose, WireGuard and Caddy; straightforward deployment across machines and the limits of automatic recovery.</p>
           </article>
         </div>
-        <p class="pdf-note"><a href="./compare/index.html">All comparisons</a> · <a href="./compare/methodology.html">Evidence and comparison method</a></p>
+        <p class="pdf-note"><a href="./compare/">All comparisons</a> · <a href="./compare/methodology">Evidence and comparison method</a></p>
       </section>
 
       <section id="internals" class="section" aria-labelledby="internals-title">

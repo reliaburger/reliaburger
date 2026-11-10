@@ -234,7 +234,7 @@ class RepositoryTests(unittest.TestCase):
 
     def test_the_homepage_links_the_page(self):
         homepage = (REPO / "docs/website/index.html").read_text(encoding="utf-8")
-        self.assertIn('href="features.html"', homepage)
+        self.assertIn('href="features"', homepage)
 
 
 if __name__ == "__main__":

@@ -117,8 +117,8 @@ Licensing also differs: Reliaburger uses Apache-2.0; Nomad 2.0.7’s source carr
 
 Baseline: [Nomad 2.0.7 release](https://github.com/hashicorp/nomad/releases/tag/v2.0.7), its official 2.0.x documentation, and the [Reliaburger 0.2.2 source](https://github.com/reliaburger/reliaburger/tree/v0.2.2/), the release the installer installs. Citations beside claims identify the supporting contract or implementation. Documentation URLs may advance; the Reliaburger and licence links are pinned.
 
-We reviewed documentation and source, and re-checked the Reliaburger side for 0.2.2 on 21 October 2026. We did not install both systems on identical machines or measure failure recovery, memory, cost or learning time. Verdicts concern the supported workflows described here. See the [shared review method](https://reliaburger.com/compare/methodology.html#method) for the wider comparison.
+We reviewed documentation and source, and re-checked the Reliaburger side for 0.2.2 on 21 October 2026. We did not install both systems on identical machines or measure failure recovery, memory, cost or learning time. Verdicts concern the supported workflows described here. See the [shared review method](https://reliaburger.com/compare/methodology#method) for the wider comparison.
 
 ---
 
-The Markdown copy of <https://reliaburger.com/compare/nomad.html>.
+The Markdown copy of <https://reliaburger.com/compare/nomad>.

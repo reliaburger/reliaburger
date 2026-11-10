@@ -229,4 +229,4 @@ Something here wrong, or missing? [Open an issue](https://github.com/reliaburger
 
 ---
 
-The Markdown copy of <https://reliaburger.com/features.html>.
+The Markdown copy of <https://reliaburger.com/features>.
