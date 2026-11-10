@@ -286,7 +286,14 @@ Decided while building (9 November 2026):
   `clear_fault` approved without the clear (the reaper's path) is recorded
   `failed`, never `applied`. If quorum is lost between the clear and its
   record, the proposal stays pending; approving again finds the fault gone
-  and records that. The issue asked for Smoker's safety pre-checks
+  and records that. Likewise, low severity and accepted: a leader that loses
+  leadership after the clear and retries the entry records `failed` although
+  the fault was cleared; the fault is gone either way, and `fault.cleared`
+  in the audit log says it was. Before clearing, the leader lists the
+  node's faults again and clears only if the id still names the same app,
+  namespace, instance and kind of fault: a node's `FaultRegistry` isn't
+  persisted and its ids restart at 1, so after a restart the id can name
+  another fault, which is refused and stays active. The issue asked for Smoker's safety pre-checks
   (`smoker::safety`) at approval: those rails judge injections (quorum,
   the last replica, the leader, half the nodes), each stopping a fault
   from taking capacity away; clearing gives capacity back, so none
@@ -362,7 +369,11 @@ desired state with the `after` specs, from a copy of the cache the real
 pass starts from. New placements' nodes become `new_nodes_forecast`;
 replicas it can't place, beyond any the app was already short of, become
 `unplaced_forecast`, with the scheduler's reason in `forecast_note`, and the
-summary says "the scheduler can't place 2 (reason)". Built-in rule 3 gains a
+summary says "the scheduler can't place 2 (reason)". A forecast takes the
+place of that tick's real pass (the next tick, a second later, runs it), so
+it costs one pass, and with the channel full it answers "busy" at once
+rather than queue in front of capacity admission. A quota shortfall the app
+already had isn't counted, as an unschedulable one isn't. Built-in rule 3 gains a
 clause: a policy never approves a proposal with `unplaced_forecast > 0`. A
 forecast that couldn't run (a leader still learning placements, a node with
 no scheduler) is **not** listed under `unknown`, unlike the paragraph above

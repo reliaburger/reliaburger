@@ -7006,7 +7006,11 @@ a bare `None` gives the compiler no `F` to infer. The clear runs only once
 the read-only versions of the state machine's checks pass, so it doesn't
 clear a fault for a proposal the entry would then fail. A `clear_fault`
 approved any other way, by the reaper say, is recorded `failed`: recording
-a fault as cleared that nobody cleared would be a lie. And a node fault isn't
+a fault as cleared that nobody cleared would be a lie. The review of this
+code caught a sharper one: a node's fault registry lives in memory, and its
+ids start again at 1 when its bun restarts, so by approval "fault 7" could be
+someone else's experiment on another app. The leader lists the node's faults
+again first and clears only if id, app, instance and kind still match. And a node fault isn't
 an agent's to propose: it changes a node, not an app.
 
 The issue asked for Smoker's safety pre-checks at approval. We looked, and

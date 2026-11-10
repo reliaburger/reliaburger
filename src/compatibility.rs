@@ -242,8 +242,8 @@ pub struct Compatibility {
 /// blast radius's forecast fields, and a failed proposal's
 /// `blast_radius_grew` and `fault` reasons.
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 59,
-    state: 75,
+    protocol: 58,
+    state: 74,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

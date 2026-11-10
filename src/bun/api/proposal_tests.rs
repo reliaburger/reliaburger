@@ -1432,3 +1432,38 @@ async fn a_clear_fault_proposal_records_what_clearing_did() {
         "{outcome:?}"
     );
 }
+
+/// A node's fault ids restart at 1 when its bun restarts, so by approval
+/// the id a `clear_fault` proposal names may be another app's fault. That
+/// one is refused, and stays active; the same fault still matches.
+#[test]
+fn a_clear_refuses_a_fault_that_took_the_same_id_on_another_app() {
+    let recorded = crate::proposal::FaultTarget {
+        id: 1,
+        node: "node-b".to_string(),
+        app: crate::meat::AppId::new("web", "shop"),
+        fault_type: "delay 200ms".to_string(),
+        instance: None,
+        remaining_secs: 240,
+        injected_by: "alice".to_string(),
+    };
+    let listed = |service: &str, kind: &str| -> crate::smoker::types::FaultSummary {
+        serde_json::from_value(serde_json::json!({
+            "id": 1, "fault_type": kind, "target_service": service, "namespace": "shop",
+            "target_instance": null, "target_node": null, "remaining_secs": 100,
+            "injected_by": "bob", "node": "node-b",
+        }))
+        .unwrap()
+    };
+    assert_eq!(
+        super::proposals::fault_still_matches(&recorded, &[listed("web", "delay 200ms")]),
+        Ok(())
+    );
+    let other = super::proposals::fault_still_matches(&recorded, &[listed("api", "delay 200ms")])
+        .unwrap_err();
+    assert!(other.contains("shop/api"), "{other}");
+    assert!(other.contains("wasn't cleared"), "{other}");
+    assert!(super::proposals::fault_still_matches(&recorded, &[listed("web", "kill")]).is_err());
+    let gone = super::proposals::fault_still_matches(&recorded, &[]).unwrap_err();
+    assert!(gone.contains("is gone"), "{gone}");
+}

@@ -470,6 +470,14 @@ fn clear_fault_action(
 > {
     move || {
         Box::pin(async move {
+            // A node's fault ids restart at 1 when its bun restarts, so the
+            // id may now name another fault. Clear it only if it's still
+            // the one the proposal showed.
+            let (listed, _) =
+                super::faults::collect_cluster_faults(&state, CLUSTER_STATUS_TIMEOUT).await;
+            if let Err(reason) = fault_still_matches(&fault, &listed) {
+                return Some(crate::proposal::FailedReason::Fault { reason });
+            }
             let response = super::faults::fault_clear_handler(
                 auth,
                 State(state),
@@ -501,6 +509,49 @@ fn clear_fault_action(
             })
         })
     }
+}
+
+/// Whether `listed` still holds the fault a `clear_fault` proposal
+/// recorded: the same id on the same node, on the same app, instance and
+/// kind of fault. A node's fault registry isn't persisted and its ids
+/// restart at 1, so after a restart the id can name a fault nobody
+/// proposed clearing; that one stays active.
+pub(crate) fn fault_still_matches(
+    recorded: &crate::proposal::FaultTarget,
+    listed: &[crate::smoker::types::FaultSummary],
+) -> Result<(), String> {
+    let Some(found) = listed.iter().find(|fault| {
+        fault.id == recorded.id
+            && fault
+                .node
+                .as_deref()
+                .is_none_or(|node| node == recorded.node)
+    }) else {
+        return Err(format!(
+            "fault {} on node {} is gone: it expired, or someone cleared it",
+            recorded.id, recorded.node
+        ));
+    };
+    let same = found.target_service == recorded.app.name
+        && found.namespace.as_deref() == Some(recorded.app.namespace.as_str())
+        && found.target_instance == recorded.instance
+        && found.fault_type == recorded.fault_type;
+    if same {
+        return Ok(());
+    }
+    Err(format!(
+        "fault {} on node {} is now {} on {}, not the {} on {} the proposal showed; it wasn't \
+         cleared (the node's fault ids restart after it restarts)",
+        recorded.id,
+        recorded.node,
+        found.fault_type,
+        found.namespace.as_deref().map_or_else(
+            || found.target_service.clone(),
+            |namespace| { format!("{namespace}/{}", found.target_service) }
+        ),
+        recorded.fault_type,
+        recorded.app
+    ))
 }
 
 /// The fault `request` names, found in every node's list: by id, and by
