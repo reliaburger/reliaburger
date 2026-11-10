@@ -517,7 +517,31 @@ pub struct Selection {
     pub propose: bool,
     /// Every tool's budget when a call names none: `relish mcp
     /// --max-bytes`. [`DEFAULT_MAX_BYTES`] when `None`.
-    pub max_bytes: Option<usize>,
+    pub max_bytes: Option<ServerBudget>,
+}
+
+/// What `relish mcp --max-bytes` set: one budget for every tool, or, with
+/// `--max-bytes 0`, each command's own default (24 KiB, 80 KiB for
+/// `guide`, 40 KiB for `schema`), as the Claude Code plugin runs it.
+/// Either way no call gets more than [`MAX_BYTES_CEILING`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerBudget {
+    /// This many bytes for every tool.
+    Every(usize),
+    /// Each command's own default: `--max-bytes 0`.
+    CommandDefaults,
+}
+
+impl ServerBudget {
+    /// The budget `command`'s tool gets when a call names none.
+    fn for_command(self, command: &str) -> usize {
+        match self {
+            ServerBudget::Every(bytes) => bytes,
+            ServerBudget::CommandDefaults => command_name(command)
+                .map_or(agent::DEFAULT_MAX_BYTES, agent::default_max_bytes)
+                .min(MAX_BYTES_CEILING),
+        }
+    }
 }
 
 /// `relish mcp`'s budget when `--max-bytes` isn't given: 8 KiB, about 2,000
@@ -584,7 +608,12 @@ pub fn select(
             Some(namespace) => tool.pin(NAMESPACE, namespace),
             None => tool,
         })
-        .map(|tool| tool.with_budget(selection.max_bytes.unwrap_or(DEFAULT_MAX_BYTES)))
+        .map(|tool| {
+            let budget = selection.max_bytes.map_or(DEFAULT_MAX_BYTES, |budget| {
+                budget.for_command(&tool.command)
+            });
+            tool.with_budget(budget)
+        })
         .collect())
 }
 

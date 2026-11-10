@@ -962,15 +962,17 @@ relish mcp --toolsets source,manual --no-logs
 Every tool's answer is held to 8 KiB, about 2,000 tokens, unless the call
 passes `max_bytes`. That's also the default each tool's schema advertises,
 because a model tends to send whatever default it reads there. `--max-bytes`
-sets it for every tool, from 1024 to 131072. No call gets more than 131072
-bytes (128 KiB), whatever it asks for, which still fits the whole guide in
-one answer. A cut answer says so, as on the command line, and when even
+sets it for every tool, from 1024 to 131072, and `--max-bytes 0` gives each
+tool its command's own default instead: 80 KiB for `guide`, 40 for `schema`,
+24 for the rest. No call gets more than 131072 bytes (128 KiB), whatever it
+asks for, which still fits the whole guide in one answer, and no `next` step
+asks for more. A cut answer says so, as on the command line, and when even
 128 KiB can't hold all of it, it says to narrow the request: a filter, a
 time range or a section. The Claude Code plugin starts the server with
-`--max-bytes 24576`, the command line's default.
+`--max-bytes 0`, so its tools answer as the command line does.
 
 ```sh
-relish mcp --max-bytes 24576
+relish mcp --max-bytes 0
 ```
 
 `--namespace` narrows what the agent asks for. It isn't a permission: a

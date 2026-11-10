@@ -80,17 +80,23 @@ pub struct McpOptions {
 
     /// Every tool's budget in bytes when a call names none, and the default
     /// its schema advertises: 8192 when left out, at least 1024 and at most
-    /// 131072. No call gets more than 131072, whatever it asks for.
+    /// 131072. 0 gives each tool its command's own default (24576, 81920
+    /// for guide, 40960 for schema). No call gets more than 131072,
+    /// whatever it asks for.
     #[arg(long, value_name = "BYTES", value_parser = parse_server_max_bytes)]
-    pub max_bytes: Option<usize>,
+    pub max_bytes: Option<tools::ServerBudget>,
 }
 
-/// `relish mcp --max-bytes`: a whole number from the floor every answer
-/// needs to the ceiling every call is held to.
-fn parse_server_max_bytes(value: &str) -> Result<usize, String> {
+/// `relish mcp --max-bytes`: 0 for each command's own default, or a whole
+/// number from the floor every answer needs to the ceiling every call is
+/// held to.
+fn parse_server_max_bytes(value: &str) -> Result<tools::ServerBudget, String> {
     let bytes: usize = value
         .parse()
         .map_err(|_| format!("{value:?} isn't a number of bytes"))?;
+    if bytes == 0 {
+        return Ok(tools::ServerBudget::CommandDefaults);
+    }
     if bytes < agent::MIN_MAX_BYTES {
         return Err(format!(
             "{bytes} is below the minimum of {}",
@@ -103,7 +109,7 @@ fn parse_server_max_bytes(value: &str) -> Result<usize, String> {
             tools::MAX_BYTES_CEILING
         ));
     }
-    Ok(bytes)
+    Ok(tools::ServerBudget::Every(bytes))
 }
 
 impl McpOptions {

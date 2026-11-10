@@ -77,6 +77,50 @@ fn ceiling() -> Option<usize> {
     CEILING.try_with(|ceiling| *ceiling).ok()
 }
 
+/// An answer bigger than its budget: how big it is whole, and the budget
+/// it was given.
+///
+/// Every step that asks for a bigger budget takes its number from
+/// [`Overflow::rerun_budget`], whether [`render`] trims the answer or a
+/// command fits it itself, as `logs` and `manual show` do. So under
+/// `relish mcp` no step asks for more than the server returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Overflow {
+    /// The bytes the whole answer takes.
+    pub whole: usize,
+    /// The budget this answer had.
+    pub max_bytes: usize,
+}
+
+impl Overflow {
+    /// The budget a "get the rest" step may name: enough for the whole
+    /// answer, rounded up to a KiB, or the ceiling the caller renders
+    /// under when the whole is bigger. `None` once this answer already had
+    /// the ceiling: asking again would get the same answer.
+    pub fn rerun_budget(self) -> Option<usize> {
+        match ceiling() {
+            Some(ceiling) if self.whole > ceiling && self.max_bytes >= ceiling => None,
+            Some(ceiling) if self.whole > ceiling => Some(ceiling),
+            _ => Some(round_up_to_kib(self.whole)),
+        }
+    }
+
+    /// Why the whole answer is out of reach, when the ceiling puts it
+    /// there.
+    pub fn out_of_reach(self) -> Option<String> {
+        ceiling()
+            .filter(|ceiling| self.whole > *ceiling)
+            .map(|ceiling| narrow_why(self.whole, ceiling))
+    }
+}
+
+/// `rerun` again with a budget of `budget` bytes: the one place a step's
+/// `--max-bytes` is written, so it always comes from
+/// [`Overflow::rerun_budget`].
+pub fn rerun_with(rerun: &str, budget: usize) -> String {
+    format!("{rerun} --max-bytes {budget}")
+}
+
 /// Why an answer bigger than the ceiling can't be had whole.
 fn narrow_why(whole: usize, ceiling: usize) -> String {
     format!(
@@ -124,10 +168,13 @@ pub fn render<T: Serialize>(envelope: &Envelope<T>, max_bytes: usize, rerun: &st
                 ErrorCode::Usage,
                 format!("the answer is {whole} bytes and doesn't fit in {max_bytes}, even trimmed"),
             )
-            .with_hint(match ceiling() {
-                Some(ceiling) if whole > ceiling => narrow_why(whole, ceiling),
-                _ => format!("run it again with --max-bytes {}", round_up_to_kib(whole)),
-            });
+            .with_hint(
+                Overflow { whole, max_bytes }
+                    .out_of_reach()
+                    .unwrap_or_else(|| {
+                        format!("run it again with --max-bytes {}", round_up_to_kib(whole))
+                    }),
+            );
             failure_that_fits(envelope.command(), envelope.relish(), error, max_bytes)
         }
     }
@@ -185,21 +232,21 @@ fn trim_answer(value: Value, max_bytes: usize, whole: usize, rerun: &str) -> Opt
     // Under a ceiling the whole answer may be out of reach: ask for the
     // ceiling once, and at the ceiling ask for nothing more, only for a
     // narrower question.
-    let hint = match ceiling() {
-        Some(ceiling) if whole > ceiling && max_bytes >= ceiling => {
-            own_warnings.insert(0, Value::String(narrow_why(whole, ceiling)));
+    let overflow = Overflow { whole, max_bytes };
+    let hint = match overflow.rerun_budget() {
+        Some(budget) => Some(json!({
+            "run": rerun_with(rerun, budget),
+            "why": overflow.out_of_reach().unwrap_or_else(|| {
+                format!("the whole answer is {whole} bytes and this budget was {max_bytes}")
+            }),
+            "read_only": true,
+        })),
+        None => {
+            if let Some(why) = overflow.out_of_reach() {
+                own_warnings.insert(0, Value::String(why));
+            }
             None
         }
-        Some(ceiling) if whole > ceiling => Some(json!({
-            "run": format!("{rerun} --max-bytes {ceiling}"),
-            "why": narrow_why(whole, ceiling),
-            "read_only": true,
-        })),
-        _ => Some(json!({
-            "run": format!("{rerun} --max-bytes {}", round_up_to_kib(whole)),
-            "why": format!("the whole answer is {whole} bytes and this budget was {max_bytes}"),
-            "read_only": true,
-        })),
     };
 
     let mut cuts: Vec<Cut> = Vec::new();
@@ -802,5 +849,39 @@ mod tests {
             let value: Value = serde_json::from_str(&text).expect("valid JSON");
             prop_assert_eq!(&value["schema"], &json!("relish.agent/v1"));
         }
+    }
+
+    /// Every "ask for more" step goes through [`Overflow::rerun_budget`], so
+    /// no command can name a budget above the ceiling `relish mcp` holds
+    /// answers to. `logs` and `manual show` each built their own and
+    /// bypassed it (#1818's review); this catches the next one.
+    #[test]
+    fn no_command_writes_its_own_max_bytes_step() {
+        fn sources(directory: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    sources(&path, found);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    found.push(path);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/relish");
+        let mut found = Vec::new();
+        sources(&root, &mut found);
+        let offenders: Vec<_> = found
+            .iter()
+            .filter(|path| !path.ends_with("agent/budget.rs"))
+            .filter(|path| {
+                std::fs::read_to_string(path)
+                    .unwrap()
+                    .contains("--max-bytes {")
+            })
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "build the step with budget::Overflow instead: {offenders:?}"
+        );
     }
 }
