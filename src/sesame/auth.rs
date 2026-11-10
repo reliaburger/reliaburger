@@ -158,6 +158,28 @@ pub struct AuthContext {
     pub scoped_namespaces: Option<Vec<String>>,
 }
 
+/// The scheme a workload's identity token names its subject with. Only
+/// [`workload_context`] makes a principal id that starts with it: a token's
+/// is `token:<digest>`, a session's `session:<name>`.
+const WORKLOAD_PRINCIPAL_SCHEME: &str = "spiffe://";
+
+impl AuthContext {
+    /// What kind of principal this is, for the audit log.
+    ///
+    /// Read from the principal id, which the server mints, and the token's
+    /// kind; never from the token's name, which anyone can choose.
+    pub fn principal_kind(&self) -> crate::sesame::types::PrincipalKind {
+        use crate::sesame::types::PrincipalKind;
+        if self.principal_id == SYSTEM_PRINCIPAL {
+            PrincipalKind::System
+        } else if self.principal_id.starts_with(WORKLOAD_PRINCIPAL_SCHEME) {
+            PrincipalKind::Workload
+        } else {
+            self.kind.into()
+        }
+    }
+}
+
 /// Extract the Bearer token from an Authorization header value.
 fn extract_bearer(header_value: &str) -> Option<&str> {
     header_value.strip_prefix("Bearer ")
@@ -212,6 +234,11 @@ pub fn authenticate(
         }
         _ => token_principal_id(stored),
     };
+    Ok(token_context(stored, principal_id))
+}
+
+/// The context a stored token authenticates as, under `principal_id`.
+fn token_context(stored: &ApiToken, principal_id: String) -> AuthContext {
     // Built-in rule 1 (#1682): an agent token proposes, it never mutates.
     // Lowering its effective role here, in the one place every request is
     // authenticated, means no route has to remember the rule.
@@ -219,7 +246,7 @@ pub fn authenticate(
         TokenKind::Human => stored.role,
         TokenKind::Agent => ApiRole::ReadOnly,
     };
-    Ok(AuthContext {
+    AuthContext {
         token_name: stored.name.clone(),
         principal_id,
         role,
@@ -227,7 +254,38 @@ pub fn authenticate(
         granted_role: stored.role,
         scoped_apps: stored.scope.apps.clone(),
         scoped_namespaces: stored.scope.namespaces.clone(),
-    })
+    }
+}
+
+/// The context of the token a browser session was made from, with that
+/// token's own role and scope, read from the store now, so a token revoked,
+/// expired, rotated past its grace period or changed since login counts as
+/// it stands. `None` when the credential is gone, and for a session made
+/// from the internal service token, which is no person.
+///
+/// The Proposals page (#1682) uses it only to decide which decision forms
+/// to show. Making a decision takes the API token itself, pasted into the
+/// form: this context is never a write credential.
+pub(crate) fn session_write_context(
+    principal_id: &str,
+    tokens: &[ApiToken],
+) -> Option<AuthContext> {
+    let now = std::time::SystemTime::now();
+    let live = find_credential(principal_id, tokens)
+        .is_some_and(|credential| credential.valid_until.is_none_or(|at| now < at));
+    if !live {
+        return None;
+    }
+    tokens
+        .iter()
+        .filter(|token| token.name != SYSTEM_PRINCIPAL)
+        .find(|token| {
+            token_principal_id(token) == principal_id
+                || token.previous_secret.as_ref().is_some_and(|previous| {
+                    principal_for_hash(&previous.token_hash) == principal_id
+                })
+        })
+        .map(|token| token_context(token, principal_id.to_string()))
 }
 
 /// The stable principal id for a stored token's current secret: a digest of
@@ -444,6 +502,13 @@ pub async fn auth_middleware(
             request
                 .extensions_mut()
                 .insert(readonly_session_context(&identity));
+            // Only the proposal decision forms read this (#1682).
+            request
+                .extensions_mut()
+                .insert(super::session::BrowserSession {
+                    principal_id: identity.principal_id.clone(),
+                    csrf_token: super::session::csrf_token_for(&id),
+                });
             return next.run(request).await;
         }
         state.sessions.remove(&id).await;
@@ -459,6 +524,8 @@ pub async fn auth_middleware(
 
 /// The `AuthContext` for a browser session: always read-only, so a request
 /// riding a stolen or forged cookie can read the dashboard but never mutate.
+/// The dashboard's proposal decisions (#1682) aren't an exception: they act
+/// as an API token the person pastes into the form, never as the cookie.
 ///
 /// The originating token's **scope** is preserved (C3): a token confined to one
 /// app/namespace stays confined when it rides a session cookie, so exchanging
@@ -812,6 +879,58 @@ mod tests {
     use crate::sesame::token::create_token;
     use crate::sesame::types::TokenScope;
     use std::time::{Duration, SystemTime};
+
+    /// Every audit record says what kind of principal acted (#1682's
+    /// design), read from what the API already knows about the caller: the
+    /// token's kind, or the node's own service principal, or a workload's
+    /// SPIFFE identity. A token's name can't fake any of these.
+    #[test]
+    fn each_caller_has_the_principal_kind_its_credential_says() {
+        use crate::sesame::types::{PrincipalKind, TokenKind};
+        let person = create_token("alice", ApiRole::Admin, TokenScope::default(), None).unwrap();
+        let mut robot =
+            create_token("holmes", ApiRole::Deployer, TokenScope::default(), None).unwrap();
+        robot.token.kind = TokenKind::Agent;
+        let disguised = create_token(
+            "workload:shop/web",
+            ApiRole::Admin,
+            TokenScope::default(),
+            None,
+        )
+        .unwrap();
+        let tokens = vec![
+            person.token.clone(),
+            robot.token.clone(),
+            disguised.token.clone(),
+        ];
+        let kind = |plaintext: &str| authenticate(plaintext, &tokens).unwrap().principal_kind();
+        assert_eq!(kind(&person.plaintext), PrincipalKind::Human);
+        assert_eq!(kind(&robot.plaintext), PrincipalKind::Agent);
+        assert_eq!(kind(&disguised.plaintext), PrincipalKind::Human);
+        assert_eq!(system_context().principal_kind(), PrincipalKind::System);
+        let claims = crate::sesame::types::WorkloadJwtClaims {
+            iss: "https://test.reliaburger.dev".to_string(),
+            sub: "spiffe://test/ns/shop/app/web".to_string(),
+            aud: vec!["spiffe://test".to_string()],
+            exp: 0,
+            iat: 0,
+            namespace: "shop".to_string(),
+            app: "web".to_string(),
+            cluster: "test".to_string(),
+            node: "node-01".to_string(),
+            instance: "web-g1-0".to_string(),
+        };
+        assert_eq!(
+            workload_context(&claims).principal_kind(),
+            PrincipalKind::Workload
+        );
+        let session = readonly_session_context(&super::super::session::SessionIdentity {
+            token_name: "alice".to_string(),
+            principal_id: token_principal_id(&person.token),
+            scope: TokenScope::default(),
+        });
+        assert_eq!(session.principal_kind(), PrincipalKind::Human);
+    }
 
     #[test]
     fn authenticate_valid_token() {
@@ -1253,6 +1372,74 @@ mod tests {
             .await
             .status();
         assert_eq!(status, StatusCode::OK);
+    }
+
+    /// The Proposals page shows forms by the token's own role, read from the
+    /// store at the time, never the session's read-only one.
+    #[tokio::test]
+    async fn a_session_reports_its_tokens_own_role_while_it_stands() {
+        let scope = TokenScope {
+            apps: None,
+            namespaces: Some(vec!["shop".to_string()]),
+        };
+        let alice = create_token("alice", ApiRole::Deployer, scope, None).unwrap();
+        let mut holmes = create_token("holmes", ApiRole::Deployer, TokenScope::default(), None)
+            .unwrap()
+            .token;
+        holmes.kind = TokenKind::Agent;
+        let alice_id = token_principal_id(&alice.token);
+        let holmes_id = token_principal_id(&holmes);
+        let mut tokens = vec![alice.token, holmes];
+
+        let context = session_write_context(&alice_id, &tokens).unwrap();
+        assert_eq!(context.role, ApiRole::Deployer);
+        assert_eq!(context.kind, TokenKind::Human);
+        assert_eq!(context.principal_id, alice_id);
+        assert_eq!(context.scoped_namespaces, Some(vec!["shop".to_string()]));
+
+        // An agent's session decides nothing: its effective role is read-only.
+        let agent = session_write_context(&holmes_id, &tokens).unwrap();
+        assert_eq!(agent.role, ApiRole::ReadOnly);
+        assert_eq!(agent.kind, TokenKind::Agent);
+
+        // Nor does the service token's, nor a token since revoked or expired.
+        assert!(session_write_context(SYSTEM_PRINCIPAL, &tokens).is_none());
+        tokens[0].expires_at =
+            Some(std::time::SystemTime::now() - std::time::Duration::from_secs(1));
+        assert!(session_write_context(&alice_id, &tokens).is_none());
+        tokens.remove(0);
+        assert!(session_write_context(&alice_id, &tokens).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_session_request_carries_its_csrf_token() {
+        let user = create_token("u", ApiRole::Deployer, TokenScope::default(), None).unwrap();
+        let store = new_token_store();
+        store.write().await.push(user.token);
+        let state = AuthState::new(store.clone(), None);
+        let id = session_for(&state, &store, "u").await;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let record = seen.clone();
+        let router = Router::new()
+            .route(
+                "/x",
+                get(
+                    move |session: Option<
+                        axum::Extension<super::super::session::BrowserSession>,
+                    >| async move {
+                        *record.lock().unwrap() = session.map(|s| s.0.csrf_token.clone());
+                        "ok"
+                    },
+                ),
+            )
+            .layer(from_fn_with_state(state, auth_middleware));
+        let cookie = format!("rb_session={id}");
+        let status = respond(router, &[("cookie", &cookie)]).await.status();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            Some(super::super::session::csrf_token_for(&id))
+        );
     }
 
     /// Create a session for the stored token named `name`, the way the login

@@ -5857,6 +5857,28 @@
           "sources": [
             "tests/cluster_failover.rs"
           ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-cluster_failover-the_dashboard_decides_a_proposal_on_the_leader_only",
+          "binary": "reliaburger::cluster_failover",
+          "test": "the_dashboard_decides_a_proposal_on_the_leader_only",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_failover.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-cluster_failover-the_dashboard_clears_a_fault_another_node_holds",
+          "binary": "reliaburger::cluster_failover",
+          "test": "the_dashboard_clears_a_fault_another_node_holds",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_failover.rs"
+          ]
         }
       ]
     },

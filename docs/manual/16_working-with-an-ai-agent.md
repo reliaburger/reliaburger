@@ -207,6 +207,17 @@ the budget that would fit.
 Through `relish mcp` the default is smaller: 8 KiB for every tool, `guide`
 and `schema` included (see [Through MCP](#through-mcp)).
 
+`guide` doesn't trim like the rest. When the whole chapter doesn't fit,
+it answers with an outline: `data.scope` is `outline`, `data.contents`
+lists every section's id, heading and size, and `data.sections` holds the
+sections to read first, whole. `--section ID` reads one section; one too
+big for its budget is cut between paragraphs and marked `truncated`.
+
+```sh
+relish agent guide --max-bytes 8192
+relish agent guide --section the-envelope
+```
+
 ## Text the cluster didn't write
 
 Some answers quote text that Reliaburger didn't write: an app's log lines,
@@ -281,10 +292,11 @@ what this binary has; `relish agent --help` says the same.
 relish agent guide
 ```
 
-`data.sections` holds it one section at a time, each with its `heading` and
-its `markdown`, and `data.commands` lists the commands above. Given a
-`--max-bytes` under its 80 KiB default, the last sections go first, and the
-`next` step asks for a `--max-bytes` that fits it all.
+`data.sections` holds it one section at a time, each with its `id`,
+`heading` and `markdown`, and `data.commands` lists the commands above.
+Given a `--max-bytes` too small for all of it, it answers with an outline
+instead: the contents and the sections to read first (see [Byte
+budgets](#byte-budgets)). `--section ID` prints one section.
 
 `relish agent schema` prints the JSON Schema of the envelope and every
 command's `data`. All together they're over the default budget, so name the
@@ -375,10 +387,17 @@ An agent never changes the cluster. It proposes, and a person approves:
 relish agent propose scale web --namespace shop --replicas 5 --reason "p99 over the SLO"
 ```
 
-Also `apply FILE`, `rollback`, `stop`, `delete`; `--dry-run` stores nothing.
-The cluster writes the summary, diff, blast radius and `undo` command.
-Proposing leases each app until it's decided. `stale`: the app changed;
-propose again. `guardrail` (exit `4`): a policy refused it. A policy may
+Also `apply FILE`, `rollback`, `stop`, `delete`, `restart APP` (replaces
+every instance through its health checks; can't be undone),
+`cancel-deploy APP` (back to the last spec that finished rolling out) and
+`clear-fault ID` (a Smoker fault on an app, from `relish fault list`, with
+`--node` if two nodes hold that id; can't be undone). `--dry-run` stores
+nothing. The cluster writes the summary, diff, blast radius and `undo`
+command; for instances it starts, the blast radius has the scheduler's
+forecast (`new_nodes_forecast`, and `unplaced_forecast` it can't place).
+Proposing leases each app until it's decided. `stale`: the app changed, or
+the blast radius grew (a new node) before approval; propose again.
+`guardrail` (exit `4`): a policy refused it. A policy may
 approve it at once (`approval.approved_by` is `policy:<name>`). `proposals`
 shows yours, `withdraw ID` takes one back, `undo ID` proposes the undo,
 refused as `stale` if anyone changed the app since.
@@ -387,6 +406,14 @@ refused as `stale` if anyone changed the app since.
 the leases held and the proposals waiting. Waiting is a `note`, not a
 problem. A waiting proposal that's stale, its app changed so approving it
 fails, makes the verdict `degraded`: withdraw it and propose again.
+
+Your human decides with `relish proposal approve ID`, or on the web
+dashboard's Proposals page (`/ui/proposals`, linked from the Cluster card's
+`agents` line). The page shows your `reason` in a box marked as your own
+words, below the cluster's summary, diff, blast radius and undo plan. Its
+approve, reject and undo buttons appear only for a person's token that may
+decide, and each asks that person to paste their API token; yours sees the
+command to copy.
 
 ## Reading an app's logs
 
@@ -962,12 +989,19 @@ relish mcp --toolsets source,manual --no-logs
 Every tool's answer is held to 8 KiB, about 2,000 tokens, unless the call
 passes `max_bytes`. That's also the default each tool's schema advertises,
 because a model tends to send whatever default it reads there. `--max-bytes`
-sets it for every tool, from 1024 to 131072. No call gets more than 131072
-bytes (128 KiB), whatever it asks for, which still fits the whole guide in
-one answer. A cut answer says so, as on the command line.
+sets it for every tool, from 1024 to 131072, and `--max-bytes 0` gives each
+tool its command's own default instead: 80 KiB for `guide`, 40 for `schema`,
+24 for the rest. No call gets more than 131072 bytes (128 KiB), whatever it
+asks for, which still fits the whole guide in one answer, and no `next` step
+asks for more. A cut answer says so, as on the command line, and when even
+128 KiB can't hold all of it, it says to narrow the request: a filter, a
+time range or a section. At 8 KiB the `guide` tool answers with its outline,
+and its `section` argument reads one section at a time. The Claude Code
+plugin starts the server with `--max-bytes 0`, so its tools answer as the
+command line does.
 
 ```sh
-relish mcp --max-bytes 24576
+relish mcp --max-bytes 0
 ```
 
 `--namespace` narrows what the agent asks for. It isn't a permission: a
@@ -1071,6 +1105,25 @@ in `mcp-token.json`; `data.mcp_tokens` lists that change. With `--remove`,
 `--namespace` and `--propose` too, and setup revokes their tokens and
 deletes the files.
 
+To let your agents propose changes as well, name the one namespace they
+may change:
+
+```sh
+relish agent setup --propose --namespace shop --yes
+```
+
+Each entry then runs `relish mcp --propose --namespace shop`, and with an
+admin context setup makes [its deployer agent token](#through-mcp) now, in
+`mcp-propose-token-shop.json`. Setup keeps `relish mcp --propose`'s rules:
+`--propose` without `--namespace` is refused (exit `2`, `usage`), because
+the token could otherwise propose in every namespace. Given a token by
+`--token` or `RELIABURGER_TOKEN`, setup makes none, and warns that it can't
+tell whether that token is a person's; it warns too if the token is an
+admin one, or if the saved context's token turns out not to be admin. Each
+warning names the `relish token create --agent` command to run instead.
+Switching between plain setup and `--propose`, or to another namespace,
+replaces setup's own entry with no `--force`; `--remove` takes either out.
+
 ## With a local model
 
 If your cluster's logs and state mustn't reach a model API, run the model on
@@ -1092,16 +1145,22 @@ adds the server to it, and `goose configure` picks Ollama and the model.
 A small model has a small window, and Reliaburger's answers are sized for a
 large one. Three habits keep it working:
 
-- **Don't read the whole guide.** `relish agent guide` is about 68 KB, some
-  17,000 tokens, which fills a 16K window on its own. Use `manual_search`
-  and `manual_show` for the section you need.
+- **Read the guide a section at a time.** The whole guide is about 75 KB,
+  some 18,000 tokens, which fills a 16K window on its own. When it doesn't
+  fit the budget, the `guide` tool answers with an outline instead: the
+  contents, each section with its size, and the two sections to read first
+  ("In brief" and "The contract"), whole. Its `next` names the section to
+  read after them, and `relish agent guide --section ID` (the tool's
+  `section`) reads any other. A section that doesn't fit is cut between
+  paragraphs, marked `truncated`, and says so.
 - **Keep answers small.** `relish mcp` holds every answer to 8 KiB, about
   2,000 tokens, unless the model asks for more, and the conversation is
   sent again on every turn. At an 8K window, start it with `--max-bytes
   4096`.
-- **Offer fewer tools.** The 14 tools' descriptions and schemas cost about
-  3,000 tokens on every turn. `--toolsets context,diagnose,explain,logs,manual`
-  keeps the six a diagnosis needs, for about 1,300:
+- **Offer fewer tools.** The 14 tools' names, descriptions and input
+  schemas are about 9,900 bytes, some 2,500 tokens, on every turn.
+  `--toolsets context,diagnose,explain,logs,manual` keeps the six a
+  diagnosis needs, for about 1,100:
 
 ```sh
 relish mcp --toolsets context,diagnose,explain,logs,manual
@@ -1120,12 +1179,19 @@ to run `relish agent propose` itself. Writing your own loop? Send the task as
 a system message: Ollama drops the oldest messages to fit the window, and
 keeps system ones.
 
-We measure local models in the gym, with Qwen3 8B first. On 9 November it
-made no change in any run, found a crash loop every time at a 32K window,
-and missed nearly everything that needed a typed command or a long session.
-The loop we used, `scripts/gym/local_model.py`, is a plain one: the model,
-`relish mcp`'s tools and a `relish` command, and nothing else. The [record](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-09-gym-local-models.md)
-has the numbers. We haven't measured Goose or any other client with a local
+We measure local models in the gym. On 9 November four of them ran every
+scenario three times at an 8K window, with `relish mcp`'s 8 KiB default
+and all its tools: Qwen3 8B and
+Qwen3 14B got 12 of 36 runs right, Llama 3.1 8B 7 and gpt-oss 20B 6. None
+changed the cluster. The best of them find crash loops and apps that can't
+be placed, and they miss what needs a step of their own: a fix in the
+source, a report, the partitioned node (Qwen3 8B every time), and most
+proposals, even with `--propose` (Qwen3 proposed in 7 of 24 runs). The loop
+we used, `scripts/gym/local_model.py`, is a plain one: the model, `relish
+mcp`'s tools and a `relish` command, and nothing else. The [first
+record](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-09-gym-local-models.md)
+and the [second](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-10-gym-local-models-second-pass.md)
+have the numbers. We haven't measured Goose or any other client with a local
 model.
 
 ## Sending us a bug or a fix

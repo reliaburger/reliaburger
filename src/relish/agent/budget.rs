@@ -57,6 +57,78 @@ pub const MIN_MAX_BYTES: usize = 1024;
 /// What a shortened string ends with.
 pub const STRING_CUT_MARKER: &str = "…[cut]";
 
+tokio::task_local! {
+    /// The most bytes any answer may have, when a caller holds every budget
+    /// to one: `relish mcp` does (#1687). The command line has none.
+    static CEILING: usize;
+}
+
+/// Run `future` with every answer it renders held to `ceiling`: a trimmed
+/// answer's hint never asks for more, because asking can't get it.
+///
+/// A task-local rather than a parameter, so the twenty commands between
+/// `relish mcp` and [`render`] needn't carry a value only one caller sets.
+pub async fn within_ceiling<F: std::future::Future>(ceiling: usize, future: F) -> F::Output {
+    CEILING.scope(ceiling, future).await
+}
+
+/// The ceiling the current task renders under, if any.
+fn ceiling() -> Option<usize> {
+    CEILING.try_with(|ceiling| *ceiling).ok()
+}
+
+/// An answer bigger than its budget: how big it is whole, and the budget
+/// it was given.
+///
+/// Every step that asks for a bigger budget takes its number from
+/// [`Overflow::rerun_budget`], whether [`render`] trims the answer or a
+/// command fits it itself, as `logs` and `manual show` do. So under
+/// `relish mcp` no step asks for more than the server returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Overflow {
+    /// The bytes the whole answer takes.
+    pub whole: usize,
+    /// The budget this answer had.
+    pub max_bytes: usize,
+}
+
+impl Overflow {
+    /// The budget a "get the rest" step may name: enough for the whole
+    /// answer, rounded up to a KiB, or the ceiling the caller renders
+    /// under when the whole is bigger. `None` once this answer already had
+    /// the ceiling: asking again would get the same answer.
+    pub fn rerun_budget(self) -> Option<usize> {
+        match ceiling() {
+            Some(ceiling) if self.whole > ceiling && self.max_bytes >= ceiling => None,
+            Some(ceiling) if self.whole > ceiling => Some(ceiling),
+            _ => Some(round_up_to_kib(self.whole)),
+        }
+    }
+
+    /// Why the whole answer is out of reach, when the ceiling puts it
+    /// there.
+    pub fn out_of_reach(self) -> Option<String> {
+        ceiling()
+            .filter(|ceiling| self.whole > *ceiling)
+            .map(|ceiling| narrow_why(self.whole, ceiling))
+    }
+}
+
+/// `rerun` again with a budget of `budget` bytes: the one place a step's
+/// `--max-bytes` is written, so it always comes from
+/// [`Overflow::rerun_budget`].
+pub fn rerun_with(rerun: &str, budget: usize) -> String {
+    format!("{rerun} --max-bytes {budget}")
+}
+
+/// Why an answer bigger than the ceiling can't be had whole.
+fn narrow_why(whole: usize, ceiling: usize) -> String {
+    format!(
+        "the whole answer is {whole} bytes, more than the {ceiling} this server returns; \
+         narrow the request instead: a filter, a time range or a section"
+    )
+}
+
 /// Render `envelope` as one line of JSON, newline included, in at most
 /// `max_bytes` bytes.
 ///
@@ -96,10 +168,13 @@ pub fn render<T: Serialize>(envelope: &Envelope<T>, max_bytes: usize, rerun: &st
                 ErrorCode::Usage,
                 format!("the answer is {whole} bytes and doesn't fit in {max_bytes}, even trimmed"),
             )
-            .with_hint(format!(
-                "run it again with --max-bytes {}",
-                round_up_to_kib(whole)
-            ));
+            .with_hint(
+                Overflow { whole, max_bytes }
+                    .out_of_reach()
+                    .unwrap_or_else(|| {
+                        format!("run it again with --max-bytes {}", round_up_to_kib(whole))
+                    }),
+            );
             failure_that_fits(envelope.command(), envelope.relish(), error, max_bytes)
         }
     }
@@ -152,13 +227,27 @@ fn trim_answer(value: Value, max_bytes: usize, whole: usize, rerun: &str) -> Opt
     };
     let mut data = top.remove("data").unwrap_or(Value::Null);
     let own_next = take_array(&mut top, "next");
-    let own_warnings = take_array(&mut top, "warnings");
+    let mut own_warnings = take_array(&mut top, "warnings");
     top.insert("truncated".to_string(), Value::Bool(true));
-    let hint = json!({
-        "run": format!("{rerun} --max-bytes {}", round_up_to_kib(whole)),
-        "why": format!("the whole answer is {whole} bytes and this budget was {max_bytes}"),
-        "read_only": true,
-    });
+    // Under a ceiling the whole answer may be out of reach: ask for the
+    // ceiling once, and at the ceiling ask for nothing more, only for a
+    // narrower question.
+    let overflow = Overflow { whole, max_bytes };
+    let hint = match overflow.rerun_budget() {
+        Some(budget) => Some(json!({
+            "run": rerun_with(rerun, budget),
+            "why": overflow.out_of_reach().unwrap_or_else(|| {
+                format!("the whole answer is {whole} bytes and this budget was {max_bytes}")
+            }),
+            "read_only": true,
+        })),
+        None => {
+            if let Some(why) = overflow.out_of_reach() {
+                own_warnings.insert(0, Value::String(why));
+            }
+            None
+        }
+    };
 
     let mut cuts: Vec<Cut> = Vec::new();
     let mut keep_next = own_next.len();
@@ -167,7 +256,7 @@ fn trim_answer(value: Value, max_bytes: usize, whole: usize, rerun: &str) -> Opt
         // Measure the envelope with `data` as `null`, then swap in the size
         // of the real `data`, so the loop never copies a big answer.
         let mut shell = top.clone();
-        let mut next = vec![hint.clone()];
+        let mut next: Vec<Value> = hint.iter().cloned().collect();
         next.extend_from_slice(&own_next[..keep_next]);
         let mut warnings = own_warnings[..keep_warnings].to_vec();
         warnings.extend(cut_notes(&cuts, &data).into_iter().map(Value::String));
@@ -546,6 +635,69 @@ mod tests {
         assert_eq!(parse(&again)["truncated"], json!(false));
     }
 
+    /// Through `relish mcp` no answer is bigger than its ceiling, so a hint
+    /// asking for the whole answer sent a model round in circles: it asked,
+    /// got the ceiling, and was told to ask again (#1687).
+    #[tokio::test]
+    async fn under_a_ceiling_the_hint_asks_for_the_ceiling_and_says_to_narrow() {
+        let apps: Vec<Value> = (0..2000).map(|index| json!(index)).collect();
+        let envelope = answered(json!({ "apps": apps }));
+        let text = within_ceiling(4096, async {
+            render_json(&envelope, 2048, "relish agent version")
+        })
+        .await;
+        let value = parse(&text);
+        assert!(text.len() <= 2048, "{} bytes", text.len());
+        let hint = &value["next"][0];
+        assert_eq!(hint["run"], json!("relish agent version --max-bytes 4096"));
+        assert!(hint["why"].as_str().unwrap().contains("narrow"), "{hint}");
+    }
+
+    #[tokio::test]
+    async fn at_the_ceiling_no_step_asks_for_more_and_a_warning_says_to_narrow() {
+        let apps: Vec<Value> = (0..2000).map(|index| json!(index)).collect();
+        let envelope = answered(json!({ "apps": apps }));
+        let text = within_ceiling(4096, async {
+            render_json(&envelope, 4096, "relish agent version")
+        })
+        .await;
+        let value = parse(&text);
+        assert_eq!(value["truncated"], json!(true));
+        for step in value["next"].as_array().unwrap() {
+            assert!(
+                !step["run"].as_str().unwrap().contains("--max-bytes"),
+                "{step}"
+            );
+        }
+        let warnings = value["warnings"].as_array().unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.as_str().unwrap().contains("narrow")),
+            "{warnings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn under_a_ceiling_an_answer_that_fits_it_keeps_the_usual_hint() {
+        let apps: Vec<Value> = (0..500).map(|index| json!(index)).collect();
+        let envelope = answered(json!({ "apps": apps }));
+        let whole = render_json(&envelope, usize::MAX, "relish agent version").len();
+        let text = within_ceiling(64 * 1024, async {
+            render_json(&envelope, 1024, "relish agent version")
+        })
+        .await;
+        let hint = &parse(&text)["next"][0];
+        assert_eq!(
+            hint["run"],
+            json!(format!(
+                "relish agent version --max-bytes {}",
+                round_up_to_kib(whole)
+            ))
+        );
+        assert!(!hint["why"].as_str().unwrap().contains("narrow"), "{hint}");
+    }
+
     #[test]
     fn a_long_string_is_shortened_at_a_character_boundary() {
         let text_value = "é".repeat(5000);
@@ -697,5 +849,39 @@ mod tests {
             let value: Value = serde_json::from_str(&text).expect("valid JSON");
             prop_assert_eq!(&value["schema"], &json!("relish.agent/v1"));
         }
+    }
+
+    /// Every "ask for more" step goes through [`Overflow::rerun_budget`], so
+    /// no command can name a budget above the ceiling `relish mcp` holds
+    /// answers to. `logs` and `manual show` each built their own and
+    /// bypassed it (#1818's review); this catches the next one.
+    #[test]
+    fn no_command_writes_its_own_max_bytes_step() {
+        fn sources(directory: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    sources(&path, found);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    found.push(path);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/relish");
+        let mut found = Vec::new();
+        sources(&root, &mut found);
+        let offenders: Vec<_> = found
+            .iter()
+            .filter(|path| !path.ends_with("agent/budget.rs"))
+            .filter(|path| {
+                std::fs::read_to_string(path)
+                    .unwrap()
+                    .contains("--max-bytes {")
+            })
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "build the step with budget::Overflow instead: {offenders:?}"
+        );
     }
 }

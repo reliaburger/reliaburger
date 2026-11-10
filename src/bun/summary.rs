@@ -590,7 +590,8 @@ pub struct LeaseBrief {
 pub struct ProposalBrief {
     /// Its number, for `relish proposal show`.
     pub id: u64,
-    /// `apply`, `scale`, `rollback`, `stop`, `delete` or `undo`.
+    /// `apply`, `scale`, `rollback`, `stop`, `delete`, `restart`, `cancel_deploy`,
+    /// `clear_fault` or `undo`.
     pub kind: String,
     /// The author's token name.
     pub author: String,
@@ -1350,11 +1351,11 @@ pub fn waiting_proposals(
 }
 
 /// Why a waiting proposal can't apply as it stands, or `None` while it
-/// still can: the same three causes that make approving it fail. It
-/// applies only while every touched app's revision still equals the one it
-/// saw and no one else's lease covers one of them; one past its TTL should
-/// already have been expired by the reaper.
-fn staleness(
+/// still can: the same causes that make approving it fail. It applies only
+/// while every touched app's revision still equals the one it saw, no one
+/// else's lease covers one of them and it touches no more than it showed;
+/// one past its TTL should already have been expired by the reaper.
+pub(crate) fn staleness(
     desired: &crate::council::types::DesiredState,
     proposal: &crate::proposal::Proposal,
     now_unix_ms: u64,
@@ -1372,6 +1373,10 @@ fn staleness(
             .map(|lease| (app, lease))
     }) {
         return Some(format!("{app} is leased by {}", lease.holder.name));
+    }
+    // Approving it would fail too: it touches more than it showed (#1682).
+    if let Some(grew) = crate::proposal::build::blast_radius_growth(desired, proposal) {
+        return Some(grew);
     }
     (proposal.expires_at_unix_ms <= now_unix_ms)
         .then(|| "past its TTL, and the reaper hasn't expired it".to_string())
@@ -2128,6 +2133,8 @@ mod tests {
             replicas: Some(5),
             config: None,
             of: None,
+            fault: None,
+            node: None,
             reason: "p99 over the SLO".to_string(),
             ttl_seconds: None,
             idempotency_key: None,

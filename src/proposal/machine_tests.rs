@@ -56,6 +56,8 @@ fn scale(app: &str, replicas: u32) -> ProposalRequest {
         replicas: Some(replicas),
         config: None,
         of: None,
+        fault: None,
+        node: None,
         reason: "p99 over the SLO".to_string(),
         ttl_seconds: None,
         idempotency_key: None,
@@ -670,6 +672,8 @@ fn an_agents_undo_is_a_proposal_that_marks_the_original_undone() {
     let undo = ProposalRequest {
         kind: RequestKind::Undo,
         of: Some(original.0),
+        fault: None,
+        node: None,
         namespace: None,
         app: None,
         replicas: None,

@@ -73,4 +73,4 @@ Pending. The record lists every cell where a Kubernetes solver had more correct 
 
 ---
 
-The Markdown copy of <https://reliaburger.com/compare/ai-agents.html>.
+The Markdown copy of <https://reliaburger.com/compare/ai-agents>.

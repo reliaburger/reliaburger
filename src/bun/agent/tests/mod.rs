@@ -14052,3 +14052,60 @@ async fn adopted_placement_query_is_answered_on_the_command_channel() {
     shutdown.cancel();
     task.await.unwrap();
 }
+
+/// A partitioned node sees every peer it blocked go Dead, and gossip then
+/// stops listing them. Clearing the fault without the leader's fence must
+/// still unblock them, so the heal can't depend on looking peers up in the
+/// live membership (#1820).
+#[tokio::test]
+async fn council_partition_heals_after_its_peers_leave_the_membership() {
+    let peer = |name: &str, port: u16| crate::mustard::membership::MembershipSnapshot {
+        node_id: crate::meat::NodeId::new(name),
+        address: std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        state: crate::mustard::state::NodeState::Alive,
+        incarnation: 1,
+        is_council: true,
+        is_leader: false,
+        labels: Default::default(),
+        first_seen: std::time::Instant::now(),
+        resources: None,
+    };
+    let (membership_tx, membership_rx) =
+        tokio::sync::watch::channel(vec![peer("q2", 7002), peer("q3", 7003)]);
+    let gossip = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new()));
+    let raft = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new()));
+    let (mut agent, _, _) = test_cluster_fault_agent().await;
+    if let Some(cluster) = agent.cluster.as_mut() {
+        cluster.membership_rx = membership_rx;
+        cluster.partition_blocklists.gossip = Some(gossip.clone());
+        cluster.partition_blocklists.raft = Some(raft.clone());
+        cluster.partition_blocklists.raft_port_offset = 100;
+    }
+    let rule = register_fault(
+        &mut agent,
+        crate::smoker::types::FaultType::CouncilPartition {
+            peers: vec!["q2".to_string(), "q3".to_string()],
+        },
+        std::time::Duration::from_secs(30),
+    );
+
+    agent.apply_fault(&rule).await.unwrap();
+    assert_eq!(gossip.read().await.len(), 2, "gossip must block both peers");
+    assert_eq!(raft.read().await.len(), 2, "raft must block both peers");
+
+    // The blocked peers go Dead and drop out of the live membership.
+    membership_tx.send_replace(Vec::new());
+
+    let stored = agent.fault_registry.get(rule.id).cloned().unwrap();
+    agent.reverse_fault(&stored).await;
+    let gossip_left = gossip.read().await.clone();
+    let raft_left = raft.read().await.clone();
+    assert!(
+        gossip_left.is_empty(),
+        "gossip still blocks peers after the heal: {gossip_left:?}"
+    );
+    assert!(
+        raft_left.is_empty(),
+        "raft still blocks peers after the heal: {raft_left:?}"
+    );
+}

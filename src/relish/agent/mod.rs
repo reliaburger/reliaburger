@@ -70,7 +70,7 @@ pub fn agent_command() -> clap::Command {
 #[derive(Debug, Clone, clap::Subcommand)]
 pub enum AgentCommand {
     /// How to use relish as an agent: the manual chapter, as Markdown sections.
-    Guide,
+    Guide(guide::GuideArgs),
     /// This binary's version, commit, target and cluster formats.
     Version,
     /// The JSON Schema of the envelope and of each command's data.
@@ -156,7 +156,7 @@ impl AgentCommand {
     /// because this `match` names every one.
     pub fn cluster_use(&self) -> ClusterUse {
         match self {
-            AgentCommand::Guide
+            AgentCommand::Guide(_)
             | AgentCommand::Version
             | AgentCommand::Schema { .. }
             | AgentCommand::Manual { .. }
@@ -199,7 +199,7 @@ impl AgentCommand {
     /// The name the envelope's `command` field carries.
     pub fn name(&self) -> CommandName {
         match self {
-            AgentCommand::Guide => CommandName::Guide,
+            AgentCommand::Guide(_) => CommandName::Guide,
             AgentCommand::Version => CommandName::Version,
             AgentCommand::Schema { .. } => CommandName::Schema,
             AgentCommand::Source(options) => options.command.name(),
@@ -245,7 +245,7 @@ pub fn render<T: Serialize>(envelope: &Envelope<T>, max_bytes: usize, rerun: &st
 pub async fn run(options: &AgentOptions, rerun: &str) -> Rendered {
     let max_bytes = options.max_bytes();
     match &options.command {
-        AgentCommand::Guide => guide::run(max_bytes, rerun),
+        AgentCommand::Guide(args) => guide::run(max_bytes, args.section.as_deref(), rerun),
         AgentCommand::Version => render(
             &Envelope::answered(CommandName::Version, BuildInfo::current(), version_data()),
             max_bytes,

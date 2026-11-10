@@ -18,7 +18,8 @@ pub struct ProposalView {
     /// `pending`, `applied`, `rejected`, `expired`, `withdrawn`, `failed` or
     /// `undone`.
     pub state: String,
-    /// `apply`, `scale`, `rollback`, `stop`, `delete` or `undo`.
+    /// `apply`, `scale`, `rollback`, `stop`, `delete`, `restart`,
+    /// `cancel_deploy`, `clear_fault` or `undo`.
     pub kind: String,
     /// For an `undo`, the proposal it undoes.
     pub undo_of: Option<u64>,
@@ -94,9 +95,15 @@ pub struct BlastRadiusView {
     pub apps: Vec<String>,
     /// The nodes they're on now.
     pub nodes: Vec<String>,
-    /// Where new instances would go; empty, the scheduler decides when it
-    /// applies.
+    /// Where the scheduler's dry run would put the instances it starts. A
+    /// forecast: the scheduler decides when it applies.
     pub new_nodes_forecast: Vec<String>,
+    /// How many of them the dry run couldn't place.
+    #[serde(default)]
+    pub unplaced_forecast: u32,
+    /// Why it couldn't, or why there's no forecast.
+    #[serde(default)]
+    pub forecast_note: Option<String>,
     /// Instances replaced by a new spec.
     pub instances_replaced: u32,
     /// Instances started.
@@ -219,6 +226,8 @@ impl Proposal {
                 apps: radius.apps.clone(),
                 nodes: radius.nodes.clone(),
                 new_nodes_forecast: radius.new_nodes_forecast.clone(),
+                unplaced_forecast: radius.unplaced_forecast,
+                forecast_note: radius.forecast_note.clone(),
                 instances_replaced: radius.instances_replaced,
                 instances_started: radius.instances_started,
                 instances_stopped: radius.instances_stopped,

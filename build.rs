@@ -15,6 +15,7 @@ mod pack;
 
 fn main() {
     embed_source();
+    find_gym_scenarios();
 
     // Cargo exposes TARGET only to build scripts. Re-export it so Phase 15
     // evidence can distinguish otherwise identical cross-compiled binaries.
@@ -37,6 +38,40 @@ fn main() {
     // Select the target OS: the build script itself runs on the host.
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") && cfg!(feature = "ebpf") {
         compile_ebpf();
+    }
+}
+
+/// Set `gym_scenarios` when `scripts/gym/relish-scenarios.rs` is there, so
+/// `src/relish/gym/catalogue.rs` includes it. It's the gym's answer key and
+/// stays out of the source bundle (#1687), so a build from the bundle alone
+/// has no scenarios. A release build (`RELIABURGER_REQUIRE_CLEAN_SOURCE=1`)
+/// fails without them rather than ship a `relish gym run` with nothing to
+/// run. The cfg also gates the scorer's parity tests, whose shared fixture
+/// is under `scripts/gym/` too: it marks a checkout that has the gym's
+/// files, and `every_included_file_is_in_the_bundle_or_behind_its_cfg`
+/// holds every other include to the bundle (#1691).
+fn find_gym_scenarios() {
+    println!("cargo:rustc-check-cfg=cfg(gym_scenarios)");
+    println!("cargo:rerun-if-env-changed=RELIABURGER_REQUIRE_CLEAN_SOURCE");
+    let root = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("Cargo manifest dir"));
+    let gym = root.join("scripts/gym");
+    let scenarios = gym.join("relish-scenarios.rs");
+    if scenarios.is_file() {
+        println!("cargo:rerun-if-changed={}", scenarios.display());
+        println!("cargo:rustc-cfg=gym_scenarios");
+        return;
+    }
+    // A file added to the directory changes its modification time, so a
+    // checkout that gains the scenarios sets the cfg on the next build.
+    if gym.is_dir() {
+        println!("cargo:rerun-if-changed={}", gym.display());
+    }
+    if std::env::var("RELIABURGER_REQUIRE_CLEAN_SOURCE").as_deref() == Ok("1") {
+        panic!(
+            "RELIABURGER_REQUIRE_CLEAN_SOURCE is set, but {} is missing: this relish would \
+             have no gym scenarios",
+            scenarios.display()
+        );
     }
 }
 

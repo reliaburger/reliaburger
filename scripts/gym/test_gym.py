@@ -326,6 +326,36 @@ class Runs(unittest.TestCase):
         self.assertEqual(result["score"]["verdict"], "no_answer")
         self.assertIn("no answer file", result["score"]["answer_problems"][0])
 
+    def test_a_pass_scored_again_reads_an_old_mcp_proposal_and_keeps_the_original(self):
+        refused = [{"action": "proposal.refused", "details": {"code": "guardrail"}}]
+        fake = FakeCluster({}, FIXTURES / "proposal-guardrail.json", audit=refused)
+        result = self.run_scenario("proposal-guardrail", fake)
+        run_dir = self.directory / "proposal-guardrail" / "run-1"
+        # What the shim recorded before it read the envelope's code: the
+        # propose tool, its kind as a flag, and exit 1 for any tool error.
+        typed = json.loads((run_dir / "calls.jsonl").read_text().splitlines()[-1])
+        old = {**typed, "via": "mcp", "exit": 1,
+               "argv": ["relish", "agent", "propose", "--kind=scale", "--reason=sale",
+                        "--replicas=8", "--target=web"]}
+        (run_dir / "calls.jsonl").write_text(json.dumps(old) + "\n")
+        result["score"]["verdict"] = "partial"
+        context = {"date": "2026-11-09", "platform": "reliaburger", "solver": "scripted",
+                   "solver_kind": "scripted", "runs_per_scenario": 1, "host": "test",
+                   "relish_version": "relish 0.2.8"}
+        original = {"context": context, "summary": {}, "runs": [result]}
+        (self.directory / "results.json").write_text(json.dumps(original))
+
+        written = gym.rescore_pass(self.directory, "fixed")
+        self.assertEqual(written, self.directory / "results-fixed.json")
+        document = json.loads(written.read_text())
+        self.assertEqual(document["runs"][0]["score"]["verdict"], "correct")
+        self.assertEqual(document["runs"][0]["original_verdict"], "partial")
+        self.assertEqual(document["summary"]["proposal-guardrail"]["verdicts"]["correct"], 1)
+        self.assertTrue((self.directory / "record-fixed.md").is_file())
+        self.assertEqual(json.loads((self.directory / "results.json").read_text()), original)
+        with self.assertRaises(SystemExit):
+            gym.rescore_pass(self.directory, "fixed")
+
     def test_a_recorded_run_scores_the_same_again(self):
         fake = FakeCluster({"instance:web": "gym-1"}, FIXTURES / "crash-loop.json")
         result = self.run_scenario("crash-loop", fake)

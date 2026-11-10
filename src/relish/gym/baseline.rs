@@ -198,7 +198,7 @@ mod tests {
     #[test]
     fn the_app_a_prompt_names_is_found() {
         assert_eq!(
-            named_app("The `gym-payments` app in the namespace `x`").as_deref(),
+            named_app("Look at the `gym-payments` app, please").as_deref(),
             Some("gym-payments")
         );
         assert_eq!(named_app("nothing here"), None);

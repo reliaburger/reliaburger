@@ -127,8 +127,9 @@ const REFUSED_VALUES: &[(&str, &str, &str, &str)] = &[(
     "propose",
     "kind",
     "apply",
-    "reads a local file, so relish mcp doesn't offer it; propose scale, rollback, stop or \
-     delete, or run `relish agent propose apply` yourself",
+    "reads a local file, so relish mcp doesn't offer it; propose scale, rollback, stop, \
+     delete, restart, cancel-deploy or clear-fault, or run `relish agent propose apply` \
+     yourself",
 )];
 
 fn covers(group: &str, command: &str) -> bool {
@@ -517,7 +518,31 @@ pub struct Selection {
     pub propose: bool,
     /// Every tool's budget when a call names none: `relish mcp
     /// --max-bytes`. [`DEFAULT_MAX_BYTES`] when `None`.
-    pub max_bytes: Option<usize>,
+    pub max_bytes: Option<ServerBudget>,
+}
+
+/// What `relish mcp --max-bytes` set: one budget for every tool, or, with
+/// `--max-bytes 0`, each command's own default (24 KiB, 80 KiB for
+/// `guide`, 40 KiB for `schema`), as the Claude Code plugin runs it.
+/// Either way no call gets more than [`MAX_BYTES_CEILING`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerBudget {
+    /// This many bytes for every tool.
+    Every(usize),
+    /// Each command's own default: `--max-bytes 0`.
+    CommandDefaults,
+}
+
+impl ServerBudget {
+    /// The budget `command`'s tool gets when a call names none.
+    fn for_command(self, command: &str) -> usize {
+        match self {
+            ServerBudget::Every(bytes) => bytes,
+            ServerBudget::CommandDefaults => command_name(command)
+                .map_or(agent::DEFAULT_MAX_BYTES, agent::default_max_bytes)
+                .min(MAX_BYTES_CEILING),
+        }
+    }
 }
 
 /// `relish mcp`'s budget when `--max-bytes` isn't given: 8 KiB, about 2,000
@@ -538,6 +563,14 @@ pub const MAX_BYTES_CEILING: usize = 128 * 1024;
 
 /// The argument that carries a call's budget.
 const MAX_BYTES: &str = "max_bytes";
+
+/// `max_bytes`'s description in every tool's input schema. The CLI's says
+/// which default each command has, which `relish mcp` doesn't use, and at
+/// about 200 bytes in each of 14 tools it was a quarter of what a model
+/// read of the tool list every turn (#1687). The schema's `default`,
+/// `minimum` and `maximum` carry the numbers.
+const BUDGET_DESCRIPTION: &str =
+    "Largest answer in bytes; a bigger one is trimmed and marked `truncated`";
 
 /// Why a [`Selection`] can't be served.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -584,7 +617,12 @@ pub fn select(
             Some(namespace) => tool.pin(NAMESPACE, namespace),
             None => tool,
         })
-        .map(|tool| tool.with_budget(selection.max_bytes.unwrap_or(DEFAULT_MAX_BYTES)))
+        .map(|tool| {
+            let budget = selection.max_bytes.map_or(DEFAULT_MAX_BYTES, |budget| {
+                budget.for_command(&tool.command)
+            });
+            tool.with_budget(budget)
+        })
         .collect())
 }
 
@@ -604,6 +642,7 @@ impl ToolSpec {
         if let Some(Value::Object(properties)) = schema.get_mut("properties")
             && let Some(Value::Object(property)) = properties.get_mut(MAX_BYTES)
         {
+            property.insert("description".into(), json!(BUDGET_DESCRIPTION));
             property.insert("default".into(), json!(budget));
             property.insert("minimum".into(), json!(agent::MIN_MAX_BYTES));
             property.insert("maximum".into(), json!(MAX_BYTES_CEILING));

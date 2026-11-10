@@ -502,6 +502,109 @@ fn snapshot_of_tools_list() {
     insta::assert_json_snapshot!(listed_for_snapshot(server.tools()));
 }
 
+/// What a model reads of the tool list on every turn: each tool's name,
+/// description and input schema, as compact JSON. The output schemas and
+/// annotations are for the client, and our gym loop doesn't send them.
+fn model_facing_bytes(tools: &[Tool]) -> usize {
+    let listed: Vec<Value> = tools
+        .iter()
+        .map(|tool| {
+            json!({
+                "name": tool.name,
+                "description": tool.description,
+                "inputSchema": tool.input_schema,
+            })
+        })
+        .collect();
+    serde_json::to_string(&listed).unwrap().len()
+}
+
+/// The 14 tools cost a small model about 3,000 tokens on every turn
+/// (#1687): 11,369 bytes before the first trim, 9,872 after. A new tool or
+/// a longer description has to fit under this, or raise it deliberately.
+const MODEL_FACING_CEILING: usize = 10 * 1024;
+
+/// The whole `tools/list` answer, output schemas and annotations included:
+/// 88,998 bytes before the first trim. Most of it is the output schemas,
+/// which clients read and models mostly don't.
+const TOOLS_LIST_CEILING: usize = 96 * 1024;
+
+#[test]
+fn the_tool_list_a_model_reads_stays_under_its_ceiling() {
+    let server = Server::new(&Selection::default()).unwrap();
+    let tools = server.tools();
+    let model_facing = model_facing_bytes(&tools);
+    assert!(
+        model_facing <= MODEL_FACING_CEILING,
+        "the tools' names, descriptions and input schemas are {model_facing} bytes, over \
+         {MODEL_FACING_CEILING}: shorten them, or raise the ceiling deliberately"
+    );
+    let whole = serde_json::to_string(&json!({ "tools": tools }))
+        .unwrap()
+        .len();
+    assert!(
+        whole <= TOOLS_LIST_CEILING,
+        "tools/list is {whole} bytes, over {TOOLS_LIST_CEILING}"
+    );
+}
+
+/// Every tool that takes `max_bytes` says what it does in a few words: the
+/// schema's `default`, `minimum` and `maximum` carry the numbers, so the
+/// description doesn't repeat the CLI's own defaults, which `relish mcp`
+/// doesn't use.
+#[test]
+fn the_budget_argument_is_described_once_briefly_and_without_the_cli_defaults() {
+    let server = Server::new(&Selection::default()).unwrap();
+    for tool in server.tools() {
+        let Some(property) = tool.input_schema["properties"].get("max_bytes") else {
+            continue;
+        };
+        let description = property["description"].as_str().unwrap();
+        assert!(description.len() <= 80, "{}: {description}", tool.name);
+        assert!(
+            !description.contains("24576"),
+            "{}: {description}",
+            tool.name
+        );
+        assert!(
+            description.contains("truncated"),
+            "{}: {description}",
+            tool.name
+        );
+        assert_eq!(property["default"], tools::DEFAULT_MAX_BYTES);
+    }
+}
+
+/// Through MCP the guide's budget is 8 KiB, a tenth of the chapter, so the
+/// first call answers with the contents and the sections to read first,
+/// each whole, and `next` names the section to read after them.
+#[tokio::test]
+async fn the_guide_tool_answers_a_small_budget_with_an_outline() {
+    let server = Server::new(&Selection::default()).unwrap();
+    let result = server.call("guide", &serde_json::Map::new()).await.unwrap();
+    let envelope = result.structured_content.unwrap();
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["data"]["scope"], "outline");
+    assert_eq!(envelope["truncated"], false, "an outline cuts nothing");
+    let headings: Vec<&str> = envelope["data"]["sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|section| section["heading"].as_str().unwrap())
+        .collect();
+    assert_eq!(headings, ["In brief", "The contract"]);
+    assert!(envelope["data"]["contents"].as_array().unwrap().len() > 20);
+    let next = envelope["next"].as_array().unwrap();
+    assert_eq!(next[0]["run"], "relish agent guide --section the-envelope");
+
+    let mut arguments = serde_json::Map::new();
+    arguments.insert("section".into(), json!("the-envelope"));
+    let result = server.call("guide", &arguments).await.unwrap();
+    let envelope = result.structured_content.unwrap();
+    assert_eq!(envelope["data"]["scope"], "section");
+    assert_eq!(envelope["data"]["sections"][0]["heading"], "The envelope");
+}
+
 // ---------------------------------------------------------------------------
 // Untrusted text through MCP.
 
@@ -1505,10 +1608,35 @@ fn the_server_advertises_eight_kib_to_every_tool_by_default() {
     assert!(budgeted > 0);
 }
 
+/// `relish mcp --max-bytes 0`, as the Claude Code plugin runs it: each
+/// tool keeps its command's own default, so the guide still comes whole
+/// in one call, and the ceiling still holds every call (#1818's review).
+#[test]
+fn max_bytes_zero_keeps_each_commands_own_default() {
+    let server = Server::new(&Selection {
+        max_bytes: Some(tools::ServerBudget::CommandDefaults),
+        ..Selection::default()
+    })
+    .unwrap();
+    let default_of = |name: &str| {
+        server
+            .tools()
+            .into_iter()
+            .find(|tool| tool.name == name)
+            .unwrap_or_else(|| panic!("no {name} tool"))
+            .input_schema["properties"]["max_bytes"]
+            .clone()
+    };
+    assert_eq!(default_of("guide")["default"], 80 * 1024);
+    assert_eq!(default_of("schema")["default"], 40 * 1024);
+    assert_eq!(default_of("context")["default"], 24 * 1024);
+    assert_eq!(default_of("guide")["maximum"], 131072);
+}
+
 #[test]
 fn max_bytes_sets_the_advertised_default() {
     let server = Server::new(&Selection {
-        max_bytes: Some(4096),
+        max_bytes: Some(tools::ServerBudget::Every(4096)),
         ..Selection::default()
     })
     .unwrap();
@@ -1549,8 +1677,18 @@ fn a_budget_above_the_ceiling_is_held_to_it() {
 
 #[test]
 fn the_max_bytes_flag_takes_the_floor_to_the_ceiling() {
-    assert_eq!(parse_server_max_bytes("1024"), Ok(1024));
-    assert_eq!(parse_server_max_bytes("131072"), Ok(131072));
+    assert_eq!(
+        parse_server_max_bytes("1024"),
+        Ok(tools::ServerBudget::Every(1024))
+    );
+    assert_eq!(
+        parse_server_max_bytes("131072"),
+        Ok(tools::ServerBudget::Every(131072))
+    );
+    assert_eq!(
+        parse_server_max_bytes("0"),
+        Ok(tools::ServerBudget::CommandDefaults)
+    );
     assert!(parse_server_max_bytes("1023").is_err());
     assert!(parse_server_max_bytes("131073").is_err());
     assert!(parse_server_max_bytes("lots").is_err());
@@ -1564,4 +1702,35 @@ async fn a_tool_answers_within_the_servers_budget_over_the_wire() {
     let text = answer["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.len() <= 8192, "{} bytes", text.len());
     assert_eq!(answer["result"]["structuredContent"]["truncated"], true);
+}
+
+/// An answer bigger than the ceiling can't be had whole through `relish
+/// mcp`. A hint that asked for all of it was held to the ceiling, cut again
+/// and asked again, and a small model follows every hint (#1687).
+#[tokio::test]
+async fn a_cut_answer_never_asks_for_more_than_the_ceiling() {
+    let (mut client, _) = Client::initialised(default_server()).await;
+    // Far more than 128 KiB: a thousand matches with twenty lines each side.
+    let wide = json!({"pattern": "fn ", "context": 20, "max_matches": 1000});
+    let answer = client.call("source_grep", wide.clone()).await;
+    let content = &answer["result"]["structuredContent"];
+    assert_eq!(content["truncated"], true, "{content}");
+    let hint = &content["next"][0];
+    assert_eq!(
+        hint["run"].as_str().unwrap().rsplit(' ').next().unwrap(),
+        tools::MAX_BYTES_CEILING.to_string(),
+        "{hint}"
+    );
+
+    let mut at_ceiling = wide;
+    at_ceiling["max_bytes"] = json!(tools::MAX_BYTES_CEILING);
+    let again = client.call("source_grep", at_ceiling).await;
+    let content = &again["result"]["structuredContent"];
+    assert_eq!(content["truncated"], true, "{content}");
+    for step in content["next"].as_array().unwrap() {
+        assert!(
+            !step["run"].as_str().unwrap().contains("--max-bytes"),
+            "{step}"
+        );
+    }
 }

@@ -217,6 +217,8 @@ struct ProposalFile {
 struct UnknownOnly {
     #[serde(default)]
     unknown: Vec<String>,
+    #[serde(default)]
+    unplaced_forecast: u32,
 }
 
 /// Judge the proposal in `json` by the guardrails in `policies`, offline.
@@ -253,15 +255,17 @@ pub fn judge_proposal_json(
             file.policy_input.proposal.reversibility.clone(),
         ))
         .unwrap_or(crate::proposal::Reversibility::Irreversible);
-        let unknown = file
+        let (unknown, unplaced) = file
             .blast_radius
-            .map(|radius| radius.unknown)
+            .map(|radius| (radius.unknown, radius.unplaced_forecast))
             .unwrap_or_default();
-        match crate::proposal::guard::held_for_a_person(
+        match crate::proposal::guard::held_for_a_person(&crate::proposal::guard::Hold {
+            kind: &file.policy_input.proposal.kind,
             reversibility,
-            &unknown,
-            !judged.verdict.warnings.is_empty(),
-        ) {
+            unknown: &unknown,
+            unplaced,
+            warned: !judged.verdict.warnings.is_empty(),
+        }) {
             Some(why) => held = Some(format!("policy {name} matched, but {why}")),
             None => approve = Some(name),
         }

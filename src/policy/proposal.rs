@@ -30,7 +30,8 @@ use crate::meat::AppId;
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProposalFacts {
-    /// `apply`, `scale`, `rollback`, `stop`, `delete` or `undo`.
+    /// `apply`, `scale`, `rollback`, `stop`, `delete`, `restart`, `cancel_deploy`,
+    /// `clear_fault` or `undo`.
     pub kind: String,
     /// The one namespace every touched app is in.
     pub namespace: String,

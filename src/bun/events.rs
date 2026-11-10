@@ -59,6 +59,8 @@ pub struct AuditEvent {
     pub action: String,
     /// Stable authenticated credential principal.
     pub principal: String,
+    /// What kind of principal that is (#1682's design).
+    pub principal_kind: crate::sesame::types::PrincipalKind,
     /// Related app, when applicable.
     pub app: Option<String>,
     /// Related namespace, when applicable.
@@ -342,6 +344,7 @@ mod tests {
             severity: EventSeverity::Info,
             action: "app.applied".to_string(),
             principal: "token:alice".to_string(),
+            principal_kind: crate::sesame::types::PrincipalKind::Human,
             app: None,
             namespace: Some("default".to_string()),
             node: None,
@@ -373,6 +376,7 @@ mod tests {
             severity: EventSeverity::Info,
             action: "token.created".to_string(),
             principal: "token:admin".to_string(),
+            principal_kind: crate::sesame::types::PrincipalKind::Human,
             app: None,
             namespace: None,
             node: Some("node-1".to_string()),

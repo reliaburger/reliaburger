@@ -34,7 +34,8 @@ pub struct ProposeArgs {
     /// The kind of change.
     #[arg(value_enum)]
     pub kind: ProposeKind,
-    /// The app, or for `apply` the TOML file whose [app.*] tables to apply.
+    /// The app; for `apply` the TOML file whose [app.*] tables to apply;
+    /// for `clear-fault` the fault's id from `relish fault list`.
     pub target: String,
     /// The new replica count, for `scale` (at least 1; to zero is `stop`).
     #[arg(long)]
@@ -42,6 +43,10 @@ pub struct ProposeArgs {
     /// The namespace; `default` when left out. For `apply`, the file's.
     #[arg(long)]
     pub namespace: Option<String>,
+    /// For `clear-fault`, the node that holds the fault, when two nodes
+    /// hold a fault with the same id.
+    #[arg(long)]
+    pub node: Option<String>,
     /// Why, in your words, for the person who decides (at most 1 KiB).
     #[arg(long)]
     pub reason: String,
@@ -69,6 +74,12 @@ pub enum ProposeKind {
     Stop,
     /// Delete an app.
     Delete,
+    /// Replace every instance of an app, node by node (can't be undone).
+    Restart,
+    /// Cancel an app's rollout in progress: back to its last released spec.
+    CancelDeploy,
+    /// Clear an active Smoker fault on an app, by its id (can't be undone).
+    ClearFault,
 }
 
 /// `relish agent proposals`' arguments.
@@ -100,7 +111,8 @@ pub struct AgentProposal {
     /// `pending`, `applied`, `rejected`, `expired`, `withdrawn`, `failed`
     /// or `undone`.
     pub state: String,
-    /// `apply`, `scale`, `rollback`, `stop`, `delete` or `undo`.
+    /// `apply`, `scale`, `rollback`, `stop`, `delete`, `restart`,
+    /// `cancel_deploy`, `clear_fault` or `undo`.
     pub kind: String,
     /// The namespace.
     pub namespace: String,
@@ -213,6 +225,9 @@ pub fn request_for(
         ProposeKind::Rollback => RequestKind::Rollback,
         ProposeKind::Stop => RequestKind::Stop,
         ProposeKind::Delete => RequestKind::Delete,
+        ProposeKind::Restart => RequestKind::Restart,
+        ProposeKind::CancelDeploy => RequestKind::CancelDeploy,
+        ProposeKind::ClearFault => RequestKind::ClearFault,
     };
     if (kind == RequestKind::Scale) != args.replicas.is_some() {
         return Err(AgentError::new(
@@ -220,6 +235,24 @@ pub fn request_for(
             "--replicas goes with `scale`, and only with it",
         ));
     }
+    if (kind != RequestKind::ClearFault) && args.node.is_some() {
+        return Err(AgentError::new(
+            ErrorCode::Usage,
+            "--node goes with `clear-fault`, and only with it",
+        ));
+    }
+    let fault = match kind {
+        RequestKind::ClearFault => Some(args.target.parse::<u64>().map_err(|_| {
+            AgentError::new(
+                ErrorCode::Usage,
+                format!(
+                    "clear-fault takes a fault's id, a number from `relish fault list`, not {}",
+                    args.target
+                ),
+            )
+        })?),
+        _ => None,
+    };
     let namespace = match (&args.namespace, &config) {
         (Some(namespace), _) => Some(namespace.clone()),
         // An apply without --namespace takes the file's.
@@ -235,10 +268,13 @@ pub fn request_for(
     Ok(ProposalRequest {
         kind,
         namespace,
-        app: (kind != RequestKind::Apply).then(|| args.target.clone()),
+        app: (!matches!(kind, RequestKind::Apply | RequestKind::ClearFault))
+            .then(|| args.target.clone()),
         replicas: args.replicas,
         config,
         of: None,
+        fault,
+        node: args.node.clone(),
         reason: args.reason.clone(),
         ttl_seconds: args.ttl.map(|ttl| ttl.as_secs()),
         idempotency_key: args.idempotency_key.clone(),
@@ -348,6 +384,8 @@ pub async fn run_undo(args: &UndoArgs, max_bytes: usize, rerun: &str) -> Rendere
         replicas: None,
         config: None,
         of: Some(args.id),
+        fault: None,
+        node: None,
         reason: args.reason.clone(),
         ttl_seconds: args.ttl.map(|ttl| ttl.as_secs()),
         idempotency_key: None,
@@ -496,6 +534,7 @@ mod tests {
             target: target.to_string(),
             replicas,
             namespace: None,
+            node: None,
             reason: "fix".to_string(),
             ttl: None,
             idempotency_key: None,
@@ -513,6 +552,34 @@ mod tests {
         assert_eq!(request.kind, RequestKind::Apply);
         assert_eq!(request.namespace.as_deref(), Some("shop"));
         assert_eq!(request.app, None);
+    }
+
+    /// `clear-fault` takes the fault's id as its target, and `--node` goes
+    /// with it only.
+    #[test]
+    fn clear_fault_takes_a_fault_id_and_node_goes_with_it_only() {
+        let mut clear = args(ProposeKind::ClearFault, "7", None);
+        clear.node = Some("node-b".to_string());
+        let request = request_for(&clear, None).unwrap();
+        assert_eq!(request.kind, RequestKind::ClearFault);
+        assert_eq!(request.fault, Some(7));
+        assert_eq!(request.node.as_deref(), Some("node-b"));
+        assert_eq!(request.app, None);
+        let error = request_for(&args(ProposeKind::ClearFault, "web", None), None).unwrap_err();
+        assert_eq!(error.code, ErrorCode::Usage);
+        let mut restart = args(ProposeKind::Restart, "web", None);
+        assert_eq!(
+            request_for(&restart, None).unwrap().kind,
+            RequestKind::Restart
+        );
+        restart.node = Some("node-b".to_string());
+        assert_eq!(
+            request_for(&restart, None).unwrap_err().code,
+            ErrorCode::Usage
+        );
+        let cancel = request_for(&args(ProposeKind::CancelDeploy, "web", None), None).unwrap();
+        assert_eq!(cancel.kind, RequestKind::CancelDeploy);
+        assert_eq!(cancel.app.as_deref(), Some("web"));
     }
 
     #[test]

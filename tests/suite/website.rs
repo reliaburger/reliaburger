@@ -723,10 +723,20 @@ fn the_jobs_section_shows_the_day_run_s_memory_chart_from_its_record() {
     }
     assert_eq!(
         read("docs/website/assets/day-run/rss.svg"),
-        read("docs/qualification/2026-10-28-v0.2.3-day-run-charts/rss.svg"),
+        read(&format!(
+            "docs/qualification/{DAY_RUN_RECORD}-charts/rss.svg"
+        )),
         "the day run's chart differs from its record; copy it again"
     );
+    assert!(
+        section.contains(&format!("docs/qualification/{DAY_RUN_RECORD}.md")),
+        "the jobs section doesn't link the day run's record"
+    );
 }
+
+/// The newest whole day of jobs the page leads with: the published 0.2.7's
+/// 24-hour run on the Mac Studio (#1417).
+const DAY_RUN_RECORD: &str = "2026-11-08-v0.2.7-memory-run";
 
 /// The page a new cluster serves tells people what to type next, so every
 /// command on it has to parse.
@@ -1685,7 +1695,7 @@ fn the_first_difference_is_that_it_was_built_for_ai_agents() {
 
     let record = "docs/qualification/2026-11-06-v0.2.7-exit-test.md";
     for href in [
-        "agents.html#measuring-an-agent-on-your-cluster".to_string(),
+        "agents#measuring-an-agent-on-your-cluster".to_string(),
         format!("https://github.com/reliaburger/reliaburger/blob/main/{record}"),
     ] {
         assert!(
@@ -1918,18 +1928,18 @@ fn the_homepage_opens_with_a_line_for_agents() {
         text.starts_with("Are you an AI agent? Start here"),
         "{text:?}"
     );
-    for href in ["agents.html", "agents.md", "llms.txt"] {
+    for href in ["agents", "agents.md", "llms.txt"] {
         assert!(
             banner.contains(&format!("href=\"{href}\"")),
             "the banner doesn't link {href}"
         );
         assert!(
-            repository().join("docs/website").join(href).is_file(),
+            published_file("index.html", href).is_some_and(|file| file.is_file()),
             "{href} isn't published"
         );
     }
     assert!(
-        banner.contains("<a href=\"agents.html\">Start here</a>"),
+        banner.contains("<a href=\"agents\">Start here</a>"),
         "\"Start here\" goes to /agents"
     );
     assert!(read("docs/website/llms.txt").starts_with("# Reliaburger\n"));
@@ -2058,8 +2068,7 @@ fn the_act_recording_slot_says_plainly_whether_there_is_a_recording() {
 }
 
 /// What 0.2.8 hasn't measured yet has a slot that names its issue and quotes
-/// no number: the local-model runs (#1687) and the Kubernetes context
-/// comparison (#1679, for #1681).
+/// no number: the Kubernetes context comparison (#1679, for #1681).
 #[test]
 fn unmeasured_results_have_slots_that_claim_nothing() {
     let page = read("docs/website/index.html");
@@ -2069,18 +2078,86 @@ fn unmeasured_results_have_slots_that_claim_nothing() {
         .skip(1)
         .map(|rest| &rest[..rest.find("</aside>").unwrap()])
         .collect();
-    for issue in ["1687", "1679"] {
-        let link = format!("https://github.com/reliaburger/reliaburger/issues/{issue}");
-        let slot = slots
-            .iter()
-            .find(|slot| slot.contains(&link))
-            .unwrap_or_else(|| panic!("no pending slot for #{issue}"));
-        let text = decode(&strip_tags(slot));
-        assert!(text.contains("Not measured yet"), "{text:?}");
-        let without_issues = text.replace(&format!("#{issue}"), "").replace("#1681", "");
+    let link = "https://github.com/reliaburger/reliaburger/issues/1679";
+    let slot = slots
+        .iter()
+        .find(|slot| slot.contains(link))
+        .expect("no pending slot for #1679");
+    let text = decode(&strip_tags(slot));
+    assert!(text.contains("Not measured yet"), "{text:?}");
+    let without_issues = text.replace("#1679", "").replace("#1681", "");
+    assert!(
+        !without_issues.chars().any(|c| c.is_ascii_digit()),
+        "the #1679 slot quotes a number: {text:?}"
+    );
+}
+
+/// Every number in a piece of text, as written: digits, with any `.` or `,`
+/// that sits between two digits (`3.1`, `12,000`).
+fn numbers_in(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut numbers = Vec::new();
+    let mut current = String::new();
+    for (index, &c) in chars.iter().enumerate() {
+        let joins_digits = (c == '.' || c == ',')
+            && !current.is_empty()
+            && chars.get(index + 1).is_some_and(char::is_ascii_digit);
+        if c.is_ascii_digit() || joins_digits {
+            current.push(c);
+        } else if !current.is_empty() {
+            numbers.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        numbers.push(current);
+    }
+    numbers
+}
+
+#[test]
+fn numbers_in_keeps_decimals_and_thousands_together() {
+    assert_eq!(
+        numbers_in("Llama 3.1 8B got 7 of 36, 12,000 tokens. Done 9."),
+        ["3.1", "8", "7", "36", "12,000", "9"]
+    );
+}
+
+/// The local-model runs (#1687) are measured. Their slot names the record it
+/// quotes in `data-record` and links it, and every number it states is one
+/// that record holds, as the Kubernetes comparison page does with its record.
+#[test]
+fn the_local_model_slot_quotes_only_its_record() {
+    let page = read("docs/website/index.html");
+    let section = act_section(&page);
+    let start = section
+        .find("<aside class=\"measured\"")
+        .expect("no measured slot in #act");
+    let slot = &section[start..start + section[start..].find("</aside>").unwrap()];
+    assert!(slot.contains("https://github.com/reliaburger/reliaburger/issues/1687"));
+    let tag = &slot[..slot.find('>').unwrap()];
+    let record = attribute(tag, "data-record").expect("the slot names no data-record");
+    assert!(
+        record.starts_with("docs/qualification/") && record.ends_with(".md"),
+        "{record:?}"
+    );
+    assert!(
+        slot.contains(&format!(
+            "https://github.com/reliaburger/reliaburger/blob/main/{record}"
+        )),
+        "the slot should link {record}"
+    );
+    let held: std::collections::BTreeSet<String> = numbers_in(&read(record)).into_iter().collect();
+    let text = decode(&strip_tags(slot)).replace("#1687", "");
+    assert!(!text.contains("Not measured yet"), "{text:?}");
+    let quoted = numbers_in(&text);
+    assert!(
+        !quoted.is_empty(),
+        "a measured slot with no numbers: {text:?}"
+    );
+    for number in quoted {
         assert!(
-            !without_issues.chars().any(|c| c.is_ascii_digit()),
-            "the #{issue} slot quotes a number: {text:?}"
+            held.contains(&number),
+            "the slot says {number}, which {record} doesn't: {text:?}"
         );
     }
 }
@@ -2164,7 +2241,7 @@ fn every_link_into_the_agents_page_lands() {
         );
     }
     let page = read("docs/website/index.html");
-    for rest in page.split("href=\"agents.html#").skip(1) {
+    for rest in page.split("href=\"agents#").skip(1) {
         let fragment = &rest[..rest.find('"').unwrap()];
         assert!(
             lands(fragment),
@@ -2184,6 +2261,91 @@ fn every_link_into_the_agents_page_lands() {
     ] {
         assert!(section.contains(needle), "how-we-test lacks {needle:?}");
     }
+}
+
+/// The file under `docs/website` that `href`, a link on `page`, lands on,
+/// or `None` when it leaves the site or stays on the page. GitHub Pages
+/// serves `NAME.html` at the bare `NAME` and `DIR/index.html` at `DIR/`,
+/// which is how the site links its pages.
+fn published_file(page: &str, href: &str) -> Option<PathBuf> {
+    let site = url::Url::parse("https://reliaburger.com/").unwrap();
+    let base = super::website_markdown::page_url(page);
+    let target = base.join(href).ok()?;
+    if target.origin() != site.origin() || href.starts_with('#') {
+        return None;
+    }
+    let path = target.path().trim_start_matches('/');
+    let path = if path.is_empty() || path.ends_with('/') {
+        format!("{path}index.html")
+    } else if Path::new(path).extension().is_some() {
+        path.to_string()
+    } else {
+        format!("{path}.html")
+    };
+    Some(repository().join("docs/website").join(path))
+}
+
+/// The `href` of every link and stylesheet in `html`.
+fn hrefs(html: &str) -> Vec<&str> {
+    html.split("href=\"")
+        .skip(1)
+        .map(|rest| &rest[..rest.find('"').unwrap()])
+        .collect()
+}
+
+/// Every link from one page of the site to another is bare (`agents`,
+/// `./compare/nomad`, `./compare/`), never `NAME.html`, and lands on a page
+/// that exists. Assets (`style.css`, `agents.md`) keep their extension.
+#[test]
+fn every_link_between_pages_is_bare_and_lands() {
+    let mut checked = 0;
+    for page in super::website_markdown::pages() {
+        let html = read(&format!("docs/website/{page}"));
+        for href in hrefs(&html) {
+            let href = href.replace("&amp;", "&");
+            let Some(file) = published_file(&page, &href) else {
+                continue;
+            };
+            let path = href.split(['#', '?']).next().unwrap_or_default();
+            assert!(
+                !path.ends_with(".html"),
+                "{page} links {href}; link the bare page instead"
+            );
+            assert!(file.is_file(), "{page} links {href}, which isn't there");
+            checked += 1;
+        }
+    }
+    assert!(checked > 100, "too few links checked: {checked}");
+}
+
+#[test]
+fn published_file_maps_bare_links_to_their_html() {
+    let site = repository().join("docs/website");
+    assert_eq!(
+        published_file("index.html", "agents#x"),
+        Some(site.join("agents.html"))
+    );
+    assert_eq!(
+        published_file("index.html", "./compare/"),
+        Some(site.join("compare/index.html"))
+    );
+    assert_eq!(
+        published_file("compare/nomad.html", "../"),
+        Some(site.join("index.html"))
+    );
+    assert_eq!(
+        published_file("compare/nomad.html", "./methodology"),
+        Some(site.join("compare/methodology.html"))
+    );
+    assert_eq!(
+        published_file("compare/nomad.html", "../style.css"),
+        Some(site.join("style.css"))
+    );
+    assert_eq!(published_file("index.html", "#install"), None);
+    assert_eq!(
+        published_file("index.html", "https://github.com/reliaburger"),
+        None
+    );
 }
 
 /// `/agents` loads the site's stylesheet and copy script and nothing else.

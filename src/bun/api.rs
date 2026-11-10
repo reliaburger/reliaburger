@@ -68,6 +68,7 @@ mod status;
 mod summary;
 mod test_leases;
 mod ui;
+mod ui_proposals;
 mod upgrade;
 
 pub(crate) use apply::{
@@ -157,6 +158,10 @@ use ui::{
     fragment_apps_handler, fragment_batches_handler, fragment_instances_handler,
     fragment_nodes_handler, fragment_summary_handler, gitops_handler, login_handler,
     node_detail_handler, ui_logout_handler, ui_session_handler,
+};
+use ui_proposals::{
+    ui_proposal_approve_handler, ui_proposal_handler, ui_proposal_reject_handler,
+    ui_proposal_undo_handler, ui_proposals_handler,
 };
 use upgrade::{
     upgrade_abort_handler, upgrade_apply_handler, upgrade_cluster_handler,
@@ -665,6 +670,14 @@ pub fn router_with_upgrade(
             get(fragment_instances_handler),
         )
         .route("/ui/app/{app}/{namespace}/env", get(app_env_handler))
+        .route("/ui/proposals", get(ui_proposals_handler))
+        .route("/ui/proposal/{id}", get(ui_proposal_handler))
+        .route(
+            "/ui/proposal/{id}/approve",
+            post(ui_proposal_approve_handler),
+        )
+        .route("/ui/proposal/{id}/reject", post(ui_proposal_reject_handler))
+        .route("/ui/proposal/{id}/undo", post(ui_proposal_undo_handler))
         .route("/v1/apply", post(apply_handler))
         .route("/v1/status", get(status_handler))
         .route("/v1/apps", get(current_apps_handler))
@@ -943,6 +956,7 @@ pub fn router_with_upgrade(
     public
         .merge(auth_routes)
         .merge(protected)
+        .layer(axum::middleware::map_response(ui::forbid_framing))
         .layer(axum::middleware::from_fn_with_state(
             state,
             refuse_retired_tls_peer,
@@ -1217,6 +1231,18 @@ pub(super) fn audit_principal(auth: Option<&crate::sesame::auth::AuthContext>) -
     }
 }
 
+/// The kind of principal an audit record names for the caller. With no
+/// credential at all, the cluster has no tokens yet, and whoever asks is
+/// the person setting it up (`local-bootstrap`).
+pub(super) fn audit_principal_kind(
+    auth: Option<&crate::sesame::auth::AuthContext>,
+) -> crate::sesame::types::PrincipalKind {
+    auth.map_or(
+        crate::sesame::types::PrincipalKind::Human,
+        crate::sesame::auth::AuthContext::principal_kind,
+    )
+}
+
 /// Record `action`, attributed to the caller and to the address the request
 /// came from, in the event ring and this node's durable audit log. Returns
 /// once the log has the record on disk, or has given up; a failed write is
@@ -1237,6 +1263,7 @@ pub(super) async fn record_caller_action(
             severity: action.severity,
             action: action.action.to_string(),
             principal,
+            principal_kind: audit_principal_kind(auth),
             app: action.app,
             namespace: action.namespace,
             node: Some(action.node.unwrap_or_else(|| local_node_name(state))),

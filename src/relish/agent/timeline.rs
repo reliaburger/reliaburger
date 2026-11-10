@@ -914,6 +914,7 @@ mod tests {
             severity: EventSeverity::Info,
             action: action.to_string(),
             principal: "token:alice".to_string(),
+            principal_kind: crate::sesame::types::PrincipalKind::Human,
             app: Some(app.to_string()),
             namespace: Some("default".to_string()),
             node: Some("node-1".to_string()),
