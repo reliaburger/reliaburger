@@ -232,6 +232,16 @@ legacy OCI mappings retain their original `make test-linux` declarations and
 receive evidence through the owned interruption driver; no other case gets an
 alias by resemblance.
 
+An owner's envelope lists only the cases
+[`tests/contracts/manifest.json`](../tests/contracts/manifest.json) says its
+gate requires. So a new ignored test that CI owns needs two entries: its exact
+identity in [`ignored-bindings.json`](../tests/contracts/ignored-bindings.json)
+and a case in the manifest whose `requires` names the owning gate (a
+`make test-cluster` test goes in `issue-555-original-cluster-tests`). With
+only the binding, the gate runs and passes the test, but the evidence job
+can't see it, and that failure shows up first in the merge queue (#1836).
+`make check-ignored` now refuses a binding no manifest case covers.
+
 The image-backed delegated-job cases live in `tests/owned_task_arrays.rs` and
 run through `make test-linux`, where the warmed digest-pinned mirror remains
 reachable. The shared-runc leader-loss case refuses to start without it: its
