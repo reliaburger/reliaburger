@@ -6352,6 +6352,15 @@ And the driver couldn't be called `record.py`: the gym already has a
 module of a name on `sys.path`. Run from `scripts/record/`, `import record`
 inside `gym.py` would have found the driver instead.
 
+The first dry run, on 9 November, failed in 55 seconds without building
+anything. Both sessions may run only `relish` through Bash, one command at a
+time. The agent chained two, `relish logs ...; relish agent patch init ...`,
+and was refused. It took the refusal to mean the patch steps were off limits,
+and answered with a patch it had never tested. Both prompts now say to run
+one `relish` command per call and that a refused call can be run again on
+its own. The second run built, tested and tried its patch, and drafted the
+report.
+
 `scripts/record/test_record.py` runs in `make test-ci-scripts`. It covers
 what each kind of event puts on screen, the chapter markers, the session's
 tools (file tools only under `./`, never a skip-permissions flag), the person's

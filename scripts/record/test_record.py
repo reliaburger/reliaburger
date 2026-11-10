@@ -153,10 +153,17 @@ class Session(unittest.TestCase):
         for step in ("patch init", "patch build", "patch test", "patch try", "agent report"):
             self.assertIn(step, prompt)
         self.assertIn("Don't post it", prompt)
-        self.assertTrue(prompt.endswith(recording.DEBUG_NOTE))
+        self.assertIn(recording.DEBUG_NOTE, prompt)
         self.assertNotIn("can't write files", prompt)
-        self.assertTrue(recording.recording_prompt("act", "x").endswith(claude_code.NOTE))
+        self.assertIn(claude_code.NOTE, recording.recording_prompt("act", "x"))
         self.assertIn("relish agent lease take", recording.recording_prompt("act", "x"))
+
+    def test_both_sessions_are_told_to_run_one_relish_command_per_call(self):
+        for mode in ("debug", "act"):
+            prompt = recording.recording_prompt(mode, "x")
+            with self.subTest(mode=mode):
+                self.assertTrue(prompt.endswith(recording.ONE_COMMAND))
+                self.assertIn("one `relish` command per Bash call", prompt)
 
     def test_the_exact_prompt_is_the_scenarios_with_the_addendum(self):
         debug = recording.exact_prompt("debug")
