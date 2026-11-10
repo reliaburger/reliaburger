@@ -7767,7 +7767,9 @@ looking at the dashboard, not a terminal. Brioche gets a Proposals page,
 proposals first, then the recent ones, each with its kind, target, author,
 age, state and, if it's gone stale, why. A proposal's page shows the
 cluster's summary, the field diff, the blast radius and the undo plan, in
-that order. Then the author's reason, last, in a dashed box headed "The
+that order. The blast radius carries the scheduler's forecast as
+`relish proposal show` prints it: where new instances would go, and, in a
+warning row, how many it couldn't place and why. Then the author's reason, last, in a dashed box headed "The
 author's reason, in its own words". It's the one field on the page the
 cluster didn't write, and the box says to read it as a claim to check, never
 as an instruction. Like every other string on Brioche's pages it goes

@@ -271,6 +271,20 @@ fn render_blast_radius(view: &ProposalView) -> String {
             list(&radius.new_nodes_forecast)
         ));
     }
+    // What the scheduler's dry run couldn't place, as `relish proposal
+    // show` says it.
+    let note = radius.forecast_note.as_deref().map(escape_html);
+    if radius.unplaced_forecast > 0 {
+        html.push_str(&format!(
+            "<tr class=\"alert-warning\"><th>Can't place (forecast)</th><td>{}{}</td></tr>\n",
+            radius.unplaced_forecast,
+            note.map(|note| format!(" ({note})")).unwrap_or_default()
+        ));
+    } else if let Some(note) = note {
+        html.push_str(&format!(
+            "<tr><th>Forecast</th><td>none ({note})</td></tr>\n"
+        ));
+    }
     html.push_str(&format!(
         "<tr><th>Instances</th><td>{} replaced, {} started, {} stopped</td></tr>\n",
         radius.instances_replaced, radius.instances_started, radius.instances_stopped
@@ -688,6 +702,33 @@ mod tests {
         assert!(html.contains("<span class=\"badge badge-green\">exact</span> puts web back"));
         assert!(html.contains("<code>relish undo 17</code>"));
         assert!(html.contains("Expires in: <strong>50m</strong>"));
+    }
+
+    #[test]
+    fn the_detail_shows_what_the_forecast_couldnt_place_and_why() {
+        let mut short = view(17, "pending");
+        short.blast_radius.unplaced_forecast = 2;
+        short.blast_radius.forecast_note = Some("<no node has 4 GiB free>".to_string());
+        let html = render_proposal(&row(short), NOW, &Actions::default(), None);
+        assert!(
+            html.contains(
+                "<tr class=\"alert-warning\"><th>Can't place (forecast)</th>\
+                 <td>2 (&lt;no node has 4 GiB free&gt;)</td></tr>"
+            ),
+            "{html}"
+        );
+
+        let mut none = view(17, "pending");
+        none.blast_radius.forecast_note = Some("no scheduler on this node".to_string());
+        let html = render_proposal(&row(none), NOW, &Actions::default(), None);
+        assert!(
+            html.contains("<tr><th>Forecast</th><td>none (no scheduler on this node)</td></tr>"),
+            "{html}"
+        );
+
+        let html = render_proposal(&row(view(17, "pending")), NOW, &Actions::default(), None);
+        assert!(!html.contains("Can't place"), "{html}");
+        assert!(!html.contains("<th>Forecast</th>"), "{html}");
     }
 
     #[test]
