@@ -8,6 +8,11 @@
 //! signing to a task in `identity_signing_tasks`, and writes the files and
 //! records the identity when that task reports back. Every change to agent
 //! state still happens on the loop, one at a time.
+//!
+//! Writing the files is an fsync each, which a slow disk can make take
+//! seconds, so it runs in a second task of the same set (#1853). The signing
+//! stays registered, with its waiters, until that write has landed, and
+//! retirement waits for it rather than remove a directory it is filling.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -28,6 +33,8 @@ pub(super) struct IdentitySigning {
     instance_id: InstanceId,
     /// Deploy workers waiting for the identity to be stored (or to fail).
     waiters: Vec<oneshot::Sender<()>>,
+    /// Whether the signature is back and its files are being written.
+    storing: bool,
 }
 
 /// Signings in flight, by the task that runs them.
@@ -40,9 +47,21 @@ pub(super) struct SignedIdentity {
     result: Result<SignedWorkload, String>,
 }
 
-/// One finished signing, as `JoinSet::join_next_with_id` yields it.
+/// What a task in `identity_signing_tasks` hands back to the loop.
+pub(super) enum IdentityTaskOutput {
+    /// The leader answered the CSR.
+    Signed(SignedIdentity),
+    /// The signed identity's files were written to its mount, or weren't.
+    Stored {
+        identity: Box<crate::sesame::types::WorkloadIdentity>,
+        directory: std::path::PathBuf,
+        result: Result<(), String>,
+    },
+}
+
+/// One finished task, as `JoinSet::join_next_with_id` yields it.
 pub(super) type IdentitySigningOutcome =
-    Result<(tokio::task::Id, SignedIdentity), tokio::task::JoinError>;
+    Result<(tokio::task::Id, IdentityTaskOutput), tokio::task::JoinError>;
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Start provisioning `instance_id`'s workload identity.
@@ -102,11 +121,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let result = tokio::time::timeout(WORKLOAD_SIGNING_TIMEOUT, request.sign())
                     .await
                     .unwrap_or_else(|_| Err("workload signing timed out".to_string()));
-                SignedIdentity {
+                IdentityTaskOutput::Signed(SignedIdentity {
                     spiffe_uri,
                     private_key_der,
                     result,
-                }
+                })
             })
             .id();
         self.identity_signings.insert(
@@ -114,25 +133,46 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             IdentitySigning {
                 instance_id: instance_id.clone(),
                 waiters: reply.into_iter().collect(),
+                storing: false,
             },
         );
     }
 
-    /// Store a finished signing's identity and answer everyone waiting on it.
+    /// Whether `id`'s signed identity is being written to its mount.
+    pub(super) fn identity_store_in_flight(&self, id: &InstanceId) -> bool {
+        self.identity_signings
+            .values()
+            .any(|signing| signing.storing && &signing.instance_id == id)
+    }
+
+    /// Take a finished task's result: start writing a signed identity, or
+    /// record one that has been written, and answer everyone waiting on it
+    /// once there is nothing left to do.
     pub(super) async fn finish_identity_provision(&mut self, outcome: IdentitySigningOutcome) {
-        let (task, signed) = match outcome {
-            Ok((task, signed)) => (task, Some(signed)),
+        let (task, output) = match outcome {
+            Ok((task, output)) => (task, Some(output)),
             Err(error) => {
                 eprintln!("bun: workload identity signing task failed: {error}");
                 (error.id(), None)
             }
         };
-        let Some(signing) = self.identity_signings.remove(&task) else {
+        let Some(mut signing) = self.identity_signings.remove(&task) else {
             return;
         };
-        if let Some(signed) = signed {
-            self.store_signed_identity(&signing.instance_id, signed)
-                .await;
+        match output {
+            Some(IdentityTaskOutput::Signed(signed)) => {
+                if let Some(store) = self.begin_identity_store(&signing.instance_id, signed) {
+                    signing.storing = true;
+                    self.identity_signings.insert(store, signing);
+                    return;
+                }
+            }
+            Some(IdentityTaskOutput::Stored {
+                identity,
+                directory,
+                result,
+            }) => self.record_stored_identity(&signing.instance_id, *identity, directory, result),
+            None => {}
         }
         for waiter in signing.waiters {
             let _ = waiter.send(());
@@ -146,20 +186,24 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.identity_signings.clear();
     }
 
-    /// Write a signed identity to the instance's mount and record it.
-    async fn store_signed_identity(&mut self, instance_id: &InstanceId, signed: SignedIdentity) {
+    /// Start writing a signed identity to the instance's mount, in a task of
+    /// `identity_signing_tasks` (#1853), and return that task. `None` when
+    /// there is nothing to write.
+    fn begin_identity_store(
+        &mut self,
+        instance_id: &InstanceId,
+        signed: SignedIdentity,
+    ) -> Option<tokio::task::Id> {
         let signed_workload = match signed.result {
             Ok(signed_workload) => signed_workload,
             Err(error) => {
                 eprintln!("bun: identity for {instance_id}: CSR signing failed: {error}");
-                return;
+                return None;
             }
         };
         // Retirement removed the instance's identity directory while its CSR
         // was out. Writing now would recreate it with no owner to remove it.
-        if self.supervisor.get_instance(instance_id).is_none() {
-            return;
-        }
+        self.supervisor.get_instance(instance_id)?;
         let identity = crate::sesame::identity::build_identity_bundle(
             signed.spiffe_uri,
             signed_workload.cert_der,
@@ -171,21 +215,46 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // prepared before the container was created; a rotation for an adopted
         // instance may find it missing, so prepare it (idempotently) here too.
         // Both run on a blocking thread: a `mount`, and an fsync per file.
-        let identity_dir = self.instance_identity_dir(instance_id);
-        // LOOP-INLINE: an fsync'd persist on a blocking thread, once per signing, like the records'
-        if let Err(error) = crate::sesame::identity::install_identity(
-            identity.clone(),
-            &identity_dir,
-            Self::workload_identity_owner,
-        )
-        .await
-        {
+        let directory = self.instance_identity_dir(instance_id);
+        let owner: fn(&std::path::Path) -> Option<(u32, u32)> = Self::workload_identity_owner;
+        #[cfg(test)]
+        let delay = self.loop_stalls.reach(super::LoopStall::IdentityWrite);
+        let task = self
+            .identity_signing_tasks
+            .spawn(async move {
+                #[cfg(test)]
+                if let Some(delay) = delay {
+                    tokio::time::sleep(delay).await;
+                }
+                let result =
+                    crate::sesame::identity::install_identity(identity.clone(), &directory, owner)
+                        .await
+                        .map_err(|error| error.to_string());
+                IdentityTaskOutput::Stored {
+                    identity: Box::new(identity),
+                    directory,
+                    result,
+                }
+            })
+            .id();
+        Some(task)
+    }
+
+    /// Record an identity whose files have been written to its mount.
+    fn record_stored_identity(
+        &mut self,
+        instance_id: &InstanceId,
+        identity: crate::sesame::types::WorkloadIdentity,
+        directory: std::path::PathBuf,
+        result: Result<(), String>,
+    ) {
+        if let Err(error) = result {
             eprintln!("bun: identity for {instance_id}: failed to store: {error}");
             return;
         }
         if let Some(instance) = self.supervisor.get_instance_mut(instance_id) {
             instance.identity = Some(identity);
-            instance.identity_mount = Some(identity_dir);
+            instance.identity_mount = Some(directory);
         }
     }
 }
@@ -246,17 +315,18 @@ fn answer(reply: Option<oneshot::Sender<()>>) {
 
 #[cfg(test)]
 impl SignedIdentity {
-    /// A finished signing carrying `result`, for tests of the loop's side.
+    /// A finished signing task's output carrying `result`, for tests of
+    /// the loop's side.
     pub(super) fn for_test(
         spiffe_uri: SpiffeUri,
         private_key_der: Vec<u8>,
         result: Result<SignedWorkload, String>,
-    ) -> Self {
-        Self {
+    ) -> IdentityTaskOutput {
+        IdentityTaskOutput::Signed(Self {
             spiffe_uri,
             private_key_der,
             result,
-        }
+        })
     }
 }
 
@@ -267,11 +337,17 @@ impl IdentitySigning {
         Self {
             instance_id,
             waiters: Vec::new(),
+            storing: false,
         }
     }
 
     /// How many callers are waiting on this signing.
     pub(super) fn waiter_count(&self) -> usize {
         self.waiters.len()
+    }
+
+    /// Have `waiter` answered when this signing's identity is stored.
+    pub(super) fn add_waiter(&mut self, waiter: oneshot::Sender<()>) {
+        self.waiters.push(waiter);
     }
 }

@@ -811,7 +811,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             journal.persist(next).await
         });
         let joined = match deadline {
-            // LOOP-INLINE: fsync'd persist (#351 decision 2); the slow-disk scenario bounds it
+            // LOOP-INLINE: no deadline is only asked for outside the loop's turns (startup recovery, tests); every turn passes its own (#1263, #1853)
             None => Some((&mut task).await),
             Some(deadline) => tokio::time::timeout_at(deadline, &mut task).await.ok(),
         };
@@ -974,7 +974,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             return;
         };
         let waited = std::time::Instant::now();
-        // LOOP-INLINE: fsync'd persist (#351 decision 2); the slow-disk scenario bounds it
+        // LOOP-INLINE: a turn reaches this only for a write that has landed (the loop's `select!`) or after `settle_discovery_write_outside_turn` has said no write is in flight; startup waits here
         let outcome = (&mut write.task).await;
         // The write's own time was the earlier turn's; name this turn's wait
         // for it, so a slow line adds up (#1100).
