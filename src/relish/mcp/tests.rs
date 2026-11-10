@@ -1565,3 +1565,34 @@ async fn a_tool_answers_within_the_servers_budget_over_the_wire() {
     assert!(text.len() <= 8192, "{} bytes", text.len());
     assert_eq!(answer["result"]["structuredContent"]["truncated"], true);
 }
+
+/// An answer bigger than the ceiling can't be had whole through `relish
+/// mcp`. A hint that asked for all of it was held to the ceiling, cut again
+/// and asked again, and a small model follows every hint (#1687).
+#[tokio::test]
+async fn a_cut_answer_never_asks_for_more_than_the_ceiling() {
+    let (mut client, _) = Client::initialised(default_server()).await;
+    // Far more than 128 KiB: a thousand matches with twenty lines each side.
+    let wide = json!({"pattern": "fn ", "context": 20, "max_matches": 1000});
+    let answer = client.call("source_grep", wide.clone()).await;
+    let content = &answer["result"]["structuredContent"];
+    assert_eq!(content["truncated"], true, "{content}");
+    let hint = &content["next"][0];
+    assert_eq!(
+        hint["run"].as_str().unwrap().rsplit(' ').next().unwrap(),
+        tools::MAX_BYTES_CEILING.to_string(),
+        "{hint}"
+    );
+
+    let mut at_ceiling = wide;
+    at_ceiling["max_bytes"] = json!(tools::MAX_BYTES_CEILING);
+    let again = client.call("source_grep", at_ceiling).await;
+    let content = &again["result"]["structuredContent"];
+    assert_eq!(content["truncated"], true, "{content}");
+    for step in content["next"].as_array().unwrap() {
+        assert!(
+            !step["run"].as_str().unwrap().contains("--max-bytes"),
+            "{step}"
+        );
+    }
+}

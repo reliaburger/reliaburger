@@ -829,7 +829,10 @@ passes <code>max_bytes</code>. That's also the default each tool's schema advert
 because a model tends to send whatever default it reads there. <code>--max-bytes</code>
 sets it for every tool, from 1024 to 131072. No call gets more than 131072
 bytes (128 KiB), whatever it asks for, which still fits the whole guide in
-one answer. A cut answer says so, as on the command line.</p>
+one answer. A cut answer says so, as on the command line, and when even
+128 KiB can't hold all of it, it says to narrow the request: a filter, a
+time range or a section. The Claude Code plugin starts the server with
+<code>--max-bytes 24576</code>, the command line's default.</p>
 <pre><code class="language-sh">relish mcp --max-bytes 24576
 </code></pre>
 <p><code>--namespace</code> narrows what the agent asks for. It isn't a permission: a

@@ -459,8 +459,23 @@ impl Server {
     ///
     /// A tool the server doesn't offer is a protocol error, as MCP asks. A
     /// call whose arguments are wrong is a tool error carrying a `usage`
-    /// envelope, so the model reads why and can try again.
+    /// envelope, so the model reads why and can try again. Every answer is
+    /// rendered under [`tools::MAX_BYTES_CEILING`], so a cut one never asks
+    /// for more than a call can get.
     pub async fn call(
+        &self,
+        name: &str,
+        arguments: &serde_json::Map<String, Value>,
+    ) -> Result<CallToolResult, ErrorData> {
+        crate::relish::agent::budget::within_ceiling(
+            tools::MAX_BYTES_CEILING,
+            self.answer(name, arguments),
+        )
+        .await
+    }
+
+    /// [`Self::call`], under whatever ceiling the caller set.
+    async fn answer(
         &self,
         name: &str,
         arguments: &serde_json::Map<String, Value>,
