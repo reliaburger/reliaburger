@@ -562,6 +562,11 @@ async fn sent_by_blocked_peer(
     raft: &Raft<TypeConfig>,
     blocklist: &RaftBlocklist,
 ) -> bool {
+    // With no partition, which is nearly always, every RPC stops here: no
+    // borrow of the metrics channel, whose writer is the Raft core itself.
+    if blocklist.read().await.is_empty() {
+        return false;
+    }
     let vote = match rpc {
         RaftRpc::AppendEntries(request) => &request.vote,
         RaftRpc::Vote(request) => &request.vote,
