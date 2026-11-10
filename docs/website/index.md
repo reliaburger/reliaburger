@@ -1,6 +1,6 @@
 <!-- Generated from docs/website/index.html by `make agent-docs`: edit the page, not this file. -->
 
-RUST · APACHE 2.0 · 0.2.7
+RUST · APACHE 2.0 · 0.2.8
 
 # The container platform, served ready.
 
@@ -56,7 +56,7 @@ One line installs `relish`, then builds a three-node cluster of Linux VMs on you
 
 You’ll need a Mac with Apple silicon, or Linux with QEMU and KVM, plus about 8 GiB of free memory and 15 GiB of disk. No Rust, no checkout.
 
-[One node, CLI only, cleanup](https://github.com/reliaburger/reliaburger/blob/main/docs/quickstart.md) · [Read the bootstrap script](https://reliaburger.com/install.sh) · [Release notes](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.7)
+[One node, CLI only, cleanup](https://github.com/reliaburger/reliaburger/blob/main/docs/quickstart.md) · [Read the bootstrap script](https://reliaburger.com/install.sh) · [Release notes](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.8)
 
 PROMPT your agent
 
@@ -89,25 +89,28 @@ Good enough for home labs and dev clusters. Not for production until 1.0.0, expe
 
 [Roadmap](https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md)
 
-**0.2.7: Built for humans and their agents**
+**0.2.8: Agents you can trust, built faster**
 
-What that line installs, released on 7 November 2026. `relish agent` answers your AI agent in JSON, with the manual and the exact source its binary was built from; `relish mcp` serves it as read-only tools; and every release file carries a provenance attestation you can check. A 0.2.6 cluster rolls onto it in place. Setup over SSH arrived in 0.2.6.
+What that line installs, released on 11 November 2026. An AI agent proposes a change and a person or a policy approves it, with the blast radius and the undo shown first; leases keep agents and people off each other’s apps; `relish timeline` says what changed and why; `relish verify` checks every node runs the published release; and `relish status` fits the whole cluster on one screen. 0.2.8 changes the cluster formats, so a 0.2.7 cluster starts afresh. `relish agent` and `relish mcp` arrived in 0.2.7.
 
-[Release notes](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.7)
+[Release notes](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.8)
 
 ## Try it in five minutes
 
-Put the cluster through its paces with a burger built from eight apps: a batch of jobs, a layer cut off, a rolling deploy, a rollback, a scale-up, a house rule, a killed patty, a slow network and a lost node.
+Put the cluster through its paces with a burger built from eight apps: a batch of jobs, a layer cut off, a rolling deploy, a rollback, a scale-up, an agent’s proposal and its undo, a house rule, a killed patty, a slow network and a lost node.
 
-The whole tour on a real laptop cluster, run by [scripts/demo/tour.sh](https://github.com/reliaburger/reliaburger/blob/main/scripts/demo/tour.sh) against the published 0.2.7 install. Setup plays four times faster and idle time is cut to two seconds; every wait says how long it really took. Jump to a step with the buttons above, or the marks on the progress bar. speed
+The whole tour on a real laptop cluster, run by [scripts/demo/tour.sh](https://github.com/reliaburger/reliaburger/blob/main/scripts/demo/tour.sh) against the published 0.2.8 install. Setup plays four times faster and idle time is cut to two seconds; every wait says how long it really took. Jump to a step with the buttons above, or the marks on the progress bar. speed
 
 Show the commands every step, with what to look for
 
 1.   ```
      curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop
      ```
+     ```
+     relish verify
+     ```
 
-     The install line from above. It’s the only step that takes minutes.
+     The install line from above. It’s the only step that takes minutes. `verify` then checks that every node runs the published, signed release, byte for byte.
 
 2.   ```
      curl -fsSL https://reliaburger.com/demo/burger.tar.gz | tar xz
@@ -128,10 +131,13 @@ Show the commands every step, with what to look for
      relish status
      ```
      ```
+     relish apps counter
+     ```
+     ```
      relish council status
      ```
 
-     Eight apps from that one image: a layer of the burger each (top bun, lettuce, tomato, cheese, patty, bottom bun), a counter in front and a diner who keeps ordering. Give it half a minute. Three counters, one on each node, named `counter-0`, `-1` and `-2`: the scheduler spread and numbered them, not you. `status` opens with a line on the council, the Raft group that holds the cluster’s state; `council status` asks every node for its own view of it.
+     Eight apps from that one image: a layer of the burger each (top bun, lettuce, tomato, cheese, patty, bottom bun), a counter in front and a diner who keeps ordering. Give it half a minute. `status` is the whole cluster on one screen, a line for each part, opening with the council, the Raft group that holds the cluster’s state. `apps counter` lists three counters, one on each node, named `counter-0`, `-1` and `-2`: the scheduler spread and numbered them, not you. `council status` asks every node for its own view of the council.
 
 4.   ```
      curl http://burger.localhost:18080
@@ -173,13 +179,13 @@ Show the commands every step, with what to look for
      relish apply burger/patty-v3.toml
      ```
      ```
-     relish status
+     relish apps patty
      ```
      ```
      relish history patty
      ```
 
-     A bad deploy: patty `v3` is raw in the middle and fails its health check. It never joins the service, so the burger keeps its beef patty. After twenty seconds the node rolls it back on its own, and `status` marks the patty `RolloutFailed` so nothing retries it. `history` shows what shipped when, on every node.
+     A bad deploy: patty `v3` is raw in the middle and fails its health check. It never joins the service, so the burger keeps its beef patty. After twenty seconds the node rolls it back on its own, and `apps patty` marks the patty `RolloutFailed`, with the node and the reason, so nothing retries it. `history` shows what shipped when, on every node.
 
 9.   ```
      relish apply burger/triple-patty.toml
@@ -191,7 +197,22 @@ Show the commands every step, with what to look for
      Three patty replicas, and the counter finds all three: a triple patty, one line per instance. Any change to the spec clears the `RolloutFailed` mark, so this one goes out.
 
 10.  ```
-     curl -fsSLO https://raw.githubusercontent.com/reliaburger/reliaburger/v0.2.7/examples/policies/platform.toml
+     AGENT=$(relish token create --name burger-agent --agent --role deployer --namespaces default --ttl 1h)
+     ```
+     ```
+     relish agent propose scale patty --replicas 2 --reason "a double is plenty" --token "$AGENT"
+     ```
+     ```
+     relish proposal approve 1 --yes
+     ```
+     ```
+     relish undo 1 --yes
+     ```
+
+     Let an AI agent ask. Its token can propose a change but never make one, so `propose` writes a proposal: the cluster works out the diff, the blast radius and the undo command, and nothing changes yet. You approve it and the burger is a double; `undo` puts the third patty back. Every step is in the audit log, with who asked, who decided and the agent’s reason.
+
+11.  ```
+     curl -fsSLO https://raw.githubusercontent.com/reliaburger/reliaburger/v0.2.8/examples/policies/platform.toml
      ```
      ```
      relish policy test -f platform.toml -f burger/burger.toml
@@ -199,31 +220,31 @@ Show the commands every step, with what to look for
 
      House rules, without forking anything. `platform.toml` is the release’s example of the four policies platform teams ask for most, each a line or two of CEL that the leader judges every apply by. `policy test` tries the burger against them offline: none of its apps comes from a trusted registry, so each one is listed with the rule’s own message. Applied, the rules would refuse the next deploy before anything is written. New in 0.2.4.
 
-11.  ```
+12.  ```
      relish fault kill patty --acknowledge
      ```
      ```
      curl http://burger.localhost:18080
      ```
      ```
-     relish events --app patty
+     relish timeline --app patty
      ```
 
-     Kill a patty. For a few seconds it’s a double; then the node agent has restarted it and it’s a triple again, the new patty under a new instance number. The cluster won’t kill an app’s last replica, which is why this is a patty and not the lettuce. `events` asks every node what happened and merges the answers by time: the deploys, the failed `v3` and its rollback, the kill and the restart, each with its node.
+     Kill a patty. For a few seconds it’s a double; then the node agent has restarted it and it’s a triple again, the new patty under a new instance number. The cluster won’t kill an app’s last replica, which is why this is a patty and not the lettuce. `timeline` asks every node what happened and merges the answers by time: the deploys, the failed `v3` and its rollback, the proposal, the kill and the restart, each with its node and the rule behind each decision.
 
-12.  ```
+13.  ```
      relish path counter --to patty
      ```
 
      Walk the path from a counter to the patties, hop by hop: DNS, the virtual IP, the eBPF service map in the kernel, the firewall, any active faults, then a real TCP connect from inside the counter. On Kubernetes you’d piece that together from five tools and a debug pod.
 
-13.  ```
+14.  ```
      relish metrics counter
      ```
 
      The counters’ own Prometheus metrics, from every replica. Each node scrapes the replicas it runs, because the app says `metrics = {}`. There’s no Prometheus to install.
 
-14.  ```
+15.  ```
      relish fault delay patty 300ms --from counter --duration 2m --acknowledge
      ```
      ```
@@ -232,13 +253,13 @@ Show the commands every step, with what to look for
 
      Now make the patties slow, but only for the counters. Every packet they send a patty waits 300 ms; the other layers don’t notice, and it lifts itself after two minutes. The path is now DEGRADED: it names the fault, shows the delay on the counter’s network interface, and every connect takes 300 ms. Your browser shows the same thing, each patty line in the hundreds of milliseconds.
 
-15.  ```
+16.  ```
      relish dashboard
      ```
 
      The same thing as live charts in your browser: CPU, memory in MiB, requests per second and latency in milliseconds, one line per replica. Ctrl-C closes it; the cluster keeps running.
 
-16.  ```
+17.  ```
      relish local stop node-3
      ```
      ```
@@ -247,7 +268,7 @@ Show the commands every step, with what to look for
 
      Now lose a whole machine. About a minute later there are three running counters again, spread over the two nodes that are left: each keeps the one it had, and one of them starts a replacement under the lost one’s name. Any layer that lived on node-3 comes back the same way. Nobody had to notice first. `inspect` asks every node, lists each instance, running or stopped, with the node it’s on, and names the node that didn’t answer.
 
-17.  ```
+18.  ```
      relish wtf
      ```
 
@@ -280,7 +301,7 @@ A million in one go? 0.2.7’s 8-hour release soak ran 64 arrays of 1,048,576 ta
 
 What does each kind of isolation cost? Here’s the same command, run four ways on the same VM with the same concurrency.
 
-Recorded on a 0.2.0 development build. Four real 60-second windows: VM baseline, fresh containers, shared containers and host jobs. Chapter jumps and playback speed change only your view; preparation and cleanup stay visible. speed 
+Recorded on a 0.2.0 development build. Four real 60-second windows: VM baseline, fresh containers, shared containers and host jobs. Chapter jumps and playback speed change only your view; preparation and cleanup stay visible. speed
 
 Show the commands run the four scenarios on your own setup
 
@@ -468,7 +489,7 @@ Last, it drafts a redacted bug report with the reproducer, the patch and what it
 
 ## Let your agent act, then take it back
 
-Reading a cluster is safe. Changing one is where an agent needs a leash. From 0.2.8, not in 0.2.7, an agent never changes the cluster itself: it asks. The cluster writes down what the change would do, a person or a policy you wrote says yes, and the undo is one command, shown before anything happens.
+Reading a cluster is safe. Changing one is where an agent needs a leash. An agent never changes the cluster itself: it asks. The cluster writes down what the change would do, a person or a policy you wrote says yes, and the undo is one command, shown before anything happens.
 
 No recording yet. A real session, an agent proposing a rollback on a real cluster and a person approving it, is being recorded for [#1690](https://github.com/reliaburger/reliaburger/issues/1690), and we won’t show a mock-up in its place. Until then, here are the steps.
 
@@ -586,23 +607,23 @@ Four open models ran the agent gym in Ollama on our Mac Studio, at an 8K window,
 
 In progress, with its scope still being settled. Agent changes as proposals you review and can undo, trying a change on a copy of production, and a record of why an agent did what it did. Alongside them, a faster loop for building and releasing Reliaburger itself.
 
-[Milestone](https://github.com/reliaburger/reliaburger/milestone/30)
+[Milestone](https://github.com/reliaburger/reliaburger/milestone/30) 
 
 **0.3.0: Bare metal in an hour**
 
 After 0.2.8. An appliance OS, netbooting and claiming machines over the LAN, and signed A/B OS updates. The exit test: Dell Wyse thin clients from power-on to a cluster.
 
-[Milestone](https://github.com/reliaburger/reliaburger/milestone/6)
+[Milestone](https://github.com/reliaburger/reliaburger/milestone/6) 
 
 **0.4.0: Full container migration**
 
 Planned. Cordon, drain and uncordon, cold moves that carry volumes, and checkpoint moves that keep memory while connections reconnect.
 
-[Milestone](https://github.com/reliaburger/reliaburger/milestone/7)
+[Milestone](https://github.com/reliaburger/reliaburger/milestone/7) 
 
 ## Read the docs
 
-Documentation lives with the code.
+Documentation lives with the code. 
 
 START HERE
 
@@ -638,7 +659,7 @@ CURRENT STATE
 
 ### [Roadmap & backlog](https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md)
 
-What’s implemented, what 0.2.7 leaves out and what’s next.
+What’s implemented, what 0.2.8 leaves out and what’s next.
 
 Every release carries PDFs, and these links always fetch the latest: [whitepaper](https://github.com/reliaburger/reliaburger/releases/latest/download/reliaburger-whitepaper.pdf), [design docs](https://github.com/reliaburger/reliaburger/releases/latest/download/reliaburger-design-docs.pdf), [the book](https://github.com/reliaburger/reliaburger/releases/latest/download/building-reliaburger.pdf) and [roadmap](https://github.com/reliaburger/reliaburger/releases/latest/download/reliaburger-roadmap.pdf). The Markdown on GitHub follows `main`, so it can be newer.
 
@@ -742,9 +763,9 @@ Hacking on Reliaburger itself? Start with a local process. No container runtime 
 
 You’ll need Rust and your platform’s build tools. This runs `hello` as a host process on one node: no images, no isolated container, only the binaries the node config allows.
 
-For real OCI containers, use runc on Linux. On macOS, the managed laptop quickstart uses Linux VMs. Direct Apple Container is deferred beyond 0.2.7.
+For real OCI containers, use runc on Linux. On macOS, the managed laptop quickstart uses Linux VMs. Direct Apple Container is deferred beyond 0.2.8.
 
-[Build requirements & runtime setup](https://github.com/reliaburger/reliaburger/blob/main/docs/README.md)
+[Build requirements & runtime setup](https://github.com/reliaburger/reliaburger/blob/main/docs/README.md) 
 
 LOCAL DEVELOPMENT sh
 

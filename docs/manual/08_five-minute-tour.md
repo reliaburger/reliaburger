@@ -3,16 +3,17 @@
 The same tour as the homepage's "Try it in five minutes": install, build a
 burger on a three-node laptop cluster and watch it, layer by layer, while you
 cook a batch of patties beside it, cut a layer off, roll one forward, roll a
-bad one back, scale one up, set a house rule, kill one, slow it down and lose a whole node. Open it any time with
+bad one back, scale one up, let an AI agent propose a change and undo it, set a house rule, kill one, slow it down and lose a whole node. Open it any time with
 `relish manual tour`.
 
 It needs a Mac with Apple silicon, or Linux with QEMU and KVM, plus about 8 GiB
-of free memory and 15 GiB of disk. The one-line install fetches the signed 0.2.7 release.
+of free memory and 15 GiB of disk. The one-line install fetches the signed 0.2.8 release.
 
 ## Install and build the cluster
 
 ```sh
 curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop
+relish verify
 ```
 
 This installs `relish`, then builds a three-node cluster in Linux VMs on this
@@ -21,6 +22,10 @@ download is checked against a pinned digest. It's the only step that takes
 minutes: about a minute and a half once the downloads are cached, closer to
 four the first time. If `relish` isn't on your `PATH` yet, the installer says how to
 add it and setup prints the full path in its next steps.
+
+`relish verify` then checks the cluster runs exactly the published release:
+it hashes each node's `bun` and this `relish` and compares them with the
+release's signed metadata, byte for byte.
 
 ## Build the burger
 
@@ -55,6 +60,7 @@ the rest of the tour needs.
 ```sh
 relish apply burger/burger.toml
 relish status
+relish apps counter
 relish council status
 ```
 
@@ -66,12 +72,14 @@ always traffic to look at. `burger:v1` is a bare name: nodes pull it from
 Pickle, and because it's signed it would deploy even on a cluster that
 requires signatures.
 
-Give it half a minute. Three counter replicas, one on each node, named
-`default__counter-0`, `-1` and `-2`. The scheduler spread them and numbered
-them across the cluster, not you. `status` opens with a line on the council,
-the Raft group that holds the cluster's state, and `council status` asks every
-node for its own view of it: its role, term and log position, with the leader
-and quorum above the table.
+Give it half a minute. `status` is the whole cluster on one screen, a line
+for each part, the same height on three nodes or three hundred. It opens with
+the council, the Raft group that holds the cluster's state. `apps counter`
+lists three counter replicas, one on each node, named `default__counter-0`,
+`-1` and `-2`. The scheduler spread them and numbered them across the
+cluster, not you. `council status` asks every node for its own view of the
+council: its role, term and log position, with the leader and quorum above
+the table.
 
 ```sh
 curl http://burger.localhost:18080
@@ -167,7 +175,7 @@ loses its cheese. It turns from cheddar to blue cheese a slice at a time.
 
 ```sh
 relish apply burger/patty-v3.toml
-relish status
+relish apps patty
 relish history patty
 ```
 
@@ -175,8 +183,8 @@ Patty `v3` is raw in the middle: it starts, but its health check always
 fails. It never joins the service, so the burger keeps its beef patty
 throughout. After the app's 20-second `health_timeout` the node gives up and
 puts v1 back by itself, and the cluster marks the patty `RolloutFailed` so
-nothing retries the same spec. `status` prints the node and the reason, and
-`history` asks every node what shipped when.
+nothing retries the same spec. `apps patty` prints the node and the reason,
+and `history` asks every node what shipped when.
 
 ## Scale one up
 
@@ -191,10 +199,32 @@ times over fresh connections, and the cluster balances connections
 round-robin, so it finds all three patties and stacks one line per instance: a
 triple patty.
 
+## Let an agent ask first
+
+```sh
+AGENT=$(relish token create --name burger-agent --agent --role deployer --namespaces default --ttl 1h)
+relish agent propose scale patty --replicas 2 --reason "a double is plenty" --token "$AGENT"
+relish proposal approve 1 --yes
+relish undo 1 --yes
+```
+
+An AI agent gets a token of its own. `--agent` makes it a proposing token:
+it can ask for a change, but never make one, and it expires in an hour. With
+it, `propose` stores a proposal instead of scaling the patty: the cluster
+writes the summary, the diff, the blast radius (the apps, nodes and
+instances it touches) and the command that undoes it, and nothing changes
+yet. `relish proposal list` and `relish proposal show 1` show it to you.
+You approve it, which applies it at once, and the burger is a double. You
+can't approve your own proposal, so an agent can't either. `relish undo 1`
+puts the third patty back, as long as nothing else has changed the patty
+since. `relish audit` records who asked, who decided and the agent's reason,
+in the agent's own words. The `working-with-an-ai-agent` chapter covers
+guardrails, leases between agents and setting up an agent client.
+
 ## Set a house rule
 
 ```sh
-curl -fsSLO https://raw.githubusercontent.com/reliaburger/reliaburger/v0.2.7/examples/policies/platform.toml
+curl -fsSLO https://raw.githubusercontent.com/reliaburger/reliaburger/v0.2.8/examples/policies/platform.toml
 relish policy test -f platform.toml -f burger/burger.toml
 ```
 
@@ -227,16 +257,18 @@ stop copying the same app around.
 ```sh
 relish fault kill patty --acknowledge
 curl http://burger.localhost:18080
-relish events --app patty
+relish timeline --app patty
 ```
 
 For a few seconds the burger is a double. Then the node agent has restarted
 the killed patty, it passes its health check, and the burger is a triple
 again, the new patty under a new instance number. The cluster won't kill an
 app's last replica (`relish fault kill lettuce` is refused), which is why this
-is a patty and not a single layer. `events` asks every node what happened and
-merges the answers by time: the deploys, the failed v3 and its rollback, the
-kill and the restart, each with its node.
+is a patty and not a single layer. `timeline` asks every node what happened
+and merges the answers by time: the deploys, the failed v3 and its rollback,
+the agent's proposal and its undo, the kill and the restart, each with its
+node. Where the cluster decided something, such as rolling v3 back, it names
+the rule and the evidence.
 
 ## See the whole path
 

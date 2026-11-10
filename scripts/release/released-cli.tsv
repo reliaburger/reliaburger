@@ -1,11 +1,19 @@
-# What relish v0.2.7 accepts, read from its -h pages by
+# What relish v0.2.8 accepts, read from its -h pages by
 # scripts/release/released_cli.py. Regenerate it when docs/website/install.sh's
 # default version changes; tests/suite/website.rs checks the two match.
-version	v0.2.7
+version	v0.2.8
 argument	relish agent explain	[ID]
+argument	relish agent lease release	<KIND>
+argument	relish agent lease release	<NAME>
+argument	relish agent lease renew	<KIND>
+argument	relish agent lease renew	<NAME>
+argument	relish agent lease take	<KIND>
+argument	relish agent lease take	<NAME>
 argument	relish agent logs	<APP>
 argument	relish agent manual search	<WORDS>...
 argument	relish agent manual show	<TARGET>
+argument	relish agent patch apply	<DIFF>
+argument	relish agent patch apply	<DIR>
 argument	relish agent patch build	<DIR>
 argument	relish agent patch destroy	[DIR]
 argument	relish agent patch diff	<DIR>
@@ -13,13 +21,19 @@ argument	relish agent patch init	<DIR>
 argument	relish agent patch test	<DIR>
 argument	relish agent patch test	[FILTER]
 argument	relish agent patch try	<DIR>
+argument	relish agent proposals	[ID]
+argument	relish agent propose	<KIND>
+argument	relish agent propose	<TARGET>
 argument	relish agent schema	[COMMAND]
 argument	relish agent setup	[AGENTS]...
 argument	relish agent source extract	<DIR>
 argument	relish agent source grep	<PATTERN>
 argument	relish agent source show	<TARGET>
 argument	relish agent source tree	[PREFIX]
+argument	relish agent undo	<ID>
+argument	relish agent withdraw	<ID>
 argument	relish apply	[PATH_OR_URL]
+argument	relish apps	[NAME]
 argument	relish batch	[PATH]
 argument	relish batch cancel	<ID>
 argument	relish batch logs	<ID>
@@ -79,6 +93,14 @@ argument	relish images delete	<REFERENCE>
 argument	relish init	[DIR]
 argument	relish inspect	<NAME>
 argument	relish join	<ADDR>
+argument	relish lease break	<KIND>
+argument	relish lease break	<NAME>
+argument	relish lease release	<KIND>
+argument	relish lease release	<NAME>
+argument	relish lease renew	<KIND>
+argument	relish lease renew	<NAME>
+argument	relish lease take	<KIND>
+argument	relish lease take	<NAME>
 argument	relish lint	<PATH>
 argument	relish local	<ACTION>
 argument	relish local	[NODE]
@@ -89,6 +111,9 @@ argument	relish manual	[CHAPTER]
 argument	relish metrics	<APP>
 argument	relish path	<SOURCE>
 argument	relish policy delete	<NAME>
+argument	relish proposal approve	<ID>
+argument	relish proposal reject	<ID>
+argument	relish proposal show	<ID>
 argument	relish release	<APP>
 argument	relish resolve	<NAME>
 argument	relish rollback	<APP>
@@ -106,6 +131,7 @@ argument	relish source	[QUERY]
 argument	relish stop	<APP>
 argument	relish token revoke	<NAME>
 argument	relish token rotate	<NAME>
+argument	relish undo	<ID>
 argument	relish upgrade plan	<VERSION>
 argument	relish upgrade rollback	[VERSION]
 argument	relish upgrade start	[VERSION]
@@ -115,17 +141,24 @@ command	relish agent context
 command	relish agent diagnose
 command	relish agent explain
 command	relish agent guide
+command	relish agent lease
+command	relish agent lease release
+command	relish agent lease renew
+command	relish agent lease take
 command	relish agent logs
 command	relish agent manual
 command	relish agent manual search
 command	relish agent manual show
 command	relish agent patch
+command	relish agent patch apply
 command	relish agent patch build
 command	relish agent patch destroy
 command	relish agent patch diff
 command	relish agent patch init
 command	relish agent patch test
 command	relish agent patch try
+command	relish agent proposals
+command	relish agent propose
 command	relish agent report
 command	relish agent schema
 command	relish agent setup
@@ -135,9 +168,14 @@ command	relish agent source grep
 command	relish agent source show
 command	relish agent source tree
 command	relish agent source version
+command	relish agent timeline
+command	relish agent undo
 command	relish agent upgrade-check
+command	relish agent verify
 command	relish agent version
+command	relish agent withdraw
 command	relish apply
+command	relish apps
 command	relish audit
 command	relish batch
 command	relish batch cancel
@@ -204,6 +242,9 @@ command	relish gitops
 command	relish gitops disable
 command	relish gitops set
 command	relish gitops status
+command	relish gym
+command	relish gym list
+command	relish gym run
 command	relish help
 command	relish history
 command	relish images
@@ -215,6 +256,12 @@ command	relish jobs
 command	relish join
 command	relish join-token
 command	relish join-token create
+command	relish lease
+command	relish lease break
+command	relish lease list
+command	relish lease release
+command	relish lease renew
+command	relish lease take
 command	relish lint
 command	relish local
 command	relish logs
@@ -231,6 +278,11 @@ command	relish policy audit
 command	relish policy delete
 command	relish policy list
 command	relish policy test
+command	relish proposal
+command	relish proposal approve
+command	relish proposal list
+command	relish proposal reject
+command	relish proposal show
 command	relish release
 command	relish resolve
 command	relish rollback
@@ -252,6 +304,7 @@ command	relish source
 command	relish status
 command	relish stop
 command	relish test
+command	relish timeline
 command	relish token
 command	relish token create
 command	relish token list
@@ -259,6 +312,7 @@ command	relish token revoke
 command	relish token rotate
 command	relish top
 command	relish tui
+command	relish undo
 command	relish uninstall
 command	relish upgrade
 command	relish upgrade abort
@@ -268,6 +322,7 @@ command	relish upgrade resume
 command	relish upgrade rollback
 command	relish upgrade start
 command	relish upgrade status
+command	relish verify
 command	relish wtf
 option	relish	--ca-cert	<CA_CERT>	
 option	relish	--endpoint	<ENDPOINT>	
@@ -279,7 +334,24 @@ option	relish agent context	--max-bytes	<MAX_BYTES>
 option	relish agent diagnose	--app	<APP>	
 option	relish agent diagnose	--max-bytes	<MAX_BYTES>	
 option	relish agent explain	--max-bytes	<MAX_BYTES>	
+option	relish agent explain	--namespace	<NAMESPACE>	
+option	relish agent explain	--placement	<INSTANCE>	
+option	relish agent explain	--refusal	<APP>	
+option	relish agent explain	--restart	<INSTANCE>	
+option	relish agent explain	--rules		
 option	relish agent guide	--max-bytes	<MAX_BYTES>	
+option	relish agent guide	--section	<SECTION>	
+option	relish agent lease	--max-bytes	<MAX_BYTES>	
+option	relish agent lease release	--max-bytes	<MAX_BYTES>	
+option	relish agent lease release	--namespace	<NAMESPACE>	
+option	relish agent lease renew	--max-bytes	<MAX_BYTES>	
+option	relish agent lease renew	--namespace	<NAMESPACE>	
+option	relish agent lease renew	--ttl	<TTL>	
+option	relish agent lease take	--max-bytes	<MAX_BYTES>	
+option	relish agent lease take	--namespace	<NAMESPACE>	
+option	relish agent lease take	--purpose	<PURPOSE>	
+option	relish agent lease take	--ttl	<TTL>	
+option	relish agent lease take	--wait	<WAIT>	
 option	relish agent logs	--grep	<GREP>	
 option	relish agent logs	--instance	<INSTANCE>	
 option	relish agent logs	--line-bytes	<LINE_BYTES>	
@@ -293,6 +365,8 @@ option	relish agent manual	--max-bytes	<MAX_BYTES>
 option	relish agent manual search	--max-bytes	<MAX_BYTES>	
 option	relish agent manual show	--max-bytes	<MAX_BYTES>	
 option	relish agent patch	--max-bytes	<MAX_BYTES>	
+option	relish agent patch apply	--check		
+option	relish agent patch apply	--max-bytes	<MAX_BYTES>	
 option	relish agent patch build	--allow-build-changes		
 option	relish agent patch build	--bun		
 option	relish agent patch build	--max-bytes	<MAX_BYTES>	
@@ -305,6 +379,29 @@ option	relish agent patch test	--allow-build-changes
 option	relish agent patch test	--max-bytes	<MAX_BYTES>	
 option	relish agent patch try	--max-bytes	<MAX_BYTES>	
 option	relish agent patch try	--nodes	<NODES>	
+option	relish agent proposals	--max-bytes	<MAX_BYTES>	
+option	relish agent propose	--dry-run		
+option	relish agent propose	--idempotency-key	<IDEMPOTENCY_KEY>	
+option	relish agent propose	--max-bytes	<MAX_BYTES>	
+option	relish agent propose	--namespace	<NAMESPACE>	
+option	relish agent propose	--node	<NODE>	
+option	relish agent propose	--reason	<REASON>	
+option	relish agent propose	--replicas	<REPLICAS>	
+option	relish agent propose	--ttl	<TTL>	
+option	relish agent propose	-o,--output	<OUTPUT>	
+option	relish agent propose	A key that makes a retry return the proposal already	made	
+option	relish agent propose	API token for authenticating to the agent. Overrides	`RELIABURGER_TOKEN`	
+option	relish agent propose	Answer the whole proposal without storing	it	
+option	relish agent propose	Bun API base URL. Overrides `RELIABURGER_ENDPOINT` and the default local address	(`http[s]://127.0.0.1:9117`)	
+option	relish agent propose	For `clear-fault`,the node that holds the fault,when two nodes hold a fault with the same	id	
+option	relish agent propose	How long it may wait for approval: 5m to 24h; 1h when left	out	
+option	relish agent propose	Largest answer to print,in bytes (at least 1024; by default 24576,81920 for `guide` and 40960 for `schema`). A bigger answer is trimmed,marked `truncated`,and says how to get the	rest	
+option	relish agent propose	Output format: human,json,or yaml. Every command takes json and yaml except the interactive ones,which refuse them [default: human] [possible values: human,json,yaml]		human,json,yaml
+option	relish agent propose	Path to the cluster CA certificate (PEM). When set,the CLI reaches the agent API over HTTPS. Overrides	`RELIABURGER_CA_CERT`	
+option	relish agent propose	Print help (see more with	'--help')	
+option	relish agent propose	The namespace; `default` when left out. For `apply`,the	file's	
+option	relish agent propose	The new replica count,for `scale` (at least 1; to zero is	`stop`)	
+option	relish agent propose	Why,in your words,for the person who decides (at most 1	KiB)	
 option	relish agent report	--caught-by	<CAUGHT_BY>	test,gate,smoker-fault,review,unknown
 option	relish agent report	--caught-how	<CAUGHT_HOW>	
 option	relish agent report	--duplicate-of	<DUPLICATE_OF>	
@@ -327,6 +424,8 @@ option	relish agent schema	--max-bytes	<MAX_BYTES>
 option	relish agent setup	--dry-run		
 option	relish agent setup	--force		
 option	relish agent setup	--max-bytes	<MAX_BYTES>	
+option	relish agent setup	--namespace	<NAMESPACE>	
+option	relish agent setup	--propose		
 option	relish agent setup	--remove		
 option	relish agent setup	--yes		
 option	relish agent source	--max-bytes	<MAX_BYTES>	
@@ -346,21 +445,59 @@ option	relish agent source tree	--max-bytes	<MAX_BYTES>
 option	relish agent source tree	--offline		
 option	relish agent source version	--max-bytes	<MAX_BYTES>	
 option	relish agent source version	--offline		
+option	relish agent timeline	--app	<APP>	
+option	relish agent timeline	--limit	<LIMIT>	
+option	relish agent timeline	--max-bytes	<MAX_BYTES>	
+option	relish agent timeline	--namespace	<NAMESPACE>	
+option	relish agent timeline	--since	<SINCE>	
+option	relish agent timeline	--until	<UNTIL>	
+option	relish agent undo	--max-bytes	<MAX_BYTES>	
+option	relish agent undo	--reason	<REASON>	
+option	relish agent undo	--ttl	<TTL>	
 option	relish agent upgrade-check	--max-bytes	<MAX_BYTES>	
 option	relish agent upgrade-check	--metadata	<FILE>	
 option	relish agent upgrade-check	--url	<URL>	
+option	relish agent verify	--artefacts	<DIR>	
+option	relish agent verify	--cli-metadata	<FILE>	
+option	relish agent verify	--max-bytes	<MAX_BYTES>	
+option	relish agent verify	--metadata	<FILE>	
+option	relish agent verify	--release-url	<URL>	
 option	relish agent version	--max-bytes	<MAX_BYTES>	
+option	relish agent withdraw	--max-bytes	<MAX_BYTES>	
+option	relish apply	--break-lease		
 option	relish apply	--dry-run		
 option	relish apply	--rerun-jobs		
 option	relish apply	-f,--file	<PATH_OR_URL>	
+option	relish apps	--instances		
+option	relish apps	--namespace	<NAMESPACE>	
+option	relish apps	--node	<NODE>	
+option	relish apps	--unhealthy		
 option	relish audit	--action	<ACTION>	
 option	relish audit	--app	<APP>	
 option	relish audit	--cluster		
 option	relish audit	--limit	<LIMIT>	
 option	relish audit	--namespace	<NAMESPACE>	
 option	relish audit	--principal	<PRINCIPAL>	
+option	relish audit	--principal-kind	<PRINCIPAL_KIND>	
+option	relish audit	--proposal	<PROPOSAL>	
 option	relish audit	--since	<SINCE>	
 option	relish audit	--until	<UNTIL>	
+option	relish audit	-o,--output	<OUTPUT>	
+option	relish audit	A token name or principal	id	
+option	relish audit	API token for authenticating to the agent. Overrides	`RELIABURGER_TOKEN`	
+option	relish audit	Bun API base URL. Overrides `RELIABURGER_ENDPOINT` and the default local address	(`http[s]://127.0.0.1:9117`)	
+option	relish audit	How many of the newest records to show (default 100,at most	10000)	
+option	relish audit	One action (e.g. "app.deleted"),or a family	("fault.*")	
+option	relish audit	Only actions by this kind of principal: human,agent,workload,system,policy or	unknown	
+option	relish audit	Only actions on this	namespace	
+option	relish audit	Only actions on this app or job,including an apply that listed it with	others	
+option	relish audit	Only records about this proposal: its own,and the app records its apply or undo	wrote	
+option	relish audit	Output format: human,json,or yaml. Every command takes json and yaml except the interactive ones,which refuse them [default: human] [possible values: human,json,yaml]		human,json,yaml
+option	relish audit	Path to the cluster CA certificate (PEM). When set,the CLI reaches the agent API over HTTPS. Overrides	`RELIABURGER_CA_CERT`	
+option	relish audit	Print	help	
+option	relish audit	Read every node's log,not just this node's,merged by	time	
+option	relish audit	Records at or after this time: epoch seconds,or a duration before now (e.g. "30m","2h","7d")		
+option	relish audit	Records at or before this time,in the same forms as	--since	
 option	relish batch	--idempotency-key	<KEY>	
 option	relish batch logs	--index	<INDEX>	
 option	relish batch replay	--acknowledge-side-effects		
@@ -448,8 +585,10 @@ option	relish dashboard	--no-open
 option	relish dashboard	--port	<PORT>	
 option	relish decommission-node	--reason	<REASON>	
 option	relish decommission-node	--workloads-stopped		
+option	relish delete	--break-lease		
 option	relish delete	--force		
 option	relish delete	--namespace	<NAMESPACE>	
+option	relish deploy	--break-lease		
 option	relish deploy	--dry-run		
 option	relish dev countersign-binary	--external-key	<EXTERNAL_KEY>	
 option	relish dev countersign-binary	--out	<OUT>	
@@ -577,6 +716,15 @@ option	relish fault scenario	--acknowledge
 option	relish fault scenario	--dry-run		
 option	relish fault scenario	--speed	<SPEED>	
 option	relish fmt	--check		
+option	relish gym run	--confirm-namespace	<NAMESPACE>	
+option	relish gym run	--image	<IMAGE>	
+option	relish gym run	--namespace	<NAMESPACE>	
+option	relish gym run	--out	<OUT>	
+option	relish gym run	--runs	<RUNS>	
+option	relish gym run	--scenario	<SCENARIOS>	
+option	relish gym run	--solver	<SOLVER>	
+option	relish gym run	--timeout	<TIMEOUT>	
+option	relish gym run	--yes		
 option	relish history	--namespace	<NAMESPACE>	
 option	relish import	--strict		
 option	relish import	-f,--file	<FILES>	
@@ -600,6 +748,13 @@ option	relish join	Read the join token from a private file instead of command-li
 option	relish join	This node's identifier (the certificate's common	name)	
 option	relish join-token create	--node-id	<NODE_ID>	
 option	relish join-token create	--ttl	<TTL>	
+option	relish lease break	--namespace	<NAMESPACE>	
+option	relish lease release	--namespace	<NAMESPACE>	
+option	relish lease renew	--for	<TTL>	
+option	relish lease renew	--namespace	<NAMESPACE>	
+option	relish lease take	--for	<TTL>	
+option	relish lease take	--namespace	<NAMESPACE>	
+option	relish lease take	--purpose	<PURPOSE>	
 option	relish local	--name	<NAME>	
 option	relish local	--yes		
 option	relish logs	--grep	<GREP>	
@@ -618,23 +773,31 @@ option	relish manual	--port	<PORT>
 option	relish manual	--web		
 option	relish manual examples	--dir	<DIR>	
 option	relish mcp	--list		
+option	relish mcp	--max-bytes	<BYTES>	
 option	relish mcp	--namespace	<NAMESPACE>	
 option	relish mcp	--no-logs		
+option	relish mcp	--propose		
 option	relish mcp	--toolsets	<TOOLSET>	
 option	relish metrics	--name	<NAME>	
 option	relish metrics	--namespace	<NAMESPACE>	
 option	relish metrics	--since	<SINCE>	
+option	relish nodes	--unhealthy		
 option	relish path	--count	<COUNT>	
 option	relish path	--namespace	<NAMESPACE>	
 option	relish path	--port	<PORT>	
 option	relish path	--to	<TO>	
 option	relish path	--to-namespace	<TO_NAMESPACE>	
 option	relish policy test	--caller	<CALLER>	
+option	relish policy test	--proposal	<FILE>	
 option	relish policy test	--role	<ROLE>	admin,deployer,read-only
 option	relish policy test	--source	<SOURCE>	apply,gitops
 option	relish policy test	-f,--file	<FILES>	
+option	relish proposal approve	--yes		
+option	relish proposal reject	--reason	<REASON>	
+option	relish release	--break-lease		
 option	relish release	--namespace	<NAMESPACE>	
 option	relish resolve	--namespace	<NAMESPACE>	
+option	relish rollback	--break-lease		
 option	relish rollback	--force		
 option	relish rollback	--namespace	<NAMESPACE>	
 option	relish run	--batch	<NAME>	
@@ -700,6 +863,9 @@ option	relish snapshot delete	-n,--namespace	<NAMESPACE>
 option	relish snapshot list	-n,--namespace	<NAMESPACE>	
 option	relish snapshot restore	--volume	<VOLUME>	
 option	relish snapshot restore	-n,--namespace	<NAMESPACE>	
+option	relish status	--check		
+option	relish status	--quick		
+option	relish stop	--break-lease		
 option	relish stop	--namespace	<NAMESPACE>	
 option	relish test	--chaos		
 option	relish test	--filter	<FILTER>	
@@ -708,14 +874,22 @@ option	relish test	--parallel	<PARALLEL>
 option	relish test	--profile	<PROFILE>	
 option	relish test	--timeout	<TIMEOUT>	
 option	relish test	--yes		
+option	relish timeline	--app	<APP>	
+option	relish timeline	--limit	<LIMIT>	
+option	relish timeline	--namespace	<NAMESPACE>	
+option	relish timeline	--since	<SINCE>	
+option	relish timeline	--until	<UNTIL>	
+option	relish token create	--agent		
 option	relish token create	--apps	<APPS>	
 option	relish token create	--inherit-permissions		
 option	relish token create	--name	<NAME>	
 option	relish token create	--namespaces	<NAMESPACES>	
 option	relish token create	--no-expiry		
 option	relish token create	--role	<ROLE>	
+option	relish token create	--ttl	<TTL>	
 option	relish token create	--ttl-days	<TTL_DAYS>	
 option	relish token rotate	--grace-hours	<GRACE_HOURS>	
+option	relish undo	--yes		
 option	relish uninstall	--yes		
 option	relish upgrade check	--url	<URL>	
 option	relish upgrade plan	--cluster-size	<CLUSTER_SIZE>	
@@ -729,6 +903,10 @@ option	relish upgrade start	--parallel	<PARALLEL>
 option	relish upgrade start	--registry	<REGISTRY>	
 option	relish upgrade start	--sig	<SIG>	
 option	relish upgrade start	--url	<URL>	
+option	relish verify	--artefacts	<DIR>	
+option	relish verify	--cli-metadata	<FILE>	
+option	relish verify	--metadata	<FILE>	
+option	relish verify	--release-url	<URL>	
 option	relish wtf	--app	<APP>	
 option	relish wtf	--interval	<INTERVAL>	
 option	relish wtf	--watch		

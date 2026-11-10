@@ -31,9 +31,9 @@
 # After each release, update the statuses, `since` versions and `release`
 # below (docs/releasing.md, step 10).
 
-release = "0.2.7"
-released = "7 November 2026"
-reviewed = "7 November 2026"
+release = "0.2.8"
+released = "11 November 2026"
+reviewed = "10 November 2026"
 
 # GitHub milestone numbers, for the links on planned rows.
 [milestones]
@@ -131,14 +131,14 @@ evidence = "Documented in the manual; used by contributors and agents, not by th
 
 [[group.feature]]
 name = "Homebrew install"
-status = "planned"
-milestone = "0.2.8"
+status = "beta"
+since = "0.2.8"
 summary = "`brew install reliaburger/tap/relish` installs the CLI."
-restrictions = "The 0.2.7 release published a tap, but no user documentation offers it yet. The site offers it from 0.2.8, with bottles so older Command Line Tools work."
-issues = [1712]
-docs = ["docs/releasing.md#the-homebrew-tap"]
-evidence = "docs/releasing.md 'The Homebrew tap'; #1583 closed in 0.2.7; the homepage install box gains Homebrew on the 0.2.8 train (#1714, #1713); #1712 open in 0.2.8."
-needs_maintainer = "Planned or Beta? The tap exists from 0.2.7, but only releasing.md mentions it and #1712 says it fails on older Command Line Tools."
+restrictions = "The CLI only, on a Mac with Apple silicon or on Linux; `relish setup` then builds the cluster as after the install line. The tap existed from 0.2.7, but the site offers it from 0.2.8, with bottles so older Command Line Tools work."
+issues = []
+docs = ["docs/quickstart.md", "docs/releasing.md#the-homebrew-tap"]
+evidence = "The homepage install box offers it (#1714), with bottles (#1713, #1712 fixed in 0.2.8). The release gate's staged installs use the install line, not Homebrew."
+needs_maintainer = "Beta or Alpha? The site offers it from 0.2.8, with bottles, but the release gate never installs through Homebrew."
 
 [[group.feature]]
 name = "Bare metal in an hour"
@@ -330,7 +330,7 @@ status = "beta"
 since = "0.1.0"
 summary = "Schedules in the Kubernetes CronJob dialect, in UTC, with the leader claiming each minute durably."
 restrictions = "Missed minutes are skipped: no catch-up, and no exactly-once promise. A catalogue test that waits for a cron firing is flaky."
-issues = [1527]
+issues = []
 docs = ["docs/README.md#jobs-and-cron"]
 evidence = "README 'Limits in 0.2.7' and docs/README 'Jobs and cron'. #1527 (flake waiting for a cron firing) in 0.2.8. The soak's job campaign isn't cron-driven."
 
@@ -996,7 +996,7 @@ status = "beta"
 since = "0.2.7"
 summary = "Serves the `relish agent` commands as read-only MCP tools over stdio."
 restrictions = "The tools are read-only, but they run with the context's token, which is usually the admin one."
-issues = [1730]
+issues = []
 docs = ["docs/manual/16_working-with-an-ai-agent.md#through-mcp"]
 evidence = "New in 0.2.7; #1730 (0.2.8) gives MCP clients a read-only token of their own."
 
@@ -1006,7 +1006,7 @@ status = "beta"
 since = "0.2.7"
 summary = "`relish agent report` drafts a redacted bug report with the reproducer, the patch and what wasn't tested, for you to read and post."
 restrictions = "Read the draft before you post it: redaction isn't idempotent, and a second pass can expose credentials in a URL."
-issues = [1717]
+issues = []
 docs = ["docs/manual/16_working-with-an-ai-agent.md#drafting-a-bug-report"]
 evidence = "#1717 (0.2.8). Nothing is posted on its own (manual 16)."
 
@@ -1016,7 +1016,7 @@ status = "alpha"
 since = "0.2.7"
 summary = "`relish agent patch` extracts the source, builds and tests a change, and boots a throwaway cluster from the patched binaries."
 restrictions = "The binaries it builds are unsigned and stay on the throwaway cluster. Producing a correct diff of the workspace is still being worked on."
-issues = [1691, 1726]
+issues = []
 docs = ["docs/manual/16_working-with-an-ai-agent.md#proving-a-fix"]
 evidence = "#1691 (diff) and #1726 (flake in the patch try test) in 0.2.8; `patch apply` lands on the 0.2.8 train (#1703)."
 
@@ -1035,30 +1035,30 @@ name = "Agent gym"
 status = "alpha"
 since = "0.2.7"
 summary = "Breaks throwaway clusters in known ways and scores whatever diagnoses them, an AI agent included."
-restrictions = "Runs from a checkout with `make test-gym`; a version for your own cluster is planned for 0.2.8."
-issues = [1683]
-docs = ["docs/manual/16_working-with-an-ai-agent.md#measuring-an-agent-on-your-cluster"]
-evidence = "Baseline record qualification/2026-11-06-agent-gym-baseline.md; #1683 in 0.2.8."
+restrictions = "From a checkout, `make test-gym` builds its own throwaway clusters; from 0.2.8, `relish gym run` runs the scenarios against your agent in a staging namespace of your own cluster, and cleans up after itself. Three runs a scenario measure an agent coarsely."
+issues = []
+docs = ["docs/manual/16_working-with-an-ai-agent.md#measuring-an-agent-on-your-cluster", "docs/manual/05_chaos.md#testing-your-agent-on-your-cluster"]
+evidence = "Baseline record qualification/2026-11-06-agent-gym-baseline.md and the local-model records of 9 and 10 November 2026; `relish gym run` shipped in 0.2.8 (#1683)."
 
 [[group.feature]]
 name = "Agent changes as proposals you can undo"
-status = "planned"
-milestone = "0.2.8"
-summary = "An agent's change becomes a reviewable proposal with guardrails and undo, and agents take locks so they don't collide."
-restrictions = "Today agents only read; changes are yours to make."
+status = "alpha"
+since = "0.2.8"
+summary = "An agent's change becomes a reviewable proposal with guardrails and undo, and agents take leases so they don't collide."
+restrictions = "An agent token proposes apply, scale, rollback, stop, delete, restart, cancel-deploy and clear-fault; a person approves on the CLI or the dashboard, or a policy does for a change that can be undone exactly. New in 0.2.8, so its shape may still change."
 issues = [1682, 1686]
-docs = ["docs/roadmap.md#releases-after-010"]
-evidence = "Roadmap 0.2.8; #1682 and #1686 in 0.2.8. Human approval for mutations is also #1085 in 0.4.2."
+docs = ["docs/manual/16_working-with-an-ai-agent.md#proposing-a-change", "docs/manual/16_working-with-an-ai-agent.md#taking-turns-leases"]
+evidence = "Unit and cluster tests on the 0.2.8 train, the gym's proposal scenarios (local-model record of 10 November 2026) and the five-minute tour's proposal step. #1682 and #1686 stay open for the rest of their design."
 
 [[group.feature]]
 name = "Incident timeline and decision provenance"
-status = "planned"
-milestone = "0.2.8"
+status = "beta"
+since = "0.2.8"
 summary = "Ask the cluster why it did something, with one merged timeline of an incident."
-restrictions = ""
-issues = [1685]
-docs = ["docs/roadmap.md#releases-after-010"]
-evidence = "#1685 in 0.2.8; #1084 (machine-readable timeline) in 0.4.2."
+restrictions = "The `/v1/timeline` endpoint, GitOps and log events are #1084 in 0.4.2."
+issues = []
+docs = ["docs/manual/07_diagnostics.md#relish-timeline-what-changed-and-why-did-it-do-that"]
+evidence = "Shipped in 0.2.8 (#1685); unit and cluster tests on the train, and the five-minute tour's kill step. #1084 (machine-readable timeline) in 0.4.2."
 
 [[group.feature]]
 name = "Remote MCP endpoint in bun"

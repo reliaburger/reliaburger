@@ -13,7 +13,7 @@ a Docker registry, GitOps and chaos testing, in one Rust agent and one CLI.
 And that CLI speaks to your AI agent too.
 <!-- hero:end -->
 
-**Status:** 0.2.7 was released on 7 November 2026. Until 1.0.0, Reliaburger is good enough for home labs and dev clusters, not for production.
+**Status:** 0.2.8 was released on 11 November 2026. Until 1.0.0, Reliaburger is good enough for home labs and dev clusters, not for production.
 
 ## Five minutes, zero to cluster
 
@@ -30,6 +30,7 @@ With Homebrew, from 0.2.7: `brew install reliaburger/tap/relish`, then
 ```sh
 # Install relish and build a three-node cluster in Linux VMs on this laptop
 curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop
+relish verify                        # every node runs the published release, byte for byte
 
 # Build a burger on the cluster (Buildah on a node, into the built-in
 # registry, signed): one Go program that plays every layer
@@ -37,7 +38,8 @@ curl -fsSL https://reliaburger.com/demo/burger.tar.gz | tar xz
 relish build burger/burger.toml
 relish images                        # burger:v1, built for amd64 and arm64
 relish apply burger/burger.toml      # six layers, a counter and a diner
-relish status                        # counter-0, -1 and -2, one on each node
+relish status                        # the whole cluster on one screen
+relish apps counter                  # counter-0, -1 and -2, one on each node
 relish council status                # every node's view of the council
 curl http://burger.localhost:18080   # the burger, layer by layer; open it in a browser too
 
@@ -46,14 +48,22 @@ relish batch submit burger/jobs.toml
 relish batch watch 1                 # the number submit printed
 relish jobs                          # the finished run and its rate
 
-# Cut a layer off, roll one forward, roll a bad one back, scale one up, kill one
+# Cut a layer off, roll one forward, roll a bad one back, scale one up
 relish fault partition lettuce --from counter --duration 30s --acknowledge  # a gap
 relish apply burger/cheese-v2.toml        # a rolling deploy to blue cheese
 relish apply burger/patty-v3.toml         # fails its health check, rolled back
 relish history patty
 relish apply burger/triple-patty.toml     # a triple patty
+
+# An AI agent proposes a change; you approve it, then undo it
+AGENT=$(relish token create --name burger-agent --agent --role deployer --namespaces default --ttl 1h)
+relish agent propose scale patty --replicas 2 --reason "a double is plenty" --token "$AGENT"
+relish proposal approve 1 --yes           # a double patty
+relish undo 1 --yes                       # a triple again
+
+# Kill a patty, then ask what happened
 relish fault kill patty --acknowledge     # a double, then a triple again
-relish events --app patty                 # what happened, from every node
+relish timeline --app patty               # what happened and why, from every node
 
 # See every hop from counter to patty: DNS, VIP, eBPF map, firewall, TCP
 relish path counter --to patty
@@ -108,13 +118,13 @@ a read-only token of its own, so an agent never holds admin credentials.
 - **Policies and templates:** CEL rules that refuse, warn or fill in defaults, and typed templates instead of CRDs.
 - **Your own controllers:** an ordinary app with a scoped token, no operator SDK.
 - **Chaos as a command:** `relish fault` injects latency, partitions, kills and pressure, and cleans up after itself.
-- **Self-upgrade:** `relish upgrade` rolls a signed `bun` across the cluster without restarting workloads, and `relish verify` (0.2.8, not in 0.2.7) checks every node runs the published release, byte for byte.
-- **Diagnostics for incidents:** `relish wtf` and `relish path` say what's wrong and where. New in 0.2.8, not in 0.2.7: `relish status` sums up the whole cluster on one screen, `relish apps` lists the apps, and `relish timeline` shows what changed before a failure, with the rule and evidence behind each decision.
-- **Built for agents:** `relish agent` answers in bounded JSON, and `relish mcp` serves it over MCP. New in 0.2.8, not in 0.2.7: an agent proposes a change, a person or a policy approves it with `relish proposal approve` or the web dashboard's buttons, `relish undo` puts it back, `relish lease` keeps two of them off the same app, and `relish gym run` tests your own agent on your own cluster.
+- **Self-upgrade:** `relish upgrade` rolls a signed `bun` across the cluster without restarting workloads, and `relish verify` checks every node runs the published release, byte for byte.
+- **Diagnostics for incidents:** `relish wtf` and `relish path` say what's wrong and where. `relish status` sums up the whole cluster on one screen, `relish apps` lists the apps, and `relish timeline` shows what changed before a failure, with the rule and evidence behind each decision.
+- **Built for agents:** `relish agent` answers in bounded JSON, and `relish mcp` serves it over MCP. An agent proposes a change, a person or a policy approves it with `relish proposal approve` or the web dashboard's buttons, `relish undo` puts it back, `relish lease` keeps two of them off the same app, and `relish gym run` tests your own agent on your own cluster.
 - **A terminal UI and a web dashboard:** run `relish` with no arguments, or `relish dashboard`.
 - **The manual and the source in the binary:** `relish manual` and `relish source` work offline.
 
-[Everything 0.2.7 does](docs/README.md#whats-in-the-binary), what you
+[Everything 0.2.8 does](docs/README.md#whats-in-the-binary), what you
 don't have to install, and its [limits](docs/README.md#scope-and-limits) are
 in the documentation. The
 [feature status page](https://reliaburger.com/features) rates every

@@ -116,3 +116,30 @@ Fixes #1777
 # - The tour (docs/manual/08_five-minute-tour.md, scripts/demo/tour.sh) and
 #   the README's quick start still run `relish status` as 0.2.7 does, where
 #   it lists the counter's instances. In 0.2.8 that's `relish apps`.
+#
+# --- Release day: what the 0-2-8/release-day branch leaves to fill in ---
+#
+# The branch makes the edits above. Before it merges, after promote:
+#
+# - The release date. It says 11 November 2026, assuming the gate passes on
+#   10 November. If it slips, change it in these four places, then run
+#   `make agent-docs` (features.md and index.md are generated):
+#   README.md (the Status line), docs/README.md (the first paragraph),
+#   docs/features.toml (`released`) and docs/website/index.html (the 0.2.8
+#   release card).
+# - docs/linux-servers.md says `bun 0.2.8 (TAG-COMMIT)`: put the v0.2.8
+#   tag's short commit there.
+# - scripts/release/released-cli.tsv was written from a train build. Write
+#   it again from the published binary
+#   (`python3 scripts/release/released_cli.py v0.2.8 > scripts/release/released-cli.tsv`)
+#   and run `make reference-commands`; it should not change.
+# - docs/features.toml: the maintainer answers Homebrew install's
+#   needs_maintainer question (Beta or Alpha), then the line goes.
+# - Still to do as for 0.2.7: re-record docs/website/assets/tour.cast
+#   against the published install, the homepage's #release-testing section
+#   and its soak charts, the release-log entry, the roadmap tick,
+#   "Upgrading from 0.2.7" in releasing.md, archiving the 0.2.8 plan, and
+#   the whitepaper's comparison column ("The Reliaburger column describes
+#   0.2.7"). Until the recording and the soak section are done,
+#   tests/suite/website.rs fails the_tour_recording_matches_the_installer_version
+#   and the two the_release_testing_section_shows_the_installed_release tests.

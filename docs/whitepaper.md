@@ -2,7 +2,7 @@
 
 **A whitepaper on the design, architecture, and vision for Reliaburger, a radically simplified container orchestration platform written in Rust.**
 
-**Version 0.2.7, November 2026**
+**Version 0.2.8, November 2026**
 
 ---
 
@@ -905,7 +905,7 @@ Relish is the CLI and interactive terminal UI for Reliaburger. Running `relish` 
 | `relish exec --debug` *(planned)* | Debug container (separate identity) | `kubectl debug` |
 | `relish resolve <name>` | Query eBPF service map | `kubectl get endpoints` + `nslookup` |
 | `relish firewall <app>` *(planned)* | Show effective firewall rules | `kubectl get networkpolicy` + CNI tools |
-| `relish timeline` (0.2.8, not in 0.2.7) | What changed in a window: events, the decisions behind them, the audit log and deploys | `kubectl get events` (1h expiry) |
+| `relish timeline` | What changed in a window: events, the decisions behind them, the audit log and deploys | `kubectl get events` (1h expiry) |
 | `relish history <app>` | Deploy history for an app | `kubectl rollout history` |
 | `relish rollback <app>` | One-command rollback | `kubectl rollout undo` |
 | `relish scale <app> <n>` *(planned)* | Set replica count | `kubectl scale` |
@@ -914,14 +914,14 @@ Relish is the CLI and interactive terminal UI for Reliaburger. Running `relish` 
 | `relish test` | Run integration test suite | (none) |
 | `relish bench` | Run performance benchmarks | (none) |
 | `relish upgrade start` | Rolling cluster upgrade | `kubeadm upgrade` (multi-step) |
-| `relish verify` (0.2.8, not in 0.2.7) | Check every node runs the published, signed release, byte for byte | (none) |
+| `relish verify` | Check every node runs the published, signed release, byte for byte | (none) |
 | `relish ca backup` / `ca verify` | Keep and check your own sealed copy of the root CA | (none — manual process) |
 | `relish ca rotate` | Rotate an intermediate CA, signed with your root backup | (none — manual process) |
 | `relish ca status` *(planned)* | Show CA hierarchy and expiry | (none) |
 | `relish ca revoke` *(planned)* | Revoke a compromised certificate | (none — manual process) |
 | `relish token` | Create, list and revoke API tokens; `--agent` for an AI agent's | `kubectl create token` + RBAC |
-| `relish proposal` / `relish undo` (0.2.8, not in 0.2.7) | Show, approve or reject an agent's proposed change; undo an applied one | (none) |
-| `relish lease` (0.2.8, not in 0.2.7) | List the leases agents hold, or break one | (none) |
+| `relish proposal` / `relish undo` | Show, approve or reject an agent's proposed change; undo an applied one | (none) |
+| `relish lease` | List the leases agents hold, or break one | (none) |
 | `relish sign` | Sign a Pickle-hosted image with your own key | `cosign sign` |
 | `relish setup` | Guided setup, or a laptop cluster with `--quickstart` | `kind create cluster` / `minikube start` |
 | `relish local <status\|start\|stop\|destroy>` | Manage the laptop cluster setup made | `kind` / `minikube` commands |
@@ -944,7 +944,7 @@ Relish is the CLI and interactive terminal UI for Reliaburger. Running `relish` 
 
 ## 17. Built for Humans and Their Agents
 
-More and more of the people who run a cluster have an LLM agent at their elbow, and the agent reads the same CLI they do. Every `relish` command was written for a person at a terminal: tables lined up for the eye, a TUI with no arguments, exit codes that mean "warnings". An agent misreads all three. From 0.2.7 Reliaburger treats the agent as a second user of the same interface, without making the first one worse. The principle is that an agent should get facts in a shape it can rely on, should never be able to change the cluster on its own, and should never have to guess whose words it's reading. 0.2.8 (not in 0.2.7, the release the installer fetches) keeps that principle and lets the agent ask: it proposes a change, and a person, or a policy a person wrote, approves it (§17.5).
+More and more of the people who run a cluster have an LLM agent at their elbow, and the agent reads the same CLI they do. Every `relish` command was written for a person at a terminal: tables lined up for the eye, a TUI with no arguments, exit codes that mean "warnings". An agent misreads all three. From 0.2.7 Reliaburger treats the agent as a second user of the same interface, without making the first one worse. The principle is that an agent should get facts in a shape it can rely on, should never be able to change the cluster on its own, and should never have to guess whose words it's reading. 0.2.8 keeps that principle and lets the agent ask: it proposes a change, and a person, or a policy a person wrote, approves it (§17.5).
 
 ### 17.1 The Improvement Loop
 
@@ -976,15 +976,15 @@ A release `relish` embeds the build, test and read set (the manifest and lockfil
 | `relish agent guide` | How to use `relish` as an agent: the manual's agent chapter, as sections |
 | `relish agent context` | The first call: `relish status`'s screen and summary, findings, unknowns, active faults, newest events |
 | `relish agent diagnose` / `explain` | Every finding with its evidence; what a finding means, its thresholds and the line of code that decides it; from 0.2.8, why the cluster restarted, placed or refused something |
-| `relish agent timeline` (0.2.8, not in 0.2.7) | What changed in a window, newest first, with the rule and evidence of each recorded decision |
+| `relish agent timeline` | What changed in a window, newest first, with the rule and evidence of each recorded decision |
 | `relish agent logs` / `manual` | An app's newest log lines in a window, wrapped as untrusted; search and show the compiled-in manual |
 | `relish agent source` | `version`, `tree`, `grep`, `show` and `extract` over the source this binary was built from |
 | `relish agent patch` | Build, test and try a fix on a throwaway cluster; patched binaries are never signed |
 | `relish agent report` | A redacted bug report draft with a dedupe fingerprint; writes files, makes no network call, never posts |
 | `relish agent upgrade-check` | `ready`, `up_to_date`, `needs_fresh_cluster`, `blocked` or `unknown`, with reasons; never `ready` on missing evidence |
-| `relish agent verify` (0.2.8, not in 0.2.7) | `verified`, `mismatch` or `unknown`: whether every node and this `relish` are the published, signed release |
-| `relish agent lease` (0.2.8, not in 0.2.7) | `take`, `renew` and `release` a short lease on an app or a namespace before changing it |
-| `relish agent propose` (0.2.8, not in 0.2.7) | Propose an apply, scale, rollback, stop or delete for a person to approve; `proposals`, `withdraw` and `undo` follow it up |
+| `relish agent verify` | `verified`, `mismatch` or `unknown`: whether every node and this `relish` are the published, signed release |
+| `relish agent lease` | `take`, `renew` and `release` a short lease on an app or a namespace before changing it |
+| `relish agent propose` | Propose an apply, scale, rollback, stop or delete for a person to approve; `proposals`, `withdraw` and `undo` follow it up |
 | `relish agent setup` | Registers `relish mcp` with six agents (Claude Code, Codex, Cursor, VS Code, Goose, Gemini CLI); shows the diff, writes only with `--yes` |
 | `relish mcp` | The read-only `relish agent` commands as MCP tools over stdio, derived from the CLI's own definitions; from 0.2.8 `--propose` adds the proposal and lease tools |
 
@@ -994,7 +994,7 @@ One manual chapter is the source of everything agent-facing: `relish agent guide
 
 ### 17.5 Asking Before Acting
 
-0.2.8 (not in 0.2.7) lets an agent change the cluster, but never by itself. Four pieces make that safe.
+From 0.2.8 an agent can change the cluster, but never by itself. Four pieces make that safe.
 
 **The token is the boundary.** `relish token create --agent` makes a token for an agent: read-only unless `--role deployer`, never admin, and gone in 8 hours unless `--ttl` says otherwise (168 hours at most). The API treats it as read-only on every route but two: a deployer agent token may propose a change and take a lease. It can't apply, stop, delete or roll back anything, and it can't approve a proposal, its own or anyone else's. The CLI's good manners aren't the control; the cluster's refusal is.
 
@@ -1158,7 +1158,7 @@ Since every component of a node lives in the one `bun` binary, upgrading a node 
 
 Reliaburger verifies binary integrity via dual signatures: an embedded signing key set compiled into the binary AND an external signing key configured in `node.toml`. Network upgrades require both signatures. Published release metadata carries only the release signature, so `relish upgrade start <version>` countersigns each download with the operator's key (`--external-key`) or takes a countersigned envelope (`--sig`). It picks the build for the platform each node reports rather than the one relish runs on, and a cluster that mixes architectures gets one build per platform. Before staging, each node runs the verified candidate once with `--compatibility` and refuses a binary whose formats differ or that doesn't answer within 60 seconds, a hang guard sized for macOS, which assesses every new executable before its first run. Automatic rollback triggers if a node fails to start on the new version.
 
-From 0.2.8 (not in 0.2.7), `relish verify` checks the result: every node reports its `bun`'s SHA-256, `verify` compares it with the hash the release metadata publishes for that version and platform, downloads each build once and checks its Ed25519 signature against the release keys compiled into `relish`, then checks the `relish` running it the same way. The metadata isn't signed and doesn't need to be: a node passes only against bytes the release key signed, so a lying metadata host can make the check fail, never pass. The verdict is `verified`, `mismatch` or `unknown`, and missing evidence is never `verified`. `--metadata`, `--cli-metadata` and `--artefacts` run it offline against downloaded files. It can't catch a node that lies about its own hash, or a replaced `relish`; `gh attestation verify` checks `relish` itself.
+From 0.2.8, `relish verify` checks the result: every node reports its `bun`'s SHA-256, `verify` compares it with the hash the release metadata publishes for that version and platform, downloads each build once and checks its Ed25519 signature against the release keys compiled into `relish`, then checks the `relish` running it the same way. The metadata isn't signed and doesn't need to be: a node passes only against bytes the release key signed, so a lying metadata host can make the check fail, never pass. The verdict is `verified`, `mismatch` or `unknown`, and missing evidence is never `verified`. `--metadata`, `--cli-metadata` and `--artefacts` run it offline against downloaded files. It can't catch a node that lies about its own hash, or a replaced `relish`; `gh attestation verify` checks `relish` itself.
 
 > For the upgrade sequence, binary versioning, rollback procedure, and security considerations, see [design/agent-bun.md](design/agent-bun.md).
 
