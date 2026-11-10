@@ -85,7 +85,7 @@ Homebrew manages only the CLI. A cluster’s nodes still upgrade with `relish up
 
 **Where it stands**
 
-Good enough for home labs and dev clusters. Not for production until 1.0.0, expected in January 2027. Until then, an upgrade can mean starting a fresh cluster.
+Good enough for home labs and dev clusters. Not for production until 1.0.0, expected in January 2027. Until then, an upgrade can mean starting a fresh cluster. [What’s ready, feature by feature](https://reliaburger.com/features.html).
 
 [Roadmap](https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md)
 
@@ -268,11 +268,15 @@ Also in the CLI: `relish manual tour` · [Read it on GitHub](https://github.com/
 
 Jobs run on the same cluster as your apps, in the room the apps leave free, so there’s no second system to install. Run one task or an array of a million, on a schedule or on demand. Give each task a fresh container for full isolation, share a container across short tasks to start them faster, or run them straight on the host when speed matters more than the boundary.
 
-**1,807,742,226 host jobs in one real day.** 0.2.3 ran host jobs for 24 hours on three 4-vCPU VMs on one laptop: 20,920 a second, counted as the council accepted them, not extrapolated from a minute. That’s 1.81 billion against the two billion we aimed for, with no failed tasks and every node within a point of its share. Short benchmarks of the same release ran 14,917 a second on one node and 29,350 on three; a whole day on a laptop whose cores the VMs fill runs slower. Bun’s memory grew all day, inside its budget, and that growth isn’t fully fixed yet ([#1417](https://github.com/reliaburger/reliaburger/issues/1417)). [Day-run record](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-28-v0.2.3-day-run.md) · [Benchmark record](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-27-v0.2.3-candidate-throughput/README.md)
+**2,709,190,725 host-job tasks in one real day.** The published 0.2.7 ran host jobs for 24 hours on three 4-vCPU VMs on one Mac Studio: 31,352 a second, counted as the council accepted them, not extrapolated from a minute. That’s more than the two billion a day we aimed for, with every node within two points of its share. The rate eased from 32,045 a second in the first hour to 30,790 in the last. [Day-run record](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-08-v0.2.7-memory-run.md)
 
-[![Bun resident memory per node over the 24-hour day run, growing from about 200 to about 345 MiB, against the 512 MiB target for node 1 and 384 MiB for the others](https://reliaburger.com/assets/day-run/rss.svg)](https://reliaburger.com/assets/day-run/rss.svg)
+Bun’s memory ended the day at 265.8, 265.4 and 225.4 MiB, against targets of 512, 384 and 384 MiB. Nodes 1 and 3 levelled off. Node 2 was still growing about 2 MiB an hour when the day ended, and its leak check flagged it 13 times, so the run doesn’t close the memory work ([#1417](https://github.com/reliaburger/reliaburger/issues/1417)). 0.2.3’s day, on a laptop, reached 1.8 billion and grew Bun to 316–345 MiB ([its record](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-28-v0.2.3-day-run.md)); the hardware differs, so that isn’t a like-for-like comparison.
 
-Bun memory per node over the day run, with the 512 and 384 MiB targets. The ✕ marks are failed health checks, nearly all the leak check flagging this growth, not failed job tasks.
+[![Bun resident memory per node over the 24-hour day run of 0.2.7, growing from about 115 to 160 MiB at the start to about 265 MiB on nodes 1 and 2 and 225 MiB on node 3, against the 512 MiB target for node 1 and 384 MiB for the others](https://reliaburger.com/assets/day-run/rss.svg)](https://reliaburger.com/assets/day-run/rss.svg)
+
+Bun memory per node over the day run, with the 512 and 384 MiB targets. The ✕ marks are node 2’s leak check flagging its growth, not failed job tasks.
+
+A million in one go? 0.2.7’s 8-hour release soak ran 64 arrays of 1,048,576 tasks each while it broke things: the median took 140 seconds, the slowest 417. [Soak record](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-07-v0.2.7-job-qualification.md) · [What’s ready in jobs](https://reliaburger.com/features.html#jobs)
 
 What does each kind of isolation cost? Here’s the same command, run four ways on the same VM with the same concurrency.
 
@@ -367,11 +371,13 @@ One occurrence of any of these fails the release: a lost write or a counter that
 
 Show 0.2.7's results headline numbers and charts, each with its record
 
-- [8-hour job soak](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-07-v0.2.7-job-qualification.md): every fault and upgrade walk settled, no data lost, every job drained, agent memory within target, a linearizable council history, and a quiet tail with every leak check armed. 9,439 accepted jobs a second against the 1,390 target, and job tasks started within 32 ms at the 99th percentile, over 217 million of them. It failed as run on one agent turn of 1,215 ms against the 1 s budget, waiting for a slow journal write.
+- [8-hour job soak](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-07-v0.2.7-job-qualification.md): every fault and upgrade walk settled, no data lost, every job drained, agent memory within target, a council history linearizable over 214,757 operations, and a quiet tail with every leak check armed. 9,439 accepted jobs a second against the 1,390 target, job tasks started within 32 ms at the 99th percentile, over 217 million of them, and a 1,048,576-task array took 140 s at the median. It failed as run on one agent turn of 1,215 ms against the 1 s budget, waiting for a slow journal write.
 - [One-hour job soak](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-07-v0.2.7-job-qualification-fast.md): 8,584 accepted jobs a second, and job tasks started within 32 ms at the 99th percentile. Clean.
 - [One-hour app soak](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-07-v0.2.7-sustained-v02-fast.md): every fault kind, special and upgrade walk on the compressed schedule. Clean.
 - [Power cuts and reboots](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-07-power-cut-reboot.md): 25 of 25 in each of five lanes.
+- [Staged installs](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-07-v0.2.7-staged-install-apple-silicon.md): `curl | sh` to a ready cluster in 73 s, then [58 s](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-07-v0.2.7-staged-install-apple-silicon-2.md) from cold caches again.
 - [Every gate and every candidate](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-07-v0.2.7-release-closure.md): one candidate, and why we shipped it with that one turn.
+- [24 hours on the published release](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-08-v0.2.7-memory-run.md), after the tag: the day of jobs in [Batch jobs](https://reliaburger.com/#job-throughput) above. Node 2’s memory was still growing at the end ([#1417](https://github.com/reliaburger/reliaburger/issues/1417)).
 
 Time runs from the start of each soak. The marks under a chart are its faults and upgrade walks, and the dashed lines its targets. Open a chart to see it full size, with every mark named when you point at it.
 
@@ -409,7 +415,7 @@ Open file descriptors per node.
 
 Bun CPU per node, as a percentage of one core.
 
-What the soaks don't prove: they run three small VMs on one laptop, so they say nothing about large clusters, real networks between machines or hardware failing. A VM forced off isn't a real power loss, the fault rates are a schedule, not production traffic, and zero failures in 25 runs only rules out failure rates above about 12%. [How each gate works](https://github.com/reliaburger/reliaburger/blob/main/docs/testing.md#before-a-release), and [how it compares with Kubernetes' release testing](https://reliaburger.com/compare/kubernetes.html#testing).
+What the soaks don't prove: they run three small VMs on one machine, so they say nothing about large clusters, real networks between machines or hardware failing. A VM forced off isn't a real power loss, the fault rates are a schedule, not production traffic, and zero failures in 25 runs only rules out failure rates above about 12%. [How each gate works](https://github.com/reliaburger/reliaburger/blob/main/docs/testing.md#before-a-release), and [how it compares with Kubernetes' release testing](https://reliaburger.com/compare/kubernetes.html#testing).
 
 ## Debug the platform, not just your app
 
@@ -574,9 +580,15 @@ Not measured yet. The agent gym with open models running locally, as well as Cla
 
 ## What’s next
 
+**0.2.8: Agents you can trust, built faster**
+
+In progress, with its scope still being settled. Agent changes as proposals you review and can undo, trying a change on a copy of production, and a record of why an agent did what it did. Alongside them, a faster loop for building and releasing Reliaburger itself.
+
+[Milestone](https://github.com/reliaburger/reliaburger/milestone/30) 
+
 **0.3.0: Bare metal in an hour**
 
-Next. An appliance OS, netbooting and claiming machines over the LAN, and signed A/B OS updates. The exit test: Dell Wyse thin clients from power-on to a cluster.
+After 0.2.8. An appliance OS, netbooting and claiming machines over the LAN, and signed A/B OS updates. The exit test: Dell Wyse thin clients from power-on to a cluster.
 
 [Milestone](https://github.com/reliaburger/reliaburger/milestone/6)
 

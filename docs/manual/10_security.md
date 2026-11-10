@@ -333,6 +333,22 @@ over agents; the audit log shows when they did. Your own lease never stops
 you, and the cluster's own work (scheduling, rollouts, the autoscaler) and
 GitOps aren't held back by any.
 
+You can take a lease too, to keep agents out while you work on something by
+hand:
+
+```sh
+relish lease take app web --namespace shop --for 10m --purpose "tuning the cache"
+relish lease renew app web --namespace shop
+relish lease release app web --namespace shop
+relish lease break namespace shop
+```
+
+`take` holds an app, or with `namespace` every app in a namespace, for 30
+seconds to 15 minutes (2 minutes when you leave `--for` out), and renews a
+lease you already hold. `break` ends someone else's lease without making a
+change, and needs deployer rights or more over the target; the audit log
+records it as `lease.broken`.
+
 Proposals are judged by your policies like any apply: the `after` specs go
 through every app policy with `source = "proposal"`, a deny refuses the
 proposal (the agent sees `guardrail`), and warnings are shown first to
