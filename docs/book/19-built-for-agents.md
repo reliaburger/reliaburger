@@ -5993,6 +5993,19 @@ shipped binary doesn't carry it. Adding `gym list` to the read-only commands
 on one side and not the other now fails the other side's tests, which is the
 point.
 
+`include_str!` has a cost we found late. The file has to exist wherever the
+crate compiles, and one place it compiles is the source bundle: `relish agent
+patch test` extracts it and runs the tests there. `scripts/gym/` isn't in the
+bundle, so that test binary didn't build, and every `patch test` failed before
+it ran a test. Putting the fixture in the bundle wasn't an option, because it
+quotes the gym's canary and planted values, the answer key the bundle keeps
+out. So the parity tests sit in a module behind `#[cfg(gym_scenarios)]`, the
+cfg `build.rs` sets only when the gym's files are there, and a build from the
+bundle leaves them out. Then a test closes the class: it finds every
+`include_str!`, `include_bytes!` and `include!` in the bundled source,
+resolves each path against the file it's in, and fails unless the file is in
+the bundle or the include sits behind that cfg.
+
 #### A trait with two implementations
 
 The runner never talks to Bun directly. It talks to a trait:
