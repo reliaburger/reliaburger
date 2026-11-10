@@ -1608,10 +1608,35 @@ fn the_server_advertises_eight_kib_to_every_tool_by_default() {
     assert!(budgeted > 0);
 }
 
+/// `relish mcp --max-bytes 0`, as the Claude Code plugin runs it: each
+/// tool keeps its command's own default, so the guide still comes whole
+/// in one call, and the ceiling still holds every call (#1818's review).
+#[test]
+fn max_bytes_zero_keeps_each_commands_own_default() {
+    let server = Server::new(&Selection {
+        max_bytes: Some(tools::ServerBudget::CommandDefaults),
+        ..Selection::default()
+    })
+    .unwrap();
+    let default_of = |name: &str| {
+        server
+            .tools()
+            .into_iter()
+            .find(|tool| tool.name == name)
+            .unwrap_or_else(|| panic!("no {name} tool"))
+            .input_schema["properties"]["max_bytes"]
+            .clone()
+    };
+    assert_eq!(default_of("guide")["default"], 80 * 1024);
+    assert_eq!(default_of("schema")["default"], 40 * 1024);
+    assert_eq!(default_of("context")["default"], 24 * 1024);
+    assert_eq!(default_of("guide")["maximum"], 131072);
+}
+
 #[test]
 fn max_bytes_sets_the_advertised_default() {
     let server = Server::new(&Selection {
-        max_bytes: Some(4096),
+        max_bytes: Some(tools::ServerBudget::Every(4096)),
         ..Selection::default()
     })
     .unwrap();
@@ -1652,8 +1677,18 @@ fn a_budget_above_the_ceiling_is_held_to_it() {
 
 #[test]
 fn the_max_bytes_flag_takes_the_floor_to_the_ceiling() {
-    assert_eq!(parse_server_max_bytes("1024"), Ok(1024));
-    assert_eq!(parse_server_max_bytes("131072"), Ok(131072));
+    assert_eq!(
+        parse_server_max_bytes("1024"),
+        Ok(tools::ServerBudget::Every(1024))
+    );
+    assert_eq!(
+        parse_server_max_bytes("131072"),
+        Ok(tools::ServerBudget::Every(131072))
+    );
+    assert_eq!(
+        parse_server_max_bytes("0"),
+        Ok(tools::ServerBudget::CommandDefaults)
+    );
     assert!(parse_server_max_bytes("1023").is_err());
     assert!(parse_server_max_bytes("131073").is_err());
     assert!(parse_server_max_bytes("lots").is_err());

@@ -1159,16 +1159,17 @@ fn plugin_json(summary: &str, version: &str) -> String {
 }
 
 /// The plugin's `.mcp.json`: the same server, under the same name, that
-/// `relish agent setup` writes into an agent's own config, with the command
-/// line's default budget. The plugin is Claude Code's, with a window for
-/// 24 KiB answers; `relish mcp`'s own 8 KiB is for small local models, and
-/// setup's clients include Goose, which runs them (#1687).
+/// `relish agent setup` writes into an agent's own config, with each
+/// command's own default budget (`--max-bytes 0`): 24 KiB, and 80 KiB for
+/// the guide, so it still comes whole in one call. The plugin is Claude
+/// Code's, with a window for those; `relish mcp`'s own 8 KiB is for small
+/// local models, and setup's clients include Goose, which runs them
+/// (#1687).
 fn plugin_mcp_json() -> String {
     let mut words = super::setup::MCP_COMMAND_LINE.iter();
     let command = words.next().copied().unwrap_or("relish");
-    let budget = super::budget::DEFAULT_MAX_BYTES.to_string();
     let mut args: Vec<&str> = words.copied().collect();
-    args.extend(["--max-bytes", budget.as_str()]);
+    args.extend(["--max-bytes", "0"]);
     let mut servers = serde_json::Map::new();
     servers.insert(
         super::setup::MCP_SERVER_NAME.to_string(),
@@ -2105,8 +2106,9 @@ Intro paragraph.\n\n## In brief\n\n\
     }
 
     /// The plugin starts the same server `relish agent setup` registers,
-    /// with the command line's 24 KiB budget: Claude Code has the window
-    /// for it, and the server's own 8 KiB is for small local models (#1687).
+    /// with each command's own budget (`--max-bytes 0`): Claude Code has the
+    /// window for 24 KiB answers and an 80 KiB guide, and the server's own
+    /// 8 KiB is for small local models (#1687, #1818's review).
     #[test]
     fn the_plugin_starts_the_server_setup_registers() {
         let value: serde_json::Value = serde_json::from_str(&artefact(paths::PLUGIN_MCP)).unwrap();
@@ -2120,9 +2122,8 @@ Intro paragraph.\n\n## In brief\n\n\
                 .map(|a| a.as_str().unwrap()),
         );
         let mut expected = super::super::setup::MCP_COMMAND_LINE.to_vec();
-        expected.extend(["--max-bytes", "24576"]);
+        expected.extend(["--max-bytes", "0"]);
         assert_eq!(line, expected);
-        assert_eq!(super::super::budget::DEFAULT_MAX_BYTES, 24576);
     }
 
     #[test]

@@ -5881,8 +5881,13 @@ whole guide in one answer, so no client loses anything it could do before.
 We kept the `relish agent` commands' own defaults. On the command line the
 caller is Claude Code or a person, with a large window, and 24 KiB costs
 them nothing; the 8 KiB default is only where small models connect. Claude
-Code reaches `relish mcp` too, through the plugin, so the plugin starts it
-with `--max-bytes 24576`, the command line's default.
+Code reaches `relish mcp` too, through the plugin. At first the plugin
+started it with `--max-bytes 24576`, the command line's default, but one
+number for every tool shrank `guide` from 80 KiB and `schema` from 40. Now
+`--max-bytes 0` means "each command's own default", and the plugin passes
+that: in `tools.rs` the server's budget is an enum, `Every(n)` or
+`CommandDefaults`, so the two can't be confused with a magic number further
+down.
 
 A review of the ceiling found a loop in it. A cut answer's first `next` asks
 for the whole answer: `--max-bytes` and its size. A 2 MB `source_grep` asked
@@ -5913,6 +5918,14 @@ an answer bigger than the ceiling gets a hint for the ceiling itself, and at
 the ceiling no hint at all, only a warning to narrow the request. Python's
 `contextvars` and Go's `context.Context` carry values the same way, though
 Go passes its context explicitly.
+
+The same review found two more commands writing their own `--max-bytes`
+step: `logs` and `manual show` built theirs by hand, so under the ceiling
+they could still ask for more than it. Now `budget.rs` is the only place
+that writes the step. A command hands it an `Overflow { whole, max_bytes }`
+and gets back the budget to ask for, or `None` when nothing bigger can be
+had, and a test scans `src/relish` for any other `--max-bytes {` and fails
+if it finds one.
 
 **`next` that leads into the source.** `diagnose` gave each finding three
 next steps: `explain` it, scope the diagnosis to the app, and show the 40

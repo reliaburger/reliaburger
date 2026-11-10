@@ -284,14 +284,15 @@ pub fn answer(
     if whole <= max_bytes {
         return budget::render(&answer.envelope(total, None), max_bytes, rerun);
     }
+    let overflow = budget::Overflow { whole, max_bytes };
     // Keep the newest lines that fit, with the hint that says how to get
     // the rest. When not even an empty answer fits (a cluster full of
     // warnings), the budget trims what's left.
     let kept = fit::largest_that_fits(total, |kept| {
-        fit::printed_length(&answer.envelope(kept, Some(whole))) <= max_bytes
+        fit::printed_length(&answer.envelope(kept, Some(overflow))) <= max_bytes
     })
     .unwrap_or(0);
-    budget::render(&answer.envelope(kept, Some(whole)), max_bytes, rerun)
+    budget::render(&answer.envelope(kept, Some(overflow)), max_bytes, rerun)
 }
 
 /// Everything an answer is built from, so it can be rebuilt with any number
@@ -307,9 +308,9 @@ struct Answer<'a> {
 }
 
 impl Answer<'_> {
-    /// The envelope with only the newest `kept` entries. `whole` is how big
-    /// the answer is with all of them, when that's too big.
-    fn envelope(&self, kept: usize, whole: Option<usize>) -> Envelope<LogsData> {
+    /// The envelope with only the newest `kept` entries. `whole` says how
+    /// big the answer is with all of them, when that's too big.
+    fn envelope(&self, kept: usize, whole: Option<budget::Overflow>) -> Envelope<LogsData> {
         let request = self.request;
         let shown = &self.entries[self.entries.len() - kept..];
         let dropped_for_budget = self.entries.len() - kept;
@@ -360,18 +361,21 @@ impl Answer<'_> {
         &self,
         oldest: Option<u64>,
         left_out: bool,
-        whole: Option<usize>,
+        whole: Option<budget::Overflow>,
     ) -> Vec<NextStep> {
         let request = self.request;
         let mut steps = Vec::new();
-        if let Some(whole) = whole {
+        if let Some(overflow) = whole
+            && let Some(budget) = overflow.rerun_budget()
+        {
             steps.push(NextStep {
-                run: format!(
-                    "{} --max-bytes {}",
-                    request.command_line(None),
-                    fit::round_up_to_kib(whole)
-                ),
-                why: format!("every fetched line; the whole answer is {whole} bytes"),
+                run: budget::rerun_with(&request.command_line(None), budget),
+                why: overflow.out_of_reach().unwrap_or_else(|| {
+                    format!(
+                        "every fetched line; the whole answer is {} bytes",
+                        overflow.whole
+                    )
+                }),
                 read_only: true,
             });
         }
@@ -535,6 +539,18 @@ mod tests {
             node_count: 3,
             warnings: Vec::new(),
         }
+    }
+
+    /// Every `--max-bytes` a `next` step of `value` names.
+    fn budgets_named(value: &serde_json::Value) -> Vec<usize> {
+        value["next"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|step| step["run"].as_str())
+            .filter_map(|run| run.split_once("--max-bytes "))
+            .map(|(_, budget)| budget.split_whitespace().next().unwrap().parse().unwrap())
+            .collect()
     }
 
     fn json(rendered: &Rendered) -> serde_json::Value {
@@ -850,5 +866,27 @@ mod tests {
         let value = json(&rendered);
         assert_eq!(value["command"], "logs");
         assert_eq!(value["error"]["code"], "unreachable");
+    }
+
+    /// #1818's review: `logs` fits its own answer, so its "every fetched
+    /// line" step never went through `budget::render`'s ceiling, and over
+    /// `relish mcp` it asked for megabytes the server would never return.
+    #[tokio::test]
+    async fn under_a_ceiling_the_every_line_step_never_asks_for_more_than_it() {
+        let line = "x".repeat(200);
+        let entries: Vec<LogEntry> = (0..400)
+            .map(|index| entry(index, "payments-0", LogStream::Stdout, &line))
+            .collect();
+        let request = request("payments --tail 1000");
+        let below = crate::relish::agent::budget::within_ceiling(4096, async {
+            answer_json(&request, result(entries.clone()), 2048)
+        })
+        .await;
+        assert_eq!(budgets_named(&below), [4096], "{below}");
+        let at = crate::relish::agent::budget::within_ceiling(4096, async {
+            answer_json(&request, result(entries), 4096)
+        })
+        .await;
+        assert!(budgets_named(&at).is_empty(), "{at}");
     }
 }
