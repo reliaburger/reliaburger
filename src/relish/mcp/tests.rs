@@ -502,6 +502,109 @@ fn snapshot_of_tools_list() {
     insta::assert_json_snapshot!(listed_for_snapshot(server.tools()));
 }
 
+/// What a model reads of the tool list on every turn: each tool's name,
+/// description and input schema, as compact JSON. The output schemas and
+/// annotations are for the client, and our gym loop doesn't send them.
+fn model_facing_bytes(tools: &[Tool]) -> usize {
+    let listed: Vec<Value> = tools
+        .iter()
+        .map(|tool| {
+            json!({
+                "name": tool.name,
+                "description": tool.description,
+                "inputSchema": tool.input_schema,
+            })
+        })
+        .collect();
+    serde_json::to_string(&listed).unwrap().len()
+}
+
+/// The 14 tools cost a small model about 3,000 tokens on every turn
+/// (#1687): 11,369 bytes before the first trim, 9,872 after. A new tool or
+/// a longer description has to fit under this, or raise it deliberately.
+const MODEL_FACING_CEILING: usize = 10 * 1024;
+
+/// The whole `tools/list` answer, output schemas and annotations included:
+/// 88,998 bytes before the first trim. Most of it is the output schemas,
+/// which clients read and models mostly don't.
+const TOOLS_LIST_CEILING: usize = 96 * 1024;
+
+#[test]
+fn the_tool_list_a_model_reads_stays_under_its_ceiling() {
+    let server = Server::new(&Selection::default()).unwrap();
+    let tools = server.tools();
+    let model_facing = model_facing_bytes(&tools);
+    assert!(
+        model_facing <= MODEL_FACING_CEILING,
+        "the tools' names, descriptions and input schemas are {model_facing} bytes, over \
+         {MODEL_FACING_CEILING}: shorten them, or raise the ceiling deliberately"
+    );
+    let whole = serde_json::to_string(&json!({ "tools": tools }))
+        .unwrap()
+        .len();
+    assert!(
+        whole <= TOOLS_LIST_CEILING,
+        "tools/list is {whole} bytes, over {TOOLS_LIST_CEILING}"
+    );
+}
+
+/// Every tool that takes `max_bytes` says what it does in a few words: the
+/// schema's `default`, `minimum` and `maximum` carry the numbers, so the
+/// description doesn't repeat the CLI's own defaults, which `relish mcp`
+/// doesn't use.
+#[test]
+fn the_budget_argument_is_described_once_briefly_and_without_the_cli_defaults() {
+    let server = Server::new(&Selection::default()).unwrap();
+    for tool in server.tools() {
+        let Some(property) = tool.input_schema["properties"].get("max_bytes") else {
+            continue;
+        };
+        let description = property["description"].as_str().unwrap();
+        assert!(description.len() <= 80, "{}: {description}", tool.name);
+        assert!(
+            !description.contains("24576"),
+            "{}: {description}",
+            tool.name
+        );
+        assert!(
+            description.contains("truncated"),
+            "{}: {description}",
+            tool.name
+        );
+        assert_eq!(property["default"], tools::DEFAULT_MAX_BYTES);
+    }
+}
+
+/// Through MCP the guide's budget is 8 KiB, a tenth of the chapter, so the
+/// first call answers with the contents and the sections to read first,
+/// each whole, and `next` names the section to read after them.
+#[tokio::test]
+async fn the_guide_tool_answers_a_small_budget_with_an_outline() {
+    let server = Server::new(&Selection::default()).unwrap();
+    let result = server.call("guide", &serde_json::Map::new()).await.unwrap();
+    let envelope = result.structured_content.unwrap();
+    assert_eq!(envelope["ok"], true);
+    assert_eq!(envelope["data"]["scope"], "outline");
+    assert_eq!(envelope["truncated"], false, "an outline cuts nothing");
+    let headings: Vec<&str> = envelope["data"]["sections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|section| section["heading"].as_str().unwrap())
+        .collect();
+    assert_eq!(headings, ["In brief", "The contract"]);
+    assert!(envelope["data"]["contents"].as_array().unwrap().len() > 20);
+    let next = envelope["next"].as_array().unwrap();
+    assert_eq!(next[0]["run"], "relish agent guide --section the-envelope");
+
+    let mut arguments = serde_json::Map::new();
+    arguments.insert("section".into(), json!("the-envelope"));
+    let result = server.call("guide", &arguments).await.unwrap();
+    let envelope = result.structured_content.unwrap();
+    assert_eq!(envelope["data"]["scope"], "section");
+    assert_eq!(envelope["data"]["sections"][0]["heading"], "The envelope");
+}
+
 // ---------------------------------------------------------------------------
 // Untrusted text through MCP.
 

@@ -539,6 +539,14 @@ pub const MAX_BYTES_CEILING: usize = 128 * 1024;
 /// The argument that carries a call's budget.
 const MAX_BYTES: &str = "max_bytes";
 
+/// `max_bytes`'s description in every tool's input schema. The CLI's says
+/// which default each command has, which `relish mcp` doesn't use, and at
+/// about 200 bytes in each of 14 tools it was a quarter of what a model
+/// read of the tool list every turn (#1687). The schema's `default`,
+/// `minimum` and `maximum` carry the numbers.
+const BUDGET_DESCRIPTION: &str =
+    "Largest answer in bytes; a bigger one is trimmed and marked `truncated`";
+
 /// Why a [`Selection`] can't be served.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SelectionError {
@@ -604,6 +612,7 @@ impl ToolSpec {
         if let Some(Value::Object(properties)) = schema.get_mut("properties")
             && let Some(Value::Object(property)) = properties.get_mut(MAX_BYTES)
         {
+            property.insert("description".into(), json!(BUDGET_DESCRIPTION));
             property.insert("default".into(), json!(budget));
             property.insert("minimum".into(), json!(agent::MIN_MAX_BYTES));
             property.insert("maximum".into(), json!(MAX_BYTES_CEILING));
