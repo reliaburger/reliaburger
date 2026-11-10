@@ -5551,6 +5551,23 @@ agent that uses MCP and one that types commands are scored the same way, and
 the containment check reads MCP answers like any other `relish agent`
 output.
 
+"The same way" took a second go. A tool's positional arguments arrive as
+named ones, so the `propose` tool lands as `relish agent propose
+--kind=scale --target=web`, and the shim first logged every tool error as
+exit 1. The proposal checks wanted the words `agent propose scale` and exit
+4 for a guardrail refusal, so no proposal made through MCP could pass. The
+tests only held typed commands, and it took the local models of the second
+local-model record ([#1832](https://github.com/reliaburger/reliaburger/pull/1832))
+proposing through `relish mcp --propose` to show it. The check also took a flag's value for a word, so `relish agent propose
+--reason 'more traffic' scale web` read `more traffic` as the kind. Now
+`runs_command` matches a command's positional words, skips the values of the
+flags that take one, and counts `--kind`'s value as a word wherever it
+comes, and the shim logs a tool error with the exit code the typed command
+would give, read from the envelope's `error.code`: 4 for a guardrail or a
+held lease, 5 for a stale undo. `gym.py rescore DIR` scores a whole saved
+pass again and writes the result beside the original, which is how the
+second record's verdicts were corrected without running a model again.
+
 The first real runs, 25 sessions on `claude-opus-5-5`, are in the
 [exit test record](../qualification/2026-11-06-v0.2.7-exit-test.md). Every
 diagnosis was right, mostly in two MCP calls: `context`, then `logs` or
