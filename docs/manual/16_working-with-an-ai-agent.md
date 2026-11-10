@@ -1123,7 +1123,7 @@ keeps system ones.
 We measure local models in the gym. On 9 November four of them ran every
 scenario three times at an 8K window, with `relish mcp`'s 8 KiB default
 and all its tools: Qwen3 8B and
-Qwen3 14B got 12 of 36 runs right, Llama 3.1 8B 7 and gpt-oss 20B 5. None
+Qwen3 14B got 12 of 36 runs right, Llama 3.1 8B 7 and gpt-oss 20B 6. None
 changed the cluster. The best of them find crash loops and apps that can't
 be placed, and they miss what needs a step of their own: a fix in the
 source, a report, the partitioned node (Qwen3 8B every time), and most

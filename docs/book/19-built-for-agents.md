@@ -5887,7 +5887,7 @@ with three runs a scenario is noise. The budget held, though. The model
 named one in 4 of 99 calls, where 76 had named the solver's advertised one,
 and on the unschedulable deploy it took `explain`'s optional step into the
 source once and stopped, instead of paging through the file. Qwen3 14B also
-got 12, Llama 3.1 8B 7 and gpt-oss 20B 5. The biggest model did worst,
+got 12, Llama 3.1 8B 7 and gpt-oss 20B 6. The biggest model did worst,
 typing `kubectl`-shaped commands `relish` doesn't have (`relish app show
 reports`, `relish node gym-1`) and often answering the last request with
 nothing at all. Both Qwen3 models found the crash loops and the
@@ -5898,7 +5898,11 @@ mostly written without calling a tool. The proposal re-run, with `relish mcp
 guardrail refused the ones it should, and the scorer counted none of them,
 because the shim logs an MCP call as `agent propose --kind=scale` and the
 check looks for the words `agent propose scale`. A scorer is code too, and
-its tests only knew the shape Claude types.
+its tests only knew the shape Claude types. With the scorer fixed
+([#1834](https://github.com/reliaburger/reliaburger/pull/1834)) we scored the
+saved runs again without running a model: 6 of the 7 proposing runs did
+everything their scenario checks, and one more of gpt-oss 20B's typed
+proposals counted, which is where its 6 comes from.
 
 ### The tests
 

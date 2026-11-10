@@ -252,13 +252,15 @@ reran run C's settings on the tuned `relish` with four models, and the
 proposal scenarios with `--propose` for the two Qwen3 models. Qwen3 8B went
 from 10 correct of 36 to 12, inside the noise; the budget now comes from
 `relish mcp` and the model stopped naming its own (4 of 99 calls). Qwen3 14B
-got 12, Llama 3.1 8B 7, gpt-oss 20B 5. It leaves two things for this plan:
+got 12, Llama 3.1 8B 7, gpt-oss 20B 6. It left two things for this plan:
 
-- **The scorer can't see an MCP proposal.** The shim records `propose` as
-  `agent propose --kind=scale ...` with exit 1 on any tool error, and the
-  outcome checks want the words `agent propose scale` and exit 4. The same
-  check misreads a typed command whose flag value comes before the kind.
-  Fix it, with tests, before the proposal scenarios are rerun.
+- **The scorer couldn't see an MCP proposal.** The shim recorded `propose`
+  as `agent propose --kind=scale ...` with exit 1 on any tool error, and the
+  outcome checks wanted the words `agent propose scale` and exit 4. The same
+  check misread a typed command whose flag value came before the kind.
+  Fixed in [#1834](https://github.com/reliaburger/reliaburger/pull/1834),
+  with tests; `gym.py rescore` scored the saved runs again, and seven
+  verdicts went from partial to correct.
 - **Proposals still mostly don't happen.** With the tools on the list, Qwen3
   proposed in 7 of 24 runs. In the rest it mostly opened with an empty
   reply, and at least three times it then claimed a proposal it never made.
