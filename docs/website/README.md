@@ -38,7 +38,7 @@ Without JavaScript all seven stay stacked.
 
 Don't add other scripts. The footer names all three, so change them together.
 
-Every `<section>` has a stable `id` (`why`, `install`, `tour`, `debug`, `start`, `docs`,
+Every `<section>` has a stable `id` (`scrutiny`, `why`, `install`, `tour`, `debug`, `start`, `docs`,
 `internals`, `next`, `contributing`) and every section heading a `#` permalink, shown on
 hover or focus, so a section can be shared as `reliaburger.com/#install`.
 Renaming an `id` breaks links people have already shared; add a new section

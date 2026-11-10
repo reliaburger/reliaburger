@@ -1621,6 +1621,46 @@ fn seven_differences_come_just_before_the_install() {
     }
 }
 
+/// The page opens its case with why Reliaburger asks to be trusted: for
+/// scrutiny anyone can repeat, not for popularity. It sits between the hero
+/// and the differences, and every paragraph or table cell that quotes a
+/// number links where the number comes from, so nothing on it is a claim a
+/// reader has to take on trust. Each part of the answer also says what
+/// doesn't exist yet.
+#[test]
+fn the_scrutiny_section_comes_first_and_sources_every_number() {
+    let page = read("docs/website/index.html");
+    let ids: Vec<String> = section_ids(&page).into_iter().flatten().collect();
+    let position = |id: &str| ids.iter().position(|i| i == id).unwrap();
+    assert_eq!(position("intro") + 1, position("scrutiny"), "{ids:?}");
+    assert_eq!(position("scrutiny") + 1, position("why"), "{ids:?}");
+
+    let start = page.find("<section id=\"scrutiny\"").unwrap();
+    let section = &page[start..start + page[start..].find("</section>").unwrap()];
+    let mut checked = 0;
+    for (open, close) in [("<p", "</p>"), ("<td", "</td>")] {
+        for (at, _) in section.match_indices(open) {
+            let block = &section[at..at + section[at..].find(close).unwrap()];
+            let text = decode(&strip_tags(block));
+            if text.chars().any(|c| c.is_ascii_digit()) {
+                checked += 1;
+                assert!(
+                    block.contains("<a href=\"https://"),
+                    "a number with no source: {text:?}"
+                );
+            }
+        }
+    }
+    assert!(checked >= 5, "the section should quote its numbers");
+    let rows = section.matches("<tr><th scope=\"row\">").count();
+    assert_eq!(rows, 4, "the four parts of the answer");
+    assert_eq!(
+        section.matches("<td>").count(),
+        rows * 2,
+        "each part says what exists and what doesn't yet"
+    );
+}
+
 /// The first difference (#1731): Reliaburger was built for AI agents from the
 /// start, not retrofitted. `bun` is already "the one agent every node runs"
 /// on the slide after it, so every "agent" here is an AI agent, your agent or

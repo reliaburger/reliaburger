@@ -6,6 +6,24 @@ I wanted to understand what a simpler alternative would look like. Not a toy, bu
 
 So I built one.
 
+## Trust you can check
+
+There's a second reason, and it got stronger while I was writing.
+
+How do you decide that a piece of infrastructure is safe to run? If you're honest, you probably do what I did for years: you look at how many people use it. Thousands of companies run this, so someone would have noticed by now. Eric Raymond named it [Linus's Law](https://en.wikipedia.org/wiki/Linus%27s_law): "given enough eyeballs, all bugs are shallow".
+
+It was always a hopeful rule. [Heartbleed](https://heartbleed.com/) lived in OpenSSL, about as widely used as code gets, for over two years. The [xz backdoor](https://www.openwall.com/lists/oss-security/2024/03/29/4) was caught by one engineer who wondered why his ssh logins had got slower, in a library whose maintainer had described it as ["an unpaid hobby project"](https://research.swtch.com/xz-timeline). Lots of users, very few eyes.
+
+Then the eyes stopped being human. In November 2026 OpenAI reported that one run of an unreleased model built working root exploits for 948 distinct Linux kernel bugs, for about $1.2 million in API credits ([OpenAI](https://openai.com/index/a-thousand-fewer-paths-to-root/), [SecurityWeek](https://www.securityweek.com/ai-agents-got-root-on-linux-via-948-kernel-flaws-in-openai-research/)). Anthropic scanned more than 1,000 open-source projects and estimated 6,202 high- or critical-severity bugs among them ([Anthropic](https://www.anthropic.com/research/glasswing-initial-update)). The kernel, the most-watched code base on the planet, went from about 500 vulnerabilities found a release at 6.9 to nearly 2,000 at 7.2 ([Linux Pro Magazine](https://www.linuxpromagazine.com/index.php/layout/set/print/Online/News/2-000-Vulnerabilities-per-Linux-Release)). Popularity doesn't protect you any more. If anything, it makes you the first thing everyone points their models at.
+
+So what *would* make an orchestrator worth trusting? I think it's three things, and you'll see each of them in this book:
+
+- **You can check it.** The code is open, and every release `relish` carries the exact source it was built from, so your agent can read the code your cluster runs (chapter 19).
+- **There's less of it, in a safer language.** One code base in Rust instead of Kubernetes plus a dozen add-ons, each with its own advisories. Rust doesn't make a program correct, but it removes whole classes of memory bugs, and Google found memory-safety vulnerabilities about a thousand times rarer per line in Android's Rust than in its C and C++ ([Google](https://security.googleblog.com/2025/11/rust-in-android-move-fast-fix-things.html)).
+- **A fix reaches every node quickly.** It's one binary, so one patch is one upgrade, and once you ask, the cluster rolls it out node by node by itself (chapter 14).
+
+I'll be straight about the limits too, because you'll find them anyway. The source is about 274,000 lines of Rust outside the tests and pulls in over 500 crate versions. That's not small, and we haven't yet measured Kubernetes and its add-ons the same way to say how much smaller it is. Machines check it every day (fuzzing, mutation testing, a dependency audit), but LLM reviews still happen when someone starts one, not on a schedule. And one binary on every node is also one target on every node. That's the deal: we can't promise there are no bugs, so we make them as cheap as possible to find, and as quick as possible to fix.
+
 ## What this book is
 
 This is the story of building Reliaburger, a batteries-included container orchestrator written in Rust. You'll build it with me, one chapter at a time, from an empty `cargo new` to a system that can:

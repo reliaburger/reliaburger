@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scrutiny, Not Popularity</title>
+<style>
+  :root {
+    --bun: #2a1b12; --mustard: #f2a900; --ketchup: #d2381f; --lettuce: #5e8f24;
+    --cream: #fff4e0; --ink: #2a1b12; --muted: #7a6a5e; --tint: #fbf3e4; --paper: #ffffff;
+    --bg: var(--paper); --fg: var(--ink); --kicker: var(--ketchup); --sub: var(--muted); --card: var(--tint);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --bg: var(--bun); --fg: var(--cream); --kicker: var(--mustard); --sub: #c9b8a6; --card: #3a2a1f; }
+  }
+  :root[data-theme="dark"] { --bg: var(--bun); --fg: var(--cream); --kicker: var(--mustard); --sub: #c9b8a6; --card: #3a2a1f; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body { background: var(--bg); color: var(--fg); font: 400 clamp(16px, 2.1vw, 26px)/1.4 system-ui, -apple-system, "Segoe UI", Arial, sans-serif; overflow: hidden; }
+  .slide { position: absolute; inset: 0; padding: 6vh 7vw 9vh; display: none; flex-direction: column; justify-content: center; overflow-y: auto; }
+  .slide.current { display: flex; }
+  .slide.dark { background: var(--bun); color: var(--cream); --kicker: var(--mustard); --sub: #c9b8a6; --card: #3a2a1f; }
+  .kicker { font-weight: 700; letter-spacing: .18em; text-transform: uppercase; font-size: .62em; color: var(--kicker); margin: 0 0 .6em; }
+  h1 { font-size: 2.6em; line-height: 1.05; margin: 0 0 .3em; letter-spacing: -.02em; }
+  h2 { font-size: 1.75em; line-height: 1.1; margin: 0 0 .7em; letter-spacing: -.01em; }
+  p, li { max-width: 46em; }
+  .sub { color: var(--sub); }
+  ul { padding-left: 1.1em; margin: 0; }
+  li { margin: .35em 0; }
+  .numbers { display: grid; grid-template-columns: repeat(auto-fit, minmax(10em, 1fr)); gap: 1em; margin: .4em 0 1em; }
+  .number { background: var(--card); border-radius: 10px; padding: .7em .9em; }
+  .number b { display: block; font-size: 1.9em; line-height: 1.05; color: var(--kicker); }
+  .number span { font-size: .7em; color: var(--sub); }
+  .source { font-size: .55em; color: var(--sub); margin-top: 1.2em; }
+  .source a, .sources a { color: inherit; }
+  .sources { font-size: .5em; columns: 2; column-gap: 2em; padding-left: 1.2em; }
+  .sources li { break-inside: avoid; margin: .2em 0; }
+  .notes { display: none; }
+  body.show-notes .slide.current .notes { display: block; position: fixed; left: 0; right: 0; bottom: 0; max-height: 34vh; overflow-y: auto; background: #111; color: #eee; font-size: .55em; padding: .8em 7vw 2.4em; border-top: 3px solid var(--mustard); }
+  .bar { position: fixed; right: 1.2em; bottom: .8em; font-size: .5em; color: var(--sub); z-index: 2; }
+  .bar button { font: inherit; color: inherit; background: none; border: 1px solid currentColor; border-radius: 4px; padding: .1em .5em; cursor: pointer; margin-left: .4em; }
+  code { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: .9em; }
+  @media (max-width: 640px) { .slide { padding: 5vh 16px 10vh; } h1 { font-size: 2em; } .sources { columns: 1; } }
+  @media print {
+    body { overflow: visible; }
+    .slide { position: relative; display: flex; break-after: page; min-height: 100vh; }
+    .notes { display: block; font-size: .5em; color: #555; margin-top: 1em; }
+    .bar { display: none; }
+  }
+</style>
+</head>
+<body>
+<section class="slide dark" aria-label="Slide 1">
+  <p class="kicker">Reliaburger · design goal</p>
+  <h1>Scrutiny, not popularity</h1>
+  <p class="sub">Why we ask you to trust an orchestrator for what anyone can check, not for how many people run it.</p>
+  <p class="source">Miko Pawlikowski · November 2026 · arrow keys to move, N for notes</p>
+  <aside class="notes">Open with the question: how did you decide your last piece of infrastructure was safe to run? For most of us the honest answer is "lots of people use it". This talk is about why that stopped working in 2026, and what Reliaburger does instead. Keep it under ten minutes.</aside>
+</section>
+
+<section class="slide" aria-label="Slide 2">
+  <p class="kicker">The old rule</p>
+  <h2>"Given enough eyeballs, all bugs are shallow"</h2>
+  <ul>
+    <li>Linus's Law, as Eric Raymond put it: popular code is safe code, because someone would have noticed.</li>
+    <li><b>Heartbleed</b>: in OpenSSL for over two years before anyone said so.</li>
+    <li><b>Log4Shell</b>: in every Log4j from 2.0-beta9 to 2.14.1.</li>
+    <li><b>xz</b>: caught by one engineer curious about slow ssh logins, in "an unpaid hobby project".</li>
+  </ul>
+  <p class="source">Sources 1–5</p>
+  <aside class="notes">Lots of users is not the same as lots of reviewers. Heartbleed: shipped in OpenSSL 1.0.1 (March 2012), found and disclosed in April 2014. Log4Shell: CISA's guidance gives the affected range 2.0-beta9 to 2.14.1. xz: Andres Freund noticed ssh logins using too much CPU and valgrind errors; Russ Cox's timeline quotes Lasse Collin calling xz "an unpaid hobby project". Don't overstate it: the rule worked often enough to feel true.</aside>
+</section>
+
+<section class="slide dark" aria-label="Slide 3">
+  <p class="kicker">2026</p>
+  <h2>Finding bugs got cheap</h2>
+  <div class="numbers">
+    <div class="number"><b>948</b><span>distinct Linux kernel bugs with working root exploits, in one OpenAI run, for about $1.2M</span></div>
+    <div class="number"><b>6,202</b><span>high- or critical-severity bugs Anthropic estimates across 1,000+ open-source projects</span></div>
+    <div class="number"><b>~2,000</b><span>kernel vulnerabilities found in release 7.2, up from ~500 at 6.9</span></div>
+  </div>
+  <p class="source">Sources 6–9</p>
+  <aside class="notes">Be exact. OpenAI's post, "A thousand fewer paths to root" (November 2026): 2,308 candidate findings, 1,724 reproduced, 1,169 working local privilege-escalation exploits, 948 distinct bugs after grouping by root cause, $1,213,430 in API credits. These are local privilege escalations, so an attacker needs an account first, and nobody outside OpenAI has verified the count. It's not 948 CVEs: within ten days about 100 were patched or had staging patches. Anthropic's Glasswing update (22 May 2026): 23,019 findings in total, an estimated 6,202 high or critical, 530 disclosed, 75 patched so far. The kernel numbers are Greg Kroah-Hartman's, via Linux Pro Magazine; they count vulnerabilities found, which says how hard people look, not how many bugs were added.</aside>
+</section>
+
+<section class="slide" aria-label="Slide 4">
+  <p class="kicker">So what changed</p>
+  <h2>Popular code is searched hardest, by everyone</h2>
+  <ul>
+    <li>The same models work for both sides. Popularity now mostly means you're first in the queue.</li>
+    <li>What counts is how quickly a fix reaches every machine you run.</li>
+    <li>On Kubernetes that's many queues: the project's own feed lists <b>95 CVEs</b> since 2017, and etcd, containerd, runc, Helm and Argo CD each keep their own.</li>
+    <li>One add-on, ingress-nginx, scored <b>9.8</b> in March 2025, and Wiz found it in about <b>43%</b> of cloud environments.</li>
+  </ul>
+  <p class="source">Sources 10–11</p>
+  <aside class="notes">The Kubernetes count is ours: we downloaded the official JSON feed on 10 November 2026 and counted 95 entries, 13 published in 2026. The feed covers only issues the Kubernetes Security Response Committee announces; it includes subprojects such as ingress-nginx (22 entries mention it) but not etcd, containerd, runc, Helm or Argo CD. IngressNightmare is CVE-2025-1974 and three siblings, CVSS 9.8.</aside>
+</section>
+
+<section class="slide dark" aria-label="Slide 5">
+  <p class="kicker">Reliaburger's answer</p>
+  <h2>Make it cheap to check, and quick to fix</h2>
+  <ul>
+    <li><b>Open, and readable by any model.</b> Apache 2.0; every release <code>relish</code> carries its exact source, and <code>relish agent source</code> lets your agent read it.</li>
+    <li><b>One binary, one advisory stream.</b> Ingress, registry, metrics, logs, PKI, consensus and GitOps are compiled into <code>bun</code>.</li>
+    <li><b>One patch upgrades everything.</b> <code>relish upgrade start</code> rolls a signed binary across the cluster, with automatic rollback.</li>
+    <li><b>Less code, in Rust.</b> One code base instead of a platform plus a dozen add-ons.</li>
+  </ul>
+  <p class="source">Source 12</p>
+  <aside class="notes">This is the design goal in the whitepaper's section 2. The point isn't "we have no bugs". It's that we make bugs cheap to find and a fix quick to ship. Rust matters here more than the line count: Google measured about a thousand times lower memory-safety vulnerability density in Android's Rust than in its C and C++.</aside>
+</section>
+
+<section class="slide" aria-label="Slide 6">
+  <p class="kicker">Measured, not guessed</p>
+  <h2>Where it stands on 10 November 2026</h2>
+  <div class="numbers">
+    <div class="number"><b>273,987</b><span>lines of Rust in <code>src/</code> outside tests (<code>make loc</code>)</span></div>
+    <div class="number"><b>521</b><span>crate versions in the Linux build, 66 of them direct</span></div>
+    <div class="number"><b>15</b><span>releases in the 40 days from 0.1.0 to 0.2.7</span></div>
+    <div class="number"><b>5 of 5</b><span>runs in which Claude Code found and patched a bug we planted in the source</span></div>
+  </div>
+  <p class="source">Sources 13–15</p>
+  <aside class="notes">Methods. make loc runs scripts/loc.sh, which counts tracked files with wc -l and treats a file's #[cfg(test)] tail and its test modules as test code (317,973 test lines). Crates: cargo tree -e normal --target x86_64-unknown-linux-gnu, unique name and version pairs, minus Reliaburger itself; Cargo.lock lists 741 packages across every platform and the dev dependencies. Releases: tags v0.1.0 (29 September) to v0.2.7 (7 November 2026). The planted bug is the agent gym's planted-logs-since scenario in 0.2.7's exit test, run with a read-only token.</aside>
+</section>
+
+<section class="slide dark" aria-label="Slide 7">
+  <p class="kicker">Honest limits</p>
+  <h2>What this doesn't buy you yet</h2>
+  <ul>
+    <li>274k lines isn't small, and we haven't measured Kubernetes the same way, so there's no ratio to quote.</li>
+    <li>Machines check the code daily (fuzzing, mutation tests, a dependency audit), but LLM reviews still happen when someone starts one.</li>
+    <li>One binary is one target: a bug in <code>bun</code> is on every node.</li>
+    <li>The host patches separately: kernel, glibc, <code>runc</code>, <code>nftables</code>.</li>
+    <li>Before 1.0 a format change means a fresh cluster, and a person starts every upgrade.</li>
+  </ul>
+  <aside class="notes">Say these out loud; the audience will think of them anyway. The next step is a scheduled LLM review of the whole code base, published as it runs, which turns "can be scrutinised" into "is scrutinised". It isn't built, and there's no issue for it yet. The crates bring their own advisories too: on 26 October 2026 RustSec published 13 against one compression crate, and 0.2.3 shipped with them under a dated, reviewed exception.</aside>
+</section>
+
+<section class="slide" aria-label="Slide 8">
+  <p class="kicker">Sources</p>
+  <h2>Every number, with its link</h2>
+  <ol class="sources">
+    <li><a href="https://en.wikipedia.org/wiki/Linus%27s_law">Linus's Law</a></li>
+    <li><a href="https://heartbleed.com/">Heartbleed, CVE-2014-0160</a></li>
+    <li><a href="https://www.cisa.gov/news-events/news/apache-log4j-vulnerability-guidance">CISA, Log4j guidance</a></li>
+    <li><a href="https://www.openwall.com/lists/oss-security/2024/03/29/4">Andres Freund, the xz backdoor</a></li>
+    <li><a href="https://research.swtch.com/xz-timeline">Russ Cox, the xz timeline</a></li>
+    <li><a href="https://openai.com/index/a-thousand-fewer-paths-to-root/">OpenAI, A thousand fewer paths to root</a></li>
+    <li><a href="https://www.securityweek.com/ai-agents-got-root-on-linux-via-948-kernel-flaws-in-openai-research/">SecurityWeek on OpenAI's 948</a></li>
+    <li><a href="https://www.anthropic.com/research/glasswing-initial-update">Anthropic, Glasswing initial update</a></li>
+    <li><a href="https://www.linuxpromagazine.com/index.php/layout/set/print/Online/News/2-000-Vulnerabilities-per-Linux-Release">Linux Pro Magazine, 2,000 vulnerabilities per release</a></li>
+    <li><a href="https://kubernetes.io/docs/reference/issues-security/official-cve-feed/">Kubernetes official CVE feed</a></li>
+    <li><a href="https://www.wiz.io/blog/ingress-nginx-kubernetes-vulnerabilities">Wiz, IngressNightmare</a></li>
+    <li><a href="https://security.googleblog.com/2025/11/rust-in-android-move-fast-fix-things.html">Google, Rust in Android</a></li>
+    <li><a href="https://github.com/reliaburger/reliaburger/blob/main/scripts/loc.sh">Reliaburger, scripts/loc.sh</a></li>
+    <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md#releases-after-010">Reliaburger, releases after 0.1.0</a></li>
+    <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-06-v0.2.7-exit-test.md">Reliaburger, the 0.2.7 exit test</a></li>
+    <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/whitepaper.md#trust-from-scrutiny-not-popularity">Reliaburger whitepaper, §2</a></li>
+  </ol>
+  <aside class="notes">Point people at the whitepaper's design-goal section, which carries the same sources and the limits in full.</aside>
+</section>
+<div class="bar"><span id="count"></span><button id="notes-toggle" type="button" aria-pressed="false">Notes (N)</button></div>
+<script>
+  (function () {
+    var slides = Array.prototype.slice.call(document.querySelectorAll(".slide"));
+    var count = document.getElementById("count");
+    var toggle = document.getElementById("notes-toggle");
+    var index = 0;
+    function fromHash() {
+      var n = parseInt(location.hash.replace("#", ""), 10);
+      return isNaN(n) ? 0 : Math.min(Math.max(n - 1, 0), slides.length - 1);
+    }
+    function show(i) {
+      index = Math.min(Math.max(i, 0), slides.length - 1);
+      slides.forEach(function (s, n) { s.classList.toggle("current", n === index); });
+      count.textContent = (index + 1) + " / " + slides.length;
+      if (history.replaceState) history.replaceState(null, "", "#" + (index + 1));
+    }
+    function notes() {
+      var on = document.body.classList.toggle("show-notes");
+      toggle.setAttribute("aria-pressed", on ? "true" : "false");
+    }
+    document.addEventListener("keydown", function (e) {
+      if (e.key === "ArrowRight" || e.key === "PageDown" || e.key === " ") { e.preventDefault(); show(index + 1); }
+      else if (e.key === "ArrowLeft" || e.key === "PageUp") { e.preventDefault(); show(index - 1); }
+      else if (e.key === "Home") show(0);
+      else if (e.key === "End") show(slides.length - 1);
+      else if (e.key === "n" || e.key === "N") notes();
+    });
+    toggle.addEventListener("click", notes);
+    window.addEventListener("hashchange", function () { show(fromHash()); });
+    show(fromHash());
+  })();
+</script>
+</body>
+</html>
