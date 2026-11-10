@@ -221,6 +221,10 @@ pub struct Compatibility {
 /// size (`RaftRequest::CouncilSize` and `DesiredState::council_size`).
 /// OIDC signing-key rotation (#709): `SecurityState::retiring_oidc_keys`, and
 /// the `RotateOidcSigningKey` and `RetireOidcSigningKeys` Raft requests.
+/// The OCI process's `provider_variables`, in OCI specs, instance records
+/// and runtime intents: a launch resolves only the env values the config
+/// typed as `PROVIDER[...]` references (#1308), so an older spec without
+/// them would start its workload with the reference text.
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 58,
     state: 74,

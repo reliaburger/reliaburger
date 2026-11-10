@@ -911,11 +911,21 @@ cannot resolve secret DB_PASSWORD: secret provider "vault" did not answer within
 ```
 
 A timeout kills the provider's whole process group. Only the apps that name
-that provider are affected; everything else on the node keeps starting. In a
-cluster, the node tries the deploy again with its usual backoff (5 seconds,
-doubling up to 5 minutes), so a provider that comes back is picked up. A
-restart the provider refuses leaves that instance failed, with the reason,
-rather than spending its restart budget on the same failure.
+that provider are affected; everything else on the node keeps starting.
+
+A provider that's down only briefly doesn't fail the launch. When it can't be
+run, times out or exits without an answer, the node asks it twice more, a
+quarter of a second and then half a second later, before it gives up. That
+covers a restart as well as a deploy. A provider that answers with an `error`
+has said no, so it isn't asked again. In a cluster, the node then tries a
+failed deploy again with its usual backoff (5 seconds, doubling up to 5
+minutes), so a provider that comes back is picked up. A restart that still
+fails leaves that instance failed, with the reason, rather than spending its
+restart budget on the same failure.
+
+Only a value you wrote as `PROVIDER[...]` is a reference. A decrypted
+`ENC[AGE:...]` secret whose plaintext happens to start with `PROVIDER[`
+reaches the workload as it is.
 
 The node keeps only the reference. The secret goes into the container's
 environment, the same way a decrypted `ENC[AGE:...]` value does, and every

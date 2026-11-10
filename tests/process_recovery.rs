@@ -33,6 +33,7 @@ fn spec(script: &str) -> OciSpec {
             readonly: false,
         },
         process: OciProcess {
+            provider_variables: Vec::new(),
             rlimits: Vec::new(),
             args: vec!["/bin/sh".into(), "-c".into(), script.into()],
             env: vec!["OWNER_TEST=preserved".into()],

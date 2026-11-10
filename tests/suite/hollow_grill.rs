@@ -27,6 +27,7 @@ fn spec() -> OciSpec {
             readonly: true,
         },
         process: OciProcess {
+            provider_variables: Vec::new(),
             rlimits: Vec::new(),
             args: vec!["hollow".into()],
             env: Vec::new(),

@@ -8,9 +8,12 @@
 //! and Docker use, so no vendor SDK is linked into Bun.
 //!
 //! Every call is bounded: a timeout, after which the provider's whole process
-//! group is killed, and a cap on how much it may write. Anything else, from a
-//! missing binary to an answer that isn't the protocol, is an error that
-//! fails the instance's launch closed.
+//! group is killed, and a cap on how much it may write. A provider that
+//! can't be run, times out or exits without an answer is asked again, a few
+//! times with a growing pause, so a brief outage doesn't fail a restart
+//! (#1308). Anything else, from a missing table to an answer that isn't the
+//! protocol, and the last failed attempt, is an error that fails the
+//! instance's launch closed.
 //!
 //! Nothing here logs, and no error carries a secret value or anything the
 //! provider wrote, apart from the short message it puts in its `error` field.
@@ -45,6 +48,10 @@ pub const MAX_OUTPUT_BYTES_CEILING: usize = 1024 * 1024;
 const MAX_PATH_BYTES: usize = 1024;
 /// How long Bun keeps reading a provider's stdout after it has exited.
 const DRAIN_AFTER_EXIT: Duration = Duration::from_millis(100);
+/// How many times a launch asks a provider that fails transiently.
+pub const RESOLVE_ATTEMPTS: usize = 3;
+/// The pause before the second attempt; each later pause doubles it.
+const RETRY_BACKOFF: Duration = Duration::from_millis(250);
 /// How much of a provider's own `error` message a launch failure keeps.
 const MAX_PROVIDER_MESSAGE_CHARS: usize = 200;
 /// The provider's `PATH` unless its `env` sets one: Bun's own environment is
@@ -316,6 +323,18 @@ pub enum ProviderError {
     /// The value it returned can't go in an environment variable.
     #[error("secret provider \"{provider}\" returned a value containing a NUL byte")]
     InvalidValue { provider: ProviderName },
+}
+
+impl ProviderError {
+    /// Whether asking again might succeed: the provider couldn't be run,
+    /// broke off, timed out or exited without an answer. A refusal, a
+    /// missing table or an answer outside the protocol would only repeat.
+    fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            Self::Spawn { .. } | Self::Io { .. } | Self::TimedOut { .. } | Self::Exited { .. }
+        )
+    }
 }
 
 /// A provider failure, with the environment variable it was resolving.
@@ -615,19 +634,45 @@ impl SecretProviders {
         Err(failure)
     }
 
-    /// Resolve every `KEY=PROVIDER[...]` entry of a launch's environment,
-    /// one provider call each, in order. Other entries are kept as they are.
-    /// The first failure stops the launch.
+    /// [`resolve`](Self::resolve), asked up to [`RESOLVE_ATTEMPTS`] times
+    /// while the failure is transient, with a pause that doubles between
+    /// attempts. The last attempt's error is the one returned.
+    async fn resolve_with_retries(
+        &self,
+        reference: &SecretReference,
+        variable: &str,
+        context: LaunchContext<'_>,
+    ) -> Result<String, ProviderError> {
+        let mut pause = RETRY_BACKOFF;
+        let mut attempt = 1;
+        loop {
+            match self.resolve(reference, variable, context).await {
+                Err(error) if error.is_transient() && attempt < RESOLVE_ATTEMPTS => {
+                    tokio::time::sleep(pause).await;
+                    pause *= 2;
+                    attempt += 1;
+                }
+                outcome => return outcome,
+            }
+        }
+    }
+
+    /// Resolve the `variables` of a launch's environment, which the config
+    /// typed as `PROVIDER[...]` references, one provider call each, in
+    /// order. Every other entry is kept as it is, even one whose value
+    /// starts with `PROVIDER[`: a decrypted secret can (#1308). The first
+    /// failure stops the launch.
     pub async fn resolve_env(
         &self,
         env: &[String],
+        variables: &[String],
         context: LaunchContext<'_>,
     ) -> Result<Vec<String>, SecretResolutionError> {
         let mut resolved = Vec::with_capacity(env.len());
         for entry in env {
             let Some((variable, value)) = entry
                 .split_once('=')
-                .filter(|(_, value)| SecretReference::is_reference(value))
+                .filter(|(variable, _)| variables.iter().any(|name| name == variable))
             else {
                 resolved.push(entry.clone());
                 continue;
@@ -638,22 +683,13 @@ impl SecretProviders {
             };
             let reference = SecretReference::parse(value).map_err(|e| fail(e.into()))?;
             let secret = self
-                .resolve(&reference, variable, context)
+                .resolve_with_retries(&reference, variable, context)
                 .await
                 .map_err(fail)?;
             resolved.push(format!("{variable}={secret}"));
         }
         Ok(resolved)
     }
-}
-
-/// Whether a launch's environment names any provider.
-pub fn needs_resolution(env: &[String]) -> bool {
-    env.iter().any(|entry| {
-        entry
-            .split_once('=')
-            .is_some_and(|(_, value)| SecretReference::is_reference(value))
-    })
 }
 
 #[cfg(test)]

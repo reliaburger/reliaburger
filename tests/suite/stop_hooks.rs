@@ -32,6 +32,7 @@ fn workload(script: &str, stop: StopPolicy) -> OciSpec {
             readonly: false,
         },
         process: OciProcess {
+            provider_variables: Vec::new(),
             rlimits: Vec::new(),
             args: vec!["/bin/sh".into(), "-c".into(), script.into()],
             env: Vec::new(),

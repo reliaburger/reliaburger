@@ -1673,6 +1673,43 @@ LaunchProblem`, which is why `create_with_secrets` can write
 `problem: error.into()`. We wrote no new failure path, just a new reason to
 take the existing one.
 
+**Brief outages, and which values are references (#1308).** The first
+version had two holes. A provider that was down for a second, restarting say,
+left a restarted instance failed until the next deploy. And `resolve_env`
+found references by scanning the finished environment for values starting
+with `PROVIDER[`. That environment already holds decrypted `ENC[AGE:...]`
+secrets, and a secret's plaintext can start with anything, so it could be
+sent to a provider as if it were a reference.
+
+The fix for the second is to keep the type. The config already knows which
+values are `EnvValue::Provider`, so the spec builder writes their names into
+a new `OciProcess::provider_variables` list, and `resolve_env` resolves only
+those. Strings are where the information got lost; the list carries it past
+the point where every value becomes `KEY=value`.
+
+The fix for the first is a retry loop around one provider call:
+
+```rust
+loop {
+    match self.resolve(reference, variable, context).await {
+        Err(error) if error.is_transient() && attempt < RESOLVE_ATTEMPTS => {
+            tokio::time::sleep(pause).await;
+            pause *= 2;
+            attempt += 1;
+        }
+        outcome => return outcome,
+    }
+}
+```
+
+The `if` after a pattern is a *match guard*: the arm matches only when the
+pattern fits and the condition holds. Anything else, a success, a
+non-transient error or the last attempt's error, falls through to `outcome`,
+a pattern that binds the whole value, and is returned. `loop` is Rust's
+endless loop, and the `return` inside it is the only way out. `is_transient` lists the failures worth repeating: a spawn failure,
+broken pipes, a timeout, an exit with no answer. A provider that answers with
+an `error` has made a decision, and asking again would only repeat it.
+
 **Placement.** A node advertises its providers in its capability report,
 `NodeCapabilities::secret_providers`, and `node_can_run` gains one line:
 

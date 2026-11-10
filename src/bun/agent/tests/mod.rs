@@ -9568,6 +9568,7 @@ fn adoption_record(
                 readonly: false,
             },
             process: crate::grill::oci::OciProcess {
+                provider_variables: Vec::new(),
                 rlimits: Vec::new(),
                 args: vec!["sleep".to_string(), "60".to_string()],
                 env: vec![],

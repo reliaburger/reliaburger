@@ -937,6 +937,7 @@ mod tests {
                         readonly: false,
                     },
                     process: OciProcess {
+                        provider_variables: Vec::new(),
                         rlimits: Vec::new(),
                         args: vec!["true".into()],
                         env: vec![],

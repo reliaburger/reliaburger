@@ -980,7 +980,8 @@ pub(super) struct LaunchTarget<'a> {
     pub(super) namespace: &'a str,
 }
 
-/// Resolve `spec`'s `PROVIDER[...]` env values, then create the instance
+/// Resolve `spec`'s `provider_variables`, the env values the config typed
+/// as `PROVIDER[...]` references, then create the instance
 /// from the resolved spec (#1123). Returns the spec it was created from, so
 /// its init containers get the same environment.
 ///
@@ -989,7 +990,8 @@ pub(super) struct LaunchTarget<'a> {
 /// and in the runtime. What the supervisor keeps is `spec`, with the
 /// references, so every restart asks the provider again.
 ///
-/// A provider that fails refuses the launch with
+/// A provider that fails transiently is asked again a few times (#1308). One
+/// that still fails refuses the launch with
 /// [`LaunchProblem::SecretUnavailable`](crate::grill::LaunchProblem), the
 /// same way a missing binary does (#881), so the instance fails closed with
 /// the reason in `relish status` and `relish wtf`.
@@ -999,14 +1001,14 @@ pub(super) async fn create_with_secrets<'s, G: Grill>(
     target: LaunchTarget<'_>,
     spec: &'s crate::grill::oci::OciSpec,
 ) -> Result<std::borrow::Cow<'s, crate::grill::oci::OciSpec>, crate::grill::GrillError> {
-    let launch = if crate::sesame::secret_provider::needs_resolution(&spec.process.env) {
+    let launch = if !spec.process.provider_variables.is_empty() {
         let context = crate::sesame::secret_provider::LaunchContext {
             namespace: target.namespace,
             app: target.app_name,
             instance: &target.instance_id.0,
         };
         let env = providers
-            .resolve_env(&spec.process.env, context)
+            .resolve_env(&spec.process.env, &spec.process.provider_variables, context)
             .await
             .map_err(|error| crate::grill::GrillError::LaunchRefused {
                 instance: target.instance_id.clone(),
@@ -1014,6 +1016,7 @@ pub(super) async fn create_with_secrets<'s, G: Grill>(
             })?;
         let mut resolved = spec.clone();
         resolved.process.env = env;
+        resolved.process.provider_variables.clear();
         std::borrow::Cow::Owned(resolved)
     } else {
         std::borrow::Cow::Borrowed(spec)

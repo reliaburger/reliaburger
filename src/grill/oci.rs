@@ -141,6 +141,12 @@ pub struct OciProcess {
     pub rlimits: Vec<OciRlimit>,
     pub args: Vec<String>,
     pub env: Vec<String>,
+    /// The variables in `env` whose values are `PROVIDER[...]` references
+    /// (#1123), for the launch to resolve. Not part of the OCI runtime spec.
+    /// The config types them, so a decrypted secret whose plaintext starts
+    /// with `PROVIDER[` stays a value (#1308). A resolved spec has none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_variables: Vec<String>,
     pub cwd: String,
     pub user: OciUser,
     /// Linux capability sets. `None` gives the process no capabilities.
@@ -479,6 +485,7 @@ pub fn generate_oci_spec_with_decryptor(
             rlimits: Vec::new(),
             args,
             env,
+            provider_variables: provider_variables(&spec.env),
             cwd: spec
                 .working_dir
                 .as_ref()
@@ -553,6 +560,14 @@ pub fn build_env_with_decryptor(
         }
     }
     Ok(env)
+}
+
+/// The variables of `env` the config typed as `PROVIDER[...]` references.
+fn provider_variables(env: &BTreeMap<String, EnvValue>) -> Vec<String> {
+    env.iter()
+        .filter(|(_, value)| value.is_provider())
+        .map(|(name, _)| name.clone())
+        .collect()
 }
 
 /// Build the process arguments from an app spec.
@@ -946,6 +961,7 @@ pub fn job_process(spec: &JobSpec) -> OciProcess {
     };
 
     OciProcess {
+        provider_variables: Vec::new(),
         rlimits: Vec::new(),
         args,
         env,
@@ -998,6 +1014,7 @@ pub fn generate_init_oci_spec(
             rlimits: Vec::new(),
             args: init.command.clone(),
             env: layered_env(&app.process.env, &init.env),
+            provider_variables: layered_provider_variables(&app.process, &init.env),
             cwd: "/".to_string(),
             user: OciUser {
                 uid: 65534,
@@ -1094,6 +1111,7 @@ pub fn generate_sidecar_oci_spec(
                 .cloned()
                 .collect(),
             env: layered_env(&app.process.env, &sidecar.env),
+            provider_variables: layered_provider_variables(&app.process, &sidecar.env),
             cwd: "/".to_string(),
             user: OciUser {
                 uid: 65534,
@@ -1148,6 +1166,17 @@ fn layered_env(app: &[String], own: &BTreeMap<String, EnvValue>) -> Vec<String> 
         EnvValue::Encrypted(_) => None,
     });
     inherited.cloned().chain(added).collect()
+}
+
+/// The provider variables of [`layered_env`]'s result: the app's that the
+/// sidecar or init doesn't replace, and its own.
+fn layered_provider_variables(app: &OciProcess, own: &BTreeMap<String, EnvValue>) -> Vec<String> {
+    app.provider_variables
+        .iter()
+        .filter(|name| !own.contains_key(*name))
+        .cloned()
+        .chain(provider_variables(own))
+        .collect()
 }
 
 impl OciSpec {
@@ -2535,6 +2564,75 @@ mod tests {
             .find(|n| n.ns_type == "network")
             .unwrap();
         assert_eq!(net_ns.path.as_deref(), Some("/var/run/netns/rb-web-0"));
+    }
+
+    // -- Provider references (#1308) ------------------------------------------
+
+    #[test]
+    fn only_typed_references_are_provider_variables_even_after_decryption() {
+        let spec: AppSpec = toml::from_str(
+            r#"
+            image = "test:v1"
+            [env]
+            TOKEN = "PROVIDER[vault:web/token]"
+            SEALED = "ENC[AGE:encrypted-data]"
+            "#,
+        )
+        .unwrap();
+        // The secret's plaintext happens to look like a reference.
+        let decryptor: SecretDecryptor =
+            Box::new(|_encrypted| Ok("PROVIDER[vault:not/a/reference]".to_string()));
+        let oci = generate_oci_spec_with_decryptor(
+            "web",
+            "default",
+            &spec,
+            "default__web-0",
+            None,
+            "/cg",
+            None,
+            None,
+            Some(&decryptor),
+        )
+        .unwrap();
+        assert!(
+            oci.process
+                .env
+                .contains(&"SEALED=PROVIDER[vault:not/a/reference]".to_string())
+        );
+        assert_eq!(oci.process.provider_variables, ["TOKEN"]);
+    }
+
+    #[test]
+    fn a_sidecar_keeps_the_apps_references_it_doesnt_override_and_adds_its_own() {
+        let app: AppSpec = toml::from_str(
+            r#"
+            image = "x:1"
+            [env]
+            TOKEN = "PROVIDER[vault:web/token]"
+            DB = "PROVIDER[vault:web/db]"
+            "#,
+        )
+        .unwrap();
+        let app = generate_oci_spec(
+            "web",
+            "default",
+            &app,
+            "default__web-0",
+            None,
+            "/cg",
+            None,
+            None,
+        );
+        let spec = generate_sidecar_oci_spec(
+            &sidecar(
+                "name = \"logs\"\nenv = { DB = \"local\", LOGS = \"PROVIDER[vault:logs/token]\" }",
+            ),
+            &app,
+            &crate::grill::InstanceId("default__web-0".into()),
+        );
+        let mut variables = spec.process.provider_variables.clone();
+        variables.sort();
+        assert_eq!(variables, ["LOGS", "TOKEN"]);
     }
 
     // -- Secret decryption ---------------------------------------------------
