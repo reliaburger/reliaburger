@@ -534,12 +534,15 @@ async fn inject(
             let placed = cluster.inject(&request).await.map_err(refused)?;
             record(&placed, instance, progress);
         }
-        FaultStep::Kill { app, times } => {
-            let replicas = super::catalogue::API.replicas;
+        FaultStep::Kill {
+            app,
+            times,
+            replicas,
+        } => {
             for kill in 0..*times {
                 if kill > 0 {
                     tokio::time::sleep(config.pace.kill_gap).await;
-                    wait_running(cluster, namespace, app, replicas, config.pace).await?;
+                    wait_running(cluster, namespace, app, *replicas, config.pace).await?;
                 }
                 let request = fault_request(
                     config,

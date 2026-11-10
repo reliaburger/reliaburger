@@ -179,7 +179,10 @@ The [first record](../qualification/2026-11-09-gym-local-models.md) (Qwen3
 3. **The gym's apps in the source bundle.** `src/relish/gym/catalogue.rs`
    holds every scenario's apps and the injected log line, and the model found
    it with `source_grep`. The bundle, or the gym's scenarios, need a way to
-   keep the answer key out of the solver's reach.
+   keep the answer key out of the solver's reach. Done: the scenarios moved
+   to `scripts/gym/relish-scenarios.rs`, outside the bundle, which `build.rs`
+   includes when it's there, and a test fails if any bundled file holds a
+   prompt, an app's log line, the canary or a planted secret from either gym.
 4. **The commands a small model won't type.** It used the `relish` tool once
    in 18 sessions that needed it. Proposals are MCP tools under `relish mcp
    --propose`; a later pass runs the proposal scenarios with it, and the
