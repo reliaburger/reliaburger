@@ -1,0 +1,9 @@
+---
+source: src/relish/audit_cmd.rs
+assertion_line: 298
+expression: table
+---
+TIME (UTC)            NODE          WHO               KIND      ACTION                      TARGET                    SOURCE
+2026-10-11 12:00:00   node-2        alice             human     app.applied                 web@team-a                10.0.0.9:51000
+    proposal 17 by holmes (agent). Its reason (its own words, unverified): p99 over the SLO
+2026-10-11 12:00:00   node-2        alice             agent     proposal.created            web@team-a                10.0.0.9:51000

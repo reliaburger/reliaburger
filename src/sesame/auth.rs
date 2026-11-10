@@ -158,6 +158,28 @@ pub struct AuthContext {
     pub scoped_namespaces: Option<Vec<String>>,
 }
 
+/// The scheme a workload's identity token names its subject with. Only
+/// [`workload_context`] makes a principal id that starts with it: a token's
+/// is `token:<digest>`, a session's `session:<name>`.
+const WORKLOAD_PRINCIPAL_SCHEME: &str = "spiffe://";
+
+impl AuthContext {
+    /// What kind of principal this is, for the audit log.
+    ///
+    /// Read from the principal id, which the server mints, and the token's
+    /// kind; never from the token's name, which anyone can choose.
+    pub fn principal_kind(&self) -> crate::sesame::types::PrincipalKind {
+        use crate::sesame::types::PrincipalKind;
+        if self.principal_id == SYSTEM_PRINCIPAL {
+            PrincipalKind::System
+        } else if self.principal_id.starts_with(WORKLOAD_PRINCIPAL_SCHEME) {
+            PrincipalKind::Workload
+        } else {
+            self.kind.into()
+        }
+    }
+}
+
 /// Extract the Bearer token from an Authorization header value.
 fn extract_bearer(header_value: &str) -> Option<&str> {
     header_value.strip_prefix("Bearer ")
@@ -812,6 +834,58 @@ mod tests {
     use crate::sesame::token::create_token;
     use crate::sesame::types::TokenScope;
     use std::time::{Duration, SystemTime};
+
+    /// Every audit record says what kind of principal acted (#1682's
+    /// design), read from what the API already knows about the caller: the
+    /// token's kind, or the node's own service principal, or a workload's
+    /// SPIFFE identity. A token's name can't fake any of these.
+    #[test]
+    fn each_caller_has_the_principal_kind_its_credential_says() {
+        use crate::sesame::types::{PrincipalKind, TokenKind};
+        let person = create_token("alice", ApiRole::Admin, TokenScope::default(), None).unwrap();
+        let mut robot =
+            create_token("holmes", ApiRole::Deployer, TokenScope::default(), None).unwrap();
+        robot.token.kind = TokenKind::Agent;
+        let disguised = create_token(
+            "workload:shop/web",
+            ApiRole::Admin,
+            TokenScope::default(),
+            None,
+        )
+        .unwrap();
+        let tokens = vec![
+            person.token.clone(),
+            robot.token.clone(),
+            disguised.token.clone(),
+        ];
+        let kind = |plaintext: &str| authenticate(plaintext, &tokens).unwrap().principal_kind();
+        assert_eq!(kind(&person.plaintext), PrincipalKind::Human);
+        assert_eq!(kind(&robot.plaintext), PrincipalKind::Agent);
+        assert_eq!(kind(&disguised.plaintext), PrincipalKind::Human);
+        assert_eq!(system_context().principal_kind(), PrincipalKind::System);
+        let claims = crate::sesame::types::WorkloadJwtClaims {
+            iss: "https://test.reliaburger.dev".to_string(),
+            sub: "spiffe://test/ns/shop/app/web".to_string(),
+            aud: vec!["spiffe://test".to_string()],
+            exp: 0,
+            iat: 0,
+            namespace: "shop".to_string(),
+            app: "web".to_string(),
+            cluster: "test".to_string(),
+            node: "node-01".to_string(),
+            instance: "web-g1-0".to_string(),
+        };
+        assert_eq!(
+            workload_context(&claims).principal_kind(),
+            PrincipalKind::Workload
+        );
+        let session = readonly_session_context(&super::super::session::SessionIdentity {
+            token_name: "alice".to_string(),
+            principal_id: token_principal_id(&person.token),
+            scope: TokenScope::default(),
+        });
+        assert_eq!(session.principal_kind(), PrincipalKind::Human);
+    }
 
     #[test]
     fn authenticate_valid_token() {

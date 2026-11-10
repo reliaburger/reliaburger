@@ -63,6 +63,7 @@ pub async fn sweep_expired_tokens_once(
                 severity: EventSeverity::Info,
                 action: "token.expired_swept".to_string(),
                 principal: SWEEP_PRINCIPAL.to_string(),
+                principal_kind: crate::sesame::types::PrincipalKind::System,
                 app: None,
                 namespace: None,
                 node: Some(node.to_string()),

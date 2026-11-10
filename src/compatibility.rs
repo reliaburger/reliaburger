@@ -234,6 +234,9 @@ pub struct Compatibility {
 /// "approve"`, and a finding's `kind = "proposal"`.
 /// The summary's leader view carries the live leases and the waiting
 /// proposals, and the summary an `agents` section (#1682).
+/// Every audit record carries `principal_kind` (#1682): a node's audit log
+/// and `GET /v1/audit`, which `--cluster` asks every peer for, so an older
+/// node's records or answer don't parse.
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 58,
     state: 74,

@@ -411,7 +411,10 @@ cluster also runs your app policies on the new specs.
 Each step is in the audit log: `proposal.created`, `.refused`, `.applied`,
 `.failed`, `.rejected`, `.withdrawn`, `.expired` and `.undone`, with the
 author, `author_kind` (`human` or `agent`), the reason and who approved: a
-token's name, or `policy:<name>` with `principal_kind` `policy`.
+token's name, or `policy:<name>` with `principal_kind` `policy`. Each app an
+applied or undone proposal changed also gets its own `app.*` record naming
+the proposal, its author and the reason (see "Audit log" below), and
+`relish audit --proposal 17` lists them all.
 
 ## Policies
 
@@ -764,11 +767,14 @@ relish audit --cluster --since 2h              # every node, the last two hours
 relish audit --cluster --action 'fault.*'      # every fault injected, cleared or expired
 relish audit --app web --since 7d              # everything that touched one app or job
 relish audit --principal ci-deploy --namespace payments --output json
+relish audit --cluster --principal-kind agent  # everything agents did
+relish audit --cluster --proposal 17           # one proposal, and every app it changed
 ```
 
 Each record has the time, the node that recorded it, the action, the
-credential (its `principal` id, and the token's name as `token_name`), the
-app and namespace it touched, the address the request came from, and the
+credential (its `principal` id, and the token's name as `token_name`), what
+kind of principal that is (`principal_kind`, below), the app and namespace it
+touched, the address the request came from, and the
 action's own facts (a fault's id and override flags, the node being
 decommissioned, the version an upgrade targets). A record never carries a
 secret: the log scrubs anything shaped like a token before writing it.
@@ -780,8 +786,8 @@ reads the list, and `--app` and `--namespace` search it, so
 `relish audit --app frontend` finds the apply below:
 
 ```text
-TIME (UTC)            NODE          WHO               ACTION                      TARGET                    SOURCE
-2026-10-31 09:12:04   node-2        alice             app.applied                 backend, frontend @default  10.0.0.9:51000
+TIME (UTC)            NODE          WHO               KIND      ACTION                      TARGET                    SOURCE
+2026-10-31 09:12:04   node-2        alice             human     app.applied                 backend, frontend @default  10.0.0.9:51000
 ```
 
 When the apps span namespaces, each name keeps its own: `api@payments,
@@ -804,6 +810,40 @@ What's recorded:
 
 The cluster's own actions (a fault expiring, an expired token being swept)
 are recorded as `system`.
+
+Every record's `principal_kind` says what kind of principal acted, and the
+table's `KIND` column shows it:
+
+| Kind | Who |
+|------|-----|
+| `human` | a person's token, a browser session, or the first caller before any token exists |
+| `agent` | an agent's token (`relish token create --agent`) |
+| `workload` | a workload's identity token |
+| `system` | the nodes' own service principal, and the cluster's background work: expiry, sweeps and the lease and proposal reapers |
+| `policy` | a guardrail policy that approved a proposal |
+| `unknown` | a refused request with no valid token, and a summary of refusals from many sources |
+
+It comes from the credential the node checked, never from a token's name,
+which anyone can choose. Like an agent token's own label, it tells you who
+acted, not what they were allowed to do. `--principal-kind agent` lists
+everything agents did.
+
+A proposal's apply writes the same records as the direct command would:
+`app.applied`, `app.stopped` or `app.deleted` for each app it changed, named
+by what happened to the app. They're attributed to whoever approved it (a
+person, or `policy:<name>` as `policy`), and they also carry the proposal's
+facts: `proposal`, `kind`, `author`, `author_kind`, `reason` and
+`approved_by`. An undo writes them too, with `undo` set. So "which agent made
+this change, and why" has its answer in the change's own record, and
+`--proposal 17` finds the proposal's records and every app record it wrote.
+The table shows it on a line of its own, with the reason marked as the
+author's words, which nothing has checked:
+
+```text
+TIME (UTC)            NODE          WHO               KIND      ACTION                      TARGET                    SOURCE
+2026-11-09 14:02:11   node-1        bob               human     app.applied                 web@shop                  10.0.0.9:51000
+    proposal 17 by holmes (agent). Its reason (its own words, unverified): p99 over the SLO
+```
 
 Refused requests are recorded too, as `api.refused`, for every route in the
 table above: a missing or unknown token, a role or `[permission]` block that

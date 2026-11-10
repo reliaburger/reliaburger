@@ -7265,6 +7265,85 @@ target up first and hands it in: `build_with_history(..., history_target:
 Option<&AppSpec>)`. `build` is that with `None`, so none of its callers
 changed.
 
+### Who did it, and why, in the change's own record
+
+The design promised two things for the audit log that the first proposals
+didn't deliver, and checking the release against its own design before the
+freeze turned them up. Every record was to say what kind of principal acted,
+so `relish audit --principal-kind agent` lists what agents did. And the app
+records a proposal's apply writes were to name the proposal, its author and
+the reason, so "which agent changed `web`, and why" has its answer in
+`app.applied` itself. What shipped wrote `principal_kind` as a string in the
+details of `proposal.*` records only, and an approved proposal wrote no
+`app.*` record at all: its change was visible only as `proposal.applied`.
+
+`principal_kind` is now a field of every `AuditRecord`, an enum:
+
+```rust
+pub enum PrincipalKind {
+    Human, Agent, Workload, System, Policy, Unknown,
+}
+```
+
+Where does it come from? Not from the token's name, which anyone can
+choose: a token called `workload:shop/web` is still a person's. It comes
+from the principal id, which the server mints, and the token's kind:
+
+```rust
+pub fn principal_kind(&self) -> PrincipalKind {
+    if self.principal_id == SYSTEM_PRINCIPAL {
+        PrincipalKind::System
+    } else if self.principal_id.starts_with(WORKLOAD_PRINCIPAL_SCHEME) {
+        PrincipalKind::Workload
+    } else {
+        self.kind.into()
+    }
+}
+```
+
+`self.kind.into()` works because `PrincipalKind` implements
+`From<TokenKind>`. The standard library then gives `TokenKind` a matching
+`Into<PrincipalKind>` for free, so the caller writes `.into()` and the
+compiler picks the conversion from the return type. Background work, the reapers and the
+sweeps, is `System`. A refusal with no valid token, and the summary of
+refusals from many sources, is `Unknown` rather than a guess.
+
+Making it a field rather than a `details` entry means every place that
+builds an audit event has to say which kind it is, and the compiler listed
+every one: a struct literal that leaves out a field doesn't compile. A `details` entry would have let the next new record forget
+it quietly, which is how the first version left most of them out.
+
+The app records come from the change itself. Each `AppChange` has a
+`before` and an `after` revision, and the record is named as the direct
+route would name the same change:
+
+```rust
+pub fn app_change_action(before: &AppRevision, after: &AppRevision) -> &'static str {
+    if before.spec.is_some() && after.spec.is_none() {
+        "app.deleted"
+    } else if after.stopped && !before.stopped {
+        "app.stopped"
+    } else {
+        "app.applied"
+    }
+}
+```
+
+An undo swaps the two, so undoing a delete writes `app.applied`. Each record
+is attributed to whoever approved, a person through the API's usual caller
+attribution or `policy:<name>` as `Policy`, and carries the proposal's
+`proposal`, `kind`, `author`, `author_kind`, `reason` and `approved_by`. The
+reason is the agent's own words, and nothing has checked them, so `relish
+audit` shows them on a line of their own, marked as such, the way `relish
+proposal show` does.
+
+`relish audit --proposal 17` matches `details.proposal` exactly, and the
+filter holds a `u64`, so a typo is a parse error rather than an empty
+answer. A test
+through the real router has an agent propose a scale, a person approve it,
+and reads back `app.applied` naming the person as the principal and the
+agent as the author.
+
 ## Guardrails in policy
 
 Proposals put a person between an agent and the cluster. That's the right

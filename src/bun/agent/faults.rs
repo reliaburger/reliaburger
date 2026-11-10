@@ -1133,6 +1133,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 severity: crate::bun::events::EventSeverity::Info,
                 action: "fault.expired".to_string(),
                 principal: FAULT_EXPIRY_PRINCIPAL.to_string(),
+                principal_kind: crate::sesame::types::PrincipalKind::System,
                 app: (!rule.target_service.is_empty()).then(|| rule.target_service.clone()),
                 namespace: rule.namespace.clone(),
                 node,

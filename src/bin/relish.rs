@@ -608,6 +608,14 @@ struct AuditOptions {
     /// Only actions on this namespace.
     #[arg(long)]
     namespace: Option<String>,
+    /// Only actions by this kind of principal: human, agent, workload,
+    /// system, policy or unknown.
+    #[arg(long)]
+    principal_kind: Option<reliaburger::sesame::types::PrincipalKind>,
+    /// Only records about this proposal: its own, and the app records its
+    /// apply or undo wrote.
+    #[arg(long)]
+    proposal: Option<u64>,
     /// How many of the newest records to show (default 100, at most 10000).
     #[arg(long)]
     limit: Option<usize>,
@@ -2357,6 +2365,8 @@ async fn main() -> ExitCode {
                 principal,
                 app,
                 namespace,
+                principal_kind,
+                proposal,
                 limit,
                 cluster,
             } = *options;
@@ -2368,6 +2378,8 @@ async fn main() -> ExitCode {
                     principal,
                     app,
                     namespace,
+                    principal_kind,
+                    proposal,
                     limit,
                     cluster,
                 },
@@ -4198,6 +4210,36 @@ mod tests {
         assert_eq!(namespace.as_deref(), Some("team-a"));
         assert_eq!(limit, Some(50));
         assert!(cluster);
+    }
+
+    /// #1682's design: what agents did, and everything one proposal wrote.
+    #[test]
+    fn audit_filters_by_principal_kind_and_proposal() {
+        let cli = parse(&[
+            "relish",
+            "audit",
+            "--principal-kind",
+            "agent",
+            "--proposal",
+            "17",
+        ])
+        .unwrap();
+        let Command::Audit(options) = cli.command else {
+            panic!("expected relish audit");
+        };
+        assert_eq!(
+            options.principal_kind,
+            Some(reliaburger::sesame::types::PrincipalKind::Agent)
+        );
+        assert_eq!(options.proposal, Some(17));
+        let refused = parse(&["relish", "audit", "--principal-kind", "robot"])
+            .err()
+            .expect("an unknown kind is refused")
+            .to_string();
+        assert!(
+            refused.contains("human, agent, workload, system, policy, unknown"),
+            "{refused}"
+        );
     }
 
     #[test]
