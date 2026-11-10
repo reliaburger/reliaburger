@@ -589,6 +589,28 @@ class StoreAwareWarmSample(unittest.TestCase):
         self.assertEqual(warm, {"1": (244376, 1.4), "2": (220228, 6.1), "3": (212192, 6.1)})
 
 
+class InstanceList(unittest.TestCase):
+    """The harness's instance list comes from `relish apps --instances`.
+
+    0.2.8's `relish status -o json` prints the cluster summary in the agent
+    envelope, not a list of instances (#1788). The 0.2.8 gate's first V02 fast
+    tier waited ten minutes for soak workloads that were running, because the
+    setup check still read the summary, and the checker's status.json
+    snapshots would have held it too.
+    """
+
+    def setUp(self):
+        self.script = (Path(__file__).parent / "qualify-sustained.sh").read_text()
+
+    def test_the_harness_never_reads_the_status_summary_as_json(self):
+        self.assertNotRegex(self.script, r"rel(ish)? (--output|-o) json status\b")
+
+    def test_every_instance_reader_uses_apps_instances(self):
+        self.assertIn("instances_json() {\n    rel --output json apps --instances\n}\n", self.script)
+        for target in ('"$file"', '"$directory/status.json"', '"$evidence/.chaos-status.json"'):
+            self.assertIn(f"instances_json > {target}", self.script)
+
+
 class Exports(Evidence):
     def test_a_file_pruned_after_export_is_fine_and_one_lost_fails(self):
         self.evaluate(self.snapshot(**{"export__rb-a-1_txt": "src logs logs_000001.parquet aa11\nsrc logs logs_000002.parquet bb22\n"}))
