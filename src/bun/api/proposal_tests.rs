@@ -1632,7 +1632,10 @@ async fn a_person_decides_and_undoes_a_proposal_on_the_dashboard() {
     let applied = cluster.records("proposal.applied").await;
     assert_eq!(applied.len(), 1);
     assert_eq!(applied[0].details["approved_by"], "bob");
-    assert_eq!(applied[0].details["principal_kind"], "human");
+    assert_eq!(
+        applied[0].principal_kind,
+        crate::sesame::types::PrincipalKind::Human
+    );
 
     let after = cluster.page("/ui/proposal/1?done=approve", &bob).await;
     assert!(after.html.contains("Approved. The leader applied it"));
