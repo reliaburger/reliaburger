@@ -13,4 +13,5 @@ gives one slide a page with its notes under it.
 Every number on a slide has its source on the last slide, and the notes give
 each one's method and caveats. The Reliaburger numbers were measured on
 10 November 2026 on the 0.2.8 train; re-measure them before you give the talk
-(`make loc`, `cargo tree -e normal --target x86_64-unknown-linux-gnu`).
+(the method is in
+[the line-count record](../../qualification/2026-11-10-loc-comparison.md)).

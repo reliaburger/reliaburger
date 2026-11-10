@@ -83,46 +83,52 @@
             for <a href="https://heartbleed.com/">over two years</a>, and xz was saved by
             <a href="https://www.openwall.com/lists/oss-security/2024/03/29/4">one engineer
             curious about slow ssh logins</a>.</p>
-          <p><strong>Finding bugs is cheap now.</strong> In November 2026 OpenAI said one run of an
-            unreleased model built working root exploits for 948 distinct Linux kernel bugs, for
-            about $1.2 million
+          <p><strong>Finding bugs is cheap now, and the CVE count shows it.</strong> January to
+            October 2026 brought 92,319 CVEs, against 41,213 in the same months of 2025, by
+            <a href="https://runtimewire.com/article/nvd-recorded-2-24-times-as-many-cves-from-january-through-october-as-in-the-same">RuntimeWire’s
+            count of NVD</a>. The Linux kernel published 8,311 by 7 November, against 5,683 in all
+            of 2025 (<a href="https://linuxcvetracker.com/cve-statistics/2026/">Linux CVE Tracker</a>).
+            Not all of that is AI, but the AI-found part is growing fast: one OpenAI run built
+            working root exploits for 948 distinct kernel bugs for about $1.2 million
             (<a href="https://openai.com/index/a-thousand-fewer-paths-to-root/">OpenAI</a>,
             <a href="https://www.securityweek.com/ai-agents-got-root-on-linux-via-948-kernel-flaws-in-openai-research/">SecurityWeek</a>).
-            Anthropic scanned more than 1,000 open-source projects and estimated 6,202 high- or
-            critical-severity bugs in them
-            (<a href="https://www.anthropic.com/research/glasswing-initial-update">Anthropic</a>).
-            The kernel went from about 500 vulnerabilities a release to nearly 2,000
-            (<a href="https://www.linuxpromagazine.com/index.php/layout/set/print/Online/News/2-000-Vulnerabilities-per-Linux-Release">Linux Pro Magazine</a>).
-            Popular code gets searched hardest, by everyone. What matters now is whether anyone can
-            check the code, how much there is, and how fast the fix reaches every node.</p>
+            Popular code gets searched hardest, by everyone. What matters now is how fast a fix
+            reaches every node, whether anyone can check the code, and how much of it there is.</p>
           <div class="throughput-comparison" role="region" aria-label="Where each part of the answer stands" tabindex="0">
           <table><caption>Reliaburger’s answer, and where each part stands on 10 November 2026</caption>
             <thead><tr><th scope="col">The answer</th><th scope="col">What exists</th><th scope="col">What doesn’t yet</th></tr></thead>
             <tbody>
-              <tr><th scope="row">Open, and readable by any model</th><td>Apache 2.0, and every
+              <tr><th scope="row">One thing to upgrade</th><td>Not Kubernetes, etcd, a CNI, an
+                ingress controller, cert-manager, Prometheus, Grafana, a log stack, Argo CD and a
+                registry, each on its own release cycle, but one binary. <code>relish upgrade start</code> rolls it
+                across the cluster, signed, with automatic rollback, and we shipped fifteen
+                releases in <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md#releases-after-010">40 days</a>.</td>
+                <td>The OS patches separately until 0.3.0’s netbooted
+                <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md#releases-after-010">appliance image</a>, which is planned,
+                not shipped. A person starts every upgrade, and before 1.0 a format change needs a
+                <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#compatibility-before-100">fresh cluster</a>.</td></tr>
+              <tr><th scope="row">Continuously scrutinised</th><td>Apache 2.0, and every
                 release <code>relish</code> carries its own source. Claude Code found and patched a
                 bug we planted in it in
-                <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-06-v0.2.7-exit-test.md">5 of 5 runs</a>.</td>
-                <td>LLM reviews of the code happen in audits someone starts, not on a schedule.</td></tr>
-              <tr><th scope="row">One patch for the whole platform</th><td>Ingress, registry,
-                metrics, logs, PKI, consensus and GitOps are one binary with one advisory stream.
-                Kubernetes’s own feed has
+                <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-06-v0.2.7-exit-test.md">5 of 5 runs</a>. Fuzzing,
+                mutation tests and a dependency audit run on a schedule.</td>
+                <td>A scheduled LLM review of the whole code base is a design goal for
+                <a href="https://github.com/reliaburger/reliaburger/issues/1840">1.0</a>. Today LLM
+                reviews happen in audits someone starts.</td></tr>
+              <tr><th scope="row">Ten times less code</th><td>202,730 lines of Rust, against
+                2,134,280 lines of Go for the Kubernetes projects that cover the same features,
+                counted with the <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-10-loc-comparison.md">same tool
+                and rules</a>.</td>
+                <td>Lines aren’t bugs, and the Kubernetes side does more. Without Cilium and
+                Grafana it’s <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-10-loc-comparison.md#results">6.7
+                times</a>.</td></tr>
+              <tr><th scope="row">One advisory stream</th><td>Our issues, plus RustSec for our
+                crates. Kubernetes’s own feed alone has
                 <a href="https://kubernetes.io/docs/reference/issues-security/official-cve-feed/">95 CVEs</a>,
                 and etcd, containerd, runc, Helm and Argo CD each keep their own.</td>
-                <td>The host’s kernel and packages such as <code>runc</code> still patch separately.</td></tr>
-              <tr><th scope="row">Fast upgrades</th><td>Fifteen releases in
-                <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md#releases-after-010">40 days</a>.
-                <code>relish upgrade start</code> rolls a signed binary across the cluster, with
-                automatic rollback.</td>
-                <td>Before 1.0 a format change needs a
-                <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#compatibility-before-100">fresh cluster</a>,
-                and a person starts every upgrade.</td></tr>
-              <tr><th scope="row">Less code</th><td>273,987 lines of Rust in <code>src/</code>
-                outside tests, counted by
-                <a href="https://github.com/reliaburger/reliaburger/blob/main/scripts/loc.sh"><code>make loc</code></a>.</td>
-                <td>That isn’t small, the build pulls in
-                <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/whitepaper.md#trust-from-scrutiny-not-popularity">521 crate versions</a>, and we haven’t measured
-                Kubernetes the same way.</td></tr>
+                <td>The crates bring their own advisories:
+                <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-26-dependency-exceptions.md">13 against one</a>
+                on 26 October 2026.</td></tr>
             </tbody>
           </table></div>
           <p class="tour-links"><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/whitepaper.md#trust-from-scrutiny-not-popularity">The design goal, with every source</a>

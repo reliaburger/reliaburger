@@ -73,14 +73,15 @@
 
 <section class="slide dark" aria-label="Slide 3">
   <p class="kicker">2026</p>
-  <h2>Finding bugs got cheap</h2>
+  <h2>The CVE count went through the roof</h2>
   <div class="numbers">
-    <div class="number"><b>948</b><span>distinct Linux kernel bugs with working root exploits, in one OpenAI run, for about $1.2M</span></div>
-    <div class="number"><b>6,202</b><span>high- or critical-severity bugs Anthropic estimates across 1,000+ open-source projects</span></div>
-    <div class="number"><b>~2,000</b><span>kernel vulnerabilities found in release 7.2, up from ~500 at 6.9</span></div>
+    <div class="number"><b>92,319</b><span>CVEs from January to October 2026, against 41,213 in the same months of 2025</span></div>
+    <div class="number"><b>17,481</b><span>CVEs in October 2026 alone, against 4,389 a year earlier</span></div>
+    <div class="number"><b>2,118</b><span>Linux kernel CVEs in September 2026, over a third of its whole 2025</span></div>
+    <div class="number"><b>948</b><span>distinct kernel bugs with working root exploits, in one OpenAI run, for about $1.2M</span></div>
   </div>
-  <p class="source">Sources 6–9</p>
-  <aside class="notes">Be exact. OpenAI's post, "A thousand fewer paths to root" (November 2026): 2,308 candidate findings, 1,724 reproduced, 1,169 working local privilege-escalation exploits, 948 distinct bugs after grouping by root cause, $1,213,430 in API credits. These are local privilege escalations, so an attacker needs an account first, and nobody outside OpenAI has verified the count. It's not 948 CVEs: within ten days about 100 were patched or had staging patches. Anthropic's Glasswing update (22 May 2026): 23,019 findings in total, an estimated 6,202 high or critical, 530 disclosed, 75 patched so far. The kernel numbers are Greg Kroah-Hartman's, via Linux Pro Magazine; they count vulnerabilities found, which says how hard people look, not how many bugs were added.</aside>
+  <p class="source">Sources 6–11</p>
+  <aside class="notes">All third parties' counts of public data. The 92,319 and 17,481 are RuntimeWire's count of the NVD API (1 November 2026); 2025's full year was a record 48,185 by Jerry Gamblin's count, quoted by Trend Micro. Gamblin's May forecast already had 2026 crossing 1,000 CVEs a week in March. Kernel: Linux CVE Tracker, from NVD: 5,683 in 2025, 8,311 in 2026 by 7 November. Causes are mixed: Trend Micro names AI-assisted discovery as one of three drivers, beside reporting changes and product sprawl, and in May Gamblin put AI-found CVEs under 1% of the total. The kernel's CNA gives almost every bug fix a CVE. OpenAI's post is one example inside the wave, not the wave: 2,308 candidates, 1,724 reproduced, 1,169 working local privilege-escalation exploits, 948 distinct bugs after grouping, $1,213,430 in API credits, not independently verified, not 948 CVEs. Anthropic's Glasswing scan estimated 6,202 high or critical bugs across 1,000+ projects.</aside>
 </section>
 
 <section class="slide" aria-label="Slide 4">
@@ -92,47 +93,47 @@
     <li>On Kubernetes that's many queues: the project's own feed lists <b>95 CVEs</b> since 2017, and etcd, containerd, runc, Helm and Argo CD each keep their own.</li>
     <li>One add-on, ingress-nginx, scored <b>9.8</b> in March 2025, and Wiz found it in about <b>43%</b> of cloud environments.</li>
   </ul>
-  <p class="source">Sources 10–11</p>
+  <p class="source">Sources 16, 19</p>
   <aside class="notes">The Kubernetes count is ours: we downloaded the official JSON feed on 10 November 2026 and counted 95 entries, 13 published in 2026. The feed covers only issues the Kubernetes Security Response Committee announces; it includes subprojects such as ingress-nginx (22 entries mention it) but not etcd, containerd, runc, Helm or Argo CD. IngressNightmare is CVE-2025-1974 and three siblings, CVSS 9.8.</aside>
 </section>
 
 <section class="slide dark" aria-label="Slide 5">
   <p class="kicker">Reliaburger's answer</p>
-  <h2>Make it cheap to check, and quick to fix</h2>
+  <h2>One thing to upgrade, and cheap to check</h2>
   <ul>
-    <li><b>Open, and readable by any model.</b> Apache 2.0; every release <code>relish</code> carries its exact source, and <code>relish agent source</code> lets your agent read it.</li>
-    <li><b>One binary, one advisory stream.</b> Ingress, registry, metrics, logs, PKI, consensus and GitOps are compiled into <code>bun</code>.</li>
-    <li><b>One patch upgrades everything.</b> <code>relish upgrade start</code> rolls a signed binary across the cluster, with automatic rollback.</li>
-    <li><b>Less code, in Rust.</b> One code base instead of a platform plus a dozen add-ons.</li>
+    <li><b>One thing to upgrade.</b> Not Kubernetes, etcd, a CNI, ingress, cert-manager, Prometheus, Grafana, logs, Argo CD and a registry on a dozen release cycles: one binary. <code>relish upgrade start</code> rolls it, signed, with automatic rollback.</li>
+    <li><b>The OS next.</b> 0.3.0 plans a netbooted appliance image with <code>bun</code> as its only service. Planned, not shipped.</li>
+    <li><b>Open, and readable by any model.</b> Every release <code>relish</code> carries its exact source; continuous LLM review is a 1.0 design goal.</li>
+    <li><b>Ten times less code, in Rust.</b></li>
   </ul>
-  <p class="source">Source 12</p>
-  <aside class="notes">This is the design goal in the whitepaper's section 2. The point isn't "we have no bugs". It's that we make bugs cheap to find and a fix quick to ship. Rust matters here more than the line count: Google measured about a thousand times lower memory-safety vulnerability density in Android's Rust than in its C and C++.</aside>
+  <p class="source">Sources 12, 17–18</p>
+  <aside class="notes">Lead with the upgrade. The pain on Kubernetes isn't one upgrade, it's a dozen release cycles and the one version you forgot. A fix in Reliaburger is a new bun, one command, workers then council then leader. The appliance image (0.3.0, "Bare metal in an hour"): our own mkosi build of Ubuntu 26.04, no SSH, no package manager, read-only verified /usr, netbooted by relish netboot, signed weekly OS builds that bun rolls out with A/B slots. Continuous LLM scrutiny is issue #1840 in the 1.0 milestone; today LLM reviews happen in audits someone starts. Rust: Google measured about a thousand times lower memory-safety vulnerability density in Android's Rust than its C and C++.</aside>
 </section>
 
 <section class="slide" aria-label="Slide 6">
   <p class="kicker">Measured, not guessed</p>
   <h2>Where it stands on 10 November 2026</h2>
   <div class="numbers">
-    <div class="number"><b>273,987</b><span>lines of Rust in <code>src/</code> outside tests (<code>make loc</code>)</span></div>
-    <div class="number"><b>521</b><span>crate versions in the Linux build, 66 of them direct</span></div>
+    <div class="number"><b>10.5×</b><span>2,134,280 lines of Go in the Kubernetes projects with the same features, against 202,730 of Rust</span></div>
+    <div class="number"><b>66 vs 698</b><span>direct dependencies: Reliaburger against those thirteen projects</span></div>
     <div class="number"><b>15</b><span>releases in the 40 days from 0.1.0 to 0.2.7</span></div>
     <div class="number"><b>5 of 5</b><span>runs in which Claude Code found and patched a bug we planted in the source</span></div>
   </div>
   <p class="source">Sources 13–15</p>
-  <aside class="notes">Methods. make loc runs scripts/loc.sh, which counts tracked files with wc -l and treats a file's #[cfg(test)] tail and its test modules as test code (317,973 test lines). Crates: cargo tree -e normal --target x86_64-unknown-linux-gnu, unique name and version pairs, minus Reliaburger itself; Cargo.lock lists 741 packages across every platform and the dev dependencies. Releases: tags v0.1.0 (29 September) to v0.2.7 (7 November 2026). The planted bug is the agent gym's planted-logs-since scenario in 0.2.7's exit test, run with a read-only token.</aside>
+  <aside class="notes">Methods are in the dated record, docs/qualification/2026-11-10-loc-comparison.md. scc 4.1.0 on both sides, code lines of the main language only, no tests, vendored, marked-generated code, docs or examples, at each project's latest release. The thirteen: Kubernetes, etcd, containerd, CoreDNS, ingress-nginx, cert-manager, Prometheus, Alertmanager, Loki, Grafana's Go backend, Argo CD, distribution, Cilium. runc and Helm are left out: Reliaburger uses runc, and has no Helm. Without Cilium and Grafana the ratio is 6.7. Lines aren't bugs, and Go is wordier than Rust. Dependencies: 698 distinct direct and 1,194 total Go modules across the thirteen go.mod files, against 66 direct and 521 crate versions. Releases: tags v0.1.0 (29 September) to v0.2.7 (7 November 2026). The planted bug is the agent gym's planted-logs-since scenario in 0.2.7's exit test, run with a read-only token.</aside>
 </section>
 
 <section class="slide dark" aria-label="Slide 7">
   <p class="kicker">Honest limits</p>
   <h2>What this doesn't buy you yet</h2>
   <ul>
-    <li>274k lines isn't small, and we haven't measured Kubernetes the same way, so there's no ratio to quote.</li>
-    <li>Machines check the code daily (fuzzing, mutation tests, a dependency audit), but LLM reviews still happen when someone starts one.</li>
+    <li>Lines aren't bugs, and the Kubernetes side does more: without Cilium and Grafana it's 6.7×, not 10.5×.</li>
+    <li>Continuous LLM review is a 1.0 goal (#1840). Today it happens when someone starts an audit.</li>
+    <li>Until the 0.3.0 appliance image ships, the host's kernel and packages patch on their own cycle.</li>
     <li>One binary is one target: a bug in <code>bun</code> is on every node.</li>
-    <li>The host patches separately: kernel, glibc, <code>runc</code>, <code>nftables</code>.</li>
-    <li>Before 1.0 a format change means a fresh cluster, and a person starts every upgrade.</li>
+    <li>A person starts every upgrade, and before 1.0 a format change means a fresh cluster.</li>
   </ul>
-  <aside class="notes">Say these out loud; the audience will think of them anyway. The next step is a scheduled LLM review of the whole code base, published as it runs, which turns "can be scrutinised" into "is scrutinised". It isn't built, and there's no issue for it yet. The crates bring their own advisories too: on 26 October 2026 RustSec published 13 against one compression crate, and 0.2.3 shipped with them under a dated, reviewed exception.</aside>
+  <aside class="notes">Say these out loud; the audience will think of them anyway. The crates bring their own advisories too: on 26 October 2026 RustSec published 13 against one compression crate, and 0.2.3 shipped with them under a dated, reviewed exception.</aside>
 </section>
 
 <section class="slide" aria-label="Slide 8">
@@ -144,16 +145,21 @@
     <li><a href="https://www.cisa.gov/news-events/news/apache-log4j-vulnerability-guidance">CISA, Log4j guidance</a></li>
     <li><a href="https://www.openwall.com/lists/oss-security/2024/03/29/4">Andres Freund, the xz backdoor</a></li>
     <li><a href="https://research.swtch.com/xz-timeline">Russ Cox, the xz timeline</a></li>
+    <li><a href="https://runtimewire.com/article/nvd-recorded-2-24-times-as-many-cves-from-january-through-october-as-in-the-same">RuntimeWire, NVD's CVEs January to October 2026</a></li>
+    <li><a href="https://www.trendmicro.com/es_mx/research/26/g/making-sense-of-the-vulnpocalypse.html">Trend Micro, making sense of the vulnpocalypse</a></li>
+    <li><a href="https://jgamblin.github.io/FirstForecast/">Jerry Gamblin, 2026 forecast update</a></li>
+    <li><a href="https://linuxcvetracker.com/cve-statistics/2026/">Linux CVE Tracker, 2026</a></li>
     <li><a href="https://openai.com/index/a-thousand-fewer-paths-to-root/">OpenAI, A thousand fewer paths to root</a></li>
     <li><a href="https://www.securityweek.com/ai-agents-got-root-on-linux-via-948-kernel-flaws-in-openai-research/">SecurityWeek on OpenAI's 948</a></li>
-    <li><a href="https://www.anthropic.com/research/glasswing-initial-update">Anthropic, Glasswing initial update</a></li>
-    <li><a href="https://www.linuxpromagazine.com/index.php/layout/set/print/Online/News/2-000-Vulnerabilities-per-Linux-Release">Linux Pro Magazine, 2,000 vulnerabilities per release</a></li>
-    <li><a href="https://kubernetes.io/docs/reference/issues-security/official-cve-feed/">Kubernetes official CVE feed</a></li>
-    <li><a href="https://www.wiz.io/blog/ingress-nginx-kubernetes-vulnerabilities">Wiz, IngressNightmare</a></li>
     <li><a href="https://security.googleblog.com/2025/11/rust-in-android-move-fast-fix-things.html">Google, Rust in Android</a></li>
-    <li><a href="https://github.com/reliaburger/reliaburger/blob/main/scripts/loc.sh">Reliaburger, scripts/loc.sh</a></li>
+    <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-10-loc-comparison.md">Reliaburger, lines of code against the Kubernetes stack</a></li>
     <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md#releases-after-010">Reliaburger, releases after 0.1.0</a></li>
     <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-06-v0.2.7-exit-test.md">Reliaburger, the 0.2.7 exit test</a></li>
+    <li><a href="https://kubernetes.io/docs/reference/issues-security/official-cve-feed/">Kubernetes official CVE feed</a></li>
+    <li><a href="https://github.com/reliaburger/reliaburger/pull/218">Reliaburger, appliance OS research</a></li>
+    <li><a href="https://github.com/reliaburger/reliaburger/issues/1840">Reliaburger #1840, scheduled LLM review</a></li>
+    <li><a href="https://www.wiz.io/blog/ingress-nginx-kubernetes-vulnerabilities">Wiz, IngressNightmare</a></li>
+    <li><a href="https://www.anthropic.com/research/glasswing-initial-update">Anthropic, Glasswing initial update</a></li>
     <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/whitepaper.md#trust-from-scrutiny-not-popularity">Reliaburger whitepaper, §2</a></li>
   </ol>
   <aside class="notes">Point people at the whitepaper's design-goal section, which carries the same sources and the limits in full.</aside>
