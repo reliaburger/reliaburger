@@ -243,6 +243,13 @@ FUZZ_SECONDS ?= 10
 # musl cargo-fuzz then asks for a static CRT that AddressSanitizer refuses.
 # Name the nightly toolchain's own host instead.
 FUZZ_TARGET ?= $(shell $(CARGO) +$(FUZZ_TOOLCHAIN) -vV 2>/dev/null | sed -n 's/^host: //p')
+# cargo-fuzz compiles each crate as one codegen unit unless told otherwise.
+# As one sanitized LLVM module, reliaburger took 31 GB in a single rustc,
+# and the 16 GB hosted runner was reclaimed mid-build (#1839). With 64 units
+# and four jobs the build peaked at 12.3 GB (16 units: 16.1 GB), at some cost
+# in executions per second. `run` must pass the same value, or its RUSTFLAGS
+# differ and it rebuilds everything.
+FUZZ_CODEGEN_UNITS ?= 64
 FUZZ_TARGETS = $(sort $(basename $(notdir $(wildcard fuzz/fuzz_targets/*.rs))))
 
 fuzz-tools: ## Check that nightly Rust and cargo-fuzz are installed, and say how to get them
@@ -252,13 +259,13 @@ fuzz-tools: ## Check that nightly Rust and cargo-fuzz are installed, and say how
 		echo "fuzzing needs cargo-fuzz: cargo install cargo-fuzz --locked" >&2; exit 1; }
 
 fuzz-build: fuzz-tools ## Build every fuzz target (nightly, cargo-fuzz)
-	$(FUZZ) build --target $(FUZZ_TARGET)
+	$(FUZZ) build --target $(FUZZ_TARGET) --codegen-units $(FUZZ_CODEGEN_UNITS)
 
 fuzz-smoke: fuzz-build ## Run every fuzz target for FUZZ_SECONDS (default 10) each; fails if any crashes
 	@failed=""; for target in $(FUZZ_TARGETS); do \
 		mkdir -p fuzz/target/corpus/$$target fuzz/target/logs; \
 		echo "fuzz: $$target for $(FUZZ_SECONDS)s (log: fuzz/target/logs/$$target.log)"; \
-		$(FUZZ) run --target $(FUZZ_TARGET) $$target fuzz/target/corpus/$$target fuzz/corpus/$$target -- \
+		$(FUZZ) run --target $(FUZZ_TARGET) --codegen-units $(FUZZ_CODEGEN_UNITS) $$target fuzz/target/corpus/$$target fuzz/corpus/$$target -- \
 			-max_total_time=$(FUZZ_SECONDS) -print_final_stats=1 \
 			>fuzz/target/logs/$$target.log 2>&1 || failed="$$failed $$target"; \
 		grep -E '^#[0-9]+.*(DONE|cov:)' fuzz/target/logs/$$target.log | tail -n 1; \
