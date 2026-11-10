@@ -319,9 +319,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// A peer is identified by gossip node name; its gossip address
     /// comes from membership and its Raft address is derived by the
     /// fixed port offset. Both must be blocked, or SWIM keeps half the
-    /// path alive and the partition doesn't take. An address another
-    /// partition already blocks isn't recorded, so healing this one
-    /// leaves that one in force.
+    /// path alive and the partition doesn't take. Two partitions can't
+    /// overlap: the leader admits one node fault at a time
+    /// (`NodeFaultReservations` in `src/smoker/reservation.rs`). An address
+    /// already blocked when this call runs isn't recorded, so the heal never
+    /// removes a block this call didn't make.
     pub(super) async fn apply_partition(
         &self,
         peers: &[String],
