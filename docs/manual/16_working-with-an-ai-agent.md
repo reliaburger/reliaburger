@@ -407,6 +407,14 @@ the leases held and the proposals waiting. Waiting is a `note`, not a
 problem. A waiting proposal that's stale, its app changed so approving it
 fails, makes the verdict `degraded`: withdraw it and propose again.
 
+Your human decides with `relish proposal approve ID`, or on the web
+dashboard's Proposals page (`/ui/proposals`, linked from the Cluster card's
+`agents` line). The page shows your `reason` in a box marked as your own
+words, below the cluster's summary, diff, blast radius and undo plan. Its
+approve, reject and undo buttons appear only for a person's token that may
+decide, and each asks that person to paste their API token; yours sees the
+command to copy.
+
 ## Reading an app's logs
 
 `relish agent logs` prints an app's recent lines, every one of them inside an
@@ -1096,6 +1104,25 @@ in `mcp-token.json`; `data.mcp_tokens` lists that change. With `--remove`,
 `data.mcp_tokens` lists every token file beside the context, from
 `--namespace` and `--propose` too, and setup revokes their tokens and
 deletes the files.
+
+To let your agents propose changes as well, name the one namespace they
+may change:
+
+```sh
+relish agent setup --propose --namespace shop --yes
+```
+
+Each entry then runs `relish mcp --propose --namespace shop`, and with an
+admin context setup makes [its deployer agent token](#through-mcp) now, in
+`mcp-propose-token-shop.json`. Setup keeps `relish mcp --propose`'s rules:
+`--propose` without `--namespace` is refused (exit `2`, `usage`), because
+the token could otherwise propose in every namespace. Given a token by
+`--token` or `RELIABURGER_TOKEN`, setup makes none, and warns that it can't
+tell whether that token is a person's; it warns too if the token is an
+admin one, or if the saved context's token turns out not to be admin. Each
+warning names the `relish token create --agent` command to run instead.
+Switching between plain setup and `--propose`, or to another namespace,
+replaces setup's own entry with no `--force`; `--remove` takes either out.
 
 ## With a local model
 
