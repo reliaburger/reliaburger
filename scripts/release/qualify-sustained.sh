@@ -875,6 +875,14 @@ apply_soak_manifests() {
     rel apply -f "$evidence/workloads.toml" >> "$log" 2>&1
 }
 
+# Every instance in the cluster as a JSON list, one object per instance with
+# its node, id, app_name and state. From 0.2.8 `relish status` prints the
+# cluster summary instead, and the instance list moved to `relish apps
+# --instances` (#1788); the checker's status.json snapshots keep this list.
+instances_json() {
+    rel --output json apps --instances
+}
+
 apply_workloads() {
     write_workloads
     rel apply -f "$podinfo" > "$evidence/config/apply-podinfo.log" 2>&1 || fail "applying $podinfo failed"
@@ -884,7 +892,7 @@ apply_workloads() {
     rel --output json policy list > "$evidence/config/policies.json" 2>&1 || fail 'listing the soak policies failed'
     check policies "$evidence" "$evidence/config/policies.json" || fail 'the soak policies are not all in force'
     local deadline=$(( $(date +%s) + 600 )) file=$evidence/.status.json
-    until rel --output json status > "$file" 2>/dev/null && python3 - "$file" <<'PY'
+    until instances_json > "$file" 2>/dev/null && python3 - "$file" <<'PY'
 import json, sys
 want = {"soak-writer": 1, "soak-redis": 1, "soak-redis-client": 1, "soak-spammer": 1, "soak-identity": 3, "soak-slo": 3,
         "frontend": 3, "backend": 1, "redis": 1, "loadgen": 1}
@@ -1219,7 +1227,7 @@ collect() {
     rel --output json wtf > "$directory/wtf.json" 2>"$directory/wtf.err" || exit_code=$?
     echo "$exit_code" > "$directory/wtf.exit"
     rel --output json nodes > "$directory/nodes.json" 2>/dev/null || rm -f "$directory/nodes.json"
-    rel --output json status > "$directory/status.json" 2>/dev/null || rm -f "$directory/status.json"
+    instances_json > "$directory/status.json" 2>/dev/null || rm -f "$directory/status.json"
     # The soak workload's policies must survive every fault (#1311).
     rel --output json policy list > "$directory/policies.json" 2>/dev/null || rm -f "$directory/policies.json"
     for node in 1 2 3; do
@@ -1283,7 +1291,7 @@ PY
         api_get "$node" /v1/diagnostics > "$directory/diagnostics-${vm[node]}.json" 2>/dev/null || true
         memory_report "$node" recent > "$directory/memory-${vm[node]}.txt" || true
     done
-    rel --output json status > "$directory/status.json" 2>&1 || true
+    instances_json > "$directory/status.json" 2>&1 || true
     rel --output json wtf > "$directory/wtf.json" 2>&1 || true
     cp "$evidence/state.json" "$directory/state.json" 2>/dev/null || true
     printf 'slot %s\nwindow %s\ndown %s %s %s\n' "${current_slot:-}" "${window_label:-}" "${down[1]}" "${down[2]}" "${down[3]}" > "$directory/context.txt"
@@ -1507,7 +1515,7 @@ slot_node_fault() {
 # the scenario runs its own checks.
 # Print one running instance of APP, or nothing unless at least two run.
 one_of_several() {
-    rel --output json status > "$evidence/.chaos-status.json" 2>/dev/null || return 0
+    instances_json > "$evidence/.chaos-status.json" 2>/dev/null || return 0
     python3 - "$evidence/.chaos-status.json" "$1" <<'PY'
 import json, sys
 ids = sorted(i["id"] for i in json.load(open(sys.argv[1])) if i["app_name"] == sys.argv[2] and i["state"] == "running")
