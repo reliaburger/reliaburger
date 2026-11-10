@@ -276,7 +276,10 @@ async fn an_agent_proposes_a_person_approves_and_undo_puts_it_back() {
     assert_eq!(applied.len(), 1);
     assert_eq!(applied[0].details["approved_by"], "bob");
     assert_eq!(applied[0].details["token_name"], "bob");
-    assert_eq!(applied[0].details["principal_kind"], "human");
+    assert_eq!(
+        applied[0].principal_kind,
+        crate::sesame::types::PrincipalKind::Human
+    );
     assert_eq!(cluster.records("proposal.undone").await.len(), 1);
 }
 
@@ -542,7 +545,10 @@ async fn an_app_policy_refuses_a_proposal_as_a_guardrail() {
     assert_eq!(body["rule"], "policy:small");
     let refused = cluster.records("proposal.refused").await;
     assert_eq!(refused[0].details["rule"], "policy:small");
-    assert_eq!(refused[0].details["principal_kind"], "agent");
+    assert_eq!(
+        refused[0].principal_kind,
+        crate::sesame::types::PrincipalKind::Agent
+    );
 }
 
 /// An agent token's lifetime and role are bounded when it's made.
@@ -596,7 +602,19 @@ async fn an_approve_policy_applies_an_agents_small_scale_at_once() {
     let applied = cluster.records("proposal.applied").await;
     assert_eq!(applied.len(), 1);
     assert_eq!(applied[0].principal, "policy:agents-scale-shop");
-    assert_eq!(applied[0].details["principal_kind"], "policy");
+    assert_eq!(
+        applied[0].principal_kind,
+        crate::sesame::types::PrincipalKind::Policy
+    );
+    let app_applied = cluster.records("app.applied").await;
+    assert_eq!(app_applied.len(), 1, "{app_applied:?}");
+    assert_eq!(app_applied[0].principal, "policy:agents-scale-shop");
+    assert_eq!(
+        app_applied[0].principal_kind,
+        crate::sesame::types::PrincipalKind::Policy
+    );
+    assert_eq!(app_applied[0].details["author"], "holmes");
+    assert_eq!(app_applied[0].details["proposal"], "1");
     assert_eq!(applied[0].details["author"], "holmes");
     assert_eq!(applied[0].details["author_kind"], "agent");
     assert_eq!(applied[0].details["reason"], "p99 over the SLO");
@@ -944,4 +962,508 @@ async fn the_cluster_summary_counts_leases_and_waiting_proposals() {
         agents["first_proposals"][0]["stale"],
         "shop/web changed after it was made"
     );
+}
+
+/// #1682's design: every audit record says what kind of principal acted,
+/// and the app records a proposal's apply writes name the proposal, its
+/// author and the author's reason, so "which agent made which change, and
+/// why" is answered from the change's own record.
+#[tokio::test]
+async fn a_proposals_app_records_name_the_agent_author_and_every_record_its_principal_kind() {
+    let cluster = cluster("proposal-app-records").await;
+    let (status, body) = cluster.scale(&cluster.holmes, "shop", "web", 5).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = cluster
+        .post("/v1/proposals/1/approve", &cluster.bob, String::new())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // The person approved it, so the app record is theirs; the proposal,
+    // its agent author and the agent's reason ride along.
+    let applied = cluster.records("app.applied").await;
+    assert_eq!(applied.len(), 1, "{applied:?}");
+    let record = &applied[0];
+    assert_eq!(record.app.as_deref(), Some("web"));
+    assert_eq!(record.namespace.as_deref(), Some("shop"));
+    assert_eq!(
+        record.principal_kind,
+        crate::sesame::types::PrincipalKind::Human
+    );
+    assert_eq!(record.details["token_name"], "bob");
+    assert_eq!(record.details["proposal"], "1");
+    assert_eq!(record.details["author"], "holmes");
+    assert_eq!(record.details["author_kind"], "agent");
+    assert_eq!(record.details["reason"], "p99 over the SLO");
+    assert_eq!(record.details["approved_by"], "bob");
+
+    // The proposal's own records say who acted too, as a field.
+    let created = cluster.records("proposal.created").await;
+    assert_eq!(
+        created[0].principal_kind,
+        crate::sesame::types::PrincipalKind::Agent
+    );
+    let approved = cluster.records("proposal.applied").await;
+    assert_eq!(
+        approved[0].principal_kind,
+        crate::sesame::types::PrincipalKind::Human
+    );
+
+    // A stop writes app.stopped, also naming the proposal.
+    let (status, body) = cluster
+        .propose(
+            &cluster.holmes,
+            serde_json::json!({
+                "kind": "stop", "namespace": "shop", "app": "api", "reason": "leaking memory",
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = cluster
+        .post("/v1/proposals/2/approve", &cluster.bob, String::new())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let stopped = cluster.records("app.stopped").await;
+    assert_eq!(stopped.len(), 1, "{stopped:?}");
+    assert_eq!(stopped[0].app.as_deref(), Some("api"));
+    assert_eq!(stopped[0].details["proposal"], "2");
+    assert_eq!(stopped[0].details["reason"], "leaking memory");
+
+    // `relish audit --principal-kind agent` and `--proposal 1`, through
+    // the real route.
+    let (status, body) = cluster
+        .get("/v1/audit?principal_kind=agent", &cluster.alice)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let records = body["records"].as_array().unwrap();
+    assert!(!records.is_empty(), "{body}");
+    assert!(
+        records
+            .iter()
+            .all(|record| record["principal_kind"] == "agent"),
+        "{body}"
+    );
+    assert!(
+        records
+            .iter()
+            .any(|record| record["action"] == "proposal.created"),
+        "{body}"
+    );
+    let (status, body) = cluster.get("/v1/audit?proposal=1", &cluster.alice).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let actions: Vec<&str> = body["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|record| record["action"].as_str().unwrap())
+        .collect();
+    assert!(actions.contains(&"proposal.created"), "{actions:?}");
+    assert!(actions.contains(&"proposal.applied"), "{actions:?}");
+    assert!(actions.contains(&"app.applied"), "{actions:?}");
+    assert!(!actions.contains(&"app.stopped"), "{actions:?}");
+    let (status, _) = cluster
+        .get("/v1/audit?principal_kind=robot", &cluster.alice)
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// A restart (#1682) stamps the spec when a person approves it, so the
+/// rollout replaces every instance; it says it can't be undone, refuses
+/// `relish undo`, and its app record names the proposal like any other.
+#[tokio::test]
+async fn a_restart_stamps_the_spec_and_cant_be_undone() {
+    let cluster = cluster("proposal-restart").await;
+    let (status, body) = cluster
+        .propose(
+            &cluster.holmes,
+            serde_json::json!({
+                "kind": "restart", "namespace": "shop", "app": "web",
+                "reason": "a leak; a fresh process buys a day",
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["kind"], "restart");
+    assert_eq!(body["reversibility"], "none");
+    assert_eq!(body["undo"]["command"], serde_json::Value::Null);
+    assert_eq!(body["blast_radius"]["instances_replaced"], 3);
+    let (status, body) = cluster
+        .post("/v1/proposals/1/approve", &cluster.bob, String::new())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let web = crate::meat::AppId::new("web", "shop");
+    let stamped = cluster.council.desired_state().await.apps[&web].restarted_at;
+    assert!(stamped.is_some());
+    let (status, body) = cluster
+        .post("/v1/proposals/1/undo", &cluster.alice, String::new())
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "no_undo");
+    let applied = cluster.records("app.applied").await;
+    assert_eq!(applied.len(), 1, "{applied:?}");
+    assert_eq!(applied[0].details["kind"], "restart");
+    assert_eq!(applied[0].details["proposal"], "1");
+
+    // Applying the same spec again by hand keeps the stamp: no second
+    // restart.
+    cluster
+        .council
+        .write(crate::council::types::RaftRequest::AppSpec {
+            app_id: web.clone(),
+            spec: web_spec(3),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        cluster.council.desired_state().await.apps[&web].restarted_at,
+        stamped
+    );
+}
+
+/// Built-in rule 3's one exception: an approve policy may approve a
+/// restart, though it can't be undone.
+#[tokio::test]
+async fn an_approve_policy_may_approve_a_small_restart() {
+    let cluster = cluster("proposal-restart-policy").await;
+    cluster.write_policies(GUARDRAILS).await;
+    let (status, body) = cluster
+        .propose(
+            &cluster.holmes,
+            serde_json::json!({
+                "kind": "restart", "namespace": "shop", "app": "web", "reason": "stuck",
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["state"], "applied", "{body}");
+    assert_eq!(
+        body["approval"]["approved_by"],
+        "policy:agents-restart-small-apps"
+    );
+}
+
+/// Cancelling a rollout puts the last released spec back; undoing the
+/// cancel puts the new spec back, and its rollout starts again.
+#[tokio::test]
+async fn cancelling_a_rollout_goes_back_to_the_released_spec_and_undo_resumes_it() {
+    let cluster = cluster("proposal-cancel-deploy").await;
+    let web = crate::meat::AppId::new("web", "shop");
+    // 1.3 rolled out everywhere; then 1.4 was applied and is rolling out.
+    let mut released = web_spec(3);
+    released.image = Some("web:1.3".to_string());
+    for request in [
+        crate::council::types::RaftRequest::AppSpec {
+            app_id: web.clone(),
+            spec: released.clone(),
+        },
+        crate::council::types::RaftRequest::RolloutReleased {
+            app_id: web.clone(),
+            spec: released,
+        },
+        crate::council::types::RaftRequest::AppSpec {
+            app_id: web.clone(),
+            spec: web_spec(3),
+        },
+    ] {
+        cluster.council.write(request).await.unwrap();
+    }
+    let (status, body) = cluster
+        .propose(
+            &cluster.holmes,
+            serde_json::json!({
+                "kind": "cancel_deploy", "namespace": "shop", "app": "web",
+                "reason": "1.4 fails its health checks on the first node",
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["reversibility"], "exact");
+    assert!(
+        body["summary"][0]
+            .as_str()
+            .unwrap()
+            .starts_with("Cancel the rollout of shop/web to web:1.4"),
+        "{body}"
+    );
+    let (status, body) = cluster
+        .post("/v1/proposals/1/approve", &cluster.bob, String::new())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let image = |desired: crate::council::types::DesiredState| desired.apps[&web].image.clone();
+    assert_eq!(
+        image(cluster.council.desired_state().await).as_deref(),
+        Some("web:1.3")
+    );
+    let (status, body) = cluster
+        .post("/v1/proposals/1/undo", &cluster.alice, String::new())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        image(cluster.council.desired_state().await).as_deref(),
+        Some("web:1.4")
+    );
+
+    // Once 1.4 finished rolling out there's nothing to cancel.
+    cluster
+        .council
+        .write(crate::council::types::RaftRequest::RolloutReleased {
+            app_id: web.clone(),
+            spec: web_spec(3),
+        })
+        .await
+        .unwrap();
+    let (status, body) = cluster
+        .propose(
+            &cluster.holmes,
+            serde_json::json!({
+                "kind": "cancel_deploy", "namespace": "shop", "app": "web", "reason": "again",
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("no rollout in progress")
+    );
+}
+
+/// The blast radius is computed again when a person approves (#1682). If
+/// the app reached a node the approver wasn't shown, the approval is
+/// refused as stale, nothing is written, and `relish status` gives the
+/// same reason beforehand.
+#[tokio::test]
+async fn an_approval_is_stale_when_the_blast_radius_grew() {
+    let cluster = cluster("proposal-blast-grew").await;
+    let (status, body) = cluster
+        .propose(
+            &cluster.holmes,
+            serde_json::json!({
+                "kind": "stop", "namespace": "shop", "app": "web", "reason": "leaking",
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["blast_radius"]["nodes"], serde_json::json!([]));
+
+    let web = crate::meat::AppId::new("web", "shop");
+    let desired = cluster.council.desired_state().await;
+    cluster
+        .council
+        .write(crate::council::types::RaftRequest::SchedulingDecisions {
+            expected_log_id: desired.last_applied_log,
+            decisions: vec![crate::meat::types::SchedulingDecision {
+                app_id: web.clone(),
+                placements: vec![crate::meat::types::Placement {
+                    node_id: crate::meat::NodeId::new("node-z"),
+                    resources: crate::meat::types::Resources::default(),
+                    ordinal: 0,
+                }],
+            }],
+        })
+        .await
+        .unwrap();
+    let waiting = crate::bun::summary::waiting_proposals(&cluster.council.desired_state().await, 0);
+    assert_eq!(
+        waiting[0].stale.as_deref(),
+        Some("its blast radius grew after it was made: it now touches node-z too")
+    );
+
+    let (status, body) = cluster
+        .post("/v1/proposals/1/approve", &cluster.bob, String::new())
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "stale");
+    assert_eq!(body["view"]["state"], "failed");
+    assert!(body["error"].as_str().unwrap().contains("node-z"), "{body}");
+    assert!(
+        !cluster
+            .council
+            .desired_state()
+            .await
+            .stopped_apps
+            .contains(&web)
+    );
+}
+
+/// A proposed clear names a fault the nodes hold; with none, there's
+/// nothing to propose.
+#[tokio::test]
+async fn a_clear_fault_proposal_needs_an_active_fault() {
+    let cluster = cluster("proposal-clear-missing").await;
+    let (status, body) = cluster
+        .propose(
+            &cluster.holmes,
+            serde_json::json!({
+                "kind": "clear_fault", "fault": 7, "reason": "the experiment is over",
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("there's no active fault 7"),
+        "{body}"
+    );
+}
+
+/// A `clear_fault` proposal applies only through an approval that clears
+/// the fault: the clear runs once, before the entry records it, and only
+/// when the proposal would apply. Approved with nothing to clear it (the
+/// reaper's path), it's recorded failed, never applied.
+#[tokio::test]
+async fn a_clear_fault_proposal_records_what_clearing_did() {
+    let cluster = cluster("proposal-clear-action").await;
+    let fault = crate::proposal::FaultTarget {
+        id: 7,
+        node: "node-b".to_string(),
+        app: crate::meat::AppId::new("web", "shop"),
+        fault_type: "delay 200ms".to_string(),
+        instance: None,
+        remaining_secs: 240,
+        injected_by: "alice".to_string(),
+    };
+    let request = crate::proposal::ProposalRequest {
+        kind: crate::proposal::RequestKind::ClearFault,
+        namespace: None,
+        app: None,
+        replicas: None,
+        config: None,
+        of: None,
+        fault: Some(7),
+        node: None,
+        reason: "the experiment is over".to_string(),
+        ttl_seconds: None,
+        idempotency_key: None,
+    };
+    let author = crate::proposal::Principal {
+        name: "holmes".to_string(),
+        principal_id: "token:holmes".to_string(),
+        kind: TokenKind::Agent,
+        role: ApiRole::Deployer,
+    };
+    let bob = crate::proposal::Principal {
+        name: "bob".to_string(),
+        principal_id: "token:bob".to_string(),
+        kind: TokenKind::Human,
+        role: ApiRole::Deployer,
+    };
+    let context = crate::proposal::build::BuildContext {
+        history_target: None,
+        fault: Some(fault),
+    };
+    let create = |now| {
+        let proposal = crate::proposal::build::build_with_context(
+            &crate::council::types::DesiredState::default(),
+            &request,
+            &author,
+            now,
+            crate::proposal::build::as_declared,
+            &context,
+        )
+        .unwrap();
+        crate::council::types::RaftRequest::ProposalCreate {
+            proposal: Box::new(proposal),
+            observed_at_unix_ms: now,
+        }
+    };
+    let now = crate::testkit::lease::now_unix_millis();
+    cluster.council.write(create(now)).await.unwrap();
+    let cleared = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = cleared.clone();
+    let outcome = crate::bun::proposals::approve_with(
+        &cluster.council,
+        crate::proposal::ProposalId(1),
+        crate::proposal::Approval::Human(bob.clone()),
+        Some(move || async move {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            None
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(outcome, crate::proposal::ProposalOutcome::Applied { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(cleared.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // The node refuses: recorded failed, with what it said.
+    cluster.council.write(create(now + 1)).await.unwrap();
+    let outcome = crate::bun::proposals::approve_with(
+        &cluster.council,
+        crate::proposal::ProposalId(2),
+        crate::proposal::Approval::Human(bob.clone()),
+        Some(|| async {
+            Some(crate::proposal::FailedReason::Fault {
+                reason: "fault 7 on node node-b wasn't cleared: no such fault".to_string(),
+            })
+        }),
+    )
+    .await
+    .unwrap();
+    let crate::proposal::ProposalOutcome::Failed { proposal } = outcome else {
+        panic!("expected failed, got {outcome:?}");
+    };
+    assert!(
+        proposal
+            .view(now)
+            .outcome
+            .unwrap()
+            .contains("no such fault"),
+        "{proposal:?}"
+    );
+
+    // Approved with nothing to clear it: failed, never applied.
+    cluster.council.write(create(now + 2)).await.unwrap();
+    let outcome = crate::bun::proposals::approve(
+        &cluster.council,
+        crate::proposal::ProposalId(3),
+        crate::proposal::Approval::Policy {
+            name: "yes".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(outcome, crate::proposal::ProposalOutcome::Failed { .. }),
+        "{outcome:?}"
+    );
+}
+
+/// A node's fault ids restart at 1 when its bun restarts, so by approval
+/// the id a `clear_fault` proposal names may be another app's fault. That
+/// one is refused, and stays active; the same fault still matches.
+#[test]
+fn a_clear_refuses_a_fault_that_took_the_same_id_on_another_app() {
+    let recorded = crate::proposal::FaultTarget {
+        id: 1,
+        node: "node-b".to_string(),
+        app: crate::meat::AppId::new("web", "shop"),
+        fault_type: "delay 200ms".to_string(),
+        instance: None,
+        remaining_secs: 240,
+        injected_by: "alice".to_string(),
+    };
+    let listed = |service: &str, kind: &str| -> crate::smoker::types::FaultSummary {
+        serde_json::from_value(serde_json::json!({
+            "id": 1, "fault_type": kind, "target_service": service, "namespace": "shop",
+            "target_instance": null, "target_node": null, "remaining_secs": 100,
+            "injected_by": "bob", "node": "node-b",
+        }))
+        .unwrap()
+    };
+    assert_eq!(
+        super::proposals::fault_still_matches(&recorded, &[listed("web", "delay 200ms")]),
+        Ok(())
+    );
+    let other = super::proposals::fault_still_matches(&recorded, &[listed("api", "delay 200ms")])
+        .unwrap_err();
+    assert!(other.contains("shop/api"), "{other}");
+    assert!(other.contains("wasn't cleared"), "{other}");
+    assert!(super::proposals::fault_still_matches(&recorded, &[listed("web", "kill")]).is_err());
+    let gone = super::proposals::fault_still_matches(&recorded, &[]).unwrap_err();
+    assert!(gone.contains("is gone"), "{gone}");
 }

@@ -1,0 +1,118 @@
+# 0.2.8 freeze: the issues the train resolves
+#
+# Collected on 9 November 2026 from `git log origin/main..origin/release-0-2-8`
+# (the commit messages) and `gh pr list --base release-0-2-8 --state merged`
+# (52 PR bodies), then checked against each issue on GitHub the same day
+# (docs/releasing.md, "Every issue closes itself"). Paste the "Fixes" block
+# into the gate PR's body (#1706) when it's rebuilt at freeze. Lines that
+# start with "#" are notes, not part of the block.
+#
+# Re-run the collection after the last PR merges into the train: anything
+# merged after #1795 (train tip 044e38d7, 9 November 2026 07:47 GMT) isn't
+# in this list.
+
+# --- Fixes: the train resolves these; each is open in the 0.2.8 milestone ---
+
+Fixes #1527
+Fixes #1584
+Fixes #1620
+Fixes #1625
+Fixes #1641
+Fixes #1673
+Fixes #1683
+Fixes #1685
+Fixes #1689
+Fixes #1691
+Fixes #1694
+Fixes #1702
+Fixes #1711
+Fixes #1712
+Fixes #1717
+Fixes #1720
+Fixes #1722
+Fixes #1723
+Fixes #1724
+Fixes #1725
+Fixes #1726
+Fixes #1730
+Fixes #1731
+Fixes #1738
+Fixes #1740
+Fixes #1748
+Fixes #1772
+Fixes #1777
+
+# --- Part of: the train works on these, and they stay open on purpose ---
+#
+# #1417  Bun's memory over a 24-hour run (the soak's per-kind breakdown, the
+#        warm-sample fix; the memory run decides leak or check)
+# #1679  the Kubernetes comparison (harness merged; real runs wait for keys)
+# #1681  the concept budget merged; the Kubernetes numbers and the website
+#        figures are still to do
+# #1682  proposals, guardrails, auto-approval and `relish mcp --propose`
+#        merged; #1767 lists what's left (restart, the scheduler forecast,
+#        principal_kind as a field, the dashboard's Proposals page)
+# #1686  leases and the lease fence merged; #1768 lists what's left (the
+#        holder's token kind, MCP lease tools, the gym's two-agents scenario)
+# #1695  bundles, the .sig sidecar, Copy-as-Markdown and the one-command
+#        registry publish merged; publishing to the MCP Registry needs the
+#        maintainer's login
+# #1707  a guard test and one plausible cause removed (#1739, #1742, #1749);
+#        not proven fixed
+# #1794  the stop_hooks pre-stop flake, registered open in docs/flakes.md
+#
+# Outside the 0.2.8 milestone, referenced with "Part of" and staying open:
+# #1773 (0.4.0), #1774 (Later), #1775 (Later), #1776 (0.4.1), all linked
+# from the feature status page (#1778). #1583 (0.2.7) is already closed.
+
+# --- In the 0.2.8 milestone with no "Fixes" or "Part of" on the train ---
+#
+# #1678  the recording of an agent debugging the platform
+# #1687  built for small local models
+# #1690  the 0.2.8 showcase on the website
+# #1721  nightly qualification on the Studio (the freeze check needs a green
+#        night of the train tip)
+#
+# Each is finished before freeze, split or moved to the next milestone with
+# the decision recorded on it.
+#
+# #1729 (the feature status page) is closed already: #1735 merged into main
+# with "Fixes #1729".
+
+# --- Flags found while collecting ---
+#
+# 1. Prose that closes an issue by accident. The merge commit of #1791,
+#    151e455b ("0.2.8: integrate the train's open PRs in one CI run"), says
+#    "none of these PRs says it closes #1682." GitHub reads "closes #1682"
+#    as a closing keyword, so #1682 closes when the gate merges into main,
+#    although it stays open on purpose. The commit is on the train and can't
+#    be rewritten. Reopen #1682 by hand straight after the gate merges, with
+#    a comment saying why, or finish #1682 in 0.2.8.
+# 2. A "Fixes" whose done-when isn't shown. #1723 asks to "measure before and
+#    after on real train PRs", about 28 min to about 19. #1744 says
+#    "Fixes #1723" but records no measurement. Post the before and after on
+#    #1723 before freeze, or change the line to "Part of".
+# 3. #1777's four checklist boxes are still unticked, though all four steps
+#    merged (#1771, #1788, #1789). Tick them before the gate closes it.
+# 4. The 0.2.7 release log and roadmap said #1707 was "fixed in 0.2.8". It
+#    isn't proven fixed and stays open; the roadmap now says so.
+
+# --- Release-day edits, once install.sh's default moves to v0.2.8 ---
+#
+# These belong with step 10 of docs/releasing.md, not before the tag:
+#
+# - The homepage's #act section from #1797 (the showcase) says
+#   "0.2.8, not in 0.2.7". Take that label off when install.sh moves to
+#   v0.2.8, or the stale-label check in tests/suite/website.rs flags it.
+#   Every other "0.2.8, not in 0.2.7" label (README, the reference chapter)
+#   goes the same way: regenerate scripts/release/released-cli.tsv and run
+#   `make reference-commands`.
+# - docs/features.toml: move it to 0.2.8, and unlink the issues the gate
+#   closes from the rows Homebrew install (#1712), Cron (#1527),
+#   `relish mcp` (#1730), Bug reports an agent drafts (#1717), Proving a fix
+#   on a throwaway cluster (#1691, #1726), Agent gym (#1683) and Incident
+#   timeline and decision provenance (#1685). Until then the nightly
+#   features.yml fails on them.
+# - The tour (docs/manual/08_five-minute-tour.md, scripts/demo/tour.sh) and
+#   the README's quick start still run `relish status` as 0.2.7 does, where
+#   it lists the counter's instances. In 0.2.8 that's `relish apps`.

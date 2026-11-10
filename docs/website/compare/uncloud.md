@@ -125,8 +125,8 @@ Both projects use Apache-2.0. [Uncloud licence](https://github.com/psviderski/un
 
 Uncloud citations are pinned to [v0.21.0](https://github.com/psviderski/uncloud/tree/v0.21.0); Reliaburger citations to the [v0.2.2](https://github.com/reliaburger/reliaburger/tree/v0.2.2/) tag, the release the installer installs, re-checked on 21 October 2026. We prioritised the versioned deployment guide and code over the older README sentence saying automatic rollback was still forthcoming.
 
-This is a documentation and source comparison. No matched performance, outage-recovery or penetration test was run. A WireGuard mesh is a connectivity mechanism, not evidence by itself of tenant isolation; a rolling deployment feature is not proof that every stateful application can update without downtime. See the [shared review method](https://reliaburger.com/compare/methodology.html#method).
+This is a documentation and source comparison. No matched performance, outage-recovery or penetration test was run. A WireGuard mesh is a connectivity mechanism, not evidence by itself of tenant isolation; a rolling deployment feature is not proof that every stateful application can update without downtime. See the [shared review method](https://reliaburger.com/compare/methodology#method).
 
 ---
 
-The Markdown copy of <https://reliaburger.com/compare/uncloud.html>.
+The Markdown copy of <https://reliaburger.com/compare/uncloud>.

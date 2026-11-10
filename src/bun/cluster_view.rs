@@ -160,15 +160,18 @@ pub fn released_rollback_target(
     rollouts: &crate::meat::deploy_types::AppRollouts,
     current: &crate::config::app::AppSpec,
 ) -> Option<crate::config::app::AppSpec> {
-    let version = crate::meat::deploy_types::rollout_fingerprint(current);
+    // A restart isn't a version: a spec that differs only in its restart
+    // stamp is the current one (#1682).
+    let version = crate::meat::deploy_types::version_fingerprint(current);
     let mut target = rollouts
         .released
         .iter()
         .rev()
-        .find(|released| crate::meat::deploy_types::rollout_fingerprint(released) != version)?
+        .find(|released| crate::meat::deploy_types::version_fingerprint(released) != version)?
         .clone();
     target.replicas = current.replicas;
     target.ordinals = None;
+    target.restarted_at = current.restarted_at;
     Some(target)
 }
 
@@ -202,10 +205,13 @@ pub fn rollback_target(
     };
     // A node records its share under the ordinals the leader gave it (#398);
     // they belong to the placement, so they're set aside with the count.
+    // So is the restart stamp (#1682): a restart isn't a version to go
+    // back to.
     let at_current_scale = |spec: &crate::config::app::AppSpec| {
         let mut spec = spec.clone();
         spec.replicas = current.replicas;
         spec.ordinals = current.ordinals.clone();
+        spec.restarted_at = current.restarted_at;
         spec
     };
     deployed
@@ -366,6 +372,38 @@ mod tests {
             rollouts
         };
         assert_eq!(released_rollback_target(&only, &spec("web:v1", 2)), None);
+    }
+
+    /// #1682: a restart stamps the spec, but it isn't a version. A
+    /// restart replaces its entry in the history instead of pushing a real
+    /// version out, and a rollback never picks the same spec restarted at
+    /// another time.
+    #[test]
+    fn a_restart_is_not_a_version_to_roll_back_to() {
+        let restarted = |image: &str, at: u64| {
+            let mut spec = spec(image, 2);
+            spec.restarted_at = Some(at);
+            spec
+        };
+        let mut rollouts = crate::meat::deploy_types::AppRollouts::default();
+        rollouts.release(&spec("web:v1", 2));
+        rollouts.release(&spec("web:v2", 2));
+        rollouts.release(&restarted("web:v2", 100));
+        assert_eq!(rollouts.released.len(), 2, "the restart replaced v2");
+        assert_eq!(rollouts.released[1].restarted_at, Some(100));
+        let target = released_rollback_target(&rollouts, &restarted("web:v2", 200)).unwrap();
+        assert_eq!(target.image.as_deref(), Some("web:v1"));
+        assert_eq!(target.restarted_at, Some(200), "the stamp stays as it is");
+
+        let mut restarted_entry = rolled_out("web:v2", 2, 30);
+        restarted_entry.spec.as_mut().unwrap().restarted_at = Some(100);
+        let history = [
+            rolled_out("web:v1", 2, 10),
+            rolled_out("web:v2", 2, 20),
+            restarted_entry,
+        ];
+        let target = rollback_target(&history, Some(&restarted("web:v2", 100))).unwrap();
+        assert_eq!(target.image.as_deref(), Some("web:v1"));
     }
 
     #[test]

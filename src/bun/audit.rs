@@ -82,6 +82,9 @@ pub struct AuditRecord {
     pub action: String,
     /// The authenticated principal that asked for the action.
     pub principal: String,
+    /// What kind of principal that is: `human`, `agent`, `workload`,
+    /// `system`, `policy` or `unknown` (#1682's design).
+    pub principal_kind: crate::sesame::types::PrincipalKind,
     /// Related app, when the action has one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app: Option<String>,
@@ -175,6 +178,13 @@ pub struct AuditFilter {
     /// The namespace the action touched.
     #[serde(default)]
     pub namespace: Option<String>,
+    /// Only records whose principal is of this kind.
+    #[serde(default)]
+    pub principal_kind: Option<crate::sesame::types::PrincipalKind>,
+    /// Only records about this proposal: its own, and the app records its
+    /// apply wrote.
+    #[serde(default)]
+    pub proposal: Option<u64>,
     /// How many of the newest matching records to return.
     #[serde(default)]
     pub limit: Option<usize>,
@@ -213,6 +223,13 @@ impl AuditFilter {
                         .details
                         .get("namespaces")
                         .is_some_and(|listed| listed.split(',').any(|name| name == namespace))
+            })
+            && self
+                .principal_kind
+                .is_none_or(|kind| record.principal_kind == kind)
+            && self.proposal.is_none_or(|proposal| {
+                record.details.get("proposal").map(String::as_str)
+                    == Some(proposal.to_string().as_str())
             })
     }
 }
@@ -639,6 +656,7 @@ fn to_record(sequence: u64, event: AuditEvent) -> AuditRecord {
         severity: event.severity,
         action: event.action,
         principal: event.principal,
+        principal_kind: event.principal_kind,
         app: event.app,
         namespace: event.namespace,
         node: event.node,
@@ -722,6 +740,7 @@ fn read_records(directory: &Path, filter: &AuditFilter) -> Result<Vec<AuditRecor
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sesame::types::PrincipalKind;
 
     fn event(action: &str, namespace: Option<&str>) -> AuditEvent {
         AuditEvent {
@@ -736,6 +755,7 @@ mod tests {
             source_address: Some("192.0.2.7:51234".parse().unwrap()),
             details: BTreeMap::from([("token_name".to_string(), "alice".to_string())]),
             message: format!("{action} by alice"),
+            principal_kind: PrincipalKind::Human,
         }
     }
 
@@ -950,6 +970,72 @@ mod tests {
         assert_eq!(query(newest_one).await, ["app.deleted"]);
     }
 
+    /// #1682's design: `relish audit --principal-kind agent` and
+    /// `--proposal 17`. The kind is a field every record has, and survives
+    /// the log's round trip through disk.
+    #[tokio::test]
+    async fn query_filters_by_principal_kind_and_proposal() {
+        let dir = tempfile::tempdir().unwrap();
+        let log =
+            AuditLog::open(dir.path().join("audit"), AuditLimits::from_total(1 << 20)).unwrap();
+        let mut proposed = event("proposal.created", Some("shop"));
+        proposed.principal_kind = PrincipalKind::Agent;
+        proposed
+            .details
+            .insert("proposal".to_string(), "17".to_string());
+        let mut applied = event("app.applied", Some("shop"));
+        applied
+            .details
+            .insert("proposal".to_string(), "17".to_string());
+        let mut other = event("app.applied", Some("shop"));
+        other
+            .details
+            .insert("proposal".to_string(), "171".to_string());
+        let mut swept = event("token.expired_swept", None);
+        swept.principal_kind = PrincipalKind::System;
+        for record in [proposed, applied, other, swept] {
+            assert!(log.submit(record).written().await);
+        }
+        let query = |filter: AuditFilter| {
+            let log = log.clone();
+            async move {
+                log.query(filter)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|record| (record.action, record.principal_kind))
+                    .collect::<Vec<_>>()
+            }
+        };
+        let agents = AuditFilter {
+            principal_kind: Some(PrincipalKind::Agent),
+            ..AuditFilter::default()
+        };
+        assert_eq!(
+            query(agents).await,
+            [("proposal.created".to_string(), PrincipalKind::Agent)]
+        );
+        let system = AuditFilter {
+            principal_kind: Some(PrincipalKind::System),
+            ..AuditFilter::default()
+        };
+        assert_eq!(
+            query(system).await,
+            [("token.expired_swept".to_string(), PrincipalKind::System)]
+        );
+        let one_proposal = AuditFilter {
+            proposal: Some(17),
+            ..AuditFilter::default()
+        };
+        assert_eq!(
+            query(one_proposal).await,
+            [
+                ("proposal.created".to_string(), PrincipalKind::Agent),
+                ("app.applied".to_string(), PrincipalKind::Human),
+            ]
+        );
+    }
+
     /// The record an apply across two namespaces makes: no single app or
     /// namespace, the names under `workloads` and `namespaces` (#1501).
     fn multi_app_apply(workloads: &str) -> AuditRecord {
@@ -969,6 +1055,7 @@ mod tests {
                 ("namespaces".to_string(), "payments,team-a".to_string()),
             ]),
             message: String::new(),
+            principal_kind: PrincipalKind::Human,
         }
     }
 
@@ -1035,6 +1122,7 @@ mod tests {
             severity: EventSeverity::Info,
             action: "app.applied".to_string(),
             principal: "token:alice".to_string(),
+            principal_kind: crate::sesame::types::PrincipalKind::Human,
             app: None,
             namespace: None,
             node: Some(node.to_string()),

@@ -25,6 +25,7 @@ run it.
 | CI scripts | Job selection, ignored-test owners, JUnit keeping, the benchmark baseline and the flakes register, against fixture repositories and the real workflow | [`scripts/ci/test_*.py`](../scripts/ci) | `make test-ci-scripts` |
 | Agent gym, without a cluster | Every scenario parses, each plant still applies to the checkout, the scorer's verdicts over recorded transcripts (right, partly right, wrong, steered, out of scope), the runner end to end with a fake cluster and a `relish` answering from calls recorded on a real one, and the Kubernetes ports against a rendered lab and fake `kubectl`, `claude`, `kubectl-ai` and `holmes` ([below](#an-agent-gym)) | [`scripts/gym/test_*.py`](../scripts/gym) | `make test-ci-scripts` |
 | Flakes register | Every open row of [`flakes.md`](flakes.md) links an issue that is still open | [`flakes_register.py`](../scripts/ci/flakes_register.py), run by [`flakes.yml`](../.github/workflows/flakes.yml) nightly and on pull requests that edit the register | `python3 scripts/ci/flakes_register.py check` (needs `gh`) |
+| Feature status page | [`features.toml`](features.toml) has a valid schema, one of four statuses per row, an issue for every planned row and docs links that land on a real heading, and [`features.html`](website/features.html) is up to date with it; nightly, every issue it links is still open | [`features_page.py`](../scripts/ci/features_page.py) and its tests in `make test-ci-scripts`; the issue states in [`features.yml`](../.github/workflows/features.yml) nightly and on pull requests that edit the TOML | `make test-ci-scripts`, `python3 scripts/ci/features_page.py check-issues` |
 | Ignored-test owners | Every `#[ignore]` reason names who runs it ([below](#who-runs-an-ignored-test)) | [`ignored_owners.py`](../scripts/ci/ignored_owners.py) | `make check-ignored` |
 
 `make ci` runs the portable set locally, the same way CI does, quickest
@@ -1051,7 +1052,9 @@ record holds ([`test_compare.py`](../scripts/gym/test_compare.py)).
 [#1683](https://github.com/reliaburger/reliaburger/issues/1683) brings the
 gym to a user's own cluster, from the binary they already have
 ([plan](plans/2026-11-08-plan-gym-for-users.md), manual chapter `chaos`). Six
-scenarios ship in `relish` (`src/relish/gym/catalogue.rs`): ports of
+scenarios ship in `relish` (`scripts/gym/relish-scenarios.rs`, which
+`src/relish/gym/catalogue.rs` includes; it stays out of the source bundle so
+a solver can't grep the answers): ports of
 `crash-loop`, `log-injection`, `unschedulable` and `report-redaction`, plus
 `paused-app` (a Smoker `pause`) and `killed-instance` (three Smoker `kill`s),
 all confined to one staging namespace the user names.

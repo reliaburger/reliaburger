@@ -27,7 +27,8 @@ pub struct ProposalRequest {
     /// The namespace; `default` when absent. For `undo`, the original's.
     #[serde(default)]
     pub namespace: Option<String>,
-    /// The app, for `scale`, `rollback`, `stop` and `delete`.
+    /// The app, for `scale`, `rollback`, `stop`, `delete`, `restart` and
+    /// `cancel_deploy`.
     #[serde(default)]
     pub app: Option<String>,
     /// The new replica count, for `scale`.
@@ -39,6 +40,14 @@ pub struct ProposalRequest {
     /// The proposal to undo, for `undo`.
     #[serde(default)]
     pub of: Option<u64>,
+    /// The fault to clear, for `clear_fault`: its id, as `relish fault
+    /// list` shows it.
+    #[serde(default)]
+    pub fault: Option<u64>,
+    /// The node that holds the fault, for `clear_fault`, when two nodes
+    /// hold a fault with the same id.
+    #[serde(default)]
+    pub node: Option<String>,
     /// Why, in the author's words. At most 1 KiB; secrets are redacted and
     /// control characters removed.
     pub reason: String,
@@ -65,8 +74,26 @@ pub enum RequestKind {
     Stop,
     /// Delete an app.
     Delete,
+    /// Replace every instance of an app, node by node.
+    Restart,
+    /// Cancel an app's rollout in progress.
+    CancelDeploy,
+    /// Clear an active Smoker fault on an app.
+    ClearFault,
     /// Undo an applied proposal.
     Undo,
+}
+
+/// What the leader looked up for a request before building it: things the
+/// council doesn't hold.
+#[derive(Debug, Clone, Default)]
+pub struct BuildContext {
+    /// For a rollback the council has no released spec for, the target the
+    /// nodes' deploy history gives
+    /// (`crate::bun::cluster_view::rollback_target`).
+    pub history_target: Option<AppSpec>,
+    /// For a `clear_fault`, the fault, as the nodes listed it.
+    pub fault: Option<FaultTarget>,
 }
 
 /// The longest idempotency key, in bytes.
@@ -99,6 +126,23 @@ pub fn build_with_history(
     fill: impl Fn(&AppId, &AppSpec) -> AppSpec,
     history_target: Option<&AppSpec>,
 ) -> Result<Proposal, ProposalRefusal> {
+    let context = BuildContext {
+        history_target: history_target.cloned(),
+        fault: None,
+    };
+    build_with_context(desired, request, author, now_unix_ms, fill, &context)
+}
+
+/// [`build`], with what the leader looked up beyond the council
+/// ([`BuildContext`]).
+pub fn build_with_context(
+    desired: &DesiredState,
+    request: &ProposalRequest,
+    author: &Principal,
+    now_unix_ms: u64,
+    fill: impl Fn(&AppId, &AppSpec) -> AppSpec,
+    context: &BuildContext,
+) -> Result<Proposal, ProposalRefusal> {
     let namespace = request
         .namespace
         .clone()
@@ -116,6 +160,20 @@ pub fn build_with_history(
             || key.chars().any(char::is_control))
     {
         return invalid("an idempotency key is 1 to 128 bytes with no control characters");
+    }
+    if request.kind == RequestKind::ClearFault {
+        let Some(fault) = context.fault.as_ref() else {
+            return invalid("a clear_fault names an active fault in `fault`");
+        };
+        check_owned(desired, &fault.app)?;
+        return Ok(clear_fault_proposal(
+            desired,
+            request,
+            author,
+            now_unix_ms,
+            ttl_ms,
+            fault,
+        ));
     }
     let (kind, namespace, changes) = match request.kind {
         RequestKind::Apply => (
@@ -139,8 +197,14 @@ pub fn build_with_history(
                 return invalid("this kind names an app in `app`");
             };
             let app = AppId::new(name, &namespace);
-            let (kind, change) =
-                one_app_change(desired, one_app, &app, request.replicas, history_target)?;
+            let (kind, change) = one_app_change(
+                desired,
+                one_app,
+                &app,
+                request.replicas,
+                context.history_target.as_ref(),
+                now_unix_ms,
+            )?;
             (kind, namespace, vec![change])
         }
     };
@@ -150,7 +214,7 @@ pub fn build_with_history(
     {
         return invalid("the proposal changes nothing; every app is already like that");
     }
-    let reversibility = reversibility_of(&changes);
+    let reversibility = reversibility_of(kind, &changes);
     let blast_radius = blast_radius(desired, &changes);
     let diff = field_diff(&changes);
     let summary = summary(kind, &changes, &blast_radius, reversibility);
@@ -176,7 +240,101 @@ pub fn build_with_history(
         undo,
         findings: Vec::new(),
         compacted: false,
+        fault: None,
     })
+}
+
+/// A `clear_fault` proposal: no spec changes, the fault as the leader
+/// found it, and a blast radius of the faulted app on the fault's node.
+fn clear_fault_proposal(
+    desired: &DesiredState,
+    request: &ProposalRequest,
+    author: &Principal,
+    now_unix_ms: u64,
+    ttl_ms: u64,
+    fault: &FaultTarget,
+) -> Proposal {
+    let app = &fault.app;
+    let mut radius = BlastRadius {
+        apps: vec![app.to_string()],
+        nodes: vec![fault.node.clone()],
+        ..BlastRadius::default()
+    };
+    if let Some(spec) = desired.apps.get(app) {
+        if let Some(ingress) = &spec.ingress {
+            radius.routes.push(format!(
+                "{}{}",
+                ingress.host,
+                ingress.path.as_deref().unwrap_or("/")
+            ));
+        }
+        if spec.port.is_some() {
+            radius
+                .services
+                .push(format!("{}.{}", app.name, app.namespace));
+        }
+    }
+    let scope = match &fault.instance {
+        Some(instance) => format!("instance {instance} of {app}"),
+        None => app.to_string(),
+    };
+    let mut summary = vec![
+        "CAN'T BE UNDONE: think before approving.".to_string(),
+        format!(
+            "Clear fault {} ({}) on {scope}, held by node {}, injected by {}, {}s left when \
+             proposed.",
+            fault.id, fault.fault_type, fault.node, fault.injected_by, fault.remaining_secs
+        ),
+        format!(
+            "Touches 1 app on node {}; it changes no spec, and the fault would expire on its \
+             own.",
+            fault.node
+        ),
+    ];
+    let mut serves: Vec<String> = radius
+        .routes
+        .iter()
+        .map(|route| format!("https://{route}"))
+        .collect();
+    serves.extend(
+        radius
+            .services
+            .iter()
+            .map(|service| format!("the service {service}")),
+    );
+    if !serves.is_empty() {
+        summary.push(format!("Serves {}.", serves.join(" and ")));
+    }
+    Proposal {
+        id: ProposalId(0),
+        kind: ProposalKind::ClearFault,
+        namespace: app.namespace.clone(),
+        author: author.clone(),
+        reason: clean_reason(&request.reason),
+        idempotency_key: request.idempotency_key.clone(),
+        created_at_unix_ms: now_unix_ms,
+        expires_at_unix_ms: now_unix_ms.saturating_add(ttl_ms),
+        state: ProposalState::Pending,
+        changes: Vec::new(),
+        summary,
+        diff: vec![FieldChange {
+            app: app.to_string(),
+            field: format!("fault.{}", fault.id),
+            from: Some(fault.fault_type.clone()),
+            to: Some("cleared".to_string()),
+        }],
+        blast_radius: radius,
+        reversibility: Reversibility::Irreversible,
+        undo: UndoPlan {
+            command: None,
+            effect: "a cleared fault can't be put back; a person injects it again with `relish \
+                     fault` if they still want it"
+                .to_string(),
+        },
+        findings: Vec::new(),
+        compacted: false,
+        fault: Some(fault.clone()),
+    }
 }
 
 /// Give a new proposal its number: the undo command, and the summary line
@@ -250,6 +408,7 @@ fn one_app_change(
     app: &AppId,
     replicas: Option<u32>,
     history_target: Option<&AppSpec>,
+    now_unix_ms: u64,
 ) -> Result<(ProposalKind, AppChange), ProposalRefusal> {
     let before = current_app(desired, app);
     let Some(spec) = before.spec.as_deref().cloned() else {
@@ -315,8 +474,28 @@ fn one_app_change(
                 AppRevision::new(Some(target), false),
             )
         }
-        RequestKind::Apply | RequestKind::Undo => {
-            return invalid("apply and undo don't name a single app");
+        RequestKind::Restart => {
+            if before.stopped {
+                return invalid(&format!("{app} is stopped; nothing runs to restart"));
+            }
+            let mut after = spec;
+            // Later than the stored stamp even if the leader's clock stepped
+            // back, so the fingerprint always moves.
+            let stamp = after
+                .restarted_at
+                .map_or(now_unix_ms, |at| now_unix_ms.max(at.saturating_add(1)));
+            after.restarted_at = Some(stamp);
+            (ProposalKind::Restart, AppRevision::new(Some(after), false))
+        }
+        RequestKind::CancelDeploy => {
+            let target = rollout_in_progress(desired, app, &spec)?;
+            (
+                ProposalKind::CancelDeploy,
+                AppRevision::new(Some(target), before.stopped),
+            )
+        }
+        RequestKind::Apply | RequestKind::Undo | RequestKind::ClearFault => {
+            return invalid("apply, undo and clear_fault don't name a single app");
         }
     };
     Ok((
@@ -327,6 +506,38 @@ fn one_app_change(
             after,
         },
     ))
+}
+
+/// The spec cancelling `app`'s rollout goes back to: the newest one that
+/// finished rolling out everywhere, at the current replica count. Refused
+/// when the current spec is that one (nothing is rolling out) or when no
+/// spec ever finished rolling out (there's nothing to go back to).
+fn rollout_in_progress(
+    desired: &DesiredState,
+    app: &AppId,
+    current: &AppSpec,
+) -> Result<AppSpec, ProposalRefusal> {
+    let Some(released) = desired
+        .rollouts
+        .get(app)
+        .and_then(|rollouts| rollouts.last_released())
+    else {
+        return invalid(&format!(
+            "{app} has no spec that finished rolling out to go back to; propose stop or delete \
+             instead"
+        ));
+    };
+    let fingerprint = crate::meat::deploy_types::rollout_fingerprint;
+    if fingerprint(released) == fingerprint(current) {
+        return invalid(&format!(
+            "{app} has no rollout in progress: its current spec finished rolling out everywhere"
+        ));
+    }
+    let mut target = released.clone();
+    target.replicas = current.replicas;
+    target.ordinals = None;
+    target.owner = None;
+    Ok(target)
 }
 
 fn apply_changes(
@@ -392,10 +603,18 @@ fn apply_changes(
                 format!("{app} declares an owner; only a controller claims an app"),
             );
         }
+        let before = current_app(desired, &app);
+        let mut after = fill(&app, spec);
+        // A file never carries the restart stamp, and `relish apply` keeps
+        // the stored one, so a proposed apply does too: applying the same
+        // file after a restart restarts nothing.
+        if after.restarted_at.is_none() {
+            after.restarted_at = before.spec.as_deref().and_then(|spec| spec.restarted_at);
+        }
         changes.push(AppChange {
             app: app.clone(),
-            before: current_app(desired, &app),
-            after: AppRevision::new(Some(fill(&app, spec)), false),
+            before,
+            after: AppRevision::new(Some(after), false),
         });
     }
     Ok(changes)
@@ -438,9 +657,13 @@ impl AppChange {
 }
 
 /// Lossy when the change deletes an app with managed volumes (no `source`
-/// on the host): undo brings back its spec, not their data. Every other kind here is exact in desired-state
-/// terms.
-fn reversibility_of(changes: &[AppChange]) -> Reversibility {
+/// on the host): undo brings back its spec, not their data. A restart
+/// can't be undone: its instances have been replaced. Every other kind
+/// here is exact in desired-state terms.
+fn reversibility_of(kind: ProposalKind, changes: &[AppChange]) -> Reversibility {
+    if matches!(kind, ProposalKind::Restart | ProposalKind::ClearFault) {
+        return Reversibility::Irreversible;
+    }
     let deletes_volumes = changes.iter().any(|change| {
         !change.after.exists()
             && change
@@ -465,7 +688,11 @@ fn running(revision: &AppRevision) -> Option<u32> {
     revision.replicas()
 }
 
-fn blast_radius(desired: &DesiredState, changes: &[AppChange]) -> BlastRadius {
+/// What `changes` touch in `desired`: apps, the nodes they're placed on,
+/// instances, routes and services. The leader computes it when the
+/// proposal is made, and the state machine again when it's approved
+/// ([`blast_radius_growth`]).
+pub fn blast_radius(desired: &DesiredState, changes: &[AppChange]) -> BlastRadius {
     let mut radius = BlastRadius::default();
     let mut nodes = BTreeSet::new();
     let mut routes = BTreeSet::new();
@@ -635,6 +862,20 @@ fn summary(
             image_of(&first.before),
             image_of(&first.after)
         ),
+        ProposalKind::Restart => format!(
+            "Restart {}: replace its instances node by node, through its health checks, on \
+             the same spec.",
+            first.app
+        ),
+        ProposalKind::CancelDeploy => format!(
+            "Cancel the rollout of {} to {}: put it back on {}, the last spec that finished \
+             rolling out; nodes already on the new spec roll back.",
+            first.app,
+            image_of(&first.before),
+            image_of(&first.after)
+        ),
+        // `clear_fault_proposal` writes a fault's summary; it changes no app.
+        ProposalKind::ClearFault => format!("Clear a fault on {}.", first.app),
         ProposalKind::Apply => {
             let described: Vec<String> = changes
                 .iter()
@@ -671,10 +912,7 @@ fn summary(
         ));
     }
     if radius.instances_started > 0 {
-        effects.push(format!(
-            "starts {} (the scheduler places them when it applies)",
-            plural(radius.instances_started as usize, "instance")
-        ));
+        effects.push(starts(radius));
     }
     if radius.instances_stopped > 0 {
         effects.push(format!(
@@ -715,6 +953,100 @@ fn summary(
     lines
 }
 
+/// "starts 2 instances", with what the scheduler's dry run said about
+/// them.
+fn starts(radius: &BlastRadius) -> String {
+    let mut line = format!(
+        "starts {}",
+        plural(radius.instances_started as usize, "instance")
+    );
+    if !radius.new_nodes_forecast.is_empty() {
+        line.push_str(&format!(
+            ", forecast on {}",
+            radius.new_nodes_forecast.join(", ")
+        ));
+    }
+    match (radius.unplaced_forecast, radius.forecast_note.as_deref()) {
+        (0, None) if radius.new_nodes_forecast.is_empty() => {
+            line.push_str(" (the scheduler places them when it applies)");
+        }
+        (0, None) => {}
+        (0, Some(note)) => line.push_str(&format!(
+            " (no forecast: {note}; the scheduler places them when it applies)"
+        )),
+        (unplaced, note) => {
+            line.push_str(&format!("; the scheduler can't place {unplaced}"));
+            if let Some(note) = note {
+                line.push_str(&format!(" ({note})"));
+            }
+        }
+    }
+    line
+}
+
+/// The scheduler's dry run for a proposal that starts instances: where
+/// they'd go, and how many it couldn't place and why.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Forecast {
+    /// The node each placed instance would go to.
+    pub nodes: Vec<String>,
+    /// How many it couldn't place.
+    pub unplaced: u32,
+    /// Why not, or why there's no forecast at all.
+    pub note: Option<String>,
+}
+
+/// Put the scheduler's `forecast` into a proposal the leader has built,
+/// and write its summary again to say so. Called before it's numbered.
+pub fn with_forecast(proposal: &mut Proposal, forecast: Forecast) {
+    let mut nodes = forecast.nodes;
+    nodes.sort();
+    nodes.dedup();
+    proposal.blast_radius.new_nodes_forecast = nodes;
+    proposal.blast_radius.unplaced_forecast = forecast.unplaced;
+    proposal.blast_radius.forecast_note = forecast.note;
+    if !proposal.changes.is_empty() {
+        proposal.summary = summary(
+            proposal.kind,
+            &proposal.changes,
+            &proposal.blast_radius,
+            proposal.reversibility,
+        );
+    }
+}
+
+/// How `proposal`'s blast radius has grown since it was made, judged
+/// against `desired` now, or `None` while it hasn't: a node it didn't
+/// touch, or more instances. The state machine fails an approval when it
+/// has, and `relish status` calls such a proposal stale, in these words.
+pub fn blast_radius_growth(desired: &DesiredState, proposal: &Proposal) -> Option<String> {
+    if proposal.compacted || proposal.changes.is_empty() {
+        return None;
+    }
+    let was = &proposal.blast_radius;
+    let now = blast_radius(desired, &proposal.changes);
+    let new_nodes: Vec<&str> = now
+        .nodes
+        .iter()
+        .filter(|node| !was.nodes.contains(node))
+        .map(String::as_str)
+        .collect();
+    if !new_nodes.is_empty() {
+        return Some(format!(
+            "its blast radius grew after it was made: it now touches {} too",
+            new_nodes.join(", ")
+        ));
+    }
+    if now.instances() > was.instances() {
+        return Some(format!(
+            "its blast radius grew after it was made: it now touches {} instances, not {}",
+            now.instances(),
+            was.instances()
+        ));
+    }
+    None
+}
+
 fn undo_effect(kind: ProposalKind, changes: &[AppChange], reversibility: Reversibility) -> String {
     let first = &changes[0];
     let effect = match kind {
@@ -747,6 +1079,15 @@ fn undo_effect(kind: ProposalKind, changes: &[AppChange], reversibility: Reversi
                 )
             }
         }
+        ProposalKind::Restart => {
+            "a restart can't be undone: its instances have already been replaced".to_string()
+        }
+        ProposalKind::CancelDeploy => format!(
+            "puts {} back on {}, which starts its rollout again",
+            first.app.name,
+            image_of(&first.before)
+        ),
+        ProposalKind::ClearFault => "a cleared fault can't be put back".to_string(),
         ProposalKind::Undo { of } => format!("puts proposal {of}'s change back"),
     };
     match reversibility {
@@ -763,11 +1104,12 @@ pub fn as_declared(_app: &AppId, spec: &AppSpec) -> AppSpec {
 
 /// Every app a request names before it's built, for authorising the
 /// caller: the `app`, or each `[app.*]` in `config`. Empty for `undo`,
-/// whose apps come from the original proposal.
+/// whose apps come from the original proposal, and for `clear_fault`,
+/// whose app comes from the fault.
 pub fn requested_apps(request: &ProposalRequest) -> Result<Vec<AppId>, ProposalRefusal> {
     let namespace = request.namespace.as_deref().unwrap_or("default");
     match request.kind {
-        RequestKind::Undo => Ok(Vec::new()),
+        RequestKind::Undo | RequestKind::ClearFault => Ok(Vec::new()),
         RequestKind::Apply => {
             let Some(text) = request.config.as_deref() else {
                 return invalid("an apply carries the TOML in `config`");

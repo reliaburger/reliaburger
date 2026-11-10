@@ -41,3 +41,15 @@
   .comparison-note { padding: 16px; }
   .comparison-page th, .comparison-page td { padding: 12px; }
 }
+/* The feature status page (features.html, generated from docs/features.toml):
+   one wide table per group that scrolls inside its wrapper, and a status badge
+   whose words carry the meaning, so colour only helps. */
+.features-page .feature-table th, .features-page .feature-table td { min-width: 110px; }
+.features-page .feature-table th[scope="row"] { min-width: 260px; font-weight: 400; background: none; }
+.features-page .feature-table td:nth-child(4) { min-width: 220px; }
+.features-page .status-table th[scope="row"] { background: none; min-width: 110px; }
+.badge { display: inline-block; padding: 2px 8px; border: 1px solid currentColor; border-radius: 3px; font-family: var(--mono); font-size: .78rem; white-space: nowrap; }
+.badge-ready { color: #1f6b3a; }
+.badge-beta { color: #7a5a00; }
+.badge-alpha { color: var(--accent); }
+.badge-planned { color: var(--muted); }

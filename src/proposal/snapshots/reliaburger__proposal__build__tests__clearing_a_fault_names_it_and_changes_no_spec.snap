@@ -1,0 +1,8 @@
+---
+source: src/proposal/build_tests.rs
+expression: "proposal.summary.join(\"\\n\")"
+---
+CAN'T BE UNDONE: think before approving.
+Clear fault 7 (delay 200ms) on shop/web, held by node node-b, injected by alice, 240s left when proposed.
+Touches 1 app on node node-b; it changes no spec, and the fault would expire on its own.
+Serves https://shop.example.com/ and the service web.shop.

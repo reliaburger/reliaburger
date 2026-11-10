@@ -80,6 +80,7 @@ pub fn expiry_event(lease: &AgentLease, node: &str, now_unix_ms: u64) -> AuditEv
         severity: EventSeverity::Info,
         action: "lease.expired".to_string(),
         principal: REAPER_PRINCIPAL.to_string(),
+        principal_kind: crate::sesame::types::PrincipalKind::System,
         app: lease.target.app_name().map(str::to_string),
         namespace: Some(lease.target.namespace_name().to_string()),
         node: Some(node.to_string()),

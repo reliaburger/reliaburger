@@ -62,6 +62,8 @@ fn request(kind: RequestKind, app: Option<&str>) -> ProposalRequest {
         replicas: None,
         config: None,
         of: None,
+        fault: None,
+        node: None,
         reason: "because".to_string(),
         ttl_seconds: None,
         idempotency_key: None,
@@ -284,4 +286,225 @@ fn a_rollback_without_a_released_spec_takes_the_deploy_history_target() {
     let after = proposal.changes[0].after.spec.as_deref().unwrap();
     assert_eq!(after.image.as_deref(), Some("web:1.3"));
     assert_eq!(proposal.kind, ProposalKind::Rollback);
+}
+
+/// A restart stamps `restarted_at` and changes nothing else: the rollout
+/// replaces every instance through the health checks. It can't be undone,
+/// and the summary says so first.
+#[test]
+fn a_restart_stamps_the_spec_and_cant_be_undone() {
+    let proposal = built(&request(RequestKind::Restart, Some("web")));
+    assert_eq!(proposal.kind, ProposalKind::Restart);
+    assert_eq!(proposal.reversibility, Reversibility::Irreversible);
+    assert_eq!(proposal.undo.command, None);
+    let after = proposal.changes[0].after.spec.as_deref().unwrap();
+    assert_eq!(after.restarted_at, Some(NOW));
+    assert_eq!(proposal.diff.len(), 1);
+    assert_eq!(proposal.diff[0].field, "restarted_at");
+    assert_eq!(proposal.blast_radius.instances_replaced, 3);
+    assert!(proposal.summary[0].starts_with("CAN'T BE UNDONE"));
+    insta::assert_snapshot!(proposal.summary.join("\n"));
+
+    // A second restart moves the stamp on even if the clock went back.
+    let mut state = desired();
+    let web = AppId::new("web", "shop");
+    state.apps.get_mut(&web).unwrap().restarted_at = Some(NOW + 50);
+    let again = build(
+        &state,
+        &request(RequestKind::Restart, Some("web")),
+        &holmes(),
+        NOW,
+        as_declared,
+    )
+    .unwrap();
+    let after = again.changes[0].after.spec.as_deref().unwrap();
+    assert_eq!(after.restarted_at, Some(NOW + 51));
+
+    state.stopped_apps.insert(web);
+    assert!(matches!(
+        refused(&state, &request(RequestKind::Restart, Some("web"))),
+        ProposalRefusal::Invalid { reason } if reason.contains("stopped")
+    ));
+}
+
+/// Cancelling a rollout puts the app back on the newest spec that finished
+/// rolling out everywhere, at its current scale. Its undo is exact: the new
+/// spec comes back and its rollout starts again.
+#[test]
+fn cancelling_a_rollout_goes_back_to_the_last_released_spec() {
+    let proposal = built(&request(RequestKind::CancelDeploy, Some("web")));
+    assert_eq!(proposal.kind, ProposalKind::CancelDeploy);
+    assert_eq!(proposal.reversibility, Reversibility::Exact);
+    let after = proposal.changes[0].after.spec.as_deref().unwrap();
+    assert_eq!(after.image.as_deref(), Some("web:1.4"));
+    assert_eq!(after.replicas, Replicas::Fixed(3));
+    assert_eq!(proposal.undo.command.as_deref(), Some("relish undo 17"));
+    assert!(proposal.undo.effect.contains("starts its rollout again"));
+    insta::assert_snapshot!(proposal.summary.join("\n"));
+
+    // Nothing rolling out: the current spec is the last released one.
+    let mut state = desired();
+    let web = AppId::new("web", "shop");
+    let current = state.apps[&web].clone();
+    state.rollouts.get_mut(&web).unwrap().release(&current);
+    assert!(matches!(
+        refused(&state, &request(RequestKind::CancelDeploy, Some("web"))),
+        ProposalRefusal::Invalid { reason } if reason.contains("no rollout in progress")
+    ));
+    // Nothing ever finished rolling out: there's nothing to go back to.
+    state.rollouts.clear();
+    assert!(matches!(
+        refused(&state, &request(RequestKind::CancelDeploy, Some("web"))),
+        ProposalRefusal::Invalid { reason } if reason.contains("nothing")
+            || reason.contains("no spec that finished")
+    ));
+}
+
+/// An apply keeps the stored restart stamp, as `relish apply` does, so
+/// applying the same file after a restart restarts nothing.
+#[test]
+fn an_apply_keeps_the_restart_stamp() {
+    let mut state = desired();
+    let web = AppId::new("web", "shop");
+    state.apps.get_mut(&web).unwrap().restarted_at = Some(42);
+    let mut apply = request(RequestKind::Apply, None);
+    apply.config = Some(
+        "[app.web]\nimage = \"web:1.6\"\nreplicas = 3\nport = 8080\nnamespace = \"shop\"\n"
+            .to_string(),
+    );
+    let proposal = build(&state, &apply, &holmes(), NOW, as_declared).unwrap();
+    let after = proposal.changes[0].after.spec.as_deref().unwrap();
+    assert_eq!(after.restarted_at, Some(42));
+    assert!(
+        proposal
+            .diff
+            .iter()
+            .all(|change| change.field != "restarted_at")
+    );
+}
+
+fn fault() -> FaultTarget {
+    FaultTarget {
+        id: 7,
+        node: "node-b".to_string(),
+        app: AppId::new("web", "shop"),
+        fault_type: "delay 200ms".to_string(),
+        instance: None,
+        remaining_secs: 240,
+        injected_by: "alice".to_string(),
+    }
+}
+
+/// Clearing a fault changes no spec: the proposal names the fault and its
+/// node, touches the faulted app, and can't be undone.
+#[test]
+fn clearing_a_fault_names_it_and_changes_no_spec() {
+    let mut clear = request(RequestKind::ClearFault, None);
+    clear.fault = Some(7);
+    let context = BuildContext {
+        history_target: None,
+        fault: Some(fault()),
+    };
+    let mut proposal =
+        build_with_context(&desired(), &clear, &holmes(), NOW, as_declared, &context).unwrap();
+    number(&mut proposal, ProposalId(17));
+    assert_eq!(proposal.kind, ProposalKind::ClearFault);
+    assert!(proposal.changes.is_empty());
+    assert_eq!(proposal.reversibility, Reversibility::Irreversible);
+    assert_eq!(proposal.undo.command, None);
+    assert_eq!(
+        proposal.apps().collect::<Vec<_>>(),
+        vec![&AppId::new("web", "shop")]
+    );
+    assert_eq!(proposal.blast_radius.nodes, vec!["node-b"]);
+    assert_eq!(proposal.namespace, "shop");
+    insta::assert_snapshot!(proposal.summary.join("\n"));
+
+    // Without the fault the leader found, there's nothing to build.
+    assert!(matches!(
+        build(&desired(), &clear, &holmes(), NOW, as_declared),
+        Err(ProposalRefusal::Invalid { .. })
+    ));
+    // A GitOps-owned app's fault is a person's to clear, like its spec.
+    let mut state = desired();
+    state.gitops_owned.apps.insert(AppId::new("web", "shop"));
+    let refusal =
+        build_with_context(&state, &clear, &holmes(), NOW, as_declared, &context).unwrap_err();
+    assert_eq!(rule_of(refusal), "gitops_owned");
+}
+
+/// The scheduler's dry run goes into the blast radius and the summary:
+/// where new instances would go, and how many it can't place.
+#[test]
+fn the_forecast_names_where_new_instances_go_and_what_wont_fit() {
+    let mut scale = request(RequestKind::Scale, Some("web"));
+    scale.replicas = Some(6);
+    let mut proposal = build(&desired(), &scale, &holmes(), NOW, as_declared).unwrap();
+    with_forecast(
+        &mut proposal,
+        Forecast {
+            nodes: vec![
+                "node-c".to_string(),
+                "node-a".to_string(),
+                "node-c".to_string(),
+            ],
+            unplaced: 0,
+            note: None,
+        },
+    );
+    assert_eq!(
+        proposal.blast_radius.new_nodes_forecast,
+        vec!["node-a", "node-c"]
+    );
+    assert!(proposal.summary[1].contains("starts 3 instances, forecast on node-a, node-c."));
+
+    with_forecast(
+        &mut proposal,
+        Forecast {
+            nodes: vec!["node-c".to_string()],
+            unplaced: 2,
+            note: Some("no node has enough free memory".to_string()),
+        },
+    );
+    assert_eq!(proposal.blast_radius.unplaced_forecast, 2);
+    insta::assert_snapshot!(proposal.summary.join("\n"));
+
+    with_forecast(
+        &mut proposal,
+        Forecast {
+            nodes: Vec::new(),
+            unplaced: 0,
+            note: Some("the leader is still learning what runs where".to_string()),
+        },
+    );
+    assert!(proposal.summary[1].contains(
+        "(no forecast: the leader is still learning what runs where; the scheduler places them \
+         when it applies)"
+    ));
+}
+
+/// Recomputed when it's approved, a blast radius that reaches a new node
+/// or more instances has grown; one that shrank hasn't.
+#[test]
+fn a_blast_radius_that_reaches_a_new_node_has_grown() {
+    let mut stop = request(RequestKind::Stop, Some("web"));
+    stop.reason = "quiet".to_string();
+    let proposal = built(&stop);
+    let mut state = desired();
+    let web = AppId::new("web", "shop");
+    assert_eq!(blast_radius_growth(&state, &proposal), None);
+
+    // The scheduler moved a replica off node-b: smaller, not grown.
+    state.scheduling.get_mut(&web).unwrap().truncate(2);
+    assert_eq!(blast_radius_growth(&state, &proposal), None);
+
+    state.scheduling.get_mut(&web).unwrap().push(Placement {
+        node_id: NodeId("node-c".to_string()),
+        resources: Resources::default(),
+        ordinal: 2,
+    });
+    assert_eq!(
+        blast_radius_growth(&state, &proposal).as_deref(),
+        Some("its blast radius grew after it was made: it now touches node-c too")
+    );
 }

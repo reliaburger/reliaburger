@@ -15,7 +15,9 @@ From 0.2.7, every release file also carries a build provenance
 attestation that anyone can check with `gh attestation verify`, and the macOS `relish` can be
 notarised ([checks a stranger can run](releasing.md#checks-a-stranger-can-run)).
 The limits below are the ones 0.2.7 ships with; the [roadmap](roadmap.md) tracks
-what comes after it.
+what comes after it. The [feature status page](https://reliaburger.com/features)
+rates every feature Ready, Beta, Alpha or Planned, with its restrictions and open
+issues; its source is [features.toml](features.toml).
 
 Found a bug? Open an issue with one of the
 [issue forms](https://github.com/reliaburger/reliaburger/issues/new/choose): each asks
@@ -165,10 +167,11 @@ jobs-shared-containers` and its siblings rerun them on your own cluster, and
 release, 0.2.0 ran 12 hours on a three-VM laptop cluster with apps, faults
 and upgrades at 4,600 accepted jobs a second, against 1,158 for 100 million a
 day ([record](qualification/2026-10-17-v0.2.0-job-qualification.md), [#668](https://github.com/reliaburger/reliaburger/issues/668)).
-0.2.3 ran host jobs for one real 24-hour day on three 4-vCPU VMs and counted
-1,807,742,226, 20,920 a second, with no failed tasks: 1.81 billion against
-the 2 billion it aimed for
-([record](qualification/2026-10-28-v0.2.3-day-run.md)).
+0.2.7 ran host jobs for one real 24-hour day on three 4-vCPU VMs and counted
+2,709,190,725, 31,352 a second, with every node's Bun under its memory target
+([record](qualification/2026-11-08-v0.2.7-memory-run.md)). One node's memory
+was still growing at the end
+([#1417](https://github.com/reliaburger/reliaburger/issues/1417)).
 
 **Self-upgrade.** `relish upgrade start` rolls a new `bun` across the cluster:
 workers first, then council members one at a time, leader last. The new binary
@@ -196,7 +199,10 @@ that pull the plug on a VM mid-write, a live-cluster test runner you can point
 at your own cluster (`relish test`), and a soak that installs the signed
 release the way you would and then breaks it for hours. An agent gym breaks
 throwaway clusters in ways it knows and scores whatever diagnoses them, an AI
-agent included, against the ground truth (`make test-gym`, from 0.2.7; Claude Code plugs in with `scripts/gym/claude_code.py`, and an open model in Ollama with `scripts/gym/local_model.py`). CI
+agent included, against the ground truth (`make test-gym`, from 0.2.7; Claude Code plugs in with `scripts/gym/claude_code.py`, and an open model in Ollama with `scripts/gym/local_model.py`).
+`relish gym run` (0.2.8, not in 0.2.7) runs the same scenarios against your
+own agent in a staging namespace of your own cluster, and cleans up after
+itself ([testing your agent](manual/05_chaos.md#testing-your-agent-on-your-cluster)). CI
 never retries a failure. See [how Reliaburger is tested](testing.md).
 
 **A terminal UI and a web dashboard.** Run `relish` with no arguments for the
@@ -1051,8 +1057,9 @@ envelope. The lists live in `relish apps` (one row per app, problems first;
 `relish agent` is the family for LLM agents: every command prints one
 `relish.agent/v1` JSON envelope within a byte budget, never prompts, and exits
 `0` whenever it answered. It has `guide` (the manual's agent chapter),
-`version`, `schema`, `context` (the first call: findings, unknowns, faults,
-alerts, one line per app and the newest events), `diagnose` (`wtf`'s findings
+`version`, `schema`, `context` (the first call: `relish status`'s screen and
+summary, findings, unknowns, the soonest faults with who injected them,
+leases, proposals and the newest events), `diagnose` (`wtf`'s findings
 with their evidence and pointers into the manual and the source), `explain`
 (what a finding id means and the constants and code that decide it, or why the
 cluster restarted an instance, placed it or refused a deploy: the rule, the
@@ -1071,12 +1078,15 @@ to read and post; it never posts, and makes no network call), `lease` (`take`,
 `renew` and `release` a short lease on an app or a namespace before changing
 it; someone else's is `lease_held`, naming them; `relish lease` is the
 people's side, with `list` and `break`, and `context` lists every lease),
-`propose` (`apply`, `scale`, `rollback`, `stop` or `delete`, for a person to
+`propose` (`apply`, `scale`, `rollback`, `stop`, `delete`, `restart`,
+`cancel-deploy` or `clear-fault`, for a person to
 approve: an agent token, `relish token create --agent`, can't change anything
-directly; the cluster writes the summary, diff, blast radius and undo
-command; `relish proposal list|show|approve|reject` and `relish undo` are the
-people's side, approval and application are one Raft entry, and a proposal
-whose apps changed in between fails as `stale`; guardrails are policies
+directly; the cluster writes the summary, diff, blast radius (with the
+scheduler's forecast of where new instances go, and how many it can't
+place) and undo command; `relish proposal list|show|approve|reject` and
+`relish undo` are the people's side, approval and application are one Raft
+entry, and a proposal whose apps changed, or whose blast radius grew, in
+between fails as `stale`; guardrails are policies
 with `applies_to = "proposals"`, which may refuse a proposal or, with `action
 = "approve"`, approve it without a person, never one that can't be undone
 exactly, and `relish policy test --proposal` tries them offline), `proposals`,
@@ -1092,7 +1102,9 @@ derived from the same definitions, with `--toolsets`, `--no-logs` and
 `--namespace` to narrow them; commands that write, build or reach past the
 cluster API aren't tools. Its answers are 8 KiB unless a call asks for more,
 up to 128 KiB, so a small local model's window holds them; `--max-bytes`
-changes the default. `relish mcp --propose` adds the proposing and lease
+changes the default. A budget too small for the whole agent guide gets its
+outline, the contents and the sections to read first, and `relish agent
+guide --section` reads one section. `relish mcp --propose` adds the proposing and lease
 tools, with a deployer agent token it makes for itself, confined to
 `--namespace`. See [Working with an AI
 agent](manual/16_working-with-an-ai-agent.md). That chapter is the one source

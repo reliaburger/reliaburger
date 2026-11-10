@@ -26,6 +26,10 @@ fn relish(args: &[&str], endpoint: Option<&str>) -> Output {
     command.output().unwrap()
 }
 
+/// Only with the scenarios: a `relish` built from the source bundle has
+/// none, and `relish agent patch test` runs every test there (#1823's
+/// review).
+#[cfg(gym_scenarios)]
 #[test]
 fn gym_list_names_every_scenario_and_no_node_fault() {
     let output = relish(&["-o", "json", "gym", "list"], None);
@@ -121,6 +125,9 @@ async fn gym_run_refuses_default_before_sending_anything() {
     assert!(requests.lock().unwrap().is_empty(), "{requests:?}");
 }
 
+/// Only with the scenarios: without them `--scenario` is refused before the
+/// namespace check this test is about.
+#[cfg(gym_scenarios)]
 #[tokio::test]
 async fn gym_run_refuses_someone_elses_namespace_without_changing_anything() {
     let requests = Arc::new(Mutex::new(Vec::new()));

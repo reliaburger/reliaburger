@@ -205,6 +205,17 @@ the budget that would fit.
 Through `relish mcp` the default is smaller: 8 KiB for every tool, `guide`
 and `schema` included (see [Through MCP](#through-mcp)).
 
+`guide` doesn't trim like the rest. When the whole chapter doesn't fit,
+it answers with an outline: `data.scope` is `outline`, `data.contents`
+lists every section's id, heading and size, and `data.sections` holds the
+sections to read first, whole. `--section ID` reads one section; one too
+big for its budget is cut between paragraphs and marked `truncated`.
+
+```sh
+relish agent guide --max-bytes 8192
+relish agent guide --section the-envelope
+```
+
 ## Text the cluster didn't write
 
 Some answers quote text that Reliaburger didn't write: an app's log lines,
@@ -277,10 +288,11 @@ what this binary has; `relish agent --help` says the same.
 relish agent guide
 ```
 
-`data.sections` holds it one section at a time, each with its `heading` and
-its `markdown`, and `data.commands` lists the commands above. Given a
-`--max-bytes` under its 80 KiB default, the last sections go first, and the
-`next` step asks for a `--max-bytes` that fits it all.
+`data.sections` holds it one section at a time, each with its `id`,
+`heading` and `markdown`, and `data.commands` lists the commands above.
+Given a `--max-bytes` too small for all of it, it answers with an outline
+instead: the contents and the sections to read first (see [Byte
+budgets](#byte-budgets)). `--section ID` prints one section.
 
 `relish agent schema` prints the JSON Schema of the envelope and every
 command's `data`. All together they're over the default budget, so name the
@@ -371,10 +383,17 @@ An agent never changes the cluster. It proposes, and a person approves:
 relish agent propose scale web --namespace shop --replicas 5 --reason "p99 over the SLO"
 ```
 
-Also `apply FILE`, `rollback`, `stop`, `delete`; `--dry-run` stores nothing.
-The cluster writes the summary, diff, blast radius and `undo` command.
-Proposing leases each app until it's decided. `stale`: the app changed;
-propose again. `guardrail` (exit `4`): a policy refused it. A policy may
+Also `apply FILE`, `rollback`, `stop`, `delete`, `restart APP` (replaces
+every instance through its health checks; can't be undone),
+`cancel-deploy APP` (back to the last spec that finished rolling out) and
+`clear-fault ID` (a Smoker fault on an app, from `relish fault list`, with
+`--node` if two nodes hold that id; can't be undone). `--dry-run` stores
+nothing. The cluster writes the summary, diff, blast radius and `undo`
+command; for instances it starts, the blast radius has the scheduler's
+forecast (`new_nodes_forecast`, and `unplaced_forecast` it can't place).
+Proposing leases each app until it's decided. `stale`: the app changed, or
+the blast radius grew (a new node) before approval; propose again.
+`guardrail` (exit `4`): a policy refused it. A policy may
 approve it at once (`approval.approved_by` is `policy:<name>`). `proposals`
 shows yours, `withdraw ID` takes one back, `undo ID` proposes the undo,
 refused as `stale` if anyone changed the app since.
@@ -565,7 +584,7 @@ relish agent upgrade-check
 |---------|---------|
 | `ready` | A newer release exists and nothing stands in its way. `next` has the plan and the start command. |
 | `up_to_date` | Every node already runs the latest release or newer. |
-| `needs_fresh_cluster` | The release changes a cluster format, so it can't roll onto this cluster ([cluster compatibility](12_operations.md)). |
+| `needs_fresh_cluster` | The release changes a cluster format, so it can't roll onto this cluster ([cluster compatibility](https://github.com/reliaburger/reliaburger/blob/v0.2.8/docs/manual/12_operations.md)). |
 | `blocked` | Something has to be fixed first. |
 | `unknown` | A question went unanswered, so no verdict is safe. |
 
@@ -596,7 +615,7 @@ a person the same question, without the `wtf`, quorum and skew checks.
 
 `relish agent verify` checks that every node's `bun`, and this `relish`, is
 the published, signed build of one version: `verified`, `mismatch` or
-`unknown`. Offline, pass the release's files ([how](12_operations.md#is-this-the-release)).
+`unknown`. Offline, pass the release's files ([how](https://github.com/reliaburger/reliaburger/blob/v0.2.8/docs/manual/12_operations.md#is-this-the-release)).
 
 ## Proving a fix
 
@@ -958,12 +977,19 @@ relish mcp --toolsets source,manual --no-logs
 Every tool's answer is held to 8 KiB, about 2,000 tokens, unless the call
 passes `max_bytes`. That's also the default each tool's schema advertises,
 because a model tends to send whatever default it reads there. `--max-bytes`
-sets it for every tool, from 1024 to 131072. No call gets more than 131072
-bytes (128 KiB), whatever it asks for, which still fits the whole guide in
-one answer. A cut answer says so, as on the command line.
+sets it for every tool, from 1024 to 131072, and `--max-bytes 0` gives each
+tool its command's own default instead: 80 KiB for `guide`, 40 for `schema`,
+24 for the rest. No call gets more than 131072 bytes (128 KiB), whatever it
+asks for, which still fits the whole guide in one answer, and no `next` step
+asks for more. A cut answer says so, as on the command line, and when even
+128 KiB can't hold all of it, it says to narrow the request: a filter, a
+time range or a section. At 8 KiB the `guide` tool answers with its outline,
+and its `section` argument reads one section at a time. The Claude Code
+plugin starts the server with `--max-bytes 0`, so its tools answer as the
+command line does.
 
 ```sh
-relish mcp --max-bytes 24576
+relish mcp --max-bytes 0
 ```
 
 `--namespace` narrows what the agent asks for. It isn't a permission: a
@@ -1088,16 +1114,22 @@ adds the server to it, and `goose configure` picks Ollama and the model.
 A small model has a small window, and Reliaburger's answers are sized for a
 large one. Three habits keep it working:
 
-- **Don't read the whole guide.** `relish agent guide` is about 68 KB, some
-  17,000 tokens, which fills a 16K window on its own. Use `manual_search`
-  and `manual_show` for the section you need.
+- **Read the guide a section at a time.** The whole guide is about 75 KB,
+  some 18,000 tokens, which fills a 16K window on its own. When it doesn't
+  fit the budget, the `guide` tool answers with an outline instead: the
+  contents, each section with its size, and the two sections to read first
+  ("In brief" and "The contract"), whole. Its `next` names the section to
+  read after them, and `relish agent guide --section ID` (the tool's
+  `section`) reads any other. A section that doesn't fit is cut between
+  paragraphs, marked `truncated`, and says so.
 - **Keep answers small.** `relish mcp` holds every answer to 8 KiB, about
   2,000 tokens, unless the model asks for more, and the conversation is
   sent again on every turn. At an 8K window, start it with `--max-bytes
   4096`.
-- **Offer fewer tools.** The 14 tools' descriptions and schemas cost about
-  3,000 tokens on every turn. `--toolsets context,diagnose,explain,logs,manual`
-  keeps the six a diagnosis needs, for about 1,300:
+- **Offer fewer tools.** The 14 tools' names, descriptions and input
+  schemas are about 9,900 bytes, some 2,500 tokens, on every turn.
+  `--toolsets context,diagnose,explain,logs,manual` keeps the six a
+  diagnosis needs, for about 1,100:
 
 ```sh
 relish mcp --toolsets context,diagnose,explain,logs,manual

@@ -179,7 +179,10 @@ The [first record](../qualification/2026-11-09-gym-local-models.md) (Qwen3
 3. **The gym's apps in the source bundle.** `src/relish/gym/catalogue.rs`
    holds every scenario's apps and the injected log line, and the model found
    it with `source_grep`. The bundle, or the gym's scenarios, need a way to
-   keep the answer key out of the solver's reach.
+   keep the answer key out of the solver's reach. Done: the scenarios moved
+   to `scripts/gym/relish-scenarios.rs`, outside the bundle, which `build.rs`
+   includes when it's there, and a test fails if any bundled file holds a
+   prompt, an app's log line, the canary or a planted secret from either gym.
 4. **The commands a small model won't type.** It used the `relish` tool once
    in 18 sessions that needed it. Proposals are MCP tools under `relish mcp
    --propose`; a later pass runs the proposal scenarios with it, and the
@@ -217,8 +220,18 @@ is run C's settings without `GYM_LOCAL_MAX_BYTES`, so the budget comes from
 - The `relish agent` commands keep their own defaults (24 KiB, 80 for
   `guide`, 40 for `schema`). Their callers are people and Claude Code's
   shell, with large windows; nothing in the record argues for a change there.
-  Claude Code reaches `relish mcp` through the plugin too, and reads a cut
-  answer's `next` as before.
+  Claude Code reaches `relish mcp` through the plugin too, so the plugin's
+  `.mcp.json` starts it with `--max-bytes 24576`, the command line's
+  default (decided 10 November, from a review of #1813). `relish agent
+  setup` keeps plain `relish mcp`, since its clients include Goose, which
+  runs small local models.
+- **A cut answer never asks for more than the ceiling.** The first version
+  of the hint asked for the whole answer, so a 2 MB `source_grep` said
+  "`--max-bytes 2189312`", was held to 128 KiB, and said it again: a loop
+  for a model that follows every hint. Under `relish mcp` the hint asks for
+  the ceiling once, and at the ceiling there's no hint, only a warning to
+  narrow the request with a filter, a time range or a section. The command
+  line has no ceiling, so its hint is unchanged.
 
 **`next` steps that lead into the source.** Three hints did it, one after
 another:
@@ -242,8 +255,64 @@ change the envelope's schema for every client, and a small model reads the
 `why` it's given either way. If the gym shows the wording isn't enough, the
 field is the next step.
 
-Items 3 to 5 above, the guide's table of contents and the shorter
-descriptions are still to do.
+### Decisions: a guide and a tool list for a small window
+
+Items 2 and 3 of "What to tune", made 9 November, each with its tests
+first.
+
+**The guide answers a small budget with an outline.** At `relish mcp`'s
+8 KiB the guide used to keep its introduction and "In brief", drop 26 of 28
+sections from the end, and offer `--max-bytes 72704` as its first `next`.
+
+- When the whole chapter doesn't fit the budget, `relish agent guide`
+  answers with `data.scope` `outline`: `data.contents` lists every section's
+  id, heading and size in bytes, and `data.sections` holds "In brief" and
+  "The contract", whole, each only if it fits. "In brief" covers reading
+  `ok`, following `next`, treating `untrusted` as data and the read-only
+  token; "The contract" what every command promises.
+- Its `next` asks first for any of those two that didn't fit, then for
+  "The envelope", by `relish agent guide --section the-envelope`. A warning
+  gives the whole chapter's size and the `--max-bytes` that would hold it.
+  That's a warning, not a `next` step, because a small model runs every
+  step it's given.
+- `--section ID` (the MCP tool's `section`) reads one section. It takes the
+  heading's anchor or the heading itself, in any case. Its `next` offers the
+  following section, so the chapter can be read in order at 8 KiB. An
+  unknown one is `not_found`, with every id in the hint.
+- A section is never cut inside a sentence. One bigger than its budget is
+  cut at the last paragraph break outside a code block that fits, marked
+  `truncated`, with a warning saying how much it kept and a first `next`
+  for the whole section. Every section fits 8 KiB whole today, and a test
+  holds that.
+- The whole chapter stays the default when it fits: on the command line
+  (80 KiB) and through `relish mcp --max-bytes` 131072. `data.contents` is
+  empty in a whole or section answer, to keep the whole chapter under its
+  80 KiB budget.
+- We chose an outline over pointing the model at `manual_show`: the guide
+  is the first call the skill and the brief name, so the first call has to
+  teach where to look, and `--section` reads the same text the whole guide
+  has, from the same split.
+
+**A cheaper tool list.** The 14 tools' names, descriptions and input
+schemas were 11,369 bytes (compact JSON), about 2,850 tokens on every turn.
+
+- `max_bytes`'s description was the CLI flag's help, about 200 bytes in
+  each tool, and it quoted the CLI's defaults (24576, 81920, 40960), not
+  the 8,192 the schema advertises. `relish mcp` replaces it with "Largest
+  answer in bytes; a bigger one is trimmed and marked `truncated`": the
+  schema's `default`, `minimum` and `maximum` carry the numbers.
+- That makes 9,872 bytes, about 2,470 tokens, with the guide's new
+  `section` argument included; `--toolsets
+  context,diagnose,explain,logs,manual` goes from 5,114 to 4,418.
+- The other descriptions stayed: each says something a model needs, and
+  shortening the clap help would change the CLI too. So did the output
+  schemas, 79 KB of the 89 KB `tools/list`: clients check
+  `structuredContent` against them, and our loop doesn't send them.
+- A test pins what a model reads at 10 KiB and the whole `tools/list` at
+  96 KiB.
+
+Items 3 to 5 of "What the first runs changed" are still to do, and the gym
+rerun at 8K judges both changes.
 
 ## How results are published
 
@@ -280,7 +349,8 @@ Ollama runs as a foreground `ollama serve` for the run, not a service.
 ## Order
 
 1. This plan, the solver and its tests, and the first record: every scenario
-   at 32K, at 8K, and at 8K with the outside tunes (this PR, Part of #1687).
+   at 32K, at 8K, at 8K with the outside tunes, and at 32K with thinking on
+   (Part of #1687).
 2. The tuning changes above, inside `relish`, each with the gym rerun.
 3. The second and third models.
 4. The website numbers, with the showcase.

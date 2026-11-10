@@ -128,9 +128,22 @@ Bash) and the Reliaburger MCP tools are the only tools you have.
 """
 
 
+# Both sessions may run only `Bash(relish *)`, so a chained command line is
+# refused. The first dry run's agent chained `relish logs ...; relish agent
+# patch init ...`, was refused, and took the refusal to mean the patch steps
+# were off limits: it answered after 55 s without building, testing or
+# trying anything.
+ONE_COMMAND = """
+Run one `relish` command per Bash call, with no pipes, `;`, `&&` or
+redirection: anything else is refused. A refused call doesn't mean the
+step is forbidden; run it again on its own. Every step above is allowed,
+and the session isn't done until all of them have run.
+"""
+
+
 def recording_prompt(mode, prompt):
     note = DEBUG_NOTE if mode == "debug" else claude_code.NOTE
-    return prompt.rstrip() + "\n" + ADDENDA[mode] + note
+    return prompt.rstrip() + "\n" + ADDENDA[mode] + note + ONE_COMMAND
 
 
 def title(mode, relish_version):

@@ -237,6 +237,14 @@ enough for the whole answer.</li>
 the budget that would fit.</p>
 <p>Through <code>relish mcp</code> the default is smaller: 8 KiB for every tool, <code>guide</code>
 and <code>schema</code> included (see <a href="#through-mcp">Through MCP</a>).</p>
+<p><code>guide</code> doesn't trim like the rest. When the whole chapter doesn't fit,
+it answers with an outline: <code>data.scope</code> is <code>outline</code>, <code>data.contents</code>
+lists every section's id, heading and size, and <code>data.sections</code> holds the
+sections to read first, whole. <code>--section ID</code> reads one section; one too
+big for its budget is cut between paragraphs and marked <code>truncated</code>.</p>
+<pre><code class="language-sh">relish agent guide --max-bytes 8192
+relish agent guide --section the-envelope
+</code></pre>
 </section>
 <section class="agents-section" id="text-the-cluster-didnt-write">
 <h2>Text the cluster didn't write <a class="permalink" href="#text-the-cluster-didnt-write" aria-label="Link to this section">#</a></h2>
@@ -302,10 +310,11 @@ what this binary has; <code>relish agent --help</code> says the same.</p>
 <p><code>relish agent guide</code> prints this chapter:</p>
 <pre><code class="language-sh">relish agent guide
 </code></pre>
-<p><code>data.sections</code> holds it one section at a time, each with its <code>heading</code> and
-its <code>markdown</code>, and <code>data.commands</code> lists the commands above. Given a
-<code>--max-bytes</code> under its 80 KiB default, the last sections go first, and the
-<code>next</code> step asks for a <code>--max-bytes</code> that fits it all.</p>
+<p><code>data.sections</code> holds it one section at a time, each with its <code>id</code>,
+<code>heading</code> and <code>markdown</code>, and <code>data.commands</code> lists the commands above.
+Given a <code>--max-bytes</code> too small for all of it, it answers with an outline
+instead: the contents and the sections to read first (see <a href="#byte-budgets">Byte
+budgets</a>). <code>--section ID</code> prints one section.</p>
 <p><code>relish agent schema</code> prints the JSON Schema of the envelope and every
 command's <code>data</code>. All together they're over the default budget, so name the
 command you need; each fits on its own:</p>
@@ -373,10 +382,17 @@ person's write there, so if an agent sits on one, repeat your command with
 <p>An agent never changes the cluster. It proposes, and a person approves:</p>
 <pre><code class="language-sh">relish agent propose scale web --namespace shop --replicas 5 --reason "p99 over the SLO"
 </code></pre>
-<p>Also <code>apply FILE</code>, <code>rollback</code>, <code>stop</code>, <code>delete</code>; <code>--dry-run</code> stores nothing.
-The cluster writes the summary, diff, blast radius and <code>undo</code> command.
-Proposing leases each app until it's decided. <code>stale</code>: the app changed;
-propose again. <code>guardrail</code> (exit <code>4</code>): a policy refused it. A policy may
+<p>Also <code>apply FILE</code>, <code>rollback</code>, <code>stop</code>, <code>delete</code>, <code>restart APP</code> (replaces
+every instance through its health checks; can't be undone),
+<code>cancel-deploy APP</code> (back to the last spec that finished rolling out) and
+<code>clear-fault ID</code> (a Smoker fault on an app, from <code>relish fault list</code>, with
+<code>--node</code> if two nodes hold that id; can't be undone). <code>--dry-run</code> stores
+nothing. The cluster writes the summary, diff, blast radius and <code>undo</code>
+command; for instances it starts, the blast radius has the scheduler's
+forecast (<code>new_nodes_forecast</code>, and <code>unplaced_forecast</code> it can't place).
+Proposing leases each app until it's decided. <code>stale</code>: the app changed, or
+the blast radius grew (a new node) before approval; propose again.
+<code>guardrail</code> (exit <code>4</code>): a policy refused it. A policy may
 approve it at once (<code>approval.approved_by</code> is <code>policy:&lt;name&gt;</code>). <code>proposals</code>
 shows yours, <code>withdraw ID</code> takes one back, <code>undo ID</code> proposes the undo,
 refused as <code>stale</code> if anyone changed the app since.</p>
@@ -521,7 +537,7 @@ latest release now? It reads the cluster and the release metadata, asks
 <table><thead><tr><th>Verdict</th><th>Meaning</th></tr></thead><tbody>
 <tr><td><code>ready</code></td><td>A newer release exists and nothing stands in its way. <code>next</code> has the plan and the start command.</td></tr>
 <tr><td><code>up_to_date</code></td><td>Every node already runs the latest release or newer.</td></tr>
-<tr><td><code>needs_fresh_cluster</code></td><td>The release changes a cluster format, so it can't roll onto this cluster (<a href="12_operations.md">cluster compatibility</a>).</td></tr>
+<tr><td><code>needs_fresh_cluster</code></td><td>The release changes a cluster format, so it can't roll onto this cluster (<a href="https://github.com/reliaburger/reliaburger/blob/v0.2.8/docs/manual/12_operations.md">cluster compatibility</a>).</td></tr>
 <tr><td><code>blocked</code></td><td>Something has to be fixed first.</td></tr>
 <tr><td><code>unknown</code></td><td>A question went unanswered, so no verdict is safe.</td></tr>
 </tbody></table>
@@ -546,7 +562,7 @@ a person the same question, without the <code>wtf</code>, quorum and skew checks
 <h2>Is this the release? <a class="permalink" href="#is-this-the-release" aria-label="Link to this section">#</a></h2>
 <p><code>relish agent verify</code> checks that every node's <code>bun</code>, and this <code>relish</code>, is
 the published, signed build of one version: <code>verified</code>, <code>mismatch</code> or
-<code>unknown</code>. Offline, pass the release's files (<a href="12_operations.md#is-this-the-release">how</a>).</p>
+<code>unknown</code>. Offline, pass the release's files (<a href="https://github.com/reliaburger/reliaburger/blob/v0.2.8/docs/manual/12_operations.md#is-this-the-release">how</a>).</p>
 </section>
 <section class="agents-section" id="proving-a-fix">
 <h2>Proving a fix <a class="permalink" href="#proving-a-fix" aria-label="Link to this section">#</a></h2>
@@ -827,10 +843,17 @@ proposals are that person's, and a guardrail matching <code>author.kind == "agen
 <p>Every tool's answer is held to 8 KiB, about 2,000 tokens, unless the call
 passes <code>max_bytes</code>. That's also the default each tool's schema advertises,
 because a model tends to send whatever default it reads there. <code>--max-bytes</code>
-sets it for every tool, from 1024 to 131072. No call gets more than 131072
-bytes (128 KiB), whatever it asks for, which still fits the whole guide in
-one answer. A cut answer says so, as on the command line.</p>
-<pre><code class="language-sh">relish mcp --max-bytes 24576
+sets it for every tool, from 1024 to 131072, and <code>--max-bytes 0</code> gives each
+tool its command's own default instead: 80 KiB for <code>guide</code>, 40 for <code>schema</code>,
+24 for the rest. No call gets more than 131072 bytes (128 KiB), whatever it
+asks for, which still fits the whole guide in one answer, and no <code>next</code> step
+asks for more. A cut answer says so, as on the command line, and when even
+128 KiB can't hold all of it, it says to narrow the request: a filter, a
+time range or a section. At 8 KiB the <code>guide</code> tool answers with its outline,
+and its <code>section</code> argument reads one section at a time. The Claude Code
+plugin starts the server with <code>--max-bytes 0</code>, so its tools answer as the
+command line does.</p>
+<pre><code class="language-sh">relish mcp --max-bytes 0
 </code></pre>
 <p><code>--namespace</code> narrows what the agent asks for. It isn't a permission: a
 token scoped to the namespace is.</p>
@@ -928,15 +951,21 @@ adds the server to it, and <code>goose configure</code> picks Ollama and the mod
 <p>A small model has a small window, and Reliaburger's answers are sized for a
 large one. Three habits keep it working:</p>
 <ul>
-<li><strong>Don't read the whole guide.</strong> <code>relish agent guide</code> is about 68 KB, some
-17,000 tokens, which fills a 16K window on its own. Use <code>manual_search</code>
-and <code>manual_show</code> for the section you need.</li>
+<li><strong>Read the guide a section at a time.</strong> The whole guide is about 75 KB,
+some 18,000 tokens, which fills a 16K window on its own. When it doesn't
+fit the budget, the <code>guide</code> tool answers with an outline instead: the
+contents, each section with its size, and the two sections to read first
+("In brief" and "The contract"), whole. Its <code>next</code> names the section to
+read after them, and <code>relish agent guide --section ID</code> (the tool's
+<code>section</code>) reads any other. A section that doesn't fit is cut between
+paragraphs, marked <code>truncated</code>, and says so.</li>
 <li><strong>Keep answers small.</strong> <code>relish mcp</code> holds every answer to 8 KiB, about
 2,000 tokens, unless the model asks for more, and the conversation is
 sent again on every turn. At an 8K window, start it with <code>--max-bytes 4096</code>.</li>
-<li><strong>Offer fewer tools.</strong> The 14 tools' descriptions and schemas cost about
-3,000 tokens on every turn. <code>--toolsets context,diagnose,explain,logs,manual</code>
-keeps the six a diagnosis needs, for about 1,300:</li>
+<li><strong>Offer fewer tools.</strong> The 14 tools' names, descriptions and input
+schemas are about 9,900 bytes, some 2,500 tokens, on every turn.
+<code>--toolsets context,diagnose,explain,logs,manual</code> keeps the six a
+diagnosis needs, for about 1,100:</li>
 </ul>
 <pre><code class="language-sh">relish mcp --toolsets context,diagnose,explain,logs,manual
 </code></pre>

@@ -592,6 +592,7 @@ async fn a_broken_audit_log_does_not_fail_the_call() {
             severity: crate::bun::events::EventSeverity::Info,
             action: "app.applied".to_string(),
             principal: "token:alice".to_string(),
+            principal_kind: crate::sesame::types::PrincipalKind::Human,
             app: None,
             namespace: None,
             node: None,
@@ -858,6 +859,7 @@ fn a_suppressed_refusal_summary_says_how_many_and_from_whom() {
             source: RefusalSource::Caller {
                 address: Some("203.0.113.9".parse().unwrap()),
                 principal: "anonymous".to_string(),
+                principal_kind: crate::sesame::types::PrincipalKind::Unknown,
             },
             suppressed: 45,
             window_start: 1_800_000_000,

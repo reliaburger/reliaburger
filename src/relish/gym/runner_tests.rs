@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use super::*;
-use crate::relish::gym::catalogue::{API, Scenario, Step, Truth, WEB_V1};
+use crate::relish::gym::catalogue::{GymApp, Scenario, Step, Truth};
 use crate::relish::gym::cluster::{ClusterError, ClusterFacts, Connection, Instance};
 use crate::relish::gym::report::Redactor;
 use crate::relish::gym::score::{Check, ScoringSpec, Verdict};
@@ -198,6 +198,26 @@ fn fake_relish(dir: &Path) -> PathBuf {
     }
     path
 }
+
+/// A healthy app with two replicas, like the catalogue's `gym-api`, which
+/// these tests can't use: a checkout's tests see the scenarios, but they
+/// aren't in the source bundle.
+const API: GymApp = GymApp {
+    name: "gym-api",
+    script: "exec sleep 86400\n",
+    replicas: 2,
+    env: &[],
+    required_label: None,
+};
+
+/// A healthy `gym-web`.
+const WEB_V1: GymApp = GymApp {
+    name: "gym-web",
+    script: "exec sleep 86400\n",
+    replicas: 1,
+    env: &[],
+    required_label: None,
+};
 
 fn paused_scenario() -> Scenario {
     Scenario {
@@ -442,6 +462,7 @@ async fn a_kill_step_kills_as_often_as_it_says_and_needs_no_clear() {
     scenario.steps[1] = Step::Fault(FaultStep::Kill {
         app: "gym-api",
         times: 3,
+        replicas: API.replicas,
     });
     let harness = harness(RIGHT_ANSWER, vec![scenario]);
     let (records, _) = run(&cluster, &harness.config).await;
@@ -523,9 +544,9 @@ async fn the_solver_gets_its_token_a_fresh_home_and_never_the_users_credentials(
 #[tokio::test]
 async fn the_token_and_planted_secrets_never_reach_the_evidence_files() {
     let cluster = FakeCluster::default();
-    let solver = r#"echo "my token is $RELIABURGER_TOKEN and gympasslog4e8a71"; printf '{"app":"gym-api","summary":"token %s"}' "$RELIABURGER_TOKEN" > "$GYM_ANSWER""#;
+    let solver = r#"echo "my token is $RELIABURGER_TOKEN and testpass5d1c"; printf '{"app":"gym-api","summary":"token %s"}' "$RELIABURGER_TOKEN" > "$GYM_ANSWER""#;
     let harness = harness(solver, vec![paused_scenario()]);
-    let mut redactor = Redactor::new(["gympasslog4e8a71".to_string()]);
+    let mut redactor = Redactor::new(["testpass5d1c".to_string()]);
     let (records, _) = run_all(
         &cluster,
         &harness.config,
@@ -539,6 +560,6 @@ async fn the_token_and_planted_secrets_never_reach_the_evidence_files() {
     for file in ["solver.stdout", "answer.json"] {
         let text = std::fs::read_to_string(run_dir.join(file)).unwrap();
         assert!(!text.contains("faketoken"), "{file}: {text}");
-        assert!(!text.contains("gympasslog4e8a71"), "{file}: {text}");
+        assert!(!text.contains("testpass5d1c"), "{file}: {text}");
     }
 }

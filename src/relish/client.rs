@@ -3575,6 +3575,12 @@ fn audit_path(filter: &crate::bun::audit::AuditFilter, cluster: bool) -> String 
     if let Some(namespace) = &filter.namespace {
         params.append_pair("namespace", namespace);
     }
+    if let Some(kind) = filter.principal_kind {
+        params.append_pair("principal_kind", kind.as_str());
+    }
+    if let Some(proposal) = filter.proposal {
+        params.append_pair("proposal", &proposal.to_string());
+    }
     if let Some(limit) = filter.limit {
         params.append_pair("limit", &limit.to_string());
     }
