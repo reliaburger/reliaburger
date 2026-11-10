@@ -189,6 +189,11 @@ pub(crate) const HANDLER_AUDITED_ROUTES: &[(RouteMethod, &str)] = &[
     (Post, "/v1/proposals/{id}/reject"),
     (Post, "/v1/proposals/{id}/withdraw"),
     (Post, "/v1/proposals/{id}/undo"),
+    // The dashboard's decision forms call the three handlers above, which
+    // write the same records under the session's token.
+    (Post, "/ui/proposal/{id}/approve"),
+    (Post, "/ui/proposal/{id}/reject"),
+    (Post, "/ui/proposal/{id}/undo"),
 ];
 
 /// Mutating routes that are not audited, and why. A new `POST` or `DELETE`
@@ -373,7 +378,24 @@ struct RefusedCaller {
     namespace: Option<String>,
 }
 
-/// Attach a [`RefusedCaller`] to `response` if it refuses the request.
+/// Say that `response` refuses on behalf of `auth`, a credential the
+/// handler checked itself, rather than the one the request authenticated
+/// with. The dashboard's decision forms use it (#1682): the request rides
+/// a read-only session, but the person pasted an API token, and the
+/// refusal is that token's.
+pub(super) fn refused_as(response: &mut Response, auth: &crate::sesame::auth::AuthContext) {
+    let (principal, token_name) = audit_principal(Some(auth));
+    response.extensions_mut().insert(RefusedCaller {
+        principal,
+        principal_kind: super::audit_principal_kind(Some(auth)),
+        token_name,
+        app: None,
+        namespace: None,
+    });
+}
+
+/// Attach a [`RefusedCaller`] to `response` if it refuses the request,
+/// unless the handler already named the caller ([`refused_as`]).
 fn mark_refusal(
     response: &mut Response,
     auth: Option<&crate::sesame::auth::AuthContext>,
@@ -383,6 +405,11 @@ fn mark_refusal(
         response.status(),
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
     ) {
+        return;
+    }
+    if let Some(named) = response.extensions_mut().get_mut::<RefusedCaller>() {
+        named.app = named.app.take().or(note.app);
+        named.namespace = named.namespace.take().or(note.namespace);
         return;
     }
     let (principal, token_name) = audit_principal(auth);

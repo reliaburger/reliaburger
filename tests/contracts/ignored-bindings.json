@@ -313,6 +313,18 @@
   },
   {
     "source": "tests/cluster_failover.rs",
+    "function": "the_dashboard_decides_a_proposal_on_the_leader_only",
+    "binary": "reliaburger::cluster_failover",
+    "test": "the_dashboard_decides_a_proposal_on_the_leader_only"
+  },
+  {
+    "source": "tests/cluster_failover.rs",
+    "function": "the_dashboard_clears_a_fault_another_node_holds",
+    "binary": "reliaburger::cluster_failover",
+    "test": "the_dashboard_clears_a_fault_another_node_holds"
+  },
+  {
+    "source": "tests/cluster_failover.rs",
     "function": "an_admin_removes_a_policy_that_denies_everything_through_any_node",
     "binary": "reliaburger::cluster_failover",
     "test": "an_admin_removes_a_policy_that_denies_everything_through_any_node"

@@ -314,6 +314,26 @@ schemas were 11,369 bytes (compact JSON), about 2,850 tokens on every turn.
 Items 3 to 5 of "What the first runs changed" are still to do, and the gym
 rerun at 8K judges both changes.
 
+### What the second pass showed
+
+The [second record](../qualification/2026-11-10-gym-local-models-second-pass.md)
+reran run C's settings on the tuned `relish` with four models, and the
+proposal scenarios with `--propose` for the two Qwen3 models. Qwen3 8B went
+from 10 correct of 36 to 12, inside the noise; the budget now comes from
+`relish mcp` and the model stopped naming its own (4 of 99 calls). Qwen3 14B
+got 12, Llama 3.1 8B 7, gpt-oss 20B 6. It left two things for this plan:
+
+- **The scorer couldn't see an MCP proposal.** The shim recorded `propose`
+  as `agent propose --kind=scale ...` with exit 1 on any tool error, and the
+  outcome checks wanted the words `agent propose scale` and exit 4. The same
+  check misread a typed command whose flag value came before the kind.
+  Fixed in [#1834](https://github.com/reliaburger/reliaburger/pull/1834),
+  with tests; `gym.py rescore` scored the saved runs again, and seven
+  verdicts went from partial to correct.
+- **Proposals still mostly don't happen.** With the tools on the list, Qwen3
+  proposed in 7 of 24 runs. In the rest it mostly opened with an empty
+  reply, and at least three times it then claimed a proposal it never made.
+
 ## How results are published
 
 - **The record:** `docs/qualification/2026-11-09-gym-local-models.md`, with the

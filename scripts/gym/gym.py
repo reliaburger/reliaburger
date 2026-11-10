@@ -15,6 +15,9 @@ Subcommands:
                               k3s on the lab (scripts/gym/k8s/lab.sh) for k8s;
                               writes DIR/results.json and DIR/record.md
   score RUN_DIR               score one recorded run again, from its files
+  rescore DIR [--suffix S]    score every run of a pass again; writes
+                              DIR/results-S.json and DIR/record-S.md beside the
+                              originals, which stay as they were
   fixture RUN_DIR OUT         turn a run's recorded calls into a fixture for the
                               portable tests' fake relish (or kubectl)
   compare --out FILE RESULTS...
@@ -316,8 +319,9 @@ def rescore(run_dir):
     scenario = scenario_module.load(directory / f"{result['scenario']}.toml")
     answer, answer_error = solvers.read_answer(run_dir / "answer.json")
     audit = json.loads((run_dir / "audit.json").read_text())
+    calls = [shim.with_mcp_exit(call) for call in shim.read_log(run_dir / "calls.jsonl")]
     scored = score_module.score(
-        scenario, result["truth"], answer, shim.read_log(run_dir / "calls.jsonl"), audit,
+        scenario, result["truth"], answer, calls, audit,
         result.get("patch_result"),
         find_reports(run_dir / "solver") + answer_reports(scenario, answer),
         shim.read_log(run_dir / "steps.jsonl"),
@@ -325,6 +329,50 @@ def rescore(run_dir):
     if answer_error:
         scored["answer_problems"].insert(0, answer_error)
     return scored
+
+
+def rescore_pass(out, suffix):
+    """Score every run of a pass in `out` again, beside the original.
+
+    Writes `results-SUFFIX.json` and `record-SUFFIX.md` next to
+    `results.json`, which stays as it was; each scored run keeps its first
+    verdict as `original_verdict`. Refuses to overwrite an earlier rescore.
+    """
+    out = Path(out)
+    written = out / f"results-{suffix}.json"
+    record_path = out / f"record-{suffix}.md"
+    for path in (written, record_path):
+        if path.exists():
+            raise SystemExit(f"{path} exists: name another suffix")
+    document = json.loads((out / "results.json").read_text())
+    runs = []
+    for run in document["runs"]:
+        if "score" not in run:
+            runs.append(run)
+            continue
+        scored = rescore(out / run["scenario"] / run["run"])
+        runs.append({**run, "original_verdict": run["score"]["verdict"], "score": scored})
+    rescored = {
+        **document,
+        "rescored": time.strftime("%Y-%m-%d", time.gmtime()),
+        "summary": score_module.summarise([run for run in runs if "score" in run]),
+        "runs": runs,
+    }
+    written.write_text(json.dumps(rescored, indent=2) + "\n")
+    platform_ = document.get("context", {}).get("platform", "reliaburger")
+    record_path.write_text(record.render(rescored, scenario_module.load_all(platform=platform_)))
+    return written
+
+
+def command_rescore(args):
+    written = rescore_pass(args.out, args.suffix)
+    document = json.loads(written.read_text())
+    for run in document["runs"]:
+        if "score" in run and run["score"]["verdict"] != run["original_verdict"]:
+            print(f"{run['scenario']} {run['run']}: {run['original_verdict']} -> "
+                  f"{run['score']['verdict']}")
+    print(f"results in {written}")
+    return 0
 
 
 def command_check(_args):
@@ -571,6 +619,10 @@ def main(argv=None):
     run.add_argument("--keep", action="store_true", help="keep the clusters' work directories")
     score = sub.add_parser("score", help="score a recorded run again")
     score.add_argument("run_dir")
+    rescore_ = sub.add_parser("rescore", help="score every run of a pass again, beside the original")
+    rescore_.add_argument("out", help="the pass's directory, holding results.json")
+    rescore_.add_argument("--suffix", default="rescored",
+                          help="writes results-SUFFIX.json and record-SUFFIX.md (default rescored)")
     fixture = sub.add_parser("fixture", help="turn a run's calls into a fake-relish fixture")
     fixture.add_argument("run_dir")
     fixture.add_argument("out")
@@ -594,6 +646,7 @@ def main(argv=None):
         "check": command_check,
         "run": command_run,
         "score": command_score,
+        "rescore": command_rescore,
         "fixture": command_fixture,
         "compare": command_compare,
         "user": command_user,
