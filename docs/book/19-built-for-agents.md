@@ -5805,6 +5805,12 @@ blamed the noisiest node rather than the dead one. With three runs a
 scenario, that's the honest size of the result: a hint the model obeys, and
 no proof yet that obeying it makes it right more often.
 
+Letting Qwen3 think first, the mode it was trained to use with tools, made
+it worse: 6 right of 36. It reasoned its way to an answer without calling a
+tool in two sessions of three, and in one it reasoned for 25 minutes and
+40,000 tokens without ever replying. A small model that thinks more is not a
+small model that looks more.
+
 So the lesson for the replies is the one the Claude runs never taught us,
 because Claude reads past a bad hint. Every `next`, every schema default and
 every tool description is an instruction to a small model, and it follows

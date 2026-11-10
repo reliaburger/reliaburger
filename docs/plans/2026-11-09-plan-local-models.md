@@ -349,7 +349,8 @@ Ollama runs as a foreground `ollama serve` for the run, not a service.
 ## Order
 
 1. This plan, the solver and its tests, and the first record: every scenario
-   at 32K, at 8K, and at 8K with the outside tunes (this PR, Part of #1687).
+   at 32K, at 8K, at 8K with the outside tunes, and at 32K with thinking on
+   (Part of #1687).
 2. The tuning changes above, inside `relish`, each with the gym rerun.
 3. The second and third models.
 4. The website numbers, with the showcase.
