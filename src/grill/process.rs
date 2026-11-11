@@ -458,6 +458,23 @@ fn owner_error(instance: &InstanceId, error: impl std::fmt::Display) -> GrillErr
     }
 }
 
+/// Create the log directory and open an instance's two append-only log
+/// files. Blocking: call it from a blocking worker.
+fn open_log_files(stem: &Path) -> Result<(std::fs::File, std::fs::File), String> {
+    if let Some(dir) = stem.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("failed to create log dir: {e}"))?;
+    }
+    let open = |suffix: &str| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_file(stem, suffix))
+    };
+    let stdout_file = open("stdout").map_err(|e| format!("failed to open stdout log: {e}"))?;
+    let stderr_file = open("stderr").map_err(|e| format!("failed to open stderr log: {e}"))?;
+    Ok((stdout_file, stderr_file))
+}
+
 fn log_file(stem: &Path, suffix: &str) -> PathBuf {
     let mut name = stem
         .file_name()
@@ -622,7 +639,7 @@ impl ProcessGrill {
             .map_err(|error| owner_error(instance, error))?
             .map_err(|error| owner_error(instance, error));
         }
-        let (buffer, capture) = {
+        let logged = {
             let mut procs = self.processes.lock().await;
             let entry = procs
                 .get_mut(instance)
@@ -630,10 +647,27 @@ impl ProcessGrill {
                     instance: instance.clone(),
                 })?;
             observe_child_exit(entry).map_err(|error| owner_error(instance, error))?;
-            if let Some(stem) = &entry.log_stem {
-                let path = log_file(stem, if stdout { "stdout" } else { "stderr" });
-                return Ok(super::capture::read_retained(&path).unwrap_or_default());
-            }
+            entry
+                .log_stem
+                .as_ref()
+                .map(|stem| log_file(stem, if stdout { "stdout" } else { "stderr" }))
+        };
+        // A file read blocks in the kernel, so it runs on a blocking worker,
+        // after the process table's lock is let go (#1857).
+        if let Some(path) = logged {
+            return Ok(tokio::task::spawn_blocking(move || {
+                super::capture::read_retained(&path).unwrap_or_default()
+            })
+            .await
+            .unwrap_or_default());
+        }
+        let (buffer, capture) = {
+            let mut procs = self.processes.lock().await;
+            let entry = procs
+                .get_mut(instance)
+                .ok_or_else(|| GrillError::NotFound {
+                    instance: instance.clone(),
+                })?;
             let buffer = if stdout {
                 entry.stdout_buf.clone()
             } else {
@@ -792,25 +826,18 @@ impl super::Grill for ProcessGrill {
         // (they must survive a self-upgrade exec). In-memory mode: pipes.
         let log_stem = self.log_dir.as_ref().map(|dir| dir.join(&instance.0));
         if let Some(stem) = &log_stem {
-            if let Some(dir) = stem.parent() {
-                std::fs::create_dir_all(dir).map_err(|e| GrillError::StartFailed {
+            // File calls block in the kernel, so they run on a blocking
+            // worker, not the runtime's (#1857).
+            let stem = stem.clone();
+            let opened = tokio::task::spawn_blocking(move || open_log_files(&stem))
+                .await
+                .map_err(|error| GrillError::StartFailed {
                     instance: instance.clone(),
-                    reason: format!("failed to create log dir: {e}"),
+                    reason: format!("failed to open the log files: {error}"),
                 })?;
-            }
-            let open = |suffix: &str| {
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(log_file(stem, suffix))
-            };
-            let stdout_file = open("stdout").map_err(|e| GrillError::StartFailed {
+            let (stdout_file, stderr_file) = opened.map_err(|reason| GrillError::StartFailed {
                 instance: instance.clone(),
-                reason: format!("failed to open stdout log: {e}"),
-            })?;
-            let stderr_file = open("stderr").map_err(|e| GrillError::StartFailed {
-                instance: instance.clone(),
-                reason: format!("failed to open stderr log: {e}"),
+                reason,
             })?;
             cmd.stdout(std::process::Stdio::from(stdout_file));
             cmd.stderr(std::process::Stdio::from(stderr_file));

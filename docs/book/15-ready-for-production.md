@@ -7716,6 +7716,64 @@ in-turn caller checks for a write in flight before starting another.
 Without the old tags, `loop_rule.rs` holds every new await of a durable
 write to the turn's deadline.
 
+The next candidate's gate turned up one the loop rule couldn't have
+caught (#1857). A node logged a 1,152 ms turn in `deploy_op
+(health_probe_result)`, all of it charged to "journal write". But the
+journal write already ran on the blocking pool, and the turn waited for
+it only until its deadline, so the deadline should have fired at 500 ms.
+The snapshot said why it couldn't: the thread that had run the loop was
+itself in `D` state, in `ext4_llseek`. The system call was
+`lseek(fd, 0x1badd, 3)`, and whence 3 is `SEEK_DATA`, which Reliaburger
+uses in one place: the capture reader that log forwarders use to skip a
+log prefix the store has already reclaimed (#1418). `read_chunk` was
+async, but it called that `lseek` directly, on whichever runtime worker
+polled it. `SEEK_DATA` takes the file's inode lock, and the workload was
+appending to its log under writeback, so the call waited as long as the
+appender's journal commit did.
+
+That held the worker, and with it the loop. Each tokio worker keeps a
+queue of tasks that are ready to run, and the loop's task must have been
+in the blocked worker's, since that was the thread that last ran it. So
+nothing ran the loop until the `lseek` returned, its
+`timeout_at` included. A timeout is just another future, and it can only
+fire when its task is polled. Nothing in the loop's code did anything
+wrong. Another task, on a worker the loop happened to share, made a
+blocking call.
+
+The fix moves the reader's file calls onto the blocking pool in two
+hops. One opens the file and reads its metadata. The other does the
+`SEEK_DATA`, the seek and the bounded read on that same descriptor.
+That's fewer hops than before, because every `tokio::fs` call is its own
+`spawn_blocking` underneath. `a_stalled_capture_read_does_not_hold_the_runtime_thread`
+stalls the blocking part of a read for 600 ms on a one-thread runtime and
+checks that a 20 ms timer still fires. On the old code it fired after
+625 ms.
+
+The rule that keeps this fixed can't stop at the loop, because the loop
+wasn't where the call was. `src/blocking_rule.rs` parses every file in
+`src/` and walks every `async fn`, `async` block and `async` closure. A
+file call there that isn't awaited is a blocking one: `std::fs`,
+`File::open`, `OpenOptions::open`, `sync_all`, `set_len`, the raw `nix`
+calls, and a short list of the crate's own helpers that make them.
+"Isn't awaited" is what tells `std::fs::read` from `tokio::fs::read`,
+since the tokio one is a future. A call inside a closure handed to
+`spawn_blocking`, or to one of the crate's three wrappers around it,
+passes, and so does one tagged `// BLOCKING-OK: <why>`. The tags so far
+are on startup code that runs before any workload does, and on cgroupfs
+reads, which the kernel answers from memory. Run against the old capture
+reader, the rule flags the `lseek` that caused this. It found 80 sites
+when it arrived. We moved the agent's onto the blocking pool and tagged
+the rest. That left 25, all in the `relish` CLI, a separate process with
+no loop to stall. They're listed in `blocking_rule_baseline.json`, and
+the test fails if that list grows, or if a listed site goes away without
+being removed from it.
+
+It also changes how to read #1606, #1707 and #1853. Each was diagnosed
+as a slow write the turn waited for. A blocking call on a shared worker
+looks the same from the turn's side, and only a thread snapshot tells the
+two apart. #1853's snapshot did: no worker was blocked there. The others
+had no snapshot, so some of their history may be this instead.
+
 #### The lock that went to the back of the queue
 
 The 24-hour memory run of the published 0.2.6 (#1417) logged a different
