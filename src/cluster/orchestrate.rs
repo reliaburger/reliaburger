@@ -2161,19 +2161,15 @@ fn build_endpoint_catalog(
             continue; // no known IP (departed, or IPv6-only) — can't route to it
         };
         for app in &report.running_apps {
-            let Some(host_port) = app.port else {
-                continue; // portless instance: nothing to resolve
-            };
-            let execution = app
-                .execution
-                .clone()
-                .or_else(|| committed_execution(desired, node_id, node_ip, host_port, app));
             if desired
                 .producer_retirements
-                .blocks(&node_id.0, execution.as_ref())
+                .blocks(&node_id.0, app.execution.as_ref())
             {
                 continue;
             }
+            let Some(host_port) = app.port else {
+                continue; // portless instance: nothing to resolve
+            };
             let service_id = ServiceId::new(&app.namespace, &app.app_name);
             // The declared container port lives in the desired spec.
             let app_id = crate::meat::types::AppId::new(&app.app_name, &app.namespace);
@@ -2186,7 +2182,7 @@ fn build_endpoint_catalog(
                 .or_insert((service_id, declared_port, Vec::new()))
                 .2
                 .push(CatalogBackend {
-                    execution,
+                    execution: app.execution.clone(),
                     node_id: node_id.0.clone(),
                     node_ip,
                     host_port,
@@ -2238,45 +2234,6 @@ fn build_endpoint_catalog(
     desired
         .endpoint_catalog
         .reconcile_reserving(grouped.into_values(), reserved)
-}
-
-/// The execution the committed catalogue holds for a reported backend
-/// that names none: the same node, address, port and replica, with an
-/// execution that isn't fenced.
-///
-/// A node reports no execution when its runtime inventory read missed the
-/// report's deadline. Without this, a node with any retirement history
-/// lost every backend for a report interval while its containers kept
-/// serving (#1855). A report that names an execution is still taken at its
-/// word, so naming a retired generation drops the backend.
-fn committed_execution(
-    desired: &crate::council::types::DesiredState,
-    node_id: &NodeId,
-    node_ip: std::net::Ipv4Addr,
-    host_port: u16,
-    app: &crate::reporting::types::RunningApp,
-) -> Option<crate::grill::RuntimeExecution> {
-    let service = crate::onion::service_id::ServiceId::new(&app.namespace, &app.app_name);
-    desired
-        .endpoint_catalog
-        .services
-        .get(&service.qualified())?
-        .backends
-        .iter()
-        .filter(|backend| {
-            backend.node_id == node_id.0
-                && backend.node_ip == node_ip
-                && backend.host_port == host_port
-        })
-        .filter_map(|backend| backend.execution.as_ref())
-        .find(|execution| {
-            crate::grill::InstanceIdentity::parse(&execution.instance_id.0).is_some_and(|id| {
-                id.ordinal == app.instance_id
-                    && id.namespace == app.namespace
-                    && id.app == app.app_name
-            }) && !desired.producer_retirements.fences(&node_id.0, execution)
-        })
-        .cloned()
 }
 
 /// Build the scheduler's view of the cluster from gossip membership
@@ -5910,15 +5867,15 @@ image = "busybox:latest"
         );
     }
 
-    /// A node whose report couldn't read its runtime inventory in time names
-    /// no execution for a backend it still runs. With retirement history on
-    /// that node, the missing evidence used to drop every one of its
-    /// backends for a report interval, and ingress answered 502 while the
-    /// containers kept serving (#1855). The committed backend at the same
-    /// node, address and port keeps its execution instead, unless that
-    /// execution is fenced.
+    /// A report that names no execution is taken as it stands: the leader
+    /// doesn't lend it the committed backend's. A restart keeps the node,
+    /// address, port and replica, so a lent execution would be the
+    /// predecessor's. Fencing the running generation then left that
+    /// backend in the catalogue and confirmed the release while consumers
+    /// still routed to its port. A backend with no execution is withdrawn
+    /// by the fence, and the release waits for every consumer (#1855).
     #[test]
-    fn a_report_missing_its_execution_keeps_the_committed_backend() {
+    fn a_fence_of_the_running_generation_withdraws_a_backend_reported_without_one() {
         use crate::onion::catalog::CatalogBackend;
 
         let mut desired = crate::council::types::DesiredState::default();
@@ -5926,26 +5883,13 @@ image = "busybox:latest"
             crate::meat::types::AppId::new("web", "default"),
             spec_from_toml("[app.web]\nimage = \"x:1\"\nport = 80\n"),
         );
-        let running: crate::grill::RuntimeExecution = serde_json::from_value(serde_json::json!({
-            "instance_id": "default__web-0", "generation": "b".repeat(64)
-        }))
-        .unwrap();
-        let retired: crate::grill::RuntimeExecution = serde_json::from_value(serde_json::json!({
-            "instance_id": "default__web-1", "generation": "a".repeat(64)
-        }))
-        .unwrap();
-        // The node has retirement history: an earlier replica was fenced.
-        desired.producer_retirements = desired
-            .producer_retirements
-            .plan_retirement("a", &retired)
-            .unwrap();
-        let committed = CatalogBackend {
-            execution: Some(running.clone()),
-            node_id: "a".into(),
-            node_ip: "127.0.0.1".parse().unwrap(),
-            host_port: 30001,
-            healthy: true,
+        let execution = |generation: &str| -> crate::grill::RuntimeExecution {
+            serde_json::from_value(serde_json::json!({
+                "instance_id": "default__web-0", "generation": generation.repeat(64)
+            }))
+            .unwrap()
         };
+        let (predecessor, running) = (execution("a"), execution("b"));
         desired.endpoint_catalog =
             build_endpoint_catalog(&[], &AggregatedState::default(), &desired).unwrap();
         desired
@@ -5953,67 +5897,47 @@ image = "busybox:latest"
             .services
             .get_mut("default__web")
             .unwrap()
-            .backends = vec![committed.clone()];
-        let members = [member("a", 1)];
-        let reporting = |port: u16, ordinal: u32| {
-            let mut app = running_app("default", "web", port, true);
-            app.instance_id = ordinal;
-            app.execution = None;
-            let mut report = report(4000, 0);
-            report.running_apps = vec![app];
-            let mut reports = AggregatedState::default();
-            reports.reports.insert(NodeId::new("a"), report);
-            reports
-        };
+            .backends = vec![CatalogBackend {
+            execution: Some(predecessor),
+            node_id: "a".into(),
+            node_ip: "127.0.0.1".parse().unwrap(),
+            host_port: 30001,
+            healthy: true,
+        }];
+        // The restarted replica's report names no execution yet.
+        let mut app = running_app("default", "web", 30001, true);
+        app.execution = None;
+        let mut report = report(4000, 0);
+        report.running_apps = vec![app];
+        let mut reports = AggregatedState::default();
+        reports.reports.insert(NodeId::new("a"), report);
 
-        let catalog = build_endpoint_catalog(&members, &reporting(30001, 0), &desired).unwrap();
+        let catalog = build_endpoint_catalog(&[member("a", 1)], &reports, &desired).unwrap();
+        let backends = &catalog.services["default__web"].backends;
+        assert_eq!(backends.len(), 1);
         assert_eq!(
-            catalog.services["default__web"].backends,
-            vec![committed.clone()],
-            "missing evidence must not erase a committed backend"
+            backends[0].execution, None,
+            "the predecessor's execution was lent to its replacement"
         );
 
-        // Another port, or another replica, isn't the committed backend.
-        for (port, ordinal) in [(30002, 0), (30001, 1)] {
-            let catalog =
-                build_endpoint_catalog(&members, &reporting(port, ordinal), &desired).unwrap();
-            assert!(
-                catalog.services["default__web"].backends.is_empty(),
-                "port {port}, replica {ordinal}"
-            );
-        }
-
-        // A committed backend whose own generation is retired stays dropped.
-        let mut fenced = desired.clone();
-        fenced.producer_retirements = fenced
+        let retirements = desired
             .producer_retirements
             .plan_retirement("a", &running)
             .unwrap();
-        let catalog = build_endpoint_catalog(&members, &reporting(30001, 0), &fenced).unwrap();
-        assert!(catalog.services["default__web"].backends.is_empty());
-
-        // A committed backend that never had an execution has nothing to keep.
-        let mut unknown = desired.clone();
-        unknown
-            .endpoint_catalog
-            .services
-            .get_mut("default__web")
-            .unwrap()
-            .backends[0]
-            .execution = None;
-        let catalog = build_endpoint_catalog(&members, &reporting(30001, 0), &unknown).unwrap();
-        assert!(catalog.services["default__web"].backends.is_empty());
-
-        // A report naming the retired generation still drops it.
-        let mut stale = reporting(30001, 0);
-        stale
-            .reports
-            .get_mut(&NodeId::new("a"))
-            .unwrap()
-            .running_apps[0]
-            .execution = Some(retired.clone());
-        let catalog = build_endpoint_catalog(&members, &stale, &desired).unwrap();
-        assert!(catalog.services["default__web"].backends.is_empty());
+        let withdrawn = retirements.withdraw(&catalog);
+        assert!(withdrawn.services["default__web"].backends.is_empty());
+        let withdrawals = desired
+            .endpoint_withdrawals
+            .plan_publication(
+                &catalog,
+                &withdrawn,
+                &std::collections::BTreeSet::from(["b".to_string()]),
+            )
+            .unwrap();
+        assert!(
+            !retirements.release_confirmed("a", &running, &withdrawals),
+            "the release must wait for node b to drop the backend"
+        );
     }
 
     #[test]

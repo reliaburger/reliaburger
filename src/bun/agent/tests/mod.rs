@@ -605,13 +605,7 @@ async fn a_slow_inventory_read_reports_the_last_known_execution() {
         instance_id: id.clone(),
         generation: launch.generation.clone(),
     };
-    async fn reported(agent: &mut TestAgent) -> Option<crate::grill::RuntimeExecution> {
-        let (tx, rx) = oneshot::channel();
-        agent
-            .handle_snapshot_request(CollectSnapshotRequest { response: tx })
-            .await;
-        rx.await.unwrap().instances[0].execution.clone()
-    }
+    let reported = reported_execution;
     grill.set_launch_inventory(vec![launch.clone()]).await;
     assert_eq!(reported(&mut agent).await, Some(known.clone()));
 
@@ -646,6 +640,107 @@ async fn a_slow_inventory_read_reports_the_last_known_execution() {
     assert_eq!(reported(&mut agent).await, None);
     grill.set_inventory_delay(Some(LOOP_RUNTIME_INVENTORY_TIMEOUT * 3));
     assert_eq!(reported(&mut agent).await, None);
+}
+
+/// The execution the node's next state report names for its only instance.
+async fn reported_execution(agent: &mut TestAgent) -> Option<crate::grill::RuntimeExecution> {
+    let (tx, rx) = oneshot::channel();
+    agent
+        .handle_snapshot_request(CollectSnapshotRequest { response: tx })
+        .await;
+    rx.await.unwrap().instances[0].execution.clone()
+}
+
+/// Deploy `web`, report its first launch from a complete inventory, crash
+/// it, and hand the loop its restart's steps until the Start step is in
+/// flight. Every inventory read from then on misses the report's deadline.
+async fn restart_with_a_slow_inventory() -> (TestAgent, MockGrill, InstanceId) {
+    let (mut agent, _, _, grill) = test_agent_with_grill();
+    expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+    let id = InstanceId("default__web-0".into());
+    let spec = agent
+        .supervisor
+        .get_instance(&id)
+        .unwrap()
+        .oci_spec
+        .clone()
+        .unwrap();
+    grill
+        .set_launch_inventory(vec![crate::grill::RuntimeLaunch {
+            instance_id: id.clone(),
+            spec,
+            generation: crate::grill::RuntimeGeneration::process("first"),
+            network_reference: None,
+        }])
+        .await;
+    assert!(reported_execution(&mut agent).await.is_some());
+
+    grill.set_inventory_delay(Some(LOOP_RUNTIME_INVENTORY_TIMEOUT * 3));
+    loop_harness::crash(&grill);
+    agent.check_apps().await;
+    agent.begin_restart_launches().await;
+    while agent.restart_step_of(&id) != Some(super::restarts::RestartStep::Start) {
+        let outcome = agent
+            .restart_steps
+            .join_next_with_id()
+            .await
+            .expect("the restart stopped before its start");
+        agent.finish_restart_step(outcome).await;
+    }
+    assert_eq!(
+        agent.supervisor.get_instance(&id).unwrap().state,
+        ContainerState::Starting
+    );
+    (agent, grill, id)
+}
+
+/// A restart replaces the launch its report named. Until the replacement's
+/// own execution is recorded, a report whose inventory read misses its
+/// deadline names none, as it did before the report kept executions. The
+/// predecessor's would survive a fence of the replacement's generation:
+/// the leader withdraws a backend by the generation it names, and confirms
+/// the release while consumers still route to the port (#1855).
+#[tokio::test]
+async fn a_restart_forgets_the_execution_its_predecessor_reported() {
+    let (mut agent, _grill, id) = restart_with_a_slow_inventory().await;
+    assert_eq!(
+        reported_execution(&mut agent).await,
+        None,
+        "a starting replacement was reported as its predecessor"
+    );
+
+    // The replacement's launch left no execution to record.
+    agent
+        .record_launch_execution(&id, &super::launch_evidence::LaunchExecution::Unrecorded)
+        .unwrap();
+    assert_eq!(reported_execution(&mut agent).await, None);
+}
+
+/// A retirement that takes an instance back from its restart owns it from
+/// then on, and the restart's own launch is never recorded. A report whose
+/// inventory read misses its deadline names no execution for it.
+#[tokio::test]
+async fn a_restart_taken_back_reports_no_execution() {
+    let (mut agent, _grill, id) = restart_with_a_slow_inventory().await;
+    agent
+        .record_launch_execution(
+            &id,
+            &super::launch_evidence::LaunchExecution::Generation(
+                crate::grill::RuntimeGeneration::process("restarted"),
+            ),
+        )
+        .unwrap();
+    assert!(reported_execution(&mut agent).await.is_some());
+
+    let taken = agent
+        .take_back_from_restart(&id)
+        .expect("the restart was no longer in flight");
+    taken
+        .settle(std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
+    agent.settle_restart_steps().await;
+    assert_eq!(reported_execution(&mut agent).await, None);
 }
 
 /// #476: a retired Runc intent keeps environment names, not values. Its

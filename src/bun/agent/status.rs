@@ -337,16 +337,27 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// only when the launch ran the instance's own spec. An ambiguous one
     /// names nothing. An inventory that wasn't read in time, or that the
     /// runtime can't give, says nothing new, so the report keeps the
-    /// execution it last knew. Whatever launches an instance again replaces
-    /// that (`record_launch_execution`), so a reused execution is always the
-    /// running launch's (#1855).
+    /// execution it last knew, but only while the instance still runs that
+    /// launch. A restart forgets it when it begins and a stop or retirement
+    /// when it takes the instance back, and whatever launches the instance
+    /// again records its own (`record_launch_execution`). So a reused
+    /// execution is always the running launch's (#1855).
     fn refresh_reported_executions(
         &mut self,
         inventory: ReportInventory,
     ) -> std::collections::HashMap<crate::grill::InstanceId, crate::grill::RuntimeExecution> {
         let instances = &self.supervisor.instances;
-        self.reported_executions
-            .retain(|id, _| instances.contains_key(id));
+        self.reported_executions.retain(|id, _| {
+            instances.get(id).is_some_and(|instance| {
+                matches!(
+                    instance.state,
+                    ContainerState::Starting
+                        | ContainerState::HealthWait
+                        | ContainerState::Running
+                        | ContainerState::Unhealthy
+                )
+            })
+        });
         match inventory {
             ReportInventory::Unread => {}
             ReportInventory::Ambiguous => self.reported_executions.clear(),
