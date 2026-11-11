@@ -330,8 +330,61 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
+    /// The execution each instance's state report names, kept in
+    /// `reported_executions` from one report to the next.
+    ///
+    /// A complete inventory is the truth: it names an instance's execution
+    /// only when the launch ran the instance's own spec. An ambiguous one
+    /// names nothing. An inventory that wasn't read in time, or that the
+    /// runtime can't give, says nothing new, so the report keeps the
+    /// execution it last knew, but only while the instance still runs that
+    /// launch. A restart forgets it when it begins and a stop or retirement
+    /// when it takes the instance back, and whatever launches the instance
+    /// again records its own (`record_launch_execution`). So a reused
+    /// execution is always the running launch's (#1855).
+    fn refresh_reported_executions(
+        &mut self,
+        inventory: ReportInventory,
+    ) -> std::collections::HashMap<crate::grill::InstanceId, crate::grill::RuntimeExecution> {
+        let instances = &self.supervisor.instances;
+        self.reported_executions.retain(|id, _| {
+            instances.get(id).is_some_and(|instance| {
+                matches!(
+                    instance.state,
+                    ContainerState::Starting
+                        | ContainerState::HealthWait
+                        | ContainerState::Running
+                        | ContainerState::Unhealthy
+                )
+            })
+        });
+        match inventory {
+            ReportInventory::Unread => {}
+            ReportInventory::Ambiguous => self.reported_executions.clear(),
+            ReportInventory::Complete(launches) => {
+                self.reported_executions = instances
+                    .values()
+                    .filter_map(|instance| {
+                        let launch = launches.get(&instance.id).filter(|launch| {
+                            instance
+                                .oci_spec
+                                .as_ref()
+                                .is_some_and(|spec| launch.launched(spec))
+                        })?;
+                        let execution = crate::grill::RuntimeExecution {
+                            instance_id: launch.instance_id.clone(),
+                            generation: launch.generation.clone(),
+                        };
+                        Some((instance.id.clone(), execution))
+                    })
+                    .collect();
+            }
+        }
+        self.reported_executions.clone()
+    }
+
     /// Handle a snapshot request from the reporting worker.
-    pub(super) async fn handle_snapshot_request(&self, req: CollectSnapshotRequest) {
+    pub(super) async fn handle_snapshot_request(&mut self, req: CollectSnapshotRequest) {
         use crate::reporting::worker::{AgentSnapshot, InstanceSnapshot};
 
         // The worker gave up on this one; building it would only delay the
@@ -358,7 +411,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
         // The report deadline is two seconds. Bound the evidence read without
         // hiding capacity when inventory is unavailable or internally ambiguous.
-        let launches = match self
+        let inventory = match self
             .runtime_inventory(LOOP_RUNTIME_INVENTORY_TIMEOUT, BunError::AdoptionState)
             .await
         {
@@ -368,10 +421,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .into_iter()
                     .map(|launch| (launch.instance_id.clone(), launch))
                     .collect();
-                (by_instance.len() == count).then_some(by_instance)
+                if by_instance.len() == count {
+                    ReportInventory::Complete(by_instance)
+                } else {
+                    ReportInventory::Ambiguous
+                }
             }
-            _ => None,
+            _ => ReportInventory::Unread,
         };
+        let executions = self.refresh_reported_executions(inventory);
         let instances = self.supervisor.list_instances();
         // LOOP-INLINE: in-memory lock, no I/O
         let snapshot = AgentSnapshot {
@@ -412,18 +470,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     };
 
                     InstanceSnapshot {
-                        execution: launches
-                            .as_ref()
-                            .and_then(|known| known.get(&inst.id))
-                            .filter(|launch| {
-                                inst.oci_spec
-                                    .as_ref()
-                                    .is_some_and(|spec| launch.launched(spec))
-                            })
-                            .map(|launch| crate::grill::RuntimeExecution {
-                                instance_id: launch.instance_id.clone(),
-                                generation: launch.generation.clone(),
-                            }),
+                        execution: executions.get(&inst.id).cloned(),
                         app_name: inst.app_name.clone(),
                         namespace: inst.namespace.clone(),
                         instance_id,
@@ -655,4 +702,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let snapshot = self.publish_status();
         status_snapshot::read_status(self.supervisor.grill(), &snapshot).await
     }
+}
+
+/// What a state report's runtime inventory read found.
+enum ReportInventory {
+    /// Every launch the runtime holds, by instance.
+    Complete(std::collections::HashMap<crate::grill::InstanceId, crate::grill::RuntimeLaunch>),
+    /// Two launches claim one instance: no execution can be trusted.
+    Ambiguous,
+    /// Not read in time, or the runtime can't enumerate its launches.
+    Unread,
 }

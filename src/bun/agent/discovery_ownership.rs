@@ -214,7 +214,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// Keep the execution whoever started `id` read from the runtime, for
-    /// the discovery journal's next publication. An inventory that couldn't
+    /// the discovery journal's next publication and the state reports. An inventory that couldn't
     /// be read fails the step while the journal is on, as the publication
     /// that read it inside the turn used to: the journal can't name the
     /// execution without it.
@@ -228,12 +228,21 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             LaunchExecution::Generation(generation) => {
                 self.launch_executions
                     .insert(id.clone(), generation.clone());
+                self.reported_executions.insert(
+                    id.clone(),
+                    crate::grill::RuntimeExecution {
+                        instance_id: id.clone(),
+                        generation: generation.clone(),
+                    },
+                );
             }
             LaunchExecution::Unrecorded => {
                 self.launch_executions.remove(id);
+                self.reported_executions.remove(id);
             }
             LaunchExecution::Unknown(reason) => {
                 self.launch_executions.remove(id);
+                self.reported_executions.remove(id);
                 if !matches!(self.discovery_ownership, DiscoveryOwnership::Disabled) {
                     return Err(BunError::AdoptionState(format!("publication {reason}")));
                 }
