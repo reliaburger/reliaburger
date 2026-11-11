@@ -181,6 +181,7 @@ pub async fn open_raft_storage(
 )> {
     let _opening_guard = crate::council::recovery_storage::lock(raft_dir)?;
     crate::council::recovery_storage::finish_pending(raft_dir)?;
+    // BLOCKING-OK: opening the Raft stores at startup, before any workload runs; the redb open below blocks the same way
     std::fs::create_dir_all(raft_dir)?;
     let log_path = raft_dir.join("log.redb");
     let log_store =

@@ -479,6 +479,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// and the caller must wait for that ([`TakenRestart::settle`]) before
     /// it signals the runtime itself.
     pub(super) fn take_back_from_restart(&mut self, id: &InstanceId) -> Option<TakenRestart> {
+        // Whatever the restart had launched is no longer its report's to name.
+        self.reported_executions.remove(id);
         let restart = self.restarts.get(id)?;
         restart.gate.cancel();
         Some(TakenRestart {
@@ -497,11 +499,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
     /// Begin cleaning up the runtime a failed restart attempt left behind.
     pub(super) async fn begin_restart_cleanup(&mut self, id: InstanceId) {
+        self.reported_executions.remove(&id);
         self.spawn_restart_step(id, RestartStep::Cleanup, None, RestartGate::default());
     }
 
     /// Begin a restart of a Pending instance: kill the predecessor first.
+    ///
+    /// The predecessor's execution leaves the state reports here. Until the
+    /// replacement's own is recorded, a report that can't read the runtime
+    /// names none: a fence of the replacement's generation would leave a
+    /// backend still named for the predecessor's in the catalogue (#1855).
     pub(super) async fn begin_restart_launch(&mut self, id: InstanceId, launch: RestartLaunch) {
+        self.reported_executions.remove(&id);
         self.spawn_restart_step(id, RestartStep::Clear, Some(launch), RestartGate::default());
     }
 

@@ -279,9 +279,11 @@ impl RollupStore {
             return Ok(());
         };
 
-        std::fs::create_dir_all(&self.data_dir).map_err(MayoError::Io)?;
         let filename = format!("rollup_{:06}.parquet", self.flush_counter);
         let path = self.data_dir.join(filename);
+        tokio::fs::create_dir_all(&self.data_dir)
+            .await
+            .map_err(MayoError::Io)?;
 
         // Move the write off the async runtime. `spawn_blocking` runs the
         // closure on tokio's blocking pool and hands back its result; the

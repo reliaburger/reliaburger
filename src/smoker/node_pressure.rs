@@ -313,12 +313,16 @@ impl NodePressureController {
                 } else {
                     ""
                 };
+                // BLOCKING-OK: cgroupfs reads, answered from memory, for a failed helper's diagnostic
                 let memory_events =
                     std::fs::read_to_string(cgroup.join("memory.events")).unwrap_or_default();
+                // BLOCKING-OK: cgroupfs, answered from memory
                 let memory_current =
                     std::fs::read_to_string(cgroup.join("memory.current")).unwrap_or_default();
+                // BLOCKING-OK: cgroupfs, answered from memory
                 let memory_peak =
                     std::fs::read_to_string(cgroup.join("memory.peak")).unwrap_or_default();
+                // BLOCKING-OK: cgroupfs, answered from memory
                 let memory_max =
                     std::fs::read_to_string(cgroup.join("memory.max")).unwrap_or_default();
                 let reason = format!(
