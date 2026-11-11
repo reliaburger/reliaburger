@@ -532,6 +532,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// start is recorded: the instance stays `Starting`, the op answers
     /// `StillRunning`, and the deploy worker's next ask finds the backend
     /// journalled and does the rest without writing it again.
+    ///
+    /// The adoption record's write comes next, the same way (#1853). Only
+    /// once it has landed does the instance get its log forwarder, its state
+    /// and its place in the service map, so an ask after `StillRunning`
+    /// repeats nothing that can't be repeated.
     pub(super) async fn finish_fresh_instance(
         &mut self,
         instance_id: &InstanceId,
@@ -579,8 +584,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             format!("journalling {instance_id}'s backend")
         })?;
 
-        self.spawn_log_forwarder(instance_id, app_name, namespace);
         self.persist_instance_record(instance_id, evidence).await?;
+        self.spawn_log_forwarder(instance_id, app_name, namespace);
         if let Some(instance) = self.supervisor.get_instance_mut(instance_id) {
             instance.container_ip = evidence.container_ip;
             instance.state = state;

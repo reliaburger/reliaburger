@@ -284,11 +284,112 @@ async fn runc_owned_adoption_validates_generation_and_restores_live_network() {
             .output,
         "adopted\n"
     );
+    // A record naming another launch's logs no longer describes this
+    // generation. It's stale, so adoption retires the generation instead of
+    // refusing startup (#1849).
     record.log_stem = Some(root.path().join("older-generation/output"));
-    assert!(recovered.adopt(&id, &record).await.is_err());
-    assert_eq!(recovered.state(&id).await.unwrap(), ContainerState::Running);
-    recovered.kill(&id).await.unwrap();
+    let stale = recovered.adopt(&id, &record).await;
+    assert!(matches!(stale, Ok(false)), "{stale:?}");
+    assert_eq!(recovered.state(&id).await.unwrap(), ContainerState::Stopped);
     assert_absent(root.path(), &id);
+}
+
+fn adoption_record(
+    id: &InstanceId,
+    pid: u32,
+    log_stem: Option<std::path::PathBuf>,
+    oci_spec: OciSpec,
+) -> reliaburger::grill::records::InstanceRecord {
+    reliaburger::grill::records::InstanceRecord {
+        schema: reliaburger::grill::records::RECORD_SCHEMA,
+        instance_id: id.0.clone(),
+        namespace: "default".into(),
+        app_name: "owned-runc".into(),
+        replica_index: 0,
+        image: "/empty-fixture".into(),
+        runtime: reliaburger::grill::records::RuntimeKind::Runc,
+        pid,
+        pid_started_at: reliaburger::grill::records::process_start_time(pid).unwrap_or(1),
+        boot_id: reliaburger::grill::records::current_boot(),
+        runc_container_id: Some(id.0.clone()),
+        log_stem,
+        host_port: None,
+        app_spec: None,
+        oci_spec,
+        rootless_network: None,
+    }
+}
+
+/// The 0.2.8 gate (#1849): Bun was SIGKILLed during a rollout, then the node
+/// lost power and its page cache. The adoption record and the generation's
+/// launcher binding reached the disk from different moments, and every later
+/// Bun exited with "adoption log identity conflicts with runtime generation".
+/// Either order is stale: adoption retires that generation, says so, and the
+/// node's other instances still adopt.
+#[tokio::test]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
+async fn a_record_and_generation_split_by_a_power_cut_retire_and_others_still_adopt() {
+    assert!(nix::unistd::geteuid().is_root());
+    let root = tempfile::tempdir().unwrap();
+    let healthy = instance(root.path());
+    // The record is newer: it names a launch whose binding never reached
+    // the generation, so the generation has no launcher at all.
+    let record_newer = InstanceId(format!("{}-r", healthy.0));
+    // The generation is newer: its launcher is bound, but the record was
+    // written before it and names no logs.
+    let generation_newer = InstanceId(format!("{}-g", healthy.0));
+    let specification = spec(root.path(), "exec /bin/busybox sleep 60");
+    let first = runtime(root.path());
+    let mut records = Vec::new();
+    for id in [&healthy, &generation_newer] {
+        first.create(id, &specification).await.unwrap();
+        install_fixture(root.path(), id);
+        first.start(id).await.unwrap();
+        let pid = first.pid(id).await.unwrap().unwrap();
+        records.push(adoption_record(
+            id,
+            pid,
+            first.log_stem(id).await,
+            specification.clone(),
+        ));
+    }
+    records[1].log_stem = None;
+    first.create(&record_newer, &specification).await.unwrap();
+    install_fixture(root.path(), &record_newer);
+    assert_eq!(first.log_stem(&record_newer).await, None);
+    let lost_launch = Some(root.path().join("lost-launch/output"));
+    records.push(adoption_record(
+        &record_newer,
+        records[0].pid,
+        lost_launch,
+        specification.clone(),
+    ));
+    drop(first);
+
+    let restarted = runtime(root.path());
+    let healthy_adoption = restarted.adopt(&healthy, &records[0]).await;
+    let generation_newer_adoption = restarted.adopt(&generation_newer, &records[1]).await;
+    let record_newer_adoption = restarted.adopt(&record_newer, &records[2]).await;
+    let healthy_state = restarted.state(&healthy).await;
+    let generation_newer_state = restarted.state(&generation_newer).await;
+    let record_newer_state = restarted.state(&record_newer).await;
+    restarted.kill(&healthy).await.unwrap();
+
+    assert!(
+        matches!(generation_newer_adoption, Ok(false)),
+        "a record older than its generation refused startup: {generation_newer_adoption:?}"
+    );
+    assert!(
+        matches!(record_newer_adoption, Ok(false)),
+        "a record newer than its generation refused startup: {record_newer_adoption:?}"
+    );
+    assert_eq!(generation_newer_state.unwrap(), ContainerState::Stopped);
+    assert_eq!(record_newer_state.unwrap(), ContainerState::Stopped);
+    assert_absent(root.path(), &generation_newer);
+    assert_absent(root.path(), &record_newer);
+    assert!(matches!(healthy_adoption, Ok(true)), "{healthy_adoption:?}");
+    assert_eq!(healthy_state.unwrap(), ContainerState::Running);
+    assert_absent(root.path(), &healthy);
 }
 
 #[tokio::test]
@@ -950,6 +1051,7 @@ async fn actual_host_reboot_preserves_holds_and_retires_original_execution() {
     let root = Path::new(&directory);
     let id = instance(root);
     let prepared = InstanceId(format!("{}-prepared", id.0));
+    let split = InstanceId(format!("{}-split", id.0));
     let runtime = runtime(root);
     let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
     let proof = root.join("proof.json");
@@ -970,6 +1072,16 @@ async fn actual_host_reboot_preserves_holds_and_retires_original_execution() {
                 .unwrap();
             runtime.start(&id).await.unwrap();
             wait_file(&root.join("shared/runs")).await;
+            runtime
+                .create(&split, &spec(root, "exec /bin/busybox sleep 86400"))
+                .await
+                .unwrap();
+            install_fixture(root, &split);
+            runtime.start(&split).await.unwrap();
+            assert_eq!(
+                runtime.state(&split).await.unwrap(),
+                ContainerState::Running
+            );
             runtime
                 .create(
                     &prepared,
@@ -995,6 +1107,24 @@ async fn actual_host_reboot_preserves_holds_and_retires_original_execution() {
                 boot,
                 "this is not an actual kernel reboot"
             );
+            // #1849: a record that lost its race with the launcher binding
+            // across the power cut is stale, never a reason to refuse startup.
+            let split_record = adoption_record(
+                &split,
+                1,
+                Some(root.join("lost-launch/output")),
+                spec(root, "exec /bin/busybox sleep 86400"),
+            );
+            let split_adoption = runtime.adopt(&split, &split_record).await;
+            assert!(
+                matches!(split_adoption, Ok(false)),
+                "a split record refused startup after a reboot: {split_adoption:?}"
+            );
+            assert_eq!(
+                runtime.state(&split).await.unwrap(),
+                ContainerState::Stopped
+            );
+            assert_absent(root, &split);
             let reference: reliaburger::grill::runc_intent::NetworkReference =
                 serde_json::from_value(evidence["reference"].clone()).unwrap();
             assert!(!reliaburger::grill::netns::namespace_path(&id).exists());

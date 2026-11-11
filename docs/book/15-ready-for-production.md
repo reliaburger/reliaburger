@@ -6094,8 +6094,9 @@ fsync'd writes, each of them a temporary file, an `fsync`, a rename and an
 `Withdrawing`, `Withdrawn`, the receipts it proved, `Publishing`, `Active`.
 Five. At roughly 400 ms a write on that disk, both add up to the journals.
 
-Persists are allowed inline (decision 2 of #351) only while a slow disk
-keeps every turn in budget, and here it didn't. The scenario that shows it,
+Persists were allowed inline (decision 2 of #351) only while a slow disk
+kept every turn in budget, and here it didn't. (0.2.8 dropped the
+allowance altogether; see "What the watchdog caught" below.) The scenario that shows it,
 `status_answers_while_a_consumer_sync_journals_to_a_slow_disk`, recovers a
 consumer, sets `LoopStall::Persist` to 400 ms and sends two leader answers.
 On the old code a status queued behind the first one took 2.08 s.
@@ -7614,6 +7615,170 @@ were in `D` and the one that ran the loop. A failure bundle also gets
 `loop-stalls-<vm>.txt`, cut from the journal it copies, so the stall sits
 next to the failure it caused. When the next soak stalls, #1707 gets its
 answer from the evidence, not from another theory.
+
+#### What the watchdog caught
+
+The watchdog paid for itself in 0.2.8's own release gate (#1853). In the
+jobs fast tier's graceful stop and start of the whole cluster, one node
+logged a 1,593 ms turn in `deploy_op (finish_fresh_instance)`, with a
+discovery journal write of just 46 ms. This time a snapshot came with it,
+taken 807 ms in: the thread that had run the loop sat in `epoll_pwait`,
+waiting on another task, and one tokio worker sat in `D` state in
+`fdatasync`. So no worker was blocked; the loop was simply waiting for a
+write, and the turn's own code told us which. After the journal write,
+`finish_fresh_instance` wrote the instance's adoption record:
+
+```rust
+// LOOP-INLINE: fsync'd persist (#351 decision 2); the slow-disk scenario bounds it
+tokio::task::spawn_blocking(move || crate::grill::records::write_record(&dir, &record))
+    .await
+```
+
+The `spawn_blocking` kept the runtime free, as it should. But the turn
+awaited the result with no deadline, and while every node of a cluster
+restarts at once, every disk is busy and an `fdatasync` can take over a
+second. Decision 2 of #351 had allowed exactly this: an fsync'd persist
+may stay inline as long as the slow-disk scenarios keep it in budget. The
+gate had just shown a real disk that doesn't, so that allowance is gone.
+No turn waits on an fsync now.
+
+The fix uses machinery the loop already had. `off_loop_work` (stage 3 of
+#351) runs a piece of work in a task under a `WorkKey`, waits for it
+until the turn's deadline, and otherwise answers `StillRunning`; the next
+ask finds the same task. Retirement's file removals used it already. The
+record write became `WorkKey::PersistRecord`, and the record's builder
+only runs on the first ask:
+
+```rust
+let record = if self.off_loop_work.started(&key, incarnation) {
+    None
+} else {
+    Some(self.instance_record(instance_id, evidence)?)
+};
+self.write_record_within_turn(key, incarnation, dir, record)
+    .await?
+```
+
+`None` here means "collect the write you already started". The task
+behind the key owns the record it is writing, so a later ask has nothing
+to pass. Four writers changed the same way: a fresh instance's record, a
+restart's (and the removal of its predecessor's), a rolling replacement's,
+and a signed workload identity's files. Each one's caller already knew
+how to ask again. A deploy worker retries `StillRunning` after 100 ms.
+A restart step re-delivers its own result after a short sleep, the way
+`recheck_restart_create` already did. And a signing's second task, the
+file write, goes into the same `JoinSet` as the signing itself, so the
+loop's `select!` lands it like any other.
+
+Two things needed care. The first is order. The record is what a
+restarted Bun adopts an instance by, so nothing may treat the instance as
+running before the record is on disk. The write still comes after the
+backend's journal entry and before everything that publishes the
+instance: its state, its place in the service map, its log forwarder.
+Asking again must not repeat what can't be repeated, and the log
+forwarder couldn't: it used to start before the record write, so a second
+ask would have started a second one. It starts after the write now.
+`no_instance_runs_before_its_record_is_on_disk` polls the status
+throughout a slow write and never sees `default__web-0` running without
+its record, and `a_fresh_instance_asked_again_starts_one_log_forwarder`
+counts forwarders.
+
+The second is a race that couldn't exist before. While the write held the
+turn, nothing else ran; now an app can be deleted while its instance's
+record is still being written. If retirement's removal finished first,
+the late write would put the record back, and the next Bun would try to
+adopt an instance that's gone. So retirement answers `StillRunning`
+while a write for the same instance is in flight
+(`retirement_waits_for_a_record_write_in_flight`), and so does the
+identity directory's removal while a signed identity is being written to
+it. Two more tests crash Bun at each side of the write: before it lands
+the next Bun has nothing to adopt, and after it lands the next Bun adopts
+the instance.
+
+Review found one more. `off_loop_work` tells one piece of work from the
+next by an *incarnation*, and for an instance that had always been its
+`created_at`. But a restart keeps `created_at`, so every launch of an
+instance shared one incarnation. Say a restart's write outlasted its turn,
+and the instance crashed again before the recheck: nothing collected the
+write, the next restart removed the record, and its own write found the
+earlier one "started", took that result and wrote nothing. The instance
+ran with no record. So the write is keyed by the launch now:
+`LaunchEvidence`, read once when a launch starts, carries the moment it
+was read, and every ask about that launch passes the same evidence. And,
+belt and braces, removing a record first drops any write of it that
+landed uncollected. `a_restart_writes_its_own_record_after_an_earlier_write_landed_uncollected`
+and its twin with a failed earlier write pin both.
+
+The remaining `LOOP-INLINE` tags on durable writes now say why they're
+bounded rather than citing decision 2: a discovery journal write with no
+deadline happens only in startup recovery, outside any turn, and every
+in-turn caller checks for a write in flight before starting another.
+Without the old tags, `loop_rule.rs` holds every new await of a durable
+write to the turn's deadline.
+
+The next candidate's gate turned up one the loop rule couldn't have
+caught (#1857). A node logged a 1,152 ms turn in `deploy_op
+(health_probe_result)`, all of it charged to "journal write". But the
+journal write already ran on the blocking pool, and the turn waited for
+it only until its deadline, so the deadline should have fired at 500 ms.
+The snapshot said why it couldn't: the thread that had run the loop was
+itself in `D` state, in `ext4_llseek`. The system call was
+`lseek(fd, 0x1badd, 3)`, and whence 3 is `SEEK_DATA`, which Reliaburger
+uses in one place: the capture reader that log forwarders use to skip a
+log prefix the store has already reclaimed (#1418). `read_chunk` was
+async, but it called that `lseek` directly, on whichever runtime worker
+polled it. `SEEK_DATA` takes the file's inode lock, and the workload was
+appending to its log under writeback, so the call waited as long as the
+appender's journal commit did.
+
+That held the worker, and with it the loop. Each tokio worker keeps a
+queue of tasks that are ready to run, and the loop's task must have been
+in the blocked worker's, since that was the thread that last ran it. So
+nothing ran the loop until the `lseek` returned, its
+`timeout_at` included. A timeout is just another future, and it can only
+fire when its task is polled. Nothing in the loop's code did anything
+wrong. Another task, on a worker the loop happened to share, made a
+blocking call.
+
+The fix moves the reader's file calls onto the blocking pool in two
+hops. One opens the file and reads its metadata. The other does the
+`SEEK_DATA`, the seek and the bounded read on that same descriptor.
+That's fewer hops than before, because every `tokio::fs` call is its own
+`spawn_blocking` underneath. `a_stalled_capture_read_does_not_hold_the_runtime_thread`
+stalls the blocking part of a read for 600 ms on a one-thread runtime and
+checks that a 20 ms timer still fires. On the old code it fired after
+625 ms.
+
+The rule that keeps this fixed can't stop at the loop, because the loop
+wasn't where the call was. `src/blocking_rule.rs` parses every file in
+`src/` and walks every `async fn`, `async` block and `async` closure. A
+file call there that isn't awaited is a blocking one: `std::fs`,
+`File::open`, `OpenOptions::open`, `sync_all`, `set_len`, the raw `nix`
+calls, and a short list of the crate's own helpers that make them.
+"Isn't awaited" is what tells `std::fs::read` from `tokio::fs::read`,
+since the tokio one is a future. Names go through the file's `use` items
+first, so `use std::fs as disk;` doesn't hide `disk::read`, and the
+exemptions match whole resolved paths, so a local function that happens
+to be called `run` or `blocking` isn't one. Review caught one exemption
+that was backwards: `std::thread::scope` runs its closure on the calling
+thread and then blocks it until every thread it spawned has finished, so
+the rule counts a scope in async code as blocking. A call inside a closure handed to
+`spawn_blocking`, or to one of the crate's three wrappers around it,
+passes, and so does one tagged `// BLOCKING-OK: <why>`. The tags so far
+are on startup code that runs before any workload does, and on cgroupfs
+reads, which the kernel answers from memory. Run against the old capture
+reader, the rule flags the `lseek` that caused this. It found 80 sites
+when it arrived. We moved the agent's onto the blocking pool and tagged
+the rest. That left 25, all in the `relish` CLI, a separate process with
+no loop to stall. They're listed in `blocking_rule_baseline.json`, and
+the test fails if that list grows, or if a listed site goes away without
+being removed from it.
+
+It also changes how to read #1606, #1707 and #1853. Each was diagnosed
+as a slow write the turn waited for. A blocking call on a shared worker
+looks the same from the turn's side, and only a thread snapshot tells the
+two apart. #1853's snapshot did: no worker was blocked there. The others
+had no snapshot, so some of their history may be this instead.
 
 #### The lock that went to the back of the queue
 

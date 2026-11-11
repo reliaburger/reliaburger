@@ -3739,6 +3739,33 @@
       ]
     },
     {
+      "id": "issue-1849-legacy-oci-owned_runc-a_record_and_generation_split_by_a_power_cut_retire_and_others_still_adopt",
+      "issue": 1849,
+      "promise": "Complete the exact retained legacy OCI case through its finite owned driver.",
+      "supported_paths": [
+        "Exact original ignored test identity and declared Make owner."
+      ],
+      "refused_paths": [
+        "No generic aliases or success from another test or owner."
+      ],
+      "boundaries": [
+        "Source binding only; real isolated Linux OCI execution and current receipt are required."
+      ],
+      "cases": [
+        {
+          "id": "legacy-oci-owned_runc-a_record_and_generation_split_by_a_power_cut_retire_and_others_still_adopt",
+          "binary": "reliaburger::owned_runc",
+          "test": "a_record_and_generation_split_by_a_power_cut_retire_and_others_still_adopt",
+          "requires": [
+            "oci-interruptions"
+          ],
+          "sources": [
+            "tests/owned_runc.rs"
+          ]
+        }
+      ]
+    },
+    {
       "id": "issue-555-original-linux-root-storage",
       "issue": 555,
       "promise": "Complete all uncovered original ignored cases through their declared owner.",
@@ -5851,6 +5878,28 @@
           "id": "legacy-ci-reliaburger-cluster_failover-a_proposal_applied_before_a_leader_change_is_undone_on_the_new_leader",
           "binary": "reliaburger::cluster_failover",
           "test": "a_proposal_applied_before_a_leader_change_is_undone_on_the_new_leader",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_failover.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-cluster_failover-the_dashboard_decides_a_proposal_on_the_leader_only",
+          "binary": "reliaburger::cluster_failover",
+          "test": "the_dashboard_decides_a_proposal_on_the_leader_only",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_failover.rs"
+          ]
+        },
+        {
+          "id": "legacy-ci-reliaburger-cluster_failover-the_dashboard_clears_a_fault_another_node_holds",
+          "binary": "reliaburger::cluster_failover",
+          "test": "the_dashboard_clears_a_fault_another_node_holds",
           "requires": [
             "cluster-tests"
           ],

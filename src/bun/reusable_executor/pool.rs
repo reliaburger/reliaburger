@@ -1773,9 +1773,9 @@ async fn wait_empty_task(task: &Path) -> std::io::Result<()> {
     let deadline = tokio::time::Instant::now() + RETIREMENT_DEADLINE;
     let mut pause = Duration::from_millis(1);
     loop {
-        // cgroupfs is an in-memory kernel interface, like /proc: reading it
-        // never waits on a disk. This runs once per command, and handing it to
-        // the blocking pool cost about 3% of host-job throughput.
+        // BLOCKING-OK: cgroupfs is an in-memory kernel interface, like /proc:
+        // reading it never waits on a disk. This runs once per command, and
+        // handing it to the blocking pool cost about 3% of host-job throughput.
         let events = std::fs::read_to_string(task.join("cgroup.events"))?;
         if events.lines().any(|line| line == "populated 0") {
             return Ok(());

@@ -1680,6 +1680,12 @@
     "test": "a_stale_adoption_record_retires_its_generation_and_others_still_adopt"
   },
   {
+    "source": "tests/owned_runc.rs",
+    "function": "a_record_and_generation_split_by_a_power_cut_retire_and_others_still_adopt",
+    "binary": "reliaburger::owned_runc",
+    "test": "a_record_and_generation_split_by_a_power_cut_retire_and_others_still_adopt"
+  },
+  {
     "source": "tests/cluster_task_arrays.rs",
     "function": "a_task_array_survives_losing_a_node_mid_run",
     "binary": "reliaburger::cluster_task_arrays",

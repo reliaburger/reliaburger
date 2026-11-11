@@ -160,7 +160,8 @@ turns short:
 |---|---|---|
 | Turn meter | Times every turn by branch, exports `bun_agent_loop_turn_seconds{branch}` through Mayo, logs any turn over 250 ms with the command or deploy op it ran. Tests read the worst turn, including one still running | [`src/bun/loop_meter.rs`](../src/bun/loop_meter.rs) |
 | Starvation harness | One scenario per inline await from the review: a `MockGrill` whose calls can each be slowed (`set_call_delay`), a council whose writes hang, a log client that never reads, and test-only stalls for awaits no mock stands behind (the disk, `nft`). Each scenario queues a status command during the slow work and fails unless it's answered, and the worst turn ends, within 1 s | [`src/bun/agent/tests/loop_harness.rs`](../src/bun/agent/tests/loop_harness.rs) |
-| Inline-await rule | Parses the agent's source with `syn`, walks every method a turn can reach from `run_loop`, and fails on an await with neither the turn's deadline (`tokio::time::timeout_at(deadline, ..)`) nor a `// LOOP-INLINE: <why>` comment. A fixed `tokio::time::timeout` needs the tag too: 1 s is already the whole budget (#418) | [`src/bun/agent/tests/loop_rule.rs`](../src/bun/agent/tests/loop_rule.rs) |
+| Inline-await rule | Parses the agent's source with `syn`, walks every method a turn can reach from `run_loop`, and fails on an await with neither the turn's deadline (`tokio::time::timeout_at(deadline, ..)`) nor a `// LOOP-INLINE: <why>` comment. A fixed `tokio::time::timeout` needs the tag too: 1 s is already the whole budget (#418). An fsync never gets one: since #1853 every durable write a turn starts runs in a task the turn waits for only until its deadline | [`src/bun/agent/tests/loop_rule.rs`](../src/bun/agent/tests/loop_rule.rs) |
+| No blocking file call in async code | Parses all of `src/` with `syn` and fails on a file call made directly in an `async fn`, `async` block or `async` closure that isn't awaited (`std::fs`, `File::open`, `OpenOptions::open`, `sync_all`, `set_len`, raw `nix` calls, and the crate's listed blocking helpers). It ties up a runtime worker, and whatever task is queued there, the agent loop included (#1857). Move the call into `spawn_blocking` or use `tokio::fs`, or tag it `// BLOCKING-OK: <why>`. Older sites are in `src/blocking_rule_baseline.json`, which may only shrink | [`src/blocking_rule.rs`](../src/blocking_rule.rs) |
 | Soak gate | The V02 checker reads each node's turn histogram at every settle and heavy check and fails the tier on any turn over 1 s | [`scripts/release/sustained_check.py`](../scripts/release/sustained_check.py) (`turn_findings`) |
 
 The first three run in `make test`; the gate's own tests run with the other
@@ -231,6 +232,16 @@ failed whole command cannot supply that evidence. The exact twenty reviewed
 legacy OCI mappings retain their original `make test-linux` declarations and
 receive evidence through the owned interruption driver; no other case gets an
 alias by resemblance.
+
+An owner's envelope lists only the cases
+[`tests/contracts/manifest.json`](../tests/contracts/manifest.json) says its
+gate requires. So a new ignored test that CI owns needs two entries: its exact
+identity in [`ignored-bindings.json`](../tests/contracts/ignored-bindings.json)
+and a case in the manifest whose `requires` names the owning gate (a
+`make test-cluster` test goes in `issue-555-original-cluster-tests`). With
+only the binding, the gate runs and passes the test, but the evidence job
+can't see it, and that failure shows up first in the merge queue (#1836).
+`make check-ignored` now refuses a binding no manifest case covers.
 
 The image-backed delegated-job cases live in `tests/owned_task_arrays.rs` and
 run through `make test-linux`, where the warmed digest-pinned mirror remains
@@ -746,7 +757,7 @@ commands never build it. Three things run the targets:
 |---|---|---|
 | `make test` (in `make ci`) | stable | `fuzz::tests`: every fixture seed is accepted and round-trips, every file in `fuzz/corpus/` runs without a panic, 512 mutated seeds run without a panic, and every target has its binary |
 | `make fuzz-corpus-check` | stable | Only those tests |
-| `make fuzz-smoke` | nightly, cargo-fuzz | Builds every target with sanitizers and runs each for `FUZZ_SECONDS` (default 10). `make fuzz-tools` says how to install what's missing. It builds for the nightly toolchain's host (`FUZZ_TARGET`), because cargo-fuzz otherwise picks the triple it was built for, and CI's prebuilt cargo-fuzz is a musl binary that AddressSanitizer can't use |
+| `make fuzz-smoke` | nightly, cargo-fuzz | Builds every target with sanitizers and runs each for `FUZZ_SECONDS` (default 10). `make fuzz-tools` says how to install what's missing. It builds for the nightly toolchain's host (`FUZZ_TARGET`), because cargo-fuzz otherwise picks the triple it was built for, and CI's prebuilt cargo-fuzz is a musl binary that AddressSanitizer can't use. It builds with `FUZZ_CODEGEN_UNITS` (default 64) codegen units: cargo-fuzz's default of one compiles reliaburger as a single sanitized LLVM module, which took 31 GB in one `rustc` and got the 16 GB hosted runner reclaimed ([#1839](https://github.com/reliaburger/reliaburger/issues/1839)) |
 
 [`fuzz.yml`](../.github/workflows/fuzz.yml) runs `make fuzz-smoke` nightly at
 300 seconds a target, and for 30 seconds on a pull request that touches a

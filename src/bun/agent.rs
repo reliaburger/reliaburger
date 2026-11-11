@@ -498,6 +498,14 @@ enum LoopStall {
     /// Committing a verified upgrade: appending its history entry, pruning
     /// old binaries and removing the marker (#1381).
     UpgradeCommit,
+    /// Writing an instance's adoption record, or removing a restarted
+    /// instance's old one: an fsync each (#1853).
+    RecordWrite,
+    /// Writing a signed workload identity to its mount, an fsync per file.
+    IdentityWrite,
+    /// Starting an instance's log forwarder. Only counted: a step asked
+    /// again must start one forwarder, not two.
+    LogForwarder,
 }
 
 /// How long each [`LoopStall`] takes. Shared with the test through an `Arc`
@@ -821,6 +829,11 @@ pub struct BunAgent<G: Grill> {
     /// journal, as whoever started it read it from the runtime (#419).
     /// Launches that hold their address have none.
     launch_executions: std::collections::HashMap<InstanceId, crate::grill::RuntimeGeneration>,
+    /// The execution each local instance's state report last named, from a
+    /// complete inventory read or from whoever launched it. A report whose
+    /// inventory read misses its deadline reuses it rather than naming no
+    /// execution, which the leader would treat as a retired producer (#1855).
+    reported_executions: std::collections::HashMap<InstanceId, crate::grill::RuntimeExecution>,
     /// Pre-created network namespace paths for instances (Linux + runc only).
     /// When present, the namespace path is passed to `generate_oci_spec` so
     /// the container joins the pre-created namespace instead of creating one.
@@ -917,7 +930,7 @@ pub struct BunAgent<G: Grill> {
     identity_signings: identity_signing::IdentitySignings,
     /// Those tasks. A follower's CSR waits on the leader for up to ten
     /// seconds, which must not stall every other command.
-    identity_signing_tasks: tokio::task::JoinSet<identity_signing::SignedIdentity>,
+    identity_signing_tasks: tokio::task::JoinSet<identity_signing::IdentityTaskOutput>,
     /// Apps adopted at startup and the spec their instances were launched
     /// from, until this agent deploys them again.
     adopted_apps: adopted_placements::AdoptedApps,
@@ -1111,6 +1124,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             network_references: std::collections::HashMap::new(),
             released_network_references: std::collections::HashMap::new(),
             launch_executions: std::collections::HashMap::new(),
+            reported_executions: std::collections::HashMap::new(),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
             capacity_refusals: std::collections::HashMap::new(),
@@ -1281,6 +1295,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             network_references: std::collections::HashMap::new(),
             released_network_references: std::collections::HashMap::new(),
             launch_executions: std::collections::HashMap::new(),
+            reported_executions: std::collections::HashMap::new(),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
             capacity_refusals: std::collections::HashMap::new(),
@@ -1666,6 +1681,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Runs off the event loop (the grill handle is cloned into the task), so
     /// following logs never blocks the agent.
     fn spawn_log_forwarder(&self, instance_id: &InstanceId, app_name: &str, namespace: &str) {
+        #[cfg(test)]
+        let _ = self.loop_stalls.reach(LoopStall::LogForwarder);
         let Some(log_tx) = self.log_tx.clone() else {
             return;
         };

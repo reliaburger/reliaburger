@@ -400,6 +400,35 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         );
     }
 
+    /// Take the restart's Start result again after a short wait, off the
+    /// loop, so the turn after Start runs again once the replacement's
+    /// adoption record may have landed (#1853). Everything that turn does
+    /// before the record write is safe to repeat.
+    fn recheck_restart_start(
+        &mut self,
+        id: InstanceId,
+        launch: RestartLaunch,
+        gate: RestartGate,
+        evidence: LaunchEvidence,
+    ) {
+        let task = self
+            .restart_steps
+            .spawn(async move {
+                tokio::time::sleep(deploy_ops::STILL_RUNNING_RECHECK).await;
+                StepResult::Started(Box::new(evidence))
+            })
+            .id();
+        self.restarts.insert(
+            id,
+            RestartInFlight {
+                step: RestartStep::Start,
+                launch: Some(launch),
+                gate,
+                task,
+            },
+        );
+    }
+
     /// Look at a started replacement's publication again after a short
     /// wait, off the loop, once its backend's journal write may have landed
     /// (#1263). A stop or retirement that takes the instance back meanwhile
@@ -450,6 +479,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// and the caller must wait for that ([`TakenRestart::settle`]) before
     /// it signals the runtime itself.
     pub(super) fn take_back_from_restart(&mut self, id: &InstanceId) -> Option<TakenRestart> {
+        // Whatever the restart had launched is no longer its report's to name.
+        self.reported_executions.remove(id);
         let restart = self.restarts.get(id)?;
         restart.gate.cancel();
         Some(TakenRestart {
@@ -468,11 +499,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
     /// Begin cleaning up the runtime a failed restart attempt left behind.
     pub(super) async fn begin_restart_cleanup(&mut self, id: InstanceId) {
+        self.reported_executions.remove(&id);
         self.spawn_restart_step(id, RestartStep::Cleanup, None, RestartGate::default());
     }
 
     /// Begin a restart of a Pending instance: kill the predecessor first.
+    ///
+    /// The predecessor's execution leaves the state reports here. Until the
+    /// replacement's own is recorded, a report that can't read the runtime
+    /// names none: a fence of the replacement's generation would leave a
+    /// backend still named for the predecessor's in the catalogue (#1855).
     pub(super) async fn begin_restart_launch(&mut self, id: InstanceId, launch: RestartLaunch) {
+        self.reported_executions.remove(&id);
         self.spawn_restart_step(id, RestartStep::Clear, Some(launch), RestartGate::default());
     }
 
@@ -716,8 +754,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.spawn_restart_step(id, RestartStep::Start, Some(launch), gate);
     }
 
-    /// The loop's step after Start: stream the replacement's logs, record
-    /// it for adoption, then publish its backend.
+    /// The loop's step after Start: record the replacement for adoption,
+    /// stream its logs, then publish its backend. The record write holds the
+    /// turn only until its deadline (#1853); while it is in flight the step
+    /// looks again after a short wait.
     async fn restart_after_start(
         &mut self,
         id: InstanceId,
@@ -738,11 +778,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             self.record_failed_restart(&id, &error.to_string()).await;
             return;
         }
-        self.spawn_log_forwarder(&id, &launch.app_name, &launch.namespace);
-        if let Err(error) = self.persist_instance_record(&id, evidence).await {
-            self.record_failed_restart(&id, &error.to_string()).await;
-            return;
+        match self.persist_instance_record(&id, evidence).await {
+            Ok(()) => {}
+            Err(BunError::StillRunning { .. }) => {
+                self.recheck_restart_start(id, launch, gate, evidence.clone());
+                return;
+            }
+            Err(error) => {
+                self.record_failed_restart(&id, &error.to_string()).await;
+                return;
+            }
         }
+        self.spawn_log_forwarder(&id, &launch.app_name, &launch.namespace);
         if let Some(instance) = self.supervisor.get_instance_mut(&id) {
             instance.container_ip = evidence.container_ip;
         }

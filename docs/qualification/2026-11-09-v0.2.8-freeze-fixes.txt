@@ -126,7 +126,10 @@ Fixes #1777
 #   `make agent-docs` (features.md and index.md are generated):
 #   README.md (the Status line), docs/README.md (the first paragraph),
 #   docs/features.toml (`released`) and docs/website/index.html (the 0.2.8
-#   release card).
+#   release card). The release count says "sixteen releases in 44 days"
+#   (29 September to 11 November, counted inclusively as 0.2.7's "40 days"
+#   was) in docs/website/index.html and docs/whitepaper.md (§2, "One thing
+#   to upgrade"); a later date adds a day each.
 # - docs/linux-servers.md says `bun 0.2.8 (TAG-COMMIT)`: put the v0.2.8
 #   tag's short commit there.
 # - scripts/release/released-cli.tsv was written from a train build. Write
@@ -135,6 +138,10 @@ Fixes #1777
 #   and run `make reference-commands`; it should not change.
 # - docs/features.toml: the maintainer answers Homebrew install's
 #   needs_maintainer question (Beta or Alpha), then the line goes.
+# - The release notes must say that `relish status -o json` changed shape in
+#   0.2.8 (#1788): it no longer lists the instances. A script that read it
+#   as an instance list should use `relish apps --instances -o json`. Our own
+#   soak harness broke on this (#1850).
 # - Still to do as for 0.2.7: re-record docs/website/assets/tour.cast
 #   against the published install, the homepage's #release-testing section
 #   and its soak charts, the release-log entry, the roadmap tick,
