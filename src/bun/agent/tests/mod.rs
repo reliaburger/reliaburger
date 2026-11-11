@@ -576,6 +576,78 @@ async fn reporting_binds_execution_to_the_original_runtime_specification() {
     }
 }
 
+/// An inventory read that misses the report's deadline must not strip the
+/// executions from the report. The leader drops a backend with no
+/// execution on any node with retirement history, so one slow read emptied
+/// every service on the node for a report interval while its containers
+/// kept serving (#1855). The report reuses the execution it last knew,
+/// until something launches the instance again or a complete read
+/// contradicts it.
+#[tokio::test]
+async fn a_slow_inventory_read_reports_the_last_known_execution() {
+    let (mut agent, _, _, grill) = test_agent_with_grill();
+    expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+    let id = InstanceId("default__web-0".into());
+    let spec = agent
+        .supervisor
+        .get_instance(&id)
+        .unwrap()
+        .oci_spec
+        .clone()
+        .unwrap();
+    let launch = crate::grill::RuntimeLaunch {
+        instance_id: id.clone(),
+        spec: spec.clone(),
+        generation: crate::grill::RuntimeGeneration::process("first"),
+        network_reference: None,
+    };
+    let known = crate::grill::RuntimeExecution {
+        instance_id: id.clone(),
+        generation: launch.generation.clone(),
+    };
+    async fn reported(agent: &mut TestAgent) -> Option<crate::grill::RuntimeExecution> {
+        let (tx, rx) = oneshot::channel();
+        agent
+            .handle_snapshot_request(CollectSnapshotRequest { response: tx })
+            .await;
+        rx.await.unwrap().instances[0].execution.clone()
+    }
+    grill.set_launch_inventory(vec![launch.clone()]).await;
+    assert_eq!(reported(&mut agent).await, Some(known.clone()));
+
+    // The next read takes longer than the loop's patience.
+    grill.set_inventory_delay(Some(LOOP_RUNTIME_INVENTORY_TIMEOUT * 3));
+    assert_eq!(
+        reported(&mut agent).await,
+        Some(known.clone()),
+        "a timed-out read must not erase the execution"
+    );
+
+    // Launching the instance again replaces what the report knows.
+    let restarted = crate::grill::RuntimeGeneration::process("restarted");
+    agent
+        .record_launch_execution(
+            &id,
+            &super::launch_evidence::LaunchExecution::Generation(restarted.clone()),
+        )
+        .unwrap();
+    assert_eq!(
+        reported(&mut agent).await,
+        Some(crate::grill::RuntimeExecution {
+            instance_id: id.clone(),
+            generation: restarted,
+        })
+    );
+
+    // A complete read that no longer finds it is believed, and a later slow
+    // read has nothing to reuse.
+    grill.set_inventory_delay(None);
+    grill.set_launch_inventory(Vec::new()).await;
+    assert_eq!(reported(&mut agent).await, None);
+    grill.set_inventory_delay(Some(LOOP_RUNTIME_INVENTORY_TIMEOUT * 3));
+    assert_eq!(reported(&mut agent).await, None);
+}
+
 /// #476: a retired Runc intent keeps environment names, not values. Its
 /// launch must still bind to the instance that started it.
 #[tokio::test]
@@ -1083,7 +1155,7 @@ async fn a_rollout_finishes_while_the_old_instance_waits_for_remote_release() {
 
 /// The states the node's next report would give every instance, by host port.
 async fn reported_states(
-    agent: &TestAgent,
+    agent: &mut TestAgent,
 ) -> std::collections::BTreeMap<Option<u16>, ContainerState> {
     let (tx, rx) = oneshot::channel();
     agent
@@ -1133,7 +1205,7 @@ async fn a_published_rolling_replacement_reports_running_before_the_old_instance
         .await
         .unwrap();
     assert_eq!(
-        reported_states(&agent).await,
+        reported_states(&mut agent).await,
         std::collections::BTreeMap::from([
             (old_port, ContainerState::Running),
             (new_port, ContainerState::Starting),
@@ -1147,7 +1219,7 @@ async fn a_published_rolling_replacement_reports_running_before_the_old_instance
         .unwrap();
     agent.begin_instance_retirement(&old).await.unwrap();
     assert_eq!(
-        reported_states(&agent).await,
+        reported_states(&mut agent).await,
         std::collections::BTreeMap::from([
             (old_port, ContainerState::Stopping),
             (new_port, ContainerState::Running),

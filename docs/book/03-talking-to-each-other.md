@@ -563,6 +563,21 @@ That rule had a hole of its own, and an audit found it (#431). "Hasn't reported 
 
 The fix gives silence a deadline. The aggregator now keeps a receive deadline per node that outlives the report payload, and a stale node publishes nothing, either from its old report or from the carried-forward catalogue. That's the `!reports.stale_nodes.contains(&node_id)` line above. A new leader still needs grace, though, or every leader change would withdraw every backend the moment the aggregator compared "never heard from" against the clock. So when the term changes, the aggregator starts a fresh deadline for every member gossip knows about. Each one gets one stale window (30 seconds by default, six report intervals) to reach the new leader. Reports arrive every five seconds, so a healthy node lands well inside it, and only a node that stays silent for a whole window loses its backends.
 
+The 0.2.8 gate found the opposite mistake: a node that did report, but left something out (#1855). Each backend in a report names its *execution*, the generation the runtime launched, read from the runtime's launch inventory. A producer retirement fences a generation, and `blocks` drops a backend whose generation is fenced. It also drops one that names no execution at all, on any node with retirement history, because missing evidence mustn't bring back a retired producer. That's right for a stale report. It's wrong for a report whose inventory read simply ran out of time. Node 3, the leader, was being CPU-throttled, and its inventory read took 501 ms, a millisecond past its turn's deadline. So its report named no execution for any instance, and the leader dropped all three podinfo backends. For one report interval every consumer saw the service empty, and ingress answered 502 while the containers kept serving.
+
+The fix is on both sides. The agent keeps the execution each instance's report last named, from a complete inventory read or from whatever launched the instance, and a read that misses its deadline reuses it. A complete read is still the truth, and whatever launches the instance again replaces the kept one, so a reused execution always belongs to the launch that's running. The leader doesn't rely on the agent alone:
+
+```rust
+let execution = app
+    .execution
+    .clone()
+    .or_else(|| committed_execution(desired, node_id, node_ip, host_port, app));
+```
+
+`or_else` is the lazy form of `or`: it calls the closure only when the first `Option` is `None`, so a report that names its execution never pays for the lookup. `committed_execution` looks for the committed backend at the same node, address and port, for the same replica, with an execution that isn't fenced, and borrows its execution. A report that names an execution is still taken at its word, so naming a retired generation still drops the backend, and a committed backend that never had an execution has nothing to lend. `a_report_missing_its_execution_keeps_the_committed_backend` checks each case, and `a_slow_inventory_read_reports_the_last_known_execution` holds the agent's inventory past the deadline.
+
+The one thing we couldn't check was the empty catalogue itself. Wrapper answered 502 for an empty pool without a word in its own journal, and the diagnosis had to work back from node 3's turn timings. Now the first 502 for a route logs a line, and later ones log at most once every ten seconds with a count of the ones in between.
+
 ### Why userspace DNS, not eBPF?
 
 The original design called for fully in-kernel DNS interception using `cgroup/sendmsg4` and `cgroup/recvmsg4` eBPF hooks. We tried it. It doesn't work *at those hooks*.

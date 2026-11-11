@@ -48,6 +48,59 @@ pub struct ProxyState {
     /// the cluster. A lapsed lease routes only to this node's own backends:
     /// the remote addresses in that view may already belong to something else.
     pub view_lease: Option<Arc<crate::onion::lease::ViewLease>>,
+    /// Rate-limits the line logged when a route has no routable backend.
+    pub empty_pool_log: tokio::sync::Mutex<EmptyPoolLog>,
+}
+
+/// The shortest gap between two empty-pool lines for one route.
+const EMPTY_POOL_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Most routes the empty-pool log remembers; past it, routes whose last line
+/// is older than the interval are forgotten.
+const EMPTY_POOL_LOG_ROUTES: usize = 1024;
+
+/// When each route last logged that it answered 502 with no routable
+/// backend, and how many it answered since.
+///
+/// Without it a node's ingress turned clients away with no trace in its own
+/// journal (#1855). A pool can stay empty for a while under load, so each
+/// route logs at most once per [`EMPTY_POOL_LOG_INTERVAL`].
+#[derive(Debug, Default)]
+pub struct EmptyPoolLog {
+    routes: std::collections::HashMap<super::routing::RouteKey, (std::time::Instant, u64)>,
+}
+
+impl EmptyPoolLog {
+    /// Count a 502 for `route`. Returns the line to log, or `None` while
+    /// the route's last line is too recent.
+    fn record(
+        &mut self,
+        now: std::time::Instant,
+        route: &super::routing::RouteKey,
+    ) -> Option<String> {
+        if let Some((last, unreported)) = self.routes.get_mut(route) {
+            if now.duration_since(*last) < EMPTY_POOL_LOG_INTERVAL {
+                *unreported += 1;
+                return None;
+            }
+            let line = format!(
+                "wrapper: answered 502 for {}{}: no routable backend ({} more since the last line)",
+                route.host, route.path_prefix, unreported
+            );
+            *last = now;
+            *unreported = 0;
+            return Some(line);
+        }
+        if self.routes.len() >= EMPTY_POOL_LOG_ROUTES {
+            self.routes
+                .retain(|_, (last, _)| now.duration_since(*last) < EMPTY_POOL_LOG_INTERVAL);
+        }
+        self.routes.insert(route.clone(), (now, 0));
+        Some(format!(
+            "wrapper: answered 502 for {}{}: no routable backend",
+            route.host, route.path_prefix
+        ))
+    }
 }
 
 /// Largest number of backends the proxy will try for one request: the primary
@@ -212,6 +265,7 @@ pub async fn bind_proxy_with_tls(
         max_request_body_bytes: config.max_request_body_bytes,
         drains,
         view_lease,
+        empty_pool_log: Default::default(),
     });
 
     let http_listener = bind(config.http_port).await?;
@@ -564,7 +618,17 @@ async fn do_proxy(
     let backend = match (candidates.first(), scope) {
         (Some((_id, addr)), _) => *addr,
         (None, BackendScope::LocalOnly) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        (None, BackendScope::Cluster) => return StatusCode::BAD_GATEWAY.into_response(),
+        (None, BackendScope::Cluster) => {
+            let line = state
+                .empty_pool_log
+                .lock()
+                .await
+                .record(std::time::Instant::now(), &route_key);
+            if let Some(line) = line {
+                eprintln!("{line}");
+            }
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
     };
 
     // WebSocket: delegate to the upgrade handler (no body buffering). The
@@ -3044,5 +3108,36 @@ mod tests {
     #[tokio::test]
     async fn fresh_upstream_waits_for_headers_and_stalled_body_reads_remain_bounded() {
         assert_upstream_inactivity_is_bounded(true).await;
+    }
+
+    /// A 502 for an empty pool used to leave no trace on the node that
+    /// answered it: #1855 could only be explained from another node's
+    /// journal. Each route logs its first one, then at most one line per
+    /// interval, counting the ones in between.
+    #[test]
+    fn an_empty_pool_is_logged_at_most_once_per_interval_per_route() {
+        use super::super::routing::RouteKey;
+        let route = |host: &str| RouteKey {
+            host: host.into(),
+            path_prefix: "/".into(),
+        };
+        let mut log = EmptyPoolLog::default();
+        let start = std::time::Instant::now();
+
+        let first = log.record(start, &route("web.example")).unwrap();
+        assert!(first.contains("web.example"), "{first}");
+        assert!(first.contains("502"), "{first}");
+        assert_eq!(log.record(start, &route("web.example")), None);
+        assert_eq!(
+            log.record(start + EMPTY_POOL_LOG_INTERVAL / 2, &route("web.example")),
+            None
+        );
+        // Another route has its own budget.
+        assert!(log.record(start, &route("api.example")).is_some());
+
+        let later = log
+            .record(start + EMPTY_POOL_LOG_INTERVAL, &route("web.example"))
+            .unwrap();
+        assert!(later.contains("2 more since"), "{later}");
     }
 }
