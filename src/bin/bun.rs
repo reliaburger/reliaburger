@@ -1084,12 +1084,14 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // Writable base for node-local runtime state (instance records,
     // upgrade markers). Prefers the configured data dir, falls back to the
     // user data dir like the metrics/logs stores below.
+    // BLOCKING-OK: startup, before the agent loop or any workload runs
     let data_base = if std::fs::create_dir_all(&config.storage.data).is_ok() {
         config.storage.data.clone()
     } else {
         let fallback = dirs::data_local_dir()
             .unwrap_or_else(|| PathBuf::from("/tmp/reliaburger"))
             .join("reliaburger");
+        // BLOCKING-OK: startup, before the agent loop or any workload runs
         std::fs::create_dir_all(&fallback)
             .map_err(|e| anyhow::anyhow!("failed to create data directory: {e}"))?;
         fallback
@@ -1124,6 +1126,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // workloads are recorded here so a future bun process (crash restart or
     // self-upgrade exec) adopts them instead of restarting them.
     let instances_dir = data_base.join("instances");
+    // BLOCKING-OK: startup, before the agent loop or any workload runs
     std::fs::create_dir_all(&instances_dir)
         .map_err(|e| anyhow::anyhow!("failed to create instances directory: {e}"))?;
 
@@ -1168,6 +1171,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // runs AFTER startup recovery so each failed boot burns an attempt and
     // the crash-loop revert machinery gets exercised for real. Release
     // builds never contain this branch.
+    // BLOCKING-OK: startup, before the agent loop or any workload runs
     if cfg!(debug_assertions)
         && let Ok(resolved) = std::fs::canonicalize(&exe_path)
         && {
@@ -1648,6 +1652,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             use reliaburger::onion::ebpf::loader::OnionEbpf;
             let loaded = if durable_kernel {
                 use sha2::{Digest, Sha256};
+                // BLOCKING-OK: startup, before the agent loop or any workload runs
                 let directory = std::fs::canonicalize(&data_base)?;
                 let identity = Sha256::digest(directory.as_os_str().as_encoded_bytes());
                 let pins =
