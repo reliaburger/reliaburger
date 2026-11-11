@@ -781,13 +781,7 @@ mod tests {
 
     /// The Bun binary that owns runtime commands in these tests.
     fn test_owner() -> PathBuf {
-        std::env::var_os("RELIABURGER_BUN_BINARY")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                // Unit tests run from target/<profile>/deps; Bun is built beside it.
-                let executable = std::env::current_exe().unwrap();
-                executable.parent().unwrap().parent().unwrap().join("bun")
-            })
+        crate::testkit::bun_binary::bun_binary().unwrap_or_else(|error| panic!("{error}"))
     }
 
     fn preparation_spec(command: &str) -> OciSpec {

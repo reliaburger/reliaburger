@@ -147,6 +147,21 @@ class MakefilePrebuilds(unittest.TestCase):
         self.assertEqual(lines[0], "$(CARGO) test --no-run --features ebpf")
         self.assertIn("--features ebpf", lines[1].split("$(NEXTEST)", 1)[1])
 
+    def test_test_linux_names_bun_in_cargos_target_directory(self):
+        # target/ in the checkout doesn't exist under an out-of-tree
+        # CARGO_TARGET_DIR, and every runtime test then failed in 30 ms (#1859).
+        text = (ROOT / "Makefile").read_text()
+        self.assertIn("TARGET_DIR = $(or $(CARGO_TARGET_DIR),$(CURDIR)/target)", text.splitlines())
+        lines = workflow_assembly.recipe(text, "test-linux")
+        self.assertIn('RELIABURGER_BUN_BINARY="$(TARGET_DIR)/debug/bun"', lines[1])
+        self.assertFalse([line for line in text.splitlines() if "$(CURDIR)/target/" in line])
+
+    def test_no_script_names_a_binary_in_the_checkouts_target_directory(self):
+        # The demos run what they build, from cargo's target directory (#1859).
+        hardcoded = [str(path.relative_to(ROOT)) for path in sorted((ROOT / "scripts").rglob("*.sh"))
+                     if "REPO_DIR}/target/debug" in path.read_text()]
+        self.assertEqual(hardcoded, [])
+
     def test_the_identity_demo_builds_the_test_it_then_runs(self):
         script = (ROOT / "scripts" / "workload-identity-demo.sh").read_text()
         commands = [line.strip() for line in script.splitlines() if line.strip().startswith("cargo ")]
