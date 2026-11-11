@@ -31,6 +31,11 @@ pub(super) struct LaunchEvidence {
     pub(super) container_ip: Option<Ipv4Addr>,
     /// Which execution the runtime ran, for the discovery journal.
     pub(super) execution: LaunchExecution,
+    /// When this evidence was read, which happens once per launch. A
+    /// restart keeps its instance's `created_at`, so the adoption record's
+    /// write is keyed by this instead: one launch never collects another's
+    /// write (#1853).
+    pub(super) read_at: Option<std::time::Instant>,
 }
 
 impl LaunchEvidence {
@@ -48,6 +53,7 @@ impl LaunchEvidence {
             rootless_network: grill.rootless_network_record(id).await,
             container_ip: grill.container_ip(id).await,
             execution: LaunchExecution::read(grill, id).await,
+            read_at: Some(std::time::Instant::now()),
         }
     }
 }

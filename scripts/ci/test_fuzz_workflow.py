@@ -57,6 +57,21 @@ class FuzzWorkflowTests(unittest.TestCase):
             with self.subTest(verb=verb):
                 self.assertIn("--target $(FUZZ_TARGET)", rest)
 
+    def test_the_sanitizer_build_fits_a_hosted_runners_memory(self):
+        # cargo-fuzz's default of one codegen unit compiled reliaburger as a
+        # single sanitized LLVM module: one rustc peaked at 31 GB, and the
+        # 16 GB runner was reclaimed mid-build (#1839). `run` builds too, so
+        # it must ask for the same units, or it rebuilds with the default.
+        makefile = (REPO / "Makefile").read_text()
+        units = re.search(r"(?m)^FUZZ_CODEGEN_UNITS \?= (\d+)$", makefile)
+        self.assertIsNotNone(units, "the Makefile sets FUZZ_CODEGEN_UNITS")
+        self.assertGreater(int(units.group(1)), 1)
+        calls = re.findall(r"\$\(FUZZ\) (build|run)\b([^\n]*)", makefile)
+        self.assertEqual(sorted({verb for verb, _ in calls}), ["build", "run"])
+        for verb, rest in calls:
+            with self.subTest(verb=verb):
+                self.assertIn("--codegen-units $(FUZZ_CODEGEN_UNITS)", rest)
+
     def test_the_sanitizer_build_is_cached_and_the_job_has_headroom(self):
         # The uncached nightly is about 33 minutes of build, 45 of fuzzing
         # and 3 of set-up: the limit leaves at least half again on top.
