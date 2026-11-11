@@ -5867,6 +5867,79 @@ image = "busybox:latest"
         );
     }
 
+    /// A report that names no execution is taken as it stands: the leader
+    /// doesn't lend it the committed backend's. A restart keeps the node,
+    /// address, port and replica, so a lent execution would be the
+    /// predecessor's. Fencing the running generation then left that
+    /// backend in the catalogue and confirmed the release while consumers
+    /// still routed to its port. A backend with no execution is withdrawn
+    /// by the fence, and the release waits for every consumer (#1855).
+    #[test]
+    fn a_fence_of_the_running_generation_withdraws_a_backend_reported_without_one() {
+        use crate::onion::catalog::CatalogBackend;
+
+        let mut desired = crate::council::types::DesiredState::default();
+        desired.apps.insert(
+            crate::meat::types::AppId::new("web", "default"),
+            spec_from_toml("[app.web]\nimage = \"x:1\"\nport = 80\n"),
+        );
+        let execution = |generation: &str| -> crate::grill::RuntimeExecution {
+            serde_json::from_value(serde_json::json!({
+                "instance_id": "default__web-0", "generation": generation.repeat(64)
+            }))
+            .unwrap()
+        };
+        let (predecessor, running) = (execution("a"), execution("b"));
+        desired.endpoint_catalog =
+            build_endpoint_catalog(&[], &AggregatedState::default(), &desired).unwrap();
+        desired
+            .endpoint_catalog
+            .services
+            .get_mut("default__web")
+            .unwrap()
+            .backends = vec![CatalogBackend {
+            execution: Some(predecessor),
+            node_id: "a".into(),
+            node_ip: "127.0.0.1".parse().unwrap(),
+            host_port: 30001,
+            healthy: true,
+        }];
+        // The restarted replica's report names no execution yet.
+        let mut app = running_app("default", "web", 30001, true);
+        app.execution = None;
+        let mut report = report(4000, 0);
+        report.running_apps = vec![app];
+        let mut reports = AggregatedState::default();
+        reports.reports.insert(NodeId::new("a"), report);
+
+        let catalog = build_endpoint_catalog(&[member("a", 1)], &reports, &desired).unwrap();
+        let backends = &catalog.services["default__web"].backends;
+        assert_eq!(backends.len(), 1);
+        assert_eq!(
+            backends[0].execution, None,
+            "the predecessor's execution was lent to its replacement"
+        );
+
+        let retirements = desired
+            .producer_retirements
+            .plan_retirement("a", &running)
+            .unwrap();
+        let withdrawn = retirements.withdraw(&catalog);
+        assert!(withdrawn.services["default__web"].backends.is_empty());
+        let withdrawals = desired
+            .endpoint_withdrawals
+            .plan_publication(
+                &catalog,
+                &withdrawn,
+                &std::collections::BTreeSet::from(["b".to_string()]),
+            )
+            .unwrap();
+        assert!(
+            !retirements.release_confirmed("a", &running, &withdrawals),
+            "the release must wait for node b to drop the backend"
+        );
+    }
+
     #[test]
     fn build_endpoint_catalog_skips_portless_and_unknown_apps() {
         // A running app with no host port, and one with no desired spec, are
