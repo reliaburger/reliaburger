@@ -7756,7 +7756,13 @@ file call there that isn't awaited is a blocking one: `std::fs`,
 `File::open`, `OpenOptions::open`, `sync_all`, `set_len`, the raw `nix`
 calls, and a short list of the crate's own helpers that make them.
 "Isn't awaited" is what tells `std::fs::read` from `tokio::fs::read`,
-since the tokio one is a future. A call inside a closure handed to
+since the tokio one is a future. Names go through the file's `use` items
+first, so `use std::fs as disk;` doesn't hide `disk::read`, and the
+exemptions match whole resolved paths, so a local function that happens
+to be called `run` or `blocking` isn't one. Review caught one exemption
+that was backwards: `std::thread::scope` runs its closure on the calling
+thread and then blocks it until every thread it spawned has finished, so
+the rule counts a scope in async code as blocking. A call inside a closure handed to
 `spawn_blocking`, or to one of the crate's three wrappers around it,
 passes, and so does one tagged `// BLOCKING-OK: <why>`. The tags so far
 are on startup code that runs before any workload does, and on cgroupfs

@@ -23,9 +23,23 @@
 //! "Isn't awaited" is what tells `std::fs` from `tokio::fs`: the tokio calls
 //! are futures, so a call followed by `.await` is never blocking.
 //!
-//! A call passes inside a closure handed to `spawn_blocking`,
-//! `block_in_place` or a thread `spawn`, or when its statement (or the
-//! comment block above it) says `// BLOCKING-OK: <why>`.
+//! Names are resolved through the file's `use` items first, renames
+//! included, so `use std::fs as disk; disk::read(..)` is caught and
+//! `use tokio::fs::File; File::open(..)` isn't. A name no `use` explains
+//! (one from a glob import) is judged by its shape: `fs::read`,
+//! `File::open`.
+//!
+//! A call passes inside a closure handed to something that runs it off the
+//! runtime, named by its resolved path ([`OFF_RUNTIME_FUNCTIONS`]): tokio's
+//! `spawn_blocking` and `block_in_place`, std's thread `spawn`, and the
+//! crate's own wrappers around `spawn_blocking`. `std::thread::scope` is
+//! the opposite: its closure runs on the calling thread, which it blocks
+//! until every thread spawned in it has finished, so the call itself counts
+//! as blocking. A method passes on
+//! its name only where the name can't mean anything else
+//! ([`OFF_RUNTIME_METHODS`]), or on `self` in the one type that defines it
+//! ([`OFF_RUNTIME_SELF_METHODS`]). A call also passes when its statement (or
+//! the comment block above it) says `// BLOCKING-OK: <why>`.
 //!
 //! What it doesn't see: a call into a synchronous function that does the
 //! I/O itself, unless that function is listed in [`BLOCKING_HELPERS`];
@@ -58,19 +72,28 @@ const NIX_FILE_CALLS: &[&str] = &["lseek", "fallocate", "fsync", "fdatasync", "f
 /// Blocking methods on a `std::fs::File`.
 const BLOCKING_METHODS: &[&str] = &["sync_all", "sync_data", "set_len"];
 
-/// Calls whose closure argument runs off the async runtime: tokio's and
-/// std's, and the crate's own wrappers around `spawn_blocking`
-/// (`ProcessControl::run`, the executor pool's `blocking`, the Raft log's
-/// `run_blocking`).
-const OFF_RUNTIME_CALLS: &[&str] = &[
-    "spawn_blocking",
-    "block_in_place",
-    "spawn",
-    "scope",
-    "run",
-    "blocking",
-    "run_blocking",
+/// Functions whose closure argument runs off the async runtime, by their
+/// resolved paths: tokio's and std's, and the crate's own wrappers around
+/// `spawn_blocking`.
+const OFF_RUNTIME_FUNCTIONS: &[&str] = &[
+    "tokio::task::spawn_blocking",
+    "tokio::task::block_in_place",
+    "std::thread::spawn",
+    "crate::bun::reusable_executor::pool::blocking",
+    "crate::council::durable_log::run_blocking",
 ];
+
+/// Methods whose closure argument runs off the runtime on whatever
+/// receiver: no type here gives these names to anything else. The crate's
+/// `SyncClaim::spawn_blocking` is one, called on a claim, not on `self`.
+const OFF_RUNTIME_METHODS: &[&str] = &["spawn_blocking", "block_in_place"];
+
+/// Methods that run their closure off the runtime only as the named type's
+/// own private wrapper, called on `self`: `(type, method)`.
+const OFF_RUNTIME_SELF_METHODS: &[(&str, &str)] = &[("ProcessControl", "run")];
+
+/// Path roots a `use` doesn't need to explain.
+const KNOWN_ROOTS: &[&str] = &["std", "core", "alloc", "crate", "tokio", "nix"];
 
 /// Where the sites the rule found when it arrived are listed.
 const BASELINE: &str = "src/blocking_rule_baseline.json";
@@ -112,13 +135,6 @@ fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
     })
 }
 
-fn last_segment(path: &syn::Path) -> String {
-    path.segments
-        .last()
-        .map(|segment| segment.ident.to_string())
-        .unwrap_or_default()
-}
-
 fn path_text(path: &syn::Path) -> String {
     path.segments
         .iter()
@@ -127,48 +143,102 @@ fn path_text(path: &syn::Path) -> String {
         .join("::")
 }
 
-/// What a call names, if it is a blocking file call.
-fn blocking_path_call(function: &syn::Path) -> Option<String> {
-    let segments: Vec<String> = function
-        .segments
-        .iter()
-        .map(|segment| segment.ident.to_string())
-        .collect();
-    if segments.first().is_some_and(|first| first == "tokio") {
-        return None;
-    }
-    let last = segments.last()?.as_str();
-    let text = path_text(function);
-    let in_fs = segments.len() >= 2 && segments[segments.len() - 2] == "fs";
-    let file_open = segments.len() >= 2
-        && segments[segments.len() - 2] == "File"
-        && matches!(last, "open" | "create");
-    let nix_call = NIX_FILE_CALLS.contains(&last)
-        && (segments.len() == 1 || segments.iter().any(|segment| segment == "nix"));
-    let helper = BLOCKING_HELPERS.contains(&last);
-    (in_fs || file_open || nix_call || helper).then_some(text)
+/// The module a source file is, as a path from the crate root:
+/// `src/grill/capture.rs` is `crate::grill::capture`.
+fn module_of(path: &str) -> Vec<String> {
+    let relative = path.strip_prefix("src/").unwrap_or(path);
+    let relative = relative.strip_suffix(".rs").unwrap_or(relative);
+    let mut module = vec!["crate".to_string()];
+    module.extend(
+        relative
+            .split('/')
+            .filter(|part| !matches!(*part, "lib" | "mod" | "main"))
+            .map(str::to_string),
+    );
+    module
 }
 
-/// Whether a method chain starts at `OpenOptions::new()`.
-fn starts_at_open_options(expr: &syn::Expr) -> bool {
-    match expr {
-        syn::Expr::MethodCall(call) => starts_at_open_options(&call.receiver),
-        syn::Expr::Call(call) => match call.func.as_ref() {
-            syn::Expr::Path(function) => {
-                let text = path_text(&function.path);
-                text.ends_with("OpenOptions::new") && !text.starts_with("tokio")
+/// The names a file's non-test `use` items bring into scope, each with the
+/// path it stands for. `use std::fs::{self as disk, File};` gives
+/// `disk -> std::fs` and `File -> std::fs::File`. Globs bring no names.
+fn use_aliases(file: &syn::File) -> std::collections::HashMap<String, Vec<String>> {
+    fn walk(
+        tree: &syn::UseTree,
+        prefix: &mut Vec<String>,
+        aliases: &mut std::collections::HashMap<String, Vec<String>>,
+    ) {
+        match tree {
+            syn::UseTree::Path(path) => {
+                prefix.push(path.ident.to_string());
+                walk(&path.tree, prefix, aliases);
+                prefix.pop();
             }
-            _ => false,
-        },
-        syn::Expr::Paren(inner) => starts_at_open_options(&inner.expr),
-        _ => false,
+            syn::UseTree::Name(name) if name.ident == "self" => {
+                if let Some(last) = prefix.last() {
+                    aliases.insert(last.clone(), prefix.clone());
+                }
+            }
+            syn::UseTree::Name(name) => {
+                let mut full = prefix.clone();
+                full.push(name.ident.to_string());
+                aliases.insert(name.ident.to_string(), full);
+            }
+            syn::UseTree::Rename(rename) => {
+                let mut full = prefix.clone();
+                if rename.ident != "self" {
+                    full.push(rename.ident.to_string());
+                }
+                aliases.insert(rename.rename.to_string(), full);
+            }
+            syn::UseTree::Glob(_) => {}
+            syn::UseTree::Group(group) => {
+                for item in &group.items {
+                    walk(item, prefix, aliases);
+                }
+            }
+        }
     }
+    struct Uses(std::collections::HashMap<String, Vec<String>>);
+    impl<'ast> Visit<'ast> for Uses {
+        fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+            if !is_cfg_test(&item.attrs) {
+                walk(&item.tree, &mut Vec::new(), &mut self.0);
+            }
+        }
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if !is_cfg_test(&item.attrs) {
+                syn::visit::visit_item_mod(self, item);
+            }
+        }
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            if !is_cfg_test(&item.attrs) {
+                syn::visit::visit_item_fn(self, item);
+            }
+        }
+    }
+    let mut uses = Uses(std::collections::HashMap::new());
+    uses.visit_file(file);
+    uses.0
+}
+
+/// A path as the file's `use` items resolve it.
+struct Resolved {
+    segments: Vec<String>,
+    /// No `use` explains its first segment, and it isn't a known root: a
+    /// glob import's name, or a local item's.
+    unexplained: bool,
 }
 
 /// Walks one file, collecting blocking calls in async code.
 struct FileVisitor<'a> {
     path: &'a str,
     lines: &'a [String],
+    /// What the file's `use` items bring into scope.
+    aliases: std::collections::HashMap<String, Vec<String>>,
+    /// The module this file is.
+    module: Vec<String>,
+    /// The enclosing `impl` blocks' types, innermost last.
+    impls: Vec<String>,
     /// The enclosing functions, innermost last.
     functions: Vec<String>,
     /// Whether the code being visited runs on the async runtime.
@@ -181,6 +251,142 @@ struct FileVisitor<'a> {
 }
 
 impl FileVisitor<'_> {
+    /// `path` with its first segment expanded through the file's `use`
+    /// items, and `self` and `super` made absolute.
+    fn resolve(&self, path: &syn::Path) -> Resolved {
+        let mut segments: Vec<String> = path
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect();
+        let first = segments.first().cloned().unwrap_or_default();
+        let mut unexplained = false;
+        if path.leading_colon.is_none()
+            && let Some(full) = self.aliases.get(&first)
+        {
+            segments.splice(0..1, full.iter().cloned());
+        } else if !KNOWN_ROOTS.contains(&first.as_str()) && first != "self" && first != "super" {
+            unexplained = true;
+        }
+        if segments.first().is_some_and(|first| first == "self") {
+            segments.splice(0..1, self.module.iter().cloned());
+        }
+        let mut module = self.module.clone();
+        let mut up = false;
+        while segments.first().is_some_and(|first| first == "super") {
+            segments.remove(0);
+            module.pop();
+            up = true;
+        }
+        if up {
+            segments.splice(0..0, module);
+        }
+        // A bare name no `use` explains is the module's own item.
+        if unexplained && segments.len() == 1 {
+            segments.splice(0..0, self.module.iter().cloned());
+        }
+        Resolved {
+            segments,
+            unexplained,
+        }
+    }
+
+    /// Whether a call of `function` is a blocking file call.
+    fn blocking_path(&self, function: &syn::Path) -> bool {
+        let resolved = self.resolve(function);
+        let segments = &resolved.segments;
+        let Some(last) = segments.last().map(String::as_str) else {
+            return false;
+        };
+        if segments.first().is_some_and(|first| first == "tokio") {
+            return false;
+        }
+        let joined = segments.join("::");
+        // `OpenOptions::new`, `DirBuilder::new` and `Permissions::from_mode`
+        // only build values; the call that uses them does the I/O.
+        let constructor = matches!(last, "new" | "from_mode");
+        if (joined.starts_with("std::fs::") || joined.starts_with("std::os::unix::fs::"))
+            && !constructor
+        {
+            return true;
+        }
+        if joined == "std::thread::scope" {
+            return true;
+        }
+        if NIX_FILE_CALLS.contains(&last)
+            && (segments.iter().any(|segment| segment == "nix")
+                || (resolved.unexplained && function.segments.len() == 1))
+        {
+            return true;
+        }
+        if BLOCKING_HELPERS.contains(&last) {
+            return true;
+        }
+        // A name no `use` explains: judge it by its shape.
+        let second_last = segments
+            .len()
+            .checked_sub(2)
+            .map(|index| segments[index].as_str());
+        resolved.unexplained
+            && function.segments.len() >= 2
+            && (second_last == Some("fs")
+                || (second_last == Some("File") && matches!(last, "open" | "create")))
+    }
+
+    /// Whether `function` runs a closure argument off the runtime.
+    fn off_runtime_function(&self, function: &syn::Path) -> bool {
+        let joined = self.resolve(function).segments.join("::");
+        OFF_RUNTIME_FUNCTIONS.contains(&joined.as_str())
+    }
+
+    /// Whether a method chain starts at a `std::fs::OpenOptions::new()`.
+    fn starts_at_open_options(&self, expr: &syn::Expr) -> bool {
+        match expr {
+            syn::Expr::MethodCall(call) => self.starts_at_open_options(&call.receiver),
+            syn::Expr::Call(call) => match call.func.as_ref() {
+                syn::Expr::Path(function) => {
+                    let resolved = self.resolve(&function.path);
+                    let joined = resolved.segments.join("::");
+                    joined == "std::fs::OpenOptions::new"
+                        || (resolved.unexplained && joined.ends_with("OpenOptions::new"))
+                }
+                _ => false,
+            },
+            syn::Expr::Paren(inner) => self.starts_at_open_options(&inner.expr),
+            _ => false,
+        }
+    }
+
+    /// Whether a method chain starts at `std::thread::Builder::new()`.
+    fn starts_at_thread_builder(&self, expr: &syn::Expr) -> bool {
+        match expr {
+            syn::Expr::MethodCall(call) => self.starts_at_thread_builder(&call.receiver),
+            syn::Expr::Call(call) => match call.func.as_ref() {
+                syn::Expr::Path(function) => {
+                    self.resolve(&function.path).segments.join("::") == "std::thread::Builder::new"
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// Whether a method call runs its closure argument off the runtime.
+    fn off_runtime_method(&self, call: &syn::ExprMethodCall) -> bool {
+        let method = call.method.to_string();
+        if OFF_RUNTIME_METHODS.contains(&method.as_str()) {
+            return true;
+        }
+        if method == "spawn" && self.starts_at_thread_builder(&call.receiver) {
+            return true;
+        }
+        let on_self = matches!(call.receiver.as_ref(), syn::Expr::Path(receiver) if receiver.path.is_ident("self"));
+        on_self
+            && self.impls.last().is_some_and(|ty| {
+                OFF_RUNTIME_SELF_METHODS.contains(&(ty.as_str(), method.as_str()))
+            })
+    }
+
     fn tagged(&self, start: usize, end: usize) -> bool {
         let justified = |line: &str| {
             line.split_once(TAG)
@@ -305,7 +511,18 @@ impl<'ast> Visit<'ast> for FileVisitor<'_> {
         if is_cfg_test(&item.attrs) {
             return;
         }
+        let ty = match item.self_ty.as_ref() {
+            syn::Type::Path(path) => path
+                .path
+                .segments
+                .last()
+                .map(|segment| segment.ident.to_string())
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        self.impls.push(ty);
         syn::visit::visit_item_impl(self, item);
+        self.impls.pop();
     }
 
     fn visit_stmt(&mut self, stmt: &'ast syn::Stmt) {
@@ -372,10 +589,10 @@ impl<'ast> Visit<'ast> for FileVisitor<'_> {
         let awaited = self.awaited.take();
         let mut off_runtime = false;
         if let syn::Expr::Path(function) = call.func.as_ref() {
-            off_runtime = OFF_RUNTIME_CALLS.contains(&last_segment(&function.path).as_str());
-            if let Some(name) = blocking_path_call(&function.path) {
+            off_runtime = self.off_runtime_function(&function.path);
+            if self.blocking_path(&function.path) {
                 self.awaited = awaited;
-                self.record(name, call.span());
+                self.record(path_text(&function.path), call.span());
                 self.awaited = None;
             }
         }
@@ -387,14 +604,14 @@ impl<'ast> Visit<'ast> for FileVisitor<'_> {
         let awaited = self.awaited.take();
         let method = call.method.to_string();
         let blocking = BLOCKING_METHODS.contains(&method.as_str())
-            || (method == "open" && starts_at_open_options(&call.receiver));
+            || (method == "open" && self.starts_at_open_options(&call.receiver));
         if blocking {
             self.awaited = awaited;
             self.record(format!(".{method}()"), call.span());
             self.awaited = None;
         }
         self.visit_expr(&call.receiver);
-        let off_runtime = OFF_RUNTIME_CALLS.contains(&method.as_str());
+        let off_runtime = self.off_runtime_method(call);
         self.visit_args_off_runtime(call.args.iter(), off_runtime);
     }
 
@@ -409,6 +626,9 @@ fn sites_in(path: &str, text: &str) -> Vec<(Site, usize)> {
     let mut visitor = FileVisitor {
         path,
         lines: &lines,
+        aliases: use_aliases(&file),
+        module: module_of(path),
+        impls: Vec::new(),
         functions: Vec::new(),
         in_async: false,
         statements: Vec::new(),
@@ -535,6 +755,22 @@ fn no_new_blocking_file_call_runs_directly_in_async_code() {
     );
 }
 
+/// `(function, call)` for each site the rule finds in `source`, read as
+/// the file at `path`.
+fn found_in(path: &str, source: &str) -> Vec<(String, String)> {
+    sites_in(path, source)
+        .into_iter()
+        .map(|(site, _)| (site.function, site.call))
+        .collect()
+}
+
+fn pairs(expected: &[(&str, &str)]) -> Vec<(String, String)> {
+    expected
+        .iter()
+        .map(|(function, call)| (function.to_string(), call.to_string()))
+        .collect()
+}
+
 #[test]
 fn the_rule_flags_unawaited_file_calls_in_async_code_only() {
     let source = r#"
@@ -571,29 +807,92 @@ fn the_rule_flags_unawaited_file_calls_in_async_code_only() {
             async fn ignored() { std::fs::read("x"); }
         }
     "#;
-    let found: Vec<(usize, String, String)> = sites_in("x.rs", source)
-        .into_iter()
-        .map(|(site, line)| (line, site.function, site.call))
-        .collect();
-    let expected: Vec<(usize, &str, &str)> = vec![
-        (3, "reads", "std::fs::read"),
-        (6, "reads", "File::open"),
-        (7, "reads", ".open()"),
-        (8, "reads", ".sync_all()"),
-        (10, "reads", "data_start"),
-        (11, "reads", "nix::unistd::lseek"),
-        // A tag with no reason doesn't count.
-        (16, "reads", "std::fs::metadata"),
-        // An iterator's closure runs inline.
-        (17, "reads", "std::fs::read"),
-        (19, "reads", "std::fs::write"),
-        (27, "Store::method", "read_retained"),
-    ]
-    .into_iter()
-    .collect();
-    let expected: Vec<(usize, String, String)> = expected
-        .into_iter()
-        .map(|(line, function, call)| (line, function.replace("Store::", ""), call.to_string()))
-        .collect();
-    assert_eq!(found, expected);
+    assert_eq!(
+        found_in("src/x.rs", source),
+        pairs(&[
+            ("reads", "std::fs::read"),
+            ("reads", "File::open"),
+            ("reads", ".open()"),
+            ("reads", ".sync_all()"),
+            ("reads", "data_start"),
+            ("reads", "nix::unistd::lseek"),
+            // A tag with no reason doesn't count.
+            ("reads", "std::fs::metadata"),
+            // An iterator's closure runs inline.
+            ("reads", "std::fs::read"),
+            ("reads", "std::fs::write"),
+            ("method", "read_retained"),
+        ])
+    );
+}
+
+/// Each way a blocking call used to slip past the rule, by renaming what
+/// it calls or by borrowing an exempt name.
+#[test]
+fn the_rule_sees_through_use_aliases_and_borrowed_names() {
+    let source = r#"
+        use std::fs as filesystem;
+        use std::fs::read as slurp;
+        use std::fs::{self as disk, File as Handle, OpenOptions as Options};
+        use tokio::fs::File as AsyncFile;
+        use tokio::task::spawn_blocking as offload;
+        use nix::unistd::lseek as seek;
+        use std::thread;
+        async fn dodges(path: &Path) {
+            filesystem::read(path);
+            slurp(path);
+            disk::write(path, b"x");
+            Handle::open(path);
+            Options::new().read(true).open(path);
+            seek(&file, 0, Whence::SeekData);
+            AsyncFile::open(path);
+            offload(move || std::fs::read(path)).await;
+            thread::spawn(move || std::fs::read(path));
+            thread::Builder::new().spawn(move || std::fs::read(path));
+            thread::scope(|s| { s.spawn(|| std::fs::read(path)); });
+            claim.spawn_blocking(move || std::fs::read(path)).await;
+            scope(|| std::fs::read(path));
+            run(|| std::fs::read(path));
+            blocking(|| std::fs::read(path)).await;
+            self.run(|| std::fs::read(path)).await;
+            other.run(|| std::fs::read(path)).await;
+        }
+        impl ProcessControl {
+            async fn forget(&self) {
+                self.run(|| std::fs::read(path)).await;
+            }
+        }
+    "#;
+    assert_eq!(
+        found_in("src/x.rs", source),
+        pairs(&[
+            ("dodges", "filesystem::read"),
+            ("dodges", "slurp"),
+            ("dodges", "disk::write"),
+            ("dodges", "Handle::open"),
+            ("dodges", ".open()"),
+            ("dodges", "seek"),
+            // A scope blocks its caller until its threads finish, and its
+            // closure runs on the caller.
+            ("dodges", "thread::scope"),
+            ("dodges", "std::fs::read"),
+            // A local function named like an exemption is no exemption.
+            ("dodges", "std::fs::read"),
+            ("dodges", "std::fs::read"),
+            ("dodges", "std::fs::read"),
+            // `run` is exempt only as ProcessControl's own, on `self`.
+            ("dodges", "std::fs::read"),
+            ("dodges", "std::fs::read"),
+        ])
+    );
+
+    // The executor pool's own `blocking` is a real wrapper, there and
+    // wherever it is imported.
+    let pool = "async fn start(path: &Path) { blocking(move || std::fs::read(path)).await; }";
+    assert!(found_in("src/bun/reusable_executor/pool.rs", pool).is_empty());
+    let importer = "use crate::bun::reusable_executor::pool::blocking;\n\
+                    async fn go(path: &Path) { blocking(move || std::fs::read(path)).await; }";
+    assert!(found_in("src/bun/other.rs", importer).is_empty());
+    let parent = "async fn go(path: &Path) { super::blocking(move || std::fs::read(path)).await; }";
+    assert!(found_in("src/bun/reusable_executor/pool/child.rs", parent).is_empty());
 }

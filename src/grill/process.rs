@@ -504,6 +504,10 @@ pub struct ProcessGrill {
     /// reply within its timeout fails.
     #[cfg(test)]
     state_failures: Arc<std::sync::atomic::AtomicUsize>,
+    /// How long opening a start's log files stalls, standing in for a slow
+    /// disk (#1857).
+    #[cfg(test)]
+    log_open_stall: Option<std::time::Duration>,
 }
 
 impl ProcessGrill {
@@ -519,6 +523,8 @@ impl ProcessGrill {
             file_eof_gate: None,
             #[cfg(test)]
             state_failures: Arc::default(),
+            #[cfg(test)]
+            log_open_stall: None,
         }
     }
 
@@ -535,6 +541,8 @@ impl ProcessGrill {
             file_eof_gate: None,
             #[cfg(test)]
             state_failures: Arc::default(),
+            #[cfg(test)]
+            log_open_stall: None,
         }
     }
 
@@ -552,6 +560,8 @@ impl ProcessGrill {
             file_eof_gate: None,
             #[cfg(test)]
             state_failures: Arc::default(),
+            #[cfg(test)]
+            log_open_stall: None,
         }
     }
 
@@ -785,6 +795,37 @@ impl super::Grill for ProcessGrill {
                     })?;
             return gate_result(instance, &record);
         }
+        // The log files are opened before the process table is locked: the
+        // calls block in the kernel, so they run on a blocking worker, and a
+        // slow disk must not hold every other instance's calls behind the
+        // lock meanwhile (#1857). The paths depend only on the log directory
+        // and the instance, and a start that then fails leaves at most two
+        // empty files that a later start appends to.
+        let log_stem = self.log_dir.as_ref().map(|dir| dir.join(&instance.0));
+        let log_files = match &log_stem {
+            Some(stem) => {
+                let stem = stem.clone();
+                #[cfg(test)]
+                let stall = self.log_open_stall;
+                let opened = tokio::task::spawn_blocking(move || {
+                    #[cfg(test)]
+                    if let Some(stall) = stall {
+                        std::thread::sleep(stall);
+                    }
+                    open_log_files(&stem)
+                })
+                .await
+                .map_err(|error| GrillError::StartFailed {
+                    instance: instance.clone(),
+                    reason: format!("failed to open the log files: {error}"),
+                })?;
+                Some(opened.map_err(|reason| GrillError::StartFailed {
+                    instance: instance.clone(),
+                    reason,
+                })?)
+            }
+            None => None,
+        };
         let mut procs = self.processes.lock().await;
         let entry = procs
             .get_mut(instance)
@@ -824,21 +865,7 @@ impl super::Grill for ProcessGrill {
 
         // File-backed mode: append to log files that outlive this process
         // (they must survive a self-upgrade exec). In-memory mode: pipes.
-        let log_stem = self.log_dir.as_ref().map(|dir| dir.join(&instance.0));
-        if let Some(stem) = &log_stem {
-            // File calls block in the kernel, so they run on a blocking
-            // worker, not the runtime's (#1857).
-            let stem = stem.clone();
-            let opened = tokio::task::spawn_blocking(move || open_log_files(&stem))
-                .await
-                .map_err(|error| GrillError::StartFailed {
-                    instance: instance.clone(),
-                    reason: format!("failed to open the log files: {error}"),
-                })?;
-            let (stdout_file, stderr_file) = opened.map_err(|reason| GrillError::StartFailed {
-                instance: instance.clone(),
-                reason,
-            })?;
+        if let Some((stdout_file, stderr_file)) = log_files {
             cmd.stdout(std::process::Stdio::from(stdout_file));
             cmd.stderr(std::process::Stdio::from(stderr_file));
         } else {
@@ -2003,6 +2030,36 @@ mod tests {
     }
 
     // ---- file-backed capture and adoption ----
+
+    /// A start opens its log files on a blocking worker, and must do it
+    /// before it takes the process table's lock: holding the lock across a
+    /// slow open would stall every other call on the runtime (#1857).
+    #[tokio::test]
+    async fn a_slow_log_open_does_not_hold_up_other_instances() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut grill = ProcessGrill::with_log_dir(dir.path().to_path_buf());
+        let stall = std::time::Duration::from_millis(800);
+        grill.log_open_stall = Some(stall);
+        let slow = InstanceId("slow-0".to_string());
+        let other = InstanceId("other-0".to_string());
+        grill.create(&slow, &echo_spec("slow")).await.unwrap();
+        grill.create(&other, &echo_spec("other")).await.unwrap();
+
+        let starting = tokio::spawn({
+            let grill = grill.clone();
+            let slow = slow.clone();
+            async move { grill.start(&slow).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let started = std::time::Instant::now();
+        let state = tokio::time::timeout(stall / 2, grill.state(&other))
+            .await
+            .expect("another instance's state waited for a slow log open");
+        assert!(state.is_ok(), "{state:?}");
+        assert!(started.elapsed() < stall / 2);
+        starting.await.unwrap().unwrap();
+        grill.kill(&slow).await.unwrap();
+    }
 
     #[tokio::test]
     async fn file_backed_mode_writes_logs_to_files() {
