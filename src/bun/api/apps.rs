@@ -289,7 +289,7 @@ pub(super) async fn cluster_app_change(
     // writes), so forward the whole request to the leader's API, as the
     // caller: the leader checks the owner below against its own desired
     // state, which a follower's replica can lag (#1442).
-    if !council.is_leader().await {
+    if !crate::bun::leadership::leads(&council).await {
         let leader_url = match leader_api_url(&state, &council, caller_headers).await {
             Ok(url) => url,
             Err(refusal) => return refusal.into_response(),
