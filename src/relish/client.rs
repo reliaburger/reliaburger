@@ -489,9 +489,10 @@ static CLI_ENDPOINT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::
 /// the context's own token. A `std` lock, not a tokio one, because
 /// [`resolve_token`] is synchronous and holds it only to clone the string,
 /// never across an `.await`.
-// One per process, like the CLI_* statics above, so the `relish::mcp`
-// tests that set it rely on nextest running each test in its own process.
-// Under plain `cargo test` they share it across threads and fail.
+// One per process, like the CLI_* statics above, so each `relish::mcp`
+// test that sets it needs a process of its own. nextest gives every test
+// one; under plain `cargo test` those tests re-run themselves in a child
+// (`ran_in_its_own_process`, #1876).
 static MCP_TOKEN: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
 
 /// Send `token` in place of the managed context's admin token from now on,

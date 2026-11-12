@@ -189,6 +189,66 @@ def answer_reports(scenario, answer):
     return [{"dir": "answer", "files": {"report.md": text}, "manifest": None}]
 
 
+# What marks a `relish agent patch init` workspace, relative to its root.
+PATCH_STATE = Path(".reliaburger-patch") / "state.json"
+
+# How long one `relish agent patch destroy` may take: it stops and deletes a
+# Lima VM on macOS.
+DESTROY_TIMEOUT = 300
+
+
+def patch_workspaces(solver_dir, calls):
+    """Every patch workspace a solver made: each under its directory, two
+    levels down at most, and each a `patch try` call named, wherever it is.
+
+    A relative name is read against the solver's directory, where it starts.
+    """
+    solver_dir = Path(solver_dir)
+    found = set()
+    for candidate in [solver_dir, *solver_dir.glob("*"), *solver_dir.glob("*/*")]:
+        if (candidate / PATCH_STATE).is_file():
+            found.add(candidate)
+    for call in calls:
+        argv = call.get("argv", [])
+        if argv[1:4] != ["agent", "patch", "try"]:
+            continue
+        named = next((arg for arg in argv[4:] if not arg.startswith("-")), None)
+        if named is None:
+            continue
+        workspace = Path(os.path.normpath(solver_dir / named))
+        if (workspace / PATCH_STATE).is_file():
+            found.add(workspace)
+    return sorted(found)
+
+
+def destroy_throwaway_clusters(solver_dir, call_log, relish):
+    """Destroy the throwaway cluster of every patch workspace the solver made.
+
+    `patch try` keeps its cluster until `patch destroy` by design, so a run
+    that ends, however it ends, would leave a VM running (#1847). Each
+    workspace by name, not `--all`, which would take every throwaway cluster
+    under `~/.reliaburger-patch`, other work's too. Returns what each did.
+    """
+    destroyed = []
+    for workspace in patch_workspaces(solver_dir, shim.read_log(call_log)):
+        try:
+            done = subprocess.run(
+                [str(relish), "agent", "patch", "destroy", str(workspace)],
+                capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                timeout=DESTROY_TIMEOUT, check=False,
+            )
+            outcome = {"workspace": str(workspace), "exit": done.returncode}
+            if done.returncode != 0:
+                outcome["stderr"] = done.stderr[-2000:]
+        except (OSError, subprocess.TimeoutExpired) as error:
+            outcome = {"workspace": str(workspace), "exit": None, "error": str(error)}
+        if outcome["exit"] != 0:
+            print(f"gym: couldn't destroy {workspace}'s throwaway cluster: "
+                  f"{outcome.get('stderr') or outcome.get('error')}", file=sys.stderr)
+        destroyed.append(outcome)
+    return destroyed
+
+
 def run_once(scenario, run_dir, make_cluster, solver, relish, planted=None, timeout=DEFAULT_TIMEOUT,
              sleep=time.sleep, tools=None):
     """One run of one scenario; returns the run's result and writes its files.
@@ -203,6 +263,8 @@ def run_once(scenario, run_dir, make_cluster, solver, relish, planted=None, time
     result = {"scenario": scenario.id, "platform": scenario.platform, "run": run_dir.name,
               "started": started}
     cluster = make_cluster(scenario.nodes, run_dir / "cluster")
+    solver_dir = run_dir / "solver"
+    solver_relish = relish
     try:
         cluster.start()
         # The person is admin; the other agent gets its own agent token.
@@ -212,7 +274,6 @@ def run_once(scenario, run_dir, make_cluster, solver, relish, planted=None, time
         run_setup(scenario, cluster, sleep, tokens)
         truth = resolve_truth(scenario.truth, cluster.facts(scenario.facts_needed()))
         result["truth"] = truth
-        solver_relish = relish
         if scenario.plant is not None:
             builder, solver_relish = planted
             control = symptom_control(cluster, scenario.plant, solver_relish)
@@ -228,7 +289,6 @@ def run_once(scenario, run_dir, make_cluster, solver, relish, planted=None, time
         else:
             token = cluster.create_token(token_name)
         tokens["solver-token"] = token
-        solver_dir = run_dir / "solver"
         solver_dir.mkdir(exist_ok=True)
         if scenario.release:
             result["release"] = cluster.write_release(solver_dir / "release", scenario.release)
@@ -298,7 +358,14 @@ def run_once(scenario, run_dir, make_cluster, solver, relish, planted=None, time
     except (cluster_module.ClusterError, plant_module.PlantError, subprocess.TimeoutExpired) as error:
         result["error"] = str(error)
     finally:
-        cluster.stop()
+        # Before the cluster stops, and on an interrupt too: a session's
+        # throwaway cluster is a VM that would otherwise run on (#1847).
+        try:
+            teardown = destroy_throwaway_clusters(solver_dir, run_dir / "calls.jsonl", solver_relish)
+            if teardown:
+                result["teardown"] = teardown
+        finally:
+            cluster.stop()
     result["wall_seconds"] = round(time.time() - started, 1)
     (run_dir / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     return result

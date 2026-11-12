@@ -26,7 +26,26 @@ const SHOWN_FAILURES: usize = 10;
 pub const NOT_RUN: &str = "only the portable suite ran: unit tests, tests/suite, every other \
      test that isn't #[ignore], and the doctests, as make test-cargo runs them. The gated \
      suites (make test-cluster, test-linux, test-slow, test-upgrade and the rest) are \
-     marked ignore, so they didn't run";
+     marked ignore, so they didn't run. Nor did the repository checks in tests/suite \
+     (agent_docs, doc_snippets, documented_manifests, issue_forms, toolchain_pins, website, \
+     website_markdown and one cloud_init test): they check the website, the workflows and \
+     the issue forms, which the source bundle doesn't carry";
+
+/// The tests `patch test` skips, as libtest `--skip` patterns: the
+/// repository checks in `tests/suite`. They read the website, the GitHub
+/// workflows and issue forms, the READMEs and the devcontainer, none of which
+/// the source bundle carries, so in a workspace they could only fail
+/// (#1876). [`NOT_RUN`] names them.
+pub const REPOSITORY_CHECKS: &[&str] = &[
+    "agent_docs::",
+    "cloud_init::the_install_line_uses_a_flag_the_installer_has",
+    "doc_snippets::",
+    "documented_manifests::",
+    "issue_forms::",
+    "toolchain_pins::",
+    "website::",
+    "website_markdown::",
+];
 
 /// Which suite ran. One variant, so the schema says exactly which.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
@@ -56,8 +75,9 @@ pub struct TestData {
     pub not_run: String,
     /// The filter, or `null` for the whole suite.
     pub filter: Option<String>,
-    /// Whether it compiled and every test that ran passed. `false` is still
-    /// an answer: `failures` or `errors` says why.
+    /// Whether it compiled and every test that ran passed: the verdict, since
+    /// the exit code is 0 either way. `false` is still an answer: `failures`
+    /// or `errors` says why.
     pub ok: bool,
     /// Tests that passed.
     pub passed: u64,
@@ -100,10 +120,20 @@ pub(super) async fn test(
     check_build_changes(dir, &state, &tree, allow_build_changes)?;
     check_disk(dir, tools.free_disk_needed)?;
 
-    let mut args = vec!["test", "--locked", "--message-format=json"];
-    // After `--`, so cargo hands it to the test binaries as their filter.
-    if let Some(filter) = filter {
-        args.extend(["--", filter]);
+    // `--no-fail-fast`: without it cargo stops at the first test binary
+    // with a failure, and every binary after it goes uncounted (#1876).
+    let mut args = vec![
+        "test",
+        "--locked",
+        "--no-fail-fast",
+        "--message-format=json",
+    ];
+    // After `--`, so cargo hands them to the test binaries: the filter, then
+    // the repository checks to skip.
+    args.push("--");
+    args.extend(filter);
+    for check in REPOSITORY_CHECKS {
+        args.extend(["--skip", check]);
     }
     let run = run_cargo(tools, dir, &args, TEST_DEADLINE).await?;
     let messages = parse_messages(&run.stdout);
@@ -234,10 +264,45 @@ echo 'test result: ok. 1 passed; 0 failed; 3 ignored; 0 measured; 9 filtered out
         let args = std::fs::read_to_string(dir.join(".reliaburger-patch/args")).unwrap();
         assert!(args.starts_with("test --manifest-path "), "{args}");
         assert!(
-            args.ends_with(" --locked --message-format=json -- a_timeout\n"),
+            args.contains(" --locked --no-fail-fast --message-format=json -- a_timeout --skip "),
             "{args}"
         );
         insta::assert_json_snapshot!(normalised(&rendered(result), fixture.root.path()));
+    }
+
+    #[tokio::test]
+    async fn a_whole_suite_run_keeps_going_past_a_failure_and_skips_the_repository_checks() {
+        let fixture = Fixture::new(CARGO_PASSES);
+        let dir = fixture.dir();
+        test(&fixture.tools, &dir, None, false).await.unwrap();
+        let args = std::fs::read_to_string(dir.join(".reliaburger-patch/args")).unwrap();
+        let skips: String = REPOSITORY_CHECKS
+            .iter()
+            .map(|check| format!(" --skip {check}"))
+            .collect();
+        assert!(
+            args.ends_with(&format!(
+                " --locked --no-fail-fast --message-format=json --{skips}\n"
+            )),
+            "{args}"
+        );
+    }
+
+    /// A skip pattern for a module that was renamed would skip nothing, and
+    /// `not_run` would name a check that ran.
+    #[test]
+    fn every_repository_check_is_a_suite_module_that_not_run_names() {
+        let suite = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/suite");
+        let main = std::fs::read_to_string(suite.join("main.rs")).unwrap();
+        for check in REPOSITORY_CHECKS {
+            let (module, test) = check.split_once("::").unwrap();
+            assert!(main.contains(&format!("\nmod {module};")), "{check}");
+            assert!(NOT_RUN.contains(module), "not_run leaves out {module}");
+            if !test.is_empty() {
+                let code = std::fs::read_to_string(suite.join(format!("{module}.rs"))).unwrap();
+                assert!(code.contains(&format!("fn {test}()")), "{check}");
+            }
+        }
     }
 
     #[tokio::test]

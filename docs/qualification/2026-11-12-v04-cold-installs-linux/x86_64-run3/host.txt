@@ -1,0 +1,6 @@
+kernel: Linux 7.0.0-1017-azure x86_64
+os: Ubuntu 24.04.5 LTS
+cpu: AuthenticAMD, AMD EPYC 9V45 96-Core Processor
+cores: 4
+memory_gib: 15
+disk_free: 86G

@@ -38,6 +38,21 @@ pub const ALLOWLIST: &[&str] = &[
     // The test set.
     "tests",
     "proptest-regressions",
+    // `src/fuzz/tests.rs` runs every target over its checked-in corpus.
+    "fuzz",
+    // Files the portable tests read at run time: the job bench's baseline
+    // report, the concept budget, and the released CLI the manual's
+    // command reference is checked against.
+    "docs/qualification/2026-10-09-timed-job-scenarios/five-round-rerun/review-fixes/r1-jobs-shared-containers.json",
+    "docs/testing/concept-budget.json",
+    "scripts/release/released-cli.tsv",
+    // `tests/suite/dependency_audit.rs` reads the audit's exceptions;
+    // `tests/documentation_first_run.rs` the READMEs and the Linux servers
+    // guide.
+    ".cargo/audit.toml",
+    "README.md",
+    "docs/README.md",
+    "docs/linux-servers.md",
     "Makefile",
     ".config",
     // The read set.
