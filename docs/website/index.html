@@ -801,20 +801,22 @@ relish setup --quickstart</code></pre>
           <a href="features#jobs">What’s ready in jobs</a></p>
         <p class="tour-note">What does each kind of isolation cost? Here’s the same command, run
           four ways on the same VM with the same concurrency.</p>
-        <figure id="throughput-recording" class="recording" data-cast="./assets/job-throughput.cast" data-poster="npt:257.7">
+        <figure id="throughput-recording" class="recording" data-cast="./assets/job-throughput.cast" data-poster="npt:246.1">
           <div class="recording-screen"></div>
           <noscript><p class="recording-fallback">The demonstration plays with JavaScript.
             <a href="./assets/job-throughput.cast">Download the recording</a> and play it
             with <code>asciinema play job-throughput.cast</code>.</p></noscript>
           <figcaption>
-            <span>Recorded on a 0.2.0 development build. Four real 60-second windows: VM baseline, fresh containers,
-              shared containers and host jobs. Chapter jumps and playback speed
-              change only your view; preparation and cleanup stay visible.</span>
+            <span>Recorded on 0.2.8, the published binaries, in one 4-vCPU, 8 GiB VM on a Mac Studio
+              (12 November 2026). Four real 60-second windows: 1,283,276 VM baseline exits, then
+              1,082 fresh containers, 577,000 shared containers and 786,000 host jobs accepted.
+              Chapter jumps and playback speed change only your view; preparation and cleanup
+              stay visible.</span>
             <span class="recording-chapters" role="group" aria-label="Throughput recording chapters" hidden>
-              <button type="button" data-start="0.012144">VM baseline</button>
-              <button type="button" data-start="60.047066">Fresh containers</button>
-              <button type="button" data-start="127.788773">Shared containers</button>
-              <button type="button" data-start="195.142933">Host jobs</button></span>
+              <button type="button" data-start="0.000247">VM baseline</button>
+              <button type="button" data-start="60.006793">Fresh containers</button>
+              <button type="button" data-start="122.06">Shared containers</button>
+              <button type="button" data-start="184.580573">Host jobs</button></span>
             <span class="recording-speed" role="group" aria-label="Throughput playback speed" hidden>speed
               <button type="button" data-speed="1" aria-pressed="true">1×</button>
               <button type="button" data-speed="4" aria-pressed="false">4×</button>
@@ -892,8 +894,9 @@ relish setup --quickstart</code></pre>
           Runs/day multiplies the minute count by 1,440; it isn't an observed daily total.</p>
         <p>The published v0.2.0 binaries, 4 vCPU / 8 GiB, Ubuntu 24.04
               aarch64, beside a 500m BusyBox web app. Pinned BusyBox commands, warm
-              images and cold executors. The recording above is an earlier
-              development build's single run.
+              images and cold executors. The recording above is one run of the
+              published 0.2.8 on a different host, an Apple M5 Max Mac Studio, so its
+              rates aren't comparable with this table's.
               All public paths request 25m CPU / 32 MiB and enforce a one-core limit;
               native/shared helpers reserve another 10m / 8 MiB. One active submission
               caps each public mode at 27. Fresh containers use one-job receipt chunks;
@@ -905,7 +908,7 @@ relish setup --quickstart</code></pre>
 
         <p><a href="https://github.com/reliaburger/reliaburger/tree/main/docs/qualification/2026-10-17-v0.2.0-job-throughput">v0.2.0 measurements</a> ·
           <a href="./assets/job-throughput-report.json">Recording's report</a> ·
-          <a href="https://github.com/reliaburger/reliaburger/tree/main/docs/qualification/2026-10-09-timed-job-scenarios">The recording's raw results</a> ·
+          <a href="https://github.com/reliaburger/reliaburger/tree/main/docs/qualification/2026-11-12-v0.2.8-job-throughput-recording">The recording's raw results</a> ·
           <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/manual/14_batch-jobs.md">Job manual</a></p>
         <p>Arrays suit data preparation, offline evaluation and independent inference
           commands. Each job still starts a process; keeping an AI model resident is a
