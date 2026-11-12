@@ -306,6 +306,8 @@ struct FileVisitor<'a> {
     awaited: Option<proc_macro2::Span>,
     /// The crate's blocking functions, by resolved path.
     blocking_functions: &'a BTreeMap<String, Reason>,
+    /// Where each struct and enum name is defined in the crate.
+    types: &'a BTreeMap<String, Vec<String>>,
     facts: BTreeMap<String, FnFacts>,
     found: Vec<Hit>,
 }
@@ -353,7 +355,20 @@ impl FileVisitor<'_> {
             segments.splice(0..0, module);
         }
         if unexplained {
-            segments.splice(0..0, self.module.iter().cloned());
+            // A glob import (`use super::*`) leaves no alias, so a type
+            // defined once, in another module, is taken to be that one:
+            // otherwise each file splitting an `impl` names a different
+            // type (#1887).
+            let mut local = self.module.clone();
+            local.push(first.clone());
+            match self.types.get(&first).map(Vec::as_slice) {
+                Some([defined]) if *defined != local.join("::") => {
+                    segments.splice(0..1, defined.split("::").map(str::to_string));
+                }
+                _ => {
+                    segments.splice(0..0, self.module.iter().cloned());
+                }
+            }
         }
         Resolved {
             segments,
@@ -789,9 +804,17 @@ impl<'ast> Visit<'ast> for FileVisitor<'_> {
         let blocking = BLOCKING_METHODS.contains(&method.as_str())
             || BLOCKING_HELPERS.contains(&method.as_str())
             || (method == "open" && self.starts_at_open_options(&call.receiver));
+        let on_self = matches!(call.receiver.as_ref(), syn::Expr::Path(receiver) if receiver.path.is_ident("self"));
         if blocking {
             self.awaited = awaited;
             self.record(format!(".{method}()"), call.span(), None);
+            self.awaited = None;
+        } else if on_self && let Some(ty) = self.impls.last().filter(|ty| !ty.is_empty()) {
+            // The enclosing `impl` names the receiver's type, so `self.m()`
+            // is `<impl type>::m`, like `Self::m(self)` (#1887).
+            let callee = format!("{}::{method}", ty.join("::"));
+            self.awaited = awaited;
+            self.record(format!("self.{method}()"), call.span(), Some(callee));
             self.awaited = None;
         }
         self.visit_expr(&call.receiver);
@@ -838,9 +861,50 @@ struct ParsedFile<'a> {
     file: syn::File,
 }
 
+/// Collects where each struct and enum is defined, outside test code.
+struct TypeIndex {
+    module: Vec<String>,
+    types: BTreeMap<String, Vec<String>>,
+}
+
+impl TypeIndex {
+    fn define(&mut self, name: &syn::Ident) {
+        let mut path = self.module.clone();
+        path.push(name.to_string());
+        self.types
+            .entry(name.to_string())
+            .or_default()
+            .push(path.join("::"));
+    }
+}
+
+impl<'ast> Visit<'ast> for TypeIndex {
+    fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+        if is_cfg_test(&item.attrs) {
+            return;
+        }
+        self.module.push(item.ident.to_string());
+        syn::visit::visit_item_mod(self, item);
+        self.module.pop();
+    }
+
+    fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+        if !is_cfg_test(&item.attrs) {
+            self.define(&item.ident);
+        }
+    }
+
+    fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
+        if !is_cfg_test(&item.attrs) {
+            self.define(&item.ident);
+        }
+    }
+}
+
 fn visit_file<'a>(
     parsed: &'a ParsedFile<'a>,
     blocking_functions: &'a BTreeMap<String, Reason>,
+    types: &'a BTreeMap<String, Vec<String>>,
 ) -> FileVisitor<'a> {
     let mut visitor = FileVisitor {
         path: parsed.path,
@@ -854,6 +918,7 @@ fn visit_file<'a>(
         statements: Vec::new(),
         awaited: None,
         blocking_functions,
+        types,
         facts: BTreeMap::new(),
         found: Vec::new(),
     };
@@ -874,15 +939,24 @@ fn sites_in_files(files: &[(String, String)]) -> Vec<Hit> {
                 .unwrap_or_else(|error| panic!("{path} does not parse: {error}")),
         })
         .collect();
+    let mut index = TypeIndex {
+        module: Vec::new(),
+        types: BTreeMap::new(),
+    };
+    for file in &parsed {
+        index.module = module_of(file.path);
+        index.visit_file(&file.file);
+    }
+    let types = index.types;
     let none = BTreeMap::new();
     let mut facts = BTreeMap::new();
     for file in &parsed {
-        facts.extend(visit_file(file, &none).facts);
+        facts.extend(visit_file(file, &none, &types).facts);
     }
     let blocking = blocking_functions(&facts);
     parsed
         .iter()
-        .flat_map(|file| visit_file(file, &blocking).found)
+        .flat_map(|file| visit_file(file, &blocking, &types).found)
         .collect()
 }
 
@@ -1307,6 +1381,87 @@ fn the_rule_looks_inside_macro_arguments() {
             ("turns", "std::fs::read"),
             ("turns", "std::fs::copy"),
             ("turns", "std::fs::read_to_string"),
+        ])
+    );
+}
+
+/// `self.method()` resolves through the enclosing `impl`, as `Self::method()`
+/// does (#1887).
+#[test]
+fn the_rule_follows_self_method_calls() {
+    let source = r#"
+        struct Store { path: PathBuf }
+        impl Store {
+            fn read_raw(&self) -> Vec<u8> { std::fs::read(&self.path).unwrap() }
+            fn load(&self) -> Vec<u8> { self.read_raw() }
+            fn pure(&self) -> u32 { 1 }
+            async fn fetch(&self) -> u32 { 2 }
+            async fn open(&self) {
+                self.load();
+                self.pure();
+                self.fetch().await;
+                tokio::task::spawn_blocking(move || store.load()).await;
+            }
+        }
+    "#;
+    assert_eq!(
+        found_in("src/x.rs", source),
+        pairs(&[("open", "self.load()")])
+    );
+}
+
+/// A file that brings its type in with `use super::*` names the same
+/// `impl` the defining file does, so a `Self::` call between the split
+/// impls of one type is followed (#1887).
+#[test]
+fn the_rule_follows_calls_between_split_impls() {
+    let agent = r#"
+        pub struct BunAgent;
+        impl BunAgent {
+            fn read_raw(&self) -> Vec<u8> { std::fs::read("x").unwrap() }
+        }
+    "#;
+    let launch = r#"
+        use super::*;
+        impl BunAgent {
+            async fn go(&self) {
+                Self::read_raw(self);
+                self.read_raw();
+            }
+        }
+    "#;
+    let hits: Vec<(String, String)> = sites_in_files(&[
+        ("src/bun/agent.rs".to_string(), agent.to_string()),
+        ("src/bun/agent/launch.rs".to_string(), launch.to_string()),
+    ])
+    .into_iter()
+    .map(|hit| (hit.site.function, hit.site.call))
+    .collect();
+    assert_eq!(
+        hits,
+        pairs(&[("go", "Self::read_raw"), ("go", "self.read_raw()")])
+    );
+}
+
+/// A `select!` arm whose body has a turbofish comma, and a macro with one
+/// argument that isn't an expression, used to hide every call in them
+/// (#1887).
+#[test]
+fn the_rule_reads_select_arms_and_macro_arguments_that_partly_parse() {
+    let source = r#"
+        async fn turns(path: &Path) {
+            tokio::select! {
+                _ = first() => Ok::<(), Error>(()),
+                _ = second() => { std::fs::remove_file(path); }
+            }
+            let empty = matches!(std::fs::read(path), Ok(v) if v.is_empty());
+        }
+    "#;
+    assert_eq!(
+        found_in("src/x.rs", source),
+        pairs(&[
+            ("turns", "std::fs::remove_file"),
+            ("turns", "std::fs::read"),
         ])
     );
 }

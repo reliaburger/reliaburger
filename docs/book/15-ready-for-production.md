@@ -7948,6 +7948,49 @@ wherever the value goes out of scope, async code included. No call
 appears in the source at that point, so a syntax-based rule can't flag
 it.
 
+#### The method on `self`
+
+One kind of method call does name its target: `self.load()`. Inside an
+`impl Store` block, `self` is a `Store`, so `self.load()` is
+`Store::load(self)` written another way. The rule followed `Self::load`
+but not `self.load()`, and review found it was skipping 11 node-side
+sites that way (#1887). Upgrade `prepare` read the history file a few
+lines below the marker read #1870 had just moved off the runtime. runc's
+`apply_image_config` resolved the image's user from the rootfs and
+chowned the identity directory, on the task that started the container.
+Now the visitor resolves `self.m()` through the enclosing `impl`, and
+both are on the blocking pool: `reverted_upgrade_ids_off_runtime` reads
+the history in `spawn_blocking`, and `apply_image_config` became a free
+function, since all it needed from `self` was one `bool`. It moves the
+spec into the closure and hands it back as the result, so nothing on the
+runtime borrows it in the meantime.
+
+The rest came down to three reads the kernel answers from memory. The
+job runtime asks `executor_support` on the agent loop, and its first
+call probes the kernel by making and removing a scratch cgroup. It's
+cached in a `OnceLock` (a value computed once, the first time anything
+asks), so Bun now asks once at startup, on the blocking pool, and the
+loop only ever reads the cached answer. A process's start time and the
+boot ID are one procfs read each, and the volumes directory's device is
+one `stat` of an inode cached since startup. Those carry tags.
+
+The same review found three places where the macro parser dropped code
+without saying so. A `select!` arm like `=> Ok::<(), Error>(())` has a
+comma inside its turbofish that no bracket holds, so splitting at the
+first top-level comma cut the arm in two, and both halves failed to
+parse. A `matches!(std::fs::read(p), Ok(v) if v.is_empty())` has a
+second argument that's a pattern, not an expression, and one bad
+argument used to lose them all. Both now try a piece with its first
+comma, then its second, and keep the shortest prefix that parses, so a
+piece that isn't an expression only hides itself. The third was about
+names, not parsing. `BunAgent`'s methods are split across a dozen files
+that start with `use super::*`. A glob import leaves no alias to follow,
+so each file resolved `BunAgent` to a type in its own module, and a
+`Self::helper()` call between two of those files never matched. The rule
+now indexes where every struct and enum in the crate is defined, and a
+name a glob brought in resolves to the one place it's defined. That
+found nothing new today, but it would have hidden the next one.
+
 It also changes how to read #1606, #1707 and #1853. Each was diagnosed
 as a slow write the turn waited for. A blocking call on a shared worker
 looks the same from the turn's side, and only a thread snapshot tells the

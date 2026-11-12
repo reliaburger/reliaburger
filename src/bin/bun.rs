@@ -1593,6 +1593,15 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // left the config key dead (review M21's second half).
     agent.set_volumes_dir(config.storage.volumes.clone());
 
+    // Probe the kernel's executor support once, on the blocking pool. It
+    // creates and removes a scratch cgroup the first time; every later
+    // call, including the job runtime's on the agent loop, reads the
+    // cached answer (#1887).
+    #[cfg(target_os = "linux")]
+    tokio::task::spawn_blocking(reliaburger::grill::kernel::executor_support)
+        .await
+        .context("kernel executor probe")?;
+
     // Settle any snapshot restore a previous Bun died in the middle of,
     // before anything can snapshot, mount or adopt those volumes. A volume
     // recovery can't settle keeps its journal, so it refuses to mount.

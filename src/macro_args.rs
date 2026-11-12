@@ -10,17 +10,21 @@
 //! - `select!`: arms of `pattern = future, if condition => body`, and
 //!   `else => body`, after an optional `biased;`;
 //! - `join!` and `try_join!`: futures separated by commas, all awaited;
-//! - anything else: arguments separated by commas, where they parse as
-//!   expressions (`format!`, `assert!`, `vec![a, b]`). A macro whose
-//!   arguments don't (`vec![x; n]`, `json!({..})`, `macro_rules!`) gives
-//!   none.
+//! - anything else: arguments separated by commas, each one that parses
+//!   as an expression (`format!`, `assert!`, `vec![a, b]`, the first
+//!   argument of `matches!(x, Ok(v) if v)`). A macro none of whose
+//!   arguments do (`vec![x; n]`, `json!({..})`, `macro_rules!`) gives none.
+//!
+//! A comma at the top level isn't always a separator: `Ok::<(), E>(())`
+//! has one inside its turbofish, which no bracket group holds. So a piece
+//! that doesn't parse at its first comma is tried with the next one too
+//! (#1887).
 //!
 //! Tokens keep their source spans through the reparse, so a rule can still
 //! name the line a call is on and read the comments above it.
 
 use proc_macro2::{Delimiter, Spacing, TokenStream, TokenTree};
 use syn::parse::{ParseStream, Parser};
-use syn::punctuated::Punctuated;
 
 /// One arm of a `select!`.
 pub(crate) struct SelectArm {
@@ -60,11 +64,39 @@ pub(crate) fn macro_args(mac: &syn::Macro) -> MacroArgs {
     }
 }
 
+/// The expressions in `tokens`, separated by commas, as far as each
+/// parses. A piece that never parses is skipped up to its first comma,
+/// so one argument that isn't an expression doesn't hide the others.
 fn comma_separated(tokens: TokenStream) -> Vec<syn::Expr> {
-    Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated
-        .parse2(tokens)
-        .map(|list| list.into_iter().collect())
-        .unwrap_or_default()
+    let tokens: Vec<TokenTree> = tokens.into_iter().collect();
+    let mut expressions = Vec::new();
+    let mut start = 0;
+    while start < tokens.len() {
+        let rest = &tokens[start..];
+        match first_expression(rest) {
+            Some((expression, end)) => {
+                expressions.push(expression);
+                start += end + 1;
+            }
+            None => start += rest.iter().position(is_comma).unwrap_or(rest.len()) + 1,
+        }
+    }
+    expressions
+}
+
+/// The shortest run of `tokens`, ending at a top-level comma or at the end,
+/// that parses as an expression, and where it ends.
+fn first_expression(tokens: &[TokenTree]) -> Option<(syn::Expr, usize)> {
+    let ends = (0..tokens.len())
+        .filter(|&index| is_comma(&tokens[index]))
+        .chain(std::iter::once(tokens.len()));
+    for end in ends {
+        let candidate: TokenStream = tokens[..end].iter().cloned().collect();
+        if let Ok(expression) = syn::parse2::<syn::Expr>(candidate) {
+            return Some((expression, end));
+        }
+    }
+    None
 }
 
 /// `tokens` without a leading `biased;`.
@@ -97,8 +129,9 @@ fn is_comma(token: &TokenTree) -> bool {
 
 /// A `select!`'s arms. A group (`(..)`, `[..]`, `{..}`) is one token tree,
 /// so walking the top-level tokens splits at depth 0 without counting
-/// brackets: each `=>` ends an arm's head, and the body runs to the next
-/// comma, or is one `{ .. }` block with an optional comma after it.
+/// brackets: each `=>` ends an arm's head, and the body runs to the first
+/// comma after which it parses, or is one `{ .. }` block with an optional
+/// comma after it.
 fn select_arms(tokens: TokenStream) -> Vec<SelectArm> {
     let tokens: Vec<TokenTree> = skip_biased(tokens).into_iter().collect();
     let mut rest = tokens.as_slice();
@@ -111,7 +144,10 @@ fn select_arms(tokens: TokenStream) -> Vec<SelectArm> {
         let after = &rest[arrow + 2..];
         let body_end = match after.first() {
             Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Brace => 1,
-            _ => after.iter().position(is_comma).unwrap_or(after.len()),
+            _ => first_expression(after).map_or_else(
+                || after.iter().position(is_comma).unwrap_or(after.len()),
+                |(_, end)| end,
+            ),
         };
         let body = &after[..body_end];
         rest = &after[body_end..];

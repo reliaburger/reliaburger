@@ -772,6 +772,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::fs::MetadataExt;
+            // BLOCKING-OK: one stat of the volumes directory, whose inode the kernel has cached since startup; only a disk-throttle fault asks (#1887)
             if let Ok(meta) = std::fs::metadata(&self.volumes_dir) {
                 let dev = meta.dev();
                 // Linux encodes major:minor in st_dev; unpack per libc rules.
