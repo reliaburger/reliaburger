@@ -846,6 +846,8 @@ Matching on a tuple is one of Rust's quiet pleasures. The compiler checks that t
 
 A join seed's token buys a certificate, and the certificate buys the master key: `GET /v1/cluster/master-key` answers only a caller presenting a node certificate the cluster signed and hasn't retired. The token never sees the key.
 
+A create seed is different: it carries the master key itself. Once its files are installed, the copy it came from has to go, and an unlink isn't enough, because it only drops the name and leaves the blocks readable. So `zero_and_remove` writes zeros over the whole file, `sync_all`s them, and only then removes it. That covers the seed file on an RBSEED stick and the seed a claim delivered. The claimed copy is also cleared on the boot that finds `node.toml` already in place, in case the power went between writing one and clearing the other. The tests watch through a hard link. A second name for the same file survives the unlink and still sees the same blocks, so it can check every byte is zero.
+
 ### Claiming over the network
 
 Seeds on a USB stick work, but you have to walk the stick round. So a machine that boots with no seed becomes *unclaimed* instead. It makes a self-signed key, shows a short fingerprint of it on its monitor, announces itself over mDNS as `_rb-unclaimed._tcp`, and serves a tiny API on port 9119: `GET /v1/claim` says what it is, and `POST /v1/claim` with a seed claims it, once. From there it carries on exactly as if the seed had come on a stick.
