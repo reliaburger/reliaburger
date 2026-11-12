@@ -362,6 +362,117 @@ class Runs(unittest.TestCase):
         self.assertEqual(gym.rescore(self.directory / "crash-loop" / "run-1"), result["score"])
 
 
+# A solver that makes a patch workspace the way `relish agent patch init`
+# does (its state file is what marks one) and tries it on a throwaway cluster.
+TRIES_A_PATCH = (
+    "mkdir -p fix/.reliaburger-patch elsewhere\n"
+    "echo '{}' > fix/.reliaburger-patch/state.json\n"
+    "relish agent patch try ./fix >/dev/null\n"
+)
+
+
+class ThrowawayClusters(unittest.TestCase):
+    """`patch try` keeps its cluster until `patch destroy` (#1847)."""
+
+    def setUp(self):
+        self.directory = Path(tempfile.mkdtemp())
+        self.log = self.directory / "relish-calls"
+        # Every call's argv, one JSON line each, whether the solver made it
+        # through the shim or the runner made it directly.
+        self.relish = self.directory / "logging-relish"
+        self.relish.write_text(
+            f"#!{sys.executable}\n"
+            "import json, sys\n"
+            f"open({str(self.log)!r}, 'a').write(json.dumps(sys.argv[1:]) + '\\n')\n"
+            "print('{}')\n"
+        )
+        self.relish.chmod(0o755)
+
+    def run_with(self, solver):
+        fake = FakeCluster({"instance:web": "gym-1"}, FIXTURES / "crash-loop.json")
+        result = gym.run_once(
+            SCENARIOS["crash-loop"], self.directory / "crash-loop" / "run-1",
+            lambda nodes, work_dir: fake, solver, self.relish, None,
+            timeout=60, sleep=lambda seconds: None,
+        )
+        return fake, result
+
+    def destroyed(self):
+        calls = [json.loads(line) for line in self.log.read_text().splitlines()]
+        return [call[3:] for call in calls if call[:3] == ["agent", "patch", "destroy"]]
+
+    def write_solver(self, body):
+        program = self.directory / "solver.sh"
+        program.write_text("#!/bin/sh\n" + body)
+        program.chmod(0o755)
+        return solvers.CommandSolver([str(program)])
+
+    def workspace(self):
+        return str(self.directory / "crash-loop" / "run-1" / "solver" / "fix")
+
+    def test_a_tried_patchs_cluster_is_destroyed_after_a_run_that_answers(self):
+        solver = self.write_solver(
+            TRIES_A_PATCH
+            + 'printf \'{"app": "web", "node": "gym-1", "fault_kind": "crash_loop"}\' > "$GYM_ANSWER"\n'
+        )
+        fake, result = self.run_with(solver)
+        self.assertEqual(result["score"]["verdict"], "correct")
+        self.assertEqual(self.destroyed(), [[self.workspace()]])
+        self.assertEqual(result["teardown"], [{"workspace": self.workspace(), "exit": 0}])
+        self.assertTrue(fake.stopped)
+
+    def test_a_tried_patchs_cluster_is_destroyed_after_a_run_that_fails(self):
+        fake, result = self.run_with(self.write_solver(TRIES_A_PATCH + "exit 3\n"))
+        self.assertEqual(result["solver_exit"], 3)
+        self.assertEqual(self.destroyed(), [[self.workspace()]])
+
+    def test_a_tried_patchs_cluster_is_destroyed_after_an_interrupted_run(self):
+        class Interrupted(solvers.CommandSolver):
+            def solve(self, prompt, env, work_dir, timeout, scenario=None):
+                super().solve(prompt, env, work_dir, timeout, scenario)
+                raise KeyboardInterrupt
+
+        program = self.directory / "solver.sh"
+        program.write_text("#!/bin/sh\n" + TRIES_A_PATCH)
+        program.chmod(0o755)
+        fake = FakeCluster({"instance:web": "gym-1"}, FIXTURES / "crash-loop.json")
+        with self.assertRaises(KeyboardInterrupt):
+            gym.run_once(
+                SCENARIOS["crash-loop"], self.directory / "crash-loop" / "run-1",
+                lambda nodes, work_dir: fake, Interrupted([str(program)]), self.relish, None,
+                timeout=60, sleep=lambda seconds: None,
+            )
+        self.assertEqual(self.destroyed(), [[self.workspace()]])
+        self.assertTrue(fake.stopped)
+
+    def test_a_workspace_tried_from_inside_it_is_still_destroyed(self):
+        # `cd fix && relish agent patch try .` names the workspace relative
+        # to a directory the call log doesn't record.
+        solver = self.write_solver(
+            "mkdir -p fix/.reliaburger-patch\n"
+            "echo '{}' > fix/.reliaburger-patch/state.json\n"
+            "cd fix && relish agent patch try . >/dev/null\n"
+        )
+        self.run_with(solver)
+        self.assertEqual(self.destroyed(), [[self.workspace()]])
+
+    def test_a_workspace_outside_the_solvers_directory_is_destroyed_by_its_path(self):
+        outside = self.directory / "outside"
+        solver = self.write_solver(
+            f"mkdir -p {outside}/.reliaburger-patch\n"
+            f"echo '{{}}' > {outside}/.reliaburger-patch/state.json\n"
+            f"relish agent patch try {outside} --nodes 1 >/dev/null\n"
+        )
+        self.run_with(solver)
+        self.assertEqual(self.destroyed(), [[str(outside)]])
+
+    def test_a_run_that_made_no_workspace_destroys_nothing(self):
+        solver = self.write_solver("relish status -o json >/dev/null\nexit 0\n")
+        _, result = self.run_with(solver)
+        self.assertEqual(self.destroyed(), [])
+        self.assertNotIn("teardown", result)
+
+
 class Commands(unittest.TestCase):
     def test_check_passes_on_the_shipped_scenarios(self):
         self.assertEqual(gym.main(["check"]), 0)
