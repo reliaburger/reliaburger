@@ -624,7 +624,7 @@ A decision the records no longer hold comes back as `not_found`, which means unk
 
 ### Small enough to hold in your head, or a context window
 
-Reliaburger has 8 resource kinds and 189 commands and subcommands, counted from the CLI’s own definitions, hidden ones included. A test fails when either number moves, so a new concept is a line in a pull request that someone has to agree with.
+Reliaburger has 8 resource kinds and 209 commands and subcommands, counted from the CLI’s own definitions, hidden ones included. A test fails when either number moves, so a new concept is a line in a pull request that someone has to agree with.
 
 **How that compares with Kubernetes**
 
