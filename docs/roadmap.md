@@ -517,16 +517,14 @@ migration and no feature gate
   appliance OS (our own mkosi image on Ubuntu 26.04), `relish netboot` and
   claiming machines over the LAN, weekly signed OS builds with A/B updates,
   and the quickstart guest on Ubuntu 26.04. The claim flow is designed so the
-  fleet control plane can extend it later. On 7 October 2026 the maintainer
-  scoped the milestone to the OS, netboot and appliance work; fault
-  pre-checks and the acceptance gates 0.1.0 didn't close moved to Later.
-  WebSocket drain parity (F08,
-  [#369](https://github.com/reliaburger/reliaburger/issues/369)) stays in its
-  milestone. On 6 November 2026, ACME moved to 0.4.0
-  ([#1667](https://github.com/reliaburger/reliaburger/issues/1667)). Exit test: three Dell Wyse 3040s from power-on to a cluster
-  ([decisions](plans/2026-10-02-plan-appliance-wyse-lab.md#decisions-7-october-2026)).
-  Its merge train is [#490](https://github.com/reliaburger/reliaburger/pull/490),
-  which waits for the 0.2.x patch releases.
+  fleet control plane can extend it later. Alongside it: the acceptance gates
+  0.1.0 didn't close (V01–V04, below), WebSocket drain parity (F08,
+  [#369](https://github.com/reliaburger/reliaburger/issues/369)), and fault
+  pre-checks that read the leader's gossip view
+  ([#334](https://github.com/reliaburger/reliaburger/issues/334)). Exit test:
+  three Dell Wyse 3040s from power-on to a cluster.
+  Next. Its merge train is [#490](https://github.com/reliaburger/reliaburger/pull/490),
+  which waited for the 0.2.x patch releases.
 - [ ] **0.4.0 and 0.4.1: "Full container migration"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/7),
   [plan](plans/2026-10-09-plan-container-migration.md),
@@ -633,10 +631,7 @@ migration and no feature gate
   [#364](https://github.com/reliaburger/reliaburger/issues/364)); bandwidth
   faults (F09, [#366](https://github.com/reliaburger/reliaburger/issues/366));
   the remaining Kubernetes translations (F11,
-  [#368](https://github.com/reliaburger/reliaburger/issues/368)); fault
-  pre-checks that read the leader's gossip view
-  ([#334](https://github.com/reliaburger/reliaburger/issues/334)); the
-  acceptance gates 0.1.0 didn't close (V01–V04, below); gVisor for
+  [#368](https://github.com/reliaburger/reliaburger/issues/368)); gVisor for
   hosts without KVM ([#1186](https://github.com/reliaburger/reliaburger/issues/1186));
   Windows Server guests
   ([#1187](https://github.com/reliaburger/reliaburger/issues/1187)); and, for
@@ -655,10 +650,11 @@ what's shipped and what's scheduled.
 - **Acceptance gates 0.1.0 didn't close.** V01, the live catalogue on three
   independent runc nodes ([#286](https://github.com/reliaburger/reliaburger/issues/286));
   the V02 leftovers, the snapshot uploader under power cuts and the
-  `v02-loops` bounds ([#287](https://github.com/reliaburger/reliaburger/issues/287));
-  V04, cold installs on Linux x86_64 and Linux arm64
-  ([#288](https://github.com/reliaburger/reliaburger/issues/288)). All in
-  [Later](https://github.com/reliaburger/reliaburger/milestone/9).
+  `v02-loops` bounds ([#287](https://github.com/reliaburger/reliaburger/issues/287)).
+  Both in 0.3.0. V04, the cold installs on Linux x86_64 and arm64
+  ([#288](https://github.com/reliaburger/reliaburger/issues/288)), passed on
+  the published 0.2.8 on 12 November 2026: a ready cluster in a median 84.8 s
+  and 83.2 s ([record](qualification/2026-11-12-v04-cold-installs-linux.md)).
   Intel macOS left V04 when 0.2.2 dropped its build: 0.2.1 is the last release
   with `relish-macos-x86_64`
   ([#1018](https://github.com/reliaburger/reliaburger/issues/1018)).

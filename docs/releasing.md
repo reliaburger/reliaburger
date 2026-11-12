@@ -1373,6 +1373,18 @@ the real `curl … | sh` install against it on every host we advertise.
    Run it at least twice per host for V04: once with nothing cached (the
    script always starts empty) and again for repeatability.
 
+   The Linux rows of V04 measure the published release on a clean host, once
+   it's promoted. `scripts/release/qualify-cold-install.sh --prepare` installs
+   QEMU and opens `/dev/kvm`, pipes `https://reliaburger.com/install.sh` to
+   `bash -s -- --laptop --timings` in the real home, checks the cluster,
+   destroys it, uninstalls, and diffs the host against how it started. Run it
+   once per fresh host. For x86_64, dispatch the `Cold install` workflow
+   (`cold-install.yml`), which runs it on three fresh GitHub-hosted runners
+   and keeps each run's evidence as an artefact. For arm64, run it in three
+   fresh Lima VMs on Apple silicon with `nestedVirtualization: true`, so the
+   quickstart's own VMs get KVM. The first record is
+   [2026-11-12-v04-cold-installs-linux.md](qualification/2026-11-12-v04-cold-installs-linux.md).
+
 4. **Soak it (V02)** on Apple silicon, in two tiers
    ([plan](plans/2026-09-25-v02-sustained.md), D3). When
    [`freeze-check`](#code-freeze) passes, the matching nightly has already
