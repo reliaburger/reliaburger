@@ -225,7 +225,12 @@ pub async fn admin_warning(
 fn spawn_admin_warning(origin: TokenOrigin) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let probe = async {
-            let client = crate::relish::client::BunClient::default_local();
+            // `relish mcp` is long-lived, so the context read goes off the
+            // runtime (#1860).
+            let client =
+                tokio::task::spawn_blocking(crate::relish::client::BunClient::default_local)
+                    .await
+                    .ok()?;
             tokio::time::timeout(ROLE_PROBE_TIMEOUT, client.token_access())
                 .await
                 .ok()?

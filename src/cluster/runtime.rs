@@ -179,7 +179,9 @@ pub async fn open_raft_storage(
     bool,
     CouncilStateMachine,
 )> {
+    // BLOCKING-OK: opening the Raft stores at startup, before any workload runs
     let _opening_guard = crate::council::recovery_storage::lock(raft_dir)?;
+    // BLOCKING-OK: opening the Raft stores at startup, before any workload runs
     crate::council::recovery_storage::finish_pending(raft_dir)?;
     // BLOCKING-OK: opening the Raft stores at startup, before any workload runs; the redb open below blocks the same way
     std::fs::create_dir_all(raft_dir)?;
@@ -666,6 +668,7 @@ pub async fn start(
     // idempotency tracker from any Parquet already on disk so a restart doesn't
     // double-count a re-sent window that was already flushed (M17).
     let mut initial_rollup_store =
+        // BLOCKING-OK: startup, before the agent loop or any workload runs
         crate::mayo::rollup_store::RollupStore::new(params.data_dir.join("rollups"));
     if let Err(e) = initial_rollup_store.hydrate_seen_windows().await {
         eprintln!("bun: WARNING: could not seed rollup idempotency from disk: {e}");

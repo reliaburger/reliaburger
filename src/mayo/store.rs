@@ -16,7 +16,7 @@ use datafusion::prelude::*;
 use object_store::ObjectStore;
 use sha2::{Digest, Sha256};
 
-use super::scan::{ParquetTable, list_local, list_remote, streaming_session};
+use super::scan::{ParquetTable, list_local_off_runtime, list_remote, streaming_session};
 use super::types::{MayoError, MetricKey, Sample};
 
 /// Where a [`MayoStore`] reads and writes Parquet.
@@ -751,6 +751,15 @@ pub(crate) fn dir_has_parquet(data_dir: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+/// [`dir_has_parquet`] on a blocking thread, for async code (#1860). A
+/// directory that can't be read holds none, as there.
+pub(crate) async fn dir_has_parquet_off_runtime(data_dir: &std::path::Path) -> bool {
+    let data_dir = data_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || dir_has_parquet(&data_dir))
+        .await
+        .unwrap_or(false)
+}
+
 /// A buffered sample waiting to be flushed.
 struct BufferedSample {
     timestamp: u64,
@@ -815,6 +824,7 @@ impl MayoStore {
         object_store_url: Option<&str>,
     ) -> Result<Self, MayoError> {
         let Some(url) = object_store_url.filter(|u| !u.is_empty()) else {
+            // BLOCKING-OK: startup, before the agent loop or any workload runs
             return Ok(Self::new(data_dir));
         };
         let (store, prefix) = parse_object_store(url)?;
@@ -1051,7 +1061,7 @@ impl MayoStore {
     async fn session_since(&self, since: Option<u64>) -> Result<SessionContext, MayoError> {
         let ctx = streaming_session();
         let sources = match &self.backend {
-            Backend::Local => list_local(&self.data_dir)?,
+            Backend::Local => list_local_off_runtime(&self.data_dir).await?,
             Backend::Remote { store, prefix } => list_remote(store, prefix, "metrics").await?,
         };
         let mut memory = Vec::new();

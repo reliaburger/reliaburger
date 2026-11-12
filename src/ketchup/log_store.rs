@@ -962,7 +962,12 @@ impl LogStore {
         // MemTable before planning, so the OBS5 limit covered only aggregation,
         // not the dominant base scan. An empty directory registers an empty
         // table so the union view below always resolves.
-        if dir_has_parquet(&self.data_dir) {
+        // Listing the directory is a disk read: do it off the runtime (#1860).
+        let listed = self.data_dir.clone();
+        let has_parquet = tokio::task::spawn_blocking(move || dir_has_parquet(&listed))
+            .await
+            .unwrap_or(false);
+        if has_parquet {
             let url = ListingTableUrl::parse(self.data_dir.to_string_lossy().as_ref())
                 .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
             let options = ListingOptions::new(Arc::new(ParquetFormat::default()))
