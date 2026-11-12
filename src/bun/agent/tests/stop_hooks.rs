@@ -339,6 +339,33 @@ async fn an_app_without_pre_stop_is_signalled_without_an_exec() {
     assert!(!operations.contains(&"exec".to_string()), "{operations:?}");
 }
 
+/// Removing a retired instance's identity directory and record is disk work
+/// off the loop. Outside a turn, as here, the stop waits for it for 10 s
+/// (`OUTSIDE_TURN_RUNTIME_PATIENCE`), then answers `StillRunning`: ask again
+/// later. On a host flushing hard the removal took longer, and the stop
+/// tests above failed on that answer (#1901). The tests' own `stop_app`
+/// asks again, as the loop's next turn would.
+#[tokio::test]
+async fn a_whole_stop_waits_out_a_slow_artifact_cleanup() {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+    let id = InstanceId("default__web-0".into());
+    // Just past that patience, so the first ask can't collect it.
+    agent
+        .loop_stalls
+        .set(LoopStall::ArtifactCleanup, Duration::from_millis(10_500));
+    let from = grill.calls().len();
+
+    agent
+        .stop_app("web", "default")
+        .await
+        .expect("a slow cleanup is waited out, not reported as a failure");
+
+    let operations = operations_on(&grill, &id, from);
+    assert!(operations.contains(&"stop".to_string()), "{operations:?}");
+    assert!(agent.loop_stalls.reached(LoopStall::ArtifactCleanup) >= 1);
+}
+
 #[tokio::test]
 async fn a_rolling_deploy_runs_the_old_instances_pre_stop_before_retiring_it() {
     let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();

@@ -5527,6 +5527,18 @@ network-reference read takes 1.5 s and one whose release does. Both used to
 answer with that error. Now both answer `Ok` after the slow call ends, with
 the runtime asked once and no turn over budget.
 
+The tests had a copy of the same mistake (#1901). Many of them drive a whole
+stop without running the loop, through a test-only `stop_app` that begins the
+stop, waits for the exit and finishes it. Outside a turn, the finish waits
+10 s for the identity directory's removal. Under a storm of disk flushes on
+macOS that removal took longer, the finish answered `StillRunning`, and two
+stop tests failed on an answer that means "ask again". The helper now asks
+again, as `recheck_stop_later` does for the loop: it calls `finish_app_stop`
+with a clone of the same `AppStop` every 50 ms, for up to a minute. Any other
+answer comes straight back. A test stalls the removal 10.5 s with the
+starvation harness's `LoopStall::ArtifactCleanup` and checks the stop still
+succeeds.
+
 Retirement wasn't the only thing asking runc for a network reference under
 the budget. When a stop the egress fence relied on fails, the agent fences
 the app's execution: it force-kills each instance, but only once the runtime
