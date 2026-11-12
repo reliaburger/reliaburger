@@ -228,13 +228,31 @@ pub(super) fn init(bundle: &Bundle, dir: &Path) -> Result<Answer<InitData>, Agen
 
 /// Keep `patch`'s own files and cargo's output out of every diff. The
 /// bundle has no `.gitignore`, so `target/` needs saying too.
+///
+/// The file is replaced by a rename, never rewritten in place: git reading
+/// it sees the old list or the new one, and a symbolic link (a git template
+/// can make every repository's exclude file one shared file) is replaced
+/// rather than written through.
 fn ignore_patch_files(dir: &Path) -> Result<(), AgentError> {
-    let exclude = dir.join(".git/info/exclude");
+    let info = dir.join(".git/info");
+    let exclude = info.join("exclude");
     let mut text = std::fs::read_to_string(&exclude).unwrap_or_default();
-    text.push_str(&format!("/{PATCH_DIR}/\n/target/\n"));
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    for line in [format!("/{PATCH_DIR}/"), "/target/".to_string()] {
+        if !text.lines().any(|existing| existing == line) {
+            text.push_str(&line);
+            text.push('\n');
+        }
+    }
     let write = || -> std::io::Result<()> {
-        std::fs::create_dir_all(dir.join(".git/info"))?;
-        std::fs::write(&exclude, text)
+        use std::io::Write;
+        std::fs::create_dir_all(&info)?;
+        let mut temporary = tempfile::NamedTempFile::new_in(&info)?;
+        temporary.write_all(text.as_bytes())?;
+        temporary.persist(&exclude).map_err(|error| error.error)?;
+        Ok(())
     };
     write().map_err(|error| {
         AgentError::new(
@@ -470,6 +488,31 @@ mod tests {
         let state = State::load(&dir).unwrap();
         assert_eq!(state.version, "0.2.7");
         assert_eq!(state.source_commit.as_deref(), Some(source_fixture::COMMIT));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_ignore_list_never_writes_through_a_shared_exclude_file() {
+        // A git template can make .git/info/exclude a symbolic link to one
+        // file every repository shares (#1726, #1738, #1748).
+        let root = tempfile::tempdir().unwrap();
+        let shared = root.path().join("shared-exclude");
+        std::fs::write(&shared, "# mine\n").unwrap();
+        let dir = root.path().join("work");
+        std::fs::create_dir_all(dir.join(".git/info")).unwrap();
+        std::os::unix::fs::symlink(&shared, dir.join(".git/info/exclude")).unwrap();
+
+        ignore_patch_files(&dir).unwrap();
+        ignore_patch_files(&dir).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&shared).unwrap(), "# mine\n");
+        let exclude = dir.join(".git/info/exclude");
+        assert!(!exclude.symlink_metadata().unwrap().is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(&exclude).unwrap(),
+            format!("# mine\n/{PATCH_DIR}/\n/target/\n"),
+            "each line once, after what was there"
+        );
     }
 
     #[test]

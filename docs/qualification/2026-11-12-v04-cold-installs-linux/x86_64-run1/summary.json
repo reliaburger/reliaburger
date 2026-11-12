@@ -1,0 +1,11 @@
+{
+  "bootstrap": "https://reliaburger.com/install.sh",
+  "bootstrap_sha256": "431a96f114252ab97816a5a03140743d9fd0e68077b2a1a7105ce7cff5659e89",
+  "install_exit": 0,
+  "install_wall_seconds": 84.8,
+  "setup_total_seconds": 82.062958684,
+  "under_five_minutes": true,
+  "checks_passed": true,
+  "teardown_passed": true,
+  "host_clean_after": true
+}

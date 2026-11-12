@@ -1,0 +1,52 @@
+name: Cold install
+
+# V04 (#288): the published release, installed cold on a clean Linux x86_64
+# host the way a user meets it, three times. Each run is its own job, so each
+# gets a fresh GitHub-hosted runner: nothing cached, nothing left from the
+# run before. scripts/release/qualify-cold-install.sh does the work; the
+# timings and the cleanup evidence come back as one artefact per run, for a
+# record in docs/qualification/. The arm64 row runs the same script in fresh
+# Lima VMs on Apple silicon (docs/releasing.md).
+
+# A pull request that changes the script or this workflow runs it too, so a
+# change is measured before it merges (and a workflow GitHub can't dispatch
+# until it reaches main still runs from its branch).
+on:
+  pull_request:
+    paths:
+      - scripts/release/qualify-cold-install.sh
+      - .github/workflows/cold-install.yml
+  workflow_dispatch:
+    inputs:
+      bootstrap:
+        description: The bootstrap to pipe to bash
+        default: https://reliaburger.com/install.sh
+
+permissions:
+  contents: read
+
+jobs:
+  cold-install:
+    name: cold install ${{ matrix.run }} on Linux x86_64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        run: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install from the bootstrap, check the cluster, tear it down
+        env:
+          BOOTSTRAP: ${{ inputs.bootstrap || 'https://reliaburger.com/install.sh' }}
+        run: >-
+          scripts/release/qualify-cold-install.sh --prepare
+          --bootstrap "$BOOTSTRAP"
+          --evidence "$RUNNER_TEMP/cold-install-${{ matrix.run }}"
+      - name: Keep the evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: cold-install-linux-x86_64-${{ matrix.run }}
+          path: ${{ runner.temp }}/cold-install-${{ matrix.run }}
+          if-no-files-found: error

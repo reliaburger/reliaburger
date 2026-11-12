@@ -480,7 +480,7 @@ pub async fn run_claim(options: &ClaimOptions) -> Result<(), RelishError> {
         post_seed(
             SocketAddr::new(*address, CLAIM_PORT),
             fingerprint,
-            std::fs::read(seed)?,
+            tokio::fs::read(seed).await?,
         )
         .await
         .map_err(|e| {

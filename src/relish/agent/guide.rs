@@ -6,7 +6,8 @@
 //! [`generate`] turns it into the files an agent finds elsewhere: `llms.txt`
 //! and the `/agents` page on the website, the `reliaburger` skill, the Claude
 //! Code plugin and its marketplace, the website's skills discovery index and
-//! its copy of the skill, `relish mcp`'s MCP Registry entry (`server.json`),
+//! its copy of the skill, `relish mcp`'s MCP Registry entry (`server.json`)
+//! and MCP Bundle manifest,
 //! and the generated block of the repository's `AGENTS.md`. A test in `tests/suite/agent_docs.rs` compares
 //! each file on disk with what [`generate`] makes, so none can drift, and
 //! `make agent-docs` rewrites them.
@@ -25,7 +26,9 @@ use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::json;
 
-use super::{AgentError, BuildInfo, CommandName, Envelope, ErrorCode, NextStep, agent_command};
+use super::{
+    AgentError, BuildInfo, CommandName, Envelope, ErrorCode, NextStep, agent_command, budget,
+};
 use super::{Rendered, render};
 
 /// The chapter's file name inside `docs/manual/`.
@@ -79,6 +82,9 @@ pub mod paths {
     /// `relish mcp`'s entry for the official
     /// [MCP Registry](https://registry.modelcontextprotocol.io).
     pub const MCP_SERVER: &str = "server.json";
+    /// The `manifest.json` release packaging puts in each platform's MCP
+    /// Bundle (`.mcpb`) beside that platform's `relish`.
+    pub const MCPB_MANIFEST: &str = "scripts/release/mcpb-manifest.json";
 }
 
 /// The `$schema` of the skills discovery index: version 0.2.0 of the RFC.
@@ -87,6 +93,26 @@ pub const SKILL_INDEX_SCHEMA: &str = "https://schemas.agentskills.io/discovery/0
 /// The `$schema` of `server.json`, the MCP Registry's format.
 pub const MCP_SERVER_SCHEMA: &str =
     "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json";
+
+/// The [MCP Bundle](https://github.com/modelcontextprotocol/mcpb) manifest
+/// format [`paths::MCPB_MANIFEST`] follows.
+pub const MCPB_MANIFEST_VERSION: &str = "0.3";
+
+/// Where a bundle keeps its `relish`, relative to the bundle's root.
+pub const MCPB_ENTRY_POINT: &str = "server/relish";
+
+/// The command that makes the read-only token a bundle's `token` setting
+/// asks for. A day is enough for one session.
+pub const READ_ONLY_TOKEN_COMMAND: &str =
+    "relish token create --name agent --role read-only --ttl-days 1";
+
+/// The bundle description's one line on credentials (#1695, decision (d)):
+/// with the token setting empty, the bundle uses the current context, which
+/// may hold an admin token.
+pub const MCPB_ADMIN_ADVICE: &str = "With the token setting empty, relish uses its current \
+context, which may hold an admin token, and warns on stderr when it does; make a read-only \
+token with `relish token create --name agent --role read-only --ttl-days 1` and put it in \
+the token setting.";
 
 /// `relish mcp`'s name in the MCP Registry. The `io.github.reliaburger`
 /// namespace is the one a GitHub login to the organisation proves.
@@ -285,11 +311,37 @@ fn one_line(text: &str) -> String {
 /// One `## ` section of the chapter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
 pub struct GuideSection {
+    /// What `--section` takes: the heading's anchor, such as `through-mcp`.
+    pub id: String,
     /// The heading, without `## `. The first section has the chapter's
     /// title.
     pub heading: String,
     /// Everything under the heading, as Markdown.
     pub markdown: String,
+}
+
+/// One line of the chapter's table of contents.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct ContentsEntry {
+    /// What `--section` takes: the heading's anchor, such as `through-mcp`.
+    pub id: String,
+    /// The heading, without `## `.
+    pub heading: String,
+    /// The size of the section's Markdown, in bytes.
+    pub bytes: usize,
+}
+
+/// How much of the chapter an answer holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GuideScope {
+    /// Every section: the whole chapter fitted the budget.
+    Whole,
+    /// The contents and the sections to read first: the whole chapter
+    /// didn't fit the budget, and `next` says how to read the rest.
+    Outline,
+    /// The one section `--section` asked for.
+    Section,
 }
 
 /// `data` for `relish agent guide`.
@@ -299,13 +351,39 @@ pub struct GuideData {
     pub chapter: String,
     /// The chapter's title.
     pub title: String,
-    /// The chapter, one section at a time and in order. A trimmed answer
-    /// drops sections from the end.
+    /// Whether `sections` is the whole chapter, an outline's first
+    /// sections, or the one section asked for.
+    pub scope: GuideScope,
+    /// An outline's table of contents: every section of the chapter, in
+    /// order, with its id and size. Empty otherwise: the whole chapter has
+    /// every section, and a `section` answer follows an outline.
+    pub contents: Vec<ContentsEntry>,
+    /// The sections this answer holds, in order. Only a `truncated`
+    /// section answer cuts one, at a paragraph break.
     pub sections: Vec<GuideSection>,
     /// Every `relish agent` command this binary has, from its own CLI
-    /// definition.
+    /// definition. Empty unless `scope` is `whole`: the `commands` section
+    /// has the same table.
     pub commands: Vec<CommandSummary>,
 }
+
+/// `relish agent guide`'s arguments.
+#[derive(Debug, Clone, clap::Args)]
+pub struct GuideArgs {
+    /// Only this section, by its id in `contents` (such as `the-envelope`)
+    /// or its heading.
+    #[arg(long)]
+    pub section: Option<String>,
+}
+
+/// The sections an outline holds, in order, when they fit: how to read an
+/// answer, follow `next`, treat `untrusted` text as data and work
+/// read-only, then the promises every command keeps.
+pub const READ_FIRST: &[&str] = &["in-brief", "the-contract"];
+
+/// The section an outline's `next` offers after [`READ_FIRST`]: every
+/// field of the envelope.
+pub const READ_NEXT: &str = "the-envelope";
 
 /// The chapter split at its `## ` headings, outside code fences, with the
 /// marker comments taken out.
@@ -326,8 +404,10 @@ pub fn sections(chapter: &str) -> (String, Vec<GuideSection>) {
             continue;
         }
         if !in_fence && let Some(next) = line.strip_prefix("## ") {
+            let heading = std::mem::replace(&mut heading, next.trim().to_string());
             sections.push(GuideSection {
-                heading: std::mem::replace(&mut heading, next.trim().to_string()),
+                id: slug(&heading),
+                heading,
                 markdown: std::mem::take(&mut body).trim().to_string(),
             });
             continue;
@@ -336,34 +416,281 @@ pub fn sections(chapter: &str) -> (String, Vec<GuideSection>) {
         body.push('\n');
     }
     sections.push(GuideSection {
+        id: slug(&heading),
         heading,
         markdown: body.trim().to_string(),
     });
     (title, sections)
 }
 
-/// `data` for `relish agent guide` from a chapter and the CLI definition.
+/// `data` for `relish agent guide` from a chapter and the CLI definition:
+/// the whole chapter.
 pub fn guide_data(chapter: &str, agent: &Command) -> GuideData {
     let (title, sections) = sections(chapter);
     GuideData {
         chapter: CHAPTER_FILE.to_string(),
         title,
+        scope: GuideScope::Whole,
+        contents: sections
+            .iter()
+            .map(|section| ContentsEntry {
+                id: section.id.clone(),
+                heading: section.heading.clone(),
+                bytes: section.markdown.len(),
+            })
+            .collect(),
         sections,
         commands: commands(agent),
     }
 }
 
-/// The envelope `relish agent guide` prints for `chapter`.
+/// The envelope `relish agent guide` prints for the whole of `chapter`.
 pub fn guide_envelope(chapter: &str, agent: &Command, relish: BuildInfo) -> Envelope<GuideData> {
-    Envelope::answered(CommandName::Guide, relish, guide_data(chapter, agent)).with_next(NextStep {
+    let data = GuideData {
+        contents: Vec::new(),
+        ..guide_data(chapter, agent)
+    };
+    Envelope::answered(CommandName::Guide, relish, data).with_next(NextStep {
         run: "relish agent source version".to_string(),
         why: "which source this relish carries, and whether the nodes run it".to_string(),
         read_only: true,
     })
 }
 
+/// Where in `sections` the one `wanted` names is, by id or heading, in any
+/// case, with or without a leading `#`.
+fn find_section(sections: &[GuideSection], wanted: &str) -> Option<usize> {
+    let wanted = slug(wanted.trim().trim_start_matches('#'));
+    sections.iter().position(|section| section.id == wanted)
+}
+
+/// A `next` step that reads the section `id`.
+fn read_section(id: &str, why: String) -> NextStep {
+    NextStep {
+        run: format!("relish agent guide --section {id}"),
+        why,
+        read_only: true,
+    }
+}
+
+/// The envelope for `relish agent guide --section wanted`, or why there's
+/// no such section.
+///
+/// A section bigger than `max_bytes` is cut at the last paragraph break
+/// that fits, outside code blocks, never inside a sentence: the answer is
+/// marked `truncated`, a warning says how much it kept, and the first
+/// `next` step asks for the whole section.
+fn section_envelope(
+    data: GuideData,
+    wanted: &str,
+    relish: BuildInfo,
+    max_bytes: usize,
+) -> Result<Envelope<GuideData>, AgentError> {
+    let Some(index) = find_section(&data.sections, wanted) else {
+        let ids: Vec<&str> = data
+            .contents
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect();
+        return Err(AgentError::new(
+            ErrorCode::NotFound,
+            format!("the guide has no section {wanted:?}"),
+        )
+        .with_hint(format!("sections: {}", ids.join(", "))));
+    };
+    let following = data.contents.get(index + 1).cloned();
+    let section = data.sections[index].clone();
+    // The contents came with the outline; a section answer leaves them out
+    // so the section has the budget to itself.
+    let make = |markdown: &str, overflow: Option<budget::Overflow>| {
+        let one = GuideData {
+            chapter: data.chapter.clone(),
+            title: data.title.clone(),
+            scope: GuideScope::Section,
+            contents: Vec::new(),
+            sections: vec![GuideSection {
+                markdown: markdown.to_string(),
+                ..section.clone()
+            }],
+            commands: Vec::new(),
+        };
+        let mut envelope = Envelope::answered(CommandName::Guide, relish.clone(), one);
+        if let Some(overflow) = overflow {
+            envelope = envelope.mark_truncated().with_warning(format!(
+                "guide_section_cut: {} is {} bytes and this is its first {}, up to a \
+                 paragraph break",
+                section.id,
+                section.markdown.len(),
+                markdown.len()
+            ));
+            // Under `relish mcp`'s ceiling the whole section may be out of
+            // reach, and then no step asks for it (#1829).
+            if let Some(rerun) = overflow.rerun_budget() {
+                envelope = envelope.with_next(NextStep {
+                    run: budget::rerun_with(
+                        &format!("relish agent guide --section {}", section.id),
+                        rerun,
+                    ),
+                    why: overflow
+                        .out_of_reach()
+                        .unwrap_or_else(|| format!("the whole section, {} bytes", overflow.whole)),
+                    read_only: true,
+                });
+            }
+        }
+        if let Some(entry) = &following {
+            envelope = envelope.with_next(read_section(
+                &entry.id,
+                format!(
+                    "the next section, {:?}, {} bytes",
+                    entry.heading, entry.bytes
+                ),
+            ));
+        }
+        envelope
+    };
+    let whole = make(&section.markdown, None);
+    let size = rendered_length(&whole);
+    if size <= max_bytes {
+        return Ok(whole);
+    }
+    let overflow = budget::Overflow {
+        whole: size,
+        max_bytes,
+    };
+    let cut = paragraph_breaks(&section.markdown)
+        .into_iter()
+        .rev()
+        .map(|end| make(&section.markdown[..end], Some(overflow)))
+        .find(|envelope| rendered_length(envelope) <= max_bytes);
+    Ok(cut.unwrap_or_else(|| make("", Some(overflow))))
+}
+
+/// The byte offsets of the blank lines in `markdown` outside code blocks:
+/// the places a section can be cut between paragraphs.
+fn paragraph_breaks(markdown: &str) -> Vec<usize> {
+    let mut breaks = Vec::new();
+    let mut offset: usize = 0;
+    let mut in_fence = false;
+    for line in markdown.split_inclusive('\n') {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+        }
+        if !in_fence && line.trim().is_empty() {
+            // Cut before the blank line, so the kept part ends with text.
+            breaks.push(offset.saturating_sub(1));
+        }
+        offset += line.len();
+    }
+    breaks
+}
+
+/// One line of JSON's length, newline included, as [`render`] counts it.
+fn rendered_length<T: Serialize>(envelope: &Envelope<T>) -> usize {
+    serde_json::to_vec(envelope).map_or(usize::MAX, |json| json.len() + 1)
+}
+
+/// The outline of the chapter, for a budget too small for all of it: the
+/// contents, as many of [`READ_FIRST`] as fit whole, and `next` steps to
+/// the ones that didn't and to [`READ_NEXT`]. `whole` is the whole
+/// answer's size in bytes.
+fn outline_envelope(
+    data: GuideData,
+    relish: BuildInfo,
+    whole: usize,
+    max_bytes: usize,
+) -> Envelope<GuideData> {
+    // Under `relish mcp`'s ceiling the whole chapter may be out of reach,
+    // and then the warning doesn't offer it (#1829).
+    let all_of_it = match (budget::Overflow { whole, max_bytes }).rerun_budget() {
+        Some(rerun) => format!(
+            ", or all of it with `{}`",
+            budget::rerun_with("relish agent guide", rerun)
+        ),
+        None => String::new(),
+    };
+    let warning = format!(
+        "guide_outline: the whole chapter is {whole} bytes, more than this budget of \
+         {max_bytes}, so this is its contents and the sections to read first, each whole; \
+         read another with --section ID{all_of_it}"
+    );
+    let build = |sections: Vec<GuideSection>| {
+        let mut steps = Vec::new();
+        for id in READ_FIRST {
+            let kept = sections.iter().any(|section| section.id == *id);
+            if let (false, Some(entry)) = (kept, data.contents.iter().find(|e| e.id == *id)) {
+                steps.push(read_section(
+                    id,
+                    format!(
+                        "read this first, {} bytes; it didn't fit this budget",
+                        entry.bytes
+                    ),
+                ));
+            }
+        }
+        steps.push(read_section(
+            READ_NEXT,
+            "how to read every answer, field by field; --section takes any id in data.contents"
+                .to_string(),
+        ));
+        let outline = GuideData {
+            scope: GuideScope::Outline,
+            sections,
+            commands: Vec::new(),
+            ..data.clone()
+        };
+        let envelope = Envelope::answered(CommandName::Guide, relish.clone(), outline)
+            .with_warning(warning.clone());
+        steps.into_iter().fold(envelope, Envelope::with_next)
+    };
+    let mut kept: Vec<GuideSection> = Vec::new();
+    for id in READ_FIRST {
+        let Some(section) = data.sections.iter().find(|section| section.id == *id) else {
+            continue;
+        };
+        let mut tried = kept.clone();
+        tried.push(section.clone());
+        if rendered_length(&build(tried.clone())) <= max_bytes {
+            kept = tried;
+        }
+    }
+    build(kept)
+}
+
+/// The answer to `relish agent guide` over `chapter`: the one section
+/// `section` names; else the whole chapter when it fits `max_bytes`; else
+/// its outline, which holds only whole sections.
+pub fn answer(
+    chapter: &str,
+    agent: &Command,
+    relish: BuildInfo,
+    section: Option<&str>,
+    max_bytes: usize,
+    rerun: &str,
+) -> Rendered {
+    let max_bytes = max_bytes.max(super::MIN_MAX_BYTES);
+    if let Some(wanted) = section {
+        let data = guide_data(chapter, agent);
+        return match section_envelope(data, wanted, relish.clone(), max_bytes) {
+            Ok(envelope) => render(&envelope, max_bytes, rerun),
+            Err(error) => render(
+                &Envelope::<()>::failed(CommandName::Guide, relish, error),
+                max_bytes,
+                rerun,
+            ),
+        };
+    }
+    let whole = guide_envelope(chapter, agent, relish.clone());
+    let size = rendered_length(&whole);
+    if size <= max_bytes {
+        return render(&whole, max_bytes, rerun);
+    }
+    let outline = outline_envelope(guide_data(chapter, agent), relish, size, max_bytes);
+    render(&outline, max_bytes, rerun)
+}
+
 /// Run `relish agent guide` against the chapter embedded in this binary.
-pub fn run(max_bytes: usize, rerun: &str) -> Rendered {
+pub fn run(max_bytes: usize, section: Option<&str>, rerun: &str) -> Rendered {
     let Some(asset) = crate::relish::manual::assets::ManualAssets::get(CHAPTER_FILE) else {
         let error = AgentError::new(
             ErrorCode::Internal,
@@ -372,8 +699,11 @@ pub fn run(max_bytes: usize, rerun: &str) -> Rendered {
         return super::failure(CommandName::Guide, error, max_bytes, rerun);
     };
     let chapter = String::from_utf8_lossy(asset.data.as_ref());
-    render(
-        &guide_envelope(&chapter, &agent_command(), BuildInfo::current()),
+    answer(
+        &chapter,
+        &agent_command(),
+        BuildInfo::current(),
+        section,
         max_bytes,
         rerun,
     )
@@ -445,7 +775,7 @@ pub fn generate(inputs: &Inputs<'_>, agent: &Command) -> Result<Vec<Artefact>, G
     let brief = region(paths::CHAPTER, &chapter, Region::Brief)?.to_string();
     let rules = region(paths::CHAPTER, &chapter, Region::Rules)?.to_string();
     let (title, _) = sections(&chapter);
-    let page = without_markers(&chapter);
+    let page = manual_links_absolute(&without_markers(&chapter), inputs.version);
     let skill = skill_md(&summary, &brief, &table)?;
 
     let agents_md = replace_region(
@@ -504,7 +834,31 @@ pub fn generate(inputs: &Inputs<'_>, agent: &Command) -> Result<Vec<Artefact>, G
             path: paths::MCP_SERVER,
             contents: mcp_server_json(agent, inputs.version),
         },
+        Artefact {
+            path: paths::MCPB_MANIFEST,
+            contents: mcpb_manifest_json(agent, inputs.version),
+        },
     ])
+}
+
+/// `markdown` with every link to another manual chapter (`12_operations.md`,
+/// relative to `docs/manual/`) pointed at that chapter in the release tag.
+/// `/agents` and `/agents.md` live on the website, where a relative chapter
+/// link would land on nothing.
+fn manual_links_absolute(markdown: &str, version: &str) -> String {
+    let base = format!("{REPOSITORY}/blob/v{version}/docs/manual/");
+    let mut out = String::with_capacity(markdown.len());
+    let mut rest = markdown;
+    while let Some(at) = rest.find("](") {
+        let (head, tail) = rest.split_at(at + 2);
+        out.push_str(head);
+        if tail.starts_with(|c: char| c.is_ascii_digit()) {
+            out.push_str(&base);
+        }
+        rest = tail;
+    }
+    out.push_str(rest);
+    out
 }
 
 /// The paths among `artefacts` whose file on disk differs, or is missing.
@@ -822,11 +1176,17 @@ fn plugin_json(summary: &str, version: &str) -> String {
 }
 
 /// The plugin's `.mcp.json`: the same server, under the same name, that
-/// `relish agent setup` writes into an agent's own config.
+/// `relish agent setup` writes into an agent's own config, with each
+/// command's own default budget (`--max-bytes 0`): 24 KiB, and 80 KiB for
+/// the guide, so it still comes whole in one call. The plugin is Claude
+/// Code's, with a window for those; `relish mcp`'s own 8 KiB is for small
+/// local models, and setup's clients include Goose, which runs them
+/// (#1687).
 fn plugin_mcp_json() -> String {
     let mut words = super::setup::MCP_COMMAND_LINE.iter();
     let command = words.next().copied().unwrap_or("relish");
-    let args: Vec<&str> = words.copied().collect();
+    let mut args: Vec<&str> = words.copied().collect();
+    args.extend(["--max-bytes", "0"]);
     let mut servers = serde_json::Map::new();
     servers.insert(
         super::setup::MCP_SERVER_NAME.to_string(),
@@ -876,19 +1236,36 @@ fn skill_index_json(description: &str, skill: &str) -> String {
 pub const MCP_DESCRIPTION: &str =
     "Read-only Reliaburger cluster diagnosis: the relish agent commands as MCP tools.";
 
+/// The tools `relish mcp` serves by default, with their descriptions.
+fn served_tools(agent: &Command) -> Vec<(String, String)> {
+    use crate::relish::mcp::tools;
+    tools::derive(agent.clone(), &tools::data_schema)
+        .into_iter()
+        .map(|spec| {
+            let description = spec
+                .tool
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .to_string();
+            (spec.tool.name.to_string(), description)
+        })
+        .collect()
+}
+
 /// `server.json` for the MCP Registry.
 ///
-/// It has no `packages` entry. The registry installs only from npm, PyPI,
-/// NuGet, crates.io, an OCI registry or an MCPB bundle, and `relish` ships
-/// as a signed binary through `install.sh`, which is none of those. So the
-/// entry says what the server is, how to start it and which tools it has, in
-/// the publisher-provided `_meta` the schema leaves open, and gives the
-/// install line, rather than claiming an install path a client can't follow.
+/// The committed file has no `packages` entry: a package's `fileSha256` is
+/// the digest of a release's `.mcpb` bundle, which only exists once the
+/// release is built. Promotion writes the entry it publishes, with one
+/// `mcpb` package per platform (`scripts/release/mcp_registry.py`). Until
+/// then the entry says what the server is, how to start it and which tools
+/// it has, in the publisher-provided `_meta` the schema leaves open, and
+/// gives the install line.
 fn mcp_server_json(agent: &Command, version: &str) -> String {
-    use crate::relish::mcp::tools;
-    let tools: Vec<String> = tools::derive(agent.clone(), &tools::data_schema)
+    let tools: Vec<String> = served_tools(agent)
         .into_iter()
-        .map(|spec| spec.tool.name.to_string())
+        .map(|(name, _)| name)
         .collect();
     pretty_json(&json!({
         "$schema": MCP_SERVER_SCHEMA,
@@ -911,6 +1288,87 @@ fn mcp_server_json(agent: &Command, version: &str) -> String {
                 ),
             },
         },
+    }))
+}
+
+/// The [MCP Bundle](https://github.com/modelcontextprotocol/mcpb)
+/// `manifest.json` for `relish mcp`.
+///
+/// Release packaging (`scripts/release/package.py`) zips it with one
+/// platform's `relish` at [`MCPB_ENTRY_POINT`], sets `version` to the
+/// release's and narrows `compatibility.platforms` to that platform. A
+/// client that installs the bundle runs the `relish` inside it, so the
+/// command is relative to the bundle's directory, never a `relish` on the
+/// `PATH`.
+///
+/// It asks for nothing by default. Two optional settings, an endpoint and a
+/// read-only token, reach `relish` as `RELIABURGER_ENDPOINT` and
+/// `RELIABURGER_TOKEN`. A client passes a setting the user left blank as
+/// an empty string, and `relish` treats an empty variable as unset, so an
+/// unconfigured bundle uses `relish`'s current context (#1695).
+fn mcpb_manifest_json(agent: &Command, version: &str) -> String {
+    let tools: Vec<serde_json::Value> = served_tools(agent)
+        .into_iter()
+        .map(|(name, description)| json!({"name": name, "description": description}))
+        .collect();
+    let args: Vec<&str> = super::setup::MCP_COMMAND_LINE
+        .iter()
+        .skip(1)
+        .copied()
+        .collect();
+    pretty_json(&json!({
+        "manifest_version": MCPB_MANIFEST_VERSION,
+        "name": "relish",
+        "display_name": "Reliaburger relish",
+        "version": version,
+        "description": MCP_DESCRIPTION,
+        "long_description": format!("{MCP_DESCRIPTION}\n\n{MCPB_ADMIN_ADVICE}"),
+        "author": {"name": AUTHOR, "url": SITE},
+        "repository": {"type": "git", "url": REPOSITORY},
+        "homepage": format!("{SITE}/agents"),
+        "documentation": format!(
+            "{REPOSITORY}/blob/v{version}/{chapter}",
+            chapter = paths::CHAPTER
+        ),
+        "support": format!("{REPOSITORY}/issues"),
+        "license": LICENSE,
+        "keywords": ["reliaburger", "relish", "orchestrator", "containers", "sre"],
+        "server": {
+            "type": "binary",
+            "entry_point": MCPB_ENTRY_POINT,
+            "mcp_config": {
+                "command": format!("${{__dirname}}/{MCPB_ENTRY_POINT}"),
+                "args": args,
+                "env": {
+                    "RELIABURGER_ENDPOINT": "${user_config.endpoint}",
+                    "RELIABURGER_TOKEN": "${user_config.token}",
+                },
+            },
+        },
+        "user_config": {
+            "endpoint": {
+                "type": "string",
+                "title": "Cluster API endpoint (optional)",
+                "description": "The Bun API address, such as https://10.0.0.5:9117. \
+                    Leave it empty to use relish's current context.",
+                "required": false,
+                "default": "",
+            },
+            "token": {
+                "type": "string",
+                "title": "Read-only API token (optional)",
+                "description": format!(
+                    "A read-only token, made with `{READ_ONLY_TOKEN_COMMAND}`: \
+                     {REPOSITORY}/blob/main/docs/manual/{CHAPTER_FILE}#a-read-only-token. \
+                     Leave it empty to use relish's current context."
+                ),
+                "sensitive": true,
+                "required": false,
+                "default": "",
+            },
+        },
+        "tools": tools,
+        "compatibility": {"platforms": ["darwin", "linux"]},
     }))
 }
 
@@ -986,6 +1444,47 @@ Intro paragraph.\n\n## In brief\n\n\
             .find(|artefact| artefact.path == path)
             .unwrap()
             .contents
+    }
+
+    #[test]
+    fn links_to_other_manual_chapters_leave_the_website_for_the_release_tag() {
+        let markdown = "See [operations](12_operations.md#is-this-the-release), \
+                        [below](#in-brief) and [the site](https://reliaburger.com/).";
+        assert_eq!(
+            manual_links_absolute(markdown, "0.2.7"),
+            "See [operations](https://github.com/reliaburger/reliaburger/blob/v0.2.7/docs/manual/\
+             12_operations.md#is-this-the-release), [below](#in-brief) and \
+             [the site](https://reliaburger.com/)."
+        );
+    }
+
+    #[test]
+    fn the_agents_page_links_no_manual_chapter_by_a_relative_path() {
+        let chapter = FIXTURE_CHAPTER.replace(
+            "Intro paragraph.",
+            "Intro paragraph, see [operations](12_operations.md).",
+        );
+        let manual = fixture_manual();
+        let inputs = Inputs {
+            chapter: &chapter,
+            agents_md: FIXTURE_AGENTS_MD,
+            manual: &manual,
+            version: "0.2.7",
+            site: &fixture_site(),
+        };
+        let generated = generate(&inputs, &fixture_agent()).unwrap();
+        for path in [paths::AGENTS_PAGE_HTML, paths::AGENTS_PAGE_MARKDOWN] {
+            let page = &generated
+                .iter()
+                .find(|artefact| artefact.path == path)
+                .unwrap()
+                .contents;
+            assert!(
+                page.contains("blob/v0.2.7/docs/manual/12_operations.md"),
+                "{path}: {page}"
+            );
+            assert!(!page.contains("(12_operations.md") && !page.contains("\"12_operations.md"));
+        }
     }
 
     #[test]
@@ -1066,7 +1565,8 @@ Intro paragraph.\n\n## In brief\n\n\
     fn every_artefact_carries_the_brief_or_the_whole_chapter() {
         let brief = "Run `relish agent guide` first.";
         for artefact in generated() {
-            if artefact.path == paths::PLUGIN_MCP || artefact.path == paths::MCP_SERVER {
+            if [paths::PLUGIN_MCP, paths::MCP_SERVER, paths::MCPB_MANIFEST].contains(&artefact.path)
+            {
                 // Server entries, with no room for prose; their own tests
                 // check them.
                 continue;
@@ -1192,7 +1692,7 @@ Intro paragraph.\n\n## In brief\n\n\
     /// The headings `relish agent guide` answers with at `max_bytes`, and
     /// whether it said it trimmed any.
     fn guide_headings(max_bytes: usize) -> (Vec<String>, serde_json::Value) {
-        let rendered = run(max_bytes, "relish agent guide");
+        let rendered = run(max_bytes, None, "relish agent guide");
         assert_eq!(rendered.exit, super::super::ExitStatus::Answered);
         let value: serde_json::Value = serde_json::from_str(&rendered.json).unwrap();
         assert_eq!(value["command"], "guide");
@@ -1207,7 +1707,7 @@ Intro paragraph.\n\n## In brief\n\n\
     }
 
     /// `relish agent guide` is the one document an agent reads whole, so
-    /// its default budget (64 KiB, not 24) returns every section in one
+    /// its default budget (80 KiB, not 24) returns every section in one
     /// call, the setup playbook (#1579) last, with no `next` asking for
     /// more.
     #[test]
@@ -1232,11 +1732,12 @@ Intro paragraph.\n\n## In brief\n\n\
     }
 
     /// The guide's default budget exists so the whole chapter comes back in
-    /// one call. If chapter 16 outgrows it, someone has to choose: split
-    /// the chapter, or raise `GUIDE_MAX_BYTES` knowing what it costs.
+    /// one call. When chapter 16 outgrew 64 KiB, the maintainer chose to
+    /// keep it whole and raise `GUIDE_MAX_BYTES` to 80 KiB (8 Nov 2026).
+    /// Outgrowing that is the same choice again, made deliberately.
     #[test]
     fn the_agent_chapter_fits_the_guides_default_budget() {
-        let rendered = run(1024 * 1024, "relish agent guide");
+        let rendered = run(1024 * 1024, None, "relish agent guide");
         let whole = rendered.json.len();
         assert!(
             whole <= super::super::GUIDE_MAX_BYTES,
@@ -1246,27 +1747,257 @@ Intro paragraph.\n\n## In brief\n\n\
         );
     }
 
-    /// An explicit `--max-bytes` still wins. At the 24 KiB every other
-    /// command defaults to, the chapter doesn't fit, so the budget keeps the
-    /// front (the brief, the contract, the command table), drops sections
-    /// only from the end, and says how to get the rest.
+    /// The guide answered at `max_bytes`, for `section` if given, as JSON.
+    fn guide_at(max_bytes: usize, section: Option<&str>) -> serde_json::Value {
+        let rendered = run(max_bytes, section, "relish agent guide");
+        serde_json::from_str(&rendered.json).unwrap()
+    }
+
+    /// Every section's Markdown in the embedded chapter, by id.
+    fn embedded_sections() -> Vec<GuideSection> {
+        let asset = crate::relish::manual::assets::ManualAssets::get(CHAPTER_FILE).unwrap();
+        sections(&String::from_utf8_lossy(asset.data.as_ref())).1
+    }
+
+    /// A budget smaller than the chapter used to drop sections from the
+    /// end, which at MCP's 8 KiB left a small model the introduction and
+    /// half the brief. Now it answers with the contents, each section with
+    /// its size, and the sections to read first, each whole, and `next`
+    /// names the section after them (#1687).
     #[test]
-    fn an_explicit_smaller_budget_drops_trailing_sections() {
-        let (headings, value) = guide_headings(super::super::DEFAULT_MAX_BYTES);
-        let (whole, _) = guide_headings(super::super::GUIDE_MAX_BYTES);
-        assert_eq!(value["truncated"], true);
-        assert!(
-            headings.len() < whole.len() && headings[..] == whole[..headings.len()],
-            "only sections from the end go: {headings:?}"
-        );
-        for kept in ["In brief", "The contract", "Commands"] {
-            assert!(headings.iter().any(|h| h == kept), "{kept}: {headings:?}");
+    fn a_budget_smaller_than_the_chapter_answers_with_its_outline() {
+        let whole = guide_at(1024 * 1024, None);
+        assert_eq!(whole["data"]["scope"], "whole");
+        assert_eq!(whole["data"]["contents"], serde_json::json!([]));
+        let all = embedded_sections();
+        for budget in [8 * 1024, super::super::DEFAULT_MAX_BYTES] {
+            let value = guide_at(budget, None);
+            assert_eq!(value["ok"], true);
+            assert_eq!(value["data"]["scope"], "outline", "{budget}");
+            assert_eq!(value["truncated"], false, "nothing is cut: {budget}");
+            let kept: Vec<&str> = value["data"]["sections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|section| section["id"].as_str().unwrap())
+                .collect();
+            assert_eq!(kept, READ_FIRST, "{budget}");
+            for section in value["data"]["sections"].as_array().unwrap() {
+                let id = section["id"].as_str().unwrap();
+                let original = all.iter().find(|s| s.id == id).unwrap();
+                assert_eq!(
+                    section["markdown"],
+                    original.markdown.as_str(),
+                    "whole: {id}"
+                );
+            }
+            assert_eq!(
+                value["next"][0]["run"],
+                format!("relish agent guide --section {READ_NEXT}")
+            );
+            let warning = value["warnings"][0].as_str().unwrap();
+            assert!(warning.starts_with("guide_outline: "), "{warning}");
+            assert!(value.to_string().len() < budget);
         }
-        let rerun = value["next"][0]["run"].as_str().unwrap();
-        assert!(
-            rerun.starts_with("relish agent guide --max-bytes "),
-            "{rerun}"
+    }
+
+    /// The table of contents lists every section once, in order, with the
+    /// size of its Markdown.
+    #[test]
+    fn the_contents_list_every_section_with_its_size() {
+        let value = guide_at(8 * 1024, None);
+        let contents = value["data"]["contents"].as_array().unwrap();
+        let all = embedded_sections();
+        assert_eq!(contents.len(), all.len());
+        for (entry, section) in contents.iter().zip(&all) {
+            assert_eq!(entry["id"], section.id.as_str());
+            assert_eq!(entry["heading"], section.heading.as_str());
+            assert_eq!(entry["bytes"], section.markdown.len());
+        }
+        let ids: Vec<&str> = all.iter().map(|section| section.id.as_str()).collect();
+        for id in READ_FIRST.iter().chain([&READ_NEXT]) {
+            assert!(ids.contains(id), "{id} isn't a section: {ids:?}");
+        }
+        let unique: std::collections::BTreeSet<&str> = ids.iter().copied().collect();
+        assert_eq!(unique.len(), ids.len(), "section ids repeat: {ids:?}");
+    }
+
+    /// When a budget is too small for a section to read first, the outline
+    /// leaves it out whole, keeps any later one that fits, and its `next`
+    /// asks for the one left out, by name, rather than cutting it.
+    #[test]
+    fn a_section_to_read_first_that_doesnt_fit_is_named_in_next() {
+        let value = guide_at(4 * 1024, None);
+        assert_eq!(value["data"]["scope"], "outline");
+        assert_eq!(value["truncated"], false);
+        let kept: Vec<&str> = value["data"]["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|section| section["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(kept, ["the-contract"]);
+        let runs: Vec<&str> = value["next"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|step| step["run"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            runs,
+            [
+                "relish agent guide --section in-brief",
+                "relish agent guide --section the-envelope",
+            ]
         );
+    }
+
+    /// `--section` takes an id or a heading, in any case, answers with that
+    /// one section whole, and offers the next one.
+    #[test]
+    fn a_section_is_found_by_id_or_heading_and_offers_the_next() {
+        for wanted in ["through-mcp", "Through MCP", "#through-mcp"] {
+            let value = guide_at(8 * 1024, Some(wanted));
+            assert_eq!(value["ok"], true, "{wanted}");
+            assert_eq!(value["data"]["scope"], "section");
+            assert_eq!(value["data"]["commands"], serde_json::json!([]));
+            let sections = value["data"]["sections"].as_array().unwrap();
+            assert_eq!(sections.len(), 1);
+            assert_eq!(sections[0]["heading"], "Through MCP");
+            assert_eq!(
+                value["next"][0]["run"],
+                "relish agent guide --section wiring-up-your-agent"
+            );
+        }
+    }
+
+    /// The last section has no next one to offer.
+    #[test]
+    fn the_last_section_offers_no_next_section() {
+        let last = embedded_sections().pop().unwrap();
+        let value = guide_at(8 * 1024, Some(&last.id));
+        assert_eq!(value["data"]["sections"][0]["id"], last.id.as_str());
+        assert_eq!(value["next"], serde_json::json!([]));
+    }
+
+    /// An unknown section is `not_found`, and the hint lists every id.
+    #[test]
+    fn an_unknown_section_is_not_found_and_lists_the_ids() {
+        let rendered = run(8 * 1024, Some("no-such-section"), "relish agent guide");
+        assert_ne!(rendered.exit, super::super::ExitStatus::Answered);
+        let value: serde_json::Value = serde_json::from_str(&rendered.json).unwrap();
+        assert_eq!(value["error"]["code"], "not_found");
+        let hint = value["error"]["hint"].as_str().unwrap();
+        assert!(
+            hint.contains("in-brief") && hint.contains("through-mcp"),
+            "{hint}"
+        );
+    }
+
+    /// A section bigger than its budget is cut between paragraphs, never
+    /// inside a sentence, and says so: `truncated`, a warning with what it
+    /// kept, and a first `next` step that asks for the whole section.
+    #[test]
+    fn a_section_bigger_than_its_budget_is_cut_between_paragraphs_and_says_so() {
+        let original = embedded_sections()
+            .into_iter()
+            .find(|section| section.id == "through-mcp")
+            .unwrap()
+            .markdown;
+        for budget in [1024, 2048, 4096] {
+            let value = guide_at(budget, Some("through-mcp"));
+            assert!(value.to_string().len() < budget, "{budget}");
+            assert_eq!(value["truncated"], true, "{budget}");
+            let kept = value["data"]["sections"][0]["markdown"].as_str().unwrap();
+            assert!(original.starts_with(kept), "{budget}: a prefix");
+            assert!(
+                kept.is_empty() || original[kept.len()..].starts_with("\n\n"),
+                "{budget}: cut at a paragraph break: {kept:?}"
+            );
+            let warning = value["warnings"][0].as_str().unwrap();
+            assert!(
+                warning.starts_with("guide_section_cut: through-mcp is "),
+                "{warning}"
+            );
+            assert!(
+                value["next"][0]["run"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("relish agent guide --section through-mcp --max-bytes "),
+                "{}",
+                value["next"]
+            );
+        }
+        let kept = guide_at(4096, Some("through-mcp"))["data"]["sections"][0]["markdown"]
+            .as_str()
+            .unwrap()
+            .len();
+        assert!(kept > 1024, "4 KiB keeps most of what fits: {kept}");
+    }
+
+    /// Every `--max-bytes N` an answer names, in its `next` steps and its
+    /// warnings.
+    fn budgets_named(value: &serde_json::Value) -> Vec<usize> {
+        let mut texts: Vec<String> = Vec::new();
+        for step in value["next"].as_array().into_iter().flatten() {
+            texts.push(step["run"].as_str().unwrap_or_default().to_string());
+        }
+        for warning in value["warnings"].as_array().into_iter().flatten() {
+            texts.push(warning.as_str().unwrap_or_default().to_string());
+        }
+        texts
+            .iter()
+            .flat_map(|text| text.split("--max-bytes ").skip(1))
+            .filter_map(|rest| {
+                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                digits.parse().ok()
+            })
+            .collect()
+    }
+
+    /// The outline (#1826) and a cut section name a bigger budget, so under
+    /// the ceiling `relish mcp` sets (#1829) they never name more than it,
+    /// and at the ceiling they name none: asking can't get more.
+    #[tokio::test]
+    async fn under_a_ceiling_the_guide_never_asks_for_more_than_it() {
+        let section = super::super::budget::within_ceiling(2048, async {
+            guide_at(1024, Some("through-mcp"))
+        })
+        .await;
+        assert_eq!(budgets_named(&section), [2048], "{section}");
+        let section_at = super::super::budget::within_ceiling(2048, async {
+            guide_at(2048, Some("through-mcp"))
+        })
+        .await;
+        assert!(budgets_named(&section_at).is_empty(), "{section_at}");
+
+        let outline =
+            super::super::budget::within_ceiling(16 * 1024, async { guide_at(8 * 1024, None) })
+                .await;
+        assert_eq!(budgets_named(&outline), [16 * 1024], "{outline}");
+        let outline_at =
+            super::super::budget::within_ceiling(8 * 1024, async { guide_at(8 * 1024, None) })
+                .await;
+        assert!(budgets_named(&outline_at).is_empty(), "{outline_at}");
+    }
+
+    /// A blank line inside a code block isn't a paragraph break.
+    #[test]
+    fn paragraph_breaks_skip_code_blocks() {
+        let markdown = "One.\n\n```sh\na\n\nb\n```\n\nTwo.";
+        let breaks = paragraph_breaks(markdown);
+        let cuts: Vec<&str> = breaks.iter().map(|&end| &markdown[..end]).collect();
+        assert_eq!(cuts, ["One.", "One.\n\n```sh\na\n\nb\n```"]);
+    }
+
+    /// Every section of the chapter fits MCP's 8 KiB default whole, so
+    /// following an outline's `next` never meets a cut section.
+    #[test]
+    fn every_section_fits_mcps_default_budget_whole() {
+        for section in embedded_sections() {
+            let value = guide_at(8 * 1024, Some(&section.id));
+            assert_eq!(value["truncated"], false, "{} is cut at 8 KiB", section.id);
+        }
     }
 
     #[test]
@@ -1437,6 +2168,10 @@ Intro paragraph.\n\n## In brief\n\n\
         insta::assert_snapshot!(artefact(paths::PLUGIN));
     }
 
+    /// The plugin starts the same server `relish agent setup` registers,
+    /// with each command's own budget (`--max-bytes 0`): Claude Code has the
+    /// window for 24 KiB answers and an 80 KiB guide, and the server's own
+    /// 8 KiB is for small local models (#1687, #1818's review).
     #[test]
     fn the_plugin_starts_the_server_setup_registers() {
         let value: serde_json::Value = serde_json::from_str(&artefact(paths::PLUGIN_MCP)).unwrap();
@@ -1449,7 +2184,9 @@ Intro paragraph.\n\n## In brief\n\n\
                 .iter()
                 .map(|a| a.as_str().unwrap()),
         );
-        assert_eq!(line, super::super::setup::MCP_COMMAND_LINE);
+        let mut expected = super::super::setup::MCP_COMMAND_LINE.to_vec();
+        expected.extend(["--max-bytes", "0"]);
+        assert_eq!(line, expected);
     }
 
     #[test]
@@ -1553,7 +2290,7 @@ Intro paragraph.\n\n## In brief\n\n\
         assert!(MCP_DESCRIPTION.chars().count() <= MCP_DESCRIPTION_MAX);
         assert!(
             value.get("packages").is_none(),
-            "relish isn't in a package registry the MCP Registry installs from"
+            "promotion adds the packages, once the bundles exist"
         );
         let provided = &value["_meta"]["io.modelcontextprotocol.registry/publisher-provided"];
         assert_eq!(provided["transport"], "stdio");
@@ -1592,5 +2329,137 @@ Intro paragraph.\n\n## In brief\n\n\
     #[test]
     fn snapshot_of_the_registry_entry() {
         insta::assert_snapshot!(artefact(paths::MCP_SERVER));
+    }
+
+    /// The MCP Bundle's manifest starts the `relish` inside the bundle as
+    /// `relish mcp`, over stdio, and lists exactly the tools that server
+    /// offers by default, as the registry entry does.
+    #[test]
+    fn the_bundle_manifest_runs_the_bundled_relish_mcp_with_the_served_tools() {
+        let manifest = generate(
+            &Inputs {
+                chapter: FIXTURE_CHAPTER,
+                agents_md: FIXTURE_AGENTS_MD,
+                manual: &fixture_manual(),
+                version: "0.2.7",
+                site: &[],
+            },
+            &agent_command(),
+        )
+        .unwrap()
+        .into_iter()
+        .find(|artefact| artefact.path == paths::MCPB_MANIFEST)
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&manifest.contents).unwrap();
+        assert_eq!(value["manifest_version"], MCPB_MANIFEST_VERSION);
+        assert_eq!(value["version"], "0.2.7");
+        assert_eq!(value["description"], MCP_DESCRIPTION);
+        let server = &value["server"];
+        assert_eq!(server["type"], "binary");
+        assert_eq!(server["entry_point"], MCPB_ENTRY_POINT);
+        assert_eq!(
+            server["mcp_config"]["command"],
+            format!("${{__dirname}}/{MCPB_ENTRY_POINT}")
+        );
+        let args: Vec<&str> = server["mcp_config"]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|word| word.as_str().unwrap())
+            .collect();
+        assert_eq!(args, &super::super::setup::MCP_COMMAND_LINE[1..]);
+        let listed: Vec<&str> = value["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        let served = crate::relish::mcp::Server::new(&Default::default()).unwrap();
+        let served: Vec<String> = served
+            .tools()
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        assert_eq!(listed, served);
+        assert!(
+            value["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|tool| !tool["description"].as_str().unwrap().is_empty())
+        );
+        assert_eq!(
+            value["compatibility"]["platforms"],
+            serde_json::json!(["darwin", "linux"]),
+            "release packaging narrows this to one platform per bundle"
+        );
+    }
+
+    /// #1695: the bundle asks for nothing by default. Its two settings are
+    /// optional and empty, so a bundle nobody configured uses relish's
+    /// current context, and the token one asks for a read-only token only.
+    #[test]
+    fn the_bundle_takes_an_optional_endpoint_and_read_only_token() {
+        let value: serde_json::Value =
+            serde_json::from_str(&artefact(paths::MCPB_MANIFEST)).unwrap();
+        let settings = value["user_config"].as_object().unwrap();
+        assert_eq!(
+            settings.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["endpoint", "token"]
+        );
+        for (name, setting) in settings {
+            assert_eq!(setting["type"], "string", "{name}");
+            assert_eq!(setting["required"], false, "{name}");
+            assert_eq!(setting["default"], "", "{name}");
+            assert!(setting["title"].as_str().unwrap().contains("(optional)"));
+            let words = format!("{} {}", setting["title"], setting["description"]);
+            assert!(!words.to_lowercase().contains("admin"), "{name}: {words}");
+        }
+        let endpoint = &settings["endpoint"];
+        assert!(endpoint.get("sensitive").is_none());
+        assert!(
+            endpoint["description"]
+                .as_str()
+                .unwrap()
+                .contains("Leave it empty to use relish's current context")
+        );
+        let token = &settings["token"];
+        assert_eq!(token["sensitive"], true);
+        assert!(token["title"].as_str().unwrap().starts_with("Read-only"));
+        let description = token["description"].as_str().unwrap();
+        assert!(
+            description.contains(READ_ONLY_TOKEN_COMMAND),
+            "{description}"
+        );
+        assert!(description.contains(&format!(
+            "{REPOSITORY}/blob/main/docs/manual/{CHAPTER_FILE}#a-read-only-token"
+        )));
+        assert_eq!(
+            value["server"]["mcp_config"]["env"],
+            serde_json::json!({
+                "RELIABURGER_ENDPOINT": "${user_config.endpoint}",
+                "RELIABURGER_TOKEN": "${user_config.token}",
+            })
+        );
+    }
+
+    /// #1695, decision (d): an unconfigured bundle uses the current context,
+    /// which may hold an admin token, so the bundle's description says so in
+    /// one line and says how to make a read-only one instead.
+    #[test]
+    fn the_bundle_description_warns_that_an_empty_token_may_mean_admin() {
+        let value: serde_json::Value =
+            serde_json::from_str(&artefact(paths::MCPB_MANIFEST)).unwrap();
+        let long = value["long_description"].as_str().unwrap();
+        let advice = long.lines().last().unwrap();
+        assert!(advice.contains("admin"), "{advice}");
+        assert!(advice.contains(READ_ONLY_TOKEN_COMMAND), "{advice}");
+        assert!(advice.contains("token setting"), "{advice}");
+        assert!(long.starts_with(MCP_DESCRIPTION), "{long}");
+    }
+
+    #[test]
+    fn snapshot_of_the_bundle_manifest() {
+        insta::assert_snapshot!(artefact(paths::MCPB_MANIFEST));
     }
 }

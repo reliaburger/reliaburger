@@ -1,0 +1,14 @@
+[
+  {
+    "namespace": "default",
+    "app": "hello",
+    "state": "running",
+    "desired": 1,
+    "running": 1,
+    "restarts": 0,
+    "nodes": [
+      "rb-5ffc4ea3df5c-1"
+    ],
+    "age_seconds": 7
+  }
+]

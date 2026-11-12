@@ -731,6 +731,45 @@ async fn a_stop_waits_out_a_network_reference_release_slower_than_the_turn() {
         .await;
 }
 
+/// The test above failed under load with two release calls (#1620): once
+/// the release landed, the journal write that forgets the hold outlasted
+/// the turn, and the retry found the hold no longer recorded and handed it
+/// back again. Holding every journal write past the turn's deadline makes
+/// that the path every run takes. The runtime confirmed the first release,
+/// so the retry only finishes the bookkeeping.
+#[tokio::test]
+async fn a_stop_whose_forget_write_outlasts_the_turn_releases_the_reference_once() {
+    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+    let root = tempfile::tempdir().unwrap();
+    agent
+        .enable_fresh_discovery_ownership(&root.path().join("discovery"))
+        .await
+        .unwrap();
+    let reference = original_test_network_reference();
+    grill.set_network_reference(reference.clone()).await;
+    expect_complete(&drain_deploy(&mut agent, replicated("web", 1)).await);
+    let running = RunningAgent::start(agent, tx, shutdown);
+    running
+        .stalls
+        .set(LoopStall::Persist, OUTLASTS_THE_TURN_DEADLINE);
+    let (response, stopped) = oneshot::channel();
+    running
+        .tx
+        .send(AgentCommand::Stop {
+            app_name: "web".into(),
+            namespace: "default".into(),
+            response,
+        })
+        .await
+        .unwrap();
+    let stopped = tokio::time::timeout(std::time::Duration::from_secs(30), stopped)
+        .await
+        .expect("the stop was never answered")
+        .expect("the stop's waiter was dropped");
+    assert!(stopped.is_ok(), "{stopped:?}");
+    assert_eq!(calls_of(&grill, "release_network_reference"), 1);
+}
+
 /// When a stop the egress fence relies on fails, the fence force-kills the
 /// app, but only once the runtime confirms each instance still holds its
 /// original address (#357). On runc that read waits for the lifecycle lock,
@@ -1709,6 +1748,51 @@ async fn a_consumer_compaction_hands_a_slow_journal_write_off_at_the_turn_deadli
     );
 }
 
+/// The 0.2.7 jobs final (#1707): a `consumer_sync/journal` turn took
+/// 1,215 ms, all of it journal write. A recovered consumer's first answer
+/// takes the journal step's other branch, which journals `Withdrawing`
+/// before anything publishes. Its write, and every later one, is that
+/// slow here, and each turn still hands off within the budget.
+#[tokio::test]
+async fn a_recovered_consumers_journal_step_hands_a_slow_write_off_at_the_turn_deadline() {
+    let (mut agent, _root, catalog, ingress) = recovered_consumer().await;
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
+    let (response, reply) = oneshot::channel();
+    agent
+        .request_consumer_sync(crate::bun::agent::consumer::ConsumerRequest {
+            generation: 1,
+            catalog,
+            ingress,
+            withdrawals: vec![],
+            answer: Some(crate::bun::agent::consumer::ConsumerAnswer {
+                requested_at_ns: crate::onion::lease::boot_clock_ns(),
+                response,
+            }),
+        })
+        .await;
+    let mut journal_steps = 0;
+    while !agent.consumer_syncs.is_idle() || agent.discovery_write_in_flight() {
+        let turn = one_consumer_sync_turn(&mut agent).await;
+        if turn.detail == Some("consumer_sync/journal") {
+            journal_steps += 1;
+            assert!(
+                agent.discovery_write_in_flight(),
+                "the journal step wrote nothing to hand off: {turn}"
+            );
+        }
+        assert!(
+            turn.took < TURN_BUDGET,
+            "{turn} waited for a {STALLED_JOURNAL_WRITE:?} journal write: {:?}",
+            turn.part(TurnPart::JournalWrite)
+        );
+    }
+    assert_eq!(journal_steps, 1, "the synchronisation never journalled");
+    assert!(reply.await.unwrap().unwrap().published);
+    assert_eq!(installed_remote_port(&agent), Some(30001));
+}
+
 /// A journal write that fails after the turn moved on fences discovery as
 /// a failed inline write does: ownership becomes uncertain, readiness says
 /// so, the view it would have recorded never reaches the kernel, and the
@@ -2472,9 +2556,9 @@ fn assert_at_most_two_writes_a_tick(writes_per_tick: &[usize]) {
 
 /// Completing a startup retirement journals it: the network reference's
 /// release, then the discovery service's retirement, four fsync'd persists.
-/// Persists may stay inline (#351, decision 2) only while a slow disk keeps
-/// every turn in budget. In one turn the four came to about 663 ms at
-/// 150 ms a write, and would pass the budget at the 250 ms a write a loaded
+/// Persists could stay inline (#351, decision 2, dropped in 0.2.8 by
+/// #1853) only while a slow disk kept every turn in budget. In one turn the
+/// four came to about 663 ms at 150 ms a write, and would pass the budget at the 250 ms a write a loaded
 /// coverage runner measured (#421), so the release and the service's
 /// retirement now journal on different ticks (#422).
 ///
@@ -2574,7 +2658,6 @@ async fn web_with_a_discovery_write_in_flight() -> (
     agent
         .loop_stalls
         .set(LoopStall::Persist, STALLED_JOURNAL_WRITE);
-    let reached = agent.loop_stalls.reached(LoopStall::Persist);
     let landing = agent
         .write_discovery_inventory(
             &service,
@@ -2588,14 +2671,46 @@ async fn web_with_a_discovery_write_in_flight() -> (
         landing,
         crate::bun::agent::discovery_ownership::Landing::InFlight
     ));
-    // Only the write in flight is slow: wait until it has read its stall.
-    while agent.loop_stalls.reached(LoopStall::Persist) == reached {
-        tokio::task::yield_now().await;
-    }
+    // Only the write in flight is slow: it took its stall when it started.
     agent
         .loop_stalls
         .set(LoopStall::Persist, std::time::Duration::ZERO);
     (agent, root, id, service)
+}
+
+/// The writes-per-tick scenarios count a journal write in the tick that
+/// starts it. The write runs in a task, and a tick past its deadline gives
+/// that task no chance to run before the tick ends; the count used to be
+/// taken inside the task, so such a write landed in the gap between ticks
+/// uncounted, and a finished retirement added up to three writes, not four
+/// (#1625). The write is counted where it starts.
+#[tokio::test]
+async fn a_journal_write_started_past_the_turns_deadline_is_counted_where_it_starts() {
+    let (mut agent, _root, _id, service) = web_journalling_discovery().await;
+    agent
+        .loop_stalls
+        .set(LoopStall::Persist, OUTLASTS_THE_TURN_DEADLINE);
+    let reached = agent.loop_stalls.reached(LoopStall::Persist);
+    // A deadline the runtime's timer has already moved past, as it has when
+    // a tick's earlier write woke the loop late: the write's timeout fires
+    // as it's registered, and the tick never yields to the write's task.
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let deadline = tokio::time::Instant::now() - std::time::Duration::from_millis(10);
+    let landing = agent
+        .write_discovery_inventory(
+            &service,
+            |_| {},
+            Some(deadline),
+            crate::bun::agent::discovery_ownership::WriteOwner::ConsumerStep,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        landing,
+        crate::bun::agent::discovery_ownership::Landing::InFlight
+    ));
+    assert_eq!(agent.loop_stalls.reached(LoopStall::Persist), reached + 1);
+    agent.settle_discovery_write().await;
 }
 
 /// The 0.2.1 candidate 5 soak: a node restarted on a busy disk, a consumer
@@ -4865,4 +4980,460 @@ async fn an_upgrade_commit_prunes_old_binaries_off_the_loop_and_refuses_the_next
     assert!(upgrade.holds_binary("0.1.0"), "pruned the rollback target");
     assert!(!upgrade.holds_binary("0.0.1"));
     assert!(!upgrade.marker_on_disk());
+}
+
+// ---- durable writes a turn used to wait out (#1853) -------------------------
+
+/// Longer than a turn's whole budget, short enough to keep the scenarios
+/// quick.
+const SLOW_RECORD_WRITE: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// An agent that records its instances for adoption under `root`.
+fn recording_agent() -> (
+    TestAgent,
+    mpsc::Sender<AgentCommand>,
+    CancellationToken,
+    MockGrill,
+    tempfile::TempDir,
+) {
+    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+    let root = tempfile::tempdir().unwrap();
+    agent.set_records_dir(root.path().join("records"));
+    grill.set_pid(std::process::id());
+    (agent, tx, shutdown, grill, root)
+}
+
+fn record_on_disk(root: &tempfile::TempDir, id: &str) -> bool {
+    crate::grill::records::record_path(&root.path().join("records"), id).exists()
+}
+
+/// Send a deploy to the running agent and hand back its events.
+async fn deploy_through_the_loop(
+    tx: &mpsc::Sender<AgentCommand>,
+    config: Config,
+) -> mpsc::Receiver<ApplyEvent> {
+    let (events, progress) = mpsc::channel(64);
+    tx.send(AgentCommand::Deploy { config, events })
+        .await
+        .unwrap();
+    progress
+}
+
+/// Wait for a deploy's last event, which must say it completed.
+async fn deploy_completes(mut progress: mpsc::Receiver<ApplyEvent>) {
+    let finished = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while let Some(event) = progress.recv().await {
+            match event {
+                ApplyEvent::Complete { .. } => return Ok(()),
+                ApplyEvent::Error { message } => return Err(message),
+                _ => {}
+            }
+        }
+        Err("the deploy's events ended without a verdict".to_string())
+    })
+    .await
+    .expect("the deploy never finished");
+    assert!(finished.is_ok(), "{finished:?}");
+}
+
+/// Wait until `stall`'s await has been reached `count` times in all.
+async fn reached(stalls: &LoopStalls, stall: LoopStall, count: usize) {
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        while stalls.reached(stall) < count {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "{stall:?} was reached {} of {count} times",
+            stalls.reached(stall)
+        )
+    });
+}
+
+async fn instance_statuses(
+    running: &RunningAgent,
+) -> Vec<crate::bun::agent::status::InstanceStatus> {
+    let (response, answer) = oneshot::channel();
+    running
+        .tx
+        .send(AgentCommand::Status { response })
+        .await
+        .unwrap();
+    tokio::time::timeout(STATUS_PATIENCE, answer)
+        .await
+        .expect("status was not answered")
+        .unwrap()
+}
+
+/// The 0.2.8 gate's jobs fast tier (#1853): in a graceful whole-cluster
+/// stop and start, one node's `finish_fresh_instance` turn took 1,593 ms.
+/// The discovery journal write was 46 ms of it, and almost all the rest was
+/// the adoption record's fdatasync, which the turn awaited with no deadline.
+/// The write now goes on off the loop, and the turn ends at its deadline.
+#[tokio::test]
+async fn status_answers_while_a_fresh_instance_writes_its_record_to_a_slow_disk() {
+    let (agent, tx, shutdown, _grill, root) = recording_agent();
+    let running = RunningAgent::start(agent, tx.clone(), shutdown);
+    running
+        .stalls
+        .set(LoopStall::RecordWrite, SLOW_RECORD_WRITE);
+    running.measure_from_here();
+    let progress = deploy_through_the_loop(&tx, replicated("web", 1)).await;
+    reached(&running.stalls, LoopStall::RecordWrite, 1).await;
+    deploy_completes(progress).await;
+    assert!(record_on_disk(&root, "default__web-0"));
+    running
+        .assert_responsive("a fresh instance's adoption record was written to a slow disk")
+        .await;
+}
+
+/// The record is what a restarted Bun adopts the instance by, so nothing may
+/// treat the instance as running before it is on disk. Moving the write off
+/// the loop kept that order: every status a slow write lets through shows
+/// a running instance only once its record exists.
+#[tokio::test]
+async fn no_instance_runs_before_its_record_is_on_disk() {
+    let (agent, tx, shutdown, _grill, root) = recording_agent();
+    let running = RunningAgent::start(agent, tx.clone(), shutdown);
+    running
+        .stalls
+        .set(LoopStall::RecordWrite, SLOW_RECORD_WRITE);
+    let mut progress = deploy_through_the_loop(&tx, replicated("web", 1)).await;
+    reached(&running.stalls, LoopStall::RecordWrite, 1).await;
+    let mut observed = 0;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        // Read the record after the status answered: a record is never
+        // removed while its instance runs, so one that landed meanwhile was
+        // already there when the instance turned running, if it had.
+        let statuses = instance_statuses(&running).await;
+        let recorded = record_on_disk(&root, "default__web-0");
+        observed += 1;
+        for status in &statuses {
+            assert!(
+                !status.state.eq_ignore_ascii_case("running") || recorded,
+                "{} was {} before its adoption record was on disk",
+                status.id,
+                status.state
+            );
+        }
+        if statuses
+            .iter()
+            .any(|status| status.state.eq_ignore_ascii_case("running"))
+        {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "web-0 never ran");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    while progress.recv().await.is_some() {}
+    stop(running).await;
+    assert!(
+        observed > 1,
+        "no status was answered while the record write was in flight"
+    );
+}
+
+/// Asking again after `StillRunning` must not repeat the steps before the
+/// write: one instance, one log forwarder, however many asks it took.
+#[tokio::test]
+async fn a_fresh_instance_asked_again_starts_one_log_forwarder() {
+    let (agent, tx, shutdown, _grill, _root) = recording_agent();
+    let running = RunningAgent::start(agent, tx.clone(), shutdown);
+    running
+        .stalls
+        .set(LoopStall::RecordWrite, SLOW_RECORD_WRITE);
+    let before = running.stalls.reached(LoopStall::LogForwarder);
+    let progress = deploy_through_the_loop(&tx, replicated("web", 1)).await;
+    deploy_completes(progress).await;
+    let forwarders = running.stalls.reached(LoopStall::LogForwarder) - before;
+    stop(running).await;
+    assert_eq!(
+        forwarders, 1,
+        "a slow record write started {forwarders} log forwarders"
+    );
+}
+
+/// A restart removes its predecessor's record, then writes its
+/// replacement's: two fsyncs a turn used to wait out.
+#[tokio::test]
+async fn status_answers_while_a_restart_rewrites_its_record_on_a_slow_disk() {
+    let (mut agent, tx, shutdown, grill, root) = recording_agent();
+    expect_complete(&drain_deploy(&mut agent, replicated("web", 1)).await);
+    let running = RunningAgent::start(agent, tx, shutdown);
+    running
+        .stalls
+        .set(LoopStall::RecordWrite, SLOW_RECORD_WRITE);
+    running.measure_from_here();
+    let before = running.stalls.reached(LoopStall::RecordWrite);
+    crash(&grill);
+    // The predecessor's record removal, then the replacement's record write.
+    // Each Clear the removal is asked again from kills the container again,
+    // so it runs, as far as the runtime says, only once the write is under
+    // way.
+    reached(&running.stalls, LoopStall::RecordWrite, before + 2).await;
+    let id = InstanceId("default__web-0".into());
+    grill.set_state(&id, ContainerState::Running);
+    grill.set_exit_code(&id, None);
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            let statuses = instance_statuses(&running).await;
+            if statuses.iter().any(|status| {
+                status.restart_count > 0 && status.state.eq_ignore_ascii_case("running")
+            }) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the restart never finished");
+    assert!(record_on_disk(&root, "default__web-0"));
+    running
+        .assert_responsive("a restart removed and wrote adoption records on a slow disk")
+        .await;
+}
+
+/// A rolling replacement records itself while its worker still owns it.
+#[tokio::test]
+async fn status_answers_while_a_rolling_replacement_writes_its_record_to_a_slow_disk() {
+    let (mut agent, tx, shutdown, _grill, root) = recording_agent();
+    expect_complete(&drain_deploy(&mut agent, replicated("web", 1)).await);
+    let running = RunningAgent::start(agent, tx.clone(), shutdown);
+    running
+        .stalls
+        .set(LoopStall::RecordWrite, SLOW_RECORD_WRITE);
+    running.measure_from_here();
+    let before = running.stalls.reached(LoopStall::RecordWrite);
+    let next = Config::parse("[app.web]\nimage = 'web:v2'\nport = 8080\nreplicas = 1\n").unwrap();
+    let progress = deploy_through_the_loop(&tx, next).await;
+    reached(&running.stalls, LoopStall::RecordWrite, before + 1).await;
+    deploy_completes(progress).await;
+    assert!(record_on_disk(&root, "default__web-g1-0"));
+    running
+        .assert_responsive("a rolling replacement's adoption record was written to a slow disk")
+        .await;
+}
+
+/// Bun killed while the record write is still in flight: the record never
+/// landed, so the next Bun has nothing to adopt and starts cleanly.
+#[tokio::test]
+async fn a_crash_before_the_record_lands_leaves_nothing_to_adopt() {
+    let (agent, tx, shutdown, _grill, root) = recording_agent();
+    let running = RunningAgent::start(agent, tx.clone(), shutdown);
+    running
+        .stalls
+        .set(LoopStall::RecordWrite, std::time::Duration::from_secs(60));
+    let _progress = deploy_through_the_loop(&tx, replicated("web", 1)).await;
+    reached(&running.stalls, LoopStall::RecordWrite, 1).await;
+    running.task.abort();
+    assert!(!record_on_disk(&root, "default__web-0"));
+
+    let (mut restarted, _, _, grill) = test_agent_with_grill();
+    restarted.set_records_dir(root.path().join("records"));
+    grill.set_pid(std::process::id());
+    assert_eq!(restarted.adopt_recorded_instances().await.unwrap(), 0);
+    assert!(restarted.supervisor.list_instances().is_empty());
+}
+
+/// Bun killed once the record has landed, whether or not the loop had
+/// collected the write yet: the next Bun adopts the instance.
+#[tokio::test]
+async fn a_crash_after_the_record_lands_adopts_the_instance() {
+    let (agent, tx, shutdown, _grill, root) = recording_agent();
+    let running = RunningAgent::start(agent, tx.clone(), shutdown);
+    running
+        .stalls
+        .set(LoopStall::RecordWrite, SLOW_RECORD_WRITE);
+    let _progress = deploy_through_the_loop(&tx, replicated("web", 1)).await;
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while !record_on_disk(&root, "default__web-0") {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the record never landed");
+    running.task.abort();
+
+    let (mut restarted, _, _, grill) = test_agent_with_grill();
+    restarted.set_records_dir(root.path().join("records"));
+    grill.set_pid(std::process::id());
+    grill.set_adopt_result(&InstanceId("default__web-0".into()), true);
+    assert_eq!(restarted.adopt_recorded_instances().await.unwrap(), 1);
+}
+
+/// A retirement that reached an instance whose record write was still in
+/// flight used to be impossible: the write held the turn. Off the loop, the
+/// write could land after retirement removed the record and leave a record
+/// for an instance that no longer exists. Retirement waits for it instead.
+#[tokio::test]
+async fn retirement_waits_for_a_record_write_in_flight() {
+    let (mut agent, _tx, _shutdown, grill, root) = recording_agent();
+    expect_complete(&drain_deploy(&mut agent, replicated("web", 1)).await);
+    let id = InstanceId("default__web-0".into());
+    let path = crate::grill::records::record_path(&root.path().join("records"), &id.0);
+    std::fs::remove_file(&path).unwrap();
+    agent
+        .loop_stalls
+        .set(LoopStall::RecordWrite, SLOW_RECORD_WRITE);
+    let evidence = crate::bun::agent::launch_evidence::LaunchEvidence::read(&grill, &id).await;
+    agent.turn_deadline = Some(tokio::time::Instant::now() + TURN_RUNTIME_BUDGET);
+    let written = agent.persist_instance_record(&id, &evidence).await;
+    assert!(
+        matches!(written, Err(BunError::StillRunning { .. })),
+        "the record write held the turn: {written:?}"
+    );
+    agent.turn_deadline = Some(tokio::time::Instant::now() + TURN_RUNTIME_BUDGET);
+    let early = agent.retire_instance_artifacts(&id).await;
+    assert!(
+        matches!(early, Err(BunError::StillRunning { .. })),
+        "retirement went ahead of a record write in flight: {early:?}"
+    );
+    tokio::time::sleep(SLOW_RECORD_WRITE + std::time::Duration::from_millis(300)).await;
+    agent.turn_deadline = None;
+    agent.retire_instance_artifacts(&id).await.unwrap();
+    assert!(
+        !path.exists(),
+        "a late record write outlived its instance's retirement"
+    );
+}
+
+/// A signed identity's files are written with an fsync each. The landing
+/// turn used to wait for them; now the write goes on off the loop and the
+/// identity is recorded, and its waiters answered, when it lands.
+#[tokio::test]
+async fn a_signed_identity_is_stored_off_the_loop() {
+    let (mut agent, _tx, _shutdown, _grill) = test_agent_with_grill();
+    let volumes = tempfile::tempdir().unwrap();
+    agent.set_volumes_dir(volumes.path().to_path_buf());
+    expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+    let id = agent.supervisor.list_instances()[0].id.clone();
+    agent.supervisor.get_instance_mut(&id).unwrap().identity = None;
+    let issued = write_test_identity(volumes.path(), "scratch");
+    let signed = super::identity_signing::SignedIdentity::for_test(
+        issued.spiffe_uri.clone(),
+        issued.private_key_der.clone(),
+        Ok(crate::cluster::workload_identity::SignedWorkload {
+            cert_der: issued.certificate_der.clone(),
+            workload_ca_cert_der: vec![1],
+            root_ca_cert_der: vec![2],
+            ca_bundle_der: vec![vec![1], vec![2]],
+            jwt_token: Some("jwt".into()),
+        }),
+    );
+    let task = agent
+        .identity_signing_tasks
+        .spawn(async move { signed })
+        .id();
+    let (waiter, answered) = oneshot::channel();
+    let mut signing = super::identity_signing::IdentitySigning::for_test(id.clone());
+    signing.add_waiter(waiter);
+    agent.identity_signings.insert(task, signing);
+    agent
+        .loop_stalls
+        .set(LoopStall::IdentityWrite, SLOW_RECORD_WRITE);
+
+    let outcome = agent
+        .identity_signing_tasks
+        .join_next_with_id()
+        .await
+        .unwrap();
+    agent.turn_deadline = Some(tokio::time::Instant::now() + TURN_RUNTIME_BUDGET);
+    let started = std::time::Instant::now();
+    agent.finish_identity_provision(outcome).await;
+    let took = started.elapsed();
+    assert!(
+        took < TURN_BUDGET,
+        "storing the identity held the turn for {took:?}"
+    );
+    assert!(
+        agent
+            .supervisor
+            .get_instance(&id)
+            .unwrap()
+            .identity
+            .is_none()
+    );
+    // Retirement must not remove the directory the write is filling.
+    let early = agent.retire_instance_artifacts(&id).await;
+    assert!(
+        matches!(early, Err(BunError::StillRunning { .. })),
+        "retirement went ahead of an identity write in flight: {early:?}"
+    );
+
+    agent.turn_deadline = None;
+    while let Some(outcome) = agent.identity_signing_tasks.join_next_with_id().await {
+        agent.finish_identity_provision(outcome).await;
+    }
+    answered.await.expect("the waiter was dropped unanswered");
+    let instance = agent.supervisor.get_instance(&id).unwrap();
+    assert_eq!(instance.identity.as_ref().unwrap().jwt_token, "jwt");
+}
+
+/// Review of #1854: a restart keeps its instance's `created_at`, so keying
+/// the record write by it let one launch collect another's. A restart's
+/// write outlasts its turn; the instance leaves `Starting` before the
+/// recheck, so nobody collects it; the next restart removes the record;
+/// and its own write found the earlier one "started", collected that
+/// result and wrote nothing. The instance ran with no record, and the next
+/// Bun would have killed it as an unacknowledged launch. Each launch now
+/// gets its own write.
+async fn a_later_launch_writes_its_own_record(earlier_fails: bool) {
+    let (mut agent, _tx, _shutdown, grill, root) = recording_agent();
+    expect_complete(&drain_deploy(&mut agent, replicated("web", 1)).await);
+    let id = InstanceId("default__web-0".into());
+    let records = root.path().join("records");
+
+    // The earlier restart's write, left in flight past its turn.
+    if earlier_fails {
+        // A directory under a regular file can't be created, by root either.
+        let blocker = root.path().join("not-a-directory");
+        std::fs::write(&blocker, "").unwrap();
+        agent.set_records_dir(blocker.join("records"));
+    }
+    agent
+        .loop_stalls
+        .set(LoopStall::RecordWrite, SLOW_RECORD_WRITE);
+    let earlier = crate::bun::agent::launch_evidence::LaunchEvidence::read(&grill, &id).await;
+    agent.turn_deadline = Some(tokio::time::Instant::now() + TURN_RUNTIME_BUDGET);
+    let in_flight = agent.persist_instance_record(&id, &earlier).await;
+    assert!(
+        matches!(in_flight, Err(BunError::StillRunning { .. })),
+        "{in_flight:?}"
+    );
+    // The instance leaves `Starting`; nothing collects the write, which
+    // lands on its own.
+    tokio::time::sleep(SLOW_RECORD_WRITE + std::time::Duration::from_millis(300)).await;
+    agent.turn_deadline = None;
+    agent.set_records_dir(records.clone());
+    agent
+        .loop_stalls
+        .set(LoopStall::RecordWrite, std::time::Duration::ZERO);
+
+    // The next restart removes the predecessor's record, then writes its own.
+    agent.retire_restart_artifacts(&id).await.unwrap();
+    let path = crate::grill::records::record_path(&records, &id.0);
+    assert!(!path.exists());
+    let later = crate::bun::agent::launch_evidence::LaunchEvidence::read(&grill, &id).await;
+    let written = agent.persist_instance_record(&id, &later).await;
+    assert!(
+        written.is_ok(),
+        "the earlier launch's result was reported against this one: {written:?}"
+    );
+    assert!(
+        path.exists(),
+        "a later launch collected an earlier launch's write and wrote nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_restart_writes_its_own_record_after_an_earlier_write_landed_uncollected() {
+    a_later_launch_writes_its_own_record(false).await;
+}
+
+#[tokio::test]
+async fn an_earlier_launchs_failed_record_write_is_not_reported_against_a_later_one() {
+    a_later_launch_writes_its_own_record(true).await;
 }

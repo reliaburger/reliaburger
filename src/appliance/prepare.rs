@@ -188,7 +188,7 @@ pub async fn run(paths: &Paths) -> Result<Step, PrepareError> {
                 if let Some(claim_dir) = &paths.claim_dir {
                     // The claimed seed may hold the master key; its files are
                     // installed now.
-                    let _ = std::fs::remove_file(claim_dir.join("claimed.seed"));
+                    let _ = tokio::fs::remove_file(claim_dir.join("claimed.seed")).await;
                 }
                 if let (Some(Source::Stick { file }), Some(Seed::V1 { config, .. })) =
                     (&source, &seed)
@@ -307,7 +307,8 @@ async fn wait_for_claim(paths: &Paths, claim_dir: &Path) -> Result<(), PrepareEr
             .map(|name| name.replace('-', ":"))
             .collect(),
         arch: std::env::consts::ARCH.to_string(),
-        os_version: std::fs::read_to_string("/usr/lib/os-release")
+        os_version: tokio::fs::read_to_string("/usr/lib/os-release")
+            .await
             .ok()
             .and_then(|text| {
                 text.lines()

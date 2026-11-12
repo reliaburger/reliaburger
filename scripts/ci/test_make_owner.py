@@ -14,7 +14,7 @@ import test_contracts as base
 import workflow_assembly as w
 
 
-MAKEFILE = '''test:
+MAKEFILE = '''test-macos:
 \t$(NEXTEST)
 test-linux:
 \t$(CARGO) test --no-run --features ebpf
@@ -40,7 +40,7 @@ class MakeOwner(unittest.TestCase):
             path = self.root / name
             path.write_text('synthetic actual ' + name)
             self.tools[name] = dict(path=str(path), sha256=c.digest(path))
-        self.entry = dict(gate='portable-darwin', host='darwin', owner_command=['make', 'test'],
+        self.entry = dict(gate='portable-darwin', host='darwin', owner_command=['make', 'test-macos'],
                           selectors=['--profile', 'ci'], run_options=['--no-tests=fail', '--retries=0'],
                           source_files=['src/contract.rs'], environment={},
                           inputs={'.config/nextest.toml': c.digest(self.root / '.config/nextest.toml')},

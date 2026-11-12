@@ -615,19 +615,25 @@ impl SecretProviders {
         Err(failure)
     }
 
-    /// Resolve every `KEY=PROVIDER[...]` entry of a launch's environment,
-    /// one provider call each, in order. Other entries are kept as they are.
-    /// The first failure stops the launch.
+    /// Resolve the entries of a launch's environment that name a variable
+    /// in `declared`, the ones the workload's config declared as
+    /// `PROVIDER[...]` references, one provider call each, in order. Every
+    /// other entry is kept as it is, even one whose value looks like a
+    /// reference: a decrypted secret was never checked at apply, so it never
+    /// reaches a provider (#1819). A declared variable
+    /// whose value doesn't parse fails the launch, as the first failure of
+    /// any kind does.
     pub async fn resolve_env(
         &self,
         env: &[String],
+        declared: &[String],
         context: LaunchContext<'_>,
     ) -> Result<Vec<String>, SecretResolutionError> {
         let mut resolved = Vec::with_capacity(env.len());
         for entry in env {
             let Some((variable, value)) = entry
                 .split_once('=')
-                .filter(|(_, value)| SecretReference::is_reference(value))
+                .filter(|(variable, _)| declared.iter().any(|name| name == variable))
             else {
                 resolved.push(entry.clone());
                 continue;
@@ -647,13 +653,10 @@ impl SecretProviders {
     }
 }
 
-/// Whether a launch's environment names any provider.
-pub fn needs_resolution(env: &[String]) -> bool {
-    env.iter().any(|entry| {
-        entry
-            .split_once('=')
-            .is_some_and(|(_, value)| SecretReference::is_reference(value))
-    })
+/// Whether a launch declared any provider reference. What its environment
+/// holds doesn't matter: only a declared reference is resolved (#1819).
+pub fn needs_resolution(declared: &[String]) -> bool {
+    !declared.is_empty()
 }
 
 #[cfg(test)]

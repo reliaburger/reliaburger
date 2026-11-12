@@ -151,7 +151,12 @@ h2:hover .permalink, .permalink:focus-visible, .permalink[data-copied] { opacity
 .why-dot[aria-current="true"]::before { background: var(--accent); border-color: var(--accent); }
 /* Only the animated shapes scale about their own centre: transform-origin also
    moves the rotate() in a transform attribute, which the seeds and timer use. */
-.why-layer, .why-addon, .why-sparkle, .why-ripple, .why-council, .why-onion, .why-task, .why-victim { transform-box: fill-box; transform-origin: center; }
+.why-layer, .why-addon, .why-sparkle, .why-ripple, .why-council, .why-onion, .why-task, .why-victim, .why-sent, .why-back, .why-blink { transform-box: fill-box; transform-origin: center; }
+.why-type { stroke-dasharray: 120; animation: why-type 6s ease-out infinite backwards; }
+.why-sent, .why-back { opacity: 0; }
+.why-sent { animation: why-send 6s ease-in-out infinite; }
+.why-back { animation: why-return 6s ease-in-out infinite; }
+.why-blink { animation: why-blink 6s ease-in-out infinite; }
 .why-addon { opacity: 0; animation: why-addon 9s ease-in-out infinite; }
 .why-layer { animation: why-assemble 9s ease-in-out infinite; }
 .why-sparkle { animation: why-twinkle 3s ease-in-out infinite; }
@@ -173,6 +178,10 @@ h2:hover .permalink, .permalink:focus-visible, .permalink[data-copied] { opacity
 .why-line { stroke: #e8c08f; animation: why-read 6s linear infinite; }
 .why-lens { animation: why-scan 6s ease-in-out infinite; }
 .why-reply { transform-box: fill-box; transform-origin: 20% 100%; animation: why-answer 6s ease-out infinite; }
+@keyframes why-type { 0% { stroke-dashoffset: 120; opacity: 1; } 8%, 72% { stroke-dashoffset: 0; opacity: 1; } 80%, 100% { stroke-dashoffset: 0; opacity: 0; } }
+@keyframes why-send { 0% { opacity: 0; transform: none; } 4% { opacity: 1; transform: none; } 16% { opacity: 1; transform: translate(-24px, 0); } 20%, 100% { opacity: 0; transform: translate(-24px, 0); } }
+@keyframes why-return { 0%, 50% { opacity: 0; transform: none; } 54% { opacity: 1; transform: none; } 66% { opacity: 1; transform: translate(24px, 0); } 70%, 100% { opacity: 0; transform: translate(24px, 0); } }
+@keyframes why-blink { 0%, 68%, 74%, 100% { transform: none; } 71% { transform: scaleY(.15); } }
 @keyframes why-assemble {
   0%, 12% { transform: translate(var(--dx), var(--dy)) scale(.45); }
   40%, 86% { transform: none; }
@@ -240,7 +249,8 @@ h2:hover .permalink, .permalink:focus-visible, .permalink[data-copied] { opacity
 .install-tab-input:focus-visible + .install-tab { outline: 3px solid var(--accent); outline-offset: 2px; }
 .install-panel { order: 1; flex-basis: 100%; display: none; padding-top: 20px; border-top: 2px solid var(--line); }
 #install-tyres:checked ~ .install-panel-tyres,
-#install-agent:checked ~ .install-panel-agent { display: grid; }
+#install-agent:checked ~ .install-panel-agent,
+#install-homebrew:checked ~ .install-panel-homebrew { display: grid; }
 /* Copy buttons, added by assets/copy.js. The button sits beside the snippet,
    not over it, so a long command scrolls without sliding under the button. */
 .copyable { display: flex; align-items: flex-start; min-width: 0; }
@@ -252,6 +262,10 @@ h2:hover .permalink, .permalink:focus-visible, .permalink[data-copied] { opacity
 .terminal .copy { margin: 20px 14px 0 0; }
 .copy:hover { border-color: #f49463; color: #fff; }
 .copy:focus-visible { outline: 3px solid #f49463; outline-offset: 2px; }
+.page-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin: 14px 0 0; }
+.page-actions button, .page-actions a { font: 500 .75rem/1 var(--mono); letter-spacing: .04em; color: var(--ink); background: var(--paper); border: 1px solid var(--line); border-radius: 3px; padding: 7px 10px; cursor: pointer; text-decoration: none; }
+.page-actions button:hover, .page-actions a:hover { border-color: var(--accent); color: var(--accent); }
+.page-actions button:focus-visible, .page-actions a:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
 .start-grid { display: grid; grid-template-columns: .8fr 1.4fr; gap: 44px; }
 .start-copy p:not(:first-child) { color: var(--muted); }
 .start-copy > a { font-size: .875rem; }
@@ -294,6 +308,14 @@ footer { display: flex; flex-wrap: wrap; gap: 12px 24px; margin-top: 20px; paddi
 .recording-pending { background: var(--ink); color: #e4e9e3; border-radius: 4px; padding: 16px; margin: 0; font-size: .9375rem; }
 .recording-pending a { color: #f49463; }
 .agent-steps code { overflow-wrap: anywhere; }
+/* A result we haven't measured yet (#1690): a dashed box that names its
+   issue, never a number. */
+.measure-pending { border: 1px dashed var(--line); border-radius: 4px; padding: 12px 16px; margin: 16px 0; font-size: .9375rem; color: var(--muted); }
+.measure-pending strong { color: var(--ink); }
+.measure-pending p { margin: 4px 0 0; }
+.measured { border: 1px solid var(--line); border-radius: 4px; padding: 12px 16px; margin: 16px 0; font-size: .9375rem; color: var(--muted); }
+.measured strong { color: var(--ink); }
+.measured p { margin: 4px 0 0; }
 /* /agents, generated from the manual chapter by src/relish/agent/guide.rs.
    The chapter's prose keeps a readable measure; its tables scroll on their
    own on a phone instead of widening the page. */
@@ -376,7 +398,7 @@ footer { display: flex; flex-wrap: wrap; gap: 12px 24px; margin-top: 20px; paddi
 }
 @media print {
   .page { max-width: none; padding: 0; }
-  nav, .skip, .copy, .permalink { display: none; }
+  nav, .skip, .copy, .permalink, .page-actions { display: none; }
   .terminal { background: white; color: black; border: 1px solid; }
   .comment, .terminal-heading, .terminal-footer { color: #444; }
   .section { break-inside: avoid; }

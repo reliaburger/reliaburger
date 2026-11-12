@@ -1071,12 +1071,6 @@ impl RuncGrill {
                     "runtime intent conflicts with adoption record",
                 ));
             }
-            let stem = context.role_log_stem(RuntimeRole::Launcher).await?;
-            if stem.is_none() || adoption.log_stem != stem {
-                return Err(io::Error::other(
-                    "adoption log identity conflicts with runtime generation",
-                ));
-            }
             if matches!(intent.phase, IntentPhase::Retired { .. }) {
                 return Ok(false);
             }
@@ -1085,6 +1079,20 @@ impl RuncGrill {
                 // gone or go now; a retained discovery address stays held until
                 // the caller's confirmed withdrawal releases it. Refusing here
                 // left the agent unable to start at all.
+                runtime.owned_cleanup(&id, &context).await?;
+                return Ok(false);
+            }
+            // The record and the launcher binding are written at different
+            // moments, and a power cut can keep one without the other. A record
+            // that names no launch, or another launch's logs, no longer
+            // describes this generation: it's stale, like one naming another
+            // process below. Retire the generation so the instance starts
+            // again. Refusing stopped Bun at every start (#1849).
+            let stem = context.role_log_stem(RuntimeRole::Launcher).await?;
+            if stem.is_none() || adoption.log_stem != stem {
+                eprintln!(
+                    "runc: {id}: adoption record names other logs than the generation's launcher; retiring the generation"
+                );
                 runtime.owned_cleanup(&id, &context).await?;
                 return Ok(false);
             }

@@ -29,7 +29,7 @@ Relish is a pure client-side binary. It doesn't run any server processes, doesn'
 
 Every Relish command that interacts with the cluster communicates through the Reliaburger cluster API, exposed on port 9117 (mTLS) on every node. The API follows the request routing described in the whitepaper:
 
-- **Read-only requests** (status, inspect, logs, top, resolve, routes, history, wtf) are served by any council member from its local Raft state replica. The receiving node forwards to the nearest council member if it isn't one itself.
+- **Read-only requests** (status, apps, nodes, inspect, logs, top, resolve, routes, history, wtf) are served by any council member from its local Raft state replica. The receiving node forwards to the nearest council member if it isn't one itself.
 - **Write requests** (apply, deploy, rollback, secret encrypt, snapshot create, fault inject) are forwarded to the leader, which commits via Raft before responding.
 
 Relish can target any node in the cluster. It doesn't need to know which node is the leader.
@@ -624,7 +624,13 @@ relish --version                    # Print version and exit
 relish --help                       # Print help and exit
 
 # Core operations
-relish status                       # Per-instance status table (app, state, PID, restarts)
+relish status                       # The whole cluster on one screen: a verdict, then one line per part
+relish status --quick               # The same without wtf's checks (otherwise run with a 2 s budget)
+relish status --check               # Exit 1 on DEGRADED, 2 on DOWN
+relish apps                         # One row per app (state, ready, restarts, nodes, age), problems first
+relish apps <app>                   # That app's instances (node, state, PID, restarts, age) and why any isn't running
+relish apps --instances             # Every instance of every app
+relish apps --namespace <ns> --unhealthy --node <node>  # Narrow the list
 relish apply <path>                 # Apply a TOML config file or directory
 relish apply -f <path-or-https-url> # Same; also takes Kubernetes YAML (imported in memory)
 relish apply <path> --dry-run       # Print the plan, contact no agent (always exits 0)
@@ -676,7 +682,8 @@ relish exec <app> --namespace <ns> <cmd...>  # Scope to a namespace
 # Cluster lifecycle
 relish init [dir] --cluster-name <name> --node-id <id> --root-backup <file> [--passphrase-file <path> | --recipient <age1...>] # Generate config + PKI; the root key goes only into the backup
 relish init [dir] --development-plaintext              # Local-only plaintext transports (explicit opt-in; no cluster registry)
-relish nodes                        # Gossip membership and node state
+relish nodes                        # Gossip state, council seat, version, usage and allocation, problems first
+relish nodes --unhealthy            # Only nodes not alive, cordoned, under disk pressure or not answering
 relish council [status]             # Every node's council view: role, epoch, term, log, quorum
 relish council recover --data-dir <dir> [--from <url> [--backup <name>]] [--master-key <path>] [--api-port <port>] [--force]
 relish council backups --from <url>                # List sealed backups, newest first by epoch, term and index
@@ -871,17 +878,93 @@ abrupt termination.
 
 **`relish status`**
 
-Prints a per-instance status table for the local node's workloads: instance id,
-app, namespace, state, PID, and restart count. It contacts the local Bun agent
-and exits 0 on success, 1 if the agent is unreachable. There is no separate
-"degraded" exit code, and it prints no cluster-wide CPU/memory/GPU summary.
+Answers "is the cluster all right?" on one screen, the same size on any
+cluster. It reads `GET /v1/cluster/summary` from the node it's connected to,
+which already holds the counts (gossip, the council, the scheduler's
+allocation, each node's published usage, apps, jobs, logs, faults, alerts,
+certificates). Alongside, it runs `relish wtf`'s checks with a 2 s budget;
+past that the `wtf` line reads `not checked in time (2 s budget)`, and
+`--quick` skips them.
 
 ```
 $ relish status
-INSTANCE             APP             NAMESPACE    STATE      PID        RESTARTS
-web-1                web             default      Running    48213      0
-worker-1             worker          default      Running    48250      0
+
+nodes      2 alive, 1 suspect, 0 dead                                relish nodes --unhealthy
+council    leader node-1 (term 41), 3/3 voters, quorum ok, 0 lagging
+gossip     3 members, last change 4 m ago, 18,442 updates received
+versions   bun 0.2.8 on 3 nodes
+capacity   cpu 61% allocated (14 of 24 cores), memory 54%
+usage      cpu 34% (busiest node-2 81%), memory 47%, disk 38%; newest sample 6 s old
+apps       4: 2 running, 1 degraded, 1 down (1 unschedulable)        relish apps --unhealthy
+instances  9 of 9 running
+jobs       12 running (40 tasks), 340 tasks queued,                  relish jobs
+           3 failed and 9 succeeded in the last hour
+logs       newest line 2 s old, slowest node 9 s (node-3)
+faults     1 active: latency on api (default), 6 m left              relish fault list
+alerts     1 firing: disk_high on node-3                             relish wtf
+certs      soonest expiry 61 days (node-2)
+wtf        1 critical, 1 warning: app web is down                    relish wtf
 ```
+
+The verdict is `HEALTHY`, `DEGRADED`, or `DOWN` when the council has lost its
+quorum or its leader. A line that needs attention ends in the command that
+shows the detail, and it's coloured only on a terminal. The commands start
+in one column, at most 56 characters in; longer text wraps between clauses
+onto the next row, so the screen fits 100 columns. The apps line's counts
+add up to its total, with unschedulable apps (already down or degraded) as
+an aside in parentheses. A `gitops` line
+appears only when GitOps is configured. A section a node didn't answer for
+ends in `; partial (2 of 3 nodes)`, one that couldn't be read says
+`unknown: <reason>`, and a scoped token's hidden sections say
+`not visible to a scoped token`.
+
+It exits 0 whenever it got an answer. `--check` exits 1 on `DEGRADED` and 2
+on `DOWN`. `-o json` prints the agent envelope (`relish.agent/v1`, command
+`status`): `data.verdict`, `data.problems`, `data.lines`, `data.wtf` and
+`data.summary` (the summary endpoint's answer), with `next` steps.
+
+Status used to print one row per instance, which grew with the cluster and
+buried the one line that mattered. Instance rows moved to `relish apps NAME`
+and `relish apps --instances`; the registry's lost-image and needs-mTLS
+warnings moved to `relish wtf`, which status's `wtf` line counts.
+
+**`relish apps [<app>]`**
+
+One row per app, problems first: `NAMESPACE APP STATE READY RESTARTS NODES
+AGE`. The state is `down`, `degraded`, `unknown` (a node didn't answer),
+`running` or `stopped`; `apps` runs no `wtf` checks, so it never says
+`troubled`, which `relish agent context` uses. Under the table, one line per listed app that
+isn't fully running says why: blocked by its namespace quota, `RolloutFailed`
+on a node, waiting for the node that holds its volume, unschedulable, or an
+instance the runtime refused to launch.
+
+```
+$ relish apps
+NAMESPACE      APP                  STATE      READY   RESTARTS NODES                    AGE
+prod           db                   down       0/1     0        -                        -
+prod           api                  degraded   1/2     1        node-1,node-2            2h
+prod           web                  running    3/3     3        node-1,node-2,node-3     3h
+prod           batch                stopped    0/0     0        -                        -
+```
+
+`--namespace`, `--unhealthy` (not running and ready) and `--node` narrow the
+list. `relish apps NAME` lists that app's instances instead (`NODE INSTANCE
+APP NAMESPACE STATE PID RESTARTS AGE`, then the same reasons in full), and
+`--instances` lists every instance of every app that way. A node that didn't
+answer is a warning on stderr. `-o json` prints the rows, or with `NAME` or
+`--instances` the instance records.
+
+**`relish nodes`**
+
+One row per node: `NODE ADDRESS STATE COUNCIL LEADER VERSION CPU MEM DISK
+ALLOCATED`, problems first. `STATE` is the gossip state, with `cordoned` or
+`disk` (disk pressure, 85% or more) added, as in `alive,cordoned`.
+`ALLOCATED` is what the scheduler has placed there (`cpu 75% mem 25%`). Under
+the table, a line names each node that didn't answer and why. `--unhealthy`
+keeps nodes that aren't alive, are cordoned, are under disk pressure or didn't
+answer. `-o json` adds `version`, `cpu_percent`, `memory_percent`,
+`disk_percent`, `allocated`, `cordoned`, `disk_pressure` and `unanswered` to
+each node's record.
 
 **`relish apply <path>`**
 

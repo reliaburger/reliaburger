@@ -105,6 +105,10 @@ struct StateMachineInner {
     /// When set, snapshots are persisted here so applied state survives a
     /// restart (the durable log replays only the post-snapshot tail).
     db: Option<Arc<Database>>,
+    /// Set while a proposal writes its apps (#1682): each app ends at
+    /// exactly the spec the proposal showed, restart stamp and all, so an
+    /// AppSpec write doesn't keep the stored stamp.
+    exact_app_writes: bool,
 }
 
 // Manual Debug: `redb::Database` isn't `Debug`, and its contents aren't useful
@@ -211,6 +215,11 @@ fn verify_snapshot_checksum(
 /// `replicas` held inside an `[autoscale]` block's `[min, max]`. A `min`
 /// above `max` can't reach the log (validation refuses it), but the clamp
 /// mustn't panic on one.
+/// A proposal entry's answer.
+fn proposal_response(outcome: crate::proposal::ProposalOutcome) -> Option<CouncilResponse> {
+    Some(CouncilResponse::Proposal(Box::new(outcome)))
+}
+
 fn clamp_to_bounds(replicas: u32, autoscale: &crate::config::app::AutoscaleSpec) -> u32 {
     replicas.max(autoscale.min).min(autoscale.max)
 }
@@ -1533,6 +1542,188 @@ impl StateMachineInner {
                 }
                 return response;
             }
+            RaftRequest::LeaseFenced {
+                lease_generation,
+                change,
+            } => {
+                let fenced = match change.as_ref() {
+                    RaftRequest::AppSpec { .. }
+                    | RaftRequest::AppStop { .. }
+                    | RaftRequest::AppDelete { .. }
+                    | RaftRequest::AppRelease { .. } => true,
+                    RaftRequest::PolicyFenced { change, .. } => {
+                        matches!(change.as_ref(), RaftRequest::AppSpec { .. })
+                    }
+                    _ => false,
+                };
+                if !fenced {
+                    return Some(CouncilResponse::Refused {
+                        reason: "a lease fence carries only a person's app write".into(),
+                    });
+                }
+                // The leader checked the leases at `lease_generation`; a
+                // take, release, break or expiry since then moved it, and
+                // the write waits for the leader to check again. A renewal
+                // doesn't move it, so a busy agent never makes a person's
+                // apply retry.
+                if *lease_generation != self.state.agent_leases.generation {
+                    return Some(CouncilResponse::LeaseGenerationMoved {
+                        current: self.state.agent_leases.generation,
+                    });
+                }
+                return self.apply_request_at(change, position);
+            }
+            RaftRequest::LeaseTake {
+                request,
+                observed_at_unix_ms,
+            } => {
+                let outcome = self
+                    .state
+                    .agent_leases
+                    .take(request, *observed_at_unix_ms)
+                    .into();
+                return Some(CouncilResponse::AgentLease(Box::new(outcome)));
+            }
+            RaftRequest::LeaseRenew {
+                target,
+                holder,
+                ttl_ms,
+                observed_at_unix_ms,
+            } => {
+                let outcome = self
+                    .state
+                    .agent_leases
+                    .renew(target, holder, *ttl_ms, *observed_at_unix_ms)
+                    .into();
+                return Some(CouncilResponse::AgentLease(Box::new(outcome)));
+            }
+            RaftRequest::LeaseRelease {
+                target,
+                holder,
+                observed_at_unix_ms,
+            } => {
+                use crate::proposal::lease::LeaseOutcome;
+                let outcome =
+                    match self
+                        .state
+                        .agent_leases
+                        .release(target, holder, *observed_at_unix_ms)
+                    {
+                        Ok(lease) => LeaseOutcome::Released { lease },
+                        Err(refusal) => LeaseOutcome::Refused { refusal },
+                    };
+                return Some(CouncilResponse::AgentLease(Box::new(outcome)));
+            }
+            RaftRequest::LeaseBreak {
+                target,
+                by: _,
+                observed_at_unix_ms,
+            } => {
+                use crate::proposal::lease::LeaseOutcome;
+                let outcome = match self
+                    .state
+                    .agent_leases
+                    .break_lease(target, *observed_at_unix_ms)
+                {
+                    Ok(lease) => LeaseOutcome::Broken { lease },
+                    Err(refusal) => LeaseOutcome::Refused { refusal },
+                };
+                return Some(CouncilResponse::AgentLease(Box::new(outcome)));
+            }
+            RaftRequest::LeaseExpire { now_unix_ms } => {
+                let leases = self.state.agent_leases.expire(*now_unix_ms);
+                return Some(CouncilResponse::AgentLease(Box::new(
+                    crate::proposal::lease::LeaseOutcome::Expired { leases },
+                )));
+            }
+            RaftRequest::ProposalCreate {
+                proposal,
+                observed_at_unix_ms,
+            } => {
+                let revisions = self.revisions_of(proposal.apps());
+                let state = &mut self.state;
+                let outcome = state.proposals.create(
+                    &mut state.agent_leases,
+                    proposal.as_ref().clone(),
+                    |app| revisions.get(app).cloned().unwrap_or_default(),
+                    *observed_at_unix_ms,
+                );
+                return proposal_response(outcome);
+            }
+            RaftRequest::ProposalApply {
+                id,
+                approval,
+                policy_generation,
+                refusal,
+                observed_at_unix_ms,
+            } => {
+                if *policy_generation != self.state.policy_generation {
+                    return Some(CouncilResponse::PolicyGenerationMoved {
+                        current: self.state.policy_generation,
+                    });
+                }
+                let outcome =
+                    self.apply_proposal(*id, approval, refusal, position, *observed_at_unix_ms);
+                return proposal_response(outcome);
+            }
+            RaftRequest::ProposalUndo {
+                id,
+                by,
+                policy_generation,
+                observed_at_unix_ms,
+            } => {
+                if *policy_generation != self.state.policy_generation {
+                    return Some(CouncilResponse::PolicyGenerationMoved {
+                        current: self.state.policy_generation,
+                    });
+                }
+                let outcome = self.undo_proposal(*id, by, position, *observed_at_unix_ms);
+                return proposal_response(outcome);
+            }
+            RaftRequest::ProposalReject {
+                id,
+                by,
+                reason,
+                observed_at_unix_ms,
+            } => {
+                let state = &mut self.state;
+                let outcome = state.proposals.reject(
+                    &mut state.agent_leases,
+                    *id,
+                    by,
+                    reason,
+                    *observed_at_unix_ms,
+                );
+                return proposal_response(outcome);
+            }
+            RaftRequest::ProposalWithdraw {
+                id,
+                by,
+                observed_at_unix_ms,
+            } => {
+                let state = &mut self.state;
+                let outcome = state.proposals.withdraw(
+                    &mut state.agent_leases,
+                    *id,
+                    by,
+                    *observed_at_unix_ms,
+                );
+                return proposal_response(outcome);
+            }
+            RaftRequest::ProposalExpire { now_unix_ms } => {
+                let state = &mut self.state;
+                let proposals = state
+                    .proposals
+                    .expire(&mut state.agent_leases, *now_unix_ms);
+                return proposal_response(crate::proposal::ProposalOutcome::Expired { proposals });
+            }
+            RaftRequest::ProposalCompact { now_unix_ms } => {
+                let (compacted, removed) = self.state.proposals.compact(*now_unix_ms);
+                return proposal_response(crate::proposal::ProposalOutcome::Compacted {
+                    compacted,
+                    removed,
+                });
+            }
             RaftRequest::AppRelease { app_id } => {
                 let Some(spec) = self.state.apps.get_mut(app_id) else {
                     return Some(CouncilResponse::Refused {
@@ -2670,6 +2861,239 @@ impl StateMachineInner {
         response
     }
 
+    /// Each app's current revision, read before a proposal entry borrows
+    /// the proposals and leases mutably.
+    fn revisions_of<'a>(
+        &self,
+        apps: impl Iterator<Item = &'a crate::meat::types::AppId>,
+    ) -> std::collections::HashMap<crate::meat::types::AppId, String> {
+        apps.map(|app| {
+            (
+                app.clone(),
+                crate::proposal::revision::current_revision(&self.state, app),
+            )
+        })
+        .collect()
+    }
+
+    /// `ProposalApply`: check, then write every `after` on a staged copy
+    /// and keep it only if every write landed (#1682).
+    fn apply_proposal(
+        &mut self,
+        id: crate::proposal::ProposalId,
+        approval: &crate::proposal::Approval,
+        refusal: &Option<crate::proposal::FailedReason>,
+        position: ApplyEntryPosition,
+        now_unix_ms: u64,
+    ) -> crate::proposal::ProposalOutcome {
+        let log_index = position.current_log_id.map_or(0, |log_id| log_id.index);
+        use crate::proposal::{ApplyBlock, FailedReason, ProposalOutcome};
+        let apps: Vec<_> = self
+            .state
+            .proposals
+            .get(id)
+            .map(|proposal| proposal.apps().cloned().collect())
+            .unwrap_or_default();
+        let revisions = self.revisions_of(apps.iter());
+        let checked = self
+            .state
+            .proposals
+            .check_apply(
+                id,
+                approval,
+                &self.state.agent_leases,
+                |app| revisions.get(app).cloned().unwrap_or_default(),
+                now_unix_ms,
+            )
+            .map(|proposal| {
+                proposal
+                    .changes
+                    .iter()
+                    .map(|change| (change.app.clone(), change.after.clone()))
+                    .collect::<Vec<_>>()
+            });
+        let failed = |inner: &mut Self, why: FailedReason| {
+            let state = &mut inner.state;
+            match state.proposals.mark_failed(
+                &mut state.agent_leases,
+                id,
+                approval.clone(),
+                why,
+                now_unix_ms,
+            ) {
+                Some(proposal) => ProposalOutcome::Failed {
+                    proposal: Box::new(proposal),
+                },
+                None => ProposalOutcome::Refused {
+                    refusal: crate::proposal::ProposalRefusal::NotFound { id },
+                },
+            }
+        };
+        let targets = match checked {
+            Err(ApplyBlock::Refuse(refusal)) => return ProposalOutcome::Refused { refusal },
+            Err(ApplyBlock::Fail(why)) => return failed(self, why),
+            Ok(targets) => targets,
+        };
+        // The blast radius again, from this state: an approver was shown
+        // the one computed when it was made, and approves only that much
+        // (#1682). Every node computes the same answer from the same state.
+        let grew = self.state.proposals.get(id).and_then(|proposal| {
+            crate::proposal::build::blast_radius_growth(&self.state, proposal)
+        });
+        if let Some(what) = grew {
+            return failed(self, FailedReason::BlastRadiusGrew { what });
+        }
+        if let Some(why) = refusal {
+            return failed(self, why.clone());
+        }
+        if let Err(reason) = self.write_revisions(&targets, position) {
+            return failed(self, FailedReason::Refused { reason });
+        }
+        let state = &mut self.state;
+        match state.proposals.mark_applied(
+            &mut state.agent_leases,
+            id,
+            approval.clone(),
+            log_index,
+            now_unix_ms,
+        ) {
+            Some(proposal) => ProposalOutcome::Applied {
+                proposal: Box::new(proposal),
+            },
+            None => ProposalOutcome::Refused {
+                refusal: crate::proposal::ProposalRefusal::NotFound { id },
+            },
+        }
+    }
+
+    /// `ProposalUndo`: a person puts every touched app back to `before`,
+    /// all or nothing (#1682).
+    fn undo_proposal(
+        &mut self,
+        id: crate::proposal::ProposalId,
+        by: &crate::proposal::Principal,
+        position: ApplyEntryPosition,
+        now_unix_ms: u64,
+    ) -> crate::proposal::ProposalOutcome {
+        use crate::proposal::{Approval, ProposalOutcome, ProposalRefusal};
+        let apps: Vec<_> = self
+            .state
+            .proposals
+            .get(id)
+            .map(|proposal| proposal.apps().cloned().collect())
+            .unwrap_or_default();
+        let revisions = self.revisions_of(apps.iter());
+        let targets = match self.state.proposals.check_undo(
+            id,
+            by,
+            &self.state.agent_leases,
+            |app| revisions.get(app).cloned().unwrap_or_default(),
+            now_unix_ms,
+        ) {
+            Ok(proposal) => proposal
+                .changes
+                .iter()
+                .map(|change| (change.app.clone(), change.after_undo()))
+                .collect::<Vec<_>>(),
+            Err(refusal) => return ProposalOutcome::Refused { refusal },
+        };
+        if let Err(reason) = self.write_revisions(&targets, position) {
+            return ProposalOutcome::Refused {
+                refusal: ProposalRefusal::Invalid { reason },
+            };
+        }
+        match self
+            .state
+            .proposals
+            .mark_undone(id, Approval::Human(by.clone()), now_unix_ms, None)
+        {
+            Some(proposal) => ProposalOutcome::Undone {
+                proposal: Box::new(proposal),
+            },
+            None => ProposalOutcome::Refused {
+                refusal: ProposalRefusal::NotFound { id },
+            },
+        }
+    }
+
+    /// Bring every app in `targets` to its revision, through the same code
+    /// as `AppSpec`, `AppStop` and `AppDelete`, on a staged copy: either
+    /// every write lands and each app ends at exactly the revision given,
+    /// or nothing changes and the first refusal is returned.
+    fn write_revisions(
+        &mut self,
+        targets: &[(crate::meat::types::AppId, crate::proposal::AppRevision)],
+        position: ApplyEntryPosition,
+    ) -> Result<(), String> {
+        let mut staged = StateMachineInner {
+            state: self.state.clone(),
+            exact_app_writes: true,
+            ..Default::default()
+        };
+        for (app, target) in targets {
+            staged.write_revision(app, target, position)?;
+            let reached = crate::proposal::revision::current_revision(&staged.state, app);
+            if reached != target.revision {
+                return Err(format!(
+                    "{app} would end at a different revision than the proposal showed"
+                ));
+            }
+        }
+        self.state = staged.state;
+        Ok(())
+    }
+
+    fn write_revision(
+        &mut self,
+        app: &crate::meat::types::AppId,
+        target: &crate::proposal::AppRevision,
+        position: ApplyEntryPosition,
+    ) -> Result<(), String> {
+        let refused = |response: Option<CouncilResponse>| match response {
+            Some(CouncilResponse::Refused { reason }) => Err(reason),
+            _ => Ok(()),
+        };
+        let Some(spec) = target.spec.as_deref() else {
+            if target.exists() {
+                return Err(format!(
+                    "proposal for {app} has been compacted; its spec is gone"
+                ));
+            }
+            if self.state.apps.contains_key(app) {
+                refused(self.apply_request_at(
+                    &RaftRequest::AppDelete {
+                        app_id: app.clone(),
+                    },
+                    position,
+                ))?;
+            }
+            return Ok(());
+        };
+        if self.state.apps.get(app) != Some(spec) {
+            refused(self.apply_request_at(
+                &RaftRequest::AppSpec {
+                    app_id: app.clone(),
+                    spec: Box::new(spec.clone()),
+                },
+                position,
+            ))?;
+        }
+        if target.stopped {
+            if !self.state.stopped_apps.contains(app) {
+                refused(self.apply_request_at(
+                    &RaftRequest::AppStop {
+                        app_id: app.clone(),
+                    },
+                    position,
+                ))?;
+            }
+        } else {
+            // Applying an app is how it starts again after `relish stop`.
+            self.state.stopped_apps.remove(app);
+        }
+        Ok(())
+    }
+
     /// Why an app write must not apply over the app's stored owner (#1125).
     fn owner_conflict(
         &self,
@@ -2734,6 +3158,23 @@ impl StateMachineInner {
         app_id: &crate::meat::types::AppId,
         spec: &crate::config::app::AppSpec,
     ) {
+        // A write without a restart stamp keeps the stored one (#1682): a
+        // file never carries it, and applying the same file after a
+        // restart mustn't restart every instance again. A proposal writes
+        // exactly what it showed, so cancelling a restart's rollout can put
+        // the unstamped spec back.
+        let carried;
+        let stored_stamp = self.state.apps.get(app_id).and_then(|old| old.restarted_at);
+        let spec = match (spec.restarted_at, stored_stamp) {
+            (None, Some(at)) if !self.exact_app_writes => {
+                carried = crate::config::app::AppSpec {
+                    restarted_at: Some(at),
+                    ..spec.clone()
+                };
+                &carried
+            }
+            _ => spec,
+        };
         // A redeploy that changes the replica baseline invalidates any
         // autoscale override: the operator has re-declared the desired count.
         let baseline_changed = self
@@ -2973,18 +3414,50 @@ impl StateMachineInner {
 pub struct CouncilStateMachine {
     inner: Arc<RwLock<StateMachineInner>>,
     gitops_triggers: Arc<tokio::sync::watch::Sender<(u64, u64)>>,
+    api_tokens: Arc<tokio::sync::watch::Sender<Vec<crate::sesame::types::ApiToken>>>,
 }
 
 impl Default for CouncilStateMachine {
     fn default() -> Self {
-        Self {
-            inner: Arc::new(RwLock::new(StateMachineInner::default())),
-            gitops_triggers: Self::trigger_sender(&DesiredState::default()),
-        }
+        Self::around(StateMachineInner::default())
     }
 }
 
 impl CouncilStateMachine {
+    /// Wrap `inner`, with each watch starting from what it holds.
+    fn around(inner: StateMachineInner) -> Self {
+        Self {
+            gitops_triggers: Self::trigger_sender(&inner.state),
+            api_tokens: Arc::new(
+                tokio::sync::watch::channel(inner.state.security_state.api_tokens.clone()).0,
+            ),
+            inner: Arc::new(RwLock::new(inner)),
+        }
+    }
+
+    /// Observe the applied API tokens. A receiver sees a change as soon as an
+    /// entry or a snapshot changes them, so a node's API can take a new token
+    /// at once rather than at its next timed refresh.
+    pub fn api_token_updates(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Vec<crate::sesame::types::ApiToken>> {
+        self.api_tokens.subscribe()
+    }
+
+    /// Compare once per applied batch, and copy only when they changed: a
+    /// cluster has tens of tokens, so this costs nothing next to the batch.
+    fn publish_api_tokens(&self, state: &DesiredState) {
+        let tokens = &state.security_state.api_tokens;
+        self.api_tokens.send_if_modified(|current| {
+            if current == tokens {
+                false
+            } else {
+                current.clone_from(tokens);
+                true
+            }
+        });
+    }
+
     fn trigger_sender(state: &DesiredState) -> Arc<tokio::sync::watch::Sender<(u64, u64)>> {
         let generations = state.gitops_sync_state.as_ref().map_or((0, 0), |sync| {
             (sync.requested_generation, sync.completed_generation)
@@ -3101,10 +3574,7 @@ impl CouncilStateMachine {
             }
         }
         inner.db = Some(db);
-        Ok(Self {
-            gitops_triggers: Self::trigger_sender(&inner.state),
-            inner: Arc::new(RwLock::new(inner)),
-        })
+        Ok(Self::around(inner))
     }
 
     /// Build an in-memory state machine seeded with a restored `DesiredState`
@@ -3122,14 +3592,10 @@ impl CouncilStateMachine {
         // `initialize` establish a fresh term line and voter set.
         state.enter_recovery_epoch(0);
 
-        let inner = StateMachineInner {
+        Self::around(StateMachineInner {
             state,
             ..StateMachineInner::default()
-        };
-        Self {
-            gitops_triggers: Self::trigger_sender(&inner.state),
-            inner: Arc::new(RwLock::new(inner)),
-        }
+        })
     }
 
     /// Offline disaster recovery (12b.2 D21/CP12): stamp a restored
@@ -3257,6 +3723,7 @@ impl RaftStateMachine<TypeConfig> for CouncilStateMachine {
             }
         }
         self.publish_gitops_triggers(&guard.state);
+        self.publish_api_tokens(&guard.state);
         Ok(responses)
     }
 
@@ -3287,6 +3754,7 @@ impl RaftStateMachine<TypeConfig> for CouncilStateMachine {
             guard.state.last_applied_log = meta.last_log_id;
             guard.state.last_membership = meta.last_membership.clone();
             self.publish_gitops_triggers(&guard.state);
+            self.publish_api_tokens(&guard.state);
             guard.snapshot_index += 1;
             guard.snapshot_data = Some(data.clone());
             guard.snapshot_last_log_id = meta.last_log_id;
@@ -6552,6 +7020,7 @@ mod tests {
                 name: "admin".to_string(),
                 token_hash: vec![1],
                 role: crate::sesame::types::ApiRole::Admin,
+                kind: crate::sesame::types::TokenKind::Human,
                 scope: crate::sesame::types::TokenScope::default(),
                 expires_at: None,
                 created_at: std::time::SystemTime::UNIX_EPOCH,
@@ -7622,6 +8091,7 @@ mod tests {
             name: "ci".to_string(),
             token_hash: vec![1, 2, 3],
             role: crate::sesame::types::ApiRole::Deployer,
+            kind: crate::sesame::types::TokenKind::Human,
             scope: crate::sesame::types::TokenScope::default(),
             expires_at: None,
             created_at: std::time::SystemTime::now(),
@@ -7639,6 +8109,7 @@ mod tests {
             name: "ci".to_string(),
             token_hash: vec![1, 2, 3],
             role: crate::sesame::types::ApiRole::Deployer,
+            kind: crate::sesame::types::TokenKind::Human,
             scope: crate::sesame::types::TokenScope::default(),
             expires_at: None,
             created_at: std::time::SystemTime::now(),
@@ -7662,6 +8133,7 @@ mod tests {
             name: name.to_string(),
             token_hash: name.as_bytes().to_vec(),
             role,
+            kind: crate::sesame::types::TokenKind::Human,
             scope: crate::sesame::types::TokenScope::default(),
             expires_at: expires_unix_ms
                 .map(|ms| std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms)),
@@ -7801,6 +8273,7 @@ mod tests {
             name: name.to_string(),
             token_hash: vec![1, 2, 3],
             role,
+            kind: crate::sesame::types::TokenKind::Human,
             scope: TokenScope::default(),
             expires_at: None,
             created_at: std::time::SystemTime::now(),
@@ -7888,6 +8361,7 @@ mod tests {
             name: "ci".to_string(),
             token_hash: vec![1, 2, 3],
             role: ApiRole::Deployer,
+            kind: crate::sesame::types::TokenKind::Human,
             scope: scope.clone(),
             expires_at: None,
             created_at: std::time::SystemTime::UNIX_EPOCH,
@@ -7916,6 +8390,7 @@ mod tests {
             name: "root".to_string(),
             token_hash: vec![1, 2, 3],
             role: ApiRole::Admin,
+            kind: crate::sesame::types::TokenKind::Human,
             scope: TokenScope::default(),
             expires_at: None,
             created_at: std::time::SystemTime::UNIX_EPOCH,
@@ -9040,6 +9515,7 @@ mod tests {
             name: "rbtest-run1-scope".into(),
             token_hash: vec![1; 32],
             role: crate::sesame::types::ApiRole::Deployer,
+            kind: crate::sesame::types::TokenKind::Human,
             scope: crate::sesame::types::TokenScope {
                 apps: None,
                 namespaces: Some(vec!["rbtest-run1".into()]),
@@ -10673,6 +11149,61 @@ mod tests {
         );
     }
 
+    /// A follower's API refreshed its tokens every 5 s, so a token created on
+    /// the leader was refused as "invalid token" by every other node for up
+    /// to 5 s (the gym's partitioned-node runs, 9 Nov). The state machine now
+    /// says when the tokens change, so a node can refresh at once.
+    #[tokio::test]
+    async fn token_changes_are_published_on_apply_and_snapshot_install() {
+        let token = crate::sesame::types::ApiToken {
+            name: "agent".to_string(),
+            token_hash: vec![1, 2, 3],
+            role: crate::sesame::types::ApiRole::ReadOnly,
+            kind: crate::sesame::types::TokenKind::Human,
+            scope: crate::sesame::types::TokenScope::default(),
+            expires_at: None,
+            created_at: std::time::SystemTime::now(),
+            previous_secret: None,
+        };
+        let mut machine = CouncilStateMachine::new();
+        let mut updates = machine.api_token_updates();
+        assert!(updates.borrow_and_update().is_empty());
+
+        // An entry that doesn't touch the tokens wakes nobody.
+        machine
+            .apply(vec![normal_entry(1, 1, RaftRequest::AllocateSerial)])
+            .await
+            .unwrap();
+        assert!(!updates.has_changed().unwrap());
+
+        machine
+            .apply(vec![normal_entry(
+                1,
+                2,
+                RaftRequest::CreateApiToken(token.clone()),
+            )])
+            .await
+            .unwrap();
+        assert!(updates.has_changed().unwrap());
+        assert_eq!(*updates.borrow_and_update(), vec![token.clone()]);
+
+        // A follower that catches up by snapshot hears about them too.
+        let snapshot = machine
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+        let mut follower = CouncilStateMachine::new();
+        let mut followed = follower.api_token_updates();
+        follower
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        assert!(followed.has_changed().unwrap());
+        assert_eq!(*followed.borrow_and_update(), vec![token]);
+    }
+
     #[test]
     fn webhook_receipts_are_bounded_and_generation_exhaustion_refuses_admission() {
         let mut inner = StateMachineInner::default();
@@ -11431,5 +11962,527 @@ mod tests {
         assert!(!state.apps.contains_key(&AppId::new("declared", "default")));
         assert_eq!(state.apps[&web].owner.as_deref(), Some("ctl"));
         assert!(!state.gitops_owned.apps.contains(&web));
+    }
+
+    // --- Agent leases (#1686) ---------------------------------------------
+
+    fn lease_holder(name: &str) -> crate::proposal::lease::LeaseHolder {
+        crate::proposal::lease::LeaseHolder {
+            name: name.to_string(),
+            principal_id: format!("token:{name}"),
+        }
+    }
+
+    fn take_lease(who: &str, at: u64) -> RaftRequest {
+        RaftRequest::LeaseTake {
+            request: crate::proposal::lease::LeaseRequest {
+                target: crate::proposal::lease::LeaseTarget::app("shop", "web"),
+                holder: lease_holder(who),
+                purpose: format!("{who} at work"),
+                ttl_ms: crate::proposal::lease::DEFAULT_LEASE_TTL_MS,
+            },
+            observed_at_unix_ms: at,
+        }
+    }
+
+    fn lease_outcome(response: Option<CouncilResponse>) -> crate::proposal::lease::LeaseOutcome {
+        match response {
+            Some(CouncilResponse::AgentLease(outcome)) => *outcome,
+            other => panic!("expected a lease outcome, got {other:?}"),
+        }
+    }
+
+    /// Every lease entry answers with what it did, judged by the time the
+    /// leader stamped in it, and a refusal leaves the leases alone.
+    #[test]
+    fn lease_entries_take_conflict_renew_release_and_expire_by_the_stamped_clock() {
+        use crate::proposal::lease::{
+            DEFAULT_LEASE_TTL_MS, LeaseOutcome, LeaseRefusal, LeaseTarget,
+        };
+        let mut inner = StateMachineInner::default();
+        let web = LeaseTarget::app("shop", "web");
+        assert!(matches!(
+            lease_outcome(inner.apply_request(&take_lease("holmes", 1_000))),
+            LeaseOutcome::Taken { .. }
+        ));
+        match lease_outcome(inner.apply_request(&take_lease("capacity", 2_000))) {
+            LeaseOutcome::Refused {
+                refusal: LeaseRefusal::Held { lease },
+            } => assert_eq!(lease.holder.name, "holmes"),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            lease_outcome(inner.apply_request(&RaftRequest::LeaseRenew {
+                target: web.clone(),
+                holder: lease_holder("capacity"),
+                ttl_ms: DEFAULT_LEASE_TTL_MS,
+                observed_at_unix_ms: 3_000,
+            })),
+            LeaseOutcome::Refused {
+                refusal: LeaseRefusal::Held { .. }
+            }
+        ));
+        assert!(matches!(
+            lease_outcome(inner.apply_request(&RaftRequest::LeaseRenew {
+                target: web.clone(),
+                holder: lease_holder("holmes"),
+                ttl_ms: DEFAULT_LEASE_TTL_MS,
+                observed_at_unix_ms: 3_000,
+            })),
+            LeaseOutcome::Renewed { .. }
+        ));
+        assert_eq!(inner.state.agent_leases.generation, 1);
+        // Not lapsed yet at the stamped time: nothing expires.
+        assert_eq!(
+            lease_outcome(inner.apply_request(&RaftRequest::LeaseExpire {
+                now_unix_ms: 3_000 + DEFAULT_LEASE_TTL_MS - 1,
+            })),
+            LeaseOutcome::Expired { leases: Vec::new() }
+        );
+        match lease_outcome(inner.apply_request(&RaftRequest::LeaseExpire {
+            now_unix_ms: 3_000 + DEFAULT_LEASE_TTL_MS,
+        })) {
+            LeaseOutcome::Expired { leases } => assert_eq!(leases.len(), 1),
+            other => panic!("{other:?}"),
+        }
+        assert!(inner.state.agent_leases.leases.is_empty());
+        assert_eq!(inner.state.agent_leases.generation, 2);
+
+        inner.apply_request(&take_lease("holmes", 500_000));
+        assert!(matches!(
+            lease_outcome(inner.apply_request(&RaftRequest::LeaseRelease {
+                target: web.clone(),
+                holder: lease_holder("capacity"),
+                observed_at_unix_ms: 500_001,
+            })),
+            LeaseOutcome::Refused { .. }
+        ));
+        assert!(matches!(
+            lease_outcome(inner.apply_request(&RaftRequest::LeaseRelease {
+                target: web.clone(),
+                holder: lease_holder("holmes"),
+                observed_at_unix_ms: 500_001,
+            })),
+            LeaseOutcome::Released { .. }
+        ));
+        inner.apply_request(&take_lease("holmes", 600_000));
+        match lease_outcome(inner.apply_request(&RaftRequest::LeaseBreak {
+            target: web.clone(),
+            by: lease_holder("alice"),
+            observed_at_unix_ms: 600_001,
+        })) {
+            LeaseOutcome::Broken { lease } => assert_eq!(lease.holder.name, "holmes"),
+            other => panic!("{other:?}"),
+        }
+        assert!(inner.state.agent_leases.leases.is_empty());
+    }
+
+    /// Two replicas applying the same lease entries hold the same leases,
+    /// whatever their own clocks say, and a snapshot carries them.
+    #[tokio::test]
+    async fn leases_replay_the_same_everywhere_and_survive_a_snapshot() {
+        let entries = || {
+            vec![
+                normal_entry(1, 1, take_lease("holmes", 10_000)),
+                normal_entry(1, 2, take_lease("capacity", 20_000)),
+            ]
+        };
+        let mut first = CouncilStateMachine::new();
+        let mut second = CouncilStateMachine::new();
+        first.apply_fixture(entries()).await.unwrap();
+        second.apply_fixture(entries()).await.unwrap();
+        let held = first.desired_state().await.agent_leases;
+        assert_eq!(held, second.desired_state().await.agent_leases);
+        assert_eq!(held.leases["app:shop/web"].holder.name, "holmes");
+
+        let mut builder = first.get_snapshot_builder().await;
+        let snapshot = builder.build_snapshot().await.unwrap();
+        let mut restored = CouncilStateMachine::new();
+        restored
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        assert_eq!(restored.desired_state().await.agent_leases, held);
+    }
+
+    // --- Agent proposals (#1682) ------------------------------------------
+
+    fn proposer(name: &str, kind: crate::sesame::types::TokenKind) -> crate::proposal::Principal {
+        crate::proposal::Principal {
+            name: name.to_string(),
+            principal_id: format!("token:{name}"),
+            kind,
+            role: crate::sesame::types::ApiRole::Deployer,
+        }
+    }
+
+    fn shop_web(replicas: u32) -> Box<AppSpec> {
+        Box::new(
+            toml::from_str(&format!(
+                "image = \"web:1.4\"\nreplicas = {replicas}\nnamespace = \"shop\""
+            ))
+            .unwrap(),
+        )
+    }
+
+    fn scale_proposal(state: &DesiredState, replicas: u32, at: u64) -> RaftRequest {
+        let request = crate::proposal::ProposalRequest {
+            kind: crate::proposal::RequestKind::Scale,
+            namespace: Some("shop".to_string()),
+            app: Some("web".to_string()),
+            replicas: Some(replicas),
+            config: None,
+            of: None,
+            fault: None,
+            node: None,
+            reason: "p99 over the SLO".to_string(),
+            ttl_seconds: None,
+            idempotency_key: None,
+        };
+        let proposal = crate::proposal::build::build(
+            state,
+            &request,
+            &proposer("holmes", crate::sesame::types::TokenKind::Agent),
+            at,
+            crate::proposal::build::as_declared,
+        )
+        .unwrap();
+        RaftRequest::ProposalCreate {
+            proposal: Box::new(proposal),
+            observed_at_unix_ms: at,
+        }
+    }
+
+    fn approve_entry(id: u64, generation: u64, at: u64) -> RaftRequest {
+        RaftRequest::ProposalApply {
+            id: crate::proposal::ProposalId(id),
+            approval: crate::proposal::Approval::Human(proposer(
+                "alice",
+                crate::sesame::types::TokenKind::Human,
+            )),
+            policy_generation: generation,
+            refusal: None,
+            observed_at_unix_ms: at,
+        }
+    }
+
+    fn proposal_outcome(response: Option<CouncilResponse>) -> crate::proposal::ProposalOutcome {
+        match response {
+            Some(CouncilResponse::Proposal(outcome)) => *outcome,
+            other => panic!("expected a proposal outcome, got {other:?}"),
+        }
+    }
+
+    fn web_app() -> AppId {
+        AppId::new("web", "shop")
+    }
+
+    /// #1682: an app write without a restart stamp keeps the stored one,
+    /// so applying the same file after a restart restarts nothing. A
+    /// proposal writes exactly what it showed, so cancelling the rollout
+    /// of a first restart can put the unstamped spec back.
+    #[test]
+    fn a_write_keeps_the_restart_stamp_but_a_proposal_writes_exactly() {
+        use crate::proposal::ProposalOutcome;
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::AppSpec {
+            app_id: web_app(),
+            spec: shop_web(3),
+        });
+        inner.apply_request(&RaftRequest::RolloutReleased {
+            app_id: web_app(),
+            spec: shop_web(3),
+        });
+        let mut stamped = shop_web(3);
+        stamped.restarted_at = Some(500);
+        inner.apply_request(&RaftRequest::AppSpec {
+            app_id: web_app(),
+            spec: stamped,
+        });
+        inner.apply_request(&RaftRequest::AppSpec {
+            app_id: web_app(),
+            spec: shop_web(3),
+        });
+        assert_eq!(inner.state.apps[&web_app()].restarted_at, Some(500));
+
+        let request = crate::proposal::ProposalRequest {
+            kind: crate::proposal::RequestKind::CancelDeploy,
+            namespace: Some("shop".to_string()),
+            app: Some("web".to_string()),
+            replicas: None,
+            config: None,
+            of: None,
+            fault: None,
+            node: None,
+            reason: "the restart is failing".to_string(),
+            ttl_seconds: None,
+            idempotency_key: None,
+        };
+        let proposal = crate::proposal::build::build(
+            &inner.state,
+            &request,
+            &proposer("holmes", crate::sesame::types::TokenKind::Agent),
+            1_000,
+            crate::proposal::build::as_declared,
+        )
+        .unwrap();
+        assert!(matches!(
+            proposal_outcome(inner.apply_request(&RaftRequest::ProposalCreate {
+                proposal: Box::new(proposal),
+                observed_at_unix_ms: 1_000,
+            })),
+            ProposalOutcome::Created { .. }
+        ));
+        match proposal_outcome(inner.apply_request(&approve_entry(1, 0, 2_000))) {
+            ProposalOutcome::Applied { .. } => {}
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(inner.state.apps[&web_app()].restarted_at, None);
+    }
+
+    /// The state machine computes the blast radius again from its own
+    /// state when a proposal is approved. Placed on a node it didn't show,
+    /// the proposal fails and nothing is written.
+    #[test]
+    fn approval_fails_when_the_blast_radius_grew() {
+        use crate::proposal::{FailedReason, ProposalOutcome, ProposalState};
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::AppSpec {
+            app_id: web_app(),
+            spec: shop_web(3),
+        });
+        let create = scale_proposal(&inner.state, 5, 1_000);
+        inner.apply_request(&create);
+        inner.state.scheduling.insert(
+            web_app(),
+            vec![crate::meat::types::Placement {
+                node_id: crate::meat::types::NodeId::new("node-c"),
+                resources: crate::meat::types::Resources::default(),
+                ordinal: 0,
+            }],
+        );
+        match proposal_outcome(inner.apply_request(&approve_entry(1, 0, 2_000))) {
+            ProposalOutcome::Failed { proposal } => match &proposal.state {
+                ProposalState::Failed {
+                    why: FailedReason::BlastRadiusGrew { what },
+                    ..
+                } => assert!(what.contains("node-c"), "{what}"),
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            inner.state.apps[&web_app()].replicas,
+            crate::config::Replicas::Fixed(3)
+        );
+    }
+
+    /// Approval and application are one entry: it writes `after` and
+    /// records `Applied`, and a direct undo puts the `before` revision back.
+    #[test]
+    fn approve_applies_in_one_entry_and_undo_restores_the_before_revision() {
+        use crate::proposal::ProposalOutcome;
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::AppSpec {
+            app_id: web_app(),
+            spec: shop_web(3),
+        });
+        let before = crate::proposal::revision::current_revision(&inner.state, &web_app());
+        let create = scale_proposal(&inner.state, 5, 1_000);
+        assert!(matches!(
+            proposal_outcome(inner.apply_request(&create)),
+            ProposalOutcome::Created { .. }
+        ));
+        assert_eq!(
+            inner.state.apps[&web_app()].replicas,
+            crate::config::Replicas::Fixed(3)
+        );
+        match proposal_outcome(inner.apply_request(&approve_entry(1, 0, 2_000))) {
+            ProposalOutcome::Applied { proposal } => {
+                assert_eq!(proposal.state.name(), "applied");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            inner.state.apps[&web_app()].replicas,
+            crate::config::Replicas::Fixed(5)
+        );
+        assert!(inner.state.agent_leases.leases.is_empty());
+        // A retried approval finds the outcome; it never runs twice.
+        assert!(matches!(
+            proposal_outcome(inner.apply_request(&approve_entry(1, 0, 3_000))),
+            ProposalOutcome::Refused { .. }
+        ));
+        match proposal_outcome(inner.apply_request(&RaftRequest::ProposalUndo {
+            id: crate::proposal::ProposalId(1),
+            by: proposer("alice", crate::sesame::types::TokenKind::Human),
+            policy_generation: 0,
+            observed_at_unix_ms: 4_000,
+        })) {
+            ProposalOutcome::Undone { .. } => {}
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            crate::proposal::revision::current_revision(&inner.state, &web_app()),
+            before
+        );
+    }
+
+    /// A refusal the leader judged, a moved revision or a moved policy
+    /// generation writes nothing.
+    #[test]
+    fn a_failed_or_fenced_approval_writes_nothing() {
+        use crate::proposal::{FailedReason, ProposalOutcome};
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::AppSpec {
+            app_id: web_app(),
+            spec: shop_web(3),
+        });
+        inner.apply_request(&scale_proposal(&inner.state, 5, 1_000));
+        // The policies moved since the leader judged: nothing at all.
+        inner.state.policy_generation = 1;
+        assert!(matches!(
+            inner.apply_request(&approve_entry(1, 0, 2_000)),
+            Some(CouncilResponse::PolicyGenerationMoved { current: 1 })
+        ));
+        assert_eq!(
+            inner
+                .state
+                .proposals
+                .get(crate::proposal::ProposalId(1))
+                .unwrap()
+                .state
+                .name(),
+            "pending"
+        );
+        // A guardrail refusal the leader judged: Failed, nothing written.
+        let mut guarded = approve_entry(1, 1, 2_000);
+        if let RaftRequest::ProposalApply { refusal, .. } = &mut guarded {
+            *refusal = Some(FailedReason::Guardrail {
+                rule: "policy:never-at-peak".to_string(),
+                message: "not now".to_string(),
+            });
+        }
+        assert!(matches!(
+            proposal_outcome(inner.apply_request(&guarded)),
+            ProposalOutcome::Failed { .. }
+        ));
+        assert_eq!(
+            inner.state.apps[&web_app()].replicas,
+            crate::config::Replicas::Fixed(3)
+        );
+
+        // A person's write in between makes the next proposal stale.
+        inner.apply_request(&scale_proposal(&inner.state, 6, 3_000));
+        inner.apply_request(&RaftRequest::AppSpec {
+            app_id: web_app(),
+            spec: shop_web(4),
+        });
+        match proposal_outcome(inner.apply_request(&approve_entry(2, 1, 4_000))) {
+            ProposalOutcome::Failed { proposal } => match &proposal.state {
+                crate::proposal::ProposalState::Failed {
+                    why: FailedReason::Stale { app, .. },
+                    ..
+                } => assert_eq!(*app, web_app()),
+                other => panic!("{other:?}"),
+            },
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            inner.state.apps[&web_app()].replicas,
+            crate::config::Replicas::Fixed(4)
+        );
+    }
+
+    /// Two replicas applying the same proposal entries end in the same
+    /// state, whatever their own clocks say, and a snapshot carries it.
+    #[tokio::test]
+    async fn proposals_replay_the_same_everywhere_and_survive_a_snapshot() {
+        let mut seed = StateMachineInner::default();
+        seed.apply_request(&RaftRequest::AppSpec {
+            app_id: web_app(),
+            spec: shop_web(3),
+        });
+        let create = scale_proposal(&seed.state, 5, 10_000);
+        let entries = || {
+            vec![
+                normal_entry(
+                    1,
+                    1,
+                    RaftRequest::AppSpec {
+                        app_id: web_app(),
+                        spec: shop_web(3),
+                    },
+                ),
+                normal_entry(1, 2, create.clone()),
+                normal_entry(1, 3, approve_entry(1, 0, 20_000)),
+            ]
+        };
+        let mut first = CouncilStateMachine::new();
+        let mut second = CouncilStateMachine::new();
+        first.apply_fixture(entries()).await.unwrap();
+        second.apply_fixture(entries()).await.unwrap();
+        let held = first.desired_state().await;
+        let other = second.desired_state().await;
+        assert_eq!(held.proposals, other.proposals);
+        assert_eq!(held.apps[&web_app()], other.apps[&web_app()]);
+        match &held
+            .proposals
+            .get(crate::proposal::ProposalId(1))
+            .unwrap()
+            .state
+        {
+            crate::proposal::ProposalState::Applied { log_index, .. } => assert_eq!(*log_index, 3),
+            other => panic!("{other:?}"),
+        }
+
+        let mut builder = first.get_snapshot_builder().await;
+        let snapshot = builder.build_snapshot().await.unwrap();
+        let mut restored = CouncilStateMachine::new();
+        restored
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        assert_eq!(restored.desired_state().await.proposals, held.proposals);
+    }
+
+    /// A person's write fenced on the lease generation applies while it's
+    /// current, waits while a take moved it, and isn't held up by a renewal.
+    #[test]
+    fn a_lease_fenced_write_applies_only_at_the_generation_it_was_checked_at() {
+        use crate::proposal::lease::{DEFAULT_LEASE_TTL_MS, LeaseTarget};
+        let mut inner = StateMachineInner::default();
+        let web = AppId::new("web", "shop");
+        let fenced = |generation| RaftRequest::LeaseFenced {
+            lease_generation: generation,
+            change: Box::new(RaftRequest::AppSpec {
+                app_id: web.clone(),
+                spec: web_spec("web:2"),
+            }),
+        };
+        inner.apply_request(&take_lease("holmes", 1_000));
+        assert_eq!(inner.state.agent_leases.generation, 1);
+        assert!(matches!(
+            inner.apply_request(&fenced(0)),
+            Some(CouncilResponse::LeaseGenerationMoved { current: 1 })
+        ));
+        assert!(!inner.state.apps.contains_key(&web));
+        // A renewal doesn't move the generation.
+        inner.apply_request(&RaftRequest::LeaseRenew {
+            target: LeaseTarget::app("shop", "web"),
+            holder: lease_holder("holmes"),
+            ttl_ms: DEFAULT_LEASE_TTL_MS,
+            observed_at_unix_ms: 2_000,
+        });
+        assert!(inner.apply_request(&fenced(1)).is_none());
+        assert_eq!(inner.state.apps[&web].image.as_deref(), Some("web:2"));
+        // Only an app write may be fenced.
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::LeaseFenced {
+                lease_generation: 1,
+                change: Box::new(RaftRequest::PolicyDelete { name: "x".into() }),
+            }),
+            Some(CouncilResponse::Refused { .. })
+        ));
     }
 }

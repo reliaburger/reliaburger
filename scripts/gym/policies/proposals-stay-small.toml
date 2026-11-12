@@ -1,0 +1,9 @@
+# A guardrail an admin wrote: an app policy that judges only proposals
+# (`source` is `proposal` for the `after` specs an agent proposes, #1682), so
+# a person can still scale web by hand, and an agent's proposal past four
+# replicas is refused with the `guardrail` code.
+
+[policy.proposals-stay-small]
+match = "source == 'proposal'"
+deny = "has(app.replicas) && app.replicas > 4"
+message = "agents may scale an app to at most 4 replicas; ask a person for more"

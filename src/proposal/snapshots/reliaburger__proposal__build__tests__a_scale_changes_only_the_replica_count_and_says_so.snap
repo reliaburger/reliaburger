@@ -1,0 +1,8 @@
+---
+source: src/proposal/build_tests.rs
+expression: "proposal.summary.join(\"\\n\")"
+---
+Scale shop/web from 3 to 5 replicas.
+Touches 1 app on 2 nodes (node-a, node-b); starts 2 instances (the scheduler places them when it applies).
+Serves https://shop.example.com/ and the service web.shop.
+Undo: `relish undo 17` puts web back to 3 replicas.

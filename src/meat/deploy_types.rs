@@ -263,6 +263,17 @@ pub fn rollout_fingerprint(spec: &crate::config::app::AppSpec) -> String {
     hex::encode(sha2::Sha256::digest(bytes))
 }
 
+/// [`rollout_fingerprint`] with the restart stamp set aside too (#1682):
+/// two specs that differ only in when they were last restarted are the
+/// same version. The rollback history and `relish rollback` compare
+/// these, so restarts don't push real versions out of the history, and a
+/// rollback never picks "the same spec, restarted earlier".
+pub fn version_fingerprint(spec: &crate::config::app::AppSpec) -> String {
+    let mut version = spec.clone();
+    version.restarted_at = None;
+    rollout_fingerprint(&version)
+}
+
 /// How many distinct fully rolled-out specs the council keeps per app as
 /// `relish rollback` targets.
 pub const ROLLBACK_TARGETS_PER_APP: usize = 10;
@@ -288,10 +299,12 @@ impl AppRollouts {
 
     /// Record `spec` as fully rolled out: it becomes the newest target, and
     /// an older entry of the same version moves up rather than repeating.
+    /// A restart is the same version ([`version_fingerprint`]), so it
+    /// replaces its entry rather than taking a second one.
     pub fn release(&mut self, spec: &crate::config::app::AppSpec) {
-        let fingerprint = rollout_fingerprint(spec);
+        let fingerprint = version_fingerprint(spec);
         self.released
-            .retain(|released| rollout_fingerprint(released) != fingerprint);
+            .retain(|released| version_fingerprint(released) != fingerprint);
         self.released.push(spec.clone());
         let excess = self.released.len().saturating_sub(ROLLBACK_TARGETS_PER_APP);
         self.released.drain(..excess);

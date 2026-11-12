@@ -1,0 +1,27 @@
+# An app that asks for a node label no node has, so the scheduler can't place
+# it anywhere: the port of apps/reports-unplaceable.toml. Reliaburger's
+# `placement.required = ["disk=nvme-raid"]` is a nodeSelector here; the pod
+# stays Pending with a FailedScheduling event.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: reports
+  namespace: default
+  labels: {app: reports}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: reports}
+  template:
+    metadata:
+      labels: {app: reports}
+    spec:
+      nodeSelector:
+        disk: nvme-raid
+      containers:
+        - name: reports
+          image: "@IMAGE@"
+          imagePullPolicy: IfNotPresent
+          command: ["httpd", "-f", "-v", "-p", "8081", "-h", "/tmp"]
+          ports:
+            - containerPort: 8081

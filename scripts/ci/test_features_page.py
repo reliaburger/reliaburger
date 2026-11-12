@@ -153,6 +153,10 @@ class PageTests(unittest.TestCase):
     def test_the_page_names_its_markdown_copy(self):
         self.assertIn('<link rel="alternate" type="text/markdown" href="features.md">', self.page)
 
+    def test_the_page_loads_the_script_that_adds_the_markdown_buttons(self):
+        # Every page offers "Copy as Markdown" and "Open in Claude" (#1695).
+        self.assertIn('<script src="assets/copy.js" defer></script>\n</body>', self.page)
+
     def test_a_row_shows_status_restrictions_issues_and_docs(self):
         row = self.page[self.page.index('<tr id="cluster-laptop-cluster">') :]
         row = row[: row.index("</tr>")]
@@ -230,7 +234,7 @@ class RepositoryTests(unittest.TestCase):
 
     def test_the_homepage_links_the_page(self):
         homepage = (REPO / "docs/website/index.html").read_text(encoding="utf-8")
-        self.assertIn('href="features.html"', homepage)
+        self.assertIn('href="features"', homepage)
 
 
 if __name__ == "__main__":

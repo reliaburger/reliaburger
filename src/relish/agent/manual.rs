@@ -363,7 +363,12 @@ struct Shown<'a> {
 impl Shown<'_> {
     /// The envelope with the first `kept` lines. `whole` is the size of the
     /// uncut answer, when it's too big.
-    fn envelope(&self, build: &BuildInfo, kept: usize, whole: Option<usize>) -> Envelope<ShowData> {
+    fn envelope(
+        &self,
+        build: &BuildInfo,
+        kept: usize,
+        whole: Option<budget::Overflow>,
+    ) -> Envelope<ShowData> {
         let complete = kept == self.lines.len();
         let to = self.start + kept.max(1);
         let data = ShowData {
@@ -404,14 +409,18 @@ impl Shown<'_> {
                 read_only: true,
             });
         }
-        if let Some(whole) = whole {
+        if let Some(overflow) = whole
+            && let Some(budget) = overflow.rerun_budget()
+        {
             let target = match &self.section {
                 Some(section) => show_command(self.chapter, Some(&section.anchor)),
                 None => show_command(self.chapter, None),
             };
             envelope = envelope.with_next(NextStep {
-                run: format!("{target} --max-bytes {}", fit::round_up_to_kib(whole)),
-                why: format!("all of it; the whole answer is {whole} bytes"),
+                run: budget::rerun_with(&target, budget),
+                why: overflow.out_of_reach().unwrap_or_else(|| {
+                    format!("all of it; the whole answer is {} bytes", overflow.whole)
+                }),
                 read_only: true,
             });
         }
@@ -528,11 +537,16 @@ pub fn answer(
                 if whole <= max_bytes {
                     return budget::render(&shown.envelope(&build, total, None), max_bytes, rerun);
                 }
+                let overflow = budget::Overflow { whole, max_bytes };
                 let kept = fit::largest_that_fits(total, |kept| {
-                    fit::printed_length(&shown.envelope(&build, kept, Some(whole))) <= max_bytes
+                    fit::printed_length(&shown.envelope(&build, kept, Some(overflow))) <= max_bytes
                 })
                 .unwrap_or(0);
-                budget::render(&shown.envelope(&build, kept, Some(whole)), max_bytes, rerun)
+                budget::render(
+                    &shown.envelope(&build, kept, Some(overflow)),
+                    max_bytes,
+                    rerun,
+                )
             }
             Err(error) => failure(command.name(), build, error, max_bytes, rerun),
         },
@@ -620,6 +634,18 @@ mod tests {
         );
         assert!(rendered.json.len() <= max_bytes, "over budget");
         (serde_json::from_str(&rendered.json).unwrap(), rendered.exit)
+    }
+
+    /// Every `--max-bytes` a `next` step of `value` names.
+    fn budgets_named(value: &serde_json::Value) -> Vec<usize> {
+        value["next"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|step| step["run"].as_str())
+            .filter_map(|run| run.split_once("--max-bytes "))
+            .map(|(_, budget)| budget.split_whitespace().next().unwrap().parse().unwrap())
+            .collect()
     }
 
     fn search_for(words: &str) -> ManualCommand {
@@ -829,5 +855,28 @@ mod tests {
             assert_eq!(exit, ExitStatus::Answered, "{target}");
             assert_eq!(shown["data"]["heading"], hit["heading"]);
         }
+    }
+
+    /// #1818's review: `manual show` fits its own answer too, so its "all
+    /// of it" step has to respect the ceiling `relish mcp` sets.
+    #[tokio::test]
+    async fn under_a_ceiling_the_all_of_it_step_never_asks_for_more_than_it() {
+        let body: String = (0..400)
+            .map(|index| format!("Line {index} of a long section about ingress.\n"))
+            .collect();
+        let chapters = vec![chapter(
+            "03_networking.md",
+            &format!("# Networking\n\n{body}"),
+        )];
+        let below = crate::relish::agent::budget::within_ceiling(4096, async {
+            run_json(&chapters, show("networking"), 2048).0
+        })
+        .await;
+        assert_eq!(budgets_named(&below), [4096], "{below}");
+        let at = crate::relish::agent::budget::within_ceiling(4096, async {
+            run_json(&chapters, show("networking"), 4096).0
+        })
+        .await;
+        assert!(budgets_named(&at).is_empty(), "{at}");
     }
 }

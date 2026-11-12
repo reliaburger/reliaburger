@@ -225,8 +225,11 @@ cluster's leader refuses it too
 0.2.7 keeps 0.2.6's pair, protocol 57 and state format 73, so a 0.2.6
 cluster can roll onto it in place
 ([upgrading from 0.2.6](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-026)).
-Development builds of 0.3.0, the appliance release, are at protocol 58 and
-state format 74, so a 0.2.x cluster's leader refuses them too.
+0.2.8 moves the pair to protocol 58 and state format 74, and a 0.2.7
+cluster's leader refuses it
+([upgrading from 0.2.7](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-027)).
+Development builds of 0.3.0, the appliance release, are at protocol 59 and
+state format 75, so a 0.2.x cluster's leader refuses them too.
 
 A laptop cluster says the same thing when you rerun the quickstart installer
 from a newer release over it. Its saved record names the release that set it
@@ -286,11 +289,16 @@ cluster and the release share a pair.
    relish upgrade status
    ```
 
-5. Confirm every node runs the new commit.
+5. Confirm every node runs the new commit, and that each one is the
+   published build, byte for byte. `relish verify` checks every node's
+   binary against the release's SHA-256 and its signature, and exits `0`
+   only when they all match ([is this the
+   release?](#is-this-the-release)).
 
    ```sh
    relish nodes
    relish wtf
+   relish verify
    ```
 
 6. If a node refused or reverted, the upgrade pauses. Fix the cause and
@@ -301,6 +309,59 @@ cluster and the release share a pair.
    relish upgrade abort
    relish upgrade rollback v0.2.0
    ```
+
+### Is this the release?
+
+`relish verify` checks that the running cluster is exactly the published
+release, byte for byte. It asks every node which `bun` it runs and the SHA-256
+of that binary, and compares it with the hash the release's `metadata.json`
+publishes for that version and platform. The release key signs a binary's
+bytes, not its hash, so `verify` downloads each build the nodes run, once, and
+checks its Ed25519 signature against the release keys compiled into `relish`.
+The metadata isn't signed, and doesn't need to be: a node passes only against
+bytes the release key signed, so a metadata host that lies can make the check
+fail, never pass. It also checks that every node runs the same version, and
+checks the `relish` running it against `cli-metadata.json` the same way. It
+changes nothing.
+
+```sh
+relish verify
+relish -o json verify
+```
+
+It exits `0` when everything matches, `1` for a mismatch and `3` when evidence
+is missing. With `-o json`, or as `relish agent verify`, `verdict` is
+`verified`, `mismatch` or `unknown`, and each entry in `reasons` has a `code`:
+
+| Kind | Codes |
+|------|-------|
+| Mismatch | `hash_mismatch` (a node's binary has drifted), `bad_signature`, `artefact_mismatch` (published bytes that don't match their metadata), `version_skew`, `unpublished_version`, `no_artefact`, `relish_mismatch` (a development build of `relish` is one) |
+| Missing evidence | `metadata_unavailable`, `cluster_unreachable`, `node_unanswered` (a dead node too), `platform_unknown`, `hash_unreported`, `signature_unchecked`, `relish_unchecked` |
+
+A mismatch outranks missing evidence, and missing evidence is never
+`verified`. `nodes` gives every node's `version`, `platform`, `sha256` and
+`published_sha256`, and whether its `hash` and `signature` checks `pass`,
+`fail` or stayed `unchecked`; `relish` is the same for the CLI, and
+`trusted_keys` names the keys the signatures were checked against.
+
+On a cluster without internet, download the release's files on a machine that
+has it and carry them over. `--metadata` turns the network off; `--artefacts`
+holds the `bun-<platform>` binaries for the signature check and
+`--cli-metadata` the metadata for `relish`. Leave one out and that check stays
+`unchecked`, so the verdict is `unknown`, and the reason names the flag.
+`--release-url` points at a mirror of the release downloads instead.
+
+```sh
+gh release download v0.2.8 --repo reliaburger/reliaburger --pattern metadata.json --pattern cli-metadata.json --pattern 'bun-*' --dir release
+relish verify --metadata release/metadata.json --cli-metadata release/cli-metadata.json --artefacts release
+```
+
+What it can't prove: a node reports its own hash, so a node someone has taken
+over can lie, and so can a `relish` someone has replaced. Check `relish`
+itself with `gh attestation verify` first ([checks a stranger can
+run](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#checks-a-stranger-can-run))
+if that matters to you. `relish mcp` doesn't offer `verify` as a tool: it
+reaches past the cluster API to the internet, and its flags read local files.
 
 ### When bun refuses its data directory
 
@@ -685,8 +746,11 @@ epoch stops that, as long as they can reach the recovered side:
   those.
 
 `relish council status` shows such a node as `fenced` (its epoch column reads
-`0 < 1`, or `1 split` for a split), `relish status` prints a warning line, and
-`relish wtf` reports it as CRITICAL until you re-enrol it.
+`0 < 1`, or `1 split` for a split), and `relish wtf` reports it as CRITICAL
+until you re-enrol it, so `relish status` counts it on its `wtf` line. If
+status sees two leaders at once, its `council` line reads `SPLIT: leader node-1
+AND node-4`; with no leader or no majority it reads `NO LEADER` or `QUORUM
+LOST`, and the verdict is `DOWN`.
 Stop the node, then:
 
 ```sh

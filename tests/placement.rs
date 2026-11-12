@@ -1617,6 +1617,11 @@ fn peer_state(observer: &Node, target: &str) -> Option<reliaburger::mustard::sta
 /// probes and its peers mark it Dead. Healing clears the blocklists and
 /// the node rejoins. This drives the binary path: a council partition fault
 /// on the isolated node, membership observed through the peers' watch.
+///
+/// The partition must hold in both directions on Raft as well (#1810). The
+/// blocklists only stopped the isolated node's own RPCs, so the leader's
+/// AppendEntries still reached it and it kept applying the log. A write
+/// made on the leader during the partition must not reach q3 until the heal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 #[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
 async fn partition_isolates_a_node_for_real() {
@@ -1685,11 +1690,82 @@ async fn partition_isolates_a_node_for_real() {
         peer_state(&n1, "q3")
     );
 
+    // A write on the leader, which q1 and q2 elect between them if q3 led.
+    let marker = reliaburger::sesame::token::create_token(
+        "written-during-partition",
+        reliaburger::sesame::types::ApiRole::ReadOnly,
+        reliaburger::sesame::types::TokenScope::default(),
+        None,
+    )
+    .unwrap()
+    .token;
+    let holds_marker = |node: &Node| {
+        let council = node.handle.council.clone();
+        async move {
+            let council = council.expect("every test node holds a council seat");
+            council
+                .api_tokens()
+                .await
+                .iter()
+                .any(|token| token.name == "written-during-partition")
+        }
+    };
+    let mut written = false;
+    for _ in 0..60 {
+        for node in [&n1, &n2] {
+            let council = node.handle.council.as_ref().expect("council seat");
+            if !written
+                && council
+                    .write(reliaburger::council::types::RaftRequest::CreateApiToken(
+                        marker.clone(),
+                    ))
+                    .await
+                    .is_ok()
+            {
+                written = true;
+            }
+        }
+        if written {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(
+        written,
+        "neither q1 nor q2 accepted a write during the partition"
+    );
+    for _ in 0..40 {
+        if holds_marker(&n1).await && holds_marker(&n2).await {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(holds_marker(&n1).await && holds_marker(&n2).await);
+    // Five seconds is many heartbeats: a leader still reaching q3 would have
+    // replicated the entry long before.
+    for _ in 0..50 {
+        assert!(
+            !holds_marker(&n3).await,
+            "the partitioned q3 applied a write made on the leader during its partition"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
     // Heal: clear q3's blocklists and it should rejoin and be Alive again.
     n3.client
         .clear_fault(fault.id, Some("q3"), true)
         .await
         .expect("heal should succeed");
+
+    let mut caught_up = false;
+    for _ in 0..300 {
+        if holds_marker(&n3).await {
+            caught_up = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(caught_up, "q3 never applied the write after the heal");
 
     let recovered = wait_until(Duration::from_secs(30), || {
         peer_state(&n1, "q3") == Some(NodeState::Alive)
@@ -2745,6 +2821,89 @@ async fn wtf_and_path_reach_every_node_through_the_entry_node() {
 
     shutdown.cancel();
     for node in &nodes {
+        if let Some(council) = &node.handle.council {
+            council.shutdown().await.ok();
+        }
+    }
+}
+
+/// An app its namespace's quota can't fit isn't placed, and Brioche's app
+/// page on every node says why, from the council's reason, whatever the
+/// shared rollup (#1789) calls its state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
+async fn brioche_says_why_a_quota_blocked_app_isnt_placed_on_every_node() {
+    let shutdown = CancellationToken::new();
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let n1 = start_node("quota1", base, vec![], &shutdown).await;
+    let n2 = start_node("quota2", base + 4, vec![local(base)], &shutdown).await;
+    let n3 = start_node("quota3", base + 8, vec![local(base)], &shutdown).await;
+    let nodes = [&n1, &n2, &n3];
+    let config = reliaburger::config::Config::parse(
+        r#"
+        [namespace.shop]
+        cpu = "1"
+
+        [app.big]
+        namespace = "shop"
+        script = "exec sleep 600"
+        replicas = 2
+        cpu = "1000m-1000m"
+    "#,
+    )
+    .unwrap();
+    let mut pages = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut last_apply = tokio::time::Instant::now() - Duration::from_secs(8);
+    while tokio::time::Instant::now() < deadline {
+        if last_apply.elapsed() >= Duration::from_secs(8) {
+            let _ = tokio::time::timeout(Duration::from_secs(5), n1.client.apply(&config)).await;
+            last_apply = tokio::time::Instant::now();
+        }
+        pages.clear();
+        for node in nodes {
+            let response = node
+                .client
+                .http()
+                .unwrap()
+                .get(format!("{}/ui/app/big/shop", node.client.base_url()))
+                .send()
+                .await;
+            if let Ok(response) = response
+                && response.status().is_success()
+            {
+                pages.push(response.text().await.unwrap_or_default());
+            }
+        }
+        if pages.len() == nodes.len()
+            && pages
+                .iter()
+                .all(|html| html.contains("Not placed, blocked:"))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert_eq!(pages.len(), nodes.len(), "every node serves the page");
+    for html in &pages {
+        assert!(html.contains("Not placed, blocked:"), "{html}");
+        assert!(html.contains("would exceed CPU quota"), "{html}");
+        assert!(html.contains("Instances: <strong>0/2</strong>"), "{html}");
+    }
+    for node in nodes {
+        let placed = node
+            .client
+            .status()
+            .await
+            .expect("node must serve status")
+            .iter()
+            .filter(|s| s.app_name == "big")
+            .count();
+        assert_eq!(placed, 0, "{} placed none", node.name);
+    }
+    shutdown.cancel();
+    for node in nodes {
         if let Some(council) = &node.handle.council {
             council.shutdown().await.ok();
         }

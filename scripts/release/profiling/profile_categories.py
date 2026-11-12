@@ -46,7 +46,11 @@ BUN_RULES = [
     ("Bun: Raft core and log", lambda s: "openraft::" in s or "reliaburger::council::" in s),
     ("Bun: agent loop and supervisor", lambda s: "reliaburger::bun::agent" in s or "reliaburger::bun::supervisor" in s),
     ("Bun: API server", lambda s: "reliaburger::bun::api" in s or "axum::" in s or "hyper::" in s),
-    ("Bun: metrics (Mayo)", lambda s: "reliaburger::mayo::" in s),
+    # Mayo's collector refreshes every process through the sysinfo crate, which
+    # walks /proc on rayon's threads, so those stacks hold no reliaburger:: frame.
+    # Matching sysinfo:: (not rayon) keeps any other crate's rayon work out; a
+    # Grill sysinfo call keeps its reliaburger::grill:: frame and matches above.
+    ("Bun: metrics (Mayo)", lambda s: "reliaburger::mayo::" in s or "sysinfo::" in s),
     ("Bun: logs (Ketchup)", lambda s: "reliaburger::ketchup::" in s),
     ("Bun: gossip (Mustard)", lambda s: "reliaburger::mustard::" in s),
     ("Bun: service discovery (Onion)", lambda s: "reliaburger::onion::" in s),

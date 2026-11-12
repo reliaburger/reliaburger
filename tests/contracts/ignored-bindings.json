@@ -307,6 +307,30 @@
   },
   {
     "source": "tests/cluster_failover.rs",
+    "function": "an_agent_lease_survives_a_leader_change_and_the_new_leader_expires_it",
+    "binary": "reliaburger::cluster_failover",
+    "test": "an_agent_lease_survives_a_leader_change_and_the_new_leader_expires_it"
+  },
+  {
+    "source": "tests/cluster_failover.rs",
+    "function": "a_proposal_applied_before_a_leader_change_is_undone_on_the_new_leader",
+    "binary": "reliaburger::cluster_failover",
+    "test": "a_proposal_applied_before_a_leader_change_is_undone_on_the_new_leader"
+  },
+  {
+    "source": "tests/cluster_failover.rs",
+    "function": "the_dashboard_decides_a_proposal_on_the_leader_only",
+    "binary": "reliaburger::cluster_failover",
+    "test": "the_dashboard_decides_a_proposal_on_the_leader_only"
+  },
+  {
+    "source": "tests/cluster_failover.rs",
+    "function": "the_dashboard_clears_a_fault_another_node_holds",
+    "binary": "reliaburger::cluster_failover",
+    "test": "the_dashboard_clears_a_fault_another_node_holds"
+  },
+  {
+    "source": "tests/cluster_failover.rs",
     "function": "an_admin_removes_a_policy_that_denies_everything_through_any_node",
     "binary": "reliaburger::cluster_failover",
     "test": "an_admin_removes_a_policy_that_denies_everything_through_any_node"
@@ -1447,6 +1471,12 @@
   },
   {
     "source": "tests/placement.rs",
+    "function": "brioche_says_why_a_quota_blocked_app_isnt_placed_on_every_node",
+    "binary": "reliaburger::placement",
+    "test": "brioche_says_why_a_quota_blocked_app_isnt_placed_on_every_node"
+  },
+  {
+    "source": "tests/placement.rs",
     "function": "ingress_reaches_nodes_without_local_replicas",
     "binary": "reliaburger::placement",
     "test": "ingress_reaches_nodes_without_local_replicas"
@@ -1666,6 +1696,12 @@
     "function": "a_stale_adoption_record_retires_its_generation_and_others_still_adopt",
     "binary": "reliaburger::owned_runc",
     "test": "a_stale_adoption_record_retires_its_generation_and_others_still_adopt"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "a_record_and_generation_split_by_a_power_cut_retire_and_others_still_adopt",
+    "binary": "reliaburger::owned_runc",
+    "test": "a_record_and_generation_split_by_a_power_cut_retire_and_others_still_adopt"
   },
   {
     "source": "tests/cluster_task_arrays.rs",

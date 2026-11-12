@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 
 use cel::common::ast::{EntryExpr, Expr, IdedExpr};
 
-use crate::config::{PolicySpec, PolicyTarget};
+use crate::config::{PolicyAction, PolicySpec, PolicyTarget};
 
 /// The longest `match` or `deny` expression a policy may hold, in bytes.
 ///
@@ -40,7 +40,7 @@ pub const MAX_MESSAGE_BYTES: usize = 512;
 pub const MAX_DEFAULT_BYTES: usize = 4096;
 
 /// App fields a `default` can never fill, and why.
-pub const UNFILLABLE_FIELDS: [(&str, &str); 13] = [
+pub const UNFILLABLE_FIELDS: [(&str, &str); 14] = [
     ("name", "is the app's table name, not a field"),
     (
         "namespace",
@@ -76,13 +76,19 @@ pub const UNFILLABLE_FIELDS: [(&str, &str); 13] = [
         "provenance",
         "says which template made the app, and only template expansion writes it",
     ),
+    (
+        "restarted_at",
+        "restarts every matching app, and only an approved restart proposal stamps it",
+    ),
 ];
 
 /// Every variable a policy expression can see. Nothing else: no other
 /// workloads, no policies, permissions or namespaces, no clock. Which of
-/// `app`, `job` and `workload` a policy sees depends on its `applies_to`
-/// ([`workload_variables`]).
-pub const POLICY_VARIABLES: [&str; 5] = ["app", "job", "workload", "caller", "source"];
+/// `app`, `job`, `workload`, `proposal` and `author` a policy sees depends
+/// on its `applies_to` ([`workload_variables`]).
+pub const POLICY_VARIABLES: [&str; 7] = [
+    "app", "job", "workload", "proposal", "author", "caller", "source",
+];
 
 /// The workload variables a policy that applies to `target` sees: `app`
 /// for apps, `job` for jobs, and `workload`, the fields both share, for
@@ -92,8 +98,30 @@ pub fn workload_variables(target: PolicyTarget) -> &'static [&'static str] {
         PolicyTarget::Apps => &["app", "workload"],
         PolicyTarget::Jobs => &["job", "workload"],
         PolicyTarget::Both => &["workload"],
+        PolicyTarget::Proposals => &["proposal", "author"],
     }
 }
+
+/// The fields of `proposal`, for a policy that applies to proposals
+/// (#1682). The proposal's `reason` isn't one: it's the author's own
+/// words, and a guardrail that read them could be talked round. A test
+/// checks this list against `crate::policy::ProposalFacts`.
+pub const PROPOSAL_FIELDS: [&str; 10] = [
+    "kind",
+    "namespace",
+    "apps",
+    "nodes",
+    "instances",
+    "replicas_from",
+    "replicas_to",
+    "reversibility",
+    "fields",
+    "images",
+];
+
+/// The fields of `author`: who made the proposal (#1682). A test checks
+/// this list against `crate::policy::AuthorFacts`.
+pub const AUTHOR_FIELDS: [&str; 3] = ["name", "kind", "role"];
 
 /// The fields of `job`: every `[job.*]` key, plus the job's `name`
 /// (#1119). `namespace` is always present, as for `app`. A test checks
@@ -146,7 +174,7 @@ const GATED_BY_THE_CALLER: &str = "can need host access or a runtime knob, which
 ///
 /// `namespace` is always present, resolved to `default` when the spec
 /// doesn't name one. A test checks this list against `AppSpec` itself.
-pub const APP_FIELDS: [&str; 36] = [
+pub const APP_FIELDS: [&str; 37] = [
     "name",
     "image",
     "command",
@@ -183,6 +211,7 @@ pub const APP_FIELDS: [&str; 36] = [
     "namespace",
     "provenance",
     "owner",
+    "restarted_at",
 ];
 
 /// The fields of `caller`.
@@ -291,6 +320,26 @@ pub enum PolicyError {
     /// The policy has neither a `deny` nor a `default`, so it does nothing.
     #[error("a policy needs a deny expression, a default table, or both")]
     NothingToDo,
+    /// `action = "approve"` on a policy that doesn't apply to proposals
+    /// (#1682): only a proposal can be approved.
+    #[error(
+        "action = \"approve\" approves proposals, so its policy needs applies_to = \"proposals\", not {}",
+        .target.as_str()
+    )]
+    ApproveOutsideProposals {
+        /// What the policy applies to.
+        target: PolicyTarget,
+    },
+    /// An approve policy with something beside its `match` (#1682).
+    #[error("an approve policy has a match and nothing else, so it can't have a {field}")]
+    ApproveTakesOnlyMatch {
+        /// `deny`, `message` or `default`.
+        field: &'static str,
+    },
+    /// An approve policy with no `match`, which would approve every
+    /// proposal (#1682).
+    #[error("an approve policy needs a match saying which proposals it approves")]
+    ApproveNeedsMatch,
     /// A `default` names an app field that doesn't exist, or one a
     /// default can't fill (#1118).
     #[error("default sets {name}, which {reason}")]
@@ -319,7 +368,7 @@ pub enum PolicyError {
         /// The cap.
         limit: usize,
     },
-    /// An expression reads a field `app` or `caller` doesn't have.
+    /// An expression reads a field its variable doesn't have.
     #[error("{field} reads {variable}.{name}, which doesn't exist")]
     UnknownField {
         /// The expression.
@@ -355,6 +404,9 @@ pub fn check_policy(name: &str, spec: &PolicySpec) -> Result<(), PolicyError> {
     if let Some(deny) = &spec.deny {
         compile_checked(PolicyField::Deny, spec.applies_to, deny)?;
     }
+    if spec.action == PolicyAction::Approve {
+        return check_approve(spec);
+    }
     match &spec.default {
         Some(_) if !spec.applies_to.is_apps() => {
             return Err(PolicyError::DefaultOutsideApps {
@@ -364,6 +416,28 @@ pub fn check_policy(name: &str, spec: &PolicySpec) -> Result<(), PolicyError> {
         Some(default) => check_default(default)?,
         None if spec.deny.is_none() => return Err(PolicyError::NothingToDo),
         None => {}
+    }
+    Ok(())
+}
+
+/// The rules for an `approve` policy (#1682): it applies to proposals and
+/// has a `match` and nothing else. Its expressions were checked already.
+fn check_approve(spec: &PolicySpec) -> Result<(), PolicyError> {
+    if spec.applies_to != PolicyTarget::Proposals {
+        return Err(PolicyError::ApproveOutsideProposals {
+            target: spec.applies_to,
+        });
+    }
+    let extra = [
+        ("deny", spec.deny.is_some()),
+        ("message", spec.message.is_some()),
+        ("default", spec.default.is_some()),
+    ];
+    if let Some((field, _)) = extra.into_iter().find(|(_, present)| *present) {
+        return Err(PolicyError::ApproveTakesOnlyMatch { field });
+    }
+    if spec.match_expression.is_none() {
+        return Err(PolicyError::ApproveNeedsMatch);
     }
     Ok(())
 }
@@ -572,6 +646,8 @@ fn check_field(field: PolicyField, variable: &str, name: &str) -> Result<(), Pol
         "job" => &JOB_FIELDS,
         "workload" => &WORKLOAD_FIELDS,
         "caller" => &CALLER_FIELDS,
+        "proposal" => &PROPOSAL_FIELDS,
+        "author" => &AUTHOR_FIELDS,
         _ => return Ok(()),
     };
     if known.contains(&name) {

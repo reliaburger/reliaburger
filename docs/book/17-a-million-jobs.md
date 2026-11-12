@@ -3659,7 +3659,11 @@ costs by frame: the GitOps loop, the Raft core, the ledger, the pool path and
 so on. Code moves, and a map that silently stops matching would make every
 release look the same. So when more than 5% of Bun's samples match no rule,
 the record says to extend the map. A hot path nobody has named is exactly
-what the step is there to find.
+what the step is there to find. The 0.2.8 record found one: Mayo's `sysinfo`
+walk of `/proc` runs on rayon's threads, where no `reliaburger::` frame
+survives, so the map now files any `sysinfo::` frame under metrics. It
+matches `sysinfo::` rather than rayon: `sysinfo` is the only crate that uses
+rayon today, but the next one to bring it in won't be Mayo's.
 
 ### What the measurements do and don't show
 
@@ -3982,6 +3986,23 @@ the other two nodes didn't keep
 Neither of these was what the day run was built to find. That's the case for
 running it anyway: give the leak checkers 23 hours instead of two, and they
 see things a gate tier can't.
+
+Seeing that RSS grows isn't the same as seeing what grows, and Bun can't
+tell us itself: it allocates through glibc's malloc, which keeps no
+statistics anyone can scrape. The kernel can, though. `/proc/PID/smaps`
+lists every mapping in a process with its resident size, so each heavy
+check now runs one `awk` pass over Bun's (`sustained/bun-memory.awk`) and
+sorts the memory into kinds: the main heap (`[heap]`), glibc's thread
+arenas, thread stacks, other anonymous memory (large allocations get a
+mapping of their own) and file-backed pages. The arenas need a heuristic.
+On 64-bit glibc each one lives in a 64 MiB reservation aligned to 64 MiB,
+with the part in use read-write and the rest `---p`, so a read-write
+mapping that starts on a 64 MiB boundary and runs into such a reserve is
+an arena. A stack is the read-write mapping just above a small `---p`
+guard page. Every sample goes into `memory.jsonl`, and the record shows
+each node hour by hour, with one line naming the kind that grew most after
+the first hour. A heap that keeps climbing points at live data or
+fragmentation; arenas that fill and stop point at a cache warming up.
 
 ### Soak jobs while the apps keep running
 
@@ -4470,6 +4491,20 @@ comparison samples, and the final fails unless each checker was armed for an
 hour on every node, with one unbroken half-hour among them. The final grew
 from eight hours to about ten and a half. We chose that over cutting the faults to six,
 because the faults are what the eight hours were for.
+
+The hour itself turned out to be too simple a baseline for long runs. In
+0.2.7's 24-hour memory run, node 2's RSS followed its log store, which the
+volume writer's eight lines a second took 15 hours to fill, so at the hour
+node 2 was at 76% of where it ended and `leak-rss` failed it 13 times.
+Moving the hour to two or four hours still failed it. So outside a final
+the warm sample now waits for the node's log and metrics stores to be 90%
+full, between the hour and six hours. On its own that would hide a real
+leak that starts late, so the record also gives each node's RSS slope over
+its last six hours, fitted by least squares. Nodes 1 and 3, which levelled
+off, show about 0.6 MiB an hour and node 2 about 2.4, and the next memory
+run decides what slope fails. A final keeps the plain hour, because its
+quiet tail is sized for it. The test replays that run's 867 samples, so
+the rule is checked against the data that prompted it.
 
 My first proposal for the tail was 90 minutes, an hour to arm and half an
 hour to compare, beside a 60-minute exposure threshold. Do the arithmetic and
@@ -5040,6 +5075,56 @@ group against a real secure node, checking that both job cases pass and
 confirm their cleanup. The refusal stays: a case that applies a job under the
 wrong lease fails loudly rather than slipping through.
 
+### The laptop that went to sleep
+
+Once, on 2 November, the job catalogue's cron case timed out waiting for its
+first firing, and the job's row had vanished from the listing altogether
+(#1527). The apply had committed the definition, nothing in the case stops or
+forgets a job, and three investigations read every path that drops a cron
+definition without finding one that could have fired. Well over a hundred
+stressed runs, at load up to twice the core count, never reproduced it.
+
+The answer was in the Mac's power log, not the code. `pmset -g log` showed the
+laptop going into idle sleep at 14:43:25, eleven seconds after the case
+started, and waking at 14:52:03. Two clocks then disagreed. The case's 90 s
+deadline is a `std::time::Instant`, and on macOS an `Instant` doesn't move
+while the machine sleeps, so on waking the case still had most of its budget.
+The lease's expiry is wall-clock time on the server, which did move: the lease
+had run out minutes earlier. The leader's TTL reaper did exactly what it's for
+and cleaned the lease up, forgetting its job's definition. The case kept
+polling a listing with nothing in it until its deadline caught up.
+
+You can't put a laptop to sleep from a test, but you can do to the lease what
+the sleep did. Renewing the cron case's lease with a 1 s TTL, as its owner,
+while the case waits reproduces the 2 November message word for word: `last
+saw 0 row(s): []; last query error: None`.
+
+Nothing in the product was wrong. A lease whose owner falls silent past its
+expiry has to be reclaimed, and the server can't tell a sleeping laptop from a
+crashed runner. What was wrong was that the failure blamed the product. So the
+fix is two things. The test fixture that starts Bun now runs
+`caffeinate -i -w <pid>` on macOS, which stops idle sleep for as long as that
+Bun runs (a closed lid still sleeps). And the runner names the condition when
+it happens anyway. It notes the wall-clock time alongside the `Instant` when a
+case starts:
+
+```rust
+let start = Instant::now();
+let wall_start = std::time::SystemTime::now();
+```
+
+`SystemTime` is the wall clock, and `elapsed()` on it returns a `Result`,
+because the wall clock can be stepped backwards and then there's no sensible
+answer. When a case doesn't pass and the wall clock ran more than 10 s ahead
+of the monotonic one, `host_suspension_note` adds that to the reason: the host
+slept or its clock was stepped, so the lease may have expired mid-case. The
+job waits also say more when a job has no row at all: whether its definition
+exists and has a `cron`, what its deployment's state is, and whether the
+case's lease is active, being cleaned up, or gone. The leader's reaper used
+to reclaim a lease without a word, so Bun's log had nothing to show either;
+now it logs a line when it takes an expired lease. The next reader gets the
+cause in the failure message, not three rounds of reading.
+
 ### Lessons
 
 **Two schedulers sharing a ledger must share a view of it.** The budget was
@@ -5054,6 +5139,11 @@ everything would have looked simpler and counted every app twice.
 because one caller still used it, and it kept collecting findings for the
 whole time it was alive. Moving that last caller was most of the work; the
 deletion itself was the easy part.
+
+**Know which clock each side keeps.** A deadline on one clock and an expiry
+on another agree only while both run at the same rate. A sleeping laptop
+stops one and not the other, and the flake that comes out of it looks like
+the product losing work.
 
 ## Telling visitors what they can actually run
 

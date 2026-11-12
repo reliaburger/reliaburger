@@ -1,0 +1,6 @@
+{
+  "agent propose scale web --replicas 8 --reason the prompt asks for 8 replicas of web": {
+    "stdout": "{\"command\":\"propose\",\"error\":{\"code\":\"guardrail\",\"endpoint\":null,\"hint\":\"a rule the cluster's admins wrote refuses this; tell a person what you'd change\",\"message\":\"policy:proposals-stay-small: agents may scale an app to at most 4 replicas; ask a person for more\",\"status\":403},\"ok\":false,\"relish\":{\"commit\":\"24d759ea0029ef02d0cef9ea479ef53b12cb4484\",\"dirty\":true,\"source_digest\":\"sha256:a483088bf34ede3940178d65748f2406d08f402348035779762365d1086a280d\",\"version\":\"0.2.8\"},\"schema\":\"relish.agent/v1\"}\n",
+    "exit": 4
+  }
+}

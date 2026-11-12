@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 272" width="720" height="272" role="img" aria-labelledby="t">
+<title id="t">Bun CPU per node</title>
+<style>svg{--surface:#fcfcfb;--ink:#0b0b0b;--ink-2:#52514e;--muted:#8a8984;--grid:#e6e5e0;--series-1:#2a78d6;--series-2:#eb6834;--series-3:#1baf7a;--series-other:#8a8984}
+@media (prefers-color-scheme: dark){svg{--surface:#1a1a19;--ink:#f0efec;--ink-2:#c3c2b7;--muted:#8f8e86;--grid:#33332f;--series-1:#3987e5;--series-2:#d95926;--series-3:#199e70;--series-other:#8f8e86}}
+text{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;font-size:11px;fill:var(--ink-2,#52514e)}
+.title{font-size:13px;font-weight:600;fill:var(--ink,#0b0b0b)}
+.surface{fill:var(--surface,#fcfcfb)}
+.grid{stroke:var(--grid,#e6e5e0);stroke-width:1}
+.axis{stroke:var(--muted,#8a8984);stroke-width:1}
+.line{fill:none;stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
+.s1{stroke:var(--series-1,#2a78d6)}.f1{fill:var(--series-1,#2a78d6)}.s2{stroke:var(--series-2,#eb6834)}.f2{fill:var(--series-2,#eb6834)}.s3{stroke:var(--series-3,#1baf7a)}.f3{fill:var(--series-3,#1baf7a)}.s0{stroke:var(--series-other,#8a8984)}.f0{fill:var(--series-other,#8a8984)}
+.target{stroke:var(--ink-2,#52514e);stroke-width:1;stroke-dasharray:4 3}
+.mark{stroke:var(--ink-2,#52514e);fill:none;stroke-width:1.5}
+.mark.failure{stroke:var(--ink,#0b0b0b);stroke-width:2}
+.mark.special,.mark.upgrade{fill:var(--surface,#fcfcfb)}</style>
+<rect class="surface" x="0" y="0" width="720" height="272" rx="6"/>
+<text class="title" x="56" y="20">Bun CPU per node</text>
+<rect class="f3" x="558" y="12" width="10" height="10" rx="2"/><text x="572" y="21">node 3</text>
+<rect class="f2" x="492" y="12" width="10" height="10" rx="2"/><text x="506" y="21">node 2</text>
+<rect class="f1" x="426" y="12" width="10" height="10" rx="2"/><text x="440" y="21">node 1</text>
+<line class="grid" x1="56" y1="210.0" x2="624" y2="210.0"/><text x="50" y="214.0" text-anchor="end">0</text>
+<line class="grid" x1="56" y1="176.8" x2="624" y2="176.8"/><text x="50" y="180.8" text-anchor="end">20</text>
+<line class="grid" x1="56" y1="143.6" x2="624" y2="143.6"/><text x="50" y="147.6" text-anchor="end">40</text>
+<line class="grid" x1="56" y1="110.4" x2="624" y2="110.4"/><text x="50" y="114.4" text-anchor="end">60</text>
+<line class="grid" x1="56" y1="77.2" x2="624" y2="77.2"/><text x="50" y="81.2" text-anchor="end">80</text>
+<line class="grid" x1="56" y1="44.0" x2="624" y2="44.0"/><text x="50" y="48.0" text-anchor="end">100</text>
+<text x="56" y="36">% of one core</text>
+<line class="axis" x1="56.0" y1="210" x2="56.0" y2="214"/><text x="56.0" y="226" text-anchor="middle">0 min</text>
+<line class="axis" x1="128.8" y1="210" x2="128.8" y2="214"/><text x="128.8" y="226" text-anchor="middle">30 min</text>
+<line class="axis" x1="201.6" y1="210" x2="201.6" y2="214"/><text x="201.6" y="226" text-anchor="middle">60 min</text>
+<line class="axis" x1="274.4" y1="210" x2="274.4" y2="214"/><text x="274.4" y="226" text-anchor="middle">90 min</text>
+<line class="axis" x1="347.2" y1="210" x2="347.2" y2="214"/><text x="347.2" y="226" text-anchor="middle">120 min</text>
+<line class="axis" x1="420.0" y1="210" x2="420.0" y2="214"/><text x="420.0" y="226" text-anchor="middle">150 min</text>
+<line class="axis" x1="492.8" y1="210" x2="492.8" y2="214"/><text x="492.8" y="226" text-anchor="middle">180 min</text>
+<line class="axis" x1="565.6" y1="210" x2="565.6" y2="214"/><text x="565.6" y="226" text-anchor="middle">210 min</text>
+<polyline class="line s1" points="56.0,199.8 56.0,179.0 56.0,196.1 56.6,192.3 57.1,168.6 68.2,152.6 81.7,162.5 93.8,154.4 105.1,155.4 105.7,153.3 106.3,151.9 118.4,154.4 130.6,152.2 132.1,173.7 132.7,154.6 133.2,152.8 142.8,153.0 153.1,152.3 153.7,151.5 154.2,149.3 154.8,155.0 155.0,141.9 157.6,153.3 158.2,150.5 161.0,150.5 161.6,151.7 167.3,151.2 179.4,151.3 181.0,171.4 181.6,156.3 181.8,126.6 184.2,153.1 184.7,155.7 194.5,153.9 201.7,155.7 202.3,154.8 202.9,156.2 206.7,152.7 218.9,154.5 225.9,155.8 226.5,155.2 227.1,156.9 231.1,153.5 243.2,154.8 259.2,157.6 260.1,163.7 260.7,155.5 271.4,159.2 283.6,158.7 295.8,158.2 308.1,157.8 320.2,157.7 326.6,158.8 327.1,162.6 327.3,139.9 332.1,158.4 332.6,157.0 340.1,157.2 348.4,161.7 352.4,159.3 364.6,159.1 371.5,159.6 372.1,158.1 372.7,154.7 376.9,157.9 389.1,157.9 396.7,158.2 397.3,158.7 397.9,165.3 401.3,156.3 413.5,158.0 425.8,160.3 428.0,164.3 428.6,156.3 429.2,158.5 438.0,157.1 445.3,158.1 445.8,152.7 446.4,159.3 449.2,156.7 449.8,154.0 450.1,148.2 452.5,158.3 453.2,160.2 462.3,155.7 473.1,160.1 473.7,149.6 473.9,147.9 476.4,154.6 477.0,151.4 486.6,201.5 493.2,193.3 493.8,153.2 494.3,151.3 494.5,157.2 495.1,152.1 495.7,150.8 498.8,154.0 511.0,154.4 518.8,154.6 519.4,160.6 519.9,149.1 523.1,152.3 535.3,154.8 552.4,158.2 553.5,158.9 554.1,158.0 554.7,161.3 564.7,157.3 576.9,157.4 589.2,157.4 601.3,157.1 613.6,156.9 622.2,156.3 622.8,158.2 623.4,151.3 623.6,119.1"><title>node 1</title></polyline>
+<polyline class="line s2" points="56.0,204.7 56.0,192.3 57.1,176.5 68.2,159.9 80.3,159.6 81.0,162.8 81.7,168.7 93.8,159.0 105.7,164.4 106.3,159.0 118.4,160.6 132.7,164.1 133.2,160.8 142.8,161.1 153.1,161.7 153.7,162.6 154.2,159.7 154.8,164.9 155.0,133.6 157.6,163.0 158.2,161.3 161.0,160.2 161.6,160.8 167.3,158.6 179.4,158.1 181.0,182.4 181.6,160.4 181.8,114.6 184.2,162.3 184.7,161.4 194.5,158.8 202.3,170.1 202.9,164.0 206.7,158.4 218.9,160.4 225.9,161.6 226.5,166.3 227.1,162.0 231.1,158.0 243.2,160.6 259.2,161.3 260.1,169.8 260.7,156.5 271.4,159.1 283.6,159.1 295.8,158.7 308.1,158.2 320.2,158.3 326.6,180.8 327.1,161.3 327.3,121.7 332.1,158.2 332.6,157.7 340.1,157.2 347.2,158.8 347.9,165.4 348.4,156.5 352.4,155.5 364.6,157.2 371.5,158.1 372.1,161.5 372.7,151.1 376.9,154.3 389.1,155.6 396.7,156.7 397.3,156.4 397.9,164.2 401.3,153.8 413.5,155.7 428.6,162.5 429.2,161.7 438.0,159.8 445.3,161.5 445.8,157.8 446.4,163.5 449.2,160.2 449.8,157.8 450.1,138.8 452.5,162.7 453.2,163.4 462.3,157.8 473.1,164.1 473.7,155.2 473.9,128.0 476.4,161.4 477.0,157.0 493.8,160.4 494.3,156.9 494.5,163.2 495.1,158.1 495.7,157.7 498.8,157.1 511.0,159.1 519.4,166.1 519.9,159.4 523.1,157.9 535.3,160.3 552.4,160.4 553.5,168.1 554.1,162.4 554.7,164.1 564.7,159.3 576.9,159.6 589.2,159.8 601.3,158.6 613.6,158.7 622.2,162.0 622.8,163.9 623.4,157.2 623.6,95.9"><title>node 2</title></polyline>
+<polyline class="line s3" points="56.0,205.0 56.0,190.1 56.0,204.4 56.6,201.6 57.1,173.8 68.2,159.4 80.3,159.8 81.0,159.0 81.7,173.3 93.8,158.5 105.1,160.1 105.7,165.6 106.3,152.3 118.4,159.2 130.6,158.3 132.1,181.0 132.7,161.3 133.2,158.0 142.8,158.0 153.1,159.6 153.7,157.8 154.2,162.0 154.8,162.3 155.0,105.4 157.6,163.1 158.2,160.0 161.0,158.0 161.6,158.5 167.3,156.7 179.4,156.7 181.0,184.8 181.6,160.2 181.8,77.6 184.2,161.5 184.7,159.1 194.5,155.4 201.7,159.5 202.3,164.3 202.9,159.3 206.7,153.0 218.9,156.8 226.5,160.5 227.1,160.9 231.1,156.4 243.2,159.6 260.1,174.2 260.7,155.3 271.4,158.2 283.6,158.2 295.8,157.6 308.1,157.4 320.2,157.7 326.6,160.3 327.1,159.6 327.3,85.2 332.1,159.1 332.6,156.5 340.1,155.5 347.2,158.7 347.9,166.1 348.4,159.6 352.4,153.8 364.6,156.8 372.1,167.1 372.7,159.1 376.9,158.2 389.1,160.3 397.3,164.6 397.9,167.6 401.3,156.4 413.5,159.8 425.8,161.0 428.0,164.3 428.6,155.2 429.2,157.0 438.0,153.3 445.3,156.7 445.8,150.9 446.4,157.9 449.2,155.5 449.8,153.1 450.1,114.1 452.5,160.4 453.2,157.3 462.3,151.4 473.1,173.1 473.7,150.5 473.9,92.8 476.4,157.6 477.0,150.4 493.8,163.0 494.3,159.6 495.1,163.8 495.7,161.4 498.8,158.3 511.0,161.4 518.8,162.9 519.4,168.5 519.9,158.9 523.1,157.1 535.3,160.7 552.4,161.7 553.5,170.9 554.1,159.3 554.7,163.1 564.7,157.3 576.9,158.7 589.2,158.5 601.3,158.4 613.6,157.8 622.2,160.1 622.8,162.2 623.4,155.5"><title>node 3</title></polyline>
+<text x="630" y="99.9">node 2</text>
+<text x="630" y="123.1">node 1</text>
+<text x="630" y="159.5">node 3</text>
+<line class="mark fault" x1="56.0" y1="236.0" x2="56.0" y2="244.0"><title>fault: bun-kill-follower at 0 min</title></line>
+<line class="mark fault" x1="80.3" y1="236.0" x2="80.3" y2="244.0"><title>fault: bun-kill-leader at 10 min</title></line>
+<line class="mark fault" x1="105.1" y1="236.0" x2="105.1" y2="244.0"><title>fault: deploy-kill at 20 min</title></line>
+<line class="mark fault" x1="128.8" y1="236.0" x2="128.8" y2="244.0"><title>fault: power-off at 30 min</title></line>
+<line class="mark fault" x1="153.1" y1="236.0" x2="153.1" y2="244.0"><title>fault: chaos-kill at 40 min</title></line>
+<line class="mark fault" x1="155.0" y1="236.0" x2="155.0" y2="244.0"><title>fault: chaos-delay at 40 min</title></line>
+<line class="mark fault" x1="158.4" y1="236.0" x2="158.4" y2="244.0"><title>fault: chaos-partition at 42 min</title></line>
+<line class="mark fault" x1="177.4" y1="236.0" x2="177.4" y2="244.0"><title>fault: node-delay at 50 min</title></line>
+<line class="mark fault" x1="201.7" y1="236.0" x2="201.7" y2="244.0"><title>fault: bun-kill-follower at 60 min</title></line>
+<line class="mark fault" x1="225.9" y1="236.0" x2="225.9" y2="244.0"><title>fault: bun-kill-leader at 70 min</title></line>
+<path class="mark upgrade" d="M250.2,235.0 L255.2,244.0 L245.2,244.0 Z"><title>upgrade: upgrade walk at 80 min</title></path>
+<line class="mark fault" x1="323.0" y1="236.0" x2="323.0" y2="244.0"><title>fault: node-disk-full at 110 min</title></line>
+<line class="mark fault" x1="347.2" y1="236.0" x2="347.2" y2="244.0"><title>fault: bun-kill-follower at 120 min</title></line>
+<line class="mark fault" x1="371.5" y1="236.0" x2="371.5" y2="244.0"><title>fault: bun-kill-leader at 130 min</title></line>
+<line class="mark fault" x1="396.7" y1="236.0" x2="396.7" y2="244.0"><title>fault: deploy-kill at 140 min</title></line>
+<line class="mark fault" x1="420.1" y1="236.0" x2="420.1" y2="244.0"><title>fault: power-off at 150 min</title></line>
+<path class="mark failure" d="M437.4,236.0 L445.4,244.0 M445.4,236.0 L437.4,244.0"><title>failure: light-check at 158 min</title></path>
+<line class="mark fault" x1="445.3" y1="236.0" x2="445.3" y2="244.0"><title>fault: chaos-scenario at 160 min</title></line>
+<line class="mark fault" x1="446.5" y1="236.0" x2="446.5" y2="244.0"><title>fault: chaos-pause at 160 min</title></line>
+<line class="mark fault" x1="449.9" y1="236.0" x2="449.9" y2="244.0"><title>fault: chaos-drop at 162 min</title></line>
+<line class="mark fault" x1="468.6" y1="236.0" x2="468.6" y2="244.0"><title>fault: node-slow-fsync at 170 min</title></line>
+<path class="mark special" d="M477.2,235.0 L482.2,240.0 L477.2,245.0 L472.2,240.0 Z"><title>special: quorum-loss at 173 min</title></path>
+<line class="mark fault" x1="494.5" y1="236.0" x2="494.5" y2="244.0"><title>fault: bun-kill-follower at 180 min</title></line>
+<line class="mark fault" x1="518.8" y1="236.0" x2="518.8" y2="244.0"><title>fault: bun-kill-leader at 190 min</title></line>
+<path class="mark upgrade" d="M543.0,235.0 L548.0,244.0 L538.0,244.0 Z"><title>upgrade: upgrade walk at 200 min</title></path>
+<line class="mark fault" x1="615.8" y1="236.0" x2="615.8" y2="244.0"><title>fault: node-delay at 230 min</title></line>
+<line class="mark fault" x1="61.0" y1="255.0" x2="61.0" y2="263.0"/><text x="70.0" y="263">fault</text>
+<path class="mark upgrade" d="M117.5,254.0 L122.5,263.0 L112.5,263.0 Z"/><text x="126.5" y="263">upgrade walk</text>
+<path class="mark special" d="M219.5,254.0 L224.5,259.0 L219.5,264.0 L214.5,259.0 Z"/><text x="228.5" y="263">special</text>
+<path class="mark failure" d="M285.0,255.0 L293.0,263.0 M293.0,255.0 L285.0,263.0"/><text x="298.0" y="263">failure</text>
+</svg>

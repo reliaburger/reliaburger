@@ -435,7 +435,15 @@ The lesson repeats one from earlier chapters: a check that always passes is wors
 
 Wiring a pipeline honestly is one thing; wiring *every* path through it is another. A few holes survived the first pass, and each one had the same shape as the bug it lived next to: a path that looked done but quietly wasn't.
 
-The council-level partition, which blocks a node's gossip and Raft transports, took effect but never cleaned up after itself. It started life as a separate `relish chaos council-partition` command with its own `chaos heal`, and heal cleared the registry and wiped the blocklists without running the per-fault reversal loop. A SIGSTOPped workload frozen by an *earlier* fault stayed frozen and a `cpu.max` cap stayed capped, with no record a fault had ever existed. We fixed heal, then deleted the whole `relish chaos` command anyway (more on why in a moment). Today a council partition is just another fault type, `FaultType::CouncilPartition { peers }`, sent to `POST /v1/fault` like the rest. It records its reversal, the exact peer ids it blocked, so clear and TTL expiry unblock precisely those peers and leave any other partition in force.
+The council-level partition, which blocks a node's gossip and Raft transports, took effect but never cleaned up after itself. It started life as a separate `relish chaos council-partition` command with its own `chaos heal`, and heal cleared the registry and wiped the blocklists without running the per-fault reversal loop. A SIGSTOPped workload frozen by an *earlier* fault stayed frozen and a `cpu.max` cap stayed capped, with no record a fault had ever existed. We fixed heal, then deleted the whole `relish chaos` command anyway (more on why in a moment). Today a council partition is just another fault type, `FaultType::CouncilPartition { peers }`, sent to `POST /v1/fault` like the rest. It records its reversal, the exact addresses it blocked, so clear and TTL expiry unblock precisely those. Two partitions never overlap, because the leader admits one node fault at a time (`NodeFaultReservations` in `src/smoker/reservation.rs`).
+
+That reversal first recorded peer ids, not addresses, and that was a bug (#1820). At heal time `remove_partition` looked each id up in the live gossip membership to find the address to unblock. But the partitioned node can't hear its peers, so within a few seconds it marks every one of them Dead, and the live membership stops listing them. The lookup found nobody, removed nothing, and the node stayed cut off. What saved it in every test was the leader's fence, which arrives over HTTP, a path the partition doesn't block, and wipes both blocklists. Take the leader away, or lose that HTTP call, and the node stayed isolated for good. Now `apply_partition` returns a `PartitionBlock { gossip, raft }` holding the exact addresses it inserted, `FaultReversal::Partition` carries it, and the heal removes exactly those, with no lookup at all. It also clears a peer whose address changed during the partition, since what matters is what we blocked, not where the peer lives now. The reversal is runtime-only (`#[serde(skip)]` on the rule), so this changes no stored state.
+
+It also turned out to be half a partition (#1810). The fault fills two blocklists on the target node, one for gossip and one for Raft, and each transport checked its blocklist only where it *sent*. For gossip that's enough by accident: a UDP datagram arrives from the peer's own gossip address, and the receive loop drops datagrams from blocked addresses. Raft is a different shape. It's request and response over TCP, and the request comes from whoever opened the connection. The target couldn't send to the leader, but the leader could still send to the target, and the target answered on the leader's own connection. So the "partitioned" node kept applying the log. Gossip called it dead, which is all the old test checked. Chasing why a node of a partitioned gym cluster knew a token made well into its partition turned it up.
+
+The server can't refuse by source address, because the connection comes from an ephemeral port, and on a laptop cluster every node shares `127.0.0.1` anyway. But every Raft RPC names its sender. AppendEntries and InstallSnapshot carry the leader's vote, and a vote request carries the candidate's, so `vote.leader_id().voted_for()` is the sending node's id. The membership maps that id to a `CouncilNodeInfo`, whose `addr` is exactly the Raft address the blocklist holds. A blocked sender gets no answer at all: the server closes the connection, and the leader's client reports the peer unreachable, as it would if the packets were lost. `partition_isolates_a_node_for_real` now writes on the leader during the partition and checks that the cut node doesn't apply it for five seconds, then does once healed. Before the fix, that check failed: the cut node had the entry.
+
+A real partition behaves a little differently, and the tests had to allow for it. The cut follower hears no heartbeats, so it campaigns with ever higher terms that nobody receives. When the partition heals, its first vote request can carry the highest term in the cluster, and a Raft leader that sees a higher term steps down, so the heal can cost one election. The old half-partition never showed that, because the follower kept hearing from the leader.
 
 The safety context had the subtlest gap. It was built "every time a fault arrives" — except when the node had no council, where it returned nothing and the caller skipped the rails entirely. That's backwards: the rail that stops you killing a service's last replica doesn't need a council at all, only a local replica count. So the context is now built unconditionally; with no council the quorum, leader, and node-percentage rails self-neutralise on zeroed fields, but the replica-minimum rail still fires. `fault kill --count 0` against a single-replica service is refused whether or not the node is part of a cluster. A council partition runs the same rails, so a partition that would strand quorum is refused like any other node fault.
 
@@ -1545,6 +1553,89 @@ Two regression tests, one per path,
 task runner's own kills: it decides "timed out" or "cancelled" before it kills
 anything and never reads an exit code afterwards. A kill from somewhere else
 while a task ran on a Mac, though, could have been read as a success.
+
+### A pause is not an exit
+
+The gym's first run against `relish gym run` (Chapter 19) found the next one.
+On a one-node process-runtime cluster on a Mac, it paused one instance with
+`relish fault pause`, cleared the pause, then deleted the app. From the pause
+on, `relish status` showed that instance as `pid: null, runtime_unknown: true`,
+and clearing the pause didn't bring the pid back. The delete then left it
+`stopping` for good, with its owner and its `sleep` still running. Stop Bun,
+and the `sleep` carried on under PID 1.
+
+Three things went wrong, one after the other. The owner asks the kernel about
+its workload every 10 ms with `waitid(P_PID, pid, …, WEXITED | WNOHANG |
+WNOWAIT)`. `WEXITED` asks for exits and nothing else, and on Linux that's what
+you get. XNU also reports a *stopped* child, with `si_code = CLD_STOPPED`. A
+ten-line C program shows it: before the SIGSTOP `si_pid` is 0, after it
+`si_pid` is the child, and after SIGCONT it's 0 again. The owner took any
+event for an exit, and since the code wasn't `CLD_EXITED`, for a death by
+signal.
+
+That's how the evidence went. Believing the root had exited, the owner went
+on to retire it. On macOS retirement lists the process group and, finding
+only the root, calls `Child::wait()`, which blocks until the child really
+exits. A paused `sleep 86400` doesn't. The owner runs on one thread, so while
+it waited it stopped answering its control socket. Every status read Bun made
+timed out after two seconds, which is exactly what `runtime_unknown` means.
+
+It never came back because the owner records an exit once and never looks
+again, and it was still blocked in `wait()`. SIGCONT woke the `sleep`, not the
+owner. And the stop gave up because every stop and kill of a process workload
+goes through its owner: only the owner may signal the workload, since only
+the owner holds it unreaped and so knows its PID still means that process
+(see "Surviving the agent" above). A stop request to an owner that never
+answers times out, the force-kill request times out the same way, and the
+instance stays `stopping`. Bun's shutdown asks the same owner, with the same
+result.
+
+The fix is to say what counts as an exit:
+
+```rust
+let code = match info.si_code {
+    nix::libc::CLD_EXITED => Some(unsafe { info.si_status() }),
+    nix::libc::CLD_KILLED | nix::libc::CLD_DUMPED => None,
+    // A stop or a continue is not an exit, whatever XNU reports.
+    _ => return Ok(None),
+};
+```
+
+`match` on an integer works like C's `switch`, except there's no fall-through
+and the `_` arm, the default, is required: the compiler won't accept a
+`match` that leaves a value unhandled. The `unsafe` block is there because
+`si_status` reads a field of a C union, which Rust can't check for us; the
+`// SAFETY:` comment above it in the source says why it's sound.
+
+Then the owner must never block on its child. Retirement on macOS now calls
+`try_wait()`, the non-blocking form, and comes back on the next tick if the
+root hasn't been reaped yet, so a mistake like the first one costs a few
+ticks, not the owner.
+
+A pause that's still in force when you delete the app was the last case. A
+signal with no handler kills a stopped process anyway, but a workload that
+traps SIGTERM to shut down cleanly can't run its handler while it's stopped.
+It would sit out its whole grace and die by SIGKILL. So a stop now sends the
+app's stop signal, then SIGCONT to the root and its group: a paused workload
+takes its signal at once, and one that isn't paused ignores the SIGCONT. The
+in-memory process runtime that tests use does the same, so both paths agree.
+
+Runc and Apple Container don't share the bug. Smoker's pause is SIGSTOP on
+every runtime, but runc's container process isn't watched through `waitid` on
+macOS (runc only runs on Linux, where `WEXITED` means exits), and runc
+reports a stopped process as running. The Apple runtime never names a pid, so
+Smoker can't pause an Apple container at all.
+
+The lesson is an old one with a new face. A status the kernel hands back is
+only what you asked for if you check that it is. And a supervisor that's the
+only thing allowed to stop a workload must never block, because when it does,
+nothing else can stop the workload either. The regression tests are
+`a_stopped_child_has_not_exited` and
+`stopping_a_paused_child_continues_it_to_take_the_signal` in the owner,
+`stop_lets_a_paused_workload_run_its_handler` in the in-memory runtime, and
+`tests/suite/paused_workloads.rs`, which pauses and resumes a real owned
+workload and checks the reads `relish status` makes, then stops it, once after
+the pause is cleared and once while it's still in force.
 
 ### A signal is not proof of exit
 

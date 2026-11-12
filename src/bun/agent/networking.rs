@@ -325,12 +325,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let reference = match self.network_references.get(id).cloned() {
             // An earlier ask's write forgot the released permission after
             // its turn ended (#1263): the journal no longer names the hold.
-            // The release is idempotent, so hand it back again and finish.
+            // That ask's release was confirmed, so only the bookkeeping is
+            // left; a hold whose release wasn't is handed back now.
             Some(reference)
                 if self.journal_reference(&reference) == JournalReference::Unrecorded =>
             {
-                self.finish_network_release(id, reference).await?;
+                self.release_held_network_reference(id, reference).await?;
                 self.network_references.remove(id);
+                self.released_network_references.remove(id);
                 return Ok(());
             }
             Some(reference) => reference,
@@ -363,9 +365,29 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.authorise_local_discovery_release(&reference, remote)
             .await?;
         self.require_discovery_release_permission(&reference)?;
-        self.finish_network_release(id, reference.clone()).await?;
+        self.release_held_network_reference(id, reference.clone())
+            .await?;
         self.forget_released_discovery_reference(&reference).await?;
         self.network_references.remove(id);
+        self.released_network_references.remove(id);
+        Ok(())
+    }
+
+    /// Hand back a hold the agent tracks, once: a retirement asked again
+    /// after the runtime confirmed the release, because the journal write
+    /// that forgets it outlasted the turn, doesn't ask the runtime again
+    /// (#1620).
+    async fn release_held_network_reference(
+        &mut self,
+        id: &InstanceId,
+        reference: crate::grill::runc_intent::NetworkReference,
+    ) -> Result<(), BunError> {
+        if self.released_network_references.get(id) == Some(&reference) {
+            return Ok(());
+        }
+        self.finish_network_release(id, reference.clone()).await?;
+        self.released_network_references
+            .insert(id.clone(), reference);
         Ok(())
     }
 

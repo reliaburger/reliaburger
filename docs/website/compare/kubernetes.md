@@ -8,7 +8,7 @@ Reliaburger brings deployment, service discovery, metrics, logs and fault inject
 
 Basis: [Integrated platform](https://github.com/reliaburger/reliaburger/blob/v0.2.2/README.md) · [App diagnostics](https://github.com/reliaburger/reliaburger/blob/v0.2.2/docs/manual/07_diagnostics.md) · [Kubernetes extension model](https://kubernetes.io/docs/concepts/extend-kubernetes/operator/). The recommendation is our judgement.
 
-**Versions matter.** Reliaburger statements below describe the [0.2.2 release](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.2), which the public installer installs, re-checked on 21 October 2026. Kubernetes reference: [v1.37.1](https://github.com/kubernetes/kubernetes/releases/tag/v1.37.1). This is a source and documentation review, not a deployment benchmark. [Method and limits](https://reliaburger.com/compare/methodology.html#method).
+**Versions matter.** Reliaburger statements below describe the [0.2.2 release](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.2), which the public installer installs, re-checked on 21 October 2026. Kubernetes reference: [v1.37.1](https://github.com/kubernetes/kubernetes/releases/tag/v1.37.1). This is a source and documentation review, not a deployment benchmark. [Method and limits](https://reliaburger.com/compare/methodology#method).
 
 ## Where each fits
 
@@ -179,8 +179,8 @@ Source: [Diagnostic commands and evidence labels](https://github.com/reliaburger
 
 The Kubernetes release reference is [v1.37.1](https://github.com/kubernetes/kubernetes/releases/tag/v1.37.1). Official documentation was checked on 15 October 2026 and may subsequently change. Reliaburger references pin the [v0.2.2](https://github.com/reliaburger/reliaburger/tree/v0.2.2) tag, the release the installer installs, re-checked on 21 October 2026. We checked command contracts and architectural limits, not comparative uptime, resource use, throughput or migration outcomes. The testing section was checked against Kubernetes' SIG Testing, SIG Release and SIG Scalability documents, etcd's robustness tests and OSS-Fuzz on 27 October 2026.
 
-For a distribution that bundles Kubernetes installation choices, read the [k3s comparison](https://reliaburger.com/compare/k3s.html). For evidence grades and correction criteria, see the [comparison methodology](https://reliaburger.com/compare/methodology.html#method).
+For a distribution that bundles Kubernetes installation choices, read the [k3s comparison](https://reliaburger.com/compare/k3s). For evidence grades and correction criteria, see the [comparison methodology](https://reliaburger.com/compare/methodology#method).
 
 ---
 
-The Markdown copy of <https://reliaburger.com/compare/kubernetes.html>.
+The Markdown copy of <https://reliaburger.com/compare/kubernetes>.

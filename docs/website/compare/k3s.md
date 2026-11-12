@@ -8,7 +8,7 @@ Reliaburger combines an app-centred configuration with built-in logs, metrics, a
 
 Basis: [Integrated platform](https://github.com/reliaburger/reliaburger/blob/v0.2.2/README.md) · [Diagnostics](https://github.com/reliaburger/reliaburger/blob/v0.2.2/docs/manual/07_diagnostics.md) · [Push registry](https://github.com/reliaburger/reliaburger/blob/v0.2.2/docs/manual/11_images-and-volumes.md) · [k3s packaging](https://docs.k3s.io/). The recommendation is our judgement.
 
-**Versions matter.** Reliaburger statements below describe the [0.2.2 release](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.2), which the public installer installs, re-checked on 21 October 2026. k3s reference: [v1.37.1+k3s1](https://github.com/k3s-io/k3s/releases/tag/v1.37.1%2Bk3s1). This is a source and documentation review, not a deployment benchmark. [Method and limits](https://reliaburger.com/compare/methodology.html#method).
+**Versions matter.** Reliaburger statements below describe the [0.2.2 release](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.2), which the public installer installs, re-checked on 21 October 2026. k3s reference: [v1.37.1+k3s1](https://github.com/k3s-io/k3s/releases/tag/v1.37.1%2Bk3s1). This is a source and documentation review, not a deployment benchmark. [Method and limits](https://reliaburger.com/compare/methodology#method).
 
 ## Choose the operating model
 
@@ -176,8 +176,8 @@ Sources: [Datastore backup scope](https://docs.k3s.io/datastore/backup-restore) 
 
 Version reference: [k3s v1.37.1+k3s1](https://github.com/k3s-io/k3s/releases/tag/v1.37.1%2Bk3s1). Official documentation was checked on 15 October 2026. Reliaburger claims pin the [v0.2.2](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.2) tag, the release the installer installs, re-checked on 21 October 2026. No cluster was deployed for this comparison; resource overhead, failure recovery and throughput remain unmeasured.
 
-For workload API, persistent-storage and compatibility details shared with upstream, read the [Kubernetes comparison](https://reliaburger.com/compare/kubernetes.html). The [comparison methodology](https://reliaburger.com/compare/methodology.html#method) explains the evidence boundary.
+For workload API, persistent-storage and compatibility details shared with upstream, read the [Kubernetes comparison](https://reliaburger.com/compare/kubernetes). The [comparison methodology](https://reliaburger.com/compare/methodology#method) explains the evidence boundary.
 
 ---
 
-The Markdown copy of <https://reliaburger.com/compare/k3s.html>.
+The Markdown copy of <https://reliaburger.com/compare/k3s>.

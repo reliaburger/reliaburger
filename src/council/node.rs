@@ -531,6 +531,14 @@ impl CouncilNode {
         self.state_machine.gitops_trigger_updates()
     }
 
+    /// Observe the API tokens this node's replica has applied: a receiver
+    /// sees each change as it's applied. A node with no Raft seat reads the
+    /// leader's view instead (see [`Self::api_tokens`]), which this doesn't
+    /// announce.
+    pub fn api_token_updates(&self) -> watch::Receiver<Vec<crate::sesame::types::ApiToken>> {
+        self.state_machine.api_token_updates()
+    }
+
     /// Read the current desired state from the state machine.
     pub async fn desired_state(&self) -> DesiredState {
         #[cfg(test)]

@@ -494,4 +494,81 @@ mod tests {
             "mine"
         );
     }
+
+    /// `relative`, read from the directory `file` is in, as a
+    /// repository-relative path.
+    fn resolve(file: &str, relative: &str) -> String {
+        let mut parts: Vec<&str> = file.split('/').collect();
+        parts.pop();
+        for part in relative.split('/') {
+            match part {
+                ".." => {
+                    parts.pop();
+                }
+                "." | "" => {}
+                part => parts.push(part),
+            }
+        }
+        parts.join("/")
+    }
+
+    /// Every file an `include_str!`, `include_bytes!` or `include!` reads
+    /// must be in the bundle, or the extracted source doesn't build, and
+    /// `relish agent patch test` fails before it runs a test: the gym's
+    /// parity fixture wasn't (#1691). The one way out is a cfg that
+    /// `build.rs` sets only when the file is there, on the include or on the
+    /// item around it, within a few lines.
+    #[test]
+    fn every_included_file_is_in_the_bundle_or_behind_its_cfg() {
+        const GATES: &[&str] = &["cfg(gym_scenarios)"];
+        let root = checkout();
+        let bundled: std::collections::BTreeSet<String> = pack::list_files(&root, pack::ALLOWLIST)
+            .unwrap()
+            .into_iter()
+            .collect();
+        let include = regex::Regex::new(concat!(
+            r#"include(?:_str|_bytes)?!\s*\(\s*"#,
+            r#"(?:concat!\s*\(\s*env!\s*\(\s*"(CARGO_MANIFEST_DIR|OUT_DIR)"\s*\)\s*,\s*)?"#,
+            r#""([^"]+)""#
+        ))
+        .unwrap();
+        let mut checked = 0;
+        let mut missing = Vec::new();
+        for file in bundled.iter().filter(|file| file.ends_with(".rs")) {
+            let text = std::fs::read_to_string(root.join(file)).unwrap();
+            // Comments only talk about includes.
+            let code: Vec<&str> = text
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect();
+            let code = code.join("\n");
+            for found in include.captures_iter(&code) {
+                let path = match found.get(1).map(|base| base.as_str()) {
+                    // `build.rs` writes these while it builds.
+                    Some("OUT_DIR") => continue,
+                    Some(_) => found[2].trim_start_matches('/').to_string(),
+                    None => resolve(file, &found[2]),
+                };
+                checked += 1;
+                if bundled.contains(&path) {
+                    continue;
+                }
+                let before = &code[..found.get(0).unwrap().start()];
+                let gated = before
+                    .lines()
+                    .rev()
+                    .take(6)
+                    .any(|line| GATES.iter().any(|gate| line.contains(gate)));
+                if !gated {
+                    missing.push(format!("{file} includes {path}"));
+                }
+            }
+        }
+        assert!(checked > 30, "found only {checked} includes");
+        assert!(
+            missing.is_empty(),
+            "outside the bundle and not behind a cfg:\n{}",
+            missing.join("\n")
+        );
+    }
 }

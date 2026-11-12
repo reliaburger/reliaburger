@@ -1,0 +1,152 @@
+# Reliaburger node configuration.
+# See docs/README.md for full reference.
+# Internal cluster transports require mTLS.
+
+[node]
+name = "node-01"
+
+[node.labels]
+
+[cluster]
+name = "bench"
+join = []
+gossip_port = 9443
+raft_port = 9444
+reporting_port = 9445
+
+[cluster.backup]
+interval_secs = 300
+retain = 24
+
+[storage]
+data = "/var/lib/reliaburger/data"
+images = "/var/lib/reliaburger/images"
+logs = "/var/lib/reliaburger/logs"
+metrics = "/var/lib/reliaburger/metrics"
+volumes = "/var/lib/reliaburger/volumes"
+audit_max_bytes = 67108864
+
+[storage.snapshots]
+interval_secs = 0
+retain = 7
+upload_timeout_secs = 3600
+
+[resources]
+reserved_cpu = "500m"
+reserved_memory = "512Mi"
+gpu_enabled = true
+
+[network.port_range]
+start = 10000
+end = 32767
+
+[reporting_tree]
+report_interval_secs = 5
+max_events_per_report = 100
+stale_report_timeout_secs = 30
+stale_node_grace_secs = 300
+
+[reconstruction]
+report_threshold_percent = 95
+learning_period_timeout_secs = 15
+large_cluster_timeout_secs = 30
+large_cluster_node_count = 5000
+
+[images]
+max_storage = "0"
+redundancy = 2
+gc_retain_days = 7
+gc_interval_hours = 1
+registry_port = 5050
+registry_bind = "127.0.0.1"
+p2p_concurrency = 4
+pull_through = true
+cache_recheck_secs = 3600
+external_registries = []
+build_timeout_secs = 900
+max_context_bytes = 268435456
+build_cache_max_bytes = 107374182400
+
+[images.trust_policy]
+require_signatures = false
+keys = []
+upstream = []
+
+[images.trust_policy.upstream_default]
+allow = true
+
+[images.mirrors]
+
+[metrics]
+collection_interval_secs = 10
+retention_days = 7
+scrape_interval_secs = 30
+scrape_targets = []
+app_scrape_interval_secs = 10
+alerts_enabled = true
+object_store_url = ""
+rollup_interval_secs = 60
+rollup_retention_hours = 24
+max_storage_mb = 1024
+
+[logs]
+retention_days = 7
+export_interval_secs = 3600
+max_storage_mb = 2048
+
+[alerts]
+evaluation_interval_secs = 30
+destinations = []
+
+[process_workloads]
+allowed_binaries = []
+
+[security]
+master_key_path = "cluster/bench-master.key"
+bootstrap_path = "cluster/bench-security-bootstrap.json"
+identity_dir = "cluster/identity"
+require_mtls = true
+bootstrap_peers = []
+operator_cidrs = []
+allow_insecure_cluster = false
+
+[security.tokens]
+default_ttl = "90d"
+
+[ingress]
+enabled = false
+http_port = 80
+https_port = 443
+max_connections = 10000
+
+[dns]
+enabled = true
+listen = "0.0.0.0:53"
+restrict_sources = true
+
+[ebpf]
+enabled = true
+cgroup_path = "/sys/fs/cgroup"
+sweep_interval_secs = 60
+
+[upgrades]
+retain_versions = 3
+boot_grace_secs = 30
+gossip_rejoin_secs = 60
+max_boot_attempts = 2
+
+[smoker]
+default_duration_secs = 600
+max_duration_secs = 3600
+
+[runtime]
+stop_confirmation_timeout_secs = 10
+
+[testing]
+safety_class = "unknown"
+allowed_operations = []
+allow_protected_mutation = false
+max_lease_seconds = 3600
+max_node_pressure_cpu_percent = 0
+max_node_pressure_memory_percent = 0
+external_probe_allowlist = []

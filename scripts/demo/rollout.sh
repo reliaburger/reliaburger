@@ -39,12 +39,12 @@ version_of_example() {
     echo "${file}"
 }
 
-status_shows_rollout_failed() {
-    "${RELISH}" status | grep -q "RolloutFailed"
+apps_show_rollout_failed() {
+    "${RELISH}" apps | grep -q "RolloutFailed"
 }
 
-status_is_clear() {
-    ! "${RELISH}" status | grep -q "RolloutFailed"
+apps_are_clear() {
+    ! "${RELISH}" apps | grep -q "RolloutFailed"
 }
 
 # How many deploys of web the node has logged as failed so far.
@@ -78,8 +78,8 @@ echo "serving $(demo_serving "${DEMO_APP_PORT}") after the rollback"
 
 demo_step "Deploy a broken v3: it never passes its health check"
 demo_run "${RELISH}" apply "${V3}"
-demo_wait_for "the cluster to mark v3 RolloutFailed" 90 status_shows_rollout_failed
-demo_run "${RELISH}" status
+demo_wait_for "the cluster to mark v3 RolloutFailed" 90 apps_show_rollout_failed
+demo_run "${RELISH}" apps
 if ! demo_serves "${DEMO_APP_PORT}" v1; then
     demo_fail "expected v1 after the failed v3, got '$(demo_serving "${DEMO_APP_PORT}")'"
 fi
@@ -90,7 +90,7 @@ fi
 # Once v3 is marked, the leader holds the node on v1: no more attempts.
 # The node logs its failed attempt only after the leader answers the
 # report, and the leader answers after it has committed the mark and
-# written its audit record, so status can show RolloutFailed before that
+# written its audit record, so apps can show RolloutFailed before that
 # first failure reaches the log. Count from that attempt, not from the
 # mark, or the first attempt's late line reads as a retry.
 demo_wait_for "the node to log its failed v3 deploy" 30 failed_deploys_logged
@@ -104,12 +104,12 @@ echo "v3 is not retried: ${ATTEMPTS_AFTER} failed deploy(s), none since the mark
 
 demo_step "Apply v3 again: the same spec isn't retried, only reported"
 demo_run "${RELISH}" apply "${V3}"
-status_shows_rollout_failed || demo_fail "re-applying v3 cleared RolloutFailed"
+apps_show_rollout_failed || demo_fail "re-applying v3 cleared RolloutFailed"
 
 demo_step "Fix it: any change to the spec clears the mark and rolls again"
 demo_run "${RELISH}" apply "${V2}"
 demo_wait_for "web to serve v2" 60 demo_serves "${DEMO_APP_PORT}" v2
-demo_wait_for "RolloutFailed to clear" 30 status_is_clear
+demo_wait_for "RolloutFailed to clear" 30 apps_are_clear
 echo "serving $(demo_serving "${DEMO_APP_PORT}")"
 demo_run "${RELISH}" history web
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write and check reliaburger.com/features.html from docs/features.toml (#1729).
+"""Write and check reliaburger.com/features from docs/features.toml (#1729).
 
 docs/features.toml says, feature by feature, what's ready in the released
 version and what isn't. This script turns it into the website's feature status
@@ -395,7 +395,7 @@ def render(catalogue, repo=REPO):
   <div class="page">
     <header class="masthead">
       <a class="wordmark" href="./" aria-label="Reliaburger home"><span class="mark" aria-hidden="true">r/</span>reliaburger</a>
-      <nav aria-label="Main navigation"><a href="./#install">Install</a><a href="./features.html">What's ready</a><a href="./compare/index.html">Compare</a><a href="{GITHUB}">GitHub <span aria-hidden="true">↗</span></a></nav>
+      <nav aria-label="Main navigation"><a href="./#install">Install</a><a href="./features">What's ready</a><a href="./compare/">Compare</a><a href="{GITHUB}">GitHub <span aria-hidden="true">↗</span></a></nav>
     </header>
     <!-- Generated from {SOURCE} by `make features-page`: edit the TOML, not this file. -->
     <main id="main" class="comparison-page features-page">
@@ -414,6 +414,7 @@ def render(catalogue, repo=REPO):
     </main>
     <footer><span>Reliaburger · by Miko Pawlikowski</span><a href="#statuses">Feature status for {release} · reviewed {html.escape(catalogue.reviewed)}</a><span class="footer-note">Static HTML and CSS, generated from docs/features.toml. No tracking or third-party requests.</span></footer>
   </div>
+  <script src="assets/copy.js" defer></script>
 </body>
 </html>
 """

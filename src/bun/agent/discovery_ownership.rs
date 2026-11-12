@@ -214,7 +214,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// Keep the execution whoever started `id` read from the runtime, for
-    /// the discovery journal's next publication. An inventory that couldn't
+    /// the discovery journal's next publication and the state reports. An inventory that couldn't
     /// be read fails the step while the journal is on, as the publication
     /// that read it inside the turn used to: the journal can't name the
     /// execution without it.
@@ -228,12 +228,21 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             LaunchExecution::Generation(generation) => {
                 self.launch_executions
                     .insert(id.clone(), generation.clone());
+                self.reported_executions.insert(
+                    id.clone(),
+                    crate::grill::RuntimeExecution {
+                        instance_id: id.clone(),
+                        generation: generation.clone(),
+                    },
+                );
             }
             LaunchExecution::Unrecorded => {
                 self.launch_executions.remove(id);
+                self.reported_executions.remove(id);
             }
             LaunchExecution::Unknown(reason) => {
                 self.launch_executions.remove(id);
+                self.reported_executions.remove(id);
                 if !matches!(self.discovery_ownership, DiscoveryOwnership::Disabled) {
                     return Err(BunError::AdoptionState(format!("publication {reason}")));
                 }
@@ -802,14 +811,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         };
         let started = std::time::Instant::now();
         #[cfg(test)]
-        let stalls = std::sync::Arc::clone(&self.loop_stalls);
+        let stall = self.loop_stalls.reach(super::LoopStall::Persist);
         let mut task = tokio::spawn(async move {
             #[cfg(test)]
-            stalls.hold(super::LoopStall::Persist).await;
+            if let Some(stall) = stall {
+                tokio::time::sleep(stall).await;
+            }
             journal.persist(next).await
         });
         let joined = match deadline {
-            // LOOP-INLINE: fsync'd persist (#351 decision 2); the slow-disk scenario bounds it
+            // LOOP-INLINE: no deadline is only asked for outside the loop's turns (startup recovery, tests); every turn passes its own (#1263, #1853)
             None => Some((&mut task).await),
             Some(deadline) => tokio::time::timeout_at(deadline, &mut task).await.ok(),
         };
@@ -972,7 +983,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             return;
         };
         let waited = std::time::Instant::now();
-        // LOOP-INLINE: fsync'd persist (#351 decision 2); the slow-disk scenario bounds it
+        // LOOP-INLINE: a turn reaches this only for a write that has landed (the loop's `select!`) or after `settle_discovery_write_outside_turn` has said no write is in flight; startup waits here
         let outcome = (&mut write.task).await;
         // The write's own time was the earlier turn's; name this turn's wait
         // for it, so a slow line adds up (#1100).

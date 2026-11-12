@@ -142,6 +142,10 @@ async fn a_denied_apply_writes_nothing_and_is_audited() {
     assert_eq!(denied.len(), 1, "{denied:?}");
     assert_eq!(denied[0].details["policies"], "no-latest");
     assert_eq!(denied[0].details["token_name"], "ci");
+    // It's a decision: the rule, and the one workload it denied as the app.
+    assert_eq!(denied[0].details["rule"], "deploy.refused.policy");
+    assert_eq!(denied[0].details["workloads"], "web@default");
+    assert_eq!(denied[0].app.as_deref(), Some("web"));
 }
 
 /// A warn policy lets the apply through and the stream says why.

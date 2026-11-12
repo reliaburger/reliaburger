@@ -190,7 +190,7 @@ const STATUS_RUNTIME_READ_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// meets a slow runtime many times still ends well inside the 1 s turn
 /// budget. What doesn't finish in time fails the step, and the tick, the
 /// deploy worker or the caller tries again.
-const TURN_RUNTIME_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+pub(crate) const TURN_RUNTIME_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// How long a runtime read may take when no turn is running: during startup
 /// adoption, which already gives each runtime inspection 10 s.
@@ -498,6 +498,14 @@ enum LoopStall {
     /// Committing a verified upgrade: appending its history entry, pruning
     /// old binaries and removing the marker (#1381).
     UpgradeCommit,
+    /// Writing an instance's adoption record, or removing a restarted
+    /// instance's old one: an fsync each (#1853).
+    RecordWrite,
+    /// Writing a signed workload identity to its mount, an fsync per file.
+    IdentityWrite,
+    /// Starting an instance's log forwarder. Only counted: a step asked
+    /// again must start one forwarder, not two.
+    LogForwarder,
 }
 
 /// How long each [`LoopStall`] takes. Shared with the test through an `Arc`
@@ -563,6 +571,19 @@ impl LoopStalls {
 
     /// Wait out `stall`'s delay, if the test set one; `true` when it did.
     async fn hold(&self, stall: LoopStall) -> bool {
+        let delay = self.reach(stall);
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        delay.is_some()
+    }
+
+    /// Count `stall`'s await as reached now, and return the delay it is to
+    /// wait out. Work the loop starts in a task is counted here, where the
+    /// turn starts it: a turn past its deadline ends before the task first
+    /// runs, and a count taken inside the task would land after the turn
+    /// (#1625).
+    fn reach(&self, stall: LoopStall) -> Option<std::time::Duration> {
         if let Ok(mut reached) = self.reached.lock() {
             *reached.entry(stall).or_default() += 1;
         }
@@ -575,15 +596,10 @@ impl LoopStalls {
             let most = per_turn.most.entry(stall).or_default();
             *most = (*most).max(this_turn);
         }
-        let delay = self
-            .delays
+        self.delays
             .lock()
             .ok()
-            .and_then(|stalls| stalls.get(&stall).copied());
-        if let Some(delay) = delay {
-            tokio::time::sleep(delay).await;
-        }
-        delay.is_some()
+            .and_then(|stalls| stalls.get(&stall).copied())
     }
 }
 
@@ -807,10 +823,20 @@ pub struct BunAgent<G: Grill> {
     startup_cleanup_pending: bool,
     network_references:
         std::collections::HashMap<InstanceId, crate::grill::runc_intent::NetworkReference>,
+    /// References the runtime has confirmed released whose retirement hasn't
+    /// finished yet: the journal write that forgets one can outlast its turn,
+    /// and the retirement's next ask mustn't release it again (#1620).
+    released_network_references:
+        std::collections::HashMap<InstanceId, crate::grill::runc_intent::NetworkReference>,
     /// The generation each local instance's launch ran, for the discovery
     /// journal, as whoever started it read it from the runtime (#419).
     /// Launches that hold their address have none.
     launch_executions: std::collections::HashMap<InstanceId, crate::grill::RuntimeGeneration>,
+    /// The execution each local instance's state report last named, from a
+    /// complete inventory read or from whoever launched it. A report whose
+    /// inventory read misses its deadline reuses it rather than naming no
+    /// execution, which the leader would treat as a retired producer (#1855).
+    reported_executions: std::collections::HashMap<InstanceId, crate::grill::RuntimeExecution>,
     /// Pre-created network namespace paths for instances (Linux + runc only).
     /// When present, the namespace path is passed to `generate_oci_spec` so
     /// the container joins the pre-created namespace instead of creating one.
@@ -907,7 +933,7 @@ pub struct BunAgent<G: Grill> {
     identity_signings: identity_signing::IdentitySignings,
     /// Those tasks. A follower's CSR waits on the leader for up to ten
     /// seconds, which must not stall every other command.
-    identity_signing_tasks: tokio::task::JoinSet<identity_signing::SignedIdentity>,
+    identity_signing_tasks: tokio::task::JoinSet<identity_signing::IdentityTaskOutput>,
     /// Apps adopted at startup and the spec their instances were launched
     /// from, until this agent deploys them again.
     adopted_apps: adopted_placements::AdoptedApps,
@@ -960,6 +986,33 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .write()
             .await
             .record(timestamp, kind, severity, app, namespace, None, message);
+    }
+
+    /// Record an event that carries a decision's rule and evidence.
+    async fn record_decision(
+        &self,
+        kind: crate::bun::events::EventKind,
+        severity: crate::bun::events::EventSeverity,
+        app: Option<String>,
+        namespace: Option<String>,
+        message: String,
+        decision: crate::bun::decisions::Decision,
+    ) {
+        let Some(events) = &self.events else { return };
+        let timestamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        events.write().await.record_with_details(
+            timestamp,
+            kind,
+            severity,
+            app,
+            namespace,
+            None,
+            message,
+            decision.into_details(),
+        );
     }
 
     /// Create a new agent in single-node mode (no cluster).
@@ -1073,7 +1126,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             startup_retirements: Default::default(),
             startup_cleanup_pending: false,
             network_references: std::collections::HashMap::new(),
+            released_network_references: std::collections::HashMap::new(),
             launch_executions: std::collections::HashMap::new(),
+            reported_executions: std::collections::HashMap::new(),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
             capacity_refusals: std::collections::HashMap::new(),
@@ -1243,7 +1298,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             startup_retirements: Default::default(),
             startup_cleanup_pending: false,
             network_references: std::collections::HashMap::new(),
+            released_network_references: std::collections::HashMap::new(),
             launch_executions: std::collections::HashMap::new(),
+            reported_executions: std::collections::HashMap::new(),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
             capacity_refusals: std::collections::HashMap::new(),
@@ -1629,6 +1686,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Runs off the event loop (the grill handle is cloned into the task), so
     /// following logs never blocks the agent.
     fn spawn_log_forwarder(&self, instance_id: &InstanceId, app_name: &str, namespace: &str) {
+        #[cfg(test)]
+        let _ = self.loop_stalls.reach(LoopStall::LogForwarder);
         let Some(log_tx) = self.log_tx.clone() else {
             return;
         };

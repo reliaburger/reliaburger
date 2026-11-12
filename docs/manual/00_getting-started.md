@@ -79,7 +79,7 @@ It verifies `bun` against the release signatures, asks a few questions and
 writes a starter `reliaburger.toml`. Pass `--yes` to accept every default.
 Real containers need runc on Linux, and a cluster needs rootful runc with eBPF
 (see `cluster-basics`). On macOS, use the quickstart above: it runs the same
-runc path inside Linux VMs. Apple Container isn't supported in 0.2.7.
+runc path inside Linux VMs. Apple Container isn't supported in 0.2.8.
 
 ## From source, without containers
 
@@ -105,9 +105,11 @@ Leave it running. In a second terminal, also from the repository root:
 ```sh
 target/debug/relish apply examples/phase-1/proc-first-run.toml
 target/debug/relish status
+target/debug/relish apps
 ```
 
-You should see the `hello` workload in `Running` state. Open
+`relish status` should count one app running on its `apps` line, and
+`relish apps` lists `hello` as `running`. Open
 <http://127.0.0.1:9117/> for the web dashboard, or run `relish` with no
 arguments for the terminal one. The process runtime supervises real processes but
 doesn't isolate them, so keep it for trying things out.

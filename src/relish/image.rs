@@ -323,12 +323,13 @@ async fn download_arch(
         .map_err(|e| failed(&e.to_string()))?;
 
     let arch_dir = directory.join(arch);
-    std::fs::create_dir_all(arch_dir.join("netboot"))?;
-    std::fs::write(arch_dir.join(&entry.sums), &sums)?;
-    std::fs::write(
+    tokio::fs::create_dir_all(arch_dir.join("netboot")).await?;
+    tokio::fs::write(arch_dir.join(&entry.sums), &sums).await?;
+    tokio::fs::write(
         arch_dir.join(format!("{}.sig", entry.sums)),
         &sums_signature,
-    )?;
+    )
+    .await?;
     progress(
         output,
         format!(
@@ -358,10 +359,10 @@ async fn download_arch(
         let url = asset_url(channel_url, &entry.tag, &name)?;
         let bytes = stream_to(client, &url, &path).await?;
         let actual = sha256_file(&path)?;
-        crate::os::check_asset(&entries, &entry.sums, &name, &actual).map_err(|e| {
-            let _ = std::fs::remove_file(&path);
-            failed(&e.to_string())
-        })?;
+        if let Err(e) = crate::os::check_asset(&entries, &entry.sums, &name, &actual) {
+            let _ = tokio::fs::remove_file(&path).await;
+            return Err(failed(&e.to_string()));
+        }
         progress(
             output,
             format!("  {name}: {} MB, checked", bytes / 1_000_000),
@@ -406,16 +407,17 @@ async fn stream_to(client: &reqwest::Client, url: &str, path: &Path) -> Result<u
         return Err(failed(&format!("{url}: {}", response.status())));
     }
     let temporary = path.with_extension("part");
-    let mut file = std::fs::File::create(&temporary)?;
+    use tokio::io::AsyncWriteExt as _;
+    let mut file = tokio::fs::File::create(&temporary).await?;
     let mut stream = response.bytes_stream();
     let mut total = 0u64;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| failed(&format!("{url}: {e}")))?;
-        file.write_all(&chunk)?;
+        file.write_all(&chunk).await?;
         total += chunk.len() as u64;
     }
-    file.sync_all()?;
-    std::fs::rename(&temporary, path)?;
+    file.sync_all().await?;
+    tokio::fs::rename(&temporary, path).await?;
     Ok(total)
 }
 

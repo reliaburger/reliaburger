@@ -382,6 +382,16 @@ impl fmt::Display for WorkloadKind {
 // FaultReversal
 // ---------------------------------------------------------------------------
 
+/// The transport addresses a council partition inserted into this node's
+/// blocklists, so its heal removes exactly those.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PartitionBlock {
+    /// Gossip addresses added to the gossip blocklist.
+    pub gossip: Vec<std::net::SocketAddr>,
+    /// Raft addresses added to the Raft blocklist.
+    pub raft: Vec<std::net::SocketAddr>,
+}
+
 /// State captured when a persistent fault is applied, so clearing or expiring
 /// it can put the target back exactly as it was.
 ///
@@ -408,10 +418,12 @@ pub enum FaultReversal {
     },
     /// A Pause: SIGCONT every instance that was frozen.
     Pause(Vec<i32>),
-    /// A network partition: unblock the named peers on both transports.
-    /// Stored as peer node ids (resolved to addresses at reversal time so a
-    /// peer that changed address is still cleared correctly).
-    Partition { peers: Vec<String> },
+    /// A council partition: unblock exactly the addresses it blocked.
+    ///
+    /// Stored as addresses, not peer ids: a partitioned node marks its
+    /// peers Dead and stops listing them, so a heal that looked them up
+    /// in the live membership would find nobody to unblock (#1820).
+    Partition(PartitionBlock),
     /// A scheduler drain: restore readiness when the final drain owner clears.
     NodeDrain,
     /// A simulated node failure: reopen gossip, Raft and reporting transports.

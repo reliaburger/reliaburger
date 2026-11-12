@@ -1,0 +1,6 @@
+kernel: Linux 6.8.0-147-generic aarch64
+os: Ubuntu 24.04.5 LTS
+cpu: 
+cores: 8
+memory_gib: 15
+disk_free: 56G

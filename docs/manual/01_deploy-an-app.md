@@ -27,7 +27,7 @@ source checkout, with Bun started from the repository root:
 ```sh
 bun --runtime process --config examples/node/process-runtime.toml
 relish apply examples/phase-1/proc-minimal-app.toml
-relish status
+relish apps
 ```
 
 Outside a checkout, `relish manual examples` writes every example config into
@@ -75,7 +75,7 @@ image = "ghcr.io/example/api:1.4.2"
 path = "/healthz"
 port = 8081               # default: the app's `port`
 interval = 10             # seconds between probes (default 10)
-timeout = 5               # seconds per probe (default 5), at most interval
+timeout = 5               # seconds per probe, at most interval (default 5, or interval if shorter)
 threshold_unhealthy = 3   # failed probes before Unhealthy (default 3)
 threshold_healthy = 1     # passing probes before Running (default 1)
 initial_delay = 0         # seconds before the first probe (default 0)
@@ -84,7 +84,8 @@ initial_delay = 0         # seconds before the first probe (default 0)
 `health.port` works without an app `port`, so an app can probe a separate
 admin listener. `relish apply` refuses a health check with neither, a zero
 interval, timeout or threshold, and a `timeout` longer than the
-`interval`. A new instance that never passes is given up after 60 failed
+`interval`. Leave `timeout` out and it's 5 seconds or the interval,
+whichever is shorter, so `interval = 2` on its own is fine. A new instance that never passes is given up after 60 failed
 probes (about ten minutes at the default interval) and restarted.
 
 ## Init containers
@@ -302,10 +303,11 @@ running apps are never evicted to make room. The app says why everywhere you'd
 look:
 
 ```text
-$ relish status
-no workloads running
+$ relish apps --namespace shop
+NAMESPACE      APP                  STATE      READY   RESTARTS NODES                    AGE
+shop           big                  down       0/2     0        -                        -
 
-big (namespace shop) is not placed, blocked: namespace "shop" would exceed CPU quota: 3000+2000 > 4000m
+big (namespace shop) not placed, blocked: namespace "shop" would exceed CPU quota: 3000+2000 > 4000m
 
 $ relish inspect big
 App: big (namespace shop)
@@ -313,11 +315,12 @@ App: big (namespace shop)
   Blocked:   namespace "shop" would exceed CPU quota: 3000+2000 > 4000m
 ```
 
-The dashboard marks the app `blocked` with the same reason on its page, and
-`relish wtf` raises a `quota-blocked` warning. The reason lives in the
-council, so any node gives the same answer. Raise the budget, or shrink or
-delete other apps in the namespace, and the next scheduling pass (a few seconds
-later) places the app and clears the reason.
+The dashboard lists the app as `down` and says `Not placed, blocked:` with
+the same reason on its page, and `relish wtf` raises a `quota-blocked`
+warning. The reason lives in the council, so any node gives the same answer.
+Raise the budget, or shrink or delete other apps in the namespace, and the
+next scheduling pass (a few seconds later) places the app and clears the
+reason.
 
 The same budget covers jobs. The leader charges each job attempt it lets start
 against the namespace's `cpu`, `memory` and GPU budget, after the namespace's
@@ -338,10 +341,11 @@ the cluster only has room for two, and you get two, plus a reason that stays
 until the third finds a home:
 
 ```text
-$ relish status
-...
+$ relish apps --unhealthy
+NAMESPACE      APP                  STATE      READY   RESTARTS NODES                    AGE
+default        web                  degraded   2/3     0        node-1,node-2            5m
 
-web (namespace default) is unschedulable: placed 2 of 3 replicas: no node that can run it has room
+web (namespace default) unschedulable: placed 2 of 3 replicas: no node that can run it has room
 
 $ relish inspect web
 App: web (namespace default)
@@ -376,8 +380,9 @@ $ relish apply ghost.toml
   creating instance default__ghost-0
 error: API error (status 500): instance default__ghost-0 cannot launch: binary not found: /usr/local/bin/ghost-server
 
-$ relish status
-...
+$ relish apps ghost
+NODE                     INSTANCE             APP             NAMESPACE    STATE      PID        RESTARTS AGE
+node-1                   default__ghost-0     ghost           default      failed     -          0        1m
 
 default__ghost-0 (ghost, namespace default) failed on node-1: binary not found: /usr/local/bin/ghost-server
 ```
@@ -427,7 +432,7 @@ command's exit code.
 
 In a cluster, `relish stop` and `relish delete` return as soon as the council
 has recorded the change. Each node then retires its instances on its own, and
-a node that's unreachable does so when it comes back. Run `relish status` (or
+a node that's unreachable does so when it comes back. Run `relish apps web` (or
 `relish inspect web`) to watch the instances go.
 
 A delete followed straight away by an apply of the same file may not restart
@@ -447,14 +452,14 @@ instance won't pick up is anything outside the spec:
   disk. The kept process still runs the old one.
 - **State the process holds in memory**, such as a cache or a connection pool.
 
-When you need fresh processes, wait until `relish status` shows none of the
+When you need fresh processes, wait until `relish apps web` shows none of the
 app's instances before you apply again.
 
 Commands that take an app name also take `--namespace` (default `default`).
 
 ## Instance names
 
-Every replica gets a name you'll see in `status`, `inspect`, logs and metrics:
+Every replica gets a name you'll see in `apps NAME`, `inspect`, logs and metrics:
 `default__web-0`, `default__web-1`, and so on, namespace first. The number is
 the replica's ordinal, and the leader hands them out across the whole cluster,
 so three replicas on three nodes are `-0`, `-1` and `-2` and no two share a
@@ -655,7 +660,9 @@ running.
 In a cluster a failed rollout also marks the app `RolloutFailed`. The leader
 keeps the desired spec as you applied it but stops handing it to nodes: the
 nodes that already run it keep it, the rest stay on the previous version, and
-nothing retries it. `relish status` prints the node and the reason:
+nothing retries it. `relish apps web` prints the node and the reason under
+its instances (`relish apps` gives the same reason, shorter, under the app's
+row):
 
 ```text
 web (namespace default) RolloutFailed on node-2: default__web-g3-0 failed its health check; apply a different spec or roll back

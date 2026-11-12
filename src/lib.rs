@@ -21,6 +21,8 @@ pub(crate) mod durable;
 pub mod file_lock;
 pub mod firewall;
 // Fuzz target bodies (#1398): the crate's own tests and the `fuzz/` crate only.
+#[cfg(test)]
+mod blocking_rule;
 #[cfg(any(test, feature = "fuzzing"))]
 pub mod fuzz;
 pub mod grill;
@@ -37,6 +39,7 @@ pub mod onion;
 pub mod os;
 pub mod pickle;
 pub mod policy;
+pub mod proposal;
 pub mod reconstruction;
 pub mod redact;
 pub mod relish;

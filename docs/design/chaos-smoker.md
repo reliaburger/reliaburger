@@ -831,8 +831,13 @@ what that fault owns. Omitting `--from` installs the explicit wildcard key.
 Bidirectional partitions require two rules.
 
 This service-data-plane operation is separate from
-the `CouncilPartition` node fault, which blocks gossip and Raft transports and
-therefore consumes the quorum safety budget. Conflating the two used to make a
+the `CouncilPartition` node fault, which blocks gossip and Raft transports in
+both directions and therefore consumes the quorum safety budget. On Raft, the
+target refuses RPCs whose vote names a blocked peer, as well as sending none
+to it (#1810). The fault records the exact gossip and Raft addresses it
+blocked, and clear or expiry removes exactly those, so the heal works even
+after the cut-off peers have dropped out of the node's live membership
+(#1820). Conflating the two used to make a
 service partition look like a node failure while allowing the service operation
 to report success without eBPF.
 
