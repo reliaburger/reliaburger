@@ -8,6 +8,61 @@ release contains is in the [roadmap](roadmap.md#releases-after-010). A new
 paragraph goes at the top when a release is promoted
 ([release gate, step 9](releasing.md#staging-a-candidate)).
 
+## 0.2.8: agents you can trust, built faster
+
+Promoted on 12 November 2026 as tag `v0.2.8` at `e423d469`
+([promote run](https://github.com/reliaburger/reliaburger/actions/runs/43152695366)).
+An agent no longer changes the cluster itself: it proposes a change, with
+the before and after state, a blast radius the cluster computes and a
+one-command undo, and a person, or a policy a person wrote, approves it
+([#1682](https://github.com/reliaburger/reliaburger/issues/1682)). Short leases on apps and namespaces keep agents and people off
+each other's work ([#1686](https://github.com/reliaburger/reliaburger/issues/1686)). `relish verify` checks every node's `bun`
+against the published release ([#1689](https://github.com/reliaburger/reliaburger/issues/1689)), `relish timeline` says what
+changed and why ([#1685](https://github.com/reliaburger/reliaburger/issues/1685)), `relish status` fits the whole cluster on one
+screen with the lists moved to `relish apps` and `relish nodes`
+([#1788](https://github.com/reliaburger/reliaburger/pull/1788)), and `relish gym run` tests your own agent on your own cluster
+([#1683](https://github.com/reliaburger/reliaburger/issues/1683)). Our own loop got shorter too: macOS CI builds only `relish`,
+qualification runs nightly on the Studio, and a candidate build reuses
+`main`'s CI ([plan](plans/archive/2026-11-07-plan-0.2.8.md)).
+`relish status -o json` changed shape: it no longer lists the instances,
+and a script that read it that way should use `relish apps --instances -o
+json`. Qualification ran from 10 to 12 November 2026 on the Mac Studio, on
+three candidates, on the full gate, because 0.2.8 changes the cluster
+formats and the agent loop
+([closure record](qualification/2026-11-11-v0.2.8-release-closure.md)). The first
+thing it found was our own harness: `qualify-sustained.sh` still read
+`relish status -o json` as a list of instances, and failed in setup with
+every app running ([#1850](https://github.com/reliaburger/reliaburger/pull/1850)). Candidate 1's V02 fast tier then found a
+crash loop: a deploy-kill one second into a rollout, then a power cut of the
+same node, left an adoption record out of step with its runtime generation,
+and Bun refused every start after that ([#1849](https://github.com/reliaburger/reliaburger/issues/1849), fixed by [#1851](https://github.com/reliaburger/reliaburger/pull/1851) and
+[#1854](https://github.com/reliaburger/reliaburger/pull/1854)). Its jobs fast tier found a 1,593 ms agent turn waiting on an
+`fdatasync` ([#1853](https://github.com/reliaburger/reliaburger/issues/1853), fixed by [#1854](https://github.com/reliaburger/reliaburger/pull/1854)), and its final one ingress 502
+after a power cut ([#1855](https://github.com/reliaburger/reliaburger/issues/1855), fixed by [#1856](https://github.com/reliaburger/reliaburger/pull/1856))
+([candidate 1](qualification/2026-11-10-v0.2.8-candidate-1/README.md)). Candidate 2's
+extra V02 run, on the seed that found the crash loop, found a 1,152 ms turn
+with the loop's thread in `lseek` on a busy disk ([#1857](https://github.com/reliaburger/reliaburger/issues/1857), fixed by
+[#1858](https://github.com/reliaburger/reliaburger/pull/1858)) ([candidate 2](qualification/2026-11-11-v0.2.8-candidate-2/README.md)).
+Candidate 3 is that fix plus `rustix` 1.1.6 for RUSTSEC-2026-0486
+([#1862](https://github.com/reliaburger/reliaburger/pull/1862)), and it passed everything clean with no turn over budget: both
+staged installs, in 125 s and 118 s
+([first](qualification/2026-11-11-v0.2.8-staged-install-apple-silicon.md),
+[second](qualification/2026-11-11-v0.2.8-staged-install-apple-silicon-2.md)), the
+power-cut and reboot lanes, 25 of 25 in every lane
+([record](qualification/2026-11-11-power-cut-reboot.md)), the V02 fast tier
+([record](qualification/2026-11-11-v0.2.8-sustained-v02-fast.md)) and its seeded rerun
+([record](qualification/2026-11-11-v0.2.8-sustained-v02-fast-seed-3139726783.md)), and
+the jobs fast tier at 8,630.0 accepted jobs a second
+([record](qualification/2026-11-11-v0.2.8-job-qualification-fast.md)). The 8-hour jobs
+final completed its whole schedule clean
+([record](qualification/2026-11-11-v0.2.8-job-qualification.md)): 9,311.2 accepted
+jobs a second against the 1,390 target, about 0.2.7's rate, job-start p99
+32 ms over 213.5 million starts, a council history linearizable over
+213,407 operations, and Bun's worst steady-state RSS 208.41 MiB against
+384 MiB. It ships with no known issue the gate found. 0.2.8 moves the
+cluster formats to protocol 58 and state format 74, so a 0.2.7 cluster
+starts afresh ([upgrading from 0.2.7](releasing.md#upgrading-from-027)).
+
 ## 0.2.7: built for humans and their agents
 
 Promoted on 7 November 2026 as tag `v0.2.7` at `ace072c7`

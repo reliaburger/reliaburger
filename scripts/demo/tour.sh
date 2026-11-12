@@ -59,8 +59,10 @@ BURGER_URL="https://reliaburger.com/demo/burger.tar.gz"
 BURGER_FETCH="curl -fsSL ${BURGER_URL} | tar xz"
 # The example policies, from the release's tag: the demo archive is
 # built from the tag too, so the tour never needs a file the release lacks.
-PLATFORM_FETCH="curl -fsSLO https://raw.githubusercontent.com/reliaburger/reliaburger/v0.2.7/examples/policies/platform.toml"
+PLATFORM_FETCH="curl -fsSLO https://raw.githubusercontent.com/reliaburger/reliaburger/v0.2.8/examples/policies/platform.toml"
 POLICY_TEST="relish policy test -f platform.toml -f burger/burger.toml"
+AGENT_TOKEN='AGENT=$(relish token create --name burger-agent --agent --role deployer --namespaces default --ttl 1h)'
+PROPOSE='relish agent propose scale patty --replicas 2 --reason "a double is plenty" --token "$AGENT"'
 # The burger as the page shows it, on the default ingress port.
 BURGER="curl http://burger.localhost:18080"
 # The burger's layers, top to bottom, each its own app.
@@ -115,11 +117,14 @@ tour_commands() {
 known_command() {
     case "$1" in
         "curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop" \
+        | "relish verify" \
         | "${BURGER_FETCH}" \
         | "relish build burger/burger.toml" \
         | "relish images" \
         | "relish apply burger/burger.toml" \
         | "relish status" \
+        | "relish apps counter" \
+        | "relish apps patty" \
         | "relish council status" \
         | "${BURGER}" \
         | "relish batch submit burger/jobs.toml" \
@@ -130,10 +135,14 @@ known_command() {
         | "relish apply burger/patty-v3.toml" \
         | "relish history patty" \
         | "relish apply burger/triple-patty.toml" \
+        | "${AGENT_TOKEN}" \
+        | "${PROPOSE}" \
+        | "relish proposal approve 1 --yes" \
+        | "relish undo 1 --yes" \
         | "${PLATFORM_FETCH}" \
         | "${POLICY_TEST}" \
         | "relish fault kill patty --acknowledge" \
-        | "relish events --app patty" \
+        | "relish timeline --app patty" \
         | "relish path counter --to patty" \
         | "relish metrics counter" \
         | "relish fault delay patty 300ms --from counter --duration 2m --acknowledge" \
@@ -291,6 +300,7 @@ step_title() {
         "relish apply burger/cheese-v2.toml") echo "Roll forward" ;;
         "relish apply burger/patty-v3.toml") echo "Roll back" ;;
         "relish apply burger/triple-patty.toml") echo "Scale up" ;;
+        "${AGENT_TOKEN}") echo "An agent asks" ;;
         "${PLATFORM_FETCH}") echo "House rules" ;;
         "relish fault kill patty --acknowledge") echo "Kill a patty" ;;
         "relish path counter --to patty") echo "The whole path" ;;
@@ -406,10 +416,9 @@ resource_summary() {
 }
 
 # Every instance with its node (NODE INSTANCE APP NAMESPACE STATE ...), then
-# why any app isn't fully running: `relish apps --instances` from 0.2.8,
-# `relish status` before it, since the tour runs the published release.
+# why any app isn't fully running.
 instances() {
-    relish apps --instances 2>/dev/null || relish status 2>/dev/null
+    relish apps --instances 2>/dev/null
 }
 
 # Running instances of an app. $2, if given, leaves out a node by name suffix.
@@ -506,7 +515,7 @@ run_dashboard() {
     sleep 0.5
 }
 
-# What an AI agent sees of the same cluster (0.2.7): the first call, the
+# What an AI agent sees of the same cluster (from 0.2.7): the first call, the
 # findings and the chapter it reads first. The homepage's agent section has
 # its own steps, so these aren't data-tour commands; jq only makes the one-line
 # JSON readable for people. Without jq the tour skips this step.
@@ -517,9 +526,10 @@ agent_step() {
     step_heading "Ask your agent"
     say "From 0.2.7 an AI agent asks relish the same questions and gets one line of"
     say "JSON back, within a byte budget. jq here only makes it readable for people."
-    # From 0.2.8 the apps come from the cluster summary, worst first; 0.2.7
-    # listed every app.
-    show "relish agent context | jq -c '(.data.status.value.summary.apps.value.worst // .data.apps.items)[] | {app, state, running, desired}'"
+    # The apps' counts come from the cluster summary, with the worst listed;
+    # after the lost node every app may be running again, so the list can
+    # be empty and the counts still say something.
+    show "relish agent context | jq -c '.data.status.value.summary.apps.value | {total, running, degraded, down, worst}'"
     show "relish agent diagnose | jq -c '.data.findings[] | {id, severity, title}'"
     say "The manual chapter an agent reads first, from the binary itself:"
     show "relish agent guide | jq -r '.data.sections[].heading' | head -n 8"
@@ -580,20 +590,44 @@ while IFS= read -r command <&3; do
                     wait_for "the image to arrive and all eight apps to run" 300 burger_running
                     show "${command}"
                     ;;
-                "relish apply burger/patty-v3.toml")
-                    LOST_LAYER=0
-                    wait_for "patty v3 to fail its health check and roll back" 180 patty_rollout_failed
-                    if [[ "${LOST_LAYER}" == 0 ]]; then
-                        say "The burger kept its v1 patty throughout."
-                    else
-                        say "The burger lost its patty for a moment during the rollout."
-                    fi
-                    show "${command}"
-                    ;;
                 *)
                     show "${command}"
                     ;;
             esac
+            ;;
+        "relish apps patty")
+            LOST_LAYER=0
+            wait_for "patty v3 to fail its health check and roll back" 180 patty_rollout_failed
+            if [[ "${LOST_LAYER}" == 0 ]]; then
+                say "The burger kept its v1 patty throughout."
+            else
+                say "The burger lost its patty for a moment during the rollout."
+            fi
+            show "${command}"
+            ;;
+        "${AGENT_TOKEN}")
+            # The token goes into a variable, so the recording never shows it.
+            show "${command}"
+            ;;
+        "${PROPOSE}")
+            # The page's later commands name proposal 1, as on a fresh
+            # cluster; the script reads the number the cluster gave.
+            type_command "${command}"
+            eval "${command}" | tee "${BURGER_WORK}/propose.json"
+            PROPOSAL_ID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["data"]["proposal"]["id"])' "${BURGER_WORK}/propose.json" 2>/dev/null)
+            [[ -n "${PROPOSAL_ID}" ]] || { echo "the agent's proposal printed no number" >&2; exit 1; }
+            say "Nothing has changed yet: the burger still has three patties."
+            printf '\n'
+            sleep 1
+            ;;
+        "relish proposal approve 1 --yes")
+            show "relish proposal approve ${PROPOSAL_ID} --yes"
+            wait_for "a double patty" 120 burger_is "len(rows('patty')) == 2"
+            show "curl ${BURGER_SENT}"
+            ;;
+        "relish undo 1 --yes")
+            show "relish undo ${PROPOSAL_ID} --yes"
+            wait_for "the third patty to come back" 120 burger_is "len(rows('patty')) == 3"
             ;;
         "${BURGER_FETCH}")
             # The site publishes the demo from the tag the installer fetches,

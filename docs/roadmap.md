@@ -491,16 +491,25 @@ migration and no feature gate
   the tag. 0.2.7 keeps 0.2.6's cluster formats, so a 0.2.6 cluster can roll
   onto it in place
   ([upgrading from 0.2.6](releasing.md#upgrading-from-026)).
-- [ ] **0.2.8: "Agents you can trust, built faster"**
+- [x] **0.2.8: "Agents you can trust, built faster".** [Released](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.8)
+  on 12 November 2026
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/30),
-  [plan](plans/2026-11-07-plan-0.2.8.md)). Agent changes become proposals a
+  [plan](plans/archive/2026-11-07-plan-0.2.8.md)). Agent changes become proposals a
   person or a policy approves and can undo, behind short leases
   ([#1682](https://github.com/reliaburger/reliaburger/issues/1682),
   [#1686](https://github.com/reliaburger/reliaburger/issues/1686)), with
   `relish verify`, `relish timeline`, a one-screen `relish status` and
   `relish gym run` beside them; and a faster loop for us, from macOS CI that
-  builds only `relish` to candidates that reuse `main`'s CI. In progress; it
-  changes the cluster formats, so it needs a fresh cluster.
+  builds only `relish` to candidates that reuse `main`'s CI. Candidates 1 and
+  2 each failed a tier on a product bug
+  ([#1849](https://github.com/reliaburger/reliaburger/issues/1849),
+  [#1853](https://github.com/reliaburger/reliaburger/issues/1853),
+  [#1857](https://github.com/reliaburger/reliaburger/issues/1857)), and
+  candidate 3 passed the full gate clean, with no known issue found by the
+  gate ([closure](qualification/2026-11-11-v0.2.8-release-closure.md),
+  [release log](release-log.md#028-agents-you-can-trust-built-faster)).
+  0.2.8 changes the cluster formats, so a 0.2.7 cluster starts afresh
+  ([upgrading from 0.2.7](releasing.md#upgrading-from-027)).
 - [ ] **0.3.0: "Bare metal in an hour"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/6),
   research and spikes in [#218](https://github.com/reliaburger/reliaburger/pull/218)
