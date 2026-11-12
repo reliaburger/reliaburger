@@ -10583,6 +10583,130 @@ async fn a_retired_stale_record_does_not_stop_the_other_instances_adopting() {
     assert_eq!(kept, vec![healthy.0]);
 }
 
+/// Two records beside each other on disk: `stale` is changed by the test,
+/// `healthy` matches its runtime launch and must still adopt (#1852).
+async fn power_cut_split_fixture(
+    stale: crate::grill::records::InstanceRecord,
+    stale_launch: Option<crate::grill::oci::OciSpec>,
+) -> (
+    TestAgent,
+    MockGrill,
+    tempfile::TempDir,
+    InstanceId,
+    InstanceId,
+) {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    let records = tempfile::tempdir().unwrap();
+    agent.set_records_dir(records.path().to_path_buf());
+    let mut healthy = adoption_record("default__redis-0", "redis", false);
+    healthy.host_port = Some(30124);
+    crate::grill::records::write_record(records.path(), &stale).unwrap();
+    crate::grill::records::write_record(records.path(), &healthy).unwrap();
+    let stale_id = InstanceId(stale.instance_id.clone());
+    let healthy_id = InstanceId(healthy.instance_id.clone());
+    let mut launches = vec![crate::grill::RuntimeLaunch {
+        instance_id: healthy_id.clone(),
+        generation: crate::grill::RuntimeGeneration::process("healthy"),
+        spec: healthy.oci_spec.clone(),
+        network_reference: None,
+    }];
+    if let Some(spec) = stale_launch {
+        launches.push(crate::grill::RuntimeLaunch {
+            instance_id: stale_id.clone(),
+            generation: crate::grill::RuntimeGeneration::process("stale"),
+            spec,
+            network_reference: None,
+        });
+    }
+    grill.set_launch_inventory(launches).await;
+    grill.set_adopt_result(&healthy_id, true);
+    (agent, grill, records, stale_id, healthy_id)
+}
+
+fn kept_records(records: &tempfile::TempDir) -> Vec<String> {
+    crate::grill::records::load_records(records.path())
+        .unwrap()
+        .into_iter()
+        .map(|record| record.instance_id)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_record_from_an_earlier_boot_with_no_runtime_launch_is_retired() {
+    // #1852: a power cut kept the adoption record but lost the runtime's
+    // launch intent. The process died with the boot, so the instance
+    // reschedules instead of stopping the node starting.
+    let mut stale = adoption_record("default__frontend-0", "frontend", false);
+    stale.boot_id = Some("an-earlier-boot".into());
+    let (mut agent, grill, records, stale_id, healthy_id) =
+        power_cut_split_fixture(stale, None).await;
+
+    assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
+    assert!(agent.supervisor.get_instance(&stale_id).is_none());
+    assert!(
+        !grill
+            .calls()
+            .iter()
+            .any(|(call, id)| call == "adopt" && *id == stale_id)
+    );
+    assert_eq!(
+        agent.supervisor.get_instance(&healthy_id).unwrap().state,
+        ContainerState::Running
+    );
+    assert_eq!(kept_records(&records), vec![healthy_id.0]);
+}
+
+#[tokio::test]
+async fn a_record_from_this_boot_with_no_runtime_launch_still_refuses_startup() {
+    // The record's process may still be running with nothing in the runtime
+    // owning it: that's uncertain, so startup keeps refusing and keeps it.
+    let stale = adoption_record("default__frontend-0", "frontend", false);
+    let (mut agent, _grill, records, stale_id, healthy_id) =
+        power_cut_split_fixture(stale, None).await;
+
+    let error = agent.adopt_recorded_instances().await.unwrap_err();
+    assert!(
+        error.to_string().contains("no runtime launch intent"),
+        "{error}"
+    );
+    let mut kept = kept_records(&records);
+    kept.sort();
+    assert_eq!(kept, vec![stale_id.0, healthy_id.0]);
+}
+
+#[tokio::test]
+async fn a_record_conflicting_with_its_runtime_launch_is_retired_and_the_launch_fenced() {
+    // #1852: the record and the launch it names were written at different
+    // moments. The launch is what the runtime runs, so it's fenced and
+    // retired like a launch with no record, and the instance reschedules.
+    let stale = adoption_record("default__frontend-0", "frontend", false);
+    let mut launched = stale.oci_spec.clone();
+    launched.process.args = vec!["sleep".into(), "120".into()];
+    let (mut agent, grill, records, stale_id, healthy_id) =
+        power_cut_split_fixture(stale, Some(launched)).await;
+    grill.set_state(&stale_id, ContainerState::Running);
+
+    assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
+    let calls = grill.calls();
+    assert!(
+        calls
+            .iter()
+            .any(|(call, id)| call == "kill" && *id == stale_id),
+        "the conflicting launch kept running: {calls:?}"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|(call, id)| call == "adopt" && *id == stale_id)
+    );
+    assert!(agent.supervisor.get_instance(&stale_id).is_none());
+    assert_eq!(
+        agent.supervisor.get_instance(&healthy_id).unwrap().state,
+        ContainerState::Running
+    );
+    assert_eq!(kept_records(&records), vec![healthy_id.0]);
+}
+
 #[tokio::test]
 async fn startup_adopts_recorded_instances_instead_of_restarting() {
     let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
