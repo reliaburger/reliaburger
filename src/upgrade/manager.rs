@@ -391,6 +391,15 @@ impl UpgradeManager {
         }
     }
 
+    /// The in-flight marker, read on a blocking thread: it is a file in the
+    /// data directory, and `prepare` runs on the async runtime (#1860).
+    async fn load_marker(&self) -> Result<Option<UpgradeMarker>, UpgradeError> {
+        let path = self.marker_path.clone();
+        tokio::task::spawn_blocking(move || UpgradeMarker::load(&path))
+            .await
+            .map_err(|error| UpgradeError::Io(std::io::Error::other(error)))?
+    }
+
     // -----------------------------------------------------------------
     // Upgrade path: prepare -> execute
     // -----------------------------------------------------------------
@@ -406,7 +415,7 @@ impl UpgradeManager {
         directive: &UpgradeDirective,
         pre_upgrade_instances: Vec<InstanceInventory>,
     ) -> Result<Option<PreparedUpgrade>, UpgradeError> {
-        if let Some(existing) = UpgradeMarker::load(&self.marker_path)? {
+        if let Some(existing) = self.load_marker().await? {
             if existing.upgrade_id == directive.upgrade_id {
                 return Ok(None);
             }
@@ -572,7 +581,7 @@ impl UpgradeManager {
         version: Option<BinaryVersion>,
         pre_upgrade_instances: Vec<InstanceInventory>,
     ) -> Result<Option<PreparedUpgrade>, UpgradeError> {
-        if let Some(existing) = UpgradeMarker::load(&self.marker_path)? {
+        if let Some(existing) = self.load_marker().await? {
             // A leader rolling itself back execs once its answer is written,
             // before it records sending the directive, so its successor sends
             // the same rollback again while this marker verifies (#526).

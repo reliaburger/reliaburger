@@ -89,6 +89,7 @@ pub(super) async fn read_pids<G: Grill>(
                 .flatten()
                 .into_iter()
                 .collect(),
+            // BLOCKING-OK: cgroupfs, an in-memory kernel interface: no disk behind it
             SignalTarget::TaskGroup(cgroup) => task_group_pids(cgroup),
         }
     });

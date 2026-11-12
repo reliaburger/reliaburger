@@ -253,6 +253,7 @@ async fn load_state_from_data_dir(
     if !raft_dir.join("log.redb").exists() && !raft_dir.join("snapshot.redb").exists() {
         return Err(no_state());
     }
+    // BLOCKING-OK: offline recovery (`relish council recover`), with no node running
     crate::compatibility::ensure_state_compatible(data_dir)
         .map_err(|e| RecoveryError::OpenSource(e.to_string()))?;
     let (mut log, _fresh, mut machine) =

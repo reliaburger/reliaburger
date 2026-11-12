@@ -1121,7 +1121,9 @@ async fn run_build_inner(
     // A unique, self-cleaning build directory. `ScopedDir::drop` removes
     // it on every exit path below, so no failure leaves a stray context.
     let base = std::env::temp_dir().join("reliaburger-build");
-    let build_dir = ScopedDir::new(&base, build_id)
+    let build_dir = tokio::task::spawn_blocking(move || ScopedDir::new(&base, build_id))
+        .await
+        .map_err(|e| format!("failed to create build directory: {e}"))?
         .map_err(|e| format!("failed to create build directory: {e}"))?;
     // The tar lands beside the context, not inside it, so `context.tar`
     // never becomes part of the build.

@@ -187,6 +187,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let cgroup_id = if capability.can_enforce_allowlist() {
             // LOOP-INLINE: one cgroupfs mkdir, microseconds
             let _ = tokio::fs::create_dir_all(cgroup_path).await;
+            // BLOCKING-OK: cgroupfs, an in-memory kernel interface: no disk behind it
             egress::cgroup_id_of_path(cgroup_path)
         } else {
             None

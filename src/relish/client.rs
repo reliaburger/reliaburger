@@ -978,6 +978,7 @@ impl BunClient {
             // An explicit endpoint picks the node; the managed context's host
             // forwards still describe how this host reaches the cluster's
             // registry and ingress, when it is the same cluster.
+            // BLOCKING-OK: relish CLI: a one-shot read of the local context before the command does anything long-lived; `relish mcp` calls this off the runtime
             let forwards = super::local_context::default_path()
                 .and_then(|path| super::local_context::LocalContext::load(&path))
                 .ok()
@@ -988,6 +989,7 @@ impl BunClient {
                 None => client,
             };
         }
+        // BLOCKING-OK: relish CLI: a one-shot read of the local context before the command does anything long-lived; `relish mcp` calls this off the runtime
         let context = super::local_context::default_path()
             .and_then(|path| super::local_context::LocalContext::load(&path));
         match context {

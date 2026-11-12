@@ -505,8 +505,8 @@ impl<G: Grill + Clone + 'static> ReusablePool<G> {
         }
         // The runtime owns helper retirement; Bun owns the sibling task group.
         // Removing/reusing a group requires emptiness, independently of PID 1.
-        // cgroupfs is an in-memory kernel interface, so this never waits on a
-        // disk (see wait_empty_task).
+        // BLOCKING-OK: cgroupfs is an in-memory kernel interface, so this
+        // never waits on a disk (see wait_empty_task).
         crate::grill::kernel::kill_group(&context.base.join("task"), self.group_kill).is_ok()
     }
     /// Retire within `budget`, every runtime call and file removal included;

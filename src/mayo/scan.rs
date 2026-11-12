@@ -96,6 +96,17 @@ pub(crate) fn list_local(directory: &std::path::Path) -> Result<Vec<ParquetSourc
         .collect())
 }
 
+/// [`list_local`] on a blocking thread, for a query planned on the async
+/// runtime: listing a directory is a disk read (#1860).
+pub(crate) async fn list_local_off_runtime(
+    directory: &std::path::Path,
+) -> Result<Vec<ParquetSource>, MayoError> {
+    let directory = directory.to_path_buf();
+    tokio::task::spawn_blocking(move || list_local(&directory))
+        .await
+        .map_err(|error| MayoError::Io(std::io::Error::other(error)))?
+}
+
 /// Every `{prefix}_*.parquet` object under `location` in a bucket, in
 /// listing order. Only names and sizes are held, never data.
 pub(crate) async fn list_remote(
