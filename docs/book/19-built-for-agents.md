@@ -2080,9 +2080,11 @@ The answer is three sets, named in one list, `ALLOWLIST` in
   `benches/` (Cargo refuses a manifest whose declared benchmarks are missing,
   even for a plain build), `brioche/dist/`, `docs/manual/`, `examples/`, and
   the four files under `scripts/release/` that the code includes.
-- **The test set**: `tests/`, `proptest-regressions/`, the `Makefile` and
-  `.config/` (nextest's configuration). An agent that patches a function should
-  run that function's tests.
+- **The test set**: `tests/`, `proptest-regressions/`, `fuzz/` (the fuzz
+  targets and their corpus, which the stable-Rust fuzz tests replay), the
+  handful of files other tests read at run time, the `Makefile` and
+  `.config/` (nextest's configuration). An agent that patches a function
+  should run that function's tests.
 - **The read set**: `CLAUDE.md`, the design docs, the book, the whitepaper,
   the roadmap, the release log and the testing, releasing and flakes docs. The
   reasoning behind the code, at the same version as the code.
@@ -2856,6 +2858,126 @@ that cluster's own home, showed the sample app running. The more useful
 lesson is that `try` did exactly its job: a `bun` that wouldn't boot came
 back as an answer with the log attached, and `destroy` cleaned up the VM it
 left behind.
+
+### A hundred failures that weren't the patch's
+
+The first filtered `test` passed, so nobody ran the whole suite in a fresh
+workspace until the agent gym did, on 0.2.8. An agent fixed a planted bug,
+ran `patch test`, and got `ok: false` with ten failures
+([#1876](https://github.com/reliaburger/reliaburger/issues/1876)). None of
+them were about its fix. Three fuzz tests found no `fuzz/` directory: the
+bundle didn't carry it. Two job bench tests couldn't open the qualification
+report they read as a baseline: the bundle carried none of
+`docs/qualification/`. And five MCP tests about stored tokens failed for two
+reasons stacked on top of each other. They saw the agent's own read-only
+`RELIABURGER_TOKEN`, which the guide tells every agent to work with, and an
+exported token beats the one `relish mcp` makes for itself. Clear that, and
+four of them still failed, because they set process-wide state.
+
+So a correct patch could never answer `ok: true`, and an agent that reads
+`ok` (as it should) would go hunting for a bug it hadn't written. That's
+worse than no test at all.
+
+And ten wasn't all of it. Every one of the ten was in the library's unit
+tests, the first binary `cargo test` runs, and `cargo test` stops at the
+first test binary that fails. The binaries after it never ran, and `passed`
+counted only what had. With `--no-fail-fast` the same workspace failed about
+a hundred tests. Two in `relish`'s own tests wanted the concept budget and
+the released-CLI list. Seven dependency audit tests wanted
+`.cargo/audit.toml`, two documentation tests the READMEs and the Linux
+servers guide. Four Mayo memory tests count heap bytes through a global
+allocator, which only works with the process to themselves. The other
+ninety-odd were `tests/suite`'s repository checks: the website, the GitHub
+workflows and issue forms, the README hero, the devcontainer.
+
+That split the fix in two. A file a test of the *code* reads goes into the
+bundle: `fuzz/` (432 KB, whole), the one 1.6 KB bench report rather than all
+34 MB of qualification evidence, the concept budget, the released-CLI list,
+the audit exceptions, the READMEs and the Linux servers guide. Each path lives where its
+test can name it (`COMMITTED_RERUN_REPORT`, `BUDGET_FILE`) and a bundle test
+checks they're carried, so a rename can't leave the bundle behind.
+
+A test of the *repository* is another matter. Carrying the website alone
+would take the bundle past the 6 MB it's allowed, and none of those checks
+says anything about a patch to `src/`. So `patch test` skips them with
+libtest's `--skip` (a substring match on the test's name, given once per
+pattern after `--`), from one list, `REPOSITORY_CHECKS`. `not_run` names
+every module on it, and a test fails if the list names a module
+`tests/suite/main.rs` doesn't have, or one `not_run` leaves out. Skipping is
+fine. Skipping quietly isn't.
+
+The token was about what the test process inherits. `run_cargo` already
+removed `CARGO_TARGET_DIR` and the two variables a release build sets. It now
+removes every `RELIABURGER_*` in the session, through a small function the
+tests can call with a list of names instead of a real environment:
+
+```rust
+pub(super) fn session_variables(
+    names: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Vec<std::ffi::OsString> {
+    names
+        .into_iter()
+        .filter(|name| {
+            name == "CARGO_TARGET_DIR"
+                || name
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("RELIABURGER_"))
+        })
+        .collect()
+}
+```
+
+`impl IntoIterator<Item = OsString>` in argument position takes anything
+that iterates over owned `OsString`s: an array in the test,
+`std::env::vars_os().map(|(name, _)| name)` in `run_cargo`. Environment
+variable names are `OsString`, not `String`, because Unix allows any bytes in
+them; `to_str()` returns `None` for a name that isn't UTF-8, and
+`is_some_and` treats that as "not ours". Testing the function rather than the
+environment matters here. Setting a variable in a test is `unsafe` in Rust
+2024 (another thread may be reading the environment at the same time), and
+`cargo test` runs tests on threads.
+
+Removing them all, rather than the three a cluster uses, also drops the
+switches the gated suites look for, such as `RELIABURGER_RUNC_TESTS`. A
+session that happened to export one would otherwise turn a portable run into
+something `not_run` says it isn't.
+
+The process-wide state took a different fix. The CLI endpoint lives in a
+`OnceLock` (a static you can set exactly once; every later `set` is
+ignored), and the token `relish mcp` makes lives in a static `RwLock`. A
+comment in `client.rs` already admitted it: these tests rely on nextest,
+which runs every test in a process of its own. `patch test` runs plain
+`cargo test`, which runs them as threads of one process, so the first test
+to set the endpoint pointed every later one at its own stand-in cluster. The
+Mayo memory tests had the same problem with their counting allocator: four
+tests on four threads add up to one heap.
+
+Switching `patch test` to nextest would have meant a second output parser,
+and a second run for the doctests, which nextest doesn't run. Instead
+`tests/support/own_process.rs` has one helper, which `tests/mayo_memory.rs`
+pulls in with `#[path]` and so does the library's MCP test module (a module
+can live in any file `#[path]` names, even one under `tests/`). Each of those
+thirteen tests now opens with
+
+```rust
+if ran_in_its_own_process("a_token_the_cluster_still_accepts_is_kept").await {
+    return;
+}
+```
+
+Under nextest (`NEXTEST_EXECUTION_MODE=process-per-test`) it returns
+`false` at once and the body runs. Under `cargo test` it starts the test
+binary again with `--exact` and that one test's name, marks the child with an
+environment variable so the child runs the body, and asserts that the child
+passed exactly one test. `--exact` with a name that matches nothing passes
+zero tests and still exits 0, which is why the assertion looks for `1 passed`
+rather than trusting the exit status.
+
+The exit code stayed 0. The issue asked whether a failing run should exit
+non-zero, and the contract already answers that: every `relish agent`
+command exits 0 when it answered, and `data` holds the verdict. The fix was
+to make `ok` mean what it says, and to put "read `data.ok`" in the command's
+own help as well as the manual.
 
 ### Unsigned on purpose
 

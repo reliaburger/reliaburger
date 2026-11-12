@@ -1139,6 +1139,12 @@ fn human_count(value: f64) -> String {
     format!("{value:.0}")
 }
 
+/// A job bench report from a committed qualification record, which the
+/// tests read as a baseline. The source bundle carries it, so the tests pass
+/// in a `relish agent patch` workspace too (#1876).
+#[cfg(test)]
+pub(crate) const COMMITTED_RERUN_REPORT: &str = "docs/qualification/2026-10-09-timed-job-scenarios/five-round-rerun/review-fixes/r1-jobs-shared-containers.json";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1147,6 +1153,11 @@ mod tests {
         routing::{get, post},
     };
     use serde_json::json;
+
+    fn committed_rerun_report() -> JobBenchReport {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(COMMITTED_RERUN_REPORT);
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
     use std::sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -1300,12 +1311,7 @@ mod tests {
 
     #[test]
     fn a_committed_rerun_report_parses_as_a_baseline() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/docs/qualification/2026-10-09-timed-job-scenarios/five-round-rerun/review-fixes/r1-jobs-shared-containers.json"
-        );
-        let baseline: JobBenchReport =
-            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let baseline = committed_rerun_report();
         assert_eq!(baseline.scenario, JobScenario::SharedContainers);
         assert!(baseline.measurement_complete);
     }
@@ -1485,12 +1491,7 @@ mod tests {
 
     #[test]
     fn an_older_report_without_a_breakdown_still_compares() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/docs/qualification/2026-10-09-timed-job-scenarios/five-round-rerun/review-fixes/r1-jobs-shared-containers.json"
-        );
-        let baseline: JobBenchReport =
-            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let baseline = committed_rerun_report();
         assert!(baseline.per_node.is_none());
         let mut current = measured(JobScenario::SharedContainers, 120_000);
         let mut counts = NodeCounts::default();

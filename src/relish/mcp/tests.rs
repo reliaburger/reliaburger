@@ -1012,8 +1012,48 @@ fn logs_arguments() -> serde_json::Map<String, Value> {
     arguments
 }
 
+#[path = "../../../tests/support/own_process.rs"]
+mod own_process;
+
+/// The full name of `name`, a test in this module, as `--exact` takes it.
+fn test_path(name: &str) -> String {
+    let module = module_path!()
+        .split_once("::")
+        .map_or(module_path!(), |(_, rest)| rest);
+    format!("{module}::{name}")
+}
+
+/// Run the test `name` in a process of its own unless it has one: `true`
+/// means a child ran it and passed, so the caller returns.
+///
+/// The tests that call this set process-wide state: the CLI endpoint (a
+/// `OnceLock`, so the first test to set it wins) and the token `relish mcp`
+/// made for itself. Under plain `cargo test` they saw each other's
+/// endpoints and tokens and failed (#1876).
+async fn ran_in_its_own_process(name: &str) -> bool {
+    own_process::ran_in_its_own_process(&test_path(name)).await
+}
+
+/// Under `cargo test` a test that calls [`ran_in_its_own_process`] runs in a
+/// child, and the child alone sees the process-wide state it sets.
+#[tokio::test]
+async fn a_test_that_needs_its_own_process_gets_one() {
+    const NAME: &str = "a_test_that_needs_its_own_process_gets_one";
+    if ran_in_its_own_process(NAME).await {
+        return;
+    }
+    assert!(
+        own_process::has_its_own_process(&test_path(NAME)),
+        "the body ran in a shared process"
+    );
+}
+
 #[tokio::test]
 async fn a_server_from_an_admin_context_sends_its_own_read_only_token() {
+    if ran_in_its_own_process("a_server_from_an_admin_context_sends_its_own_read_only_token").await
+    {
+        return;
+    }
     let directory = tempfile::tempdir().unwrap();
     let (url, seen) = token_cluster(false, &[]).await;
     crate::relish::client::set_cli_endpoint(Some(url.clone())).unwrap();
@@ -1037,6 +1077,13 @@ async fn a_server_from_an_admin_context_sends_its_own_read_only_token() {
 
 #[tokio::test]
 async fn a_cluster_that_refuses_the_token_fails_the_tool_and_never_falls_back_to_admin() {
+    if ran_in_its_own_process(
+        "a_cluster_that_refuses_the_token_fails_the_tool_and_never_falls_back_to_admin",
+    )
+    .await
+    {
+        return;
+    }
     let directory = tempfile::tempdir().unwrap();
     let (url, seen) = token_cluster(true, &[]).await;
     let server = Server::new(&Selection::default())
@@ -1071,6 +1118,9 @@ async fn a_cluster_that_refuses_the_token_fails_the_tool_and_never_falls_back_to
 /// read-only one and asks again, and never with the admin token.
 #[tokio::test]
 async fn a_revoked_stored_token_is_replaced_and_the_call_retried() {
+    if ran_in_its_own_process("a_revoked_stored_token_is_replaced_and_the_call_retried").await {
+        return;
+    }
     let directory = tempfile::tempdir().unwrap();
     let (url, seen) = token_cluster(false, &["rbrg_revoked"]).await;
     crate::relish::client::set_cli_endpoint(Some(url.clone())).unwrap();
@@ -1148,6 +1198,13 @@ async fn tool_bearers(seen: &Seen) -> Vec<String> {
 /// token too, not only a top-level `unauthenticated`.
 #[tokio::test]
 async fn a_revoked_stored_token_is_renewed_when_context_or_diagnose_answer_with_401s() {
+    if ran_in_its_own_process(
+        "a_revoked_stored_token_is_renewed_when_context_or_diagnose_answer_with_401s",
+    )
+    .await
+    {
+        return;
+    }
     let (url, seen) = token_cluster(false, &["rbrg_revoked"]).await;
     crate::relish::client::set_cli_endpoint(Some(url.clone())).unwrap();
     for tool in ["context", "diagnose"] {
@@ -1178,6 +1235,9 @@ async fn a_revoked_stored_token_is_renewed_when_context_or_diagnose_answer_with_
 /// a 401: the cluster is asked first.
 #[tokio::test]
 async fn a_token_the_cluster_still_accepts_is_kept() {
+    if ran_in_its_own_process("a_token_the_cluster_still_accepts_is_kept").await {
+        return;
+    }
     let (url, seen) = token_cluster(false, &[]).await;
     crate::relish::client::set_cli_endpoint(Some(url.clone())).unwrap();
     let directory = tempfile::tempdir().unwrap();
@@ -1210,6 +1270,11 @@ async fn a_token_the_cluster_still_accepts_is_kept() {
 /// token stored, and make none.
 #[tokio::test]
 async fn offline_tools_answer_with_the_cluster_down_and_no_token_stored() {
+    if ran_in_its_own_process("offline_tools_answer_with_the_cluster_down_and_no_token_stored")
+        .await
+    {
+        return;
+    }
     let directory = tempfile::tempdir().unwrap();
     let server = Server::new(&Selection::default())
         .unwrap()
@@ -1239,6 +1304,11 @@ async fn offline_tools_answer_with_the_cluster_down_and_no_token_stored() {
 /// than fail, and never ask with the admin token.
 #[tokio::test]
 async fn source_tools_answer_offline_when_no_read_only_token_can_be_made() {
+    if ran_in_its_own_process("source_tools_answer_offline_when_no_read_only_token_can_be_made")
+        .await
+    {
+        return;
+    }
     let directory = tempfile::tempdir().unwrap();
     let (url, seen) = token_cluster(true, &[]).await;
     crate::relish::client::set_cli_endpoint(Some(url.clone())).unwrap();
@@ -1257,6 +1327,9 @@ async fn source_tools_answer_offline_when_no_read_only_token_can_be_made() {
 /// admin requests each time. A refusal is remembered for a while.
 #[tokio::test]
 async fn a_refusal_is_remembered_and_asked_again_only_after_a_while() {
+    if ran_in_its_own_process("a_refusal_is_remembered_and_asked_again_only_after_a_while").await {
+        return;
+    }
     let directory = tempfile::tempdir().unwrap();
     let (url, seen) = token_cluster(true, &[]).await;
     let server = Server::new(&Selection::default())
@@ -1440,6 +1513,13 @@ async fn with_propose_the_server_lists_them_and_says_a_person_approves() {
 /// own, kept apart from the read-only one.
 #[tokio::test]
 async fn a_proposing_server_from_an_admin_context_sends_its_own_proposing_token() {
+    if ran_in_its_own_process(
+        "a_proposing_server_from_an_admin_context_sends_its_own_proposing_token",
+    )
+    .await
+    {
+        return;
+    }
     let directory = tempfile::tempdir().unwrap();
     let (url, seen) = token_cluster(false, &[]).await;
     crate::relish::client::set_cli_endpoint(Some(url.clone())).unwrap();

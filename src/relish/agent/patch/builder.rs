@@ -236,13 +236,7 @@ pub(super) async fn run_cargo(
         .current_dir(dir)
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true);
-    // A release build's commit and its clean-source check belong to the
-    // release; a patched binary takes its commit from the workspace.
-    for variable in [
-        "CARGO_TARGET_DIR",
-        "RELIABURGER_GIT_SHA",
-        "RELIABURGER_REQUIRE_CLEAN_SOURCE",
-    ] {
+    for variable in session_variables(std::env::vars_os().map(|(name, _)| name)) {
         command.env_remove(variable);
     }
     let output = tokio::time::timeout(deadline, command.output())
@@ -270,6 +264,31 @@ pub(super) async fn run_cargo(
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         seconds: started.elapsed().as_secs_f64(),
     })
+}
+
+/// The names, out of `names`, of the session's variables that a build or a
+/// test run in the workspace mustn't see.
+///
+/// `CARGO_TARGET_DIR` would send the build somewhere other than the
+/// workspace's `target/`. Every `RELIABURGER_*` goes too: a release build's
+/// commit and clean-source check (`RELIABURGER_GIT_SHA`,
+/// `RELIABURGER_REQUIRE_CLEAN_SOURCE`) belong to the release; the agent's
+/// own `RELIABURGER_TOKEN`, `RELIABURGER_ENDPOINT` or `RELIABURGER_HOME`
+/// would reach the tests that read them (#1876); and a gated suite's
+/// switch, such as `RELIABURGER_RUNC_TESTS`, would run tests the portable
+/// suite leaves out.
+pub(super) fn session_variables(
+    names: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Vec<std::ffi::OsString> {
+    names
+        .into_iter()
+        .filter(|name| {
+            name == "CARGO_TARGET_DIR"
+                || name
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("RELIABURGER_"))
+        })
+        .collect()
 }
 
 /// Refuse to start when the workspace's disk has less than `needed` free.
@@ -921,5 +940,41 @@ exit 101
         .unwrap_err();
         assert_eq!(error.code, ErrorCode::BuildFailed);
         assert!(error.hint.unwrap().contains("rustup"));
+    }
+
+    #[test]
+    fn the_sessions_reliaburger_variables_and_target_dir_stay_out_of_cargo() {
+        let names = [
+            "PATH",
+            "HOME",
+            "RUSTUP_HOME",
+            "CARGO_HOME",
+            "CARGO_TARGET_DIR",
+            "RELIABURGER_TOKEN",
+            "RELIABURGER_ENDPOINT",
+            "RELIABURGER_CA_CERT",
+            "RELIABURGER_HOME",
+            "RELIABURGER_GIT_SHA",
+            "RELIABURGER_REQUIRE_CLEAN_SOURCE",
+            "RELIABURGER_RUNC_TESTS",
+            "RELIABURGER",
+            "MY_RELIABURGER_TOKEN",
+        ]
+        .map(std::ffi::OsString::from);
+        let removed = session_variables(names);
+        assert_eq!(
+            removed,
+            [
+                "CARGO_TARGET_DIR",
+                "RELIABURGER_TOKEN",
+                "RELIABURGER_ENDPOINT",
+                "RELIABURGER_CA_CERT",
+                "RELIABURGER_HOME",
+                "RELIABURGER_GIT_SHA",
+                "RELIABURGER_REQUIRE_CLEAN_SOURCE",
+                "RELIABURGER_RUNC_TESTS",
+            ]
+            .map(std::ffi::OsString::from)
+        );
     }
 }

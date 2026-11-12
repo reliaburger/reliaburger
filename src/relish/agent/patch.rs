@@ -78,6 +78,10 @@ pub enum PatchCommand {
         allow_build_changes: bool,
     },
     /// Run the portable test suite in the workspace, optionally filtered.
+    ///
+    /// A failing test or a compile error still exits 0, as every answer
+    /// does: `data.ok` is the verdict. The run doesn't see the session's
+    /// `RELIABURGER_*` variables or `CARGO_TARGET_DIR`.
     Test {
         /// The workspace `init` made.
         dir: PathBuf,
