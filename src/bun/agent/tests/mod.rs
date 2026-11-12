@@ -14283,6 +14283,7 @@ async fn council_partition_heals_after_its_peers_leave_the_membership() {
 #[tokio::test]
 async fn deploy_history_spans_the_time_the_deploy_took() {
     const CREATE_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+    const SLACK: std::time::Duration = std::time::Duration::from_millis(5);
     let (agent, tx, shutdown, grill) = test_agent_with_grill();
     grill.set_pid(std::process::id());
     let history = agent.deploy_history_handle();
@@ -14292,8 +14293,9 @@ async fn deploy_history_spans_the_time_the_deploy_took() {
     });
     grill.set_call_delay(crate::grill::mock::MockCall::Create, Some(CREATE_DELAY));
 
-    // The fresh deploy, a rolling redeploy, a blue-green redeploy and a
-    // rollout that halts after its 1 s health wait each write one entry.
+    // The fresh deploy, a rolling redeploy, a blue-green redeploy, an
+    // in-place share change and a rollout that halts after its 1 s health
+    // wait each write one entry.
     let halted = crate::grill::InstanceIdentity::canary("default", "web", 3, 0).instance_id();
     let deploys = [
         (
@@ -14315,9 +14317,18 @@ async fn deploy_history_spans_the_time_the_deploy_took() {
             CREATE_DELAY,
             None,
         ),
+        // Only the replica count changes, so the second replica starts
+        // beside the first through `change_share_in_place`.
+        (
+            "share change",
+            "[app.web]\nimage = 'web:v3'\nport = 8080\nreplicas = 2\n\
+             [app.web.deploy]\nstrategy = 'blue-green'\n",
+            CREATE_DELAY,
+            None,
+        ),
         (
             "halted",
-            "[app.web]\nimage = 'web:v4'\nport = 8080\n\
+            "[app.web]\nimage = 'web:v4'\nport = 8080\nreplicas = 2\n\
              [app.web.deploy]\nauto_rollback = false\nhealth_timeout = '1s'\n",
             CREATE_DELAY + std::time::Duration::from_secs(1),
             Some(halted),
@@ -14334,6 +14345,15 @@ async fn deploy_history_spans_the_time_the_deploy_took() {
         if failing.is_none() {
             expect_complete(&events);
         }
+        if name == "share change" {
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    ApplyEvent::Progress { message } if message.contains("beside the running ones")
+                )),
+                "the replica must start in place, not roll: {events:?}"
+            );
+        }
         let entries = history.read().await.clone();
         assert_eq!(
             entries.len(),
@@ -14345,12 +14365,16 @@ async fn deploy_history_spans_the_time_the_deploy_took() {
             .completed_at
             .duration_since(entry.created_at)
             .expect("a deploy can't finish before it starts");
+        // The entry's span comes from the wall clock (`SystemTime`), the
+        // bounds from `Instant` and the mock's sleeps, which are monotonic.
+        // The two clocks can disagree by a little, and retries are 0, so
+        // both bounds allow a few milliseconds of slack.
         assert!(
-            span >= at_least,
+            span + SLACK >= at_least,
             "{name}: the entry spans {span:?}, but the deploy took at least {at_least:?}"
         );
         assert!(
-            span <= took,
+            span <= took + SLACK,
             "{name}: the entry spans {span:?}, longer than the {took:?} the deploy took"
         );
     }

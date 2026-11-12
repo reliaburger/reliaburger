@@ -1226,4 +1226,31 @@ mod tests {
         });
         assert_eq!(rollout_fingerprint(&spec), rollout_fingerprint(&templated));
     }
+
+    /// #1640: a finished entry starts when the caller says the deploy
+    /// began, ends when it was built, and takes its id from the end.
+    #[test]
+    fn a_finished_entry_spans_from_the_given_start_to_now() {
+        let spec: crate::config::app::AppSpec = toml::from_str("image = 'web:v2'").unwrap();
+        let started_at = SystemTime::now() - Duration::from_secs(90);
+        let entry = DeployHistoryEntry::finished(
+            AppId::new("web", "default"),
+            &spec,
+            DeployResult::Completed,
+            started_at,
+            2,
+            3,
+        );
+        assert_eq!(entry.created_at, started_at);
+        assert!(entry.completed_at >= started_at);
+        let completed_second = entry
+            .completed_at
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert_eq!(entry.id, DeployId(completed_second));
+        assert_eq!(entry.image, "web:v2");
+        assert_eq!((entry.steps_completed, entry.steps_total), (2, 3));
+        assert_eq!(entry.spec.as_deref(), Some(&spec));
+    }
 }
