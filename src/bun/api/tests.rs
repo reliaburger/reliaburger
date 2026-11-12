@@ -2642,6 +2642,124 @@ async fn send_while_heartbeats_lag(
 // leadership the same way as the submissions above (#1253), but nothing
 // tested them. A settled leader whose followers answer one round late must
 // serve each, not refuse it with "can't confirm it with a quorum".
+//
+// #1393: the app routes (apply, stop, delete) decided with one round too, so
+// the same lag refused them. They now confirm leadership like the job routes.
+#[tokio::test]
+async fn a_settled_leader_applies_stops_and_deletes_an_app_after_a_missed_heartbeat_round() {
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let (nodes, network) = council_and_network(3).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !nodes[0].is_leader().await {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    for node in &nodes {
+        node.hold_elections_until(std::time::Instant::now() + std::time::Duration::from_secs(60));
+    }
+    let app = router_over(nodes[0].clone(), admin);
+    let leader = nodes[0].as_ref();
+
+    for (method, path, body) in [
+        ("POST", "/v1/apply", "[app.web]\nimage = \"x:1\"\n"),
+        ("POST", "/v1/stop/web/default", ""),
+        ("POST", "/v1/delete/web/default", ""),
+    ] {
+        let (status, reply) =
+            send_while_heartbeats_lag(&app, &network, leader, (method, path, body), &admin_key)
+                .await;
+        assert!(status.is_success(), "{method} {path}: {status} {reply}");
+    }
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+// #1393: the test-lease routes, a lease's test token and the build-sign
+// request decided with one round as well, so the same lag refused them.
+#[tokio::test]
+async fn a_settled_leader_serves_test_leases_tokens_and_build_signs_after_a_missed_heartbeat_round()
+{
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let service = "lagging-service-secret";
+    let (nodes, network) = council_and_network(3).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !nodes[0].is_leader().await {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    for node in &nodes {
+        node.hold_elections_until(std::time::Instant::now() + std::time::Duration::from_secs(60));
+    }
+    let (app, shutdown) = setup_with_auth_leases_events_and_council(
+        vec![admin],
+        Some(service.into()),
+        crate::bun::readiness::ReadinessTracker::new(),
+        lease_static_capabilities(),
+        None,
+        None,
+        Some(nodes[0].clone()),
+    )
+    .await;
+    let leader = nodes[0].as_ref();
+
+    let (status, reply) = send_while_heartbeats_lag(
+        &app,
+        &network,
+        leader,
+        ("POST", "/v1/test/leases", r#"{"ttl_seconds":60}"#),
+        &admin_key,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create lease: {reply}");
+    let lease: crate::testkit::lease::TestLease = serde_json::from_str(&reply).unwrap();
+
+    let renew = format!("/v1/test/leases/{}/renew", lease.lease_id);
+    let token = serde_json::json!({
+        "name": format!("{}-ci", lease.namespace),
+        "role": "deployer",
+        "namespaces": [lease.namespace],
+        "lease_id": lease.lease_id,
+    })
+    .to_string();
+    let delete = format!("/v1/test/leases/{}", lease.lease_id);
+    for (method, path, body) in [
+        ("POST", renew.as_str(), r#"{"ttl_seconds":60}"#),
+        ("POST", "/v1/token/create", token.as_str()),
+        ("DELETE", delete.as_str(), ""),
+    ] {
+        let (status, reply) =
+            send_while_heartbeats_lag(&app, &network, leader, (method, path, body), &admin_key)
+                .await;
+        assert!(status.is_success(), "{method} {path}: {status} {reply}");
+    }
+
+    // The build isn't running, so a leader that confirms it leads answers
+    // 409; one that trusted the single round would answer 503.
+    let (status, reply) = send_while_heartbeats_lag(
+        &app,
+        &network,
+        leader,
+        (
+            "POST",
+            "/v1/build/sign",
+            r#"{"build_id":1,"namespace":"default","digests":[]}"#,
+        ),
+        service,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "build sign: {reply}");
+
+    shutdown.cancel();
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn a_settled_leader_serves_batch_apply_replay_disable_and_stop_after_a_missed_heartbeat_round()
  {

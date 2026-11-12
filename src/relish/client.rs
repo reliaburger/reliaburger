@@ -978,6 +978,7 @@ impl BunClient {
             // An explicit endpoint picks the node; the managed context's host
             // forwards still describe how this host reaches the cluster's
             // registry and ingress, when it is the same cluster.
+            // BLOCKING-OK: relish CLI: a one-shot read of the local context before the command does anything long-lived; `relish mcp` calls this off the runtime
             let forwards = super::local_context::default_path()
                 .and_then(|path| super::local_context::LocalContext::load(&path))
                 .ok()
@@ -988,6 +989,7 @@ impl BunClient {
                 None => client,
             };
         }
+        // BLOCKING-OK: relish CLI: a one-shot read of the local context before the command does anything long-lived; `relish mcp` calls this off the runtime
         let context = super::local_context::default_path()
             .and_then(|path| super::local_context::LocalContext::load(&path));
         match context {
@@ -4704,9 +4706,7 @@ mod tests {
     /// localhost:9117 default, and says the port refused the connection.
     #[tokio::test]
     async fn a_refused_connection_names_the_endpoint_and_says_refused() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        drop(listener);
+        let address = crate::refused_address::refused_address();
         let client = BunClient::build(&format!("http://{address}"), None, None);
 
         let error = client.health().await.unwrap_err();

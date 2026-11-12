@@ -1021,9 +1021,11 @@ impl super::Grill for ProcessGrill {
                 entry.state = ContainerState::Stopping;
             }
         } else if entry.adopted.is_some() {
+            // BLOCKING-OK: procfs, answered from memory
             entry.state = if signal_adopted_process(entry, signal).map_err(error)? {
                 // Best effort: a process already exiting can't be verified,
                 // and needs no SIGCONT.
+                // BLOCKING-OK: procfs, answered from memory
                 let _ = signal_adopted_process(entry, resume);
                 ContainerState::Stopping
             } else {
@@ -1079,6 +1081,7 @@ impl super::Grill for ProcessGrill {
                 capture.start_drain();
             }
         } else if entry.adopted.is_some() {
+            // BLOCKING-OK: procfs, answered from memory
             entry.state = if signal_adopted_process(entry, nix::sys::signal::Signal::SIGKILL)
                 .map_err(error)?
             {
@@ -1136,6 +1139,7 @@ impl super::Grill for ProcessGrill {
             // doubles as the zombie reaper — the supervisor polls state
             // regularly, so exited adoptees get waitpid'd here.
             if entry.state != ContainerState::Stopped {
+                // BLOCKING-OK: procfs, answered from memory
                 let (running, exit_code) = poll_adopted_process(adopted.pid, adopted.started_at)
                     .map_err(|error| GrillError::StateUnavailable {
                         instance: instance.clone(),
@@ -1236,10 +1240,12 @@ impl super::Grill for ProcessGrill {
             };
         }
         // A process recorded in an earlier boot is gone, whatever now holds its pid.
+        // BLOCKING-OK: procfs, answered from memory
         if !records::from_this_boot(record) {
             return Ok(false);
         }
         let (running, _) =
+            // BLOCKING-OK: procfs, answered from memory
             poll_adopted_process(record.pid, record.pid_started_at).map_err(|error| {
                 GrillError::StateUnavailable {
                     instance: instance.clone(),

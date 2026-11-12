@@ -420,6 +420,52 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         })
     }
 
+    /// [`Self::oci_spec_with_secrets`] on a blocking thread. Building the
+    /// spec writes each inline config file and creates the identity mount
+    /// directory with `std::fs`, and decrypts secrets, so on a runtime
+    /// worker it would hold that worker, and the loop if it is queued
+    /// there, for as long as the disk takes (#1860).
+    #[allow(clippy::too_many_arguments)]
+    async fn oci_spec_off_runtime(
+        app_name: &str,
+        namespace: &str,
+        spec: &AppSpec,
+        instance_id: &str,
+        host_port: Option<u16>,
+        cgroup_str: &str,
+        volumes_dir: &std::path::Path,
+        netns_path: Option<String>,
+        identities: Vec<age::x25519::Identity>,
+    ) -> Result<crate::grill::oci::OciSpec, BunError> {
+        let (app, namespace, spec, instance_id, cgroup_str, volumes_dir) = (
+            app_name.to_string(),
+            namespace.to_string(),
+            spec.clone(),
+            instance_id.to_string(),
+            cgroup_str.to_string(),
+            volumes_dir.to_path_buf(),
+        );
+        // LOOP-INLINE: the container is built from this spec, so its launch waits for it; the writes run on a blocking thread, not the loop's worker
+        tokio::task::spawn_blocking(move || {
+            Self::oci_spec_with_secrets(
+                &app,
+                &namespace,
+                &spec,
+                &instance_id,
+                host_port,
+                &cgroup_str,
+                Some(&volumes_dir),
+                netns_path.as_deref(),
+                identities,
+            )
+        })
+        .await
+        .map_err(|error| BunError::DeployFailed {
+            app_name: app_name.to_string(),
+            reason: format!("building the container spec stopped: {error}"),
+        })?
+    }
+
     /// Fast pre-create bookkeeping for a fresh instance (the loop side of the
     /// former `drive_instance_startup`): transition to Preparing, prepare
     /// managed volumes and the identity dir, and build the OCI spec. The
@@ -478,17 +524,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // Mount the host paths the policy approves now, resolved (#797).
         // LOOP-INLINE: the container is built from the approved paths; symlinks resolve on a blocking thread, and an app with none does no I/O
         let spec = self.supervisor.approve_host_paths(app_name, spec).await?;
-        let oci_spec = Self::oci_spec_with_secrets(
+        let oci_spec = Self::oci_spec_off_runtime(
             app_name,
             namespace,
             &spec,
             &instance_id.0,
             host_port,
             &cgroup_str,
-            Some(&self.volumes_dir),
-            netns_path.as_deref(),
+            &self.volumes_dir,
+            netns_path,
             identities,
-        )?;
+        )
+        .await?;
 
         Ok(PreparedInstance {
             oci_spec,
@@ -692,17 +739,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // path check as well as the resolution of what to mount (#797).
         // LOOP-INLINE: the container is built from the approved paths; symlinks resolve on a blocking thread, and an app with none does no I/O
         let spec = self.supervisor.approve_host_paths(app_name, spec).await?;
-        let oci_spec = Self::oci_spec_with_secrets(
+        let oci_spec = Self::oci_spec_off_runtime(
             app_name,
             namespace,
             &spec,
             &instance_id.0,
             host_port,
             &cgroup_path.to_string_lossy(),
-            Some(&self.volumes_dir),
+            &self.volumes_dir,
             None,
             identities,
-        )?;
+        )
+        .await?;
         let owner = self
             .supervisor
             .get_instance_mut(instance_id)

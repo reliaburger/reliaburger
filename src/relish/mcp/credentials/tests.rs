@@ -329,9 +329,7 @@ async fn a_cluster_that_refuses_token_creation_is_a_clear_error_and_stores_nothi
 async fn an_unreachable_cluster_is_an_error_too() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("mcp-token.json");
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    drop(listener);
+    let address = crate::refused_address::refused_address();
     let admin = BunClient::new_with_token(&format!("http://{address}"), Some(ADMIN));
     let error = obtain(&path, &scope(None), &admin, now(), None)
         .await
@@ -391,9 +389,7 @@ async fn the_cluster_says_whether_it_still_accepts_a_token() {
     let admin = cluster.client(ADMIN);
     assert_eq!(accepted(&admin, "rbrg_minted_7").await, Some(true));
     assert_eq!(accepted(&admin, "rbrg_revoked").await, Some(false));
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    drop(listener);
+    let address = crate::refused_address::refused_address();
     let nowhere = BunClient::new_with_token(&format!("http://{address}"), Some(ADMIN));
     assert_eq!(accepted(&nowhere, "rbrg_minted_7").await, None, "can't say");
 }

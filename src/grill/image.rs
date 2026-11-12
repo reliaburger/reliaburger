@@ -2909,12 +2909,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// A loopback address nothing listens on: any request to it is refused.
-    fn unreachable_registry() -> String {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap().to_string()
-    }
-
     /// `fixture`'s image under another registry host, and a mirror map
     /// sending that host to `mirror`.
     fn mirrored(fixture: &RegistryFixture, origin: &str, mirror: &str) -> (String, ImageMirrors) {
@@ -2973,8 +2967,9 @@ mod tests {
     #[tokio::test]
     async fn a_mirror_serves_digest_pinned_pulls_without_the_origin() {
         let mirror = start_registry_fixture().await;
-        let (reference, mirrors) =
-            mirrored(&mirror, &unreachable_registry(), registry_host(&mirror));
+        // The origin refuses every request (#1844).
+        let origin = crate::refused_address::refused_address();
+        let (reference, mirrors) = mirrored(&mirror, &origin.to_string(), registry_host(&mirror));
         let tmp = tempfile::tempdir().unwrap();
         let store = ImageStore::new(tmp.path().to_path_buf()).with_mirrors(mirrors);
         let rootfs = store.pull_and_unpack(&reference).await.unwrap().rootfs;
@@ -3036,8 +3031,8 @@ mod tests {
     async fn pull_through_reads_digest_pinned_images_from_a_loopback_mirror() {
         use crate::pickle::upstream::{OciUpstream, UpstreamRegistry};
         let mirror = start_registry_fixture().await;
-        let (reference, mirrors) =
-            mirrored(&mirror, &unreachable_registry(), registry_host(&mirror));
+        let origin = crate::refused_address::refused_address();
+        let (reference, mirrors) = mirrored(&mirror, &origin.to_string(), registry_host(&mirror));
         // The HTTPS client still reaches a loopback mirror over plain HTTP.
         let upstream = OciUpstream::new(Default::default()).with_mirrors(mirrors);
         let reference = ImageReference::parse(&reference).unwrap();

@@ -850,9 +850,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unreachable_cluster_is_an_unreachable_failure_not_an_empty_answer() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        drop(listener);
+        let url = crate::refused_address::refused_url();
         let rendered = run_with(
             &args("payments"),
             &BunClient::new(&url),
