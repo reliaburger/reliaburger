@@ -41,7 +41,12 @@ for `zstd` `^0.13.0`, which 0.13.4 satisfies, so this is one command:
 cargo update -p zstd@0.13.3 --precise 0.13.4
 ```
 
-It moved those two packages and nothing else. Both still link `zstd-sys`
+It moved those two packages, and one thing it didn't report. Re-resolving
+the graph also pointed `tempfile` 3.27.0's `getrandom` edge from 0.4.3 to
+0.3.4. Both are in the lockfile, and `tempfile` accepts `>=0.3.0, <0.5`, so
+Cargo is free to pick either. We put main's 0.4.3 back by hand, and
+`cargo metadata --locked` accepts the result, so the only versions that
+change are zstd and zstd-safe. Both still link `zstd-sys`
 2.1.2 (libzstd 1.5.7), which `Cargo.lock` holds once, so the compressor
 underneath is the same code, and zstd frames are a stable format. Log and
 metric Parquet written before the change reads back the same. No `CURRENT`
@@ -110,7 +115,7 @@ date until someone reviews the list again.
 `make audit` passes with the two remaining exceptions against RustSec database
 commit `fd6f39814c4d3c359fdbe223d0280dec4933f78f` (1,458 advisories), across
 741 locked packages. The lockfile's SHA-256 is
-`41a77fb6725fcf15729f7b59ef9a807a2d5adab85132837ad83e27ea8f0a9ebe`.
+`ee099237fe7029bc8b0d8fc16687614f3b806271045764977f19d86a443d3f2f`.
 
 ## Reproduce the review
 
