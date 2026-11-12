@@ -1169,13 +1169,8 @@ mod tests {
             "set RELIABURGER_RUNC_TESTS=1 after installing runc"
         );
         let root = tempfile::tempdir().unwrap();
-        let owner = std::env::var_os("RELIABURGER_BUN_BINARY")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                // Unit tests run from target/<profile>/deps; Bun is built beside it.
-                let executable = std::env::current_exe().unwrap();
-                executable.parent().unwrap().parent().unwrap().join("bun")
-            });
+        let owner =
+            crate::testkit::bun_binary::bun_binary().unwrap_or_else(|error| panic!("{error}"));
         let grill = crate::grill::runc::RuncGrill::new(
             root.path().join("bundles"),
             crate::grill::ImageStore::new(root.path().join("images")),

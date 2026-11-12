@@ -51,7 +51,8 @@ section "Reliaburger Kubernetes Migration Demo"
 # Build
 cmd "building relish"
 cargo build --bin relish --manifest-path "${REPO_DIR}/Cargo.toml" --quiet
-RELISH="${REPO_DIR}/target/debug/relish"
+# Cargo's target directory: CARGO_TARGET_DIR if set, as for parallel agents (#1859).
+RELISH="${CARGO_TARGET_DIR:-${REPO_DIR}/target}/debug/relish"
 
 # -----------------------------------------------------------------------
 # Example 1: Web app with Service and Ingress

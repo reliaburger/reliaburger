@@ -65,13 +65,23 @@ disclaims responsibility (`posix_spawn` with
 [Chapter 14](book/14-changing-the-tyres.md#the-deadline-was-timing-macos-not-the-candidate).
 
 The same rule holds for every target that builds before its tests. `make
-test-linux` needs `target/debug/bun` with the `ebpf` feature
+test-linux` needs `debug/bun` with the `ebpf` feature
 (`RELIABURGER_BUN_BINARY` names it), so it first runs `cargo test --no-run
 --features ebpf`, the build nextest's `--features ebpf` will ask for. It used
 to run `cargo build --features ebpf --bin bun`, so on a fresh target nextest
 compiled the library, every proc macro and `bun` a second time, and replaced
 the `bun` the step had built. On a Mac the two builds took 710 s; now they take 327 s
 ([#904](https://github.com/reliaburger/reliaburger/issues/904)).
+
+That `bun` is in cargo's target directory: `$CARGO_TARGET_DIR` if it's set,
+otherwise `target/` in the checkout. The Makefile's `TARGET_DIR` says so, and
+the demo scripts do the same. `make test-linux` used to name
+`target/debug/bun` in the checkout. Under an out-of-tree `CARGO_TARGET_DIR`
+that file doesn't exist, every runtime command failed with ENOENT in about
+30 ms, and the run looked like a burst of flaky runc failures. Now a test whose
+`RELIABURGER_BUN_BINARY` names a missing file fails at once, naming the path
+(`testkit::bun_binary`,
+[#1859](https://github.com/reliaburger/reliaburger/issues/1859)).
 A pre-build is `cargo test --no-run` with exactly the build flags of the test
 run that follows it (`--features`, `--release` and the like); selection flags
 such as `-E` don't matter, since nextest builds every test target anyway.
