@@ -1,0 +1,46 @@
+
+ -------------------------------------------------------------------------------------------------------------------------------------------
+  Task                  |   Runtime ms  | Switches | Avg delay ms    | Max delay ms    | Max delay start           | Max delay end          |
+ -------------------------------------------------------------------------------------------------------------------------------------------
+  busybox:(79789)       |   6930.147 ms |   110586 | avg:   0.150 ms | max:   8.406 ms | max start:   213.304394 s | max end:   213.312801 s
+  helper:(29)           |   2953.192 ms |   397824 | avg:   0.118 ms | max:   5.297 ms | max start:   213.304275 s | max end:   213.309572 s
+  ksoftirqd/3:36        |     56.926 ms |     1328 | avg:   0.012 ms | max:   3.982 ms | max start:   209.740099 s | max end:   209.744082 s
+  tokio-rt-worker:(72)  |   2542.802 ms |   112811 | avg:   0.037 ms | max:   1.892 ms | max start:   210.308757 s | max end:   210.310649 s
+  exe:(28)              |    115.702 ms |    14032 | avg:   0.020 ms | max:   1.580 ms | max start:   211.310642 s | max end:   211.312223 s
+  rcu_preempt:17        |     11.631 ms |     3007 | avg:   0.010 ms | max:   1.508 ms | max start:   210.308963 s | max end:   210.310471 s
+  kworker/u8:3-fl:320   |      0.935 ms |       76 | avg:   0.036 ms | max:   1.297 ms | max start:   210.297671 s | max end:   210.298967 s
+  kworker/2:1-eve:78    |     28.271 ms |    11448 | avg:   0.007 ms | max:   1.045 ms | max start:   212.414553 s | max end:   212.415598 s
+  ksoftirqd/2:30        |     77.459 ms |     1232 | avg:   0.011 ms | max:   1.033 ms | max start:   214.693103 s | max end:   214.694136 s
+  lima-guestagent:(7)   |     10.210 ms |      272 | avg:   0.023 ms | max:   0.717 ms | max start:   210.487428 s | max end:   210.488145 s
+  kworker/3:2-eve:170   |     22.819 ms |     8598 | avg:   0.007 ms | max:   0.598 ms | max start:   214.308225 s | max end:   214.308823 s
+  rb-bun:(4)            |     13.802 ms |       31 | avg:   0.087 ms | max:   0.577 ms | max start:   210.300064 s | max end:   210.300641 s
+  containerd:(4)        |      1.798 ms |      184 | avg:   0.018 ms | max:   0.542 ms | max start:   213.450453 s | max end:   213.450995 s
+  kworker/1:1-eve:77    |     26.775 ms |    11179 | avg:   0.006 ms | max:   0.533 ms | max start:   213.717317 s | max end:   213.717849 s
+  kworker/0:0-eve:8     |     24.166 ms |    10258 | avg:   0.006 ms | max:   0.498 ms | max start:   213.885305 s | max end:   213.885802 s
+  jbd2/vda1-8:229       |      2.951 ms |      254 | avg:   0.019 ms | max:   0.484 ms | max start:   210.300119 s | max end:   210.300603 s
+  ksoftirqd/0:16        |     63.387 ms |     1364 | avg:   0.008 ms | max:   0.464 ms | max start:   210.883848 s | max end:   210.884312 s
+  perf:(2)              |     76.680 ms |       22 | avg:   0.039 ms | max:   0.451 ms | max start:   214.618848 s | max end:   214.619299 s
+  ksoftirqd/1:24        |     72.473 ms |     1220 | avg:   0.009 ms | max:   0.446 ms | max start:   210.479933 s | max end:   210.480379 s
+  sleep:2274078         |      0.351 ms |        2 | avg:   0.213 ms | max:   0.424 ms | max start:   209.740834 s | max end:   209.741258 s
+  rb-relish:1894547     |      2.053 ms |       77 | avg:   0.019 ms | max:   0.380 ms | max start:   209.801703 s | max end:   209.802084 s
+  kworker/u8:0-ev:11    |      2.619 ms |      158 | avg:   0.021 ms | max:   0.277 ms | max start:   212.505295 s | max end:   212.505572 s
+  vmstat:1894546        |      0.363 ms |        7 | avg:   0.075 ms | max:   0.268 ms | max start:   210.631373 s | max end:   210.631641 s
+  in:imklog:771         |      0.017 ms |        1 | avg:   0.138 ms | max:   0.138 ms | max start:   209.773070 s | max end:   209.773208 s
+  kcompactd0:46         |      0.033 ms |       10 | avg:   0.013 ms | max:   0.094 ms | max start:   212.471527 s | max end:   212.471621 s
+  systemd-journal:302   |      0.121 ms |        2 | avg:   0.047 ms | max:   0.084 ms | max start:   209.773072 s | max end:   209.773156 s
+  hwrng:146             |      0.014 ms |        2 | avg:   0.042 ms | max:   0.082 ms | max start:   209.936037 s | max end:   209.936120 s
+  kworker/0:1H-kb:61    |      1.319 ms |      242 | avg:   0.003 ms | max:   0.079 ms | max start:   209.936039 s | max end:   209.936118 s
+  rootlesskit:(3)       |      0.184 ms |       12 | avg:   0.021 ms | max:   0.060 ms | max start:   212.468545 s | max end:   212.468606 s
+  migration/3:35        |     24.156 ms |     6684 | avg:   0.001 ms | max:   0.043 ms | max start:   212.048980 s | max end:   212.049023 s
+  migration/2:29        |     27.909 ms |     7557 | avg:   0.001 ms | max:   0.041 ms | max start:   212.048977 s | max end:   212.049018 s
+  migration/1:23        |     28.018 ms |     7609 | avg:   0.001 ms | max:   0.016 ms | max start:   211.952629 s | max end:   211.952645 s
+  migration/0:18        |     23.937 ms |     6510 | avg:   0.001 ms | max:   0.010 ms | max start:   211.317925 s | max end:   211.317935 s
+  multipathd:(2)        |      0.207 ms |       10 | avg:   0.005 ms | max:   0.009 ms | max start:   209.772162 s | max end:   209.772171 s
+  kworker/1:1H-kb:111   |      0.157 ms |       23 | avg:   0.002 ms | max:   0.005 ms | max start:   213.401346 s | max end:   213.401351 s
+  kworker/2:1H-kb:130   |      0.072 ms |       10 | avg:   0.002 ms | max:   0.004 ms | max start:   211.297364 s | max end:   211.297368 s
+  gmain:(2)             |      0.045 ms |        2 | avg:   0.003 ms | max:   0.003 ms | max start:   212.051944 s | max end:   212.051947 s
+  kworker/3:1H-kb:129   |      0.033 ms |        3 | avg:   0.002 ms | max:   0.003 ms | max start:   212.298935 s | max end:   212.298937 s
+ -----------------------------------------------------------------------------------------------------------------
+  TOTAL:                |  13143.734 ms |   714647 |
+ ---------------------------------------------------
+

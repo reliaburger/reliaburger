@@ -1,0 +1,441 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="524" viewBox="0 0 1400 524" font-family="monospace" font-size="11">
+<rect width="100%" height="100%" fill="#fbfbf6"/>
+<text x="700.0" y="20" text-anchor="middle" font-size="15">v0.2.8: host jobs, helpers off-CPU</text>
+<text x="10" y="40" font-size="11">total 141,471,464 us; frames under 0.2% hidden; hover for detail</text>
+<g><title>all (141,471,464 us, 100.00%)</title><rect x="10.0" y="498" width="1379.5" height="15" fill="rgb(254,101,73)" rx="1"/>
+<text x="12.0" y="510">all</text>
+</g>
+<g><title>helper (141,471,464 us, 100.00%)</title><rect x="10.0" y="482" width="1379.5" height="15" fill="rgb(219,139,43)" rx="1"/>
+<text x="12.0" y="494">helper</text>
+</g>
+<g><title>state=D (38,054,724 us, 26.90%)</title><rect x="10.0" y="466" width="370.7" height="15" fill="rgb(250,85,47)" rx="1"/>
+<text x="12.0" y="478">state=D</text>
+</g>
+<g><title>[helper] (38,054,724 us, 26.90%)</title><rect x="10.0" y="450" width="370.7" height="15" fill="rgb(249,155,49)" rx="1"/>
+<text x="12.0" y="462">[helper]</text>
+</g>
+<g><title>[helper] (38,054,724 us, 26.90%)</title><rect x="10.0" y="434" width="370.7" height="15" fill="rgb(249,155,49)" rx="1"/>
+<text x="12.0" y="446">[helper]</text>
+</g>
+<g><title>[helper] (38,054,724 us, 26.90%)</title><rect x="10.0" y="418" width="370.7" height="15" fill="rgb(249,155,49)" rx="1"/>
+<text x="12.0" y="430">[helper]</text>
+</g>
+<g><title>[helper] (38,054,724 us, 26.90%)</title><rect x="10.0" y="402" width="370.7" height="15" fill="rgb(249,155,49)" rx="1"/>
+<text x="12.0" y="414">[helper]</text>
+</g>
+<g><title>[helper] (38,053,114 us, 26.90%)</title><rect x="10.0" y="386" width="370.7" height="15" fill="rgb(249,155,49)" rx="1"/>
+<text x="12.0" y="398">[helper]</text>
+</g>
+<g><title>el0t_64_sync (38,053,114 us, 26.90%)</title><rect x="10.0" y="370" width="370.7" height="15" fill="rgb(235,98,63)" rx="1"/>
+<text x="12.0" y="382">el0t_64_sync</text>
+</g>
+<g><title>el0t_64_sync_handler (38,053,114 us, 26.90%)</title><rect x="10.0" y="354" width="370.7" height="15" fill="rgb(220,85,42)" rx="1"/>
+<text x="12.0" y="366">el0t_64_sync_handler</text>
+</g>
+<g><title>el0_svc (38,053,114 us, 26.90%)</title><rect x="10.0" y="338" width="370.7" height="15" fill="rgb(215,151,76)" rx="1"/>
+<text x="12.0" y="350">el0_svc</text>
+</g>
+<g><title>do_el0_svc (38,053,114 us, 26.90%)</title><rect x="10.0" y="322" width="370.7" height="15" fill="rgb(218,174,40)" rx="1"/>
+<text x="12.0" y="334">do_el0_svc</text>
+</g>
+<g><title>el0_svc_common.constprop.0 (38,053,114 us, 26.90%)</title><rect x="10.0" y="306" width="370.7" height="15" fill="rgb(230,117,62)" rx="1"/>
+<text x="12.0" y="318">el0_svc_common.constprop.0</text>
+</g>
+<g><title>invoke_syscall (38,053,114 us, 26.90%)</title><rect x="10.0" y="290" width="370.7" height="15" fill="rgb(247,138,71)" rx="1"/>
+<text x="12.0" y="302">invoke_syscall</text>
+</g>
+<g><title>__arm64_sys_clone3 (38,053,114 us, 26.90%)</title><rect x="10.0" y="274" width="370.7" height="15" fill="rgb(205,187,74)" rx="1"/>
+<text x="12.0" y="286">__arm64_sys_clone3</text>
+</g>
+<g><title>__do_sys_clone3 (38,053,114 us, 26.90%)</title><rect x="10.0" y="258" width="370.7" height="15" fill="rgb(232,151,69)" rx="1"/>
+<text x="12.0" y="270">__do_sys_clone3</text>
+</g>
+<g><title>kernel_clone (38,053,114 us, 26.90%)</title><rect x="10.0" y="242" width="370.7" height="15" fill="rgb(210,146,59)" rx="1"/>
+<text x="12.0" y="254">kernel_clone</text>
+</g>
+<g><title>wait_for_completion_state (37,930,967 us, 26.81%)</title><rect x="11.2" y="226" width="369.5" height="15" fill="rgb(242,159,67)" rx="1"/>
+<text x="13.2" y="238">wait_for_completion_state</text>
+</g>
+<g><title>schedule_timeout (37,930,967 us, 26.81%)</title><rect x="11.2" y="210" width="369.5" height="15" fill="rgb(224,186,49)" rx="1"/>
+<text x="13.2" y="222">schedule_timeout</text>
+</g>
+<g><title>schedule (37,930,967 us, 26.81%)</title><rect x="11.2" y="194" width="369.5" height="15" fill="rgb(208,127,57)" rx="1"/>
+<text x="13.2" y="206">schedule</text>
+</g>
+<g><title>__schedule (37,930,967 us, 26.81%)</title><rect x="11.2" y="178" width="369.5" height="15" fill="rgb(209,168,45)" rx="1"/>
+<text x="13.2" y="190">__schedule</text>
+</g>
+<g><title>__schedule (37,930,967 us, 26.81%)</title><rect x="11.2" y="162" width="369.5" height="15" fill="rgb(209,168,45)" rx="1"/>
+<text x="13.2" y="174">__schedule</text>
+</g>
+<g><title>state=R (14,100,971 us, 9.97%)</title><rect x="381.2" y="466" width="137.0" height="15" fill="rgb(233,184,66)" rx="1"/>
+<text x="383.2" y="478">state=R</text>
+</g>
+<g><title>[helper] (14,100,971 us, 9.97%)</title><rect x="381.2" y="450" width="137.0" height="15" fill="rgb(249,155,49)" rx="1"/>
+<text x="383.2" y="462">[helper]</text>
+</g>
+<g><title>[helper] (14,090,133 us, 9.96%)</title><rect x="381.2" y="434" width="136.9" height="15" fill="rgb(249,155,49)" rx="1"/>
+<text x="383.2" y="446">[helper]</text>
+</g>
+<g><title>[helper] (14,090,133 us, 9.96%)</title><rect x="381.2" y="418" width="136.9" height="15" fill="rgb(249,155,49)" rx="1"/>
+<text x="383.2" y="430">[helper]</text>
+</g>
+<g><title>[helper] (13,894,919 us, 9.82%)</title><rect x="381.2" y="402" width="135.0" height="15" fill="rgb(249,155,49)" rx="1"/>
+<text x="383.2" y="414">[helper]</text>
+</g>
+<g><title>[helper] (4,749,092 us, 3.36%)</title><rect x="381.2" y="386" width="45.8" height="15" fill="rgb(249,155,49)" rx="1"/>
+<text x="383.2" y="398">[help..</text>
+</g>
+<g><title>[helper] (2,692,647 us, 1.90%)</title><rect x="381.2" y="370" width="25.8" height="15" fill="rgb(249,155,49)" rx="1"/>
+<text x="383.2" y="382">[..</text>
+</g>
+<g><title>[helper] (2,227,461 us, 1.57%)</title><rect x="381.2" y="354" width="21.2" height="15" fill="rgb(249,155,49)" rx="1"/>
+<text x="383.2" y="366">[..</text>
+</g>
+<g><title>[helper] (1,022,623 us, 0.72%)</title><rect x="381.2" y="338" width="9.5" height="15" fill="rgb(249,155,49)" rx="1"/>
+</g>
+<g><title>el0t_64_sync (768,676 us, 0.54%)</title><rect x="383.7" y="322" width="7.0" height="15" fill="rgb(235,98,63)" rx="1"/>
+</g>
+<g><title>el0t_64_sync_handler (768,676 us, 0.54%)</title><rect x="383.7" y="306" width="7.0" height="15" fill="rgb(220,85,42)" rx="1"/>
+</g>
+<g><title>el0_svc (768,676 us, 0.54%)</title><rect x="383.7" y="290" width="7.0" height="15" fill="rgb(215,151,76)" rx="1"/>
+</g>
+<g><title>do_notify_resume (717,173 us, 0.51%)</title><rect x="384.2" y="274" width="6.5" height="15" fill="rgb(231,197,74)" rx="1"/>
+</g>
+<g><title>schedule (717,173 us, 0.51%)</title><rect x="384.2" y="258" width="6.5" height="15" fill="rgb(208,127,57)" rx="1"/>
+</g>
+<g><title>__schedule (717,173 us, 0.51%)</title><rect x="384.2" y="242" width="6.5" height="15" fill="rgb(209,168,45)" rx="1"/>
+</g>
+<g><title>__schedule (717,173 us, 0.51%)</title><rect x="384.2" y="226" width="6.5" height="15" fill="rgb(209,168,45)" rx="1"/>
+</g>
+<g><title>el0t_64_sync (1,199,440 us, 0.85%)</title><rect x="391.2" y="338" width="11.2" height="15" fill="rgb(235,98,63)" rx="1"/>
+</g>
+<g><title>el0t_64_sync_handler (1,199,440 us, 0.85%)</title><rect x="391.2" y="322" width="11.2" height="15" fill="rgb(220,85,42)" rx="1"/>
+</g>
+<g><title>el0_svc (1,199,440 us, 0.85%)</title><rect x="391.2" y="306" width="11.2" height="15" fill="rgb(215,151,76)" rx="1"/>
+</g>
+<g><title>do_notify_resume (1,166,964 us, 0.82%)</title><rect x="391.6" y="290" width="10.9" height="15" fill="rgb(231,197,74)" rx="1"/>
+</g>
+<g><title>schedule (1,166,964 us, 0.82%)</title><rect x="391.6" y="274" width="10.9" height="15" fill="rgb(208,127,57)" rx="1"/>
+</g>
+<g><title>__schedule (1,166,964 us, 0.82%)</title><rect x="391.6" y="258" width="10.9" height="15" fill="rgb(209,168,45)" rx="1"/>
+</g>
+<g><title>__schedule (1,166,964 us, 0.82%)</title><rect x="391.6" y="242" width="10.9" height="15" fill="rgb(209,168,45)" rx="1"/>
+</g>
+<g><title>el0t_64_sync (455,698 us, 0.32%)</title><rect x="403.0" y="354" width="3.9" height="15" fill="rgb(235,98,63)" rx="1"/>
+</g>
+<g><title>el0t_64_sync_handler (455,698 us, 0.32%)</title><rect x="403.0" y="338" width="3.9" height="15" fill="rgb(220,85,42)" rx="1"/>
+</g>
+<g><title>el0_svc (455,698 us, 0.32%)</title><rect x="403.0" y="322" width="3.9" height="15" fill="rgb(215,151,76)" rx="1"/>
+</g>
+<g><title>do_notify_resume (417,453 us, 0.30%)</title><rect x="403.4" y="306" width="3.6" height="15" fill="rgb(231,197,74)" rx="1"/>
+</g>
+<g><title>schedule (417,444 us, 0.30%)</title><rect x="403.4" y="290" width="3.6" height="15" fill="rgb(208,127,57)" rx="1"/>
+</g>
+<g><title>__schedule (417,444 us, 0.30%)</title><rect x="403.4" y="274" width="3.6" height="15" fill="rgb(209,168,45)" rx="1"/>
+</g>
+<g><title>__schedule (417,444 us, 0.30%)</title><rect x="403.4" y="258" width="3.6" height="15" fill="rgb(209,168,45)" rx="1"/>
+</g>
+<g><title>el0t_64_sync (1,978,044 us, 1.40%)</title><rect x="407.9" y="370" width="18.8" height="15" fill="rgb(235,98,63)" rx="1"/>
+</g>
+<g><title>el0t_64_sync_handler (1,978,044 us, 1.40%)</title><rect x="407.9" y="354" width="18.8" height="15" fill="rgb(220,85,42)" rx="1"/>
+</g>
+<g><title>el0_svc (1,978,044 us, 1.40%)</title><rect x="407.9" y="338" width="18.8" height="15" fill="rgb(215,151,76)" rx="1"/>
+</g>
+<g><title>do_el0_svc (1,938,022 us, 1.37%)</title><rect x="407.9" y="322" width="18.4" height="15" fill="rgb(218,174,40)" rx="1"/>
+</g>
+<g><title>el0_svc_common.constprop.0 (1,938,022 us, 1.37%)</title><rect x="407.9" y="306" width="18.4" height="15" fill="rgb(230,117,62)" rx="1"/>
+</g>
+<g><title>invoke_syscall (1,938,022 us, 1.37%)</title><rect x="407.9" y="290" width="18.4" height="15" fill="rgb(247,138,71)" rx="1"/>
+</g>
+<g><title>__arm64_sys_clone3 (1,938,022 us, 1.37%)</title><rect x="407.9" y="274" width="18.4" height="15" fill="rgb(205,187,74)" rx="1"/>
+</g>
+<g><title>__do_sys_clone3 (1,938,022 us, 1.37%)</title><rect x="407.9" y="258" width="18.4" height="15" fill="rgb(232,151,69)" rx="1"/>
+</g>
+<g><title>kernel_clone (1,938,022 us, 1.37%)</title><rect x="407.9" y="242" width="18.4" height="15" fill="rgb(210,146,59)" rx="1"/>
+</g>
+<g><title>wait_for_completion_state (1,709,314 us, 1.21%)</title><rect x="410.1" y="226" width="16.2" height="15" fill="rgb(242,159,67)" rx="1"/>
+</g>
+<g><title>dynamic_might_resched (1,694,501 us, 1.20%)</title><rect x="410.1" y="210" width="16.0" height="15" fill="rgb(214,126,55)" rx="1"/>
+</g>
+<g><title>preempt_schedule_common (1,694,501 us, 1.20%)</title><rect x="410.1" y="194" width="16.0" height="15" fill="rgb(252,86,45)" rx="1"/>
+</g>
+<g><title>__schedule (1,694,501 us, 1.20%)</title><rect x="410.1" y="178" width="16.0" height="15" fill="rgb(209,168,45)" rx="1"/>
+</g>
+<g><title>__schedule (1,694,501 us, 1.20%)</title><rect x="410.1" y="162" width="16.0" height="15" fill="rgb(209,168,45)" rx="1"/>
+</g>
+<g><title>el0t_64_sync (9,102,281 us, 6.43%)</title><rect x="428.0" y="386" width="88.3" height="15" fill="rgb(235,98,63)" rx="1"/>
+<text x="430.0" y="398">el0t_64_sync</text>
+</g>
+<g><title>el0t_64_sync_handler (9,102,281 us, 6.43%)</title><rect x="428.0" y="370" width="88.3" height="15" fill="rgb(220,85,42)" rx="1"/>
+<text x="430.0" y="382">el0t_64_syn..</text>
+</g>
+<g><title>el0_svc (9,102,281 us, 6.43%)</title><rect x="428.0" y="354" width="88.3" height="15" fill="rgb(215,151,76)" rx="1"/>
+<text x="430.0" y="366">el0_svc</text>
+</g>
+<g><title>do_el0_svc (8,731,599 us, 6.17%)</title><rect x="428.0" y="338" width="84.7" height="15" fill="rgb(218,174,40)" rx="1"/>
+<text x="430.0" y="350">do_el0_svc</text>
+</g>
+<g><title>el0_svc_common.constprop.0 (8,731,599 us, 6.17%)</title><rect x="428.0" y="322" width="84.7" height="15" fill="rgb(230,117,62)" rx="1"/>
+<text x="430.0" y="334">el0_svc_co..</text>
+</g>
+<g><title>invoke_syscall (8,731,599 us, 6.17%)</title><rect x="428.0" y="306" width="84.7" height="15" fill="rgb(247,138,71)" rx="1"/>
+<text x="430.0" y="318">invoke_sys..</text>
+</g>
+<g><title>__arm64_sys_execve (8,710,642 us, 6.16%)</title><rect x="428.0" y="290" width="84.5" height="15" fill="rgb(222,144,54)" rx="1"/>
+<text x="430.0" y="302">__arm64_sy..</text>
+</g>
+<g><title>do_execveat_common.isra.0 (8,709,836 us, 6.16%)</title><rect x="428.0" y="274" width="84.5" height="15" fill="rgb(249,81,47)" rx="1"/>
+<text x="430.0" y="286">do_execvea..</text>
+</g>
+<g><title>bprm_execve (8,489,644 us, 6.00%)</title><rect x="428.6" y="258" width="82.3" height="15" fill="rgb(229,182,48)" rx="1"/>
+<text x="430.6" y="270">bprm_execve</text>
+</g>
+<g><title>bprm_execve.part.0 (8,484,062 us, 6.00%)</title><rect x="428.6" y="242" width="82.3" height="15" fill="rgb(222,131,43)" rx="1"/>
+<text x="430.6" y="254">bprm_execv..</text>
+</g>
+<g><title>exec_binprm (2,451,599 us, 1.73%)</title><rect x="428.6" y="226" width="23.4" height="15" fill="rgb(244,88,65)" rx="1"/>
+<text x="430.6" y="238">e..</text>
+</g>
+<g><title>search_binary_handler (2,451,599 us, 1.73%)</title><rect x="428.6" y="210" width="23.4" height="15" fill="rgb(252,124,47)" rx="1"/>
+<text x="430.6" y="222">s..</text>
+</g>
+<g><title>kernel_read (395,496 us, 0.28%)</title><rect x="428.6" y="194" width="3.4" height="15" fill="rgb(231,119,52)" rx="1"/>
+</g>
+<g><title>__kernel_read (395,496 us, 0.28%)</title><rect x="428.6" y="178" width="3.4" height="15" fill="rgb(238,162,60)" rx="1"/>
+</g>
+<g><title>ext4_file_read_iter (395,496 us, 0.28%)</title><rect x="428.6" y="162" width="3.4" height="15" fill="rgb(242,123,57)" rx="1"/>
+</g>
+<g><title>generic_file_read_iter (395,496 us, 0.28%)</title><rect x="428.6" y="146" width="3.4" height="15" fill="rgb(250,175,45)" rx="1"/>
+</g>
+<g><title>filemap_read (395,496 us, 0.28%)</title><rect x="428.6" y="130" width="3.4" height="15" fill="rgb(225,131,70)" rx="1"/>
+</g>
+<g><title>dynamic_cond_resched (395,496 us, 0.28%)</title><rect x="428.6" y="114" width="3.4" height="15" fill="rgb(242,95,43)" rx="1"/>
+</g>
+<g><title>preempt_schedule_common (395,496 us, 0.28%)</title><rect x="428.6" y="98" width="3.4" height="15" fill="rgb(252,86,45)" rx="1"/>
+</g>
+<g><title>__schedule (395,496 us, 0.28%)</title><rect x="428.6" y="82" width="3.4" height="15" fill="rgb(209,168,45)" rx="1"/>
+</g>
+<g><title>__schedule (395,496 us, 0.28%)</title><rect x="428.6" y="66" width="3.4" height="15" fill="rgb(209,168,45)" rx="1"/>
+</g>
+<g><title>load_elf_binary (2,056,103 us, 1.45%)</title><rect x="432.4" y="194" width="19.6" height="15" fill="rgb(252,131,68)" rx="1"/>
+<text x="434.4" y="206">l..</text>
+</g>
+<g><title>begin_new_exec (2,020,113 us, 1.43%)</title><rect x="432.4" y="178" width="19.2" height="15" fill="rgb(236,90,73)" rx="1"/>
+</g>
+<g><title>exec_mmap (2,004,562 us, 1.42%)</title><rect x="432.4" y="162" width="19.1" height="15" fill="rgb(226,155,64)" rx="1"/>
+</g>
+<g><title>down_write_killable (1,992,498 us, 1.41%)</title><rect x="432.4" y="146" width="18.9" height="15" fill="rgb(248,142,68)" rx="1"/>
+</g>
+<g><title>dynamic_might_resched (1,992,498 us, 1.41%)</title><rect x="432.4" y="130" width="18.9" height="15" fill="rgb(214,126,55)" rx="1"/>
+</g>
+<g><title>preempt_schedule_common (1,992,498 us, 1.41%)</title><rect x="432.4" y="114" width="18.9" height="15" fill="rgb(252,86,45)" rx="1"/>
+</g>
+<g><title>__schedule (1,992,498 us, 1.41%)</title><rect x="432.4" y="98" width="18.9" height="15" fill="rgb(209,168,45)" rx="1"/>
+</g>
+<g><title>__schedule (1,992,498 us, 1.41%)</title><rect x="432.4" y="82" width="18.9" height="15" fill="rgb(209,168,45)" rx="1"/>
+</g>
+<g><title>sched_exec (6,032,463 us, 4.26%)</title><rect x="452.5" y="226" width="58.3" height="15" fill="rgb(232,132,63)" rx="1"/>
+<text x="454.5" y="238">sched_..</text>
+</g>
+<g><title>stop_one_cpu (6,032,463 us, 4.26%)</title><rect x="452.5" y="210" width="58.3" height="15" fill="rgb(214,168,45)" rx="1"/>
+<text x="454.5" y="222">stop_o..</text>
+</g>
+<g><title>dynamic_cond_resched (6,032,463 us, 4.26%)</title><rect x="452.5" y="194" width="58.3" height="15" fill="rgb(242,95,43)" rx="1"/>
+<text x="454.5" y="206">dynami..</text>
+</g>
+<g><title>preempt_schedule_common (6,032,463 us, 4.26%)</title><rect x="452.5" y="178" width="58.3" height="15" fill="rgb(252,86,45)" rx="1"/>
+<text x="454.5" y="190">preemp..</text>
+</g>
+<g><title>__schedule (6,032,463 us, 4.26%)</title><rect x="452.5" y="162" width="58.3" height="15" fill="rgb(209,168,45)" rx="1"/>
+<text x="454.5" y="174">__sche..</text>
+</g>
+<g><title>__schedule (6,032,463 us, 4.26%)</title><rect x="452.5" y="146" width="58.3" height="15" fill="rgb(209,168,45)" rx="1"/>
+<text x="454.5" y="158">__sche..</text>
+</g>
+<g><title>do_notify_resume (370,682 us, 0.26%)</title><rect x="513.1" y="338" width="3.1" height="15" fill="rgb(231,197,74)" rx="1"/>
+</g>
+<g><title>schedule (370,682 us, 0.26%)</title><rect x="513.1" y="322" width="3.1" height="15" fill="rgb(208,127,57)" rx="1"/>
+</g>
+<g><title>__schedule (370,682 us, 0.26%)</title><rect x="513.1" y="306" width="3.1" height="15" fill="rgb(209,168,45)" rx="1"/>
+</g>
+<g><title>__schedule (370,682 us, 0.26%)</title><rect x="513.1" y="290" width="3.1" height="15" fill="rgb(209,168,45)" rx="1"/>
+</g>
+<g><title>state=S (89,315,769 us, 63.13%)</title><rect x="518.8" y="466" width="870.7" height="15" fill="rgb(207,105,74)" rx="1"/>
+<text x="520.8" y="478">state=S</text>
+</g>
+<g><title>[helper] (89,315,769 us, 63.13%)</title><rect x="518.8" y="450" width="870.7" height="15" fill="rgb(249,155,49)" rx="1"/>
+<text x="520.8" y="462">[helper]</text>
+</g>
+<g><title>[helper] (89,315,769 us, 63.13%)</title><rect x="518.8" y="434" width="870.7" height="15" fill="rgb(249,155,49)" rx="1"/>
+<text x="520.8" y="446">[helper]</text>
+</g>
+<g><title>[helper] (89,315,769 us, 63.13%)</title><rect x="518.8" y="418" width="870.7" height="15" fill="rgb(249,155,49)" rx="1"/>
+<text x="520.8" y="430">[helper]</text>
+</g>
+<g><title>[helper] (89,315,769 us, 63.13%)</title><rect x="518.8" y="402" width="870.7" height="15" fill="rgb(249,155,49)" rx="1"/>
+<text x="520.8" y="414">[helper]</text>
+</g>
+<g><title>[helper] (89,315,769 us, 63.13%)</title><rect x="518.8" y="386" width="870.7" height="15" fill="rgb(249,155,49)" rx="1"/>
+<text x="520.8" y="398">[helper]</text>
+</g>
+<g><title>[helper] (89,315,769 us, 63.13%)</title><rect x="518.8" y="370" width="870.7" height="15" fill="rgb(249,155,49)" rx="1"/>
+<text x="520.8" y="382">[helper]</text>
+</g>
+<g><title>[helper] (70,791,885 us, 50.04%)</title><rect x="518.8" y="354" width="690.0" height="15" fill="rgb(249,155,49)" rx="1"/>
+<text x="520.8" y="366">[helper]</text>
+</g>
+<g><title>[helper] (10,146,799 us, 7.17%)</title><rect x="518.8" y="338" width="98.5" height="15" fill="rgb(249,155,49)" rx="1"/>
+<text x="520.8" y="350">[helper]</text>
+</g>
+<g><title>el0t_64_sync (10,146,799 us, 7.17%)</title><rect x="518.8" y="322" width="98.5" height="15" fill="rgb(235,98,63)" rx="1"/>
+<text x="520.8" y="334">el0t_64_sync</text>
+</g>
+<g><title>el0t_64_sync_handler (10,146,799 us, 7.17%)</title><rect x="518.8" y="306" width="98.5" height="15" fill="rgb(220,85,42)" rx="1"/>
+<text x="520.8" y="318">el0t_64_sync..</text>
+</g>
+<g><title>el0_svc (10,146,799 us, 7.17%)</title><rect x="518.8" y="290" width="98.5" height="15" fill="rgb(215,151,76)" rx="1"/>
+<text x="520.8" y="302">el0_svc</text>
+</g>
+<g><title>do_el0_svc (10,146,799 us, 7.17%)</title><rect x="518.8" y="274" width="98.5" height="15" fill="rgb(218,174,40)" rx="1"/>
+<text x="520.8" y="286">do_el0_svc</text>
+</g>
+<g><title>el0_svc_common.constprop.0 (10,146,799 us, 7.17%)</title><rect x="518.8" y="258" width="98.5" height="15" fill="rgb(230,117,62)" rx="1"/>
+<text x="520.8" y="270">el0_svc_comm..</text>
+</g>
+<g><title>invoke_syscall (10,146,799 us, 7.17%)</title><rect x="518.8" y="242" width="98.5" height="15" fill="rgb(247,138,71)" rx="1"/>
+<text x="520.8" y="254">invoke_syscall</text>
+</g>
+<g><title>__arm64_sys_read (10,146,799 us, 7.17%)</title><rect x="518.8" y="226" width="98.5" height="15" fill="rgb(240,102,78)" rx="1"/>
+<text x="520.8" y="238">__arm64_sys_..</text>
+</g>
+<g><title>ksys_read (10,146,799 us, 7.17%)</title><rect x="518.8" y="210" width="98.5" height="15" fill="rgb(249,157,57)" rx="1"/>
+<text x="520.8" y="222">ksys_read</text>
+</g>
+<g><title>vfs_read (10,146,799 us, 7.17%)</title><rect x="518.8" y="194" width="98.5" height="15" fill="rgb(240,90,55)" rx="1"/>
+<text x="520.8" y="206">vfs_read</text>
+</g>
+<g><title>sock_read_iter (10,146,799 us, 7.17%)</title><rect x="518.8" y="178" width="98.5" height="15" fill="rgb(254,104,74)" rx="1"/>
+<text x="520.8" y="190">sock_read_iter</text>
+</g>
+<g><title>sock_recvmsg (10,146,799 us, 7.17%)</title><rect x="518.8" y="162" width="98.5" height="15" fill="rgb(223,199,77)" rx="1"/>
+<text x="520.8" y="174">sock_recvmsg</text>
+</g>
+<g><title>unix_stream_recvmsg (10,146,799 us, 7.17%)</title><rect x="518.8" y="146" width="98.5" height="15" fill="rgb(238,117,49)" rx="1"/>
+<text x="520.8" y="158">unix_stream_..</text>
+</g>
+<g><title>unix_stream_read_generic (10,146,799 us, 7.17%)</title><rect x="518.8" y="130" width="98.5" height="15" fill="rgb(225,108,41)" rx="1"/>
+<text x="520.8" y="142">unix_stream_..</text>
+</g>
+<g><title>unix_stream_data_wait (10,146,799 us, 7.17%)</title><rect x="518.8" y="114" width="98.5" height="15" fill="rgb(236,93,53)" rx="1"/>
+<text x="520.8" y="126">unix_stream_..</text>
+</g>
+<g><title>schedule_timeout (10,146,799 us, 7.17%)</title><rect x="518.8" y="98" width="98.5" height="15" fill="rgb(224,186,49)" rx="1"/>
+<text x="520.8" y="110">schedule_tim..</text>
+</g>
+<g><title>schedule (10,146,799 us, 7.17%)</title><rect x="518.8" y="82" width="98.5" height="15" fill="rgb(208,127,57)" rx="1"/>
+<text x="520.8" y="94">schedule</text>
+</g>
+<g><title>__schedule (10,146,799 us, 7.17%)</title><rect x="518.8" y="66" width="98.5" height="15" fill="rgb(209,168,45)" rx="1"/>
+<text x="520.8" y="78">__schedule</text>
+</g>
+<g><title>__schedule (10,146,799 us, 7.17%)</title><rect x="518.8" y="50" width="98.5" height="15" fill="rgb(209,168,45)" rx="1"/>
+<text x="520.8" y="62">__schedule</text>
+</g>
+<g><title>el0t_64_sync (60,645,086 us, 42.87%)</title><rect x="617.7" y="338" width="591.1" height="15" fill="rgb(235,98,63)" rx="1"/>
+<text x="619.7" y="350">el0t_64_sync</text>
+</g>
+<g><title>el0t_64_sync_handler (60,645,086 us, 42.87%)</title><rect x="617.7" y="322" width="591.1" height="15" fill="rgb(220,85,42)" rx="1"/>
+<text x="619.7" y="334">el0t_64_sync_handler</text>
+</g>
+<g><title>el0_svc (60,645,086 us, 42.87%)</title><rect x="617.7" y="306" width="591.1" height="15" fill="rgb(215,151,76)" rx="1"/>
+<text x="619.7" y="318">el0_svc</text>
+</g>
+<g><title>do_el0_svc (60,645,086 us, 42.87%)</title><rect x="617.7" y="290" width="591.1" height="15" fill="rgb(218,174,40)" rx="1"/>
+<text x="619.7" y="302">do_el0_svc</text>
+</g>
+<g><title>el0_svc_common.constprop.0 (60,645,086 us, 42.87%)</title><rect x="617.7" y="274" width="591.1" height="15" fill="rgb(230,117,62)" rx="1"/>
+<text x="619.7" y="286">el0_svc_common.constprop.0</text>
+</g>
+<g><title>invoke_syscall (60,645,086 us, 42.87%)</title><rect x="617.7" y="258" width="591.1" height="15" fill="rgb(247,138,71)" rx="1"/>
+<text x="619.7" y="270">invoke_syscall</text>
+</g>
+<g><title>__arm64_sys_read (60,645,086 us, 42.87%)</title><rect x="617.7" y="242" width="591.1" height="15" fill="rgb(240,102,78)" rx="1"/>
+<text x="619.7" y="254">__arm64_sys_read</text>
+</g>
+<g><title>ksys_read (60,645,086 us, 42.87%)</title><rect x="617.7" y="226" width="591.1" height="15" fill="rgb(249,157,57)" rx="1"/>
+<text x="619.7" y="238">ksys_read</text>
+</g>
+<g><title>vfs_read (60,645,086 us, 42.87%)</title><rect x="617.7" y="210" width="591.1" height="15" fill="rgb(240,90,55)" rx="1"/>
+<text x="619.7" y="222">vfs_read</text>
+</g>
+<g><title>sock_read_iter (60,645,086 us, 42.87%)</title><rect x="617.7" y="194" width="591.1" height="15" fill="rgb(254,104,74)" rx="1"/>
+<text x="619.7" y="206">sock_read_iter</text>
+</g>
+<g><title>sock_recvmsg (60,645,086 us, 42.87%)</title><rect x="617.7" y="178" width="591.1" height="15" fill="rgb(223,199,77)" rx="1"/>
+<text x="619.7" y="190">sock_recvmsg</text>
+</g>
+<g><title>unix_stream_recvmsg (60,645,086 us, 42.87%)</title><rect x="617.7" y="162" width="591.1" height="15" fill="rgb(238,117,49)" rx="1"/>
+<text x="619.7" y="174">unix_stream_recvmsg</text>
+</g>
+<g><title>unix_stream_read_generic (60,645,086 us, 42.87%)</title><rect x="617.7" y="146" width="591.1" height="15" fill="rgb(225,108,41)" rx="1"/>
+<text x="619.7" y="158">unix_stream_read_generic</text>
+</g>
+<g><title>unix_stream_data_wait (60,645,086 us, 42.87%)</title><rect x="617.7" y="130" width="591.1" height="15" fill="rgb(236,93,53)" rx="1"/>
+<text x="619.7" y="142">unix_stream_data_wait</text>
+</g>
+<g><title>schedule_timeout (60,645,086 us, 42.87%)</title><rect x="617.7" y="114" width="591.1" height="15" fill="rgb(224,186,49)" rx="1"/>
+<text x="619.7" y="126">schedule_timeout</text>
+</g>
+<g><title>schedule (60,645,086 us, 42.87%)</title><rect x="617.7" y="98" width="591.1" height="15" fill="rgb(208,127,57)" rx="1"/>
+<text x="619.7" y="110">schedule</text>
+</g>
+<g><title>__schedule (60,645,086 us, 42.87%)</title><rect x="617.7" y="82" width="591.1" height="15" fill="rgb(209,168,45)" rx="1"/>
+<text x="619.7" y="94">__schedule</text>
+</g>
+<g><title>__schedule (60,645,086 us, 42.87%)</title><rect x="617.7" y="66" width="591.1" height="15" fill="rgb(209,168,45)" rx="1"/>
+<text x="619.7" y="78">__schedule</text>
+</g>
+<g><title>el0t_64_sync (18,523,884 us, 13.09%)</title><rect x="1209.3" y="354" width="180.2" height="15" fill="rgb(235,98,63)" rx="1"/>
+<text x="1211.3" y="366">el0t_64_sync</text>
+</g>
+<g><title>el0t_64_sync_handler (18,523,884 us, 13.09%)</title><rect x="1209.3" y="338" width="180.2" height="15" fill="rgb(220,85,42)" rx="1"/>
+<text x="1211.3" y="350">el0t_64_sync_handler</text>
+</g>
+<g><title>el0_svc (18,523,884 us, 13.09%)</title><rect x="1209.3" y="322" width="180.2" height="15" fill="rgb(215,151,76)" rx="1"/>
+<text x="1211.3" y="334">el0_svc</text>
+</g>
+<g><title>do_el0_svc (18,523,884 us, 13.09%)</title><rect x="1209.3" y="306" width="180.2" height="15" fill="rgb(218,174,40)" rx="1"/>
+<text x="1211.3" y="318">do_el0_svc</text>
+</g>
+<g><title>el0_svc_common.constprop.0 (18,523,884 us, 13.09%)</title><rect x="1209.3" y="290" width="180.2" height="15" fill="rgb(230,117,62)" rx="1"/>
+<text x="1211.3" y="302">el0_svc_common.constprop.0</text>
+</g>
+<g><title>invoke_syscall (18,523,884 us, 13.09%)</title><rect x="1209.3" y="274" width="180.2" height="15" fill="rgb(247,138,71)" rx="1"/>
+<text x="1211.3" y="286">invoke_syscall</text>
+</g>
+<g><title>__arm64_sys_ppoll (18,523,884 us, 13.09%)</title><rect x="1209.3" y="258" width="180.2" height="15" fill="rgb(207,142,76)" rx="1"/>
+<text x="1211.3" y="270">__arm64_sys_ppoll</text>
+</g>
+<g><title>do_sys_poll (18,523,884 us, 13.09%)</title><rect x="1209.3" y="242" width="180.2" height="15" fill="rgb(218,162,52)" rx="1"/>
+<text x="1211.3" y="254">do_sys_poll</text>
+</g>
+<g><title>do_poll.constprop.0 (18,523,884 us, 13.09%)</title><rect x="1209.3" y="226" width="180.2" height="15" fill="rgb(226,154,74)" rx="1"/>
+<text x="1211.3" y="238">do_poll.constprop.0</text>
+</g>
+<g><title>schedule_hrtimeout_range (18,523,884 us, 13.09%)</title><rect x="1209.3" y="210" width="180.2" height="15" fill="rgb(209,134,70)" rx="1"/>
+<text x="1211.3" y="222">schedule_hrtimeout_range</text>
+</g>
+<g><title>schedule_hrtimeout_range_clock (18,523,884 us, 13.09%)</title><rect x="1209.3" y="194" width="180.2" height="15" fill="rgb(238,118,42)" rx="1"/>
+<text x="1211.3" y="206">schedule_hrtimeout_range_..</text>
+</g>
+<g><title>schedule (18,523,884 us, 13.09%)</title><rect x="1209.3" y="178" width="180.2" height="15" fill="rgb(208,127,57)" rx="1"/>
+<text x="1211.3" y="190">schedule</text>
+</g>
+<g><title>__schedule (18,523,884 us, 13.09%)</title><rect x="1209.3" y="162" width="180.2" height="15" fill="rgb(209,168,45)" rx="1"/>
+<text x="1211.3" y="174">__schedule</text>
+</g>
+<g><title>__schedule (18,523,884 us, 13.09%)</title><rect x="1209.3" y="146" width="180.2" height="15" fill="rgb(209,168,45)" rx="1"/>
+<text x="1211.3" y="158">__schedule</text>
+</g>
+</svg>

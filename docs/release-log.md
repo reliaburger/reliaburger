@@ -62,6 +62,10 @@ jobs a second against the 1,390 target, about 0.2.7's rate, job-start p99
 384 MiB. It ships with no known issue the gate found. 0.2.8 moves the
 cluster formats to protocol 58 and state format 74, so a 0.2.7 cluster
 starts afresh ([upgrading from 0.2.7](releasing.md#upgrading-from-027)).
+The release profile ran on the published binaries after the tag: in the
+same VM, 0.2.8 ran host jobs at the same rate as 0.2.7 and shared containers
+1.3% faster, with the same start lag and an idle Bun at 1.5% of a core
+([record](qualification/2026-11-12-v0.2.8-profile/README.md)).
 
 ## 0.2.7: built for humans and their agents
 
