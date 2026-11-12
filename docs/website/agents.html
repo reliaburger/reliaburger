@@ -602,8 +602,10 @@ test that isn't <code>#[ignore]</code>. The gated suites (<code>make test-cluste
 <code>test-linux</code>, <code>test-slow</code> and the rest) are ignored there, and <code>data.not_run</code>
 says so in every answer. A failing test or a compile error
 is still an answer, with exit code 0: <code>data.ok</code> is <code>false</code>, and <code>failures</code> or
-<code>errors</code> says why, with each test's output or each error's file and line. So
-read <code>data.ok</code>, not the exit code, to tell whether the suite passed.</p>
+<code>errors</code> says why, with each test's output or each error's file and line.
+When cargo stops before anything compiles (a dependency it can't resolve, a
+lock file out of date), its own error is in <code>errors</code>, with no file. <code>patch build</code> answers the same way. So read <code>data.ok</code>, not the exit code, to tell
+whether the suite passed.</p>
 <p>An unchanged workspace answers <code>ok: true</code>. It carries what the tests read,
 the fuzz corpus and the bench report they use as a baseline included. The
 repository checks in <code>tests/suite</code> (the website, the workflows, the issue
