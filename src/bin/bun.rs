@@ -1288,6 +1288,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // With `[metrics] object_store_url` set, metrics are persisted to and
     // queried from an object store (s3://, gs://, file://) so they survive node
     // loss (H8); otherwise Parquet stays in the local metrics dir.
+    // BLOCKING-OK: startup, before the agent loop or any workload runs
     let archive_owner = configured_metrics_archive_owner(&config)?;
     let mayo_store = Arc::new(RwLock::new(
         MayoStore::open_for_node(

@@ -1106,6 +1106,7 @@ impl RuncGrill {
             // adoption record naming another process is stale: retire the
             // generation so the instance starts again. Refusing here took
             // the agent, and every workload on the node, down with it (#607).
+            // BLOCKING-OK: procfs, answered from memory
             if adoption.pid != launcher_pid || !crate::grill::records::is_live(&adoption) {
                 eprintln!(
                     "runc: {id}: adoption record names another process than the running launcher {launcher_pid}; retiring the generation"

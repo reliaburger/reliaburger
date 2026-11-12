@@ -895,6 +895,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
             FaultReversal::CpuMax(saved) => {
                 for (_id, cgroup, value) in self.rejoin_cgroups(rule, saved) {
+                    // BLOCKING-OK: cgroupfs, an in-memory kernel interface: no disk behind it
                     if let Err(e) = crate::smoker::resource::restore_cpu_max(&cgroup, &value) {
                         eprintln!(
                             "smoker: restore cpu.max on {} failed: {e}",
@@ -905,6 +906,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
             FaultReversal::MemoryHigh(saved) => {
                 for (_id, cgroup, value) in self.rejoin_cgroups(rule, saved) {
+                    // BLOCKING-OK: cgroupfs, an in-memory kernel interface: no disk behind it
                     if let Err(e) = crate::smoker::resource::restore_memory_high(&cgroup, &value) {
                         eprintln!(
                             "smoker: restore memory.high on {} failed: {e}",
@@ -917,6 +919,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 for (path, device) in instances {
                     let cgroup = std::path::PathBuf::from(path);
                     if let Err(e) =
+                        // BLOCKING-OK: cgroupfs, an in-memory kernel interface: no disk behind it
                         crate::smoker::resource::remove_disk_io_throttle(&cgroup, device)
                     {
                         eprintln!("smoker: lift io.max on {path} failed: {e}");
@@ -976,12 +979,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if let Some(cgroup) = self.workload_cgroup_dir(spec)
             && cgroup.is_dir()
         {
+            // BLOCKING-OK: cgroupfs, an in-memory kernel interface: no disk behind it
             if let Err(error) = crate::smoker::resource::restore_recorded_limits(
                 &cgroup,
                 spec.linux.resources.as_ref(),
             ) {
                 eprintln!("smoker: restoring {id}'s recorded limits failed: {error}");
             }
+            // BLOCKING-OK: cgroupfs, an in-memory kernel interface: no disk behind it
             if let Err(error) = crate::smoker::process::resume_cgroup_processes(&cgroup) {
                 eprintln!("smoker: resuming {id}'s processes failed: {error}");
             }

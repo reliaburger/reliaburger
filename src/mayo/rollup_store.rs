@@ -16,8 +16,10 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::prelude::*;
 
 use super::rollup::{MetricsQueryRow, NodeRollup, OwnedRollupRow};
-use super::scan::{ParquetSource, ParquetTable, list_local, streaming_session};
-use super::store::{dir_has_parquet, next_flush_counter, write_batch_parquet};
+use super::scan::{
+    ParquetSource, ParquetTable, list_local, list_local_off_runtime, streaming_session,
+};
+use super::store::{dir_has_parquet_off_runtime, next_flush_counter, write_batch_parquet};
 use super::types::MayoError;
 
 /// Cap on un-flushed buffered rollup rows. A council member receives rollups
@@ -131,7 +133,7 @@ impl RollupStore {
     /// idempotency horizon once at startup closes that gap. Call after `new()`
     /// and before the first ingest.
     pub async fn hydrate_seen_windows(&mut self) -> Result<(), MayoError> {
-        if !dir_has_parquet(&self.data_dir) {
+        if !dir_has_parquet_off_runtime(&self.data_dir).await {
             return Ok(());
         }
         // Only windows within the horizon of the newest one are kept, so only
@@ -306,7 +308,7 @@ impl RollupStore {
         let ctx = streaming_session();
         let table = ParquetTable::new(
             Arc::new(rollup_schema()),
-            list_local(&self.data_dir)?,
+            list_local_off_runtime(&self.data_dir).await?,
             self.buffer_to_batch()?,
             None,
             "rollup",

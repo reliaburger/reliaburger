@@ -621,7 +621,7 @@ pub(super) async fn cluster_apply(
 ) -> Response {
     // Follower? Forward to the leader rather than half-failing. The leader
     // binds images: a follower's binder (or lack of one) plays no part.
-    if !council.is_leader().await {
+    if !crate::bun::leadership::leads(&council).await {
         let leader_url = match leader_api_url(&state, &council, &caller_headers).await {
             Ok(url) => url,
             Err(refusal) => return refusal.into_response(),
@@ -731,7 +731,7 @@ pub(super) async fn cluster_apply(
         };
         let app_id = crate::meat::AppId::new(name, spec.namespace.as_deref().unwrap_or("default"));
         let outcome = admission.check(&app_id, spec).await;
-        if !council.is_leader().await {
+        if !crate::bun::leadership::leads(&council).await {
             return unavailable_response("leadership changed during capacity admission".into());
         }
         let active_lease = council.desired_state().await.test_leases;

@@ -1003,6 +1003,7 @@ impl super::Grill for MockGrill {
             .lock()
             .unwrap()
             .get(instance)
+            // BLOCKING-OK: cgroupfs, an in-memory kernel interface: no disk behind it
             .and_then(|path| crate::sesame::egress::cgroup_id_of_path(path)))
     }
 
