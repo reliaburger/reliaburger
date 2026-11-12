@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::cargo::{CompilerError, Messages, SHOWN_ERRORS, last_lines, parse_messages};
+use super::cargo::{
+    CompilerError, Messages, SHOWN_ERRORS, cargo_error, last_lines, parse_messages,
+};
 use super::git::snapshot;
 use super::workspace::{BuildRun, State, changed_files};
 use super::{HostOs, PATCH_DIR, Tools, answer_of, open, patch_command, shown, step};
@@ -223,6 +225,20 @@ pub(super) async fn run_cargo(
     deadline: Duration,
 ) -> Result<CargoRun, AgentError> {
     let started = Instant::now();
+    // Cargo runs inside the workspace, so a relative `dir` (`./fix`, as
+    // `patch init` suggests) would be read from there a second time, as
+    // `./fix/fix` (#1882). Made absolute against our own working directory
+    // first, it means the same thing to both.
+    let dir = std::path::absolute(dir).map_err(|error| {
+        AgentError::new(
+            ErrorCode::Usage,
+            format!(
+                "couldn't read the workspace path {}: {error}",
+                dir.display()
+            ),
+        )
+    })?;
+    let dir = dir.as_path();
     let mut command = tokio::process::Command::new(&tools.cargo);
     command
         // The subcommand, then our options, then the caller's, which may end
@@ -568,6 +584,8 @@ pub(super) async fn build(
                 .collect();
             if data.errors.is_empty() {
                 data.cargo_output = Some(last_lines(&result.stderr, 20));
+                data.errors.push(cargo_error(&result.stderr));
+                data.total_errors = 1;
             }
         }
         data.binaries.extend(result.binaries);
@@ -842,7 +860,16 @@ exit 101
         .await
         .unwrap();
         assert!(!answer.data.ok);
-        assert!(answer.data.errors.is_empty());
+        // `ok: false` always comes with an error to read (#1882).
+        assert_eq!(answer.data.errors.len(), 1, "{:?}", answer.data.errors);
+        assert_eq!(answer.data.total_errors, 1);
+        assert!(
+            answer.data.errors[0]
+                .message
+                .contains("needs to be updated"),
+            "{:?}",
+            answer.data.errors
+        );
         assert!(
             answer
                 .data
@@ -850,6 +877,24 @@ exit 101
                 .unwrap()
                 .contains("needs to be updated")
         );
+    }
+
+    /// `patch init ./fix` suggests `patch build ./fix`, so a relative
+    /// workspace must reach cargo once, not joined onto itself (#1882).
+    #[tokio::test]
+    async fn cargo_finds_a_workspace_named_by_a_relative_path() {
+        let fixture = Fixture::new(CARGO_CHECKS_THE_MANIFEST);
+        let relative = relative_to_cwd(&fixture.dir());
+        assert!(relative.is_relative());
+        let run = run_cargo(
+            &fixture.tools,
+            &relative,
+            &["test"],
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+        assert!(run.success, "{}", run.stderr);
     }
 
     #[tokio::test]

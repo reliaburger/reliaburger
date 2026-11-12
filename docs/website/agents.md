@@ -669,8 +669,11 @@ test that isn't `#[ignore]`. The gated suites (`make test-cluster`,
 `test-linux`, `test-slow` and the rest) are ignored there, and `data.not_run`
 says so in every answer. A failing test or a compile error
 is still an answer, with exit code 0: `data.ok` is `false`, and `failures` or
-`errors` says why, with each test's output or each error's file and line. So
-read `data.ok`, not the exit code, to tell whether the suite passed.
+`errors` says why, with each test's output or each error's file and line.
+When cargo stops before anything compiles (a dependency it can't resolve, a
+lock file out of date), its own error is in `errors`, with no file. `patch
+build` answers the same way. So read `data.ok`, not the exit code, to tell
+whether the suite passed.
 
 An unchanged workspace answers `ok: true`. It carries what the tests read,
 the fuzz corpus and the bench report they use as a baseline included. The

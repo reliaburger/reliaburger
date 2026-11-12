@@ -2979,6 +2979,47 @@ command exits 0 when it answered, and `data` holds the verdict. The fix was
 to make `ok` mean what it says, and to put "read `data.ok`" in the command's
 own help as well as the manual.
 
+### What the review of that fix found
+
+Re-running the gym's debug scenario on the branch turned up three more things
+([#1882](https://github.com/reliaburger/reliaburger/issues/1882)), all older
+than the fix.
+
+The first was the path. `patch init ./fix` prints `patch test ./fix` as its
+next step, and that step failed with "manifest path `./fix/Cargo.toml` does
+not exist". `run_cargo` hands cargo `--manifest-path dir.join("Cargo.toml")`
+and also starts it inside the workspace with `current_dir(dir)`. A relative
+`dir` is then read from inside itself, as `./fix/fix/Cargo.toml`. Every test
+used an absolute temporary directory, so none had ever passed it a relative
+one. Now `run_cargo` makes `dir` absolute first, with `std::path::absolute`.
+Unlike `canonicalize`, it doesn't touch the filesystem or resolve symbolic
+links. It only joins a relative path onto the working directory, which is all
+the fix needs. The new test builds a relative path to the fixture's workspace
+from `..` components, rather than changing the working directory. The working
+directory belongs to the whole process, and `cargo test` runs the other tests
+on threads of that same process.
+
+The second was what that failure looked like: `ok: false`, `failed: 0` and
+`errors: []`. The cause was only in `cargo_output`, a field an agent has no
+reason to read when it's looking for errors. When cargo stops before the
+compiler or a test says anything (a dependency it can't resolve, a lock file
+out of date, a manifest it can't find), `cargo_error` now turns its first
+`error:` line into an entry in `errors`. That entry has no file or line, and
+the end of what cargo printed is its `rendered` text. `ok: false` always comes
+with something to read.
+
+The third was the totals. A whole-suite run reported `filtered_out` as
+31,587, with no filter given. One TLS test in the library runs its own test
+binary four times, with `--exact` and one test's name, to get a fresh process
+each time, and it let each child print to the same stdout. Each child's
+`test result: ok. 1 passed; ... 7870 filtered out` line landed in cargo's
+output among the library's own, and the parser counted all five. The test now
+pipes its child's output and shows it only if the child fails. A test that
+reads the portable suite's sources fails if any other `current_exe()` re-run
+starts its child with `.spawn()` or `.status()` and never sets `.stdout(...)`.
+`own_process.rs` uses `.output()`, which pipes stdout by default, so it was
+never one of them.
+
 ### Unsigned on purpose
 
 Nothing `patch` builds is signed, and nothing in it can sign. Every node

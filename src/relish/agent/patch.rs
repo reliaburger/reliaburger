@@ -368,6 +368,34 @@ pub(crate) mod fixture {
         }
     }
 
+    /// A `cargo` that, like the real one, refuses a `--manifest-path` that
+    /// doesn't exist before it runs anything; otherwise one test passes.
+    pub const CARGO_CHECKS_THE_MANIFEST: &str = r#"
+manifest=""
+previous=""
+for argument in "$@"; do
+  [ "$previous" = --manifest-path ] && manifest="$argument"
+  previous="$argument"
+done
+if [ ! -f "$manifest" ]; then
+  echo "error: manifest path \`$manifest\` does not exist" >&2
+  exit 101
+fi
+echo 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s'
+"#;
+
+    /// `path` relative to this process's working directory, the way a
+    /// person types `./fix`, without changing the working directory, which
+    /// the other tests in the process share.
+    pub fn relative_to_cwd(path: &Path) -> PathBuf {
+        let cwd = std::env::current_dir().unwrap();
+        let mut relative = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            relative.push("..");
+        }
+        relative.join(path.strip_prefix("/").unwrap())
+    }
+
     /// Write an executable shell script.
     pub fn write_script(path: &Path, body: &str) {
         std::fs::write(path, format!("#!/bin/sh\n{body}")).unwrap();
