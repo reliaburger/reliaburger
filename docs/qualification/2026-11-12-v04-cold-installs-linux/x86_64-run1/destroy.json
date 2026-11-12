@@ -1,0 +1,18 @@
+{
+  "cluster": "laptop",
+  "action": "destroy",
+  "nodes": [
+    {
+      "name": "rb-7e5b25951952-1",
+      "result": "removed"
+    },
+    {
+      "name": "rb-7e5b25951952-2",
+      "result": "removed"
+    },
+    {
+      "name": "rb-7e5b25951952-3",
+      "result": "removed"
+    }
+  ]
+}
