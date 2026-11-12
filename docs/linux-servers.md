@@ -140,7 +140,7 @@ relish --version
 ```
 
 Each prints its version and the commit it was built from, such as
-`bun 0.2.8 (TAG-COMMIT)`. Every node should print the same commit.
+`bun 0.2.8 (e423d46)`. Every node should print the same commit.
 
 *(Optional: If building from source instead of using pre-built releases, install
 `build-essential clang llvm libbpf-dev` (the static job executor helpers need a

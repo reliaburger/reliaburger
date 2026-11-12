@@ -5,7 +5,7 @@ laptop, see the [quickstart guide](quickstart.md). For the architectural vision,
 see the [whitepaper](whitepaper.md); for status and what's next, see the
 [roadmap](roadmap.md).
 
-0.2.8 was released on 11 November 2026. Its signed binaries, guest images and
+0.2.8 was released on 12 November 2026. Its signed binaries, guest images and
 installer are on the [GitHub release](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.8),
 and `curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop` installs it
 and builds a laptop cluster; without a flag the installer explains the choices.

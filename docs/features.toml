@@ -32,7 +32,7 @@
 # below (docs/releasing.md, step 10).
 
 release = "0.2.8"
-released = "11 November 2026"
+released = "12 November 2026"
 reviewed = "10 November 2026"
 
 # GitHub milestone numbers, for the links on planned rows.

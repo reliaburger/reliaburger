@@ -13,7 +13,7 @@ a Docker registry, GitOps and chaos testing, in one Rust agent and one CLI.
 And that CLI speaks to your AI agent too.
 <!-- hero:end -->
 
-**Status:** 0.2.8 was released on 11 November 2026. Until 1.0.0, Reliaburger is good enough for home labs and dev clusters, not for production.
+**Status:** 0.2.8 was released on 12 November 2026. Until 1.0.0, Reliaburger is good enough for home labs and dev clusters, not for production.
 
 ## Five minutes, zero to cluster
 
