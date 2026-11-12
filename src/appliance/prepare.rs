@@ -164,6 +164,9 @@ impl std::fmt::Display for Source {
 pub async fn run(paths: &Paths) -> Result<Step, PrepareError> {
     if Disk::read(paths).node_toml {
         say("node.toml is in place");
+        // A power cut can land between writing node.toml and clearing the
+        // claimed seed below, so clear it here too.
+        clear_claimed_seed(paths).await;
         return Ok(Step::Done);
     }
     let mut found = find_seed(paths)?;
@@ -185,11 +188,7 @@ pub async fn run(paths: &Paths) -> Result<Step, PrepareError> {
         match (step, &seed) {
             (Step::Done, _) => {
                 say("node.toml is in place");
-                if let Some(claim_dir) = &paths.claim_dir {
-                    // The claimed seed may hold the master key; its files are
-                    // installed now.
-                    let _ = tokio::fs::remove_file(claim_dir.join("claimed.seed")).await;
-                }
+                clear_claimed_seed(paths).await;
                 if let (Some(Source::Stick { file }), Some(Seed::V1 { config, .. })) =
                     (&source, &seed)
                     && config.role == SeedRole::Create
@@ -388,6 +387,35 @@ fn read_stick(paths: &Paths) -> Option<(Vec<u8>, String)> {
 
 /// Overwrite a create seed on the stick and delete it: it carries the
 /// cluster's master key, which mustn't outlive its job on removable media.
+/// Zero and remove the seed a claim delivered, if there is one: it may
+/// hold the master key, and its files are installed now.
+async fn clear_claimed_seed(paths: &Paths) {
+    let Some(claim_dir) = &paths.claim_dir else {
+        return;
+    };
+    let path = claim_dir.join("claimed.seed");
+    let shown = path.display().to_string();
+    let cleared = tokio::task::spawn_blocking(move || match zero_and_remove(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        outcome => outcome,
+    })
+    .await;
+    if !matches!(cleared, Ok(Ok(()))) {
+        say(&format!("couldn't clear {shown}; remove it by hand"));
+    }
+}
+
+/// Overwrite `path` with zeros, flush them, then remove it: a seed that may
+/// hold the master key shouldn't stay readable in the blocks an unlink
+/// leaves behind.
+fn zero_and_remove(path: &Path) -> std::io::Result<()> {
+    let len = std::fs::metadata(path)?.len();
+    let mut handle = std::fs::OpenOptions::new().write(true).open(path)?;
+    handle.write_all(&vec![0u8; len as usize])?;
+    handle.sync_all()?;
+    std::fs::remove_file(path)
+}
+
 fn wipe_from_stick(paths: &Paths, file: &str) {
     let mount = &paths.stick_mount;
     if !paths.stick_device.exists()
@@ -406,15 +434,7 @@ fn wipe_from_stick(paths: &Paths, file: &str) {
         ));
         return;
     }
-    let path = mount.join(file);
-    let wiped = std::fs::metadata(&path)
-        .and_then(|meta| {
-            let mut handle = std::fs::OpenOptions::new().write(true).open(&path)?;
-            handle.write_all(&vec![0u8; meta.len() as usize])?;
-            handle.sync_all()?;
-            std::fs::remove_file(&path)
-        })
-        .is_ok();
+    let wiped = zero_and_remove(&mount.join(file)).is_ok();
     run_command("sync", &[]);
     run_command("umount", &[&mount.to_string_lossy()]);
     say(&if wiped {
@@ -748,6 +768,73 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600);
         // A second boot changes nothing.
         assert_eq!(run(&paths).await.unwrap(), Step::Done);
+    }
+
+    /// Every byte of the file behind `link` is zero, and there are `len`.
+    fn assert_zeroed(link: &Path, len: usize) {
+        let bytes = std::fs::read(link).unwrap();
+        assert_eq!(bytes.len(), len);
+        assert!(
+            bytes.iter().all(|byte| *byte == 0),
+            "the seed's bytes survived"
+        );
+    }
+
+    #[test]
+    fn a_seed_file_is_zeroed_before_it_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seed");
+        std::fs::write(&path, b"master key bytes").unwrap();
+        // A hard link sees the same blocks after the name is gone.
+        let link = dir.path().join("link");
+        std::fs::hard_link(&path, &link).unwrap();
+        zero_and_remove(&path).unwrap();
+        assert!(!path.exists());
+        assert_zeroed(&link, b"master key bytes".len());
+    }
+
+    fn claimed_create_seed(paths: &Paths) -> (PathBuf, PathBuf, usize) {
+        let toml = "schema = 1\ncluster = \"home\"\nnode = \"home-1\"\nrole = \"create\"\nadvertise = \"10.0.0.5\"\n";
+        let tarball = tarball(&[
+            ("seed.toml", toml.as_bytes()),
+            ("master.key", b"ab"),
+            ("security-bootstrap.json", b"{}"),
+            ("identity/node.crt", b"c"),
+            ("identity/bundle.committed", b""),
+        ]);
+        let claim_dir = paths.claim_dir.clone().unwrap();
+        std::fs::create_dir_all(&claim_dir).unwrap();
+        let seed = claim_dir.join("claimed.seed");
+        std::fs::write(&seed, &tarball).unwrap();
+        let link = claim_dir.join("observer");
+        std::fs::hard_link(&seed, &link).unwrap();
+        (seed, link, tarball.len())
+    }
+
+    #[tokio::test]
+    async fn a_claimed_seed_is_zeroed_once_its_files_are_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut paths = paths(dir.path());
+        paths.claim_dir = Some(dir.path().join("claim"));
+        let (seed, link, len) = claimed_create_seed(&paths);
+        assert_eq!(run(&paths).await.unwrap(), Step::Done);
+        assert!(!seed.exists());
+        assert_zeroed(&link, len);
+    }
+
+    #[tokio::test]
+    async fn a_claimed_seed_a_power_cut_left_behind_is_zeroed_on_the_next_boot() {
+        // node.toml landed but the seed's removal didn't: the next boot
+        // stops at "node.toml is in place", and must still clear the seed.
+        let dir = tempfile::tempdir().unwrap();
+        let mut paths = paths(dir.path());
+        paths.claim_dir = Some(dir.path().join("claim"));
+        let (seed, link, len) = claimed_create_seed(&paths);
+        std::fs::create_dir_all(&paths.config_dir).unwrap();
+        std::fs::write(paths.node_toml(), "[node]\n").unwrap();
+        assert_eq!(run(&paths).await.unwrap(), Step::Done);
+        assert!(!seed.exists());
+        assert_zeroed(&link, len);
     }
 
     #[tokio::test]
