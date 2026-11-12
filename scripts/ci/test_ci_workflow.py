@@ -1013,6 +1013,125 @@ class RetargetTests(unittest.TestCase):
         self.assertIn("github.workflow", group)
 
 
+class V02LoopArchiveTests(unittest.TestCase):
+    """The V02 loops archive only the test binaries the loops run.
+
+    Archiving every test binary took more than the build job's 60 minutes
+    on macos-15 from a cold cache, and the ubuntu-24.04-arm runner was shut
+    down mid-compile in two of four attempts (runs 36114785981 and
+    43174277022). One failed platform skips every loop, since they all need
+    the build job.
+    """
+
+    # A cold macos-15 build of the archived binaries, with room to spare.
+    MIN_BUILD_MINUTES = 90
+
+    def setUp(self):
+        self.text = (WORKFLOWS / "v02-loops.yml").read_text()
+        self.loops = jobs(self.text)
+
+    @staticmethod
+    def make_targets(workflow_jobs):
+        """The make targets the upgrade loop's matrix runs."""
+        matrix = re.search(r"\n        target: \[([^\]]*)\]", workflow_jobs["upgrade"])
+        return [target.strip() for target in matrix.group(1).split(",")]
+
+    def selected_binaries(self, workflow_jobs):
+        """Every test binary a loop's nextest filter names."""
+        text = "\n".join(workflow_jobs[name] for name in ("upgrade", "council", "leases"))
+        names = set(re.findall(r"binary\(([\w-]+)\)", text))
+        matrix = re.search(r"\n        binary: \[([^\]]*)\]", workflow_jobs["council"])
+        names.update(binary.strip() for binary in matrix.group(1).split(","))
+        for target in self.make_targets(workflow_jobs):
+            _, recipe = dry_run(target)
+            names.update(re.findall(r"binary\(([\w-]+)\)", "\n".join(recipe)))
+        names.discard("${{ matrix.binary }}")
+        return names
+
+    def assert_archives_what_the_loops_run(self, workflow_jobs):
+        """No subTest here: the detection test expects the first failure to raise."""
+        build = workflow_jobs["build-tests"]
+        archive = next(step for step in steps(build) if "nextest archive" in step)
+        archived = set(re.findall(r"--test ([\w-]+)", archive))
+        self.assertTrue(archived, "the archive names the test binaries it builds")
+        self.assertEqual(archived, self.selected_binaries(workflow_jobs))
+        self.assertNotIn("--workspace", archive)
+        self.assertNotIn("--lib", archive, "the loops run no library unit tests")
+        limit = re.search(r"\n    timeout-minutes: (\d+)\n", build + "\n")
+        self.assertIsNotNone(limit)
+        self.assertGreaterEqual(int(limit.group(1)), self.MIN_BUILD_MINUTES)
+
+    def test_the_archive_builds_exactly_the_binaries_the_loops_select(self):
+        self.assert_archives_what_the_loops_run(self.loops)
+
+    def test_the_selection_covers_every_loop(self):
+        self.assertEqual(
+            self.selected_binaries(self.loops),
+            {"self_upgrade", "self_upgrade_cluster", "council_disaster_recovery",
+             "cluster_failover", "registry_recovery", "suite",
+             "test_storage"},
+        )
+
+    @staticmethod
+    def named_tests(workflow_jobs):
+        """(binary, test path) for every exact test a lease loop's filter names."""
+        found = []
+        for line in workflow_jobs["leases"].splitlines():
+            filter_line = re.search(r"filter: (.*)$", line)
+            if not filter_line:
+                continue
+            binary = re.search(r"binary\(([\w-]+)\)", filter_line.group(1)).group(1)
+            for test in re.findall(r"test\(=([\w:]+)\)", filter_line.group(1)):
+                found.append((binary, test))
+        return found
+
+    @staticmethod
+    def defines(binary, test):
+        """Whether the binary's source defines the test function."""
+        *modules, function = test.split("::")
+        if binary == "suite":
+            source = REPO / "tests" / "suite" / ("/".join(modules) + ".rs")
+        else:
+            source = REPO / "tests" / f"{binary}.rs"
+        if not source.is_file():
+            return False
+        return re.search(rf"\bfn {re.escape(function)}\s*\(", source.read_text()) is not None
+
+    def test_every_test_a_lease_loop_names_exists(self):
+        # Run 43183887759's job-lease loop selected nothing on every platform:
+        # its test went when node-local jobs were retired (2560765c).
+        named = self.named_tests(self.loops)
+        self.assertTrue(named)
+        for binary, test in named:
+            with self.subTest(binary=binary, test=test):
+                self.assertTrue(self.defines(binary, test), f"{binary} has no test {test}")
+
+    def test_a_filter_naming_a_removed_test_is_detected(self):
+        self.assertFalse(self.defines(
+            "job_recovery", "node_job_lease_reaps_a_surviving_process_after_bun_is_killed"))
+        self.assertFalse(self.defines("suite", "log_export::no_such_test"))
+        self.assertTrue(self.defines(
+            "suite", "log_export::export_persists_and_reloads_the_authoritative_checkpoint"))
+
+    def test_a_missing_extra_or_whole_workspace_archive_is_detected(self):
+        build = self.loops["build-tests"]
+        archive = next(step for step in steps(build) if "nextest archive" in step)
+        changes = [
+            archive.replace(" --test registry_recovery", ""),
+            archive.replace(" --test suite", " --test suite --test oci_crash"),
+            re.sub(r"( --test [\w-]+)+", " --workspace", archive),
+            archive.replace(" --test suite", " --test suite --lib"),
+        ]
+        for changed in changes:
+            altered = dict(self.loops, **{"build-tests": build.replace(archive, changed)})
+            with self.subTest(change=changed), self.assertRaises(AssertionError):
+                self.assert_archives_what_the_loops_run(altered)
+        short = dict(self.loops, **{"build-tests": re.sub(
+            r"\n    timeout-minutes: \d+", "\n    timeout-minutes: 60", build)})
+        with self.assertRaises(AssertionError):
+            self.assert_archives_what_the_loops_run(short)
+
+
 class ApplianceTests(unittest.TestCase):
     """appliance.yml: lab builds carry a next version and a lab channel for
     the Wyse lab, without loosening how a published build is signed."""
