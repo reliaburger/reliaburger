@@ -1751,6 +1751,24 @@ async fn partition_isolates_a_node_for_real() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
+    // Hold the partition until q3 no longer lists its blocked peers either.
+    // A heal that looked those peers up in q3's live membership then found
+    // nobody to unblock, so q3 stayed cut off and the cluster never released
+    // the fault's reservation (#1820, #1835). Healing as soon as q1 noticed
+    // only hit that when a loaded host made detection slow.
+    let isolated = wait_until(Duration::from_secs(60), || {
+        ["q1", "q2"]
+            .iter()
+            .all(|peer| peer_state(&n3, peer).is_none())
+    })
+    .await;
+    assert!(
+        isolated,
+        "q3 still lists its blocked peers; saw q1 {:?}, q2 {:?}",
+        peer_state(&n3, "q1"),
+        peer_state(&n3, "q2")
+    );
+
     // Heal: clear q3's blocklists and it should rejoin and be Alive again.
     n3.client
         .clear_fault(fault.id, Some("q3"), true)
