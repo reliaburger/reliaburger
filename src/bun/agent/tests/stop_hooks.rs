@@ -360,3 +360,88 @@ async fn a_rolling_deploy_runs_the_old_instances_pre_stop_before_retiring_it() {
         "the retired instance's pre_stop must run before its signal: {operations:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A runtime too busy to answer (#1898). A process owner answers a state
+// query "busy" while another operation holds its lock, which on a host
+// flushing hard can last seconds. That isn't an answer about the instance,
+// so the stop asks again until its bound runs out.
+
+/// A mock instance, running, that stops when asked.
+async fn running_mock(id: &InstanceId) -> MockGrill {
+    let grill = MockGrill::new();
+    let policy = StopPolicy {
+        signal: StopSignal::Term,
+        grace: Some(Duration::from_secs(5)),
+        pre_stop: None,
+    };
+    grill.create(id, &workload("true", policy)).await.unwrap();
+    grill.start(id).await.unwrap();
+    grill
+}
+
+#[tokio::test]
+async fn a_busy_runtime_is_asked_again_until_it_reports_the_exit() {
+    let id = InstanceId("default__busy-0".into());
+    let grill = running_mock(&id).await;
+    grill.set_state_unavailable_times(&id, 2);
+    let from = grill.calls().len();
+
+    let stop = InstanceStop::for_policy(None, Duration::from_secs(5));
+    stop_runtime_instance(&grill, &id, &stop, CONFIRMATION)
+        .await
+        .expect("two busy answers then the exit is a confirmed stop");
+
+    let operations = operations_on(&grill, &id, from);
+    assert_eq!(
+        operations.iter().filter(|op| *op == "state").count(),
+        3,
+        "{operations:?}"
+    );
+    assert!(!operations.contains(&"kill".to_string()), "{operations:?}");
+}
+
+#[tokio::test]
+async fn a_runtime_busy_for_good_still_ends_the_stop_within_its_bounds() {
+    let id = InstanceId("default__busy-1".into());
+    let grill = running_mock(&id).await;
+    grill.set_state_unavailable_times(&id, u32::MAX);
+    let grace = Duration::from_millis(300);
+    let confirmation = Duration::from_millis(300);
+
+    let begun = Instant::now();
+    let stop = InstanceStop::for_policy(None, grace);
+    let error = stop_runtime_instance(&grill, &id, &stop, confirmation)
+        .await
+        .expect_err("a stop nobody can confirm isn't a stop");
+    let took = begun.elapsed();
+
+    assert!(
+        matches!(error, BunError::StopUnconfirmed { .. }),
+        "{error:?}"
+    );
+    assert!(
+        grill
+            .calls()
+            .iter()
+            .any(|(op, instance)| op == "kill" && instance == &id),
+        "the grace ran out, so the instance is killed"
+    );
+    assert!(took < Duration::from_secs(3), "{took:?}");
+}
+
+#[tokio::test]
+async fn a_runtime_that_cannot_inspect_the_instance_fails_the_stop_at_once() {
+    let id = InstanceId("default__broken-0".into());
+    let grill = running_mock(&id).await;
+    grill.set_fail_state(true);
+
+    let begun = Instant::now();
+    let stop = InstanceStop::for_policy(None, Duration::from_secs(5));
+    let error = stop_runtime_instance(&grill, &id, &stop, CONFIRMATION)
+        .await
+        .expect_err("an inspection failure isn't a busy owner");
+
+    assert!(matches!(error, BunError::Grill(_)), "{error:?}");
+    assert!(begun.elapsed() < Duration::from_secs(1));
+}

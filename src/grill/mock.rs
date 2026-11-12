@@ -110,6 +110,8 @@ pub struct MockGrill {
     create_image_error: Arc<Mutex<Option<ImageErrorFactory>>>,
     fail_start: Arc<AtomicBool>,
     fail_state: Arc<AtomicBool>,
+    /// State queries still to answer `StateUnavailable`, per instance.
+    state_unavailable: Arc<Mutex<HashMap<InstanceId, u32>>>,
     inspection_failures: Arc<Mutex<std::collections::HashSet<InstanceId>>>,
     exit_code_failures: Arc<Mutex<std::collections::HashSet<InstanceId>>>,
     /// How many times `network_reference` was asked. Kept apart from
@@ -188,6 +190,7 @@ impl Default for MockGrill {
             create_image_error: Arc::default(),
             fail_start: Arc::default(),
             fail_state: Arc::default(),
+            state_unavailable: Arc::default(),
             inspection_failures: Arc::default(),
             exit_code_failures: Arc::default(),
             network_reference_reads: Arc::default(),
@@ -292,6 +295,16 @@ impl MockGrill {
     /// Make runtime state inspection fail without proving absence.
     pub fn set_fail_state(&self, value: bool) {
         self.fail_state.store(value, Ordering::SeqCst);
+    }
+
+    /// Answer the next `times` state queries for `instance` with
+    /// `StateUnavailable`, as a process owner busy with another operation
+    /// does (#1898).
+    pub fn set_state_unavailable_times(&self, instance: &InstanceId, times: u32) {
+        self.state_unavailable
+            .lock()
+            .unwrap()
+            .insert(instance.clone(), times);
     }
 
     /// Fail state inspection only for the named instance.
@@ -911,6 +924,15 @@ impl super::Grill for MockGrill {
             .unwrap()
             .push(("state".to_string(), instance.clone()));
         self.delay(MockCall::State).await;
+        if let Some(left) = self.state_unavailable.lock().unwrap().get_mut(instance)
+            && *left > 0
+        {
+            *left -= 1;
+            return Err(GrillError::StateUnavailable {
+                instance: instance.clone(),
+                reason: "process owner is busy".into(),
+            });
+        }
         if self.fail_state.load(Ordering::SeqCst)
             || self.inspection_failures.lock().unwrap().contains(instance)
         {

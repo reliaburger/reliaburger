@@ -414,6 +414,12 @@ async fn kill_runtime_instance<G: Grill>(
 }
 
 /// Bound the whole observation loop, including a stalled runtime query.
+///
+/// A runtime that can't say yet (`StateUnavailable`: a process owner busy
+/// with another operation, a runtime command that timed out) is asked again,
+/// like one that says the instance still runs. Any other error ends the
+/// observation at once. So does `wait` running out, whichever answer came
+/// last (#1898).
 async fn observe_runtime_exit<G: Grill>(
     grill: &G,
     id: &InstanceId,
@@ -421,8 +427,10 @@ async fn observe_runtime_exit<G: Grill>(
 ) -> Result<bool, BunError> {
     let observation = async {
         loop {
-            if grill.state(id).await? == ContainerState::Stopped {
-                return Ok::<(), BunError>(());
+            match grill.state(id).await {
+                Ok(ContainerState::Stopped) => return Ok::<(), BunError>(()),
+                Ok(_) | Err(crate::grill::GrillError::StateUnavailable { .. }) => {}
+                Err(error) => return Err(error.into()),
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
