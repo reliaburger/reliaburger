@@ -64,7 +64,7 @@ Each is one stacked PR, unless it grows too big to review. Estimates are enginee
 ### W3. relish for bare metal (~1.5 weeks), [#403](https://github.com/reliaburger/reliaburger/issues/403)
 
 - `relish cluster create --bare-metal`: the cluster's PKI on the laptop, in a bare-metal context (generalising `LocalContext`), with the master-key backup prompt. (7 October 2026: it becomes a real prompt, with `--yes` to skip it.)
-- `relish image download | write | seed`: fetch and verify a channel release, write a disk or stick, write seeds. These replace `seed-fleet.sh`, `node-toml.py` and `make-seed-stick.sh`.
+- `relish image download | write | seed`: fetch and verify a channel release, write a disk or stick, write seeds. These replace `seed-fleet.sh` and `node-toml.py`. `image/lab/make-seed-stick.sh` stays, as lab tooling: it packs the `stick/` directory relish writes into a FAT disk image for QEMU, which a real machine doesn't need, since you copy the folder onto a stick (maintainer, 12 November 2026).
 - **Tests:** snapshot tests of the generated seeds and `node.toml`, and verification failures.
 
 ### W4. `relish netboot` (~2.5 weeks), [#404](https://github.com/reliaburger/reliaburger/issues/404)
