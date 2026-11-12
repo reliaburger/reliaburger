@@ -338,6 +338,7 @@ pub(crate) async fn settle(state: &ApiState) {
         .take(16)
     {
         if let Some(council) = &state.council
+            // One round: the deployment hooks run again next tick (#1393).
             && !council.is_leader().await
         {
             return;

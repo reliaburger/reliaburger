@@ -275,8 +275,11 @@ impl SigningRequest {
     /// leader transport otherwise.
     async fn sign(self) -> Result<SignedWorkload, String> {
         // Only the leader can sign. A follower used to call its own council,
-        // fail, and start the container with no identity at all.
-        if self.council.is_leader().await {
+        // fail, and start the container with no identity at all. A leader
+        // whose followers answer one heartbeat late must still sign here
+        // rather than ask the leader transport, which leads back to itself
+        // (#1393).
+        if crate::bun::leadership::leads(&self.council).await {
             return self
                 .council
                 .sign_workload_csr(

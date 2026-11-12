@@ -35,6 +35,7 @@ pub async fn expire_leases_once(
     node: &str,
     now_unix_ms: u64,
 ) -> Result<Vec<AgentLease>, CouncilError> {
+    // One round: the loop asks again next tick (#1393).
     if !council.is_leader().await {
         return Ok(Vec::new());
     }
