@@ -342,6 +342,36 @@ http: 6c:4b:90:12:34:56: disk /dev/mmcblk0, 7.8 GB, gpt, 4 partitions: …: wipi
 
 If several machines report at once, the questions come one at a time.
 
+### Without network boot
+
+A machine that can't network-boot, or that you'd rather not run a boot server
+for, can have the image written straight onto its disk from another computer.
+Take the disk out and attach it, or use a USB drive the machine boots from,
+then name the device:
+
+```sh
+lsblk                         # Linux: find the device, e.g. /dev/sdb
+diskutil list                 # macOS: e.g. /dev/disk4
+diskutil unmountDisk /dev/disk4
+sudo relish image write os/x86_64/reliaburger-os_2026.41.0.raw.zst /dev/disk4 --yes
+```
+
+- `relish image write` decompresses a `.raw.zst` image as it writes, and
+  writes a `.raw` one as it is. It writes from the start of the device and
+  flushes before it exits.
+- Everything on the device is lost. Without `--yes` it refuses and says which
+  device it would have erased.
+- It doesn't check the image itself: `relish image download` already checked
+  it against the release key. Nor does it check the device. It will write over
+  the disk you're running from if you name it, so make sure of the name first.
+- Writing to a device usually needs root.
+
+The installer also makes a firmware boot entry for the disk and puts it first;
+`image write` can't, since it runs on another computer. The written disk boots
+through its fallback path, `\EFI\BOOT`, so set the machine's firmware to boot
+that disk first. From there it's an appliance like any other: bun runs on its
+own, unclaimed, and the next section claims it.
+
 ## Claim them
 
 After the install, each machine reboots into the appliance and looks for a
