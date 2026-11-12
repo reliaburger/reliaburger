@@ -34,25 +34,9 @@ async fn serve_peer(peer: Router) -> SocketAddr {
     address
 }
 
-/// An address nothing listens on, so a request to it fails fast. The
-/// socket is bound but never listens: a connection to it is refused, and
-/// while the caller holds it no other test can bind the port (#1844).
-async fn dead_address() -> (SocketAddr, tokio::net::TcpSocket) {
-    let socket = tokio::net::TcpSocket::new_v4().unwrap();
-    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-    (socket.local_addr().unwrap(), socket)
-}
-
-#[tokio::test]
-async fn a_dead_address_refuses_connections_and_stays_reserved() {
-    // #1844: dropping the listener freed the port, and a parallel test's
-    // server could take it and answer for the "dead" node.
-    let (dead, _held) = dead_address().await;
-    assert!(
-        tokio::net::TcpListener::bind(dead).await.is_err(),
-        "another listener took the dead address's port"
-    );
-    assert!(tokio::net::TcpStream::connect(dead).await.is_err());
+/// An address nothing listens on, so a request to it fails fast (#1844).
+fn dead_address() -> SocketAddr {
+    crate::refused_address::refused_address()
 }
 
 fn members(nodes: &[(&str, SocketAddr)]) -> Arc<RwLock<Vec<NodeMembershipInfo>>> {
@@ -256,7 +240,7 @@ async fn deploy_history_merges_every_members_record_with_its_node() {
 
 #[tokio::test]
 async fn deploy_history_names_a_member_that_did_not_answer() {
-    let (dead, _held) = dead_address().await;
+    let dead = dead_address();
     let mut setup = Setup::new(spawn_agent(Vec::new(), Vec::new()));
     setup.history = vec![history_entry("web", "default", 1, 100)];
     setup.members = Some(members(&[("gone", dead)]));
@@ -272,7 +256,7 @@ async fn deploy_history_names_a_member_that_did_not_answer() {
 
 #[tokio::test]
 async fn a_peer_asked_for_its_own_history_does_not_fan_out_again() {
-    let (dead, _held) = dead_address().await;
+    let dead = dead_address();
     let mut setup = Setup::new(spawn_agent(Vec::new(), Vec::new()));
     setup.history = vec![history_entry("web", "default", 1, 100)];
     setup.members = Some(members(&[("gone", dead)]));
@@ -356,7 +340,7 @@ async fn events_merge_every_members_newest_with_their_node() {
 
 #[tokio::test]
 async fn events_name_a_member_that_did_not_answer() {
-    let (dead, _held) = dead_address().await;
+    let dead = dead_address();
     let mut local_store = EventStore::new();
     record(&mut local_store, 10, "local deployed");
     let mut setup = Setup::new(spawn_agent(Vec::new(), Vec::new()));
@@ -421,7 +405,7 @@ async fn node_page_lists_another_nodes_workloads_without_this_nodes_charts() {
 
 #[tokio::test]
 async fn node_page_says_when_that_node_did_not_answer() {
-    let (dead, _held) = dead_address().await;
+    let dead = dead_address();
     let mut setup = Setup::new(spawn_agent(Vec::new(), Vec::new()));
     setup.members = Some(members(&[("gone", dead)]));
     let app = setup.router().await;
@@ -759,7 +743,7 @@ async fn token_list_merges_every_members_last_use_and_names_a_silent_one() {
         }),
     ))
     .await;
-    let (dead, _held) = dead_address().await;
+    let dead = dead_address();
 
     let tokens = vec![admin.token.clone(), ci.token.clone()];
     let mut setup = Setup::new(spawn_agent(Vec::new(), Vec::new()));

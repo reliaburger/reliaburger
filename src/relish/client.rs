@@ -4704,9 +4704,7 @@ mod tests {
     /// localhost:9117 default, and says the port refused the connection.
     #[tokio::test]
     async fn a_refused_connection_names_the_endpoint_and_says_refused() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        drop(listener);
+        let address = crate::refused_address::refused_address();
         let client = BunClient::build(&format!("http://{address}"), None, None);
 
         let error = client.health().await.unwrap_err();

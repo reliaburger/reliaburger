@@ -1312,13 +1312,9 @@ mod tests {
         ])
     }
 
-    /// An address that refuses connections. The socket is bound but never
-    /// listens, and while the caller holds it no parallel test can bind
-    /// the port and answer for it (#1844).
-    async fn closed_port() -> (std::net::SocketAddr, tokio::net::TcpSocket) {
-        let socket = tokio::net::TcpSocket::new_v4().unwrap();
-        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        (socket.local_addr().unwrap(), socket)
+    /// A loopback address that refuses connections (#1844).
+    fn closed_port() -> std::net::SocketAddr {
+        crate::refused_address::refused_address()
     }
 
     /// Serve `router` on a fresh loopback port.
@@ -1364,8 +1360,7 @@ mod tests {
     async fn relayed_peers_go_through_the_entry_node_and_the_entry_node_uses_its_own_connection() {
         // Neither advertised address is reachable, as from a laptop: the
         // guests' own API ports mean nothing on the host.
-        let (unreachable, _held) = closed_port().await;
-        let unreachable = unreachable.to_string();
+        let unreachable = closed_port().to_string();
         let (base, server) = serve(entry_router(two_nodes(&unreachable, &unreachable), true)).await;
         let mut context = context("rbtest-relay");
         context.client = BunClient::new(&base);
@@ -1387,8 +1382,7 @@ mod tests {
 
     #[tokio::test]
     async fn direct_route_still_uses_the_entry_connection_for_the_entry_node() {
-        let (unreachable, _held) = closed_port().await;
-        let unreachable = unreachable.to_string();
+        let unreachable = closed_port().to_string();
         let (base, server) = serve(entry_router(
             two_nodes(&unreachable, "127.0.0.1:29117"),
             true,
@@ -1406,8 +1400,7 @@ mod tests {
 
     #[tokio::test]
     async fn peer_route_is_relay_when_a_peer_answers_only_through_the_entry_node() {
-        let (unreachable, _held) = closed_port().await;
-        let unreachable = unreachable.to_string();
+        let unreachable = closed_port().to_string();
         let (base, server) = serve(entry_router(two_nodes(&unreachable, &unreachable), true)).await;
         let route = PeerRoute::detect(&BunClient::new(&base), "one").await;
         server.abort();
@@ -1422,8 +1415,7 @@ mod tests {
         ))
         .await;
         let peer = peer.trim_start_matches("http://").to_string();
-        let (unreachable, _held) = closed_port().await;
-        let unreachable = unreachable.to_string();
+        let unreachable = closed_port().to_string();
         let (base, server) = serve(entry_router(two_nodes(&unreachable, &peer), true)).await;
         let route = PeerRoute::detect(&BunClient::new(&base), "one").await;
         server.abort();
@@ -1433,8 +1425,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_peer_down_both_ways_says_nothing_about_the_route() {
-        let (unreachable, _held) = closed_port().await;
-        let unreachable = unreachable.to_string();
+        let unreachable = closed_port().to_string();
         let (base, server) =
             serve(entry_router(two_nodes(&unreachable, &unreachable), false)).await;
         let route = PeerRoute::detect(&BunClient::new(&base), "one").await;

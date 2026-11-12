@@ -40,6 +40,8 @@ pub mod policy;
 pub mod proposal;
 pub mod reconstruction;
 pub mod redact;
+#[cfg(test)]
+pub(crate) mod refused_address;
 pub mod relish;
 pub mod reporting;
 pub mod sesame;
