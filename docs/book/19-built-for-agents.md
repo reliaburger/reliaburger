@@ -7114,6 +7114,20 @@ Serves https://shop.example.com/ and the service web.shop.
 Undo: `relish undo 17` puts web back to 3 replicas.
 ```
 
+A rollback and a cancelled rollout name two specs, the one running now and
+the one they go back to. The first version named each by its image, and
+fell back to "its previous spec" when a spec had none, so a rollback of a
+host `exec` app read "Roll default/web back from its previous spec to its
+previous spec" (#1875). Two specs with the same image, where only the env
+changed, read "from web:1.5 to web:1.5", which is no better. Now `ends_of`
+names both ends together: by image when the images differ, and otherwise
+by the first 12 hex digits of each revision, after the image if there is
+one ("from web:1.5 at revision d7b37c953ce8 to web:1.5 at revision
+1aba4a92d327"). The revision is the same hash the approval checks, cut by
+the same `view::short` that fills `revisions` in `relish proposal show -o
+json`, so the screen and the JSON name an end the same way. The tests cover both kinds that name two ends, each with no image and
+with one image at both ends.
+
 The reason comes last in `relish proposal show`, under "The agent's reason
 (its own words, unverified)", and an agent reading another agent's proposal
 gets it wrapped as untrusted text, origin `proposal_reason`. The agent's
