@@ -215,20 +215,20 @@ The leader selects council members from the general node pool. Selection criteri
 | 5-6 | 5 |
 | 7+ | 7 |
 
-Growth promotes two caught-up learners in one joint-consensus change (`PromotePair`, 1 to 3 or 3 to 5). A dead or disk-pressured voter is replaced by swapping a caught-up learner in for it in one change (`Replace`), so the count never passes through an even number. With no replacement, two dead voters leave together (`RemoveVoterPair`, 5 to 3, never below `min_council_size`). An even council found on entry (left by an older release, or by a decommission) goes back to odd: up by one (`Promote`) when a caught-up learner exists and the live nodes allow it, otherwise down by one (`RemoveVoter`), a dead voter first, while quorum allows. Spare eligible nodes join as learners up to `max_council_size` (or the cluster's `council_size`), and only nodes past that stay plain workers. A learner has the replicated state, and an mTLS node needs it: its API opens only once the API tokens reach it through Raft (#1477). A two-node cluster therefore has one voter and one learner: losing the other node is survivable, losing the voter stops the control plane until it returns or is recovered. The upgrade planner's refusal of a two-voter council (`src/upgrade/plan.rs`) stays as a guard.
+Growth promotes two caught-up learners in one joint-consensus change (`PromotePair`, 1 to 3 or 3 to 5). A dead or disk-pressured voter is replaced by swapping a caught-up learner in for it in one change (`Replace`), so the count never passes through an even number. With no replacement, two dead voters leave together (`RemoveVoterPair`, 5 to 3, never below `min_council_size`). An even council found on entry (left by an older release, or by a decommission) goes back to odd: up by one (`Promote`) when a caught-up learner exists and the live nodes allow it, otherwise down by one (`RemoveVoter`), a dead voter first, while quorum allows. Spare eligible nodes join as learners up to `max_council_size`, and only nodes past that stay plain workers. A learner has the replicated state, and an mTLS node needs it: its API opens only once the API tokens reach it through Raft (#1477). A two-node cluster therefore has one voter and one learner: losing the other node is survivable, losing the voter stops the control plane until it returns or is recovered. The upgrade planner's refusal of a two-voter council (`src/upgrade/plan.rs`) stays as a guard.
 
 Council replacement flow:
 
 ```
-Council member C departs (detected via Raft heartbeat timeout)
-     │
-     ▼
-Remaining council members detect departure
+Council member C departs
      │
      ├── Was C the leader?
-     │     YES: Raft election among remaining members (<5s)
-     │           New leader emerges
+     │     YES: the followers miss its Raft heartbeats and elect a
+     │           new leader among the remaining members (<5s)
      │     NO:  Current leader continues
+     │
+     ▼
+Gossip declares C dead; the leader's HealthTracker stops counting it alive
      │
      ▼
 Leader evaluates candidate pool via Mustard membership
@@ -1088,8 +1088,7 @@ The council sizing constants below are compile-time defaults in `CouncilSelectio
 
 ```text
 # Minimum council size: the planner's target never drops below it, and
-# it never removes voters past it. A smaller cluster-wide council_size
-# lowers it to match.
+# it never removes voters past it.
 min_council_size = 3
 
 # Maximum council size. The council holds the largest odd number of
@@ -1151,9 +1150,9 @@ candidate_refresh_interval = "5m"
 
 ### 7.2 Council Member Departure (Non-Leader)
 
-**Detection:** Leader detects missing Raft heartbeat response within a few heartbeat intervals (~500ms).
+**Detection:** Gossip declares the member dead, and the leader's `HealthTracker` stops counting it as alive. Raft's own heartbeats don't decide it.
 
-**Recovery:** Leader issues RemoveNode, selects a replacement from the general pool, issues AddNode. The new member catches up via Raft log replication. Workers assigned to the departed member's subtree in the reporting tree re-hash to remaining council members.
+**Recovery:** Add before remove. If a caught-up learner exists, the planner swaps it in for the departed voter in one membership change (`Replace`). With none, the leader adds the best-ranked candidate as a learner, which catches up by Raft log replication, and the swap waits for it. Two dead voters with no replacement leave together (`RemoveVoterPair`), never below `min_council_size`. Workers assigned to the departed member's subtree in the reporting tree re-hash to remaining council members.
 
 **Data plane impact:** None. Workers transparently reroute their reports.
 
