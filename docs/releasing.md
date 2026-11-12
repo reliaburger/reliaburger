@@ -1553,6 +1553,26 @@ the real `curl … | sh` install against it on every host we advertise.
    image's BusyBox, which costs twice as much per process. The record lists
    both as deviations.
 
+   It also carries two diagnostics for Bun's memory
+   ([#1417](https://github.com/reliaburger/reliaburger/issues/1417)), listed
+   as deviations too. At hours 6, 12, 18 and 24 it installs gdb in each
+   guest and, one node at a time, attaches it to Bun to call glibc's
+   `malloc_stats()` and `malloc_trim(0)`, with Bun's RSS and heap and arena
+   split read just before and about 5 s after
+   (`sustained/malloc-point.sh`, `malloc.jsonl`). Each point waits for every
+   node's `leak-rss` warm sample, for at most 30 minutes, so a trim never
+   lowers a baseline. The attach stops Bun's threads briefly, so the record
+   puts a failure first seen inside an attach window, or up to 180 s after
+   it, down to the attach and doesn't count it; the checks themselves don't
+   change. And it runs a log-store A/B: `soak-quiet`
+   (`sustained/soak-workloads-day.toml`) logs about 8 lines a second on
+   node 3 and nothing queries it, while node 2's writer is tailed at every
+   check. `relish logs` fans out to every node, so the day tier tails the
+   writer and the Redis client (pinned to node 1 by a `soak-logs` label)
+   through `/v1/logs/entries` on the node that holds their lines. The
+   record tables each node's log store size and Parquet file count beside
+   its RSS.
+
    ```sh
    scripts/release/qualify-jobs-sustained.sh --tier day \
      --base-url https://github.com/reliaburger/reliaburger/releases/download/staging-v0.2.3-RUN_ID-ATTEMPT \

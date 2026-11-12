@@ -2351,3 +2351,281 @@ mkdir -p "$evidence/failures"
         self.assertTrue((failure / "journal-rb-a-1.txt").exists())
         # No stall in a node's journal: no empty file beside it.
         self.assertFalse((failure / "loop-stalls-rb-a-2.txt").exists())
+
+
+# What sustained/malloc-point.sh prints for one node: Bun's memory before
+# and after, the gdb attach and the malloc_stats lines from Bun's journal.
+MALLOC_REPORT = """@@ before
+bun_pid 1813
+bun_mem_rss_kb 271776
+bun_mem_anonymous_kb 194496
+bun_mem_heap_kb 92058
+bun_mem_arena_kb 89907
+bun_mem_other_anon_kb 717
+@@ attach
+start 1794571200.250
+Attaching to process 1813
+$1 = 1
+[Inferior 1 (process 1813) detached]
+gdb_exit 0
+end 1794571202.750
+@@ after
+bun_pid 1813
+bun_mem_rss_kb 180000
+bun_mem_anonymous_kb 102720
+bun_mem_heap_kb 40000
+bun_mem_arena_kb 50000
+bun_mem_other_anon_kb 717
+@@ stats
+Arena 0:
+system bytes     =   94267392
+in use bytes     =   60000000
+bun: 12:00:01 an unrelated line in the middle
+Arena 1:
+system bytes     =   92065792
+in use bytes     =   50000000
+Total (incl. mmap):
+system bytes     =  190000000
+in use bytes     =  113000000
+max mmap regions =         12
+max mmap bytes   =    3667824
+"""
+
+
+class MallocPoints(Evidence):
+    """#1417, the 0.2.8 memory run: at hours 6, 12, 18 and 24 the harness
+    asks Bun's glibc malloc what it holds (malloc_stats) and gives back what
+    it can (malloc_trim), through gdb, so the record can say whether the
+    growth is live heap or malloc's high-water mark."""
+
+    def point(self, node="rb-a-2", hour=6, report=MALLOC_REPORT):
+        path = self.evidence / f"malloc-{node}-{hour}.txt"
+        path.write_text(report)
+        return checker.main(["malloc-point", str(self.evidence), "--node", node, "--hour", str(hour),
+                             "--report", str(path)])
+
+    def rows(self):
+        return [json.loads(line) for line in (self.evidence / "malloc.jsonl").read_text().splitlines()]
+
+    def test_malloc_stats_lines_parse_into_arenas_and_totals_among_other_journal_lines(self):
+        stats = checker.malloc_points.parse_stats(MALLOC_REPORT.split("@@ stats\n")[1])
+        self.assertEqual(stats["arenas"], [{"arena": 0, "system_bytes": 94267392, "in_use_bytes": 60000000},
+                                           {"arena": 1, "system_bytes": 92065792, "in_use_bytes": 50000000}])
+        self.assertEqual((stats["system_bytes"], stats["in_use_bytes"]), (190000000, 113000000))
+        self.assertEqual((stats["mmap_regions"], stats["mmap_bytes"]), (12, 3667824))
+
+    def test_no_malloc_stats_output_parses_to_nothing(self):
+        self.assertIsNone(checker.malloc_points.parse_stats("bun: nothing here\n"))
+        # A block cut off before its total isn't a reading either.
+        self.assertIsNone(checker.malloc_points.parse_stats("Arena 0:\nsystem bytes = 1\nin use bytes = 1\n"))
+
+    def test_a_point_appends_one_row_with_rss_before_and_after_the_trim(self):
+        self.assertEqual(self.point(), 0)
+        [row] = self.rows()
+        self.assertEqual((row["node"], row["hour"], row["pid"], row["gdb_exit"]), ("rb-a-2", 6, 1813, 0))
+        self.assertEqual((row["attach_start"], row["attach_end"]), (1794571200.25, 1794571202.75))
+        self.assertEqual((row["before"]["rss_kb"], row["after"]["rss_kb"]), (271776, 180000))
+        self.assertEqual((row["before"]["heap_kb"], row["after"]["arena_kb"]), (92058, 50000))
+        self.assertEqual(row["in_use_bytes"], 113000000)
+        self.assertEqual(row["system_bytes"], 190000000)
+        self.assertEqual([arena["in_use_bytes"] for arena in row["arenas"]], [60000000, 50000000])
+        # The attach is an event, timed, so the record can tell what it paused.
+        [event] = [item for item in checker.read_events(self.evidence) if item["phase"] == "diagnostic:malloc-trim"]
+        self.assertEqual((event["target"], event["ts"], event["duration"]), ("rb-a-2", 1794571200, 3))
+
+    def test_a_point_whose_gdb_failed_is_kept_and_says_so(self):
+        report = MALLOC_REPORT.replace("gdb_exit 0", "gdb_exit 1").split("@@ stats")[0] + "@@ stats\n"
+        self.assertEqual(self.point(report=report), 0)
+        [row] = self.rows()
+        self.assertEqual(row["gdb_exit"], 1)
+        self.assertIsNone(row["in_use_bytes"])
+        text = "\n".join(checker.malloc_points.section(self.evidence))
+        self.assertIn("gdb exited 1", text)
+
+    def due(self, now, warm=("rb-a-1", "rb-a-2", "rb-a-3")):
+        state = checker.load_state(self.evidence)
+        state["resources"] = {node: ({"rss_warm_kb": 200000} if node in warm else {}) for node in NODES}
+        checker.save_state(self.evidence, state)
+        (self.evidence / "metadata.json").write_text(json.dumps({"started_at": NOW}))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(checker.main(["malloc-due", str(self.evidence), "--now", str(now)]), 0)
+        return out.getvalue().strip()
+
+    def test_hours_six_twelve_and_eighteen_fall_due_in_turn(self):
+        self.assertEqual(self.due(NOW + 6 * 3600 - 1), "")
+        self.assertEqual(self.due(NOW + 6 * 3600), "6")
+        self.point(hour=6)
+        self.assertEqual(self.due(NOW + 6 * 3600 + 60), "")
+        self.assertEqual(self.due(NOW + 12 * 3600), "12")
+        self.point(hour=12)
+        self.assertEqual(self.due(NOW + 18 * 3600 + 5), "18")
+        self.point(hour=18)
+        # Hour 24 runs once the soak time is up, before the drain, not here.
+        self.assertEqual(self.due(NOW + 24 * 3600), "")
+
+    def test_a_trim_waits_for_every_leak_rss_warm_sample_but_not_for_ever(self):
+        # A trim before a node's warm sample would lower its baseline.
+        self.assertEqual(self.due(NOW + 6 * 3600, warm=("rb-a-1", "rb-a-3")), "")
+        self.assertEqual(self.due(NOW + 6 * 3600 + 1799, warm=("rb-a-1", "rb-a-3")), "")
+        self.assertEqual(self.due(NOW + 6 * 3600 + 1800, warm=("rb-a-1", "rb-a-3")), "6")
+
+    def test_the_record_tables_each_point_with_what_the_trim_gave_back(self):
+        self.point()
+        text = "\n".join(checker.malloc_points.section(self.evidence))
+        self.assertIn("## malloc_stats and malloc_trim", text)
+        self.assertIn("| rb-a-2 | 6 | 1813 | 2026-11-13 12:00:00 | 2.5 s | 265.4 | 175.8 | 89.6 | 89.9 → 39.1 | "
+                      "87.8 → 48.8 | 107.8 | 181.2 |", text)
+        self.assertIn("- rb-a-2, hour 6: arena 0 57.2 of 89.9 MiB in use; arena 1 47.7 of 87.8 MiB in use", text)
+
+    def test_failures_inside_an_attach_window_are_put_down_to_the_attach(self):
+        self.point()
+        start = 1794571200
+        failures = [{"number": "1", "ts": start + 30, "check": "agent-loop-turn", "detail": "slow"},
+                    {"number": "2", "ts": start - 60, "check": "settle", "detail": "before"},
+                    {"number": "3", "ts": start + 3 + checker.malloc_points.EXCUSE_AFTER + 1, "check": "settle",
+                     "detail": "after"}]
+        excused = checker.malloc_points.excuse(failures, checker.malloc_points.read(self.evidence))
+        self.assertEqual([row.get("disposition", "open") for row in excused], ["attach", "open", "open"])
+        self.assertEqual(excused[0]["class"], "diagnostic")
+        self.assertIn("malloc_stats/malloc_trim attach on rb-a-2 at hour 6", excused[0]["cause"])
+
+    def test_a_run_whose_only_failure_is_an_attach_renders_pass(self):
+        Record.write_run(self, failures=["agent loop turn over budget"])
+        row = dict(node="rb-a-2", hour=6, pid=1, attach_start=NOW + 90, attach_end=NOW + 92, gdb_exit=0,
+                   before={}, after={}, arenas=[], system_bytes=None, in_use_bytes=None)
+        checker.malloc_points.append(self.evidence, row)
+        record = self.evidence / "record.md"
+        self.assertEqual(checker.render(self.evidence, record), 0)
+        text = record.read_text()
+        self.assertTrue(text.startswith("# Sustained soak (V02): PASS"))
+        self.assertIn("| diagnostic |", text)
+
+    def test_the_day_tier_installs_gdb_and_runs_every_point_with_the_attach_awk(self):
+        import subprocess
+        script = (Path(__file__).parent / "qualify-sustained.sh").read_text()
+        self.assertIn("apt-get install -y --no-install-recommends gdb", script)
+        self.assertIn('[ "$malloc_points" != true ] || run_slot malloc_point 24', script)
+        guest = Path(__file__).parent / "sustained" / "malloc-point.sh"
+        self.assertIn("-ex 'call (void)malloc_stats()' -ex 'call (int)malloc_trim(0)' -ex detach", guest.read_text())
+        subprocess.run(["bash", "-n", str(guest)], check=True)
+        # Hour 24 comes after the soak time and before the drain asks jobs to stop.
+        self.assertLess(script.index("run_slot malloc_point 24"), script.index('meta job_stop_at "json:$(date +%s)"'))
+
+    def test_the_plan_names_the_malloc_points_and_the_log_ab(self):
+        import subprocess
+        result = subprocess.run([str(Path(__file__).parent / "qualify-jobs-sustained.sh"), "--tier", "day", "--plan"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("plan: malloc-trim at hours 6 12 18 24 on every node", result.stdout)
+        self.assertIn("plan: log-ab soak-quiet on node 3, never queried", result.stdout)
+
+
+class LogStoreAB(Evidence):
+    """#1417, the 0.2.8 memory run: node 2's RSS followed its slowly filled,
+    often queried log store. The day tier adds a slow log source on node 3
+    that nothing ever queries, and sends every log tail to the node that
+    holds the lines, so node 3's store fills the same way but is never read."""
+
+    release = Path(__file__).parent
+
+    def workloads(self, tier):
+        import subprocess
+        import tomllib
+        script = (self.release / "qualify-sustained.sh").read_text()
+        function = script[script.index("soak_workloads() {"):]
+        function = function[:function.index("\n}\n") + 3]
+        prelude = (f"tier={tier} generation=0 slo_generation=0 "
+                   f"workloads_template={self.release / 'sustained' / 'soak-workloads.toml'} "
+                   f"day_workloads={self.release / 'sustained' / 'soak-workloads-day.toml'}\n")
+        out = subprocess.run(["bash", "-c", prelude + function + "soak_workloads"], stdout=subprocess.PIPE,
+                             text=True, check=True).stdout
+        return tomllib.loads(out)["app"]
+
+    def test_the_day_tier_adds_a_quiet_writer_on_node_3_and_pins_the_redis_client_to_node_1(self):
+        apps = self.workloads("day")
+        self.assertEqual(apps["soak-quiet"]["placement"]["required"], ["soak-volume=redis"])
+        self.assertIn("QUIET", apps["soak-quiet"]["command"][2])
+        self.assertEqual(apps["soak-redis-client"]["placement"]["required"], ["soak-logs=client"])
+        self.assertEqual(apps["soak-writer"]["placement"]["required"], ["soak-volume=writer"])
+
+    def test_other_tiers_keep_their_workloads(self):
+        for tier in ("fast", "final"):
+            apps = self.workloads(tier)
+            self.assertNotIn("soak-quiet", apps)
+            self.assertNotIn("placement", apps["soak-redis-client"])
+
+    def tails(self, tier):
+        import subprocess
+        script = (self.release / "qualify-sustained.sh").read_text()
+        functions = ""
+        for name in ("log_tail() {", "collect_light() {"):
+            function = script[script.index(name):]
+            functions += function[:function.index("\n}\n") + 3]
+        calls = self.evidence / "calls.txt"
+        entries = json.dumps([
+            {"timestamp": 1, "sequence": 2, "instance": "default__soak-writer-0", "stream": "stdout", "line": "ACK 8"},
+            {"timestamp": 1, "sequence": 1, "instance": "default__soak-writer-0", "stream": "stdout", "line": "ACK 7"}])
+        stubs = f"""
+tier={tier}
+evidence={self.evidence}
+window_label=
+checker={self.release / 'sustained_check.py'}
+check() {{ python3 "$checker" "$@"; }}
+api_get() {{ echo "api_get $*" >> {calls}; echo '{entries}'; }}
+rel() {{ echo "rel $*" >> {calls}; }}
+probe_forwards() {{ :; }}
+slo_reads() {{ :; }}
+"""
+        directory = self.evidence / "snap"
+        directory.mkdir()
+        subprocess.run(["bash", "-c", stubs + functions + f"collect_light {directory}"], check=True, timeout=60)
+        return calls.read_text().splitlines(), directory
+
+    def test_day_tier_tails_ask_only_the_node_that_holds_the_lines(self):
+        calls, directory = self.tails("day")
+        self.assertEqual(calls, ["api_get 2 /v1/logs/entries/soak-writer/default?tail=20",
+                                 "api_get 1 /v1/logs/entries/soak-redis-client/default?tail=20"])
+        # The checker reads the tail as it read relish logs: in ingest order, by run.
+        text = (directory / "writer-log.txt").read_text()
+        self.assertEqual(text, "[default__soak-writer-0] ACK 7\n[default__soak-writer-0] ACK 8\n")
+        self.assertEqual(checker.parse_runs(text, "ACK"), {"default__soak-writer-0": [7, 8]})
+
+    def test_other_tiers_still_tail_through_relish_logs(self):
+        calls, _ = self.tails("final")
+        self.assertEqual(calls, ["rel logs soak-writer --tail 20", "rel logs soak-redis-client --tail 20"])
+
+    def test_an_unreadable_answer_leaves_a_note_and_no_numbers(self):
+        import subprocess
+        out = subprocess.run(["python3", str(self.release / "sustained_check.py"), "log-lines"],
+                             input="curl: (7) refused ACK 5", stdout=subprocess.PIPE, text=True, check=True).stdout
+        self.assertEqual(checker.parse_runs(out, "ACK"), {})
+        self.assertIn("unreadable", out)
+
+    def test_nothing_in_the_harness_queries_soak_quiet(self):
+        # Named only in the expected instances, the plan and the deviation note.
+        script = (self.release / "qualify-sustained.sh").read_text()
+        self.assertNotRegex(script, r"(logs|log_tail [0-9]|entries/|exec)\s+soak-quiet|entries/soak-quiet")
+        self.assertEqual(script.count("soak-quiet"), 3)
+        for name in ("job_soak.py", "sustained_check.py"):
+            self.assertNotIn("soak-quiet", (self.release / name).read_text())
+
+    def test_the_day_tier_labels_node_1_for_the_redis_client(self):
+        script = (self.release / "qualify-sustained.sh").read_text()
+        self.assertIn("""settings+=('node.labels.soak-logs="client"')""", script)
+
+    def test_each_memory_row_carries_its_log_store_size_and_file_count(self):
+        inventory = checker.parse_inventory(INVENTORY + "disk metrics 8400\nlog_files 1216\n"
+                                            + "bun_mem_heap_kb 5000\nbun_mem_rss_kb 300000\n")
+        row = checker.bun_memory.sample(inventory, "rb-a-2", NOW)
+        self.assertEqual((row["logs_kb"], row["metrics_kb"], row["log_files"]), (20, 8400, 1216))
+        checker.bun_memory.append(self.evidence, row)
+        checker.bun_memory.append(self.evidence, dict(row, ts=NOW + 3600, logs_kb=9908, rss_kb=310000))
+        text = "\n".join(checker.bun_memory.section(self.evidence))
+        self.assertIn("### Log stores against RSS", text)
+        self.assertIn("| rb-a-2 | 1:00 | 302.7 | 9,908 | 1,216 | 8,400 |", text)
+
+    def test_the_guest_report_counts_the_log_parquet_files(self):
+        script = (self.release / "qualify-sustained.sh").read_text()
+        self.assertIn("""echo "log_files $(find /var/lib/reliaburger/logs/parquet -maxdepth 1 -name '*.parquet' -type f """
+                      """2>/dev/null | wc -l | tr -d ' ')\"""", script)

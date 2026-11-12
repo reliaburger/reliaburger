@@ -103,6 +103,9 @@ history_clients=4
 jobs_pid=
 history_pid=
 workloads_template=$repository/scripts/release/sustained/soak-workloads.toml
+# The day tier's log-store A/B and malloc points (#1417).
+day_workloads=$repository/scripts/release/sustained/soak-workloads-day.toml
+malloc_script=$repository/scripts/release/sustained/malloc-point.sh
 podinfo=$repository/examples/kubernetes/podinfo.yaml
 base_url=
 qualified_digest=
@@ -187,6 +190,10 @@ if [ "$tier" = day ]; then
 elif [ "$job_load" = day ] || [ "$schedule" = none ]; then
     fail '--job-load day and --schedule none belong to the day tier'
 fi
+# The day tier asks Bun's malloc what it holds at hours 6, 12, 18 and 24
+# (#1417); no gated tier attaches a debugger to Bun.
+malloc_points=false
+[ "$tier" != day ] || malloc_points=true
 [ -z "$seed" ] || [[ $seed =~ ^[0-9]+$ ]] || fail '--seed must be a whole number'
 # A final tier owes every upgrade walk and a candidate it verified itself
 # (#1061), so one that could only finish incomplete never starts.
@@ -705,6 +712,9 @@ configure_nodes() {
             process_workloads.mount_isolation=false
         )
         [ -z "$label" ] || settings+=("node.labels.soak-volume=\"$label\"")
+        # The day tier pins the Redis client here, so its log tails only
+        # ever ask node 1 (#1417).
+        if [ "$node" -eq 1 ] && [ "$tier" = day ]; then settings+=('node.labels.soak-logs="client"'); fi
         [ "$leaf_supported" != yes ] || settings+=("security.leaf_lifetime_override_secs=$leaf_lifetime")
         [ -z "$operator_public" ] || settings+=("upgrades.external_signing_key=\"$operator_public\"")
         check toml-set "$evidence/config/node-$node.soak.toml" "${settings[@]}"
@@ -750,12 +760,14 @@ GUEST
 # node.toml labels; that is a failure row, and one more restart is tried.
 # Print the nodes (2, 3) whose soak-volume label the cluster doesn't show yet.
 missing_labels() {
-    rel --output json nodes > "$evidence/.nodes.json" 2>/dev/null || { echo 2 3; return; }
-    python3 - "$evidence/.nodes.json" "${vm[2]}" "${vm[3]}" <<'PY'
+    rel --output json nodes > "$evidence/.nodes.json" 2>/dev/null || { if [ "$tier" = day ]; then echo 1 2 3; else echo 2 3; fi; return; }
+    python3 - "$evidence/.nodes.json" "${vm[1]}" "${vm[2]}" "${vm[3]}" "$tier" <<'PY'
 import json, sys
-labels = {node["node_id"]: node.get("labels", {}).get("soak-volume") for node in json.load(open(sys.argv[1]))}
-print(" ".join(index for index, name, want in (("2", sys.argv[2], "writer"), ("3", sys.argv[3], "redis"))
-               if labels.get(name) != want))
+labels = {node["node_id"]: node.get("labels", {}) for node in json.load(open(sys.argv[1]))}
+wanted = [("2", sys.argv[3], "soak-volume", "writer"), ("3", sys.argv[4], "soak-volume", "redis")]
+if sys.argv[5] == "day":
+    wanted.insert(0, ("1", sys.argv[2], "soak-logs", "client"))
+print(" ".join(index for index, name, key, want in wanted if labels.get(name, {}).get(key) != want))
 PY
 }
 
@@ -822,6 +834,33 @@ resize_nodes() {
     meta deviations+ "Each quickstart VM resized from 2 vCPU / 2 GiB to $day_cpus vCPU / $day_memory_gib GiB before configuring, the size the scale-out record measured (maintainer decision, 27 October 2026)"
 }
 
+# The malloc points (#1417) call glibc functions inside Bun through gdb,
+# which the guest image doesn't ship.
+install_gdb() {
+    local node version
+    for node in 1 2 3; do
+        gsh "$node" 'command -v gdb >/dev/null || { DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gdb >/dev/null; }' \
+            > "$evidence/snapshots/gdb-$node.log" 2>&1 || setup_fail "could not install gdb on ${vm[node]}"
+        version=$(gsh "$node" 'gdb --version | head -n 1') || setup_fail "gdb does not run on ${vm[node]}"
+    done
+    meta deviations+ "gdb installed in each guest ($version) for the malloc points: at hours 6, 12, 18 and 24 it attaches to Bun and calls \`malloc_stats()\` and \`malloc_trim(0)\` (#1417); a failure first seen inside an attach window, or up to 180 s after it, is put down to the attach (\`EXCUSE_AFTER\` in malloc_points.py)"
+}
+
+# One malloc point: every node that is up, one at a time, so only one Bun
+# is stopped at once. Each report is kept in malloc/hour-H/.
+malloc_point() {
+    local hour=$1 node directory=$evidence/malloc/hour-$1
+    mkdir -p "$directory"
+    say "malloc point, hour $hour: malloc_stats and malloc_trim(0) in each node's Bun"
+    for node in 1 2 3; do
+        [ "${down[node]}" = 0 ] || continue
+        { printf 'bun_memory_awk=%q\n' "$(cat "$bun_memory_awk")"; cat "$malloc_script"; } \
+            | gsh_in "$node" > "$directory/${vm[node]}.txt" 2>&1 || true
+        check malloc-point "$evidence" --node "${vm[node]}" --hour "$hour" --report "$directory/${vm[node]}.txt" \
+            || event --phase harness-error --target malloc-point --detail "${vm[node]} hour $hour"
+    done
+}
+
 wait_cluster() {
     local deadline=$(( $(date +%s) + $1 )) file=$evidence/.nodes.json
     while [ "$(date +%s)" -lt "$deadline" ]; do
@@ -855,6 +894,9 @@ jobs_applied() {
 soak_workloads() {
     sed -e "s/SOAK_GENERATION = \"[0-9]*\"/SOAK_GENERATION = \"$generation\"/" \
         -e "s/SOAK_SLO_GENERATION = \"[0-9]*\"/SOAK_SLO_GENERATION = \"$slo_generation\"/" "$workloads_template"
+    # The day tier's log-store A/B (#1417): a slow, never-queried log source
+    # on node 3, and the Redis client pinned to node 1.
+    [ "$tier" != day ] || cat "$day_workloads"
 }
 
 # The policies go in their own manifest: the API refuses policies in a
@@ -892,10 +934,12 @@ apply_workloads() {
     rel --output json policy list > "$evidence/config/policies.json" 2>&1 || fail 'listing the soak policies failed'
     check policies "$evidence" "$evidence/config/policies.json" || fail 'the soak policies are not all in force'
     local deadline=$(( $(date +%s) + 600 )) file=$evidence/.status.json
-    until instances_json > "$file" 2>/dev/null && python3 - "$file" <<'PY'
+    until instances_json > "$file" 2>/dev/null && python3 - "$file" "$tier" <<'PY'
 import json, sys
 want = {"soak-writer": 1, "soak-redis": 1, "soak-redis-client": 1, "soak-spammer": 1, "soak-identity": 3, "soak-slo": 3,
         "frontend": 3, "backend": 1, "redis": 1, "loadgen": 1}
+if sys.argv[2] == "day":
+    want["soak-quiet"] = 1
 running = {}
 for instance in json.load(open(sys.argv[1])):
     if instance["state"] == "running":
@@ -1091,6 +1135,8 @@ ss -ltnH | awk '{print "listen " $4}'
 for directory in data images logs metrics volumes soak-export; do
     echo "disk $directory $(du -sk /var/lib/reliaburger/$directory 2>/dev/null | cut -f1)"
 done
+# A log tail lists every Parquet file in the store (#1417).
+echo "log_files $(find /var/lib/reliaburger/logs/parquet -maxdepth 1 -name '*.parquet' -type f 2>/dev/null | wc -l | tr -d ' ')"
 echo "panics $(journalctl -u reliaburger --no-pager -q --cursor-file=/var/tmp/soak-journal.cursor 2>/dev/null | grep -c 'panicked at')"
 # One clock source (#608): Lima's guest agent owns the clock, and every step
 # it takes since the last report is counted.
@@ -1178,8 +1224,24 @@ collect_light() {
         "http://127.0.0.1:$ingress_port/" > "$directory/http.txt" 2>/dev/null || true
     probe_forwards "$directory"
     [ -n "$window_label" ] || slo_reads "$directory"
-    rel logs soak-writer --tail 20 > "$directory/writer-log.txt" 2>&1 || true
-    rel logs soak-redis-client --tail 20 > "$directory/redis-log.txt" 2>&1 || true
+    if [ "$tier" = day ]; then
+        # `relish logs` fans out to every node, so every store would be
+        # queried; the day tier asks only the node holding the lines, and
+        # node 3's store is never read (#1417).
+        log_tail 2 soak-writer > "$directory/writer-log.txt" 2>&1 || true
+        log_tail 1 soak-redis-client > "$directory/redis-log.txt" 2>&1 || true
+    else
+        rel logs soak-writer --tail 20 > "$directory/writer-log.txt" 2>&1 || true
+        rel logs soak-redis-client --tail 20 > "$directory/redis-log.txt" 2>&1 || true
+    fi
+}
+
+# The last 20 lines of APP from one node's own log store, through that
+# node's per-node query (the endpoint a cross-node query fans out to), as
+# `[instance] line`.
+log_tail() {
+    local node=$1 app=$2
+    api_get "$node" "/v1/logs/entries/$app/default?tail=20" | check log-lines
 }
 
 # Every forwarded port (each node's API, node 1's ingress and registry),
@@ -1811,6 +1873,10 @@ wait_until() {
         elif [ "$now" -ge "$next_heavy" ]; then
             next_heavy=$(( now + heavy_every ))
             observe heavy || true
+        elif [ "$malloc_points" = true ] && [ "$now" -ge "$next_malloc" ]; then
+            next_malloc=$(( now + 60 ))
+            malloc_hour=$(check malloc-due "$evidence" 2>> "$evidence/harness-errors.log" || true)
+            [ -z "$malloc_hour" ] || run_slot malloc_point "$malloc_hour"
         elif [ "$now" -ge "$next_slo" ] && [ -z "$window_label" ]; then
             next_slo=$(( now + slo_every ))
             run_slot slo_rollout
@@ -2034,6 +2100,8 @@ if [ "$plan" = true ]; then
     fi
     [ "$tier" != day ] || printf 'plan: resize %s vCPU %s GiB each node, one at a time, before configuring\n' "$day_cpus" "$day_memory_gib"
     [ "$tier" != day ] || printf 'plan: host-busybox busybox-static %s %s\n' "$day_busybox_version" "$day_busybox_sha256"
+    [ "$malloc_points" != true ] || printf 'plan: malloc-trim at hours 6 12 18 24 on every node (gdb: malloc_stats, malloc_trim(0))\n'
+    [ "$tier" != day ] || printf 'plan: log-ab soak-quiet on node 3, never queried; tails ask only the node holding the lines\n'
     printf 'plan: %s\n' "$job_runs"
     printf 'plan: seed %s for every fault and node choice\n' "${seed:-random}"
     [ "$tier" = day ] || printf 'plan: council-history %s clients, checked for linearizability after the soak\n' "$history_clients"
@@ -2097,6 +2165,10 @@ json.dump({"nodes": sys.argv[2:]}, open(sys.argv[1], "w"))
 PY
     [ "$tier" != day ] || resize_nodes
     configure_nodes
+    [ "$malloc_points" != true ] || install_gdb
+    if [ "$tier" = day ]; then
+        meta deviations+ 'Log-store A/B (#1417): `soak-quiet` logs about 8 lines a second on node 3 (pinned by `soak-volume=redis`) and nothing queries it; `soak-redis-client` is pinned to node 1 (node.toml `[node.labels] soak-logs = "client"`); each check tails `soak-writer` and `soak-redis-client` through `/v1/logs/entries` on node 2 and node 1, the per-node query `relish logs` fans out to, so node 3'"'"'s log store is never read'
+    fi
     apply_workloads
     versions=$(node_versions)
     meta versions "$(printf '%s\n' "$versions" | sort | uniq -c | awk '{printf "%s%s x%s", sep, $2, $1; sep=", "}')"
@@ -2128,6 +2200,7 @@ fi
 start_council_history
 
 next_light=$(date +%s)
+next_malloc=$(date +%s)
 next_heavy=$(( $(date +%s) + heavy_every ))
 next_slo=$(( $(date +%s) + slo_every / 2 ))
 index=$first_cycle
@@ -2144,6 +2217,8 @@ while [ "$schedule" != none ]; do
 done
 current_slot=final
 wait_until "$end"
+# The last malloc point, with the job load still running (#1417).
+[ "$malloc_points" != true ] || run_slot malloc_point 24
 if [ "$quiet_tail" -gt 0 ]; then
     # The tail starts when the last cycle has finished, however late, and
     # always runs its full length.
