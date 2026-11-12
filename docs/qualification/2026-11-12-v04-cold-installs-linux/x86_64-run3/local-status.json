@@ -1,0 +1,25 @@
+{
+  "cluster": "laptop",
+  "nodes": [
+    {
+      "name": "rb-d1cf64973ff7-1",
+      "condition": {
+        "state": "ready"
+      }
+    },
+    {
+      "name": "rb-d1cf64973ff7-2",
+      "condition": {
+        "state": "ready"
+      }
+    },
+    {
+      "name": "rb-d1cf64973ff7-3",
+      "condition": {
+        "state": "ready"
+      }
+    }
+  ],
+  "fault_policy": "fault policy: development; allows inject_workload_faults, alter_node_state",
+  "ready": true
+}

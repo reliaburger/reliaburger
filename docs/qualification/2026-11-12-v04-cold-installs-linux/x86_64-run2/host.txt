@@ -1,0 +1,6 @@
+kernel: Linux 7.0.0-1017-azure x86_64
+os: Ubuntu 24.04.5 LTS
+cpu: GenuineIntel, Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz
+cores: 4
+memory_gib: 15
+disk_free: 86G
