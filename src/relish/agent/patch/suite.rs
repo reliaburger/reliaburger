@@ -8,7 +8,9 @@ use schemars::JsonSchema;
 use serde::Serialize;
 
 use super::builder::{check_build_changes, check_disk, run_cargo};
-use super::cargo::{CompilerError, SHOWN_ERRORS, last_lines, parse_messages, parse_test_output};
+use super::cargo::{
+    CompilerError, SHOWN_ERRORS, cargo_error, last_lines, parse_messages, parse_test_output,
+};
 use super::git::snapshot;
 use super::workspace::TestRun;
 use super::{Tools, answer_of, open, patch_command, shown, step};
@@ -136,11 +138,17 @@ pub(super) async fn test(
         args.extend(["--skip", check]);
     }
     let run = run_cargo(tools, dir, &args, TEST_DEADLINE).await?;
-    let messages = parse_messages(&run.stdout);
+    let mut messages = parse_messages(&run.stdout);
     let results = parse_test_output(&run.stdout);
     let ok = run.success && messages.errors.is_empty();
-    let cargo_output = (!ok && messages.errors.is_empty() && results.failures.is_empty())
-        .then(|| last_lines(&run.stderr, 20));
+    // Cargo stopped with no compiler error and no failed test to show for
+    // it: its own error is the answer's, so `ok: false` never comes with
+    // empty `errors` (#1882).
+    let cargo_failed = !ok && messages.errors.is_empty() && results.failures.is_empty();
+    let cargo_output = cargo_failed.then(|| last_lines(&run.stderr, 20));
+    if cargo_failed {
+        messages.errors.push(cargo_error(&run.stderr));
+    }
 
     state.record_test(TestRun {
         filter: filter.map(str::to_string),
@@ -285,6 +293,47 @@ echo 'test result: ok. 1 passed; 0 failed; 3 ignored; 0 measured; 9 filtered out
                 " --locked --no-fail-fast --message-format=json --{skips}\n"
             )),
             "{args}"
+        );
+    }
+
+    /// `patch init ./fix` suggests `patch test ./fix` (#1882).
+    #[tokio::test]
+    async fn a_workspace_named_by_a_relative_path_runs_its_tests() {
+        let fixture = Fixture::new(CARGO_CHECKS_THE_MANIFEST);
+        let relative = relative_to_cwd(&fixture.dir());
+        let answer = test(&fixture.tools, &relative, None, false).await.unwrap();
+        assert!(answer.data.ok, "{:?}", answer.data);
+        assert_eq!(answer.data.passed, 1);
+    }
+
+    /// Cargo can fail before a single test runs: a dependency it can't
+    /// resolve, a lock file out of date. `ok: false` then still names the
+    /// error, rather than coming with no errors and no failed tests (#1882).
+    #[tokio::test]
+    async fn cargo_failing_before_any_test_ran_is_an_error_in_the_answer() {
+        let fixture = Fixture::new(
+            "echo '    Updating crates.io index' >&2\n\
+             echo 'error: failed to select a version for the requirement `tokio = \"^9\"`' >&2\n\
+             exit 101\n",
+        );
+        let answer = test(&fixture.tools, &fixture.dir(), None, false)
+            .await
+            .unwrap();
+        assert!(!answer.data.ok);
+        assert_eq!((answer.data.passed, answer.data.failed), (0, 0));
+        assert_eq!(answer.data.total_errors, 1);
+        let error = &answer.data.errors[0];
+        assert_eq!(
+            error.message,
+            "failed to select a version for the requirement `tokio = \"^9\"`"
+        );
+        assert!(error.file.is_none());
+        assert!(
+            error
+                .rendered
+                .as_deref()
+                .unwrap()
+                .contains("Updating crates.io index")
         );
     }
 

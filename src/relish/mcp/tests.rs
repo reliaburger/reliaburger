@@ -1161,14 +1161,6 @@ async fn a_revoked_stored_token_is_replaced_and_the_call_retried() {
 // ---------------------------------------------------------------------------
 // Follow-ups from the live-cluster review of #1763.
 
-/// An endpoint nothing listens on.
-fn nowhere() -> String {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    drop(listener);
-    format!("http://{address}")
-}
-
 fn stored_token(directory: &std::path::Path, token: &str) {
     credentials::StoredToken {
         schema: 1,
@@ -1275,10 +1267,11 @@ async fn offline_tools_answer_with_the_cluster_down_and_no_token_stored() {
     {
         return;
     }
+    let nowhere = crate::refused_address::refused_url();
     let directory = tempfile::tempdir().unwrap();
     let server = Server::new(&Selection::default())
         .unwrap()
-        .with_managed(managed(directory.path(), &nowhere()));
+        .with_managed(managed(directory.path(), &nowhere));
     let calls = [
         ("version", json!({})),
         ("guide", json!({})),
