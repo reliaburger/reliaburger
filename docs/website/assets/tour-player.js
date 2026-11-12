@@ -34,7 +34,18 @@
     return assets;
   }
 
+  // One figure that can't be set up mustn't stop the others: the agent
+  // recordings once had no speed buttons, and the error that threw on the
+  // first of them left both unplayed (#1874).
   figures.forEach(function (figure) {
+    try {
+      setUp(figure);
+    } catch (error) {
+      if (window.console) window.console.error("recording", figure.id, error);
+    }
+  });
+
+  function setUp(figure) {
     var screen = figure.querySelector(".recording-screen");
     var speeds = figure.querySelector(".recording-speed");
     var chapters = figure.querySelector(".recording-chapters");
@@ -77,7 +88,7 @@
 
     function setSpeed(button) {
       speed = Number(button.getAttribute("data-speed"));
-      speeds.querySelectorAll("button").forEach(function (other) {
+      if (speeds) speeds.querySelectorAll("button").forEach(function (other) {
         other.setAttribute("aria-pressed", String(other === button));
       });
       if (!player) return;
@@ -127,7 +138,7 @@
       started = true;
       playerAssets().then(function () {
         figure.classList.add("has-player");
-        speeds.hidden = false;
+        if (speeds) speeds.hidden = false;
         if (figure.getAttribute("data-chapters") !== "markers") {
           if (chapters) chapters.hidden = false;
           create(0, false);
@@ -147,7 +158,7 @@
     screen.addEventListener("pointerdown", function () { hasPlayed = true; });
     screen.addEventListener("keydown", function () { hasPlayed = true; });
 
-    speeds.addEventListener("click", function (event) {
+    if (speeds) speeds.addEventListener("click", function (event) {
       var button = event.target.closest("button[data-speed]");
       if (button) setSpeed(button);
     });
@@ -172,5 +183,5 @@
       start();
     }, { rootMargin: "600px 0px" });
     observer.observe(figure);
-  });
+  }
 })();

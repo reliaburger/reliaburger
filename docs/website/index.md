@@ -457,7 +457,7 @@ What the soaks don't prove: they run three small VMs on one machine, so they say
 
 When something breaks, the bug may be in your app or in the platform under it. Your AI agent can tell which: it reads the cluster, the manual and the exact source its `relish` was built from. When the bug is ours, it proves a fix on a throwaway cluster and drafts the report for you to send. It never fixes your cluster for you.
 
-A real session: Claude Code with a read-only token on a 0.2.8 cluster (the published `relish`, and `bun` built from the v0.2.8 tag), recorded through the agent gym by [scripts/record/recording.py](https://github.com/reliaburger/reliaburger/blob/main/scripts/record/recording.py), which scored it correct. Still stretches are cut to two seconds, and each result says how long its call really took.
+A real session: Claude Code with a read-only token on a 0.2.8 cluster (the published `relish`, and `bun` built from the v0.2.8 tag), recorded through the agent gym by [scripts/record/recording.py](https://github.com/reliaburger/reliaburger/blob/main/scripts/record/recording.py), which scored it correct. Still stretches are cut to two seconds, and each result says how long its call really took. speed
 
 1.  ```
     relish token create --name agent --role read-only --ttl-days 1
@@ -506,7 +506,7 @@ Last, it drafts a redacted bug report with the reproducer, the patch and what it
 
 Reading a cluster is safe. Changing one is where an agent needs a leash. An agent never changes the cluster itself: it asks. The cluster writes down what the change would do, a person or a policy you wrote says yes, and the undo is one command, shown before anything happens.
 
-A real session: Claude Code with an agent token on a 0.2.8 cluster (the published `relish`, and `bun` built from the v0.2.8 tag) proposes a rollback, then a person approves it and undoes it with their own token. Recorded through the agent gym by [scripts/record/recording.py](https://github.com/reliaburger/reliaburger/blob/main/scripts/record/recording.py), which scored it correct. Still stretches are cut to two seconds.
+A real session: Claude Code with an agent token on a 0.2.8 cluster (the published `relish`, and `bun` built from the v0.2.8 tag) proposes a rollback, then a person approves it and undoes it with their own token. Recorded through the agent gym by [scripts/record/recording.py](https://github.com/reliaburger/reliaburger/blob/main/scripts/record/recording.py), which scored it correct. Still stretches are cut to two seconds. speed
 
 1.  ```
     relish token create --name holmes --agent --role deployer --namespaces shop --ttl 8h
