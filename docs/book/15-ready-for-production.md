@@ -7864,8 +7864,17 @@ had looked at: `self.supervisor.grill().state(id).await` inside a
 their tagged neighbours, so they got the same tag.
 
 Run over the crate, the new rule found 219 sites the old one couldn't
-see. 179 were in the `relish` CLI, which goes in the baseline with the
-first 25. The 40 on the node's side went three ways:
+see. 179 were in the `relish` CLI, and 116 of those came down to two
+helpers: `BunClient::default_local`, which reads the local context file,
+and `BuildInfo::current`, which a dev build works out by packing its
+checkout. A baseline that may only shrink would make every new async
+command trip over them. So the read inside each carries a CLI tag (a
+one-shot read before the command does anything long-lived), and the
+baseline lists the other 63 beside the first 25. `relish mcp` is the
+exception. It's a server and runs for hours, so it gets no tag: its one
+call of `default_local` now goes through `spawn_blocking`, and its other
+sites stay in the baseline where we can see them. The 40 on the node's
+side went three ways:
 
 - **Moved off the runtime.** Building a container's OCI spec writes each
   inline config file and creates the identity mount directory with
@@ -7877,9 +7886,17 @@ first 25. The 40 on the node's side went three ways:
   listings for every query and the rollup hydration, the rootless
   runtime's socket checks under `/tmp`, the build runner's scratch
   directory, and the upgrade marker read moved to `spawn_blocking` too.
+  So did the node-pressure fault's cgroup setup and teardown, after
+  review caught a tag that wasn't true. The first pass had tagged
+  `remove_fault_cgroup` "cgroupfs, no disk behind it". It writes
+  `cgroup.kill`, then retries `remove_dir` up to 20 times with a
+  `std::thread::sleep` of 10 ms between tries: up to 200 ms on a runtime
+  worker. A tag is a claim about the code under it, and nothing checks
+  the claim. The rule now counts `std::thread::sleep` as blocking too.
 - **Tagged cgroupfs and procfs.** Most of the rest were reads and writes
   of `cgroup.procs`, `cpu.max` or `/proc/<pid>/stat` behind a helper or
-  two: fault reversals, egress cgroup ids, adopted-process polls. The
+  two: fault reversals, egress cgroup ids, task-group pid lists,
+  adopted-process polls. The
   kernel answers those from memory, so they carry
   `// BLOCKING-OK: cgroupfs, ...` or `procfs, ...`.
 - **Tagged startup.** Opening the Raft stores, the metrics store and the

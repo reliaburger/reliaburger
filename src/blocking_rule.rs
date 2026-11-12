@@ -18,6 +18,7 @@
 //! - `.sync_all()`, `.sync_data()` or `.set_len(..)`;
 //! - a raw `nix` file call (`lseek`, `fallocate`, `fsync`, `fdatasync`,
 //!   `ftruncate`);
+//! - `std::thread::sleep`, which blocks its thread for the whole sleep;
 //! - a call of a synchronous crate function that is blocking (#1860): one
 //!   whose own code makes one of the calls above, or calls another such
 //!   function, however deep. The rule reads every file once to collect
@@ -61,7 +62,11 @@
 //! (`vec![x; n]`, `json!({..})`); and `#[cfg(test)]` code. The sites that
 //! were already there when the rule arrived, and the `relish` CLI's that
 //! the fixed point found, are in `blocking_rule_baseline.json`. That list
-//! may only shrink.
+//! may only shrink. The CLI's own two shared helpers,
+//! `BunClient::default_local` and `BuildInfo::current`, are tagged instead
+//! (a one-shot read before any long-lived work), so a new command doesn't
+//! inherit their sites; `relish mcp`, which is long-lived, calls the first
+//! off the runtime.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -375,7 +380,9 @@ impl FileVisitor<'_> {
         {
             return true;
         }
-        if joined == "std::thread::scope" {
+        // A scope blocks until its threads finish; a sleep blocks for its
+        // whole duration.
+        if joined == "std::thread::scope" || joined == "std::thread::sleep" {
             return true;
         }
         if NIX_FILE_CALLS.contains(&last)
@@ -1198,6 +1205,34 @@ fn the_rule_follows_sync_helpers_that_block() {
             ("reads", "Store::stored"),
             ("reads", "inner::remove"),
         ])
+    );
+
+    // A thread sleep blocks the worker as surely as a disk does: a retry
+    // loop's `std::thread::sleep` once hid behind a "cgroupfs" tag.
+    let sleeper = "fn nap() { std::thread::sleep(PAUSE); }\n\
+                   async fn go() { nap(); std::thread::sleep(PAUSE); tokio::time::sleep(PAUSE).await; }";
+    assert_eq!(
+        found_in("src/x.rs", sleeper),
+        pairs(&[("go", "nap"), ("go", "std::thread::sleep")])
+    );
+
+    // A tag inside a helper clears its callers, the way the CLI's context
+    // read is cleared, and nothing else: a direct call beside it is still
+    // flagged.
+    let cli = r#"
+        fn default_local() -> Client {
+            // BLOCKING-OK: relish CLI: a one-shot read before any long-lived work
+            let context = std::fs::read_to_string(path());
+            Client::from(context)
+        }
+        async fn run() {
+            let client = default_local();
+            let manifest = std::fs::read_to_string("app.toml");
+        }
+    "#;
+    assert_eq!(
+        found_in("src/relish/x.rs", cli),
+        pairs(&[("run", "std::fs::read_to_string")])
     );
 }
 
