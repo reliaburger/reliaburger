@@ -3659,7 +3659,11 @@ costs by frame: the GitOps loop, the Raft core, the ledger, the pool path and
 so on. Code moves, and a map that silently stops matching would make every
 release look the same. So when more than 5% of Bun's samples match no rule,
 the record says to extend the map. A hot path nobody has named is exactly
-what the step is there to find.
+what the step is there to find. The 0.2.8 record found one: Mayo's `sysinfo`
+walk of `/proc` runs on rayon's threads, where no `reliaburger::` frame
+survives, so the map now files any `sysinfo::` frame under metrics. It
+matches `sysinfo::` rather than rayon: `sysinfo` is the only crate that uses
+rayon today, but the next one to bring it in won't be Mayo's.
 
 ### What the measurements do and don't show
 

@@ -1,0 +1,14 @@
+samples 39884, Bun 115
+ 99.58%                   idle (no runnable work)
+  0.00%    0.87% of Bun    Bun: pool path, rest of ReusablePool::run (slots lock, timers, logs)
+  0.02%    5.22% of Bun    Bun: Raft core and log
+  0.01%    2.61% of Bun    Bun: agent loop and supervisor
+  0.02%    6.09% of Bun    Bun: API server
+  0.01%    2.61% of Bun    Bun: metrics (Mayo)
+  0.11%   39.13% of Bun    Bun: containers (Grill)
+  0.04%   13.04% of Bun    Bun: other Reliaburger code
+  0.06%   20.87% of Bun    Bun: async runtime (scheduler, timers, parking)
+  0.03%    9.57% of Bun    Bun: uncategorised (extend the map)
+  0.13%                   other processes and kernel threads
+other by command: lima-guestagent 0.05%, exe 0.04%, rcu_preempt 0.01%, containerd 0.01%, kworker/0:3-eve 0.01%, kworker/u8:0-ev 0.01%, perf 0.01%, vmstat 0.01%, multipathd 0.00%, systemd-journal 0.00%
+9.6% of Bun's samples are uncategorised, over the 5% limit: extend BUN_RULES in scripts/release/profiling/profile_categories.py

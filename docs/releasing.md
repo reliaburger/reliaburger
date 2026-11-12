@@ -653,6 +653,23 @@ the same commit and back
 proves the walk itself but not the two releases together. If a walk fails, a
 fresh cluster, as [from 0.2.0](#upgrading-from-020), still works.
 
+### Upgrading from 0.2.7
+
+0.2.8 can't roll onto a 0.2.7 cluster. Agent leases and proposals are new
+Raft requests and new fields in desired state
+([#1682](https://github.com/reliaburger/reliaburger/issues/1682),
+[#1686](https://github.com/reliaburger/reliaburger/issues/1686)), every audit
+record names the kind of principal that acted, and the new cluster summary
+behind `relish status` adds fields to node reports
+([#1788](https://github.com/reliaburger/reliaburger/pull/1788)). So the
+protocol moved from 57 to 58 and the state format from 73 to 74, once for the
+whole release, and a 0.2.7 leader refuses `relish upgrade start v0.2.8`
+before it records a run.
+
+The move is a fresh cluster, as [from 0.2.0](#upgrading-from-020), with the
+same steps and the same losses. A script that read `relish status -o json`
+as a list of instances should read `relish apps --instances -o json` instead.
+
 ## Signing identity
 
 Configure `RELIABURGER_RELEASE_KEY` as a secret of the `release` GitHub
@@ -1077,7 +1094,7 @@ and the [release asset digest fields](https://docs.github.com/en/rest/releases/r
 The website and installer are separate static assets under `docs/website`,
 published by `static.yml`. GitHub Pages cannot select a different response for
 curl and a browser at `/`; the shell endpoint is `/install.sh`. The bootstrap
-installs the version in its `RELIABURGER_VERSION` default (`v0.2.7` today), so
+installs the version in its `RELIABURGER_VERSION` default (`v0.2.8` today), so
 bump that default in the same change that announces a newer release. Both
 scripts need a mode, `--laptop` or `--install-only`; with none they explain the
 choices and exit 2. For a release from before 0.2.2 the bootstrap drops

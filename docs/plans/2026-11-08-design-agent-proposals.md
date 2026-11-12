@@ -7,7 +7,7 @@ undo and guardrails), built together with
 agents) and touching
 [#1730](https://github.com/reliaburger/reliaburger/issues/1730) (the MCP
 client's own token). The release plan is
-[2026-11-07-plan-0.2.8.md](2026-11-07-plan-0.2.8.md); status lives in the
+[2026-11-07-plan-0.2.8.md](archive/2026-11-07-plan-0.2.8.md); status lives in the
 [0.2.8 milestone](https://github.com/reliaburger/reliaburger/milestone/30).
 
 This document decides. The maintainer reviews the finished feature, so every

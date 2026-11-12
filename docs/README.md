@@ -5,8 +5,8 @@ laptop, see the [quickstart guide](quickstart.md). For the architectural vision,
 see the [whitepaper](whitepaper.md); for status and what's next, see the
 [roadmap](roadmap.md).
 
-0.2.7 was released on 7 November 2026. Its signed binaries, guest images and
-installer are on the [GitHub release](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.7),
+0.2.8 was released on 12 November 2026. Its signed binaries, guest images and
+installer are on the [GitHub release](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.8),
 and `curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop` installs it
 and builds a laptop cluster; without a flag the installer explains the choices.
 Until 1.0.0 Reliaburger is good enough for home labs and dev clusters, not production. Every
@@ -14,7 +14,7 @@ release follows the same [build, staging and promotion procedure](releasing.md#m
 From 0.2.7, every release file also carries a build provenance
 attestation that anyone can check with `gh attestation verify`, and the macOS `relish` can be
 notarised ([checks a stranger can run](releasing.md#checks-a-stranger-can-run)).
-The limits below are the ones 0.2.7 ships with; the [roadmap](roadmap.md) tracks
+The limits below are the ones 0.2.8 ships with; the [roadmap](roadmap.md) tracks
 what comes after it. The [feature status page](https://reliaburger.com/features)
 rates every feature Ready, Beta, Alpha or Planned, with its restrictions and open
 issues; its source is [features.toml](features.toml).
@@ -34,7 +34,7 @@ and trade-offs against other projects, with dated evidence and explicit release 
 
 ## What's in the binary
 
-This is what 0.2.7, the release the installer fetches, does. Each node runs
+This is what 0.2.8, the release the installer fetches, does. Each node runs
 one agent, `bun`; you drive the cluster with one CLI, `relish`. Scheduling,
 clustering, service discovery, ingress, PKI, secrets, an image registry,
 metrics, logs, GitOps, jobs and fault injection are compiled into that agent,
@@ -181,8 +181,9 @@ and your own, which `--external-key` adds as relish downloads the build for
 each node's platform. Until 1.0 it works only between builds with the same
 cluster formats. 0.2.3 kept 0.2.2's, and a 0.2.2 cluster rolled onto it in
 place ([record](qualification/2026-10-29-rolling-walk-0.2.2-to-0.2.3.md));
-0.2.4, 0.2.5 and 0.2.6 each change them again, and 0.2.7 keeps 0.2.6's, so a
-0.2.6 cluster can roll onto 0.2.7 in place. A release with other cluster formats, or a
+0.2.4, 0.2.5 and 0.2.6 each change them again, 0.2.7 kept 0.2.6's, and 0.2.8
+changes them again, so a 0.2.7 cluster starts afresh on 0.2.8
+([compatibility before 1.0.0](releasing.md#compatibility-before-100)). A release with other cluster formats, or a
 rollback to a version some node doesn't hold, is refused before anything is
 recorded.
 
@@ -200,7 +201,7 @@ at your own cluster (`relish test`), and a soak that installs the signed
 release the way you would and then breaks it for hours. An agent gym breaks
 throwaway clusters in ways it knows and scores whatever diagnoses them, an AI
 agent included, against the ground truth (`make test-gym`, from 0.2.7; Claude Code plugs in with `scripts/gym/claude_code.py`, and an open model in Ollama with `scripts/gym/local_model.py`).
-`relish gym run` (0.2.8, not in 0.2.7) runs the same scenarios against your
+`relish gym run` runs the same scenarios against your
 own agent in a staging namespace of your own cluster, and cleans up after
 itself ([testing your agent](manual/05_chaos.md#testing-your-agent-on-your-cluster)). CI
 never retries a failure. See [how Reliaburger is tested](testing.md).
@@ -380,9 +381,9 @@ lists which work.
 
 ### Jobs and cron
 
-Jobs arrived in 0.2.0. 0.2.7 keeps 0.2.6's cluster formats, so a 0.2.6
-cluster can roll onto it with `relish upgrade`; a 0.2.5 or older cluster
-starts afresh ([upgrading from 0.2.6](releasing.md#upgrading-from-026)). The
+Jobs arrived in 0.2.0. 0.2.8 changes the cluster formats, so a 0.2.7 or older
+cluster starts afresh
+([compatibility before 1.0.0](releasing.md#compatibility-before-100)). The
 [job manual](manual/14_batch-jobs.md) covers jobs in full.
 
 Every job, cron occurrence, hook and task array runs on one lifecycle: a durable
@@ -557,7 +558,7 @@ xcode-select --install
 
 ## Container runtimes (optional)
 
-For 0.2.7, Bun selects Linux runc or the built-in process runtime. macOS containers run through managed Linux VMs. **ProcessGrill** (plain OS processes) is the built-in fallback that works everywhere without extra software — you don't need to install anything else to get started.
+For 0.2.8, Bun selects Linux runc or the built-in process runtime. macOS containers run through managed Linux VMs. **ProcessGrill** (plain OS processes) is the built-in fallback that works everywhere without extra software — you don't need to install anything else to get started.
 
 ### runc (Linux)
 
@@ -596,7 +597,7 @@ or operator firewall rules when diagnosing direct-host connectivity.
 
 ### macOS containers: managed Linux VMs
 
-For 0.2.7, run containers through the [managed laptop quickstart](quickstart.md):
+For 0.2.8, run containers through the [managed laptop quickstart](quickstart.md):
 
 ```sh
 relish setup --quickstart --nodes 3
@@ -607,7 +608,7 @@ foreground process workloads. Direct Apple Container selection is disabled,
 even when its CLI is installed: interrupted CLI requests can outlive Bun and
 mutate the Apple daemon, and their recovery guarantees are not yet complete.
 The adapter and its manual development tests remain in the repository for future
-work; they are outside the 0.2.7 runtime profile.
+work; they are outside the 0.2.8 runtime profile.
 
 ### ProcessGrill (built-in fallback)
 
@@ -627,7 +628,7 @@ sixteen concurrent exec requests, with a five-minute deadline, 64 KiB request
 limit and 1 MiB combined stdout/stderr response limit. Commands inherit the host
 environment and run without container isolation.
 
-**0.2.7 contract: foreground workloads only.** The main process stays under Bun's
+**0.2.8 contract: foreground workloads only.** The main process stays under Bun's
 supervision and children must remain in its supervised process group. A service
 can run unattended and spawn workers; foreground does not mean an open terminal.
 Use the application's foreground/no-daemon option. A shell wrapper should `exec`
@@ -1941,7 +1942,7 @@ different name or namespace for the other kind.
 
 Release maintainers: see [the build, signing and publication procedure](releasing.md).
 
-Direct Apple Container is disabled for 0.2.7 while interrupted daemon-command
+Direct Apple Container is disabled for 0.2.8 while interrupted daemon-command
 recovery remains unfinished. Use the managed Linux/runc quickstart on macOS.
 
 Node chaos (kill, drain, pressure and council partitions) reserves one cluster-wide

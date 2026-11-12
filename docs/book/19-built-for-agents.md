@@ -8023,10 +8023,10 @@ are the opposite case: they're measured on every build, so another test
 reads them from `docs/testing/concept-budget.json` and fails if the page
 quotes anything else.
 
-The commands aren't in the release the installer fetches yet, so the section
-says "0.2.8, not in 0.2.7", which the installed-release check asks for. When
-0.2.8 ships, that check fails until the label goes, so the page can't keep
-calling a released feature new.
+Until 0.2.8 shipped, the commands weren't in the release the installer
+fetched, so the section said "0.2.8, not in 0.2.7", which the
+installed-release check asks for. When 0.2.8 shipped, that check failed until
+the label went, so the page can't keep calling a released feature new.
 
 ## What we didn't do
 

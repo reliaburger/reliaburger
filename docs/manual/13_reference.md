@@ -10,7 +10,7 @@ The flags, variables, files and ports you'll reach for. `relish help COMMAND`
 | `--endpoint URL` | `RELIABURGER_ENDPOINT` | Bun API to talk to |
 | `--token TOKEN` | `RELIABURGER_TOKEN` | API bearer token |
 | `--ca-cert PATH` | `RELIABURGER_CA_CERT` | cluster root CA; switches the default to HTTPS |
-| `-o`, `--output FORMAT` | | `human` (default), `json` or `yaml`; every command takes it except the eight interactive ones ([machine output](#machine-output)) |
+| `-o`, `--output FORMAT` | | `human` (default), `json` or `yaml`; every command takes it except the six interactive ones ([machine output](#machine-output)) |
 
 A flag beats its variable. With neither, `relish` uses the laptop cluster's
 saved context, then `http://127.0.0.1:9117`.
@@ -102,11 +102,10 @@ would the token. Everything else names where a secret is (`init`'s
 `master_key`, `sign keygen`'s `path`), never the secret itself, and `secret
 encrypt` never echoes the plaintext.
 
-Eight commands refuse `-o json`, exit `2` and say they're interactive: `tui`,
-`dashboard`, `manual` (the reader and `--web`), `source`, the guided `setup`,
-`dev shell`, `machines claim` and `netboot`. They take over the terminal or a
-browser, ask their questions as they go, or serve until stopped, so there's
-nothing to print as data. Bare `relish -o json` is
+Six commands refuse `-o json`, exit `2` and say they're interactive: `tui`,
+`dashboard`, `manual` (the reader and `--web`), `source`, the guided `setup`
+and `dev shell`. They take over the terminal or a browser, or ask their questions as
+they go, so there's nothing to print as data. Bare `relish -o json` is
 `relish -o json tui`, so it refuses too. `setup --quickstart` and `setup
 --ssh` aren't among them: they never ask, so they print what they built, and
 an agent that ran them can quote it. `exec` isn't one of them either: it runs a
@@ -120,10 +119,10 @@ Three commands answer "is it all right?" at three depths:
 | Command | Flags | What it shows |
 |---|---|---|
 | `relish status` | `--quick` skips `wtf`'s checks (otherwise run with a 2 s budget); `--check` sets the exit code from the verdict | one screen: a verdict (`HEALTHY`, `DEGRADED` or `DOWN`), then one line per part of the cluster, each needing attention ending in the command that shows the detail |
-| `relish apps [NAME]` *(0.2.8, not in 0.2.7)* | `--namespace NS`, `--unhealthy` (not running and ready), `--node NODE`, `--instances` | one row per app, problems first, then why each isn't fully running; with `NAME` or `--instances`, one row per instance with its PID, restarts and age |
+| `relish apps [NAME]` | `--namespace NS`, `--unhealthy` (not running and ready), `--node NODE`, `--instances` | one row per app, problems first, then why each isn't fully running; with `NAME` or `--instances`, one row per instance with its PID, restarts and age |
 | `relish nodes` | `--unhealthy` (not alive, cordoned, under disk pressure or not answering) | one row per node: gossip state, council seat, leader, version, CPU, memory and disk use, and what the scheduler allocated |
 
-An app's state in `relish apps` (0.2.8, not in 0.2.7) is, worst first, `down` (it wants replicas
+An app's state in `relish apps` is, worst first, `down` (it wants replicas
 and none run), `degraded` (some run), `unknown` (a node didn't answer, so what runs there
 isn't known), `running` or `stopped` (it wants none). A node
 that didn't answer is a warning on stderr for `apps`, and a line under the
@@ -344,7 +343,7 @@ startup instead of being ignored.
 | Section | For |
 |---------|-----|
 | `[node]` | `name`, `labels` (matched by `placement`), `loop_stall_snapshot_ms` (750: when one turn of Bun's agent loop runs this long, a watchdog thread writes a snapshot of every Bun thread to the journal, starting `bun: agent loop stalled`; at most ten an hour; `0` turns it off) |
-| `[cluster]` | `name`, `join`, ports, `council_size` (how many voters the council grows to, odd, 1 to 7; read when the node creates the cluster), `[cluster.backup]` (see `operations`) |
+| `[cluster]` | `name`, `join`, ports, `[cluster.backup]` (see `operations`) |
 | `[storage]` | data directories, `allowed_host_paths`, `audit_max_bytes` (see `security`), `[storage.snapshots]` (see `images-and-volumes`) |
 | `[resources]` | CPU and memory held back for the node itself (`500m` or `0.5` cores, `512Mi`) |
 | `[network]` | `advertise_address`, host `port_range` (default `{ start = 10000, end = 32767 }`, end exclusive: below Linux's ephemeral range; ports something on the host already listens on are skipped) |
@@ -429,27 +428,27 @@ See [getting started](00_getting-started.md) and [cluster basics](02_cluster-bas
 - `relish setup`: Guided setup: detect or install bun, then write a starter config
 - `relish local <status|start|stop|destroy> [NODE]`: Manage a laptop cluster created by setup --quickstart
 - `relish init [DIR]`: Initialise a new cluster (generates CAs, age keypair, node identity)
-- `relish cluster`: Create a cluster of bare-metal appliances (docs/manual/15_appliance.md) *(0.3.0, not in 0.2.7)*
-  - `relish cluster create --bare-metal --name <NAME> --operator <OPERATORS>... <DIRECTORY> <MACHINES>...`: Create a cluster for appliance machines: its PKI and admin token on this machine, and a seed per machine for an RBSEED stick *(0.3.0, not in 0.2.7)*
-- `relish image`: Appliance OS images: download, write to a disk, and seed machines *(0.3.0, not in 0.2.7)*
-  - `relish image download`: Download the newest OS build for every architecture and check it against the release key *(0.3.0, not in 0.2.7)*
-  - `relish image write <IMAGE> <DEVICE>`: Write a disk image (.raw or .raw.zst) onto a device, erasing it *(0.3.0, not in 0.2.7)*
-  - `relish image seed <DIRECTORY> <MACHINES>...`: Write seeds for machines joining a running bare-metal cluster *(0.3.0, not in 0.2.7)*
-  - `relish image delete <REFERENCE>`: Delete a registry tag: the same as `relish images delete` *(0.3.0, not in 0.2.7)*
-- `relish machines`: Unclaimed appliances on the LAN: list them, or claim them with seeds over the network *(0.3.0, not in 0.2.7)*
-  - `relish machines claim <DIRECTORY> <MACHINES>...`: Claim machines: compare each one's claim key with its console, then send it a seed, joining it to the cluster in DIRECTORY (or, with --create, making a new cluster there from them) *(0.3.0, not in 0.2.7)*
-- `relish netboot <DIR>`: Install appliances over the network: ProxyDHCP, TFTP and HTTP for the OS that `relish image download` saved *(0.3.0, not in 0.2.7)*
-- `relish os`: The appliance OS across the cluster: what each node runs, and rolling a new version out node by node *(0.3.0, not in 0.2.7)*
-  - `relish os list`: Each node's OS version, and the newest release *(0.3.0, not in 0.2.7)*
-  - `relish os upgrade [VERSION]`: Roll an OS version across the cluster, one node at a time: workers, then the council, the leader last. Each node's workloads move off before it reboots *(0.3.0, not in 0.2.7)*
-  - `relish os status`: The rollout in progress, or the last one *(0.3.0, not in 0.2.7)*
-  - `relish os resume`: Carry on with a paused rollout, retrying the node that stopped it *(0.3.0, not in 0.2.7)*
-  - `relish os abort`: Stop the rollout; nodes keep the version they're on *(0.3.0, not in 0.2.7)*
+- `relish cluster`: Create a cluster of bare-metal appliances (docs/manual/15_appliance.md) *(0.3.0, not in 0.2.8)*
+  - `relish cluster create --bare-metal --name <NAME> --operator <OPERATORS>... <DIRECTORY> <MACHINES>...`: Create a cluster for appliance machines: its PKI and admin token on this machine, and a seed per machine for an RBSEED stick *(0.3.0, not in 0.2.8)*
+- `relish image`: Appliance OS images: download, write to a disk, and seed machines *(0.3.0, not in 0.2.8)*
+  - `relish image download`: Download the newest OS build for every architecture and check it against the release key *(0.3.0, not in 0.2.8)*
+  - `relish image write <IMAGE> <DEVICE>`: Write a disk image (.raw or .raw.zst) onto a device, erasing it *(0.3.0, not in 0.2.8)*
+  - `relish image seed <DIRECTORY> <MACHINES>...`: Write seeds for machines joining a running bare-metal cluster *(0.3.0, not in 0.2.8)*
+  - `relish image delete <REFERENCE>`: Delete a registry tag: the same as `relish images delete` *(0.3.0, not in 0.2.8)*
+- `relish machines`: Unclaimed appliances on the LAN: list them, or claim them with seeds over the network *(0.3.0, not in 0.2.8)*
+  - `relish machines claim <DIRECTORY> <MACHINES>...`: Claim machines: compare each one's claim key with its console, then send it a seed, joining it to the cluster in DIRECTORY (or, with --create, making a new cluster there from them) *(0.3.0, not in 0.2.8)*
+- `relish netboot <DIR>`: Install appliances over the network: ProxyDHCP, TFTP and HTTP for the OS that `relish image download` saved *(0.3.0, not in 0.2.8)*
+- `relish os`: The appliance OS across the cluster: what each node runs, and rolling a new version out node by node *(0.3.0, not in 0.2.8)*
+  - `relish os list`: Each node's OS version, and the newest release *(0.3.0, not in 0.2.8)*
+  - `relish os upgrade [VERSION]`: Roll an OS version across the cluster, one node at a time: workers, then the council, the leader last. Each node's workloads move off before it reboots *(0.3.0, not in 0.2.8)*
+  - `relish os status`: The rollout in progress, or the last one *(0.3.0, not in 0.2.8)*
+  - `relish os resume`: Carry on with a paused rollout, retrying the node that stopped it *(0.3.0, not in 0.2.8)*
+  - `relish os abort`: Stop the rollout; nodes keep the version they're on *(0.3.0, not in 0.2.8)*
 - `relish join --node-id <NODE_ID> <ADDR>`: Join an existing cluster
 - `relish join-token`: Manage short-lived node-enrolment tokens
   - `relish join-token create --node-id <NODE_ID>`: Create a single-use token for enrolling one node
-  - `relish join-token list`: List join tokens: node id, expiry and whether each has been used *(0.3.0, not in 0.2.7)*
-  - `relish join-token revoke <NODE_ID>`: Revoke every unused join token for a node id *(0.3.0, not in 0.2.7)*
+  - `relish join-token list`: List join tokens: node id, expiry and whether each has been used *(0.3.0, not in 0.2.8)*
+  - `relish join-token revoke <NODE_ID>`: Revoke every unused join token for a node id *(0.3.0, not in 0.2.8)*
 - `relish nodes`: List cluster nodes: gossip state, version, usage and what's allocated
 - `relish council`: Show the council (Raft) on every node, or recover from full loss
   - `relish council status`: Show every node's view of the council (the default)
@@ -465,7 +464,7 @@ See [deploy an app](01_deploy-an-app.md) and [writing a controller](15_writing-a
 
 - `relish apply [PATH_OR_URL]`: Apply a Reliaburger TOML or Kubernetes YAML manifest
 - `relish status`: Is the cluster all right? One screen: a verdict, then one line per part of the cluster with the command that lists the detail
-- `relish apps [NAME]`: List apps with their state, problems first; with NAME, that app's instances *(0.3.0, not in 0.2.7)*
+- `relish apps [NAME]`: List apps with their state, problems first; with NAME, that app's instances
 - `relish inspect <NAME>`: Show every instance of an app across the cluster, with its node
 - `relish exec <APP> [COMMAND]...`: Run a command once inside a running instance and exit with its exit code. Not interactive: no stdin and no terminal
 - `relish deploy <PATH>`: Trigger a rolling deploy for an app
@@ -516,7 +515,7 @@ See [observability](04_observability.md).
 - `relish logs-export --dest <DEST>`: Copy a node's Parquet log files here, or have it ship them to object storage
 - `relish logs-search <SOURCE> <SQL>`: Search exported Parquet log archives with SQL
 - `relish events`: Show the cluster's recent events: deploys, restarts, health, faults, tokens, secrets and audited operations, newest last
-- `relish timeline`: What changed in a window, newest first: events (with the decisions they record), the audit log and an app's deploys *(0.3.0, not in 0.2.7)*
+- `relish timeline`: What changed in a window, newest first: events (with the decisions they record), the audit log and an app's deploys
 
 ### Diagnose and test
 
@@ -548,9 +547,9 @@ See [working with an AI agent](16_working-with-an-ai-agent.md).
   - `relish agent context`: The first call: `relish status`'s screen and summary, findings, unknowns, active faults and the newest events, in one bounded answer
   - `relish agent diagnose`: Every finding with its evidence, read-only next steps, and pointers into the manual and the source
   - `relish agent explain [ID]`: What a finding means and where it's decided, or why the cluster made a decision: --restart, --placement, --refusal
-  - `relish agent timeline`: What changed in a window: events, audit and deploys, newest first *(0.3.0, not in 0.2.7)*
+  - `relish agent timeline`: What changed in a window: events, audit and deploys, newest first
   - `relish agent upgrade-check`: Whether the cluster can take the latest release: `ready`, `up_to_date`, `needs_fresh_cluster`, `blocked` or `unknown`
-  - `relish agent verify`: Whether the cluster runs the published release, byte for byte: `verified`, `mismatch` or `unknown` *(0.3.0, not in 0.2.7)*
+  - `relish agent verify`: Whether the cluster runs the published release, byte for byte: `verified`, `mismatch` or `unknown`
   - `relish agent report --title <TITLE> --what-happened <WHAT_HAPPENED> --expected <EXPECTED> --not-tested <NOT_TESTED> --caught-by <CAUGHT_BY> --out <OUT>`: Draft a redacted bug report for a human to post. Never posts
   - `relish agent patch`: Build, test and try a fix on a throwaway cluster
     - `relish agent patch init <DIR>`: Extract this binary's source into a new workspace, on a `patch` branch
@@ -558,30 +557,30 @@ See [working with an AI agent](16_working-with-an-ai-agent.md).
     - `relish agent patch test <DIR> [FILTER]`: Run the portable test suite in the workspace, optionally filtered
     - `relish agent patch try <DIR>`: Boot a throwaway cluster from the workspace's binaries, with its own `RELIABURGER_HOME`
     - `relish agent patch diff <DIR>`: The change against the extracted source, and the tests that ran
-    - `relish agent patch apply <DIR> <DIFF>`: Apply a unified diff to the workspace, matching each hunk by its lines rather than its header's counts. All or nothing *(0.3.0, not in 0.2.7)*
+    - `relish agent patch apply <DIR> <DIFF>`: Apply a unified diff to the workspace, matching each hunk by its lines rather than its header's counts. All or nothing
     - `relish agent patch destroy [DIR]`: Remove the workspace's throwaway cluster, or every one with `--all`. The workspace and its source stay
   - `relish agent setup [claude-code|codex|cursor|vscode|goose|gemini]...`: Wire Reliaburger into the AI agents on this machine. Shows the diff; writes only with --yes
-  - `relish agent lease`: Take, renew or release a lease on an app or a namespace *(0.3.0, not in 0.2.7)*
-    - `relish agent lease take <app|namespace> <NAME>`: Take a lease before changing an app or a namespace, or renew yours *(0.3.0, not in 0.2.7)*
-    - `relish agent lease renew <app|namespace> <NAME>`: Extend a lease you hold *(0.3.0, not in 0.2.7)*
-    - `relish agent lease release <app|namespace> <NAME>`: Give up a lease you hold *(0.3.0, not in 0.2.7)*
-  - `relish agent propose --reason <REASON> <apply|scale|rollback|stop|delete|restart|cancel-deploy|clear-fault> <TARGET>`: Propose a change for a person to approve: apply, scale, rollback, stop or delete. Shows the summary, blast radius and undo command *(0.3.0, not in 0.2.7)*
-  - `relish agent proposals [ID]`: Proposals you can see, newest first; one when given its number *(0.3.0, not in 0.2.7)*
-  - `relish agent withdraw <ID>`: Withdraw a pending proposal you made *(0.3.0, not in 0.2.7)*
-  - `relish agent undo --reason <REASON> <ID>`: Propose undoing an applied proposal, for a person to approve *(0.3.0, not in 0.2.7)*
+  - `relish agent lease`: Take, renew or release a lease on an app or a namespace
+    - `relish agent lease take <app|namespace> <NAME>`: Take a lease before changing an app or a namespace, or renew yours
+    - `relish agent lease renew <app|namespace> <NAME>`: Extend a lease you hold
+    - `relish agent lease release <app|namespace> <NAME>`: Give up a lease you hold
+  - `relish agent propose --reason <REASON> <apply|scale|rollback|stop|delete|restart|cancel-deploy|clear-fault> <TARGET>`: Propose a change for a person to approve: apply, scale, rollback, stop or delete. Shows the summary, blast radius and undo command
+  - `relish agent proposals [ID]`: Proposals you can see, newest first; one when given its number
+  - `relish agent withdraw <ID>`: Withdraw a pending proposal you made
+  - `relish agent undo --reason <REASON> <ID>`: Propose undoing an applied proposal, for a person to approve
 - `relish mcp`: Serve the `relish agent` commands as read-only MCP tools over stdio
-- `relish lease`: List, take, renew, release or break leases on apps and namespaces, which keep agents and people from changing the same thing at once *(0.3.0, not in 0.2.7)*
-  - `relish lease list`: List the leases held now: target, holder, time left and purpose *(0.3.0, not in 0.2.7)*
-  - `relish lease take <app|namespace> <NAME>`: Take a lease to keep agents out while you work; renews one you hold *(0.3.0, not in 0.2.7)*
-  - `relish lease renew <app|namespace> <NAME>`: Extend a lease you hold *(0.3.0, not in 0.2.7)*
-  - `relish lease release <app|namespace> <NAME>`: Give up a lease you hold *(0.3.0, not in 0.2.7)*
-  - `relish lease break <app|namespace> <NAME>`: End someone else's lease (deployer or above over the target; audited) *(0.3.0, not in 0.2.7)*
-- `relish proposal`: List, show, approve or reject the changes agents propose. Approving applies it; each shows its blast radius and undo command first *(0.3.0, not in 0.2.7)*
-  - `relish proposal list`: Every proposal you can see, newest first *(0.3.0, not in 0.2.7)*
-  - `relish proposal show <ID>`: One proposal: summary, undo, findings, blast radius, diff, reason *(0.3.0, not in 0.2.7)*
-  - `relish proposal approve <ID>`: Approve a proposal, which applies it at once. You can't approve your own, and need deployer rights over every app it touches *(0.3.0, not in 0.2.7)*
-  - `relish proposal reject <ID>`: Reject a pending proposal *(0.3.0, not in 0.2.7)*
-- `relish undo <ID>`: Put an applied proposal back, if nothing has changed its apps since *(0.3.0, not in 0.2.7)*
+- `relish lease`: List, take, renew, release or break leases on apps and namespaces, which keep agents and people from changing the same thing at once
+  - `relish lease list`: List the leases held now: target, holder, time left and purpose
+  - `relish lease take <app|namespace> <NAME>`: Take a lease to keep agents out while you work; renews one you hold
+  - `relish lease renew <app|namespace> <NAME>`: Extend a lease you hold
+  - `relish lease release <app|namespace> <NAME>`: Give up a lease you hold
+  - `relish lease break <app|namespace> <NAME>`: End someone else's lease (deployer or above over the target; audited)
+- `relish proposal`: List, show, approve or reject the changes agents propose. Approving applies it; each shows its blast radius and undo command first
+  - `relish proposal list`: Every proposal you can see, newest first
+  - `relish proposal show <ID>`: One proposal: summary, undo, findings, blast radius, diff, reason
+  - `relish proposal approve <ID>`: Approve a proposal, which applies it at once. You can't approve your own, and need deployer rights over every app it touches
+  - `relish proposal reject <ID>`: Reject a pending proposal
+- `relish undo <ID>`: Put an applied proposal back, if nothing has changed its apps since
 
 ### Break things on purpose
 
@@ -605,9 +604,9 @@ See [chaos](05_chaos.md).
   - `relish fault list`: List all active faults
   - `relish fault clear [TARGET]`: Clear faults — all, by numeric id, or by service name
   - `relish fault scenario <PATH>`: Run a scripted chaos scenario from a TOML file
-- `relish gym`: Test your own agent on your own cluster: break a staging namespace in known ways, run the agent, score it *(0.3.0, not in 0.2.7)*
-  - `relish gym run --namespace <NAMESPACE>`: Deploy the gym's apps into a staging namespace, break them, run your agent, score it and clean up *(0.3.0, not in 0.2.7)*
-  - `relish gym list`: List the scenarios: what each deploys, breaks and scores *(0.3.0, not in 0.2.7)*
+- `relish gym`: Test your own agent on your own cluster: break a staging namespace in known ways, run the agent, score it
+  - `relish gym run --namespace <NAMESPACE>`: Deploy the gym's apps into a staging namespace, break them, run your agent, score it and clean up
+  - `relish gym list`: List the scenarios: what each deploys, breaks and scores
 
 ### Security and access
 
@@ -623,11 +622,11 @@ See [security and access](10_security.md).
   - `relish secret encrypt --pubkey <PUBKEY> <VALUE>`: Encrypt a plaintext value for use in app config ENC[AGE:...] fields
   - `relish secret rotate`: Rotate the secret encryption key (start or finalise)
 - `relish ca`: Back up the cluster's root CA, check the backup, and rotate intermediates
-  - `relish ca backup --from <FROM> --out <OUT>`: Re-seal a root CA backup to a new passphrase or age recipient *(0.3.0, not in 0.2.7)*
+  - `relish ca backup --from <FROM> --out <OUT>`: Re-seal a root CA backup to a new passphrase or age recipient *(0.3.0, not in 0.2.8)*
   - `relish ca verify --fingerprint <FINGERPRINT> <FILE>`: Check a root CA backup offline
   - `relish ca rotate --role <ROLE>`: Rotate an intermediate CA, signing the new one with your root backup
-- `relish identity`: Rotate the key that signs workload identity tokens *(0.3.0, not in 0.2.7)*
-  - `relish identity rotate-signing-key`: Sign workload identity tokens with a new key *(0.3.0, not in 0.2.7)*
+- `relish identity`: Rotate the key that signs workload identity tokens *(0.3.0, not in 0.2.8)*
+  - `relish identity rotate-signing-key`: Sign workload identity tokens with a new key *(0.3.0, not in 0.2.8)*
 - `relish sign --key <KEY> <IMAGE>`: Sign a Pickle-hosted image with your own key so `require_signatures` admits it
   - `relish sign keygen --out <OUT>`: Generate an image signing key and print the public key line for `[images.trust_policy] keys`
 - `relish audit`: Show who did what: the durable audit log of applies, deletes, execs, upgrades, faults, tokens and the other changes to the cluster
@@ -662,7 +661,7 @@ See [operations](12_operations.md).
   - `relish upgrade rollback [VERSION]`: Roll back to a previous version (cluster: version required)
   - `relish upgrade resume`: Resume a paused upgrade
   - `relish upgrade abort`: End a paused upgrade in which no node has moved. When some nodes already swapped, use `rollback <version>` instead
-- `relish verify`: Check the cluster runs exactly the published release: each node's bun and this relish, by SHA-256 and release signature *(0.3.0, not in 0.2.7)*
+- `relish verify`: Check the cluster runs exactly the published release: each node's bun and this relish, by SHA-256 and release signature
 - `relish gitops`: Show or change the cluster's GitOps configuration
   - `relish gitops status`: Show the cluster's GitOps configuration, sync status and what GitOps owns. Credentials are never shown
   - `relish gitops set <PATH>`: Replace the cluster's GitOps configuration from a TOML file holding a `[gitops]` section (admin only; audited). Credentials in it are sealed with the cluster master key before they reach Raft

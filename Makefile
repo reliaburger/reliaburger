@@ -148,9 +148,9 @@ lint-macos: ## Run clippy once on the library, relish and bun, with all features
 	$(CARGO) clippy --lib --bin relish --bin bun --all-features -- -D warnings
 
 audit: ## Fail on new RustSec findings or an expired advisory exception
-	@today=$$(date -u +%Y%m%d); expiry=20261118; \
+	@today=$$(date -u +%Y%m%d); expiry=20261210; \
 	if [ "$$today" -gt "$$expiry" ]; then \
-		echo "dependency advisory exceptions expired on 2026-11-18; review .cargo/audit.toml" >&2; \
+		echo "dependency advisory exceptions expired on 2026-12-10; review .cargo/audit.toml" >&2; \
 		exit 1; \
 	fi
 	$(CARGO) audit

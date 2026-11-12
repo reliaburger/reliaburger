@@ -26,49 +26,32 @@
 #   - RUSTSEC-2024-0370 (proc-macro-error): age 0.10 -> 0.12 (#1026) moves to
 #     i18n-embed-fl 0.10, which uses proc-macro-error2. Removed. age is now
 #     0.11.5 (below), whose i18n-embed-fl 0.9.4 also uses proc-macro-error2.
+#   - RUSTSEC-2026-0381 (webpki-roots 0.26.11 shim, distrusted emSign
+#     intermediates), added 21 October 2026: RustSec amended the advisory the
+#     same day to list the 0.26.11 shim as unaffected, provided its 1.x parent
+#     is patched (Cargo.lock holds 1.0.10). Removed 12 November 2026.
+#     tests/suite/dependency_audit.rs still fails if 1.x is unpatched (#1269).
+#   - RUSTSEC-2026-0391 and 0395 to 0406 (zstd 0.13.3, zstd-safe 7.3.0), added
+#     26 October 2026: zstd 0.13.4 and zstd-safe 7.4.0 (1 November 2026) patch
+#     all 13 and satisfy parquet, arrow-ipc and DataFusion 55.2.0's ^0.13.
+#     Removed 12 November 2026; moving DataFusion to arrow 60 stays #1366.
+#   See docs/qualification/2026-11-12-dependency-exceptions.md.
 #
 # RUSTSEC-2026-0374 (basic-toml) was added 20 October 2026 (see
 # docs/qualification/2026-10-20-dependency-exceptions.md): unmaintained, no
 # patched release, reached only at compile time through age's i18n proc macros.
-# RUSTSEC-2026-0381 (webpki-roots, distrusted emSign intermediates) was added
-# 21 October 2026 (see docs/qualification/2026-10-21-dependency-exceptions.md)
-# for the webpki-roots 0.26.11 shim only: it has no patched 0.26 release and
-# re-exports webpki-roots 1.x, which Cargo.lock holds at the patched 1.0.10.
-# tests/suite/dependency_audit.rs fails if 1.x is unpatched (#1269).
 # RUSTSEC-2026-0173 (proc-macro-error2) was added 25 October 2026 (see
 # docs/qualification/2026-10-25-dependency-exceptions.md): unmaintained, no
 # patched release, compile time only, through age 0.11.5's i18n proc macros.
 # age 0.12 avoided it but compiled in P-256 code built on crypto-bigint 0.5
 # (RUSTSEC-2026-0387, timing variability), so age went back to 0.11.5.
-# RUSTSEC-2026-0391 and 0395 to 0406 (zstd 0.13.3, zstd-safe
-# 7.3.0) were added 26 October 2026 (see
-# docs/qualification/2026-10-26-dependency-exceptions.md): parquet, arrow-ipc
-# and DataFusion 55.2.0 still require zstd 0.13, and only Parquet that
-# Reliaburger wrote itself is decompressed. Moving to zstd 0.14.3 is #1366.
-# On 6 November 2026 the source bundle and include-flate 0.3.5 moved to zstd
-# 0.14.3, so only parquet, arrow-ipc and DataFusion 55.2.0 still need these
-# (tests/suite/dependency_audit.rs); they go when DataFusion 56 (arrow 60) is
-# on crates.io. See docs/qualification/2026-11-06-dependency-exceptions.md.
-# Next review: 18 November 2026.
+# Both were reviewed again and kept on 12 November 2026: no newer basic-toml,
+# proc-macro-error2, age or i18n-config release changes that.
+# Next review: 10 December 2026.
 [advisories]
 ignore = [
     "RUSTSEC-2026-0374",
-    "RUSTSEC-2026-0381",
     "RUSTSEC-2026-0173",
-    # zstd 0.13.3 and zstd-safe 7.3.0, until #1366.
-    "RUSTSEC-2026-0391",
-    "RUSTSEC-2026-0395",
-    "RUSTSEC-2026-0396",
-    "RUSTSEC-2026-0397",
-    "RUSTSEC-2026-0398",
-    "RUSTSEC-2026-0399",
-    "RUSTSEC-2026-0400",
-    "RUSTSEC-2026-0401",
-    "RUSTSEC-2026-0402",
-    "RUSTSEC-2026-0403",
-    "RUSTSEC-2026-0404",
-    "RUSTSEC-2026-0405",
-    "RUSTSEC-2026-0406",
 ]
 
 [output]

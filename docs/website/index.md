@@ -1,6 +1,6 @@
 <!-- Generated from docs/website/index.html by `make agent-docs`: edit the page, not this file. -->
 
-RUST · APACHE 2.0 · 0.2.7
+RUST · APACHE 2.0 · 0.2.8
 
 # The container platform, served ready.
 
@@ -21,7 +21,7 @@ We used to trust infrastructure because lots of people ran it. More users meant 
 Reliaburger’s answer, and where each part stands on 10 November 2026
 | The answer               | What exists                                                                                                                                                                                                                                                                                                                                                                                            | What doesn’t yet                                                                                                                                                                                                                                                                                                                                                                     |
 | ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| One thing to upgrade     | Not Kubernetes, etcd, a CNI, an ingress controller, cert-manager, Prometheus, Grafana, a log stack, Argo CD and a registry, each on its own release cycle, but one binary. `relish upgrade start` rolls it across the cluster, signed, with automatic rollback, and we shipped fifteen releases in [40 days](https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md#releases-after-010). | The OS patches separately until 0.3.0’s netbooted [appliance image](https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md#releases-after-010), which is planned, not shipped. A person starts every upgrade, and before 1.0 a format change needs a [fresh cluster](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#compatibility-before-100). |
+| One thing to upgrade     | Not Kubernetes, etcd, a CNI, an ingress controller, cert-manager, Prometheus, Grafana, a log stack, Argo CD and a registry, each on its own release cycle, but one binary. `relish upgrade start` rolls it across the cluster, signed, with automatic rollback, and we shipped sixteen releases in [45 days](https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md#releases-after-010). | The OS patches separately until 0.3.0’s netbooted [appliance image](https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md#releases-after-010), which is planned, not shipped. A person starts every upgrade, and before 1.0 a format change needs a [fresh cluster](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#compatibility-before-100). |
 | Continuously scrutinised | Apache 2.0, and every release `relish` carries its own source. Claude Code found and patched a bug we planted in it in [5 of 5 runs](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-06-v0.2.7-exit-test.md). Fuzzing, mutation tests and a dependency audit run on a schedule.                                                                                        | A scheduled LLM review of the whole code base is a design goal for [1.0](https://github.com/reliaburger/reliaburger/issues/1840). Today LLM reviews happen in audits someone starts.                                                                                                                                                                                                 |
 | Ten times less code      | 202,730 lines of Rust, against 2,134,280 lines of Go for the Kubernetes projects that cover the same features, counted with the [same tool and rules](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-10-loc-comparison.md).                                                                                                                                           | Lines aren’t bugs, and the Kubernetes side does more. Without Cilium and Grafana it’s [6.7 times](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-10-loc-comparison.md#results).                                                                                                                                                                     |
 | One advisory stream      | Our issues, plus RustSec for our crates. Kubernetes’s own feed alone has [95 CVEs](https://kubernetes.io/docs/reference/issues-security/official-cve-feed/), and etcd, containerd, runc, Helm and Argo CD each keep their own.                                                                                                                                                                         | The crates bring their own advisories: [13 against one](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-26-dependency-exceptions.md) on 26 October 2026.                                                                                                                                                                                             |
@@ -72,7 +72,7 @@ One line installs `relish`, then builds a three-node cluster of Linux VMs on you
 
 You’ll need a Mac with Apple silicon, or Linux with QEMU and KVM, plus about 8 GiB of free memory and 15 GiB of disk. No Rust, no checkout.
 
-[One node, CLI only, cleanup](https://github.com/reliaburger/reliaburger/blob/main/docs/quickstart.md) · [Read the bootstrap script](https://reliaburger.com/install.sh) · [Release notes](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.7)
+[One node, CLI only, cleanup](https://github.com/reliaburger/reliaburger/blob/main/docs/quickstart.md) · [Read the bootstrap script](https://reliaburger.com/install.sh) · [Release notes](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.8)
 
 PROMPT your agent
 
@@ -105,25 +105,28 @@ Good enough for home labs and dev clusters. Not for production until 1.0.0, expe
 
 [Roadmap](https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md)
 
-**0.2.7: Built for humans and their agents**
+**0.2.8: Agents you can trust, built faster**
 
-What that line installs, released on 7 November 2026. `relish agent` answers your AI agent in JSON, with the manual and the exact source its binary was built from; `relish mcp` serves it as read-only tools; and every release file carries a provenance attestation you can check. A 0.2.6 cluster rolls onto it in place. Setup over SSH arrived in 0.2.6.
+What that line installs, released on 12 November 2026. An AI agent proposes a change and a person or a policy approves it, with the blast radius and the undo shown first; leases keep agents and people off each other’s apps; `relish timeline` says what changed and why; `relish verify` checks every node runs the published release; and `relish status` fits the whole cluster on one screen. 0.2.8 changes the cluster formats, so a 0.2.7 cluster starts afresh. `relish agent` and `relish mcp` arrived in 0.2.7.
 
-[Release notes](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.7)
+[Release notes](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.8)
 
 ## Try it in five minutes
 
-Put the cluster through its paces with a burger built from eight apps: a batch of jobs, a layer cut off, a rolling deploy, a rollback, a scale-up, a house rule, a killed patty, a slow network and a lost node.
+Put the cluster through its paces with a burger built from eight apps: a batch of jobs, a layer cut off, a rolling deploy, a rollback, a scale-up, an agent’s proposal and its undo, a house rule, a killed patty, a slow network and a lost node.
 
-The whole tour on a real laptop cluster, run by [scripts/demo/tour.sh](https://github.com/reliaburger/reliaburger/blob/main/scripts/demo/tour.sh) against the published 0.2.7 install. Setup plays four times faster and idle time is cut to two seconds; every wait says how long it really took. Jump to a step with the buttons above, or the marks on the progress bar. speed
+The whole tour on a real laptop cluster, run by [scripts/demo/tour.sh](https://github.com/reliaburger/reliaburger/blob/main/scripts/demo/tour.sh) against the published 0.2.8 install. Setup plays four times faster and idle time is cut to two seconds; every wait says how long it really took. Jump to a step with the buttons above, or the marks on the progress bar. speed
 
 Show the commands every step, with what to look for
 
 1.   ```
      curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop
      ```
+     ```
+     relish verify
+     ```
 
-     The install line from above. It’s the only step that takes minutes.
+     The install line from above. It’s the only step that takes minutes. `verify` then checks that every node runs the published, signed release, byte for byte.
 
 2.   ```
      curl -fsSL https://reliaburger.com/demo/burger.tar.gz | tar xz
@@ -144,10 +147,13 @@ Show the commands every step, with what to look for
      relish status
      ```
      ```
+     relish apps counter
+     ```
+     ```
      relish council status
      ```
 
-     Eight apps from that one image: a layer of the burger each (top bun, lettuce, tomato, cheese, patty, bottom bun), a counter in front and a diner who keeps ordering. Give it half a minute. Three counters, one on each node, named `counter-0`, `-1` and `-2`: the scheduler spread and numbered them, not you. `status` opens with a line on the council, the Raft group that holds the cluster’s state; `council status` asks every node for its own view of it.
+     Eight apps from that one image: a layer of the burger each (top bun, lettuce, tomato, cheese, patty, bottom bun), a counter in front and a diner who keeps ordering. Give it half a minute. `status` is the whole cluster on one screen, a line for each part, opening with the council, the Raft group that holds the cluster’s state. `apps counter` lists three counters, one on each node, named `counter-0`, `-1` and `-2`: the scheduler spread and numbered them, not you. `council status` asks every node for its own view of the council.
 
 4.   ```
      curl http://burger.localhost:18080
@@ -189,13 +195,13 @@ Show the commands every step, with what to look for
      relish apply burger/patty-v3.toml
      ```
      ```
-     relish status
+     relish apps patty
      ```
      ```
      relish history patty
      ```
 
-     A bad deploy: patty `v3` is raw in the middle and fails its health check. It never joins the service, so the burger keeps its beef patty. After twenty seconds the node rolls it back on its own, and `status` marks the patty `RolloutFailed` so nothing retries it. `history` shows what shipped when, on every node.
+     A bad deploy: patty `v3` is raw in the middle and fails its health check. It never joins the service, so the burger keeps its beef patty. After twenty seconds the node rolls it back on its own, and `apps patty` marks the patty `RolloutFailed`, with the node and the reason, so nothing retries it. `history` shows what shipped when, on every node.
 
 9.   ```
      relish apply burger/triple-patty.toml
@@ -207,7 +213,22 @@ Show the commands every step, with what to look for
      Three patty replicas, and the counter finds all three: a triple patty, one line per instance. Any change to the spec clears the `RolloutFailed` mark, so this one goes out.
 
 10.  ```
-     curl -fsSLO https://raw.githubusercontent.com/reliaburger/reliaburger/v0.2.7/examples/policies/platform.toml
+     AGENT=$(relish token create --name burger-agent --agent --role deployer --namespaces default --ttl 1h)
+     ```
+     ```
+     relish agent propose scale patty --replicas 2 --reason "a double is plenty" --token "$AGENT"
+     ```
+     ```
+     relish proposal approve 1 --yes
+     ```
+     ```
+     relish undo 1 --yes
+     ```
+
+     Let an AI agent ask. Its token can propose a change but never make one, so `propose` writes a proposal: the cluster works out the diff, the blast radius and the undo command, and nothing changes yet. You approve it and the burger is a double; `undo` puts the third patty back. Every step is in the audit log, with who asked, who decided and the agent’s reason.
+
+11.  ```
+     curl -fsSLO https://raw.githubusercontent.com/reliaburger/reliaburger/v0.2.8/examples/policies/platform.toml
      ```
      ```
      relish policy test -f platform.toml -f burger/burger.toml
@@ -215,31 +236,31 @@ Show the commands every step, with what to look for
 
      House rules, without forking anything. `platform.toml` is the release’s example of the four policies platform teams ask for most, each a line or two of CEL that the leader judges every apply by. `policy test` tries the burger against them offline: none of its apps comes from a trusted registry, so each one is listed with the rule’s own message. Applied, the rules would refuse the next deploy before anything is written. New in 0.2.4.
 
-11.  ```
+12.  ```
      relish fault kill patty --acknowledge
      ```
      ```
      curl http://burger.localhost:18080
      ```
      ```
-     relish events --app patty
+     relish timeline --app patty
      ```
 
-     Kill a patty. For a few seconds it’s a double; then the node agent has restarted it and it’s a triple again, the new patty under a new instance number. The cluster won’t kill an app’s last replica, which is why this is a patty and not the lettuce. `events` asks every node what happened and merges the answers by time: the deploys, the failed `v3` and its rollback, the kill and the restart, each with its node.
+     Kill a patty. For a few seconds it’s a double; then the node agent has restarted it and it’s a triple again, the new patty under a new instance number. The cluster won’t kill an app’s last replica, which is why this is a patty and not the lettuce. `timeline` asks every node what happened and merges the answers by time: the deploys, the failed `v3` and its rollback, the proposal, the kill and the restart, each with its node and the rule behind each decision.
 
-12.  ```
+13.  ```
      relish path counter --to patty
      ```
 
      Walk the path from a counter to the patties, hop by hop: DNS, the virtual IP, the eBPF service map in the kernel, the firewall, any active faults, then a real TCP connect from inside the counter. On Kubernetes you’d piece that together from five tools and a debug pod.
 
-13.  ```
+14.  ```
      relish metrics counter
      ```
 
      The counters’ own Prometheus metrics, from every replica. Each node scrapes the replicas it runs, because the app says `metrics = {}`. There’s no Prometheus to install.
 
-14.  ```
+15.  ```
      relish fault delay patty 300ms --from counter --duration 2m --acknowledge
      ```
      ```
@@ -248,13 +269,13 @@ Show the commands every step, with what to look for
 
      Now make the patties slow, but only for the counters. Every packet they send a patty waits 300 ms; the other layers don’t notice, and it lifts itself after two minutes. The path is now DEGRADED: it names the fault, shows the delay on the counter’s network interface, and every connect takes 300 ms. Your browser shows the same thing, each patty line in the hundreds of milliseconds.
 
-15.  ```
+16.  ```
      relish dashboard
      ```
 
      The same thing as live charts in your browser: CPU, memory in MiB, requests per second and latency in milliseconds, one line per replica. Ctrl-C closes it; the cluster keeps running.
 
-16.  ```
+17.  ```
      relish local stop node-3
      ```
      ```
@@ -263,7 +284,7 @@ Show the commands every step, with what to look for
 
      Now lose a whole machine. About a minute later there are three running counters again, spread over the two nodes that are left: each keeps the one it had, and one of them starts a replacement under the lost one’s name. Any layer that lived on node-3 comes back the same way. Nobody had to notice first. `inspect` asks every node, lists each instance, running or stopped, with the node it’s on, and names the node that didn’t answer.
 
-17.  ```
+18.  ```
      relish wtf
      ```
 
@@ -292,11 +313,11 @@ Bun’s memory ended the day at 265.8, 265.4 and 225.4 MiB, against targets of 5
 
 Bun memory per node over the day run, with the 512 and 384 MiB targets. The ✕ marks are node 2’s leak check flagging its growth, not failed job tasks.
 
-A million in one go? 0.2.7’s 8-hour release soak ran 64 arrays of 1,048,576 tasks each while it broke things: the median took 140 seconds, the slowest 417. [Soak record](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-07-v0.2.7-job-qualification.md) · [What’s ready in jobs](https://reliaburger.com/features#jobs)
+A million in one go? 0.2.8’s 8-hour release soak ran 64 arrays of 1,048,576 tasks each while it broke things: the median took 145 seconds, the slowest 411. [Soak record](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-11-v0.2.8-job-qualification.md) · [What’s ready in jobs](https://reliaburger.com/features#jobs)
 
 What does each kind of isolation cost? Here’s the same command, run four ways on the same VM with the same concurrency.
 
-Recorded on a 0.2.0 development build. Four real 60-second windows: VM baseline, fresh containers, shared containers and host jobs. Chapter jumps and playback speed change only your view; preparation and cleanup stay visible. speed 
+Recorded on a 0.2.0 development build. Four real 60-second windows: VM baseline, fresh containers, shared containers and host jobs. Chapter jumps and playback speed change only your view; preparation and cleanup stay visible. speed
 
 Show the commands run the four scenarios on your own setup
 
@@ -383,51 +404,50 @@ What the soak does to the cluster, every hour of the full schedule
 
 One occurrence of any of these fails the release: a lost write or a counter that goes backwards, a certificate close to expiry, no leader for more than 30 seconds, a fault that doesn't settle in time, leaked containers, namespaces or memory, an upgrade on the wrong version, an agent panic or an unexplained restart, an agent loop stalled for over a second, a job that runs twice, goes missing or never drains, a council history that isn't linearizable, or job tasks slower than 256 ms to start at the 99th percentile. A failure gets a root cause before anything else happens. A product fix means a new candidate, and every soak starts again.
 
-**The latest: 0.2.7, 7 November 2026.** One candidate in one day, on the full gate because it changes the agent loop, on the Mac Studio. It passed everything clean but one slow agent turn in the 8-hour soak, waiting on a slow disk write. We shipped with it as a known issue, and fix it in 0.2.8. [The release log](https://github.com/reliaburger/reliaburger/blob/main/docs/release-log.md) has every release’s story.
+**The latest: 0.2.8, 12 November 2026.** Three candidates in three days, on the full gate because it changes the cluster formats and the agent loop, on the Mac Studio. The first two each failed a soak on a real bug: Bun crash-looped after a power cut that hit it mid-deploy, and two agent turns waited on the disk. The third passed everything clean, and ships with no known issue the gate found. [The release log](https://github.com/reliaburger/reliaburger/blob/main/docs/release-log.md) has every release’s story.
 
-Show 0.2.7's results headline numbers and charts, each with its record
+Show 0.2.8's results headline numbers and charts, each with its record
 
-- [8-hour job soak](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-07-v0.2.7-job-qualification.md): every fault and upgrade walk settled, no data lost, every job drained, agent memory within target, a council history linearizable over 214,757 operations, and a quiet tail with every leak check armed. 9,439 accepted jobs a second against the 1,390 target, job tasks started within 32 ms at the 99th percentile, over 217 million of them, and a 1,048,576-task array took 140 s at the median. It failed as run on one agent turn of 1,215 ms against the 1 s budget, waiting for a slow journal write.
-- [One-hour job soak](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-07-v0.2.7-job-qualification-fast.md): 8,584 accepted jobs a second, and job tasks started within 32 ms at the 99th percentile. Clean.
-- [One-hour app soak](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-07-v0.2.7-sustained-v02-fast.md): every fault kind, special and upgrade walk on the compressed schedule. Clean.
-- [Power cuts and reboots](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-07-power-cut-reboot.md): 25 of 25 in each of five lanes.
-- [Staged installs](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-07-v0.2.7-staged-install-apple-silicon.md): `curl | sh` to a ready cluster in 73 s, then [58 s](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-07-v0.2.7-staged-install-apple-silicon-2.md) from cold caches again.
-- [Every gate and every candidate](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-07-v0.2.7-release-closure.md): one candidate, and why we shipped it with that one turn.
-- [24 hours on the published release](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-08-v0.2.7-memory-run.md), after the tag: the day of jobs in [Batch jobs](https://reliaburger.com/#job-throughput) above. Node 2’s memory was still growing at the end ([#1417](https://github.com/reliaburger/reliaburger/issues/1417)).
+- [8-hour job soak](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-11-v0.2.8-job-qualification.md): every fault and upgrade walk settled, no data lost, every job drained, agent memory within target (the worst node steady at 208 MiB against 384), no agent turn over budget, a council history linearizable over 213,407 operations, and a quiet tail with every leak check armed. 9,311 accepted jobs a second against the 1,390 target, job tasks started within 32 ms at the 99th percentile, over 213 million of them, and a 1,048,576-task array took 145 s at the median. Clean.
+- [One-hour job soak](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-11-v0.2.8-job-qualification-fast.md): 8,630 accepted jobs a second. Clean.
+- [One-hour app soak](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-11-v0.2.8-sustained-v02-fast.md): every fault kind, special and upgrade walk on the compressed schedule. Clean, and so was [a second run](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-11-v0.2.8-sustained-v02-fast-seed-3139726783.md) on the seed that found the power-cut bug.
+- [Power cuts and reboots](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-11-power-cut-reboot.md): 25 of 25 in each of five lanes.
+- [Staged installs](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-11-v0.2.8-staged-install-apple-silicon.md): `curl | sh` to a ready cluster in 125 s, then [118 s](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-11-v0.2.8-staged-install-apple-silicon-2.md) from cold caches again.
+- [Every gate and every candidate](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-11-v0.2.8-release-closure.md): three candidates, what the first two found, and what fixed it.
 
 Time runs from the start of each soak. The marks under a chart are its faults and upgrade walks, and the dashed lines its targets. Open a chart to see it full size, with every mark named when you point at it.
 
-### [The 8-hour job soak](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-07-v0.2.7-job-qualification.md)
+### [The 8-hour job soak](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-11-v0.2.8-job-qualification.md)
 
-[![Accepted jobs a second in 10-minute windows over the 8-hour job soak, against the target rate, with the faults marked along the time axis](https://reliaburger.com/assets/soak/2026-11-07-v0.2.7-job-qualification-charts/jobs.svg)](https://reliaburger.com/assets/soak/2026-11-07-v0.2.7-job-qualification-charts/jobs.svg)
+[![Accepted jobs a second in 10-minute windows over the 8-hour job soak, against the target rate, with the faults marked along the time axis](https://reliaburger.com/assets/soak/2026-11-11-v0.2.8-job-qualification-charts/jobs.svg)](https://reliaburger.com/assets/soak/2026-11-11-v0.2.8-job-qualification-charts/jobs.svg)
 
 Accepted jobs a second, in 10-minute windows, against the target.
 
-[![Bun resident memory per node over the 8-hour job soak, against the 512 MiB target for node 1 and 384 MiB for the others, with the faults marked along the time axis](https://reliaburger.com/assets/soak/2026-11-07-v0.2.7-job-qualification-charts/rss.svg)](https://reliaburger.com/assets/soak/2026-11-07-v0.2.7-job-qualification-charts/rss.svg)
+[![Bun resident memory per node over the 8-hour job soak, against the 512 MiB target for node 1 and 384 MiB for the others, with the faults marked along the time axis](https://reliaburger.com/assets/soak/2026-11-11-v0.2.8-job-qualification-charts/rss.svg)](https://reliaburger.com/assets/soak/2026-11-11-v0.2.8-job-qualification-charts/rss.svg)
 
 Bun memory per node, with the 512 and 384 MiB targets.
 
-[![Open file descriptors per node over the 8-hour job soak, with the faults marked along the time axis](https://reliaburger.com/assets/soak/2026-11-07-v0.2.7-job-qualification-charts/fds.svg)](https://reliaburger.com/assets/soak/2026-11-07-v0.2.7-job-qualification-charts/fds.svg)
+[![Open file descriptors per node over the 8-hour job soak, with the faults marked along the time axis](https://reliaburger.com/assets/soak/2026-11-11-v0.2.8-job-qualification-charts/fds.svg)](https://reliaburger.com/assets/soak/2026-11-11-v0.2.8-job-qualification-charts/fds.svg)
 
 Open file descriptors per node.
 
-[![Bun CPU per node over the 8-hour job soak, as a percentage of one core, with the faults marked along the time axis](https://reliaburger.com/assets/soak/2026-11-07-v0.2.7-job-qualification-charts/cpu.svg)](https://reliaburger.com/assets/soak/2026-11-07-v0.2.7-job-qualification-charts/cpu.svg)
+[![Bun CPU per node over the 8-hour job soak, as a percentage of one core, with the faults marked along the time axis](https://reliaburger.com/assets/soak/2026-11-11-v0.2.8-job-qualification-charts/cpu.svg)](https://reliaburger.com/assets/soak/2026-11-11-v0.2.8-job-qualification-charts/cpu.svg)
 
 Bun CPU per node, as a percentage of one core.
 
-### [The one-hour app soak](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-07-v0.2.7-sustained-v02-fast.md)
+### [The one-hour app soak](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-11-v0.2.8-sustained-v02-fast.md)
 
 The gate has no separate 8-hour app soak: the job soak above runs the same apps and faults. These are from the compressed one.
 
-[![Bun resident memory per node over the one-hour app soak, against the 512 MiB target for node 1 and 384 MiB for the others, with the faults marked along the time axis](https://reliaburger.com/assets/soak/2026-11-07-v0.2.7-sustained-v02-fast-charts/rss.svg)](https://reliaburger.com/assets/soak/2026-11-07-v0.2.7-sustained-v02-fast-charts/rss.svg)
+[![Bun resident memory per node over the one-hour app soak, against the 512 MiB target for node 1 and 384 MiB for the others, with the faults marked along the time axis](https://reliaburger.com/assets/soak/2026-11-11-v0.2.8-sustained-v02-fast-charts/rss.svg)](https://reliaburger.com/assets/soak/2026-11-11-v0.2.8-sustained-v02-fast-charts/rss.svg)
 
 Bun memory per node, with the 512 and 384 MiB targets.
 
-[![Open file descriptors per node over the one-hour app soak, with the faults marked along the time axis](https://reliaburger.com/assets/soak/2026-11-07-v0.2.7-sustained-v02-fast-charts/fds.svg)](https://reliaburger.com/assets/soak/2026-11-07-v0.2.7-sustained-v02-fast-charts/fds.svg)
+[![Open file descriptors per node over the one-hour app soak, with the faults marked along the time axis](https://reliaburger.com/assets/soak/2026-11-11-v0.2.8-sustained-v02-fast-charts/fds.svg)](https://reliaburger.com/assets/soak/2026-11-11-v0.2.8-sustained-v02-fast-charts/fds.svg)
 
 Open file descriptors per node.
 
-[![Bun CPU per node over the one-hour app soak, as a percentage of one core, with the faults marked along the time axis](https://reliaburger.com/assets/soak/2026-11-07-v0.2.7-sustained-v02-fast-charts/cpu.svg)](https://reliaburger.com/assets/soak/2026-11-07-v0.2.7-sustained-v02-fast-charts/cpu.svg)
+[![Bun CPU per node over the one-hour app soak, as a percentage of one core, with the faults marked along the time axis](https://reliaburger.com/assets/soak/2026-11-11-v0.2.8-sustained-v02-fast-charts/cpu.svg)](https://reliaburger.com/assets/soak/2026-11-11-v0.2.8-sustained-v02-fast-charts/cpu.svg)
 
 Bun CPU per node, as a percentage of one core.
 
@@ -437,9 +457,9 @@ What the soaks don't prove: they run three small VMs on one machine, so they say
 
 Old mini PCs, thin clients, anything x86\_64 or arm64 with UEFI network boot: plug them into your switch and power them on. Your laptop serves the OS, they install themselves in under a minute, and one command makes them a cluster. No USB sticks, no distro, nothing to configure on each machine. Your router keeps handing out the addresses; relish only answers the boot part.
 
-Three machines with blank disks network-boot into Reliaburger and become one cluster. They’re QEMU VMs with UEFI firmware on a virtual switch, run by [scripts/demo/netboot.sh](https://github.com/reliaburger/reliaburger/blob/main/scripts/demo/netboot.sh) in CI, serving a lab build of the OS signed with that run’s own key. Idle time is cut to two seconds; every wait says how long it really took. speed 
+Three machines with blank disks network-boot into Reliaburger and become one cluster. They’re QEMU VMs with UEFI firmware on a virtual switch, run by [scripts/demo/netboot.sh](https://github.com/reliaburger/reliaburger/blob/main/scripts/demo/netboot.sh) in CI, serving a lab build of the OS signed with that run’s own key. Idle time is cut to two seconds; every wait says how long it really took. speed
 
-Show the commands from blank disks to a cluster (0.3.0, not in 0.2.7)
+Show the commands from blank disks to a cluster (0.3.0, not in 0.2.8)
 
 1.  In each machine’s firmware setup, turn on UEFI network boot and turn Secure Boot off. A blank disk falls through to the network by itself.
 
@@ -526,7 +546,7 @@ Last, it drafts a redacted bug report with the reproducer, the patch and what it
 
 ## Let your agent act, then take it back
 
-Reading a cluster is safe. Changing one is where an agent needs a leash. From 0.2.8, not in 0.2.7, an agent never changes the cluster itself: it asks. The cluster writes down what the change would do, a person or a policy you wrote says yes, and the undo is one command, shown before anything happens.
+Reading a cluster is safe. Changing one is where an agent needs a leash. An agent never changes the cluster itself: it asks. The cluster writes down what the change would do, a person or a policy you wrote says yes, and the undo is one command, shown before anything happens.
 
 No recording yet. A real session, an agent proposing a rollback on a real cluster and a person approving it, is being recorded for [#1690](https://github.com/reliaburger/reliaburger/issues/1690), and we won’t show a mock-up in its place. Until then, here are the steps.
 
@@ -644,23 +664,23 @@ Four open models ran the agent gym in Ollama on our Mac Studio, at an 8K window,
 
 In progress, with its scope still being settled. Agent changes as proposals you review and can undo, trying a change on a copy of production, and a record of why an agent did what it did. Alongside them, a faster loop for building and releasing Reliaburger itself.
 
-[Milestone](https://github.com/reliaburger/reliaburger/milestone/30) 
+[Milestone](https://github.com/reliaburger/reliaburger/milestone/30)
 
 **0.3.0: Bare metal in an hour**
 
 After 0.2.8. An appliance OS, netbooting and claiming machines over the LAN, and signed A/B OS updates. The exit test: Dell Wyse thin clients from power-on to a cluster.
 
-[Milestone](https://github.com/reliaburger/reliaburger/milestone/6) 
+[Milestone](https://github.com/reliaburger/reliaburger/milestone/6)
 
 **0.4.0: Full container migration**
 
 Planned. Cordon, drain and uncordon, cold moves that carry volumes, and checkpoint moves that keep memory while connections reconnect.
 
-[Milestone](https://github.com/reliaburger/reliaburger/milestone/7) 
+[Milestone](https://github.com/reliaburger/reliaburger/milestone/7)
 
 ## Read the docs
 
-Documentation lives with the code. 
+Documentation lives with the code.
 
 START HERE
 
@@ -696,7 +716,7 @@ CURRENT STATE
 
 ### [Roadmap & backlog](https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md)
 
-What’s implemented, what 0.2.7 leaves out and what’s next.
+What’s implemented, what 0.2.8 leaves out and what’s next.
 
 Every release carries PDFs, and these links always fetch the latest: [whitepaper](https://github.com/reliaburger/reliaburger/releases/latest/download/reliaburger-whitepaper.pdf), [design docs](https://github.com/reliaburger/reliaburger/releases/latest/download/reliaburger-design-docs.pdf), [the book](https://github.com/reliaburger/reliaburger/releases/latest/download/building-reliaburger.pdf) and [roadmap](https://github.com/reliaburger/reliaburger/releases/latest/download/reliaburger-roadmap.pdf). The Markdown on GitHub follows `main`, so it can be newer.
 
@@ -800,9 +820,9 @@ Hacking on Reliaburger itself? Start with a local process. No container runtime 
 
 You’ll need Rust and your platform’s build tools. This runs `hello` as a host process on one node: no images, no isolated container, only the binaries the node config allows.
 
-For real OCI containers, use runc on Linux. On macOS, the managed laptop quickstart uses Linux VMs. Direct Apple Container is deferred beyond 0.2.7.
+For real OCI containers, use runc on Linux. On macOS, the managed laptop quickstart uses Linux VMs. Direct Apple Container is deferred beyond 0.2.8.
 
-[Build requirements & runtime setup](https://github.com/reliaburger/reliaburger/blob/main/docs/README.md) 
+[Build requirements & runtime setup](https://github.com/reliaburger/reliaburger/blob/main/docs/README.md)
 
 LOCAL DEVELOPMENT sh
 

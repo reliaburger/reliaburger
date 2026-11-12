@@ -1,0 +1,6 @@
+2026-11-12T05:17:06Z bun pid 1832
+2026-11-12T05:18:07Z raw jobs-vm-baseline perf=none exit 0
+2026-11-12T05:19:18Z host jobs-host-processes perf=none exit 0
+2026-11-12T05:20:30Z shared jobs-shared-containers perf=none exit 0
+2026-11-12T05:21:40Z idle idle perf=none
+2026-11-12T05:21:40Z DONE

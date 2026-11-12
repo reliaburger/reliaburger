@@ -1357,11 +1357,14 @@ items, so 0.26.11 serves exactly the roots of whichever 1.x the lockfile picked,
 now the fixed 1.0.10. So the flagged version was safe, but only because of what it
 re-exported. We gave the advisory a narrow exception, and a test in `tests/suite/` reads
 `Cargo.lock` and fails if any copy of the three crates is older than its fix. The exception
-leans on that test.
+leans on that test. RustSec reached the same conclusion the same day and amended the
+advisory to list the 0.26.11 shim as unaffected, so the 12 November review found an
+exception that excused nothing and deleted it. The test stays: the shim is only safe while
+the 1.x underneath it is.
 
 The repository audit denies every new vulnerability and maintenance warning. Its short
-exception list expires on 18 November 2026, and the Make target fails after that date until we
-review it. CI runs the audit on changes and releases; a weekly job catches a new advisory
+exception list carries a review date (10 December 2026 at the time of writing), and the Make
+target fails after that date until we review it. CI runs the audit on changes and releases; a weekly job catches a new advisory
 even when nobody changes the source. An exception without an owner and an alarm is just a
 quieter way to forget a problem.
 
@@ -1526,6 +1529,17 @@ low, and the alternative was holding the whole gate for an upstream release with
 ([the 26 October review](../qualification/2026-10-26-dependency-exceptions.md)), and
 [#1366](https://github.com/reliaburger/reliaburger/issues/1366) removes it once DataFusion
 moves.
+
+In the end it didn't wait for DataFusion. On 1 November the zstd maintainer published
+0.13.4, a patched release of the old line, and every one of the 13 advisories now names it
+as a fix. Parquet asks for `zstd` `^0.13.0`, and a caret requirement in Cargo means "this
+version or any later one that's semver-compatible", so 0.13.4 satisfies it without anyone
+changing a `Cargo.toml`. One `cargo update -p zstd@0.13.3 --precise 0.13.4` moved the
+lockfile, and the 12 November review deleted all 13 exceptions
+([the 12 November review](../qualification/2026-11-12-dependency-exceptions.md)). The
+6 November review had looked only at DataFusion's release, so we ran with exceptions for a
+week longer than we needed. The lesson for the next review: check whether the old line got a
+fix of its own before waiting on whatever is upstream of it.
 
 Two days later, with the candidate most of the way through its 24-hour run, RustSec flagged
 `pulldown-cmark` 0.13.4, the Markdown parser behind `relish manual`. The advisory's own
