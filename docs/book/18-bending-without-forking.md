@@ -1697,6 +1697,36 @@ LaunchProblem`, which is why `create_with_secrets` can write
 `problem: error.into()`. We wrote no new failure path, just a new reason to
 take the existing one.
 
+**Brief outages (#1308).** Failing closed is right when the provider says no,
+but not when it's down for a second, restarting say. Then a restarted instance
+stayed failed until the next deploy. So one provider call is wrapped in a
+retry loop:
+
+```rust
+loop {
+    match self.resolve(reference, variable, context).await {
+        Err(error) if error.is_transient() && attempt < RESOLVE_ATTEMPTS => {
+            tokio::time::sleep(pause).await;
+            pause *= 2;
+            attempt += 1;
+        }
+        outcome => return outcome,
+    }
+}
+```
+
+The `if` after a pattern is a *match guard*: the arm matches only when the
+pattern fits and the condition holds. Anything else, a success, a
+non-transient error or the last attempt's error, falls through to `outcome`,
+a pattern that binds the whole value, and is returned. `loop` is Rust's
+endless loop, and the `return` inside it is the only way out. `is_transient`
+lists the failures worth repeating: a spawn failure, broken pipes, a timeout,
+an exit with no answer. A provider that answers with an `error` has made a
+decision, and asking again would only repeat it. The sleep is
+`tokio::time::sleep`, which yields to the runtime, and the loop runs on the
+deploy worker or the restart task, never the agent loop, so a slow provider
+holds up only its own instance.
+
 **Placement.** A node advertises its providers in its capability report,
 `NodeCapabilities::secret_providers`, and `node_can_run` gains one line:
 
