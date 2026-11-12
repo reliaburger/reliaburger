@@ -448,6 +448,16 @@ we had? `soak-identity` was the only multi-instance soak app, and rolling it eve
 would have changed its certificate serials, which is exactly what the identity-rotation gate
 counts. A rollout would have hidden a rotation that had stopped.
 
+The app start number was wrong for a while, and the harness wasn't to blame. Every record
+from 0.2.4 to 0.2.8 shows an app start p99 of 1 ms, because each node wrote its history
+entry's start and completion with the same clock read at the end of the deploy
+([#1640](https://github.com/reliaburger/reliaburger/issues/1640), and Chapter 7 has the
+fix). Those records measured the gap between two consecutive calls to
+`SystemTime::now()`, not an app start, so read their app start column as "not measured".
+Gating it on those records would have set a threshold on a number that can't move, so app
+start waits for records with real starts in them before
+[#1405](https://github.com/reliaburger/reliaburger/issues/1405) sets its gate.
+
 The samples go into a bucketed histogram rather than a list, so a 24-hour run keeps a few
 kilobytes of state, and each p99 is a bucket's upper bound. We put every threshold on a
 bucket bound for the same reason we picked 256 ms: the record's number is then exactly the

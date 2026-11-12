@@ -732,6 +732,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         new_ips: &std::collections::HashMap<InstanceId, Option<std::net::Ipv4Addr>>,
         mut new_specs: std::collections::HashMap<InstanceId, crate::grill::oci::OciSpec>,
         now: Instant,
+        started_at: SystemTime,
     ) -> Result<(), BunError> {
         let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
         // The service as the rollout leaves it is journalled before anything
@@ -900,22 +901,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
         self.rebuild_routing_table().await;
 
-        let entry = crate::meat::deploy_types::DeployHistoryEntry {
-            id: crate::meat::deploy_types::DeployId(
-                SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-            ),
-            app_id: crate::meat::types::AppId::new(app_name, namespace),
-            image: spec.image.clone().unwrap_or_default(),
-            result: crate::meat::deploy_types::DeployResult::Completed,
-            created_at: SystemTime::now(),
-            completed_at: SystemTime::now(),
-            steps_completed: new_ids.len(),
-            steps_total: new_ids.len(),
-            spec: Some(Box::new(spec.clone())),
-        };
+        let entry = crate::meat::deploy_types::DeployHistoryEntry::finished(
+            crate::meat::types::AppId::new(app_name, namespace),
+            spec,
+            crate::meat::deploy_types::DeployResult::Completed,
+            started_at,
+            new_ids.len(),
+            new_ids.len(),
+        );
         super::deploy_ops::record_deploy_history(&mut *self.deploy_history.write().await, entry);
         Ok(())
     }
