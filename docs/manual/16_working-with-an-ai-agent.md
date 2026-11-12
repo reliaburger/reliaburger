@@ -673,7 +673,18 @@ test that isn't `#[ignore]`. The gated suites (`make test-cluster`,
 `test-linux`, `test-slow` and the rest) are ignored there, and `data.not_run`
 says so in every answer. A failing test or a compile error
 is still an answer, with exit code 0: `data.ok` is `false`, and `failures` or
-`errors` says why, with each test's output or each error's file and line.
+`errors` says why, with each test's output or each error's file and line. So
+read `data.ok`, not the exit code, to tell whether the suite passed.
+
+An unchanged workspace answers `ok: true`. It carries what the tests read,
+the fuzz corpus and the bench report they use as a baseline included. The
+repository checks in `tests/suite` (the website, the workflows, the issue
+forms, the doc snippets) read files the workspace doesn't carry, so `test`
+skips them, and `data.not_run` names them. A failure in one test binary
+doesn't stop the rest: `passed` and `failed` count the whole suite. The tests
+run without your session's `RELIABURGER_*` variables and `CARGO_TARGET_DIR`:
+the read-only token you gave the agent in `RELIABURGER_TOKEN` would
+otherwise reach the tests that read one, and fail them.
 
 `build` compiles the workspace:
 

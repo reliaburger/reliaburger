@@ -13,7 +13,7 @@ expression: "normalised(&rendered(result), fixture.root.path())"
     "filter": "a_timeout",
     "filtered_out": 9,
     "ignored": 3,
-    "not_run": "only the portable suite ran: unit tests, tests/suite, every other test that isn't #[ignore], and the doctests, as make test-cargo runs them. The gated suites (make test-cluster, test-linux, test-slow, test-upgrade and the rest) are marked ignore, so they didn't run",
+    "not_run": "only the portable suite ran: unit tests, tests/suite, every other test that isn't #[ignore], and the doctests, as make test-cargo runs them. The gated suites (make test-cluster, test-linux, test-slow, test-upgrade and the rest) are marked ignore, so they didn't run. Nor did the repository checks in tests/suite (agent_docs, doc_snippets, documented_manifests, issue_forms, toolchain_pins, website, website_markdown and one cloud_init test): they check the website, the workflows and the issue forms, which the source bundle doesn't carry",
     "ok": true,
     "passed": 1,
     "seconds": 0,
