@@ -88,7 +88,7 @@ for n in 1 2 3 4 5; do ./rbnode.sh $n run; done
 
 ### Or seed from a USB stick, as on real machines
 
-The manual's bare-metal chapter (`docs/manual/15_appliance.md`) carries seeds to real machines on a stick labelled `RBSEED`. To try that path here, turn the cluster's `stick` directory into a FAT image and plug it in with `STICK=`:
+The manual's bare-metal chapter (`docs/manual/17_appliance.md`) carries seeds to real machines on a stick labelled `RBSEED`. To try that path here, turn the cluster's `stick` directory into a FAT image and plug it in with `STICK=`:
 
 ```sh
 ./make-seed-stick.sh work/stick.img work/cluster/stick

@@ -101,7 +101,7 @@ enum Command {
         #[arg(long)]
         instance: String,
     },
-    /// Appliance OS steps (docs/manual/15_appliance.md).
+    /// Appliance OS steps (`relish manual appliance`).
     #[command(subcommand)]
     Appliance(ApplianceCommand),
     /// Run the built-in test workload.

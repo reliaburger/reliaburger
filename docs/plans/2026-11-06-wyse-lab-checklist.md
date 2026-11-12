@@ -1,6 +1,6 @@
 # Wyse 3040 lab checklist
 
-The fastest path from a CI lab build to Reliaburger on real Dell Wyse 3040s, written on 6 November 2026 for the first hands-on run. Take one machine all the way through first, including the OS fallback, then run the three-machine gated test. It's the [S5 runbook](2026-10-01-plan-appliance-s5-wyse.md) cut down to the commands, in the order you type them. The runbook has the reasoning, the record to keep and the go/no-go, and [manual chapter 15](../manual/15_appliance.md) explains each command. An interactive copy of this page, which fills in your MACs and addresses for you, is at https://claude.ai/artifact/1hMbg9hTE8CiHeifHDcir9.
+The fastest path from a CI lab build to Reliaburger on real Dell Wyse 3040s, written on 6 November 2026 for the first hands-on run. Take one machine all the way through first, including the OS fallback, then run the three-machine gated test. It's the [S5 runbook](2026-10-01-plan-appliance-s5-wyse.md) cut down to the commands, in the order you type them. The runbook has the reasoning, the record to keep and the go/no-go, and [manual chapter 17](../manual/17_appliance.md) explains each command. An interactive copy of this page, which fills in your MACs and addresses for you, is at https://claude.ai/artifact/1hMbg9hTE8CiHeifHDcir9.
 
 The commands use these placeholders:
 

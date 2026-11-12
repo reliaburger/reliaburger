@@ -1066,7 +1066,7 @@ enum Command {
         #[command(subcommand)]
         action: TokenAction,
     },
-    /// Create a cluster of bare-metal appliances (docs/manual/15_appliance.md).
+    /// Create a cluster of bare-metal appliances (`relish manual appliance`).
     Cluster {
         #[command(subcommand)]
         action: ClusterAction,

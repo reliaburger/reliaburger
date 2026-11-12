@@ -15,8 +15,9 @@ Four commands do it all:
 - or `relish cluster create --bare-metal` writes a seed per machine for a USB
   stick, if you'd rather not claim over the network.
 
-CI runs every one of them against QEMU VMs, both aarch64 and x86_64, on every
-change to the image. The hardware it's built for is the Dell Wyse 3040,
+CI runs them against QEMU VMs on every change to the image. On x86_64 it
+runs the lot: netboot installs, claimed and seeded clusters, an OS update
+and a broken update falling back. On aarch64 it runs the boot test only. The hardware it's built for is the Dell Wyse 3040,
 netbooted from a Mac, and the release isn't tagged until three of them go
 from power-on to a working cluster. Other firmware may still have surprises;
 "What's missing" lists the ones we know of.
@@ -69,6 +70,11 @@ relish image download --dir os --arch x86_64
 
 An architecture the release doesn't have is refused, and so is a name relish
 doesn't know (`x86_64` and `aarch64` are the two it builds).
+
+It saves what an install needs. `--all` also fetches the pieces only OS
+updates use, the kernel image and the `/usr` images, for serving updates
+yourself. `--channel URL` reads another release channel than the published
+one, such as a CI lab build's, and `--key` names the public key that signs it.
 
 ### A CI lab build
 
@@ -130,6 +136,9 @@ A few options for real networks:
   `--interface eth0` (or `--address 192.168.1.20`).
 - `--mac d8:9e:f3:12:34:56`, once per machine, answers only those machines.
   Anything else on the LAN that network-boots is left alone.
+- `--http-port 8081` serves HTTP on another port than 8080, for a serving
+  machine where 8080 is taken. The machines are told the port, so nothing
+  else changes. Open that port instead of 8080 in its firewall.
 - `--ipxe full` hands machines iPXE's full-driver build instead of the
   default `snp` one. `snp` drives the network card through the firmware's
   own driver, which suits odd cards; `full` brings iPXE's drivers, for
@@ -400,6 +409,8 @@ ADDRESS           MAC               ARCH     CLAIM KEY
 ```
 
 It listens for three seconds; `relish machines --wait 10` listens longer.
+`relish machines claim`, below, listens the same three seconds to find the
+machines you name by MAC. Name them by address and it doesn't need to.
 Create the cluster from them, node 1 first, by MAC or by address:
 
 ```sh
@@ -737,9 +748,9 @@ across a cluster you care about.
   other, and to anything the release key signs.
 - **CI builds no next version for arm64**, only for x86_64.
 - **Secure Boot** has to be off.
-- **Two machines can't roll a bun upgrade.** Both are in the council, and
-  upgrading one would leave the other without a majority, so
-  `relish upgrade start` refuses. Use three or more.
+- **Two machines can't roll a bun upgrade or an OS update.** Both are in
+  the council, and taking one down would leave the other without a majority,
+  so `relish upgrade start` and `relish os upgrade` refuse. Use three or more.
 
 The design and the test results are in `docs/plans/2026-09-28-plan-appliance-lab.md`.
 The QEMU lab that exercises all of this without hardware is in `image/lab/`.

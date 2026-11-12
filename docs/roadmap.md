@@ -515,7 +515,8 @@ migration and no feature gate
   research and spikes in [#218](https://github.com/reliaburger/reliaburger/pull/218)
   and [#259](https://github.com/reliaburger/reliaburger/pull/259)). The
   appliance OS (our own mkosi image on Ubuntu 26.04), `relish netboot` and
-  claiming machines over the LAN, weekly signed OS builds with A/B updates,
+  claiming machines over the LAN, signed OS builds with A/B updates (built
+  weekly once v0.3.0 is out),
   and the quickstart guest on Ubuntu 26.04. The claim flow is designed so the
   fleet control plane can extend it later. Alongside it: the acceptance gates
   0.1.0 didn't close (V01–V04, below), WebSocket drain parity (F08,
@@ -674,8 +675,7 @@ what's shipped and what's scheduled.
 - **Whitepaper design ahead of the binary.** The [whitepaper](whitepaper.md)
   marks each of these as planned where it describes them: the reporting tree,
   resource-aware council selection, per-app rollups and remote-read
-  ([#364](https://github.com/reliaburger/reliaburger/issues/364)); an offline
-  root CA ([#709](https://github.com/reliaburger/reliaburger/issues/709));
+  ([#364](https://github.com/reliaburger/reliaburger/issues/364));
   keyless cosign ([#619](https://github.com/reliaburger/reliaburger/issues/619));
   fully leader-coordinated rollouts
   ([#1776](https://github.com/reliaburger/reliaburger/issues/1776)), static builds

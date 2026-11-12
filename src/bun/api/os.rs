@@ -115,6 +115,12 @@ pub(super) async fn os_rollout_start_handler(
             ),
         );
     }
+    // Council members update one at a time, like a bun upgrade's. Two voters
+    // never have the headroom to lose one, so the rollout would sit pending
+    // for ever.
+    if let Err(resp) = super::upgrade::check_council_can_roll(council) {
+        return resp;
+    }
 
     let view = match super::upgrade::build_authoritative_view(&state, council).await {
         Ok(view) => view,

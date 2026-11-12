@@ -22,7 +22,7 @@ protocol, state and security model:
   time, onto the inactive half of an A/B `/usr`. If a node doesn't come back
   healthy, systemd-boot falls back to the old image (§4).
 
-Users read [manual chapter 15](../manual/15_appliance.md) and the book's
+Users read [manual chapter 17](../manual/17_appliance.md) and the book's
 [Becoming the OS](../book/15a-becoming-the-os.md). The CI lab that runs all
 of this against QEMU is `image/lab/` and `.github/workflows/appliance.yml`.
 
