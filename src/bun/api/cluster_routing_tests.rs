@@ -34,9 +34,7 @@ impl FakeCluster {
     /// List a member whose address has nothing listening, like a node
     /// that died before gossip noticed.
     async fn add_unreachable_member(&self, name: &str) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        drop(listener);
+        let address = crate::refused_address::refused_address();
         self.membership.write().await.push(NodeMembershipInfo {
             node_id: crate::meat::NodeId::new(name),
             address,
