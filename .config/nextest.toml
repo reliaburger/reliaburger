@@ -29,6 +29,12 @@ process-heavy = { max-threads = 2 }
 upgrade-heavy = { max-threads = 1 }
 crash-recovery = { max-threads = 1 }
 
+# A stop hook test may spend its 30 s pre-stop bound and its 30 s stop
+# confirmation on a host flushing hard (#1794), past the default 60 s.
+[[profile.default.overrides]]
+filter = 'binary(suite) & test(/^stop_hooks::/)'
+slow-timeout = { period = "60s", terminate-after = 3 }
+
 # The hollow-node checks share one port range and each starts a council
 # process and a fleet, so they run one at a time. The 100-node summary
 # check starts a hundred nodes and schedules a thousand apps before it
