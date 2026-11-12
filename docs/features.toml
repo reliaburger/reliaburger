@@ -1046,9 +1046,9 @@ status = "alpha"
 since = "0.2.8"
 summary = "An agent's change becomes a reviewable proposal with guardrails and undo, and agents take leases so they don't collide."
 restrictions = "An agent token proposes apply, scale, rollback, stop, delete, restart, cancel-deploy and clear-fault; a person approves on the CLI or the dashboard, or a policy does for a change that can be undone exactly. New in 0.2.8, so its shape may still change."
-issues = [1682, 1686]
+issues = []
 docs = ["docs/manual/16_working-with-an-ai-agent.md#proposing-a-change", "docs/manual/16_working-with-an-ai-agent.md#taking-turns-leases"]
-evidence = "Unit and cluster tests on the 0.2.8 train, the gym's proposal scenarios (local-model record of 10 November 2026) and the five-minute tour's proposal step. #1682 and #1686 stay open for the rest of their design."
+evidence = "Unit and cluster tests on the 0.2.8 train, the gym's proposal scenarios (local-model record of 10 November 2026) and the five-minute tour's proposal step, recorded against the published 0.2.8. The 0.2.8 gate closed #1682 and #1686."
 
 [[group.feature]]
 name = "Incident timeline and decision provenance"

@@ -526,8 +526,10 @@ agent_step() {
     step_heading "Ask your agent"
     say "From 0.2.7 an AI agent asks relish the same questions and gets one line of"
     say "JSON back, within a byte budget. jq here only makes it readable for people."
-    # The apps come from the cluster summary, worst first.
-    show "relish agent context | jq -c '.data.status.value.summary.apps.value.worst[] | {app, state, running, desired}'"
+    # The apps' counts come from the cluster summary, with the worst listed;
+    # after the lost node every app may be running again, so the list can
+    # be empty and the counts still say something.
+    show "relish agent context | jq -c '.data.status.value.summary.apps.value | {total, running, degraded, down, worst}'"
     show "relish agent diagnose | jq -c '.data.findings[] | {id, severity, title}'"
     say "The manual chapter an agent reads first, from the binary itself:"
     show "relish agent guide | jq -r '.data.sections[].heading' | head -n 8"
@@ -612,7 +614,7 @@ while IFS= read -r command <&3; do
             # cluster; the script reads the number the cluster gave.
             type_command "${command}"
             eval "${command}" | tee "${BURGER_WORK}/propose.json"
-            PROPOSAL_ID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["data"]["id"])' "${BURGER_WORK}/propose.json" 2>/dev/null)
+            PROPOSAL_ID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["data"]["proposal"]["id"])' "${BURGER_WORK}/propose.json" 2>/dev/null)
             [[ -n "${PROPOSAL_ID}" ]] || { echo "the agent's proposal printed no number" >&2; exit 1; }
             say "Nothing has changed yet: the burger still has three patties."
             printf '\n'

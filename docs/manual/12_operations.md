@@ -225,6 +225,9 @@ cluster's leader refuses it too
 0.2.7 keeps 0.2.6's pair, protocol 57 and state format 73, so a 0.2.6
 cluster can roll onto it in place
 ([upgrading from 0.2.6](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-026)).
+0.2.8 moves the pair to protocol 58 and state format 74, and a 0.2.7
+cluster's leader refuses it
+([upgrading from 0.2.7](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-027)).
 
 A laptop cluster says the same thing when you rerun the quickstart installer
 from a newer release over it. Its saved record names the release that set it
@@ -347,7 +350,7 @@ holds the `bun-<platform>` binaries for the signature check and
 `--release-url` points at a mirror of the release downloads instead.
 
 ```sh
-gh release download v0.2.7 --repo reliaburger/reliaburger --pattern metadata.json --pattern cli-metadata.json --pattern 'bun-*' --dir release
+gh release download v0.2.8 --repo reliaburger/reliaburger --pattern metadata.json --pattern cli-metadata.json --pattern 'bun-*' --dir release
 relish verify --metadata release/metadata.json --cli-metadata release/cli-metadata.json --artefacts release
 ```
 
