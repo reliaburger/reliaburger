@@ -138,7 +138,9 @@ pub async fn gather(paths: &super::Paths) -> Status {
         bun_version,
         node: node_config.as_ref().and_then(|c| c.node.name.clone()),
         cluster: node_config.as_ref().map(|c| c.cluster.name.clone()),
+        // BLOCKING-OK: appliance console: its own process, redrawing every five seconds, with nothing else on its runtime
         address: super::address::detect().map(|a| a.to_string()),
+        // BLOCKING-OK: appliance console: its own process, redrawing every five seconds, with nothing else on its runtime
         macs: super::prepare::stick_names(&paths.net_dir)
             .into_iter()
             .map(|name| name.replace('-', ":"))

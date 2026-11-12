@@ -677,7 +677,10 @@ mod tests {
         drop(key_file);
         async fn issue(directory: &Path, node: &str) -> Vec<u8> {
             let destination = directory.join(node);
-            let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            // The child's own `test result:` line mustn't reach this test
+            // binary's stdout, where `relish agent patch test` would count
+            // it as this binary's (#1882).
+            let child = tokio::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
                     "wrapper::tls::tests::ingress_serial_child",
@@ -685,14 +688,22 @@ mod tests {
                 ])
                 .env("RELIABURGER_SERIAL_TEST_DIRECTORY", directory)
                 .env("RELIABURGER_SERIAL_TEST_OUTPUT", &destination)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
                 .kill_on_drop(true)
                 .spawn()
                 .unwrap();
-            let status = tokio::time::timeout(std::time::Duration::from_secs(60), child.wait())
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(status.success());
+            let output =
+                tokio::time::timeout(std::time::Duration::from_secs(60), child.wait_with_output())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
             std::fs::read(destination).unwrap()
         }
         let first = issue(directory.path(), "first.der").await;

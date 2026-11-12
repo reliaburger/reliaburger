@@ -190,6 +190,146 @@ mod tests {
     use crate::sesame::{ca, identity_store, types::SerialNumber};
     use std::time::{Duration, SystemTime};
 
+    fn node_identity(hierarchy: &ca::CaHierarchy, node: &str, serial: u64) -> NodeIdentity {
+        let (certificate_der, private_key_der, serial) = ca::issue_node_cert(
+            node,
+            SerialNumber(serial),
+            &hierarchy.node.signing_keypair,
+            &hierarchy.node.certificate_params,
+        )
+        .unwrap();
+        NodeIdentity {
+            node_id: node.into(),
+            certificate_der,
+            private_key_der,
+            serial,
+            ca_generation: 0,
+            trust: crate::sesame::trust::TrustSet::single(
+                hierarchy.node.ca.certificate_der.clone(),
+                hierarchy.root.ca.certificate_der.clone(),
+            ),
+            node_ca_der: hierarchy.node.ca.certificate_der.clone(),
+            root_ca_der: hierarchy.root.ca.certificate_der.clone(),
+            not_before: SystemTime::UNIX_EPOCH,
+            not_after: SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    /// One TLS handshake: the client certificate the server saw, or the
+    /// server's error.
+    async fn server_sees(
+        server: Arc<rustls::ServerConfig>,
+        client: Arc<rustls::ClientConfig>,
+    ) -> Result<Vec<u8>, String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accept = async {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut stream = tokio_rustls::TlsAcceptor::from(server)
+                .accept(socket)
+                .await
+                .map_err(|error| error.to_string())?;
+            let peer = stream
+                .get_ref()
+                .1
+                .peer_certificates()
+                .map(|chain| chain[0].to_vec())
+                .ok_or_else(|| "no client certificate".to_string())?;
+            let _ = stream.write_all(b"ok").await;
+            Ok(peer)
+        };
+        let connect = async {
+            let socket = tokio::net::TcpStream::connect(address).await.unwrap();
+            let name = rustls::pki_types::ServerName::IpAddress(address.ip().into());
+            if let Ok(mut stream) = tokio_rustls::TlsConnector::from(client)
+                .connect(name, socket)
+                .await
+            {
+                let _ = stream.read_u8().await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(accept, connect).0
+        })
+        .await
+        .unwrap()
+    }
+
+    /// The live client resolver presents its identity even once it has
+    /// expired, so the optional-mTLS API refuses it rather than treating the
+    /// client as anonymous. The identity is published already expired:
+    /// `replace` refuses an expired certificate, and the integration test
+    /// that let one expire in real time raced its own setup (#1841).
+    #[tokio::test]
+    async fn an_expired_identity_is_presented_so_optional_mtls_refuses_it() {
+        let hierarchy = ca::generate_ca_hierarchy("live-expiry", b"test-ikm").unwrap();
+        let server_identity = node_identity(&hierarchy, "server", 10);
+        let valid = node_identity(&hierarchy, "client", 11);
+        let directory = tempfile::tempdir().unwrap();
+        identity_store::save(directory.path(), &valid).unwrap();
+        let live = LiveNodeIdentity::load(directory.path()).unwrap();
+
+        let mut expired = node_identity(&hierarchy, "client", 12);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["client".into()]).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "client");
+        params.subject_alt_names.push(rcgen::SanType::URI(
+            ca::node_spiffe_uri("client").try_into().unwrap(),
+        ));
+        params.serial_number = Some(rcgen::SerialNumber::from_slice(&12u64.to_be_bytes()));
+        params.extended_key_usages = vec![
+            rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+            rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        params.not_before = time::OffsetDateTime::now_utc() - time::Duration::hours(2);
+        params.not_after = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
+        let issuer = rcgen::Issuer::from_params(
+            &hierarchy.node.certificate_params,
+            &hierarchy.node.signing_keypair,
+        );
+        expired.certificate_der = params.signed_by(&key, &issuer).unwrap().der().to_vec();
+        expired.private_key_der = key.serialize_der();
+        let (chain, private_key) = super::super::mtls::identity_chain_and_key(&expired).unwrap();
+        let expired_key = CertifiedKey::from_der(
+            chain,
+            private_key,
+            &rustls::crypto::ring::default_provider(),
+        )
+        .unwrap();
+
+        let server = super::super::mtls::build_api_server_config(
+            &server_identity,
+            super::super::mtls::CrlHandle::default(),
+        )
+        .unwrap();
+        let mut client = (*super::super::mtls::build_mtls_client_config(
+            &live.snapshot(),
+            super::super::mtls::CrlHandle::default(),
+        )
+        .unwrap())
+        .clone();
+        client.client_auth_cert_resolver = Arc::new(live.clone());
+        let client = Arc::new(client);
+
+        let seen = server_sees(server.clone(), client.clone()).await;
+        assert_eq!(seen.as_deref(), Ok(valid.certificate_der.as_slice()));
+
+        live.current.send_replace(ValidatedIdentity {
+            identity: Arc::new(expired),
+            key: Arc::new(expired_key),
+        });
+        let refused = server_sees(server, client).await;
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|error| error.to_lowercase().contains("expired")),
+            "an expired identity must fail TLS, never become anonymous client auth: {refused:?}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn caller_cancellation_after_persistence_cannot_interrupt_publication() {
         let hierarchy = ca::generate_ca_hierarchy("cancel-renewal", b"test-ikm").unwrap();

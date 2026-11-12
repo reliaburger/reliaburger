@@ -334,6 +334,7 @@ pub async fn reap_once(
     node: &str,
     now_unix_ms: u64,
 ) -> Result<(), CouncilError> {
+    // One round: the reaper asks again next tick (#1393).
     if !council.is_leader().await {
         return Ok(());
     }

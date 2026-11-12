@@ -169,11 +169,13 @@ pub async fn run(paths: &Paths) -> Result<Step, PrepareError> {
         clear_claimed_seed(paths).await;
         return Ok(Step::Done);
     }
+    // BLOCKING-OK: appliance prepare: its own process, one step at a time before bun starts, with nothing else on its runtime
     let mut found = find_seed(paths)?;
     if found.is_none()
         && let Some(claim_dir) = &paths.claim_dir
     {
         wait_for_claim(paths, claim_dir).await?;
+        // BLOCKING-OK: appliance prepare: its own process, one step at a time before bun starts, with nothing else on its runtime
         found = find_seed(paths)?;
     }
     let (seed, source) = match found {
@@ -193,6 +195,7 @@ pub async fn run(paths: &Paths) -> Result<Step, PrepareError> {
                     (&source, &seed)
                     && config.role == SeedRole::Create
                 {
+                    // BLOCKING-OK: appliance prepare: its own process, one step at a time before bun starts, with nothing else on its runtime
                     wipe_from_stick(paths, file);
                 }
                 return Ok(Step::Done);
@@ -202,7 +205,9 @@ pub async fn run(paths: &Paths) -> Result<Step, PrepareError> {
                 return Ok(Step::NoSeed);
             }
             (Step::InstallLegacy, Some(Seed::Legacy { files })) => {
+                // BLOCKING-OK: appliance prepare: its own process, one step at a time before bun starts, with nothing else on its runtime
                 install_files(paths, files)?;
+                // BLOCKING-OK: appliance prepare: its own process, one step at a time before bun starts, with nothing else on its runtime
                 install_ssh_key(paths);
             }
             (Step::InstallBootstrap, Some(Seed::V1 { config, files })) => {
@@ -216,16 +221,22 @@ pub async fn run(paths: &Paths) -> Result<Step, PrepareError> {
                         "the create seed's bootstrap files are gone; seed this node again".into(),
                     ));
                 }
+                // BLOCKING-OK: appliance prepare: its own process, one step at a time before bun starts, with nothing else on its runtime
                 keep_seed(paths, config)?;
+                // BLOCKING-OK: appliance prepare: its own process, one step at a time before bun starts, with nothing else on its runtime
                 install_files(paths, files)?;
+                // BLOCKING-OK: appliance prepare: its own process, one step at a time before bun starts, with nothing else on its runtime
                 install_ssh_key(paths);
             }
             (Step::Enrol, Some(Seed::V1 { config, files })) => {
+                // BLOCKING-OK: appliance prepare: its own process, one step at a time before bun starts, with nothing else on its runtime
                 keep_seed(paths, config)?;
+                // BLOCKING-OK: appliance prepare: its own process, one step at a time before bun starts, with nothing else on its runtime
                 write_private(
                     &paths.config_dir.join("authorized_keys"),
                     files.get("authorized_keys"),
                 )?;
+                // BLOCKING-OK: appliance prepare: its own process, one step at a time before bun starts, with nothing else on its runtime
                 install_ssh_key(paths);
                 enrol(paths, config).await?;
             }
@@ -239,6 +250,7 @@ pub async fn run(paths: &Paths) -> Result<Step, PrepareError> {
                     .map_err(|e| PrepareError::Config(e.to_string()))?;
                 let text = toml::to_string_pretty(&node)
                     .map_err(|e| PrepareError::Config(e.to_string()))?;
+                // BLOCKING-OK: appliance prepare: its own process, one step at a time before bun starts, with nothing else on its runtime
                 write_atomic(&paths.node_toml(), text.as_bytes(), 0o600)?;
                 say(&format!(
                     "{} is ready to {} {} as {} on {advertise}",
@@ -299,8 +311,10 @@ fn find_seed(paths: &Paths) -> Result<Option<(Seed, Source)>, PrepareError> {
 
 /// No seed anywhere: become unclaimed until `relish machines claim` posts one.
 async fn wait_for_claim(paths: &Paths, claim_dir: &Path) -> Result<(), PrepareError> {
+    // BLOCKING-OK: appliance prepare: its own process, one step at a time before bun starts, with nothing else on its runtime
     let key = super::claim::ClaimKey::load_or_create(claim_dir)?;
     let info = super::claim::MachineInfo {
+        // BLOCKING-OK: appliance prepare: its own process, one step at a time before bun starts, with nothing else on its runtime
         macs: stick_names(&paths.net_dir)
             .into_iter()
             .map(|name| name.replace('-', ":"))
@@ -465,6 +479,7 @@ async fn enrol(paths: &Paths, config: &SeedConfig) -> Result<(), PrepareError> {
             .await
             {
                 Ok(identity) => {
+                    // BLOCKING-OK: appliance prepare: its own process, one step at a time before bun starts, with nothing else on its runtime
                     crate::sesame::identity_store::save(&paths.identity_dir(), &identity)
                         .map_err(|e| PrepareError::Config(format!("saving the identity: {e}")))?;
                     say(&format!("enrolled as {} through {member}", config.node));
@@ -516,6 +531,7 @@ async fn fetch_master_key(paths: &Paths, config: &SeedConfig) -> Result<(), Prep
         .join
         .as_ref()
         .ok_or_else(|| PrepareError::Config("no [join]".into()))?;
+    // BLOCKING-OK: appliance prepare: its own process, one step at a time before bun starts, with nothing else on its runtime
     let identity = crate::sesame::identity_store::load(&paths.identity_dir())
         .map_err(|e| PrepareError::Config(format!("loading the identity: {e}")))?
         .ok_or_else(|| PrepareError::Config("the identity vanished".into()))?;
@@ -525,6 +541,7 @@ async fn fetch_master_key(paths: &Paths, config: &SeedConfig) -> Result<(), Prep
             let base = format!("https://{}", std::net::SocketAddr::new(*member, 9117));
             match crate::sesame::join::fetch_master_key(&base, &identity).await {
                 Ok(key) => {
+                    // BLOCKING-OK: appliance prepare: its own process, one step at a time before bun starts, with nothing else on its runtime
                     write_atomic(&paths.master_key(), hex::encode(key).as_bytes(), 0o600)?;
                     say(&format!("fetched the master key from {member}"));
                     return Ok(());
@@ -546,6 +563,7 @@ async fn advertise_address(config: &SeedConfig) -> Result<IpAddr, PrepareError> 
         return Ok(address);
     }
     for _ in 0..30 {
+        // BLOCKING-OK: appliance prepare: its own process, one step at a time before bun starts, with nothing else on its runtime
         if let Some(address) = super::address::detect() {
             return Ok(address);
         }

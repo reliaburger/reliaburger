@@ -2081,6 +2081,33 @@ fn the_agent_recording_slot_says_plainly_whether_there_is_a_recording() {
     }
 }
 
+/// `tour-player.js` sets up every figure with a cast the same way: it needs
+/// a screen to draw on and a speed group to show. The agent recordings
+/// arrived without a speed group, the script threw on them, and neither
+/// played (#1874). Each recording needs both.
+#[test]
+fn every_recording_has_a_screen_and_speed_buttons() {
+    let page = read("docs/website/index.html");
+    let mut figures = 0;
+    for (start, _) in page.match_indices("<figure ") {
+        let figure = &page[start..start + page[start..].find("</figure>").unwrap()];
+        let tag = &figure[..figure.find('>').unwrap()];
+        if !(tag.contains("class=\"recording\"") && tag.contains("data-cast=")) {
+            continue;
+        }
+        figures += 1;
+        assert!(
+            figure.contains("<div class=\"recording-screen\"></div>"),
+            "no screen: {tag}"
+        );
+        assert!(
+            figure.contains("class=\"recording-speed\"") && figure.contains("data-speed=\"1\""),
+            "no speed buttons: {tag}"
+        );
+    }
+    assert!(figures >= 4, "found only {figures} recordings");
+}
+
 /// The `#act` section of the homepage: what 0.2.8 lets an agent do (#1690).
 fn act_section(page: &str) -> &str {
     let start = page.find("<section id=\"act\"").expect("no #act section");

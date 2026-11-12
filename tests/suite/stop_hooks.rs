@@ -13,7 +13,21 @@ use reliaburger::grill::state::ContainerState;
 use reliaburger::grill::stop::{PreStop, StopPolicy, StopSignal};
 use reliaburger::grill::{Grill, InstanceId};
 
-const CONFIRMATION: Duration = Duration::from_secs(10);
+/// How long the runtime may take to accept a stop or a kill and report the
+/// exit. Each request goes through an owner process that makes durable
+/// writes, and on macOS every `sync_all` is an `F_FULLFSYNC`. With hundreds
+/// of other writers flushing at once, as in a full `make ci`, one stop took
+/// 16 s (#1794). These tests check order and outcome, not speed, so the
+/// bounds leave a loaded host room.
+const CONFIRMATION: Duration = Duration::from_secs(30);
+
+/// The pre-stop command's bound, for the same reason. The hook runs
+/// through a fresh owner and exec gate, two `bun` processes, and under that
+/// load it ran past a 10 s bound, so the stop went ahead without it and
+/// the workload logged only `INT` (#1794). What a bound does when a hook
+/// overruns it is tested without a host in the way, in
+/// `bun::agent::tests::stop_hooks::a_pre_stop_that_overruns_costs_only_its_own_bound`.
+const PRE_STOP_BOUND: Duration = Duration::from_secs(30);
 
 fn runtime(directory: &Path) -> ProcessGrill {
     // Every owned start runs a `bun` owner that gets 15 s to answer, so its
@@ -87,7 +101,7 @@ async fn an_owned_workload_gets_its_own_signal_after_its_pre_stop() {
     let began = dir.path().join("pre-stop-began");
     let grill = runtime(&dir.path().join("owners"));
     let id = InstanceId("default__owned-hooks-0".into());
-    let bound = Duration::from_secs(10);
+    let bound = PRE_STOP_BOUND;
     let policy = StopPolicy {
         signal: StopSignal::Int,
         grace: Some(Duration::from_secs(10)),

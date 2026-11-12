@@ -440,6 +440,7 @@ pub async fn run_claim(options: &ClaimOptions) -> Result<(), RelishError> {
             let keys = crate::relish::quickstart::security::root_backup_keys_in(
                 &crate::relish::local_context::root_directory()?,
             );
+            // BLOCKING-OK: relish CLI: a one-shot step before the command does anything long-lived
             let created = bare_metal::create(&cluster.create_options(
                 &options.directory,
                 pairs,
@@ -500,6 +501,7 @@ pub async fn run_claim(options: &ClaimOptions) -> Result<(), RelishError> {
             created.fleet.cluster,
             options.directory.display()
         );
+        // BLOCKING-OK: relish CLI: a one-shot step before the command does anything long-lived
         print!("{}", bare_metal::adopt(created, &options.directory)?);
     }
     Ok(())

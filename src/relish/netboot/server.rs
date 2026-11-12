@@ -58,6 +58,7 @@ pub async fn run(options: NetbootOptions) -> Result<(), NetbootError> {
     let listener = TcpListener::bind(SocketAddrV4::new(server, options.http_port))
         .await
         .map_err(|e| interface::bind_error("HTTP", options.http_port, e))?;
+    // BLOCKING-OK: relish netboot: read once at start, before it serves anything
     let record = InstalledRecord::load(&options.directory.join(RECORD_FILE))?;
 
     print_summary(&options, &interface, &artefacts, &record);

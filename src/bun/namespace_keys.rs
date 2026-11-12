@@ -71,6 +71,7 @@ pub async fn provision_namespace_keys_once(
     events: Option<&Arc<RwLock<EventStore>>>,
     node: &str,
 ) -> Result<Vec<String>, NamespaceKeyError> {
+    // One round: the loop asks again next tick (#1393).
     if !council.is_leader().await {
         return Ok(Vec::new());
     }

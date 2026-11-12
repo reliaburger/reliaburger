@@ -408,10 +408,12 @@ pub async fn add(
         with_node.nodes.push(node.clone());
         let config = with_node.seed_config(node, SeedRole::Join, Some(token), &None);
         let path = directory.join("stick").join(stick_file(&node.mac));
+        // BLOCKING-OK: relish CLI: a one-shot write before the command does anything long-lived
         write_private(&path, &seed_tarball(&config, &files)?)?;
         written.push(path);
     }
     fleet.nodes.extend(added.iter().cloned());
+    // BLOCKING-OK: relish CLI: a one-shot write before the command does anything long-lived
     write_private(
         &fleet_path,
         &serde_json::to_vec_pretty(&fleet).map_err(RelishError::SerialiseJson)?,

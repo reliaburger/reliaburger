@@ -214,6 +214,7 @@ pub fn process_start_time(pid: u32) -> Option<u64> {
         if pid == 0 {
             return None;
         }
+        // BLOCKING-OK: one procfs read, answered from memory, not from a disk (#1887)
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         stat_start_ticks(&stat)
     }

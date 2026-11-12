@@ -545,6 +545,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         loop {
             let mut all_stopped = true;
             for id in ids {
+                // LOOP-INLINE: shutdown's last turn; nothing is queued behind it
                 if !matches!(
                     self.supervisor.grill().state(id).await,
                     Ok(ContainerState::Stopped)
@@ -560,6 +561,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         for id in ids {
+            // LOOP-INLINE: shutdown's last turn; nothing is queued behind it
             if !matches!(
                 self.supervisor.grill().state(id).await,
                 Ok(ContainerState::Stopped)
