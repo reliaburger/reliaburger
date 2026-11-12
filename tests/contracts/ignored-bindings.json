@@ -301,6 +301,12 @@
   },
   {
     "source": "tests/cluster_failover.rs",
+    "function": "a_lease_history_through_a_leader_partition_is_linearizable",
+    "binary": "reliaburger::cluster_failover",
+    "test": "a_lease_history_through_a_leader_partition_is_linearizable"
+  },
+  {
+    "source": "tests/cluster_failover.rs",
     "function": "an_agent_lease_survives_a_leader_change_and_the_new_leader_expires_it",
     "binary": "reliaburger::cluster_failover",
     "test": "an_agent_lease_survives_a_leader_change_and_the_new_leader_expires_it"
@@ -466,6 +472,18 @@
     "function": "two_node_cluster_survives_losing_the_non_voter",
     "binary": "reliaburger::council_self_healing",
     "test": "two_node_cluster_survives_losing_the_non_voter"
+  },
+  {
+    "source": "tests/council_self_healing.rs",
+    "function": "a_replaced_voter_coming_back_joins_as_a_learner_without_an_election",
+    "binary": "reliaburger::council_self_healing",
+    "test": "a_replaced_voter_coming_back_joins_as_a_learner_without_an_election"
+  },
+  {
+    "source": "tests/ebpf.rs",
+    "function": "onion_objects_use_only_the_original_bpf_instruction_set",
+    "binary": "reliaburger::ebpf",
+    "test": "onion_objects_use_only_the_original_bpf_instruction_set"
   },
   {
     "source": "tests/ebpf.rs",

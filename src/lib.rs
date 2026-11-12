@@ -10,6 +10,7 @@
 #[path = "../tests/support/first_launch.rs"]
 pub(crate) mod first_launch;
 
+pub mod appliance;
 pub mod brioche;
 pub mod bun;
 pub mod cluster;
@@ -35,6 +36,7 @@ pub(crate) mod object_storage;
 #[cfg(test)]
 pub(crate) mod off_runtime;
 pub mod onion;
+pub mod os;
 pub mod pickle;
 pub mod policy;
 pub mod proposal;

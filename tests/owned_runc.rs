@@ -1598,7 +1598,7 @@ mod capacity_contract {
         )
         .await
         .unwrap();
-        router.register(1, node.raft().clone()).await;
+        router.register(1, &node).await;
         let mut members = BTreeMap::new();
         members.insert(
             1u64,

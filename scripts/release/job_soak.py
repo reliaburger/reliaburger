@@ -20,6 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import random
 import re
 import signal
 import sqlite3
@@ -91,6 +92,10 @@ NODE_FAULT_KINDS = ("delay", "disk-full", "slow-fsync")
 # (600 s); a result still missing after that is lost, not late (V02 candidate
 # 6, run 15, #954).
 RESULT_UNREACHABLE_GRACE = 600
+# Chunks of a drained run's results checked for exactly-once completion,
+# beyond its first and last (#1415). Each costs one results read of at most
+# a chunk's rows.
+CHUNK_SAMPLE = 6
 # Final-attempt and start-lag bucket upper bounds in milliseconds; None is +Inf.
 BUCKETS = [1 << i for i in range(15)] + [None]
 
@@ -311,6 +316,42 @@ def audit_effects(count, ledgers):
             local.add(index); seen.add(index); attempts += executions
     if seen != set(range(count)): raise InvalidEvidence("accepted successes lack exact independent effects")
     return dict(effects=len(seen), attempts=attempts, repeated_attempts=attempts-len(seen))
+
+
+def sampled_chunks(count, chunk_size, seed):
+    """The chunks a drained run's history check reads (#1415): all of a small
+    run, otherwise the first, the last and CHUNK_SAMPLE more picked by a
+    generator seeded with the run's name, so a rerun reads the same ones."""
+    chunks = -(-count // chunk_size)
+    if chunks <= CHUNK_SAMPLE + 2: return list(range(chunks))
+    middle = random.Random(seed).sample(range(1, chunks - 1), CHUNK_SAMPLE)
+    return sorted({0, chunks - 1, *middle})
+
+
+def check_chunk(chunk, chunk_size, count, rows):
+    """A chunk's accepted results: each of its tasks exactly once, every one from
+    the same grant. Two grants in one chunk mean the council accepted the chunk
+    twice. Returns that grant's attempt."""
+    start = chunk * chunk_size
+    if [row.get("index") for row in rows] != list(range(start, min(start + chunk_size, count))):
+        raise InvalidEvidence(f"chunk {chunk} results do not hold each task exactly once")
+    grants = {row.get("grant_attempt") for row in rows}
+    if len(grants) != 1: raise InvalidEvidence(f"chunk {chunk} was accepted from more than one grant: {sorted(map(str, grants))}")
+    grant = grants.pop()
+    if type(grant) is not int or grant < 1: raise InvalidEvidence(f"chunk {chunk} has no valid grant attempt")
+    return grant
+
+
+def explain_effects(rows, ledgers):
+    """A task whose chunk was granted only once ran no more often than its
+    accepted attempts. Running it again needs a re-grant, after a lost node."""
+    executions = {}
+    for ledger in ledgers:
+        for index, count in ledger: executions[index] = executions.get(index, 0) + count
+    for row in rows:
+        ran = executions.get(row["index"], 0)
+        if row["grant_attempt"] == 1 and ran > row["attempts"]:
+            raise InvalidEvidence(f'task {row["index"]} ran {ran} times but its only grant accepted {row["attempts"]} attempts')
 
 
 def serve(path, token, address, port):
@@ -631,10 +672,17 @@ class Campaign:
                         rows[0]["started_effect"]=True
                 if not stop and not intent.get("failed_at"):
                     judge_terminal(intent["purpose"],value,rows)
+                    history=None
+                    if intent["purpose"] in ("work","audit"):
+                        history=self.read_chunks(intent,value,now)
+                        if history is None: continue
                     if intent["purpose"] == "audit":
                         if self.ledger_reader is None: raise InvalidEvidence("independent ledger unavailable")
                         receipts=self.ledger_reader(intent["name"])
                         proof=audit_effects(value["total"],receipts)
+                        explain_effects([row for _,_,chunk_rows in history for row in chunk_rows],receipts)
+                    if history is not None: self.record_chunks(intent,history)
+                    if intent["purpose"] == "audit":
                         self.state["totals"]["audit_attempts"]=self.state["totals"].get("audit_attempts",0)+proof["attempts"]
                     coverage=self.state["coverage"][intent["mode"]]
                     coverage[intent["purpose"] if intent["purpose"]!="work" else "reuse"]=True
@@ -651,6 +699,32 @@ class Campaign:
         if self.state.get("load")=="day": self.mark_hours(now)
         self.save(); self.publish(int(time.time()),fault)
         return not self.state["active"]
+    def read_chunks(self, intent, value, now):
+        """The sampled chunks of a drained run, each checked for exactly-once
+        completion from one grant (#1415), as (chunk, grant, rows). None while
+        a chunk's node is unreachable within RESULT_UNREACHABLE_GRACE."""
+        size=self.body(intent)["definition"]["tasks"]["chunk_size"]; count=value["total"]
+        history=[]
+        for chunk in sampled_chunks(count,size,intent["name"]):
+            start=chunk*size
+            query=f"limit={min(size,count-start)}"+(f"&after={start-1}" if start else "")
+            page=self.api.request("GET",f'/v1/batch/{intent["id"]}/results?{query}')
+            if page.get("unreachable"):
+                since=intent.setdefault("result_unreachable_since",now); self.save()
+                if now-since<RESULT_UNREACHABLE_GRACE: return None
+                raise InvalidEvidence(f"chunk {chunk} results incomplete: "+", ".join(map(str,page["unreachable"]))
+                                      +f" unreachable for {now-since} s")
+            history.append((chunk,check_chunk(chunk,size,count,page["rows"]),page["rows"]))
+        return history
+    def record_chunks(self, intent, history):
+        """Keep each checked chunk's grant as evidence, and count the re-granted ones."""
+        totals=self.state["totals"]
+        totals["chunks_checked"]=totals.get("chunks_checked",0)+len(history)
+        totals["chunks_regranted"]=totals.get("chunks_regranted",0)+sum(grant>1 for _,grant,_ in history)
+        with open(self.directory/"chunk-history.jsonl","a") as evidence:
+            for chunk,grant,chunk_rows in history:
+                evidence.write(json.dumps(dict(run=intent["name"],id=intent["id"],mode=intent["mode"],profile=intent["profile"],
+                                               purpose=intent["purpose"],chunk=chunk,grant_attempt=grant,tasks=len(chunk_rows)))+"\n")
     def count_nodes(self, intent, value):
         """Add each node's new host-job successes in this run (#1032), the
         way relish bench counts them (#1362): a counter that went backwards
@@ -801,6 +875,7 @@ def report(snapshot):
         accepted_successes_per_second=rate,target_met=target_met,
         retries=retries,retry_causes=causes,
         audited_attempts=totals.get("audit_attempts",0),
+        chunks_checked=totals.get("chunks_checked",0),chunks_regranted=totals.get("chunks_regranted",0),
         api_fallbacks=snapshot.get("api_fallbacks") or dict(missed={},answered={}),
         operator_replay_decisions=totals.get("operator_replay_decisions",0),
         fault_markers=totals.get("fault_markers",0),errors=list(snapshot.get("errors",[])),

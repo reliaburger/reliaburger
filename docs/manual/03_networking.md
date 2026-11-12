@@ -155,7 +155,17 @@ written before them), every node skips that one route, logs it with its app and
 namespace, and keeps serving discovery and ingress for every other app.
 
 Streaming responses pass through, and so do WebSockets on routes that allow
-them. A stopping instance drains its connections before it goes.
+them. A stopping instance drains its connections before it goes. A WebSocket
+still open when the drain timeout ends gets a Close frame with code 1001
+(Going Away), so a well-behaved client reconnects to another instance rather
+than reporting an error.
+
+Your app sees the client's address in `X-Forwarded-For` and `X-Real-IP`, and
+`X-Forwarded-Proto` says whether the client came over HTTPS. The ingress sets
+all three itself and drops any a client sent, so your app can trust them. Each
+request also carries an `X-Request-ID`: the client's own, or a new random one,
+for matching your app's logs to the client's. WebSocket upgrades get the same
+headers.
 
 ## Fault injection lives nearby
 

@@ -100,6 +100,18 @@ pub const FINDINGS: &[FindingKind] = &[
         thresholds: &[],
     },
     FindingKind {
+        id: "os-update-failed",
+        severities: WARNING,
+        meaning: "an appliance couldn't update its OS during `relish os upgrade`; the rollout stops at that node until `relish os resume`",
+        thresholds: &[],
+    },
+    FindingKind {
+        id: "os-skew",
+        severities: WARNING,
+        meaning: "the appliances run different Reliaburger OS versions, as they do partway through a rollout",
+        thresholds: &[],
+    },
+    FindingKind {
         id: "council-recovery-split",
         severities: CRITICAL,
         meaning: "two `relish council recover` runs landed on the same recovery epoch, so both councils fenced themselves and refuse writes",

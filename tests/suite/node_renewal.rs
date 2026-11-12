@@ -31,7 +31,7 @@ use tower::ServiceExt;
 
 use crate::bun_process;
 use bun_process::{
-    BunProcess, WAIT, assert_success, reserve_address, reserve_ports, run_relish,
+    BunProcess, WAIT, assert_success, reserve_address, reserve_ports, run_relish_init,
     spawn_bun_with_port_retry, wait_for_relish,
 };
 
@@ -56,7 +56,7 @@ async fn council(hierarchy: &ca::CaHierarchy, initialise: bool) -> Arc<CouncilNo
         .await
         .unwrap(),
     );
-    network.register(1, node.raft().clone()).await;
+    network.register(1, &node).await;
     if initialise {
         node.initialize(BTreeMap::from([(
             1,
@@ -145,6 +145,58 @@ async fn post(
         )
         .await
         .unwrap()
+}
+
+async fn get_master_key(router: Router) -> (StatusCode, serde_json::Value) {
+    let response = router
+        .oneshot(
+            Request::get("/v1/cluster/master-key")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&body).unwrap_or_default())
+}
+
+/// G1: a node that just joined fetches the master key with its certificate
+/// alone, and nothing else gets it.
+#[tokio::test]
+async fn a_member_certificate_and_only_that_gets_the_master_key() {
+    let hierarchy = ca::generate_ca_hierarchy("master-key", &IKM).unwrap();
+    let council = council(&hierarchy, true).await;
+
+    let (status, body) = get_master_key(router(council.clone(), Some(peer(&hierarchy, 10)))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["master_key"], hex::encode(IKM));
+
+    let (status, _) = get_master_key(router(council.clone(), None)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "no client certificate");
+
+    let foreign = peer(&ca::generate_ca_hierarchy("foreign", &IKM).unwrap(), 10);
+    let (status, _) = get_master_key(router(council.clone(), Some(foreign))).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "another cluster's certificate"
+    );
+
+    council
+        .write(RaftRequest::RevokeCertificate(CrlEntry {
+            serial: SerialNumber(10),
+            issuer: CaRole::Node,
+            revoked_at: SystemTime::now(),
+            reason: "lost stick".into(),
+            expires_at: None,
+        }))
+        .await
+        .unwrap();
+    let (status, _) = get_master_key(router(council.clone(), Some(peer(&hierarchy, 10)))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "a revoked certificate");
 }
 
 /// #1508: the renewed leaf names the address the request came from, as an
@@ -1090,14 +1142,7 @@ fn secure_bun_renews_a_due_node_leaf_and_reuses_it_after_restart() {
     let root = tempfile::tempdir().unwrap();
     let cluster_dir = root.path().join("cluster");
     assert_success(
-        &run_relish(&[
-            "init",
-            cluster_dir.to_str().unwrap(),
-            "--cluster-name",
-            "renewal-startup",
-            "--node-id",
-            "node-01",
-        ]),
+        &run_relish_init(&cluster_dir, "renewal-startup", "node-01"),
         "initialise renewal fixture",
     );
     let node_path = cluster_dir.join("reliaburger.toml");

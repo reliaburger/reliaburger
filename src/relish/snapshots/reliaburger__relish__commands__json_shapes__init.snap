@@ -1,6 +1,6 @@
 ---
 source: src/relish/commands.rs
-expression: "json(&InitReport\n{\n    cluster: \"prod\".to_string(), node: \"node-01\".to_string(), node_config:\n    PathBuf::from(\"/etc/reliaburger/reliaburger.toml\"), app_config:\n    PathBuf::from(\"/etc/reliaburger/app.toml\"), master_key:\n    PathBuf::from(\"/etc/reliaburger/prod-master.key\"), security_bootstrap:\n    PathBuf::from(\"/etc/reliaburger/prod-security-bootstrap.json\"),\n    identity_dir: PathBuf::from(\"/etc/reliaburger/identity\"), sealed_root_ca:\n    \"/etc/reliaburger/prod-root-ca.age\".to_string(), root_ca_fingerprint:\n    \"sha256:ab12\".to_string(), development_plaintext: false,\n})"
+expression: "json(&InitReport\n{\n    cluster: \"prod\".to_string(), node: \"node-01\".to_string(), node_config:\n    PathBuf::from(\"/etc/reliaburger/reliaburger.toml\"), app_config:\n    PathBuf::from(\"/etc/reliaburger/app.toml\"), master_key:\n    PathBuf::from(\"/etc/reliaburger/prod-master.key\"), security_bootstrap:\n    PathBuf::from(\"/etc/reliaburger/prod-security-bootstrap.json\"),\n    identity_dir: PathBuf::from(\"/etc/reliaburger/identity\"), root_backup:\n    PathBuf::from(\"/media/usb/prod-root-backup.age\"), root_ca_fingerprint:\n    \"sha256:ab12\".to_string(), development_plaintext: false,\n})"
 ---
 {
   "cluster": "prod",
@@ -10,7 +10,7 @@ expression: "json(&InitReport\n{\n    cluster: \"prod\".to_string(), node: \"nod
   "master_key": "/etc/reliaburger/prod-master.key",
   "security_bootstrap": "/etc/reliaburger/prod-security-bootstrap.json",
   "identity_dir": "/etc/reliaburger/identity",
-  "sealed_root_ca": "/etc/reliaburger/prod-root-ca.age",
+  "root_backup": "/media/usb/prod-root-backup.age",
   "root_ca_fingerprint": "sha256:ab12",
   "development_plaintext": false
 }

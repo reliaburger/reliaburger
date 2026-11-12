@@ -910,7 +910,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             app_id: crate::meat::types::AppId::new(app_name, namespace),
             image: spec.image.clone().unwrap_or_default(),
             result: crate::meat::deploy_types::DeployResult::Completed,
-            created_at: SystemTime::now(),
+            created_at: crate::meat::deploy_types::wall_clock_at(now),
             completed_at: SystemTime::now(),
             steps_completed: new_ids.len(),
             steps_total: new_ids.len(),

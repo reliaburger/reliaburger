@@ -275,7 +275,7 @@ async fn seeded_council_with_log(
     )
     .await
     .unwrap();
-    raft_router.register(1, node.raft().clone()).await;
+    raft_router.register(1, &node).await;
     let mut members = BTreeMap::new();
     members.insert(
         1,
@@ -290,7 +290,7 @@ async fn seeded_council_with_log(
         .prefix(&format!("rb-api-seeded-{tag}-"))
         .tempdir()
         .unwrap();
-    let init = crate::sesame::init::initialize_cluster("apitest", "node-1", dir.path()).unwrap();
+    let init = crate::sesame::init::initialize_cluster("apitest", "node-1").unwrap();
     drop(dir);
 
     // Retry while leadership settles after initialize.
@@ -1630,7 +1630,7 @@ async fn lease_reads_forward_user_authority_and_refuse_an_isolated_leader() {
             .await
             .unwrap(),
         );
-        network.register(id, node.raft().clone()).await;
+        network.register(id, &node).await;
         nodes.push(node);
     }
     nodes[0].initialize(members).await.unwrap();
@@ -1836,7 +1836,7 @@ async fn council_and_network(
             .await
             .unwrap(),
         );
-        network.register(id, node.raft().clone()).await;
+        network.register(id, &node).await;
         nodes.push(node);
     }
     nodes[0].initialize(members).await.unwrap();
@@ -1934,7 +1934,7 @@ async fn follower_with_history_of_a_recording_leader(
             .await
             .unwrap(),
         );
-        network.register(id, node.raft().clone()).await;
+        network.register(id, &node).await;
         nodes.push(node);
     }
     nodes[0].initialize(members).await.unwrap();
@@ -2074,6 +2074,12 @@ async fn a_follower_forwards_upgrade_control_calls_to_the_leader_with_the_caller
             "/v1/upgrade/cluster-rollback",
             r#"{"target_version":"v0.1.0"}"#,
         ),
+        (
+            "/v1/os/rollout/start",
+            r#"{"version":"2026.42.0","channel_url":"https://example/os-channel.json"}"#,
+        ),
+        ("/v1/os/rollout/resume", ""),
+        ("/v1/os/rollout/abort", ""),
     ];
     for (path, body) in calls {
         let (status, reply) =
@@ -2280,7 +2286,7 @@ async fn router_of_a_leader_without_quorum(
             .await
             .unwrap(),
         );
-        network.register(id, node.raft().clone()).await;
+        network.register(id, &node).await;
         nodes.push(node);
     }
     nodes[0].initialize(members).await.unwrap();
@@ -2466,7 +2472,7 @@ async fn a_node_with_no_leader_or_a_closed_fence_answers_run_calls_503_not_404()
         )
         .await
         .unwrap();
-        network.register(1, node.raft().clone()).await;
+        network.register(1, &node).await;
         if initialised {
             let info = CouncilNodeInfo::new("127.0.0.1:9444".parse().unwrap(), "node-1");
             node.initialize(std::collections::BTreeMap::from([(1, info)]))
@@ -2642,6 +2648,41 @@ async fn send_while_heartbeats_lag(
 // leadership the same way as the submissions above (#1253), but nothing
 // tested them. A settled leader whose followers answer one round late must
 // serve each, not refuse it with "can't confirm it with a quorum".
+//
+// #1393: the app routes (apply, stop, delete) decided with one round too, so
+// the same lag refused them. They now confirm leadership like the job routes.
+#[tokio::test]
+async fn a_settled_leader_applies_stops_and_deletes_an_app_after_a_missed_heartbeat_round() {
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let (nodes, network) = council_and_network(3).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !nodes[0].is_leader().await {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    for node in &nodes {
+        node.hold_elections_until(std::time::Instant::now() + std::time::Duration::from_secs(60));
+    }
+    let app = router_over(nodes[0].clone(), admin);
+    let leader = nodes[0].as_ref();
+
+    for (method, path, body) in [
+        ("POST", "/v1/apply", "[app.web]\nimage = \"x:1\"\n"),
+        ("POST", "/v1/stop/web/default", ""),
+        ("POST", "/v1/delete/web/default", ""),
+    ] {
+        let (status, reply) =
+            send_while_heartbeats_lag(&app, &network, leader, (method, path, body), &admin_key)
+                .await;
+        assert!(status.is_success(), "{method} {path}: {status} {reply}");
+    }
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn a_settled_leader_serves_batch_apply_replay_disable_and_stop_after_a_missed_heartbeat_round()
  {
@@ -2895,7 +2936,7 @@ async fn lease_created_through_a_lagging_follower_is_in_its_replica_when_returne
             .await
             .unwrap(),
         );
-        network.register(id, node.raft().clone()).await;
+        network.register(id, &node).await;
         nodes.push(node);
     }
     nodes[0].initialize(members).await.unwrap();
@@ -4138,7 +4179,7 @@ async fn seeded_council_with_ikm(tag: &str) -> Arc<crate::council::CouncilNode> 
         .prefix(&format!("rb-api-seeded-{tag}-"))
         .tempdir()
         .unwrap();
-    let init = crate::sesame::init::initialize_cluster("apitest", "node-1", dir.path()).unwrap();
+    let init = crate::sesame::init::initialize_cluster("apitest", "node-1").unwrap();
     drop(dir);
 
     let raft_router = InMemoryRaftRouter::new();
@@ -4153,7 +4194,7 @@ async fn seeded_council_with_ikm(tag: &str) -> Arc<crate::council::CouncilNode> 
     )
     .await
     .unwrap();
-    raft_router.register(1, node.raft().clone()).await;
+    raft_router.register(1, &node).await;
     let mut members = BTreeMap::new();
     members.insert(
         1,
@@ -4933,7 +4974,11 @@ async fn a_scoped_token_reads_only_its_own_namespaces_events() {
 }
 
 /// Every route that upgrades, rolls back or re-elects the cluster.
-const CLUSTER_ADMIN_ROUTES: [&str; 7] = [
+const CLUSTER_ADMIN_ROUTES: [&str; 11] = [
+    "/v1/os/stage",
+    "/v1/os/rollout/start",
+    "/v1/os/rollout/resume",
+    "/v1/os/rollout/abort",
     "/v1/upgrade/apply",
     "/v1/upgrade/rollback",
     "/v1/upgrade/start",
@@ -7159,7 +7204,7 @@ async fn health_says_whether_this_node_is_a_council_voter() {
         )
         .await
         .unwrap();
-        router.register(1, node.raft().clone()).await;
+        router.register(1, &node).await;
         if initialised {
             let info = CouncilNodeInfo::new("127.0.0.1:9444".parse().unwrap(), "node-1");
             node.initialize(std::collections::BTreeMap::from([(1, info)]))
@@ -9090,6 +9135,45 @@ async fn per_app_process_metric_is_queryable() {
 }
 
 #[tokio::test]
+async fn an_admin_opens_a_join_window_of_up_to_an_hour() {
+    let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let (app, shutdown) = setup_with_auth(vec![token], None).await;
+    let admit = |minutes: u64| format!(r#"{{"address": "192.168.1.60", "minutes": {minutes}}}"#);
+    for (minutes, expected) in [
+        (0, StatusCode::BAD_REQUEST),
+        (61, StatusCode::BAD_REQUEST),
+        (15, StatusCode::OK),
+    ] {
+        let status = post_status(
+            app.clone(),
+            "/v1/perimeter/admit",
+            &plaintext,
+            &admit(minutes),
+        )
+        .await;
+        assert_eq!(status, expected, "{minutes} minutes");
+    }
+    shutdown.cancel();
+}
+
+#[tokio::test]
+async fn a_node_that_isnt_an_appliance_refuses_to_stage_an_os() {
+    let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let (app, shutdown) = setup_with_auth(vec![token], None).await;
+    let (status, body) = post_authenticated(
+        app,
+        "/v1/os/stage",
+        &plaintext,
+        r#"{"rollout_id":"r","version":"2026.42.0","channel_url":"https://example/os-channel.json"}"#,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(String::from_utf8_lossy(&body).contains("isn't an appliance"));
+    shutdown.cancel();
+}
+
+#[tokio::test]
 async fn apply_uses_committed_namespace_context_before_any_resource_write() {
     use crate::council::RaftRequest;
     let council = seeded_council("namespace-context-review2").await;
@@ -10024,7 +10108,7 @@ async fn a_follower_forwards_the_signed_webhook_and_handover_keeps_its_admitted_
             .await
             .unwrap(),
         );
-        transport.register(id, node.raft().clone()).await;
+        transport.register(id, &node).await;
         nodes.push(node);
         listeners.push(listener);
     }
@@ -10330,7 +10414,7 @@ async fn whole_webhook_budget_bounds_held_follower_metadata_and_restores_reserva
             .await
             .unwrap(),
         );
-        transport.register(id, node.raft().clone()).await;
+        transport.register(id, &node).await;
         nodes.push(node);
         listeners.push(listener);
     }
@@ -10420,6 +10504,207 @@ async fn whole_webhook_budget_bounds_held_follower_metadata_and_restores_reserva
         leader_wake && !follower_wake,
         "only the admitted leader consumes the wakeup"
     );
+}
+
+/// #709 through the API: a rotation answers with the new and retiring key
+/// ids, JWKS then publishes both, the old key is in the retiring list until
+/// its window ends, and the step is audited.
+#[tokio::test]
+async fn rotating_the_signing_key_publishes_both_keys_and_is_audited() {
+    use crate::sesame::oidc::RotatedSigningKey;
+    let council = seeded_council_with_ikm("signing-key-rotation").await;
+    let before = council.security_state().await;
+    let old = before.oidc_signing_config.clone().unwrap();
+    let (admin, tok) = named_user_token("root-op", crate::sesame::types::ApiRole::Admin);
+    let token_store = crate::sesame::auth::new_token_store();
+    *token_store.write().await = vec![admin];
+    let events = Arc::new(RwLock::new(crate::bun::events::EventStore::new()));
+    let (cmd_tx, _cmd_rx) = mpsc::channel(32);
+    let app = router(
+        cmd_tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(Arc::clone(&council)),
+        Some(token_store),
+        None,
+        None,
+        None,
+        None,
+        9117,
+        Some(Arc::clone(&events)),
+    );
+    let send = |method: &'static str, uri: &'static str| {
+        let app = app.clone();
+        let tok = tok.clone();
+        async move {
+            let response = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("authorization", format!("Bearer {tok}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            (status, body)
+        }
+    };
+
+    let (status, body) = send("POST", "/v1/identity/signing-key/rotate").await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let rotated: RotatedSigningKey = serde_json::from_slice(&body).unwrap();
+    assert_eq!(rotated.retiring_key_id, old.key_id);
+    assert_ne!(rotated.key_id, old.key_id);
+
+    let after = council.security_state().await;
+    assert_eq!(after.oidc_signing_config.unwrap().key_id, rotated.key_id);
+    assert_eq!(after.retiring_oidc_keys.len(), 1);
+    assert_eq!(after.retiring_oidc_keys[0].not_after, rotated.retire_after);
+
+    let (status, body) = send("GET", "/v1/identity/jwks").await;
+    assert_eq!(status, StatusCode::OK);
+    let jwks: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let kids: Vec<&str> = jwks["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|key| key["kid"].as_str().unwrap())
+        .collect();
+    assert_eq!(kids, [rotated.key_id.as_str(), old.key_id.as_str()]);
+
+    let recorded = events.read().await.recent(20, None, None);
+    let audit = recorded
+        .iter()
+        .find(|event| event.action.as_deref() == Some("identity.signing_key_rotated"))
+        .expect("the rotation is audited");
+    assert_eq!(audit.details.get("key_id"), Some(&rotated.key_id));
+    assert_eq!(audit.details.get("retiring_key_id"), Some(&old.key_id));
+}
+
+/// #709: a rotation reaches every node. A follower's replica carries the
+/// new key and the retiring one, so its verifier, refreshed from that
+/// replica as Bun refreshes it, accepts tokens from both keys.
+#[tokio::test]
+async fn a_signing_key_rotation_reaches_every_node() {
+    let (nodes, _network) = council_and_network(3).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !nodes[0].is_leader().await {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let ikm = [8u8; 32];
+    let issuer = "https://every-node";
+    let old = crate::sesame::oidc::generate_oidc_keypair(issuer, &ikm).unwrap();
+    let new = crate::sesame::oidc::generate_oidc_keypair(issuer, &ikm).unwrap();
+    nodes[0]
+        .write(crate::council::RaftRequest::SecurityStateInit(Box::new(
+            crate::sesame::types::SecurityState {
+                oidc_signing_config: Some(old.clone()),
+                ..Default::default()
+            },
+        )))
+        .await
+        .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    nodes[0]
+        .write(crate::council::RaftRequest::RotateOidcSigningKey {
+            signing_key: new.clone(),
+            retire_after_unix_secs: now + crate::sesame::oidc::RETIRING_KEY_WINDOW_SECS,
+            now_unix_secs: now,
+        })
+        .await
+        .unwrap();
+
+    let token = |config: &crate::sesame::types::OidcSigningConfig| {
+        let claims = crate::sesame::types::WorkloadJwtClaims {
+            iss: issuer.to_string(),
+            sub: "spiffe://test/ns/default/app/api".to_string(),
+            aud: vec!["spiffe://test".to_string()],
+            exp: now + 600,
+            iat: now,
+            namespace: "default".to_string(),
+            app: "api".to_string(),
+            cluster: "test".to_string(),
+            node: "node-1".to_string(),
+            instance: "api-g1-0".to_string(),
+        };
+        crate::sesame::oidc::mint_jwt(&claims, config, &ikm).unwrap()
+    };
+    let (old_token, new_token) = (token(&old), token(&new));
+    for follower in &nodes[1..] {
+        let replicated = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let state = follower.security_state().await;
+                if state.oidc_signing_config.as_ref() == Some(&new) {
+                    return state;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the rotation reached the follower");
+        let verifier = crate::sesame::auth::WorkloadJwtVerifier::new(old.clone(), "test");
+        verifier.refresh(&replicated, now);
+        assert!(
+            verifier.verify(&old_token).is_some(),
+            "old token refused on a follower"
+        );
+        assert!(
+            verifier.verify(&new_token).is_some(),
+            "new token refused on a follower"
+        );
+    }
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// #709: rotation is leader only. A follower answers 421 and changes
+/// nothing, so the operator knows to ask the leader.
+#[tokio::test]
+async fn rotating_the_signing_key_is_refused_on_a_follower() {
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let (nodes, _network) = council_and_network(3).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !nodes[0].is_leader().await {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let follower = router_over(nodes[1].clone(), admin);
+    let (status, reply) = send_bounded(
+        follower,
+        "POST",
+        "/v1/identity/signing-key/rotate",
+        &admin_key,
+        "",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::MISDIRECTED_REQUEST, "{reply}");
+    assert!(
+        nodes[0]
+            .security_state()
+            .await
+            .retiring_oidc_keys
+            .is_empty()
+    );
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
 }
 
 /// F04 R4 through the API: prepare answers with a CSR the operator can

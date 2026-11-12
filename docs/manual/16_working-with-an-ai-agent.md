@@ -48,9 +48,9 @@ If you're an agent operating or debugging a Reliaburger cluster:
   A warning starting `source_mismatch:` means a node runs another commit, and
   links that commit's code.
 - **Use `-o json` for everything else.** Every `relish` command takes it
-  except the six interactive ones: `tui`, `dashboard`, `manual`, `source`,
-  `dev shell` and the guided `setup`. `setup --quickstart` and `setup --ssh`
-  take it.
+  except the eight interactive ones: `tui`, `dashboard`, `manual`, `source`,
+  `dev shell`, the guided `setup`, `machines claim` and `netboot`. `setup
+  --quickstart` and `setup --ssh` take it.
 - **Never post, change or file anything without your human.** Draft it, show
   it, and let them send it.
 - **Asked to set up a cluster?** Follow the playbook "Setting up a cluster for
@@ -839,11 +839,13 @@ field names and no URL carries, gets through. Read `MANIFEST.json` and
 ## Every other command
 
 The rest of `relish` was written for people first, but every command takes
-`-o json` (or `-o yaml`) and prints the facts its table shows, except six
+`-o json` (or `-o yaml`) and prints the facts its table shows, except eight
 interactive ones that exit `2`: `tui`, `dashboard`, `manual`, `source`, `dev
-shell` and `setup` without `--quickstart` or `--ssh`. Without a terminal,
-`relish`, `relish manual` and `relish source` exit at once and name the
-command to use instead. The `reference` chapter lists each command's JSON.
+shell`, `setup` without `--quickstart` or `--ssh`, `machines claim`, which
+asks you to compare claim keys, and `netboot`, which serves until stopped.
+Without a terminal, `relish`, `relish manual` and `relish source` exit at
+once and name the command to use instead. The `reference` chapter lists each
+command's JSON.
 
 Unlike `relish agent`, these commands keep their own exit codes: `relish wtf`
 exits `1` for a critical finding and `3` for warnings only, not because you

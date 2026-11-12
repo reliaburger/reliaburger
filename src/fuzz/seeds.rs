@@ -44,6 +44,9 @@ pub(super) fn for_target(target: &str) -> Vec<Seed> {
         "join_csr" => csrs(),
         "app_config" => config_files(&["phase-1", "phase-8", "templates", "policies"]),
         "node_config" => config_files(&["node"]),
+        "task_manifest" => task_manifests(),
+        "chaos_scenario" => scenario_files(),
+        "council_backup_state" => council_states(),
         other => panic!("no seeds for fuzz target {other}"),
     }
 }
@@ -356,4 +359,54 @@ fn config_files(directories: &[&str]) -> Vec<Seed> {
         }
     }
     seeds
+}
+
+fn task_manifests() -> Vec<Seed> {
+    let cohort = |name: &str, count: u32| {
+        serde_json::json!({
+            "name": name,
+            "count": count,
+            "template": {"runtime": "process", "exec": "/bin/true"},
+        })
+    };
+    vec![
+        seed(
+            "one-cohort",
+            json(serde_json::json!({"name": "mixed", "cohort": [cohort("small", 1)]})),
+        ),
+        seed(
+            "two-cohorts",
+            json(serde_json::json!({
+                "name": "render",
+                "namespace": "media",
+                "cohort": [cohort("thumbnails", 100), cohort("posters", 3)],
+            })),
+        ),
+    ]
+}
+
+fn scenario_files() -> Vec<Seed> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("examples/phase-8/container-chaos-scenario.toml");
+    vec![seed(
+        "container-chaos-scenario",
+        std::fs::read(&path).expect("the example scenario reads"),
+    )]
+}
+
+fn council_states() -> Vec<Seed> {
+    use crate::council::types::DesiredState;
+
+    let empty = DesiredState::default();
+    let mut configured = DesiredState::default();
+    configured.config.insert("heartbeat".into(), "1".into());
+    [("empty", empty), ("with-config", configured)]
+        .into_iter()
+        .map(|(name, state)| {
+            seed(
+                name,
+                serde_json::to_vec(&state).expect("seed state encodes"),
+            )
+        })
+        .collect()
 }

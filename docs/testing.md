@@ -36,6 +36,11 @@ checks formatting before it restores a cache. `make ci-bench` is `make ci` follo
 runs a privileged, cluster or upgrade suite; those have their own targets
 below, because they need root, a provisioned host or a lot of wall time.
 
+Test threads get an 8 MiB stack (`RUST_MIN_STACK` in
+[`.cargo/config.toml`](../.cargo/config.toml)), not std's 2 MiB. An
+unoptimised build of clap's derived `relish` parser needs more than 2 MiB, so
+without it every test that parses the CLI overflows its stack.
+
 `make test` first runs `make warm-executables`: it builds the suite with
 `cargo test --no-run`, which builds the `[[bin]]` targets (`bun`, `relish`,
 `testapp`) as the tests use them, and, on macOS, runs each binary once with
@@ -273,6 +278,7 @@ record goes in [`qualification/`](qualification):
 | `make test-gpu` | An NVIDIA GPU and `nvidia-smi` | The maintainer, before any release that touches GPU detection (`src/bun/gpu.rs`) |
 | `qualify-power-cut-reboot.sh`, which runs `qualify-oci-reboot.sh`, `qualify-discovery-reboot.sh` and `qualify-storage-power-cut.sh` | A disposable VM, which it creates and deletes that can be rebooted or powered off ([below](#pulling-the-plug)) | The maintainer, on every release candidate ([release gate](releasing.md#staging-a-candidate)) |
 | `qualify-ssh-setup.sh` (`relish setup --ssh` end to end) | Lima on the host. It creates three disposable VMs from `ssh-setup-vm.yaml` (or `--machines N`; eight puts one past the council's cap of seven), on Ubuntu 24.04 or, with `--ubuntu 26.04`, the newest LTS, builds a cluster on them over SSH, checks `status` and `wtf` and that every node's Bun stays up, runs setup again to show it resumes without restarting a node, shows a second operator refused, and deletes the VMs | The maintainer, before any release that touches SSH setup (`src/relish/quickstart/ssh.rs`, `server.rs`, `server_runner.rs`), from 0.2.6 ([#1529](https://github.com/reliaburger/reliaburger/issues/1529)) |
+| `qualify-cold-install.sh` (V04: the published release's `curl \| bash -s -- --laptop --timings` on a clean Linux host, then a check, teardown and a before-and-after diff of the host) | A fresh Linux host with KVM that it may change: a new Lima VM with `nestedVirtualization: true` for arm64, a new GitHub-hosted runner for x86_64 (the `Cold install` workflow, `cold-install.yml`, runs it three times) | The maintainer, after a promote, for the Linux rows of V04 ([#288](https://github.com/reliaburger/reliaburger/issues/288), [record](qualification/2026-11-12-v04-cold-installs-linux.md)). `make test-ci-scripts` tests its arguments and the workflow's shape ([`test_cold_install.py`](../scripts/release/test_cold_install.py)) |
 | `nightly-qualify.sh` (the power-cut runs and the soak tiers, one after another on a train's tip) | The quiet host with Lima, a staged build of the tip for the soaks, and the signed soak bun for the job final | The quiet host every night, from 0.2.4 ([nightly qualification](releasing.md#nightly-qualification-on-the-train-tip)); `nightly.py freeze-check` compares the candidate with the latest green night. `make test-ci-scripts` tests its plan, record and freeze rule ([`test_nightly.py`](../scripts/release/test_nightly.py)) |
 | `make test-gym` (the agent gym's scenarios on throwaway local clusters, [below](#an-agent-gym)) | macOS or Linux, about ten minutes and the ports from `GYM_PORT_BASE` (default 29400) to 29413 free; nothing else. `GYM_SOLVER=command:PROGRAM` runs an agent instead of the scripted baseline, which costs API spend | The maintainer, before any release that changes `relish wtf`, `relish agent` or a scenario; the 0.2.7 exit test ([#1093](https://github.com/reliaburger/reliaburger/issues/1093)) runs it with an agent. The record goes in [`qualification/`](qualification) |
 | `make test-gym-user` (`relish gym run` on a throwaway local cluster: the baseline, then Ctrl-C mid-run, [below](#on-a-users-cluster-relish-gym-run)) | macOS or Linux, about ten minutes, and the ports from `GYM_PORT_BASE` free; no API spend | The maintainer, before any release that changes `relish gym`, Smoker's workload faults or token scoping |
@@ -739,6 +745,9 @@ plan: [`plans/2026-10-28-research-kubernetes-release-testing.md`](plans/2026-10-
 | `join_csr` | `sesame::ca::sign_node_csr` | a joining node |
 | `app_config` | `config::Config::parse` | `relish apply` or a GitOps repository |
 | `node_config` | `config::node::NodeConfig::parse` | a node's config file |
+| `task_manifest` | `TaskManifestRequest` and `validate_submission` (`bun::task_array_api`) | `relish batch submit` or `POST /v1/batch/manifest` |
+| `chaos_scenario` | `ScriptedScenario` and `smoker::scenario::build_timeline` | a chaos scenario file for `relish fault scenario` |
+| `council_backup_state` | `DesiredState`, then `BackupKey::for_state` and `BackupKey::parse` | the state inside an unsealed backup, during `relish council recover` |
 
 A target's body lives in [`src/fuzz/mod.rs`](../src/fuzz/mod.rs), behind the
 `fuzzing` feature, and [`fuzz/fuzz_targets/`](../fuzz/fuzz_targets) only wraps
@@ -1197,10 +1206,10 @@ why we copied the idea and not the tooling.
 | SLO (p99) | What's timed | Threshold | Mode |
 |---|---|---|---|
 | Job task start | A job task's start lag on a pooled executor, from the job campaign's buckets, in runs no fault window overlapped | ≤ 256 ms | Gated in the fast and final tiers |
-| API read | `GET /v1/status?cluster=true` and `GET /v1/cluster/nodes` (what `relish status` and `relish nodes` ask) on every node, at every light check, from the host | ≤ 1,000 ms | Record only |
-| API write | `relish apply` of the soak workloads, from the call to the Raft commit | ≤ 2,000 ms | Record only |
+| API read | `GET /v1/status?cluster=true` and `GET /v1/cluster/nodes` (what `relish status` and `relish nodes` ask) on every node, at every light check, from the host | ≤ 3,000 ms | Gated in the fast and final tiers |
+| API write | `relish apply` of the soak workloads, from the call to the Raft commit | ≤ 3,000 ms | Gated in the fast and final tiers |
 | App start | Each node's deploy of a new `soak-slo` instance, from its start until the instance passes its health check | ≤ 5,000 ms | Record only |
-| Rolling update | From `relish apply` returning until every node runs the new `soak-slo` | ≤ 30,000 ms | Record only |
+| Rolling update | From `relish apply` returning until every node runs the new `soak-slo` | ≤ 100,000 ms | Gated in the fast and final tiers |
 
 **Where the gated number comes from.** The job start lag is the one latency
 earlier records already kept. Across the ten 0.2.0 to 0.2.2 soak records its
@@ -1230,15 +1239,33 @@ tail gives it millions, so a final short of 1,000 fails. 0.2.4's 8-hour
 final, the first to gate on it, measured 32 ms over 137,306,923 quiet tasks
 ([record](qualification/2026-10-30-v0.2.4-job-qualification.md)).
 
-**Record only, from 28 October 2026.** No soak before 0.2.4 timed the API,
-an app start or a rolling update, so those four start in record-only mode:
-the record shows the value and whether it's over the provisional threshold,
-and never fails on it. The provisional thresholds are Kubernetes's for reads
-and app start, and a guess with room to spare for writes and rolling updates.
-The first 0.2.4 fast and final records exist now
-([release closure](qualification/2026-10-30-v0.2.4-release-closure.md)),
-and the maintainer sets each gate from them, with margin, the same way as
-the job start.
+**The API and rollout gates, from 6 November 2026.** No soak before 0.2.4
+timed the API, an app start or a rolling update, so those four started in
+record-only mode on 28 October: the record showed the value and whether it
+was over a provisional threshold, and never failed on it. The fast and final
+records from 0.2.4 to 0.2.6 then set three of the gates
+([#1405](https://github.com/reliaburger/reliaburger/issues/1405);
+`python3 scripts/release/soak_slo.py trend docs/qualification` lists them):
+
+| SLO (p99) | Fast-tier records | Final records | Worst | Gate |
+|---|---|---|---|---|
+| API read | 100 to 150 ms | 150, 1,500, 150 ms | 1,500 ms | 3,000 ms |
+| API write | 150 to 300 ms | 500, 1,500, 1,500 ms | 1,500 ms | 3,000 ms |
+| Rolling update | 30,000 ms | 30,000, 50,000, 50,000 ms | 50,000 ms | 100,000 ms |
+
+Each gate sits two histogram buckets above the worst value. A p99 is the
+upper bound of its bucket, so one bucket of margin would fail a run that was
+only a little slower than the worst so far, and the job start's four times
+would leave the rolling update at 200 s, longer than the rollout's own
+budget. A day tier and a custom run still record these without gating them:
+the 0.2.4 day run measured a rolling update p99 of 100,000 ms at six times
+the load.
+
+App start stays record only. It's 1 ms in every record, because deploy
+history stamps a deploy's start at the moment it records the deploy's end,
+so `completed_at − created_at` measures nothing
+([#1640](https://github.com/reliaburger/reliaburger/issues/1640)). Its gate
+waits until records time it for real.
 
 **How it's measured.** At every light, settle and heavy check outside a fault
 window, the harness times the two API reads on each node that is up
@@ -1339,6 +1366,14 @@ and checks the record. The gated
 `cluster_failover::a_lease_history_through_a_leader_kill_is_linearizable`
 (`make test-cluster`) runs the client against three in-process nodes while
 it kills the leader, and checks the history.
+`cluster_failover::a_lease_history_through_a_leader_partition_is_linearizable`
+runs the same client while the leader is cut off rather than killed
+([#1415](https://github.com/reliaburger/reliaburger/issues/1415)): every
+cluster transport of the old leader is quiesced, as a `node-kill` fault does,
+while its API keeps answering. The test waits for one of the other two to be
+elected, leaves the old leader cut off for ten seconds more, then heals it.
+That's the direct test for a stale read after a leader change, which a kill
+can't give, because a killed leader answers nothing.
 
 **Showing it can fail.** The bug the issue names is a follower answering a
 read from its own copy without confirming leadership: in
@@ -1373,6 +1408,11 @@ building it.
 cover lost admission replies, resumption with the same request ID, monotonic
 accounting, unknown-owner fences, independent effects, stale observations,
 exact orphan detection and failure propagation into the final V02 verdict.
+They also cover the exactly-once chunk check (#1415). A drained work or audit
+run's sampled chunks must each hold every task once, all from one grant. An
+audit task whose chunk was granted once mustn't have run more often than its
+accepted attempts. A chunk on an unreachable node waits out the same 600 s
+grace as a failure fixture's result.
 For the job qualification tiers they also parse `--plan` output (an hour-long
 fast tier whose first four cycles carry every fault kind and every special,
 node faults on every node, an 8-hour final whose cycles, quiet tail and run

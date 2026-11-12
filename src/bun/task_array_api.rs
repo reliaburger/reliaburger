@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use super::api::ApiState;
 use super::batch::{forward_get_to_leader, forward_to_leader};
+use super::leadership::council_to_forward_to;
 use super::task_array_leader::{NodeView, TaskArrayWriteError, read_task_arrays, write_task_array};
 use super::task_array_node::{MAX_RESULT_ROWS, NodeSyncRequest, TaskArrayNodeError, TaskResultRow};
 use crate::config::job::JobSpec;
@@ -120,7 +121,7 @@ fn write_error(failure: TaskArrayWriteError) -> Response {
 
 /// Check a submission and settle its namespace. Everything here is also
 /// enforced by the state machine; checking first gives a precise 400.
-fn validate_submission(request: &mut TaskArraySubmitRequest) -> Result<String, String> {
+pub(crate) fn validate_submission(request: &mut TaskArraySubmitRequest) -> Result<String, String> {
     let namespace = match (&request.namespace, &request.template.namespace) {
         (Some(a), Some(b)) if a != b => {
             return Err(format!(
@@ -144,31 +145,6 @@ fn validate_submission(request: &mut TaskArraySubmitRequest) -> Result<String, S
         crate::meat::cron::CronSchedule::parse(expression).map_err(|e| e.to_string())?;
     }
     Ok(namespace)
-}
-
-/// How long a leader gets to prove it leads before it serves a job or
-/// task-array request itself (#1009, #1192, #1253).
-const LEADER_CONFIRMATION: std::time::Duration = std::time::Duration::from_secs(3);
-
-/// The council to forward a job or task-array request to, or `None` when
-/// this node has proved it leads (or runs without a council) and may serve
-/// the request itself.
-///
-/// A follower's replica can lag, and a node back from a stop may hold a log
-/// older than the run, so only a confirmed leader may say "not found". The
-/// leader gets [`LEADER_CONFIRMATION`] to prove it, so one heartbeat round
-/// its followers answer late doesn't turn into a 503: a leader that fails a
-/// single round would forward to itself, which `leader_api_url` refuses. A
-/// follower answers at once, without waiting.
-pub(super) async fn council_to_forward_to(
-    state: &ApiState,
-) -> Option<&crate::council::CouncilNode> {
-    let council = state.council.as_deref()?;
-    if council.confirm_leadership(LEADER_CONFIRMATION).await {
-        None
-    } else {
-        Some(council)
-    }
 }
 
 /// `POST /v1/batch/array`: submit a task array.

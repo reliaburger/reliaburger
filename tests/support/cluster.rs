@@ -201,7 +201,7 @@ pub async fn build_council() -> (Vec<Arc<CouncilNode>>, InMemoryRaftRouter) {
         )
         .await
         .unwrap();
-        router.register(rid(index), node.raft().clone()).await;
+        router.register(rid(index), &node).await;
         nodes.push(Arc::new(node));
     }
 
@@ -422,6 +422,7 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
             seeds,
             wrapping_ikm: None,
             bootstrap_security_state: None,
+            bootstrap_council_size: None,
             data_dir,
             mayo: mayo.clone(),
             rollup_interval: metrics_rollup.unwrap_or(Duration::from_secs(60)),

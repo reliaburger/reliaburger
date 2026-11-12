@@ -260,6 +260,22 @@ pub struct OidcSigningConfig {
     pub issuer: String,
 }
 
+/// A replaced OIDC signing key that still verifies (#709).
+///
+/// `relish identity rotate-signing-key` moves the active key here and signs
+/// with a new one. Workloads hold JWTs from the old key for up to their
+/// lifetime, so the old public key stays in JWKS and keeps verifying until
+/// `not_after`. Its private key is dropped: it never signs again.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RetiringOidcKey {
+    /// Ed25519 public key bytes.
+    pub public_key_der: Vec<u8>,
+    /// The `kid` its tokens declare.
+    pub key_id: String,
+    /// Unix seconds after which tokens signed with it are refused.
+    pub not_after: u64,
+}
+
 /// Claims embedded in a workload identity JWT.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkloadJwtClaims {
@@ -678,6 +694,9 @@ pub struct SecurityState {
     pub next_serial: u64,
     /// OIDC signing configuration for workload identity JWTs.
     pub oidc_signing_config: Option<OidcSigningConfig>,
+    /// Signing keys a rotation replaced, still verifying until their
+    /// `not_after` (#709).
+    pub retiring_oidc_keys: Vec<RetiringOidcKey>,
     /// Certificate revocation list.
     pub crl: Crl,
     /// Sealing generation per stored encrypted secret, keyed by
@@ -849,12 +868,7 @@ mod tests {
     /// no join tokens, seals or pending intermediates.
     #[test]
     fn a_node_view_keeps_what_verifies_and_drops_what_issues() {
-        let init = crate::sesame::init::initialize_cluster(
-            "view",
-            "node-1",
-            tempfile::tempdir().unwrap().path(),
-        )
-        .unwrap();
+        let init = crate::sesame::init::initialize_cluster("view", "node-1").unwrap();
         let mut state = init.security_state;
         state.join_tokens.push(JoinToken {
             token_hash: [7; 32],

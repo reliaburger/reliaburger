@@ -1092,14 +1092,37 @@ pub fn enable_node_data_path(config: &mut crate::config::node::NodeConfig, host:
     }
 }
 
-/// Initialise a new cluster with starter config files and PKI, using mTLS for
-/// its internal transports.
-pub fn init(dir: &Path, cluster_name: &str, node_id: &str) -> Result<(), RelishError> {
+/// `relish init` for tests and harnesses that need a cluster and never its
+/// root: the backup and the identity that opens it go into `dir` itself, as
+/// `throwaway-root-backup.age` and `throwaway-root-backup.age-identity`.
+/// Never use it for a real cluster, whose root mustn't stay on the node
+/// (#709).
+#[doc(hidden)]
+pub fn init_with_throwaway_root(
+    dir: &Path,
+    cluster_name: &str,
+    node_id: &str,
+) -> Result<(), RelishError> {
+    fs::create_dir_all(dir)?;
+    let identity = age::x25519::Identity::generate();
+    let identity_path = dir.join("throwaway-root-backup.age-identity");
+    {
+        use age::secrecy::ExposeSecret as _;
+        crate::sesame::identity::atomic_write_mode(
+            &identity_path,
+            format!("{}\n", identity.to_string().expose_secret()).as_bytes(),
+            Some(0o600),
+        )?;
+    }
     init_with_security(
         dir,
         cluster_name,
         node_id,
         InitSecurityMode::MutualTls,
+        &super::ca_cmd::InitRootBackup {
+            path: dir.join("throwaway-root-backup.age"),
+            target: super::ca_cmd::BackupTarget::Recipient(identity.to_public().to_string()),
+        },
         OutputFormat::Human,
     )
 }
@@ -1114,12 +1137,12 @@ pub struct InitReport {
     pub node_config: PathBuf,
     /// The sample app.
     pub app_config: PathBuf,
-    /// The master secret's file (mode 0600). Back it up with the sealed
-    /// root CA key.
+    /// The master secret's file (mode 0600).
     pub master_key: PathBuf,
     pub security_bootstrap: PathBuf,
     pub identity_dir: PathBuf,
-    pub sealed_root_ca: String,
+    /// The root CA backup, the only copy of the root key (#709).
+    pub root_backup: PathBuf,
     /// What a joiner must see from `relish join`.
     pub root_ca_fingerprint: String,
     /// The internal transports run in the clear (`--development-plaintext`).
@@ -1137,13 +1160,15 @@ impl std::fmt::Display for InitReport {
 /// transport-security mode.
 ///
 /// Creates `reliaburger.toml` (node config) and `app.toml` (sample app)
-/// in the given directory. Generates the CA hierarchy, age keypair,
-/// first node certificate, and a join token.
+/// in the given directory. Generates the CA hierarchy, age keypair and first
+/// node certificate, and writes the root CA's key only into `root_backup`,
+/// sealed to the operator, before anything else (#709).
 pub fn init_with_security(
     dir: &Path,
     cluster_name: &str,
     node_id: &str,
     security_mode: InitSecurityMode,
+    root_backup: &super::ca_cmd::InitRootBackup,
     output: OutputFormat,
 ) -> Result<(), RelishError> {
     let cluster_identity = crate::config::node::ClusterSection {
@@ -1168,9 +1193,28 @@ pub fn init_with_security(
         });
     }
 
-    // Generate the security state (CAs, age keypair, join token)
-    let init_result = crate::sesame::init::initialize_cluster(cluster_name, node_id, dir)
+    if root_backup.path.exists() {
+        return Err(RelishError::FileExists {
+            path: root_backup.path.display().to_string(),
+        });
+    }
+    // Ask for the passphrase before generating anything.
+    let seal = root_backup.seal()?;
+
+    // Generate the security state (CAs, age keypair)
+    let init_result = crate::sesame::init::initialize_cluster(cluster_name, node_id)
         .map_err(|e| RelishError::InitFailed(e.to_string()))?;
+
+    // The root key's only copy goes to the operator first: if it can't be
+    // written and checked, nothing else is.
+    crate::sesame::root_backup::write_backup(
+        &init_result.root_backup,
+        &crate::sesame::root_backup::BackupDestination::Sealed {
+            path: &root_backup.path,
+            seal: &seal,
+        },
+        std::time::SystemTime::now(),
+    )?;
 
     // Persist the master secret to a secure file
     let secret_path = dir.join(format!("{cluster_name}-master.key"));
@@ -1197,16 +1241,16 @@ pub fn init_with_security(
         crate::sesame::identity_store::root_ca_fingerprint(&node_identity.root_ca_der);
 
     // Output the init summary to stderr (join token is sensitive)
-    eprint!("{}", crate::sesame::init::format_init_output(&init_result));
+    eprint!(
+        "{}",
+        crate::sesame::init::format_init_output(&init_result, &root_backup.path)
+    );
     eprintln!("  Master secret:   {}", secret_path.display());
     eprintln!("  Security state:  {}", bootstrap_path.display());
     eprintln!("  Node identity:   {}", identity_dir.display());
     eprintln!("  Root CA:         {root_fingerprint}");
     eprintln!();
-    eprintln!(
-        "  Back up {}-master.key alongside the sealed root CA key.",
-        cluster_name
-    );
+    eprintln!("  Back up {cluster_name}-master.key too, but never with the root CA backup.");
     eprintln!("  Joiners must see the same root CA fingerprint from `relish join`.");
 
     let mut node_config = crate::config::node::NodeConfig::default();
@@ -1268,7 +1312,7 @@ path = "/"
             master_key: secret_path,
             security_bootstrap: bootstrap_path,
             identity_dir,
-            sealed_root_ca: init_result.sealed_root_ca_path.clone(),
+            root_backup: root_backup.path.clone(),
             root_ca_fingerprint: root_fingerprint,
             development_plaintext: security_mode == InitSecurityMode::DevelopmentPlaintext,
         },
@@ -1367,60 +1411,20 @@ pub async fn join(
     output: OutputFormat,
 ) -> Result<(), RelishError> {
     let base = normalise_member_base(addr);
-    let ca_url = format!("{base}/v1/cluster/ca");
-    let member_url = format!("{base}/v1/cluster/join");
     let dir = identity_dir
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("identity"));
-
-    // Phase 1 — fetch the cluster's public CA over trust-on-first-use. This
-    // reveals no secret; a joiner has no CA yet, so it cannot verify the
-    // member's certificate on this first contact. If a fingerprint was pinned,
-    // a mismatch is refused *here*, before the one-time token is ever sent — so
-    // a man-in-the-middle cannot capture and replay a token the real cluster
-    // never consumed.
-    let tofu_client = crate::http_client::builder()
-        .danger_accept_invalid_certs(true)
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| RelishError::JoinFailed(e.to_string()))?;
-
-    let ca = crate::sesame::join::fetch_ca(&tofu_client, &ca_url)
+    let identity = crate::sesame::join::enrol(&base, token, node_id, ca_fingerprint)
         .await
-        .map_err(|e| RelishError::JoinFailed(e.to_string()))?;
-    let offered = ca
-        .root_ca_fingerprint()
-        .map_err(|e| RelishError::JoinFailed(e.to_string()))?;
-    if let Some(expected) = ca_fingerprint
-        && offered != expected
-    {
-        return Err(RelishError::JoinFailed(format!(
-            "root CA fingerprint mismatch: member offered {offered}, expected {expected} — \
-             refusing to send the join token"
-        )));
-    }
-    let trust = ca
-        .decode()
-        .map_err(|e| RelishError::JoinFailed(e.to_string()))?;
-
-    // Phase 2 — send the token only over a connection whose server certificate
-    // is cryptographically verified to chain to the CA we just fetched (and, if
-    // pinned, fingerprint-checked). A man-in-the-middle without the cluster's
-    // key cannot present such a chain, so the handshake fails before the token
-    // leaves this node. `request_join` re-checks the pinned fingerprint against
-    // the returned bundle as defence in depth.
-    let pinned_client = crate::sesame::mtls::build_ca_pinned_client(trust)
-        .map_err(|e| RelishError::JoinFailed(e.to_string()))?;
-
-    let identity = crate::sesame::join::request_join(
-        &pinned_client,
-        &member_url,
-        token,
-        node_id,
-        ca_fingerprint,
-    )
-    .await
-    .map_err(|e| RelishError::JoinFailed(e.to_string()))?;
+        .map_err(|e| match e {
+            crate::sesame::join::JoinClientError::FingerprintMismatch { offered, expected } => {
+                RelishError::JoinFailed(format!(
+                    "root CA fingerprint mismatch: member offered {offered}, expected {expected} — \
+                     refusing to send the join token"
+                ))
+            }
+            other => RelishError::JoinFailed(other.to_string()),
+        })?;
 
     let fingerprint = crate::sesame::identity_store::root_ca_fingerprint(&identity.root_ca_der);
     crate::sesame::identity_store::save(&dir, &identity)
@@ -4707,6 +4711,75 @@ impl std::fmt::Display for JoinTokenReport<'_> {
     }
 }
 
+/// List the council's join tokens.
+pub async fn join_token_list() -> Result<(), RelishError> {
+    let tokens = BunClient::default_local().join_token_list().await?;
+    print!(
+        "{}",
+        render_join_tokens(&tokens, std::time::SystemTime::now())
+    );
+    Ok(())
+}
+
+/// Revoke a node id's unused join tokens.
+pub async fn join_token_revoke(node_id: &str) -> Result<(), RelishError> {
+    let revoked = BunClient::default_local()
+        .join_token_revoke(node_id)
+        .await?;
+    match revoked {
+        0 => println!("{node_id} had no unused join tokens"),
+        1 => println!("revoked 1 join token for {node_id}"),
+        n => println!("revoked {n} join tokens for {node_id}"),
+    }
+    Ok(())
+}
+
+/// The `relish join-token list` table: one row per token, its state
+/// relative to `now`.
+fn render_join_tokens(
+    tokens: &[crate::sesame::join::JoinTokenSummary],
+    now: std::time::SystemTime,
+) -> String {
+    if tokens.is_empty() {
+        return "no join tokens\n".to_string();
+    }
+    let now = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let width = tokens
+        .iter()
+        .map(|t| t.node_id.len())
+        .max()
+        .unwrap_or(0)
+        .max(4);
+    let mut out = format!("{:<10} {:<width$} STATE\n", "ID", "NODE");
+    for token in tokens {
+        let state = if token.consumed {
+            "used".to_string()
+        } else if token.expires_at <= now {
+            "expired".to_string()
+        } else {
+            format!("valid for {}", format_ttl_rounded(token.expires_at - now))
+        };
+        out.push_str(&format!(
+            "{:<10} {:<width$} {state}\n",
+            token.id, token.node_id
+        ));
+    }
+    out
+}
+
+/// A duration as its largest whole unit: 6d, 3h, 14m or 40s.
+fn format_ttl_rounded(seconds: u64) -> String {
+    match seconds {
+        s if s >= 86_400 => format!("{}d", s / 86_400),
+        s if s >= 3_600 => format!("{}h", s / 3_600),
+        s if s >= 60 => format!("{}m", s / 60),
+        s => format!("{s}s"),
+    }
+}
+
 fn format_ttl(seconds: u64) -> String {
     if seconds.is_multiple_of(3600) {
         format!("{}h", seconds / 3600)
@@ -5089,6 +5162,34 @@ mod tests {
     }
 
     #[test]
+    fn join_token_table_shows_used_expired_and_remaining_time() {
+        use crate::sesame::join::JoinTokenSummary;
+        let now = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        let token = |id: &str, node: &str, expires_at: u64, consumed: bool| JoinTokenSummary {
+            id: id.into(),
+            node_id: node.into(),
+            expires_at,
+            consumed,
+        };
+        let table = render_join_tokens(
+            &[
+                token("aaaaaaaa", "node-02", 999_000, true),
+                token("bbbbbbbb", "node-03", 999_000, false),
+                token("cccccccc", "home-10", 1_000_000 + 6 * 86_400 + 5, false),
+            ],
+            now,
+        );
+        assert_eq!(
+            table,
+            "ID         NODE    STATE\n\
+             aaaaaaaa   node-02 used\n\
+             bbbbbbbb   node-03 expired\n\
+             cccccccc   home-10 valid for 6d\n"
+        );
+        assert_eq!(render_join_tokens(&[], now), "no join tokens\n");
+    }
+
+    #[test]
     fn build_plan_shows_the_destination_and_build_but_no_push() {
         let spec = crate::config::build::BuildSpec {
             context: ".".into(),
@@ -5407,8 +5508,7 @@ mod tests {
     fn secret_pubkey_prints_age_key_from_bootstrap() {
         let dir = tempfile::tempdir().unwrap();
         // `relish init` writes the bootstrap file from the init result; mimic it.
-        let init =
-            crate::sesame::init::initialize_cluster("pubkeytest", "node-1", dir.path()).unwrap();
+        let init = crate::sesame::init::initialize_cluster("pubkeytest", "node-1").unwrap();
         let bootstrap = dir.path().join("pubkeytest-security-bootstrap.json");
         fs::write(
             &bootstrap,
@@ -6012,11 +6112,136 @@ spec:
         );
     }
 
+    const ROOT_PASSPHRASE: &str = "correct horse battery staple";
+
+    /// `relish init` with a passphrase backup kept outside `dir`, as an
+    /// operator keeps it off the node. Returns where the backup went.
+    fn init_with_backup(
+        dir: &Path,
+        cluster: &str,
+        node: &str,
+        backup_dir: &Path,
+    ) -> Result<PathBuf, RelishError> {
+        let passphrase = backup_dir.join("root-passphrase");
+        std::fs::write(&passphrase, format!("{ROOT_PASSPHRASE}\n")).unwrap();
+        let path = backup_dir.join("root-backup.age");
+        init_with_security(
+            dir,
+            cluster,
+            node,
+            InitSecurityMode::MutualTls,
+            &super::super::ca_cmd::InitRootBackup {
+                path: path.clone(),
+                target: super::super::ca_cmd::BackupTarget::Passphrase(
+                    super::super::ca_cmd::PassphraseSource::File(passphrase),
+                ),
+            },
+            OutputFormat::Human,
+        )?;
+        Ok(path)
+    }
+
+    /// `relish init` for tests that don't look at the backup. It goes into
+    /// `dir`'s own temporary tree, which an operator's never would.
+    fn init(dir: &Path, cluster: &str, node: &str) -> Result<(), RelishError> {
+        std::fs::create_dir_all(dir)?;
+        init_with_backup(dir, cluster, node, dir).map(|_| ())
+    }
+
+    /// #709: no file `relish init` leaves on the node holds the root key.
     #[test]
-    fn init_creates_sealed_root_ca() {
+    fn init_writes_no_root_key_on_the_node() {
         let dir = tempfile::tempdir().unwrap();
-        init(dir.path(), "mycluster", "node-01").unwrap();
-        assert!(dir.path().join("mycluster-root-ca.age").exists());
+        let backups = tempfile::tempdir().unwrap();
+        let backup = init_with_backup(dir.path(), "mycluster", "node-01", backups.path()).unwrap();
+        let opened = crate::sesame::root_backup::RootBackup::open(
+            &std::fs::read(&backup).unwrap(),
+            &crate::sesame::root_backup::BackupOpener::Passphrase(
+                age::secrecy::SecretString::from(ROOT_PASSPHRASE.to_string()),
+            ),
+        )
+        .unwrap();
+        let root_key = opened.private_key_der().unwrap();
+        let mut files = vec![dir.path().to_path_buf()];
+        while let Some(path) = files.pop() {
+            if path.is_dir() {
+                files.extend(std::fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()));
+                continue;
+            }
+            let bytes = std::fs::read(&path).unwrap();
+            assert!(
+                !bytes
+                    .windows(root_key.len())
+                    .any(|w| w == root_key.as_slice()),
+                "{} holds the root key",
+                path.display()
+            );
+            assert!(
+                !path.to_string_lossy().ends_with("root-ca.age"),
+                "{}",
+                path.display()
+            );
+        }
+    }
+
+    /// The backup opens with the passphrase init was given and holds the
+    /// root the node pins.
+    #[test]
+    fn init_backup_opens_with_the_given_passphrase_and_matches_the_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        let backup = init_with_backup(dir.path(), "mycluster", "node-01", backups.path()).unwrap();
+        let identity = crate::sesame::identity_store::load(&dir.path().join("identity"))
+            .unwrap()
+            .unwrap();
+        let fingerprint = crate::sesame::identity_store::root_ca_fingerprint(&identity.root_ca_der);
+        let opened = crate::sesame::root_backup::RootBackup::open(
+            &std::fs::read(&backup).unwrap(),
+            &crate::sesame::root_backup::BackupOpener::Passphrase(
+                age::secrecy::SecretString::from(ROOT_PASSPHRASE.to_string()),
+            ),
+        )
+        .unwrap();
+        opened
+            .verify(&fingerprint, std::time::SystemTime::now())
+            .unwrap();
+    }
+
+    /// A backup that can't be written leaves no cluster behind: no config,
+    /// no master key, no state.
+    #[test]
+    fn init_does_not_report_success_when_the_backup_write_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        let missing = backups.path().join("not-there");
+        let passphrase = backups.path().join("passphrase");
+        std::fs::write(&passphrase, ROOT_PASSPHRASE).unwrap();
+        let err = init_with_security(
+            dir.path(),
+            "mycluster",
+            "node-01",
+            InitSecurityMode::MutualTls,
+            &super::super::ca_cmd::InitRootBackup {
+                path: missing.join("root.age"),
+                target: super::super::ca_cmd::BackupTarget::Passphrase(
+                    super::super::ca_cmd::PassphraseSource::File(passphrase),
+                ),
+            },
+            OutputFormat::Human,
+        )
+        .unwrap_err();
+        assert!(matches!(err, RelishError::RootBackup(_)), "{err}");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn init_never_overwrites_an_existing_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        std::fs::write(backups.path().join("root-backup.age"), "keep me").unwrap();
+        let err = init_with_backup(dir.path(), "mycluster", "node-01", backups.path()).unwrap_err();
+        assert!(matches!(err, RelishError::FileExists { .. }), "{err}");
+        assert!(!dir.path().join("reliaburger.toml").exists());
     }
 
     #[test]
@@ -6082,11 +6307,20 @@ spec:
     #[test]
     fn init_development_plaintext_is_explicit_and_marks_the_generated_config() {
         let dir = tempfile::tempdir().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        let passphrase = backups.path().join("passphrase");
+        std::fs::write(&passphrase, ROOT_PASSPHRASE).unwrap();
         init_with_security(
             dir.path(),
             "devcluster",
             "node-01",
             InitSecurityMode::DevelopmentPlaintext,
+            &super::super::ca_cmd::InitRootBackup {
+                path: backups.path().join("root.age"),
+                target: super::super::ca_cmd::BackupTarget::Passphrase(
+                    super::super::ca_cmd::PassphraseSource::File(passphrase),
+                ),
+            },
             OutputFormat::Human,
         )
         .unwrap();
@@ -6902,7 +7136,7 @@ mod json_shapes {
                 master_key: PathBuf::from("/etc/reliaburger/prod-master.key"),
                 security_bootstrap: PathBuf::from("/etc/reliaburger/prod-security-bootstrap.json"),
                 identity_dir: PathBuf::from("/etc/reliaburger/identity"),
-                sealed_root_ca: "/etc/reliaburger/prod-root-ca.age".to_string(),
+                root_backup: PathBuf::from("/media/usb/prod-root-backup.age"),
                 root_ca_fingerprint: "sha256:ab12".to_string(),
                 development_plaintext: false,
             })

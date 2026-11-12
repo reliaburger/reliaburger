@@ -88,15 +88,16 @@ fn lock_file_has_no_proc_macro_error_and_audit_needs_no_exception_for_it() {
 /// RUSTSEC-2026-0381, -0382 and -0383: older rustls-webpki accepts paths
 /// through the distrusted emSign intermediates, whose private keys are public,
 /// and older webpki-roots and webpki-root-certs bundle the root they chain to.
-/// Every locked copy must be a patched release (#1269).
+/// Every locked copy must be a patched release (#1269), and the audit must not
+/// need an exception for any of them.
 #[test]
 fn lock_file_has_only_webpki_releases_that_distrust_emsign() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let lock = std::fs::read_to_string(root.join("Cargo.lock")).unwrap();
     // The first patched release of each. webpki-roots 0.26.x is a shim that
     // re-exports the 1.x roots (`pub use parent::TLS_SERVER_ROOTS`), so 1.x
-    // decides; `.cargo/audit.toml` ignores RUSTSEC-2026-0381 for the shim on
-    // that basis.
+    // decides. RustSec's advisory lists the 0.26.11 shim as unaffected on the
+    // same basis, provided the 1.x it resolves to is patched.
     let patched = [
         ("rustls-webpki", [0, 103, 16]),
         ("webpki-roots", [1, 0, 10]),
@@ -123,6 +124,17 @@ fn lock_file_has_only_webpki_releases_that_distrust_emsign() {
                 "Cargo.lock locks {name} {version:?}"
             );
         }
+    }
+    let audit = std::fs::read_to_string(root.join(".cargo/audit.toml")).unwrap();
+    for id in [
+        "RUSTSEC-2026-0381",
+        "RUSTSEC-2026-0382",
+        "RUSTSEC-2026-0383",
+    ] {
+        assert!(
+            !audit.contains(&format!("\"{id}\"")),
+            ".cargo/audit.toml ignores {id}"
+        );
     }
 }
 
@@ -162,8 +174,8 @@ fn lock_file_has_no_crypto_bigint_with_timing_leaks_and_audit_needs_no_exception
 /// RUSTSEC-2026-0391 and 0395 to 0406: zstd 0.13.3 and zstd-safe 7.3.0. The
 /// source bundle (#1570) and rust-embed's include-flate moved to zstd 0.14.3,
 /// so the only crates still allowed to depend on the old line are Arrow,
-/// Parquet and DataFusion 55, which `.cargo/audit.toml` excuses until
-/// DataFusion 56 moves them to arrow 60 (#1366).
+/// Parquet and DataFusion 55, until DataFusion 56 moves them to arrow 60
+/// (#1366).
 #[test]
 fn only_arrow_parquet_and_datafusion_still_lock_zstd_0_13() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -195,5 +207,59 @@ fn only_arrow_parquet_and_datafusion_still_lock_zstd_0_13() {
                 "reliaburger no longer depends on zstd 0.14"
             );
         }
+    }
+}
+
+/// The 13 zstd advisories again: Arrow, Parquet and DataFusion 55 still ask
+/// for zstd 0.13, but the patched 0.13.4 and zstd-safe 7.4.0 (published 1
+/// November 2026) satisfy that, so every locked copy of either line must be a
+/// patched release, and the audit must not need an exception for any of them.
+#[test]
+fn lock_file_has_only_patched_zstd_and_audit_needs_no_exception_for_it() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let lock = std::fs::read_to_string(root.join("Cargo.lock")).unwrap();
+    // The first patched release of each line Cargo.lock holds.
+    let patched = [
+        ("zstd", [0, 13, 4]),
+        ("zstd", [0, 14, 3]),
+        ("zstd-safe", [7, 4, 0]),
+        ("zstd-safe", [8, 2, 0]),
+    ];
+    let mut checked = 0;
+    for package in lock.split("[[package]]") {
+        for (name, first_patched) in patched {
+            if !package.contains(&format!("\nname = \"{name}\"\n")) {
+                continue;
+            }
+            let version: Vec<u64> = package
+                .split("\nversion = \"")
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .unwrap()
+                .split('.')
+                .map(|part| part.parse().unwrap())
+                .collect();
+            if version[..2] != first_patched[..2] {
+                continue;
+            }
+            assert!(
+                version.as_slice() >= first_patched.as_slice(),
+                "Cargo.lock locks {name} {version:?}"
+            );
+            checked += 1;
+        }
+    }
+    // A line that disappears should take its row out of `patched`, not let
+    // the test pass on nothing.
+    assert_eq!(checked, patched.len(), "Cargo.lock lost a zstd line");
+    let audit = std::fs::read_to_string(root.join(".cargo/audit.toml")).unwrap();
+    for id in [
+        "0391", "0395", "0396", "0397", "0398", "0399", "0400", "0401", "0402", "0403", "0404",
+        "0405", "0406",
+    ] {
+        assert!(
+            !audit.contains(&format!("\"RUSTSEC-2026-{id}\"")),
+            ".cargo/audit.toml ignores RUSTSEC-2026-{id}"
+        );
     }
 }

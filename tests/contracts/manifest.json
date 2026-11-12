@@ -4121,6 +4121,17 @@
           ]
         },
         {
+          "id": "legacy-ci-reliaburger-ebpf-onion_objects_use_only_the_original_bpf_instruction_set",
+          "binary": "reliaburger::ebpf",
+          "test": "onion_objects_use_only_the_original_bpf_instruction_set",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "tests/ebpf.rs"
+          ]
+        },
+        {
           "id": "legacy-ci-reliaburger-ebpf-embedded_program_loads_without_an_object_directory",
           "binary": "reliaburger::ebpf",
           "test": "embedded_program_loads_without_an_object_directory",
@@ -5864,6 +5875,17 @@
           ]
         },
         {
+          "id": "legacy-ci-reliaburger-cluster_failover-a_lease_history_through_a_leader_partition_is_linearizable",
+          "binary": "reliaburger::cluster_failover",
+          "test": "a_lease_history_through_a_leader_partition_is_linearizable",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/cluster_failover.rs"
+          ]
+        },
+        {
           "id": "legacy-ci-reliaburger-cluster_failover-an_agent_lease_survives_a_leader_change_and_the_new_leader_expires_it",
           "binary": "reliaburger::cluster_failover",
           "test": "an_agent_lease_survives_a_leader_change_and_the_new_leader_expires_it",
@@ -7242,6 +7264,33 @@
       ],
       "boundaries": [
         "Old voters that can reach only each other, never a node on the newer epoch, still can't learn of the recovery."
+      ]
+    },
+    {
+      "id": "issue-1524-returning-voter-hold",
+      "issue": 1524,
+      "promise": "A voter replaced while it was down and then restarted on its old Raft state holds its elections until it hears from a leader, so rejoining as a learner never deposes the leader or raises its term.",
+      "supported_paths": [
+        "In-process clusters on the real cluster runtime and the in-memory Raft router"
+      ],
+      "refused_paths": [
+        "A returning node's election campaign while a leader it can reach is live"
+      ],
+      "boundaries": [
+        "After the grace with no live leader in gossip, or at the cap, the hold ends and the node may campaign, as a whole-cluster restart needs."
+      ],
+      "cases": [
+        {
+          "id": "returning-voter-a_replaced_voter_coming_back_joins_as_a_learner_without_an_election",
+          "binary": "reliaburger::council_self_healing",
+          "test": "a_replaced_voter_coming_back_joins_as_a_learner_without_an_election",
+          "requires": [
+            "cluster-tests"
+          ],
+          "sources": [
+            "tests/council_self_healing.rs"
+          ]
+        }
       ]
     },
     {

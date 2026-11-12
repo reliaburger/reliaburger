@@ -1,0 +1,18 @@
+# The verity hash tree for the /usr in 20-usr.transfer.
+[Transfer]
+ProtectVersion=%A
+Verify=no
+
+[Source]
+Type=regular-file
+Path=/var/lib/reliaburger/os-staging
+MatchPattern=reliaburger-os_@v.usr-verity.@u.raw.zst
+
+[Target]
+Type=partition
+Path=auto
+MatchPattern=reliaburger_@v_verity
+MatchPartitionType=usr-verity
+PartitionFlags=0
+ReadOnly=1
+InstancesMax=2

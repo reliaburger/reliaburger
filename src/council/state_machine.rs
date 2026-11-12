@@ -224,13 +224,6 @@ fn clamp_to_bounds(replicas: u32, autoscale: &crate::config::app::AutoscaleSpec)
     replicas.max(autoscale.min).min(autoscale.max)
 }
 
-/// Whether `keypair` is the age key `relish init` sealed the root CA backup
-/// to: the cluster-wide key of generation 0. Nothing else seals to it, so
-/// finalising a rotation keeps it, read-only.
-fn opens_root_ca_backup(keypair: &crate::sesame::types::AgeKeypair) -> bool {
-    keypair.scope == crate::sesame::types::AgeKeyScope::ClusterWide && keypair.generation == 0
-}
-
 impl StateMachineInner {
     fn registry_publication_is_current(
         &self,
@@ -1139,14 +1132,12 @@ impl StateMachineInner {
                         ),
                     });
                 }
-                // The cluster-wide generation-0 key stays, read-only: `relish
-                // init` sealed the root CA's private key to it
-                // (`<cluster>-root-ca.age`), and no seal record knows that, so
-                // retiring it would leave the root backup unopenable (F04 R0).
+                // Every old key goes: the root CA backup is sealed to the
+                // operator, not to a cluster key (#709).
                 self.state
                     .security_state
                     .age_keypairs
-                    .retain(|kp| kp.scope != *scope || !kp.read_only || opens_root_ca_backup(kp));
+                    .retain(|kp| kp.scope != *scope || !kp.read_only);
             }
             RaftRequest::RevokeCertificate(entry) => {
                 self.state.security_state.crl.entries.push(entry.clone());
@@ -1274,6 +1265,14 @@ impl StateMachineInner {
                 {
                     return None;
                 }
+                // A bun upgrade and an OS rollout both restart nodes; never
+                // start one while the other holds the fleet.
+                if self.state.os_rollout.is_some()
+                    && self.state.active_upgrade.as_ref().map(|a| &a.upgrade_id)
+                        != Some(&state.upgrade_id)
+                {
+                    return None;
+                }
                 self.state.active_upgrade = Some(*state.clone());
             }
             RaftRequest::UpgradeClear { upgrade_id } => {
@@ -1286,6 +1285,39 @@ impl StateMachineInner {
                     } else {
                         // Clear for a different id: put it back untouched.
                         self.state.active_upgrade = Some(active);
+                    }
+                }
+            }
+            RaftRequest::OsRolloutUpdate { rollout } => {
+                // The same guards as a bun upgrade's (M13): no different
+                // rollout over a running one (a resume replaces a paused
+                // one), and none while a bun upgrade holds the fleet.
+                if self.state.active_upgrade.is_some() {
+                    return None;
+                }
+                if let Some(active) = &self.state.os_rollout
+                    && active.rollout_id != rollout.rollout_id
+                    && !matches!(
+                        active.phase,
+                        crate::os::rollout::OsRolloutPhase::Paused { .. }
+                    )
+                {
+                    return None;
+                }
+                self.state.os_rollout = Some(*rollout.clone());
+            }
+            RaftRequest::CouncilSize { voters } => {
+                self.state.council_size = Some(*voters);
+            }
+            RaftRequest::OsRolloutClear { rollout_id } => {
+                if let Some(active) = self.state.os_rollout.take() {
+                    if active.rollout_id == *rollout_id {
+                        self.state.os_rollout_history.push(active);
+                        if self.state.os_rollout_history.len() > 20 {
+                            self.state.os_rollout_history.remove(0);
+                        }
+                    } else {
+                        self.state.os_rollout = Some(active);
                     }
                 }
             }
@@ -2499,6 +2531,29 @@ impl StateMachineInner {
                         },
                     },
                 );
+            }
+            RaftRequest::RotateOidcSigningKey {
+                signing_key,
+                retire_after_unix_secs,
+                now_unix_secs,
+            } => {
+                return crate::sesame::oidc::rotate_signing_key(
+                    &mut self.state.security_state,
+                    signing_key.clone(),
+                    *retire_after_unix_secs,
+                    *now_unix_secs,
+                )
+                .err()
+                .map(|error| CouncilResponse::Refused {
+                    reason: error.to_string(),
+                });
+            }
+            RaftRequest::RetireOidcSigningKeys { now_unix_secs } => {
+                crate::sesame::oidc::retire_signing_keys(
+                    &mut self.state.security_state,
+                    *now_unix_secs,
+                );
+                return None;
             }
             RaftRequest::AcknowledgeNodeTrust {
                 node_id,
@@ -7035,9 +7090,9 @@ mod tests {
             .iter()
             .map(|kp| (kp.generation, kp.read_only))
             .collect();
-        // Gen 1 is retired; gen 0 stays, read-only, because it opens the
-        // root CA backup `relish init` wrote (F04 R0).
-        assert_eq!(remaining, [(0, true), (2, false)]);
+        // Every old generation is retired: nothing is sealed to gen 0 any
+        // more, because the root CA backup is the operator's (#709).
+        assert_eq!(remaining, [(2, false)]);
     }
 
     /// F04 R1 through the log: a Node CA rotation begins, a second one is
@@ -7159,6 +7214,43 @@ mod tests {
             inner.state.security_state.trusted_cas(CaRole::Node).len(),
             1
         );
+    }
+
+    /// #709: a signing-key rotation through the log moves the old key to
+    /// retiring with the window the proposer chose, refuses a cluster with
+    /// no key, and a later retire drops the old key once its window ends.
+    #[test]
+    fn oidc_signing_key_rotation_and_retirement_through_the_log() {
+        let ikm = [6u8; 32];
+        let old = crate::sesame::oidc::generate_oidc_keypair("https://rotate", &ikm).unwrap();
+        let new = crate::sesame::oidc::generate_oidc_keypair("https://rotate", &ikm).unwrap();
+        let mut inner = StateMachineInner::default();
+        let rotate = RaftRequest::RotateOidcSigningKey {
+            signing_key: new.clone(),
+            retire_after_unix_secs: 2_000,
+            now_unix_secs: 1_000,
+        };
+        assert!(matches!(
+            inner.apply_request(&rotate),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        inner.state.security_state.oidc_signing_config = Some(old.clone());
+        assert_eq!(inner.apply_request(&rotate), None);
+        let security = &inner.state.security_state;
+        assert_eq!(security.oidc_signing_config.as_ref(), Some(&new));
+        assert_eq!(security.retiring_oidc_keys.len(), 1);
+        assert_eq!(security.retiring_oidc_keys[0].key_id, old.key_id);
+
+        let early = RaftRequest::RetireOidcSigningKeys {
+            now_unix_secs: 1_999,
+        };
+        assert_eq!(inner.apply_request(&early), None);
+        assert_eq!(inner.state.security_state.retiring_oidc_keys.len(), 1);
+        let due = RaftRequest::RetireOidcSigningKeys {
+            now_unix_secs: 2_000,
+        };
+        assert_eq!(inner.apply_request(&due), None);
+        assert!(inner.state.security_state.retiring_oidc_keys.is_empty());
     }
 
     /// F04 R4 through the log: prepare allocates the serial the operator's
@@ -7482,15 +7574,13 @@ mod tests {
         );
     }
 
-    /// F04 R0: `relish init` seals the root CA's private key to the cluster's
-    /// generation-0 age key, in `<cluster>-root-ca.age`. Finalising a secret
-    /// rotation used to drop that key, after which nothing the cluster holds
-    /// could open the root backup.
+    /// #709: the root CA backup is sealed to the operator, so nothing keeps
+    /// an old cluster-wide key alive. Finalising a rotation retires every
+    /// one, generation 0 included.
     #[test]
-    fn the_root_backup_still_opens_after_a_finalised_secret_rotation() {
+    fn secret_rotation_finalise_retires_the_generation_zero_key() {
         use crate::sesame::types::AgeKeyScope;
-        let dir = tempfile::tempdir().unwrap();
-        let init = crate::sesame::init::initialize_cluster("prod", "node-1", dir.path()).unwrap();
+        let init = crate::sesame::init::initialize_cluster("prod", "node-1").unwrap();
         let mut inner = StateMachineInner::default();
         inner.apply_request(&RaftRequest::SecurityStateInit(Box::new(
             init.security_state.clone(),
@@ -7513,22 +7603,15 @@ mod tests {
             !matches!(response, Some(CouncilResponse::Refused { .. })),
             "{response:?}"
         );
-
-        let sealed = std::fs::read(&init.sealed_root_ca_path).unwrap();
-        let opened = inner
+        let generations: Vec<u64> = inner
             .state
             .security_state
             .age_keypairs
             .iter()
             .filter(|kp| kp.scope == AgeKeyScope::ClusterWide)
-            .filter_map(|kp| {
-                crate::sesame::secret::unwrap_age_identity(kp, &init.master_secret).ok()
-            })
-            .find_map(|identity| crate::sesame::secret::unseal_with_age(&sealed, &identity).ok());
-        assert!(
-            opened.is_some(),
-            "no key left in the state opens the root CA backup"
-        );
+            .map(|kp| kp.generation)
+            .collect();
+        assert_eq!(generations, vec![1]);
     }
 
     #[test]
@@ -7657,9 +7740,8 @@ mod tests {
             .iter()
             .map(|kp| (kp.generation, kp.read_only))
             .collect();
-        // Gen 1 is the only active key; gen 0 stays read-only for the root
-        // CA backup (F04 R0).
-        assert_eq!(remaining, [(0, true), (1, false)]);
+        // Gen 1 is the only key left (#709).
+        assert_eq!(remaining, [(1, false)]);
     }
 
     /// PKI8: a second rotation while one is un-finalised is refused; the
@@ -8390,6 +8472,96 @@ mod tests {
 
         assert_eq!(inner.state.active_upgrade, Some(advanced));
         assert!(inner.state.upgrade_history.is_empty());
+    }
+
+    fn os_rollout(id: &str) -> crate::os::rollout::OsRollout {
+        crate::os::rollout::plan(
+            id,
+            "2026.42.0",
+            "https://example/os-channel.json",
+            "n1",
+            vec![(
+                "n1".into(),
+                "10.0.0.1:9117".into(),
+                true,
+                "2026.41.0".into(),
+            )],
+            0,
+        )
+    }
+
+    #[test]
+    fn an_os_rollout_and_a_bun_upgrade_never_overlap() {
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::OsRolloutUpdate {
+            rollout: Box::new(os_rollout("os-1")),
+        });
+        inner.apply_request(&RaftRequest::UpgradeUpdate {
+            state: Box::new(upgrade_state("up-1")),
+        });
+        assert!(
+            inner.state.active_upgrade.is_none(),
+            "no bun upgrade during an OS rollout"
+        );
+        inner.apply_request(&RaftRequest::OsRolloutUpdate {
+            rollout: Box::new(os_rollout("os-2")),
+        });
+        assert_eq!(inner.state.os_rollout.as_ref().unwrap().rollout_id, "os-1");
+
+        inner.apply_request(&RaftRequest::OsRolloutClear {
+            rollout_id: "os-1".into(),
+        });
+        assert!(inner.state.os_rollout.is_none());
+        assert_eq!(inner.state.os_rollout_history.len(), 1);
+
+        inner.apply_request(&RaftRequest::UpgradeUpdate {
+            state: Box::new(upgrade_state("up-1")),
+        });
+        inner.apply_request(&RaftRequest::OsRolloutUpdate {
+            rollout: Box::new(os_rollout("os-3")),
+        });
+        assert!(
+            inner.state.os_rollout.is_none(),
+            "no OS rollout during a bun upgrade"
+        );
+    }
+
+    #[test]
+    fn a_paused_os_rollout_can_be_resumed_under_a_new_id() {
+        let mut inner = StateMachineInner::default();
+        let mut paused = os_rollout("os-1");
+        paused.phase = crate::os::rollout::OsRolloutPhase::Paused {
+            reason: "n1 fell back".into(),
+        };
+        inner.apply_request(&RaftRequest::OsRolloutUpdate {
+            rollout: Box::new(paused.clone()),
+        });
+        inner.apply_request(&RaftRequest::OsRolloutUpdate {
+            rollout: Box::new(crate::os::rollout::resume(paused, 10)),
+        });
+        assert_eq!(
+            inner.state.os_rollout.as_ref().unwrap().rollout_id,
+            "os-1-retry"
+        );
+    }
+
+    #[test]
+    fn the_council_size_is_cluster_state_that_survives_a_snapshot() {
+        let mut inner = StateMachineInner::default();
+        assert_eq!(inner.state.council_size, None);
+        inner.apply_request(&RaftRequest::CouncilSize {
+            voters: crate::council::CouncilSize::APPLIANCE,
+        });
+        assert_eq!(
+            inner.state.council_size,
+            Some(crate::council::CouncilSize::APPLIANCE)
+        );
+        let json = serde_json::to_vec(&inner.state).unwrap();
+        let restored: DesiredState = serde_json::from_slice(&json).unwrap();
+        assert_eq!(
+            restored.council_size,
+            Some(crate::council::CouncilSize::APPLIANCE)
+        );
     }
 
     #[test]

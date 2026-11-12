@@ -13,7 +13,8 @@
 # scripts run in the chroot, so a foreign architecture would need emulation,
 # and GitHub has native arm64 runners.
 #
-# Needs root, python3, curl, qemu-img, losetup, lsblk, mount and chroot.
+# Needs root, python3, curl, qemu-img, losetup, lsblk, growpart, resize2fs,
+# mount and chroot.
 set -euo pipefail
 
 usage() { echo "usage: $0 --output DIR [--source FILE]" >&2; exit 2; }
@@ -72,16 +73,25 @@ fi
 echo "$source_sha256  $source" | sha256sum --check --quiet - >&2 \
   || { echo "upstream image does not match its pinned SHA-256" >&2; exit 1; }
 
-# A sparse raw copy that the kernel can loop-mount. Its virtual size stays the
-# upstream one; Lima grows the disk and cloud-init the filesystem at boot.
+# A sparse raw copy that the kernel can loop-mount. Ubuntu 26.04's image
+# leaves its 2.5 GiB root filesystem about 160 MiB free, less than the
+# packages need (about 270 MiB), so the copy gets 1 GiB more, sparse until
+# used. Lima grows the disk to the VM's size and cloud-init the filesystem
+# again at boot.
 qemu-img convert -O raw "$source" "$work/disk.raw"
+truncate --size=+1G "$work/disk.raw"
 loop=$(losetup --find --show --partscan "$work/disk.raw")
 udevadm settle 2>/dev/null || true
 partition() { lsblk --raw --noheadings --output PATH,LABEL "$loop" | awk -v l="$1" '$2 == l { print $1 }'; }
 rootfs=$(partition cloudimg-rootfs)
 [ -n "$rootfs" ] || { echo "no cloudimg-rootfs partition in the upstream image" >&2; exit 1; }
+# The root partition is the last on the disk; growpart also moves the GPT
+# backup header to the new end.
+growpart "$loop" "${rootfs##*p}" >&2
+udevadm settle 2>/dev/null || true
 mkdir -p "$root"
 mount "$rootfs" "$root"
+resize2fs "$rootfs" >&2
 # Package triggers (btrfs-progs' initramfs hook) rewrite /boot, which is its
 # own partition in Ubuntu's cloud images.
 boot=$(partition BOOT)
@@ -111,10 +121,25 @@ in_guest apt-get -o Acquire::Retries=3 update -qq >&2
 # shellcheck disable=SC2086
 in_guest apt-get -o Acquire::Retries=3 install -y -qq $packages >&2
 # One clock source: Lima's guest agent sets the guest clock to the host's
-# every 10 s and has no switch to stop it, so timesyncd beside it only
-# fights it (#608). Disabling only removes symlinks, which works offline in
-# the chroot. Quickstart provisioning disables it on stock images too.
-in_guest systemctl disable systemd-timesyncd.service >&2
+# every 10 s and has no switch to stop it, so a time daemon beside it only
+# fights it (#608). Ubuntu 26.04's is chrony (24.04's was timesyncd).
+# Disabling only removes symlinks, which works offline in the chroot.
+# Quickstart provisioning disables it on stock images too.
+in_guest systemctl disable chrony.service >&2
+# One name for the NIC from the first boot. Ubuntu 26.04's initrd brings it
+# up as enp0s1, and Lima's network config wants eth0. cloud-init can't rename
+# an interface that is up, so a fresh VM waited two minutes for an eth0 that
+# never came. With this file in place, udev renames it when the real root
+# takes over, as it does on every later boot once netplan has written its own
+# .link. A quickstart VM has exactly one NIC.
+mkdir -p "$root/etc/systemd/network"
+cat >"$root/etc/systemd/network/10-reliaburger-eth0.link" <<'LINK'
+[Match]
+Driver=virtio_net
+
+[Link]
+Name=eth0
+LINK
 
 # SC2016: ${Package} is dpkg-query's format syntax, not a shell expansion.
 # shellcheck disable=SC2086,SC2016

@@ -125,6 +125,13 @@ pub fn plan(root: &Path, local_bin: Option<&Path>) -> Result<Plan, UninstallErro
     if exists(&clusters) {
         remove.push(clusters);
     }
+    // `relish local destroy` removes each cluster's root-backup identity, so
+    // an empty directory is ours to remove. One that still holds identities
+    // may open a root backup someone moved offline (#709): it stays.
+    let root_backup_keys = root.join("root-backup-keys");
+    if exists(&root_backup_keys) && entries(&root_backup_keys)?.is_empty() {
+        remove.push(root_backup_keys);
+    }
     // The lock only guards the context file; with no context it's litter.
     let context_lock = root.join(CONTEXT_LOCK);
     if exists(&context_lock) && !exists(&root.join(CONTEXT)) {
@@ -550,6 +557,20 @@ mod tests {
         let plan = plan(&temp.path().join("missing"), None).unwrap();
         assert!(plan.remove.is_empty());
         assert!(plan.keep.is_empty());
+    }
+
+    /// #709: an empty root-backup-keys directory is relish's to remove; one
+    /// still holding an identity may open a backup kept offline, so it stays.
+    #[test]
+    fn uninstall_removes_only_an_empty_root_backup_keys_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let keys = root.path().join("root-backup-keys");
+        std::fs::create_dir(&keys).unwrap();
+        assert!(plan(root.path(), None).unwrap().remove.contains(&keys));
+        std::fs::write(keys.join("root-0123.age-identity"), "AGE-SECRET-KEY-1").unwrap();
+        let kept = plan(root.path(), None).unwrap();
+        assert!(!kept.remove.contains(&keys));
+        assert!(kept.keep.contains(&keys));
     }
 
     #[test]

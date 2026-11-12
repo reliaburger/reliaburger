@@ -101,6 +101,9 @@ enum Command {
         #[arg(long)]
         instance: String,
     },
+    /// Appliance OS steps (docs/manual/15_appliance.md).
+    #[command(subcommand)]
+    Appliance(ApplianceCommand),
     /// Run the built-in test workload.
     ///
     /// The same server the library exposes, shipped inside `bun` so every
@@ -142,6 +145,21 @@ enum Command {
         /// Number of CPU-burning worker threads.
         #[arg(long)]
         cpu_workers: usize,
+    },
+}
+
+/// `bun appliance ...`: what an appliance runs before and beside the agent.
+#[derive(clap::Subcommand)]
+enum ApplianceCommand {
+    /// Prepare this node from its seed: install the bootstrap material, or
+    /// enrol and fetch the master key, then write node.toml. Run by
+    /// reliaburger-seed.service before the agent.
+    Prepare,
+    /// Show this node's status on a console, refreshed every five seconds.
+    Console {
+        /// The terminal to draw on.
+        #[arg(long, default_value = "/dev/tty1")]
+        tty: PathBuf,
     },
 }
 
@@ -237,6 +255,7 @@ fn cluster_params_from_config(
         seeds,
         wrapping_ikm,
         bootstrap_security_state,
+        bootstrap_council_size: config.cluster.council_size,
         data_dir: config.storage.data.clone(),
         // The MayoStore doesn't exist yet when params are built; the
         // caller sets it before starting the runtime.
@@ -987,6 +1006,19 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     }) = &cli.command
     {
         return run_testapp(mode, *port, *count, *delay, *alloc_mib).await;
+    }
+    // The appliance's own steps, before (prepare) or beside (console) an agent.
+    if let Some(Command::Appliance(command)) = &cli.command {
+        let paths = reliaburger::appliance::Paths::system();
+        return match command {
+            ApplianceCommand::Prepare => reliaburger::appliance::prepare::run(&paths)
+                .await
+                .map(|_| ())
+                .map_err(|e| anyhow::anyhow!("reliaburger: {e}")),
+            ApplianceCommand::Console { tty } => reliaburger::appliance::console::run(&paths, tty)
+                .await
+                .map_err(|e| anyhow::anyhow!("console {}: {e}", tty.display())),
+        };
     }
 
     // Resolve the running version from the real executable path (not argv[0]):
@@ -1898,6 +1930,32 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 config.runtime.stop_confirmation_timeout(),
             );
         }
+    }
+
+    // Appliance OS updates (W6): on an appliance, the slot this node stages
+    // updates into, and the leader's rollout loop beside the orchestrator.
+    match reliaburger::upgrade::keys::release_keys(&config.upgrades) {
+        Ok(keys) => {
+            if let Some(slot) = reliaburger::os::slot::OsSlot::detect(keys) {
+                reliaburger::os::slot::install(slot);
+            }
+        }
+        Err(error) => eprintln!("bun: OS updates disabled: {error}"),
+    }
+    if let (Some(council), Some(membership_rx)) =
+        (api_council.clone(), upgrade_membership_rx.clone())
+    {
+        let control = reliaburger::os::rollout::HttpOsControl::new(
+            cluster_http.clone(),
+            service_token.clone(),
+        );
+        tokio::spawn(reliaburger::os::rollout::run_rollout(
+            council,
+            control,
+            node_name.clone(),
+            membership_rx,
+            shutdown.clone(),
+        ));
     }
 
     // Rolling-upgrade orchestrator: dormant unless this node is the Raft
@@ -3108,6 +3166,28 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             }),
         None => None,
     };
+    // The verifier's keys follow the council, on the token store's 5 s
+    // cadence: after `relish identity rotate-signing-key` the new key's
+    // tokens verify here, and the old key's stop once its window ends (#709).
+    // Clones share the keys, so refreshing this one refreshes the router's.
+    if let (Some(verifier), Some(council)) = (jwt_verifier.clone(), api_council.clone()) {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = ticker.tick() => {
+                        let state = council.security_state().await;
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |elapsed| elapsed.as_secs());
+                        verifier.refresh(&state, now);
+                    }
+                }
+            }
+        });
+    }
 
     let leader_directory = registry_directory.clone().map(api::LeaderDirectory);
     let registry_forwarder = if let Some(directory) = registry_directory {
@@ -4807,7 +4887,7 @@ mod tests {
         )
         .await
         .unwrap();
-        raft_router.register(1, council.raft().clone()).await;
+        raft_router.register(1, &council).await;
         let mut members = BTreeMap::new();
         members.insert(
             1,
@@ -4939,7 +5019,12 @@ mod tests {
     #[test]
     fn changing_a_node_name_requires_fresh_enrolment() {
         let dir = tempfile::tempdir().unwrap();
-        reliaburger::relish::commands::init(dir.path(), "secure-test", "old-worker").unwrap();
+        reliaburger::relish::commands::init_with_throwaway_root(
+            dir.path(),
+            "secure-test",
+            "old-worker",
+        )
+        .unwrap();
         let mut config = NodeConfig::from_file(&dir.path().join("reliaburger.toml")).unwrap();
         config.node.name = Some("fresh-worker".into());
         let error = cluster_params_from_config(&config)
@@ -4951,7 +5036,12 @@ mod tests {
     #[test]
     fn normal_init_config_loads_the_generated_identity_for_mtls() {
         let dir = tempfile::tempdir().unwrap();
-        reliaburger::relish::commands::init(dir.path(), "secure-test", "node-secure").unwrap();
+        reliaburger::relish::commands::init_with_throwaway_root(
+            dir.path(),
+            "secure-test",
+            "node-secure",
+        )
+        .unwrap();
         let config = NodeConfig::from_file(&dir.path().join("reliaburger.toml")).unwrap();
 
         assert!(config.security.require_mtls);
@@ -5010,11 +5100,18 @@ mod tests {
     #[test]
     fn development_plaintext_init_sets_the_insecure_cluster_ack() {
         let dir = tempfile::tempdir().unwrap();
+        let operator = age::x25519::Identity::generate();
         reliaburger::relish::commands::init_with_security(
             dir.path(),
             "dev",
             "node-01",
             reliaburger::relish::commands::InitSecurityMode::DevelopmentPlaintext,
+            &reliaburger::relish::ca_cmd::InitRootBackup {
+                path: dir.path().join("root-backup.age"),
+                target: reliaburger::relish::ca_cmd::BackupTarget::Recipient(
+                    operator.to_public().to_string(),
+                ),
+            },
             reliaburger::relish::OutputFormat::Human,
         )
         .unwrap();
@@ -5309,9 +5406,18 @@ mod tests {
     fn enrolled_metrics_archive_owner_uses_the_root_and_certificate_node_id() {
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
-        reliaburger::relish::commands::init(first.path(), "first-cluster", "shared-label").unwrap();
-        reliaburger::relish::commands::init(second.path(), "second-cluster", "shared-label")
-            .unwrap();
+        reliaburger::relish::commands::init_with_throwaway_root(
+            first.path(),
+            "first-cluster",
+            "shared-label",
+        )
+        .unwrap();
+        reliaburger::relish::commands::init_with_throwaway_root(
+            second.path(),
+            "second-cluster",
+            "shared-label",
+        )
+        .unwrap();
         let config_one = NodeConfig::from_file(&first.path().join("reliaburger.toml")).unwrap();
         let config_two = NodeConfig::from_file(&second.path().join("reliaburger.toml")).unwrap();
         let one = metrics_archive_owner(&config_one, first.path()).unwrap();

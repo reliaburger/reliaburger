@@ -18,7 +18,7 @@ name: Mutants
 
 on:
   pull_request:
-    branches: [main, "codex/**", "fix/**", "release-*"]
+    branches: [main, "codex/**", "fix/**", "feat/appliance-*", "release-*"]
     paths:
       - src/**
       - .cargo/mutants.toml

@@ -508,7 +508,7 @@ async fn full_council_loss_recovers_from_backup() {
     )
     .await
     .unwrap();
-    router.register(rid(3), recovered.raft().clone()).await;
+    router.register(rid(3), &recovered).await;
     let recovered = Arc::new(recovered);
 
     // The recovered node is the sole voter and leads.
@@ -540,7 +540,7 @@ async fn full_council_loss_recovers_from_backup() {
     let shutdown = CancellationToken::new();
 
     // Bring node-5 up as a spare that can actually replicate.
-    router.register(rid(4), nodes[4].raft().clone()).await;
+    router.register(rid(4), &nodes[4]).await;
 
     spawn_council_reconciler_with_config(
         Arc::clone(&recovered),
@@ -658,6 +658,7 @@ impl FenceNode {
                 seeds: seeds.clone(),
                 wrapping_ikm: None,
                 bootstrap_security_state: None,
+                bootstrap_council_size: None,
                 data_dir: fence_data_dir(index),
                 mayo: None,
                 rollup_interval: Duration::from_secs(60),

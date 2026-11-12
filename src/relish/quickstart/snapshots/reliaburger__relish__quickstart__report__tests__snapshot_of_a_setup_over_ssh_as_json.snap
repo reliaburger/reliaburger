@@ -57,6 +57,10 @@ expression: "format_output(&servers_report(None), OutputFormat::Json).unwrap()"
   "state_directory": "/home/me/.reliaburger/clusters/servers",
   "timings_file": null,
   "back_up": "/home/me/.reliaburger/clusters/servers/security",
+  "root_backup": {
+    "backup": "/home/me/.reliaburger/clusters/servers/security/root-ca-backup.age",
+    "identity": "/home/me/.reliaburger/root-backup-keys/root-fedcba9876543210.age-identity"
+  },
   "next": [
     {
       "run": "relish status",

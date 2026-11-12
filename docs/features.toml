@@ -558,11 +558,11 @@ needs_maintainer = "Central retention and tamper evidence have no issue. File on
 name = "Root CA backup and intermediate rotation"
 status = "beta"
 since = "0.1.6"
-summary = "`relish ca backup` writes the root CA to a sealed file you keep, and `relish ca rotate` rotates an intermediate CA signed with it."
-restrictions = "Rotating the root itself isn't supported, and there's no offline root CA yet."
+summary = "The root CA is offline: `relish init` writes its key only to a sealed backup you keep, and `relish ca rotate` rotates an intermediate CA signed with it."
+restrictions = "Rotating the root itself isn't supported."
 issues = [362, 709]
-docs = ["docs/manual/10_security.md#backing-up-the-root-ca", "docs/manual/10_security.md#rotating-an-intermediate-ca"]
-evidence = "F04 R1-R4 in 0.1.6; root rotation is F04 (#362, Later), offline root CA #709 (0.3.0). Not exercised by the release gate."
+docs = ["docs/manual/10_security.md#the-root-ca-backup", "docs/manual/10_security.md#rotating-an-intermediate-ca"]
+evidence = "F04 R1-R4 in 0.1.6; the offline root (#709) on the 0.3.0 train; root rotation is F04 (#362, Later). Not exercised by the release gate."
 
 [[group.feature]]
 name = "Tags bound to digests"

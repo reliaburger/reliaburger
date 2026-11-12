@@ -875,7 +875,8 @@ lease ownership must also be unscoped, for both inspection and cleanup.
 configuration; no security switch needs hand-editing:
 
 ```sh
-sudo target/debug/relish init cluster --cluster-name prod --node-id node-01
+sudo target/debug/relish init cluster --cluster-name prod --node-id node-01 \
+  --root-backup ~/prod-root-backup.age
 sudo target/debug/bun --cluster --runtime runc --config cluster/reliaburger.toml
 ```
 
@@ -896,17 +897,17 @@ target/debug/relish --ca-cert cluster/identity/root-ca.crt apply cluster/app.tom
 target/debug/relish --ca-cert cluster/identity/root-ca.crt status
 ```
 
-Then keep a copy of the root CA that only you can open, sealed to a passphrase
-(or `--recipient` for your age key), and check it offline against the
-fingerprint `init` printed:
+`init` asked for a passphrase and sealed the root CA's private key into
+`--root-backup`, its only copy (`--passphrase-file` or `--recipient` for your
+age key, in a script). Check it offline against the fingerprint `init`
+printed, and keep it off the cluster:
 
 ```sh
-target/debug/relish ca backup --out prod-root-backup.age --dir cluster
-target/debug/relish ca verify prod-root-backup.age --fingerprint sha256:...
+target/debug/relish ca verify ~/prod-root-backup.age --fingerprint sha256:...
 ```
 
 The same file is what replaces an intermediate CA later:
-`relish ca rotate --role node --root-backup prod-root-backup.age` signs the
+`relish ca rotate --role node --root-backup ~/prod-root-backup.age` signs the
 cluster's new Node CA on your machine, and `--finalize` retires the old one
 once every node has moved (see the manual's security chapter).
 
@@ -944,6 +945,9 @@ does not commit or disclose a usable token.
 For the whole walkthrough on three Linux VMs or bare-metal servers you
 already run, from packages and firewall rules to systemd units, see
 [Running Reliaburger on your own Linux servers](linux-servers.md).
+To turn spare mini PCs or thin clients into appliance nodes over the network
+instead, with no distro to install, see
+[Bare metal: the appliance and netboot](manual/15_appliance.md).
 
 Keep `[cluster].name` identical on every node. `relish init`, `relish setup`
 and `relish dev create` write it for you; Bun validates it as a DNS-style SPIFFE trust domain.
@@ -1842,9 +1846,9 @@ that gossip reports dead is named rather than silently left out.
 (`--app`, `--severity`, `--limit`). `relish exec <app> <cmd>` runs a command
 once, without stdin or a terminal, and exits with its exit code. `relish
 resolve <name> --namespace <ns>` picks a service whose name exists in several
-namespaces. `-o json` works on every command except the six interactive
+namespaces. `-o json` works on every command except the eight interactive
 ones (`tui`, `dashboard`, `manual`, `source`, the guided `setup`, `dev
-shell`), which refuse it with exit 2; `setup --quickstart` and `setup --ssh`
+shell`, `machines claim`, `netboot`), which refuse it with exit 2; `setup --quickstart` and `setup --ssh`
 print what they built, for an agent to quote; `logs` and `batch watch` print one object per line,
 and a command that changes something reports what it did (manual chapter
 13). `relish fmt` keeps comments.

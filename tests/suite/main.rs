@@ -35,6 +35,7 @@ mod agent_docs;
 mod api_tls;
 mod api_tokens;
 mod app_metrics;
+mod bare_metal;
 mod batch;
 mod bun_auth_startup;
 mod bun_startup_exit;

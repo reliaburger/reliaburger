@@ -184,6 +184,23 @@ We didn't add a JWT crate for this. JWT is three base64url segments joined by do
 
 The JWT claims include the SPIFFE URI as the subject, the cluster name, namespace, node, and instance ID. External verifiers use the JWKS endpoint (which publishes the Ed25519 public key in RFC 8037 OKP format) to validate these tokens.
 
+### Rotating the signing key
+
+For a long time that one key was forever: no command replaced it, though the incident runbook told operators to "rotate the OIDC signing keypair" ([#709](https://github.com/reliaburger/reliaburger/issues/709)). A rotation has one awkward property. Every running workload holds a token the old key signed, valid for up to an hour, and an outside verifier, a cloud provider say, caches the JWKS. Swap the key outright and both break at once.
+
+So the old key doesn't go away. It retires. `SecurityState` keeps a list of retiring keys beside the active one, each with a `not_after`, and the verifier picks a key by the token's `kid`:
+
+```rust
+let Some(key) = keys.iter().find(|key| key.key_id == kid) else {
+    return Err(OidcError::UnexpectedKeyId { got: kid.to_string(), want: /* the accepted kids */ });
+};
+let claims = verify_signature_and_decode(token, &key.public_key_der)?;
+```
+
+The order of those two lines matters. An unknown `kid` is refused before anything checks a signature, which is the same reason the algorithm is checked first: a token shouldn't get to choose what it's verified against. `relish identity rotate-signing-key` makes the new key on the leader, and Raft carries it to every replica. The leader makes it, not the state machine, because applying a log entry has to give the same answer on every node, and "generate a random key" doesn't. JWKS lists both keys during the window: 75 minutes, the token's hour plus clock skew plus ten minutes of slack. An hourly sweep then retires the old key.
+
+One piece of Rust is worth pausing on. The auth middleware's `verify` is a plain synchronous function, and each node now refreshes its verifier's keys every five seconds from council state. A `std::sync::Mutex` would work, but the project's rule keeps those out of shared state. A `tokio::sync::Mutex` can't be locked from synchronous code. So the keys live in a `watch` channel: `borrow()` is synchronous and cheap, and the refresher's `send_if_modified` replaces the set only when it really changed.
+
 ### Only the leader signs
 
 Signing a workload certificate reads the CA from linearised state and takes a serial number from Raft, so it only works on the leader. For most of the project every node called its own council to sign, and every follower got an error back. The error went into a progress message, the container started anyway, and its `/run/reliaburger/identity/` stayed empty. The V02 soak's identity app ran on all three nodes for 76 minutes and only the leader's copy ever had a certificate.
@@ -420,9 +437,9 @@ mycluster-master.key              # hex-encoded 32-byte master secret (0o600)
 mycluster-security-bootstrap.json # full SecurityState as JSON
 ```
 
-The master key file is the crown jewel. Lose it and you can't unwrap any CA private key, which means you can't sign new node certificates, workload certificates, or JWTs. Back it up alongside the sealed root CA file, and make an operator-held copy of the root itself with `relish ca backup` (Chapter 4 explains why the sealed file alone isn't enough).
+The master key file is the crown jewel. Lose it and you can't unwrap any CA private key, which means you can't sign new node certificates, workload certificates, or JWTs. Back it up, but never with the root CA backup `relish init` wrote: the master key opens everything on the cluster, and the root backup is the one thing the cluster can't open (Chapter 4 explains why).
 
-The bootstrap file is a one-time transfer mechanism. When `bun` starts for the first time, it loads the JSON and writes a `SecurityStateInit` command to Raft. After that, SecurityState lives in Raft and replicates to every council node automatically. The file itself stays on disk: `relish ca backup` reads the root certificate and the cluster's `age` keys from it.
+The bootstrap file is a one-time transfer mechanism. When `bun` starts for the first time, it loads the JSON and writes a `SecurityStateInit` command to Raft. After that, SecurityState lives in Raft and replicates to every council node automatically. The file itself stays on disk; it holds no root key.
 
 ### Turning mTLS on: the mode matrix
 
@@ -1680,7 +1697,7 @@ The ingress swap has its own test in `wrapper::tls`, which handshakes against a 
 
 ## Rotating a CA, part three: the operator signs
 
-Parts one and two gave the council room for two CAs and taught every verifier to trust both. Nothing made a new CA yet. That needs the root, and the root key isn't on the cluster: `relish init` sealed it away, and chapter 4's `relish ca backup` put it in a file the operator keeps. The maintainer's decision was to keep it there. So who signs the new intermediate?
+Parts one and two gave the council room for two CAs and taught every verifier to trust both. Nothing made a new CA yet. That needs the root, and the root key isn't on the cluster: `relish init` wrote it only into the backup the operator keeps (chapter 4). The maintainer's decision was to keep it there. So who signs the new intermediate?
 
 The answer is the oldest trick in PKI. The cluster makes the new key pair and sends a certificate signing request (a CSR: "here's my public key, please certify it"). The operator signs it on their own machine with the root key from the backup, and sends back only the certificate. The new private key never leaves the cluster. The root key never reaches it.
 

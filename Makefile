@@ -72,7 +72,7 @@ test-rootless-runc: ## Prove rootless runc networking and port adoption as a non
 	RELIABURGER_ROOTLESS_RUNC_TESTS=1 $(NEXTEST) --features ebpf --run-ignored=only -E 'binary(owned_rootless) | test(rootless_published_port_survives_bun_replacement) | test(normal_rootless_bun)'
 
 test-cluster: ## Run all real multi-node cluster acceptance suites and the scripted feature demos
-	RELIABURGER_CLUSTER_TESTS=1 $(NEXTEST) --run-ignored=only -E 'binary(cluster_failover) | binary(cluster_gossip) | binary(council_self_healing) | binary(council_disaster_recovery) | binary(placement) | binary(cluster_task_arrays) | binary(registry_durability) | binary(demos)'
+	RELIABURGER_CLUSTER_TESTS=1 $(NEXTEST) --run-ignored=only -E '(binary(cluster_failover) | binary(cluster_gossip) | binary(council_self_healing) | binary(council_disaster_recovery) | binary(placement) | binary(cluster_task_arrays) | binary(registry_durability) | binary(demos))'
 
 test-hollow: ## Run the 20-node hollow-node harness check (#1401) and the 100-node, 1,000-app summary budget; measured fleets run through scripts/release/qualify-hollow-nodes.sh
 	$(NEXTEST) --run-ignored=only -E 'binary(hollow_nodes) & (test(twenty_hollow_nodes) | test(a_hundred_hollow_nodes))'
@@ -148,9 +148,9 @@ lint-macos: ## Run clippy once on the library, relish and bun, with all features
 	$(CARGO) clippy --lib --bin relish --bin bun --all-features -- -D warnings
 
 audit: ## Fail on new RustSec findings or an expired advisory exception
-	@today=$$(date -u +%Y%m%d); expiry=20261118; \
+	@today=$$(date -u +%Y%m%d); expiry=20261210; \
 	if [ "$$today" -gt "$$expiry" ]; then \
-		echo "dependency advisory exceptions expired on 2026-11-18; review .cargo/audit.toml" >&2; \
+		echo "dependency advisory exceptions expired on 2026-12-10; review .cargo/audit.toml" >&2; \
 		exit 1; \
 	fi
 	$(CARGO) audit

@@ -217,6 +217,8 @@ The leader selects council members from the general node pool. Selection criteri
 
 Growth promotes two caught-up learners in one joint-consensus change (`PromotePair`, 1 to 3 or 3 to 5). A dead or disk-pressured voter is replaced by swapping a caught-up learner in for it in one change (`Replace`), so the count never passes through an even number. With no replacement, two dead voters leave together (`RemoveVoterPair`, 5 to 3, never below `min_council_size`). An even council found on entry (left by an older release, or by a decommission) goes back to odd: up by one (`Promote`) when a caught-up learner exists and the live nodes allow it, otherwise down by one (`RemoveVoter`), a dead voter first, while quorum allows. Spare eligible nodes join as learners up to `max_council_size` (or the cluster's `council_size`), and only nodes past that stay plain workers. A learner has the replicated state, and an mTLS node needs it: its API opens only once the API tokens reach it through Raft (#1477). A two-node cluster therefore has one voter and one learner: losing the other node is survivable, losing the voter stops the control plane until it returns or is recovered. The upgrade planner's refusal of a two-voter council (`src/upgrade/plan.rs`) stays as a guard.
 
+**A replaced voter coming back holds its elections (#1524).** A voter that was replaced while it was down comes back with its old Raft state, which still lists it as a voter, because it missed its own removal. On its election timer it would campaign, and each failed campaign raises its term past the leader's; when the reconciler then adds it as a learner, the leader's first replication meets the higher term and steps down (openraft 0.9's `HigherVote`). So a node that starts on a log store holding a vote starts openraft with elections off (`src/council/return_hold.rs`). The hold ends at the first AppendEntries from a leader, which the TCP server and the in-memory router note on the node's `LeaderContact`; or once a startup grace of three election timeouts passes while gossip names no live leader (the leader's own hint, for an alive node); or at a cap of ten election timeouts. A voter that's still a member hears from the leader within a heartbeat; a whole-council restart waits at most the grace. `a_replaced_voter_coming_back_joins_as_a_learner_without_an_election` in `tests/council_self_healing.rs` checks it.
+
 Council replacement flow:
 
 ```
@@ -999,7 +1001,7 @@ When the entire Raft council is lost simultaneously (all 3-7 members fail at onc
 
 **If no recovery candidates survive:**
 
-All nodes remain in read-only mode. Apps continue running. No new deploys are accepted. Manual intervention via `relish recover` bootstraps a new council from any surviving node. This is the true catastrophic case and manual intervention is appropriate.
+All nodes remain in read-only mode. Apps continue running. No new deploys are accepted. Manual intervention via `relish council recover` bootstraps a new council from any surviving node. This is the true catastrophic case and manual intervention is appropriate.
 
 ### 5.6 Split-Brain Prevention
 
@@ -1025,29 +1027,33 @@ Split-brain can occur during a network partition where two groups each believe t
 
 ### 5.7 Membership Changes (Raft)
 
-Council membership changes use the single-server-at-a-time approach (Raft's joint consensus is complex and error-prone). The leader issues one AddNode or RemoveNode Raft log entry at a time and waits for it to commit before issuing another.
+The council reconciler on the leader makes one membership change at a time. Each tick it plans a single action (`plan_council_action`, `src/council/selection.rs`), and its change-in-flight gate holds the next until the current one has committed.
 
 ```
 Add member flow:
-1. Leader selects candidate C via council selection algorithm.
-2. Leader appends AddNode(C) to the Raft log.
-3. Once committed, leader begins sending AppendEntries to C.
-4. C enters LEARNER state, receiving log entries but not voting.
-5. Once C's log is within a configurable threshold of the leader's log:
-   C transitions to FOLLOWER and becomes a voting member.
-6. Leader broadcasts updated council membership via Mustard.
+1. The planner takes the best-ranked candidate C (select_council_candidates).
+2. AddLearner(C): a learner membership entry commits, and the leader
+   replicates the log to C. C receives entries but doesn't vote.
+3. Once C's replicated index is within max_promotion_lag (64) entries of
+   the leader's, the planner may promote it. Growth promotes two caught-up
+   learners together (PromotePair), so the voter count stays odd.
+4. Gossip carries the new council membership to every node.
 
 Remove member flow:
-1. Leader detects member M is unhealthy (Raft heartbeat timeout).
-2. Leader appends RemoveNode(M) to the Raft log.
-3. Once committed, M is no longer counted for quorum.
-4. Leader selects a replacement (loops back to Add member flow).
-5. Leader broadcasts updated council membership via Mustard.
+1. The leader's HealthTracker, fed by gossip, reports voter M dead, or M is
+   under sustained disk pressure. (A voter an operator retired is different:
+   the reconciler takes it out of the voter set straight away.)
+2. Add before remove: if a caught-up learner L exists, the planner swaps L
+   in for M in one change (Replace). M stops counting for quorum when the
+   change commits.
+3. With no replacement, two dead voters leave together (RemoveVoterPair),
+   never below min_council_size.
+4. Gossip carries the new council membership to every node.
 ```
 
 In the implementation, promotion and eviction go through openraft's joint consensus (`change_membership`): a joint configuration commits first, then the uniform one. The caller's future proposes the second step, so a caller that times out or a leader that fails over between the steps leaves a committed joint configuration behind. The council reconciler finishes it before planning anything else (`CouncilNode::finish_membership_change`), proposing the joint configuration's target voter set; otherwise its change-in-flight gate would hold every later membership change (#673).
 
-Each reconciler operation runs under a five-second bound and costs a fixed number of commits: a guard no-op that makes earlier node-fault grants visible, then one membership entry (add or remove a learner) or two (the joint and uniform steps of a voter change). Step 5's catch-up is not part of any operation. Adding a learner returns once its membership entry commits, without openraft's blocking wait, which holds until the learner trails by at most 5,000 entries and so grows with the log gap (on a large council log, it includes installing a snapshot). Replication carries on between ticks, and the planner promotes the learner only once its replicated index is within `max_promotion_lag` (64) entries of the leader's. With a log store that takes 20 ms per entry, the guard no-op took 46 ms, adding a learner 90 ms and a promotion 147 ms (#779).
+Each reconciler operation runs under a five-second bound and costs a fixed number of commits: a guard no-op that makes earlier node-fault grants visible, then one membership entry (add or remove a learner) or two (the joint and uniform steps of a voter change). The catch-up in step 3 of the add flow is not part of any operation. Adding a learner returns once its membership entry commits, without openraft's blocking wait, which holds until the learner trails by at most 5,000 entries and so grows with the log gap (on a large council log, it includes installing a snapshot). Replication carries on between ticks, and the planner promotes the learner only once its replicated index is within `max_promotion_lag` (64) entries of the leader's. With a log store that takes 20 ms per entry, the guard no-op took 46 ms, adding a learner 90 ms and a promotion 147 ms (#779).
 
 ---
 
@@ -1072,6 +1078,13 @@ raft_port = 9444
 # Reporting-tree state reports (TCP + mTLS). Default: 9445.
 reporting_port = 9445
 
+# How many voters the council grows to: odd, 1 to 7. Unset keeps the
+# default cap of 7. Read only by the node that bootstraps the cluster,
+# which commits it to council state (RaftRequest::CouncilSize).
+# `relish cluster create --bare-metal` and `relish machines claim --create`
+# write 5 into node 1's config unless --council-size says otherwise.
+# council_size = 5
+
 # How long a restarted voter keeps listening for its peers' recovery
 # epochs after gossip has synced, unless every peer advertises sooner.
 # Unset means two anti-entropy intervals (20 s).
@@ -1080,10 +1093,12 @@ reporting_port = 9445
 
 (The old `7946`/`7947` gossip/raft ports never shipped; the real defaults are `9443`/`9444`/`9445`. The node HTTP API is a separate port, `9117`.)
 
-The council sizing constants below are compile-time defaults in `CouncilSelectionConfig` (`src/council/selection.rs`), shown here for reference — they are **not** a `[council]` TOML section:
+The council sizing constants below are compile-time defaults in `CouncilSelectionConfig` (`src/council/selection.rs`), shown here for reference — they are **not** a `[council]` TOML section. The one exception is the cluster-wide council size above: when council state holds one (`DesiredState::council_size`), the reconciler caps `max_council_size` at it every tick, and lowers `min_council_size` to match when it's smaller (`CouncilSelectionConfig::sized`). It lives in council state rather than in each node's config so that every leader, after any failover, grows the council to the same size:
 
 ```text
-# Minimum council size (below this, the cluster enters degraded mode).
+# Minimum council size: the planner's target never drops below it, and
+# it never removes voters past it. A smaller cluster-wide council_size
+# lowers it to match.
 min_council_size = 3
 
 # Maximum council size. The council holds the largest odd number of
@@ -1433,7 +1448,7 @@ There is no production-quality Rust equivalent of HashiCorp's `memberlist` (Go).
 
 1. **Gossip library vs. custom implementation.** Should we use `foca` or write our own SWIM implementation? The fixed-size message constraint and HMAC authentication are non-standard requirements. A custom implementation is ~1000 lines and fully under our control, but a library gives us battle-tested edge case handling. Decision needed after evaluating `foca`'s extensibility.
 
-2. **Council size auto-tuning.** The whitepaper specifies a configurable council size of 3-7. Should the leader automatically adjust the council size based on cluster size (e.g., 3 at <50 nodes, 5 at 50-500 nodes, 7 at >500 nodes)? Or is a static default of 5 sufficient? Auto-tuning adds complexity but improves fault tolerance at scale.
+2. **Council size auto-tuning.** The whitepaper specifies a configurable council size of 3-7. Should the leader automatically adjust the council size based on cluster size (e.g., 3 at <50 nodes, 5 at 50-500 nodes, 7 at >500 nodes)? Or is a static default of 5 sufficient? Auto-tuning adds complexity but improves fault tolerance at scale. *Partly settled (0.3.0):* no auto-tuning. The cap stays 7 by default, and a cluster can be created with a fixed odd size from 1 to 7 (`[cluster] council_size`, committed to council state at bootstrap). Appliance clusters default to 5, for a ten-node lab of 2 GB machines. There's no command yet to change it on a running cluster.
 
 3. **Recovery candidate notification timing.** Recovery candidates are notified via the reporting tree's mTLS channel. If the reporting tree itself is disrupted (e.g., the candidate's council member parent dies), the notification may not arrive. Should candidates also be able to discover their priority from the encrypted gossip blob alone (requiring them to have a decryption key)? This changes the security model.
 

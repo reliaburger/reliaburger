@@ -1,24 +1,22 @@
-//! The root CA backup the operator holds (F04 R3).
+//! The root CA backup the operator holds (F04 R3, #709).
 //!
-//! `relish init` seals the root CA's private key to the cluster's
-//! generation-0 age key, in `<cluster>-root-ca.age`. That file only opens
-//! with the master key and the cluster's own state, so it's a backup for the
-//! cluster, not for the operator. This module builds the second kind: the
-//! root key and certificate plus the metadata needed to check them (cluster,
-//! trust domain, fingerprint, expiry), sealed to a passphrase or to an
-//! operator's age recipient. It's never sealed to a cluster key, because
-//! cluster keys rotate and the backup has to outlive them.
+//! The root CA is offline: no node ever keeps its private key. `relish init`
+//! and the setups that build a cluster from the operator's machine write it
+//! only into this backup: the root key and certificate plus the metadata
+//! needed to check them (cluster, trust domain, fingerprint, expiry), sealed
+//! to a passphrase or to an age recipient the operator holds. It's never
+//! sealed to a cluster key, because cluster keys live on the nodes and rotate,
+//! and the backup has to outlive them.
 //!
 //! The sealed file is an ordinary ASCII-armoured age file. The `age` tool
 //! opens it too, and inside is JSON with PEM-encoded certificate and key.
 
 use std::io::{Read as _, Write as _};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use age::secrecy::{ExposeSecret as _, SecretString};
 use serde::{Deserialize, Serialize};
-
-use super::types::{AgeKeyScope, CaRole, SecurityState};
 
 /// The format tag written into every backup, checked on open.
 pub const BACKUP_FORMAT: &str = "reliaburger-root-ca-backup/v1";
@@ -69,8 +67,11 @@ pub enum RootBackupError {
     #[error("the backup holds root {actual}, not this cluster's {expected}")]
     ForeignRoot { expected: String, actual: String },
 
-    #[error("could not reach the root key: {0}")]
-    RootKeyUnavailable(String),
+    #[error("could not write the backup to {path}: {reason}")]
+    WriteFailed { path: String, reason: String },
+
+    #[error("the backup written to {0} doesn't check out")]
+    WrittenBackupUnreadable(String),
 }
 
 /// What a backup is sealed to.
@@ -291,46 +292,119 @@ pub fn seal_kind(sealed: &[u8]) -> Result<SealKind, RootBackupError> {
     }
 }
 
-/// Reach the root's private key the way `relish init` left it: open
-/// `<cluster>-root-ca.age` with the cluster-wide age keys in `state`,
-/// unwrapped with the master key.
-///
-/// Every cluster-wide key is tried, though `init` sealed to generation 0
-/// and finalising a secret rotation keeps that key for this reason (F04 R0).
-pub fn unseal_init_root_key(
-    state: &SecurityState,
-    sealed_root: &[u8],
-    master_key: &[u8],
-) -> Result<Vec<u8>, RootBackupError> {
-    state
-        .age_keypairs
-        .iter()
-        .filter(|kp| kp.scope == AgeKeyScope::ClusterWide)
-        .filter_map(|kp| super::secret::unwrap_age_identity(kp, master_key).ok())
-        .find_map(|identity| super::secret::unseal_with_age(sealed_root, &identity).ok())
-        .ok_or_else(|| {
-            RootBackupError::RootKeyUnavailable(
-                "no cluster-wide age key in the security state opens the sealed root \
-                 (is this the cluster's master key?)"
-                    .to_string(),
-            )
-        })
+/// Where `write_backup` writes a backup, and what it seals it to.
+pub enum BackupDestination<'a> {
+    /// Sealed to a passphrase or an age recipient the operator chose.
+    Sealed {
+        /// Where the backup goes.
+        path: &'a Path,
+        /// What it's sealed to.
+        seal: &'a BackupSeal,
+    },
+    /// Sealed to a fresh age identity, written to its own file. For the
+    /// setups that run on the operator's machine and never ask anything.
+    FreshIdentity {
+        /// Where the backup goes.
+        path: &'a Path,
+        /// Where the identity that opens it goes.
+        identity: &'a Path,
+    },
 }
 
-/// Build a backup from what `relish init` wrote on the bootstrap node: the
-/// security state, the sealed root key and the master key.
-pub fn backup_from_init(
-    cluster: &str,
-    state: &SecurityState,
-    sealed_root: &[u8],
-    master_key: &[u8],
+/// Seal `backup`, write it where `destination` says, and check what landed
+/// on disk before returning. Neither file may exist yet, and both are
+/// written owner-only.
+///
+/// A passphrase backup and one sealed to a fresh identity are opened again
+/// and verified against the backup's fingerprint. A backup sealed to an
+/// operator's recipient can't be opened here, so it's checked as an age file
+/// sealed to a recipient.
+pub fn write_backup(
+    backup: &RootBackup,
+    destination: &BackupDestination<'_>,
     now: SystemTime,
-) -> Result<RootBackup, RootBackupError> {
-    let root = state.active_ca(CaRole::Root).ok_or_else(|| {
-        RootBackupError::RootKeyUnavailable("the security state has no root CA".to_string())
-    })?;
-    let private_key_der = unseal_init_root_key(state, sealed_root, master_key)?;
-    RootBackup::new(cluster, &root.certificate_der, &private_key_der, now)
+) -> Result<(), RootBackupError> {
+    match destination {
+        BackupDestination::Sealed { path, seal } => {
+            let sealed = backup.seal(seal)?;
+            write_new_private(path, &sealed)?;
+            let written = read_back(path)?;
+            match seal {
+                BackupSeal::Passphrase(passphrase) => check_opens(
+                    &written,
+                    &BackupOpener::Passphrase(passphrase.clone()),
+                    backup,
+                    path,
+                    now,
+                ),
+                BackupSeal::Recipient(_) => match seal_kind(&written) {
+                    Ok(SealKind::Recipient) => Ok(()),
+                    _ => Err(RootBackupError::WrittenBackupUnreadable(
+                        path.display().to_string(),
+                    )),
+                },
+            }
+        }
+        BackupDestination::FreshIdentity { path, identity } => {
+            let key = age::x25519::Identity::generate();
+            let recipient = key.to_public().to_string();
+            let identity_file = format!(
+                "# The age identity that opens the root CA backup {}\n\
+                 # for cluster {} (root {}). Keep it offline, apart from the backup.\n{}\n",
+                path.display(),
+                backup.cluster,
+                backup.fingerprint,
+                key.to_string().expose_secret()
+            );
+            write_new_private(identity, identity_file.as_bytes())?;
+            let sealed = backup.seal(&BackupSeal::Recipient(recipient))?;
+            write_new_private(path, &sealed)?;
+            let written = read_back(path)?;
+            check_opens(&written, &BackupOpener::Identity(key), backup, path, now)
+        }
+    }
+}
+
+fn check_opens(
+    written: &[u8],
+    opener: &BackupOpener,
+    backup: &RootBackup,
+    path: &Path,
+    now: SystemTime,
+) -> Result<(), RootBackupError> {
+    let unreadable = || RootBackupError::WrittenBackupUnreadable(path.display().to_string());
+    let opened = RootBackup::open(written, opener).map_err(|_| unreadable())?;
+    opened
+        .verify(&backup.fingerprint, now)
+        .map_err(|_| unreadable())?;
+    if opened != *backup {
+        return Err(unreadable());
+    }
+    Ok(())
+}
+
+fn write_new_private(path: &Path, bytes: &[u8]) -> Result<(), RootBackupError> {
+    let failed = |e: std::io::Error| RootBackupError::WriteFailed {
+        path: path.display().to_string(),
+        reason: e.to_string(),
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(failed)?;
+    file.write_all(bytes).map_err(failed)?;
+    file.sync_all().map_err(failed)
+}
+
+fn read_back(path: &Path) -> Result<Vec<u8>, RootBackupError> {
+    std::fs::read(path).map_err(|e| RootBackupError::WriteFailed {
+        path: path.display().to_string(),
+        reason: e.to_string(),
+    })
 }
 
 fn parse_pem(text: &str, tag: &str) -> Result<Vec<u8>, RootBackupError> {
@@ -612,40 +686,124 @@ mod tests {
         assert!(!printed.contains("PRIVATE KEY"));
     }
 
-    /// The backup is built from what `relish init` wrote, and it still
-    /// builds after a finalised secret rotation (F04 R0 kept the key).
     #[test]
-    fn the_backup_is_built_from_what_init_wrote() {
+    fn a_passphrase_backup_is_written_owner_only_and_opens() {
         let dir = tempfile::tempdir().unwrap();
-        let init = crate::sesame::init::initialize_cluster("prod", "node-1", dir.path()).unwrap();
-        let sealed_root = std::fs::read(&init.sealed_root_ca_path).unwrap();
-
-        let backup = backup_from_init(
-            "prod",
-            &init.security_state,
-            &sealed_root,
-            &init.master_secret,
+        let path = dir.path().join("root.age");
+        let backup = root_backup("prod");
+        let seal = BackupSeal::Passphrase(passphrase(PASSPHRASE));
+        write_backup(
+            &backup,
+            &BackupDestination::Sealed {
+                path: &path,
+                seal: &seal,
+            },
             SystemTime::now(),
         )
         .unwrap();
+        let opened = RootBackup::open(
+            &std::fs::read(&path).unwrap(),
+            &BackupOpener::Passphrase(passphrase(PASSPHRASE)),
+        )
+        .unwrap();
+        assert_eq!(opened, backup);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
 
-        let root = init.security_state.active_ca(CaRole::Root).unwrap();
-        let fingerprint = crate::sesame::identity_store::root_ca_fingerprint(&root.certificate_der);
-        assert_eq!(backup.fingerprint, fingerprint);
-        backup.verify(&fingerprint, SystemTime::now()).unwrap();
+    #[test]
+    fn a_recipient_backup_is_written_as_an_age_file_for_that_recipient() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("root.age");
+        let operator = age::x25519::Identity::generate();
+        let seal = BackupSeal::Recipient(operator.to_public().to_string());
+        let backup = root_backup("prod");
+        write_backup(
+            &backup,
+            &BackupDestination::Sealed {
+                path: &path,
+                seal: &seal,
+            },
+            SystemTime::now(),
+        )
+        .unwrap();
+        let opened = RootBackup::open(
+            &std::fs::read(&path).unwrap(),
+            &BackupOpener::Identity(operator),
+        )
+        .unwrap();
+        assert_eq!(opened, backup);
+    }
 
-        let wrong_master = [9u8; 32];
-        let err = backup_from_init(
-            "prod",
-            &init.security_state,
-            &sealed_root,
-            &wrong_master,
+    #[test]
+    fn a_backup_sealed_to_a_fresh_identity_opens_only_with_that_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("root.age");
+        let identity_path = dir.path().join("keys").join("root.key");
+        std::fs::create_dir(dir.path().join("keys")).unwrap();
+        let backup = root_backup("prod");
+        write_backup(
+            &backup,
+            &BackupDestination::FreshIdentity {
+                path: &path,
+                identity: &identity_path,
+            },
+            SystemTime::now(),
+        )
+        .unwrap();
+        let identity_text = std::fs::read_to_string(&identity_path).unwrap();
+        let key: age::x25519::Identity = identity_text
+            .lines()
+            .find(|line| line.starts_with("AGE-SECRET-KEY-"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let sealed = std::fs::read(&path).unwrap();
+        assert_eq!(
+            RootBackup::open(&sealed, &BackupOpener::Identity(key)).unwrap(),
+            backup
+        );
+        let other = age::x25519::Identity::generate();
+        assert!(RootBackup::open(&sealed, &BackupOpener::Identity(other)).is_err());
+    }
+
+    #[test]
+    fn a_backup_never_overwrites_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("root.age");
+        std::fs::write(&path, b"an older backup").unwrap();
+        let seal = BackupSeal::Passphrase(passphrase(PASSPHRASE));
+        let err = write_backup(
+            &root_backup("prod"),
+            &BackupDestination::Sealed {
+                path: &path,
+                seal: &seal,
+            },
             SystemTime::now(),
         )
         .unwrap_err();
-        assert!(
-            matches!(err, RootBackupError::RootKeyUnavailable(_)),
-            "{err}"
-        );
+        assert!(matches!(err, RootBackupError::WriteFailed { .. }), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"an older backup");
+    }
+
+    #[test]
+    fn a_backup_that_cannot_be_written_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing").join("root.age");
+        let seal = BackupSeal::Passphrase(passphrase(PASSPHRASE));
+        let err = write_backup(
+            &root_backup("prod"),
+            &BackupDestination::Sealed {
+                path: &path,
+                seal: &seal,
+            },
+            SystemTime::now(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, RootBackupError::WriteFailed { .. }), "{err}");
     }
 }

@@ -47,9 +47,9 @@ If you're an agent operating or debugging a Reliaburger cluster:
   A warning starting `source_mismatch:` means a node runs another commit, and
   links that commit's code.
 - **Use `-o json` for everything else.** Every `relish` command takes it
-  except the six interactive ones: `tui`, `dashboard`, `manual`, `source`,
-  `dev shell` and the guided `setup`. `setup --quickstart` and `setup --ssh`
-  take it.
+  except the eight interactive ones: `tui`, `dashboard`, `manual`, `source`,
+  `dev shell`, the guided `setup`, `machines claim` and `netboot`. `setup
+  --quickstart` and `setup --ssh` take it.
 - **Never post, change or file anything without your human.** Draft it, show
   it, and let them send it.
 - **Asked to set up a cluster?** Follow the playbook "Setting up a cluster for
@@ -592,7 +592,7 @@ relish agent upgrade-check
 |---------|---------|
 | `ready` | A newer release exists and nothing stands in its way. `next` has the plan and the start command. |
 | `up_to_date` | Every node already runs the latest release or newer. |
-| `needs_fresh_cluster` | The release changes a cluster format, so it can't roll onto this cluster ([cluster compatibility](https://github.com/reliaburger/reliaburger/blob/v0.2.8/docs/manual/12_operations.md)). |
+| `needs_fresh_cluster` | The release changes a cluster format, so it can't roll onto this cluster ([cluster compatibility](https://github.com/reliaburger/reliaburger/blob/v0.3.0/docs/manual/12_operations.md)). |
 | `blocked` | Something has to be fixed first. |
 | `unknown` | A question went unanswered, so no verdict is safe. |
 
@@ -623,7 +623,7 @@ a person the same question, without the `wtf`, quorum and skew checks.
 
 `relish agent verify` checks that every node's `bun`, and this `relish`, is
 the published, signed build of one version: `verified`, `mismatch` or
-`unknown`. Offline, pass the release's files ([how](https://github.com/reliaburger/reliaburger/blob/v0.2.8/docs/manual/12_operations.md#is-this-the-release)).
+`unknown`. Offline, pass the release's files ([how](https://github.com/reliaburger/reliaburger/blob/v0.3.0/docs/manual/12_operations.md#is-this-the-release)).
 
 ## Proving a fix
 
@@ -835,11 +835,13 @@ field names and no URL carries, gets through. Read `MANIFEST.json` and
 ## Every other command
 
 The rest of `relish` was written for people first, but every command takes
-`-o json` (or `-o yaml`) and prints the facts its table shows, except six
+`-o json` (or `-o yaml`) and prints the facts its table shows, except eight
 interactive ones that exit `2`: `tui`, `dashboard`, `manual`, `source`, `dev
-shell` and `setup` without `--quickstart` or `--ssh`. Without a terminal,
-`relish`, `relish manual` and `relish source` exit at once and name the
-command to use instead. The `reference` chapter lists each command's JSON.
+shell`, `setup` without `--quickstart` or `--ssh`, `machines claim`, which
+asks you to compare claim keys, and `netboot`, which serves until stopped.
+Without a terminal, `relish`, `relish manual` and `relish source` exit at
+once and name the command to use instead. The `reference` chapter lists each
+command's JSON.
 
 Unlike `relish agent`, these commands keep their own exit codes: `relish wtf`
 exits `1` for a critical finding and `3` for warnings only, not because you

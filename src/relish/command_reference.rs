@@ -66,6 +66,11 @@ pub const GROUPS: &[CommandGroup] = &[
             "setup",
             "local",
             "init",
+            "cluster",
+            "image",
+            "machines",
+            "netboot",
+            "os",
             "join",
             "join-token",
             "nodes",
@@ -175,7 +180,9 @@ pub const GROUPS: &[CommandGroup] = &[
             label: "security and access",
             path: "10_security.md",
         }],
-        commands: &["token", "secret", "ca", "sign", "audit", "policy"],
+        commands: &[
+            "token", "secret", "ca", "identity", "sign", "audit", "policy",
+        ],
     },
     CommandGroup {
         title: "Images and volumes",

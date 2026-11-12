@@ -1947,21 +1947,38 @@ mod tests {
     }
 
     /// The trap wrapper, run by the host's `sh`: TERM ends it at once with
-    /// status 0 while its long-running child is still going.
+    /// status 0 while its long-running child is still going, and the trap
+    /// stops that child too.
+    ///
+    /// The shell gets none of the test's stdio. Its child dies on its own
+    /// schedule after the wrapper exits, and one holding the test's stdout
+    /// or stderr kept nextest's capture pipes open past the test's exit,
+    /// which a loaded host reported as a leak (#1516).
     #[tokio::test]
     async fn sigterm_wrapper_exits_promptly_while_its_child_runs() {
         let dir = tempfile::tempdir().unwrap();
-        let ready = dir.path().join("ready");
-        let script = exit_on_sigterm(&format!("touch {}; sleep 30", ready.display()));
+        let pid_file = dir.path().join("child.pid");
+        // The child writes its own pid, so TERM can't arrive before it runs.
+        let script = exit_on_sigterm(&format!(
+            "sh -c 'echo $$ > {}; exec sleep 30'",
+            pid_file.display()
+        ));
         let mut child = tokio::process::Command::new("/bin/sh")
             .args(["-c", &script])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap();
         let started = std::time::Instant::now();
-        while !ready.exists() {
+        let sleeper = loop {
+            let written = std::fs::read_to_string(&pid_file).unwrap_or_default();
+            if let Ok(pid) = written.trim().parse::<u32>() {
+                break pid.to_string();
+            }
             assert!(started.elapsed() < Duration::from_secs(20), "never ready");
             tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        };
         let pid = child.id().unwrap().to_string();
         let killed = tokio::process::Command::new("kill")
             .args(["-TERM", &pid])
@@ -1975,6 +1992,24 @@ mod tests {
             .expect("the wrapper ignored SIGTERM")
             .unwrap();
         assert_eq!(status.code(), Some(0));
+
+        let started = std::time::Instant::now();
+        loop {
+            let alive = tokio::process::Command::new("kill")
+                .args(["-0", &sleeper])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await
+                .unwrap();
+            if !alive.success() {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the trap left its child {sleeper} running"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     #[test]

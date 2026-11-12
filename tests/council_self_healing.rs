@@ -359,7 +359,7 @@ async fn two_node_cluster_survives_losing_the_non_voter() {
         )
         .await
         .unwrap();
-        router.register(rid(index), node.raft().clone()).await;
+        router.register(rid(index), &node).await;
         nodes.push(Arc::new(node));
     }
     nodes[0]
@@ -435,4 +435,198 @@ async fn two_node_cluster_survives_losing_the_non_voter() {
     }
     assert_eq!(nodes[0].current_leader().await, Some(rid(0)));
     shutdown.cancel();
+}
+
+/// #1524: a voter replaced while it was down comes back with its old Raft
+/// state, which still lists it as a voter and holds a higher term from the
+/// campaigns it lost. The reconciler adds it back as a learner, and the
+/// leader then replicates to it. That must not cost the cluster its leader:
+/// leadership and the leader's term stay where they were, and the returning
+/// node ends up a learner, not a voter.
+///
+/// Before #1524's fix it failed every time: the returning node campaigned
+/// while it was out of gossip, and its higher term deposed the leader as
+/// soon as the leader replicated to it. Now it starts with its elections
+/// held, and the leader's first AppendEntries ends the hold.
+#[tokio::test]
+#[ignore = "run with make test-cluster"]
+async fn a_replaced_voter_coming_back_joins_as_a_learner_without_an_election() {
+    use reliaburger::council::log_store::MemLogStore;
+    use reliaburger::council::network::InMemoryRaftNetworkFactory;
+    use reliaburger::council::state_machine::CouncilStateMachine;
+
+    assert!(
+        cluster_tests_enabled(),
+        "set RELIABURGER_CLUSTER_TESTS=1 on a provisioned multi-core host"
+    );
+
+    // Four live nodes and a cap of five: the council stays at three voters
+    // (the largest odd number four nodes allow) and node-4 waits as a
+    // learner, so a returning node has room to be added back.
+    let mut config = heal_reconciler_config();
+    config.selection.max_council_size = 5;
+    let live = 4;
+    let router = InMemoryRaftRouter::new();
+    let mut stores = Vec::new();
+    let mut nodes = Vec::new();
+    for index in 0..live {
+        let store = MemLogStore::new();
+        let node = CouncilNode::new(
+            rid(index),
+            cluster_support::fast_council_config(),
+            InMemoryRaftNetworkFactory::new(rid(index), router.clone()),
+            store.clone(),
+            CouncilStateMachine::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        router.register(rid(index), &node).await;
+        stores.push(store);
+        nodes.push(Arc::new(node));
+    }
+    let initial: std::collections::BTreeMap<u64, _> =
+        (0..3).map(|index| (rid(index), node_info(index))).collect();
+    nodes[0].initialize(initial).await.unwrap();
+
+    let gossip = |alive: &[usize]| -> Vec<MembershipSnapshot> {
+        let now = Instant::now();
+        alive.iter().map(|index| member(*index, now)).collect()
+    };
+    let everyone: Vec<usize> = (0..live).collect();
+    let (membership_tx, membership_rx) = watch::channel(gossip(&everyone));
+    let shutdown = CancellationToken::new();
+    for (index, node) in nodes.iter().enumerate() {
+        spawn_council_reconciler_with_config(
+            Arc::clone(node),
+            membership_rx.clone(),
+            1,
+            rid(index),
+            node_info(index),
+            config.clone(),
+            shutdown.clone(),
+        );
+    }
+    let voters_of = |node: &CouncilNode| -> BTreeSet<u64> {
+        node.metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .voter_ids()
+            .collect()
+    };
+    let members_of = |node: &CouncilNode| -> BTreeSet<u64> {
+        node.metrics()
+            .borrow()
+            .membership_config
+            .membership()
+            .nodes()
+            .map(|(id, _)| *id)
+            .collect()
+    };
+
+    let leader = initial_voter_leader_index(&nodes)
+        .await
+        .expect("no leader elected within 5s");
+    let leader_id = rid(leader);
+    let spare_learner = wait_until(Duration::from_secs(10), || {
+        members_of(&nodes[leader]).contains(&rid(3))
+    })
+    .await;
+    assert!(spare_learner, "node-4 never joined as a learner");
+
+    // Kill a voter that isn't the leader. The spare takes its seat.
+    let victim = if leader == 2 { 1 } else { 2 };
+    nodes[victim].shutdown().await.unwrap();
+    let without: Vec<usize> = everyone.iter().copied().filter(|i| *i != victim).collect();
+    membership_tx.send(gossip(&without)).unwrap();
+    let healed = wait_until(Duration::from_secs(15), || {
+        let voters = voters_of(&nodes[leader]);
+        voters.contains(&rid(3))
+            && !voters.contains(&rid(victim))
+            && !members_of(&nodes[leader]).contains(&rid(victim))
+    })
+    .await;
+    assert!(
+        healed,
+        "the dead voter wasn't replaced; voters {:?}",
+        voters_of(&nodes[leader])
+    );
+    let term_before = nodes[leader].metrics().borrow().current_term;
+
+    // Bring the old voter back with its log, its vote and its old view of
+    // the membership, which still names it a voter.
+    let returned = Arc::new(
+        CouncilNode::new(
+            rid(victim),
+            cluster_support::fast_council_config(),
+            InMemoryRaftNetworkFactory::new(rid(victim), router.clone()),
+            stores[victim].clone(),
+            CouncilStateMachine::new(),
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    assert!(
+        returned.elections_held_on_return(),
+        "the returning node didn't hold its elections"
+    );
+    // Its own gossip view names the live leader, as a returning node's does
+    // once gossip has caught up, though the others don't see it yet.
+    returned.report_gossip_leader(true);
+    router.register(rid(victim), &returned).await;
+    spawn_council_reconciler_with_config(
+        Arc::clone(&returned),
+        membership_rx.clone(),
+        1,
+        rid(victim),
+        node_info(victim),
+        config.clone(),
+        shutdown.clone(),
+    );
+    // Out of the others' gossip for several election timeouts, as a node is
+    // in the seconds before gossip sees it again. Before the fix it
+    // campaigned within one, raising its term past the leader's.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        returned.metrics().borrow().current_term,
+        term_before,
+        "the returning node campaigned while it held its elections"
+    );
+    membership_tx.send(gossip(&everyone)).unwrap();
+
+    // Watch for long enough to see it added back and replicated to, and
+    // for any election it would force to land.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let mut rejoined = false;
+    while tokio::time::Instant::now() < deadline {
+        let metrics = nodes[leader].metrics().borrow().clone();
+        assert_eq!(
+            metrics.current_leader,
+            Some(leader_id),
+            "leadership moved when the replaced voter came back"
+        );
+        assert_eq!(
+            metrics.current_term, term_before,
+            "the leader's term moved when the replaced voter came back"
+        );
+        rejoined |= members_of(&nodes[leader]).contains(&rid(victim));
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+    assert!(rejoined, "the returning node was never added back");
+    assert!(
+        !voters_of(&nodes[leader]).contains(&rid(victim)),
+        "the returning node got its vote back: {:?}",
+        voters_of(&nodes[leader])
+    );
+    assert!(
+        returned.leader_contact().heard() && !returned.elections_held_on_return(),
+        "the leader's replication didn't end the returning node's hold"
+    );
+
+    shutdown.cancel();
+    for node in nodes.iter().chain(std::iter::once(&returned)) {
+        let _ = node.shutdown().await;
+    }
 }

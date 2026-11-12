@@ -2083,6 +2083,17 @@ async fn a_controller_fails_a_templated_database_pair_over_when_its_node_dies() 
     fixture.root.cancel();
 }
 
+/// How a lease-history test disrupts the leader part-way through.
+#[derive(Clone, Copy)]
+enum LeaderDisruption {
+    /// Kill it, Raft core and all.
+    Kill,
+    /// Cut it off from the cluster (every cluster transport quiesced, as a
+    /// `node-kill` fault does) while its API keeps answering, then heal it
+    /// fifteen seconds later (#1415).
+    Partition,
+}
+
 /// #1399: four clients take, renew, read and release test leases through
 /// all three nodes while the leader is killed part-way, recording every
 /// operation; the history must check as linearizable. The same test with
@@ -2092,6 +2103,22 @@ async fn a_controller_fails_a_templated_database_pair_over_when_its_node_dies() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "requires RELIABURGER_CLUSTER_TESTS=1, a multi-core host and python3; run with make test-cluster"]
 async fn a_lease_history_through_a_leader_kill_is_linearizable() {
+    lease_history_is_linearizable_through(LeaderDisruption::Kill).await;
+}
+
+/// #1415: the same history while the leader is cut off rather than killed.
+/// The old leader keeps answering API calls, and until it notices it has
+/// lost the cluster it still believes it leads. So this is the test for a
+/// stale read after a leader change: a read through the old leader that
+/// answered from its own copy, past the new leader's first write, would
+/// fail the check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1, a multi-core host and python3; run with make test-cluster"]
+async fn a_lease_history_through_a_leader_partition_is_linearizable() {
+    lease_history_is_linearizable_through(LeaderDisruption::Partition).await;
+}
+
+async fn lease_history_is_linearizable_through(disruption: LeaderDisruption) {
     assert!(cluster_tests_enabled());
     let operator = admin_token("history");
     let mut fixture = Fixture::new();
@@ -2141,7 +2168,25 @@ async fn a_lease_history_through_a_leader_kill_is_linearizable() {
     let mut client = client.spawn().expect("python3 runs the history client");
 
     tokio::time::sleep(Duration::from_secs(15)).await;
-    kill(&nodes[leader]).await;
+    match disruption {
+        LeaderDisruption::Kill => kill(&nodes[leader]).await,
+        LeaderDisruption::Partition => {
+            let gate = nodes[leader].partition_blocklists.node_gate.clone();
+            gate.quiesce();
+            // The test is only about a leader change if there is one: the
+            // other two elect a leader while the old one is cut off.
+            let others: Vec<usize> = (0..3).filter(|&index| index != leader).collect();
+            let elected = wait_for_leader(&nodes, &others, Duration::from_secs(15)).await;
+            assert_ne!(
+                elected, leader,
+                "no new leader while the old one was cut off"
+            );
+            // Leave the old leader cut off a while longer, so reads through
+            // it meet the new leader's writes.
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            gate.restore();
+        }
+    }
     let finished = tokio::time::timeout(Duration::from_secs(120), client.wait())
         .await
         .expect("the history client stops after its duration")

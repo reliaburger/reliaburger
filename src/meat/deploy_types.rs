@@ -619,6 +619,16 @@ pub enum DeployResult {
     Cancelled,
 }
 
+/// The wall-clock time `at` was, for a history entry's `created_at`: a
+/// deploy times itself with a monotonic `Instant`, and the entry carries
+/// `SystemTime`. An `at` older than the epoch, which can't happen on a
+/// real clock, reads as the epoch.
+pub fn wall_clock_at(at: std::time::Instant) -> SystemTime {
+    SystemTime::now()
+        .checked_sub(at.elapsed())
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+}
+
 /// A summary entry for deploy history.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeployHistoryEntry {

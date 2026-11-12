@@ -228,6 +228,8 @@ cluster can roll onto it in place
 0.2.8 moves the pair to protocol 58 and state format 74, and a 0.2.7
 cluster's leader refuses it
 ([upgrading from 0.2.7](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-027)).
+Development builds of 0.3.0, the appliance release, are at protocol 59 and
+state format 75, so a 0.2.x cluster's leader refuses them too.
 
 A laptop cluster says the same thing when you rerun the quickstart installer
 from a newer release over it. Its saved record names the release that set it
@@ -608,8 +610,9 @@ the shell you run `relish council recover` from. With none set, S3 falls back
 to the instance's metadata credentials. Volume-snapshot upload and log and
 metrics export read the same variables. Volumes aren't in it; snapshot those separately (see
 `images-and-volumes`). Nor is the root CA's private key, which never enters the
-council: back that up yourself with `relish ca backup`, sealed to a passphrase
-or your own age key, and check it with `relish ca verify` (see `security`).
+council: its only copy is the backup `relish init` wrote for you, sealed to a
+passphrase or your own age key. Check it with `relish ca verify` (see
+`security`).
 
 If every voter is gone, stop a surviving node and recover it:
 

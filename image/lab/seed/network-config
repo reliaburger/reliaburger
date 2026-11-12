@@ -1,0 +1,24 @@
+network:
+  version: 2
+  ethernets:
+    wan:
+      match: {macaddress: "52:54:00:00:00:10"}
+      set-name: wan
+      dhcp4: true
+    lan:
+      match: {macaddress: "52:54:00:00:00:01"}
+      set-name: lan
+      optional: true
+      dhcp4: false
+      dhcp6: false
+      accept-ra: false
+      link-local: []
+  bridges:
+    br0:
+      optional: true
+      interfaces: [lan]
+      addresses: [192.168.105.1/24]
+      dhcp4: false
+      dhcp6: false
+      accept-ra: false
+      parameters: {stp: false, forward-delay: 0}

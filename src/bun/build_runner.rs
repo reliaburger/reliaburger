@@ -420,7 +420,7 @@ async fn sign_on_leader(
     let Some(council) = &state.council else {
         return Err(BuildSignError::Failed("no council available".to_string()));
     };
-    if !council.is_leader().await {
+    if !crate::bun::leadership::leads(council).await {
         return Err(BuildSignError::NotLeader);
     }
     let running = council
@@ -1973,7 +1973,7 @@ mod tests {
         )
         .await
         .unwrap();
-        router.register(1, node.raft().clone()).await;
+        router.register(1, &node).await;
         let members = std::collections::BTreeMap::from([(
             1u64,
             CouncilNodeInfo::new("127.0.0.1:9001".parse().unwrap(), "node-1".to_string()),
@@ -2008,6 +2008,7 @@ mod tests {
             join_tokens: vec![],
             next_serial: 10,
             oidc_signing_config: Some(oidc_config),
+            retiring_oidc_keys: Vec::new(),
             crl: crate::sesame::types::Crl::default(),
             secret_seals: std::collections::BTreeMap::new(),
             node_leaves: std::collections::BTreeMap::new(),
@@ -2135,7 +2136,7 @@ mod tests {
         )
         .await
         .unwrap();
-        router.register(1, node.raft().clone()).await;
+        router.register(1, &node).await;
         let members = std::collections::BTreeMap::from([(
             1u64,
             CouncilNodeInfo::new("127.0.0.1:9002".parse().unwrap(), "node-1".to_string()),
