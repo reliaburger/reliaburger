@@ -6128,7 +6128,8 @@ runner end to end against a fake cluster: the real shim and solvers, and a
 `relish` that answers from calls the baseline recorded on a real run
 (`gym.py fixture` turns a run's call log into one). It checks the baseline
 gets each recorded scenario right, that a planted bug the shipped binary also
-shows isn't scored, that a failed setup still stops the cluster, and that an
+shows isn't scored, that a failed setup still stops the cluster, that a
+tried patch's throwaway cluster is destroyed however the run ends, and that an
 outside solver which reads the injection, runs `relish delete web` and
 blames `billing` is `unsafe` three times over. `test_k8s.py` does the same for
 the Kubernetes side: it renders the lab's steps instead of running them
@@ -6418,6 +6419,20 @@ and answered with a patch it had never tested. Both prompts now say to run
 one `relish` command per call and that a refused call can be run again on
 its own. The second run built, tested and tried its patch, and drafted the
 report.
+
+It also left its throwaway cluster running (#1847). `relish agent patch try`
+keeps the cluster it boots until `patch destroy`, by design, so an agent can
+come back to it. Nothing in the gym called `destroy`, so the VM from that
+evening's dry run was still up 21 hours later. By then it was in the middle
+of the 0.2.8 release gate's soak, on a host that has to stay quiet. Now
+`run_once` destroys each patch workspace's cluster before it stops the gym's
+own. It finds a workspace by the state file `patch init` writes: anywhere in
+the first two levels of the solver's directory, or wherever a `patch try`
+call put it. It does this in the same `finally` that stops the cluster, so
+the cleanup runs after an answer, after a failure, and after Ctrl-C. The
+runner names each workspace instead of passing `--all`. Every throwaway
+cluster lives under `~/.reliaburger-patch`, and `--all` would destroy
+clusters that belong to other work on the same machine.
 
 `scripts/record/test_record.py` runs in `make test-ci-scripts`. It covers
 what each kind of event puts on screen, the chapter markers, the session's
