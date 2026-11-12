@@ -1070,11 +1070,20 @@ relish setup --quickstart</code></pre>
             it reads the cluster, the manual and the exact source its <code>relish</code> was
             built from. When the bug is ours, it proves a fix on a throwaway cluster and
             drafts the report for you to send. It never fixes your cluster for you.</p>
-          <figure id="agent-recording" class="recording">
-            <p class="recording-pending">No recording yet. A real session, an agent with a
-              read-only token on a real cluster with real build times, is being recorded for
-              <a href="https://github.com/reliaburger/reliaburger/issues/1579">#1579</a>, and
-              we won’t show a mock-up in its place. Until then, here are the steps it takes.</p>
+          <figure id="agent-recording" class="recording" data-cast="./assets/agent-debug.cast" data-chapters="markers">
+            <div class="recording-screen"></div>
+            <noscript><p class="recording-fallback">The recording plays with JavaScript. Without it,
+              <a href="./assets/agent-debug.cast">download the recording</a> and play it in a terminal with
+              <code>asciinema play agent-debug.cast</code>, or follow the steps below.</p></noscript>
+            <figcaption>
+              <span class="recording-chapters" role="group" aria-label="Debugging recording chapters" hidden></span>
+              <span>A real session: Claude Code with a read-only token on a 0.2.8 cluster
+                (the published <code>relish</code>, and <code>bun</code> built from the v0.2.8
+                tag), recorded through the agent gym by
+                <a href="https://github.com/reliaburger/reliaburger/blob/main/scripts/record/recording.py">scripts/record/recording.py</a>,
+                which scored it correct. Still stretches are cut to two seconds, and each result
+                says how long its call really took.</span>
+            </figcaption>
           </figure>
           <ol class="tour-steps agent-steps">
             <li>
@@ -1134,11 +1143,20 @@ relish setup --quickstart</code></pre>
             asks. The cluster writes down what the change would do, a person or
             a policy you wrote says yes, and the undo is one command, shown before anything
             happens.</p>
-          <figure id="act-recording" class="recording">
-            <p class="recording-pending">No recording yet. A real session, an agent proposing
-              a rollback on a real cluster and a person approving it, is being recorded for
-              <a href="https://github.com/reliaburger/reliaburger/issues/1690">#1690</a>, and
-              we won’t show a mock-up in its place. Until then, here are the steps.</p>
+          <figure id="act-recording" class="recording" data-cast="./assets/agent-act.cast" data-chapters="markers">
+            <div class="recording-screen"></div>
+            <noscript><p class="recording-fallback">The recording plays with JavaScript. Without it,
+              <a href="./assets/agent-act.cast">download the recording</a> and play it in a terminal with
+              <code>asciinema play agent-act.cast</code>, or follow the steps below.</p></noscript>
+            <figcaption>
+              <span class="recording-chapters" role="group" aria-label="Proposal recording chapters" hidden></span>
+              <span>A real session: Claude Code with an agent token on a 0.2.8 cluster
+                (the published <code>relish</code>, and <code>bun</code> built from the v0.2.8
+                tag) proposes a rollback, then a person approves it and undoes it with their own
+                token. Recorded through the agent gym by
+                <a href="https://github.com/reliaburger/reliaburger/blob/main/scripts/record/recording.py">scripts/record/recording.py</a>,
+                which scored it correct. Still stretches are cut to two seconds.</span>
+            </figcaption>
           </figure>
           <ol class="tour-steps agent-steps">
             <li>
