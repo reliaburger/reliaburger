@@ -99,6 +99,43 @@ class StrangerChecksTests(unittest.TestCase):
         self.assertIn("python3 scripts/release/homebrew.py publish --formula relish.rb", self.tap)
         self.assertEqual(self.text.count("secrets.HOMEBREW_TAP_TOKEN"), 1)
 
+    def test_bottles_come_from_the_published_binaries_and_reach_the_tap_first(self):
+        # Without bottles Homebrew demands current Command Line Tools to "build"
+        # a formula that only copies a binary.
+        self.assertIn("--pattern 'relish-*'", self.tap)
+        self.assertIn("python3 scripts/release/homebrew.py bottles --record published/candidate.json", self.tap)
+        self.assertIn("--binaries published --output bottles", self.tap)
+        self.assertEqual(self.tap.count('--qualified-digest "$QUALIFIED_DIGEST"'), 2)
+        self.assertIn("--bottles bottles/bottles.json", self.tap)
+        self.assertIn("--bottles bottles", self.tap.split("homebrew.py publish", 1)[1])
+
+
+class RegistryEntryJobTests(unittest.TestCase):
+    """Promotion writes the MCP Registry entry with the bundles' digests, and publishes nothing (#1695)."""
+
+    def setUp(self):
+        self.text = WORKFLOW.read_text()
+        self.promote = job(self.text, "promote")
+        self.registry = job(self.text, "mcp-registry-entry")
+
+    def test_it_runs_only_after_publication_without_write_access_or_secrets(self):
+        self.assertIn("needs: promote", self.registry)
+        self.assertIn("if: github.ref == 'refs/heads/main'", self.registry)
+        self.assertNotIn("contents: write", self.registry)
+        self.assertNotIn("secrets.", self.registry)
+        self.assertNotIn("environment:", self.registry)
+
+    def test_it_reads_the_published_record_and_the_tag_s_entry(self):
+        self.assertIn("--pattern candidate.json", self.registry)
+        self.assertIn('git show "refs/tags/$RELEASE_TAG:server.json"', self.registry)
+        self.assertIn("python3 scripts/release/mcp_registry.py --record published/candidate.json", self.registry)
+        self.assertIn('--qualified-digest "$QUALIFIED_DIGEST"', self.registry)
+
+    def test_the_entry_is_kept_for_the_maintainer_and_never_published(self):
+        # Publishing needs a GitHub login to the organisation (#1695).
+        self.assertIn("actions/upload-artifact@", self.registry)
+        self.assertNotIn("mcp-publisher publish", self.registry.replace("`mcp-publisher publish`", ""))
+
 
 if __name__ == "__main__":
     unittest.main()

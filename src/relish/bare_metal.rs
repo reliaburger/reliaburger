@@ -391,7 +391,7 @@ pub async fn add(
     ssh_key: Option<Vec<u8>>,
 ) -> Result<Vec<(FleetNode, PathBuf)>, RelishError> {
     let fleet_path = directory.join("fleet.json");
-    let mut fleet: Fleet = serde_json::from_slice(&std::fs::read(&fleet_path)?)
+    let mut fleet: Fleet = serde_json::from_slice(&tokio::fs::read(&fleet_path).await?)
         .map_err(|e| failed(&format!("{}: {e}", fleet_path.display())))?;
     let added = plan_additions(&fleet, machines)?;
     let client = super::client::BunClient::default_local();

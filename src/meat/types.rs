@@ -250,7 +250,7 @@ impl fmt::Display for UnplacedReason {
 }
 
 /// An app the scheduler placed only part of (#702). The leader records it in
-/// council state, so `relish status` and `relish wtf` can say why replicas
+/// council state, so `relish apps` and `relish wtf` can say why replicas
 /// are missing, and clears it once every replica is placed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Unschedulable {

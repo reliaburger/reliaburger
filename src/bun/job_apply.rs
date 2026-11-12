@@ -84,7 +84,10 @@ pub(crate) async fn apply(
         .await
         {
             Ok(notes) => notes,
-            Err(error) => return super::api::apply::owner_refusal(&error),
+            Err(error) => {
+                super::api::apply::record_owner_refusal(&state, auth, &error).await;
+                return super::api::apply::owner_refusal(&error);
+            }
         };
         // The apps and jobs in a job manifest are judged by the policies in
         // force, as `relish apply` judges any app (#1117, #1119). The state

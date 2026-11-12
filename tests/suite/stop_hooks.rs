@@ -35,6 +35,7 @@ fn workload(script: &str, stop: StopPolicy) -> OciSpec {
             rlimits: Vec::new(),
             args: vec!["/bin/sh".into(), "-c".into(), script.into()],
             env: Vec::new(),
+            provider_env: Vec::new(),
             cwd: "/".into(),
             user: OciUser { uid: 0, gid: 0 },
             capabilities: None,
@@ -81,8 +82,12 @@ fn lines(path: &Path) -> Vec<String> {
 async fn an_owned_workload_gets_its_own_signal_after_its_pre_stop() {
     let dir = tempfile::tempdir_in("/tmp").unwrap();
     let (log, ready) = (dir.path().join("log"), dir.path().join("ready"));
+    // Written first thing by the hook, so a failure says whether it ever
+    // started (#1794).
+    let began = dir.path().join("pre-stop-began");
     let grill = runtime(&dir.path().join("owners"));
     let id = InstanceId("default__owned-hooks-0".into());
+    let bound = Duration::from_secs(10);
     let policy = StopPolicy {
         signal: StopSignal::Int,
         grace: Some(Duration::from_secs(10)),
@@ -90,9 +95,13 @@ async fn an_owned_workload_gets_its_own_signal_after_its_pre_stop() {
             command: vec![
                 "/bin/sh".into(),
                 "-c".into(),
-                format!("echo pre-stop >> {}", log.display()),
+                format!(
+                    "touch {}; echo pre-stop >> {}",
+                    began.display(),
+                    log.display()
+                ),
             ],
-            timeout: Duration::from_secs(10),
+            timeout: bound,
         }),
     };
     let script = format!(
@@ -104,11 +113,26 @@ async fn an_owned_workload_gets_its_own_signal_after_its_pre_stop() {
     started(&grill, &id, &workload(&script, policy.clone()), &ready).await;
 
     let stop = InstanceStop::for_policy(Some(&policy), Duration::from_secs(30));
+    let stopping = Instant::now();
     stop_runtime_instance(&grill, &id, &stop, CONFIRMATION)
         .await
         .unwrap();
+    let took = stopping.elapsed();
 
-    assert_eq!(lines(&log), ["pre-stop", "INT"]);
+    // `run_pre_stop` reports a hook that failed only on stderr, which
+    // nextest prints under a failure; this says which way it went (#1794).
+    assert_eq!(
+        lines(&log),
+        ["pre-stop", "INT"],
+        "the stop took {took:?} against a {bound:?} pre-stop bound, and the hook {}; \
+         see the `bun: {}: pre_stop` line on stderr",
+        if began.exists() {
+            "started"
+        } else {
+            "never started"
+        },
+        id.0
+    );
     assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Stopped);
 }
 

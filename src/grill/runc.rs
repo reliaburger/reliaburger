@@ -331,7 +331,8 @@ impl RuncGrill {
             if spec.root.readonly {
                 // A read-only OCI root cannot mutate the shared generation, so
                 // it is safe to point runc at the immutable lower directly.
-                spec.root.path = std::fs::canonicalize(&lower)
+                spec.root.path = tokio::fs::canonicalize(&lower)
+                    .await
                     .unwrap_or(lower)
                     .to_string_lossy()
                     .to_string();
@@ -360,7 +361,8 @@ impl RuncGrill {
                     instance: instance.clone(),
                     reason: format!("failed to create rootfs: {e}"),
                 })?;
-            spec.root.path = std::fs::canonicalize(&rootfs)
+            spec.root.path = tokio::fs::canonicalize(&rootfs)
+                .await
                 .unwrap_or(rootfs)
                 .to_string_lossy()
                 .to_string();
@@ -398,7 +400,8 @@ impl RuncGrill {
         // concurrent creates and leaks node-local configuration into the
         // unpacked image cache.
         if let Some(nameserver) = self.dns_nameserver {
-            let resolv_path = std::fs::canonicalize(&bundle_dir)
+            let resolv_path = tokio::fs::canonicalize(&bundle_dir)
+                .await
                 .unwrap_or_else(|_| bundle_dir.clone())
                 .join("resolv.conf");
             let namespace = super::InstanceIdentity::parse(&instance.0).map(|id| id.namespace);
@@ -929,6 +932,7 @@ mod tests {
                 rlimits: Vec::new(),
                 args: vec!["/bin/true".to_string()],
                 env: vec![],
+                provider_env: Vec::new(),
                 cwd: "/".to_string(),
                 user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
                 capabilities: None,
@@ -997,6 +1001,7 @@ mod tests {
                 rlimits: Vec::new(),
                 args: vec!["sh".into()],
                 env: vec![],
+                provider_env: Vec::new(),
                 cwd: "/".into(),
                 user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
                 capabilities: None,
@@ -1069,6 +1074,7 @@ mod tests {
                 rlimits: Vec::new(),
                 args: vec!["sh".to_string(), "-c".to_string(), "echo hello".to_string()],
                 env: vec![],
+                provider_env: Vec::new(),
                 cwd: "/".to_string(),
                 user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
                 capabilities: None,
@@ -1181,6 +1187,7 @@ mod tests {
                         .to_string(),
                 ],
                 env: vec!["PATH=/usr/sbin:/usr/bin:/sbin:/bin".to_string()],
+                provider_env: Vec::new(),
                 cwd: "/".to_string(),
                 user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
                 capabilities: None,
@@ -1341,6 +1348,7 @@ mod tests {
                         ),
                     ],
                     env: vec!["PATH=/usr/sbin:/usr/bin:/sbin:/bin".to_string()],
+                    provider_env: Vec::new(),
                     cwd: "/".to_string(),
                     user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
                     capabilities: None,
@@ -1506,6 +1514,7 @@ mod tests {
                 rlimits: Vec::new(),
                 args: vec!["/bin/true".to_string()],
                 env: vec![],
+                provider_env: Vec::new(),
                 cwd: "/".to_string(),
                 user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
                 capabilities: None,
@@ -1576,6 +1585,7 @@ mod tests {
                     "echo adopted > /reliaburger-isolation; sleep 30".to_string(),
                 ],
                 env: vec!["PATH=/usr/sbin:/usr/bin:/sbin:/bin".to_string()],
+                provider_env: Vec::new(),
                 cwd: "/".to_string(),
                 user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
                 capabilities: None,
@@ -1773,6 +1783,7 @@ mod tests {
                 rlimits: Vec::new(),
                 args: vec!["/bin/sleep".to_string(), "30".to_string()],
                 env: vec![],
+                provider_env: Vec::new(),
                 cwd: "/".to_string(),
                 user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
                 capabilities: None,

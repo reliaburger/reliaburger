@@ -429,7 +429,7 @@ pub(super) enum DesiredAppsSource<'a> {
 /// Only a leader that still holds a quorum answers from its own state. A
 /// worker outside Raft has an empty, unreplicated state machine, so its own
 /// view would claim the cluster runs nothing (#436). Any other node forwards
-/// the read to the leader, so `relish status` and the dashboard work from
+/// the read to the leader, so `relish apps` and the dashboard work from
 /// every node, and reports an error when no leader answers.
 pub(super) async fn gather_desired_apps(
     state: &ApiState,

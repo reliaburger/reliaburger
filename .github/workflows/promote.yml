@@ -1,4 +1,6 @@
 name: Promote qualified release
+# Named for the tag, so `make mcp-registry-publish` can find a release's run.
+run-name: Promote ${{ inputs.tag }}
 
 on:
   workflow_dispatch:
@@ -99,7 +101,11 @@ jobs:
     # update never touches the release, and it reads only the published
     # candidate.json, checked against the qualified digest. The token is a
     # secret of the `release` environment, which only main can reach.
-    # Without it the job says so and succeeds.
+    # Without it the job says so and succeeds. Each published relish binary,
+    # checked against that record, is also packed as a bottle: without one,
+    # Homebrew treats the formula as a build from source and demands current
+    # Command Line Tools though nothing compiles. The bottles go to a release
+    # of the tap's own, so this job never needs write access here.
     needs: promote
     if: github.ref == 'refs/heads/main'
     environment: release
@@ -113,14 +119,56 @@ jobs:
       QUALIFIED_DIGEST: ${{ inputs.qualified_digest }}
     steps:
       - uses: actions/checkout@v4
-      - name: Write the formula from the published release
+      - name: Write the bottles and formula from the published release
         run: |
           gh release download "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" \
-            --pattern candidate.json --dir published
+            --pattern candidate.json --pattern 'relish-*' --dir published
+          python3 scripts/release/homebrew.py bottles --record published/candidate.json \
+            --qualified-digest "$QUALIFIED_DIGEST" --binaries published --output bottles
           python3 scripts/release/homebrew.py formula --record published/candidate.json \
-            --qualified-digest "$QUALIFIED_DIGEST" --output relish.rb
+            --qualified-digest "$QUALIFIED_DIGEST" --bottles bottles/bottles.json --output relish.rb
           { echo '### Homebrew formula'; echo '```ruby'; cat relish.rb; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-      - name: Push the formula to the tap
+      - name: Push the bottles and formula to the tap
         env:
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-        run: python3 scripts/release/homebrew.py publish --formula relish.rb --version "$RELEASE_TAG"
+        run: |
+          python3 scripts/release/homebrew.py publish --formula relish.rb --version "$RELEASE_TAG" \
+            --bottles bottles
+
+  mcp-registry-entry:
+    # The MCP Registry entry for this release (#1695): the tag's server.json
+    # plus one `mcpb` package per relish platform, each with the SHA-256 the
+    # published candidate.json records for its bundle. Publishing it needs
+    # the maintainer's GitHub login to the organisation, so this job only
+    # writes it, to the run summary and as an artefact; the maintainer
+    # publishes it with `make mcp-registry-publish TAG=<tag>` (docs/releasing.md).
+    needs: promote
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.tag }}
+      RELEASE_REPOSITORY: ${{ github.repository }}
+      QUALIFIED_DIGEST: ${{ inputs.qualified_digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Write the entry from the published release
+        run: |
+          git fetch --no-tags origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          git show "refs/tags/$RELEASE_TAG:server.json" > tagged-server.json
+          gh release download "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" \
+            --pattern candidate.json --dir published
+          mkdir registry
+          python3 scripts/release/mcp_registry.py --record published/candidate.json \
+            --server tagged-server.json --qualified-digest "$QUALIFIED_DIGEST" \
+            --output registry/server.json
+          { echo '### MCP Registry entry'; echo '```json'; cat registry/server.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Keep the entry for the maintainer to publish
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcp-registry-server-json
+          path: registry/server.json
+          if-no-files-found: error
+          retention-days: 90

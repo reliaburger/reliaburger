@@ -102,12 +102,23 @@ it, and list your own laptop's network in `[security] operator_cidrs` so
 ## Watch it
 
 ```sh
-relish nodes            # gossip membership and node state
+relish status           # the whole cluster on one screen
+relish nodes            # gossip membership, version, usage and allocation
 relish council status   # every node's view of the council
 ```
 
+`relish status` gives a verdict (`HEALTHY`, `DEGRADED`, or `DOWN` when the
+council has lost its quorum or its leader), then one line each for nodes, the
+council, gossip, versions, capacity, apps, jobs, logs, faults, alerts,
+certificates and agents (leases held, proposals waiting for approval). It's the same size on three nodes or three hundred: a line that
+needs attention ends in the command that shows the detail, such as
+`relish nodes --unhealthy` or `relish apps --unhealthy`.
+
 `relish nodes` shows every member's gossip state: `alive`, `suspect` (missed
-its probes, not yet declared dead) or `dead`. A dead node stays listed for up
+its probes, not yet declared dead) or `dead`, with `cordoned` or `disk` (85%
+full or more) added to an alive node's state. Beside it are the node's Bun
+version, its CPU, memory and disk use, and what the scheduler has allocated
+there. Nodes with a problem come first, and `--unhealthy` keeps only them. A dead node stays listed for up
 to a day after it was last heard from, so you can see what went missing. It
 drops off sooner if it comes back, leaves the cluster on purpose, or you
 retire it with `relish decommission-node`.
@@ -118,8 +129,9 @@ the table it prints the epoch, the leader and quorum (`3/3 voters, quorum
 ok`), and it lists any node that didn't answer. One node's answer can't show a
 split, so it compares them all and calls out fenced nodes, two epochs or two
 leaders. A cluster created with a council size shows it on a `Size:` line
-(`up to 5 voters`). `--output json` gives the same report to scripts. `relish
-status` opens with a one-line summary of it.
+(`up to 5 voters`). `--output json` gives the same report to scripts.
+`relish status` sums it up on its `council` line: the leader and its term,
+the voters, and whether quorum holds.
 
 The council heals itself: lose a voter and the reconciler swaps a caught-up
 node in for it, in one membership change, so the voter count stays odd. A voter whose disk is at least 95% full for ten minutes
@@ -147,6 +159,10 @@ should come in under:
 | `relish apply` returns, its change committed | 2 s |
 | A new instance of an app passes its health check | 5 s |
 | A rolling update reaches every node | 30 s |
+
+`relish status` answers from one summary call to the node you're connected
+to. It also runs `relish wtf`'s checks alongside, with their own 2 s budget;
+past that its `wtf` line says `not checked in time`, and `--quick` skips them.
 
 Only the first one fails a release today. The other four were first measured
 in October 2026 and are recorded, not yet enforced: treat them as targets

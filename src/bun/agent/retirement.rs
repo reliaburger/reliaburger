@@ -105,25 +105,55 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.release_network_reference(instance_id, remote.as_ref())
             .await?;
         if let Some(directory) = self.records_dir.clone() {
-            let id = instance_id.0.clone();
-            // LOOP-INLINE: fsync'd persist (#351 decision 2); the slow-disk scenario bounds it
-            tokio::task::spawn_blocking(move || {
-                crate::grill::records::remove_record(&directory, &id)
-            })
-            .await
-            .map_err(|error| BunError::RetirementState {
-                instance_id: instance_id.clone(),
-                reason: error.to_string(),
-            })?
-            .map_err(|error| BunError::RetirementState {
-                instance_id: instance_id.clone(),
-                reason: error.to_string(),
-            })?;
+            self.remove_restart_record(instance_id, directory).await?;
         }
         self.forget_retired_egress_owner(instance_id).await?;
         // Validate the mount source before a new runtime can consume it. The
         // preparation is idempotent and preserves this workload's credentials.
         self.prepare_instance_identity(instance_id).await
+    }
+
+    /// Remove a restarted instance's previous adoption record from a task
+    /// ([`off_loop_work`]), waiting for it only until the turn's deadline
+    /// (#1853). `StillRunning` means ask again: the next pass of the restart
+    /// collects the same removal. A write of the record still in flight goes
+    /// first, so it can't land after the removal.
+    async fn remove_restart_record(
+        &mut self,
+        instance_id: &InstanceId,
+        directory: PathBuf,
+    ) -> Result<(), BunError> {
+        if self.record_write_in_flight(instance_id) {
+            return Err(BunError::StillRunning {
+                work: off_loop_work::WorkKey::PersistRecord(instance_id.clone()).to_string(),
+            });
+        }
+        self.forget_landed_record_write(instance_id);
+        let key = off_loop_work::WorkKey::RemoveRestartRecord(instance_id.clone());
+        let incarnation = self.incarnation_of(instance_id);
+        #[cfg(test)]
+        let delay = (!self.off_loop_work.started(&key, incarnation))
+            .then(|| self.loop_stalls.reach(LoopStall::RecordWrite))
+            .flatten();
+        let id = instance_id.0.clone();
+        let removal = async move {
+            #[cfg(test)]
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            tokio::task::spawn_blocking(move || {
+                crate::grill::records::remove_record(&directory, &id)
+            })
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())
+        };
+        self.finish_off_loop_work(key, incarnation, removal)
+            .await?
+            .map_err(|reason| BunError::RetirementState {
+                instance_id: instance_id.clone(),
+                reason,
+            })
     }
 
     pub(super) async fn retire_initialisers(
@@ -168,6 +198,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         &mut self,
         instance_id: &InstanceId,
     ) -> Result<(), BunError> {
+        // A write that lands after the removal would leave a record or an
+        // identity for an instance that no longer exists (#1853).
+        if self.record_write_in_flight(instance_id) || self.identity_store_in_flight(instance_id) {
+            return Err(BunError::StillRunning {
+                work: format!("writing {instance_id}'s adoption record or identity"),
+            });
+        }
+        self.forget_landed_record_write(instance_id);
         let key = off_loop_work::WorkKey::RetireArtifacts(instance_id.clone());
         let incarnation = self.incarnation_of(instance_id);
         if !self.off_loop_work.started(&key, incarnation) {
@@ -218,6 +256,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             })?;
         self.forget_retired_egress_owner(instance_id).await?;
         self.launch_executions.remove(instance_id);
+        self.reported_executions.remove(instance_id);
         if let Some(instance) = self.supervisor.get_instance_mut(instance_id) {
             instance.identity = None;
             instance.identity_mount = None;

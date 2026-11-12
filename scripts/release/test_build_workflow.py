@@ -191,6 +191,38 @@ class SourceCiReuseTests(unittest.TestCase):
         self.assertIn('source_ci="reused ci.yml run $CI_RUN, attempt $CI_RUN_ATTEMPT"', record)
         self.assertIn('echo "Source CI: $source_ci"', record)
 
+    def test_the_search_waits_for_a_run_still_going_within_its_timeout(self):
+        # A candidate is dispatched while main's push CI still runs (#1722):
+        # the search waits for it, and the job's timeout must outlast the wait,
+        # so the script reaches its own deadline and says why it gave up.
+        evidence = job(self.text, "ci-evidence")
+        wait = int(re.search(r'--wait-minutes (\d+)', evidence).group(1))
+        timeout = int(re.search(r"^    timeout-minutes: (\d+)$", evidence, re.M).group(1))
+        self.assertGreaterEqual(wait, 60)
+        self.assertGreater(timeout, wait + 5)
+
+    def test_the_build_jobs_never_wait_for_the_search(self):
+        # The wait overlaps the binary builds; only the suite and the
+        # candidate job depend on it.
+        for name in ("changes", "build-pdf", "build-binaries", "build-profiling", "build-guest-images",
+                     "test-packaging", "notarise-macos"):
+            with self.subTest(job=name):
+                self.assertNotIn("ci-evidence", job(self.text, name))
+
+    def test_the_record_names_the_ci_run_the_candidate_rests_on(self):
+        # candidate.json says which ci.yml run passed: the reused one, or this
+        # build's own when validate-release ran (#1722).
+        record = step_named(self.text, "Record exact candidate identity and all asset digests")
+        self.assertIn("VALIDATE_RESULT: ${{ needs.validate-release.result }}", record)
+        self.assertIn('if [ "$VALIDATE_RESULT" = success ]; then', record)
+        self.assertIn('ci_run=$CANDIDATE_RUN ci_attempt=$CANDIDATE_ATTEMPT', record)
+        self.assertIn('ci_run=$CI_RUN ci_attempt=$CI_RUN_ATTEMPT', record)
+        self.assertIn('--source-ci-run "$ci_run" --source-ci-attempt "$ci_attempt"', record)
+        self.assertIn('echo "SOURCE_CI_RUN=$ci_run"', record)
+        self.assertIn('echo "SOURCE_CI_ATTEMPT=$ci_attempt"', record)
+        verify = step_named(self.text, "Check the candidate is still exactly what was recorded")
+        self.assertIn('--source-ci-run "$SOURCE_CI_RUN" --source-ci-attempt "$SOURCE_CI_ATTEMPT"', verify)
+
 
 def run_script(block):
     """The shell script of a step's `run: |`, dedented."""
@@ -286,6 +318,55 @@ class SourceBundleTests(unittest.TestCase):
         text = WORKFLOW.read_text()
         job = text.split("\n  build-binaries:\n", 1)[1].split("\n  build-profiling:\n", 1)[0]
         self.assertIn('RELIABURGER_REQUIRE_CLEAN_SOURCE: "1"', job)
+
+    def test_no_source_bundle_work_is_left_to_do(self):
+        self.assertNotIn("TODO(#1570)", WORKFLOW.read_text())
+
+    def test_each_build_reads_the_digest_from_the_relish_it_built(self):
+        # The relish itself says what it embeds; nothing recomputes it (#1694).
+        text = WORKFLOW.read_text()
+        binaries = job(text, "build-binaries")
+        record = step_named(binaries, "Record the embedded source bundle's digest")
+        self.assertIn("target/${{ matrix.target }}/release/relish agent source version --offline", record)
+        self.assertIn("python3 scripts/release/candidate.py bundle-digest", record)
+        self.assertIn("source-digest/relish-${{ matrix.suffix }}", record)
+        upload = step_named(binaries, "Upload the source bundle's digest")
+        self.assertIn("name: source-digest-${{ matrix.suffix }}", upload)
+        self.assertIn("path: source-digest/*", upload)
+        self.assertIn("if-no-files-found: error", upload)
+        # Never among the binaries: the candidate job records every file it
+        # downloads as `binaries-*` as a release asset, and notarisation
+        # replaces the macOS one wholesale.
+        self.assertFalse(fnmatch.fnmatch("source-digest-linux-x86_64", "binaries-*"))
+        order = [block.splitlines()[0].strip() for block in steps(binaries)]
+        self.assertLess(order.index("- name: Smoke test and package native binaries"),
+                        order.index("- name: Record the embedded source bundle's digest"))
+
+    def test_the_candidate_records_the_digest_every_platform_agrees_on(self):
+        text = WORKFLOW.read_text()
+        candidate = job(text, "candidate")
+        download = step_named(candidate, "Download every build's source bundle digest")
+        self.assertIn("pattern: source-digest-*", download)
+        self.assertIn("merge-multiple: true", download)
+        self.assertIn("path: source-digests", download)
+        agree = step_named(candidate, "Agree on the source bundle's digest")
+        self.assertIn("python3 scripts/release/candidate.py agreed-source-digest --directory source-digests",
+                      agree)
+        self.assertIn('echo "SOURCE_DIGEST=$digest" >> "$GITHUB_ENV"', agree)
+        record = step_named(candidate, "Record exact candidate identity and all asset digests")
+        self.assertIn('--source-digest "$SOURCE_DIGEST"', record)
+        self.assertIn("Source bundle: ", record)
+        check = step_named(candidate, "Check the candidate is still exactly what was recorded")
+        self.assertIn('--source-digest "$SOURCE_DIGEST"', check)
+        order = [block.splitlines()[0].strip() for block in steps(candidate)]
+        self.assertLess(order.index("- name: Agree on the source bundle's digest"),
+                        order.index("- name: Record exact candidate identity and all asset digests"))
+
+    def test_the_digest_files_are_named_for_every_relish_platform(self):
+        from package import PLATFORMS
+
+        suffixes = {entry["suffix"] for entry in build_matrix(WORKFLOW.read_text())}
+        self.assertTrue(set(PLATFORMS["relish"]) <= suffixes)
 
 
 class StrangerChecksTests(unittest.TestCase):

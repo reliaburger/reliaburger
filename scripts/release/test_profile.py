@@ -117,6 +117,24 @@ class CategoriesTests(unittest.TestCase):
         self.assertEqual(result["uncategorised_share"], 0.0)
         self.assertNotIn("extend", profile_categories.table(result))
 
+    RAYON = ("rb-bun;[libc.so.6];<std::sys::thread::unix::Thread>::new::thread_start;"
+             "<rayon_core::registry::ThreadBuilder>::run;<rayon_core::registry::WorkerThread>::wait_until_cold;"
+             "rayon::iter::plumbing::bridge_producer_consumer::helper<rayon::iter::par_bridge::IterParallelProducer>")
+
+    def test_sysinfo_proc_walks_on_rayon_threads_count_as_mayo(self):
+        # Mayo's collector refreshes every process through sysinfo, which walks
+        # /proc on rayon's threads: no reliaburger:: frame is on the stack.
+        walk = self.RAYON + ";sysinfo::unix::linux::process::refresh_procs::{closure};" \
+            "sysinfo::unix::linux::process::_get_stat_data;open64;el0_svc;do_sys_openat2"
+        result = profile_categories.categorise({walk: 7}, {walk: 7})
+        self.assertEqual(result["bun_categories"], {"Bun: metrics (Mayo)": 7})
+        self.assertEqual(result["uncategorised_share"], 0.0)
+
+    def test_rayon_work_without_sysinfo_stays_uncategorised(self):
+        # Rayon work from any crate other than sysinfo isn't Mayo's.
+        other = self.RAYON + ";some_crate::parallel_sort::{closure}"
+        self.assertEqual(profile_categories.bun_category(other), profile_categories.BUN_UNCATEGORISED)
+
     def test_per_task_microseconds_use_the_rate(self):
         result = profile_categories.categorise({"swapper;idle": 50, "busybox;x": 50}, {})
         table = profile_categories.table(result, rate=10000, cpus=4)

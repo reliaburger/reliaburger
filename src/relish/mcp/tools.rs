@@ -14,6 +14,12 @@
 //! a tool that could would turn a prompt injection in a log line into an
 //! action. The tools/list snapshot in the tests is where a reviewer sees a
 //! new tool arrive.
+//!
+//! [`PROPOSING`] is the one exception, and only under `relish mcp
+//! --propose` (#1682): the commands that write a proposal or a lease to the
+//! council. They change no workload. A person, or a policy an admin wrote,
+//! approves a proposal, and nothing in `relish agent` can approve, reject or
+//! undo directly, so the worst an injected instruction can do is ask.
 
 use std::any::TypeId;
 use std::collections::BTreeSet;
@@ -54,20 +60,91 @@ pub const EXCLUDED: &[Exclusion] = &[
               and --metadata reads any local file",
     },
     Exclusion {
+        command: "verify",
+        why: "downloads release metadata and binaries from the internet, beyond the cluster API, \
+              and --metadata, --cli-metadata and --artefacts read any local file",
+    },
+    Exclusion {
         command: "setup",
         why: "writes the configuration of the user's agents",
     },
 ];
 
+/// A `relish agent` command only `relish mcp --propose` offers (#1682).
+#[derive(Debug, Clone, Copy)]
+pub struct Proposing {
+    /// The command, or group of commands, after `relish agent`.
+    pub command: &'static str,
+    /// What it does to the council.
+    pub what: &'static str,
+    /// Whether it only reads.
+    pub read_only: bool,
+}
+
+/// The proposing commands: they write proposals and leases to the council,
+/// never a workload. Plain `relish mcp` names them in its instructions and
+/// refuses them, saying how to get them.
+pub const PROPOSING: &[Proposing] = &[
+    Proposing {
+        command: "lease",
+        what: "takes, renews and releases leases on apps and namespaces",
+        read_only: false,
+    },
+    Proposing {
+        command: "propose",
+        what: "proposes a change for a person or an admin's policy to approve",
+        read_only: false,
+    },
+    Proposing {
+        command: "proposals",
+        what: "reads proposals",
+        read_only: true,
+    },
+    Proposing {
+        command: "withdraw",
+        what: "withdraws a proposal it made",
+        read_only: false,
+    },
+    Proposing {
+        command: "undo",
+        what: "proposes undoing an applied proposal",
+        read_only: false,
+    },
+];
+
+/// The proposing entry for `command`, if there is one; a group covers every
+/// command under it.
+pub fn proposing(command: &str) -> Option<&'static Proposing> {
+    PROPOSING
+        .iter()
+        .find(|entry| covers(entry.command, command))
+}
+
+/// Argument values `relish mcp` never passes, and why: `propose apply`
+/// reads a local TOML file, so through MCP it would read any file the
+/// server can.
+const REFUSED_VALUES: &[(&str, &str, &str, &str)] = &[(
+    "propose",
+    "kind",
+    "apply",
+    "reads a local file, so relish mcp doesn't offer it; propose scale, rollback, stop, \
+     delete, restart, cancel-deploy or clear-fault, or run `relish agent propose apply` \
+     yourself",
+)];
+
+fn covers(group: &str, command: &str) -> bool {
+    command == group
+        || command
+            .strip_prefix(group)
+            .is_some_and(|rest| rest.starts_with(' '))
+}
+
 /// The exclusion for `command`, if there is one. An excluded group, such as
 /// `patch`, excludes every command under it (`patch init`, `patch try`).
 pub fn exclusion(command: &str) -> Option<&'static Exclusion> {
-    EXCLUDED.iter().find(|excluded| {
-        command == excluded.command
-            || command
-                .strip_prefix(excluded.command)
-                .is_some_and(|rest| rest.starts_with(' '))
-    })
+    EXCLUDED
+        .iter()
+        .find(|excluded| covers(excluded.command, command))
 }
 
 /// The shape of one argument's value, as JSON and on the command line.
@@ -112,6 +189,9 @@ pub struct ToolSpec {
     /// Arguments `relish mcp` fixed, such as `--namespace`'s; the caller
     /// can't pass them and the input schema doesn't list them.
     pub pinned: JsonObject,
+    /// The budget a call gets when it names none, set by [`select`] for a
+    /// tool that takes `max_bytes`. `None` leaves the command's own.
+    pub budget: Option<usize>,
     /// The tool as `tools/list` describes it.
     pub tool: Tool,
 }
@@ -141,6 +221,16 @@ pub fn command_name(command: &str) -> Option<CommandName> {
 /// gives a command's `data` schema ([`data_schema`]); the tests pass
 /// stand-ins for both.
 pub fn derive(tree: clap::Command, schema: &dyn Fn(&str) -> Option<Value>) -> Vec<ToolSpec> {
+    derive_with(tree, schema, false)
+}
+
+/// [`derive`], with the [`PROPOSING`] commands too when `propose` is set:
+/// `relish mcp --propose`.
+pub fn derive_with(
+    tree: clap::Command,
+    schema: &dyn Fn(&str) -> Option<Value>,
+    propose: bool,
+) -> Vec<ToolSpec> {
     let mut tree = tree;
     // Building copies global flags (`--max-bytes`, `source --offline`) into
     // every subcommand, so each leaf lists all the flags it accepts.
@@ -150,6 +240,7 @@ pub fn derive(tree: clap::Command, schema: &dyn Fn(&str) -> Option<Value>) -> Ve
     leaves
         .into_iter()
         .filter(|(words, _)| exclusion(&words.join(" ")).is_none())
+        .filter(|(words, _)| propose || proposing(&words.join(" ")).is_none())
         .filter_map(|(words, command)| {
             let name = words.join(" ");
             let data = schema(&name)?;
@@ -192,14 +283,18 @@ fn tool_spec(words: &[String], command: &clap::Command, data: Value) -> ToolSpec
         .unwrap_or_else(|| format!("relish agent {name}"));
     let mut input = input_schema(command);
     with_budget_default(&mut input, &name);
+    without_refused_values(&mut input, &name);
     let mut tool = Tool::new(tool_name(&name), description, Arc::new(input));
     tool.title = Some(format!("relish agent {name}"));
     tool.output_schema = Some(Arc::new(output_schema(data)));
+    // A proposing tool writes a council record, never a workload, so it
+    // isn't destructive; it isn't read-only or idempotent either.
+    let writes = proposing(&name).is_some_and(|entry| !entry.read_only);
     tool.annotations = Some(
         ToolAnnotations::with_title(format!("relish agent {name}"))
-            .read_only(true)
+            .read_only(!writes)
             .destructive(false)
-            .idempotent(true)
+            .idempotent(!writes)
             // The tool's world is this binary and the cluster it points at.
             .open_world(false),
     );
@@ -209,6 +304,7 @@ fn tool_spec(words: &[String], command: &clap::Command, data: Value) -> ToolSpec
         returns_workload_text,
         arguments,
         pinned: JsonObject::new(),
+        budget: None,
         tool,
     }
 }
@@ -282,6 +378,22 @@ fn input_schema(command: &clap::Command) -> JsonObject {
     }
     schema.insert("additionalProperties".into(), json!(false));
     schema
+}
+
+/// Take [`REFUSED_VALUES`] out of a command's `enum`s, so the schema
+/// offers only what `relish mcp` passes.
+fn without_refused_values(schema: &mut JsonObject, command: &str) {
+    for (refused_command, property, value, _) in REFUSED_VALUES {
+        if *refused_command != command {
+            continue;
+        }
+        if let Some(Value::Object(properties)) = schema.get_mut("properties")
+            && let Some(Value::Object(property)) = properties.get_mut(*property)
+            && let Some(Value::Array(choices)) = property.get_mut("enum")
+        {
+            choices.retain(|choice| choice != value);
+        }
+    }
 }
 
 /// `--max-bytes` has no clap default because the default depends on the
@@ -402,7 +514,63 @@ pub struct Selection {
     pub no_logs: bool,
     /// Fix every `namespace` argument to this one.
     pub namespace: Option<String>,
+    /// Offer the [`PROPOSING`] tools too: `relish mcp --propose`.
+    pub propose: bool,
+    /// Every tool's budget when a call names none: `relish mcp
+    /// --max-bytes`. [`DEFAULT_MAX_BYTES`] when `None`.
+    pub max_bytes: Option<ServerBudget>,
 }
+
+/// What `relish mcp --max-bytes` set: one budget for every tool, or, with
+/// `--max-bytes 0`, each command's own default (24 KiB, 80 KiB for
+/// `guide`, 40 KiB for `schema`), as the Claude Code plugin runs it.
+/// Either way no call gets more than [`MAX_BYTES_CEILING`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerBudget {
+    /// This many bytes for every tool.
+    Every(usize),
+    /// Each command's own default: `--max-bytes 0`.
+    CommandDefaults,
+}
+
+impl ServerBudget {
+    /// The budget `command`'s tool gets when a call names none.
+    fn for_command(self, command: &str) -> usize {
+        match self {
+            ServerBudget::Every(bytes) => bytes,
+            ServerBudget::CommandDefaults => command_name(command)
+                .map_or(agent::DEFAULT_MAX_BYTES, agent::default_max_bytes)
+                .min(MAX_BYTES_CEILING),
+        }
+    }
+}
+
+/// `relish mcp`'s budget when `--max-bytes` isn't given: 8 KiB, about 2,000
+/// tokens, for every tool.
+///
+/// The `relish agent` commands default to 24 KiB (80 KiB for `guide`), which
+/// a large model reads easily. A small local model copies a schema's
+/// `default` into its calls, and the largest it has seen, so the default is
+/// the budget it sends; at 24 KiB three answers fill an 8K-token window.
+/// An answer that doesn't fit says so and names the rerun that would, so a
+/// client with room asks for more (#1687).
+pub const DEFAULT_MAX_BYTES: usize = 8 * 1024;
+
+/// The most a `relish mcp` call gets, whatever it asks for: 128 KiB, room
+/// for the whole guide (80 KiB) or the biggest schema (40 KiB), and an
+/// eighth of the megabyte a small model was seen asking for.
+pub const MAX_BYTES_CEILING: usize = 128 * 1024;
+
+/// The argument that carries a call's budget.
+const MAX_BYTES: &str = "max_bytes";
+
+/// `max_bytes`'s description in every tool's input schema. The CLI's says
+/// which default each command has, which `relish mcp` doesn't use, and at
+/// about 200 bytes in each of 14 tools it was a quarter of what a model
+/// read of the tool list every turn (#1687). The schema's `default`,
+/// `minimum` and `maximum` carry the numbers.
+const BUDGET_DESCRIPTION: &str =
+    "Largest answer in bytes; a bigger one is trimmed and marked `truncated`";
 
 /// Why a [`Selection`] can't be served.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -449,6 +617,12 @@ pub fn select(
             Some(namespace) => tool.pin(NAMESPACE, namespace),
             None => tool,
         })
+        .map(|tool| {
+            let budget = selection.max_bytes.map_or(DEFAULT_MAX_BYTES, |budget| {
+                budget.for_command(&tool.command)
+            });
+            tool.with_budget(budget)
+        })
         .collect())
 }
 
@@ -456,6 +630,50 @@ pub fn select(
 const NAMESPACE: &str = "namespace";
 
 impl ToolSpec {
+    /// The same tool with `budget` as the default `max_bytes`, advertised
+    /// in its input schema with the floor and [`MAX_BYTES_CEILING`] as
+    /// bounds, when it takes one.
+    fn with_budget(mut self, budget: usize) -> Self {
+        if !self.arguments.iter().any(|spec| spec.property == MAX_BYTES) {
+            return self;
+        }
+        self.budget = Some(budget);
+        let mut schema = (*self.tool.input_schema).clone();
+        if let Some(Value::Object(properties)) = schema.get_mut("properties")
+            && let Some(Value::Object(property)) = properties.get_mut(MAX_BYTES)
+        {
+            property.insert("description".into(), json!(BUDGET_DESCRIPTION));
+            property.insert("default".into(), json!(budget));
+            property.insert("minimum".into(), json!(agent::MIN_MAX_BYTES));
+            property.insert("maximum".into(), json!(MAX_BYTES_CEILING));
+        }
+        self.tool.input_schema = Arc::new(schema);
+        self
+    }
+
+    /// `arguments` with this tool's budget filled in when they name none,
+    /// and held to [`MAX_BYTES_CEILING`] when they name more.
+    fn budgeted(&self, arguments: &JsonObject) -> JsonObject {
+        let mut arguments = arguments.clone();
+        let Some(budget) = self.budget else {
+            return arguments;
+        };
+        match arguments.get(MAX_BYTES) {
+            None | Some(Value::Null) => {
+                arguments.insert(MAX_BYTES.into(), json!(budget));
+            }
+            Some(Value::Number(asked))
+                if asked
+                    .as_u64()
+                    .is_some_and(|asked| asked > MAX_BYTES_CEILING as u64) =>
+            {
+                arguments.insert(MAX_BYTES.into(), json!(MAX_BYTES_CEILING));
+            }
+            Some(_) => {}
+        }
+        arguments
+    }
+
     /// The same tool with `property` fixed to `value`, when it takes it.
     fn pin(mut self, property: &str, value: &str) -> Self {
         if !self.arguments.iter().any(|spec| spec.property == property) {
@@ -480,6 +698,13 @@ impl ToolSpec {
     /// read as another flag, and positionals go after `--` for the same
     /// reason. clap then parses the line exactly as it parses a typed one.
     pub fn command_line(&self, arguments: &JsonObject) -> Result<Vec<String>, String> {
+        for (command, property, value, why) in REFUSED_VALUES {
+            if self.command == *command
+                && arguments.get(*property).and_then(Value::as_str) == Some(*value)
+            {
+                return Err(format!("{property} {value} {why}"));
+            }
+        }
         for key in arguments.keys() {
             if let Some(value) = self.pinned.get(key) {
                 return Err(format!(
@@ -499,6 +724,7 @@ impl ToolSpec {
                 ));
             }
         }
+        let arguments = &self.budgeted(arguments);
         let mut line: Vec<String> = std::iter::once("agent".to_string())
             .chain(self.command.split(' ').map(str::to_string))
             .collect();

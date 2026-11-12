@@ -272,7 +272,7 @@ pub enum GrillError {
 
 /// Why a workload's executable can't run, found before launching it.
 ///
-/// Its message is the reason `relish status` and `relish wtf` show.
+/// Its message is the reason `relish apps` and `relish wtf` show.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LaunchProblem {
     /// No file at the path, or no match on the workload's `PATH`.

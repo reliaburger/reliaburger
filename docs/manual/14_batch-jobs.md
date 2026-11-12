@@ -134,7 +134,7 @@ those exact unknown grants; repeating an old acknowledgement can't authorise a
 later unknown attempt. The cluster service principal cannot make this decision.
 
 Singleton status and logs use `run-ID`, a stable identifier independent of the
-worker's reusable runtime slot. `relish status` reports a live singleton's PID;
+worker's reusable runtime slot. `relish apps --instances` reports a live singleton's PID;
 indexed batches stay in summary views. Select `--instance run-ID` when several
 retained runs share a logical name. Live logs follow the owning worker and
 completed singleton output remains bounded by the task-output retention policy.

@@ -2,7 +2,9 @@
   "mcpServers": {
     "reliaburger": {
       "args": [
-        "mcp"
+        "mcp",
+        "--max-bytes",
+        "0"
       ],
       "command": "relish"
     }

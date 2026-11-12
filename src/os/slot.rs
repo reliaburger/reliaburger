@@ -302,31 +302,51 @@ impl OsSlot {
             .map_err(|e: OsError| e.to_string())?;
         let files = wanted(&entries, version)?;
 
-        std::fs::create_dir_all(&self.paths.staging).map_err(|e| e.to_string())?;
-        set_private(&self.paths.staging)?;
-        let incoming = self.paths.staging.join(".incoming");
-        let _ = std::fs::remove_dir_all(&incoming);
-        std::fs::create_dir_all(&incoming).map_err(|e| e.to_string())?;
+        let staging = self.paths.staging.clone();
+        let incoming = tokio::task::spawn_blocking(move || empty_incoming(&staging))
+            .await
+            .map_err(|e| e.to_string())??;
         for file in &files {
             eprintln!("bun: os update: fetching {file}");
             let digest = download(&client, &url(file)?, &incoming.join(file)).await?;
             check_asset(&entries, &sums_name, file, &digest).map_err(|e| e.to_string())?;
         }
-        // Only verified files, and only this version's, reach sysupdate.
-        for entry in std::fs::read_dir(&self.paths.staging).map_err(|e| e.to_string())? {
-            let path = entry.map_err(|e| e.to_string())?.path();
-            if path.is_file() {
-                std::fs::remove_file(&path).map_err(|e| e.to_string())?;
-            }
-        }
-        for file in &files {
-            std::fs::rename(incoming.join(file), self.paths.staging.join(file))
-                .map_err(|e| e.to_string())?;
-        }
-        let _ = std::fs::remove_dir_all(&incoming);
+        let staging = self.paths.staging.clone();
+        tokio::task::spawn_blocking(move || promote_incoming(&staging, &incoming, &files))
+            .await
+            .map_err(|e| e.to_string())??;
         eprintln!("bun: os update: {version} checked; running systemd-sysupdate");
         run(&self.paths.sysupdate, &[version.as_str()]).await
     }
+}
+
+/// Make the private staging directory and an empty `.incoming` inside it,
+/// where downloads land until they're checked. Blocking: run it off the
+/// runtime.
+fn empty_incoming(staging: &Path) -> Result<std::path::PathBuf, String> {
+    std::fs::create_dir_all(staging).map_err(|e| e.to_string())?;
+    set_private(staging)?;
+    let incoming = staging.join(".incoming");
+    let _ = std::fs::remove_dir_all(&incoming);
+    std::fs::create_dir_all(&incoming).map_err(|e| e.to_string())?;
+    Ok(incoming)
+}
+
+/// Replace what `staging` holds with the checked `files` from `incoming`, so
+/// only verified files, and only this version's, reach sysupdate. Blocking:
+/// run it off the runtime.
+fn promote_incoming(staging: &Path, incoming: &Path, files: &[String]) -> Result<(), String> {
+    for entry in std::fs::read_dir(staging).map_err(|e| e.to_string())? {
+        let path = entry.map_err(|e| e.to_string())?.path();
+        if path.is_file() {
+            std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+        }
+    }
+    for file in files {
+        std::fs::rename(incoming.join(file), staging.join(file)).map_err(|e| e.to_string())?;
+    }
+    let _ = std::fs::remove_dir_all(incoming);
+    Ok(())
 }
 
 fn save(path: &Path, state: &OsUpdateState) -> std::io::Result<()> {
@@ -502,6 +522,32 @@ mod tests {
 
     /// Stage a signed release from a local server, through to sysupdate and
     /// the reboot (both stand-ins that record what they were given).
+    #[test]
+    fn staging_keeps_only_the_checked_files_of_this_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("staging");
+        let incoming = empty_incoming(&staging).unwrap();
+        std::fs::write(staging.join("reliaburger-os_1.usr.raw"), b"old").unwrap();
+        std::fs::write(incoming.join("reliaburger-os_2.usr.raw"), b"new").unwrap();
+
+        promote_incoming(
+            &staging,
+            &incoming,
+            &["reliaburger-os_2.usr.raw".to_string()],
+        )
+        .unwrap();
+
+        let names: Vec<String> = std::fs::read_dir(&staging)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["reliaburger-os_2.usr.raw"]);
+        assert_eq!(
+            std::fs::read(staging.join("reliaburger-os_2.usr.raw")).unwrap(),
+            b"new"
+        );
+    }
+
     #[tokio::test]
     async fn staging_checks_the_release_then_runs_sysupdate_and_reboots() {
         let dir = tempfile::tempdir().unwrap();

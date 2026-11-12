@@ -11,6 +11,8 @@ The nodes run plaintext on loopback (`require_mtls = false`) with a shared
 master key, so the API still checks every token: the solver's read-only token
 is refused anything else, and the refusal lands in the audit log.
 """
+import base64
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -232,15 +234,20 @@ class LocalCluster:
             text = text.replace(placeholder, value)
         return text
 
-    def apply(self, relative):
+    def write_manifest(self, relative):
+        """Write a scenario manifest out for this cluster; its path."""
         path = self.work_dir / Path(relative).name
         path.write_text(self.manifest(relative))
+        return path
+
+    def apply(self, relative):
+        path = self.write_manifest(relative)
         completed = self.relish(["apply", str(path)])
         if completed.returncode != 0:
             raise ClusterError(f"relish apply {relative} failed: {completed.stderr.strip()}")
 
     def instances(self):
-        return status_instances(self.relish_json(["status"]))
+        return status_instances(self.relish_json(["apps", "--instances"]))
 
     def wait_running(self, app):
         def running():
@@ -308,12 +315,34 @@ class LocalCluster:
                 f"the partition of {target} was refused: {error.code} {error.read().decode()}"
             ) from error
 
+    def write_release(self, directory, kind):
+        """Write the release files a scenario hands the solver; see scenario.RELEASES.
+
+        The metadata names the version and platform the first node reports,
+        so `relish agent verify` finds the release, and a SHA-256 of other
+        bytes, so the node's binary doesn't match it. Returns what it wrote.
+        """
+        with urllib.request.urlopen(f"{self.api(self.names[0])}/v1/version", timeout=10) as reply:
+            running = json.loads(reply.read())
+        return write_release(directory, kind, running["version"], running["platform"])
+
     def create_token(self, name):
         """A read-only token for the solver, and its plaintext."""
         created = self.relish(["token", "create", "--name", name, "--role", "read-only"])
         if created.returncode != 0:
             raise ClusterError(f"couldn't create the solver's token: {created.stderr.strip()}")
         return created.stdout.strip().splitlines()[-1].strip()
+
+    def create_agent_token(self, name):
+        """A deployer agent token (#1682): it proposes and takes leases, never writes."""
+        created = self.relish(["token", "create", "--name", name, "--agent", "--role", "deployer"])
+        if created.returncode != 0:
+            raise ClusterError(f"couldn't create the agent token {name}: {created.stderr.strip()}")
+        return created.stdout.strip().splitlines()[-1].strip()
+
+    def newest_proposal(self, author):
+        """The number of the newest proposal `author` made, or None."""
+        return newest_proposal(self.relish_json(["proposal", "list"]), author)
 
     def audit(self, principal):
         """Every audit record, on every node, whose principal is `principal`."""
@@ -356,7 +385,7 @@ class LocalCluster:
 
 
 def status_instances(document):
-    """`relish status -o json` as [{"app", "namespace", "node", "state"}]."""
+    """`relish apps --instances -o json` as [{"app", "namespace", "node", "state"}]."""
     rows = document if isinstance(document, list) else document.get("instances", [])
     instances = []
     for row in rows:
@@ -382,7 +411,42 @@ def council_voters(council):
     return ((council or {}).get("summary") or {}).get("voters_answering") or []
 
 
+def newest_proposal(listing, author):
+    """The highest proposal id by `author` in `relish proposal list -o json`."""
+    rows = listing if isinstance(listing, list) else listing.get("proposals", [])
+    ids = [row["id"] for row in rows if row.get("author") == author]
+    return max(ids) if ids else None
+
+
 def audit_records(document):
     if isinstance(document, list):
         return document
     return document.get("records", [])
+
+
+def write_release(directory, kind, version, platform):
+    """`metadata.json` for a release of `version` whose bun for `platform`
+    isn't the bytes the cluster runs (kind `drifted`). Returns the published
+    SHA-256 and the file written."""
+    if kind != "drifted":
+        raise ClusterError(f"unknown release kind {kind!r}")
+    published = hashlib.sha256(f"the published bun {version} for {platform}".encode()).hexdigest()
+    document = {
+        "schema": 1,
+        "latest": version,
+        "releases": [{
+            "version": version,
+            "platforms": {platform: {
+                "url": f"https://github.com/reliaburger/reliaburger/releases/download/{version}/bun-{platform}",
+                "sha256": published,
+                "embedded_signature": base64.b64encode(bytes(64)).decode(),
+                "external_signature": None,
+            }},
+        }],
+    }
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "metadata.json"
+    path.write_text(json.dumps(document, indent=2) + "\n")
+    return {"kind": kind, "version": version, "platform": platform, "published_sha256": published,
+            "metadata": str(path)}

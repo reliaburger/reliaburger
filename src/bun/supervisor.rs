@@ -62,8 +62,11 @@ pub struct WorkloadInstance {
     /// Bind-mounted into the container at `/run/reliaburger/identity/`.
     pub identity_mount: Option<std::path::PathBuf>,
     /// Why the runtime refused to launch this instance (#881), shown by
-    /// `relish status` and `relish wtf`. Set only on a `Failed` instance.
+    /// `relish apps` and `relish wtf`. Set only on a `Failed` instance.
     pub launch_failure: Option<String>,
+    /// Why it's waiting to restart, set when it stops and cleared when the
+    /// restart records its decision.
+    pub restart_cause: Option<crate::bun::restart::RestartCause>,
 }
 
 impl WorkloadInstance {
@@ -215,6 +218,16 @@ impl<G: Grill> WorkloadSupervisor<G> {
     /// supervisor can refuse workloads the node can't honour.
     pub fn set_capabilities(&mut self, capabilities: PlatformCapabilities) {
         self.capabilities = capabilities;
+    }
+
+    /// GPUs this node offers: the detected cards when `[resources]
+    /// gpu_enabled` is set, none otherwise.
+    pub fn schedulable_gpus(&self) -> u32 {
+        if self.capabilities.gpu_enabled {
+            self.capabilities.gpu_count
+        } else {
+            0
+        }
     }
 
     /// Refresh the live egress enforcement capability without disturbing
@@ -799,6 +812,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
                 identity: None,
                 identity_mount: None,
                 launch_failure: None,
+                restart_cause: None,
             });
         }
 
@@ -1099,6 +1113,7 @@ mod tests {
             pre_stop_timeout: None,
             runtime: None,
             owner: None,
+            restarted_at: None,
             firewall: None,
             egress: None,
             autoscale: None,

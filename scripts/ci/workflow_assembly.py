@@ -23,7 +23,7 @@ import gates
 
 OWNERS = {
     'portable-linux': ['make', 'coverage'],
-    'portable-darwin': ['make', 'test'],
+    'portable-darwin': ['make', 'test-macos'],
     'optimized-cron': ['make', 'test-contract-boundaries'],
     'rootless-linux': ['make', 'test-rootless-runc'],
     'linux-root-storage': ['make', 'test-linux'],

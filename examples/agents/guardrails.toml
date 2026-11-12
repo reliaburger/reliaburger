@@ -1,0 +1,41 @@
+# Guardrails for agent proposals (#1682): five policies that judge a
+# proposed change rather than an app. Apply them with an admin token,
+# `relish apply -f examples/agents/guardrails.toml`, and try them first
+# with `relish policy test -f examples/agents/guardrails.toml --proposal
+# proposal.json`. The manual's chapter "Working with an AI agent" walks
+# through them.
+
+# Agents may scale and roll back, never delete.
+[policy.agents-never-delete]
+applies_to = "proposals"
+match = 'author.kind == "agent"'
+deny = 'proposal.kind == "delete"'
+message = "agents may scale and roll back, never delete"
+
+# Keep agents out of a namespace. A token scoped with --namespaces is the
+# stronger tool when it fits; this is for a token that needs the rest.
+[policy.agents-keep-out-of-payments]
+applies_to = "proposals"
+match = 'author.kind == "agent"'
+deny = 'proposal.namespace == "payments"'
+message = "agents don't touch payments; page the payments on-call"
+
+# Approve an agent's scale in shop, up to 10 replicas, without a person.
+[policy.agents-scale-shop]
+applies_to = "proposals"
+action = "approve"
+match = 'author.kind == "agent" && proposal.kind == "scale" && proposal.namespace == "shop" && proposal.replicas_to <= 10'
+
+# Approve rolling one small app back to its previous release.
+[policy.agents-roll-back-small-apps]
+applies_to = "proposals"
+action = "approve"
+match = 'proposal.kind == "rollback" && size(proposal.apps) == 1 && proposal.instances <= 5'
+
+# Approve restarting one small app. A restart can't be undone, but it's the
+# one such change a policy may approve: it replaces instances through their
+# health checks and changes nothing else.
+[policy.agents-restart-small-apps]
+applies_to = "proposals"
+action = "approve"
+match = 'proposal.kind == "restart" && size(proposal.apps) == 1 && proposal.instances <= 5'

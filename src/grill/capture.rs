@@ -292,6 +292,33 @@ fn punch_hole(_file: &std::fs::File, _offset: u64, _length: u64) -> io::Result<(
     Err(io::ErrorKind::Unsupported.into())
 }
 
+/// Open a capture file and read its metadata, or `None` when it has gone.
+/// Blocking: call it from a blocking worker.
+fn open_capture(path: &Path) -> io::Result<Option<(std::fs::File, std::fs::Metadata)>> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata()?;
+    Ok(Some((file, metadata)))
+}
+
+/// Read at most [`CAPTURE_CHUNK_BYTES`] of an open capture file from
+/// `offset`, or from past a reclaimed prefix if `offset` is inside one
+/// (#1418): a store that lost its checkpoint reads from byte 0, and would
+/// otherwise hand on zeros. Returns where the read started, and the bytes.
+/// Blocking: call it from a blocking worker.
+fn read_capture_from(mut file: std::fs::File, offset: u64) -> io::Result<(u64, Vec<u8>)> {
+    use std::io::{Read, Seek};
+    let start = data_start(&file, offset)?;
+    file.seek(io::SeekFrom::Start(start))?;
+    let mut chunk = Vec::with_capacity(CAPTURE_CHUNK_BYTES);
+    file.take(CAPTURE_CHUNK_BYTES as u64)
+        .read_to_end(&mut chunk)?;
+    Ok((start, chunk))
+}
+
 /// Read a whole capture file, minus any prefix [`reclaim_ingested`] freed.
 ///
 /// The line the reclaimed prefix ends in may have lost its start, so the
@@ -394,6 +421,10 @@ pub struct CaptureReader {
     identity: Option<CaptureFileIdentity>,
     #[cfg(test)]
     read_test_gate: Option<std::sync::Arc<CaptureReadGate>>,
+    /// How long the blocking part of a read stalls, standing in for a
+    /// `SEEK_DATA` lseek under writeback (#1857).
+    #[cfg(test)]
+    blocking_stall: Option<std::time::Duration>,
 }
 
 impl CaptureReader {
@@ -409,6 +440,8 @@ impl CaptureReader {
             identity: None,
             #[cfg(test)]
             read_test_gate: None,
+            #[cfg(test)]
+            blocking_stall: None,
         }
     }
 
@@ -448,6 +481,8 @@ impl CaptureReader {
             identity,
             #[cfg(test)]
             read_test_gate: None,
+            #[cfg(test)]
+            blocking_stall: None,
         }
     }
 
@@ -455,17 +490,22 @@ impl CaptureReader {
     ///
     /// No reader state changes until every await has completed. Cancellation
     /// cannot discard a partial line or bind it to an unrelated replacement.
+    ///
+    /// The file calls run on a blocking worker, together. They block in the
+    /// kernel: under writeback a `SEEK_DATA` lseek waits for the inode lock
+    /// for as long as the appender's journal wait, and made inline it held a
+    /// runtime worker that long, stranding whatever task was queued on it,
+    /// the agent loop included (#1857).
     pub async fn read_chunk(&mut self) -> io::Result<Vec<u8>> {
-        use tokio::io::{AsyncReadExt, AsyncSeekExt};
-        let Some(path) = self.file.as_ref() else {
+        let Some(path) = self.file.clone() else {
             return Ok(Vec::new());
         };
-        let mut file = match tokio::fs::File::open(path).await {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(error),
+        let opened = tokio::task::spawn_blocking(move || open_capture(&path))
+            .await
+            .map_err(io::Error::other)??;
+        let Some((file, metadata)) = opened else {
+            return Ok(Vec::new());
         };
-        let metadata = file.metadata().await?;
         let identity = CaptureFileIdentity::of(&metadata);
         let replaced = self.identity.is_some_and(|old| old != identity);
         let reset = replaced || metadata.len() < self.read_offset();
@@ -475,15 +515,17 @@ impl CaptureReader {
             gate.entered.notify_one();
             gate.release.notified().await;
         }
-        // A reader that starts inside a reclaimed prefix (a store that lost
-        // its checkpoint reads from byte 0) jumps to the retained bytes
-        // instead of handing on zeros (#1418).
-        let start = data_start(&file, offset)?;
-        file.seek(io::SeekFrom::Start(start)).await?;
-        let mut chunk = Vec::with_capacity(CAPTURE_CHUNK_BYTES);
-        file.take(CAPTURE_CHUNK_BYTES as u64)
-            .read_to_end(&mut chunk)
-            .await?;
+        #[cfg(test)]
+        let stall = self.blocking_stall;
+        let (start, chunk) = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some(stall) = stall {
+                std::thread::sleep(stall);
+            }
+            read_capture_from(file, offset)
+        })
+        .await
+        .map_err(io::Error::other)??;
         if reset {
             self.consumed = 0;
             self.partial.clear();
@@ -978,6 +1020,40 @@ mod tests {
             old_identity,
             CaptureFileIdentity::of(&std::fs::metadata(file).unwrap())
         );
+    }
+
+    /// A capture read's file calls block in the kernel, and under writeback
+    /// a `SEEK_DATA` lseek waits for the inode lock for as long as the
+    /// appender's journal wait. Made inline, it held a runtime worker that
+    /// long, and the agent loop's task was stranded on that worker past its
+    /// turn deadline (#1857). On a one-thread runtime, a timer must still
+    /// fire while a read is stalled.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stalled_capture_read_does_not_hold_the_runtime_thread() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("app.stdout");
+        std::fs::write(&file, b"one\ntwo\n").unwrap();
+        let mut reader = CaptureReader::new(LogStream::Stdout, Some(file));
+        let stall = std::time::Duration::from_millis(600);
+        reader.blocking_stall = Some(stall);
+        let started = std::time::Instant::now();
+        let read = reader.read_chunk();
+        tokio::pin!(read);
+        let timer = tokio::time::sleep(std::time::Duration::from_millis(20));
+        tokio::pin!(timer);
+        let mut timer_fired = None;
+        let bytes = loop {
+            tokio::select! {
+                bytes = &mut read => break bytes.unwrap(),
+                () = &mut timer, if timer_fired.is_none() => timer_fired = Some(started.elapsed()),
+            }
+        };
+        let timer_fired = timer_fired.expect("the timer never fired before the read finished");
+        assert!(
+            timer_fired < stall / 2,
+            "a 20 ms timer fired after {timer_fired:?}: the read blocked the runtime thread"
+        );
+        assert_eq!(bytes, b"one\ntwo\n");
     }
 
     #[tokio::test]

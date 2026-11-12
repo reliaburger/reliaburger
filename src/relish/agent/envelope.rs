@@ -70,9 +70,13 @@ pub enum CommandName {
     Diagnose,
     /// `relish agent explain`.
     Explain,
+    /// `relish agent timeline`.
+    Timeline,
     /// `relish agent upgrade-check`.
     #[serde(rename = "upgrade-check")]
     UpgradeCheck,
+    /// `relish agent verify`.
+    Verify,
     /// `relish agent report`.
     Report,
     /// `relish agent patch init`.
@@ -95,16 +99,44 @@ pub enum CommandName {
     #[serde(rename = "patch diff")]
     #[value(name = "patch-diff")]
     PatchDiff,
+    /// `relish agent patch apply`.
+    #[serde(rename = "patch apply")]
+    #[value(name = "patch-apply")]
+    PatchApply,
     /// `relish agent patch destroy`.
     #[serde(rename = "patch destroy")]
     #[value(name = "patch-destroy")]
     PatchDestroy,
     /// `relish agent setup`.
     Setup,
+    /// `relish agent lease take`.
+    #[serde(rename = "lease take")]
+    #[value(name = "lease-take")]
+    LeaseTake,
+    /// `relish agent lease renew`.
+    #[serde(rename = "lease renew")]
+    #[value(name = "lease-renew")]
+    LeaseRenew,
+    /// `relish agent lease release`.
+    #[serde(rename = "lease release")]
+    #[value(name = "lease-release")]
+    LeaseRelease,
+    /// `relish agent propose`.
+    Propose,
+    /// `relish agent proposals`.
+    Proposals,
+    /// `relish agent withdraw`.
+    Withdraw,
+    /// `relish agent undo`.
+    Undo,
+    /// `relish status -o json`: not under `relish agent`, but it answers in
+    /// the same envelope, so `relish agent schema status` describes it.
+    Status,
 }
 
 impl CommandName {
-    /// The command as a caller types it after `relish agent`.
+    /// The command as a caller types it after `relish agent`, or after
+    /// `relish` for `status`.
     pub fn as_str(self) -> &'static str {
         match self {
             CommandName::Agent => "agent",
@@ -122,15 +154,26 @@ impl CommandName {
             CommandName::Context => "context",
             CommandName::Diagnose => "diagnose",
             CommandName::Explain => "explain",
+            CommandName::Timeline => "timeline",
             CommandName::UpgradeCheck => "upgrade-check",
+            CommandName::Verify => "verify",
             CommandName::Report => "report",
             CommandName::PatchInit => "patch init",
             CommandName::PatchBuild => "patch build",
             CommandName::PatchTest => "patch test",
             CommandName::PatchTry => "patch try",
             CommandName::PatchDiff => "patch diff",
+            CommandName::PatchApply => "patch apply",
             CommandName::PatchDestroy => "patch destroy",
             CommandName::Setup => "setup",
+            CommandName::LeaseTake => "lease take",
+            CommandName::LeaseRenew => "lease renew",
+            CommandName::LeaseRelease => "lease release",
+            CommandName::Propose => "propose",
+            CommandName::Proposals => "proposals",
+            CommandName::Withdraw => "withdraw",
+            CommandName::Undo => "undo",
+            CommandName::Status => "status",
         }
     }
 
@@ -151,15 +194,26 @@ impl CommandName {
         CommandName::Context,
         CommandName::Diagnose,
         CommandName::Explain,
+        CommandName::Timeline,
         CommandName::UpgradeCheck,
+        CommandName::Verify,
         CommandName::Report,
         CommandName::PatchInit,
         CommandName::PatchBuild,
         CommandName::PatchTest,
         CommandName::PatchTry,
         CommandName::PatchDiff,
+        CommandName::PatchApply,
         CommandName::PatchDestroy,
         CommandName::Setup,
+        CommandName::LeaseTake,
+        CommandName::LeaseRenew,
+        CommandName::LeaseRelease,
+        CommandName::Propose,
+        CommandName::Proposals,
+        CommandName::Withdraw,
+        CommandName::Undo,
+        CommandName::Status,
     ];
 }
 
@@ -247,6 +301,13 @@ pub enum ErrorCode {
     UnsupportedPlatform,
     /// Something went wrong inside `relish` itself.
     Internal,
+    /// Someone else holds a lease on what you asked for; `lease` says who,
+    /// why and for how long.
+    LeaseHeld,
+    /// An app changed since the proposal saw it.
+    Stale,
+    /// A policy or built-in rule refused the proposal.
+    Guardrail,
 }
 
 /// The process exit status of a `relish agent` command.
@@ -292,9 +353,12 @@ impl ErrorCode {
             | ErrorCode::TlsUntrusted
             | ErrorCode::Timeout
             | ErrorCode::Unauthenticated => ExitStatus::Unreachable,
-            ErrorCode::Forbidden => ExitStatus::Refused,
+            ErrorCode::Forbidden | ErrorCode::LeaseHeld | ErrorCode::Guardrail => {
+                ExitStatus::Refused
+            }
             ErrorCode::NotFound
             | ErrorCode::Conflict
+            | ErrorCode::Stale
             | ErrorCode::Api
             | ErrorCode::SourceMismatch
             | ErrorCode::BuildFailed
@@ -318,6 +382,9 @@ pub struct AgentError {
     pub status: Option<u16>,
     /// What to do about it, when we know.
     pub hint: Option<String>,
+    /// The lease in the way, for `lease_held`; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease: Option<Box<super::lease::LeaseLine>>,
 }
 
 impl AgentError {
@@ -329,6 +396,7 @@ impl AgentError {
             endpoint: None,
             status: None,
             hint: None,
+            lease: None,
         }
     }
 

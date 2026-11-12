@@ -162,6 +162,7 @@ async fn record(
         severity: EventSeverity::Info,
         action: "secret.namespace_key_created".to_string(),
         principal: NAMESPACE_KEY_PRINCIPAL.to_string(),
+        principal_kind: crate::sesame::types::PrincipalKind::System,
         app: None,
         namespace: Some(namespace.to_string()),
         node: Some(node.to_string()),

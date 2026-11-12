@@ -1449,6 +1449,20 @@ The `match` uses Rust's pattern matching with guards (the `if` clauses). The tup
 
 Making this a free function rather than a method on `HealthChecker` or `WorkloadInstance` is a deliberate choice. It has no hidden state, no side effects, and it's trivially testable. You can write a dozen test cases for it without setting up a supervisor, a mock runtime, or an instance. Just call the function with different inputs and check the output.
 
+### A default that depends on another field
+
+Every field of `[health]` is optional, so `HealthCheckConfig::from_spec` fills in defaults: probe every 10 seconds, give each probe 5. `relish apply` also refuses a timeout longer than the interval, because a probe that may outlast the interval overlaps the next one. Those two rules met in the gym's health-restart scenario, which set only `interval = 2` and was refused with "timeout (5s) must not be longer than interval (2s)", about a timeout it never wrote.
+
+So the default timeout now depends on the interval: 5 seconds, or the interval if that's shorter. One function in `src/bun/health.rs` says so, and both validation and the running health checker call it:
+
+```rust
+pub fn timeout_secs(timeout: Option<u64>, interval_secs: u64) -> u64 {
+    timeout.unwrap_or(DEFAULT_HEALTH_TIMEOUT_SECS.min(interval_secs))
+}
+```
+
+`unwrap_or` returns what's inside the `Option` when it's `Some`, and its argument when it's `None`. `min` is a method on `u64` itself; integers in Rust have methods, as every type can. A timeout the user wrote is kept as written, so `interval = 2` with `timeout = 3` is still refused: we'd rather tell the user than quietly change a number they chose. Why not just check the default separately in validation? Because then the checker could probe with a timeout validation never saw. With one function, what `relish apply` accepts is exactly what runs. `an_interval_alone_caps_the_default_timeout_at_the_interval` pins the resolved timeout for intervals of 1, 2, 5 and 10 seconds, and `health_interval_alone_is_accepted_at_any_length` in `src/config/validate.rs` pins that apply accepts them.
+
 ## Restart backoff
 
 When a container fails, you want to restart it. But you don't want to restart it immediately, because if it's crashing due to a configuration error or a missing dependency, it'll just crash again. And again. And again. Each failed start consumes CPU, writes logs, and might even make things worse (imagine a container that corrupts a database on startup before crashing).
@@ -3090,6 +3104,8 @@ fn stat_start_ticks(stat: &str) -> Option<u64> {
 The command name in field 2 sits in parentheses and can contain spaces and `)` itself, which is why we split at the *last* parenthesis (`rsplit_once`). The state is then the first field (field 3), so the start is `nth(19)`. A tick count resets when the machine boots, so every adoption record now also stores the boot ID (described below), and a record from another boot never matches.
 
 The same incident fixed what happens on a mismatch. The check used to return an error, and Bun refuses to start on any adoption error, so one stale record took every workload on the node down. The process owner is the authority on which launcher runs this generation. A record that names a different process is therefore just out of date, so adoption now cleans the generation up and returns `Ok(false)`, and the instance starts again like any other that wasn't adopted.
+
+The 0.2.8 release gate found the same mistake in the next check down ([#1849](https://github.com/reliaburger/reliaburger/issues/1849)). Besides the PID, the adoption record names the launcher's log files, and adoption compared that with the log stem bound in the generation. A mismatch returned an error. In the soak, Bun was SIGKILLed one second into a rollout, came back and adopted everything, and a minute later the node lost power for 25 seconds. The record and the launcher binding are written at different moments, and the page cache that held one of them was lost. Every Bun after that exited at startup with "adoption log identity conflicts with runtime generation", over 500 times, and the node never rejoined. Either way round the record is stale: if it names logs the generation never bound, the record is newer, and if it names none, or another launch's, the generation is newer. So adoption treats it like a record that names another process. It retires the generation, says so on stderr and returns `Ok(false)`, and the instance is rescheduled. It also checks for a `Retired` or `Retiring` generation before comparing logs, because a sealed generation's logs don't matter. `a_record_and_generation_split_by_a_power_cut_retire_and_others_still_adopt` builds both orders on disk, beside a healthy instance that must still adopt, and the reboot qualification (`scripts/release/qualify-oci-reboot.sh`) now carries a split record across a real power cycle. On the old code the first fails with the exact error from the gate. The rule we keep relearning: on startup, a record that disagrees with the runtime's own evidence describes the past, and the cure is to retire it, never to stop the node.
 
 One question remains: did the *machine* restart? Kill Bun and the container can keep running. Reboot Linux and it can't. Every intent and owner record stores the kernel's boot ID from `/proc/sys/kernel/random/boot_id`, a random UUID that changes on every boot. A different boot ID proves that every process from the old record is dead, so recovery records the execution as interrupted with no exit code and removes the stale runc state directly. It never passes the old PID to `runc delete --force`; that number might belong to something else by now.
 

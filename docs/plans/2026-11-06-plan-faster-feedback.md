@@ -256,7 +256,9 @@ job's timeout rises to match. Or, simpler, the runbook says to dispatch only
 after `main`'s CI is green; the script change makes that impossible to
 forget.
 **Risk:** low. Every rule about what may be reused stays.
-**When:** 0.2.7.
+**When:** 0.2.7. Done in 0.2.8
+([#1722](https://github.com/reliaburger/reliaburger/issues/1722)): the
+script waits, and `candidate.json` names the run as `source_ci`.
 
 ### F5. Run the nightly qualification every night
 

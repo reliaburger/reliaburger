@@ -366,7 +366,7 @@ matching gates run.
 
 Brioche is a single HTML page. No React, no Vue, no webpack. The server renders the HTML with current data, embeds a 2KB CSS stylesheet, and sends it. The browser refreshes every 5 seconds via a `<meta http-equiv="refresh">` tag.
 
-The dashboard shows three sections: apps (name, status, instance count), nodes (name, state, app count), and alerts. Status dots are green for healthy, amber for pending, red for failed. The dark theme is easy on the eyes during those late-night debugging sessions.
+The dashboard shows three sections: apps (name, status, instance count), nodes (name, state, app count), and alerts. Status dots are green for healthy, amber for pending, red for failed. (From 0.2.8 an app's status is the word `relish apps` uses, `running`, `degraded`, `down` or `stopped`, from one shared rollup; see [Built for Humans and Their Agents](19-built-for-agents.md#brioches-dashboard).) The dark theme is easy on the eyes during those late-night debugging sessions.
 
 Total payload: under 10KB. First paint: instant.
 
@@ -1592,7 +1592,7 @@ The temptation was to build something simpler: a custom iterator over Parquet fi
 
 ### Five default alerts cover 90% of incidents
 
-We thought operators would want to define custom alert rules from day one. In practice, the five defaults (CPU throttle, OOM risk, memory high, disk high, CPU idle) catch nearly every production incident that metrics can detect. Custom rules are a Phase 11 feature, and nobody has complained about the delay.
+We thought operators would want to define custom alert rules from day one. In practice, the five defaults (CPU throttle, OOM risk, memory high, disk high, CPU idle) catch nearly every production incident that metrics can detect. Custom rules still aren't supported, and nobody has complained yet.
 
 The lesson: don't build config for things that have obvious defaults. Ship the defaults, add config later if someone needs it.
 

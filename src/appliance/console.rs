@@ -107,12 +107,15 @@ pub fn render(status: &Status, width: usize) -> String {
 
 /// Read what the screen shows from this machine.
 pub async fn gather(paths: &super::Paths) -> Status {
-    let os_release = std::fs::read_to_string("/usr/lib/os-release").unwrap_or_default();
+    let os_release = tokio::fs::read_to_string("/usr/lib/os-release")
+        .await
+        .unwrap_or_default();
     let os_version = os_release
         .lines()
         .find_map(|line| line.strip_prefix("IMAGE_VERSION="))
         .map(|v| v.trim_matches('"').to_string());
-    let node_config = std::fs::read_to_string(paths.config_dir.join("node.toml"))
+    let node_config = tokio::fs::read_to_string(paths.config_dir.join("node.toml"))
+        .await
         .ok()
         .and_then(|text| toml::from_str::<crate::config::node::NodeConfig>(&text).ok());
     let bun_version = std::process::Command::new("/var/lib/reliaburger/bin/bun")
@@ -121,6 +124,15 @@ pub async fn gather(paths: &super::Paths) -> Status {
         .ok()
         .and_then(|out| String::from_utf8(out.stdout).ok())
         .and_then(|line| line.split_whitespace().nth(1).map(str::to_string));
+    let claim_key = match &paths.claim_dir {
+        Some(dir) => tokio::fs::read(dir.join("claim.crt"))
+            .await
+            .ok()
+            .map(|der| {
+                super::claim::short_fingerprint(&super::claim::certificate_fingerprint(&der))
+            }),
+        None => None,
+    };
     Status {
         os_version,
         bun_version,
@@ -132,11 +144,7 @@ pub async fn gather(paths: &super::Paths) -> Status {
             .map(|name| name.replace('-', ":"))
             .collect(),
         healthy: healthy().await,
-        claim_key: paths.claim_dir.as_ref().and_then(|dir| {
-            std::fs::read(dir.join("claim.crt")).ok().map(|der| {
-                super::claim::short_fingerprint(&super::claim::certificate_fingerprint(&der))
-            })
-        }),
+        claim_key,
         notes: Vec::new(),
     }
 }
@@ -161,13 +169,15 @@ async fn healthy() -> Option<bool> {
 
 /// Redraw `tty` every five seconds, for ever.
 pub async fn run(paths: &super::Paths, tty: &std::path::Path) -> std::io::Result<()> {
-    use std::io::Write;
+    use tokio::io::AsyncWriteExt as _;
     loop {
         let screen = render(&gather(paths).await, 80);
-        std::fs::OpenOptions::new()
+        tokio::fs::OpenOptions::new()
             .write(true)
-            .open(tty)?
-            .write_all(screen.as_bytes())?;
+            .open(tty)
+            .await?
+            .write_all(screen.as_bytes())
+            .await?;
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
 }

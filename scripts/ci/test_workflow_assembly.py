@@ -17,6 +17,8 @@ MAKEFILE = '''NEXTEST_PROFILE ?= default
 NEXTEST = $(CARGO) nextest run --profile $(NEXTEST_PROFILE) --no-tests=fail
 test:
 \t$(NEXTEST)
+test-macos:
+\t$(NEXTEST)
 test-cluster:
 \tRELIABURGER_CLUSTER_TESTS=1 $(NEXTEST) --run-ignored=only -E 'binary(cluster_failover) | binary(cluster_gossip) '
 test-linux:
@@ -93,7 +95,7 @@ class WorkflowAssembly(unittest.TestCase):
     def test_a_shard_lists_and_runs_with_its_partition(self):
         self.root.joinpath('.config').mkdir()
         self.root.joinpath('.config/nextest.toml').write_text('synthetic expected config')
-        manifest = {'gates': {'portable-darwin': {'command': ['make', 'test'], 'hosts': ['darwin']}},
+        manifest = {'gates': {'portable-darwin': {'command': ['make', 'test-macos'], 'hosts': ['darwin']}},
                     'contracts': [{'cases': [{'requires': ['portable-darwin'], 'sources': ['src/contract.rs']}]}]}
         entry = self.w.entry_from_make(self.root, manifest, 'portable-darwin', 'darwin', shard=1)
         self.assertEqual(entry['partition'], 'hash:1/1')
@@ -217,7 +219,7 @@ class WorkflowAssembly(unittest.TestCase):
     def test_make_entry_preserves_default_filter_and_profile_for_both_operations(self):
         self.root.joinpath('.config').mkdir()
         self.root.joinpath('.config/nextest.toml').write_text('synthetic expected config')
-        manifest = {'gates': {'portable-darwin': {'command': ['make', 'test'], 'hosts': ['darwin']}},
+        manifest = {'gates': {'portable-darwin': {'command': ['make', 'test-macos'], 'hosts': ['darwin']}},
                     'contracts': [{'cases': [{'requires': ['portable-darwin'], 'sources': ['src/contract.rs']}]}]}
         entry = self.w.entry_from_make(self.root, manifest, 'portable-darwin', 'darwin')
         run, listed = self.w.gates.commands(entry)

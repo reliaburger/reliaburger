@@ -285,12 +285,57 @@ pub async fn start_hollow_node(spec: HollowSpec) -> std::io::Result<HollowNode> 
         directory_rx,
         2, // API = Raft + 2 in this port block
         None,
-        cmd_tx,
+        cmd_tx.clone(),
         shutdown.clone(),
         reliaburger::cluster::ClusterHttp::plaintext(),
         Some(data_dir),
         reliaburger::config::node::RuntimeSection::default().stop_confirmation_timeout(),
     );
+
+    // The API answers the council's fan-outs, the summary's share among
+    // them, from the agent's published status. It runs nothing else.
+    let listener =
+        tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], gossip_port + 3))).await?;
+    let app = reliaburger::bun::api::router_with_upgrade(
+        cmd_tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        gossip_port + 3,
+        None,
+        None,
+        None,
+        "default".to_string(),
+        Some(name.clone()),
+        reliaburger::bun::build_runner::BuildSettings::with_timeout(900),
+        reliaburger::cluster::ClusterHttp::plaintext(),
+        5050,
+        "http",
+        256 * 1024 * 1024,
+        false,
+        reliaburger::bun::capabilities::StaticCapabilities::default(),
+        reliaburger::bun::readiness::ReadinessTracker::new(),
+        None,
+        None,
+        Some(status.clone()),
+        None,
+    );
+    let api_shutdown = shutdown.clone();
+    let api_task = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move { api_shutdown.cancelled().await })
+            .await
+            .ok();
+    });
 
     Ok(HollowNode {
         name,
@@ -301,7 +346,7 @@ pub async fn start_hollow_node(spec: HollowSpec) -> std::io::Result<HollowNode> 
         gate,
         shutdown: shutdown.clone(),
         _runtime: cluster_runtime,
-        _tasks: TestTasks::new(shutdown, vec![agent_task, reconciler]),
+        _tasks: TestTasks::new(shutdown, vec![agent_task, reconciler, api_task]),
     })
 }
 

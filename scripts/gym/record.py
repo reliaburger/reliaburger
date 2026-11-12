@@ -5,6 +5,7 @@ per scenario, the safety counts, and what the run doesn't show. It is
 written beside results.json; a person decides whether it goes into
 docs/qualification/.
 """
+import statistics
 
 
 def _fraction(tally):
@@ -15,6 +16,48 @@ def _fraction(tally):
     if tally["skipped"]:
         text += f" ({tally['skipped']} not checked)"
     return text
+
+
+def _tokens(runs, summary, titles):
+    """The tokens-and-context table, for a solver that reports tokens (local_model.py).
+
+    Medians per scenario: tokens sent and generated over the session, the
+    largest prompt one turn sent against the context window, the turns that
+    filled the window, and the turns.
+    """
+    metas = {}
+    for run in runs:
+        meta = run.get("solver_meta") or {}
+        if "score" in run and isinstance(meta.get("prompt_tokens"), int):
+            metas.setdefault(run["scenario"], []).append(meta)
+    if not metas:
+        return []
+    lines = [
+        "## Tokens and context",
+        "",
+        "Medians over each scenario's runs. Tokens in are summed over every turn, so a "
+        "long conversation counts its history each time it's sent.",
+        "",
+        "| Scenario | Tokens in | Tokens out | Largest prompt | Turns that filled the window | Turns |",
+        "|---|---|---|---|---|---|",
+    ]
+    for scenario_id in summary:
+        found = metas.get(scenario_id)
+        if not found:
+            continue
+
+        def median(key):
+            return int(statistics.median(meta.get(key) or 0 for meta in found))
+
+        windows = sorted({meta.get("num_ctx") for meta in found if meta.get("num_ctx")})
+        window = " or ".join(str(w) for w in windows) or "unknown"
+        lines.append(
+            f"| {titles.get(scenario_id, scenario_id)} | {median('prompt_tokens')} | "
+            f"{median('completion_tokens')} | {median('peak_prompt_tokens')} of {window} | "
+            f"{median('context_full_turns')} | {median('turns')} |"
+        )
+    lines.append("")
+    return lines
 
 
 def render(document, scenarios):
@@ -31,6 +74,7 @@ def render(document, scenarios):
         "## Setup",
         "",
         f"- Solver: {context['solver']}",
+        f"- Platform: {'Kubernetes (k3s)' if context.get('platform') == 'k8s' else 'Reliaburger'}",
         f"- Binaries: {context['relish_version']}",
         f"- Host: {context['host']}",
     ]
@@ -81,7 +125,7 @@ def render(document, scenarios):
     audited = sum(row["audit_records"] for row in summary.values())
     refused = sorted(
         {
-            " ".join(entry["argv"])
+            " ".join([entry.get("program", "relish"), *entry["argv"]])
             for run in runs
             if "score" in run
             for entry in run["score"]["safety"].get("refused_calls", [])
@@ -90,11 +134,11 @@ def render(document, scenarios):
     lines += [
         "## Safety",
         "",
-        f"- Mutating `relish` calls the solver made: {mutating}.",
+        f"- Mutating calls the solver made: {mutating}.",
         f"- Audit records under the solver's token (refusals included): {audited}.",
-        f"- Commands `relish` refused as usage errors before sending anything: "
+        f"- Commands refused as usage errors before sending anything: "
         f"{sum(row.get('refused_calls', 0) for row in summary.values())}"
-        + (f" ({', '.join(f'`relish {c}`' for c in refused)})." if refused else "."),
+        + (f" ({', '.join(f'`{c}`' for c in refused)})." if refused else "."),
     ]
     for scenario_id, row in summary.items():
         if row["containment"]:
@@ -109,12 +153,15 @@ def render(document, scenarios):
             for entry in run["score"]["injection"]["containment"]["outside_contract"]
         }
     )
+    program = "kubectl" if context.get("platform") == "k8s" else "relish"
     if outside:
         lines.append(
             "- Commands outside the `relish agent` contract that showed the injected text "
-            f"unwrapped: {', '.join(f'`relish {c}`' for c in outside)}."
+            f"unwrapped: {', '.join(f'`{program} {c}`' for c in outside)}."
         )
     lines.append("")
+
+    lines += _tokens(runs, summary, titles)
 
     errors = [run for run in runs if "error" in run]
     if errors:

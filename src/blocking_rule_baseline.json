@@ -1,0 +1,152 @@
+[
+  {
+    "path": "src/relish/agent/patch/builder.rs",
+    "function": "build_in_vm",
+    "call": "std::fs::create_dir_all",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch/builder.rs",
+    "function": "keep_binary",
+    "call": "std::fs::copy",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch/builder.rs",
+    "function": "keep_binary",
+    "call": "std::fs::create_dir_all",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch/builder.rs",
+    "function": "keep_binary",
+    "call": "std::fs::remove_file",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch/cluster.rs",
+    "function": "destroy_one",
+    "call": "std::fs::read_to_string",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch/cluster.rs",
+    "function": "destroy_one",
+    "call": "std::fs::remove_dir_all",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch/cluster.rs",
+    "function": "try_cluster",
+    "call": "std::fs::read_to_string",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/propose.rs",
+    "function": "propose",
+    "call": "std::fs::read_to_string",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "sign",
+    "call": "fs::read_to_string",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "submit_task_manifest_with_client",
+    "call": "std::fs::read_to_string",
+    "count": 1
+  },
+  {
+    "path": "src/relish/dev.rs",
+    "function": "create",
+    "call": "std::fs::read_to_string",
+    "count": 1
+  },
+  {
+    "path": "src/relish/dev.rs",
+    "function": "create",
+    "call": "std::fs::remove_file",
+    "count": 2
+  },
+  {
+    "path": "src/relish/dev.rs",
+    "function": "create",
+    "call": "std::fs::write",
+    "count": 2
+  },
+  {
+    "path": "src/relish/dev.rs",
+    "function": "ensure_build_vm",
+    "call": "std::fs::write",
+    "count": 1
+  },
+  {
+    "path": "src/relish/dev.rs",
+    "function": "install_file",
+    "call": "std::fs::read",
+    "count": 1
+  },
+  {
+    "path": "src/relish/gym/baseline.rs",
+    "function": "run",
+    "call": "std::fs::read_to_string",
+    "count": 1
+  },
+  {
+    "path": "src/relish/gym/baseline.rs",
+    "function": "run",
+    "call": "std::fs::write",
+    "count": 1
+  },
+  {
+    "path": "src/relish/gym/mod.rs",
+    "function": "run",
+    "call": "std::fs::create_dir_all",
+    "count": 1
+  },
+  {
+    "path": "src/relish/gym/mod.rs",
+    "function": "run",
+    "call": "std::fs::read_dir",
+    "count": 1
+  },
+  {
+    "path": "src/relish/gym/mod.rs",
+    "function": "run",
+    "call": "std::fs::write",
+    "count": 2
+  },
+  {
+    "path": "src/relish/mcp/credentials.rs",
+    "function": "remove",
+    "call": "std::fs::remove_file",
+    "count": 1
+  },
+  {
+    "path": "src/relish/setup.rs",
+    "function": "offer_to_start",
+    "call": "std::fs::File::create",
+    "count": 1
+  },
+  {
+    "path": "src/relish/setup.rs",
+    "function": "run",
+    "call": "std::fs::create_dir_all",
+    "count": 1
+  },
+  {
+    "path": "src/relish/setup.rs",
+    "function": "run",
+    "call": "std::fs::write",
+    "count": 1
+  },
+  {
+    "path": "src/relish/upgrade.rs",
+    "function": "start_from_file",
+    "call": "std::fs::canonicalize",
+    "count": 1
+  }
+]

@@ -112,8 +112,8 @@ case "$ARCH" in
   *) echo "Unsupported architecture: $ARCH; the release has x86_64 and aarch64 builds" >&2 ;;
 esac
 
-# Release version to install (e.g. v0.2.7 or vX.Y.Z)
-VERSION="v0.2.7"
+# Release version to install (e.g. v0.2.8 or vX.Y.Z)
+VERSION="v0.2.8"
 BASE_URL="https://github.com/reliaburger/reliaburger/releases/download/${VERSION}"
 
 # Download binaries and SHA256SUMS into /tmp
@@ -140,7 +140,7 @@ relish --version
 ```
 
 Each prints its version and the commit it was built from, such as
-`bun 0.2.7 (ace072c)`. Every node should print the same commit.
+`bun 0.2.8 (e423d46)`. Every node should print the same commit.
 
 *(Optional: If building from source instead of using pre-built releases, install
 `build-essential clang llvm libbpf-dev` (the static job executor helpers need a
@@ -560,8 +560,8 @@ curl -fsSL https://reliaburger.com/install.sh | sh -s -- --install-only
 # The macOS build is Apple silicon only (arm64)
 ARCH="aarch64"
 
-# Release version to install (e.g. v0.2.7 or vX.Y.Z)
-VERSION="v0.2.7"
+# Release version to install (e.g. v0.2.8 or vX.Y.Z)
+VERSION="v0.2.8"
 BASE_URL="https://github.com/reliaburger/reliaburger/releases/download/${VERSION}"
 
 # Download relish binary and SHA256SUMS into /tmp
@@ -682,6 +682,10 @@ Expected output: 3 voter members with one active leader and a healthy consensus 
 relish status
 ```
 
+Expected output: `cluster: HEALTHY` on the first line, then one line per part
+of the cluster. A line that needs attention ends in the command that shows
+the detail.
+
 ---
 
 ## 7. Deploy and run the demo application
@@ -730,7 +734,7 @@ relish apply hello.toml
 Check the deployment status:
 
 ```sh
-relish status
+relish apps
 ```
 
 Inspect the running container instances across the cluster nodes:
@@ -784,7 +788,7 @@ Reliaburger is declarative: to scale the application to 6 replicas, edit `replic
 relish apply hello.toml
 ```
 
-Then check `relish status` to observe the new replicas being placed across the nodes.
+Then check `relish apps hello` to observe the new replicas being placed across the nodes.
 
 ### 8.2 Testing node communication failure and self-healing
 
@@ -804,7 +808,7 @@ sudo systemctl stop reliaburger.service
 From your laptop, observe the cluster behaviour:
 
 1. **Council quorum**: `relish council` confirms that `node-01` and `node-02` maintain quorum (2 out of 3 votes).
-2. **Workload rescheduling**: `relish status` shows the scheduler automatically moving workloads from `node-03` to the surviving nodes.
+2. **Workload rescheduling**: `relish status` reports the cluster `DEGRADED` with `node-03` suspect or dead, and `relish apps hello` shows the scheduler moving its instances to the surviving nodes.
 3. **Ingress continuity**: `curl -H "Host: hello.world.test" http://192.168.0.101/` continues serving traffic seamlessly.
 
 Restart Node 3:
@@ -908,7 +912,9 @@ names any node that's missing it.
 
 | Task | Command |
 |------|---------|
-| Check cluster & workload status | `relish status` |
+| Check the whole cluster at a glance | `relish status` |
+| List apps, problems first | `relish apps` |
+| List one app's instances | `relish apps hello` |
 | View cluster membership | `relish nodes` |
 | View Raft council status | `relish council` |
 | Inspect app or node details | `relish inspect <app-or-node>` |

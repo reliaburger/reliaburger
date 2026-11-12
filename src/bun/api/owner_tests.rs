@@ -23,6 +23,7 @@ struct Cluster {
     human: String,
     controller: String,
     rival: String,
+    events: Arc<tokio::sync::RwLock<crate::bun::events::EventStore>>,
     _shutdown: tokio_util::sync::CancellationToken,
 }
 
@@ -47,13 +48,16 @@ async fn cluster(tag: &str) -> Cluster {
     let (human_token, human) = named_user_token("alice", ApiRole::Deployer);
     let (controller_token, controller) = scoped_token("pg-failover");
     let (rival_token, rival) = scoped_token("other-controller");
+    let events = Arc::new(tokio::sync::RwLock::new(
+        crate::bun::events::EventStore::new(),
+    ));
     let (app, shutdown) = setup_with_auth_leases_events_and_council(
         vec![admin_token, human_token, controller_token, rival_token],
         None,
         crate::bun::readiness::ReadinessTracker::new(),
         crate::bun::capabilities::StaticCapabilities::default(),
         None,
-        None,
+        Some(Arc::clone(&events)),
         Some(Arc::clone(&council)),
     )
     .await;
@@ -64,6 +68,7 @@ async fn cluster(tag: &str) -> Cluster {
         human,
         controller,
         rival,
+        events,
         _shutdown: shutdown,
     };
     let (status, body) = cluster.call("/v1/apply", &cluster.admin, NAMESPACE).await;
@@ -81,6 +86,11 @@ impl Cluster {
         let status = response.status();
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// This node's events, oldest first.
+    async fn events(&self) -> Vec<crate::bun::events::ClusterEvent> {
+        self.events.read().await.recent(100, None, None)
     }
 
     async fn db(&self) -> Option<crate::config::AppSpec> {
@@ -161,6 +171,19 @@ async fn declaring_another_tokens_name_as_owner_is_forbidden() {
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert!(body.contains("must be the name of the token"), "{body}");
     assert!(cluster.db().await.is_none());
+    // The refusal is recorded as a decision, attributed to the caller.
+    let refused: Vec<_> = cluster
+        .events()
+        .await
+        .into_iter()
+        .filter(|event| event.action.as_deref() == Some("deploy.refused"))
+        .collect();
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused[0].details["rule"], "deploy.refused.owner");
+    assert_eq!(refused[0].details["reason"], "not_the_caller");
+    assert_eq!(refused[0].details["workloads"], "db@pg");
+    assert_eq!(refused[0].app.as_deref(), Some("db"));
+    assert_eq!(refused[0].details["token_name"], "alice");
 
     let (status, body) = cluster.call("/v1/apply", &cluster.admin, CLAIMED_DB).await;
     assert!(body.contains("committed"), "{status}: {body}");

@@ -67,6 +67,8 @@ pub enum TokenLifetime {
     Days(u64),
     /// No expiry (`--no-expiry`).
     Never,
+    /// This many seconds (`--ttl`), for an agent token.
+    Seconds(u64),
 }
 
 /// A token for `relish token create` to ask for.
@@ -84,6 +86,8 @@ pub struct TokenRequest {
     pub lifetime: TokenLifetime,
     /// Take over the `[permission]` spec already keyed by this name.
     pub inherit_permissions: bool,
+    /// An agent token (#1682): read-only unless `deployer`, never `admin`.
+    pub agent: bool,
 }
 
 /// A secret the cluster just issued, shown once.
@@ -135,6 +139,9 @@ pub struct BunClient {
     token: Option<String>,
     ca_pem: Option<Vec<u8>>,
     service_endpoints: Option<crate::bun::capabilities::ServiceEndpoints>,
+    /// Ask writes to break any agent lease in their way (`--break-lease`,
+    /// #1686).
+    break_lease: bool,
 }
 
 /// Options for fetching or streaming logs.
@@ -483,6 +490,35 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// The `--endpoint` CLI override, set once from `main` before dispatch.
 static CLI_ENDPOINT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 
+/// The token `relish mcp` made for itself from an admin context (#1730),
+/// read-only or, with `--propose`, a deployer agent one, sent in place of
+/// the context's own token. A `std` lock, not a tokio one, because
+/// [`resolve_token`] is synchronous and holds it only to clone the string,
+/// never across an `.await`.
+// One per process, like the CLI_* statics above, so the `relish::mcp`
+// tests that set it rely on nextest running each test in its own process.
+// Under plain `cargo test` they share it across threads and fail.
+static MCP_TOKEN: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// Send `token` in place of the managed context's admin token from now on,
+/// or stop doing so with `None`. Only `relish mcp` calls this. An explicit
+/// `--token` or `RELIABURGER_TOKEN` still wins.
+pub fn set_mcp_token(token: Option<String>) {
+    // A poisoned lock means a panic mid-write of an `Option<String>`, which
+    // can't leave it half-written; take the value either way.
+    let mut slot = MCP_TOKEN
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *slot = token;
+}
+
+fn mcp_token() -> Option<String> {
+    MCP_TOKEN
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
 /// An invalid Bun API base URL supplied through Relish's connection options.
 #[derive(Debug, thiserror::Error)]
 pub enum EndpointError {
@@ -537,8 +573,14 @@ fn resolve_ca_cert() -> Option<std::path::PathBuf> {
 }
 
 /// Resolve the auth token: the `--token` flag takes precedence over the
-/// `RELIABURGER_TOKEN` environment variable.
-fn resolve_token() -> Option<String> {
+/// `RELIABURGER_TOKEN` environment variable, and either over the read-only
+/// token `relish mcp` made for itself.
+pub(crate) fn resolve_token() -> Option<String> {
+    explicit_token().or_else(mcp_token)
+}
+
+/// The token the user gave: `--token`, else `RELIABURGER_TOKEN`.
+fn explicit_token() -> Option<String> {
     pick_token(CLI_TOKEN.get(), std::env::var("RELIABURGER_TOKEN").ok())
 }
 
@@ -554,13 +596,59 @@ pub fn endpoint_overridden() -> bool {
     resolve_endpoint().is_some()
 }
 
+/// Where the bearer token a command sends comes from, which is what `relish`
+/// knows about its role without asking the cluster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenOrigin {
+    /// `--token` or `RELIABURGER_TOKEN`: any role, which only the cluster
+    /// knows.
+    Explicit,
+    /// The managed local context's own token. `relish setup` saves the
+    /// cluster's admin token there, so its role is admin.
+    ContextAdmin,
+    /// No token at all.
+    Absent,
+}
+
+/// Where the token [`BunClient::default_local`] sends comes from.
+///
+/// It reads the flags, the environment and the local context file, and never
+/// the network. An explicit `--endpoint` bypasses the context's
+/// credentials, so with no explicit token there's no token at all.
+pub fn token_origin() -> TokenOrigin {
+    if explicit_token().is_some() {
+        return TokenOrigin::Explicit;
+    }
+    if endpoint_overridden() {
+        return TokenOrigin::Absent;
+    }
+    let context = super::local_context::default_path()
+        .and_then(|path| super::local_context::LocalContext::load(&path));
+    match context {
+        Ok(Some(_)) => TokenOrigin::ContextAdmin,
+        _ => TokenOrigin::Absent,
+    }
+}
+
+/// What the cluster says a token may do, as far as telling admin from the
+/// rest goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenAccess {
+    /// An admin token.
+    Admin,
+    /// A valid token with a lesser role (deployer or read-only).
+    Lesser,
+    /// The cluster rejected it: unknown, expired or revoked (401).
+    Rejected,
+}
+
 /// Precedence rule for [`resolve_token`], split out to be testable without the
 /// process-global flag and environment. A present `--token` flag wins;
-/// otherwise fall back to the environment value.
+/// otherwise fall back to the environment value, unless it's blank.
 fn pick_token(cli_flag: Option<&Option<String>>, env: Option<String>) -> Option<String> {
     match cli_flag {
         Some(Some(t)) => Some(t.clone()),
-        _ => env,
+        _ => unless_blank(env),
     }
 }
 
@@ -568,8 +656,18 @@ fn pick_token(cli_flag: Option<&Option<String>>, env: Option<String>) -> Option<
 fn pick_endpoint(cli_flag: Option<&Option<String>>, env: Option<String>) -> Option<String> {
     match cli_flag {
         Some(Some(endpoint)) => Some(endpoint.clone()),
-        _ => env,
+        _ => unless_blank(env),
     }
+}
+
+/// An environment value, or `None` when it's empty or only whitespace.
+///
+/// An MCP Bundle client passes an optional setting the user left blank as
+/// an empty variable (#1695). Blank means "not set", so `relish` falls back
+/// to the current context instead of refusing an empty URL or sending an
+/// empty bearer in place of the context's own token.
+fn unless_blank(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.trim().is_empty())
 }
 
 /// Validate an operator-supplied Bun API base URL.
@@ -641,6 +739,7 @@ impl BunClient {
                     websocket_tls: None,
                     ca_pem: None,
                     service_endpoints: None,
+                    break_lease: false,
                     token: token.map(str::to_string),
                 };
             }
@@ -704,6 +803,7 @@ impl BunClient {
             websocket_tls,
             ca_pem: ca_pem.map(<[u8]>::to_vec),
             service_endpoints: None,
+            break_lease: false,
             token: token.map(str::to_string),
         }
     }
@@ -727,6 +827,12 @@ impl BunClient {
         &self.base_url
     }
 
+    /// The cluster CA this client pins, PEM, when it has one. `relish gym
+    /// run` hands it to the solver, which never gets the user's token.
+    pub fn ca_pem(&self) -> Option<&[u8]> {
+        self.ca_pem.as_deref()
+    }
+
     /// Address another node with the same authenticated, CA-pinned HTTP
     /// client. Cluster fan-out must not silently lose the caller's bearer or
     /// replace its trust roots while changing only the authority.
@@ -737,6 +843,7 @@ impl BunClient {
             websocket_tls: self.websocket_tls.clone(),
             ca_pem: self.ca_pem.clone(),
             service_endpoints: None,
+            break_lease: self.break_lease,
             token: self.token.clone(),
         }
     }
@@ -785,6 +892,23 @@ impl BunClient {
     }
 
     /// Use another bearer credential with this connection's existing trust roots and forwards.
+    /// The same client, asking its app writes (apply, stop, delete,
+    /// rollback, release) to break any agent lease in their way: the
+    /// `x-reliaburger-break-lease` header (#1686).
+    pub fn breaking_leases(mut self, break_lease: bool) -> Self {
+        self.break_lease = break_lease;
+        self
+    }
+
+    /// `request` with the break-lease header, when this client asks for it.
+    fn lease_header(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if self.break_lease {
+            request.header(crate::bun::lease_fence::BREAK_LEASE_HEADER, "acknowledged")
+        } else {
+            request
+        }
+    }
+
     pub fn with_token(&self, token: &str) -> Self {
         let mut client = Self::build(&self.base_url, Some(token), self.ca_pem.as_deref());
         client.service_endpoints = self.service_endpoints.clone();
@@ -881,6 +1005,7 @@ impl BunClient {
                         websocket_tls: None,
                         ca_pem: None,
                         service_endpoints: None,
+                        break_lease: false,
                         token: None,
                     });
             }
@@ -891,6 +1016,7 @@ impl BunClient {
                     websocket_tls: None,
                     ca_pem: None,
                     service_endpoints: None,
+                    break_lease: false,
                     token: None,
                 };
             }
@@ -1008,7 +1134,7 @@ impl BunClient {
             body: format!("failed to serialise config: {e}"),
         })?;
 
-        let mut request = self.http()?.post(&url).body(toml_str);
+        let mut request = self.lease_header(self.http()?.post(&url).body(toml_str));
         if rerun_jobs {
             request = request.header("x-reliaburger-rerun-jobs", "acknowledged");
         }
@@ -1149,8 +1275,7 @@ impl BunClient {
             force_query(force)
         );
         let response = self
-            .http()?
-            .post(&url)
+            .lease_header(self.http()?.post(&url))
             .send()
             .await
             .map_err(classify_error)?;
@@ -1552,6 +1677,17 @@ impl BunClient {
         parse_typed_response(response).await
     }
 
+    /// Fetch a test resource lease as its owner sees it: its state and its
+    /// server-side expiry. A lease whose cleanup has finished is gone, and
+    /// the server answers 404.
+    pub async fn test_lease(
+        &self,
+        lease_id: &str,
+    ) -> Result<crate::testkit::lease::TestLease, RelishError> {
+        self.get_typed_json(&format!("/v1/test/leases/{lease_id}"))
+            .await
+    }
+
     /// Renew an active test resource lease as its authenticated owner.
     ///
     /// The node-local job recovery integration test uses this endpoint. The
@@ -1766,8 +1902,7 @@ impl BunClient {
     pub async fn stop(&self, app: &str, namespace: &str) -> Result<(), RelishError> {
         let url = format!("{}/v1/stop/{}/{}", self.base_url, app, namespace);
         let response = self
-            .http()?
-            .post(&url)
+            .lease_header(self.http()?.post(&url))
             .send()
             .await
             .map_err(classify_error)?;
@@ -1803,8 +1938,7 @@ impl BunClient {
             force_query(force)
         );
         let response = self
-            .http()?
-            .post(&url)
+            .lease_header(self.http()?.post(&url))
             .send()
             .await
             .map_err(classify_error)?;
@@ -1824,8 +1958,7 @@ impl BunClient {
     pub async fn release(&self, app: &str, namespace: &str) -> Result<(), RelishError> {
         let url = format!("{}/v1/release/{}/{}", self.base_url, app, namespace);
         let response = self
-            .http()?
-            .post(&url)
+            .lease_header(self.http()?.post(&url))
             .send()
             .await
             .map_err(classify_error)?;
@@ -2178,6 +2311,28 @@ impl BunClient {
             });
         }
         Ok(retirement)
+    }
+
+    /// The whole cluster at a glance (`GET /v1/cluster/summary`).
+    pub async fn cluster_summary(
+        &self,
+    ) -> Result<crate::bun::summary::ClusterSummary, RelishError> {
+        self.get_typed_json("/v1/cluster/summary").await
+    }
+
+    /// This node's own share of the summary: its version, usage and disks
+    /// (`GET /v1/cluster/summary/node`). Pair it with [`Self::via_node`] to
+    /// ask one node.
+    pub async fn node_summary(&self) -> Result<crate::bun::summary::NodeSummary, RelishError> {
+        self.get_typed_json("/v1/cluster/summary/node").await
+    }
+
+    /// What the scheduler has committed on each node
+    /// (`GET /v1/cluster/capacity`).
+    pub async fn cluster_capacity(
+        &self,
+    ) -> Result<crate::bun::summary::ClusterCapacity, RelishError> {
+        self.get_typed_json("/v1/cluster/capacity").await
     }
 
     /// Get cluster node membership.
@@ -2598,19 +2753,48 @@ impl BunClient {
         self.get_typed_json::<TokenListing>("/v1/token/list").await
     }
 
+    /// Ask the cluster whether this client's token is an admin one.
+    ///
+    /// There's no "who am I" route, so this asks for `GET /v1/token/list`,
+    /// which only admin may read and which changes nothing: 2xx is admin,
+    /// 403 a valid token with a lesser role, 401 a token the cluster
+    /// rejects. Any other answer is an error. The caller bounds the wait.
+    pub async fn token_access(&self) -> Result<TokenAccess, RelishError> {
+        let response = self
+            .http()?
+            .get(format!("{}/v1/token/list", self.base_url))
+            .send()
+            .await
+            .map_err(classify_error)?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(TokenAccess::Admin);
+        }
+        match status.as_u16() {
+            401 => Ok(TokenAccess::Rejected),
+            403 => Ok(TokenAccess::Lesser),
+            code => Err(RelishError::ApiError {
+                status: code,
+                body: response.text().await.unwrap_or_default(),
+            }),
+        }
+    }
+
     /// Create an API token via the agent (persisted in Raft). Returns the
     /// plaintext, shown once, and when it expires.
     pub async fn token_create(&self, request: &TokenRequest) -> Result<IssuedToken, RelishError> {
-        let (ttl_days, no_expiry) = match request.lifetime {
-            TokenLifetime::Default => (None, false),
-            TokenLifetime::Days(days) => (Some(days), false),
-            TokenLifetime::Never => (None, true),
+        let (ttl_days, ttl_seconds, no_expiry) = match request.lifetime {
+            TokenLifetime::Default => (None, None, false),
+            TokenLifetime::Days(days) => (Some(days), None, false),
+            TokenLifetime::Never => (None, None, true),
+            TokenLifetime::Seconds(seconds) => (None, Some(seconds), false),
         };
         self.issue_token(
             "/v1/token/create",
             serde_json::json!({
                 "name": request.name, "role": request.role, "apps": request.apps,
                 "namespaces": request.namespaces, "ttl_days": ttl_days,
+                "ttl_seconds": ttl_seconds, "agent": request.agent,
                 "no_expiry": no_expiry, "inherit_permissions": request.inherit_permissions,
             }),
         )
@@ -3331,6 +3515,155 @@ impl BunClient {
         self.get_typed_json("/v1/policies/audit").await
     }
 
+    /// The live agent leases this caller's scope reaches (`GET /v1/leases`,
+    /// #1686).
+    pub async fn leases(&self) -> Result<crate::proposal::lease::LeaseListing, RelishError> {
+        self.get_typed_json("/v1/leases").await
+    }
+
+    /// Take a lease, or renew one this caller holds. A lease someone else
+    /// holds is a 409 whose body has `code: "lease_held"` and the `lease`.
+    pub async fn lease_take(
+        &self,
+        request: &crate::proposal::lease::TakeLeaseRequest,
+    ) -> Result<crate::proposal::lease::LeaseAnswer, RelishError> {
+        self.lease_post("/v1/leases", request).await
+    }
+
+    /// Extend a lease this caller holds.
+    pub async fn lease_renew(
+        &self,
+        request: &crate::proposal::lease::RenewLeaseRequest,
+    ) -> Result<crate::proposal::lease::LeaseAnswer, RelishError> {
+        self.lease_post("/v1/leases/renew", request).await
+    }
+
+    /// Give up a lease this caller holds.
+    pub async fn lease_release(
+        &self,
+        request: &crate::proposal::lease::LeaseTargetRequest,
+    ) -> Result<crate::proposal::lease::LeaseAnswer, RelishError> {
+        self.lease_post("/v1/leases/release", request).await
+    }
+
+    /// End anyone's lease (deployer or above over the target; audited).
+    pub async fn lease_break(
+        &self,
+        request: &crate::proposal::lease::LeaseTargetRequest,
+    ) -> Result<crate::proposal::lease::LeaseAnswer, RelishError> {
+        self.lease_post("/v1/leases/break", request).await
+    }
+
+    async fn lease_post<T: serde::Serialize>(
+        &self,
+        path: &str,
+        request: &T,
+    ) -> Result<crate::proposal::lease::LeaseAnswer, RelishError> {
+        let body = serde_json::to_string(request).map_err(|error| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to encode the request: {error}"),
+        })?;
+        let answer = self.post_json(path, body).await?;
+        serde_json::from_value(answer).map_err(|error| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse response: {error}"),
+        })
+    }
+
+    /// Propose a change (`POST /v1/proposals`, #1682). With `dry_run`, the
+    /// cluster answers the whole proposal without storing it. A refusal is
+    /// an `ApiError` whose body carries a `code`: `lease_held`, `stale`,
+    /// `guardrail`, `conflict` and so on.
+    pub async fn propose(
+        &self,
+        request: &crate::proposal::ProposalRequest,
+        dry_run: bool,
+    ) -> Result<crate::proposal::view::ProposalView, RelishError> {
+        let path = if dry_run {
+            "/v1/proposals?dry_run=true"
+        } else {
+            "/v1/proposals"
+        };
+        self.proposal_post(path, request).await
+    }
+
+    /// Every proposal this caller's scope reaches, newest first.
+    pub async fn proposals(&self) -> Result<crate::proposal::view::ProposalListing, RelishError> {
+        self.get_typed_json("/v1/proposals").await
+    }
+
+    /// One proposal.
+    pub async fn proposal(
+        &self,
+        id: u64,
+    ) -> Result<crate::proposal::view::ProposalView, RelishError> {
+        self.get_typed_json(&format!("/v1/proposals/{id}")).await
+    }
+
+    /// Withdraw a proposal this caller made.
+    pub async fn withdraw_proposal(
+        &self,
+        id: u64,
+    ) -> Result<crate::proposal::view::ProposalView, RelishError> {
+        self.proposal_post(
+            &format!("/v1/proposals/{id}/withdraw"),
+            &serde_json::json!({}),
+        )
+        .await
+    }
+
+    /// Approve a proposal, which applies it (a person's token only).
+    pub async fn approve_proposal(
+        &self,
+        id: u64,
+    ) -> Result<crate::proposal::view::ProposalView, RelishError> {
+        self.proposal_post(
+            &format!("/v1/proposals/{id}/approve"),
+            &serde_json::json!({}),
+        )
+        .await
+    }
+
+    /// Reject a proposal (a person's token only).
+    pub async fn reject_proposal(
+        &self,
+        id: u64,
+        reason: &str,
+    ) -> Result<crate::proposal::view::ProposalView, RelishError> {
+        self.proposal_post(
+            &format!("/v1/proposals/{id}/reject"),
+            &crate::proposal::view::RejectRequest {
+                reason: reason.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// Undo an applied proposal directly (a person's token only).
+    pub async fn undo_proposal(
+        &self,
+        id: u64,
+    ) -> Result<crate::proposal::view::ProposalView, RelishError> {
+        self.proposal_post(&format!("/v1/proposals/{id}/undo"), &serde_json::json!({}))
+            .await
+    }
+
+    async fn proposal_post<T: serde::Serialize>(
+        &self,
+        path: &str,
+        request: &T,
+    ) -> Result<crate::proposal::view::ProposalView, RelishError> {
+        let body = serde_json::to_string(request).map_err(|error| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to encode the request: {error}"),
+        })?;
+        let answer = self.post_json(path, body).await?;
+        serde_json::from_value(answer).map_err(|error| RelishError::ApiError {
+            status: 0,
+            body: format!("failed to parse response: {error}"),
+        })
+    }
+
     /// Delete a policy (admin only).
     pub async fn delete_policy(&self, name: &str) -> Result<(), RelishError> {
         let name: String = url::form_urlencoded::byte_serialize(name.as_bytes()).collect();
@@ -3396,6 +3729,12 @@ fn audit_path(filter: &crate::bun::audit::AuditFilter, cluster: bool) -> String 
     }
     if let Some(namespace) = &filter.namespace {
         params.append_pair("namespace", namespace);
+    }
+    if let Some(kind) = filter.principal_kind {
+        params.append_pair("principal_kind", kind.as_str());
+    }
+    if let Some(proposal) = filter.proposal {
+        params.append_pair("proposal", &proposal.to_string());
     }
     if let Some(limit) = filter.limit {
         params.append_pair("limit", &limit.to_string());
@@ -4461,6 +4800,37 @@ mod tests {
             Some("https://env.example:9117".to_string())
         );
         assert_eq!(pick_endpoint(None, None), None);
+    }
+
+    /// #1695: an MCPB client passes an optional setting the user left blank
+    /// as an empty variable. Blank must mean "not set", so the saved
+    /// context's own token is used rather than an empty bearer.
+    #[test]
+    fn blank_token_variable_counts_as_unset() {
+        for blank in ["", "   ", "\t\n"] {
+            assert_eq!(pick_token(None, Some(blank.to_string())), None);
+            assert_eq!(pick_token(Some(&None), Some(blank.to_string())), None);
+        }
+        let flag = Some("rbrg_flag".to_string());
+        assert_eq!(
+            pick_token(Some(&flag), Some(String::new())),
+            Some("rbrg_flag".to_string())
+        );
+    }
+
+    /// #1695: a blank `RELIABURGER_ENDPOINT` falls back to the current
+    /// context instead of failing as an invalid URL.
+    #[test]
+    fn blank_endpoint_variable_counts_as_unset() {
+        for blank in ["", "   ", "\t\n"] {
+            assert_eq!(pick_endpoint(None, Some(blank.to_string())), None);
+            assert_eq!(pick_endpoint(Some(&None), Some(blank.to_string())), None);
+        }
+        let flag = Some("https://flag.example:9117".to_string());
+        assert_eq!(
+            pick_endpoint(Some(&flag), Some(String::new())),
+            Some("https://flag.example:9117".to_string())
+        );
     }
 
     /// A firewall that drops packets makes the connection time out. Nothing

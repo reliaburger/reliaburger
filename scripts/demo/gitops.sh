@@ -39,12 +39,12 @@ point_at_demo() {
         "$1" >"$2"
 }
 
-# The STATE column of every instance `relish status` lists for app $1 in
+# The STATE column of every instance `relish apps --instances` lists for app $1 in
 # namespace $2, one per line. Fails when relish does, so a cluster that
 # doesn't answer never looks like one without the app.
 app_states() {
     local listing node instance app namespace state rest
-    listing="$("${RELISH}" status)" || return 1
+    listing="$("${RELISH}" apps --instances)" || return 1
     while read -r node instance app namespace state rest; do
         if [[ "${app}" == "$1" && "${namespace}" == "$2" ]]; then
             echo "${state}"
@@ -59,7 +59,7 @@ app_runs() {
     [[ $'\n'"${states}"$'\n' == *$'\n'running$'\n'* ]]
 }
 
-# Whether `relish status` no longer lists app $1 in namespace $2 at all.
+# Whether `relish apps --instances` no longer lists app $1 in namespace $2 at all.
 app_is_gone() {
     local states
     states="$(app_states "$1" "$2")" || return 1
@@ -92,7 +92,7 @@ demo_run "${RELISH}" gitops set "${DEMO_WORK}/gitops.toml"
 demo_wait_for "storefront to run in namespace shop" 90 app_runs storefront shop
 demo_wait_for "status-page to run in namespace ops" 90 app_runs status-page ops
 demo_wait_for "storefront to answer" 60 demo_serves "${DEMO_APP_PORT}" storefront-v1
-demo_run "${RELISH}" status
+demo_run "${RELISH}" apps
 demo_run "${RELISH}" gitops status
 app_runs web default || demo_fail "the first sync removed web, which GitOps never wrote"
 echo "web, applied by hand, survived the first sync"
@@ -109,7 +109,7 @@ demo_git commit --quiet -m "retire the storefront"
 demo_git push --quiet origin main
 demo_wait_for "GitOps to remove storefront" 90 app_is_gone storefront shop
 echo "GitOps removed storefront"
-demo_run "${RELISH}" status
+demo_run "${RELISH}" apps
 app_runs status-page ops || demo_fail "status-page went away with storefront"
 app_runs web default || demo_fail "a sync removed web, which GitOps never wrote"
 echo "web, applied by hand, survived every sync"

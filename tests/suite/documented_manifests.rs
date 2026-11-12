@@ -108,3 +108,39 @@ fn every_published_manifest_passes_apply_validation() {
         refused.join("\n")
     );
 }
+
+/// The agent gym's apps, with the placeholders the runner fills in
+/// (`scripts/gym/cluster.py`), pass the same validation. A scenario whose
+/// setup the cluster refuses tests no agent: `health-restart` did, for a
+/// health timeout longer than its interval.
+#[test]
+fn every_gym_app_passes_apply_validation() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut apps = Vec::new();
+    files_with_extension(&root.join("scripts/gym/apps"), "toml", &mut apps);
+    assert!(apps.len() >= 8, "found only {} gym apps", apps.len());
+    let mut refused = Vec::new();
+    for path in &apps {
+        let toml = std::fs::read_to_string(path)
+            .unwrap()
+            .replace("@TESTAPP@", "/usr/local/bin/testapp")
+            .replace("@APP_PORT@", "29500")
+            .replace("@SECOND_PORT@", "29501");
+        let validated = match workload_manifest(&toml) {
+            Some(config) => config.and_then(|config| {
+                config
+                    .validate_intrinsic()
+                    .map_err(|error| error.to_string())
+            }),
+            None => Err("doesn't parse as an app or job manifest".to_string()),
+        };
+        if let Err(error) = validated {
+            refused.push(format!("{}: {error}", path.display()));
+        }
+    }
+    assert!(
+        refused.is_empty(),
+        "gym apps the cluster would refuse:\n{}",
+        refused.join("\n")
+    );
+}

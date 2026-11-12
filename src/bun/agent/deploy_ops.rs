@@ -334,6 +334,7 @@ impl DeployOp {
 }
 
 /// Launch data owned by the deploy worker before supervisor registration.
+#[derive(Clone)]
 pub(super) struct RollingInstance {
     pub(super) instance_id: InstanceId,
     pub(super) app_name: String,
@@ -979,16 +980,19 @@ impl DeployOps {
         &self,
         instance: RollingInstance,
     ) -> Result<(), BunError> {
-        let missing = BunError::InstanceNotFound {
-            instance_id: instance.instance_id.clone(),
-        };
-        self.call(
-            |reply| DeployOp::RegisterRollingInstance {
-                instance: Box::new(instance),
-                reply,
-            },
-            Err(missing),
-        )
+        // The loop answers `StillRunning` while the replacement's adoption
+        // record is being written (#1853); ask again until it has landed.
+        retry_while_still_running(|| {
+            self.call(
+                |reply| DeployOp::RegisterRollingInstance {
+                    instance: Box::new(instance.clone()),
+                    reply,
+                },
+                Err(BunError::InstanceNotFound {
+                    instance_id: instance.instance_id.clone(),
+                }),
+            )
+        })
         .await
     }
 

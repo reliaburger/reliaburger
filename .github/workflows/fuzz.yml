@@ -103,6 +103,9 @@ jobs:
           # otherwise prune as a local crate; on a nightly with no new
           # commits its build is reusable whole.
           cache-workspace-crates: true
+      # The Makefile builds with FUZZ_CODEGEN_UNITS (64): with cargo-fuzz's
+      # default of one unit, reliaburger's rustc alone needs 31 GB and the
+      # 16 GB runner is reclaimed mid-build (#1839).
       - name: Run each target
         env:
           FUZZ_SECONDS: ${{ github.event_name == 'pull_request' && '30' || inputs.seconds || '300' }}

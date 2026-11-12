@@ -40,7 +40,7 @@ For book, manual or website prose, follow [docs/book/STYLE.md](docs/book/STYLE.m
 
 ### 1. Follow the Plan
 
-Every roadmap phase is done; 0.1.0 was released on 29 September 2026, 0.1.1 on 30 September, 0.1.2 on 1 October, 0.1.3 and 0.1.4 on 3 October, 0.1.5 on 6 October, 0.1.6 on 7 October, 0.2.0 ("A million jobs") on 16 October, 0.2.1 (cluster safety) on 21 October, 0.2.2 (UX polish) on 25 October, 0.2.3 (two billion a day) on 28 October, 0.2.4 (extension points) on 30 October, 0.2.5 (bugs an outside evaluation found) on 3 November, 0.2.6 (setup over SSH) on 6 November and 0.2.7 ("Built for humans and their agents") on 7 November 2026. Status lives in [docs/roadmap.md](docs/roadmap.md) plus the GitHub milestones and issues it links: read its release list and "Known gaps" before starting. Releases after 0.1.0 follow its [release order](docs/roadmap.md#releases-after-010): one headline feature per minor release. 0.2.8 ("Agents you can trust, built faster") is in progress, then 0.3.0 ("Bare metal in an hour"). Releases go out as soon as they're ready and verified, with no target dates before 1.0 (maintainer decision, 6 November 2026). New work goes through a dated plan in `docs/plans/`; the plans that led to 0.1.0 are history in `docs/plans/archive/`. Releases follow [docs/releasing.md](docs/releasing.md).
+Every roadmap phase is done; 0.1.0 was released on 29 September 2026, 0.1.1 on 30 September, 0.1.2 on 1 October, 0.1.3 and 0.1.4 on 3 October, 0.1.5 on 6 October, 0.1.6 on 7 October, 0.2.0 ("A million jobs") on 16 October, 0.2.1 (cluster safety) on 21 October, 0.2.2 (UX polish) on 25 October, 0.2.3 (two billion a day) on 28 October, 0.2.4 (extension points) on 30 October, 0.2.5 (bugs an outside evaluation found) on 3 November, 0.2.6 (setup over SSH) on 6 November, 0.2.7 ("Built for humans and their agents") on 7 November and 0.2.8 ("Agents you can trust, built faster") on 12 November 2026. Status lives in [docs/roadmap.md](docs/roadmap.md) plus the GitHub milestones and issues it links: read its release list and "Known gaps" before starting. Releases after 0.1.0 follow its [release order](docs/roadmap.md#releases-after-010): one headline feature per minor release. 0.3.0 ("Bare metal in an hour") is next. Releases go out as soon as they're ready and verified, with no target dates before 1.0 (maintainer decision, 6 November 2026). New work goes through a dated plan in `docs/plans/`; the plans that led to 0.1.0 are history in `docs/plans/archive/`. Releases follow [docs/releasing.md](docs/releasing.md).
 
 ### 2. Tests First
 
@@ -147,6 +147,17 @@ See [docs/testing.md](docs/testing.md) and [docs/design/test-harness.md](docs/de
 - Never amend a commit (`git commit --amend`); always make a new one.
 - Update the book chapter in the same change, not at the end.
 - Update `README.md` and `docs/README.md` when features, commands or status change. Never quote test counts.
+
+## Running Agents in Parallel
+
+Lessons from running many agents on one machine (6–7 November 2026, #1724):
+
+- Keep the load average under about twice the core count. Above that, builds and timing-sensitive tests slow down for every agent at once.
+- Give each agent its own `CARGO_TARGET_DIR` (for example `../rb-wt/target-<issue>`), and delete it once its PR merges. Each one grows to about 30 GB. Never share one across worktrees: cargo decides what to rebuild from file mtimes, so a checkout whose files are older than the last build isn't recompiled, and its green run tests another branch's binaries (#1745). If you must share one to save disk, run `git ls-files -z | xargs -0 touch` before each build.
+- Give each agent its own log directory, so parallel runs don't overwrite each other's logs.
+- Check free disk (`df -h`) before a heavy build. A full disk fails builds with odd errors that look like code bugs.
+- When many PRs touch the same shared files (`ci.yml`, the `Makefile`, the evidence manifest), merge them in one integration pass, not one at a time.
+- When the macOS queue is starved, fold the PRs into one integration PR, so the macOS job runs once.
 
 ## Example Naming Convention
 

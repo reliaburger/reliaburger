@@ -106,8 +106,31 @@ fn relish_lines(commands: &[String]) -> Vec<String> {
     lines
 }
 
+/// A command line split into words as a shell would for the commands the
+/// site shows: on whitespace, with a double-quoted string as one word.
+fn shell_words(command: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quoted = false;
+    for c in command.chars() {
+        match c {
+            '"' => quoted = !quoted,
+            c if c.is_whitespace() && !quoted => {
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+            }
+            c => word.push(c),
+        }
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words
+}
+
 fn parses(command: &str) -> Result<(), String> {
-    let arguments: Vec<&str> = command.split_whitespace().skip(1).collect();
+    let arguments: Vec<String> = shell_words(command).into_iter().skip(1).collect();
     let output = Command::new(env!("CARGO_BIN_EXE_relish"))
         .args(&arguments)
         .env("RELISH_PARSE_ONLY", "1")
@@ -707,6 +730,7 @@ fn every_section_can_be_linked_to() {
         "tour",
         "netboot",
         "debug",
+        "act",
         "start",
         "docs",
         "internals",
@@ -768,10 +792,20 @@ fn the_jobs_section_shows_the_day_run_s_memory_chart_from_its_record() {
     }
     assert_eq!(
         read("docs/website/assets/day-run/rss.svg"),
-        read("docs/qualification/2026-10-28-v0.2.3-day-run-charts/rss.svg"),
+        read(&format!(
+            "docs/qualification/{DAY_RUN_RECORD}-charts/rss.svg"
+        )),
         "the day run's chart differs from its record; copy it again"
     );
+    assert!(
+        section.contains(&format!("docs/qualification/{DAY_RUN_RECORD}.md")),
+        "the jobs section doesn't link the day run's record"
+    );
 }
+
+/// The newest whole day of jobs the page leads with: the published 0.2.7's
+/// 24-hour run on the Mac Studio (#1417).
+const DAY_RUN_RECORD: &str = "2026-11-08-v0.2.7-memory-run";
 
 /// The page a new cluster serves tells people what to type next, so every
 /// command on it has to parse.
@@ -1615,12 +1649,22 @@ fn why_section(page: &str) -> &str {
     &page[start..start + page[start..].find("</section>").unwrap()]
 }
 
-/// The six differences sit between the hero and the install, each a short
+/// The slides of the "Built differently" carousel, in order, each from its
+/// `<li>` to the next.
+fn why_slides(section: &str) -> Vec<&str> {
+    section.split("<li class=\"why-slide\"").skip(1).collect()
+}
+
+/// The number of slides as the prose around the carousel spells it.
+const SLIDE_COUNT_WORD: &str = "seven";
+
+/// The seven differences sit between the hero and the install, each a short
 /// punchline, two sentences and a drawing. The list works without script;
-/// `assets/why-carousel.js` turns it into a slideshow. The sixth, from 0.2.7,
-/// is the one for agents (#1578).
+/// `assets/why-carousel.js` turns it into a slideshow. The first, from 0.2.8,
+/// says it was built for AI agents from the start (#1731); the last, from
+/// 0.2.7, is the one about reading the recipe (#1578).
 #[test]
-fn six_differences_come_just_before_the_install() {
+fn seven_differences_come_just_before_the_install() {
     let page = read("docs/website/index.html");
     let ids: Vec<String> = section_ids(&page).into_iter().flatten().collect();
     let position = |id: &str| ids.iter().position(|i| i == id).unwrap();
@@ -1628,11 +1672,15 @@ fn six_differences_come_just_before_the_install() {
 
     let section = why_section(&page);
     assert!(section.contains("data-carousel"));
-    let slides: Vec<&str> = section.split("<li class=\"why-slide\"").skip(1).collect();
-    assert_eq!(slides.len(), 6, "the section should show six differences");
+    let slides = why_slides(section);
+    assert_eq!(slides.len(), 7, "the section should show seven differences");
     assert!(
-        section.contains(">Your agent can read the recipe.</h3>"),
-        "the sixth difference is the agent one"
+        slides[0].starts_with(" id=\"why-ai-agents\""),
+        "the first difference is the AI-agent one"
+    );
+    assert!(
+        slides[6].contains(">Your agent can read the recipe.</h3>"),
+        "the last difference is the recipe one"
     );
     for slide in slides {
         assert_eq!(slide.matches("<h3 class=\"why-punchline\">").count(), 1);
@@ -1652,15 +1700,128 @@ fn six_differences_come_just_before_the_install() {
     }
 }
 
+/// The page opens its case with why Reliaburger asks to be trusted: for
+/// scrutiny anyone can repeat, not for popularity. It sits between the hero
+/// and the differences, and every paragraph or table cell that quotes a
+/// number links where the number comes from, so nothing on it is a claim a
+/// reader has to take on trust. Each part of the answer also says what
+/// doesn't exist yet.
+#[test]
+fn the_scrutiny_section_comes_first_and_sources_every_number() {
+    let page = read("docs/website/index.html");
+    let ids: Vec<String> = section_ids(&page).into_iter().flatten().collect();
+    let position = |id: &str| ids.iter().position(|i| i == id).unwrap();
+    assert_eq!(position("intro") + 1, position("scrutiny"), "{ids:?}");
+    assert_eq!(position("scrutiny") + 1, position("why"), "{ids:?}");
+
+    let start = page.find("<section id=\"scrutiny\"").unwrap();
+    let section = &page[start..start + page[start..].find("</section>").unwrap()];
+    let mut checked = 0;
+    for (open, close) in [("<p", "</p>"), ("<td", "</td>")] {
+        for (at, _) in section.match_indices(open) {
+            let block = &section[at..at + section[at..].find(close).unwrap()];
+            let text = decode(&strip_tags(block));
+            if text.chars().any(|c| c.is_ascii_digit()) {
+                checked += 1;
+                assert!(
+                    block.contains("<a href=\"https://"),
+                    "a number with no source: {text:?}"
+                );
+            }
+        }
+    }
+    assert!(checked >= 5, "the section should quote its numbers");
+    let rows = section.matches("<tr><th scope=\"row\">").count();
+    assert_eq!(rows, 4, "the four parts of the answer");
+    assert_eq!(
+        section.matches("<td>").count(),
+        rows * 2,
+        "each part says what exists and what doesn't yet"
+    );
+}
+
+/// The first difference (#1731): Reliaburger was built for AI agents from the
+/// start, not retrofitted. `bun` is already "the one agent every node runs"
+/// on the slide after it, so every "agent" here is an AI agent, your agent or
+/// part of a `relish agent` command. It links the page for agents and the
+/// gym's exit-test record, and claims nothing 0.2.8 hasn't shipped: no
+/// proposals or guardrails (#1682).
+#[test]
+fn the_first_difference_is_that_it_was_built_for_ai_agents() {
+    let page = read("docs/website/index.html");
+    let section = why_section(&page);
+    let slide = why_slides(section)[0];
+    assert!(
+        slide.contains(
+            "<h3 class=\"why-punchline\">Native to AI agents from day one, not bolted on.</h3>"
+        ),
+        "{slide}"
+    );
+    assert!(
+        why_slides(section)[1].contains("the one agent every node runs"),
+        "the slide after it still calls bun the agent every node runs"
+    );
+
+    let record = "docs/qualification/2026-11-06-v0.2.7-exit-test.md";
+    for href in [
+        "agents#measuring-an-agent-on-your-cluster".to_string(),
+        format!("https://github.com/reliaburger/reliaburger/blob/main/{record}"),
+    ] {
+        assert!(
+            slide.contains(&format!("<a href=\"{href}\">")),
+            "the slide doesn't link {href}"
+        );
+    }
+    assert!(repository().join(record).is_file(), "{record} is missing");
+    assert!(read(record).contains("**Verdict: the exit test passes.**"));
+
+    // The split leaves the rest of the `<li>` tag at the front.
+    let text = decode(&strip_tags(&slide[slide.find('>').unwrap() + 1..]));
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    for command in ["relish agent", "relish mcp"] {
+        assert!(text.contains(command), "the slide doesn't name {command}");
+    }
+    for (at, _) in text.match_indices("agent") {
+        let before = &text[..at];
+        assert!(
+            ["AI ", "your ", "relish "]
+                .iter()
+                .any(|word| before.ends_with(word)),
+            "an ambiguous \"agent\" after {:?}",
+            &before[before.len().saturating_sub(30)..]
+        );
+    }
+    let lower = text.to_lowercase();
+    for unshipped in ["proposal", "guardrail", "relish gym"] {
+        assert!(!lower.contains(unshipped), "the slide claims {unshipped:?}");
+    }
+}
+
 /// The drawings are inline and animated by the site's own CSS, so nothing in
-/// the section loads from anywhere else, and reduced motion stills them.
+/// the section loads from anywhere else, and reduced motion stills them. A
+/// slide may link out: a link loads nothing until it's followed.
 #[test]
 fn the_differences_load_nothing_and_respect_reduced_motion() {
     let page = read("docs/website/index.html");
     let section = why_section(&page);
-    for external in ["http:", "https:", "//", "<img", "<script", "<link", "<use"] {
+    let mut unlinked = String::new();
+    let mut rest = section;
+    while let Some(at) = rest.find("<a ") {
+        unlinked.push_str(&rest[..at]);
+        let tag = &rest[at..at + rest[at..].find('>').unwrap()];
+        let href = attribute(tag, "href").expect("a link with no href");
         assert!(
-            !section.contains(external),
+            href.starts_with("https://github.com/reliaburger/reliaburger/") || !href.contains(':'),
+            "a slide links outside the project: {href}"
+        );
+        rest = &rest[at + tag.len()..];
+    }
+    unlinked.push_str(rest);
+    for external in [
+        "http:", "https:", "//", "<img", "<script", "<link", "<use", "url(", "href=",
+    ] {
+        assert!(
+            !unlinked.contains(external),
             "the #why section contains {external:?}"
         );
     }
@@ -1673,7 +1834,20 @@ fn the_differences_load_nothing_and_respect_reduced_motion() {
     ] {
         assert!(script.contains(needle), "why-carousel.js lacks {needle:?}");
     }
+    // Every class a drawing animates with has its rule in the stylesheet. The
+    // `<svg>` element's own classes only name the drawing, so they're skipped.
     let style = read("docs/website/style.css");
+    for slide in why_slides(section) {
+        let svg = &slide[slide.find("<svg").unwrap()..slide.find("</svg>").unwrap()];
+        for classes in svg.split("class=\"").skip(2) {
+            for class in classes[..classes.find('"').unwrap()].split_whitespace() {
+                assert!(
+                    style.contains(&format!(".{class} ")) || style.contains(&format!(".{class},")),
+                    "style.css has no rule for .{class}"
+                );
+            }
+        }
+    }
     let reduced = style
         .split("@media (prefers-reduced-motion: reduce)")
         .skip(1)
@@ -1684,6 +1858,62 @@ fn the_differences_load_nothing_and_respect_reduced_motion() {
         reduced,
         "style.css should stop the drawings' animation for reduced motion"
     );
+}
+
+/// The carousel script counts the slides it finds, so a new one needs no
+/// script change, and its Pause and Play button stays (#1552). The footer and
+/// the site's README say how many differences there are, so they follow the
+/// count; the script and the section's comment don't name one to go stale.
+#[test]
+fn the_carousel_counts_its_slides_and_keeps_pause_and_play() {
+    let page = read("docs/website/index.html");
+    let slides = why_slides(why_section(&page)).len();
+    let words = ["", "one", "two", "three", "four", "five", "six", "seven"];
+    assert_eq!(words[slides], SLIDE_COUNT_WORD);
+
+    let script = read("docs/website/assets/why-carousel.js");
+    assert!(script.contains("var slides = Array.prototype.slice.call(list.children);"));
+    assert!(script.contains("index + 1 + \" of \" + slides.length"));
+    for needle in [
+        "button(\"why-toggle\", \"Pause\")",
+        "stopped ? \"Play\" : \"Pause\"",
+        "aria-pressed",
+        "event.pointerType !== \"mouse\"",
+    ] {
+        assert!(script.contains(needle), "why-carousel.js lacks {needle:?}");
+    }
+    let comment = &page[page.find("<!-- ").unwrap()..page.find("<section id=\"why\"").unwrap()];
+    let comment = &comment[comment.rfind("<!--").unwrap()..];
+    for (name, text) in [
+        ("why-carousel.js", script.as_str()),
+        ("the comment", comment),
+    ] {
+        let text = text.to_lowercase();
+        for word in &words[2..] {
+            assert!(
+                !text.contains(&format!("all {word} "))
+                    && !text.contains(&format!("{word} differences")),
+                "{name} names a slide count ({word})"
+            );
+        }
+    }
+
+    let footer = &page[page.find("<footer>").unwrap()..];
+    assert!(
+        footer.contains(&format!("the {SLIDE_COUNT_WORD} differences")),
+        "the footer miscounts the differences"
+    );
+    let readme = read("docs/website/README.md");
+    for phrase in [
+        format!("plain list of {SLIDE_COUNT_WORD} architectural differences"),
+        format!("{SLIDE_COUNT_WORD} dots"),
+        format!("all {SLIDE_COUNT_WORD} stay stacked"),
+    ] {
+        assert!(
+            readme.contains(&phrase),
+            "docs/website/README.md lacks {phrase:?}"
+        );
+    }
 }
 
 /// The install section has two tabs (#1579): the one-line install, and one
@@ -1713,6 +1943,26 @@ fn the_install_section_offers_the_one_line_install_and_an_agent_prompt() {
     let agents = read("docs/website/agents.html");
     assert!(agents.contains("Setting up a cluster for your human"));
     assert!(!section.contains("<script"), "the tabs need no script");
+}
+
+/// A third tab installs the CLI with Homebrew (#1583): the tap, then the
+/// quickstart. The one-line install stays the first tab and the chosen one,
+/// and the Homebrew panel shows each tab its own style rule.
+#[test]
+fn the_install_section_offers_homebrew_after_the_one_line_install() {
+    let page = read("docs/website/index.html");
+    let section = &page[page.find("<section id=\"install\"").unwrap()..];
+    let section = &section[..section.find("</section>").unwrap()];
+    let tyres = section.find(">Kick the tyres</label>").unwrap();
+    let homebrew = section.find(">Homebrew</label>").expect("no Homebrew tab");
+    assert!(tyres < homebrew, "the one-line install comes first");
+    let panel = &section[section.find("install-panel-homebrew").unwrap()..];
+    let panel = &panel[..panel.find("</pre>").unwrap()];
+    let brew = panel.find("brew install reliaburger/tap/relish").unwrap();
+    let quickstart = panel.find("relish setup --quickstart").unwrap();
+    assert!(brew < quickstart, "install the CLI, then build the cluster");
+    let style = read("docs/website/style.css");
+    assert!(style.contains("#install-homebrew:checked ~ .install-panel-homebrew"));
 }
 
 // --- Built for humans and their agents (#1578) -----------------------------
@@ -1747,18 +1997,18 @@ fn the_homepage_opens_with_a_line_for_agents() {
         text.starts_with("Are you an AI agent? Start here"),
         "{text:?}"
     );
-    for href in ["agents.html", "agents.md", "llms.txt"] {
+    for href in ["agents", "agents.md", "llms.txt"] {
         assert!(
             banner.contains(&format!("href=\"{href}\"")),
             "the banner doesn't link {href}"
         );
         assert!(
-            repository().join("docs/website").join(href).is_file(),
+            published_file("index.html", href).is_some_and(|file| file.is_file()),
             "{href} isn't published"
         );
     }
     assert!(
-        banner.contains("<a href=\"agents.html\">Start here</a>"),
+        banner.contains("<a href=\"agents\">Start here</a>"),
         "\"Start here\" goes to /agents"
     );
     assert!(read("docs/website/llms.txt").starts_with("# Reliaburger\n"));
@@ -1831,6 +2081,177 @@ fn the_agent_recording_slot_says_plainly_whether_there_is_a_recording() {
     }
 }
 
+/// The `#act` section of the homepage: what 0.2.8 lets an agent do (#1690).
+fn act_section(page: &str) -> &str {
+    let start = page.find("<section id=\"act\"").expect("no #act section");
+    &page[start..start + page[start..].find("</section>").unwrap()]
+}
+
+/// 0.2.8's showcase sits right after the agent debugging section, which it
+/// builds on, and every command it shows parses with the real CLI.
+#[test]
+fn every_act_section_command_parses_with_the_real_cli() {
+    let page = read("docs/website/index.html");
+    let ids: Vec<String> = section_ids(&page).into_iter().flatten().collect();
+    let debug = ids.iter().position(|id| id == "debug").unwrap();
+    assert_eq!(
+        ids.get(debug + 1).map(String::as_str),
+        Some("act"),
+        "#act should follow #debug: {ids:?}"
+    );
+    let section = act_section(&page);
+    let commands = marked_commands(section, "data-act-command");
+    assert!(commands.len() >= 10, "too few commands: {commands:?}");
+    assert_eq!(
+        commands.len(),
+        marked_commands(&page, "data-act-command").len(),
+        "data-act-command belongs to the #act section"
+    );
+    for command in &commands {
+        assert!(command.starts_with("relish "), "{command:?}");
+        parses(command).unwrap_or_else(|error| panic!("{command:?}: {error}"));
+    }
+}
+
+/// Like the debugging section's, the showcase's recording slot says so
+/// while there's no recording, and gives the player nothing to load.
+#[test]
+fn the_act_recording_slot_says_plainly_whether_there_is_a_recording() {
+    let page = read("docs/website/index.html");
+    let section = act_section(&page);
+    let start = section
+        .find("<figure id=\"act-recording\"")
+        .expect("no #act recording slot");
+    let figure = &section[start..start + section[start..].find("</figure>").unwrap()];
+    let tag = &figure[..figure.find('>').unwrap()];
+    if tag.contains("data-cast=") {
+        assert!(figure.contains("<div class=\"recording-screen\"></div>"));
+        assert!(!figure.contains("recording-pending"));
+    } else {
+        assert!(!figure.contains("recording-screen"));
+        assert!(figure.contains("class=\"recording-pending\""));
+        let text = decode(&strip_tags(figure));
+        assert!(text.contains("No recording yet"), "{text:?}");
+        assert!(figure.contains("https://github.com/reliaburger/reliaburger/issues/1690"));
+    }
+}
+
+/// What 0.2.8 hasn't measured yet has a slot that names its issue and quotes
+/// no number: the Kubernetes context comparison (#1679, for #1681).
+#[test]
+fn unmeasured_results_have_slots_that_claim_nothing() {
+    let page = read("docs/website/index.html");
+    let section = act_section(&page);
+    let slots: Vec<&str> = section
+        .split("<aside class=\"measure-pending\"")
+        .skip(1)
+        .map(|rest| &rest[..rest.find("</aside>").unwrap()])
+        .collect();
+    let link = "https://github.com/reliaburger/reliaburger/issues/1679";
+    let slot = slots
+        .iter()
+        .find(|slot| slot.contains(link))
+        .expect("no pending slot for #1679");
+    let text = decode(&strip_tags(slot));
+    assert!(text.contains("Not measured yet"), "{text:?}");
+    let without_issues = text.replace("#1679", "").replace("#1681", "");
+    assert!(
+        !without_issues.chars().any(|c| c.is_ascii_digit()),
+        "the #1679 slot quotes a number: {text:?}"
+    );
+}
+
+/// Every number in a piece of text, as written: digits, with any `.` or `,`
+/// that sits between two digits (`3.1`, `12,000`).
+fn numbers_in(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut numbers = Vec::new();
+    let mut current = String::new();
+    for (index, &c) in chars.iter().enumerate() {
+        let joins_digits = (c == '.' || c == ',')
+            && !current.is_empty()
+            && chars.get(index + 1).is_some_and(char::is_ascii_digit);
+        if c.is_ascii_digit() || joins_digits {
+            current.push(c);
+        } else if !current.is_empty() {
+            numbers.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        numbers.push(current);
+    }
+    numbers
+}
+
+#[test]
+fn numbers_in_keeps_decimals_and_thousands_together() {
+    assert_eq!(
+        numbers_in("Llama 3.1 8B got 7 of 36, 12,000 tokens. Done 9."),
+        ["3.1", "8", "7", "36", "12,000", "9"]
+    );
+}
+
+/// The local-model runs (#1687) are measured. Their slot names the record it
+/// quotes in `data-record` and links it, and every number it states is one
+/// that record holds, as the Kubernetes comparison page does with its record.
+#[test]
+fn the_local_model_slot_quotes_only_its_record() {
+    let page = read("docs/website/index.html");
+    let section = act_section(&page);
+    let start = section
+        .find("<aside class=\"measured\"")
+        .expect("no measured slot in #act");
+    let slot = &section[start..start + section[start..].find("</aside>").unwrap()];
+    assert!(slot.contains("https://github.com/reliaburger/reliaburger/issues/1687"));
+    let tag = &slot[..slot.find('>').unwrap()];
+    let record = attribute(tag, "data-record").expect("the slot names no data-record");
+    assert!(
+        record.starts_with("docs/qualification/") && record.ends_with(".md"),
+        "{record:?}"
+    );
+    assert!(
+        slot.contains(&format!(
+            "https://github.com/reliaburger/reliaburger/blob/main/{record}"
+        )),
+        "the slot should link {record}"
+    );
+    let held: std::collections::BTreeSet<String> = numbers_in(&read(record)).into_iter().collect();
+    let text = decode(&strip_tags(slot)).replace("#1687", "");
+    assert!(!text.contains("Not measured yet"), "{text:?}");
+    let quoted = numbers_in(&text);
+    assert!(
+        !quoted.is_empty(),
+        "a measured slot with no numbers: {text:?}"
+    );
+    for number in quoted {
+        assert!(
+            held.contains(&number),
+            "the slot says {number}, which {record} doesn't: {text:?}"
+        );
+    }
+}
+
+/// The concept counts the showcase quotes are the budget the test in
+/// `src/bin/relish.rs` holds the CLI to, so the page can't drift from it.
+#[test]
+fn the_act_section_quotes_the_concept_budget() {
+    let budget: serde_json::Value =
+        serde_json::from_str(&read("docs/testing/concept-budget.json")).unwrap();
+    let page = read("docs/website/index.html");
+    let text = decode(&strip_tags(act_section(&page)));
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    for (key, words) in [
+        ("resource_kinds", "resource kinds"),
+        ("commands", "commands"),
+    ] {
+        let count = budget[key]["budget"].as_u64().unwrap();
+        assert!(
+            text.contains(&format!("{count} {words}")),
+            "the #act section should say \"{count} {words}\""
+        );
+    }
+}
+
 /// The install buttons on `/agents` and in the README add the server `relish
 /// agent setup` writes, and the command they start parses with the real CLI.
 #[test]
@@ -1889,7 +2310,7 @@ fn every_link_into_the_agents_page_lands() {
         );
     }
     let page = read("docs/website/index.html");
-    for rest in page.split("href=\"agents.html#").skip(1) {
+    for rest in page.split("href=\"agents#").skip(1) {
         let fragment = &rest[..rest.find('"').unwrap()];
         assert!(
             lands(fragment),
@@ -1909,6 +2330,91 @@ fn every_link_into_the_agents_page_lands() {
     ] {
         assert!(section.contains(needle), "how-we-test lacks {needle:?}");
     }
+}
+
+/// The file under `docs/website` that `href`, a link on `page`, lands on,
+/// or `None` when it leaves the site or stays on the page. GitHub Pages
+/// serves `NAME.html` at the bare `NAME` and `DIR/index.html` at `DIR/`,
+/// which is how the site links its pages.
+fn published_file(page: &str, href: &str) -> Option<PathBuf> {
+    let site = url::Url::parse("https://reliaburger.com/").unwrap();
+    let base = super::website_markdown::page_url(page);
+    let target = base.join(href).ok()?;
+    if target.origin() != site.origin() || href.starts_with('#') {
+        return None;
+    }
+    let path = target.path().trim_start_matches('/');
+    let path = if path.is_empty() || path.ends_with('/') {
+        format!("{path}index.html")
+    } else if Path::new(path).extension().is_some() {
+        path.to_string()
+    } else {
+        format!("{path}.html")
+    };
+    Some(repository().join("docs/website").join(path))
+}
+
+/// The `href` of every link and stylesheet in `html`.
+fn hrefs(html: &str) -> Vec<&str> {
+    html.split("href=\"")
+        .skip(1)
+        .map(|rest| &rest[..rest.find('"').unwrap()])
+        .collect()
+}
+
+/// Every link from one page of the site to another is bare (`agents`,
+/// `./compare/nomad`, `./compare/`), never `NAME.html`, and lands on a page
+/// that exists. Assets (`style.css`, `agents.md`) keep their extension.
+#[test]
+fn every_link_between_pages_is_bare_and_lands() {
+    let mut checked = 0;
+    for page in super::website_markdown::pages() {
+        let html = read(&format!("docs/website/{page}"));
+        for href in hrefs(&html) {
+            let href = href.replace("&amp;", "&");
+            let Some(file) = published_file(&page, &href) else {
+                continue;
+            };
+            let path = href.split(['#', '?']).next().unwrap_or_default();
+            assert!(
+                !path.ends_with(".html"),
+                "{page} links {href}; link the bare page instead"
+            );
+            assert!(file.is_file(), "{page} links {href}, which isn't there");
+            checked += 1;
+        }
+    }
+    assert!(checked > 100, "too few links checked: {checked}");
+}
+
+#[test]
+fn published_file_maps_bare_links_to_their_html() {
+    let site = repository().join("docs/website");
+    assert_eq!(
+        published_file("index.html", "agents#x"),
+        Some(site.join("agents.html"))
+    );
+    assert_eq!(
+        published_file("index.html", "./compare/"),
+        Some(site.join("compare/index.html"))
+    );
+    assert_eq!(
+        published_file("compare/nomad.html", "../"),
+        Some(site.join("index.html"))
+    );
+    assert_eq!(
+        published_file("compare/nomad.html", "./methodology"),
+        Some(site.join("compare/methodology.html"))
+    );
+    assert_eq!(
+        published_file("compare/nomad.html", "../style.css"),
+        Some(site.join("style.css"))
+    );
+    assert_eq!(published_file("index.html", "#install"), None);
+    assert_eq!(
+        published_file("index.html", "https://github.com/reliaburger"),
+        None
+    );
 }
 
 /// `/agents` loads the site's stylesheet and copy script and nothing else.
