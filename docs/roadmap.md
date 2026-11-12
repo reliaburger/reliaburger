@@ -650,9 +650,11 @@ what's shipped and what's scheduled.
 - **Acceptance gates 0.1.0 didn't close.** V01, the live catalogue on three
   independent runc nodes ([#286](https://github.com/reliaburger/reliaburger/issues/286));
   the V02 leftovers, the snapshot uploader under power cuts and the
-  `v02-loops` bounds ([#287](https://github.com/reliaburger/reliaburger/issues/287));
-  V04, cold installs on Linux x86_64 and Linux arm64
-  ([#288](https://github.com/reliaburger/reliaburger/issues/288)). All in 0.3.0.
+  `v02-loops` bounds ([#287](https://github.com/reliaburger/reliaburger/issues/287)).
+  Both in 0.3.0. V04, the cold installs on Linux x86_64 and arm64
+  ([#288](https://github.com/reliaburger/reliaburger/issues/288)), passed on
+  the published 0.2.8 on 12 November 2026: a ready cluster in a median 84.8 s
+  and 83.2 s ([record](qualification/2026-11-12-v04-cold-installs-linux.md)).
   Intel macOS left V04 when 0.2.2 dropped its build: 0.2.1 is the last release
   with `relish-macos-x86_64`
   ([#1018](https://github.com/reliaburger/reliaburger/issues/1018)).
