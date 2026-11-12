@@ -665,6 +665,39 @@ impl DeployHistoryEntry {
             spec: None,
         }
     }
+
+    /// The entry for a node's deploy of `spec` that began at `started_at`
+    /// and has just ended with `result`.
+    ///
+    /// `completed_at` is now, so `completed_at - created_at` is how long
+    /// the deploy took: what `relish history` and the soak's app start
+    /// read (#1640). The id is the completion time in seconds.
+    pub fn finished(
+        app_id: AppId,
+        spec: &crate::config::app::AppSpec,
+        result: DeployResult,
+        started_at: SystemTime,
+        steps_completed: usize,
+        steps_total: usize,
+    ) -> Self {
+        let completed_at = SystemTime::now();
+        Self {
+            id: DeployId(
+                completed_at
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            ),
+            app_id,
+            image: spec.image.clone().unwrap_or_default(),
+            result,
+            created_at: started_at,
+            completed_at,
+            steps_completed,
+            steps_total,
+            spec: Some(Box::new(spec.clone())),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
