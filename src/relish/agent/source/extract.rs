@@ -141,7 +141,10 @@ fn commit_tree(dir: &Path, message: &str) -> Result<String, String> {
         format!("user.email={email}"),
         "commit.gpgsign=false".to_string(),
     ];
-    git(dir, &["init", "--quiet"], &[])?;
+    // An empty --template: the user's init.templateDir can hold hooks that
+    // run on our commit, and an info/exclude that is a symbolic link to one
+    // file every repository shares (#1726, #1738, #1748).
+    git(dir, &["init", "--quiet", "--template="], &[])?;
     // --force: the user's global ignore file mustn't leave a bundled file
     // out of the commit, or `git status` would show it as untracked.
     git(dir, &["add", "--all", "--force", "."], &[])?;
@@ -245,6 +248,17 @@ mod tests {
         let diff = git_output(&dir, &["diff", "--stat"]);
         assert!(diff.contains("src/lib.rs"), "{diff}");
         assert!(diff.contains("1 file changed"), "{diff}");
+    }
+
+    #[test]
+    fn the_extracted_repository_takes_nothing_from_a_git_template() {
+        // A template can hold hooks that run on every commit and an
+        // info/exclude that is a symbolic link every repository shares.
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("source");
+        run(&dir);
+        assert!(!dir.join(".git/hooks").exists());
+        assert!(!dir.join(".git/info").exists());
     }
 
     #[test]

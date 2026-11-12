@@ -1,0 +1,7 @@
+---
+source: src/proposal/build_tests.rs
+expression: "proposal.summary.join(\"\\n\")"
+---
+Scale shop/web from 3 to 6 replicas.
+Touches 1 app on 2 nodes (node-a, node-b); starts 3 instances, forecast on node-c; the scheduler can't place 2 (no node has enough free memory).
+Serves https://shop.example.com/ and the service web.shop.

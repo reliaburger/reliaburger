@@ -290,6 +290,7 @@ async fn run_one(
     peer_route: crate::testkit::context::PeerRoute,
 ) -> TestCaseResult {
     let start = Instant::now();
+    let wall_start = std::time::SystemTime::now();
     let started_at = now_rfc3339();
     let deadline_at = rfc3339_after(timeout);
     let required = profile_requires_case(profile, case.requires);
@@ -511,7 +512,7 @@ async fn run_one(
     // The case body gets its own task so a panic is data and the outer owner
     // still reaches cleanup. Spawning `run_one` directly did the opposite.
     let mut body = tokio::spawn((case.run)(context.clone()));
-    let outcome = match deadline.run("case", &mut body).await {
+    let mut outcome = match deadline.run("case", &mut body).await {
         Ok(Ok(Ok(()))) => TestOutcome::Pass,
         Ok(Ok(Err(CaseError::Unknown(reason)))) => TestOutcome::Unknown {
             kind: UnknownKind::MissingEvidence,
@@ -540,6 +541,10 @@ async fn run_one(
             outcome
         }
     };
+    let wall_elapsed = wall_start.elapsed().unwrap_or_default();
+    if let Some(note) = host_suspension_note(wall_elapsed, start.elapsed()) {
+        append_reason(&mut outcome, &note);
+    }
 
     let cleanup_deadline = Deadline::after(teardown_timeout()).expect("non-zero cleanup timeout");
     let cleanup = context.teardown(cleanup_deadline).await;
@@ -615,6 +620,41 @@ pub(crate) fn now_rfc3339() -> String {
         now.minute(),
         now.second(),
     )
+}
+
+/// How far the wall clock may run ahead of the monotonic one during a case
+/// before the runner says so. NTP slews the wall clock by milliseconds; a
+/// gap this size means the host slept, or its clock was stepped.
+const HOST_SUSPENSION_THRESHOLD: Duration = Duration::from_secs(10);
+
+/// Name a host suspension, when the wall clock ran well ahead of the
+/// monotonic clock while a case ran.
+///
+/// The case's deadline is an `Instant`, and on macOS (and Linux) `Instant`
+/// doesn't count time asleep. The server's lease expiry is wall-clock time. So a laptop
+/// that sleeps mid-case wakes with the case's budget nearly untouched and
+/// its lease long expired, and the lease's cleanup has already removed what
+/// the case was waiting for (#1527). The case then fails in a way that
+/// points at the product. This says what really happened.
+fn host_suspension_note(wall_elapsed: Duration, monotonic_elapsed: Duration) -> Option<String> {
+    let gap = wall_elapsed.checked_sub(monotonic_elapsed)?;
+    (gap >= HOST_SUSPENSION_THRESHOLD).then(|| {
+        format!(
+            "the host's wall clock ran {} s ahead of the case's monotonic clock, so the host \
+             slept or its clock was stepped; the lease's server-side expiry is wall-clock \
+             time, so it may have expired and been cleaned up mid-case",
+            gap.as_secs()
+        )
+    })
+}
+
+/// Add `note` to a failed or unknown outcome's reason. A pass or a skip
+/// keeps its own.
+fn append_reason(outcome: &mut TestOutcome, note: &str) {
+    if let TestOutcome::Fail { reason } | TestOutcome::Unknown { reason, .. } = outcome {
+        reason.push_str("; ");
+        reason.push_str(note);
+    }
 }
 
 fn rfc3339_after(duration: Duration) -> String {
@@ -1562,6 +1602,7 @@ mod tests {
             pid: None,
             runtime_unknown: false,
             status_age_ms: None,
+            age_seconds: None,
             reason: None,
         }
     }
@@ -1626,5 +1667,46 @@ mod tests {
         // Parses back as an RFC 3339 instant if the feature is on; at minimum
         // the year is four digits.
         assert!(stamp[..4].chars().all(|c| c.is_ascii_digit()), "{stamp}");
+    }
+
+    /// #1527: the Mac fell asleep 11 s into the node-jobs catalogue case
+    /// and woke 518 s later. The case's deadline doesn't count sleep, but
+    /// its lease's expiry does, so the case failed with nothing that said
+    /// the host had slept.
+    #[test]
+    fn a_host_that_slept_through_a_case_is_named_in_its_outcome() {
+        let note = host_suspension_note(Duration::from_secs(608), Duration::from_secs(90))
+            .expect("a 518 s gap is a suspension");
+        assert!(note.contains("ran 518 s ahead"), "{note}");
+        let mut timed_out = TestOutcome::timed_out("case", 90_000);
+        append_reason(&mut timed_out, &note);
+        let TestOutcome::Unknown { reason, .. } = &timed_out else {
+            panic!("a timeout stays unknown: {timed_out:?}");
+        };
+        assert!(
+            reason.starts_with("case exceeded its 90000 ms deadline; the host's wall clock"),
+            "{reason}"
+        );
+        let mut failed = TestOutcome::Fail {
+            reason: "no row".into(),
+        };
+        append_reason(&mut failed, &note);
+        assert!(matches!(&failed, TestOutcome::Fail { reason } if reason.contains("slept")));
+        let mut passed = TestOutcome::Pass;
+        append_reason(&mut passed, &note);
+        assert_eq!(passed, TestOutcome::Pass);
+    }
+
+    #[test]
+    fn ordinary_clock_drift_is_not_called_a_suspension() {
+        for (wall, monotonic) in [(90_000, 90_000), (90_500, 90_000), (89_000, 90_000)] {
+            assert_eq!(
+                host_suspension_note(
+                    Duration::from_millis(wall),
+                    Duration::from_millis(monotonic)
+                ),
+                None
+            );
+        }
     }
 }

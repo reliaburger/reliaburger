@@ -67,7 +67,11 @@ fn standalone_first_run_reaches_a_running_workload() {
 
     let status = run_relish(&["--endpoint", &endpoint, "status"]);
     assert_success(&status, "documented standalone status");
-    assert!(String::from_utf8_lossy(&status.stdout).contains("hello"));
+    assert!(String::from_utf8_lossy(&status.stdout).starts_with("cluster: "));
+
+    let apps = run_relish(&["--endpoint", &endpoint, "apps"]);
+    assert_success(&apps, "documented standalone apps");
+    assert!(String::from_utf8_lossy(&apps.stdout).contains("hello"));
 
     let top = run_relish(&["--endpoint", &endpoint, "top"]);
     assert_success(&top, "documented standalone top");
@@ -258,7 +262,8 @@ command = ["--port", "0"]
             token,
             "--output",
             "json",
-            "status",
+            "apps",
+            "--instances",
         ],
         "\"state\": \"running\"",
     );

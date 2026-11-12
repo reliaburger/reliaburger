@@ -17,6 +17,19 @@
 //! - No entry approves anything: no `trust`, no auto-approve, no wildcard.
 //!
 //! `--remove` takes the entries (and the skill) back out, by the same rules.
+//!
+//! When the saved context holds the cluster's admin token, setup also makes
+//! `relish mcp` its own read-only token (#1730,
+//! [`crate::relish::mcp::credentials`]), so the agents it wires never carry
+//! admin credentials. The preview says so; `--yes` makes it; `--remove`
+//! revokes it.
+//!
+//! `--propose --namespace NAME` (#1682) wires `relish mcp --propose
+//! --namespace NAME` instead, and the token it makes is the one `relish mcp
+//! --propose` keeps: a deployer agent token confined to that namespace,
+//! which may propose changes and take leases but changes nothing directly.
+//! It keeps `relish mcp --propose`'s rules: no namespace is refused, and a
+//! token setup didn't make, which may be a person's, is warned about.
 
 pub mod clients;
 pub mod edit;
@@ -33,7 +46,7 @@ use super::envelope::{AgentError, BuildInfo, CommandName, Envelope, ErrorCode, N
 use clients::{Client, Home};
 use edit::Existing;
 
-pub use clients::{MCP_COMMAND_LINE, MCP_DESCRIPTION, MCP_SERVER_NAME, mcp_command_line};
+pub use clients::{MCP_COMMAND_LINE, MCP_DESCRIPTION, MCP_SERVER_NAME, Mode, mcp_command_line};
 
 /// The Reliaburger skill for agents that read Agent Skills, as `make
 /// agent-docs` generates it from the manual's agent chapter. Setup installs
@@ -65,6 +78,47 @@ pub struct SetupOptions {
     /// Replace, or remove, a `reliaburger` entry that setup didn't write.
     #[arg(long)]
     pub force: bool,
+
+    /// Let the agents propose changes too: their entry runs `relish mcp
+    /// --propose --namespace NAME`, and from the saved admin context setup
+    /// makes it a deployer agent token confined to that namespace. A person
+    /// or an admin's policy approves every proposal. Needs --namespace.
+    #[arg(long, conflicts_with = "remove")]
+    pub propose: bool,
+
+    /// The one namespace a proposing agent may change, with --propose.
+    #[arg(long, requires = "propose")]
+    pub namespace: Option<String>,
+}
+
+impl SetupOptions {
+    /// What the entries' `relish mcp` offers, or the refusal when
+    /// `--propose` has no `--namespace`: the same rule `relish mcp
+    /// --propose` keeps, because the token it makes from the admin context
+    /// could otherwise propose in every namespace.
+    pub fn mode(&self) -> Result<Mode, AgentError> {
+        match (self.propose, &self.namespace) {
+            (false, _) => Ok(Mode::Read),
+            (true, Some(namespace))
+                if crate::relish::mcp::credentials::valid_namespace(namespace) =>
+            {
+                Ok(Mode::Propose {
+                    namespace: namespace.clone(),
+                })
+            }
+            (true, Some(namespace)) => Err(AgentError::new(
+                ErrorCode::Usage,
+                format!("namespace {namespace:?} isn't a valid namespace name"),
+            )),
+            (true, None) => Err(AgentError::new(
+                ErrorCode::Usage,
+                "--propose needs --namespace: from the saved admin context, setup makes the \
+                 agents a deployer agent token, and without a namespace it could propose in \
+                 every namespace",
+            )
+            .with_hint("relish agent setup --propose --namespace NAME")),
+        }
+    }
 }
 
 /// `data` for `relish agent setup`.
@@ -79,6 +133,14 @@ pub struct SetupData {
     pub server: Server,
     /// Every agent setup knows, found or not, in a fixed order.
     pub agents: Vec<AgentPlan>,
+    /// `relish mcp`'s own read-only tokens, made from the context's admin
+    /// one so no agent carries admin credentials: `mcp-token.json` to make,
+    /// or with `--remove` every token file beside the context
+    /// (`mcp-token*.json` and `mcp-propose-token*.json`), each one's token
+    /// revoked and the file deleted. Empty
+    /// when the context isn't an admin one (or there's none), so there's
+    /// nothing to do.
+    pub mcp_tokens: Vec<Change>,
 }
 
 /// Adding or removing.
@@ -141,6 +203,8 @@ pub enum ChangeKind {
     McpServer,
     /// The Reliaburger skill.
     Skill,
+    /// `relish mcp`'s read-only token, kept beside the context.
+    McpToken,
 }
 
 /// What happens to one entry.
@@ -149,7 +213,8 @@ pub enum ChangeKind {
 pub enum ChangeStatus {
     /// It isn't there; setup adds it.
     Add,
-    /// Someone else's entry, replaced because of `--force`.
+    /// Setup's own entry for the other mode, or someone else's entry
+    /// replaced because of `--force`.
     Replace,
     /// Setup takes it out.
     Remove,
@@ -170,6 +235,90 @@ impl ChangeStatus {
     }
 }
 
+/// One of `relish mcp`'s token files.
+pub struct TokenFile {
+    /// Where it is, or would be.
+    pub path: PathBuf,
+    /// Whether a token that's still good is there (for `--remove`, whether
+    /// the file is there at all).
+    pub stored: bool,
+    /// The file's JSON with the secret redacted, for the diff.
+    pub preview: String,
+    /// Why a token that's there doesn't count, for the answer to say.
+    pub note: Option<String>,
+}
+
+/// What setup can do about `relish mcp`'s read-only tokens, when the saved
+/// context holds an admin one.
+pub struct TokenPlan {
+    /// The files: `mcp-token.json` to make, or every token file there is
+    /// to remove.
+    pub files: Vec<TokenFile>,
+    /// Make the token at a path ([`Action::Install`]) or revoke and delete
+    /// it ([`Action::Remove`]). `Ok(false)` means there was nothing to do:
+    /// the cluster says the context's token isn't admin, or the file had
+    /// already gone. Called only with `--yes`.
+    pub apply: ApplyToken,
+}
+
+/// Makes or removes the token at a path; see [`TokenPlan::apply`].
+pub type ApplyToken = Box<dyn FnMut(Action, &Path) -> Result<bool, String> + Send>;
+
+/// Plan, and with `--yes` make, the change for every token file.
+fn plan_tokens(token: TokenPlan, action: Action, yes: bool) -> Vec<Change> {
+    let TokenPlan { files, mut apply } = token;
+    files
+        .into_iter()
+        .map(|file| plan_token(file, &mut apply, action, yes))
+        .collect()
+}
+
+/// Plan, and with `--yes` make, the change for one token file.
+fn plan_token(
+    file: TokenFile,
+    apply: &mut dyn FnMut(Action, &Path) -> Result<bool, String>,
+    action: Action,
+    yes: bool,
+) -> Change {
+    let exists = file.stored || (action == Action::Remove && file.path.exists());
+    let status = match (action, exists) {
+        (Action::Install, false) => ChangeStatus::Add,
+        (Action::Remove, true) => ChangeStatus::Remove,
+        (Action::Install, true) | (Action::Remove, false) => ChangeStatus::Unchanged,
+    };
+    let mut change = change(
+        ChangeKind::McpToken,
+        file.path.clone(),
+        "token".to_string(),
+        status,
+    );
+    change.note = file.note;
+    if !status.changes_something() {
+        return change;
+    }
+    // The file's JSON, never the secret: the preview has it redacted.
+    let contents = format!("{}\n", file.preview);
+    change.diff = Some(match action {
+        Action::Install => diff(&file.path, "", &contents),
+        Action::Remove => diff(&file.path, &contents, ""),
+    });
+    if yes {
+        match apply(action, &file.path) {
+            Ok(true) => change.written = true,
+            Ok(false) => {
+                change.note = Some(match action {
+                    Action::Install => "the cluster says the context's token isn't admin, so \
+                                        relish mcp uses it as it is"
+                        .to_string(),
+                    Action::Remove => "it was already gone".to_string(),
+                })
+            }
+            Err(error) => change.note = Some(format!("not written: {error}")),
+        }
+    }
+    change
+}
+
 /// A planned change, with the text to write.
 #[derive(Debug, Clone)]
 struct Planned {
@@ -182,8 +331,15 @@ struct Planned {
 
 /// Work out, and with `--yes` make, every change.
 ///
-/// `skill` is the skill file's text, when this build carries one.
-pub fn setup(options: &SetupOptions, home: &Home, skill: Option<&str>) -> SetupData {
+/// `skill` is the skill file's text, when this build carries one; `mode`
+/// is what the entries' `relish mcp` offers, from [`SetupOptions::mode`].
+pub fn setup(
+    options: &SetupOptions,
+    mode: &Mode,
+    home: &Home,
+    skill: Option<&str>,
+    token: Option<TokenPlan>,
+) -> SetupData {
     let action = if options.remove {
         Action::Remove
     } else {
@@ -199,7 +355,7 @@ pub fn setup(options: &SetupOptions, home: &Home, skill: Option<&str>) -> SetupD
         };
         let mut changes = Vec::new();
         if chosen {
-            changes.push(plan_server(client, home, action, options.force));
+            changes.push(plan_server(client, home, mode, action, options.force));
             if let (Some(path), Some(skill)) = (client.skill(home), skill) {
                 changes.push(plan_skill(path, skill, action, options.force));
             }
@@ -220,9 +376,10 @@ pub fn setup(options: &SetupOptions, home: &Home, skill: Option<&str>) -> SetupD
         applied: options.yes,
         server: Server {
             name: MCP_SERVER_NAME.to_string(),
-            command: mcp_command_line(),
+            command: mode.command_line(),
         },
         agents,
+        mcp_tokens: token.map_or_else(Vec::new, |token| plan_tokens(token, action, options.yes)),
     }
 }
 
@@ -271,7 +428,7 @@ fn left_alone(mut change: Change, status: ChangeStatus, note: String) -> Planned
 
 const CONFLICT_NOTE: &str = "an entry by this name that setup didn't write; read it, then add --force to replace or remove it";
 
-fn plan_server(client: Client, home: &Home, action: Action, force: bool) -> Planned {
+fn plan_server(client: Client, home: &Home, mode: &Mode, action: Action, force: bool) -> Planned {
     let config = client.config(home);
     let path = resolve(config.path);
     let entry_name = format!("{}.{MCP_SERVER_NAME}", config.parent);
@@ -292,10 +449,9 @@ fn plan_server(client: Client, home: &Home, action: Action, force: bool) -> Plan
         }
     };
     let text = before.as_deref().unwrap_or("");
-    let ours = client.entry();
-    let existing = match edit::existing(config.format, text, config.parent, MCP_SERVER_NAME, &ours)
-    {
-        Ok(existing) => existing,
+    let ours = client.entry_for(mode);
+    let current = match edit::current(config.format, text, config.parent, MCP_SERVER_NAME) {
+        Ok(current) => current,
         Err(error) => {
             return left_alone(
                 base,
@@ -304,15 +460,24 @@ fn plan_server(client: Client, home: &Home, action: Action, force: bool) -> Plan
             );
         }
     };
+    let existing = match current {
+        None => Existing::Absent,
+        Some(value) if value == ours => Existing::Same,
+        // Setup's own entry for the other mode (or another namespace):
+        // switching to or from --propose replaces it without --force.
+        Some(value) if client.is_own(&value) => Existing::Own,
+        Some(_) => Existing::Different,
+    };
     let status = match (action, existing, force) {
         (Action::Install, Existing::Absent, _) => ChangeStatus::Add,
         (Action::Install, Existing::Same, _) | (Action::Remove, Existing::Absent, _) => {
             ChangeStatus::Unchanged
         }
-        (Action::Install, Existing::Different, true) => ChangeStatus::Replace,
-        (Action::Remove, Existing::Same, _) | (Action::Remove, Existing::Different, true) => {
-            ChangeStatus::Remove
+        (Action::Install, Existing::Own, _) | (Action::Install, Existing::Different, true) => {
+            ChangeStatus::Replace
         }
+        (Action::Remove, Existing::Same | Existing::Own, _)
+        | (Action::Remove, Existing::Different, true) => ChangeStatus::Remove,
         (_, Existing::Different, false) => {
             return left_alone(base, ChangeStatus::Conflict, CONFLICT_NOTE.to_string());
         }
@@ -469,6 +634,70 @@ fn write(path: &Path, before: Option<&str>, after: Option<&str>) -> io::Result<(
     })
 }
 
+/// What setup knows about the token the agents' `relish mcp` will send,
+/// beyond the token plan: where it comes from, and for a token given with
+/// `--token` or `RELIABURGER_TOKEN`, what the cluster says it may do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenFacts {
+    /// Where the token comes from.
+    pub origin: crate::relish::client::TokenOrigin,
+    /// The cluster's word on an explicit token; `None` when it wasn't
+    /// asked or didn't answer.
+    pub access: Option<crate::relish::client::TokenAccess>,
+}
+
+/// The warnings about the token the agents will send: a person's token,
+/// an admin one, or a context that turned out not to be admin. Each says
+/// what to do instead.
+fn token_warnings(mode: &Mode, facts: &TokenFacts, tokens: &[Change]) -> Vec<String> {
+    use crate::relish::client::{TokenAccess, TokenOrigin};
+    let (role, scope, namespace) = match mode {
+        Mode::Read => ("read-only", String::new(), None),
+        Mode::Propose { namespace } => (
+            "deployer",
+            format!(" --namespaces {namespace}"),
+            Some(namespace.as_str()),
+        ),
+    };
+    let make = format!("relish token create --name holmes --agent --role {role}{scope}");
+    let mut warnings = Vec::new();
+    if facts.origin == TokenOrigin::Explicit && facts.access == Some(TokenAccess::Admin) {
+        warnings.push(format!(
+            "the token from --token or RELIABURGER_TOKEN is an admin one; if the agents' relish \
+             mcp sends it, they carry admin credentials. Make them their own with `{make}` and \
+             put it in RELIABURGER_TOKEN in their MCP server entry"
+        ));
+    }
+    let Some(namespace) = namespace else {
+        return warnings;
+    };
+    if facts.origin == TokenOrigin::Explicit {
+        warnings.push(format!(
+            "--propose: the token comes from --token or RELIABURGER_TOKEN, so setup makes no \
+             agent token and can't tell whether that one is an agent's. If it's a person's, the \
+             agents' proposals are that person's, and a guardrail that matches author.kind == \
+             \"agent\" doesn't see them. Give them an agent token confined to {namespace}, made \
+             with `{make}`"
+        ));
+    }
+    let not_admin = tokens.iter().any(|token| {
+        !token.written
+            && token
+                .note
+                .as_deref()
+                .is_some_and(|note| note.contains("isn't admin"))
+    });
+    if not_admin {
+        warnings.push(format!(
+            "--propose: the saved context's token isn't an admin one, so setup made no agent \
+             token and relish mcp --propose will send the context's own: the agents' proposals \
+             are that person's, and its scope, not --namespace, decides where they may propose. \
+             Give them an agent token, made with `{make}`, in RELIABURGER_TOKEN"
+        ));
+    }
+    warnings
+}
+
 /// The whole answer: [`setup`]'s data, what to run next, and warnings.
 ///
 /// `rerun` is this command line, for the `--yes` step.
@@ -476,10 +705,16 @@ pub fn answer(
     options: &SetupOptions,
     home: &Home,
     skill: Option<&str>,
+    token: Option<TokenPlan>,
+    facts: TokenFacts,
     build: BuildInfo,
     rerun: &str,
 ) -> Envelope<SetupData> {
-    let data = setup(options, home, skill);
+    let mode = match options.mode() {
+        Ok(mode) => mode,
+        Err(error) => return Envelope::failed(CommandName::Setup, build, error),
+    };
+    let data = setup(options, &mode, home, skill, token);
     let changes: Vec<(Client, Change)> = data
         .agents
         .iter()
@@ -500,7 +735,9 @@ pub fn answer(
     }
     let pending = changes
         .iter()
-        .any(|(_, change)| change.status.changes_something());
+        .map(|(_, change)| change)
+        .chain(&data.mcp_tokens)
+        .any(|change| change.status.changes_something());
     if !data.applied && pending {
         next.push(NextStep {
             run: format!("{} --yes", without_dry_run(rerun)),
@@ -517,6 +754,24 @@ pub fn answer(
                 change.entry
             ));
         }
+    }
+    let which = match mode {
+        Mode::Read => "read-only token",
+        Mode::Propose { .. } => "deployer agent token",
+    };
+    for note in data
+        .mcp_tokens
+        .iter()
+        .filter_map(|token| token.note.as_deref())
+        .filter(|note| note.starts_with("not written"))
+    {
+        warnings.push(format!(
+            "relish mcp's {which}: {note}; relish mcp will try again when it starts, \
+             and sends only its own agent token, never the admin one"
+        ));
+    }
+    if !options.remove {
+        warnings.extend(token_warnings(&mode, &facts, &data.mcp_tokens));
     }
     let mut restart: Vec<&str> = changes
         .iter()
@@ -552,6 +807,18 @@ fn without_dry_run(rerun: &str) -> String {
 pub async fn run(options: &SetupOptions, max_bytes: usize, rerun: &str) -> Rendered {
     let options = options.clone();
     let rerun_for_task = rerun.to_string();
+    let action = if options.remove {
+        Action::Remove
+    } else {
+        Action::Install
+    };
+    // A refused --propose makes no token and asks the cluster nothing.
+    let mode = match options.mode() {
+        Ok(mode) => mode,
+        Err(error) => return failed(error, max_bytes, rerun),
+    };
+    let token = token_plan(action, &mode).await;
+    let facts = token_facts().await;
     // File I/O, and packing the source digest on a dev build, so off the
     // async worker threads.
     let outcome = tokio::task::spawn_blocking(move || {
@@ -560,6 +827,8 @@ pub async fn run(options: &SetupOptions, max_bytes: usize, rerun: &str) -> Rende
             &options,
             &home,
             Some(SKILL_MD),
+            token,
+            facts,
             BuildInfo::current(),
             &rerun_for_task,
         ))
@@ -579,6 +848,137 @@ pub async fn run(options: &SetupOptions, max_bytes: usize, rerun: &str) -> Rende
             rerun,
         ),
     }
+}
+
+/// Where the token `relish mcp` would send comes from, and, for one given
+/// with `--token` or `RELIABURGER_TOKEN`, whether the cluster says it's an
+/// admin one. The question is bounded; no answer leaves `access` unknown.
+async fn token_facts() -> TokenFacts {
+    use crate::relish::client::{BunClient, TokenOrigin, token_origin};
+    let origin = token_origin();
+    let access = match origin {
+        TokenOrigin::Explicit => tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            BunClient::default_local().token_access(),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok),
+        TokenOrigin::ContextAdmin | TokenOrigin::Absent => None,
+    };
+    TokenFacts { origin, access }
+}
+
+/// The token plan for this machine: `None` unless the token `relish mcp`
+/// would send is the saved context's admin one.
+///
+/// To make the token, a stored one that's still good on disk is checked
+/// with the cluster too (one cheap admin-only read), so a token revoked or
+/// rotated behind `relish mcp`'s back is replaced, not called unchanged.
+/// To remove, every token file beside the context is in the plan.
+///
+/// For `relish mcp --propose` ([`Mode::Propose`]) the token is the one it
+/// keeps in `mcp-propose-token-<namespace>.json`: a deployer agent token
+/// confined to the namespace.
+async fn token_plan(action: Action, mode: &Mode) -> Option<TokenPlan> {
+    use crate::relish::client::{TokenOrigin, token_origin};
+    use crate::relish::mcp::credentials;
+    if token_origin() != TokenOrigin::ContextAdmin {
+        return None;
+    }
+    let context_path = crate::relish::local_context::default_path().ok()?;
+    let context = crate::relish::local_context::LocalContext::load(&context_path)
+        .ok()
+        .flatten()?;
+    let admin = context.client(None, None).ok()?;
+    let (namespace, purpose) = match mode {
+        Mode::Read => (None, credentials::Purpose::Read),
+        Mode::Propose { namespace } => (Some(namespace.clone()), credentials::Purpose::Propose),
+    };
+    let scope = credentials::Scope {
+        owner: context.owner.clone(),
+        endpoint: context.endpoint.clone(),
+        namespace,
+        purpose,
+    };
+    let now = credentials::now();
+    let mut rejected = None;
+    let files = match action {
+        Action::Install => {
+            let path =
+                credentials::path_for(&context_path, scope.namespace.as_deref(), purpose).ok()?;
+            let usable = credentials::StoredToken::load(&path)
+                .ok()
+                .flatten()
+                .filter(|stored| stored.usable(&scope, now));
+            let mut note = None;
+            if let Some(stored) = usable.as_ref()
+                && credentials::accepted(&admin, &stored.token).await == Some(false)
+            {
+                note = Some(
+                    "the cluster rejects the stored token (revoked or rotated); a new one \
+                     replaces it"
+                        .to_string(),
+                );
+                rejected = Some(stored.token.clone());
+            }
+            vec![TokenFile {
+                path,
+                stored: usable.is_some() && rejected.is_none(),
+                preview: credentials::shape(&scope, None, now),
+                note,
+            }]
+        }
+        Action::Remove => {
+            let mut files: Vec<TokenFile> = credentials::files_beside(&context_path)
+                .ok()?
+                .into_iter()
+                .map(|path| {
+                    let stored = credentials::StoredToken::load(&path).ok().flatten();
+                    TokenFile {
+                        preview: credentials::shape(&scope, stored.as_ref(), now),
+                        path,
+                        stored: true,
+                        note: None,
+                    }
+                })
+                .collect();
+            if files.is_empty() {
+                files.push(TokenFile {
+                    path: credentials::path_beside(&context_path, None).ok()?,
+                    stored: false,
+                    preview: String::new(),
+                    note: None,
+                });
+            }
+            files
+        }
+    };
+    let runtime = tokio::runtime::Handle::current();
+    let apply = move |action: Action, path: &Path| -> Result<bool, String> {
+        // `apply` runs inside `spawn_blocking`, where blocking on the
+        // runtime is allowed: that thread isn't one of its workers.
+        runtime
+            .block_on(async {
+                match action {
+                    Action::Install => credentials::obtain(
+                        path,
+                        &scope,
+                        &admin,
+                        credentials::now(),
+                        rejected.as_deref(),
+                    )
+                    .await
+                    .map(|(_, obtained)| obtained != credentials::Obtained::NotNeeded),
+                    Action::Remove => credentials::remove(path, &admin).await,
+                }
+            })
+            .map_err(|error| error.to_string())
+    };
+    Some(TokenPlan {
+        files,
+        apply: Box::new(apply),
+    })
 }
 
 fn failed(error: AgentError, max_bytes: usize, rerun: &str) -> Rendered {

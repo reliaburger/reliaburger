@@ -313,15 +313,24 @@ pub(super) fn delay_callers(
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Populate the gossip + Raft blocklists to partition this node
-    /// from the named peers. Returns how many addresses were blocked.
+    /// from the named peers. Returns the addresses this call inserted,
+    /// which the fault's reversal removes again.
     ///
     /// A peer is identified by gossip node name; its gossip address
     /// comes from membership and its Raft address is derived by the
     /// fixed port offset. Both must be blocked, or SWIM keeps half the
-    /// path alive and the partition doesn't take.
-    pub(super) async fn apply_partition(&self, peers: &[String]) -> usize {
+    /// path alive and the partition doesn't take. Two partitions can't
+    /// overlap: the leader admits one node fault at a time
+    /// (`NodeFaultReservations` in `src/smoker/reservation.rs`). An address
+    /// already blocked when this call runs isn't recorded, so the heal never
+    /// removes a block this call didn't make.
+    pub(super) async fn apply_partition(
+        &self,
+        peers: &[String],
+    ) -> crate::smoker::types::PartitionBlock {
+        let mut block = crate::smoker::types::PartitionBlock::default();
         let Some(handle) = &self.cluster else {
-            return 0;
+            return block;
         };
         let blocklists = &handle.partition_blocklists;
 
@@ -339,12 +348,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .collect()
         };
 
-        let mut blocked = 0;
         if let Some(gossip) = &blocklists.gossip {
             let mut set = gossip.write().await;
             for addr in &targets {
                 if set.insert(*addr) {
-                    blocked += 1;
+                    block.gossip.push(*addr);
                 }
             }
         }
@@ -355,10 +363,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     addr.ip(),
                     (addr.port() as i32 + blocklists.raft_port_offset) as u16,
                 );
-                set.insert(raft_addr);
+                if set.insert(raft_addr) {
+                    block.raft.push(raft_addr);
+                }
             }
         }
-        blocked
+        block
     }
 
     /// Clear both transport blocklists (heal all partitions).
@@ -374,40 +384,26 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
-    /// Unblock a specific set of peers on both transports — the reversal of
-    /// [`apply_partition`]. Only the addresses this fault added are removed, so
-    /// healing one partition fault leaves any others still in force.
-    pub(super) async fn remove_partition(&self, peers: &[String]) {
+    /// Undo [`apply_partition`]: remove exactly the addresses it inserted.
+    ///
+    /// No membership lookup: by heal time the partitioned node has marked
+    /// its peers Dead and stopped listing them (#1820). Other partition
+    /// faults' addresses stay in force.
+    pub(super) async fn remove_partition(&self, block: &crate::smoker::types::PartitionBlock) {
         let Some(handle) = &self.cluster else {
             return;
         };
         let blocklists = &handle.partition_blocklists;
-        let targets: Vec<std::net::SocketAddr> = {
-            let membership = handle.membership_rx.borrow();
-            peers
-                .iter()
-                .filter_map(|name| {
-                    membership
-                        .iter()
-                        .find(|m| &m.node_id.0 == name)
-                        .map(|m| m.address)
-                })
-                .collect()
-        };
         if let Some(gossip) = &blocklists.gossip {
             let mut set = gossip.write().await;
-            for addr in &targets {
+            for addr in &block.gossip {
                 set.remove(addr);
             }
         }
         if let Some(raft) = &blocklists.raft {
             let mut set = raft.write().await;
-            for addr in &targets {
-                let raft_addr = std::net::SocketAddr::new(
-                    addr.ip(),
-                    (addr.port() as i32 + blocklists.raft_port_offset) as u16,
-                );
-                set.remove(&raft_addr);
+            for addr in &block.raft {
+                set.remove(addr);
             }
         }
     }
@@ -686,14 +682,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
             FaultType::CouncilPartition { peers } => {
                 // Block both the gossip and Raft transports to each named
-                // peer, and record exactly which peers so clear and expiry
-                // unblock these and leave any other partition in force.
-                self.apply_partition(peers).await;
+                // peer, and record exactly which addresses so clear and
+                // expiry unblock these and leave any other partition in force.
+                let block = self.apply_partition(peers).await;
                 self.record_reversal(
                     rule.id,
-                    crate::smoker::types::FaultReversal::Partition {
-                        peers: peers.clone(),
-                    },
+                    crate::smoker::types::FaultReversal::Partition(block),
                 );
                 Ok(())
             }
@@ -929,8 +923,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     }
                 }
             }
-            FaultReversal::Partition { peers } => {
-                self.remove_partition(peers).await;
+            FaultReversal::Partition(block) => {
+                self.remove_partition(block).await;
             }
             FaultReversal::NodeDrain => {
                 if self.node_drain_gate.finish()
@@ -1133,6 +1127,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 severity: crate::bun::events::EventSeverity::Info,
                 action: "fault.expired".to_string(),
                 principal: FAULT_EXPIRY_PRINCIPAL.to_string(),
+                principal_kind: crate::sesame::types::PrincipalKind::System,
                 app: (!rule.target_service.is_empty()).then(|| rule.target_service.clone()),
                 namespace: rule.namespace.clone(),
                 node,

@@ -132,58 +132,50 @@ pub(super) async fn ui_logout_handler(
 }
 
 /// Build dashboard app rows from instance statuses.
+///
+/// Each row's state is [`crate::bun::summary::app_state`]'s word, the
+/// rollup the summary, `relish apps` and `relish status` use, so an app
+/// can't read `degraded` in one place and something else here. The
+/// statuses come from every node or the call fails, so no node is
+/// unanswered; findings are `wtf`'s, which Brioche doesn't run.
 pub(super) fn statuses_to_dashboard_apps(
     statuses: &[InstanceStatus],
     desired: &[crate::bun::diagnostics::DesiredAppEvidence],
 ) -> Vec<DashboardApp> {
-    let mut rows = std::collections::BTreeMap::new();
-    for app in desired {
-        rows.insert(
-            (app.namespace.clone(), app.app.clone()),
+    let mut running: std::collections::BTreeMap<(&str, &str), usize> =
+        std::collections::BTreeMap::new();
+    for instance in statuses
+        .iter()
+        .filter(|instance| instance.state == "running")
+    {
+        *running
+            .entry((instance.namespace.as_str(), instance.app_name.as_str()))
+            .or_default() += 1;
+    }
+    let mut rows: Vec<DashboardApp> = desired
+        .iter()
+        .map(|app| {
+            let instances_running = running
+                .get(&(app.namespace.as_str(), app.app.as_str()))
+                .copied()
+                .unwrap_or(0);
+            let state = crate::bun::summary::app_state(
+                app.desired_replicas,
+                u32::try_from(instances_running).unwrap_or(u32::MAX),
+                false,
+                false,
+            );
             DashboardApp {
                 name: app.app.clone(),
                 namespace: app.namespace.clone(),
-                instances_running: 0,
+                instances_running,
                 instances_desired: app.desired_replicas as usize,
-                state: "pending".to_string(),
-            },
-        );
-    }
-    for instance in statuses {
-        let Some(row) = rows.get_mut(&(instance.namespace.clone(), instance.app_name.clone()))
-        else {
-            continue;
-        };
-        if instance.state == "running" {
-            row.instances_running += 1;
-        }
-        if matches!(instance.state.as_str(), "failed" | "unhealthy") {
-            row.state = "unhealthy".into();
-        }
-    }
-    // A quota block, or a volume app waiting for its home node (#423): either
-    // way the scheduler holds it back on purpose, so it reads as blocked.
-    for app in desired
-        .iter()
-        .filter(|app| app.blocked.is_some() || app.volume_home_away.is_some())
-    {
-        if let Some(row) = rows.get_mut(&(app.namespace.clone(), app.app.clone()))
-            && row.state == "pending"
-        {
-            row.state = "blocked".into();
-        }
-    }
-    for row in rows.values_mut() {
-        if row.state != "unhealthy" && row.instances_running == row.instances_desired {
-            row.state = if row.instances_desired == 0 {
-                "stopped"
-            } else {
-                "running"
+                state: state.word().to_string(),
             }
-            .into();
-        }
-    }
-    rows.into_values().collect()
+        })
+        .collect();
+    rows.sort_by(|left, right| (&left.namespace, &left.name).cmp(&(&right.namespace, &right.name)));
+    rows
 }
 
 pub(super) async fn gather_dashboard_apps(
@@ -198,30 +190,33 @@ pub(super) async fn gather_dashboard_apps(
     Ok(statuses_to_dashboard_apps(&statuses, &desired))
 }
 
-/// Build the dashboard data from current agent state.
+/// Build the dashboard data from current agent state: the cluster
+/// summary, as `auth` may see it, and the lists below it. A node that
+/// doesn't answer leaves the app list out with the reason, rather than
+/// failing the page: the summary above it says how much the cluster saw.
 pub(super) async fn gather_dashboard_data(
     state: &ApiState,
-    directory: Option<&LeaderDirectory>,
-) -> Result<DashboardData, String> {
-    let apps = gather_dashboard_apps(state, directory).await?;
-
-    let alerts = firing_dashboard_alerts(state).await;
-    let alert_count = alerts.len();
-
-    let nodes = gather_dashboard_nodes(state).await;
-    // The node count follows the real membership when we have it. A
-    // standalone node with no gossip table still shows itself as one node.
-    let node_count = if nodes.is_empty() { 1 } else { nodes.len() };
-
-    Ok(DashboardData {
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    sources: super::summary::SummarySources<'_>,
+) -> DashboardData {
+    let (summary, apps, alerts, nodes) = tokio::join!(
+        super::summary::gather_cluster_summary(state, auth, sources),
+        gather_dashboard_apps(state, sources.directory),
+        firing_dashboard_alerts(state),
+        gather_dashboard_nodes(state),
+    );
+    let (apps, apps_error) = match apps {
+        Ok(apps) => (apps, None),
+        Err(error) => (Vec::new(), Some(error)),
+    };
+    DashboardData {
         cluster_name: String::new(),
-        node_count,
-        app_count: apps.len(),
-        alert_count,
+        summary: Some(summary),
+        apps_error,
         apps,
         nodes,
         alerts,
-    })
+    }
 }
 
 /// Build the dashboard node rows from the live gossip membership (AUTH7).
@@ -262,6 +257,34 @@ pub(super) async fn gather_dashboard_nodes(
 }
 
 /// Return an HTML response.
+/// Forbid framing on every HTML page the API serves (#1682).
+///
+/// The Proposals page carries approve buttons, and a page on the same site
+/// (an app behind this node's ingress, another port on the host) could
+/// frame it invisibly and steer a click. `X-Frame-Options` is the old
+/// browsers' spelling, `frame-ancestors` the current one; both say never.
+/// A layer over the whole router rather than a line per page, so a new
+/// page can't forget.
+pub(super) async fn forbid_framing(mut response: Response) -> Response {
+    let html = response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/html"));
+    if html {
+        let headers = response.headers_mut();
+        headers.insert(
+            axum::http::header::X_FRAME_OPTIONS,
+            axum::http::HeaderValue::from_static("DENY"),
+        );
+        headers.insert(
+            axum::http::header::CONTENT_SECURITY_POLICY,
+            axum::http::HeaderValue::from_static("frame-ancestors 'none'"),
+        );
+    }
+    response
+}
+
 pub(super) fn html_response(html: String) -> Response {
     let mut headers = HeaderMap::new();
     headers.insert("content-type", "text/html; charset=utf-8".parse().unwrap());
@@ -275,12 +298,18 @@ pub(super) fn html_response(html: String) -> Response {
 pub(super) async fn dashboard_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     directory: Option<axum::Extension<LeaderDirectory>>,
+    known: Option<axum::Extension<KnownMembers>>,
+    gossip: Option<axum::Extension<crate::mustard::stats::GossipStats>>,
+    identity: Option<axum::Extension<crate::sesame::credentials::LiveNodeIdentity>>,
     State(state): State<ApiState>,
 ) -> Response {
-    let mut data = match gather_dashboard_data(&state, directory.as_deref()).await {
-        Ok(data) => data,
-        Err(error) => return unavailable_response(error),
+    let sources = super::summary::SummarySources {
+        known: known.as_deref(),
+        directory: directory.as_deref(),
+        gossip: gossip.as_deref(),
+        identity: identity.as_deref(),
     };
+    let mut data = gather_dashboard_data(&state, auth.as_deref(), sources).await;
     if enforce_cluster_permission(
         &state,
         auth.as_deref(),
@@ -290,7 +319,6 @@ pub(super) async fn dashboard_handler(
     .is_err()
     {
         data.alerts.clear();
-        data.alert_count = 0;
     }
     html_response(render_dashboard(&data))
 }
@@ -532,6 +560,27 @@ pub(super) async fn fragment_apps_handler(
         Ok(apps) => html_response(fragments::render_apps_table_fragment(&apps)),
         Err(error) => unavailable_response(error),
     }
+}
+
+/// `GET /ui/fragment/summary` — the cluster summary's lines, for HTMX swap.
+pub(super) async fn fragment_summary_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    directory: Option<axum::Extension<LeaderDirectory>>,
+    known: Option<axum::Extension<KnownMembers>>,
+    gossip: Option<axum::Extension<crate::mustard::stats::GossipStats>>,
+    identity: Option<axum::Extension<crate::sesame::credentials::LiveNodeIdentity>>,
+    State(state): State<ApiState>,
+) -> Response {
+    let sources = super::summary::SummarySources {
+        known: known.as_deref(),
+        directory: directory.as_deref(),
+        gossip: gossip.as_deref(),
+        identity: identity.as_deref(),
+    };
+    let summary = super::summary::gather_cluster_summary(&state, auth.as_deref(), sources).await;
+    html_response(crate::brioche::dashboard::render_summary_fragment(Some(
+        &summary,
+    )))
 }
 
 /// `GET /ui/fragment/nodes` — nodes table HTML fragment for HTMX swap.

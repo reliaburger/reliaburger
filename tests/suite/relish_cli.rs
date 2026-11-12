@@ -141,6 +141,76 @@ fn endpoint_environment_rejects_remote_plaintext_before_dispatch() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("must use HTTPS"));
 }
 
+/// #1695: the MCPB bundle passes its optional endpoint setting as
+/// `RELIABURGER_ENDPOINT`, empty when the user left it blank. Blank means
+/// "use the current context", not "an invalid URL".
+#[test]
+fn blank_endpoint_environment_falls_back_to_the_current_context() {
+    let home = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_relish"))
+        .arg("status")
+        .env("RELIABURGER_HOME", home.path())
+        .env("RELIABURGER_ENDPOINT", "  ")
+        .env("RELIABURGER_TOKEN", "")
+        .env_remove("RELIABURGER_CA_CERT")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("invalid endpoint URL"), "{stderr}");
+    assert!(!stderr.contains("endpoint URL must"), "{stderr}");
+}
+
+/// #1695: a blank `RELIABURGER_TOKEN` sends no bearer at all, the same as
+/// an unset one, rather than an empty `Bearer ` header.
+#[tokio::test]
+async fn blank_token_environment_sends_no_bearer() {
+    use axum::{Router, http::HeaderMap};
+    use std::sync::{Arc, Mutex};
+
+    let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
+    let record = seen.clone();
+    let app = Router::new().fallback(move |headers: HeaderMap| {
+        let record = record.clone();
+        async move {
+            record.lock().unwrap().push(
+                headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .map(|value| value.to_str().unwrap_or("<binary>").to_string()),
+            );
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    // Pay `relish`'s first launch before the 60 s bound starts (#1149).
+    crate::bun_process::first_launch_binaries();
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_relish"))
+            .arg("status")
+            .env("RELIABURGER_ENDPOINT", &endpoint)
+            .env("RELIABURGER_TOKEN", " ")
+            .env_remove("RELIABURGER_CA_CERT")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    server.abort();
+    let _ = server.await;
+
+    let seen = seen.lock().unwrap();
+    assert!(
+        !seen.is_empty(),
+        "relish never reached the stub: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(seen.iter().all(Option::is_none), "{seen:?}");
+}
+
 #[test]
 fn offline_log_export_refuses_an_unreadable_checkpoint_before_upload() {
     let dir = tempfile::tempdir().unwrap();
@@ -928,6 +998,49 @@ fn agent_patch_init_then_diff_shows_the_edit() {
     assert_eq!(diff["data"]["build_changes"], serde_json::json!([]));
 }
 
+/// #1691: an agent with only `relish` hands `patch apply` a diff whose hunk
+/// counts are wrong, inline as one argument starting `---`; it applies,
+/// and `patch diff` prints it with headers git wrote. A hunk that doesn't
+/// match is a usage error that names it.
+#[test]
+fn agent_patch_apply_takes_a_miscounted_diff_and_diff_prints_a_correct_one() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("fix");
+    let dir_text = dir.to_str().unwrap();
+    let output = run_agent(&["agent", "patch", "init", dir_text]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+
+    let source = std::fs::read_to_string(dir.join("src/relish/agent/patch.rs")).unwrap();
+    let first = source.lines().next().unwrap();
+    let miscounted = format!(
+        "--- a/src/relish/agent/patch.rs\n+++ b/src/relish/agent/patch.rs\n@@ -1,5 +1,9 @@\n-{first}\n+//! Patched by an agent.\n"
+    );
+    let output = run_agent(&["agent", "patch", "apply", dir_text, &miscounted]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let applied = agent_envelope(&output);
+    assert_eq!(applied["command"], "patch apply");
+    assert_eq!(applied["data"]["files"][0]["hunks"][0]["recounted"], true);
+
+    let output = run_agent(&["agent", "patch", "diff", dir_text]);
+    let diff = agent_envelope(&output);
+    let text = diff["data"]["diff"].as_str().unwrap();
+    assert!(text.contains("@@ -1,4 +1,4 @@"), "{text}");
+    assert!(text.contains("+//! Patched by an agent."), "{text}");
+
+    let wrong = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-no such line\n+x\n";
+    let output = run_agent(&["agent", "patch", "apply", dir_text, wrong]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let refused = agent_envelope(&output);
+    assert_eq!(refused["error"]["code"], "usage");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("hunk 1 of src/lib.rs"),
+        "{refused}"
+    );
+}
+
 #[test]
 fn agent_patch_on_a_directory_that_is_not_a_workspace_is_not_found() {
     let root = tempfile::tempdir().unwrap();
@@ -1005,4 +1118,210 @@ fn agent_report_writes_a_redacted_draft_and_posts_nothing() {
             assert!(!text.contains(planted), "{planted} in {name}");
         }
     }
+}
+
+/// A stub Bun that answers `/v1/events` with one health-check restart of
+/// `web-0` and the event before it, and refuses `/v1/audit` the way a
+/// token without audit access is refused (#1685).
+async fn stub_bun_with_a_health_restart() -> (String, tokio::task::JoinHandle<()>) {
+    use axum::{Json, Router, routing::get};
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let details = reliaburger::bun::restart::restart_decision(
+        "restart.health_failed",
+        "default__web-0",
+        2,
+        &reliaburger::bun::restart::RestartPolicy::default(),
+    )
+    .with("consecutive_failures", 2)
+    .with("threshold", 2)
+    .into_details();
+    let events = serde_json::json!({
+        "events": [
+            {
+                "sequence": 1, "timestamp": now - 40, "kind": "health",
+                "severity": "warning", "app": "web", "namespace": "default",
+                "node": "node-1", "message": "instance default__web-0 became unhealthy"
+            },
+            {
+                "sequence": 2, "timestamp": now - 30, "kind": "restart",
+                "severity": "warning", "app": "web", "namespace": "default",
+                "node": "node-1", "details": details,
+                "message": "instance default__web-0 restarted (attempt 2)"
+            }
+        ],
+        "warnings": []
+    });
+    let app = Router::new()
+        .route(
+            "/v1/events",
+            get(move || {
+                let events = events.clone();
+                async move { Json(events) }
+            }),
+        )
+        .route(
+            "/v1/audit",
+            get(|| async {
+                (
+                    axum::http::StatusCode::FORBIDDEN,
+                    "insufficient permissions",
+                )
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (endpoint, server)
+}
+
+/// A single node on v0.2.7 whose binary isn't the one the release
+/// publishes, for `relish verify` and `relish agent verify` (#1689).
+async fn drifted_node() -> (String, tokio::task::JoinHandle<()>) {
+    use axum::{Json, Router, http::StatusCode, routing::get};
+    let app = Router::new()
+        .route(
+            "/v1/upgrade/cluster",
+            get(|| async {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({"error": reliaburger::upgrade::NO_COUNCIL})),
+                )
+            }),
+        )
+        .route(
+            "/v1/version",
+            get(|| async {
+                Json(serde_json::json!({
+                    "version": "v0.2.7",
+                    "binary_sha256": "9f3c".repeat(16),
+                    "platform": "linux-x86_64",
+                }))
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (endpoint, server)
+}
+
+/// Release metadata for v0.2.7 naming other bytes than the node runs.
+fn published_metadata(directory: &std::path::Path) -> std::path::PathBuf {
+    let path = directory.join("metadata.json");
+    let document = serde_json::json!({
+        "schema": 1,
+        "latest": "v0.2.7",
+        "releases": [{"version": "v0.2.7", "platforms": {"linux-x86_64": {
+            "url": "https://releases.invalid/bun-linux-x86_64",
+            "sha256": "41aa".repeat(16),
+            "embedded_signature": "c2ln",
+        }}}],
+    });
+    std::fs::write(&path, document.to_string()).unwrap();
+    path
+}
+
+async fn run_against(endpoint: &str, args: &[&str]) -> Output {
+    // Pay `relish`'s first launch before the 60 s bound starts (#1149).
+    crate::bun_process::first_launch_binaries();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_relish"))
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .env("RELIABURGER_ENDPOINT", endpoint)
+            .env_remove("RELIABURGER_TOKEN")
+            .env_remove("RELIABURGER_CA_CERT")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+}
+
+/// #1685: `relish agent explain --restart` answers with the rule, the
+/// evidence and the event before it, and says the audit log was unreadable.
+#[tokio::test]
+async fn agent_explain_says_why_an_instance_restarted() {
+    let (endpoint, server) = stub_bun_with_a_health_restart().await;
+    let output = run_against(&endpoint, &["agent", "explain", "--restart", "web-0"]).await;
+    server.abort();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let value = agent_envelope(&output);
+    assert_eq!(value["command"], "explain");
+    let decision = &value["data"]["decisions"][0];
+    assert_eq!(decision["rule"], "restart.health_failed");
+    assert_eq!(decision["evidence"]["threshold"], "2");
+    assert_eq!(decision["related"][0]["kind"], "health");
+    assert_eq!(
+        decision["decided_in"]["function"], "restart_published_unhealthy",
+        "{decision}"
+    );
+    assert_eq!(value["data"]["sources"][1]["state"], "unknown");
+}
+
+/// #1685: the timeline merges what the stub has, newest first, as an agent
+/// envelope and as a table.
+#[tokio::test]
+async fn timeline_lists_what_changed_newest_first() {
+    let (endpoint, server) = stub_bun_with_a_health_restart().await;
+    let agent = run_against(&endpoint, &["agent", "timeline", "--since", "10m"]).await;
+    let human = run_against(&endpoint, &["timeline", "--since", "10m"]).await;
+    server.abort();
+    assert_eq!(agent.status.code(), Some(0), "{agent:?}");
+    let value = agent_envelope(&agent);
+    let kinds: Vec<&str> = value["data"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["restart", "health"]);
+    assert_eq!(
+        value["next"][0]["run"],
+        "relish agent explain --restart default__web-0"
+    );
+    assert!(human.status.success(), "{human:?}");
+    let table = String::from_utf8_lossy(&human.stdout);
+    assert!(table.contains("restart.health_failed"), "{table}");
+    assert!(table.contains("audit: unknown"), "{table}");
+}
+
+/// #1689: offline, against a node whose binary drifted, both commands say
+/// `mismatch` and name the node; the human one exits 1, the agent one 0.
+/// Nothing touches the network: `--metadata` turns it off.
+#[tokio::test]
+async fn verify_finds_a_drifted_node_offline() {
+    let directory = tempfile::tempdir().unwrap();
+    let metadata = published_metadata(directory.path());
+    let metadata = metadata.to_str().unwrap();
+    let (endpoint, server) = drifted_node().await;
+
+    let agent = run_against(&endpoint, &["agent", "verify", "--metadata", metadata]).await;
+    assert_eq!(agent.status.code(), Some(0), "an answer exits 0");
+    let envelope: serde_json::Value = serde_json::from_slice(&agent.stdout).unwrap();
+    assert_eq!(envelope["command"], "verify");
+    let data = &envelope["data"];
+    assert_eq!(data["verdict"], "mismatch", "{data}");
+    assert_eq!(data["reasons"][0]["code"], "hash_mismatch");
+    assert_eq!(data["reasons"][0]["node"], "this node");
+    assert_eq!(data["nodes"][0]["hash"], "fail");
+    assert_eq!(data["metadata"][0], metadata);
+
+    let human = run_against(&endpoint, &["verify", "--metadata", metadata]).await;
+    assert_eq!(human.status.code(), Some(1), "a mismatch exits 1");
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(text.starts_with("mismatch: "), "{text}");
+    assert!(text.contains("this node"), "{text}");
+
+    let json = run_against(&endpoint, &["-o", "json", "verify", "--metadata", metadata]).await;
+    assert_eq!(json.status.code(), Some(1));
+    let data: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(data["verdict"], "mismatch");
+
+    server.abort();
+    let _ = server.await;
 }

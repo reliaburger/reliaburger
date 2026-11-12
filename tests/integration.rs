@@ -268,6 +268,9 @@ async fn tui_fetches_renders_and_navigates_real_api_data() {
         client: harness.client.clone(),
     };
     let mut app = TuiApp::new();
+    app.update(Msg::Data(DataUpdate::Summary(
+        provider.summary().await.map(Box::new),
+    )));
     app.update(Msg::Data(DataUpdate::Status(provider.status().await)));
     app.update(Msg::Data(DataUpdate::Nodes(provider.nodes().await)));
     app.update(Msg::Data(DataUpdate::Council(provider.council().await)));
@@ -275,14 +278,16 @@ async fn tui_fetches_renders_and_navigates_real_api_data() {
         provider.recent_events(100).await,
     )));
 
+    // The dashboard is the cluster summary's screen; the apps view lists.
     let dashboard = render_to_string(&app, 120, 40);
-    assert!(dashboard.contains("worker"));
-    assert!(dashboard.contains("nodes"));
+    assert!(dashboard.contains("Cluster "), "{dashboard}");
+    assert!(dashboard.contains("apps       1:"), "{dashboard}");
 
     app.update(Msg::Key(KeyEvent::new(
         KeyCode::Char('a'),
         KeyModifiers::NONE,
     )));
+    assert!(render_to_string(&app, 120, 40).contains("worker"));
     app.update(Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
     assert!(matches!(app.view(), View::AppDetail { app, .. } if app == "worker"));
     app.view_stack.pop();

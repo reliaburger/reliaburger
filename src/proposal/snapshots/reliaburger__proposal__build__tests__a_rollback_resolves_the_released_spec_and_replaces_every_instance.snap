@@ -1,0 +1,8 @@
+---
+source: src/proposal/build_tests.rs
+expression: "proposal.summary.join(\"\\n\")"
+---
+Roll shop/web back from web:1.5 to web:1.4.
+Touches 1 app on 2 nodes (node-a, node-b); replaces 3 instances.
+Serves https://shop.example.com/ and the service web.shop.
+Undo: `relish undo 17` puts web back on web:1.5.

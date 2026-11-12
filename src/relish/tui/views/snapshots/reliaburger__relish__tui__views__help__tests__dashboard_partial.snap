@@ -1,0 +1,43 @@
+---
+source: src/relish/tui/views/help.rs
+expression: output
+---
+ RELISH  2 nodes, partial (2 of 3 nodes) · 3 apps, partial (2 of 3 nodes) · leader node-1 · CONNECTED                   
+                                                                                                                        
+┌dashboard─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│Cluster DEGRADED, 8 problems (node-1 answered at 15:06:40)                                                            │
+│                                                                                                                      │
+│nodes      2 alive, 0 suspect, 0 dead; partial (2 of 3 nodes)  relish nodes --unhealthy                               │
+│council    leader node-1 (term 4), 3/3 voters, quorum ok, 0 lagging                                                   │
+│gossip     3 members, last change 10 m ago, 1,204 updates received                                                    │
+│versions   bun 0.2.8 on 2 nodes; partial (2 of 3 nodes)  relish nodes --unhealthy                                     │
+│capacity   cpu 25% allocated (6 of 24 cores), memory 3%                                                               │
+│usage      cpu 21%, memory 40%, disk 30%; newest sample 5 s old; partial (2 of 3 nodes)  relish nodes --unhealthy     │
+│apps       3: 3 running; partial (2 of 3 nodes)  relish nodes --unhealthy                                             │
+│instances  6 of 6 running; partial (2 of 3 nodes)  relish nodes --unhealthy                                           │
+│jobs       none running or finished in the last hour                                                                  │
+│logs       newest line 2 s old; partial (2 of 3 nodes)  relish nodes --unhealthy                                      │
+│faults     none active; partial (2 of 3 nodes)  relish nodes --unhealthy                                              │
+│alerts     none firing                                                                                                │
+│certs      none tracked; partial (2 of 3 nodes)  relish nodes --unhealthy                                             │
+│agents     no leases held, no proposals waiting                                                                       │
+│                                                                                                                      │
+│Recent events                                                                                                         │
+│15:05:40  Health  fixture event 1                                                                                     │
+│15:05:50  Health  fixture event 2                                                                                     │
+│15:06:00  Health  fixture event 3                                                                                     │
+│15:06:10  Health  fixture event 4                                                                                     │
+│15:06:20  Health  fixture event 5                                                                                     │
+│15:06:30  Deploy  fixture event 6                                                                                     │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+│                                                                                                                      │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ [a]pps [n]odes [j]obs [e]vents [l]ogs [r]outes [s]earch [?]help [:]cmd [q]uit

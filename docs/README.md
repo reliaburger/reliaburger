@@ -15,7 +15,7 @@ From 0.2.7, every release file also carries a build provenance
 attestation that anyone can check with `gh attestation verify`, and the macOS `relish` can be
 notarised ([checks a stranger can run](releasing.md#checks-a-stranger-can-run)).
 The limits below are the ones 0.2.7 ships with; the [roadmap](roadmap.md) tracks
-what comes after it. The [feature status page](https://reliaburger.com/features.html)
+what comes after it. The [feature status page](https://reliaburger.com/features)
 rates every feature Ready, Beta, Alpha or Planned, with its restrictions and open
 issues; its source is [features.toml](features.toml).
 
@@ -167,10 +167,11 @@ jobs-shared-containers` and its siblings rerun them on your own cluster, and
 release, 0.2.0 ran 12 hours on a three-VM laptop cluster with apps, faults
 and upgrades at 4,600 accepted jobs a second, against 1,158 for 100 million a
 day ([record](qualification/2026-10-17-v0.2.0-job-qualification.md), [#668](https://github.com/reliaburger/reliaburger/issues/668)).
-0.2.3 ran host jobs for one real 24-hour day on three 4-vCPU VMs and counted
-1,807,742,226, 20,920 a second, with no failed tasks: 1.81 billion against
-the 2 billion it aimed for
-([record](qualification/2026-10-28-v0.2.3-day-run.md)).
+0.2.7 ran host jobs for one real 24-hour day on three 4-vCPU VMs and counted
+2,709,190,725, 31,352 a second, with every node's Bun under its memory target
+([record](qualification/2026-11-08-v0.2.7-memory-run.md)). One node's memory
+was still growing at the end
+([#1417](https://github.com/reliaburger/reliaburger/issues/1417)).
 
 **Self-upgrade.** `relish upgrade start` rolls a new `bun` across the cluster:
 workers first, then council members one at a time, leader last. The new binary
@@ -198,7 +199,10 @@ that pull the plug on a VM mid-write, a live-cluster test runner you can point
 at your own cluster (`relish test`), and a soak that installs the signed
 release the way you would and then breaks it for hours. An agent gym breaks
 throwaway clusters in ways it knows and scores whatever diagnoses them, an AI
-agent included, against the ground truth (`make test-gym`, from 0.2.7; Claude Code plugs in with `scripts/gym/claude_code.py`). CI
+agent included, against the ground truth (`make test-gym`, from 0.2.7; Claude Code plugs in with `scripts/gym/claude_code.py`, and an open model in Ollama with `scripts/gym/local_model.py`).
+`relish gym run` (0.2.8, not in 0.2.7) runs the same scenarios against your
+own agent in a staging namespace of your own cluster, and cleans up after
+itself ([testing your agent](manual/05_chaos.md#testing-your-agent-on-your-cluster)). CI
 never retries a failure. See [how Reliaburger is tested](testing.md).
 
 **A terminal UI and a web dashboard.** Run `relish` with no arguments for the
@@ -260,6 +264,17 @@ and its trade-offs; the [design docs](design/) cover each subsystem.
   Bun refuses their state, snapshots and backups, so create a new cluster.
   Rolling upgrades need matching protocol and state formats; see the
   [compatibility policy](releasing.md#cluster-compatibility).
+- **Three nodes are what's qualified.** Every release is soaked on three
+  nodes. The [hollow-node record](qualification/2026-10-28-hollow-nodes.md)
+  found the leader refusing report connections from 500 nodes up
+  ([#1411](https://github.com/reliaburger/reliaburger/issues/1411)), its API
+  slowing sharply between 500 and 1,000
+  ([#1412](https://github.com/reliaburger/reliaburger/issues/1412)), and gossip
+  at 1,000 not settling within six minutes
+  ([#1413](https://github.com/reliaburger/reliaburger/issues/1413)).
+- **Alerts are five built-in node rules.** CPU, memory and disk thresholds,
+  delivered by webhook; you can't define your own rules yet
+  ([manual](manual/04_observability.md#alerts)).
 - **One Bun per writable image store.** Registry startup claims exclusive
   ownership of the image store's upload directory.
 - **Test volumes have no snapshots.** Disposable test-volume snapshots aren't
@@ -628,13 +643,14 @@ No installation needed. This is what you get by default.
 
 ## Building
 
-The portable test gate requires cargo-nextest 0.9.145 or newer. That release
-fixes capture-pipe inheritance between concurrent macOS tests, which could make
-a completed test appear to leak a child process. CI pins 0.9.145 and treats a
-leak as a failure at the existing 100 ms deadline.
+The portable test gate requires cargo-nextest 0.9.151 or newer. 0.9.145 fixed
+capture-pipe inheritance between concurrent macOS tests, which could make a
+completed test appear to leak a child process, and 0.9.151 is past
+[GHSA-vc25-qg58-w57c](https://github.com/nextest-rs/nextest/security/advisories/GHSA-vc25-qg58-w57c).
+CI pins 0.9.151 and treats a leak as a failure at the existing 100 ms deadline.
 
 ```sh
-cargo install cargo-nextest --locked --version 0.9.145
+cargo install cargo-nextest --locked --version 0.9.151
 ```
 
 The [Makefile](../Makefile) provides all build targets:
@@ -669,15 +685,18 @@ cargo test
 ```sh
 make test                  # portable nextest suite
 make test-doc              # doctests (nextest does not run them)
+make test-macos            # what the macOS CI job runs: relish and the macOS-only tests
 make test-slow             # genuine wall-clock acceptance tests
 sudo make test-linux       # runc, netns, eBPF, Btrfs, Buildah and root-only tests
 make test-rootless-runc    # rootless runc port and replacement test (never sudo)
 make test-cluster          # failover, healing, recovery, placement and chaos
 make test-hollow           # a three-member council and twenty hollow nodes (#1401)
 make test-gym              # the agent gym's scenarios on throwaway clusters, scored (#1086)
+make test-gym-user         # relish gym run on a throwaway cluster: baseline, then Ctrl-C, nothing left (#1683)
 make test-upgrade-node     # real single-node binary replacement
 make test-upgrade-cluster  # real rolling cluster replacement
-make coverage              # portable suite under line coverage (HTML and LCOV)
+make coverage              # portable suite under line coverage (LCOV) and the floor
+make coverage-html         # HTML report from the last make coverage run
 make audit                 # fail on new RustSec dependency findings
 ```
 
@@ -706,6 +725,18 @@ backups, OCI manifests, join CSRs, app and node TOML) has a
 ```sh
 make fuzz-corpus-check  # every target body over its checked-in corpus, on stable
 make fuzz-smoke         # every target for FUZZ_SECONDS (default 10); needs nightly and cargo-fuzz
+```
+
+### Mutation testing
+
+A pull request that touches `src/` gets a non-blocking
+[cargo-mutants](https://mutants.rs/) job on the lines it changes, and a weekly
+run takes the week's changes on `main`. The job summary links a pre-filled
+`missed-mutant` issue for each mutant no test caught. See
+[testing.md](testing.md#mutation-testing).
+
+```sh
+cargo mutants --file src/onion/dns.rs   # mutate one file and run the portable suite against each mutant
 ```
 
 ### Benchmarks
@@ -765,6 +796,7 @@ Leave Bun running. In a second terminal:
 ```sh
 target/debug/relish apply examples/phase-1/proc-first-run.toml
 target/debug/relish status
+target/debug/relish apps
 target/debug/relish top
 ```
 
@@ -1016,28 +1048,71 @@ That list is generated from relish's own command definitions, so it matches
 the binary. `relish help COMMAND` (or `--help` on any command) shows every
 flag.
 
+`relish status` answers "is my cluster all right?" on one screen, the same
+size on any cluster: a `HEALTHY`, `DEGRADED` or `DOWN` verdict, then one line
+per part of the cluster from `GET /v1/cluster/summary` plus `relish wtf`'s
+checks (2 s budget, `--quick` skips them), each line that needs attention
+ending in the command to run next. It exits 0 when it got an answer;
+`--check` exits 1 on `DEGRADED` and 2 on `DOWN`. `-o json` prints the agent
+envelope. The lists live in `relish apps` (one row per app, problems first;
+`relish apps NAME` or `--instances` for instances) and `relish nodes`
+(version, usage and allocation per node); both filter with `--unhealthy`.
+
 `relish agent` is the family for LLM agents: every command prints one
 `relish.agent/v1` JSON envelope within a byte budget, never prompts, and exits
 `0` whenever it answered. It has `guide` (the manual's agent chapter),
-`version`, `schema`, `context` (the first call: findings, unknowns, faults,
-alerts, one line per app and the newest events), `diagnose` (`wtf`'s findings
+`version`, `schema`, `context` (the first call: `relish status`'s screen and
+summary, findings, unknowns, the soonest faults with who injected them,
+leases, proposals and the newest events), `diagnose` (`wtf`'s findings
 with their evidence and pointers into the manual and the source), `explain`
-(what a finding id means and the constants and code that decide it), `source`
+(what a finding id means and the constants and code that decide it, or why the
+cluster restarted an instance, placed it or refused a deploy: the rule, the
+evidence and the code), `timeline` (what changed in a window, merged from
+events, the audit log and deploys, also `relish timeline` for people), `source`
 (`version`, `tree`, `grep`, `show` and `extract` over the code this binary was
 built from, with a warning when a node runs another commit), `logs` (an app's
 newest lines in a time window, each wrapped as untrusted text, with a summary
 of what was left out), `manual` (`search` and `show` over this manual),
 `upgrade-check` (whether the cluster can take the latest release, with the
-reasons), `patch` (build, test and try a fix on a throwaway cluster), `report`
+reasons), `verify` (whether every node's `bun` and this `relish` are the
+published release, by SHA-256 and release signature, also as `relish verify`
+for people, with `--metadata` for air-gapped clusters), `patch` (build, test and try a fix on a throwaway cluster), `report`
 (a redacted bug report, with a fingerprint for finding duplicates, for a human
-to read and post; it never posts, and makes no network call) and `setup`, which
+to read and post; it never posts, and makes no network call), `lease` (`take`,
+`renew` and `release` a short lease on an app or a namespace before changing
+it; someone else's is `lease_held`, naming them; `relish lease` is the
+people's side, with `list` and `break`, and `context` lists every lease),
+`propose` (`apply`, `scale`, `rollback`, `stop`, `delete`, `restart`,
+`cancel-deploy` or `clear-fault`, for a person to
+approve: an agent token, `relish token create --agent`, can't change anything
+directly; the cluster writes the summary, diff, blast radius (with the
+scheduler's forecast of where new instances go, and how many it can't
+place) and undo command; `relish proposal list|show|approve|reject` and
+`relish undo` are the people's side, as is the web dashboard's Proposals page,
+whose approve, reject and undo buttons appear only for a token that may decide
+and ask for that token; approval and application are one Raft entry, and a proposal whose apps changed, or whose blast radius grew, in
+between fails as `stale`; guardrails are policies
+with `applies_to = "proposals"`, which may refuse a proposal or, with `action
+= "approve"`, approve it without a person, never one that can't be undone
+exactly, and `relish policy test --proposal` tries them offline), `proposals`,
+`withdraw`, `undo` (which proposes the undo, refused as `stale` if the app
+changed since) and
+`setup`, which
 adds the `relish mcp` server to Claude Code, Codex, Cursor, VS Code, Goose and
 Gemini CLI: it shows the diff, writes only with `--yes`, never touches an entry
-it didn't write, and approves no tools. `relish mcp` serves the read-only
+it didn't write, and approves no tools (`--propose --namespace NAME` wires
+`relish mcp --propose` instead). `relish mcp` serves the read-only
 commands as MCP tools over stdio (`claude mcp add reliaburger -- relish mcp`),
+sending a read-only token it makes for itself when the context's is admin,
 derived from the same definitions, with `--toolsets`, `--no-logs` and
 `--namespace` to narrow them; commands that write, build or reach past the
-cluster API aren't tools. See [Working with an AI
+cluster API aren't tools. Its answers are 8 KiB unless a call asks for more,
+up to 128 KiB, so a small local model's window holds them; `--max-bytes`
+changes the default. A budget too small for the whole agent guide gets its
+outline, the contents and the sections to read first, and `relish agent
+guide --section` reads one section. `relish mcp --propose` adds the proposing and lease
+tools, with a deployer agent token it makes for itself, confined to
+`--namespace`. See [Working with an AI
 agent](manual/16_working-with-an-ai-agent.md). That chapter is the one source
 of everything agent-facing: `make agent-docs` generates
 [`llms.txt`](website/llms.txt), the website's [`/agents`](website/agents.md)
@@ -1045,10 +1120,12 @@ page, the `reliaburger` skill and Claude Code plugin in
 [`plugins/`](../plugins/reliaburger) (install it with `/plugin marketplace add
 reliaburger/reliaburger`), the website's skills index
 (`/.well-known/agent-skills/index.json`), `relish mcp`'s MCP Registry entry
-([`server.json`](../server.json), not yet published) and a block of
+([`server.json`](../server.json), not yet published; each release carries an
+MCP Bundle per platform for it) and a block of
 [`AGENTS.md`](../AGENTS.md), and a test fails when any of them is stale. It
 also writes a Markdown copy beside every website page (`/index.md`,
-`/compare/nomad.md`), which `llms.txt` lists.
+`/compare/nomad.md`), which `llms.txt` lists, and each page offers "Copy as
+Markdown" and "Open in Claude" buttons for it.
 The chapter ends with the playbook an agent follows to set a cluster up for
 you, on this computer, on machines over SSH or in a cloud, with a cloud-init
 file that readies machines for `relish setup --ssh` and the rule that nothing
@@ -1391,8 +1468,8 @@ Operational constraints:
   state, redundancy target, live node count, under-replicated layer count and
   lost images. Copies on dead nodes don't count: heal re-replicates after a
   node loss, with each chosen node copying straight from a live holder, and an
-  image with no live copy left is reported lost by `relish status` and
-  `relish wtf`.
+  image with no live copy left is reported lost by `relish wtf`, which
+  `relish status` counts on its `wtf` line.
 - `relish images delete repo:tag` (OCI `DELETE /v2/<name>/manifests/<tag>`)
   untags an image. A manifest untagged for `gc_retain_days` expires, unless an
   app or job pins it, and GC reclaims its layers.
@@ -1458,7 +1535,7 @@ interval = 10
 timeout = 5
 ```
 
-An app runs a host binary (`exec`, or an inline `script` through `/bin/sh`) or an `image`. A host app runs on the node itself, and only when the node's `[process_workloads] allowed_binaries` names its binary. An image app needs a container runtime. The process runtime (ProcessGrill) runs host apps only, so it refuses an image app: `relish apply`, `relish status` and `relish wtf` say it `needs a container runtime to run image ...`. In a cluster the scheduler places an image app only on nodes that run containers.
+An app runs a host binary (`exec`, or an inline `script` through `/bin/sh`) or an `image`. A host app runs on the node itself, and only when the node's `[process_workloads] allowed_binaries` names its binary. An image app needs a container runtime. The process runtime (ProcessGrill) runs host apps only, so it refuses an image app: `relish apply`, `relish apps` and `relish wtf` say it `needs a container runtime to run image ...`. In a cluster the scheduler places an image app only on nodes that run containers.
 
 On runc, an image app runs the way Kubernetes would run it. Everything below is optional:
 
@@ -1490,9 +1567,9 @@ source = "/srv/import"              # host path: never chowned by Bun
 
 A managed volume is `chown`ed to the container process's host uid and gid (container uid `u` is host uid `2000000000 + u`) the first time it's mounted, and left alone after that, so an entrypoint that hands `/data` to a service user keeps it that way across restarts. If the image's `USER` (or `run_as_user`) changes, files the previous user owned move to the new one. A host-path directory stays as you made it: own it by the mapped uid (`sudo chown 2000000999:2000000999 /srv/import` for container uid 999) or make it world-writable, otherwise Bun logs a warning at start and the container can only read it. There is no `fs_group`; `relish import` drops Kubernetes `fsGroup` with a warning. A node mounts a host path only under a prefix in its `[storage] allowed_host_paths` (empty by default, so every host path is refused) and never its own storage or security directories; a token with a `[permission]` block also needs `host-exec` to deploy one.
 
-In a cluster the scheduler places every replica that fits. An app it can place only in part shows `is unschedulable: placed N of M replicas` and why in `relish status`, `relish inspect` and `relish wtf`. An `exec` or `script` app only goes to nodes whose `[process_workloads]` allowlist names its binary. A live node whose reports stop keeps its replicas for `[reporting_tree] stale_node_grace_secs` (five minutes), then they move.
+In a cluster the scheduler places every replica that fits. An app it can place only in part shows `is unschedulable: placed N of M replicas` and why in `relish apps`, `relish inspect` and `relish wtf`. An `exec` or `script` app only goes to nodes whose `[process_workloads]` allowlist names its binary. A live node whose reports stop keeps its replicas for `[reporting_tree] stale_node_grace_secs` (five minutes), then they move.
 
-A managed volume stays on its node, and so does its app: restarting Bun, rebooting or losing the node from gossip never moves it to a node with an empty volume. While its node is away the app waits, `relish status` and `relish inspect` name the node, and `relish wtf` reports it as critical. `relish decommission-node <node> --workloads-stopped --reason <why>` (or new `placement.required` labels) is the explicit way to move it, onto a new, empty volume.
+A managed volume stays on its node, and so does its app: restarting Bun, rebooting or losing the node from gossip never moves it to a node with an empty volume. While its node is away the app waits, `relish apps` and `relish inspect` name the node, and `relish wtf` reports it as critical. `relish decommission-node <node> --workloads-stopped --reason <why>` (or new `placement.required` labels) is the explicit way to move it, onto a new, empty volume.
 
 An app that serves Prometheus metrics declares where, and every node scrapes its own instances of it (no Prometheus install needed):
 
@@ -1612,6 +1689,8 @@ The bun agent exposes a local HTTP API on port 9117:
 | `GET` | `/v1/logs/{app}/{namespace}` | Captured stdout/stderr (`?tail=N&follow=true`) |
 | `POST` | `/v1/exec/{app}/{namespace}` | Execute a command (JSON body: `{"command":["..."]}`) |
 | `GET` | `/v1/cluster/nodes` | List cluster nodes (gossip membership, dead members included with state `dead`) |
+| `GET` | `/v1/cluster/summary` | The whole cluster at a glance: counts per section (nodes, council, gossip, versions, capacity, usage, apps, instances, jobs, logs, faults, alerts, certs, GitOps, agents: leases held and proposals waiting), each marked `complete`, `partial` or `missing` with the nodes that answered. A scoped token sees its own apps and jobs; the cluster-wide sections come back `missing` |
+| `GET` | `/v1/cluster/capacity` | Requested CPU, memory and GPUs against schedulable capacity per node, from the leader's state reports; unscoped tokens only |
 | `GET` | `/v1/cluster/council` | Council (Raft) status |
 | `POST` | `/v1/cluster/join` | Join with a single-use token, node ID, CSR and format compatibility |
 | `POST` | `/v1/cluster/renew` | Renew the authenticated TLS node’s CSR on the leader; requires the service token, current peer certificate and format compatibility |
@@ -1905,7 +1984,7 @@ An app env value `PROVIDER[name:path]` is resolved when an instance launches,
 by a binary the node names in `[secret_providers.name]` in `node.toml`, over
 JSON on stdin and stdout with a timeout and an output cap. The scheduler places
 such an app only on nodes that run its provider, and a provider that fails
-keeps that instance from starting, with the reason in `relish status` and
+keeps that instance from starting, with the reason in `relish apps` and
 `relish wtf`. See [Secrets from a provider](manual/10_security.md#secrets-from-a-provider).
 
 ### OCI release qualification

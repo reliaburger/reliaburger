@@ -216,3 +216,150 @@ async fn list_honours_toolsets_and_refuses_an_unknown_one() {
         "{stderr}"
     );
 }
+
+/// A cluster API that knows two bearers: `admin-secret` may read the token
+/// list and `reader-secret` may not, as `bun` decides for an admin and a
+/// read-only token.
+async fn cluster_with_two_tokens() -> String {
+    let app = axum::Router::new().fallback(|headers: axum::http::HeaderMap| async move {
+        let bearer = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        match bearer.as_str() {
+            "Bearer admin-secret" => (StatusCode::OK, r#"{"tokens":[]}"#),
+            "Bearer reader-secret" => (StatusCode::FORBIDDEN, "requires admin role"),
+            _ => (StatusCode::UNAUTHORIZED, "invalid token"),
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{address}")
+}
+
+/// One short session, `initialize` then `tools/list`, as a client runs it.
+/// Returns every stdout line and the whole of stderr once relish has exited.
+async fn session(mut command: tokio::process::Command) -> (Vec<String>, String) {
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let messages = [
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "suite", "version": "1"}
+        }}),
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
+    ];
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut lines = Vec::new();
+    for message in messages {
+        stdin
+            .write_all(format!("{message}\n").as_bytes())
+            .await
+            .unwrap();
+        stdin.flush().await.unwrap();
+    }
+    // Read until the tools/list answer, then hang up as a client does.
+    while !lines.iter().any(|line: &String| line.contains("\"id\":2")) {
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(60), stdout.read_line(&mut line))
+            .await
+            .expect("relish mcp answers within 60 s")
+            .unwrap();
+        assert!(!line.is_empty(), "relish mcp hung up");
+        lines.push(line);
+    }
+    drop(stdin);
+    let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
+        .await
+        .expect("relish mcp exits once the client hangs up")
+        .unwrap();
+    let rest = String::from_utf8(output.stdout).unwrap();
+    lines.extend(rest.lines().map(str::to_string));
+    (lines, String::from_utf8(output.stderr).unwrap())
+}
+
+/// Every stdout line is a JSON-RPC message: a warning there would break the
+/// client.
+fn assert_only_frames(lines: &[String]) {
+    for line in lines {
+        let message: Value = serde_json::from_str(line)
+            .unwrap_or_else(|error| panic!("not JSON-RPC ({error}): {line}"));
+        assert_eq!(message["jsonrpc"], "2.0", "{line}");
+    }
+}
+
+#[tokio::test]
+async fn an_admin_token_prints_one_warning_on_stderr_and_nothing_on_stdout() {
+    let home = tempfile::tempdir().unwrap();
+    let endpoint = cluster_with_two_tokens().await;
+    let mut command = relish(home.path());
+    command.args(["--endpoint", &endpoint, "--token", "admin-secret", "mcp"]);
+    let (lines, stderr) = session(command).await;
+    assert_only_frames(&lines);
+    assert!(!lines.join("\n").contains("admin"), "{lines:?}");
+    assert_eq!(
+        stderr.matches("admin credentials").count(),
+        1,
+        "one warning: {stderr}"
+    );
+    assert!(
+        stderr.contains("relish token create --name agent --role read-only --ttl-days 1"),
+        "{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn a_read_only_token_prints_no_warning() {
+    let home = tempfile::tempdir().unwrap();
+    let endpoint = cluster_with_two_tokens().await;
+    let mut command = relish(home.path());
+    command
+        .args(["--endpoint", &endpoint, "mcp"])
+        .env("RELIABURGER_TOKEN", "reader-secret");
+    let (lines, stderr) = session(command).await;
+    assert_only_frames(&lines);
+    assert!(!stderr.contains("admin"), "{stderr}");
+}
+
+/// The managed context's token is the cluster's admin token, so relish mcp
+/// swaps in a read-only token of its own (#1730) and has nothing to warn
+/// about. It makes that token on the first tool call, not at start: this
+/// context's endpoint has nothing behind it, and the session still starts.
+#[tokio::test]
+async fn the_managed_context_starts_without_a_warning_or_a_round_trip() {
+    let home = tempfile::tempdir().unwrap();
+    let ca =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pem/root-ca.crt.pem");
+    let context = json!({
+        "schema": 1,
+        "owner": "suite",
+        "endpoint": "https://127.0.0.1:9",
+        "token": "rbrg_context_admin",
+        "ca_cert": ca,
+        "service_endpoints": {},
+    });
+    let path = home.path().join("context.json");
+    std::fs::write(&path, context.to_string()).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let mut command = relish(home.path());
+    command.arg("mcp");
+    let (lines, stderr) = session(command).await;
+    assert_only_frames(&lines);
+    assert!(!stderr.contains("admin"), "{stderr}");
+    assert!(!home.path().join("mcp-token.json").exists());
+}

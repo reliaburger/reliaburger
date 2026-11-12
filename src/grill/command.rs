@@ -144,6 +144,7 @@ impl OwnedCommands {
                     .iter()
                     .map(|(key, value)| format!("{key}={value}"))
                     .collect(),
+                provider_env: Vec::new(),
                 cwd: "/".into(),
                 user: OciUser { uid: 0, gid: 0 },
                 capabilities: None,

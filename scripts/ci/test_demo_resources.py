@@ -10,6 +10,7 @@ import pathlib
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import xml.etree.ElementTree as ET
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -83,6 +84,16 @@ class LocalSamples(unittest.TestCase):
         303: Proc(101, 1024, 0.0, 'git ls-remote'),
         404: Proc(1, 9999, 50.0, '/other/testapp'),
     }
+    # The sampler leaves out its own pid, and these tests are the sampler.
+    # A host whose pids have wrapped can hand this process one of the table's
+    # pids (it got 505 once, #1702), so the tests give it one the table never
+    # uses.
+    SAMPLER_PID = 90000
+
+    def setUp(self):
+        patcher = mock.patch.object(resources.os, 'getpid', return_value=self.SAMPLER_PID)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_workloads_are_bun_descendants_and_processes_naming_the_demo_directory(self):
         self.assertEqual(resources.workload_pids(self.TABLE, 101, '/tmp/demo'), {150, 202, 303})

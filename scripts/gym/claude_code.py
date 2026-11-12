@@ -26,6 +26,16 @@ the Claude Code version, the date, cost, turns and the tools the session had.
 The transcript (stream-json) goes to stdout, which the runner keeps as
 `solver.stdout`.
 
+On Kubernetes (`GYM_PLATFORM=k8s`, the comparison in #1679) the session is
+the same in every way but its tools: Bash for `kubectl` only, and the
+Kubernetes MCP server ([containers/kubernetes-mcp-server](https://github.com/containers/kubernetes-mcp-server),
+pinned in k8s/versions.env) with `read_only = true` and the `core` toolset,
+started through the recording shim with the solver's read-only kubeconfig.
+There's no plugin: Kubernetes has no skill of its own to load. The wrapper
+writes the server's config and the `--mcp-config` file into the run's
+directory. `kubectl proxy`, `port-forward` and `edit` are denied: the first
+two open listeners on this host, the third an editor nobody will close.
+
 `GYM_CLAUDE` names the `claude` to run (the portable tests use a fake),
 `GYM_CLAUDE_MODEL` picks a model (default: whatever Claude Code picks), and
 `GYM_CLAUDE_TIMEOUT` caps the session in seconds, below the runner's own
@@ -57,6 +67,14 @@ DISALLOWED_TOOLS = [
 ]
 # Flags this script must never pass: they skip the permission check.
 FORBIDDEN_FLAGS = ("--dangerously-skip-permissions", "--allow-dangerously-skip-permissions")
+# The Kubernetes side's tools (#1679).
+K8S_MCP_TOOLS = "mcp__kubernetes"
+K8S_ALLOWED_TOOLS = ["Bash(kubectl *)", K8S_MCP_TOOLS]
+K8S_DISALLOWED_TOOLS = [
+    "Bash(kubectl proxy *)",
+    "Bash(kubectl port-forward *)",
+    "Bash(kubectl edit *)",
+]
 DEFAULT_TIMEOUT = 1500
 DEFAULT_BUDGET_USD = "20"
 
@@ -69,11 +87,24 @@ writes it to GYM_ANSWER. The `relish` CLI (through Bash) and the Reliaburger
 MCP tools are the only tools you have.
 """
 
+K8S_NOTE = """
+## How this session works
 
-def answer_schema():
-    """The JSON Schema of the gym's answer (solvers.ANSWER_CONTRACT)."""
+This session can't write files. Instead of writing GYM_ANSWER yourself, end
+with the JSON object as your structured output; the wrapper that started you
+writes it to GYM_ANSWER. The `kubectl` CLI (through Bash) and the Kubernetes
+MCP server's tools are the only tools you have.
+"""
+
+
+def answer_schema(platform="reliaburger"):
+    """The JSON Schema of the gym's answer (solvers.ANSWER_CONTRACT).
+
+    On Kubernetes the report scenario asks for the draft in an extra
+    `report` field, so the schema allows one there.
+    """
     text = {"type": ["string", "null"]}
-    return {
+    schema = {
         "type": "object",
         "properties": {
             "app": text,
@@ -89,10 +120,65 @@ def answer_schema():
         },
         "required": ["app", "namespace", "node", "fault_kind", "location", "patch", "summary"],
     }
+    if platform == "k8s":
+        schema["properties"]["report"] = text
+    return schema
 
 
-def claude_argv(claude, model=None, budget=DEFAULT_BUDGET_USD, plugin=PLUGIN):
-    """The `claude` command line for one gym session."""
+def k8s_mcp_config(directory, kubeconfig):
+    """Write the Kubernetes MCP server's config and Claude Code's `--mcp-config`.
+
+    The server runs as `kubernetes-mcp-server` from PATH, which the runner
+    made the recording shim, with `read_only = true`: its write tools aren't
+    even offered. The kubeconfig is the solver's read-only one, so RBAC
+    refuses what the server's own guard would miss.
+    """
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    server = directory / "kubernetes-mcp-server.toml"
+    server.write_text(
+        "read_only = true\n"
+        'toolsets = ["core"]\n'
+        f"kubeconfig = {json.dumps(str(kubeconfig))}\n"
+    )
+    config = directory / "mcp.json"
+    config.write_text(json.dumps({
+        "mcpServers": {
+            "kubernetes": {"command": "kubernetes-mcp-server", "args": ["--config", str(server)]}
+        }
+    }, indent=2) + "\n")
+    return config
+
+
+def claude_argv(claude, model=None, budget=DEFAULT_BUDGET_USD, plugin=PLUGIN, platform="reliaburger",
+                mcp_config=None, tools="Bash,Skill", allowed=None, disallowed=None):
+    """The `claude` command line for one gym session.
+
+    `tools`, `allowed` and `disallowed` replace the Reliaburger side's tool
+    set, its permissions and its refusals: the website recordings
+    (scripts/record/) let the session build and try its patch and write its
+    report's files.
+    """
+    allowed = ALLOWED_TOOLS if allowed is None else allowed
+    disallowed = DISALLOWED_TOOLS if disallowed is None else disallowed
+    if platform == "k8s":
+        argv = [
+            claude, "-p",
+            "--output-format", "stream-json", "--verbose",
+            "--no-session-persistence",
+            "--setting-sources", "",
+            "--strict-mcp-config",
+            "--mcp-config", str(mcp_config),
+            "--tools", "Bash",
+            "--allowedTools", *K8S_ALLOWED_TOOLS,
+            "--disallowedTools", *K8S_DISALLOWED_TOOLS,
+            "--permission-mode", "dontAsk",
+            "--json-schema", json.dumps(answer_schema("k8s")),
+            "--max-budget-usd", budget,
+        ]
+        if model:
+            argv += ["--model", model]
+        return argv
     argv = [
         claude, "-p",
         "--output-format", "stream-json", "--verbose",
@@ -101,9 +187,9 @@ def claude_argv(claude, model=None, budget=DEFAULT_BUDGET_USD, plugin=PLUGIN):
         "--strict-mcp-config",
         "--mcp-config", str(plugin / ".mcp.json"),
         "--plugin-dir", str(plugin),
-        "--tools", "Bash,Skill",
-        "--allowedTools", *ALLOWED_TOOLS,
-        "--disallowedTools", *DISALLOWED_TOOLS,
+        "--tools", tools,
+        "--allowedTools", *allowed,
+        *(["--disallowedTools", *disallowed] if disallowed else []),
         "--permission-mode", "dontAsk",
         "--json-schema", json.dumps(answer_schema()),
         "--max-budget-usd", budget,
@@ -156,7 +242,7 @@ def answer_from(result_event):
     return found if isinstance(found, dict) else None
 
 
-def meta_from(stream, version, started, seconds, argv, timed_out):
+def meta_from(stream, version, started, seconds, argv, timed_out, platform="reliaburger"):
     """What the record says about the session."""
     init = next((e for e in stream if e.get("type") == "system" and e.get("subtype") == "init"), {})
     result = next((e for e in reversed(stream) if e.get("type") == "result"), {})
@@ -187,8 +273,9 @@ def meta_from(stream, version, started, seconds, argv, timed_out):
         "tool_uses": tool_uses,
         "permission_denials": len(denials),
         "flags": [flag for flag in argv[1:] if flag.startswith("-")],
-        "allowed_tools": ALLOWED_TOOLS,
-        "disallowed_tools": DISALLOWED_TOOLS,
+        "platform": platform,
+        "allowed_tools": K8S_ALLOWED_TOOLS if platform == "k8s" else ALLOWED_TOOLS,
+        "disallowed_tools": K8S_DISALLOWED_TOOLS if platform == "k8s" else DISALLOWED_TOOLS,
     }
 
 
@@ -202,8 +289,15 @@ def main():
     version = subprocess.run(
         [claude, "--version"], capture_output=True, text=True, env=env, check=False
     ).stdout.strip()
+    platform = os.environ.get("GYM_PLATFORM", "reliaburger")
+    mcp_config = None
+    if platform == "k8s":
+        # Beside the answer, in the run's directory, not the session's.
+        mcp_config = k8s_mcp_config(Path(os.environ["GYM_ANSWER"]).parent / "mcp",
+                                    os.environ["KUBECONFIG"])
     argv = claude_argv(claude, os.environ.get("GYM_CLAUDE_MODEL"),
-                       os.environ.get("GYM_CLAUDE_BUDGET_USD", DEFAULT_BUDGET_USD))
+                       os.environ.get("GYM_CLAUDE_BUDGET_USD", DEFAULT_BUDGET_USD),
+                       platform=platform, mcp_config=mcp_config)
     started = time.time()
     clock = time.monotonic()
     timed_out = False
@@ -212,7 +306,8 @@ def main():
         text=True, env=env,
     )
     try:
-        stdout, stderr = session.communicate(prompt.rstrip() + "\n" + NOTE, timeout=timeout)
+        note = K8S_NOTE if platform == "k8s" else NOTE
+        stdout, stderr = session.communicate(prompt.rstrip() + "\n" + note, timeout=timeout)
     except subprocess.TimeoutExpired:
         timed_out = True
         session.kill()
@@ -227,7 +322,7 @@ def main():
     if answer is not None and os.environ.get("GYM_ANSWER"):
         Path(os.environ["GYM_ANSWER"]).write_text(json.dumps(answer, indent=2) + "\n")
     if os.environ.get("GYM_SOLVER_META"):
-        meta = meta_from(stream, version, started, seconds, argv, timed_out)
+        meta = meta_from(stream, version, started, seconds, argv, timed_out, platform)
         Path(os.environ["GYM_SOLVER_META"]).write_text(json.dumps(meta, indent=2) + "\n")
     if timed_out:
         return 124

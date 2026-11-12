@@ -561,6 +561,97 @@ pub enum RaftRequest {
     /// the state machine refuses a release of an app that isn't there or
     /// has no owner.
     AppRelease { app_id: AppId },
+    /// A person's direct app write, made after the leader checked the agent
+    /// leases at `lease_generation` (#1686). The state machine applies
+    /// `change` only while the lease generation is still `lease_generation`,
+    /// and otherwise answers `LeaseGenerationMoved`, so the leader checks
+    /// the leases again. It compares two numbers, like `PolicyFenced`.
+    ///
+    /// `change` is an `AppSpec`, a `PolicyFenced` app write, `AppStop`,
+    /// `AppDelete` or `AppRelease`.
+    LeaseFenced {
+        lease_generation: u64,
+        change: Box<RaftRequest>,
+    },
+    /// Take a lease on an app or a namespace for the caller (#1686), or
+    /// renew it when the caller already holds it. `observed_at_unix_ms` is
+    /// the leader's clock when it built the entry, so every replica judges
+    /// expiry against the same instant. Answers `AgentLease`.
+    LeaseTake {
+        request: crate::proposal::lease::LeaseRequest,
+        observed_at_unix_ms: u64,
+    },
+    /// Extend the holder's live lease to `observed_at_unix_ms + ttl_ms`.
+    LeaseRenew {
+        target: crate::proposal::lease::LeaseTarget,
+        holder: crate::proposal::lease::LeaseHolder,
+        ttl_ms: u64,
+        observed_at_unix_ms: u64,
+    },
+    /// Give up the holder's lease.
+    LeaseRelease {
+        target: crate::proposal::lease::LeaseTarget,
+        holder: crate::proposal::lease::LeaseHolder,
+        observed_at_unix_ms: u64,
+    },
+    /// End anyone's live lease on `target`. The API checked that `by` may.
+    LeaseBreak {
+        target: crate::proposal::lease::LeaseTarget,
+        by: crate::proposal::lease::LeaseHolder,
+        observed_at_unix_ms: u64,
+    },
+    /// The leader's reaper: remove every lease lapsed by `now_unix_ms`.
+    LeaseExpire { now_unix_ms: u64 },
+    /// Store a proposal the leader built (#1682): number it, take and pin a
+    /// lease on each touched app for its author, and leave it pending.
+    /// Refused over a limit, on another pending proposal on the same app,
+    /// on an app that moved since the leader built it, or on someone
+    /// else's lease. Answers `Proposal`.
+    ProposalCreate {
+        proposal: Box<crate::proposal::Proposal>,
+        observed_at_unix_ms: u64,
+    },
+    /// Approve and apply a pending proposal in one entry: write every
+    /// touched app's `after` and record `Applied`, or write nothing and
+    /// record `Failed` (a moved revision, someone else's lease, `refusal`
+    /// from the leader's policy judgement, or a refused app write).
+    /// `policy_generation` is the generation the leader judged at; a moved
+    /// one answers `PolicyGenerationMoved` and changes nothing.
+    ProposalApply {
+        id: crate::proposal::ProposalId,
+        approval: crate::proposal::Approval,
+        policy_generation: u64,
+        refusal: Option<crate::proposal::FailedReason>,
+        observed_at_unix_ms: u64,
+    },
+    /// A person's direct undo: write every touched app's `before` back,
+    /// if each is still at its `after` revision, and mark the proposal
+    /// `Undone`. Refused as a whole otherwise.
+    ProposalUndo {
+        id: crate::proposal::ProposalId,
+        by: crate::proposal::Principal,
+        policy_generation: u64,
+        observed_at_unix_ms: u64,
+    },
+    /// A person rejects a pending proposal.
+    ProposalReject {
+        id: crate::proposal::ProposalId,
+        by: crate::proposal::Principal,
+        reason: String,
+        observed_at_unix_ms: u64,
+    },
+    /// The author withdraws a pending proposal.
+    ProposalWithdraw {
+        id: crate::proposal::ProposalId,
+        by: crate::proposal::Principal,
+        observed_at_unix_ms: u64,
+    },
+    /// The leader's reaper: expire every pending proposal past its TTL at
+    /// `now_unix_ms`.
+    ProposalExpire { now_unix_ms: u64 },
+    /// The leader's reaper: drop the specs of proposals that can't be
+    /// undone any more, and the oldest records beyond the limit.
+    ProposalCompact { now_unix_ms: u64 },
 }
 
 // ---------------------------------------------------------------------------
@@ -621,6 +712,14 @@ pub enum CouncilResponse {
     /// the policies are now at `current`. Nothing applied; the leader
     /// evaluates the app again and retries (#1117).
     PolicyGenerationMoved { current: u64 },
+    /// A `LeaseFenced` write was checked against leases at an older
+    /// generation; the leases are now at `current`. Nothing applied; the
+    /// leader checks the leases again and retries (#1686).
+    LeaseGenerationMoved { current: u64 },
+    /// What a lease entry did, or why it changed nothing (#1686).
+    AgentLease(Box<crate::proposal::lease::LeaseOutcome>),
+    /// What a proposal entry did, or why it changed nothing (#1682).
+    Proposal(Box<crate::proposal::ProposalOutcome>),
 }
 
 // ---------------------------------------------------------------------------
@@ -778,6 +877,12 @@ pub struct DesiredState {
     /// Active or interrupted-cleanup Phase 15 leases. Replication lets a new
     /// leader resume cleanup after the issuing process dies.
     pub test_leases: std::collections::BTreeMap<String, crate::testkit::lease::TestLease>,
+    /// Leases agents and people hold on apps and namespaces (#1686), and
+    /// the generation that moves whenever the set of holders changes.
+    pub agent_leases: crate::proposal::lease::AgentLeases,
+    /// Agent proposals (#1682): pending ones, applied ones inside the undo
+    /// window, compacted records, and the id counter.
+    pub proposals: crate::proposal::Proposals,
     /// Durable ownership of the single cluster-wide node-chaos slot.
     pub node_fault_reservations: crate::smoker::reservation::NodeFaultReservations,
     /// How many voters the council grows to, when the cluster was created
@@ -1075,6 +1180,7 @@ mod tests {
                 name: "ci-deploy".to_string(),
                 token_hash: vec![1, 2, 3],
                 role: crate::sesame::types::ApiRole::Deployer,
+                kind: crate::sesame::types::TokenKind::Human,
                 scope: crate::sesame::types::TokenScope::default(),
                 expires_at: None,
                 created_at: std::time::SystemTime::UNIX_EPOCH,

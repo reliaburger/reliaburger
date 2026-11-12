@@ -36,6 +36,7 @@ pub(crate) fn render_nav() -> &'static str {
 <span class="brand">Reliaburger</span>
 <a href="/">Dashboard</a>
 <a href="/ui/gitops">GitOps</a>
+<a href="/ui/proposals">Proposals</a>
 </nav>
 "#
 }
@@ -293,6 +294,7 @@ mod tests {
                     pid: Some(1234),
                     runtime_unknown: false,
                     status_age_ms: None,
+                    age_seconds: None,
                     reason: None,
                 },
                 InstanceStatus {
@@ -306,6 +308,7 @@ mod tests {
                     pid: Some(1235),
                     runtime_unknown: false,
                     status_age_ms: None,
+                    age_seconds: None,
                     reason: None,
                 },
             ],

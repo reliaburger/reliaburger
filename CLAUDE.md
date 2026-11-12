@@ -148,6 +148,17 @@ See [docs/testing.md](docs/testing.md) and [docs/design/test-harness.md](docs/de
 - Update the book chapter in the same change, not at the end.
 - Update `README.md` and `docs/README.md` when features, commands or status change. Never quote test counts.
 
+## Running Agents in Parallel
+
+Lessons from running many agents on one machine (6–7 November 2026, #1724):
+
+- Keep the load average under about twice the core count. Above that, builds and timing-sensitive tests slow down for every agent at once.
+- Give each agent its own `CARGO_TARGET_DIR` (for example `../rb-wt/target-<issue>`), and delete it once its PR merges. Each one grows to about 30 GB. Never share one across worktrees: cargo decides what to rebuild from file mtimes, so a checkout whose files are older than the last build isn't recompiled, and its green run tests another branch's binaries (#1745). If you must share one to save disk, run `git ls-files -z | xargs -0 touch` before each build.
+- Give each agent its own log directory, so parallel runs don't overwrite each other's logs.
+- Check free disk (`df -h`) before a heavy build. A full disk fails builds with odd errors that look like code bugs.
+- When many PRs touch the same shared files (`ci.yml`, the `Makefile`, the evidence manifest), merge them in one integration pass, not one at a time.
+- When the macOS queue is starved, fold the PRs into one integration PR, so the macOS job runs once.
+
 ## Example Naming Convention
 
 Example configs in `examples/phase-N/` use a runtime prefix so it's immediately clear what runtime they target:

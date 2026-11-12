@@ -1,0 +1,68 @@
+# Two agents, one app (#1686): another agent holds a lease on web, so the
+# solver's proposal is refused with `lease_held` (exit 4), naming the holder.
+# A person's write meets the same lease and is refused until they repeat it
+# with --break-lease, which takes web over; after that the solver's token
+# can take the lease itself.
+id = "two-agents"
+title = "Two agents want the same app, and a person takes it over"
+nodes = 1
+solver_token = "agent"
+
+prompt = """
+The `web` app needs 3 replicas for tonight's traffic. Propose the change with
+`relish agent propose`; a person reviews and approves it. Another agent may be
+working on `web` too: if one is, don't fight it. Say who holds it in your
+answer and stop.
+"""
+
+[[setup]]
+apply = "apps/web-v1.toml"
+wait_running = "web"
+
+[[setup]]
+as = "other-agent"
+run = ["agent", "lease", "take", "app", "web", "--purpose", "resizing web for the sale", "--ttl", "15m"]
+
+[[after]]
+as = "person"
+run = ["apply", "@file:apps/web-v1-hotfix.toml"]
+
+[[after]]
+as = "person"
+run = ["apply", "@file:apps/web-v1-hotfix.toml", "--break-lease"]
+
+[[after]]
+as = "solver-token"
+run = ["agent", "lease", "take", "app", "web", "--purpose", "my turn, after the person's hotfix"]
+
+[truth]
+app = "web"
+namespace = "default"
+fault_kind = "none"
+
+[score]
+checks = ["app"]
+
+[[outcome]]
+by = "solver"
+command = "agent propose scale"
+exit = 4
+code = "lease_held"
+holder = "gym-other-agent"
+
+[[outcome]]
+by = "person"
+command = "apply"
+exit = 1
+code = "lease_held"
+holder = "gym-other-agent"
+
+[[outcome]]
+by = "person"
+command = "apply"
+exit = 0
+
+[[outcome]]
+by = "solver-token"
+command = "agent lease take"
+exit = 0

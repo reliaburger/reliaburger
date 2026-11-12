@@ -235,6 +235,8 @@ fn owner() -> reliaburger::sesame::auth::AuthContext {
         token_name: "ci".into(),
         principal_id: "exact-ci-credential".into(),
         role: reliaburger::sesame::types::ApiRole::Admin,
+        kind: reliaburger::sesame::types::TokenKind::Human,
+        granted_role: reliaburger::sesame::types::ApiRole::Admin,
         scoped_apps: None,
         scoped_namespaces: None,
     }

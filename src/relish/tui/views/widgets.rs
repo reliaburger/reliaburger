@@ -4,6 +4,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
+use crate::bun::summary::{ClusterSummary, Section, Source};
 use crate::relish::tui::app::{Connection, Level, TuiApp, View};
 use crate::relish::tui::theme;
 
@@ -17,13 +18,10 @@ pub fn too_small(frame: &mut Frame<'_>) {
 }
 
 pub fn header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let leader = app
-        .data
-        .council
-        .as_ref()
-        .and_then(|council| council.leader.as_deref())
-        .unwrap_or("-");
-    let apps = app.all_apps().len();
+    let counts = match &app.data.summary {
+        Some(summary) => header_counts(summary),
+        None => "waiting for the cluster summary".to_string(),
+    };
     let connection = match app.connection {
         Connection::Connected => Span::styled("CONNECTED", Style::default().fg(theme::GOOD)),
         Connection::Disconnected { .. } => {
@@ -33,14 +31,42 @@ pub fn header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(" RELISH ", theme::title()),
-            Span::raw(format!(
-                " {} nodes · {apps} apps · leader {leader} · ",
-                app.data.nodes.len()
-            )),
+            Span::raw(format!(" {counts} · ")),
             connection,
         ])),
         area,
     );
+}
+
+/// The header's nodes, apps and leader, from the summary. A partial count
+/// says so, and a missing one says "unknown", never 0.
+pub fn header_counts(summary: &ClusterSummary) -> String {
+    let nodes = counted(&summary.nodes, "nodes", |nodes| {
+        nodes.alive + nodes.suspect + nodes.dead
+    });
+    let apps = counted(&summary.apps, "apps", |apps| apps.total);
+    let leader = summary
+        .council
+        .value
+        .as_ref()
+        .and_then(|council| council.leader.as_deref())
+        .unwrap_or("-");
+    format!("{nodes} · {apps} · leader {leader}")
+}
+
+fn counted<T>(section: &Section<T>, noun: &str, count: impl Fn(&T) -> u32) -> String {
+    let Some(value) = &section.value else {
+        return format!("{noun} unknown");
+    };
+    let count = count(value);
+    match (section.source, section.coverage) {
+        (Source::Partial, Some(coverage)) => format!(
+            "{count} {noun}, partial ({} of {} nodes)",
+            coverage.answered, coverage.asked
+        ),
+        (Source::Partial, None) => format!("{count} {noun}, partial"),
+        _ => format!("{count} {noun}"),
+    }
 }
 
 pub fn status_bar(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {

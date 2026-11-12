@@ -16,21 +16,27 @@ expression: value
         "command": "relish agent source grep"
       }
     ],
+    "contents": [],
+    "scope": "whole",
     "sections": [
       {
         "heading": "Working with an AI agent",
+        "id": "working-with-an-ai-agent",
         "markdown": "Reliaburger is an orchestrator.\nIts CLI is `relish`.\n\nIntro paragraph."
       },
       {
         "heading": "In brief",
+        "id": "in-brief",
         "markdown": "- **Run `relish agent guide` first.**"
       },
       {
         "heading": "Commands",
+        "id": "commands",
         "markdown": "stale table\n\n```sh\n## not a heading inside a fence\nrelish agent guide\n```"
       },
       {
         "heading": "Sending us a fix",
+        "id": "sending-us-a-fix",
         "markdown": "- **Disclose.**"
       }
     ],

@@ -405,10 +405,16 @@ resource_summary() {
     printf '\n'
 }
 
-# Running instances of an app, from `relish status` (NODE INSTANCE APP
-# NAMESPACE STATE ...). $2, if given, leaves out a node by name suffix.
+# Every instance with its node (NODE INSTANCE APP NAMESPACE STATE ...), then
+# why any app isn't fully running: `relish apps --instances` from 0.2.8,
+# `relish status` before it, since the tour runs the published release.
+instances() {
+    relish apps --instances 2>/dev/null || relish status 2>/dev/null
+}
+
+# Running instances of an app. $2, if given, leaves out a node by name suffix.
 running() {
-    relish status 2>/dev/null \
+    instances \
         | awk -v app="$1" -v skip="${2:-}" \
             '$3 == app && $5 == "running" && (skip == "" || $1 !~ skip "$") { n++ } END { print n + 0 }'
 }
@@ -457,7 +463,7 @@ rolled_to() {
 
 patty_rollout_failed() {
     burger_is "len(rows('patty')) > 0" || LOST_LAYER=1
-    relish status 2>/dev/null | grep -q '^patty (namespace default) RolloutFailed'
+    instances | grep -q '^patty (namespace default) RolloutFailed'
 }
 
 # The patties' instance numbers, sorted, one line.
@@ -511,7 +517,9 @@ agent_step() {
     step_heading "Ask your agent"
     say "From 0.2.7 an AI agent asks relish the same questions and gets one line of"
     say "JSON back, within a byte budget. jq here only makes it readable for people."
-    show "relish agent context | jq -c '.data.apps.items[] | {app, state, running, desired}'"
+    # From 0.2.8 the apps come from the cluster summary, worst first; 0.2.7
+    # listed every app.
+    show "relish agent context | jq -c '(.data.status.value.summary.apps.value.worst // .data.apps.items)[] | {app, state, running, desired}'"
     show "relish agent diagnose | jq -c '.data.findings[] | {id, severity, title}'"
     say "The manual chapter an agent reads first, from the binary itself:"
     show "relish agent guide | jq -r '.data.sections[].heading' | head -n 8"

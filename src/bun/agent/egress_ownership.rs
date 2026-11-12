@@ -208,7 +208,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let started = std::time::Instant::now();
         #[cfg(test)]
         self.loop_stalls.hold(super::LoopStall::Persist).await;
-        // LOOP-INLINE: fsync'd persist (#351 decision 2); the slow-disk scenario bounds it
+        // LOOP-INLINE: startup adoption only, before the loop's first turn; the loop checkpoints one owner at a time and leaves a slow write in flight
         let persisted = tokio::task::spawn_blocking(move || {
             crate::bun::egress_owners::persist(&directory, owners)
         })
@@ -422,10 +422,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         };
         let started = std::time::Instant::now();
         #[cfg(test)]
-        let stalls = std::sync::Arc::clone(&self.loop_stalls);
+        let stall = self.loop_stalls.reach(super::LoopStall::Persist);
         let mut task = tokio::spawn(async move {
             #[cfg(test)]
-            stalls.hold(super::LoopStall::Persist).await;
+            if let Some(stall) = stall {
+                tokio::time::sleep(stall).await;
+            }
             tokio::task::spawn_blocking(move || {
                 crate::bun::egress_owners::persist(&directory, owners)
             })

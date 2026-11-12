@@ -1,0 +1,38 @@
+# The gym's web app on Kubernetes, version 1: healthy. The port of
+# apps/web-v1.toml: one replica serving HTTP, with a Service in front, as
+# Reliaburger gives an app with a `port`. @IMAGE@ is the lab's pinned BusyBox,
+# already in every node's image store, so no run waits on a pull.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: default
+  labels: {app: web}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: web}
+  template:
+    metadata:
+      labels: {app: web}
+    spec:
+      containers:
+        - name: web
+          image: "@IMAGE@"
+          imagePullPolicy: IfNotPresent
+          command: ["httpd", "-f", "-v", "-p", "8080", "-h", "/tmp"]
+          ports:
+            - containerPort: 8080
+          env:
+            - {name: VERSION, value: v1}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+  namespace: default
+spec:
+  selector: {app: web}
+  ports:
+    - port: 8080
+      targetPort: 8080

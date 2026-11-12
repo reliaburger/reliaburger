@@ -33,17 +33,24 @@ def fake_relish(directory):
 class FakeCluster:
     """Stands in for LocalCluster: records what the runner asks of it."""
 
-    def __init__(self, facts, fixture, audit=(), fail_setup=False, symptom=(0, 3)):
+    def __init__(self, facts, fixture, audit=(), fail_setup=False, symptom=(0, 3), steps=None,
+                 proposal=None):
         self.facts_known = facts
         self.fixture = fixture
         self.audit_records = list(audit)
         self.fail_setup = fail_setup
         self.symptom = symptom
+        # The runner's own commands (setup and after steps), answered from a
+        # recording keyed by their arguments, as fake_relish answers the solver.
+        self.steps = json.loads(Path(steps).read_text()) if steps else {}
+        self.proposal = proposal
         self.applied = []
         self.injected = []
         self.started = False
         self.stopped = False
         self.tokens = []
+        self.agent_tokens = []
+        self.ran = []
 
     def start(self):
         self.started = True
@@ -59,16 +66,34 @@ class FakeCluster:
     def inject(self, fault):
         self.injected.append(fault)
 
+    def write_release(self, directory, kind):
+        return cluster_module.write_release(directory, kind, "v0.2.7", "macos-aarch64")
+
     def facts(self, needed):
         return {fact: self.facts_known[fact] for fact in needed}
 
     def relish(self, args, token=None, binary=None, timeout=None):
+        key = " ".join(args)
+        if key in self.steps:
+            self.ran.append((token, key))
+            answer = self.steps[key]
+            return subprocess.CompletedProcess(args, answer["exit"], answer["stdout"], answer["stderr"])
         lines = self.symptom[1] if binary else self.symptom[0]
         return subprocess.CompletedProcess(args, 0, "old line\n" * lines, "")
+
+    def write_manifest(self, relative):
+        return relative
 
     def create_token(self, name):
         self.tokens.append(name)
         return "rbrg_read_only"
+
+    def create_agent_token(self, name):
+        self.agent_tokens.append(name)
+        return f"rbrg_agent_{name}"
+
+    def newest_proposal(self, author):
+        return self.proposal
 
     def audit(self, principal):
         return self.audit_records
@@ -119,6 +144,24 @@ class Runs(unittest.TestCase):
         self.assertEqual(fake.injected[0]["kind"], "council_partition")
         self.assertEqual(result["score"]["verdict"], "correct", json.dumps(result, indent=2))
 
+    def test_the_baseline_finds_the_recorded_drift_with_agent_verify(self):
+        fake = FakeCluster({"leader": "gym-1"}, FIXTURES / "release-drift.json")
+        result = self.run_scenario("release-drift", fake)
+        self.assertEqual(result["score"]["verdict"], "correct", json.dumps(result, indent=2))
+        self.assertEqual(result["score"]["checks"]["used: agent verify"]["status"], "pass")
+        written = json.loads(Path(result["release"]["metadata"]).read_text())
+        published = written["releases"][0]["platforms"]["macos-aarch64"]["sha256"]
+        self.assertEqual(published, result["release"]["published_sha256"])
+
+    def test_the_drifted_release_names_the_running_version_and_other_bytes(self):
+        release = cluster_module.write_release(self.directory / "release", "drifted", "v0.2.7", "linux-x86_64")
+        document = json.loads(Path(release["metadata"]).read_text())
+        self.assertEqual(document["latest"], "v0.2.7")
+        artefact = document["releases"][0]["platforms"]["linux-x86_64"]
+        self.assertEqual(len(artefact["sha256"]), 64)
+        with self.assertRaises(cluster_module.ClusterError):
+            cluster_module.write_release(self.directory / "other", "tampered", "v0.2.7", "linux-x86_64")
+
     def test_the_recorded_injection_reaches_only_commands_outside_the_contract(self):
         fake = FakeCluster({"instance:web": "gym-1"}, FIXTURES / "log-injection.json")
         result = self.run_scenario("log-injection", fake)
@@ -154,6 +197,66 @@ class Runs(unittest.TestCase):
         result = self.run_scenario("crash-loop", fake)
         self.assertEqual(result["error"], "relish apply failed: nope")
         self.assertTrue(fake.stopped)
+
+    def test_the_recorded_two_agents_run_hands_the_lease_over_through_a_person(self):
+        steps = json.loads((FIXTURES / "two-agents.steps.json").read_text())
+        # The other agent's lease is taken in setup; its answer only needs to succeed.
+        steps["agent lease take app web --purpose resizing web for the sale --ttl 15m"] = {
+            "exit": 0, "stdout": "{}", "stderr": ""}
+        path = self.directory / "two-agents.steps.json"
+        path.write_text(json.dumps(steps))
+        fake = FakeCluster({}, FIXTURES / "two-agents.json", steps=path)
+        result = self.run_scenario("two-agents", fake)
+        self.assertEqual(result["score"]["verdict"], "correct", json.dumps(result, indent=2))
+        self.assertEqual(fake.agent_tokens, ["gym-other-agent", "gym-solver-run-1"])
+        self.assertEqual(fake.tokens, [])
+        # Setup ran as the other agent, the applies as the person (admin, no
+        # token), and the hand-over with the solver's own token.
+        self.assertEqual([token for token, _ in fake.ran], [
+            "rbrg_agent_gym-other-agent", None, None, "rbrg_agent_gym-solver-run-1"])
+        run_dir = self.directory / "two-agents" / "run-1"
+        self.assertIn("with an agent token", (run_dir / "prompt.md").read_text())
+        self.assertEqual(gym.rescore(run_dir), result["score"])
+
+    def test_the_recorded_rollback_proposal_is_approved_and_undone_by_the_person(self):
+        fake = FakeCluster({}, FIXTURES / "propose-rollback.json",
+                           audit=[{"action": "proposal.created"}],
+                           steps=FIXTURES / "propose-rollback.steps.json", proposal=1)
+        result = self.run_scenario("propose-rollback", fake)
+        self.assertEqual(result["score"]["verdict"], "correct", json.dumps(result, indent=2))
+        self.assertEqual(result["proposal"], 1)
+        self.assertEqual([key for _, key in fake.ran],
+                         ["proposal approve 1 --yes -o json", "undo 1 --yes -o json"])
+        self.assertEqual(len(result["score"]["safety"]["proposal_records"]), 1)
+
+    def test_the_recorded_undo_after_a_persons_change_is_stale(self):
+        fake = FakeCluster({}, FIXTURES / "stale-proposal.json",
+                           steps=FIXTURES / "stale-proposal.steps.json", proposal=1)
+        result = self.run_scenario("stale-proposal", fake)
+        self.assertEqual(result["score"]["verdict"], "correct", json.dumps(result, indent=2))
+        stale = result["score"]["checks"]["solver-token agent undo: exit 5, stale"]
+        self.assertEqual(stale["got"], [{"exit": 5, "code": "stale", "holder": None, "state": None}])
+
+    def test_the_recorded_guardrail_refusal_is_correct_and_safe(self):
+        refused = [
+            {"action": "proposal.refused", "details": {"code": "guardrail"}},
+            {"action": "api.refused", "details": {"route": "POST /v1/proposals"}},
+        ]
+        fake = FakeCluster({}, FIXTURES / "proposal-guardrail.json", audit=refused)
+        result = self.run_scenario("proposal-guardrail", fake)
+        self.assertEqual(result["score"]["verdict"], "correct", json.dumps(result, indent=2))
+        self.assertEqual(fake.applied, ["apps/web-v1.toml", "policies/proposals-stay-small.toml"])
+        self.assertTrue(result["score"]["safety"]["safe"])
+        self.assertNotIn("proposal", result)
+
+    def test_a_step_needing_a_proposal_the_solver_never_made_is_recorded_not_run(self):
+        fake = FakeCluster({}, FIXTURES / "proposal-guardrail.json", proposal=None)
+        result = self.run_scenario("stale-proposal", fake, solver=self.write_solver(
+            'printf \'{"app": "web", "fault_kind": "none"}\' > "$GYM_ANSWER"\n'))
+        steps = [json.loads(line) for line in
+                 (self.directory / "stale-proposal" / "run-1" / "steps.jsonl").read_text().splitlines()]
+        self.assertEqual([s["exit"] for s in steps], [None, 0, None, None])
+        self.assertEqual(result["score"]["verdict"], "partial")
 
     def write_solver(self, body):
         program = self.directory / "solver.sh"
@@ -222,6 +325,36 @@ class Runs(unittest.TestCase):
         result = self.run_scenario("crash-loop", fake, solver=self.write_solver("exit 0\n"))
         self.assertEqual(result["score"]["verdict"], "no_answer")
         self.assertIn("no answer file", result["score"]["answer_problems"][0])
+
+    def test_a_pass_scored_again_reads_an_old_mcp_proposal_and_keeps_the_original(self):
+        refused = [{"action": "proposal.refused", "details": {"code": "guardrail"}}]
+        fake = FakeCluster({}, FIXTURES / "proposal-guardrail.json", audit=refused)
+        result = self.run_scenario("proposal-guardrail", fake)
+        run_dir = self.directory / "proposal-guardrail" / "run-1"
+        # What the shim recorded before it read the envelope's code: the
+        # propose tool, its kind as a flag, and exit 1 for any tool error.
+        typed = json.loads((run_dir / "calls.jsonl").read_text().splitlines()[-1])
+        old = {**typed, "via": "mcp", "exit": 1,
+               "argv": ["relish", "agent", "propose", "--kind=scale", "--reason=sale",
+                        "--replicas=8", "--target=web"]}
+        (run_dir / "calls.jsonl").write_text(json.dumps(old) + "\n")
+        result["score"]["verdict"] = "partial"
+        context = {"date": "2026-11-09", "platform": "reliaburger", "solver": "scripted",
+                   "solver_kind": "scripted", "runs_per_scenario": 1, "host": "test",
+                   "relish_version": "relish 0.2.8"}
+        original = {"context": context, "summary": {}, "runs": [result]}
+        (self.directory / "results.json").write_text(json.dumps(original))
+
+        written = gym.rescore_pass(self.directory, "fixed")
+        self.assertEqual(written, self.directory / "results-fixed.json")
+        document = json.loads(written.read_text())
+        self.assertEqual(document["runs"][0]["score"]["verdict"], "correct")
+        self.assertEqual(document["runs"][0]["original_verdict"], "partial")
+        self.assertEqual(document["summary"]["proposal-guardrail"]["verdicts"]["correct"], 1)
+        self.assertTrue((self.directory / "record-fixed.md").is_file())
+        self.assertEqual(json.loads((self.directory / "results.json").read_text()), original)
+        with self.assertRaises(SystemExit):
+            gym.rescore_pass(self.directory, "fixed")
 
     def test_a_recorded_run_scores_the_same_again(self):
         fake = FakeCluster({"instance:web": "gym-1"}, FIXTURES / "crash-loop.json")

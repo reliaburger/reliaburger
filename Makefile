@@ -1,4 +1,4 @@
-.PHONY: build test warm-executables test-cargo test-doc test-slow test-images test-linux test-rootless-runc test-cluster test-hollow test-upgrade test-upgrade-node test-upgrade-cluster test-apple test-standard-clients test-gym test-gpu test-s3 test-ci-scripts check-ignored coverage check fmt lint lint-macos audit outdated clean pdf loc help bench bench-large ci ci-bench rollout-demo gitops-demo observability-demo kubernetes-demo toml-demo reference-commands agent-docs bench-task-arrays fuzz-tools fuzz-build fuzz-smoke fuzz-corpus-check fuzz-corpus-seed features-page
+.PHONY: build test warm-executables test-cargo test-doc test-slow test-images test-linux test-rootless-runc test-cluster test-hollow test-upgrade test-upgrade-node test-upgrade-cluster test-apple test-standard-clients test-gym test-gym-user test-gpu test-s3 test-ci-scripts check-ignored coverage check fmt lint lint-macos audit outdated clean pdf loc help bench bench-large ci ci-bench rollout-demo gitops-demo observability-demo kubernetes-demo toml-demo reference-commands agent-docs bench-task-arrays fuzz-tools fuzz-build fuzz-smoke fuzz-corpus-check fuzz-corpus-seed coverage-html test-macos mcp-registry-publish features-page
 
 CARGO = cargo
 NEXTEST_PROFILE ?= default
@@ -36,6 +36,20 @@ warm-executables: ## Build the suite and its binaries, then run each binary once
 	$(CARGO) test --no-run
 	python3 scripts/ci/warm_executables.py
 
+# The macOS CI job (#1720). Bun ships for Linux only, so on macOS CI tests
+# relish (its binary, `relish::` in the library and the suite's `relish_*`
+# modules) and the tests only macOS compiles: the Apple runtime, the
+# non-Linux process start times, the macOS home directories and runtime
+# selection. Bun, grill, cluster and eBPF tests run on Linux. Cargo still
+# links `bun` and `testapp`, because it builds every binary for an integration
+# test, but none of their tests run. scripts/ci/test_macos_selection.py pins
+# this filterset, and scripts/ci/macos_selection.py keeps the evidence
+# manifest's portable-darwin cases inside it.
+test-macos: ## Run relish's tests and the macOS-only tests (the macOS CI job; `test` runs everything)
+	$(CARGO) test --no-run --lib --bin relish --test suite --test runtime_selection
+	python3 scripts/ci/warm_executables.py
+	$(NEXTEST) --lib --bin relish --test suite --test runtime_selection -E 'binary_id(reliaburger::bin/relish) | (binary_id(reliaburger) & (test(/^relish::/) | test(/^grill::apple::/) | test(/^grill::records::tests::absolute_start_time/))) | (binary_id(reliaburger::suite) & (test(/^relish_/) | test(/^user_directories::macos_/))) | binary_id(reliaburger::runtime_selection)'
+
 test-cargo: ## Run the portable suite with Cargo's built-in runner
 	$(CARGO) test
 
@@ -60,8 +74,8 @@ test-rootless-runc: ## Prove rootless runc networking and port adoption as a non
 test-cluster: ## Run all real multi-node cluster acceptance suites and the scripted feature demos
 	RELIABURGER_CLUSTER_TESTS=1 $(NEXTEST) --run-ignored=only -E '(binary(cluster_failover) | binary(cluster_gossip) | binary(council_self_healing) | binary(council_disaster_recovery) | binary(placement) | binary(cluster_task_arrays) | binary(registry_durability) | binary(demos))'
 
-test-hollow: ## Run the 20-node hollow-node harness check (#1401); measured fleets run through scripts/release/qualify-hollow-nodes.sh
-	$(NEXTEST) --run-ignored=only -E 'binary(hollow_nodes) & test(twenty_hollow_nodes)'
+test-hollow: ## Run the 20-node hollow-node harness check (#1401) and the 100-node, 1,000-app summary budget; measured fleets run through scripts/release/qualify-hollow-nodes.sh
+	$(NEXTEST) --run-ignored=only -E 'binary(hollow_nodes) & (test(twenty_hollow_nodes) | test(a_hundred_hollow_nodes))'
 
 test-upgrade: ## Run all real-binary self-upgrade acceptance tests
 	RELIABURGER_UPGRADE_TESTS=1 $(NEXTEST) --run-ignored=only -E 'binary(self_upgrade) | binary(self_upgrade_cluster)'
@@ -92,6 +106,14 @@ test-gym: ## Run the agent gym's scenarios on throwaway local clusters (#1086); 
 	$(CARGO) build --locked --bin relish --bin bun --bin testapp
 	python3 scripts/gym/gym.py run --solver '$(GYM_SOLVER)' --runs $(GYM_RUNS) --port-base $(GYM_PORT_BASE) --out '$(GYM_OUT)'
 
+# `relish gym run` (#1683), tested by the gym: the baseline over every
+# scenario on a fresh local cluster, then a Ctrl-C mid-run, each followed by a
+# check that no fault, gym app or solver token is left. No API spend.
+test-gym-user: ## Test `relish gym run` on a throwaway local cluster (#1683): the baseline, then Ctrl-C mid-run, checking cleanup
+	python3 scripts/release/require_python.py
+	$(CARGO) build --locked --bin relish --bin bun --bin testapp
+	python3 scripts/gym/gym.py user --port-base $(GYM_PORT_BASE) --out '$(GYM_OUT)/user'
+
 test-gpu: ## Detect a real NVIDIA GPU (needs the GPU and nvidia-smi)
 	RELIABURGER_GPU_TESTS=1 $(NEXTEST) --run-ignored=only -E 'test(=bun::gpu::tests::nvidia_detector_finds_hardware)'
 
@@ -112,13 +134,18 @@ lint: ## Run clippy for every target, with all features and with none, warnings 
 	$(CARGO) clippy --all-targets --no-default-features -- -D warnings
 
 # One Clippy pass for the macOS CI job. The `lint` job on Linux runs both
-# passes. What only macOS compiles is `cfg(target_os = "macos")` code and the
-# `not(all(feature = "ebpf", target_os = "linux"))` fallbacks, and every
-# feature leaves both in, so the all-features pass covers them. The code that
-# only the no-features pass reaches is gated on a feature alone, and that
-# compiles the same on Linux. A second pass here took about three minutes.
-lint-macos: ## Run clippy once, every target with all features (the macOS CI job; `lint` runs both)
-	$(CARGO) clippy --all-targets --all-features -- -D warnings
+# passes over every target. What only macOS compiles is `cfg(target_os =
+# "macos")` code and the `not(all(feature = "ebpf", target_os = "linux"))`
+# fallbacks, and every feature leaves both in, so the all-features pass
+# covers them. The code that only the no-features pass reaches is gated on a
+# feature alone, and that compiles the same on Linux. It lints the library
+# and the two binaries, not every target: Linux lints the test code, and
+# every target means compiling every Linux-only test binary on a Mac too.
+# Test code that only macOS compiles (the Apple runtime's tests, say) is
+# built by `test-macos` but linted only by `make lint` on a Mac. Linting
+# `bun` is its compile check on macOS; its tests run on Linux (#1720).
+lint-macos: ## Run clippy once on the library, relish and bun, with all features (the macOS CI job; `lint` runs both passes on every target)
+	$(CARGO) clippy --lib --bin relish --bin bun --all-features -- -D warnings
 
 audit: ## Fail on new RustSec findings or an expired advisory exception
 	@today=$$(date -u +%Y%m%d); expiry=20261118; \
@@ -144,13 +171,19 @@ bench-large: ## Run reproducible 500 and 1000 node gossip benchmarks
 bench-task-arrays: ## Run in-process task-array benchmarks (leader cost, pool overhead, fork/exec floor)
 	$(CARGO) bench --bench task_arrays
 
-coverage: ## Run the portable suite once under line coverage and enforce the floor
+# One report call writes the lcov file and then checks the floor: each call
+# merges every profile and reads every binary's coverage map again, about two
+# minutes on CI (plan 2026-11-06, F3). scripts/ci/coverage_owner.py pins this
+# recipe, so CI's evidence owner runs exactly these stages.
+coverage: ## Run the portable suite once under line coverage, write the lcov report and enforce the floor
 	$(CARGO) llvm-cov clean --workspace
 	$(CARGO) llvm-cov --no-report nextest --profile $(NEXTEST_PROFILE) --no-tests=fail
 	mkdir -p target/coverage
-	$(COVERAGE_REPORT) --lcov --output-path target/coverage/lcov.info
+	$(COVERAGE_REPORT) --lcov --output-path target/coverage/lcov.info --fail-under-lines $(COVERAGE_MIN_LINES)
+
+# CI writes the HTML on pushes to main and the nightly only (D5).
+coverage-html: ## Write the HTML coverage report from the last make coverage run
 	$(COVERAGE_REPORT) --html --output-dir target/coverage/html
-	$(COVERAGE_REPORT) --fail-under-lines $(COVERAGE_MIN_LINES)
 
 rollout-demo: ## Roll an app forward, roll it back, and watch a bad version roll back by itself
 	scripts/demo/rollout.sh
@@ -167,16 +200,20 @@ kubernetes-demo: build ## Demo Kubernetes YAML import/export round-trip
 toml-demo: build ## Demo config tooling (lint, fmt, compile, diff)
 	./scripts/relish-toml-demo.sh
 
-test-ci-scripts: ## Test the CI scripts: job selection, ignored-test owners and JUnit keeping, and the agent gym's scorer and runner
+test-ci-scripts: ## Test the CI scripts: job selection, ignored-test owners and JUnit keeping, the agent gym's scorer and runner, and the website's agent recordings
 	python3 scripts/release/require_python.py
 	python3 -m unittest discover -s scripts/ci -p 'test_*.py'
 	python3 -m unittest discover -s scripts/release -p 'test_*.py'
 	python3 -m unittest discover -s scripts/gym -p 'test_*.py'
+	python3 -m unittest discover -s scripts/record -p 'test_*.py'
 
 check-ignored: ## Fail when an #[ignore] reason names no gate, script, fixture parent or issue
 	python3 scripts/ci/ignored_owners.py reasons
 
-ci: fmt-check lint test test-doc test-ci-scripts check-ignored ## Run the portable CI checks
+# The checks that take seconds come first, so a format slip or an unowned
+# #[ignore] fails before Clippy and the suite compile anything (#1724). Make
+# runs prerequisites in the order listed unless you pass -j.
+ci: fmt-check check-ignored test-ci-scripts lint test test-doc ## Run the portable CI checks, quickest first
 
 ci-bench: ci bench ## Run the portable CI checks, then the 5-250 node gossip benchmarks (no privileged, cluster or upgrade suites)
 
@@ -206,6 +243,13 @@ FUZZ_SECONDS ?= 10
 # musl cargo-fuzz then asks for a static CRT that AddressSanitizer refuses.
 # Name the nightly toolchain's own host instead.
 FUZZ_TARGET ?= $(shell $(CARGO) +$(FUZZ_TOOLCHAIN) -vV 2>/dev/null | sed -n 's/^host: //p')
+# cargo-fuzz compiles each crate as one codegen unit unless told otherwise.
+# As one sanitized LLVM module, reliaburger took 31 GB in a single rustc,
+# and the 16 GB hosted runner was reclaimed mid-build (#1839). With 64 units
+# and four jobs the build peaked at 12.3 GB (16 units: 16.1 GB), at some cost
+# in executions per second. `run` must pass the same value, or its RUSTFLAGS
+# differ and it rebuilds everything.
+FUZZ_CODEGEN_UNITS ?= 64
 FUZZ_TARGETS = $(sort $(basename $(notdir $(wildcard fuzz/fuzz_targets/*.rs))))
 
 fuzz-tools: ## Check that nightly Rust and cargo-fuzz are installed, and say how to get them
@@ -215,13 +259,13 @@ fuzz-tools: ## Check that nightly Rust and cargo-fuzz are installed, and say how
 		echo "fuzzing needs cargo-fuzz: cargo install cargo-fuzz --locked" >&2; exit 1; }
 
 fuzz-build: fuzz-tools ## Build every fuzz target (nightly, cargo-fuzz)
-	$(FUZZ) build --target $(FUZZ_TARGET)
+	$(FUZZ) build --target $(FUZZ_TARGET) --codegen-units $(FUZZ_CODEGEN_UNITS)
 
 fuzz-smoke: fuzz-build ## Run every fuzz target for FUZZ_SECONDS (default 10) each; fails if any crashes
 	@failed=""; for target in $(FUZZ_TARGETS); do \
 		mkdir -p fuzz/target/corpus/$$target fuzz/target/logs; \
 		echo "fuzz: $$target for $(FUZZ_SECONDS)s (log: fuzz/target/logs/$$target.log)"; \
-		$(FUZZ) run --target $(FUZZ_TARGET) $$target fuzz/target/corpus/$$target fuzz/corpus/$$target -- \
+		$(FUZZ) run --target $(FUZZ_TARGET) --codegen-units $(FUZZ_CODEGEN_UNITS) $$target fuzz/target/corpus/$$target fuzz/corpus/$$target -- \
 			-max_total_time=$(FUZZ_SECONDS) -print_final_stats=1 \
 			>fuzz/target/logs/$$target.log 2>&1 || failed="$$failed $$target"; \
 		grep -E '^#[0-9]+.*(DONE|cov:)' fuzz/target/logs/$$target.log | tail -n 1; \

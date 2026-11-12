@@ -131,7 +131,9 @@ default_ttl = "90d"   # or "12h", or "none" for no default
 `relish token list` warns on stderr about every token that has expired or
 expires within 14 days, with the `rotate` command to run. `relish wtf` raises
 the same warning, and also warns about an admin token whose secret is more
-than 90 days old.
+than 90 days old. Neither warns about a `relish-mcp-` token: `relish mcp`
+makes those for a day and renews them itself, so revoke one rather than
+rotate it ([why](16_working-with-an-ai-agent.md#through-mcp)).
 
 ### Rotation
 
@@ -240,10 +242,41 @@ anyone, so it needs `deploy` granted the same way, and a build that sets
 one app still shows that app's charts on its dashboard page, but the dashboard
 leaves out the alert panel, and `relish top` shows only that app's rows.
 
-A browser session keeps its token's permissions, and it's always read-only:
-a cookie can read the dashboard but never change anything. That holds for a
-session opened with the cluster's service token too. It reads everything, but
-it isn't a node, so the node-to-node routes refuse it. Nodes talking to each other
+A browser session keeps its token's permissions, and it's read-only: a
+cookie can read the dashboard but never change anything. The Proposals page
+lets a person approve, reject or undo an agent's proposal, but the cookie
+can't do that on its own. These are the browser path's defences:
+
+- **Your token, every time.** Each decision form asks you to paste your API
+  token. It must be the token you logged in with, still valid, and the
+  decision acts as that token: the same checks, and the same audit record
+  under its name, as `relish proposal approve`. Someone holding only your
+  session cookie can read, never decide.
+- **Forms only for those who may decide.** The forms appear only when your
+  token may make that decision (a person's token, deployer or above,
+  covering every app the proposal touches, and not its author), and the
+  server checks again when one is posted.
+- **No forged or framed posts.** Each form carries an anti-forgery token
+  tied to the session. The server refuses a post the browser marks as
+  cross-site, as sent from inside a frame (`Sec-Fetch-Dest`), or whose
+  `Origin` is another host. Every dashboard page also refuses to be framed
+  (`X-Frame-Options: DENY` and `Content-Security-Policy: frame-ancestors
+  'none'`), and the session cookie is `SameSite=Strict`.
+- **The cookie stays on the node.** A browser sends cookies by host, not
+  port, so a request to an app served through this node's ingress could
+  carry the dashboard's `rb_session` cookie. The ingress takes it out
+  before the request reaches the app.
+- **The leader decides.** Only the council leader can apply a decision, so
+  on another node the page says so and shows the command instead.
+  `relish dashboard`'s proxy forwards no writes at all, so it shows the
+  commands too.
+
+A refused decision is audited as the token that was pasted, with the
+reason the API gave.
+
+A session opened with the cluster's service token reads everything and
+decides nothing. It isn't a node either, so the node-to-node routes refuse
+it. Nodes talking to each other
 use the cluster's internal identity, which no block can restrict, so
 `relish logs` and `relish top` still gather every node's answer; the
 node you asked filters it. `relish wtf` reads health, membership and
@@ -281,6 +314,183 @@ a node's poll for its placements and its report that a rollout failed (see
 which is less than an anonymous caller can already do in that window. The
 moment the cluster has a master key or a first token, both need the service
 token again.
+
+## Agent tokens and proposals
+
+An AI agent should have its own token, never yours. Make one with `--agent`:
+
+```sh
+relish token create --name holmes --agent --role deployer --namespaces shop --ttl 8h
+```
+
+An agent token is `read-only` unless you say `--role deployer`, can't be
+`admin`, and lives 8 hours unless `--ttl` says otherwise (at most 168h). The
+cluster treats it as read-only on every route but two: a deployer agent token
+may **propose** a change, and take a lease (see `working-with-an-ai-agent`).
+It can't apply, stop, delete or roll back anything itself. That's the
+boundary the cluster enforces: an agent using your admin token is you, as far
+as the cluster can tell.
+
+A proposal is a question for a person. The cluster writes everything you read
+about it from its own state, not the agent's words: a plain-language summary,
+the field diff, the blast radius (apps, nodes, instances replaced, started
+and stopped, ingress routes and service names), and the one command that
+undoes it. For instances it starts, the blast radius has the scheduler's
+forecast: the nodes a dry run of its placement would use, against the
+capacity the nodes last reported, and how many it couldn't place, and why
+("the scheduler can't place 2"). It's a forecast; the scheduler places them
+when the change applies. The agent's reason comes last, labelled as its own
+words.
+
+An agent may propose `apply`, `scale`, `rollback`, `stop` and `delete`, and
+three more:
+
+- **`restart`** replaces every instance of one app, node by node through
+  its health checks, by stamping the spec's `restarted_at`. It can't be
+  undone, and says so. Applying the same file afterwards keeps the stamp,
+  so it doesn't restart the app again.
+- **`cancel_deploy`** cancels a rollout in progress: the app goes back to
+  the newest spec that finished rolling out everywhere, and nodes already on
+  the new one roll back. `relish undo` puts the new spec back, and its
+  rollout starts again.
+- **`clear_fault`** clears one Smoker fault on an app (`relish fault list`
+  gives its id). Approving it clears the fault on its node as you, with the
+  checks `relish fault clear` makes, so you need the fault permission and
+  the cluster's reversal grant; the proposal is recorded `failed` with what
+  the node said if it isn't cleared. It can't be undone. A node fault isn't
+  an agent's to clear: a person runs `relish fault clear`.
+
+```sh
+relish proposal list            # newest first; BY shows who decided
+relish proposal show 17
+relish proposal approve 17      # applies it at once; asks first
+relish proposal reject 17 --reason "not during the sale"
+relish undo 17                  # puts it back, if nothing changed since
+```
+
+`approve` asks before it applies, and for a change that's lossy to undo (a
+delete of an app with managed volumes) asks you to type the app's name. `-o
+json` asks nothing, so it needs `--yes`. Approving and applying are one step
+in the council: a leader change can't leave a proposal approved but not run,
+or run it twice. To approve, you need a human token with the deployer role or
+above whose scope and `[permission]` spec cover every app the proposal
+touches, and you can't approve a proposal made under your own token's name.
+
+A proposal **fails**, and changes nothing, if any app it touches has changed
+since it was made, if someone other than its author holds a lease on one, or
+if its blast radius grew: approving computes it again, and a node it didn't
+touch before means you'd approve more than you were shown. `approve` then
+answers with why (`stale` or `lease_held`) and exits non-zero,
+and the agent proposes again. An agent's `relish agent undo` is refused
+straight away when the app has changed since the proposal applied.
+`relish undo` refuses in the same way when
+something changed the app after the proposal applied, because undoing would
+overwrite that change; use `relish rollback` or an apply, which show their
+own diff. Undo works for 24 hours and the newest 64 applied proposals; after
+that, use `relish rollback`. A proposal nobody decides expires after an hour
+(the agent may ask for 5 minutes to 24 hours). At most 64 wait at once, 8
+per author and one per app.
+
+An agent may hold a short **lease** on an app or a namespace while it
+works (`relish lease list` shows them). Someone else's lease stops your own
+`relish apply`, `deploy`, `stop`, `delete`, `rollback` or `release` of that
+app, naming the holder, why and for how long:
+
+```text
+app:shop/web is held by holmes for 87s more (rolling back); repeat with --break-lease to take it over
+```
+
+Repeat the command with `--break-lease` and the cluster ends the lease,
+records `lease.broken` with your name, and makes the change. People win
+over agents; the audit log shows when they did. Your own lease never stops
+you, and the cluster's own work (scheduling, rollouts, the autoscaler) and
+GitOps aren't held back by any.
+
+You can take a lease too, to keep agents out while you work on something by
+hand:
+
+```sh
+relish lease take app web --namespace shop --for 10m --purpose "tuning the cache"
+relish lease renew app web --namespace shop
+relish lease release app web --namespace shop
+relish lease break namespace shop
+```
+
+`take` holds an app, or with `namespace` every app in a namespace, for 30
+seconds to 15 minutes (2 minutes when you leave `--for` out), and renews a
+lease you already hold. `break` ends someone else's lease without making a
+change, and needs deployer rights or more over the target; the audit log
+records it as `lease.broken`.
+
+Proposals are judged by your policies like any apply: the `after` specs go
+through every app policy with `source = "proposal"`, a deny refuses the
+proposal (the agent sees `guardrail`), and warnings are shown first to
+whoever approves. Approving judges it again under the policies in force then.
+
+### Guardrails
+
+A **guardrail** is a policy that judges the proposed change itself rather
+than an app. Give it `applies_to = "proposals"`. It sees `proposal` and
+`author`, plus `caller` (the author when it's made, the person who approves
+it, or the author again when a policy approves it) and `source`, which is
+`proposal`:
+
+| Variable | Fields |
+|----------|--------|
+| `proposal` | `kind` (`apply`, `scale`, `rollback`, `stop`, `delete`, `restart`, `cancel_deploy`, `clear_fault`, `undo`), `namespace`, `apps` (names), `nodes`, `instances` (replaced, started and stopped), `replicas_from` and `replicas_to` (a scale's, else 0), `reversibility` (`exact`, `lossy`, `none`), `fields` (the changed field paths) and `images` (in the new specs) |
+| `author` | `name`, `kind` (`agent` or `human`) and `role` |
+
+The agent's reason isn't a variable: a guardrail that read it could be
+talked round by it. There's no clock either, so "only in office hours"
+can't be said. `examples/agents/guardrails.toml` has five:
+
+```toml
+[policy.agents-never-delete]
+applies_to = "proposals"
+match = 'author.kind == "agent"'
+deny = 'proposal.kind == "delete"'
+message = "agents may scale and roll back, never delete"
+
+[policy.agents-scale-shop]
+applies_to = "proposals"
+action = "approve"
+match = 'author.kind == "agent" && proposal.kind == "scale" && proposal.namespace == "shop" && proposal.replicas_to <= 10'
+```
+
+A `deny`, `warn` or `audit` guardrail works as it does for an app. `action =
+"approve"` is for guardrails only, and has a `match` and nothing else: the
+first approve policy, by name, whose `match` is true approves the proposal
+with no person, as soon as it's made, or within a second for one already
+waiting. The cluster never lets a policy approve a change it can't undo
+exactly (a delete of an app with managed volumes, a cleared fault), one a
+`warn` policy flagged, one whose blast radius it couldn't fully see, or one
+that starts instances the scheduler forecasts it can't place; those wait
+for a person, and the `proposal.created` record says why. A `restart` is the
+one exception to the first rule: it changes nothing but the restart stamp,
+so a policy may approve it. Only an admin writes
+policies, so only an admin grants approval. A new cluster has none: every
+proposal waits for a person.
+
+"Keep out of this namespace" is better said with the token's scope
+(`--namespaces shop`) when it fits: a scoped token can't even read
+elsewhere. Test a guardrail on a real proposal before you trust it:
+
+```sh
+relish proposal show 17 -o json > proposal.json
+relish policy test -f examples/agents/guardrails.toml --proposal proposal.json
+```
+
+It prints what the guardrails say and whether one would approve it, and
+exits non-zero when one would refuse it. It runs only the guardrails; the
+cluster also runs your app policies on the new specs.
+
+Each step is in the audit log: `proposal.created`, `.refused`, `.applied`,
+`.failed`, `.rejected`, `.withdrawn`, `.expired` and `.undone`, with the
+author, `author_kind` (`human` or `agent`), the reason and who approved: a
+token's name, or `policy:<name>` with `principal_kind` `policy`. Each app an
+applied or undone proposal changed also gets its own `app.*` record naming
+the proposal, its author and the reason (see "Audit log" below), and
+`relish audit --proposal 17` lists them all.
 
 ## Policies
 
@@ -351,13 +561,16 @@ The cluster checks a policy when you apply it, and refuses one that:
   (`app.args.all(a, app.args.exists_one(b, a == b))` is as deep as it goes),
   because each level multiplies what the policy costs to run;
 - names anything other than `app`, `caller` and `source`, such as `policy`,
-  `permission` or `namespaces`;
+  `permission` or `namespaces` (a guardrail sees `proposal` and `author`
+  instead of `app`);
 - reads a field `app` or `caller` doesn't have (`app.memroy`);
 - has neither a `deny` nor a `default`;
 - reads a workload variable its `applies_to` doesn't give it (`job` in an
   apps policy, `app` in a policy for both), or a `workload` field apps and
   jobs don't share;
 - has a `default` but doesn't apply to apps only;
+- has `action = "approve"` but doesn't apply to proposals, has no `match`,
+  or has a `deny`, `message` or `default` beside it;
 - has a `default` that's empty or over 4096 bytes, names a field an app
   doesn't have (`memroy`, `deploy.max_unavaliable`) or one a default can't
   fill (`namespace`, `replicas`, `sidecar`, `owner`, and the fields your
@@ -630,11 +843,14 @@ relish audit --cluster --since 2h              # every node, the last two hours
 relish audit --cluster --action 'fault.*'      # every fault injected, cleared or expired
 relish audit --app web --since 7d              # everything that touched one app or job
 relish audit --principal ci-deploy --namespace payments --output json
+relish audit --cluster --principal-kind agent  # everything agents did
+relish audit --cluster --proposal 17           # one proposal, and every app it changed
 ```
 
 Each record has the time, the node that recorded it, the action, the
-credential (its `principal` id, and the token's name as `token_name`), the
-app and namespace it touched, the address the request came from, and the
+credential (its `principal` id, and the token's name as `token_name`), what
+kind of principal that is (`principal_kind`, below), the app and namespace it
+touched, the address the request came from, and the
 action's own facts (a fault's id and override flags, the node being
 decommissioned, the version an upgrade targets). A record never carries a
 secret: the log scrubs anything shaped like a token before writing it.
@@ -646,8 +862,8 @@ reads the list, and `--app` and `--namespace` search it, so
 `relish audit --app frontend` finds the apply below:
 
 ```text
-TIME (UTC)            NODE          WHO               ACTION                      TARGET                    SOURCE
-2026-10-31 09:12:04   node-2        alice             app.applied                 backend, frontend @default  10.0.0.9:51000
+TIME (UTC)            NODE          WHO               KIND      ACTION                      TARGET                    SOURCE
+2026-10-31 09:12:04   node-2        alice             human     app.applied                 backend, frontend @default  10.0.0.9:51000
 ```
 
 When the apps span namespaces, each name keeps its own: `api@payments,
@@ -670,6 +886,40 @@ What's recorded:
 
 The cluster's own actions (a fault expiring, an expired token being swept)
 are recorded as `system`.
+
+Every record's `principal_kind` says what kind of principal acted, and the
+table's `KIND` column shows it:
+
+| Kind | Who |
+|------|-----|
+| `human` | a person's token, a browser session, or the first caller before any token exists |
+| `agent` | an agent's token (`relish token create --agent`) |
+| `workload` | a workload's identity token |
+| `system` | the nodes' own service principal, and the cluster's background work: expiry, sweeps and the lease and proposal reapers |
+| `policy` | a guardrail policy that approved a proposal |
+| `unknown` | a refused request with no valid token, and a summary of refusals from many sources |
+
+It comes from the credential the node checked, never from a token's name,
+which anyone can choose. Like an agent token's own label, it tells you who
+acted, not what they were allowed to do. `--principal-kind agent` lists
+everything agents did.
+
+A proposal's apply writes the same records as the direct command would:
+`app.applied`, `app.stopped` or `app.deleted` for each app it changed, named
+by what happened to the app. They're attributed to whoever approved it (a
+person, or `policy:<name>` as `policy`), and they also carry the proposal's
+facts: `proposal`, `kind`, `author`, `author_kind`, `reason` and
+`approved_by`. An undo writes them too, with `undo` set. So "which agent made
+this change, and why" has its answer in the change's own record, and
+`--proposal 17` finds the proposal's records and every app record it wrote.
+The table shows it on a line of its own, with the reason marked as the
+author's words, which nothing has checked:
+
+```text
+TIME (UTC)            NODE          WHO               KIND      ACTION                      TARGET                    SOURCE
+2026-11-09 14:02:11   node-1        bob               human     app.applied                 web@shop                  10.0.0.9:51000
+    proposal 17 by holmes (agent). Its reason (its own words, unverified): p99 over the SLO
+```
 
 Refused requests are recorded too, as `api.refused`, for every route in the
 table above: a missing or unknown token, a role or `[permission]` block that
@@ -855,6 +1105,11 @@ it's asked for. What the path means is up to the provider. A value that starts
 with `PROVIDER[` but doesn't parse is refused at apply. Jobs can't use
 providers yet: a job with one is refused at apply too.
 
+Only a reference written in the config is one. An encrypted secret whose
+value happens to start with `PROVIDER[` reaches the workload as it is, and no
+provider is asked for it: the node can't read an encrypted value when you
+apply it, so it never treats one as a reference.
+
 A provider is a binary on the node, named in `node.toml`. Nothing else runs:
 the table is the allowlist.
 
@@ -904,7 +1159,7 @@ unplaced, and `relish wtf` says no node can run it.
 
 It fails closed. When the provider is missing, slow, killed, writes too much,
 exits unsuccessfully or answers with anything but the protocol, the instance
-doesn't start, and `relish status` and `relish wtf` give the reason:
+doesn't start, and `relish apps NAME` and `relish wtf` give the reason:
 
 ```text
 cannot resolve secret DB_PASSWORD: secret provider "vault" did not answer within 5s and was killed

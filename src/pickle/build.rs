@@ -1899,6 +1899,8 @@ mod tests {
             token_name: "ci".into(),
             principal_id: "ci-1".into(),
             role: crate::sesame::types::ApiRole::Deployer,
+            kind: crate::sesame::types::TokenKind::Human,
+            granted_role: crate::sesame::types::ApiRole::Deployer,
             scoped_apps: None,
             scoped_namespaces: namespaces,
         }

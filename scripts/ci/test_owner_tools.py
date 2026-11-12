@@ -22,7 +22,7 @@ class OwnerTools(unittest.TestCase):
         self.tools = {}
         for name in ['cargo', 'rustc', 'nextest']:
             path = str(self.root / name)
-            prefix = 'cargo-nextest 0.9.145' if name == 'nextest' else name + ' 1.98.1 (synthetic)'
+            prefix = 'cargo-nextest 0.9.151' if name == 'nextest' else name + ' 1.98.1 (synthetic)'
             verbose = '\nrelease: 1.98.1\nhost: x86_64-unknown-linux-gnu\ncommit-hash: ' + 'a' * 40
             version = prefix + (verbose if name != 'nextest' else '')
             if name == 'rustc':

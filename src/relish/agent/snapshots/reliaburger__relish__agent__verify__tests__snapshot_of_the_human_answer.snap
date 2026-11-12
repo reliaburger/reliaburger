@@ -1,0 +1,14 @@
+---
+source: src/relish/agent/verify.rs
+expression: "HumanVerify { data, next }.to_string()"
+---
+mismatch: this cluster isn't exactly the published release
+
+NODE             VERSION    PLATFORM        SHA256         HASH       SIGNATURE
+node-1           v0.2.7     linux-x86_64    16b0f4bd8796   pass       pass
+node-2           v0.2.7     linux-x86_64    79cc72ddfaac   FAIL       pass
+node-3           -          -               -              unchecked  unchecked
+relish           v0.2.7     linux-aarch64   98f2fe8a0255   pass       pass
+
+MISMATCH [hash_mismatch] node-2's bun hashes to 79cc72ddfaac326fa76c96a5f6d8bd1219ed12b4e38e91e6e842b916bcae27c1, but the published bun-linux-x86_64 v0.2.7 is 16b0f4bd879682d7bebdc4688032b95c3933673b922a5d358673a3da95850970
+UNKNOWN [node_unanswered] node-3 is dead, so its binary can't be checked

@@ -600,8 +600,8 @@ real world it touched.
 ## Coverage is a map, not a target
 
 `cargo-llvm-cov` instruments the compiled programme and records which source regions execute.
-Our `make coverage` runs the portable suite once under instrumentation and emits LCOV plus an
-HTML report. On Linux CI that same run is the test gate, so we don't pay for the suite twice. The first combined Linux CI measurement covered
+Our `make coverage` runs the portable suite once under instrumentation and writes an LCOV
+report; `make coverage-html` turns the same counters into HTML when someone wants to read them. On Linux CI that same run is the test gate, so we don't pay for the suite twice. The first combined Linux CI measurement covered
 79.65% of lines, so CI starts at 78.65%, one percentage point lower, and can ratchet upwards.
 
 Instrumented programmes write their counters to a `.profraw` file as they exit. Our
@@ -933,6 +933,15 @@ links a successor. Re-running those loops for the register paid for itself strai
 one test whose old cause was fixed failed twice in a hundred runs for a new one, a stop that
 races the child's own exit on macOS.
 
+Some flakes are tests that quietly share the machine. The port allocator skips any port
+something on the host already listens on, so a published port never shadows a host daemon.
+Its bookkeeping tests built the allocator the same way, over the fixed range 10000 to 10003,
+and one failed on a macOS runner with the range "exhausted" after only two allocations
+(#1711): something else held one of those ports. Those tests now opt out of the probe with
+`without_host_probe()`, because they check counting, not the host. One test keeps the probe,
+and it binds an ephemeral port itself first, so the port the probe must refuse is one the test
+holds, whatever else the runner is doing.
+
 ### Light checks on the train, everything in the queue
 
 By 0.2.1 the waiting was back. Every pull request into a train got the whole of CI, and a
@@ -1051,6 +1060,86 @@ suite, and the gate's merge checks one list the way it checked three: every list
 and the required cases are all there. The lesson? Parallel jobs only help when they split the
 expensive part. Ours was the compile, and every shard paid for it in full.
 
+One job still took a 66-minute median, and most of what it tested was Bun. But Bun ships for
+Linux only: on a Mac, the quickstart runs it inside a Lima VM. What a Mac user runs natively is
+`relish`. So since 0.2.8 the macOS job builds and tests `relish` and the code only macOS
+compiles, and nothing else
+([#1720](https://github.com/reliaburger/reliaburger/issues/1720)). The selection is one nextest
+filterset in `make test-macos`:
+
+```make
+$(NEXTEST) --lib --bin relish --test suite --test runtime_selection -E 'binary_id(reliaburger::bin/relish) | (binary_id(reliaburger) & (test(/^relish::/) | test(/^grill::apple::/) | test(/^grill::records::tests::absolute_start_time/))) | (binary_id(reliaburger::suite) & (test(/^relish_/) | test(/^user_directories::macos_/))) | binary_id(reliaburger::runtime_selection)'
+```
+
+`--lib --bin relish --test suite` tells Cargo which test binaries to build at all, which is
+where the time goes: the other 38 integration test binaries never compile. `-E` then picks
+tests inside them. `binary_id(...)` names a test binary exactly, `test(/regex/)` matches a
+test's full path, and `&` and `|` combine them. Besides relish, it keeps the tests that exist
+only on macOS, because nowhere else can run them: the Apple Container adapter, process start
+times off Linux, where `relish` keeps files under `~/Library` and how Bun picks a runtime on a
+Mac. Bun itself only gets a compile check, through the lint. A measurement run took 31 minutes
+from a cold cache, against the 66-minute median, and 23.5 of those minutes were still compiling,
+because relish's unit tests live in the library's test binary and that compiles the whole
+crate. Splitting `relish` into its own crate is the obvious next move.
+
+The evidence gate needed telling. Its manifest listed 250 finite cases as required on macOS,
+and the gate refuses a run where a required case didn't run. A relish-only job runs 19 of
+them. We didn't edit 231 entries by hand: `scripts/ci/macos_selection.py` parses the
+filterset, evaluates it against each case's binary and test name, and keeps `portable-darwin`
+exactly where the job will run the case. Every one keeps `portable-linux`. A test fails if the
+manifest or the qualification matrix ever disagrees with the filterset, so narrowing what
+macOS proves is a change somebody has to review, not something that happens by accident.
+
+With macOS off the light set, portable Linux was every train PR's critical path, at about 30
+minutes in the five green train PRs before
+[#1723](https://github.com/reliaburger/reliaburger/issues/1723). Only about 15 of those
+minutes were the build and the tests. The rest was three things the coverage run didn't need.
+
+The doctests and the nightly-signing key test ran after it, in the same job, and took about six
+minutes between them. Neither is instrumented, so neither could reuse the coverage build;
+they only waited for it. They now run in their own job, `doctests and feature tests`, which
+starts when portable Linux does and finishes long before it.
+
+The coverage run ended with three `cargo llvm-cov report` calls: LCOV, HTML and the floor. Each
+call merges every `.profraw` file into one profile and then reads every test binary's coverage
+map again, so each cost about two minutes. One call does both jobs that matter, because
+`--fail-under-lines` works with any output format: cargo-llvm-cov writes the LCOV file, then
+asks `llvm-cov` for a JSON summary and compares its line percentage with the floor.
+
+```make
+$(COVERAGE_REPORT) --lcov --output-path target/coverage/lcov.info --fail-under-lines $(COVERAGE_MIN_LINES)
+```
+
+Nobody opens the HTML on a pull request, so CI writes it only on pushes to `main` and the
+nightly, with `make coverage-html`, from the counters the run already left behind. The floor
+didn't move, and the evidence owner still checks it: `coverage_owner.py` pins the recipe stage
+by stage, so it now expects three stages instead of five, and the floor check is part of the
+last one.
+
+On the change's own pull request, portable Linux took 17.0 minutes, its coverage step 15.3
+against 23 to 27 before, and the new job 5.7. Over every green train PR on the light path,
+the run without runner queueing went from a median of 30.0 minutes to 19.5
+([measurements](../qualification/2026-11-09-v0.2.8-train-pr-timings.md)). What an author waits
+didn't fall with it: in the same days the runs queued for a median of 56.6 minutes, against
+7.6 before. Timing a run's jobs from when they started, not from when it was created, is what
+separates the two, and the extra job is one more runner each PR asks for when they're short.
+
+Two smaller fixes came with it
+([#1724](https://github.com/reliaburger/reliaburger/issues/1724)). `make ci` now runs its
+quick checks first: formatting, the ignored-test owners and the CI scripts' own tests take a
+minute or two, and a slip in one of them used to show only after Clippy and the whole suite
+had compiled. Make runs a target's prerequisites in the order they're listed (unless you pass
+`-j`), so the fix is the order of one line. The lint job in CI does the same, running `rustfmt`
+before it restores a cache.
+
+The other was the cache quota. GitHub keeps 10 GB of caches per repository and quietly evicts
+the least recently used beyond that, and we were at 9.57 GB. A cache saved on a pull request
+that has since merged can never be restored again, but it still counts, and it can push out
+`main`'s, which every train PR restores. A nightly workflow now deletes caches whose pull
+request is closed, whose branch is gone, or which a newer cache of the same family on the
+same ref has replaced. The rule is a pure function, `stale(caches, open_pulls, branches)`,
+tested on fixtures, with the `gh` calls kept at the edges so it can be tested without network access.
+
 ### A release gate that fits in a week
 
 Pull requests were quick by 0.2.3. The release wasn't. From code freeze to ready-to-tag took
@@ -1098,6 +1187,40 @@ another commit: all of them leave `reuse` false, or empty if the job itself died
 `validate-release` checks `!= 'true'` rather than `== 'false'` so that an empty answer runs
 the suite too. The signature still only ever covers a commit that passed everything; it just
 doesn't make it pass twice.
+
+It took two more releases to notice that the fast path never ran. 0.2.6's candidate took 89
+minutes and 0.2.7's about two hours, and both re-ran the whole suite. Why? Look at when they
+were dispatched: 0.2.6's three seconds after the gate PR merged, 0.2.7's two minutes after.
+The push to `main` had started its CI run, but that run had nowhere near finished, and the
+script asked the API for *completed* runs only. Nothing completed, so nothing to reuse, so
+run the suite. Every rule was right; the question was asked too early
+([#1722](https://github.com/reliaburger/reliaburger/issues/1722)).
+
+You could fix that in the runbook: "wait for `main`'s CI to go green before dispatching". But
+a rule a person has to remember at code freeze is a rule that gets forgotten at code freeze.
+So the script now waits. If a push, merge-queue or nightly run on the commit is still queued
+or in progress, and nothing on the commit has passed yet, it asks again every minute, for up
+to two hours, and then applies exactly the same rules as before. The waiting is free, or
+nearly: the build jobs don't depend on the search, and building the binaries takes about 40
+minutes anyway. For 0.2.6 the candidate would have been ready when the push's run finished,
+about 53 minutes in, instead of 89, and three macOS jobs would never have queued.
+
+Waiting adds new ways to be wrong, so each one is spelled out and tested with a fake clock
+that never sleeps. A run that fails while we wait ends the wait at once and runs the suite. A
+run still going after two hours runs the suite. A pull request's run is never waited for,
+since it could never be reused. An API error mid-wait runs the suite, just as it did before.
+The `find passing CI` job's own timeout is longer than the wait. A job killed by its timeout
+would still fall back safely, since an empty `reuse` runs the suite, but it would die without
+saying why; the script's own deadline writes the reason into the summary. And one race is the other way
+round: a build dispatched the moment a merge lands can ask before GitHub has even created the
+push's run, so with no run at all on the commit the script keeps asking for three minutes
+before giving up.
+
+The evidence also moved somewhere more durable. The job summary is a web page that expires
+with the run; `candidate.json` is the file qualification pins by its SHA-256. So the record
+now carries `source_ci`, the run id and attempt of the `ci.yml` run the candidate rests on:
+the reused run, or the build's own when it ran the suite itself. A qualification record can
+cite it, and because it's inside the digest, nobody can swap it afterwards.
 
 **Qualify the train every night.** The long tiers (power-cut and reboot runs, the V02 and jobs
 soaks) now run on the train's tip each night, one after another on the quiet host
@@ -5908,6 +6031,35 @@ write for 300 ms, three fifths of the turn budget, so each tick's second
 write always goes off the loop. It still counts four writes, at most two a
 tick.
 
+That third test failed once more, on a Mac at a load of about 45, with
+`[2, 0, 1, 0]`: the retirement finished, but the count came to three
+(#1625). The count was the bug. `LoopStalls::hold` counted a write inside
+the task the write runs in, and a `#[tokio::test]` runtime has one thread,
+so that task runs only when the tick yields. A tick whose first write woke
+the loop late has a deadline the timer has already passed. The second
+write's `timeout_at` then fires as it's registered, without yielding, and
+the tick ends with the write's task never polled. The write was counted
+later, in the gap between ticks, where nobody was counting. A test that
+starts a write with such a deadline reproduces it every time. Now
+`LoopStalls::reach` counts the write, and reads how long to stall it,
+where the tick starts the write, and the task only sleeps:
+
+```rust
+#[cfg(test)]
+let stall = self.loop_stalls.reach(super::LoopStall::Persist);
+let mut task = tokio::spawn(async move {
+    #[cfg(test)]
+    if let Some(stall) = stall {
+        tokio::time::sleep(stall).await;
+    }
+    journal.persist(next).await
+});
+```
+
+`stall` is an `Option<Duration>`, which is `Copy`, so the `async move`
+block takes its own copy and nothing is borrowed from `self` across the
+spawn.
+
 A day later the same trap caught a third test, in a different place
 (#1396). The scenario that publishes a thousand-service view drove its
 consumer-sync turns by hand, one step a turn, and measured each turn's CPU
@@ -5953,8 +6105,9 @@ fsync'd writes, each of them a temporary file, an `fsync`, a rename and an
 `Withdrawing`, `Withdrawn`, the receipts it proved, `Publishing`, `Active`.
 Five. At roughly 400 ms a write on that disk, both add up to the journals.
 
-Persists are allowed inline (decision 2 of #351) only while a slow disk
-keeps every turn in budget, and here it didn't. The scenario that shows it,
+Persists were allowed inline (decision 2 of #351) only while a slow disk
+kept every turn in budget, and here it didn't. (0.2.8 dropped the
+allowance altogether; see "What the watchdog caught" below.) The scenario that shows it,
 `status_answers_while_a_consumer_sync_journals_to_a_slow_disk`, recovers a
 consumer, sets `LoopStall::Persist` to 400 ms and sends two leader answers.
 On the old code a status queued behind the first one took 2.08 s.
@@ -6739,9 +6892,15 @@ set that sleeps 100 ms and comes back, the way it already did for Create.
 
 Releases and retirements read the journal to decide what's left, so the
 next ask works it out from there. A release whose "forget the permission"
-write landed after its turn finds the journal no longer naming the hold.
-It hands the address back again (the runtime's release is idempotent and
-names its generation) and finishes. A service retirement skips its
+write landed after its turn finds the journal no longer naming the hold,
+and only the bookkeeping is left. At first it handed the address back
+again, on the grounds that the runtime's release is idempotent and names
+its generation. That was harmless, but a loop-harness test that counts
+runtime calls saw two releases under load (#1620), and holding every
+journal write past the turn made it happen every time. So the agent now
+keeps a release the runtime has confirmed in `released_network_references`
+until the retirement finishes, and the ask after a late forget doesn't go
+back to the runtime. A service retirement skips its
 `Withdrawn` write once that's on disk. The removal after it is the one
 case the journal can't answer alone: an allocation that's gone looks like
 one that was never there, which retirement refuses as "original service
@@ -7302,6 +7461,335 @@ The rest of the list is longer and less likely to bite: log and metrics
 queries and flushes copy up to a million buffered rows under their store's
 lock, and the log export hashes every archive file on the worker. They're
 in the pull requests for this section, with a line each.
+
+0.2.7's jobs final had one more turn like it (#1707): a
+`consumer_sync/journal` turn that took 1,215 ms, all of it journal write,
+while the turns around it handed their slow writes off at 500 ms. The
+first guess was a write with no deadline, and the code has one:
+`persist_discovery_publication` passes `None` and waits for the landing.
+But it carries `#[cfg(test)]`, so it isn't in the binary at all. Every
+consumer step journals through `journal_consumer`, which passes the turn's
+deadline. The only other `None` writers are consumer recovery at startup,
+before the loop runs, and the egress checkpoint outside a turn.
+`a_recovered_consumers_journal_step_hands_a_slow_write_off_at_the_turn_deadline`
+drives the journal step's last untested branch, a recovered consumer's
+first answer, with every write stalled at 1.6 s, and each turn still
+hands off in time. The node's journal agreed: the very next line was "a
+discovery journal write took 1219 ms; the agent loop went on meanwhile".
+The write was handed off, but the 500 ms deadline fired at about 1,215 ms,
+so for some 700 ms nothing polled the turn's future or checked its timer.
+That's #1606 again: a late wake-up, not a missing deadline. This time no
+disk-pressure prune ran in that second, so the hunt for what held the
+runtime goes on.
+
+Two things narrow it. First, tokio puts a task woken on a worker thread,
+by its timer included, in that worker's LIFO slot: the next task it runs.
+Other workers can steal from its queue but not from that slot (the
+`Builder::disable_lifo_slot` docs in tokio say so). So it takes just one
+worker stuck in one long poll to hold up the agent loop, while the rest
+sit idle. Second, the loop woke at 1,215 ms, 4 ms before the discovery
+fsync finished. That looks like a worker blocked on the same disk, in a
+call that waited for the fsync to end. On ext4 an fsync forces a journal
+commit, and a call that creates or removes a file needs a journal handle,
+so it can wait for that commit. We searched Bun for such calls on async
+workers. Nearly all its disk work is already on the blocking pool. One
+call wasn't: a job executor's cold start bound its control socket with
+`tokio::net::UnixListener::bind`, which makes the syscall on the spot, and
+the socket lives in the executor's directory on the data disk. A jobs
+soak starts executors all the time. The bind now runs on the blocking
+pool, and the listener crosses back to tokio:
+
+```rust
+let listener = blocking(move || {
+    let listener = std::os::unix::net::UnixListener::bind(&path)?;
+    listener.set_nonblocking(true)?;
+    Ok(listener)
+})
+.await?;
+Ok(UnixListener::from_std(listener)?)
+```
+
+`std::os::unix::net::UnixListener` is the standard library's blocking
+socket. `from_std` registers it with tokio's reactor, and that expects a
+non-blocking socket. Forget `set_nonblocking` and the first `accept`
+blocks the worker it runs on, which is the very thing this change
+removes. `a_control_socket_is_bound_off_the_runtime` checks the bind with
+`assert_runs_on_blocking_pool`. We can't prove this bind was the 700 ms:
+the evidence fits it, but it fits any file-creating call on a worker.
+
+#### Catching the stall in the act
+
+So the bind is a suspect, not a culprit, and the node's log couldn't
+settle it, because by the time a turn ends and its line gets written,
+whatever held the worker has let go. We wanted the next soak to catch the
+stall while it was happening and say which thread held it, and in which
+call.
+
+So Bun now has a watchdog. The loop meter already marks the start and end
+of each turn; it now also stamps a `LoopHeartbeat`:
+
+```rust
+pub fn begin(&self, branch: LoopBranch, detail: Option<&'static str>) {
+    if let Ok(mut slot) = self.detail.lock() {
+        *slot = detail;
+    }
+    self.branch.store(branch as u8, Ordering::Relaxed);
+    self.loop_thread.store(current_thread_id(), Ordering::Relaxed);
+    self.turn_started_ms.store(self.now_ms(), Ordering::Release);
+}
+```
+
+The fields are atomics (`AtomicU64`, `AtomicU8`, `AtomicU32`): integers
+that two threads can read and write without a lock, like C11's
+`_Atomic` or Go's `sync/atomic`. Each operation names an `Ordering`, which
+says what other memory the operation makes visible. `Relaxed` promises
+only that the value itself is never torn. The last store is `Release`, and
+the watchdog's load of it is `Acquire`: once the watchdog sees the new
+start time, it also sees every store made before it, the branch and the
+thread id included. The detail is a `&'static str`, a pointer and a length,
+which no atomic holds, so it sits in a `std::sync::Mutex`. That's allowed
+here: the loop holds it to store one pointer, the watchdog to copy one,
+and neither holds it across an `.await`.
+
+`current_thread_id` asks Linux for the thread's id once per thread:
+
+```rust
+thread_local! {
+    static TID: u32 = u32::try_from(nix::unistd::gettid().as_raw()).unwrap_or(0);
+}
+TID.with(|tid| *tid)
+```
+
+`thread_local!` is Rust's version of C's `__thread`: each thread gets its
+own `TID`, set the first time that thread reads it. `gettid` is a real
+system call, and a turn shouldn't make one for an answer that never
+changes.
+
+The watchdog itself is a `std::thread`, not a tokio task. That's the whole
+point: a task would be queued behind the same blocked worker it's meant
+to catch. Every 100 ms it reads the heartbeat, and an `IncidentTracker`
+decides what to do. A turn that has run past the threshold (750 ms by
+default, `[node] loop_stall_snapshot_ms`) is a stall. Each stall gets one
+snapshot, however long it lasts; the watchdog re-arms when the loop gets
+to a new turn, and takes at most ten snapshots an hour. The tracker never
+reads a clock. It takes "now" and the turn's start time as arguments, so
+its tests (`a_turn_past_the_threshold_is_captured_once`,
+`the_watchdog_rearms_once_the_stalled_turn_ends`,
+`snapshots_past_the_hourly_limit_are_rate_limited`) are plain function
+calls, with no sleeping and no flakes.
+
+A snapshot reads every thread of Bun from `/proc/self/task/<tid>/`: its
+name, its state from `stat` (`R` running, `S` sleeping, `D` in
+uninterruptible sleep, which is how a thread waiting on a disk looks), its
+wait channel, the system call in flight with its first arguments, and for
+any thread that isn't sleeping, the kernel stack, cut to twelve frames.
+It goes to stderr, and so to the journal, as one block:
+
+```
+bun: agent loop stalled 812 ms in follow_up (consumer_sync/journal), 312 ms past its turn deadline; thread snapshot (pid 4242, 41 threads):
+bun:   tid 4250 tokio-runtime-w D wchan=jbd2_log_wait_commit syscall=openat(0xffffff9c, 0xffff8000, 0x80241) [ran the agent loop]
+bun:     jbd2_log_wait_commit+0xc4/0x120
+bun:     ...
+bun:   tid 4251 tokio-runtime-w S wchan=futex_wait_queue syscall=futex(0xaaaa0000, 0x189, 0x0)
+bun:   tid 4260 loop-watchdog R [this watchdog]
+bun: end of thread snapshot
+```
+
+That example is made up, but it's the shape of the answer we hope for:
+the worker that last ran the loop, in `D`, in `openat`, waiting for a
+journal commit. Kernel stacks need root, which Bun has on a node; without
+it each one says `permission denied` and the rest of the snapshot still
+comes out. The whole block is capped at 32 KiB.
+
+What about the userspace stack, the Rust function each thread is in? You
+can't read another thread's stack from outside it. The usual way is to
+signal every thread and walk its stack in the signal handler, which takes
+`unsafe` code, calls the unwinder where only async-signal-safe functions
+are allowed, and could hang the process we're trying to diagnose. The
+kernel's view is enough for this bug: which thread, which syscall, waiting
+on what.
+
+The watchdog's integration test does on purpose what we suspect Bun does
+by accident. It builds a two-worker runtime whose threads are named
+`stall-worker`, begins a turn and then calls `std::thread::sleep` for
+1.5 s on the worker. The test checks for exactly one snapshot, with the
+`stall-worker` thread marked as the loop's, in `S`, in `nanosleep`. Earlier
+we said blocking a test runtime on purpose proves only that tokio behaves
+like tokio. That's still true, and it's what we need here: a worker that
+really is stuck, for the watchdog to see.
+
+The soak keeps the evidence. Each guest report reads the journal lines
+since its last read (a `journalctl` cursor file, like the panic count) into
+a `loop_stalls` section, and the checker keeps every block in
+`loop-stalls.jsonl`. The record lists each stall with the threads that
+were in `D` and the one that ran the loop. A failure bundle also gets
+`loop-stalls-<vm>.txt`, cut from the journal it copies, so the stall sits
+next to the failure it caused. When the next soak stalls, #1707 gets its
+answer from the evidence, not from another theory.
+
+#### What the watchdog caught
+
+The watchdog paid for itself in 0.2.8's own release gate (#1853). In the
+jobs fast tier's graceful stop and start of the whole cluster, one node
+logged a 1,593 ms turn in `deploy_op (finish_fresh_instance)`, with a
+discovery journal write of just 46 ms. This time a snapshot came with it,
+taken 807 ms in: the thread that had run the loop sat in `epoll_pwait`,
+waiting on another task, and one tokio worker sat in `D` state in
+`fdatasync`. So no worker was blocked; the loop was simply waiting for a
+write, and the turn's own code told us which. After the journal write,
+`finish_fresh_instance` wrote the instance's adoption record:
+
+```rust
+// LOOP-INLINE: fsync'd persist (#351 decision 2); the slow-disk scenario bounds it
+tokio::task::spawn_blocking(move || crate::grill::records::write_record(&dir, &record))
+    .await
+```
+
+The `spawn_blocking` kept the runtime free, as it should. But the turn
+awaited the result with no deadline, and while every node of a cluster
+restarts at once, every disk is busy and an `fdatasync` can take over a
+second. Decision 2 of #351 had allowed exactly this: an fsync'd persist
+may stay inline as long as the slow-disk scenarios keep it in budget. The
+gate had just shown a real disk that doesn't, so that allowance is gone.
+No turn waits on an fsync now.
+
+The fix uses machinery the loop already had. `off_loop_work` (stage 3 of
+#351) runs a piece of work in a task under a `WorkKey`, waits for it
+until the turn's deadline, and otherwise answers `StillRunning`; the next
+ask finds the same task. Retirement's file removals used it already. The
+record write became `WorkKey::PersistRecord`, and the record's builder
+only runs on the first ask:
+
+```rust
+let record = if self.off_loop_work.started(&key, incarnation) {
+    None
+} else {
+    Some(self.instance_record(instance_id, evidence)?)
+};
+self.write_record_within_turn(key, incarnation, dir, record)
+    .await?
+```
+
+`None` here means "collect the write you already started". The task
+behind the key owns the record it is writing, so a later ask has nothing
+to pass. Four writers changed the same way: a fresh instance's record, a
+restart's (and the removal of its predecessor's), a rolling replacement's,
+and a signed workload identity's files. Each one's caller already knew
+how to ask again. A deploy worker retries `StillRunning` after 100 ms.
+A restart step re-delivers its own result after a short sleep, the way
+`recheck_restart_create` already did. And a signing's second task, the
+file write, goes into the same `JoinSet` as the signing itself, so the
+loop's `select!` lands it like any other.
+
+Two things needed care. The first is order. The record is what a
+restarted Bun adopts an instance by, so nothing may treat the instance as
+running before the record is on disk. The write still comes after the
+backend's journal entry and before everything that publishes the
+instance: its state, its place in the service map, its log forwarder.
+Asking again must not repeat what can't be repeated, and the log
+forwarder couldn't: it used to start before the record write, so a second
+ask would have started a second one. It starts after the write now.
+`no_instance_runs_before_its_record_is_on_disk` polls the status
+throughout a slow write and never sees `default__web-0` running without
+its record, and `a_fresh_instance_asked_again_starts_one_log_forwarder`
+counts forwarders.
+
+The second is a race that couldn't exist before. While the write held the
+turn, nothing else ran; now an app can be deleted while its instance's
+record is still being written. If retirement's removal finished first,
+the late write would put the record back, and the next Bun would try to
+adopt an instance that's gone. So retirement answers `StillRunning`
+while a write for the same instance is in flight
+(`retirement_waits_for_a_record_write_in_flight`), and so does the
+identity directory's removal while a signed identity is being written to
+it. Two more tests crash Bun at each side of the write: before it lands
+the next Bun has nothing to adopt, and after it lands the next Bun adopts
+the instance.
+
+Review found one more. `off_loop_work` tells one piece of work from the
+next by an *incarnation*, and for an instance that had always been its
+`created_at`. But a restart keeps `created_at`, so every launch of an
+instance shared one incarnation. Say a restart's write outlasted its turn,
+and the instance crashed again before the recheck: nothing collected the
+write, the next restart removed the record, and its own write found the
+earlier one "started", took that result and wrote nothing. The instance
+ran with no record. So the write is keyed by the launch now:
+`LaunchEvidence`, read once when a launch starts, carries the moment it
+was read, and every ask about that launch passes the same evidence. And,
+belt and braces, removing a record first drops any write of it that
+landed uncollected. `a_restart_writes_its_own_record_after_an_earlier_write_landed_uncollected`
+and its twin with a failed earlier write pin both.
+
+The remaining `LOOP-INLINE` tags on durable writes now say why they're
+bounded rather than citing decision 2: a discovery journal write with no
+deadline happens only in startup recovery, outside any turn, and every
+in-turn caller checks for a write in flight before starting another.
+Without the old tags, `loop_rule.rs` holds every new await of a durable
+write to the turn's deadline.
+
+The next candidate's gate turned up one the loop rule couldn't have
+caught (#1857). A node logged a 1,152 ms turn in `deploy_op
+(health_probe_result)`, all of it charged to "journal write". But the
+journal write already ran on the blocking pool, and the turn waited for
+it only until its deadline, so the deadline should have fired at 500 ms.
+The snapshot said why it couldn't: the thread that had run the loop was
+itself in `D` state, in `ext4_llseek`. The system call was
+`lseek(fd, 0x1badd, 3)`, and whence 3 is `SEEK_DATA`, which Reliaburger
+uses in one place: the capture reader that log forwarders use to skip a
+log prefix the store has already reclaimed (#1418). `read_chunk` was
+async, but it called that `lseek` directly, on whichever runtime worker
+polled it. `SEEK_DATA` takes the file's inode lock, and the workload was
+appending to its log under writeback, so the call waited as long as the
+appender's journal commit did.
+
+That held the worker, and with it the loop. Each tokio worker keeps a
+queue of tasks that are ready to run, and the loop's task must have been
+in the blocked worker's, since that was the thread that last ran it. So
+nothing ran the loop until the `lseek` returned, its
+`timeout_at` included. A timeout is just another future, and it can only
+fire when its task is polled. Nothing in the loop's code did anything
+wrong. Another task, on a worker the loop happened to share, made a
+blocking call.
+
+The fix moves the reader's file calls onto the blocking pool in two
+hops. One opens the file and reads its metadata. The other does the
+`SEEK_DATA`, the seek and the bounded read on that same descriptor.
+That's fewer hops than before, because every `tokio::fs` call is its own
+`spawn_blocking` underneath. `a_stalled_capture_read_does_not_hold_the_runtime_thread`
+stalls the blocking part of a read for 600 ms on a one-thread runtime and
+checks that a 20 ms timer still fires. On the old code it fired after
+625 ms.
+
+The rule that keeps this fixed can't stop at the loop, because the loop
+wasn't where the call was. `src/blocking_rule.rs` parses every file in
+`src/` and walks every `async fn`, `async` block and `async` closure. A
+file call there that isn't awaited is a blocking one: `std::fs`,
+`File::open`, `OpenOptions::open`, `sync_all`, `set_len`, the raw `nix`
+calls, and a short list of the crate's own helpers that make them.
+"Isn't awaited" is what tells `std::fs::read` from `tokio::fs::read`,
+since the tokio one is a future. Names go through the file's `use` items
+first, so `use std::fs as disk;` doesn't hide `disk::read`, and the
+exemptions match whole resolved paths, so a local function that happens
+to be called `run` or `blocking` isn't one. Review caught one exemption
+that was backwards: `std::thread::scope` runs its closure on the calling
+thread and then blocks it until every thread it spawned has finished, so
+the rule counts a scope in async code as blocking. A call inside a closure handed to
+`spawn_blocking`, or to one of the crate's three wrappers around it,
+passes, and so does one tagged `// BLOCKING-OK: <why>`. The tags so far
+are on startup code that runs before any workload does, and on cgroupfs
+reads, which the kernel answers from memory. Run against the old capture
+reader, the rule flags the `lseek` that caused this. It found 80 sites
+when it arrived. We moved the agent's onto the blocking pool and tagged
+the rest. That left 25, all in the `relish` CLI, a separate process with
+no loop to stall. They're listed in `blocking_rule_baseline.json`, and
+the test fails if that list grows, or if a listed site goes away without
+being removed from it.
+
+It also changes how to read #1606, #1707 and #1853. Each was diagnosed
+as a slow write the turn waited for. A blocking call on a shared worker
+looks the same from the turn's side, and only a thread snapshot tells the
+two apart. #1853's snapshot did: no worker was blocked there. The others
+had no snapshot, so some of their history may be this instead.
 
 #### The lock that went to the back of the queue
 

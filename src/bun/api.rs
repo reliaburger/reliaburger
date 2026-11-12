@@ -54,18 +54,22 @@ mod gitops;
 mod identity;
 mod internal;
 mod join;
+pub(crate) mod leases;
 mod logs;
 mod metrics;
 mod node_info;
 mod nodes;
 mod os;
 pub(crate) mod policies;
+pub(crate) mod proposals;
 mod registry;
 mod secrets;
 mod snapshots;
 mod status;
+mod summary;
 mod test_leases;
 mod ui;
+mod ui_proposals;
 mod upgrade;
 
 pub(crate) use apply::{
@@ -106,6 +110,10 @@ use join::{
     cluster_ca_handler, join_handler, master_key_handler, node_renewal_handler,
     node_security_view_handler, node_trust_ack_handler,
 };
+use leases::{
+    lease_break_handler, lease_release_handler, lease_renew_handler, lease_take_handler,
+    leases_handler,
+};
 use logs::{
     logs_archive_file_handler, logs_archive_handler, logs_cross_node_handler, logs_entries_handler,
     logs_export_handler, logs_handler, logs_sql_handler, ws_logs_handler,
@@ -129,6 +137,10 @@ use os::{
     os_rollout_start_handler, os_stage_handler,
 };
 use policies::{policies_handler, policy_audit_handler, policy_delete_handler};
+use proposals::{
+    proposal_approve_handler, proposal_create_handler, proposal_handler, proposal_reject_handler,
+    proposal_undo_handler, proposal_withdraw_handler, proposals_handler,
+};
 use registry::{
     images_handler, registry_proposal_deadline, registry_proposal_handler, registry_query_handler,
 };
@@ -141,6 +153,9 @@ use status::{
     cluster_statuses, collect_cluster_statuses, current_apps_handler, events_handler, jobs_handler,
     status_app_handler, status_handler, top_handler, ws_events_handler,
 };
+use summary::{
+    cluster_capacity_handler, cluster_summary_handler, leader_view_handler, node_summary_handler,
+};
 use test_leases::{
     authenticated_test_user, find_test_lease, forward_test_lease_request, lease_error_response,
     test_lease_create_handler, test_lease_get_handler, test_lease_release_handler,
@@ -150,8 +165,12 @@ use test_leases::{
 use ui::{
     app_detail_handler, app_env_handler, dashboard_handler, fragment_alerts_handler,
     fragment_apps_handler, fragment_batches_handler, fragment_instances_handler,
-    fragment_nodes_handler, gitops_handler, login_handler, node_detail_handler, ui_logout_handler,
-    ui_session_handler,
+    fragment_nodes_handler, fragment_summary_handler, gitops_handler, login_handler,
+    node_detail_handler, ui_logout_handler, ui_session_handler,
+};
+use ui_proposals::{
+    ui_proposal_approve_handler, ui_proposal_handler, ui_proposal_reject_handler,
+    ui_proposal_undo_handler, ui_proposals_handler,
 };
 use upgrade::{
     upgrade_abort_handler, upgrade_apply_handler, upgrade_cluster_handler,
@@ -656,12 +675,21 @@ pub fn router_with_upgrade(
         .route("/ui/fragment/apps", get(fragment_apps_handler))
         .route("/ui/fragment/batches", get(fragment_batches_handler))
         .route("/ui/fragment/nodes", get(fragment_nodes_handler))
+        .route("/ui/fragment/summary", get(fragment_summary_handler))
         .route("/ui/fragment/alerts", get(fragment_alerts_handler))
         .route(
             "/ui/fragment/app/{app}/{namespace}/instances",
             get(fragment_instances_handler),
         )
         .route("/ui/app/{app}/{namespace}/env", get(app_env_handler))
+        .route("/ui/proposals", get(ui_proposals_handler))
+        .route("/ui/proposal/{id}", get(ui_proposal_handler))
+        .route(
+            "/ui/proposal/{id}/approve",
+            post(ui_proposal_approve_handler),
+        )
+        .route("/ui/proposal/{id}/reject", post(ui_proposal_reject_handler))
+        .route("/ui/proposal/{id}/undo", post(ui_proposal_undo_handler))
         .route("/v1/apply", post(apply_handler))
         .route("/v1/status", get(status_handler))
         .route("/v1/apps", get(current_apps_handler))
@@ -738,6 +766,10 @@ pub fn router_with_upgrade(
             axum::routing::delete(test_lease_release_handler),
         )
         .route("/v1/cluster/nodes", get(nodes_handler))
+        .route("/v1/cluster/summary", get(cluster_summary_handler))
+        .route("/v1/cluster/summary/node", get(node_summary_handler))
+        .route("/v1/cluster/summary/leader", get(leader_view_handler))
+        .route("/v1/cluster/capacity", get(cluster_capacity_handler))
         .route(
             "/v1/nodes/{node}/relay/{*path}",
             get(node_relay_handler).post(node_relay_handler).layer(
@@ -817,6 +849,22 @@ pub fn router_with_upgrade(
         .route("/v1/rollback/{app}/{namespace}", post(rollback_handler))
         .route("/v1/gitops", get(gitops_status_handler))
         .route("/v1/gitops/config", post(gitops_config_handler))
+        .route("/v1/leases", get(leases_handler).post(lease_take_handler))
+        .route("/v1/leases/renew", post(lease_renew_handler))
+        .route("/v1/leases/release", post(lease_release_handler))
+        .route("/v1/leases/break", post(lease_break_handler))
+        .route(
+            "/v1/proposals",
+            get(proposals_handler).post(proposal_create_handler),
+        )
+        .route("/v1/proposals/{id}", get(proposal_handler))
+        .route("/v1/proposals/{id}/approve", post(proposal_approve_handler))
+        .route("/v1/proposals/{id}/reject", post(proposal_reject_handler))
+        .route(
+            "/v1/proposals/{id}/withdraw",
+            post(proposal_withdraw_handler),
+        )
+        .route("/v1/proposals/{id}/undo", post(proposal_undo_handler))
         .route("/v1/policies", get(policies_handler))
         .route("/v1/policies/audit", get(policy_audit_handler))
         .route("/v1/policies/{name}/delete", post(policy_delete_handler))
@@ -932,6 +980,7 @@ pub fn router_with_upgrade(
     public
         .merge(auth_routes)
         .merge(protected)
+        .layer(axum::middleware::map_response(ui::forbid_framing))
         .layer(axum::middleware::from_fn_with_state(
             state,
             refuse_retired_tls_peer,
@@ -1206,6 +1255,18 @@ pub(super) fn audit_principal(auth: Option<&crate::sesame::auth::AuthContext>) -
     }
 }
 
+/// The kind of principal an audit record names for the caller. With no
+/// credential at all, the cluster has no tokens yet, and whoever asks is
+/// the person setting it up (`local-bootstrap`).
+pub(super) fn audit_principal_kind(
+    auth: Option<&crate::sesame::auth::AuthContext>,
+) -> crate::sesame::types::PrincipalKind {
+    auth.map_or(
+        crate::sesame::types::PrincipalKind::Human,
+        crate::sesame::auth::AuthContext::principal_kind,
+    )
+}
+
 /// Record `action`, attributed to the caller and to the address the request
 /// came from, in the event ring and this node's durable audit log. Returns
 /// once the log has the record on disk, or has given up; a failed write is
@@ -1226,6 +1287,7 @@ pub(super) async fn record_caller_action(
             severity: action.severity,
             action: action.action.to_string(),
             principal,
+            principal_kind: audit_principal_kind(auth),
             app: action.app,
             namespace: action.namespace,
             node: Some(action.node.unwrap_or_else(|| local_node_name(state))),
@@ -1374,6 +1436,14 @@ pub(crate) fn copy_forwarded_auth(
             request = request.header(name.as_str(), value.as_bytes());
         }
     }
+    // A person's `--break-lease` travels with their credential, so the
+    // leader, which checks the leases, sees it (#1686).
+    if let Some(value) = headers.get(crate::bun::lease_fence::BREAK_LEASE_HEADER) {
+        request = request.header(
+            crate::bun::lease_fence::BREAK_LEASE_HEADER,
+            value.as_bytes(),
+        );
+    }
     request
 }
 
@@ -1394,12 +1464,19 @@ mod permission_tests;
 #[cfg(test)]
 mod contract_tests;
 #[cfg(test)]
+mod lease_tests;
+#[cfg(test)]
 mod owner_tests;
 #[cfg(test)]
 mod policy_tests;
+#[cfg(test)]
+mod proposal_tests;
 
 #[cfg(test)]
 mod cluster_view_tests;
+
+#[cfg(test)]
+mod summary_tests;
 
 #[cfg(test)]
 mod token_tests;
