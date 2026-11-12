@@ -233,6 +233,7 @@ impl NodePressureController {
                 .as_ref()
                 .ok_or_else(|| "node-pressure helper executable is unavailable".to_string())?;
             let cgroup = Path::new(NODE_PRESSURE_CGROUP_ROOT).join(id.to_string());
+            // BLOCKING-OK: cgroupfs, an in-memory kernel interface: no disk behind it
             let (_memory_ceiling_bytes, cores) = prepare_fault_cgroup(&cgroup, memory_percentage)?;
 
             // No await may move this task to another worker between recording
@@ -260,6 +261,7 @@ impl NodePressureController {
             let mut child = match command.spawn() {
                 Ok(child) => child,
                 Err(error) => {
+                    // BLOCKING-OK: cgroupfs, an in-memory kernel interface: no disk behind it
                     let _ = remove_fault_cgroup(&cgroup);
                     return Err(format!("failed to start node-pressure helper: {error}"));
                 }
@@ -267,12 +269,14 @@ impl NodePressureController {
             let Some(stdout) = child.stdout.take() else {
                 let _ = child.kill().await;
                 let _ = child.wait().await;
+                // BLOCKING-OK: cgroupfs, an in-memory kernel interface: no disk behind it
                 let _ = remove_fault_cgroup(&cgroup);
                 return Err("node-pressure helper stdout was not captured".to_string());
             };
             let Some(stderr) = child.stderr.take() else {
                 let _ = child.kill().await;
                 let _ = child.wait().await;
+                // BLOCKING-OK: cgroupfs, an in-memory kernel interface: no disk behind it
                 let _ = remove_fault_cgroup(&cgroup);
                 return Err("node-pressure helper stderr was not captured".to_string());
             };
@@ -336,6 +340,7 @@ impl NodePressureController {
                     memory_max.trim(),
                     memory_events.trim(),
                 );
+                // BLOCKING-OK: cgroupfs, an in-memory kernel interface: no disk behind it
                 let _ = remove_fault_cgroup(&cgroup);
                 return Err(reason);
             }
@@ -344,6 +349,7 @@ impl NodePressureController {
             // workers run unthrottled for at most this one round-trip; the
             // memory ceiling has bounded the allocation since before spawn.
             if cpu_percentage > 0
+                // BLOCKING-OK: cgroupfs, an in-memory kernel interface: no disk behind it
                 && let Err(error) = write_control(
                     &cgroup,
                     "cpu.max",
@@ -352,6 +358,7 @@ impl NodePressureController {
             {
                 let _ = child.kill().await;
                 let _ = child.wait().await;
+                // BLOCKING-OK: cgroupfs, an in-memory kernel interface: no disk behind it
                 let _ = remove_fault_cgroup(&cgroup);
                 return Err(error);
             }

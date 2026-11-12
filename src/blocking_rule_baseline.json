@@ -1,5 +1,125 @@
 [
   {
+    "path": "src/relish/agent/context.rs",
+    "function": "run",
+    "call": "BuildInfo::current",
+    "count": 2
+  },
+  {
+    "path": "src/relish/agent/context.rs",
+    "function": "run",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/diagnose.rs",
+    "function": "run_diagnose",
+    "call": "BuildInfo::current",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/diagnose.rs",
+    "function": "run_diagnose",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/diagnose.rs",
+    "function": "run_diagnose",
+    "call": "load_bundle",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/lease.rs",
+    "function": "run",
+    "call": "BuildInfo::current",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/lease.rs",
+    "function": "run",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/logs.rs",
+    "function": "run",
+    "call": "BuildInfo::current",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/logs.rs",
+    "function": "run",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/mod.rs",
+    "function": "run",
+    "call": "manual::run",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/mod.rs",
+    "function": "run",
+    "call": "report::run",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch.rs",
+    "function": "answer",
+    "call": "BuildInfo::current",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch.rs",
+    "function": "answer",
+    "call": "apply::apply",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch.rs",
+    "function": "answer",
+    "call": "apply::read_diff",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch.rs",
+    "function": "answer",
+    "call": "workspace::diff",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch.rs",
+    "function": "answer",
+    "call": "workspace::init",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch.rs",
+    "function": "run",
+    "call": "BuildInfo::current",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch.rs",
+    "function": "run",
+    "call": "Bundle::load",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch/builder.rs",
+    "function": "build",
+    "call": "open",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch/builder.rs",
+    "function": "build",
+    "call": "snapshot",
+    "count": 1
+  },
+  {
     "path": "src/relish/agent/patch/builder.rs",
     "function": "build_in_vm",
     "call": "std::fs::create_dir_all",
@@ -25,6 +145,30 @@
   },
   {
     "path": "src/relish/agent/patch/cluster.rs",
+    "function": "destroy",
+    "call": "every_record",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch/cluster.rs",
+    "function": "destroy",
+    "call": "forget",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch/cluster.rs",
+    "function": "destroy",
+    "call": "open",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch/cluster.rs",
+    "function": "destroy_one",
+    "call": "child_relish",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch/cluster.rs",
     "function": "destroy_one",
     "call": "std::fs::read_to_string",
     "count": 1
@@ -38,13 +182,529 @@
   {
     "path": "src/relish/agent/patch/cluster.rs",
     "function": "try_cluster",
+    "call": "child_relish",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch/cluster.rs",
+    "function": "try_cluster",
+    "call": "make_home",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch/cluster.rs",
+    "function": "try_cluster",
+    "call": "open",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch/cluster.rs",
+    "function": "try_cluster",
+    "call": "snapshot",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch/cluster.rs",
+    "function": "try_cluster",
     "call": "std::fs::read_to_string",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch/cluster.rs",
+    "function": "try_cluster",
+    "call": "write_record",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch/suite.rs",
+    "function": "test",
+    "call": "open",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch/suite.rs",
+    "function": "test",
+    "call": "snapshot",
     "count": 1
   },
   {
     "path": "src/relish/agent/propose.rs",
     "function": "propose",
     "call": "std::fs::read_to_string",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/propose.rs",
+    "function": "run_proposals",
+    "call": "BuildInfo::current",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/propose.rs",
+    "function": "run_proposals",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/propose.rs",
+    "function": "run_propose",
+    "call": "BuildInfo::current",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/propose.rs",
+    "function": "run_propose",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/propose.rs",
+    "function": "run_undo",
+    "call": "BuildInfo::current",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/propose.rs",
+    "function": "run_undo",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/propose.rs",
+    "function": "run_withdraw",
+    "call": "BuildInfo::current",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/propose.rs",
+    "function": "run_withdraw",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/setup/mod.rs",
+    "function": "run",
+    "call": "failed",
+    "count": 3
+  },
+  {
+    "path": "src/relish/agent/setup/mod.rs",
+    "function": "token_facts",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/setup/mod.rs",
+    "function": "token_facts",
+    "call": "token_origin",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/setup/mod.rs",
+    "function": "token_plan",
+    "call": "crate::relish::local_context::LocalContext::load",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/setup/mod.rs",
+    "function": "token_plan",
+    "call": "credentials::StoredToken::load",
+    "count": 2
+  },
+  {
+    "path": "src/relish/agent/setup/mod.rs",
+    "function": "token_plan",
+    "call": "credentials::files_beside",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/setup/mod.rs",
+    "function": "token_plan",
+    "call": "token_origin",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/source.rs",
+    "function": "run",
+    "call": "BuildInfo::current",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/source.rs",
+    "function": "run",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/source.rs",
+    "function": "run",
+    "call": "Bundle::load",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/timeline.rs",
+    "function": "human",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/timeline.rs",
+    "function": "run",
+    "call": "BuildInfo::current",
+    "count": 3
+  },
+  {
+    "path": "src/relish/agent/timeline.rs",
+    "function": "run",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/upgrade_check.rs",
+    "function": "run",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/upgrade_check.rs",
+    "function": "run_with_client",
+    "call": "BuildInfo::current",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/verify.rs",
+    "function": "run",
+    "call": "BuildInfo::current",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/verify.rs",
+    "function": "run",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/verify.rs",
+    "function": "run_human",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/why.rs",
+    "function": "run",
+    "call": "BuildInfo::current",
+    "count": 2
+  },
+  {
+    "path": "src/relish/agent/why.rs",
+    "function": "run",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/why.rs",
+    "function": "run",
+    "call": "load_bundle",
+    "count": 2
+  },
+  {
+    "path": "src/relish/agent/why.rs",
+    "function": "run",
+    "call": "super::diagnose::run_explain",
+    "count": 1
+  },
+  {
+    "path": "src/relish/apps_cmd.rs",
+    "function": "run",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/audit_cmd.rs",
+    "function": "audit",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/bench_cmd.rs",
+    "function": "run",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/bench_jobs.rs",
+    "function": "run",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/ca_cmd.rs",
+    "function": "ca_rotate",
+    "call": "open_and_verify",
+    "count": 1
+  },
+  {
+    "path": "src/relish/ca_cmd.rs",
+    "function": "ca_rotate",
+    "call": "super::client::BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/ca_cmd.rs",
+    "function": "ca_rotate_finalize",
+    "call": "super::client::BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "apply",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "batch",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "batch_cancel",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "batch_results",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "batch_status",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "batch_task_logs",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "batch_with_client",
+    "call": "Config::from_file",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "build",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "build",
+    "call": "Config::from_file",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "cancel_deploy",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "council",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "council_recover",
+    "call": "crate::sesame::bootstrap::load_master_key",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "council_recover",
+    "call": "recover_data_dir",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "decommission_node",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "delete",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "deploy",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "deploy",
+    "call": "load_config_file",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "exec",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "gitops_disable",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "gitops_set",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "gitops_set",
+    "call": "read_gitops_section",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "gitops_status",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "history",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "image_delete",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "images",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "inspect",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "jobs",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "join",
+    "call": "crate::sesame::identity_store::save",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "join_token_create",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "logs",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "logs_export",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "release",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "replay_job",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "rerun_jobs",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "resolve",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "rollback",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "routes",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "run_task_array",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "secret_pubkey",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "secret_pubkey",
+    "call": "resolve_secret_pubkey",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "secret_rotate",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "sign",
+    "call": "BunClient::default_local",
     "count": 1
   },
   {
@@ -55,8 +715,98 @@
   },
   {
     "path": "src/relish/commands.rs",
+    "function": "snapshot_create",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "snapshot_delete",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "snapshot_list",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "snapshot_restore",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "stop",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "submit_task_manifest",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
     "function": "submit_task_manifest_with_client",
     "call": "std::fs::read_to_string",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "token_create",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "token_list",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "token_revoke",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "token_rotate",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "top",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "watch_task_batch",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/dashboard.rs",
+    "function": "run",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/dev.rs",
+    "function": "create",
+    "call": "prepare_security",
+    "count": 1
+  },
+  {
+    "path": "src/relish/dev.rs",
+    "function": "create",
+    "call": "save_cluster",
     "count": 1
   },
   {
@@ -79,6 +829,24 @@
   },
   {
     "path": "src/relish/dev.rs",
+    "function": "destroy",
+    "call": "delete_cluster_state",
+    "count": 1
+  },
+  {
+    "path": "src/relish/dev.rs",
+    "function": "destroy",
+    "call": "load_cluster",
+    "count": 1
+  },
+  {
+    "path": "src/relish/dev.rs",
+    "function": "destroy",
+    "call": "remove_security",
+    "count": 1
+  },
+  {
+    "path": "src/relish/dev.rs",
     "function": "ensure_build_vm",
     "call": "std::fs::write",
     "count": 1
@@ -87,6 +855,60 @@
     "path": "src/relish/dev.rs",
     "function": "install_file",
     "call": "std::fs::read",
+    "count": 1
+  },
+  {
+    "path": "src/relish/dev.rs",
+    "function": "start",
+    "call": "load_cluster",
+    "count": 1
+  },
+  {
+    "path": "src/relish/dev.rs",
+    "function": "status",
+    "call": "load_cluster",
+    "count": 1
+  },
+  {
+    "path": "src/relish/dev.rs",
+    "function": "stop",
+    "call": "load_cluster",
+    "count": 1
+  },
+  {
+    "path": "src/relish/events_cmd.rs",
+    "function": "events",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/fault.rs",
+    "function": "clear",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/fault.rs",
+    "function": "inject_and_print",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/fault.rs",
+    "function": "list",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/fault.rs",
+    "function": "scenario",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/fault.rs",
+    "function": "scenario",
+    "call": "scenario::load_scenario",
     "count": 1
   },
   {
@@ -99,6 +921,12 @@
     "path": "src/relish/gym/baseline.rs",
     "function": "run",
     "call": "std::fs::write",
+    "count": 1
+  },
+  {
+    "path": "src/relish/gym/mod.rs",
+    "function": "run",
+    "call": "BunClient::default_local",
     "count": 1
   },
   {
@@ -120,15 +948,207 @@
     "count": 2
   },
   {
+    "path": "src/relish/gym/record.rs",
+    "function": "record",
+    "call": "append",
+    "count": 1
+  },
+  {
+    "path": "src/relish/gym/runner.rs",
+    "function": "one_run",
+    "call": "finish",
+    "count": 1
+  },
+  {
+    "path": "src/relish/gym/runner.rs",
+    "function": "run_body",
+    "call": "find_drafts",
+    "count": 1
+  },
+  {
+    "path": "src/relish/gym/runner.rs",
+    "function": "run_body",
+    "call": "prepare",
+    "count": 1
+  },
+  {
+    "path": "src/relish/gym/runner.rs",
+    "function": "run_body",
+    "call": "read_answer",
+    "count": 1
+  },
+  {
+    "path": "src/relish/gym/runner.rs",
+    "function": "run_body",
+    "call": "record::read_log",
+    "count": 1
+  },
+  {
+    "path": "src/relish/lease_cmd.rs",
+    "function": "lease_break",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/lease_cmd.rs",
+    "function": "lease_list",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/lease_cmd.rs",
+    "function": "lease_release",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/lease_cmd.rs",
+    "function": "lease_renew",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/lease_cmd.rs",
+    "function": "lease_take",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/manifest.rs",
+    "function": "load",
+    "call": "read_file",
+    "count": 1
+  },
+  {
+    "path": "src/relish/mcp.rs",
+    "function": "run",
+    "call": "Managed::from_context",
+    "count": 1
+  },
+  {
+    "path": "src/relish/mcp.rs",
+    "function": "run",
+    "call": "crate::relish::client::token_origin",
+    "count": 1
+  },
+  {
+    "path": "src/relish/mcp.rs",
+    "function": "spawn_admin_warning",
+    "call": "crate::relish::client::BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/mcp/credentials.rs",
+    "function": "obtain",
+    "call": "StoredToken::load",
+    "count": 2
+  },
+  {
+    "path": "src/relish/mcp/credentials.rs",
+    "function": "remove",
+    "call": "StoredToken::load",
+    "count": 1
+  },
+  {
     "path": "src/relish/mcp/credentials.rs",
     "function": "remove",
     "call": "std::fs::remove_file",
     "count": 1
   },
   {
+    "path": "src/relish/metrics_cmd.rs",
+    "function": "metrics",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/nodes_cmd.rs",
+    "function": "run",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/path_cmd.rs",
+    "function": "run",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/policy_cmd.rs",
+    "function": "policy_audit",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/policy_cmd.rs",
+    "function": "policy_delete",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/policy_cmd.rs",
+    "function": "policy_list",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/proposal_cmd.rs",
+    "function": "proposal_approve",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/proposal_cmd.rs",
+    "function": "proposal_list",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/proposal_cmd.rs",
+    "function": "proposal_reject",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/proposal_cmd.rs",
+    "function": "proposal_show",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/proposal_cmd.rs",
+    "function": "undo",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/quickstart/runner.rs",
+    "function": "run",
+    "call": "crate::relish::install::invocation",
+    "count": 1
+  },
+  {
+    "path": "src/relish/quickstart/server_runner.rs",
+    "function": "run",
+    "call": "crate::relish::install::invocation",
+    "count": 1
+  },
+  {
     "path": "src/relish/setup.rs",
     "function": "offer_to_start",
     "call": "std::fs::File::create",
+    "count": 1
+  },
+  {
+    "path": "src/relish/setup.rs",
+    "function": "run",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/setup.rs",
+    "function": "run",
+    "call": "find_on_path",
     "count": 1
   },
   {
@@ -144,9 +1164,63 @@
     "count": 1
   },
   {
+    "path": "src/relish/source.rs",
+    "function": "run",
+    "call": "documents",
+    "count": 1
+  },
+  {
+    "path": "src/relish/status_cmd.rs",
+    "function": "run",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/status_cmd.rs",
+    "function": "run_with_client",
+    "call": "BuildInfo::current",
+    "count": 1
+  },
+  {
+    "path": "src/relish/status_cmd.rs",
+    "function": "run_with_client",
+    "call": "envelope",
+    "count": 2
+  },
+  {
+    "path": "src/relish/test_cmd.rs",
+    "function": "run",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/tui/mod.rs",
+    "function": "run",
+    "call": "BunClient::default_local",
+    "count": 1
+  },
+  {
+    "path": "src/relish/upgrade.rs",
+    "function": "start_from_file",
+    "call": "SignatureEnvelope::load",
+    "count": 1
+  },
+  {
+    "path": "src/relish/upgrade.rs",
+    "function": "start_from_file",
+    "call": "signing::sha256_file",
+    "count": 1
+  },
+  {
     "path": "src/relish/upgrade.rs",
     "function": "start_from_file",
     "call": "std::fs::canonicalize",
+    "count": 1
+  },
+  {
+    "path": "src/relish/wtf_cmd.rs",
+    "function": "run",
+    "call": "BunClient::default_local",
     "count": 1
   }
 ]

@@ -171,6 +171,7 @@ impl NamespaceLease {
         if allow.is_empty() {
             return Ok(());
         }
+        // BLOCKING-OK: cgroupfs, an in-memory kernel interface: no disk behind it
         let cgroup_id = egress::cgroup_id_of_path(cgroup)
             .ok_or_else(|| std::io::Error::other("task cgroup identity is unavailable"))?;
         let entries = allow.to_vec();
@@ -220,6 +221,7 @@ impl NamespaceLease {
         if !crate::config::valid_workload_label(job) {
             return Ok(());
         }
+        // BLOCKING-OK: cgroupfs, an in-memory kernel interface: no disk behind it
         let cgroup_id = crate::sesame::egress::cgroup_id_of_path(cgroup)
             .ok_or_else(|| std::io::Error::other("task cgroup identity is unavailable"))?;
         // Remember the binding before writing it, so retirement lifts even a
@@ -384,6 +386,7 @@ impl TaskNamespacePolicy {
             ));
         }
         tokio::fs::create_dir_all(directory).await?;
+        // BLOCKING-OK: cgroupfs, an in-memory kernel interface: no disk behind it
         let cgroup_id = crate::sesame::egress::cgroup_id_of_path(directory)
             .ok_or_else(|| std::io::Error::other("delegated namespace identity is unavailable"))?;
         let mut bindings = self.bindings.lock().await;
