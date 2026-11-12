@@ -1068,9 +1068,50 @@ class V02LoopArchiveTests(unittest.TestCase):
         self.assertEqual(
             self.selected_binaries(self.loops),
             {"self_upgrade", "self_upgrade_cluster", "council_disaster_recovery",
-             "cluster_failover", "job_recovery", "registry_recovery", "suite",
+             "cluster_failover", "registry_recovery", "suite",
              "test_storage"},
         )
+
+    @staticmethod
+    def named_tests(workflow_jobs):
+        """(binary, test path) for every exact test a lease loop's filter names."""
+        found = []
+        for line in workflow_jobs["leases"].splitlines():
+            filter_line = re.search(r"filter: (.*)$", line)
+            if not filter_line:
+                continue
+            binary = re.search(r"binary\(([\w-]+)\)", filter_line.group(1)).group(1)
+            for test in re.findall(r"test\(=([\w:]+)\)", filter_line.group(1)):
+                found.append((binary, test))
+        return found
+
+    @staticmethod
+    def defines(binary, test):
+        """Whether the binary's source defines the test function."""
+        *modules, function = test.split("::")
+        if binary == "suite":
+            source = REPO / "tests" / "suite" / ("/".join(modules) + ".rs")
+        else:
+            source = REPO / "tests" / f"{binary}.rs"
+        if not source.is_file():
+            return False
+        return re.search(rf"\bfn {re.escape(function)}\s*\(", source.read_text()) is not None
+
+    def test_every_test_a_lease_loop_names_exists(self):
+        # Run 43183887759's job-lease loop selected nothing on every platform:
+        # its test went when node-local jobs were retired (2560765c).
+        named = self.named_tests(self.loops)
+        self.assertTrue(named)
+        for binary, test in named:
+            with self.subTest(binary=binary, test=test):
+                self.assertTrue(self.defines(binary, test), f"{binary} has no test {test}")
+
+    def test_a_filter_naming_a_removed_test_is_detected(self):
+        self.assertFalse(self.defines(
+            "job_recovery", "node_job_lease_reaps_a_surviving_process_after_bun_is_killed"))
+        self.assertFalse(self.defines("suite", "log_export::no_such_test"))
+        self.assertTrue(self.defines(
+            "suite", "log_export::export_persists_and_reloads_the_authoritative_checkpoint"))
 
     def test_a_missing_extra_or_whole_workspace_archive_is_detected(self):
         build = self.loops["build-tests"]

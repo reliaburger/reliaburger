@@ -126,7 +126,7 @@ are `#[ignore]`d with a reason naming the target or script that runs them:
 someone pushes the `v02-loops` branch or dispatches it by hand, and loops the upgrade,
 council, lease-recovery and exporter-lock suites for hours on Linux x86-64, Linux
 arm64 and macOS, then reports each lane's runs, failures and rule-of-three bound.
-Its build job archives only the eight test binaries the loops select, so a
+Its build job archives only the seven test binaries the loops select, so a
 cold macOS build fits its 90 minutes; `V02LoopArchiveTests` in
 `scripts/ci/test_ci_workflow.py` keeps that list in step with the loops' filters.
 `scripts/release/loop_summary.py` gives every test a status (pass, fail, skip or
