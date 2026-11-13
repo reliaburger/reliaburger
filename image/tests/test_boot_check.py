@@ -87,5 +87,20 @@ class BootCheckTests(unittest.TestCase):
         self.assertIn("reboot", calls)
 
 
+class BootCheckUnitTests(unittest.TestCase):
+    """The unit, which runs everywhere (no os-release needed)."""
+
+    def test_the_unit_drops_the_test_override_from_the_manager_s_environment(self):
+        # BOOT_CHECK_EFIVARS is the tests' way to fake a counted boot. A
+        # value inherited from the service manager (systemd.setenv=, or a
+        # DefaultEnvironment= drop-in in /etc) would let a node decide its
+        # own boots were never counted, so a bad update would never fall
+        # back. The unit unsets it before the script runs.
+        unit = (ROOT / "image" / "mkosi.extra" / "usr" / "lib" / "systemd" / "system"
+                / "reliaburger-boot-check.service").read_text()
+        service = unit.split("[Service]", 1)[1].split("\n[", 1)[0]
+        self.assertIn("\nUnsetEnvironment=BOOT_CHECK_EFIVARS\n", service)
+
+
 if __name__ == "__main__":
     unittest.main()
