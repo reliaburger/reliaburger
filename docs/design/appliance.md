@@ -129,8 +129,11 @@ locally-administered MAC, and listens for 5 seconds (`server.rs`):
 - Silence gets a warning, and it serves.
 - If the probe can't run, it depends. A permission error is fatal (it needs
   root anyway). Any other failure to bind, send or receive prints "can't check
-  the network … make sure no other netboot server runs on it" and carries on.
-  Whether that should refuse instead is open in #1893.
+  the network … make sure no other netboot server runs on it" and carries on
+  (`when_the_probe_cannot_run`). That's deliberate. The usual cause is the
+  host's own DHCP client holding UDP 68 alone, and refusing then would stop
+  netboot on an ordinary Linux laptop, with no fix short of stopping the
+  DHCP client.
 
 ### 2.6 Asking before a wipe
 

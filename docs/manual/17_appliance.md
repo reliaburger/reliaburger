@@ -163,6 +163,10 @@ and listens for five seconds:
   relish anything, so check that the router is up and on the same switch. A
   DHCP server that only answers machines it knows (reservations with no
   range) stays quiet too, and then the warning is harmless.
+- If it can't send the request at all, it warns (`can't check the network`)
+  and starts anyway. This happens when your machine's own DHCP client holds
+  UDP port 68, as many Linux ones do. relish can't tell then whether another
+  netboot server is running, so check that yourself.
 
 It also refuses to serve from a self-assigned address (`169.254.x.x`). An
 interface gets one when no DHCP server answered it, and the machines you
