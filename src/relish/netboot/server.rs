@@ -190,25 +190,16 @@ enum Report {
 /// anything. With `setup` [`DhcpSetup::ThisMachine`], the DHCP server must
 /// be this machine's alone.
 async fn check_the_network(interface: &Interface, setup: DhcpSetup) -> Result<(), NetbootError> {
-    let skipped = |error: &dyn std::fmt::Display| {
-        eprintln!(
-            "relish netboot: warning: can't check the network ({error}); make sure no other netboot server runs on it, and that its DHCP server is up"
-        );
-    };
     let socket = match interface::probe_socket(dhcp::DHCP_CLIENT_PORT, Some(interface)) {
         Ok(socket) => socket,
-        Err(NetbootError::NeedsRoot) => return Err(NetbootError::NeedsRoot),
-        Err(error) => {
-            skipped(&error);
-            return Ok(());
-        }
+        Err(error) => return print_report(when_the_probe_cannot_run(error)?),
     };
     let broadcast = SocketAddrV4::new(Ipv4Addr::BROADCAST, dhcp::DHCP_SERVER_PORT);
     let network = match probe(&socket, broadcast, interface.address, PROBE_WAIT).await {
         Ok(network) => network,
         Err(error) => {
-            skipped(&error);
-            return Ok(());
+            let error = NetbootError::io("probing the network", error);
+            return print_report(when_the_probe_cannot_run(error)?);
         }
     };
     let report = match setup {
@@ -217,11 +208,32 @@ async fn check_the_network(interface: &Interface, setup: DhcpSetup) -> Result<()
             verdict_beside_local_dhcp(network, interface, local_dhcp_server_runs())?
         }
     };
+    print_report(report)
+}
+
+fn print_report(report: Report) -> Result<(), NetbootError> {
     match report {
         Report::Fine(line) => println!("{line}"),
         Report::Warning(line) => eprintln!("{line}"),
     }
     Ok(())
+}
+
+/// What to do when the start-up probe can't run: warn and serve, except
+/// without root, which nothing after this would have either.
+///
+/// The usual cause is the host's own DHCP client holding UDP 68 alone, as
+/// many Linux ones do. Refusing then would stop netboot on an ordinary
+/// laptop, and the operator couldn't fix it without stopping their DHCP
+/// client. So it's a warning, which names what the check would have
+/// caught, and serving goes on.
+fn when_the_probe_cannot_run(error: NetbootError) -> Result<Report, NetbootError> {
+    if let NetbootError::NeedsRoot = error {
+        return Err(error);
+    }
+    Ok(Report::Warning(format!(
+        "relish netboot: warning: can't check the network ({error}); make sure no other netboot server runs on it, and that its DHCP server is up"
+    )))
 }
 
 /// Whether something on this machine holds UDP 67, as a DHCP server does.
@@ -797,5 +809,45 @@ mod tests {
         assert_eq!(describe_duration(Duration::from_secs(5400)), "90m");
         assert_eq!(describe_duration(Duration::from_secs(172_800)), "2d");
         assert_eq!(describe_duration(Duration::from_secs(61)), "61s");
+    }
+
+    #[test]
+    fn a_probe_that_cannot_run_warns_and_serves_rather_than_refusing() {
+        // A host's own DHCP client often holds UDP 68 alone, so the probe
+        // can't listen; refusing then would stop netboot on an ordinary
+        // laptop (#1893 W4, decided in the PR that adds this test).
+        for error in [
+            NetbootError::PortInUse {
+                what: "the DHCP probe",
+                port: dhcp::DHCP_CLIENT_PORT,
+                hint: "",
+            },
+            NetbootError::io(
+                "probing the network",
+                std::io::Error::from(std::io::ErrorKind::NetworkUnreachable),
+            ),
+        ] {
+            let shown = error.to_string();
+            let Ok(Report::Warning(line)) = when_the_probe_cannot_run(error) else {
+                panic!("{shown}: not a warning");
+            };
+            assert!(
+                line.starts_with("relish netboot: warning: can't check the network ("),
+                "{line}"
+            );
+            assert!(line.contains(&shown), "{line}");
+            assert!(
+                line.contains("make sure no other netboot server runs on it"),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_probe_that_needs_root_still_refuses() {
+        assert!(matches!(
+            when_the_probe_cannot_run(NetbootError::NeedsRoot),
+            Err(NetbootError::NeedsRoot)
+        ));
     }
 }
