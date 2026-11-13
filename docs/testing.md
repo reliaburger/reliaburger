@@ -65,13 +65,23 @@ disclaims responsibility (`posix_spawn` with
 [Chapter 14](book/14-changing-the-tyres.md#the-deadline-was-timing-macos-not-the-candidate).
 
 The same rule holds for every target that builds before its tests. `make
-test-linux` needs `target/debug/bun` with the `ebpf` feature
+test-linux` needs `debug/bun` with the `ebpf` feature
 (`RELIABURGER_BUN_BINARY` names it), so it first runs `cargo test --no-run
 --features ebpf`, the build nextest's `--features ebpf` will ask for. It used
 to run `cargo build --features ebpf --bin bun`, so on a fresh target nextest
 compiled the library, every proc macro and `bun` a second time, and replaced
 the `bun` the step had built. On a Mac the two builds took 710 s; now they take 327 s
 ([#904](https://github.com/reliaburger/reliaburger/issues/904)).
+
+That `bun` is in cargo's target directory: `$CARGO_TARGET_DIR` if it's set,
+otherwise `target/` in the checkout. The Makefile's `TARGET_DIR` says so, and
+the demo scripts do the same. `make test-linux` used to name
+`target/debug/bun` in the checkout. Under an out-of-tree `CARGO_TARGET_DIR`
+that file doesn't exist, every runtime command failed with ENOENT in about
+30 ms, and the run looked like a burst of flaky runc failures. Now a test whose
+`RELIABURGER_BUN_BINARY` names a missing file fails at once, naming the path
+(`testkit::bun_binary`,
+[#1859](https://github.com/reliaburger/reliaburger/issues/1859)).
 A pre-build is `cargo test --no-run` with exactly the build flags of the test
 run that follows it (`--features`, `--release` and the like); selection flags
 such as `-E` don't matter, since nextest builds every test target anyway.
@@ -165,8 +175,8 @@ turns short:
 |---|---|---|
 | Turn meter | Times every turn by branch, exports `bun_agent_loop_turn_seconds{branch}` through Mayo, logs any turn over 250 ms with the command or deploy op it ran. Tests read the worst turn, including one still running | [`src/bun/loop_meter.rs`](../src/bun/loop_meter.rs) |
 | Starvation harness | One scenario per inline await from the review: a `MockGrill` whose calls can each be slowed (`set_call_delay`), a council whose writes hang, a log client that never reads, and test-only stalls for awaits no mock stands behind (the disk, `nft`). Each scenario queues a status command during the slow work and fails unless it's answered, and the worst turn ends, within 1 s | [`src/bun/agent/tests/loop_harness.rs`](../src/bun/agent/tests/loop_harness.rs) |
-| Inline-await rule | Parses the agent's source with `syn`, walks every method a turn can reach from `run_loop`, and fails on an await with neither the turn's deadline (`tokio::time::timeout_at(deadline, ..)`) nor a `// LOOP-INLINE: <why>` comment. A fixed `tokio::time::timeout` needs the tag too: 1 s is already the whole budget (#418). An fsync never gets one: since #1853 every durable write a turn starts runs in a task the turn waits for only until its deadline | [`src/bun/agent/tests/loop_rule.rs`](../src/bun/agent/tests/loop_rule.rs) |
-| No blocking file call in async code | Parses all of `src/` with `syn` and fails on a file call made directly in an `async fn`, `async` block or `async` closure that isn't awaited (`std::fs`, `File::open`, `OpenOptions::open`, `sync_all`, `set_len`, raw `nix` calls, and the crate's listed blocking helpers). It ties up a runtime worker, and whatever task is queued there, the agent loop included (#1857). Move the call into `spawn_blocking` or use `tokio::fs`, or tag it `// BLOCKING-OK: <why>`. Older sites are in `src/blocking_rule_baseline.json`, which may only shrink | [`src/blocking_rule.rs`](../src/blocking_rule.rs) |
+| Inline-await rule | Parses the agent's source with `syn`, walks every method a turn can reach from `run_loop`, and fails on an await with neither the turn's deadline (`tokio::time::timeout_at(deadline, ..)`) nor a `// LOOP-INLINE: <why>` comment. A fixed `tokio::time::timeout` needs the tag too: 1 s is already the whole budget (#418). `select!` arm bodies and `join!` futures count as turn code (#1860). An fsync never gets one: since #1853 every durable write a turn starts runs in a task the turn waits for only until its deadline | [`src/bun/agent/tests/loop_rule.rs`](../src/bun/agent/tests/loop_rule.rs) |
+| No blocking file call in async code | Parses all of `src/` with `syn` and fails on a file call made directly in an `async fn`, `async` block or `async` closure that isn't awaited (`std::fs`, `File::open`, `OpenOptions::open`, `sync_all`, `set_len`, raw `nix` calls, `std::thread::sleep`, and any synchronous crate function that makes one, however many calls deep: the rule computes that set as a fixed point over the crate, #1860). It reads `select!`, `join!` and other macro arguments too. Such a call ties up a runtime worker, and whatever task is queued there, the agent loop included (#1857). Move the call into `spawn_blocking` or use `tokio::fs`, or tag it `// BLOCKING-OK: <why>`. Older sites are in `src/blocking_rule_baseline.json`, which may only shrink | [`src/blocking_rule.rs`](../src/blocking_rule.rs) |
 | Soak gate | The V02 checker reads each node's turn histogram at every settle and heavy check and fails the tier on any turn over 1 s | [`scripts/release/sustained_check.py`](../scripts/release/sustained_check.py) (`turn_findings`) |
 
 The first three run in `make test`; the gate's own tests run with the other

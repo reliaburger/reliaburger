@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::cargo::{CompilerError, Messages, SHOWN_ERRORS, last_lines, parse_messages};
+use super::cargo::{
+    CompilerError, Messages, SHOWN_ERRORS, cargo_error, last_lines, parse_messages,
+};
 use super::git::snapshot;
 use super::workspace::{BuildRun, State, changed_files};
 use super::{HostOs, PATCH_DIR, Tools, answer_of, open, patch_command, shown, step};
@@ -223,6 +225,20 @@ pub(super) async fn run_cargo(
     deadline: Duration,
 ) -> Result<CargoRun, AgentError> {
     let started = Instant::now();
+    // Cargo runs inside the workspace, so a relative `dir` (`./fix`, as
+    // `patch init` suggests) would be read from there a second time, as
+    // `./fix/fix` (#1882). Made absolute against our own working directory
+    // first, it means the same thing to both.
+    let dir = std::path::absolute(dir).map_err(|error| {
+        AgentError::new(
+            ErrorCode::Usage,
+            format!(
+                "couldn't read the workspace path {}: {error}",
+                dir.display()
+            ),
+        )
+    })?;
+    let dir = dir.as_path();
     let mut command = tokio::process::Command::new(&tools.cargo);
     command
         // The subcommand, then our options, then the caller's, which may end
@@ -236,13 +252,7 @@ pub(super) async fn run_cargo(
         .current_dir(dir)
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true);
-    // A release build's commit and its clean-source check belong to the
-    // release; a patched binary takes its commit from the workspace.
-    for variable in [
-        "CARGO_TARGET_DIR",
-        "RELIABURGER_GIT_SHA",
-        "RELIABURGER_REQUIRE_CLEAN_SOURCE",
-    ] {
+    for variable in session_variables(std::env::vars_os().map(|(name, _)| name)) {
         command.env_remove(variable);
     }
     let output = tokio::time::timeout(deadline, command.output())
@@ -270,6 +280,31 @@ pub(super) async fn run_cargo(
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         seconds: started.elapsed().as_secs_f64(),
     })
+}
+
+/// The names, out of `names`, of the session's variables that a build or a
+/// test run in the workspace mustn't see.
+///
+/// `CARGO_TARGET_DIR` would send the build somewhere other than the
+/// workspace's `target/`. Every `RELIABURGER_*` goes too: a release build's
+/// commit and clean-source check (`RELIABURGER_GIT_SHA`,
+/// `RELIABURGER_REQUIRE_CLEAN_SOURCE`) belong to the release; the agent's
+/// own `RELIABURGER_TOKEN`, `RELIABURGER_ENDPOINT` or `RELIABURGER_HOME`
+/// would reach the tests that read them (#1876); and a gated suite's
+/// switch, such as `RELIABURGER_RUNC_TESTS`, would run tests the portable
+/// suite leaves out.
+pub(super) fn session_variables(
+    names: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Vec<std::ffi::OsString> {
+    names
+        .into_iter()
+        .filter(|name| {
+            name == "CARGO_TARGET_DIR"
+                || name
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("RELIABURGER_"))
+        })
+        .collect()
 }
 
 /// Refuse to start when the workspace's disk has less than `needed` free.
@@ -549,6 +584,8 @@ pub(super) async fn build(
                 .collect();
             if data.errors.is_empty() {
                 data.cargo_output = Some(last_lines(&result.stderr, 20));
+                data.errors.push(cargo_error(&result.stderr));
+                data.total_errors = 1;
             }
         }
         data.binaries.extend(result.binaries);
@@ -823,7 +860,16 @@ exit 101
         .await
         .unwrap();
         assert!(!answer.data.ok);
-        assert!(answer.data.errors.is_empty());
+        // `ok: false` always comes with an error to read (#1882).
+        assert_eq!(answer.data.errors.len(), 1, "{:?}", answer.data.errors);
+        assert_eq!(answer.data.total_errors, 1);
+        assert!(
+            answer.data.errors[0]
+                .message
+                .contains("needs to be updated"),
+            "{:?}",
+            answer.data.errors
+        );
         assert!(
             answer
                 .data
@@ -831,6 +877,24 @@ exit 101
                 .unwrap()
                 .contains("needs to be updated")
         );
+    }
+
+    /// `patch init ./fix` suggests `patch build ./fix`, so a relative
+    /// workspace must reach cargo once, not joined onto itself (#1882).
+    #[tokio::test]
+    async fn cargo_finds_a_workspace_named_by_a_relative_path() {
+        let fixture = Fixture::new(CARGO_CHECKS_THE_MANIFEST);
+        let relative = relative_to_cwd(&fixture.dir());
+        assert!(relative.is_relative());
+        let run = run_cargo(
+            &fixture.tools,
+            &relative,
+            &["test"],
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+        assert!(run.success, "{}", run.stderr);
     }
 
     #[tokio::test]
@@ -921,5 +985,41 @@ exit 101
         .unwrap_err();
         assert_eq!(error.code, ErrorCode::BuildFailed);
         assert!(error.hint.unwrap().contains("rustup"));
+    }
+
+    #[test]
+    fn the_sessions_reliaburger_variables_and_target_dir_stay_out_of_cargo() {
+        let names = [
+            "PATH",
+            "HOME",
+            "RUSTUP_HOME",
+            "CARGO_HOME",
+            "CARGO_TARGET_DIR",
+            "RELIABURGER_TOKEN",
+            "RELIABURGER_ENDPOINT",
+            "RELIABURGER_CA_CERT",
+            "RELIABURGER_HOME",
+            "RELIABURGER_GIT_SHA",
+            "RELIABURGER_REQUIRE_CLEAN_SOURCE",
+            "RELIABURGER_RUNC_TESTS",
+            "RELIABURGER",
+            "MY_RELIABURGER_TOKEN",
+        ]
+        .map(std::ffi::OsString::from);
+        let removed = session_variables(names);
+        assert_eq!(
+            removed,
+            [
+                "CARGO_TARGET_DIR",
+                "RELIABURGER_TOKEN",
+                "RELIABURGER_ENDPOINT",
+                "RELIABURGER_CA_CERT",
+                "RELIABURGER_HOME",
+                "RELIABURGER_GIT_SHA",
+                "RELIABURGER_REQUIRE_CLEAN_SOURCE",
+                "RELIABURGER_RUNC_TESTS",
+            ]
+            .map(std::ffi::OsString::from)
+        );
     }
 }

@@ -17,6 +17,10 @@ LINUX_EXCLUDE ?=
 TEST_IMAGE_CACHE ?= $(HOME)/.cache/reliaburger/test-images
 TEST_IMAGE_MIRROR ?= 127.0.0.1:5099
 WITH_TEST_IMAGES = python3 scripts/test-images/mirror.py run --cache "$(TEST_IMAGE_CACHE)" --listen $(TEST_IMAGE_MIRROR) --
+# Cargo's target directory, where the builds below put their binaries. Parallel
+# agents point CARGO_TARGET_DIR outside the checkout, and a path into target/
+# then named nothing (#1859).
+TARGET_DIR = $(or $(CARGO_TARGET_DIR),$(CURDIR)/target)
 
 # --- Rust targets ---
 
@@ -66,7 +70,7 @@ test-images: ## Fetch the pinned test images (with retries) into the local mirro
 # nextest compiles nothing again and leaves that file alone (#904).
 test-linux: ## Run provisioned Linux runtime, network, eBPF, Btrfs and Buildah tests
 	$(CARGO) test --no-run --features ebpf
-	RELIABURGER_RUNC_TESTS=1 RELIABURGER_NETNS_TESTS=1 RELIABURGER_EBPF_TESTS=1 RELIABURGER_BTRFS_TESTS=1 RELIABURGER_BUILDAH_TESTS=1 RELIABURGER_CGROUP_TESTS=1 RELIABURGER_NODE_PRESSURE_TESTS=1 RELIABURGER_BUN_BINARY="$(CURDIR)/target/debug/bun" $(WITH_TEST_IMAGES) $(NEXTEST) --features ebpf --run-ignored=only -E '(binary(ebpf) | binary(build) | binary(node_pressure) | binary(test_storage) | binary(owned_network) | binary(owned_runc) | binary(kubernetes_demo) | test(/^grill::(volume|image)::tests::/) | test(/(runc_|netns|btrfs_|cgroup_|identity_dir_is_tmpfs|pinned_images_serve)/)) & not binary(oci_crash) & !test(/^actual_(host_reboot|bun_kernel_discovery_host_reboot)/) $(LINUX_EXCLUDE)'
+	RELIABURGER_RUNC_TESTS=1 RELIABURGER_NETNS_TESTS=1 RELIABURGER_EBPF_TESTS=1 RELIABURGER_BTRFS_TESTS=1 RELIABURGER_BUILDAH_TESTS=1 RELIABURGER_CGROUP_TESTS=1 RELIABURGER_NODE_PRESSURE_TESTS=1 RELIABURGER_BUN_BINARY="$(TARGET_DIR)/debug/bun" $(WITH_TEST_IMAGES) $(NEXTEST) --features ebpf --run-ignored=only -E '(binary(ebpf) | binary(build) | binary(node_pressure) | binary(test_storage) | binary(owned_network) | binary(owned_runc) | binary(kubernetes_demo) | test(/^grill::(volume|image)::tests::/) | test(/(runc_|netns|btrfs_|cgroup_|identity_dir_is_tmpfs|pinned_images_serve)/)) & not binary(oci_crash) & !test(/^actual_(host_reboot|bun_kernel_discovery_host_reboot)/) $(LINUX_EXCLUDE)'
 
 test-rootless-runc: ## Prove rootless runc networking and port adoption as a non-root user
 	RELIABURGER_ROOTLESS_RUNC_TESTS=1 $(NEXTEST) --features ebpf --run-ignored=only -E 'binary(owned_rootless) | test(rootless_published_port_survives_bun_replacement) | test(normal_rootless_bun)'

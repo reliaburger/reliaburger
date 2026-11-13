@@ -158,7 +158,8 @@ pub struct RejectRequest {
     pub reason: String,
 }
 
-fn short(revision: &str) -> String {
+/// The first 12 hex digits of `revision`, as people read it.
+pub(super) fn short(revision: &str) -> String {
     revision.chars().take(12).collect()
 }
 

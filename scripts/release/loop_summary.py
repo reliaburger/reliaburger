@@ -33,6 +33,9 @@ import xml.etree.ElementTree as ElementTree
 # is the iterations that ran. Its JUnit report holds one testsuite per
 # iteration ("binary@stress-N"), so counting testcases counts every run.
 ITERATIONS = re.compile(r"Summary \[[^\]]*\]\s+(\d+)(?:/\d+)? stress run iterations?")
+# The workflow sets CARGO_TERM_COLOR=always, which colours nextest's output
+# too; the count is read from the text with the escape codes taken out.
+ESCAPES = re.compile(r"\x1b\[[0-9;]*m")
 
 PASS, FAIL, SKIP, INCOMPLETE = "pass", "fail", "skip", "incomplete"
 
@@ -62,7 +65,7 @@ def stress_iterations(log: pathlib.Path | None) -> int | None:
     """The iteration count nextest reported for the stress run, if any."""
     if log is None or not log.is_file():
         return None
-    found = ITERATIONS.findall(log.read_text(errors="replace"))
+    found = ITERATIONS.findall(ESCAPES.sub("", log.read_text(errors="replace")))
     return int(found[-1]) if found else None
 
 

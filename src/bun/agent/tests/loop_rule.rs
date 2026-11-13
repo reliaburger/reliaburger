@@ -12,6 +12,12 @@
 //! meets is a leaf: a runtime call, a council write, a channel send, a
 //! `spawn_blocking` join. A leaf without a deadline or a tag fails the test.
 //!
+//! Macro arguments are code too (#1860). `crate::macro_args`, shared with
+//! the blocking-call rule, parses them back into expressions: a `select!`
+//! arm's body is checked like any other turn code, a `join!` awaits its
+//! futures in place, and a `select!` arm's future is a leaf only when it
+//! is a fixed `timeout(..)`, since the race itself only finds work.
+//!
 //! What it deliberately doesn't look at: bodies of `async` blocks and
 //! closures (they are spawned, or awaited by a leaf that is itself tagged),
 //! `#[cfg(test)]` code, and awaits on an in-process lock (`.lock()`,
@@ -23,6 +29,8 @@ use std::path::{Path, PathBuf};
 
 use syn::spanned::Spanned;
 use syn::visit::Visit;
+
+use crate::macro_args::{MacroArgs, macro_args};
 
 /// The comment that allowlists an inline await.
 const TAG: &str = "LOOP-INLINE:";
@@ -171,6 +179,70 @@ struct BodyVisitor<'a> {
 }
 
 impl BodyVisitor<'_> {
+    /// Check one expression the turn awaits in place: an `.await`'s base,
+    /// or a `join!` argument. `end` is the line the wait is charged to.
+    fn inline_await(&mut self, base: &syn::Expr, end: usize) {
+        // `async { .. }.await` runs its body inline, as part of this turn.
+        if let syn::Expr::Async(block) = base {
+            self.visit_block(&block.block);
+            return;
+        }
+        if let Some(method) = called_method(base)
+            && self.methods.contains_key(&method)
+        {
+            self.calls.push(method);
+            syn::visit::visit_expr(self, base);
+            return;
+        }
+        if is_bounded(base) {
+            return;
+        }
+        self.flag_untagged(end);
+        syn::visit::visit_expr(self, base);
+    }
+
+    /// Check one future a `select!` races. A turn doesn't wait for the race
+    /// to find work, so a future is a leaf only when it is a fixed
+    /// `timeout(..)`: that one the turn waits out inline, and it needs the
+    /// same tag as one outside a `select!`. An agent method raced here is
+    /// followed.
+    fn race(&mut self, future: &syn::Expr) {
+        if let Some(method) = called_method(future)
+            && self.methods.contains_key(&method)
+        {
+            self.calls.push(method);
+        } else if let syn::Expr::Call(call) = future
+            && let syn::Expr::Path(function) = call.func.as_ref()
+            && function
+                .path
+                .segments
+                .last()
+                .is_some_and(|segment| segment.ident == "timeout")
+        {
+            self.flag_untagged(future.span().start().line);
+        }
+        syn::visit::visit_expr(self, future);
+    }
+
+    /// A violation at `line`, unless its statement is tagged.
+    fn flag_untagged(&mut self, line: usize) {
+        let start = self.statements.last().copied().unwrap_or(line);
+        if self.tagged(start, line) {
+            return;
+        }
+        let awaited = self
+            .source
+            .lines
+            .get(line - 1)
+            .map(|text| text.trim().to_string())
+            .unwrap_or_default();
+        self.violations.push(Violation {
+            path: self.source.path.display().to_string(),
+            line,
+            awaited,
+        });
+    }
+
     /// Whether the statement starting at `start` (and running to `end`), or
     /// the comment block right above it, carries a justified tag.
     fn tagged(&self, start: usize, end: usize) -> bool {
@@ -217,37 +289,7 @@ impl<'ast> Visit<'ast> for BodyVisitor<'_> {
         if is_cfg_test(&expr.attrs) {
             return;
         }
-        // `async { .. }.await` runs its body inline, as part of this turn.
-        if let syn::Expr::Async(block) = expr.base.as_ref() {
-            self.visit_block(&block.block);
-            return;
-        }
-        if let Some(method) = called_method(&expr.base)
-            && self.methods.contains_key(&method)
-        {
-            self.calls.push(method);
-            syn::visit::visit_expr(self, &expr.base);
-            return;
-        }
-        if is_bounded(&expr.base) {
-            return;
-        }
-        let end = expr.await_token.span.start().line;
-        let start = self.statements.last().copied().unwrap_or(end);
-        if !self.tagged(start, end) {
-            let awaited = self
-                .source
-                .lines
-                .get(end - 1)
-                .map(|line| line.trim().to_string())
-                .unwrap_or_default();
-            self.violations.push(Violation {
-                path: self.source.path.display().to_string(),
-                line: end,
-                awaited,
-            });
-        }
-        syn::visit::visit_expr(self, &expr.base);
+        self.inline_await(&expr.base, expr.await_token.span.start().line);
     }
 
     fn visit_expr_async(&mut self, _: &'ast syn::ExprAsync) {}
@@ -256,45 +298,32 @@ impl<'ast> Visit<'ast> for BodyVisitor<'_> {
 
     fn visit_item(&mut self, _: &'ast syn::Item) {}
 
+    /// `select!` arms and `join!` futures are macro tokens, not parsed
+    /// expressions; the parser the blocking-call rule uses gives them back
+    /// as expressions (#1860). An arm's body is turn code like any other,
+    /// and a `join!` awaits its futures in place.
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
-        // `select!` arms are macro tokens, not parsed expressions. The only
-        // thing a turn does inside one is call agent methods, so follow those.
-        use proc_macro2::TokenTree;
-        let tokens = flatten(mac.tokens.clone());
-        // A fixed `timeout(..)` raced in a `select!` arm is awaited inline
-        // too, and needs the same tag as one outside it.
-        for window in tokens.windows(2) {
-            if let [TokenTree::Ident(timeout), TokenTree::Group(_)] = window
-                && timeout == "timeout"
-            {
-                let line = timeout.span().start().line;
-                let start = self.statements.last().copied().unwrap_or(line);
-                if !self.tagged(start, line) {
-                    self.violations.push(Violation {
-                        path: self.source.path.display().to_string(),
-                        line,
-                        awaited: self
-                            .source
-                            .lines
-                            .get(line - 1)
-                            .map(|text| text.trim().to_string())
-                            .unwrap_or_default(),
-                    });
+        match macro_args(mac) {
+            MacroArgs::Select(arms) => {
+                for arm in &arms {
+                    if let Some(future) = &arm.future {
+                        self.race(future);
+                    }
+                    if let Some(condition) = &arm.condition {
+                        self.visit_expr(condition);
+                    }
+                    self.visit_expr(&arm.body);
                 }
             }
-        }
-        for window in tokens.windows(4) {
-            if let [
-                TokenTree::Ident(this),
-                TokenTree::Punct(dot),
-                TokenTree::Ident(method),
-                TokenTree::Group(_),
-            ] = window
-                && this == "self"
-                && dot.as_char() == '.'
-                && self.methods.contains_key(&method.to_string())
-            {
-                self.calls.push(method.to_string());
+            MacroArgs::Join(futures) => {
+                for future in &futures {
+                    self.inline_await(future, future.span().start().line);
+                }
+            }
+            MacroArgs::Other(args) => {
+                for arg in &args {
+                    self.visit_expr(arg);
+                }
             }
         }
     }
@@ -314,21 +343,6 @@ fn expr_attrs(expr: &syn::Expr) -> &[syn::Attribute] {
         syn::Expr::Try(inner) => &inner.attrs,
         _ => &[],
     }
-}
-
-fn flatten(stream: proc_macro2::TokenStream) -> Vec<proc_macro2::TokenTree> {
-    let mut tokens = Vec::new();
-    for token in stream {
-        match token {
-            proc_macro2::TokenTree::Group(ref group)
-                if group.delimiter() != proc_macro2::Delimiter::Parenthesis =>
-            {
-                tokens.extend(flatten(group.stream()));
-            }
-            other => tokens.push(other),
-        }
-    }
-    tokens
 }
 
 /// Every await reachable from `run_loop` that has neither a deadline nor a tag.
@@ -494,4 +508,29 @@ fn the_rule_follows_agent_methods_and_flags_only_untagged_leaves() {
             (32, "self.grill.logs(&id).await;"),
         ]
     );
+}
+
+/// A `select!` arm's body is turn code, and a `join!` awaits its futures
+/// in place, so both are checked like code outside a macro (#1860).
+#[test]
+fn the_rule_reads_select_bodies_and_join_futures_as_turn_code() {
+    let source = r#"
+        impl<G: Grill> BunAgent<G> {
+            async fn run_loop(&mut self) {
+                tokio::select! {
+                    _ = self.shutdown.cancelled() => { self.grill.stop(&id).await; }
+                    Some(cmd) = self.command_rx.recv() => self.handle(cmd).await,
+                }
+            }
+            async fn handle(&mut self, cmd: Command) {
+                tokio::join!(self.grill.kill(&id), self.helper());
+                // LOOP-INLINE: bounded by the harness
+                tokio::join!(self.grill.kill(&id));
+            }
+            async fn helper(&self) {}
+        }
+    "#;
+    let found = violations(&[parse(PathBuf::from("agent.rs"), source)]);
+    let lines: Vec<usize> = found.iter().map(|violation| violation.line).collect();
+    assert_eq!(lines, vec![5, 10]);
 }

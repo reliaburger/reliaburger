@@ -250,7 +250,9 @@ impl OsSlot {
         *state = OsUpdateState::Staging {
             target: directive.version.clone(),
         };
-        save(&self.paths.state_file, &state).map_err(|e| e.to_string())?;
+        save_off_runtime(&self.paths.state_file, &state)
+            .await
+            .map_err(|e| e.to_string())?;
         drop(state);
         let slot = Arc::clone(self);
         let directive = directive.clone();
@@ -271,7 +273,7 @@ impl OsSlot {
         };
         let rebooting = matches!(next, OsUpdateState::Rebooting { .. });
         *self.state.lock().await = next.clone();
-        if let Err(error) = save(&self.paths.state_file, &next) {
+        if let Err(error) = save_off_runtime(&self.paths.state_file, &next).await {
             eprintln!("bun: os update: saving its state: {error}");
         }
         if rebooting {
@@ -281,7 +283,7 @@ impl OsSlot {
                     target,
                     reason: format!("rebooting: {error}"),
                 };
-                let _ = save(&self.paths.state_file, &failed);
+                let _ = save_off_runtime(&self.paths.state_file, &failed).await;
                 *self.state.lock().await = failed;
             }
         }
@@ -352,6 +354,15 @@ fn promote_incoming(staging: &Path, incoming: &Path, files: &[String]) -> Result
 fn save(path: &Path, state: &OsUpdateState) -> std::io::Result<()> {
     let bytes = serde_json::to_vec(state).map_err(std::io::Error::other)?;
     crate::appliance::prepare::write_atomic(path, &bytes, 0o600)
+}
+
+/// [`save`] on the blocking pool: bun's API answers the stage request while
+/// the state file is written and flushed.
+async fn save_off_runtime(path: &Path, state: &OsUpdateState) -> std::io::Result<()> {
+    let (path, state) = (path.to_path_buf(), state.clone());
+    tokio::task::spawn_blocking(move || save(&path, &state))
+        .await
+        .map_err(std::io::Error::other)?
 }
 
 #[cfg(unix)]

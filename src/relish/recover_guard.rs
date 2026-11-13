@@ -197,12 +197,6 @@ mod tests {
         address
     }
 
-    /// An address nothing listens on.
-    async fn gone() -> SocketAddr {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        listener.local_addr().unwrap()
-    }
-
     fn voter(name: &str, api_address: SocketAddr) -> VoterEndpoint {
         VoterEndpoint {
             name: name.to_string(),
@@ -213,7 +207,8 @@ mod tests {
     #[tokio::test]
     async fn recover_refuses_while_a_persisted_voter_answers() {
         let live = fake_voter(r#"{"status":"ok","council_voter":true}"#).await;
-        let voters = [voter("node-1", gone().await), voter("node-2", live)];
+        let gone = crate::refused_address::refused_address();
+        let voters = [voter("node-1", gone), voter("node-2", live)];
         let refused = check_voters_gone(&probe_client().unwrap(), &voters).await;
         assert_eq!(
             refused,
@@ -228,7 +223,8 @@ mod tests {
     #[tokio::test]
     async fn recover_proceeds_when_every_voter_is_gone_or_no_longer_votes() {
         let worker = fake_voter(r#"{"status":"ok","council_voter":false}"#).await;
-        let voters = [voter("node-1", gone().await), voter("node-2", worker)];
+        let gone = crate::refused_address::refused_address();
+        let voters = [voter("node-1", gone), voter("node-2", worker)];
         assert_eq!(
             check_voters_gone(&probe_client().unwrap(), &voters).await,
             Ok(())

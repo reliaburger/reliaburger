@@ -29,6 +29,9 @@ pub mod grill;
 pub mod http_client;
 pub mod ketchup;
 pub mod lettuce;
+// The source rules' parser for macro arguments (#1860): tests only.
+#[cfg(test)]
+mod macro_args;
 pub mod mayo;
 pub mod meat;
 pub mod mustard;
@@ -42,6 +45,8 @@ pub mod policy;
 pub mod proposal;
 pub mod reconstruction;
 pub mod redact;
+#[cfg(test)]
+pub(crate) mod refused_address;
 pub mod relish;
 pub mod reporting;
 pub mod sesame;

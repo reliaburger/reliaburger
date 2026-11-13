@@ -83,10 +83,10 @@ name = "Cluster built by hand on Linux"
 status = "beta"
 since = "0.1.0"
 summary = "`relish init`, join tokens and `relish join` build a cluster on Linux servers or VMs, step by step, with systemd units."
-restrictions = "Rootful runc with eBPF. Cold installs on Linux x86_64 and arm64 hosts haven't been qualified yet."
-issues = [288]
+restrictions = "Rootful runc with eBPF. The release gate doesn't build a cluster by hand."
+issues = []
 docs = ["docs/linux-servers.md", "docs/manual/02_cluster-basics.md#add-nodes"]
-evidence = "Documented in docs/linux-servers.md. The gate's clusters are built by `relish setup --quickstart`, not by hand. V04 (cold installs on Linux x86_64 and arm64) is still open (#288, roadmap Known gaps)."
+evidence = "Documented in docs/linux-servers.md. The gate's clusters are built by `relish setup --quickstart`, not by hand. V04 cold installs of the quickstart passed on clean Linux x86_64 and arm64 hosts on 12 November 2026 (docs/qualification/2026-11-12-v04-cold-installs-linux.md)."
 
 [[group.feature]]
 name = "Agent-guided setup"
@@ -1224,10 +1224,10 @@ name = "Linux hosts, x86_64 and arm64"
 status = "beta"
 since = "0.1.0"
 summary = "`bun` runs on Linux with rootful runc and eBPF; the quickstart guest is Ubuntu 26.04."
-restrictions = "Clusters need rootful runc with eBPF and bpffs at /sys/fs/bpf. Cold installs on Linux hosts haven't been qualified yet; the gate runs arm64 guests on a Mac."
-issues = [288]
+restrictions = "Clusters need rootful runc with eBPF and bpffs at /sys/fs/bpf. The release gate runs arm64 guests on a Mac."
+issues = []
 docs = ["docs/README.md#runc-linux", "docs/linux-servers.md"]
-evidence = "The gate's nodes are Ubuntu 24.04 aarch64 Lima guests (staged install record, Downloaded bytes). Privileged Linux CI suites run on x86_64. V04 (#288) is open."
+evidence = "The gate's nodes are Ubuntu 24.04 aarch64 Lima guests (staged install record, Downloaded bytes). Privileged Linux CI suites run on x86_64. V04 cold installs passed 3 of 3 on clean Linux x86_64 (GitHub-hosted) and arm64 (Lima) hosts, median 85 s and 83 s (docs/qualification/2026-11-12-v04-cold-installs-linux.md)."
 
 [[group.feature]]
 name = "Rootless runc"

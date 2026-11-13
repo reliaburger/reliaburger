@@ -152,6 +152,19 @@ class LoopSummaryTests(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "incomplete")
         self.assertIn("200", rows[0]["note"])
 
+    def test_a_coloured_log_still_reports_its_iteration_count(self):
+        # The workflow sets CARGO_TERM_COLOR=always, so nextest wraps the
+        # words and numbers in escape codes, as run 43183887759 logged them.
+        coloured = (
+            "\x1b[32;1m     Summary\x1b[0m [   0.143s] \x1b[1m3\x1b[0m/\x1b[1m3\x1b[0m"
+            " stress run iterations: \x1b[1m3\x1b[0m \x1b[32;1mpassed\x1b[0m\n"
+        )
+        process, rows, report = self.summarise(PASSING, log_text=coloured)
+        self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+        self.assertEqual(rows[0]["iterations_reported"], 3)
+        self.assertEqual(rows[0]["status"], "pass")
+        self.assertIn("Verdict: **PASS**", report)
+
     def test_a_missing_iteration_count_is_incomplete(self):
         process, rows, _ = self.summarise(PASSING, log_text=None)
         self.assertNotEqual(process.returncode, 0)

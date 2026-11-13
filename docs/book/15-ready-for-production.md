@@ -448,6 +448,16 @@ we had? `soak-identity` was the only multi-instance soak app, and rolling it eve
 would have changed its certificate serials, which is exactly what the identity-rotation gate
 counts. A rollout would have hidden a rotation that had stopped.
 
+The app start number was wrong for a while, and the harness wasn't to blame. Every record
+from 0.2.4 to 0.2.8 shows an app start p99 of 1 ms, because each node wrote its history
+entry's start and completion with the same clock read at the end of the deploy
+([#1640](https://github.com/reliaburger/reliaburger/issues/1640), and Chapter 7 has the
+fix). Those records measured the gap between two consecutive calls to
+`SystemTime::now()`, not an app start, so read their app start column as "not measured".
+Gating it on those records would have set a threshold on a number that can't move, so app
+start waits for records with real starts in them before
+[#1405](https://github.com/reliaburger/reliaburger/issues/1405) sets its gate.
+
 The samples go into a bucketed histogram rather than a list, so a 24-hour run keeps a few
 kilobytes of state, and each p99 is a bucket's upper bound. We put every threshold on a
 bucket bound for the same reason we picked 256 ms: the record's number is then exactly the
@@ -5528,6 +5538,18 @@ network-reference read takes 1.5 s and one whose release does. Both used to
 answer with that error. Now both answer `Ok` after the slow call ends, with
 the runtime asked once and no turn over budget.
 
+The tests had a copy of the same mistake (#1901). Many of them drive a whole
+stop without running the loop, through a test-only `stop_app` that begins the
+stop, waits for the exit and finishes it. Outside a turn, the finish waits
+10 s for the identity directory's removal. Under a storm of disk flushes on
+macOS that removal took longer, the finish answered `StillRunning`, and two
+stop tests failed on an answer that means "ask again". The helper now asks
+again, as `recheck_stop_later` does for the loop: it calls `finish_app_stop`
+with a clone of the same `AppStop` every 50 ms, for up to a minute. Any other
+answer comes straight back. A test stalls the removal 10.5 s with the
+starvation harness's `LoopStall::ArtifactCleanup` and checks the stop still
+succeeds.
+
 Retirement wasn't the only thing asking runc for a network reference under
 the budget. When a stop the egress fence relied on fails, the agent fences
 the app's execution: it force-kills each instance, but only once the runtime
@@ -7798,6 +7820,187 @@ the rest. That left 25, all in the `relish` CLI, a separate process with
 no loop to stall. They're listed in `blocking_rule_baseline.json`, and
 the test fails if that list grows, or if a listed site goes away without
 being removed from it.
+
+#### One call away
+
+That first version had two blind spots, and we knew it when it went in
+(#1860). The capture reader's `lseek` was caught only because its helper,
+`data_start`, was on a hand-kept list of five blocking helpers. Move the
+call one function further down and the rule went quiet. And it never
+looked inside a macro, which sounds harmless until you remember that the
+agent loop's turns are `select!` arms.
+
+The first fix is a *fixed point*. A synchronous function is blocking if
+its own code makes a blocking call, or if it calls a blocking function.
+That definition refers to itself, so you can't answer it in one pass:
+`a` calls `b`, `b` calls `std::fs::read`, and when you read `a` you don't
+know yet what `b` does. So the rule reads every file in `src/` once and
+writes down, for each synchronous function, the first blocking call it
+makes itself and every crate function it calls, resolved through the
+file's `use` items the same way the calls themselves are. Then it marks
+the functions that block directly, and keeps sweeping: any function
+that calls a marked one gets marked. Each sweep can only add functions,
+and there are finitely many, so it stops. That last state, where one
+more sweep changes nothing, is the fixed point. A compiler's dataflow
+analyses work the same way. A second read of every file then flags any
+call from async code into a marked function. Here's what the failure
+message said about the old launch code, with the chain down to the I/O:
+
+```
+src/bun/agent/launch.rs in prepare_fresh_instance: Self::oci_spec_with_secrets
+  (line 481, via crate::bun::agent::launch::BunAgent::oci_spec_with_secrets
+   -> crate::grill::oci::generate_oci_spec_with_decryptor
+   -> crate::grill::oci::build_mounts -> std::fs::create_dir_all)
+```
+
+It resolves free functions and associated calls, `Self::load(..)` and
+`Store::load(..)`, because those name their target. A method called on a
+value (`store.load()`) doesn't: knowing which `load` that is needs the
+value's type, and `syn` gives us syntax, not types. That's what the old
+list is for now. `BLOCKING_HELPERS` stays, for methods and for names that
+arrive through a glob import.
+
+The second fix is parsing macro arguments. `syn` stops at a macro call's
+tokens, because only the macro knows its own grammar: `select!` has
+`pattern = future => body` arms, `vec![0; n]` isn't a list of
+expressions at all. So `src/macro_args.rs` parses the shapes our async
+code uses. A `select!` gets split into arms. Every bracketed group is one
+token tree, so walking the top-level tokens splits at depth 0 without
+counting brackets: each `=>` ends an arm's head, and the body runs to
+the next comma, or is one `{ .. }` block. Then `syn` parses each piece
+as an expression. A `join!`'s arguments are futures it awaits, and any
+other macro's comma-separated arguments (`format!`, `assert!`,
+`matches!`) are expressions too, if they parse. The head of a `select!`
+arm is parsed by a closure:
+
+```rust
+let head_parser = |input: ParseStream| {
+    syn::Pat::parse_multi_with_leading_vert(input)?;
+    input.parse::<syn::Token![=]>()?;
+    let future: syn::Expr = input.parse()?;
+    // ..then an optional `, if condition`
+    Ok((future, condition))
+};
+let (future, condition) = head_parser.parse2(head.iter().cloned().collect()).ok()?;
+```
+
+`head_parser.parse2(..)` calls a method on a closure, which looks odd
+if you come from C or Go. `syn` implements its `Parser` trait for every
+function or closure that takes a `ParseStream` and returns a
+`syn::Result`, so any such closure gets `parse2` for free. In Rust you
+can implement a trait for a whole family of types at once, closures
+included, and that's how a library hands you methods on things you
+wrote yourself.
+
+The parsed expressions raise a lifetime question. The visitor is
+`impl<'ast> Visit<'ast> for FileVisitor<'_>`, and its `visit_expr` takes
+an `&'ast syn::Expr`: a borrow of the file's syntax tree. The arms we just
+parsed don't live in that tree; they're locals in `visit_macro`, and die
+when it returns. They can still be visited, because the impl is generic
+over `'ast`. It holds for *every* lifetime, so calling `self.visit_expr`
+on a local picks the short lifetime of that borrow, and the compiler
+checks nothing outlives it. Had we written the impl for one fixed
+lifetime, it wouldn't compile.
+
+The agent loop's await rule had its own way into `select!`: it scanned
+the arm tokens for `self.method(..)` and for `timeout(..)`. It uses the
+shared parser now, so an arm's body is checked like any other turn code
+and a `join!` awaits its futures in place. That found two awaits nobody
+had looked at: `self.supervisor.grill().state(id).await` inside a
+`matches!` in shutdown's stop loop. They're shutdown's last turn, like
+their tagged neighbours, so they got the same tag.
+
+Run over the crate, the new rule found 219 sites the old one couldn't
+see. 179 were in the `relish` CLI, and 116 of those came down to two
+helpers: `BunClient::default_local`, which reads the local context file,
+and `BuildInfo::current`, which a dev build works out by packing its
+checkout. A baseline that may only shrink would make every new async
+command trip over them. So the read inside each carries a CLI tag (a
+one-shot read before the command does anything long-lived), and the
+baseline lists the other 63 beside the first 25. `relish mcp` is the
+exception. It's a server and runs for hours, so it gets no tag: its one
+call of `default_local` now goes through `spawn_blocking`, and its other
+sites stay in the baseline where we can see them. The 40 on the node's
+side went three ways:
+
+- **Moved off the runtime.** Building a container's OCI spec writes each
+  inline config file and creates the identity mount directory with
+  `std::fs`, and the agent loop did it inline in `prepare_fresh_instance`
+  and `prepare_rolling_instance`. That's the #1857 shape exactly: disk
+  writes on the loop's own worker. Now `oci_spec_off_runtime` builds the
+  spec on the blocking pool (the secret decryptor is `!Send`, so it's
+  made and used inside the closure). The metric and log stores' directory
+  listings for every query and the rollup hydration, the rootless
+  runtime's socket checks under `/tmp`, the build runner's scratch
+  directory, and the upgrade marker read moved to `spawn_blocking` too.
+  So did the node-pressure fault's cgroup setup and teardown, after
+  review caught a tag that wasn't true. The first pass had tagged
+  `remove_fault_cgroup` "cgroupfs, no disk behind it". It writes
+  `cgroup.kill`, then retries `remove_dir` up to 20 times with a
+  `std::thread::sleep` of 10 ms between tries: up to 200 ms on a runtime
+  worker. A tag is a claim about the code under it, and nothing checks
+  the claim. The rule now counts `std::thread::sleep` as blocking too.
+- **Tagged cgroupfs and procfs.** Most of the rest were reads and writes
+  of `cgroup.procs`, `cpu.max` or `/proc/<pid>/stat` behind a helper or
+  two: fault reversals, egress cgroup ids, task-group pid lists,
+  adopted-process polls. The
+  kernel answers those from memory, so they carry
+  `// BLOCKING-OK: cgroupfs, ...` or `procfs, ...`.
+- **Tagged startup.** Opening the Raft stores, the metrics store and the
+  rollup store, the metrics archive owner, and identity restore during
+  adoption all run before the agent loop does, and offline recovery runs
+  with no node at all.
+
+What it still can't see: a method on a value whose name isn't listed, a
+function behind a glob or a `pub use` re-export, and a `Drop` impl. That
+last one is worth remembering. The build runner's scratch directory
+removes itself with `remove_dir_all` when it's dropped, and a drop runs
+wherever the value goes out of scope, async code included. No call
+appears in the source at that point, so a syntax-based rule can't flag
+it.
+
+#### The method on `self`
+
+One kind of method call does name its target: `self.load()`. Inside an
+`impl Store` block, `self` is a `Store`, so `self.load()` is
+`Store::load(self)` written another way. The rule followed `Self::load`
+but not `self.load()`, and review found it was skipping 11 node-side
+sites that way (#1887). Upgrade `prepare` read the history file a few
+lines below the marker read #1870 had just moved off the runtime. runc's
+`apply_image_config` resolved the image's user from the rootfs and
+chowned the identity directory, on the task that started the container.
+Now the visitor resolves `self.m()` through the enclosing `impl`, and
+both are on the blocking pool: `reverted_upgrade_ids_off_runtime` reads
+the history in `spawn_blocking`, and `apply_image_config` became a free
+function, since all it needed from `self` was one `bool`. It moves the
+spec into the closure and hands it back as the result, so nothing on the
+runtime borrows it in the meantime.
+
+The rest came down to three reads the kernel answers from memory. The
+job runtime asks `executor_support` on the agent loop, and its first
+call probes the kernel by making and removing a scratch cgroup. It's
+cached in a `OnceLock` (a value computed once, the first time anything
+asks), so Bun now asks once at startup, on the blocking pool, and the
+loop only ever reads the cached answer. A process's start time and the
+boot ID are one procfs read each, and the volumes directory's device is
+one `stat` of an inode cached since startup. Those carry tags.
+
+The same review found three places where the macro parser dropped code
+without saying so. A `select!` arm like `=> Ok::<(), Error>(())` has a
+comma inside its turbofish that no bracket holds, so splitting at the
+first top-level comma cut the arm in two, and both halves failed to
+parse. A `matches!(std::fs::read(p), Ok(v) if v.is_empty())` has a
+second argument that's a pattern, not an expression, and one bad
+argument used to lose them all. Both now try a piece with its first
+comma, then its second, and keep the shortest prefix that parses, so a
+piece that isn't an expression only hides itself. The third was about
+names, not parsing. `BunAgent`'s methods are split across a dozen files
+that start with `use super::*`. A glob import leaves no alias to follow,
+so each file resolved `BunAgent` to a type in its own module, and a
+`Self::helper()` call between two of those files never matched. The rule
+now indexes where every struct and enum in the crate is defined, and a
+name a glob brought in resolves to the one place it's defined. That
+found nothing new today, but it would have hidden the next one.
 
 It also changes how to read #1606, #1707 and #1853. Each was diagnosed
 as a slow write the turn waited for. A blocking call on a shared worker

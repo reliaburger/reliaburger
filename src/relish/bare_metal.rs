@@ -408,24 +408,35 @@ pub async fn add(
         with_node.nodes.push(node.clone());
         let config = with_node.seed_config(node, SeedRole::Join, Some(token), &None);
         let path = directory.join("stick").join(stick_file(&node.mac));
+        // BLOCKING-OK: relish CLI: a one-shot write before the command does anything long-lived
         write_private(&path, &seed_tarball(&config, &files)?)?;
         written.push(path);
     }
     fleet.nodes.extend(added.iter().cloned());
+    // BLOCKING-OK: relish CLI: a one-shot write before the command does anything long-lived
     write_private(
         &fleet_path,
         &serde_json::to_vec_pretty(&fleet).map_err(RelishError::SerialiseJson)?,
     )?;
     for node in &added {
         if !admitted(&fleet, node.address) {
-            eprintln!(
-                "warning: {} isn't in a network the cluster admits (cluster create --network); add it to \
-                 [security] bootstrap_peers on the existing nodes, or it can't reach them to join",
-                node.address
-            );
+            eprintln!("{}", not_admitted_warning(node.address));
         }
     }
     Ok(added.into_iter().zip(written).collect())
+}
+
+/// What to tell the user about a machine outside the network the cluster
+/// admits (`cluster create --network`): its firewalls drop it until it
+/// joins. Claiming it opens a join window on every node, so only a stick
+/// boot needs `bootstrap_peers`.
+fn not_admitted_warning(address: IpAddr) -> String {
+    format!(
+        "warning: {address} isn't in a network the cluster admits (cluster create --network), so the \
+         existing nodes' firewalls drop it until it joins. `relish machines claim` opens a join window \
+         for it; to boot it from its stick instead, add it to [security] bootstrap_peers on the \
+         existing nodes first"
+    )
 }
 
 /// A machine and the seed written for it.
@@ -985,6 +996,18 @@ mod tests {
             },
             "192.168.1.54".parse().unwrap()
         ));
+    }
+
+    #[test]
+    fn an_unadmitted_machine_s_warning_says_claiming_needs_no_bootstrap_peers() {
+        // A claim opens a join window on every node, so only a machine
+        // booted from its stick needs `bootstrap_peers` (G2).
+        let warning = not_admitted_warning("10.0.0.5".parse().unwrap());
+        assert!(warning.contains("10.0.0.5"), "{warning}");
+        assert!(warning.contains("relish machines claim"), "{warning}");
+        assert!(warning.contains("join window"), "{warning}");
+        assert!(warning.contains("bootstrap_peers"), "{warning}");
+        assert!(warning.contains("stick"), "{warning}");
     }
 
     #[test]

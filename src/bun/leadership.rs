@@ -42,20 +42,42 @@ pub async fn council_to_forward_to(state: &ApiState) -> Option<&CouncilNode> {
 
 #[cfg(test)]
 mod tests {
-    /// No request handler under `src/bun/api/` decides with a single round.
-    /// A background loop may, if the line before says why, with `(#1393)`.
+    /// Every `.rs` file under `src/bun/`, leaving out test-only files.
+    fn production_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            if path.is_dir() {
+                if name != "tests" {
+                    production_sources(&path, out);
+                }
+            } else if name.ends_with(".rs") && !name.contains("tests") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// No request handler in `src/bun/` decides with a single round: not
+    /// only the API modules, since the job, batch, task-array and build
+    /// routes live beside them. A background loop may, if the line before
+    /// says why, with `(#1393)`. A file's inline test module is skipped.
     #[test]
     fn request_handlers_confirm_leadership_rather_than_trust_one_round() {
-        let api = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bun/api");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bun");
+        let mut sources = Vec::new();
+        production_sources(&root, &mut sources);
         let mut found = Vec::new();
-        for entry in std::fs::read_dir(&api).unwrap() {
-            let path = entry.unwrap().path();
-            if path.extension().is_none_or(|e| e != "rs") || path.ends_with("tests.rs") {
-                continue;
-            }
+        for path in sources {
             let source = std::fs::read_to_string(&path).unwrap();
             let lines: Vec<&str> = source.lines().collect();
             for (index, line) in lines.iter().enumerate() {
+                let test_module = line.trim() == "#[cfg(test)]"
+                    && lines
+                        .get(index + 1)
+                        .is_some_and(|next| next.trim_start().starts_with("mod "));
+                if test_module {
+                    break;
+                }
                 let explained = index > 0 && lines[index - 1].contains("(#1393)");
                 if line.contains(".is_leader()") && !explained {
                     found.push(format!("{}:{}: {}", path.display(), index + 1, line.trim()));

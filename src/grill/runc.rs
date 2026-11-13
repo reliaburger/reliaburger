@@ -320,7 +320,20 @@ impl RuncGrill {
                 .await
                 .map_err(GrillError::ImagePull)?;
             let lower = pulled.rootfs;
-            self.apply_image_config(instance, &mut spec, &pulled.config, &lower)?;
+            // Resolving the image's user reads the rootfs, and handing the
+            // identity directory over chowns a tree: the blocking pool's work
+            // (#1887).
+            let rootless = self.rootless;
+            let (id, rootfs) = (instance.clone(), lower.clone());
+            spec = tokio::task::spawn_blocking(move || {
+                let mut spec = spec;
+                apply_image_config(rootless, &id, &mut spec, &pulled.config, &rootfs).map(|()| spec)
+            })
+            .await
+            .map_err(|error| GrillError::StartFailed {
+                instance: instance.clone(),
+                reason: format!("applying the image config stopped: {error}"),
+            })??;
             // An init container borrows the app's volumes: handing them to
             // its user would take them from the app's (#701). Root in the
             // container's user namespace can write them as they are.
@@ -464,39 +477,38 @@ impl RuncGrill {
     }
 }
 
-impl RuncGrill {
-    /// Resolve the process against the image config, then (rootful) move it
-    /// into the node's user namespace and hand it its identity directory.
-    fn apply_image_config(
-        &self,
-        instance: &InstanceId,
-        spec: &mut OciSpec,
-        config: &super::image_config::ImageConfig,
-        rootfs: &std::path::Path,
-    ) -> Result<(), GrillError> {
-        let failed = |reason: String| GrillError::StartFailed {
-            instance: instance.clone(),
-            reason,
-        };
-        super::image_config::resolve_process(&mut spec.process, config, rootfs)
-            .map_err(|e| failed(e.to_string()))?;
-        if self.rootless {
-            return Ok(());
-        }
-        super::userns::apply(spec).map_err(|e| failed(e.to_string()))?;
-        if let Some(identity) =
-            super::userns::bind_source(spec, std::path::Path::new(IDENTITY_MOUNT)).cloned()
-            && identity.is_dir()
-        {
-            super::userns::chown_to_container_user(&identity, spec).map_err(|e| {
-                failed(format!(
-                    "failed to hand identity directory {} to the container user: {e}",
-                    identity.display()
-                ))
-            })?;
-        }
-        Ok(())
+/// Resolve the process against the image config, then (rootful) move it
+/// into the node's user namespace and hand it its identity directory.
+/// Synchronous: it reads the rootfs and chowns a tree.
+fn apply_image_config(
+    rootless: bool,
+    instance: &InstanceId,
+    spec: &mut OciSpec,
+    config: &super::image_config::ImageConfig,
+    rootfs: &std::path::Path,
+) -> Result<(), GrillError> {
+    let failed = |reason: String| GrillError::StartFailed {
+        instance: instance.clone(),
+        reason,
+    };
+    super::image_config::resolve_process(&mut spec.process, config, rootfs)
+        .map_err(|e| failed(e.to_string()))?;
+    if rootless {
+        return Ok(());
     }
+    super::userns::apply(spec).map_err(|e| failed(e.to_string()))?;
+    if let Some(identity) =
+        super::userns::bind_source(spec, std::path::Path::new(IDENTITY_MOUNT)).cloned()
+        && identity.is_dir()
+    {
+        super::userns::chown_to_container_user(&identity, spec).map_err(|e| {
+            failed(format!(
+                "failed to hand identity directory {} to the container user: {e}",
+                identity.display()
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 /// Where the workload identity directory appears inside a container.
@@ -784,13 +796,7 @@ mod tests {
 
     /// The Bun binary that owns runtime commands in these tests.
     fn test_owner() -> PathBuf {
-        std::env::var_os("RELIABURGER_BUN_BINARY")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                // Unit tests run from target/<profile>/deps; Bun is built beside it.
-                let executable = std::env::current_exe().unwrap();
-                executable.parent().unwrap().parent().unwrap().join("bun")
-            })
+        crate::testkit::bun_binary::bun_binary().unwrap_or_else(|error| panic!("{error}"))
     }
 
     fn preparation_spec(command: &str) -> OciSpec {

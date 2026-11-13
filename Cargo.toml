@@ -151,6 +151,8 @@ http-body-util = "0.1"
 syn = { version = "2", features = ["full", "visit"] }
 # Line numbers for syn's spans, so the agent-loop rule can point at a line.
 proc-macro2 = { version = "1", features = ["span-locations"] }
+# Prints a parsed expression back as text, for the macro-argument parser's tests.
+quote = "1"
 insta = { version = "1", features = ["json"] }
 proptest = "1"
 tower = { version = "0.5", features = ["util"] }

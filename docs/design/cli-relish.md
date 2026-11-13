@@ -1822,7 +1822,7 @@ These events are visible in `relish history` and in the TUI/web events view. Sec
 
 Target: under 50ms from invocation to first API request.
 
-Relish is a single Rust binary. Linux release builds link glibc (`*-linux-gnu`); static musl builds are planned with 0.3.0 (#401). Startup consists of: argument parsing (clap, <1ms), config file loading (TOML parse, <2ms), API client construction (TLS context, <10ms), and the first HTTP request.
+Relish is a single Rust binary. Linux release builds link glibc (`*-linux-gnu`); static musl builds are planned ([#1774](https://github.com/reliaburger/reliaburger/issues/1774)). Startup consists of: argument parsing (clap, <1ms), config file loading (TOML parse, <2ms), API client construction (TLS context, <10ms), and the first HTTP request.
 
 For commands that don't contact the cluster (`compile`, `lint`, `fmt`, `diff`, `--version`), total execution time is typically under 20ms.
 
@@ -2051,7 +2051,7 @@ Relish is implemented in Rust. The following crates are used:
 | `rustls` | 0.23.x | TLS implementation (used by reqwest) for mTLS client certs |
 | `insta` | 1.x | Snapshot testing for TUI rendering (dev dependency) |
 
-Release builds pin every dependency in `Cargo.lock`. Linux builds link glibc dynamically; a static musl build is planned with 0.3.0 (#401).
+Release builds pin every dependency in `Cargo.lock`. Linux builds link glibc dynamically; a static musl build is planned ([#1774](https://github.com/reliaburger/reliaburger/issues/1774)).
 
 ---
 

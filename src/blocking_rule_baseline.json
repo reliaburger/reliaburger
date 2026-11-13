@@ -1,5 +1,59 @@
 [
   {
+    "path": "src/relish/agent/diagnose.rs",
+    "function": "run_diagnose",
+    "call": "load_bundle",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/mod.rs",
+    "function": "run",
+    "call": "report::run",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch.rs",
+    "function": "answer",
+    "call": "apply::apply",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch.rs",
+    "function": "answer",
+    "call": "apply::read_diff",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch.rs",
+    "function": "answer",
+    "call": "workspace::diff",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch.rs",
+    "function": "answer",
+    "call": "workspace::init",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch.rs",
+    "function": "run",
+    "call": "Bundle::load",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch/builder.rs",
+    "function": "build",
+    "call": "open",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch/builder.rs",
+    "function": "build",
+    "call": "snapshot",
+    "count": 1
+  },
+  {
     "path": "src/relish/agent/patch/builder.rs",
     "function": "build_in_vm",
     "call": "std::fs::create_dir_all",
@@ -25,6 +79,30 @@
   },
   {
     "path": "src/relish/agent/patch/cluster.rs",
+    "function": "destroy",
+    "call": "every_record",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch/cluster.rs",
+    "function": "destroy",
+    "call": "forget",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch/cluster.rs",
+    "function": "destroy",
+    "call": "open",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch/cluster.rs",
+    "function": "destroy_one",
+    "call": "child_relish",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch/cluster.rs",
     "function": "destroy_one",
     "call": "std::fs::read_to_string",
     "count": 1
@@ -38,13 +116,157 @@
   {
     "path": "src/relish/agent/patch/cluster.rs",
     "function": "try_cluster",
+    "call": "child_relish",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch/cluster.rs",
+    "function": "try_cluster",
+    "call": "make_home",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch/cluster.rs",
+    "function": "try_cluster",
+    "call": "open",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch/cluster.rs",
+    "function": "try_cluster",
+    "call": "snapshot",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch/cluster.rs",
+    "function": "try_cluster",
     "call": "std::fs::read_to_string",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch/cluster.rs",
+    "function": "try_cluster",
+    "call": "write_record",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch/suite.rs",
+    "function": "test",
+    "call": "open",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/patch/suite.rs",
+    "function": "test",
+    "call": "snapshot",
     "count": 1
   },
   {
     "path": "src/relish/agent/propose.rs",
     "function": "propose",
     "call": "std::fs::read_to_string",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/setup/mod.rs",
+    "function": "token_facts",
+    "call": "token_origin",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/setup/mod.rs",
+    "function": "token_plan",
+    "call": "crate::relish::local_context::LocalContext::load",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/setup/mod.rs",
+    "function": "token_plan",
+    "call": "credentials::StoredToken::load",
+    "count": 2
+  },
+  {
+    "path": "src/relish/agent/setup/mod.rs",
+    "function": "token_plan",
+    "call": "credentials::files_beside",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/setup/mod.rs",
+    "function": "token_plan",
+    "call": "token_origin",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/source.rs",
+    "function": "run",
+    "call": "Bundle::load",
+    "count": 1
+  },
+  {
+    "path": "src/relish/agent/why.rs",
+    "function": "run",
+    "call": "load_bundle",
+    "count": 2
+  },
+  {
+    "path": "src/relish/agent/why.rs",
+    "function": "run",
+    "call": "super::diagnose::run_explain",
+    "count": 1
+  },
+  {
+    "path": "src/relish/ca_cmd.rs",
+    "function": "ca_rotate",
+    "call": "open_and_verify",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "batch_with_client",
+    "call": "Config::from_file",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "build",
+    "call": "Config::from_file",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "council_recover",
+    "call": "crate::sesame::bootstrap::load_master_key",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "council_recover",
+    "call": "recover_data_dir",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "deploy",
+    "call": "load_config_file",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "gitops_set",
+    "call": "read_gitops_section",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "join",
+    "call": "crate::sesame::identity_store::save",
+    "count": 1
+  },
+  {
+    "path": "src/relish/commands.rs",
+    "function": "secret_pubkey",
+    "call": "resolve_secret_pubkey",
     "count": 1
   },
   {
@@ -57,6 +279,18 @@
     "path": "src/relish/commands.rs",
     "function": "submit_task_manifest_with_client",
     "call": "std::fs::read_to_string",
+    "count": 1
+  },
+  {
+    "path": "src/relish/dev.rs",
+    "function": "create",
+    "call": "prepare_security",
+    "count": 1
+  },
+  {
+    "path": "src/relish/dev.rs",
+    "function": "create",
+    "call": "save_cluster",
     "count": 1
   },
   {
@@ -79,6 +313,24 @@
   },
   {
     "path": "src/relish/dev.rs",
+    "function": "destroy",
+    "call": "delete_cluster_state",
+    "count": 1
+  },
+  {
+    "path": "src/relish/dev.rs",
+    "function": "destroy",
+    "call": "load_cluster",
+    "count": 1
+  },
+  {
+    "path": "src/relish/dev.rs",
+    "function": "destroy",
+    "call": "remove_security",
+    "count": 1
+  },
+  {
+    "path": "src/relish/dev.rs",
     "function": "ensure_build_vm",
     "call": "std::fs::write",
     "count": 1
@@ -87,6 +339,30 @@
     "path": "src/relish/dev.rs",
     "function": "install_file",
     "call": "std::fs::read",
+    "count": 1
+  },
+  {
+    "path": "src/relish/dev.rs",
+    "function": "start",
+    "call": "load_cluster",
+    "count": 1
+  },
+  {
+    "path": "src/relish/dev.rs",
+    "function": "status",
+    "call": "load_cluster",
+    "count": 1
+  },
+  {
+    "path": "src/relish/dev.rs",
+    "function": "stop",
+    "call": "load_cluster",
+    "count": 1
+  },
+  {
+    "path": "src/relish/fault.rs",
+    "function": "scenario",
+    "call": "scenario::load_scenario",
     "count": 1
   },
   {
@@ -120,15 +396,99 @@
     "count": 2
   },
   {
+    "path": "src/relish/gym/record.rs",
+    "function": "record",
+    "call": "append",
+    "count": 1
+  },
+  {
+    "path": "src/relish/gym/runner.rs",
+    "function": "one_run",
+    "call": "finish",
+    "count": 1
+  },
+  {
+    "path": "src/relish/gym/runner.rs",
+    "function": "run_body",
+    "call": "find_drafts",
+    "count": 1
+  },
+  {
+    "path": "src/relish/gym/runner.rs",
+    "function": "run_body",
+    "call": "prepare",
+    "count": 1
+  },
+  {
+    "path": "src/relish/gym/runner.rs",
+    "function": "run_body",
+    "call": "read_answer",
+    "count": 1
+  },
+  {
+    "path": "src/relish/gym/runner.rs",
+    "function": "run_body",
+    "call": "record::read_log",
+    "count": 1
+  },
+  {
+    "path": "src/relish/manifest.rs",
+    "function": "load",
+    "call": "read_file",
+    "count": 1
+  },
+  {
+    "path": "src/relish/mcp.rs",
+    "function": "run",
+    "call": "Managed::from_context",
+    "count": 1
+  },
+  {
+    "path": "src/relish/mcp.rs",
+    "function": "run",
+    "call": "crate::relish::client::token_origin",
+    "count": 1
+  },
+  {
+    "path": "src/relish/mcp/credentials.rs",
+    "function": "obtain",
+    "call": "StoredToken::load",
+    "count": 2
+  },
+  {
+    "path": "src/relish/mcp/credentials.rs",
+    "function": "remove",
+    "call": "StoredToken::load",
+    "count": 1
+  },
+  {
     "path": "src/relish/mcp/credentials.rs",
     "function": "remove",
     "call": "std::fs::remove_file",
     "count": 1
   },
   {
+    "path": "src/relish/quickstart/runner.rs",
+    "function": "run",
+    "call": "crate::relish::install::invocation",
+    "count": 1
+  },
+  {
+    "path": "src/relish/quickstart/server_runner.rs",
+    "function": "run",
+    "call": "crate::relish::install::invocation",
+    "count": 1
+  },
+  {
     "path": "src/relish/setup.rs",
     "function": "offer_to_start",
     "call": "std::fs::File::create",
+    "count": 1
+  },
+  {
+    "path": "src/relish/setup.rs",
+    "function": "run",
+    "call": "find_on_path",
     "count": 1
   },
   {
@@ -141,6 +501,24 @@
     "path": "src/relish/setup.rs",
     "function": "run",
     "call": "std::fs::write",
+    "count": 1
+  },
+  {
+    "path": "src/relish/source.rs",
+    "function": "run",
+    "call": "documents",
+    "count": 1
+  },
+  {
+    "path": "src/relish/upgrade.rs",
+    "function": "start_from_file",
+    "call": "SignatureEnvelope::load",
+    "count": 1
+  },
+  {
+    "path": "src/relish/upgrade.rs",
+    "function": "start_from_file",
+    "call": "signing::sha256_file",
     "count": 1
   },
   {

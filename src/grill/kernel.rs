@@ -59,7 +59,9 @@ impl ExecutorSupport {
 pub fn executor_support() -> ExecutorSupport {
     static SUPPORT: OnceLock<ExecutorSupport> = OnceLock::new();
     *SUPPORT.get_or_init(|| {
+        // BLOCKING-OK: probed once per process; Bun warms this on the blocking pool at startup, so later calls read the cached answer (#1887)
         let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").ok();
+        // BLOCKING-OK: the same one-time probe, warmed at startup (#1887)
         let support = probe(
             release.as_deref(),
             Path::new("/proc/thread-self/children"),

@@ -661,8 +661,22 @@ impl ScopedDir {
 }
 
 impl Drop for ScopedDir {
+    /// A build context can hold thousands of files, and the value is
+    /// dropped in async code, so inside a runtime the delete goes to the
+    /// blocking pool rather than stalling the worker it was dropped on
+    /// (#1871). Outside one there's no worker to stall.
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+        let path = std::mem::take(&mut self.path);
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn_blocking(move || {
+                    let _ = std::fs::remove_dir_all(path);
+                });
+            }
+            Err(_) => {
+                let _ = std::fs::remove_dir_all(&path);
+            }
+        }
     }
 }
 
@@ -1121,7 +1135,9 @@ async fn run_build_inner(
     // A unique, self-cleaning build directory. `ScopedDir::drop` removes
     // it on every exit path below, so no failure leaves a stray context.
     let base = std::env::temp_dir().join("reliaburger-build");
-    let build_dir = ScopedDir::new(&base, build_id)
+    let build_dir = tokio::task::spawn_blocking(move || ScopedDir::new(&base, build_id))
+        .await
+        .map_err(|e| format!("failed to create build directory: {e}"))?
         .map_err(|e| format!("failed to create build directory: {e}"))?;
     // The tar lands beside the context, not inside it, so `context.tar`
     // never becomes part of the build.
@@ -2231,6 +2247,54 @@ mod tests {
             path
         };
         assert!(!path.exists(), "ScopedDir should delete itself on drop");
+    }
+
+    /// #1871: dropping a build directory in async code mustn't stall the
+    /// worker it runs on while thousands of files are deleted. On a
+    /// current-thread runtime an inline delete would stop the ticker for
+    /// the whole delete.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_a_scoped_dir_in_async_code_never_blocks_the_runtime() {
+        let base = std::env::temp_dir().join("reliaburger-build-test");
+        let dir = ScopedDir::new(&base, 1871).unwrap();
+        let path = dir.path().to_path_buf();
+        let tree = path.clone();
+        tokio::task::spawn_blocking(move || {
+            for d in 0..100 {
+                let sub = tree.join(format!("d{d}"));
+                std::fs::create_dir(&sub).unwrap();
+                for f in 0..100 {
+                    std::fs::write(sub.join(format!("f{f}")), b"x").unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        let ticker = tokio::spawn(async {
+            let mut longest = std::time::Duration::ZERO;
+            let mut last = std::time::Instant::now();
+            for _ in 0..50 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                longest = longest.max(last.elapsed());
+                last = std::time::Instant::now();
+            }
+            longest
+        });
+        tokio::task::yield_now().await;
+        drop(dir);
+        let longest = ticker.await.unwrap();
+        assert!(
+            longest < std::time::Duration::from_millis(200),
+            "the runtime stalled for {longest:?} while the directory was deleted"
+        );
+        for _ in 0..300 {
+            if !path.exists() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!("the dropped build directory was never deleted");
     }
 
     #[test]

@@ -4333,6 +4333,7 @@ fn finalise_web(
         new_ips: [(replacement, None)].into_iter().collect(),
         new_specs: Default::default(),
         now: Instant::now(),
+        started_at: std::time::SystemTime::now(),
         reply,
     }
 }

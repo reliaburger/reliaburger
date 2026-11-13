@@ -1226,9 +1226,7 @@ mod tests {
             serde_json::to_string(&metadata(Some(OLD), None)).unwrap(),
         )
         .unwrap();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        drop(listener);
+        let address = crate::refused_address::refused_address();
         let client = BunClient::new_with_token(&format!("http://{address}"), None);
         let args = UpgradeCheckArgs {
             url: "https://unused.invalid/metadata.json".to_string(),

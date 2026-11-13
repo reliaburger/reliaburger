@@ -1968,9 +1968,7 @@ mod tests {
     /// cluster it never saw.
     #[tokio::test]
     async fn plan_refuses_a_cluster_it_could_not_reach() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        drop(listener);
+        let address = crate::refused_address::refused_address();
         let client = BunClient::new_with_token(&format!("http://{address}"), None);
 
         let error = plan_roles(&client, None).await.unwrap_err();
