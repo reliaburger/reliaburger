@@ -485,12 +485,13 @@ jobs:
 
       - name: Seeded pair (x86-64, KVM)
         # Two appliances form a cluster from their seeds alone, with the
-        # bun and relish of the commit under test (lab builds only).
+        # bun and relish of the commit under test (lab builds only). Node 1
+        # reads its seed from an RBSEED stick: qemu-img and mtools make it.
         if: matrix.arch == 'x86_64' && env.BROKEN_BUN != '1' && hashFiles('source-bin/relish-linux-x86_64') != ''
         timeout-minutes: 25
         run: |
           set -euo pipefail
-          sudo apt-get install -y -qq dnsmasq-base
+          sudo apt-get install -y -qq dnsmasq-base qemu-utils mtools
           chmod +x source-bin/relish-linux-x86_64
           image/tests/seeded-pair.sh image/mkosi.output "$IMAGE_VERSION" source-bin/relish-linux-x86_64
 
