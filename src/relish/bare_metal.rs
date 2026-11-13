@@ -652,19 +652,37 @@ pub fn create_confirmed(
 
 /// Every file and directory under `dir`, relative to it; empty if `dir`
 /// doesn't exist. Symbolic links count as files and aren't followed.
+///
+/// A directory it may not read, or an entry that vanishes while it looks,
+/// is skipped rather than failing `cluster create`: `create` writes only
+/// its own files, never into something it can't read, so what it can't
+/// list is never in the difference, and is never removed.
 fn written_tree(dir: &Path) -> std::io::Result<BTreeSet<PathBuf>> {
+    let skipped = |error: &std::io::Error| {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+        )
+    };
     let mut found = BTreeSet::new();
     let mut pending = vec![dir.to_path_buf()];
     while let Some(current) = pending.pop() {
         let entries = match std::fs::read_dir(&current) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if skipped(&error) => continue,
             Err(error) => return Err(error),
         };
         for entry in entries {
-            let path = entry?.path();
-            if std::fs::symlink_metadata(&path)?.is_dir() {
-                pending.push(path.clone());
+            let path = match entry {
+                Ok(entry) => entry.path(),
+                Err(error) if skipped(&error) => continue,
+                Err(error) => return Err(error),
+            };
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_dir() => pending.push(path.clone()),
+                Ok(_) => {}
+                Err(error) if skipped(&error) => continue,
+                Err(error) => return Err(error),
             }
             if let Ok(relative) = path.strip_prefix(dir) {
                 found.insert(relative.to_path_buf());
@@ -1426,6 +1444,31 @@ mod tests {
         assert_eq!(
             std::fs::read(dir.path().join("notes.txt")).unwrap(),
             b"mine"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_directory_inside_an_existing_one_neither_stops_create_nor_is_touched() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::write(locked.join("private.txt"), b"not yours").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let keys = tempfile::tempdir().unwrap();
+
+        let refused = create_confirmed(&options_keeping_keys_in(dir.path(), keys.path()), || {
+            ctrl_d(&dir.path().join("secrets"))
+        });
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            matches!(refused, Err(RelishError::BackupNotConfirmed { .. })),
+            "listing the directory stopped create: {refused:?}"
+        );
+        assert_eq!(everything_in(dir.path()), ["locked", "locked/private.txt"]);
+        assert_eq!(
+            std::fs::read(locked.join("private.txt")).unwrap(),
+            b"not yours"
         );
     }
 
