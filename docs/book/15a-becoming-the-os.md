@@ -884,6 +884,19 @@ The `'_` in `CertificateDer<'_>` is an elided lifetime: the certificate borrows 
 
 Notice what the verifier doesn't skip. The certificate must still match the key that signed the handshake, so a machine that merely *copies* another's certificate can't finish connecting. The test for all this runs the real claim server on loopback: a post pinned to the wrong fingerprint never connects and the seed never lands, then the right one claims the machine.
 
+The pinning only helps if the human's answer is read properly, and at first nothing tested the question itself, because it read the real stdin. So the question became `confirm_with`, which takes the terminal flag, the input and the output as arguments:
+
+```rust
+fn confirm_with(
+    machines: &[(String, IpAddr, String)],
+    is_terminal: bool,
+    mut input: impl std::io::BufRead,
+    mut output: impl std::io::Write,
+) -> Result<(), RelishError>
+```
+
+`impl BufRead` in argument position means "any type that implements this trait", picked at compile time, much like a Go function taking an `io.Reader`, except that Rust builds a separate copy for each concrete type, so there's no interface dispatch at run time. The real command passes `stdin().lock()` and `stdout()`. A test passes a byte slice of typed answers (`&[u8]` implements `BufRead`) and a `Vec<u8>` that collects the prompts. The tests check that each machine is shown with its short key, that a "no" stops at that machine without asking about the next, that only `y`, `Y` and `yes` count (an empty answer or end of input is a no), and that without a terminal it refuses and points at `--trust-lan`.
+
 ### A window in the firewall
 
 One more problem. Each node's perimeter firewall lets cluster ports through only from known nodes, the operator, and the bootstrap peers in `node.toml`. A machine claimed into a running cluster is none of those yet, so its enrolment request is dropped before it can show its token. Editing every node's `node.toml` for each new machine defeats the point of claiming.

@@ -546,21 +546,38 @@ async fn open_join_windows(machines: &[(String, IpAddr)]) -> Result<(), RelishEr
 /// Anyone on the LAN can answer mDNS, so this is what stops a seed, and the
 /// cluster's secrets in it, going to the wrong machine.
 fn confirm(machines: &[(String, IpAddr, String)]) -> Result<(), RelishError> {
-    use std::io::{BufRead, IsTerminal, Write};
-    if !std::io::stdin().is_terminal() {
+    use std::io::IsTerminal;
+    confirm_with(
+        machines,
+        std::io::stdin().is_terminal(),
+        std::io::stdin().lock(),
+        std::io::stdout(),
+    )
+}
+
+/// [`confirm`], reading the answers from `input` and asking on `output`, so
+/// a test can be the operator.
+fn confirm_with(
+    machines: &[(String, IpAddr, String)],
+    is_terminal: bool,
+    mut input: impl std::io::BufRead,
+    mut output: impl std::io::Write,
+) -> Result<(), RelishError> {
+    if !is_terminal {
         return Err(failed(
             "compare the claim keys with the machines' consoles: run this in a terminal, \
              or pass --trust-lan if you trust everything on this network",
         ));
     }
     for (mac, address, fingerprint) in machines {
-        print!(
+        write!(
+            output,
             "Does the console of {mac} ({address}) show claim key {}? [y/N] ",
             short_fingerprint(fingerprint)
-        );
-        std::io::stdout().flush()?;
+        )?;
+        output.flush()?;
         let mut answer = String::new();
-        std::io::stdin().lock().read_line(&mut answer)?;
+        input.read_line(&mut answer)?;
         if !matches!(answer.trim(), "y" | "Y" | "yes") {
             return Err(failed(&format!(
                 "{mac} not claimed: its claim key wasn't confirmed"
@@ -577,6 +594,84 @@ fn failed(message: &str) -> RelishError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const KEY_ONE: &str = "sha256:3f9a12bc77de0a41aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const KEY_TWO: &str = "sha256:9c0e44d1b2a37f58bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn two_machines() -> Vec<(String, IpAddr, String)> {
+        vec![
+            (
+                "52:54:00:42:00:01".into(),
+                "10.42.0.11".parse().unwrap(),
+                KEY_ONE.into(),
+            ),
+            (
+                "52:54:00:42:00:02".into(),
+                "10.42.0.12".parse().unwrap(),
+                KEY_TWO.into(),
+            ),
+        ]
+    }
+
+    /// Run the comparison with `answers` typed at a terminal; return the
+    /// outcome and what the operator saw.
+    fn compare(answers: &str) -> (Result<(), RelishError>, String) {
+        let mut shown = Vec::new();
+        let outcome = confirm_with(&two_machines(), true, answers.as_bytes(), &mut shown);
+        (outcome, String::from_utf8(shown).unwrap())
+    }
+
+    #[test]
+    fn each_claim_key_is_shown_short_beside_its_machine_and_a_yes_claims_both() {
+        let (outcome, shown) = compare("y\nyes\n");
+        outcome.unwrap();
+        assert!(
+            shown.contains("Does the console of 52:54:00:42:00:01 (10.42.0.11) show claim key 3f9a-12bc-77de-0a41? [y/N] "),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("Does the console of 52:54:00:42:00:02 (10.42.0.12) show claim key 9c0e-44d1-b2a3-7f58? [y/N] "),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn a_no_refuses_that_machine_and_asks_about_no_more() {
+        let (outcome, shown) = compare("Y\nn\n");
+        let error = outcome.unwrap_err().to_string();
+        assert!(
+            error.contains("52:54:00:42:00:02 not claimed: its claim key wasn't confirmed"),
+            "{error}"
+        );
+
+        let (outcome, shown_after_first) = compare("no\ny\n");
+        let error = outcome.unwrap_err().to_string();
+        assert!(error.contains("52:54:00:42:00:01 not claimed"), "{error}");
+        assert!(
+            !shown_after_first.contains("52:54:00:42:00:02"),
+            "{shown_after_first}"
+        );
+        assert!(shown.contains("52:54:00:42:00:02"), "{shown}");
+    }
+
+    #[test]
+    fn anything_but_yes_is_a_no_and_so_is_an_empty_answer() {
+        for answers in ["\n", "", "yep\n", "maybe\n", "1\n"] {
+            let (outcome, _) = compare(answers);
+            assert!(outcome.is_err(), "{answers:?} claimed a machine");
+        }
+    }
+
+    #[test]
+    fn without_a_terminal_the_comparison_refuses_and_points_at_trust_lan() {
+        let mut shown = Vec::new();
+        let error = confirm_with(&two_machines(), false, "y\ny\n".as_bytes(), &mut shown)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("run this in a terminal"), "{error}");
+        assert!(error.contains("--trust-lan"), "{error}");
+        assert!(shown.is_empty(), "asked without a terminal: {shown:?}");
+    }
 
     fn machine(address: &str, mac: &str) -> Discovered {
         Discovered {
