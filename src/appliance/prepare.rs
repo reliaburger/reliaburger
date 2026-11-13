@@ -399,8 +399,6 @@ fn read_stick(paths: &Paths) -> Option<(Vec<u8>, String)> {
     found
 }
 
-/// Overwrite a create seed on the stick and delete it: it carries the
-/// cluster's master key, which mustn't outlive its job on removable media.
 /// Zero and remove the seed a claim delivered, if there is one: it may
 /// hold the master key, and its files are installed now.
 async fn clear_claimed_seed(paths: &Paths) {
@@ -430,6 +428,8 @@ fn zero_and_remove(path: &Path) -> std::io::Result<()> {
     std::fs::remove_file(path)
 }
 
+/// Overwrite a create seed on the stick and delete it: it carries the
+/// cluster's master key, which mustn't outlive its job on removable media.
 fn wipe_from_stick(paths: &Paths, file: &str) {
     let mount = &paths.stick_mount;
     if !paths.stick_device.exists()
