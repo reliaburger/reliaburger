@@ -12,8 +12,8 @@
 # healthy too, since it's bun answering.
 set -u
 . /usr/lib/os-release
-# BOOT_CHECK_EFIVARS is for image/tests/test_boot_check.py; the unit never
-# sets it.
+# BOOT_CHECK_EFIVARS is for image/tests/test_boot_check.py; the unit unsets
+# it (UnsetEnvironment=), so the manager's environment can't supply it.
 efivars=${BOOT_CHECK_EFIVARS:-/sys/firmware/efi/efivars}
 counted() {
     # systemd-boot sets this only when the entry has tries left (+N).
