@@ -7615,7 +7615,12 @@ proposal 1". An agent's `kind: undo` proposal reads its original the same
 way, after forwarding. The new test makes the lag certain rather than
 likely: it shuts down one follower's Raft core, leaving its API up, and
 makes every decision through it, then checks each audit record names
-whoever asked.
+whoever asked. It also checks the refusals still come from the leader. A
+person approving their own proposal through that follower gets the
+leader's 403 naming them as its author; the follower, which can't see the
+proposal, could only have said 404. A deployer scoped to another namespace
+gets 404, the answer for a proposal outside your scope, which says nothing
+about it.
 
 ### What the gym found first
 

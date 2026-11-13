@@ -2474,7 +2474,10 @@ async fn audit_records(node: &WiredNode, bearer: &str, action: &str) -> Vec<serd
 /// here has stopped applying altogether (its Raft core is shut down, its API
 /// still answers), so it can never have the proposal: before the fix it
 /// answered 404 to approve, reject, withdraw and undo. The leader decides
-/// as the caller, so each audit record names the person or agent who asked.
+/// as the caller, so each audit record names the person or agent who asked,
+/// and makes every check: a person approving their own proposal, or one
+/// scoped to another namespace, is refused by the leader, not let through
+/// by the follower that can't see the proposal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host; run with make test-cluster"]
 async fn a_follower_that_has_not_applied_a_proposal_passes_each_decision_to_the_leader() {
@@ -2516,8 +2519,19 @@ async fn a_follower_that_has_not_applied_a_proposal_passes_each_decision_to_the_
     )
     .unwrap();
     grant(&nodes, &watson.token).await;
+    let lestrade = reliaburger::sesame::token::create_token(
+        "lestrade",
+        reliaburger::sesame::types::ApiRole::Deployer,
+        reliaburger::sesame::types::TokenScope {
+            apps: None,
+            namespaces: Some(vec!["yard".to_string()]),
+        },
+        None,
+    )
+    .unwrap();
+    grant(&nodes, &lestrade.token).await;
 
-    for app in ["web", "api", "db", "cache"] {
+    for app in ["web", "api", "db", "cache", "queue"] {
         let spec: reliaburger::config::app::AppSpec = toml::from_str(&format!(
             "image = \"{app}:v1\"\nreplicas = 1\nnamespace = \"shop\""
         ))
@@ -2584,6 +2598,50 @@ async fn a_follower_that_has_not_applied_a_proposal_passes_each_decision_to_the_
         assert_eq!(answer["state"], state, "{decision} {proposal}: {answer}");
     }
 
+    // The leader's checks still hold for a decision the lagging follower
+    // passes on. A person can't approve their own proposal: only the
+    // leader, which holds it, knows who wrote it, so a 403 naming the
+    // author (and not the follower's 404) shows the leader judged it.
+    let (status, body) = post_json(
+        creator,
+        &watson.plaintext,
+        "/v1/proposals",
+        r#"{"kind":"scale","namespace":"shop","app":"queue","replicas":2,"reason":"drill"}"#,
+    )
+    .await
+    .expect("the follower answers");
+    assert_eq!(status, 201, "{body}");
+    ids.insert("queue", body["id"].as_u64().unwrap());
+    let queue = ids["queue"];
+    let (status, body) = post_json(
+        lagging,
+        &watson.plaintext,
+        &format!("/v1/proposals/{queue}/approve"),
+        "",
+    )
+    .await
+    .expect("the lagging follower answers");
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(body["code"], "forbidden", "{body}");
+    assert_eq!(
+        body["error"],
+        format!("watson made proposal {queue} and can't approve it; another person must"),
+        "{body}"
+    );
+    // A deployer scoped to another namespace gets the leader's answer for
+    // a proposal outside its scope, the same as a missing one, so it
+    // learns nothing about it.
+    let (status, body) = post_json(
+        lagging,
+        &lestrade.plaintext,
+        &format!("/v1/proposals/{queue}/approve"),
+        "",
+    )
+    .await
+    .expect("the lagging follower answers");
+    assert_eq!(status, 404, "{body}");
+    assert_eq!(body["code"], "not_found", "{body}");
+
     // An agent's proposal to undo one, through the same follower, names an
     // original only the leader is sure to hold.
     let (status, body) = post_json(
@@ -2601,7 +2659,12 @@ async fn a_follower_that_has_not_applied_a_proposal_passes_each_decision_to_the_
     assert_eq!(body["state"], "pending", "{body}");
 
     let decided = nodes[leader].council.desired_state().await;
-    for (app, state) in [("web", "undone"), ("api", "rejected"), ("db", "withdrawn")] {
+    for (app, state) in [
+        ("web", "undone"),
+        ("api", "rejected"),
+        ("db", "withdrawn"),
+        ("queue", "pending"),
+    ] {
         let proposal = decided.proposals.get(id(ids[app])).unwrap();
         assert_eq!(proposal.state.name(), state, "{app}");
     }
