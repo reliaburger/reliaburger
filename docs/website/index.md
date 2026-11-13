@@ -115,7 +115,7 @@ What that line installs, released on 12 November 2026. An AI agent proposes a ch
 
 Put the cluster through its paces with a burger built from eight apps: a batch of jobs, a layer cut off, a rolling deploy, a rollback, a scale-up, an agent’s proposal and its undo, a house rule, a killed patty, a slow network and a lost node.
 
-The whole tour on a real laptop cluster, run by [scripts/demo/tour.sh](https://github.com/reliaburger/reliaburger/blob/main/scripts/demo/tour.sh) against the published 0.2.8 install. Setup plays four times faster and idle time is cut to two seconds; every wait says how long it really took. Jump to a step with the buttons above, or the marks on the progress bar. speed
+The whole tour on a real laptop cluster, run by [scripts/demo/tour.sh](https://github.com/reliaburger/reliaburger/blob/main/scripts/demo/tour.sh) against the published 0.2.8 install. Setup plays four times faster and idle time is cut to two seconds; every wait says how long it really took. Jump to a step with the buttons above, or the marks on the progress bar.
 
 Show the commands every step, with what to look for
 
@@ -317,7 +317,7 @@ A million in one go? 0.2.8’s 8-hour release soak ran 64 arrays of 1,048,576 ta
 
 What does each kind of isolation cost? Here’s the same command, run four ways on the same VM with the same concurrency.
 
-Recorded on a 0.2.0 development build. Four real 60-second windows: VM baseline, fresh containers, shared containers and host jobs. Chapter jumps and playback speed change only your view; preparation and cleanup stay visible. speed
+Recorded on a 0.2.0 development build. Four real 60-second windows: VM baseline, fresh containers, shared containers and host jobs. Chapter jumps and playback speed change only your view; preparation and cleanup stay visible.
 
 Show the commands run the four scenarios on your own setup
 
@@ -457,7 +457,7 @@ What the soaks don't prove: they run three small VMs on one machine, so they say
 
 Old mini PCs, thin clients, anything x86\_64 or arm64 with UEFI network boot: plug them into your switch and power them on. Your laptop serves the OS, they install themselves in under a minute, and one command makes them a cluster. No USB sticks, no distro, nothing to configure on each machine. Your router keeps handing out the addresses; relish only answers the boot part.
 
-Three machines with blank disks network-boot into Reliaburger and become one cluster. They’re QEMU VMs with UEFI firmware on a virtual switch, run by [scripts/demo/netboot.sh](https://github.com/reliaburger/reliaburger/blob/main/scripts/demo/netboot.sh) in CI, serving a lab build of the OS signed with that run’s own key. Idle time is cut to two seconds; every wait says how long it really took. speed
+Three machines with blank disks network-boot into Reliaburger and become one cluster. They’re QEMU VMs with UEFI firmware on a virtual switch, run by [scripts/demo/netboot.sh](https://github.com/reliaburger/reliaburger/blob/main/scripts/demo/netboot.sh) in CI, serving a lab build of the OS signed with that run’s own key. Idle time is cut to two seconds; every wait says how long it really took.
 
 Show the commands from blank disks to a cluster (0.3.0, not in 0.2.8)
 
@@ -499,7 +499,7 @@ Serving from a Mac, an isolated switch, firmware quirks: [the appliance chapter 
 
 When something breaks, the bug may be in your app or in the platform under it. Your AI agent can tell which: it reads the cluster, the manual and the exact source its `relish` was built from. When the bug is ours, it proves a fix on a throwaway cluster and drafts the report for you to send. It never fixes your cluster for you.
 
-A real session: Claude Code with a read-only token on a 0.2.8 cluster (the published `relish`, and `bun` built from the v0.2.8 tag), recorded through the agent gym by [scripts/record/recording.py](https://github.com/reliaburger/reliaburger/blob/main/scripts/record/recording.py), which scored it correct. Still stretches are cut to two seconds, and each result says how long its call really took. speed 
+A real session: Claude Code with a read-only token on a 0.2.8 cluster (the published `relish`, and `bun` built from the v0.2.8 tag), recorded through the agent gym by [scripts/record/recording.py](https://github.com/reliaburger/reliaburger/blob/main/scripts/record/recording.py), which scored it correct. Still stretches are cut to two seconds, and each result says how long its call really took. 
 
 1.  ```
     relish token create --name agent --role read-only --ttl-days 1
@@ -548,7 +548,7 @@ Last, it drafts a redacted bug report with the reproducer, the patch and what it
 
 Reading a cluster is safe. Changing one is where an agent needs a leash. An agent never changes the cluster itself: it asks. The cluster writes down what the change would do, a person or a policy you wrote says yes, and the undo is one command, shown before anything happens.
 
-A real session: Claude Code with an agent token on a 0.2.8 cluster (the published `relish`, and `bun` built from the v0.2.8 tag) proposes a rollback, then a person approves it and undoes it with their own token. Recorded through the agent gym by [scripts/record/recording.py](https://github.com/reliaburger/reliaburger/blob/main/scripts/record/recording.py), which scored it correct. Still stretches are cut to two seconds. speed 
+A real session: Claude Code with an agent token on a 0.2.8 cluster (the published `relish`, and `bun` built from the v0.2.8 tag) proposes a rollback, then a person approves it and undoes it with their own token. Recorded through the agent gym by [scripts/record/recording.py](https://github.com/reliaburger/reliaburger/blob/main/scripts/record/recording.py), which scored it correct. Still stretches are cut to two seconds. 
 
 1.  ```
     relish token create --name holmes --agent --role deployer --namespaces shop --ttl 8h
