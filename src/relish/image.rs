@@ -798,4 +798,329 @@ mod tests {
             "wrote 2400 MB to /dev/sdb\n"
         );
     }
+
+    const VERSION: &str = "2026.46.3";
+    const TAG: &str = "os-2026.46.3-x86_64";
+
+    /// A release laid out as GitHub serves one
+    /// (`…/releases/download/<tag>/<file>`, the channel under `os-channel/`),
+    /// signed with a key made for the test and served over local HTTP.
+    struct Release {
+        root: tempfile::TempDir,
+        channel_url: String,
+        key_file: PathBuf,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    impl Release {
+        /// Where the server reads `name` of the x86_64 build from.
+        fn served(&self, name: &str) -> PathBuf {
+            self.root
+                .path()
+                .join("releases/download")
+                .join(TAG)
+                .join(name)
+        }
+
+        fn trust(&self) -> ChannelTrust {
+            ChannelTrust::from_key_file(Some(&self.key_file)).unwrap()
+        }
+    }
+
+    fn install_files() -> Vec<(String, Vec<u8>)> {
+        vec![
+            (
+                format!("reliaburger-os_{VERSION}.raw.zst"),
+                b"disk".repeat(4096),
+            ),
+            (
+                format!("reliaburger-os-installer_{VERSION}.efi"),
+                b"installer".to_vec(),
+            ),
+            ("ipxe-snp-x86_64.efi".into(), b"ipxe".to_vec()),
+            ("boot.ipxe".into(), b"#!ipxe\n".to_vec()),
+            // An update part: in the sums, but an install doesn't need it.
+            (
+                format!("reliaburger-os_{VERSION}.usr.ab12.raw.zst"),
+                b"usr".to_vec(),
+            ),
+        ]
+    }
+
+    /// The PEM `openssl pkey -pubout` writes for an Ed25519 key.
+    fn public_key_pem(key: &PublicKey) -> String {
+        const SPKI_PREFIX: [u8; 12] = [
+            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+        ];
+        pem::encode(&pem::Pem::new(
+            "PUBLIC KEY",
+            [&SPKI_PREFIX[..], key].concat(),
+        ))
+    }
+
+    fn raw_signature(pkcs8: &[u8], bytes: &[u8]) -> Vec<u8> {
+        use base64::Engine as _;
+        let signature = crate::upgrade::signing::sign(pkcs8, bytes).unwrap();
+        base64::engine::general_purpose::STANDARD
+            .decode(signature)
+            .unwrap()
+    }
+
+    async fn serve_release(files: &[(String, Vec<u8>)]) -> Release {
+        let root = tempfile::tempdir().unwrap();
+        let (pkcs8, public) = crate::upgrade::signing::generate_keypair().unwrap();
+        let tag_dir = root.path().join("releases/download").join(TAG);
+        std::fs::create_dir_all(&tag_dir).unwrap();
+        let mut sums = String::new();
+        for (name, bytes) in files {
+            std::fs::write(tag_dir.join(name), bytes).unwrap();
+            sums.push_str(&format!(
+                "{}  {name}\n",
+                crate::upgrade::signing::sha256_hex(bytes)
+            ));
+        }
+        let sums_name = format!("reliaburger-os_{VERSION}.SHA256SUMS");
+        std::fs::write(tag_dir.join(&sums_name), &sums).unwrap();
+        std::fs::write(
+            tag_dir.join(format!("{sums_name}.sig")),
+            raw_signature(&pkcs8, sums.as_bytes()),
+        )
+        .unwrap();
+        let channel = serde_json::json!({
+            "architectures": {"x86_64": {
+                "sums": sums_name,
+                "sums_sha256": crate::upgrade::signing::sha256_hex(sums.as_bytes()),
+                "tag": TAG,
+            }},
+            "schema": 1,
+            "version": VERSION,
+        })
+        .to_string();
+        let channel_dir = root.path().join("releases/download/os-channel");
+        std::fs::create_dir_all(&channel_dir).unwrap();
+        std::fs::write(channel_dir.join("os-channel.json"), &channel).unwrap();
+        std::fs::write(
+            channel_dir.join("os-channel.json.sig"),
+            raw_signature(&pkcs8, channel.as_bytes()),
+        )
+        .unwrap();
+        let key_file = root.path().join("signing-key.pub.pem");
+        std::fs::write(&key_file, public_key_pem(&public)).unwrap();
+
+        let served = root.path().to_path_buf();
+        let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+            let path = served.join(uri.path().trim_start_matches('/'));
+            async move {
+                match tokio::fs::read(&path).await {
+                    Ok(bytes) => axum::response::IntoResponse::into_response(bytes),
+                    Err(_) => axum::response::IntoResponse::into_response(
+                        axum::http::StatusCode::NOT_FOUND,
+                    ),
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        Release {
+            root,
+            channel_url: format!("http://{address}/releases/download/os-channel/os-channel.json"),
+            key_file,
+            server,
+        }
+    }
+
+    /// Fetch and check the channel, then run the per-architecture loop.
+    async fn download_x86_64(
+        release: &Release,
+        directory: &Path,
+    ) -> Result<DownloadedArch, RelishError> {
+        let client = crate::http_client::builder().build().unwrap();
+        let trust = release.trust();
+        let channel = trust.verify(
+            &fetch(&client, &release.channel_url).await?,
+            &fetch(&client, &format!("{}.sig", release.channel_url)).await?,
+        )?;
+        download_arch(
+            &client,
+            &release.channel_url,
+            &channel,
+            Arch::X86_64,
+            directory,
+            false,
+            &trust,
+            OutputFormat::Json,
+        )
+        .await
+    }
+
+    /// Every file left under `directory`, relative to it.
+    fn tree(directory: &Path) -> Vec<String> {
+        let mut found = Vec::new();
+        let mut pending = vec![directory.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    let relative = path.strip_prefix(directory).unwrap();
+                    found.push(relative.display().to_string());
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
+    #[tokio::test]
+    async fn a_download_fetches_and_checks_each_file_an_install_needs_then_reuses_them() {
+        let files = install_files();
+        let release = serve_release(&files).await;
+        let target = tempfile::tempdir().unwrap();
+
+        let first = download_x86_64(&release, target.path()).await.unwrap();
+        assert_eq!(first.tag, TAG);
+        let fetched: Vec<(&str, Option<u64>)> = first
+            .files
+            .iter()
+            .map(|file| (file.name.as_str(), file.fetched_bytes))
+            .collect();
+        assert_eq!(
+            fetched,
+            [
+                ("reliaburger-os_2026.46.3.raw.zst", Some(4 * 4096)),
+                ("reliaburger-os-installer_2026.46.3.efi", Some(9)),
+                ("ipxe-snp-x86_64.efi", Some(4)),
+                ("boot.ipxe", Some(7)),
+            ]
+        );
+        for file in &first.files {
+            let (_, bytes) = files.iter().find(|(name, _)| *name == file.name).unwrap();
+            assert_eq!(&std::fs::read(&file.path).unwrap(), bytes, "{}", file.name);
+        }
+        // The layout `relish netboot` serves, the signed sums beside it, no
+        // update part and no half-written `.part` file.
+        assert_eq!(
+            tree(target.path()),
+            [
+                "x86_64/netboot/boot.ipxe",
+                "x86_64/netboot/ipxe-snp-x86_64.efi",
+                "x86_64/reliaburger-os-installer_2026.46.3.efi",
+                "x86_64/reliaburger-os_2026.46.3.SHA256SUMS",
+                "x86_64/reliaburger-os_2026.46.3.SHA256SUMS.sig",
+                "x86_64/reliaburger-os_2026.46.3.raw.zst",
+            ]
+        );
+
+        // A second run finds every checked copy in place and fetches none,
+        // even if the server would now send something else.
+        std::fs::write(release.served("boot.ipxe"), b"changed").unwrap();
+        let second = download_x86_64(&release, target.path()).await.unwrap();
+        assert!(
+            second.files.iter().all(|file| file.fetched_bytes.is_none()),
+            "{:?}",
+            second.files
+        );
+    }
+
+    #[tokio::test]
+    async fn a_local_copy_that_no_longer_matches_is_fetched_again() {
+        let release = serve_release(&install_files()).await;
+        let target = tempfile::tempdir().unwrap();
+        download_x86_64(&release, target.path()).await.unwrap();
+        let script = target.path().join("x86_64/netboot/boot.ipxe");
+        std::fs::write(&script, b"truncated").unwrap();
+
+        let again = download_x86_64(&release, target.path()).await.unwrap();
+        let refetched: Vec<&str> = again
+            .files
+            .iter()
+            .filter(|file| file.fetched_bytes.is_some())
+            .map(|file| file.name.as_str())
+            .collect();
+        assert_eq!(refetched, ["boot.ipxe"]);
+        assert_eq!(std::fs::read(&script).unwrap(), b"#!ipxe\n");
+    }
+
+    #[tokio::test]
+    async fn a_file_that_does_not_match_the_signed_sums_is_refused_and_removed() {
+        let release = serve_release(&install_files()).await;
+        // Someone swaps the installer after the sums were signed.
+        let installer = format!("reliaburger-os-installer_{VERSION}.efi");
+        std::fs::write(release.served(&installer), b"tampered").unwrap();
+        let target = tempfile::tempdir().unwrap();
+
+        let error = download_x86_64(&release, target.path())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&installer), "{error}");
+        let left = tree(target.path());
+        assert!(
+            !left.iter().any(|path| path.ends_with(&installer)),
+            "{left:?}"
+        );
+        assert!(!left.iter().any(|path| path.ends_with(".part")), "{left:?}");
+    }
+
+    #[tokio::test]
+    async fn sums_the_channel_does_not_vouch_for_are_refused_before_any_file() {
+        let release = serve_release(&install_files()).await;
+        let sums = release.served(&format!("reliaburger-os_{VERSION}.SHA256SUMS"));
+        let mut text = std::fs::read_to_string(&sums).unwrap();
+        text.push_str(&format!("{}  extra.efi\n", "0".repeat(64)));
+        std::fs::write(&sums, text).unwrap();
+        let target = tempfile::tempdir().unwrap();
+
+        assert!(download_x86_64(&release, target.path()).await.is_err());
+        assert!(tree(target.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_channel_another_key_signed_downloads_nothing() {
+        let release = serve_release(&install_files()).await;
+        let (_, other) = crate::upgrade::signing::generate_keypair().unwrap();
+        std::fs::write(&release.key_file, public_key_pem(&other)).unwrap();
+        let target = tempfile::tempdir().unwrap();
+
+        let error = download(
+            &release.channel_url,
+            &[],
+            target.path(),
+            false,
+            &release.trust(),
+            OutputFormat::Json,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("signature doesn't match the key in"),
+            "{error}"
+        );
+        assert!(tree(target.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_file_missing_from_the_release_fails_naming_its_url() {
+        let release = serve_release(&install_files()).await;
+        std::fs::remove_file(release.served("boot.ipxe")).unwrap();
+        let target = tempfile::tempdir().unwrap();
+
+        let error = download_x86_64(&release, target.path())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&format!("{TAG}/boot.ipxe")), "{error}");
+        assert!(error.contains("404"), "{error}");
+    }
 }

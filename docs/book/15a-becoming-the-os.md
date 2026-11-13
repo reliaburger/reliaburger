@@ -370,6 +370,14 @@ arches: Vec<reliaburger::relish::netboot::Arch>,
 
 A `Vec` field makes clap accept the flag any number of times, `--arch x86_64 --arch aarch64`, the same repeatable style as `relish netboot --mac`. With no `--arch` the vector is empty, and empty means "everything". `value_parser` runs `parse_arch` on each value as clap reads it, so `--arch riscv64` fails before relish touches the network, and the field holds `Arch`, the enum `relish netboot` already uses, not strings. The choice itself is a pure function, `select_architectures`, that takes what the channel offers and what the operator asked for: the tests check the default, a narrowed list, and a request for an architecture the release doesn't have. The last line names what landed, `Saved x86_64 and aarch64 under os (os/x86_64/, os/aarch64/)`, so nobody has to `ls` to find out. It costs one more image's download, a few hundred megabytes, which is cheap next to a lab of machines that won't boot.
 
+Those tests stop at the choice, and the loop that does the fetching went untested for a while. It runs the channel, its signature, each architecture's signed `SHA256SUMS`, then every file, streamed to a `.part` file and renamed into place. Now a test builds a release the way GitHub lays one out, signs it with a key it makes on the spot, and serves it from a small axum router on loopback. The router has no routes, only a `fallback` that reads whatever path it's asked for from a temporary directory. The tests check five things:
+
+- the files an install needs land where `relish netboot` looks, and the update parts don't come down;
+- a second run fetches nothing, because each checked copy is reused;
+- a copy changed on disk is fetched again;
+- a file swapped on the server after its sums were signed is refused and deleted, with no `.part` left behind;
+- a channel signed by another key leaves the directory empty.
+
 ### The installer: curl | zstd | dd
 
 The installer is its own mkosi subimage, `image/mkosi.images/installer/`, with `Format=uki`. Its initrd *is* the whole installer: a small Ubuntu with networking, curl, zstd, openssl, the partition tools and `efibootmgr`, running from RAM. One systemd unit starts `/usr/lib/reliaburger/install` once the network is up.
