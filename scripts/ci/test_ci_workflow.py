@@ -1172,6 +1172,19 @@ class ApplianceTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertIn(path, paths)
 
+    def test_every_build_checks_its_manifest_for_an_ssh_server_before_uploading(self):
+        # #401: a published image has no SSH server. The check reads the
+        # built image's manifest, so it must run after the build and before
+        # anything uploads the image for signing.
+        check = self.step("No SSH server in a published image")
+        self.assertIn("image/tests/no_ssh_server.py manifest", check)
+        self.assertIn('[ "$PUBLISH" = true ] || lab=(--lab)', check)
+        position = self.image.index(check)
+        self.assertGreater(position, self.image.index(self.step("Build the image")))
+        uploads = [i for i, s in enumerate(self.image) if "actions/upload-artifact" in s]
+        self.assertTrue(uploads)
+        self.assertTrue(all(position < i for i in uploads), uploads)
+
     def test_only_main_publishes(self):
         plan = self.jobs["plan"]
         self.assertIn('if [ "$GITHUB_REF" = refs/heads/main ]', plan)
