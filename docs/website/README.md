@@ -275,8 +275,9 @@ cuts each still stretch to two seconds, and the call's result line then says
 how long it really took ("that took 6 m 12 s; the recording cut the wait").
 The opening lines say the same. Each part starts with a bold `» Title` line,
 which becomes a chapter marker: The prompt, Look at the cluster, Diagnose,
-Read the source, Start a fix, Write the fix, Build it, Test it, Try it, Draft
-the report, and You read the draft. The last one is the person's part, typed
+Read the source, Start a fix, Write the fix, Build it, Test it, Try it, Save
+the patch (writing the `.diff` the report carries), Draft the report, and You
+read the draft. The last one is the person's part, typed
 by the script: `ls`, then `head` of the draft's `issue.md` and
 `MANIFEST.json`, and a line saying nothing was posted. A chapter the agent
 comes back to says so: `Test it (again)`.

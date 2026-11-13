@@ -57,6 +57,12 @@ DIM = "\033[2m"
 GREEN = "\033[32m"
 RESET = "\033[0m"
 
+WRITE_FIX = "Write the fix"
+# Writing the diff the report carries isn't more of the fix (#1904).
+SAVE_PATCH = "Save the patch"
+PATCH_FILE = re.compile(r"\.(diff|patch)$")
+WRITTEN = re.compile(r"^✎ (?:edit|write) (.+)$")
+
 # A command's first words, flags left out, and the chapter it opens. The
 # first matching prefix wins; a chapter is only opened when it changes.
 PHASES = {
@@ -68,7 +74,7 @@ PHASES = {
         ("logs", "Diagnose"),
         ("agent source", "Read the source"),
         ("agent patch init", "Start a fix"),
-        ("agent patch apply", "Write the fix"),
+        ("agent patch apply", WRITE_FIX),
         ("agent patch build", "Build it"),
         ("agent patch test", "Test it"),
         ("agent patch try", "Try it"),
@@ -133,6 +139,16 @@ def again(title, seen):
     shown = f"{title} (again)" if title in seen else title
     seen.add(title)
     return shown
+
+
+def retitle(title, next_line):
+    """`Save the patch` for a `Write the fix` heading whose next line, as
+    shown, writes a `.diff` or `.patch`; otherwise `title`. For casts
+    recorded before the renderer chose that chapter itself."""
+    written = WRITTEN.match(next_line)
+    if title == WRITE_FIX and written and PATCH_FILE.search(written.group(1).strip()):
+        return SAVE_PATCH
+    return title
 
 
 def ended(turns, seconds):
@@ -255,7 +271,10 @@ class Renderer:
             return lines
         if name in ("Edit", "Write"):
             path = arguments.get("file_path", "")
-            lines = self._open(phase_of(self.mode, ["agent", "patch", "apply"]))
+            title = phase_of(self.mode, ["agent", "patch", "apply"])
+            if title is not None and PATCH_FILE.search(path):
+                title = SAVE_PATCH
+            lines = self._open(title)
             lines.append(f"{GREEN}{BOLD}✎{RESET} {name.lower()} {path}")
             return lines
         return [f"{DIM}({name}){RESET}"]

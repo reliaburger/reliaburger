@@ -195,7 +195,8 @@ def tidy(lines, events):
 
     Claude Code's background notices go (with a `that took` line under
     one, since that command hadn't finished), the model line shows once, a
-    repeated chapter says `(again)` in its marker and its heading, and the
+    `Write the fix` that writes a `.diff` or `.patch` becomes `Save the
+    patch`, a repeated chapter says `(again)` in its marker and its heading, and the
     session ends once, where the last part ended, with the turns and time
     of every part from `events`, the session's stream-json. An event left
     with nothing to show goes, and in a v3 cast its wait moves to the next
@@ -221,11 +222,14 @@ def tidy(lines, events):
             event[0] = round(event[0] + carry, 3)
             carry = 0.0
         if event[1] == "m":
-            event[2] = stage.again(event[2], markers)
+            event[2] = stage.again(stage.retitle(event[2], line_after_heading(parsed, index + 1)),
+                                   markers)
         elif event[1] == "o":
             kept, removed = [], False
-            for piece in event[2].split("\r\n"):
+            pieces = event[2].split("\r\n")
+            for position, piece in enumerate(pieces):
                 shown = COLOURS.sub("", piece)
+                after = COLOURS.sub("", pieces[position + 1]) if position + 1 < len(pieces) else ""
                 drop = False
                 if stage.BACKGROUND.match(shown):
                     drop, after_notice = True, True
@@ -243,7 +247,9 @@ def tidy(lines, events):
                 if shown:
                     after_notice = False
                 kept.append(stage.HEADING_TEXT.sub(
-                    lambda found: stage.heading(stage.again(found.group(1), headings)), piece))
+                    lambda found: stage.heading(
+                        stage.again(stage.retitle(found.group(1), after), headings)),
+                    piece))
             if removed and not any(kept):
                 if relative:
                     carry = event[0]
@@ -251,6 +257,17 @@ def tidy(lines, events):
             event[2] = "\r\n".join(kept)
         out.append(json.dumps(event, ensure_ascii=False))
     return out
+
+
+def line_after_heading(parsed, index):
+    """The line shown after the first heading in event `index`, plain, or ""."""
+    if index >= len(parsed) or parsed[index][1] != "o":
+        return ""
+    pieces = [COLOURS.sub("", piece) for piece in parsed[index][2].split("\r\n")]
+    for position, piece in enumerate(pieces[:-1]):
+        if piece.startswith("» "):
+            return pieces[position + 1]
+    return ""
 
 
 def tidy_cast(cast, session):

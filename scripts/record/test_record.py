@@ -131,6 +131,22 @@ class Screen(unittest.TestCase):
         self.assertEqual(plain(renderer.ending()),
                          ["", "# The session ended after 22 turns and 11 m 20 s."])
 
+    def test_saving_the_patch_is_its_own_chapter_not_the_fix_again(self):
+        renderer = stage.Renderer("debug")
+
+        def write(id_, name, path):
+            return plain(renderer.lines({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": id_, "name": name, "input": {"file_path": path}}]}}))
+
+        self.assertEqual(write("1", "Edit", "fix/src/relish/client.rs"),
+                         ["", "» Write the fix", "✎ edit fix/src/relish/client.rs"])
+        self.assertEqual(write("2", "Write", "/run/solver/fix.diff"),
+                         ["", "» Save the patch", "✎ write /run/solver/fix.diff"])
+        # Saving again straight away stays in the same chapter.
+        self.assertEqual(write("3", "Write", "out/change.patch"), ["✎ write out/change.patch"])
+        self.assertEqual(write("4", "Edit", "fix/src/relish/client.rs")[1], "» Write the fix (again)")
+        self.assertEqual(write("5", "Write", "fix.diff")[1], "» Save the patch (again)")
+
     def test_a_session_with_no_result_has_no_ending(self):
         self.assertEqual(stage.Renderer("act").ending(), [])
 
@@ -205,6 +221,8 @@ class Tidy(unittest.TestCase):
                        f"background (ID: b2). Output is…{reset}\r\n"
                        + self.say("that took 10 m 00 s; the recording cut the wait")],
             [0.25, "o", "\r\n" + self.say("The session ended after 5 turns and 20 s.")],
+            [1.0, "m", "Write the fix"],
+            [0.0, "o", f"\r\n{bold}» Write the fix{reset}\r\n\x1b[32m{bold}✎{reset} write /run/fix.diff\r\n"],
             [1.0, "m", "You read the draft"],
             [0.0, "o", f"\r\n{bold}» You read the draft{reset}\r\n"],
         ]
@@ -217,7 +235,7 @@ class Tidy(unittest.TestCase):
     def test_notices_and_repeated_lines_go_and_repeated_chapters_say_again(self):
         out = recording.tidy(self.cast(), self.session())
         markers = [json.loads(line)[2] for line in out[1:] if json.loads(line)[1] == "m"]
-        self.assertEqual(markers, ["Test it", "Test it (again)", "You read the draft"])
+        self.assertEqual(markers, ["Test it", "Test it (again)", "Save the patch", "You read the draft"])
         shown = [line for line in event_text(out) if line]
         self.assertEqual(shown, [
             "# Claude Code, model m",
@@ -225,6 +243,7 @@ class Tidy(unittest.TestCase):
             "claude ▸ The tests run in the background.",
             "» Test it (again)", "$ relish agent patch test ./fix",
             "# The session ended after 22 turns and 11 m 20 s.",
+            "» Save the patch", "✎ write /run/fix.diff",
             "» You read the draft",
         ])
 
