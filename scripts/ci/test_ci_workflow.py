@@ -1154,6 +1154,17 @@ class ApplianceTests(unittest.TestCase):
         self.assertNotRegex(triggers, r"(?m)^\s+schedule:")
         self.assertNotRegex(triggers, r"(?m)^\s+- cron:")
 
+    def test_a_pull_request_changing_the_os_update_code_builds_and_tests_the_image(self):
+        # src/os is the node's half of an OS update (the slot, the channel,
+        # the rollout). Only the image's QEMU tests run it, and a PR run
+        # builds bun from source, so a change there has to trigger them.
+        triggers = self.text.split("\njobs:", 1)[0]
+        pull_request = triggers.split("\n  pull_request:", 1)[1]
+        paths = re.findall(r'(?m)^      - "([^"]+)"$', pull_request)
+        for path in ("image/**", ".github/workflows/appliance.yml", "src/os/**"):
+            with self.subTest(path=path):
+                self.assertIn(path, paths)
+
     def test_only_main_publishes(self):
         plan = self.jobs["plan"]
         self.assertIn('if [ "$GITHUB_REF" = refs/heads/main ]', plan)
