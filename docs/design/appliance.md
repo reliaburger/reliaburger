@@ -1,7 +1,7 @@
 # Appliance: netboot, claim and `relish os`
 
 **Component:** the appliance OS, `relish netboot`, `relish machines claim`, `relish os`
-**Status:** Implemented on the 0.3.0 train (#401–#406); qualified by the Wyse exit test (#407)
+**Status:** Implemented on the 0.3.0 train (#401–#406); to be qualified by the Wyse exit test (#407)
 
 ---
 
@@ -310,7 +310,8 @@ cut anywhere just resumes on the next boot:
 | Seed | On disk | Step |
 |---|---|---|
 | any | `node.toml` | Done |
-| none | | NoSeed: bun runs standalone (unclaimed) |
+| none | | NoSeed: with a claim directory (the appliance has one), wait for a claim (§3.1) and look again; without one, bun runs standalone |
+| spike (`node.toml` in the seed) | | InstallLegacy: install its files as they are, then Done |
 | create | no identity or no master key | InstallBootstrap |
 | create | identity and master key | WriteConfig |
 | join | no identity | Enrol |
@@ -322,9 +323,9 @@ incompatible cluster ends Enrol. Anything else is retried, backing off from
 2 to 30 seconds. WriteConfig writes `node.toml` last, from the seed, with the
 appliance profile's paths.
 
-When prepare is done, a create seed's copy holds the master key. The claimed
-seed and the stick's file are overwritten with zeros, flushed and only then
-removed. The claimed seed is also cleared on a boot that finds `node.toml`
+The stick's and the claimed copies of a create seed hold the master key,
+which is why prepare zeroes them: when it's done, the claimed seed and the
+stick's file are overwritten with zeros, flushed and only then removed. The claimed seed is also cleared on a boot that finds `node.toml`
 already in place, in case the power went between the two.
 
 ### 3.6 The RBSEED stick
@@ -381,6 +382,9 @@ A rollout lives in Raft as `DesiredState::os_rollout` (`src/os/rollout.rs`).
 **Starting.** It refuses while a bun upgrade or another OS rollout runs. It
 also refuses if any node isn't answering or isn't an appliance, or if the
 target is older than a node's version and `--allow-downgrade` isn't given.
+It refuses a two-voter council too, for the same reason a bun upgrade does:
+taking either voter down leaves the other without a majority, so the rollout
+could never move past the council (`check_council_can_roll`).
 
 **Order.** Workers first, then council members, then the leader. A node
 already on the target is skipped.
