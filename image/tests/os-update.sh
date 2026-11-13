@@ -25,11 +25,14 @@
 # The test passes when the node is healthy on <version> again, never was on
 # <target>, and the rollout has paused on the fallback bun reported. It
 # records how long the fallback took, from the reboot into <target> to bun
-# healthy on <version>: the Wyse exit test needs 10 minutes or less (S5).
+# healthy on <version>, and fails if that took more than the 10 minutes the
+# Wyse exit test allows (S5, image/tests/fallback.sh).
 # Needs root (the bridge), qemu-system-x86, ovmf, dnsmasq and /dev/kvm.
 set -euo pipefail
 # shellcheck source=image/tests/disk.sh
 . "$(dirname "$0")/disk.sh"
+# shellcheck source=image/tests/fallback.sh
+. "$(dirname "$0")/fallback.sh"
 usage="usage: os-update.sh <artefact dir> <version> <release tree> <target> <relish> [--fallback]"
 out=$(cd "${1:?$usage}" && pwd)
 version=${2:?$usage}
@@ -163,14 +166,16 @@ else
     if [ "$result" = pass ] && { [ "$tries" -ne 3 ] || [ "$on_broken" -ne 0 ]; }; then
         result=fail
     fi
-    outcome="$result: $tries failed tries, $boots boots"
+    detail="$tries failed tries, $boots boots"
     if [ -n "$t_back" ]; then
         fallback=$((t_back - t_reboot))
-        outcome="$outcome, fell back in ${fallback} s ($((fallback / 60)) min $((fallback % 60)) s) from the reboot into $target, $((t_back - t_upgrade)) s from \`relish os upgrade\`"
-        if [ "$fallback" -gt 600 ]; then
-            echo "::warning::the fallback took ${fallback} s, more than the 10 minutes the Wyse exit test allows"
+        detail="$detail, fell back in ${fallback} s ($((fallback / 60)) min $((fallback % 60)) s) from the reboot into $target, $((t_back - t_upgrade)) s from \`relish os upgrade\`"
+        if ! fallback_within_limit "$fallback"; then
+            result=fail
+            detail="$detail, past the ${FALLBACK_LIMIT_S} s limit"
         fi
     fi
+    outcome="$result: $detail"
     title="OS fallback $version → $target → $version"
 fi
 elapsed=$(( $(date +%s) - start ))
