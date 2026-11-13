@@ -182,20 +182,6 @@ pub(super) async fn proposal_create_handler(
     if let Err(response) = authorise_apps(&state, auth, action, named.iter()).await {
         return response;
     }
-    // An undo names no app; its apps are the original's. Check them before
-    // building it, whose refusals name them, and answer an original out of
-    // scope as a missing one, as reading it would.
-    if request.kind == RequestKind::Undo
-        && let Some(of) = request.of
-    {
-        let original = match read_proposal(&state, auth, ProposalId(of)).await {
-            Ok(original) => original,
-            Err(response) => return response,
-        };
-        if let Err(response) = authorise_apps(&state, auth, action, original.apps()).await {
-            return response;
-        }
-    }
     let Some(council) = &state.council else {
         return standalone();
     };
@@ -216,6 +202,21 @@ pub(super) async fn proposal_create_handler(
     .await
     {
         return forwarded;
+    }
+    // An undo names no app; its apps are the original's. Check them before
+    // building it, whose refusals name them, and answer an original out of
+    // scope as a missing one, as reading it would. Only here, on the
+    // leader: a follower may not have applied the original yet (#1928).
+    if request.kind == RequestKind::Undo
+        && let Some(of) = request.of
+    {
+        let original = match read_proposal(&state, auth, ProposalId(of)).await {
+            Ok(original) => original,
+            Err(response) => return response,
+        };
+        if let Err(response) = authorise_apps(&state, auth, action, original.apps()).await {
+            return response;
+        }
     }
     let author = principal_of(auth);
     let now = crate::testkit::lease::now_unix_millis();
@@ -400,6 +401,15 @@ pub(super) async fn proposal_approve_handler(
     let auth_extension = auth.clone();
     let auth = auth.as_deref();
     let id = ProposalId(id);
+    if let Err(response) = may_decide(auth) {
+        return response;
+    }
+    let path = format!("/v1/proposals/{id}/approve");
+    if let Some(forwarded) =
+        decide_on_leader(&state, directory.as_deref(), &headers, &path, "").await
+    {
+        return forwarded;
+    }
     let proposal =
         match authorise_decider(&state, auth, id, crate::config::PermissionAction::Deploy).await {
             Ok(proposal) => proposal,
@@ -422,18 +432,6 @@ pub(super) async fn proposal_approve_handler(
     let Some(council) = &state.council else {
         return standalone();
     };
-    if let Some(forwarded) = super::upgrade::forward_upgrade_to_leader(
-        &state,
-        council,
-        directory.as_deref(),
-        &format!("/v1/proposals/{id}/approve"),
-        &headers,
-        "",
-    )
-    .await
-    {
-        return forwarded;
-    }
     let approval = Approval::Human(approver.clone());
     let outcome = match &proposal.fault {
         // The fault is cleared on its node, as the approver, with the
@@ -700,29 +698,31 @@ pub(super) async fn proposal_reject_handler(
 ) -> Response {
     let auth = auth.as_deref();
     let id = ProposalId(id);
+    if let Err(response) = may_decide(auth) {
+        return response;
+    }
+    let body = serde_json::to_string(&request).unwrap_or_default();
+    let path = format!("/v1/proposals/{id}/reject");
+    if let Some(forwarded) =
+        decide_on_leader(&state, directory.as_deref(), &headers, &path, &body).await
+    {
+        return forwarded;
+    }
     if let Err(response) =
         authorise_decider(&state, auth, id, crate::config::PermissionAction::Deploy).await
     {
         return response;
     }
     let by = principal_of(auth);
-    let body = serde_json::to_string(&request).unwrap_or_default();
     let reason = request.reason.clone();
-    proposal_write(
-        &state,
-        auth,
-        directory.as_deref(),
-        &headers,
-        &format!("/v1/proposals/{id}/reject"),
-        &body,
-        &by.clone(),
-        move |now| crate::council::types::RaftRequest::ProposalReject {
+    proposal_write(&state, auth, &by.clone(), move |now| {
+        crate::council::types::RaftRequest::ProposalReject {
             id,
             by,
             reason,
             observed_at_unix_ms: now,
-        },
-    )
+        }
+    })
     .await
 }
 
@@ -741,24 +741,23 @@ pub(super) async fn proposal_withdraw_handler(
         return response;
     }
     let id = ProposalId(id);
+    let path = format!("/v1/proposals/{id}/withdraw");
+    if let Some(forwarded) =
+        decide_on_leader(&state, directory.as_deref(), &headers, &path, "").await
+    {
+        return forwarded;
+    }
     if let Err(response) = read_proposal(&state, auth, id).await {
         return response;
     }
     let by = principal_of(auth);
-    proposal_write(
-        &state,
-        auth,
-        directory.as_deref(),
-        &headers,
-        &format!("/v1/proposals/{id}/withdraw"),
-        "",
-        &by.clone(),
-        move |now| crate::council::types::RaftRequest::ProposalWithdraw {
+    proposal_write(&state, auth, &by.clone(), move |now| {
+        crate::council::types::RaftRequest::ProposalWithdraw {
             id,
             by,
             observed_at_unix_ms: now,
-        },
-    )
+        }
+    })
     .await
 }
 
@@ -774,24 +773,23 @@ pub(super) async fn proposal_undo_handler(
     let auth = auth.as_deref();
     let id = ProposalId(id);
     let action = crate::config::PermissionAction::Deploy;
+    if let Err(response) =
+        crate::sesame::auth::authorize_user(auth, crate::sesame::types::ApiRole::Deployer)
+    {
+        return response;
+    }
+    let path = format!("/v1/proposals/{id}/undo");
+    if let Some(forwarded) =
+        decide_on_leader(&state, directory.as_deref(), &headers, &path, "").await
+    {
+        return forwarded;
+    }
     if let Err(response) = authorise_undoer(&state, auth, id, action).await {
         return response;
     }
     let Some(council) = &state.council else {
         return standalone();
     };
-    if let Some(forwarded) = super::upgrade::forward_upgrade_to_leader(
-        &state,
-        council,
-        directory.as_deref(),
-        &format!("/v1/proposals/{id}/undo"),
-        &headers,
-        "",
-    )
-    .await
-    {
-        return forwarded;
-    }
     let by = principal_of(auth);
     let outcome = match crate::bun::proposals::undo(council, id, by.clone()).await {
         Ok(outcome) => outcome,
@@ -826,17 +824,7 @@ pub(super) async fn authorise_decider(
     id: ProposalId,
     action: crate::config::PermissionAction,
 ) -> Result<Proposal, Response> {
-    if let Some(auth) = auth
-        && auth.kind == crate::sesame::types::TokenKind::Agent
-    {
-        return Err(refusal_response(
-            &ProposalRefusal::AgentDecides {
-                action: "approve or reject".to_string(),
-            },
-            None,
-        ));
-    }
-    crate::sesame::auth::authorize_user(auth, crate::sesame::types::ApiRole::Deployer)?;
+    may_decide(auth)?;
     let proposal = read_proposal(state, auth, id).await?;
     // Clearing a fault is a fault permission, as `relish fault clear` is.
     let action = match proposal.kind {
@@ -858,28 +846,54 @@ pub(super) async fn authorise_decider(
     Ok(proposal)
 }
 
-/// Forward to the leader, or write `build(now)` here, then audit and
-/// answer.
-#[allow(clippy::too_many_arguments)]
-async fn proposal_write(
+/// What a caller's token alone decides: a person, deployer or above, may
+/// approve or reject; an agent never may. Asked before forwarding, so a
+/// token that could never decide is refused where it asked.
+#[allow(clippy::result_large_err)]
+fn may_decide(auth: Option<&crate::sesame::auth::AuthContext>) -> Result<(), Response> {
+    if let Some(auth) = auth
+        && auth.kind == crate::sesame::types::TokenKind::Agent
+    {
+        return Err(refusal_response(
+            &ProposalRefusal::AgentDecides {
+                action: "approve or reject".to_string(),
+            },
+            None,
+        ));
+    }
+    crate::sesame::auth::authorize_user(auth, crate::sesame::types::ApiRole::Deployer)
+}
+
+/// Send a decision on a proposal to the leader, unless this node has
+/// proved it leads (`None`: decide here). Only the leader's replica is sure
+/// to hold the proposal: a follower may not have applied the entry that
+/// created it yet, and would answer 404 for a proposal that exists
+/// (#1928). So a follower reads nothing first; the caller's credential
+/// travels with the request, and the leader makes every check and writes
+/// the audit record as the caller.
+async fn decide_on_leader(
     state: &ApiState,
-    auth: Option<&crate::sesame::auth::AuthContext>,
     directory: Option<&LeaderDirectory>,
     headers: &HeaderMap,
     path: &str,
     body: &str,
+) -> Option<Response> {
+    let Some(council) = &state.council else {
+        return Some(standalone());
+    };
+    super::upgrade::forward_upgrade_to_leader(state, council, directory, path, headers, body).await
+}
+
+/// Write `build(now)`, on the leader, then audit and answer.
+async fn proposal_write(
+    state: &ApiState,
+    auth: Option<&crate::sesame::auth::AuthContext>,
     by: &Principal,
     build: impl FnOnce(u64) -> crate::council::types::RaftRequest,
 ) -> Response {
     let Some(council) = &state.council else {
         return standalone();
     };
-    if let Some(forwarded) =
-        super::upgrade::forward_upgrade_to_leader(state, council, directory, path, headers, body)
-            .await
-    {
-        return forwarded;
-    }
     let now = crate::testkit::lease::now_unix_millis();
     let outcome = match council.write(build(now)).await {
         Ok(crate::council::types::CouncilResponse::Proposal(outcome)) => *outcome,

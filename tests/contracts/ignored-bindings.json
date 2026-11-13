@@ -319,6 +319,12 @@
   },
   {
     "source": "tests/cluster_failover.rs",
+    "function": "a_follower_that_has_not_applied_a_proposal_passes_each_decision_to_the_leader",
+    "binary": "reliaburger::cluster_failover",
+    "test": "a_follower_that_has_not_applied_a_proposal_passes_each_decision_to_the_leader"
+  },
+  {
+    "source": "tests/cluster_failover.rs",
     "function": "the_dashboard_decides_a_proposal_on_the_leader_only",
     "binary": "reliaburger::cluster_failover",
     "test": "the_dashboard_decides_a_proposal_on_the_leader_only"
