@@ -12,9 +12,12 @@
 # healthy too, since it's bun answering.
 set -u
 . /usr/lib/os-release
+# BOOT_CHECK_EFIVARS is for image/tests/test_boot_check.py; the unit never
+# sets it.
+efivars=${BOOT_CHECK_EFIVARS:-/sys/firmware/efi/efivars}
 counted() {
     # systemd-boot sets this only when the entry has tries left (+N).
-    [ -e /sys/firmware/efi/efivars/LoaderBootCountPath-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f ]
+    [ -e "$efivars/LoaderBootCountPath-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f" ]
 }
 report() {
     echo "reliaburger: $1 on OS ${IMAGE_VERSION:-unknown}"

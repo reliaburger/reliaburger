@@ -1586,6 +1586,71 @@ async fn image_seed_writes_a_join_seed_whose_token_the_council_accepts_for_that_
     );
 }
 
+/// #1893: `relish join-token list` and `revoke` through relish's own client
+/// against a running council. The list shows a token without its secret; a
+/// revoke spends every unused token for that node through Raft, so the
+/// token can no longer enrol it, and a second revoke finds nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_listed_join_token_shows_no_secret_and_a_revoke_stops_it_enrolling() {
+    let cluster = TokenCluster::start().await;
+    let mut plaintexts = Vec::new();
+    for node_id in ["node-7", "node-7", "node-8"] {
+        let created: serde_json::Value = cluster
+            .post(
+                &cluster.leader_url,
+                "/v1/join-token/create",
+                serde_json::json!({"node_id": node_id, "ttl_seconds": 900}),
+            )
+            .await
+            .json()
+            .await
+            .unwrap();
+        plaintexts.push(created["token"].as_str().unwrap().to_string());
+    }
+    let relish = reliaburger::relish::client::BunClient::new_with_token(
+        &cluster.leader_url,
+        Some(&cluster.admin),
+    );
+
+    let listed = relish.join_token_list().await.unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .map(|token| (token.node_id.as_str(), token.consumed))
+            .collect::<Vec<_>>(),
+        [("node-7", false), ("node-7", false), ("node-8", false)]
+    );
+    let shown = serde_json::to_string(&listed).unwrap();
+    for (token, plaintext) in listed.iter().zip(&plaintexts) {
+        assert_eq!(token.id.len(), 8, "{shown}");
+        assert!(
+            !shown.contains(plaintext.as_str()),
+            "the list shows a token: {shown}"
+        );
+    }
+
+    assert_eq!(relish.join_token_revoke("node-7").await.unwrap(), 2);
+
+    let listed = relish.join_token_list().await.unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .map(|token| (token.node_id.as_str(), token.consumed))
+            .collect::<Vec<_>>(),
+        [("node-7", true), ("node-7", true), ("node-8", false)]
+    );
+    let security = cluster.leader.security_state().await;
+    for plaintext in &plaintexts[..2] {
+        assert!(matches!(
+            reliaburger::sesame::join::check_join_token(plaintext, "node-7", &security),
+            Err(reliaburger::sesame::join::JoinError::TokenConsumed)
+        ));
+    }
+    reliaburger::sesame::join::check_join_token(&plaintexts[2], "node-8", &security)
+        .expect("revoking node-7 left node-8's token alone");
+    assert_eq!(relish.join_token_revoke("node-7").await.unwrap(), 0);
+}
+
 /// Refusals are the leader's to give, and they come back as it gave them,
 /// with no secret and nothing written.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
