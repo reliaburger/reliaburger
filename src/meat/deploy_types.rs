@@ -619,16 +619,6 @@ pub enum DeployResult {
     Cancelled,
 }
 
-/// The wall-clock time `at` was, for a history entry's `created_at`: a
-/// deploy times itself with a monotonic `Instant`, and the entry carries
-/// `SystemTime`. An `at` older than the epoch, which can't happen on a
-/// real clock, reads as the epoch.
-pub fn wall_clock_at(at: std::time::Instant) -> SystemTime {
-    SystemTime::now()
-        .checked_sub(at.elapsed())
-        .unwrap_or(SystemTime::UNIX_EPOCH)
-}
-
 /// A summary entry for deploy history.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeployHistoryEntry {
@@ -673,6 +663,39 @@ impl DeployHistoryEntry {
             steps_completed: completed,
             steps_total: state.steps.len(),
             spec: None,
+        }
+    }
+
+    /// The entry for a node's deploy of `spec` that began at `started_at`
+    /// and has just ended with `result`.
+    ///
+    /// `completed_at` is now, so `completed_at - created_at` is how long
+    /// the deploy took: what `relish history` and the soak's app start
+    /// read (#1640). The id is the completion time in seconds.
+    pub fn finished(
+        app_id: AppId,
+        spec: &crate::config::app::AppSpec,
+        result: DeployResult,
+        started_at: SystemTime,
+        steps_completed: usize,
+        steps_total: usize,
+    ) -> Self {
+        let completed_at = SystemTime::now();
+        Self {
+            id: DeployId(
+                completed_at
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            ),
+            app_id,
+            image: spec.image.clone().unwrap_or_default(),
+            result,
+            created_at: started_at,
+            completed_at,
+            steps_completed,
+            steps_total,
+            spec: Some(Box::new(spec.clone())),
         }
     }
 }
@@ -1202,5 +1225,32 @@ mod tests {
             instance: "orders-db".into(),
         });
         assert_eq!(rollout_fingerprint(&spec), rollout_fingerprint(&templated));
+    }
+
+    /// #1640: a finished entry starts when the caller says the deploy
+    /// began, ends when it was built, and takes its id from the end.
+    #[test]
+    fn a_finished_entry_spans_from_the_given_start_to_now() {
+        let spec: crate::config::app::AppSpec = toml::from_str("image = 'web:v2'").unwrap();
+        let started_at = SystemTime::now() - Duration::from_secs(90);
+        let entry = DeployHistoryEntry::finished(
+            AppId::new("web", "default"),
+            &spec,
+            DeployResult::Completed,
+            started_at,
+            2,
+            3,
+        );
+        assert_eq!(entry.created_at, started_at);
+        assert!(entry.completed_at >= started_at);
+        let completed_second = entry
+            .completed_at
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert_eq!(entry.id, DeployId(completed_second));
+        assert_eq!(entry.image, "web:v2");
+        assert_eq!((entry.steps_completed, entry.steps_total), (2, 3));
+        assert_eq!(entry.spec.as_deref(), Some(&spec));
     }
 }

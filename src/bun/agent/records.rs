@@ -503,6 +503,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             // unprovisioned directory loads as `None` and the rotation loop
             // provisions afresh.
             let identity_dir = self.instance_identity_dir(&runtime_id);
+            // BLOCKING-OK: adoption at startup, before the agent loop starts; the identity directory is tmpfs on a root node
             let identity = match crate::sesame::identity::load_identity(&identity_dir) {
                 Ok(identity) => identity,
                 Err(e) => {

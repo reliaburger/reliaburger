@@ -39,6 +39,7 @@ pub async fn sweep_expired_tokens_once(
     node: &str,
     now: SystemTime,
 ) -> Result<Vec<String>, CouncilError> {
+    // One round: the loop asks again next tick (#1393).
     if !council.is_leader().await {
         return Ok(Vec::new());
     }
@@ -89,6 +90,7 @@ pub async fn retire_signing_keys_once(
     node: &str,
     now: SystemTime,
 ) -> Result<Vec<String>, CouncilError> {
+    // One round: the sweep asks again next tick (#1393).
     if !council.is_leader().await {
         return Ok(Vec::new());
     }

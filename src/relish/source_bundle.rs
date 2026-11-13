@@ -304,6 +304,49 @@ mod tests {
         }
     }
 
+    /// `relish agent patch test` runs the portable suite in an extracted
+    /// bundle, and the fuzz tests there read every target's source and
+    /// corpus (#1876).
+    #[test]
+    fn bundle_carries_every_fuzz_target_and_its_corpus() {
+        let paths: Vec<String> = files().unwrap().into_iter().map(|file| file.path).collect();
+        for target in crate::fuzz::TARGETS {
+            let source = format!("fuzz/fuzz_targets/{}.rs", target.name);
+            assert!(
+                paths.contains(&source),
+                "{source} is missing from the bundle"
+            );
+            let corpus = format!("fuzz/corpus/{}/", target.name);
+            assert!(
+                paths.iter().any(|path| path.starts_with(&corpus)),
+                "{corpus} is empty in the bundle"
+            );
+        }
+    }
+
+    /// Files outside the build set that portable tests read at run time: the
+    /// job bench's baseline report, the concept budget, the released CLI the
+    /// manual's reference labels commands against, the audit's exceptions,
+    /// the READMEs and the Linux servers guide.
+    #[test]
+    fn bundle_carries_the_files_the_portable_tests_read() {
+        for path in [
+            crate::relish::bench_jobs::COMMITTED_RERUN_REPORT,
+            crate::relish::concept_budget::BUDGET_FILE,
+            crate::relish::command_reference::REFERENCE_CHAPTER,
+            "scripts/release/released-cli.tsv",
+            ".cargo/audit.toml",
+            "README.md",
+            "docs/README.md",
+            "docs/linux-servers.md",
+        ] {
+            assert!(
+                read(path).unwrap().is_some(),
+                "{path} is missing from the bundle"
+            );
+        }
+    }
+
     #[test]
     fn a_file_read_back_equals_the_checkouts() {
         for path in ["Cargo.toml", "Cargo.lock", "src/relish/source_bundle.rs"] {

@@ -151,6 +151,7 @@ async fn claim_handler(State(state): State<ClaimState>, body: Bytes) -> impl Int
     if let Err(error) = Seed::from_tar_gz(&body) {
         return (StatusCode::BAD_REQUEST, format!("not a seed: {error}"));
     }
+    // BLOCKING-OK: appliance prepare's claim server: its own process, with nothing else on its runtime
     if let Err(error) = super::prepare::write_atomic(&state.seed_path, &body, 0o600) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -207,6 +208,7 @@ pub async fn serve_until_claimed(
 async fn wait_for_address(limit: Duration) -> Option<IpAddr> {
     let deadline = tokio::time::Instant::now() + limit;
     loop {
+        // BLOCKING-OK: appliance prepare's claim server: its own process, with nothing else on its runtime
         if let Some(address) = super::address::detect() {
             return Some(address);
         }

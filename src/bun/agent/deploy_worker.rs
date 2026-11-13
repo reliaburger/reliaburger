@@ -67,6 +67,8 @@ pub(super) struct AbortedRollout<'a> {
     pub(super) retired: usize,
     pub(super) replica_count: u32,
     pub(super) config: &'a crate::meat::deploy_types::DeployConfig,
+    /// When this node's deploy of the app began: its history entry's start.
+    pub(super) started_at: SystemTime,
 }
 
 /// The last few hundred bytes of a runtime's captured stderr (`{stem}.stderr`),
@@ -200,6 +202,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 .await;
             return;
         }
+        let now = Instant::now();
         let mut all_ids: Vec<String> = Vec::new();
         let deployed_apps: Vec<(String, String)> = config
             .app
@@ -230,10 +233,10 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             if self.report_cancellation(&events).await {
                 return;
             }
-            // When this node's deploy of this app started: its health clocks
-            // count from here, and its history entry's `created_at` (#1640).
-            let now = Instant::now();
             let namespace = spec.namespace.as_deref().unwrap_or("default");
+            // This app's history entry starts here, not when it's written,
+            // so it records how long the deploy took (#1640).
+            let started_at = SystemTime::now();
 
             if self.report_cancellation(&events).await {
                 return;
@@ -300,6 +303,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                         previous.as_ref(),
                         change,
                         &events,
+                        started_at,
                     )
                     .await
                     .is_break()
@@ -348,6 +352,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                             existing,
                             &events,
                             now,
+                            started_at,
                         )
                         .await
                     }
@@ -360,6 +365,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                             existing,
                             &events,
                             now,
+                            started_at,
                         )
                         .await
                     }
@@ -463,22 +469,14 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             }
 
             self.ops
-                .push_deploy_history(crate::meat::deploy_types::DeployHistoryEntry {
-                    id: crate::meat::deploy_types::DeployId(
-                        SystemTime::now()
-                            .duration_since(SystemTime::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs(),
-                    ),
-                    app_id: crate::meat::types::AppId::new(app_name, namespace),
-                    image: spec.image.clone().unwrap_or_default(),
-                    result: crate::meat::deploy_types::DeployResult::Completed,
-                    created_at: crate::meat::deploy_types::wall_clock_at(now),
-                    completed_at: SystemTime::now(),
-                    steps_completed: ids.len(),
-                    steps_total: ids.len(),
-                    spec: Some(Box::new(spec.clone())),
-                })
+                .push_deploy_history(crate::meat::deploy_types::DeployHistoryEntry::finished(
+                    crate::meat::types::AppId::new(app_name, namespace),
+                    spec,
+                    crate::meat::deploy_types::DeployResult::Completed,
+                    started_at,
+                    ids.len(),
+                    ids.len(),
+                ))
                 .await;
 
             all_ids.extend(ids.iter().map(|id| id.0.clone()));
@@ -843,6 +841,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
     /// place, rather than seeing its own spec already stored and rolling
     /// every replica, which would need room for all of them twice over
     /// (#971).
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn change_share_in_place(
         &self,
         app_name: &str,
@@ -851,8 +850,8 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         previous: Option<&AppSpec>,
         change: super::scale_in_place::InPlaceChange,
         events: &mpsc::Sender<ApplyEvent>,
+        started_at: SystemTime,
     ) -> std::ops::ControlFlow<()> {
-        let started_at = SystemTime::now();
         let super::scale_in_place::InPlaceChange { add: count, retire } = change;
         let message = match (count, retire.len()) {
             (0, 0) => format!(
@@ -959,22 +958,14 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 .await;
         }
         self.ops
-            .push_deploy_history(crate::meat::deploy_types::DeployHistoryEntry {
-                id: crate::meat::deploy_types::DeployId(
-                    SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs(),
-                ),
-                app_id: crate::meat::types::AppId::new(app_name, namespace),
-                image: spec.image.clone().unwrap_or_default(),
-                result: crate::meat::deploy_types::DeployResult::Completed,
-                created_at: started_at,
-                completed_at: SystemTime::now(),
-                steps_completed: ids.len(),
-                steps_total: ids.len(),
-                spec: Some(Box::new(spec.clone())),
-            })
+            .push_deploy_history(crate::meat::deploy_types::DeployHistoryEntry::finished(
+                crate::meat::types::AppId::new(app_name, namespace),
+                spec,
+                crate::meat::deploy_types::DeployResult::Completed,
+                started_at,
+                ids.len(),
+                ids.len(),
+            ))
             .await;
         std::ops::ControlFlow::Continue(())
     }
@@ -1015,6 +1006,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         existing: Vec<InstanceId>,
         events: &mpsc::Sender<ApplyEvent>,
         now: Instant,
+        started_at: SystemTime,
     ) -> std::ops::ControlFlow<()> {
         let _ = events
             .send(ApplyEvent::Progress {
@@ -1214,6 +1206,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     retired,
                     replica_count,
                     config: &deploy_config,
+                    started_at,
                 },
                 events,
             )
@@ -1279,6 +1272,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 started.ips.clone(),
                 started.specs.clone(),
                 now,
+                started_at,
             )
             .await
         {
@@ -1455,7 +1449,6 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         rollout: AbortedRollout<'_>,
         events: &mpsc::Sender<ApplyEvent>,
     ) {
-        let started_at = SystemTime::now();
         let AbortedRollout {
             app_name,
             namespace,
@@ -1466,6 +1459,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             retired,
             replica_count,
             config,
+            started_at,
         } = rollout;
         let auto_rollback = config.auto_rollback;
         let restore = auto_rollback && retired > 0;
@@ -1558,22 +1552,14 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             eprintln!("deploy: could not record {namespace}/{app_name}'s previous spec: {error}");
         }
         self.ops
-            .push_deploy_history(crate::meat::deploy_types::DeployHistoryEntry {
-                id: crate::meat::deploy_types::DeployId(
-                    SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs(),
-                ),
-                app_id: crate::meat::types::AppId::new(app_name, namespace),
-                image: spec.image.clone().unwrap_or_default(),
+            .push_deploy_history(crate::meat::deploy_types::DeployHistoryEntry::finished(
+                crate::meat::types::AppId::new(app_name, namespace),
+                spec,
                 result,
-                created_at: started_at,
-                completed_at: SystemTime::now(),
-                steps_completed: started.healthy.len(),
-                steps_total: replica_count as usize,
-                spec: Some(Box::new(spec.clone())),
-            })
+                started_at,
+                started.healthy.len(),
+                replica_count as usize,
+            ))
             .await;
         // An operator's cancellation isn't evidence that the spec is bad.
         let cancelled = self
@@ -1864,6 +1850,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         existing: Vec<InstanceId>,
         events: &mpsc::Sender<ApplyEvent>,
         now: Instant,
+        started_at: SystemTime,
     ) -> std::ops::ControlFlow<()> {
         let _ = events
             .send(ApplyEvent::Progress {
@@ -2081,6 +2068,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             retired: 0,
             replica_count,
             config: &deploy_config,
+            started_at,
         };
         if new_failed {
             self.abort_rollout(aborted(&green), events).await;
@@ -2160,6 +2148,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 new_ips.clone(),
                 new_specs.clone(),
                 now,
+                started_at,
             )
             .await
         {

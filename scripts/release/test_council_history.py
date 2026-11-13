@@ -170,11 +170,14 @@ class EndToEnd(unittest.TestCase):
         self.assertGreater(result["checked"], 300)
 
     def test_follower_reads_without_asking_the_leader_fail_the_check(self):
-        events = run_fake(FakeCouncil(follower_reads=True))
+        # One client, so the history is a sequence and every answer is a
+        # quiet moment to cut at. Three flat-out client threads overlapped
+        # however the runner scheduled them, and a slow runner gave a
+        # 32-operation slice (CI run 43262482619).
+        events = run_fake(FakeCouncil(follower_reads=True), clients=1)
         result = lin.check(lin.operations_from_events(events))
         self.assertEqual(result["verdict"], "violation")
-        # The clients run flat out here, so a quiet moment to cut at is rare.
-        self.assertLessEqual(len(result["violation"]["slice"]), 20, result["violation"])
+        self.assertLessEqual(len(result["violation"]["slice"]), 3, result["violation"])
         self.assertIn("read", [entry["op"] for entry in result["violation"]["slice"]])
 
 

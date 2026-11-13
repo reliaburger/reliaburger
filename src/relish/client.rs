@@ -495,9 +495,10 @@ static CLI_ENDPOINT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::
 /// the context's own token. A `std` lock, not a tokio one, because
 /// [`resolve_token`] is synchronous and holds it only to clone the string,
 /// never across an `.await`.
-// One per process, like the CLI_* statics above, so the `relish::mcp`
-// tests that set it rely on nextest running each test in its own process.
-// Under plain `cargo test` they share it across threads and fail.
+// One per process, like the CLI_* statics above, so each `relish::mcp`
+// test that sets it needs a process of its own. nextest gives every test
+// one; under plain `cargo test` those tests re-run themselves in a child
+// (`ran_in_its_own_process`, #1876).
 static MCP_TOKEN: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
 
 /// Send `token` in place of the managed context's admin token from now on,
@@ -983,6 +984,7 @@ impl BunClient {
             // An explicit endpoint picks the node; the managed context's host
             // forwards still describe how this host reaches the cluster's
             // registry and ingress, when it is the same cluster.
+            // BLOCKING-OK: relish CLI: a one-shot read of the local context before the command does anything long-lived; `relish mcp` calls this off the runtime
             let forwards = super::local_context::default_path()
                 .and_then(|path| super::local_context::LocalContext::load(&path))
                 .ok()
@@ -993,6 +995,7 @@ impl BunClient {
                 None => client,
             };
         }
+        // BLOCKING-OK: relish CLI: a one-shot read of the local context before the command does anything long-lived; `relish mcp` calls this off the runtime
         let context = super::local_context::default_path()
             .and_then(|path| super::local_context::LocalContext::load(&path));
         match context {
@@ -4858,9 +4861,7 @@ mod tests {
     /// localhost:9117 default, and says the port refused the connection.
     #[tokio::test]
     async fn a_refused_connection_names_the_endpoint_and_says_refused() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        drop(listener);
+        let address = crate::refused_address::refused_address();
         let client = BunClient::build(&format!("http://{address}"), None, None);
 
         let error = client.health().await.unwrap_err();

@@ -338,6 +338,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// off the command loop instead (`request_app_stop`,
     /// `stop_app_unattended`). This inline form lets tests drive a whole stop
     /// without running the loop.
+    ///
+    /// `StillRunning` from the finish means off-loop work, such as removing
+    /// the instance's identity directory, hasn't landed yet. The loop asks
+    /// again on a later turn (`recheck_stop_later`); so does this, for up to
+    /// a minute, so a slow disk doesn't fail a test about something else
+    /// (#1901).
     #[cfg(test)]
     pub(super) async fn stop_app(
         &mut self,
@@ -346,7 +352,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     ) -> Result<(), BunError> {
         let stop = self.begin_app_stop(app_name, namespace).await?;
         self.app_exit_wait(&stop).await?;
-        self.finish_app_stop(app_name, namespace, stop).await
+        let patience = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            match self
+                .finish_app_stop(app_name, namespace, stop.clone())
+                .await
+            {
+                Err(BunError::StillRunning { .. }) if tokio::time::Instant::now() < patience => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                finished => return finished,
+            }
+        }
     }
 
     /// Withdraw an app's routing and move its instances to Stopping.

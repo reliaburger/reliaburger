@@ -347,7 +347,7 @@ async fn download_arch(
             .map(|e| e.sha256.clone())
             .unwrap_or_default();
         let path = local_path(&arch_dir, &name);
-        if path.is_file() && sha256_file(&path)? == expected {
+        if path.is_file() && sha256_file_off_runtime(&path).await? == expected {
             progress(output, format!("  {name}: already here"));
             files.push(DownloadedFile {
                 name,
@@ -358,7 +358,7 @@ async fn download_arch(
         }
         let url = asset_url(channel_url, &entry.tag, &name)?;
         let bytes = stream_to(client, &url, &path).await?;
-        let actual = sha256_file(&path)?;
+        let actual = sha256_file_off_runtime(&path).await?;
         if let Err(e) = crate::os::check_asset(&entries, &entry.sums, &name, &actual) {
             let _ = tokio::fs::remove_file(&path).await;
             return Err(failed(&e.to_string()));
@@ -419,6 +419,15 @@ async fn stream_to(client: &reqwest::Client, url: &str, path: &Path) -> Result<u
     file.sync_all().await?;
     tokio::fs::rename(&temporary, path).await?;
     Ok(total)
+}
+
+/// [`sha256_file`] on the blocking pool: an OS image is over a gigabyte,
+/// and hashing it inline would hold up the runtime's other work.
+async fn sha256_file_off_runtime(path: &Path) -> std::io::Result<String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || sha256_file(&path))
+        .await
+        .map_err(std::io::Error::other)?
 }
 
 /// The hex SHA-256 of a file, read in 1 MiB pieces (disk images are

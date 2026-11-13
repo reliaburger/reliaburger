@@ -202,7 +202,13 @@ impl RuncGrill {
     ) -> io::Result<()> {
         let intent = context.intent().await?;
         let directory = directory(&intent);
-        crate::grill::process_owner::validate_socket_directory(&directory)?;
+        // The directory is under /tmp, which may be on disk (#1860).
+        let checked = directory.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::grill::process_owner::validate_socket_directory(&checked)
+        })
+        .await
+        .map_err(io::Error::other)??;
         let socket = directory.join("api.sock");
         let mut started = 0;
         loop {
@@ -246,7 +252,11 @@ impl RuncGrill {
         socket: &Path,
         pid: u32,
     ) -> io::Result<()> {
-        crate::grill::process_owner::remove_socket(socket)?;
+        // The socket is under /tmp, which may be on disk (#1860).
+        let stale = socket.to_path_buf();
+        tokio::task::spawn_blocking(move || crate::grill::process_owner::remove_socket(&stale))
+            .await
+            .map_err(io::Error::other)??;
         let stem = context
             .role_log_stem(RuntimeRole::Launcher)
             .await?
@@ -366,6 +376,7 @@ impl RuncGrill {
             Ok(Some(crate::grill::records::RootlessNetworkRecord {
                 api_socket: directory(&intent).join("api.sock"),
                 owner_pid: pid,
+                // BLOCKING-OK: procfs, answered from memory
                 owner_pid_started_at: crate::grill::records::process_start_time(pid)
                     .ok_or_else(|| io::Error::other("rootless helper identity is unavailable"))?,
                 container_pid,

@@ -242,6 +242,7 @@ impl BuildInfo {
     /// and says `null` when the checkout has gone.
     pub fn current() -> Self {
         use crate::relish::source_bundle;
+        // BLOCKING-OK: relish CLI: read once per command, before any long-lived work; a release build reads what it embedded
         BuildInfo {
             version: env!("CARGO_PKG_VERSION").to_string(),
             commit: crate::upgrade::version::build_commit().map(str::to_string),
