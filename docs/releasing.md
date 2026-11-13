@@ -1573,6 +1573,12 @@ the real `curl … | sh` install against it on every host we advertise.
    record tables each node's log store size and Parquet file count beside
    its RSS.
 
+   Every tier disables Ubuntu's `apt-daily` and `apt-daily-upgrade` timers
+   and `unattended-upgrades` in the guests before it configures them, and
+   refuses to start unless each guest shows them inactive: in the first
+   0.2.8 memory run the daily unattended upgrade restarted Bun on all three
+   nodes at hour 16.7.
+
    ```sh
    scripts/release/qualify-jobs-sustained.sh --tier day \
      --base-url https://github.com/reliaburger/reliaburger/releases/download/staging-v0.2.3-RUN_ID-ATTEMPT \

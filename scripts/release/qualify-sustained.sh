@@ -834,6 +834,34 @@ resize_nodes() {
     meta deviations+ "Each quickstart VM resized from 2 vCPU / 2 GiB to $day_cpus vCPU / $day_memory_gib GiB before configuring, the size the scale-out record measured (maintainer decision, 27 October 2026)"
 }
 
+# Ubuntu's daily unattended upgrade restarts services whose packages it
+# upgrades: in the 0.2.8 memory run it restarted Bun on two nodes at hour
+# 16.7 (#1417). The soak's guests take no upgrades while it runs.
+stop_guest_upgrades() {
+    local node
+    for node in 1 2 3; do
+        # Disabled, not only stopped: the day tier's resize restarts the VMs.
+        gsh "$node" 'systemctl disable --now apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service; systemctl stop apt-daily.service apt-daily-upgrade.service' \
+            > "$evidence/snapshots/upgrades-$node.log" 2>&1 || setup_fail "could not stop unattended upgrades on ${vm[node]}"
+    done
+    meta deviations+ "Ubuntu's apt-daily and apt-daily-upgrade timers stopped and disabled in each guest, so unattended upgrades can't restart Bun during the soak (#1417)"
+}
+
+# Just before the baseline, after anything that ran apt: every guest must
+# show its upgrade timers and services inactive, and the timers not enabled.
+verify_guest_upgrades_off() {
+    local node file
+    for node in 1 2 3; do
+        file=$evidence/snapshots/upgrades-verified-$node.txt
+        gsh "$node" 'for unit in apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service unattended-upgrades.service; do echo "$unit $(systemctl is-active "$unit") $(systemctl is-enabled "$unit" 2>/dev/null)"; done' \
+            > "$file" 2>&1 || setup_fail "could not read the upgrade units on ${vm[node]}"
+        if grep -E ' active( |$)|\.timer [a-z]+ enabled' "$file" > /dev/null; then
+            setup_fail "unattended upgrades still active on ${vm[node]}: $(tr '\n' ';' < "$file")"
+        fi
+    done
+    meta deviations+ "apt-daily, apt-daily-upgrade and unattended-upgrades verified inactive on every node before the baseline (snapshots/upgrades-verified-N.txt)"
+}
+
 # The malloc points (#1417) call glibc functions inside Bun through gdb,
 # which the guest image doesn't ship.
 install_gdb() {
@@ -2163,9 +2191,11 @@ else
 import json, sys
 json.dump({"nodes": sys.argv[2:]}, open(sys.argv[1], "w"))
 PY
+    stop_guest_upgrades
     [ "$tier" != day ] || resize_nodes
     configure_nodes
     [ "$malloc_points" != true ] || install_gdb
+    verify_guest_upgrades_off
     if [ "$tier" = day ]; then
         meta deviations+ 'Log-store A/B (#1417): `soak-quiet` logs about 8 lines a second on node 3 (pinned by `soak-volume=redis`) and nothing queries it; `soak-redis-client` is pinned to node 1 (node.toml `[node.labels] soak-logs = "client"`); each check tails `soak-writer` and `soak-redis-client` through `/v1/logs/entries` on node 2 and node 1, the per-node query `relish logs` fans out to, so node 3'"'"'s log store is never read'
     fi

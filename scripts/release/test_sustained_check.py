@@ -2512,6 +2512,58 @@ class MallocPoints(Evidence):
         # Hour 24 comes after the soak time and before the drain asks jobs to stop.
         self.assertLess(script.index("run_slot malloc_point 24"), script.index('meta job_stop_at "json:$(date +%s)"'))
 
+    def test_guests_take_no_unattended_upgrades_during_a_soak(self):
+        # In the 0.2.8 memory run the guests' daily unattended upgrade
+        # restarted Bun on nodes 1 and 2 at hour 16.7.
+        import subprocess
+        script = (Path(__file__).parent / "qualify-sustained.sh").read_text()
+        function = script[script.index("stop_guest_upgrades() {"):]
+        function = function[:function.index("\n}\n") + 3]
+        calls = Path(self.temp.name) / "gsh.txt"
+        stubs = (f"evidence={self.evidence}\nmkdir -p $evidence/snapshots\nvm=([1]=a [2]=b [3]=c)\n"
+                 f"gsh() {{ echo \"$1 $2\" >> {calls}; }}\nmeta() {{ echo \"meta $*\" >> {calls}; }}\n"
+                 "setup_fail() { exit 9; }\n")
+        subprocess.run(["bash", "-c", stubs + function + "stop_guest_upgrades"], check=True, timeout=30)
+        lines = calls.read_text().splitlines()
+        self.assertEqual([line.split(" ")[0] for line in lines[:3]], ["1", "2", "3"])
+        for line in lines[:3]:
+            self.assertIn("systemctl disable --now apt-daily.timer apt-daily-upgrade.timer", line)
+        self.assertIn("unattended upgrades can't restart Bun", lines[3])
+        # Every tier, before the nodes are resized or configured.
+        start = script[script.index("    start_run\n"):]
+        self.assertLess(start.index("stop_guest_upgrades"), start.index("configure_nodes"))
+        self.assertLess(start.index("stop_guest_upgrades"), start.index("resize_nodes"))
+
+    def verify_upgrades(self, answer):
+        import subprocess
+        script = (Path(__file__).parent / "qualify-sustained.sh").read_text()
+        function = script[script.index("verify_guest_upgrades_off() {"):]
+        function = function[:function.index("\n}\n") + 3]
+        notes = Path(self.temp.name) / "notes.txt"
+        stubs = (f"evidence={self.evidence}\nmkdir -p $evidence/snapshots\nvm=([1]=a [2]=b [3]=c)\n"
+                 f"gsh() {{ printf '%s\\n' {answer}; }}\nmeta() {{ echo \"meta $*\" >> {notes}; }}\n"
+                 "setup_fail() { echo \"failed: $*\"; exit 9; }\n")
+        result = subprocess.run(["bash", "-c", stubs + function + "verify_guest_upgrades_off"],
+                                stdout=subprocess.PIPE, text=True, timeout=30)
+        return result, notes.read_text() if notes.exists() else ""
+
+    def test_the_soak_starts_only_once_every_guest_shows_upgrades_off(self):
+        quiet = ("'apt-daily.timer inactive disabled' 'apt-daily-upgrade.timer inactive disabled' "
+                 "'apt-daily.service inactive static' 'apt-daily-upgrade.service inactive static' "
+                 "'unattended-upgrades.service inactive enabled'")
+        result, notes = self.verify_upgrades(quiet)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("verified inactive on every node", notes)
+        self.assertTrue((self.evidence / "snapshots" / "upgrades-verified-1.txt").exists())
+        busy = quiet.replace("'apt-daily-upgrade.timer inactive disabled'", "'apt-daily-upgrade.timer active enabled'")
+        result, _ = self.verify_upgrades(busy)
+        self.assertEqual(result.returncode, 9)
+        self.assertIn("apt-daily-upgrade.timer active enabled", result.stdout)
+        script = (Path(__file__).parent / "qualify-sustained.sh").read_text()
+        start = script[script.index("    start_run\n"):]
+        self.assertLess(start.index("install_gdb"), start.index("verify_guest_upgrades_off"))
+        self.assertLess(start.index("verify_guest_upgrades_off"), start.index("apply_workloads"))
+
     def test_the_plan_names_the_malloc_points_and_the_log_ab(self):
         import subprocess
         result = subprocess.run([str(Path(__file__).parent / "qualify-jobs-sustained.sh"), "--tier", "day", "--plan"],
