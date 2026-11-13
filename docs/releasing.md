@@ -42,6 +42,18 @@ build it, and pull requests only when the workflow changes. Its name matches
 neither the candidate job's `binaries-*` nor `candidate-*`, so it never
 reaches `candidate.json`, staging or promotion.
 
+The appliance OS images are built separately, by
+`.github/workflows/appliance.yml`. A publishing run releases them as
+`os-<version>-<arch>` with a signed `os-channel.json`, which is what `relish
+image download` and `relish os` read. Today only a manual dispatch with
+`publish` set publishes. The weekly scheduled build (Monday 04:00 UTC,
+`cron: "0 4 * * 1"`) is switched off until v0.3.0 is promoted (maintainer,
+7 October 2026), so the 0.3.0 train reaching main publishes nothing by
+itself. **After v0.3.0 is promoted, restore the `schedule` trigger** in
+`appliance.yml`. Its plan job already treats a scheduled run on main as a
+publishing one, and a build whose packages match the last release publishes
+nothing.
+
 There's no Intel macOS build. 0.2.1 was the last release with
 `relish-macos-x86_64` (maintainer decision, 17 October 2026,
 [#1018](https://github.com/reliaburger/reliaburger/issues/1018)): nothing ever

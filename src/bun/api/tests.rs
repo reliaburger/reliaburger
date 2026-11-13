@@ -1877,6 +1877,34 @@ async fn a_two_voter_council_refuses_to_roll_and_three_voters_can() {
     }
 }
 
+/// An OS rollout updates council members one at a time too. On two voters
+/// the rollout planner never finds the headroom to take one down, so the
+/// rollout would sit pending for ever: start refuses it instead, with the
+/// same reason a bun upgrade gives.
+#[tokio::test]
+async fn an_os_rollout_on_a_two_voter_council_is_refused_at_start() {
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let pair = council_of(2).await;
+    let app = router_over(pair[0].clone(), admin);
+    let (status, reply) = send_bounded(
+        app,
+        "POST",
+        "/v1/os/rollout/start",
+        &admin_key,
+        r#"{"version":"2026.42.0","channel_url":"https://example/os-channel.json"}"#,
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{reply}");
+    assert!(
+        reply.contains("council of 2 voters") && reply.contains("at least three voters"),
+        "{reply}"
+    );
+    for node in pair {
+        node.shutdown().await.unwrap();
+    }
+}
+
 /// A three-node council led by node 1, whose API is a fake that records
 /// every request and accepts it. Returns node 2's real router (a
 /// follower) with `token` in its store, what the leader has seen, and

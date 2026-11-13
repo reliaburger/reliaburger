@@ -493,7 +493,7 @@ Show the commands from blank disks to a cluster (0.3.0, not in 0.2.8)
 
     Three nodes alive. From here it’s the same cluster as the tour’s: deploy with `relish apply`, and update the OS with `relish os upgrade`, one node at a time.
 
-Serving from a Mac, an isolated switch, firmware quirks: [the appliance chapter of the manual](https://github.com/reliaburger/reliaburger/blob/main/docs/manual/15_appliance.md).
+Serving from a Mac, an isolated switch, firmware quirks: [the appliance chapter of the manual](https://github.com/reliaburger/reliaburger/blob/main/docs/manual/17_appliance.md).
 
 ## Debug the platform, not just your app
 

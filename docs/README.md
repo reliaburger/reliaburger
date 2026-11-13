@@ -41,8 +41,8 @@ metrics, logs, GitOps, jobs and fault injection are compiled into that agent,
 so there's no control plane to assemble and no add-ons to install. A Linux node
 needs a few distribution packages (`runc`, `nftables`, `iproute2` and friends,
 listed in the [Linux servers guide](linux-servers.md)), and releases are glibc
-builds; static builds are planned for 0.3.0
-([#401](https://github.com/reliaburger/reliaburger/issues/401)). Every
+builds; static builds are planned
+([#1774](https://github.com/reliaburger/reliaburger/issues/1774)). Every
 command is listed in the manual's
 [reference](manual/13_reference.md#every-relish-command).
 
@@ -947,7 +947,7 @@ already run, from packages and firewall rules to systemd units, see
 [Running Reliaburger on your own Linux servers](linux-servers.md).
 To turn spare mini PCs or thin clients into appliance nodes over the network
 instead, with no distro to install, see
-[Bare metal: the appliance and netboot](manual/15_appliance.md).
+[Bare metal: the appliance and netboot](manual/17_appliance.md).
 
 Keep `[cluster].name` identical on every node. `relish init`, `relish setup`
 and `relish dev create` write it for you; Bun validates it as a DNS-style SPIFFE trust domain.

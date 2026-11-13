@@ -64,7 +64,7 @@ Each is one stacked PR, unless it grows too big to review. Estimates are enginee
 ### W3. relish for bare metal (~1.5 weeks), [#403](https://github.com/reliaburger/reliaburger/issues/403)
 
 - `relish cluster create --bare-metal`: the cluster's PKI on the laptop, in a bare-metal context (generalising `LocalContext`), with the master-key backup prompt. (7 October 2026: it becomes a real prompt, with `--yes` to skip it.)
-- `relish image download | write | seed`: fetch and verify a channel release, write a disk or stick, write seeds. These replace `seed-fleet.sh`, `node-toml.py` and `make-seed-stick.sh`.
+- `relish image download | write | seed`: fetch and verify a channel release, write a disk or stick, write seeds. These replace `seed-fleet.sh` and `node-toml.py`. `image/lab/make-seed-stick.sh` stays, as lab tooling: it packs the `stick/` directory relish writes into a FAT disk image for QEMU, which a real machine doesn't need, since you copy the folder onto a stick (maintainer, 12 November 2026).
 - **Tests:** snapshot tests of the generated seeds and `node.toml`, and verification failures.
 
 ### W4. `relish netboot` (~2.5 weeks), [#404](https://github.com/reliaburger/reliaburger/issues/404)
@@ -126,7 +126,7 @@ What was built, and (in italics) what the original plan had that wasn't:
 
 ### W7. Docs, lab and the exit test (~1.5 weeks, then the hardware), [#407](https://github.com/reliaburger/reliaburger/issues/407)
 
-- **Docs:** rewrite `docs/manual/15_appliance.md` around the real commands (no "preview" scripts). Update `docs/book/15a-becoming-the-os.md` with the Rust parts and the lessons. Update README, `docs/README.md` and the roadmap.
+- **Docs:** rewrite `docs/manual/17_appliance.md` around the real commands (no "preview" scripts). Update `docs/book/15a-becoming-the-os.md` with the Rust parts and the lessons. Update README, `docs/README.md` and the roadmap.
 - **Retire the preview tools:** `image/tools/` and the lab's hand staging go once their replacements are tested. The lab keeps only what QEMU needs. **Done 7 October 2026:** `image/tools/` is gone; the lab seeds with `relish cluster create --bare-metal` (`image/lab/seed-lab.sh`), and `fleet-measure.sh`, which S5 still needs, moved to `image/lab/`.
 - **The quickstart guest moves to Ubuntu 26.04**, sharing the appliance's package list (approved 27 Sep).
   - Done on 7 October: the guest is pinned to the 26.04 cloud images of 20260927, chrony is disabled as timesyncd was, the build grows the full root filesystem and names the NIC `eth0` before first boot (otherwise each new VM waited 2 minutes in `systemd-networkd-wait-online`), `build.rs` pins eBPF to `-mcpu=v1` (kernel 7.0 refused clang 21's default v3 code), and `scripts/release/test_guest_images.py` fails if the guest's list and the appliance's node packages drift (the guest adds Buildah). mkosi can't read the JSON, so the test holds the two lists together instead of one file generating the other.

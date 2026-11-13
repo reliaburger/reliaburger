@@ -55,8 +55,8 @@ If you're an agent operating or debugging a Reliaburger cluster:
 - [Upgrades, GitOps and backups](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.0/docs/manual/12_operations.md)
 - [Reference](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.0/docs/manual/13_reference.md)
 - [Batch jobs](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.0/docs/manual/14_batch-jobs.md)
-- [Bare metal: the appliance and netboot](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.0/docs/manual/15_appliance.md)
 - [Writing a controller](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.0/docs/manual/15_writing-a-controller.md)
+- [Bare metal: the appliance and netboot](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.0/docs/manual/17_appliance.md)
 
 ## Website
 
