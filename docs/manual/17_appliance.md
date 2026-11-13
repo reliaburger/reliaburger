@@ -468,8 +468,10 @@ Type yes once it's backed up:
 ```
 
 Copy the folder somewhere that isn't this laptop, then type `yes`. Anything
-else asks again; Ctrl-D stops without claiming anything, and you start again
-from an empty directory. In a script, `--yes` prints the reminder and carries
+else asks again. Ctrl-D stops without claiming anything. relish then removes
+the files it wrote, the keys and the root backup's identity included, so you
+can run the same command again. Anything else in the directory stays,
+including a copy of the keys you made while it waited. In a script, `--yes` prints the reminder and carries
 on without waiting, so the backup is then your script's job. Without a
 terminal and without `--yes`, relish refuses before it makes anything. Every other
 machine's seed holds only a join token: single-use, bound to that machine's

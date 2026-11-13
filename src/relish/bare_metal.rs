@@ -11,7 +11,7 @@
 //! prepare`). Seeds go on a USB stick labelled `RBSEED` as
 //! `seeds/<mac>.seed`, so one stick serves the whole fleet.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -610,10 +610,101 @@ pub fn run_create(
     use std::io::IsTerminal;
     let secrets = options.directory.join("secrets");
     let check = backup_check(yes, std::io::stdin().is_terminal(), &secrets)?;
-    let created = create(options)?;
-    back_up(check, &secrets, output)?;
+    let created = create_confirmed(options, || back_up(check, &secrets, output))?;
     let context = adopt(&created, &options.directory)?;
     print_output(&ClusterCreated::new(&created, options, context), output)
+}
+
+/// [`create`], then `confirm` the master-key backup. If the operator
+/// doesn't confirm it (Ctrl-D, or a pipe that closes), remove exactly what
+/// `create` wrote: no seed has left this machine, so the cluster never
+/// existed, and keeping a master key nobody has a copy of helps no one. It
+/// also lets the same command run again, rather than finding a directory
+/// that "already holds a cluster".
+///
+/// What `create` wrote is worked out as soon as it returns, before the
+/// question: told to copy the keys somewhere safe, an operator may copy them
+/// into the cluster directory, and that copy must survive. So only the paths
+/// that appeared during `create` go, a directory only once it's empty, and
+/// so does the root backup's identity (named after this cluster's root, in
+/// `root_backup_keys`). Anything else stays.
+pub fn create_confirmed(
+    options: &CreateOptions,
+    confirm: impl FnOnce() -> Result<(), RelishError>,
+) -> Result<Created, RelishError> {
+    let dir = &options.directory;
+    let existed = dir.exists();
+    let before = written_tree(dir)?;
+    let created = create(options)?;
+    let written: Vec<PathBuf> = written_tree(dir)?.difference(&before).cloned().collect();
+    if let Err(error) = confirm() {
+        remove_written(dir, &written, existed);
+        if let Err(problem) = std::fs::remove_file(&created.root_backup.identity) {
+            eprintln!(
+                "warning: couldn't remove {}: {problem}",
+                created.root_backup.identity.display()
+            );
+        }
+        return Err(error);
+    }
+    Ok(created)
+}
+
+/// Every file and directory under `dir`, relative to it; empty if `dir`
+/// doesn't exist. Symbolic links count as files and aren't followed.
+fn written_tree(dir: &Path) -> std::io::Result<BTreeSet<PathBuf>> {
+    let mut found = BTreeSet::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        let entries = match std::fs::read_dir(&current) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        for entry in entries {
+            let path = entry?.path();
+            if std::fs::symlink_metadata(&path)?.is_dir() {
+                pending.push(path.clone());
+            }
+            if let Ok(relative) = path.strip_prefix(dir) {
+                found.insert(relative.to_path_buf());
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// Remove the `written` paths under `dir`: files first, then directories
+/// deepest first and only when empty, then `dir` itself if `create` made it
+/// and it's empty. A directory the operator has put something in stays,
+/// with a warning. A failure is reported, not returned: the caller is
+/// already returning the reason it stopped.
+fn remove_written(dir: &Path, written: &[PathBuf], existed: bool) {
+    let mut directories = Vec::new();
+    for relative in written {
+        let path = dir.join(relative);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() => directories.push(path),
+            Ok(_) => {
+                if let Err(error) = std::fs::remove_file(&path) {
+                    eprintln!("warning: couldn't remove {}: {error}", path.display());
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    if !existed {
+        directories.push(dir.to_path_buf());
+    }
+    directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for path in directories {
+        if std::fs::remove_dir(&path).is_err() && path.exists() {
+            eprintln!(
+                "kept {}: it holds files cluster create didn't write",
+                path.display()
+            );
+        }
+    }
 }
 
 /// How a new cluster's master-key backup gets confirmed.
@@ -1211,5 +1302,166 @@ mod tests {
             assert!(message.starts_with(char::is_lowercase), "{message}");
             assert!(message.contains("/home/me/home-cluster"), "{message}");
         }
+    }
+
+    /// The operator pressing Ctrl-D at the backup question.
+    fn ctrl_d(secrets: &Path) -> Result<(), RelishError> {
+        confirm_backup(
+            &mut std::io::Cursor::new(Vec::new()),
+            &mut Vec::new(),
+            secrets,
+        )
+    }
+
+    const ONE_MACHINE: &[&str] = &["d8:9e:f3:00:00:01@192.168.1.51"];
+
+    /// [`options`], with the root backup's identity outside the cluster
+    /// directory, as relish keeps it (`root_backup_keys_in`).
+    fn options_keeping_keys_in(dir: &Path, keys: &Path) -> CreateOptions {
+        CreateOptions {
+            root_backup_keys: keys.to_path_buf(),
+            ..options(dir, ONE_MACHINE)
+        }
+    }
+
+    /// Every path under `dir`, relative to it.
+    fn everything_in(dir: &Path) -> Vec<String> {
+        let mut found: Vec<String> = written_tree(dir)
+            .unwrap()
+            .into_iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn a_cluster_whose_backup_is_not_confirmed_leaves_nothing_behind() {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("home-cluster");
+        let keys = parent.path().join("root-backup-keys");
+        let mut identity = None;
+        let error = create_confirmed(&options_keeping_keys_in(&dir, &keys), || {
+            // The question comes once the keys exist, so the operator can
+            // copy them before answering.
+            assert!(dir.join("fleet.json").is_file());
+            assert!(std::fs::read_dir(dir.join("secrets")).unwrap().count() > 0);
+            identity = std::fs::read_dir(&keys)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .next();
+            ctrl_d(&dir.join("secrets"))
+        })
+        .unwrap_err();
+        assert!(
+            matches!(error, RelishError::BackupNotConfirmed { .. }),
+            "{error}"
+        );
+        assert!(!dir.exists(), "left behind: {:?}", everything_in(&dir));
+        let identity = identity.expect("create wrote the root backup's identity");
+        assert!(!identity.exists(), "{} left behind", identity.display());
+        let message = error.to_string();
+        assert!(message.contains("create the cluster again"), "{message}");
+
+        // So the same command works straight away, rather than finding
+        // "already holds a cluster".
+        create_confirmed(&options_keeping_keys_in(&dir, &keys), || Ok(())).unwrap();
+        assert!(dir.join("fleet.json").is_file());
+    }
+
+    #[test]
+    fn a_backup_copied_into_the_cluster_directory_survives_a_refusal() {
+        // Told to copy the keys somewhere safe, an operator copies them
+        // into the cluster directory itself, then presses Ctrl-D.
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("home-cluster");
+        let keys = parent.path().join("root-backup-keys");
+        create_confirmed(&options_keeping_keys_in(&dir, &keys), || {
+            std::fs::create_dir(dir.join("my-backup")).unwrap();
+            for entry in std::fs::read_dir(dir.join("secrets")).unwrap() {
+                let entry = entry.unwrap();
+                if entry.path().is_file() {
+                    std::fs::copy(entry.path(), dir.join("my-backup").join(entry.file_name()))
+                        .unwrap();
+                }
+            }
+            std::fs::write(dir.join("secrets/copied-by-hand.key"), b"mine").unwrap();
+            ctrl_d(&dir.join("secrets"))
+        })
+        .unwrap_err();
+
+        let left = everything_in(&dir);
+        assert!(
+            left.contains(&"secrets/copied-by-hand.key".to_string()),
+            "{left:?}"
+        );
+        assert!(
+            left.iter().any(|path| path.starts_with("my-backup/")),
+            "{left:?}"
+        );
+        assert!(!left.contains(&"fleet.json".to_string()), "{left:?}");
+        let written: Vec<&String> = left
+            .iter()
+            .filter(|path| {
+                !path.starts_with("my-backup")
+                    && *path != "secrets"
+                    && *path != "secrets/copied-by-hand.key"
+            })
+            .collect();
+        assert!(written.is_empty(), "create's files left: {written:?}");
+    }
+
+    #[test]
+    fn a_refused_backup_removes_only_what_create_made_in_an_existing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.txt"), b"mine").unwrap();
+        std::fs::create_dir(dir.path().join("photos")).unwrap();
+        let keys = tempfile::tempdir().unwrap();
+
+        create_confirmed(&options_keeping_keys_in(dir.path(), keys.path()), || {
+            ctrl_d(&dir.path().join("secrets"))
+        })
+        .unwrap_err();
+        assert_eq!(everything_in(dir.path()), ["notes.txt", "photos"]);
+        assert_eq!(
+            std::fs::read(dir.path().join("notes.txt")).unwrap(),
+            b"mine"
+        );
+    }
+
+    #[test]
+    fn a_refusal_with_an_existing_secrets_directory_keeps_only_what_was_there() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("secrets")).unwrap();
+        std::fs::write(dir.path().join("secrets/old.key"), b"an older key").unwrap();
+        let keys = tempfile::tempdir().unwrap();
+
+        create_confirmed(&options_keeping_keys_in(dir.path(), keys.path()), || {
+            assert!(
+                std::fs::read_dir(dir.path().join("secrets"))
+                    .unwrap()
+                    .count()
+                    > 1
+            );
+            ctrl_d(&dir.path().join("secrets"))
+        })
+        .unwrap_err();
+        assert_eq!(everything_in(dir.path()), ["secrets", "secrets/old.key"]);
+        assert_eq!(
+            std::fs::read(dir.path().join("secrets/old.key")).unwrap(),
+            b"an older key"
+        );
+    }
+
+    #[test]
+    fn a_confirmed_backup_keeps_the_cluster() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = tempfile::tempdir().unwrap();
+        let created =
+            create_confirmed(&options_keeping_keys_in(dir.path(), keys.path()), || Ok(())).unwrap();
+        assert_eq!(created.fleet.nodes.len(), 1);
+        assert!(dir.path().join("fleet.json").is_file());
+        assert!(dir.path().join("secrets").is_dir());
+        assert!(created.root_backup.identity.is_file());
     }
 }
