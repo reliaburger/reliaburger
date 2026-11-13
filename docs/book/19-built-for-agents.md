@@ -7599,6 +7599,24 @@ people scoped to other namespaces, and reads the audit log back. And
 the other, kills the leader, and undoes on the new one, checking the app is
 back at its exact `before` revision.
 
+That test once failed in a merge queue with a 404 (#1928). The approve
+handler checked the caller first and forwarded second, and checking the
+caller meant reading the proposal from the receiving node's own replica.
+The second follower hadn't yet applied the entry that created proposal 1,
+so it found nothing and said so, though the leader had it. Approve, reject,
+withdraw and undo now split their checks in two. What the token alone
+decides, an agent trying to approve or a read-only token, is still refused
+where it asked. Everything that reads the proposal happens after
+`decide_on_leader`, which sends the request on unless this node has proved
+it leads. The caller's own credential travels with it, so the leader
+repeats every check and writes the audit record as the caller. A
+follower's replica can lag, so only the leader may say "there's no
+proposal 1". An agent's `kind: undo` proposal reads its original the same
+way, after forwarding. The new test makes the lag certain rather than
+likely: it shuts down one follower's Raft core, leaving its API up, and
+makes every decision through it, then checks each audit record names
+whoever asked.
+
 ### What the gym found first
 
 The laptop ran the proposals on a real cluster through the gym before any of
