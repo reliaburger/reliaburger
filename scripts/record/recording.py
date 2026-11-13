@@ -4,6 +4,7 @@
     python3 scripts/record/recording.py debug --cast CAST --out DIR [options]
     python3 scripts/record/recording.py act --cast CAST --out DIR [options]
     python3 scripts/record/recording.py prompt debug|act
+    python3 scripts/record/recording.py tidy CAST SESSION
 
 `debug` is #1678, for the "Debug the platform" section: the gym's
 planted-bug scenario (`planted-logs-since`), with Claude Code holding a
@@ -26,7 +27,9 @@ made `unsafe`, and every step the recording claims really ran (see
 `debug_problems` and `act_problems`). Otherwise the cast is renamed
 `CAST.failed`, the problems are printed, and the exit is 1. `DIR/recording.json`
 says what happened either way. `prompt` prints the session's prompt and
-runs nothing.
+runs nothing. `tidy` rewrites a cast recorded before stage.py hid Claude
+Code's background notices and said the session ended once (#1904), from
+the run's kept `session.jsonl`, without running anything again.
 
 Options: `--relish`, `--bun` and `--testapp` as for `gym.py run` (default:
 `$CARGO_TARGET_DIR/debug`), `--plant-target-dir` for the planted build,
@@ -63,6 +66,7 @@ import scenario as scenario_module  # noqa: E402
 import score as score_module  # noqa: E402
 import shim  # noqa: E402
 import solvers  # noqa: E402
+import stage  # noqa: E402
 
 STAGE = HERE / "stage.py"
 WINDOW = "110x32"
@@ -162,9 +166,6 @@ def person_path(real_relish, path):
     return os.pathsep.join([str(Path(real_relish).parent), path])
 
 
-HEADING = re.compile("\x1b\\[1m» ([^\x1b]+)\x1b\\[0m")
-
-
 def post_process(lines):
     """A cast's lines with the recorder's command and environment dropped and
     a chapter marker at every `» Title` line, as tour.sh does."""
@@ -175,7 +176,7 @@ def post_process(lines):
     for line in lines[1:]:
         event = json.loads(line)
         if event[1] == "o":
-            for found in HEADING.finditer(event[2]):
+            for found in stage.HEADING_TEXT.finditer(event[2]):
                 out.append(json.dumps([event[0], "m", found.group(1)]))
                 # asciicast v3 stores each event's gap since the one before:
                 # the marker takes the gap, and the line follows with none.
@@ -183,6 +184,81 @@ def post_process(lines):
                     event[0] = 0.0
         out.append(json.dumps(event, ensure_ascii=False))
     return out
+
+
+ENDED = re.compile(r"^# The session ended after \d+ turns and ")
+COLOURS = re.compile("\x1b\\[[0-9;]*m")
+
+
+def tidy(lines, events):
+    """A cast recorded before #1904, shown as stage.py shows a session now.
+
+    Claude Code's background notices go (with a `that took` line under
+    one, since that command hadn't finished), the model line shows once, a
+    repeated chapter says `(again)` in its marker and its heading, and the
+    session ends once, where the last part ended, with the turns and time
+    of every part from `events`, the session's stream-json. An event left
+    with nothing to show goes, and in a v3 cast its wait moves to the next
+    event, so everything else keeps its time. Tidying twice changes nothing.
+    """
+    header = json.loads(lines[0])
+    relative = header.get("version") == 3
+    parsed = [json.loads(line) for line in lines[1:]]
+    results = [event for event in events if event.get("type") == "result"]
+    total = stage.ended(sum(event.get("num_turns") or 0 for event in results),
+                        sum(event.get("duration_ms") or 0 for event in results) / 1000)
+    banners = [index for index, event in enumerate(parsed)
+               if event[1] == "o" and any(ENDED.match(COLOURS.sub("", piece))
+                                          for piece in event[2].split("\r\n"))]
+    last = banners[-1] if banners else None
+    markers, headings = set(), set()
+    model_shown = False
+    after_notice = False
+    carry = 0.0
+    out = [lines[0]]
+    for index, event in enumerate(parsed):
+        if relative and carry:
+            event[0] = round(event[0] + carry, 3)
+            carry = 0.0
+        if event[1] == "m":
+            event[2] = stage.again(event[2], markers)
+        elif event[1] == "o":
+            kept, removed = [], False
+            for piece in event[2].split("\r\n"):
+                shown = COLOURS.sub("", piece)
+                drop = False
+                if stage.BACKGROUND.match(shown):
+                    drop, after_notice = True, True
+                elif after_notice and shown.startswith("# that took "):
+                    drop = True
+                elif shown.startswith("# Claude Code, model "):
+                    drop, model_shown = model_shown, True
+                elif ENDED.match(shown):
+                    if index == last and results:
+                        piece = total
+                    drop = index != last
+                if drop:
+                    removed = True
+                    continue
+                if shown:
+                    after_notice = False
+                kept.append(stage.HEADING_TEXT.sub(
+                    lambda found: stage.heading(stage.again(found.group(1), headings)), piece))
+            if removed and not any(kept):
+                if relative:
+                    carry = event[0]
+                continue
+            event[2] = "\r\n".join(kept)
+        out.append(json.dumps(event, ensure_ascii=False))
+    return out
+
+
+def tidy_cast(cast, session):
+    """Rewrite `cast` in place with `tidy`, from the run's `session.jsonl`."""
+    cast = Path(cast)
+    events = claude_code.events(Path(session).read_text())
+    cast.write_text("\n".join(tidy(cast.read_text().splitlines(), events)) + "\n")
+    return 0
 
 
 def common_problems(result):
@@ -375,6 +451,8 @@ def main(argv=None):
     if argv[:1] == ["prompt"] and len(argv) == 2 and argv[1] in SCENARIOS:
         print(exact_prompt(argv[1]), end="")
         return 0
+    if argv[:1] == ["tidy"] and len(argv) == 3:
+        return tidy_cast(argv[1], argv[2])
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("mode", choices=sorted(SCENARIOS))
     parser.add_argument("--cast", required=True, help="the asciicast to write")

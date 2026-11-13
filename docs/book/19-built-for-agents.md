@@ -6597,11 +6597,30 @@ runner names each workspace instead of passing `--all`. Every throwaway
 cluster lives under `~/.reliaburger-patch`, and `--all` would destroy
 clusters that belong to other work on the same machine.
 
+The 0.2.8 casts went on the page as they were (#1874), with three rough
+edges (#1904). A long `patch build` hit Claude Code's ten-minute command
+limit and went to the background, and so did the tests and `patch try`
+later. Each time Claude Code printed a notice naming a task file under
+`/private/tmp`. When a background command finishes, Claude Code resumes the
+session, and each resumed part sends its own `init` and `result` events. So
+the debug cast named the model five times and said "The session ended"
+five times. And the agent went back to testing and trying, so its chapters
+read Test it, Try it, Test it, Try it. Now `stage.py`'s `Renderer` hides the
+notices. It shows the model once and keeps a running total from each
+`result`, and `ending()` prints one banner after the stream closes. A
+chapter it has opened before is marked "(again)". The casts didn't need
+another run. `recording.py tidy` applies the same rules to an existing
+cast, using the run's kept `session.jsonl` for the totals. When it drops an
+event, it adds that event's wait to the next one. An asciicast v3 stores
+each event's time as a gap since the one before, so deleting an event
+without moving its gap would pull everything after it earlier.
+
 `scripts/record/test_record.py` runs in `make test-ci-scripts`. It covers
 what each kind of event puts on screen, the chapter markers, the session's
 tools (file tools only under `./`, never a skip-permissions flag), the person's
 environment, and when a run is kept. One test runs a whole recording with a
-fake `claude` and a fake `asciinema`.
+fake `claude` and a fake `asciinema`. The tidy tests check that a tidied
+cast lasts as long as the original and that tidying twice changes nothing.
 
 ## Work an agent can check
 

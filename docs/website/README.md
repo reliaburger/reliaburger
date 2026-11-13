@@ -278,7 +278,15 @@ which becomes a chapter marker: The prompt, Look at the cluster, Diagnose,
 Read the source, Start a fix, Write the fix, Build it, Test it, Try it, Draft
 the report, and You read the draft. The last one is the person's part, typed
 by the script: `ls`, then `head` of the draft's `issue.md` and
-`MANIFEST.json`, and a line saying nothing was posted.
+`MANIFEST.json`, and a line saying nothing was posted. A chapter the agent
+comes back to says so: `Test it (again)`.
+
+Claude Code runs a long command in the background, and its end resumes the
+session, so one recording can hold several parts of a session. The screen
+leaves out Claude Code's notice that a command went to the background (it
+names a task file under `/private/tmp`), shows the model line once, and says
+the session ended once, at the very end, with every part's turns and time
+added up.
 
 **Success check:** the script prints `kept CAST` and exits 0 only when every
 one of these holds. Otherwise `DIR/recording.json` lists what failed.
@@ -320,6 +328,17 @@ Propose, You review it, You approve it and Undo, cut the same way.
 - the session ran `relish agent lease take`;
 - approve exited 0 and left the proposal `applied`, and undo exited 0 and
   left it `undone`.
+
+#### Tidying a cast recorded before #1904
+
+The 0.2.8 casts were recorded before the screen did those three things.
+`recording.py tidy` rewrites one in place from the run's kept stream-json,
+without calling a model again, and keeps every other line at its time:
+
+```sh
+python3 scripts/record/recording.py tidy docs/website/assets/agent-debug.cast \
+  ~/record-runs/debug-20261112-0814/planted-logs-since/solver/session.jsonl
+```
 
 #### Putting a cast on the page
 

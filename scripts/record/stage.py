@@ -33,6 +33,7 @@ import json
 import os
 from pathlib import Path
 import random
+import re
 import shlex
 import subprocess
 import sys
@@ -101,6 +102,16 @@ INTRO = {
 }
 
 
+# Claude Code's notice that a command now runs in the background, by its
+# own choice or after a timeout. It names a task file under /private/tmp,
+# and the agent's next words say what's running, so the screen leaves it
+# out (#1904).
+BACKGROUND = re.compile(
+    r"^(Command running in background with ID: "
+    r"|Command did not complete within its \d+s timeout and was moved to the background)"
+)
+
+
 def say(text):
     """A comment line, the way a person narrates at a shell prompt."""
     return f"{DIM}# {text}{RESET}"
@@ -109,6 +120,24 @@ def say(text):
 def heading(title):
     """A part's bold title line; recording.py puts a chapter marker on it."""
     return f"{BOLD}» {title}{RESET}"
+
+
+HEADING_TEXT = re.compile(re.escape(BOLD) + "» ([^\x1b]+)" + re.escape(RESET))
+
+
+def again(title, seen):
+    """A chapter's title, marked when it has opened before: `Test it (again)`.
+
+    `seen` holds the titles opened so far, and this adds `title` to it.
+    """
+    shown = f"{title} (again)" if title in seen else title
+    seen.add(title)
+    return shown
+
+
+def ended(turns, seconds):
+    """The one line that says the session is over."""
+    return say(f"The session ended after {turns} turns and {took(seconds)}.")
 
 
 def took(seconds):
@@ -191,13 +220,21 @@ class Renderer:
         self.mode = mode
         self.clock = clock
         self.phase = None
+        self.seen = set()
         self.started = {}
+        self.model_shown = False
+        # A background command's end resumes the session, which sends a
+        # result for each part; the screen adds them up and says it ended
+        # once, from `ending`.
+        self.turns = 0
+        self.seconds = 0.0
+        self.results = 0
 
     def _open(self, title):
         if title is None or title == self.phase:
             return []
         self.phase = title
-        return ["", heading(title)]
+        return ["", heading(again(title, self.seen))]
 
     def _tool_use(self, block):
         self.started[block.get("id")] = self.clock()
@@ -226,6 +263,8 @@ class Renderer:
     def _tool_result(self, block):
         started = self.started.pop(block.get("tool_use_id"), None)
         text = result_text(block.get("content"))
+        if BACKGROUND.match(text.strip()):
+            return []
         lines = readable(text)
         shown = [f"{DIM}{cut(line)}{RESET}" for line in lines[:RESULT_LINES]]
         if block.get("is_error"):
@@ -240,6 +279,9 @@ class Renderer:
         """The lines one event adds to the screen."""
         kind = event.get("type")
         if kind == "system" and event.get("subtype") == "init":
+            if self.model_shown:
+                return []
+            self.model_shown = True
             return [say(f"Claude Code, model {event.get('model')}")]
         if kind == "assistant":
             out = []
@@ -261,9 +303,17 @@ class Renderer:
                     out.extend(self._tool_result(block))
             return out
         if kind == "result":
-            seconds = (event.get("duration_ms") or 0) / 1000
-            return ["", say(f"The session ended after {event.get('num_turns')} turns and {took(seconds)}.")]
+            self.results += 1
+            self.turns += event.get("num_turns") or 0
+            self.seconds += (event.get("duration_ms") or 0) / 1000
         return []
+
+    def ending(self):
+        """The line saying the session ended, with every part's turns and
+        time, once the stream is over; nothing if it never sent a result."""
+        if not self.results:
+            return []
+        return ["", ended(self.turns, self.seconds)]
 
 
 def emit(lines):
@@ -312,7 +362,9 @@ def run_session(mode, argv, prompt, env, cwd, stream_path, timeout):
                     continue
                 if isinstance(event, dict):
                     emit(renderer.lines(event))
-        return session.wait()
+        status = session.wait()
+        emit(renderer.ending())
+        return status
     finally:
         timer.cancel()
 
