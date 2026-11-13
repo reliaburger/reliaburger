@@ -390,11 +390,23 @@ pub async fn add(
     token_ttl: Duration,
     ssh_key: Option<Vec<u8>>,
 ) -> Result<Vec<(FleetNode, PathBuf)>, RelishError> {
+    let client = super::client::BunClient::default_local();
+    add_with(&client, directory, machines, token_ttl, ssh_key).await
+}
+
+/// [`add`], asking `client`'s cluster for the join tokens, so a test can
+/// point it at a council of its own.
+pub async fn add_with(
+    client: &super::client::BunClient,
+    directory: &Path,
+    machines: &[(String, IpAddr)],
+    token_ttl: Duration,
+    ssh_key: Option<Vec<u8>>,
+) -> Result<Vec<(FleetNode, PathBuf)>, RelishError> {
     let fleet_path = directory.join("fleet.json");
     let mut fleet: Fleet = serde_json::from_slice(&tokio::fs::read(&fleet_path).await?)
         .map_err(|e| failed(&format!("{}: {e}", fleet_path.display())))?;
     let added = plan_additions(&fleet, machines)?;
-    let client = super::client::BunClient::default_local();
     let mut written = Vec::new();
     for node in &added {
         let token = client

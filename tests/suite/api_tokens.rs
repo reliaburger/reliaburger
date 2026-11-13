@@ -1489,6 +1489,103 @@ async fn a_join_token_created_through_a_follower_commits_on_the_leader() {
     assert_eq!(stored[0].node_id, "node-7");
 }
 
+/// #1893 W3: `relish image seed` against a running council. It adds a
+/// machine to a bare-metal cluster's directory: the council mints a join
+/// token bound to the new node's name, the seed carries it, and the fleet
+/// lists the machine, so a second seed for it is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn image_seed_writes_a_join_seed_whose_token_the_council_accepts_for_that_node() {
+    use reliaburger::appliance::seed::{Seed, SeedRole};
+    use reliaburger::relish::bare_metal;
+
+    let cluster = TokenCluster::start().await;
+    let parent = tempfile::tempdir().unwrap();
+    let directory = parent.path().join("home-cluster");
+    let machine = |text: &str| bare_metal::parse_machine(text).unwrap();
+    bare_metal::create(&bare_metal::CreateOptions {
+        directory: directory.clone(),
+        cluster: "home".into(),
+        machines: vec![machine("d8:9e:f3:00:00:01@192.168.1.51")],
+        operators: vec!["192.168.1.10".into()],
+        network: Some("192.168.1.0/24".into()),
+        faults: false,
+        ssh_key: None,
+        token_ttl: Duration::from_secs(3600),
+        external_signing_key: None,
+        council_size: reliaburger::council::CouncilSize::APPLIANCE,
+        root_backup_keys: parent.path().join("operator-keys"),
+    })
+    .unwrap();
+    let relish = reliaburger::relish::client::BunClient::new_with_token(
+        &cluster.leader_url,
+        Some(&cluster.admin),
+    );
+    let new = machine("d8:9e:f3:00:00:02@192.168.1.52");
+
+    let added = bare_metal::add_with(
+        &relish,
+        &directory,
+        std::slice::from_ref(&new),
+        Duration::from_secs(3600),
+        Some(b"ssh-ed25519 AAAA operator".to_vec()),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(added.len(), 1);
+    let (node, seed_path) = &added[0];
+    assert_eq!(node.name, "home-2");
+    assert_eq!(
+        seed_path,
+        &directory.join("stick/seeds/d8-9e-f3-00-00-02.seed")
+    );
+    let Seed::V1 { config, files } = Seed::from_tar_gz(&std::fs::read(seed_path).unwrap()).unwrap()
+    else {
+        panic!("not a v1 seed");
+    };
+    assert_eq!(config.role, SeedRole::Join);
+    assert_eq!(config.node, "home-2");
+    assert!(
+        !files.contains_key("master.key"),
+        "a join seed holds no master key"
+    );
+    assert_eq!(files["authorized_keys"], b"ssh-ed25519 AAAA operator");
+    let join = config.join.expect("a join seed has [join]");
+    assert_eq!(
+        join.members,
+        ["192.168.1.51".parse::<std::net::IpAddr>().unwrap()]
+    );
+    let security = cluster.leader.security_state().await;
+    reliaburger::sesame::join::check_join_token(&join.token, "home-2", &security)
+        .expect("the council accepts the seed's token for home-2");
+    assert!(
+        reliaburger::sesame::join::check_join_token(&join.token, "home-1", &security).is_err(),
+        "the token is bound to home-2 alone"
+    );
+
+    let fleet: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.join("fleet.json")).unwrap()).unwrap();
+    let names: Vec<&str> = fleet["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|node| node["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["home-1", "home-2"]);
+
+    let tokens = security.join_tokens.len();
+    let error = bare_metal::add_with(&relish, &directory, &[new], Duration::from_secs(3600), None)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("clashes with home-2"), "{error}");
+    assert_eq!(
+        cluster.leader.security_state().await.join_tokens.len(),
+        tokens,
+        "a refused seed mints no token"
+    );
+}
+
 /// #1893: `relish join-token list` and `revoke` through relish's own client
 /// against a running council. The list shows a token without its secret; a
 /// revoke spends every unused token for that node through Raft, so the
