@@ -97,7 +97,7 @@ async fn single_node_leader() -> (Arc<CouncilNode>, MemLogStore) {
     )
     .await
     .unwrap();
-    router.register(1, node.raft().clone()).await;
+    router.register(1, &node).await;
     let mut members = BTreeMap::new();
     members.insert(
         1u64,

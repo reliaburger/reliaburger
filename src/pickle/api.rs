@@ -3426,9 +3426,7 @@ mod tests {
             .await
             .unwrap(),
         );
-        network
-            .register(state.node_raft_id, council.raft().clone())
-            .await;
+        network.register(state.node_raft_id, &council).await;
         state.council = Some(council.clone());
         state.persist_path = Some(directory.path().join("catalog.json"));
         let app = test_router(state.clone());

@@ -599,11 +599,15 @@ fn prepare_security(
     if let Some(parent) = directory.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let keys = crate::relish::quickstart::security::root_backup_keys_in(
+        &crate::relish::local_context::root_directory()?,
+    );
     crate::relish::quickstart::security::prepare_in(
         directory,
         cluster_name,
         first_node,
         &format!("dev-{cluster_name}-admin"),
+        &keys,
     )
 }
 
@@ -1915,8 +1919,7 @@ mod tests {
         // member, so the perimeter must already know every dev node.
         let text = generate_node_config("dev", "reliaburger-1", "192.168.105.2", None, PEERS);
         let config = crate::config::node::NodeConfig::parse(&text).unwrap();
-        let expected: Vec<std::net::IpAddr> =
-            PEERS.iter().map(|peer| peer.parse().unwrap()).collect();
+        let expected: Vec<String> = PEERS.iter().map(|peer| peer.to_string()).collect();
         assert_eq!(config.security.bootstrap_peers, expected);
     }
 

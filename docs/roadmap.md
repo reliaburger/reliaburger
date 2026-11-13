@@ -515,7 +515,8 @@ migration and no feature gate
   research and spikes in [#218](https://github.com/reliaburger/reliaburger/pull/218)
   and [#259](https://github.com/reliaburger/reliaburger/pull/259)). The
   appliance OS (our own mkosi image on Ubuntu 26.04), `relish netboot` and
-  claiming machines over the LAN, weekly signed OS builds with A/B updates,
+  claiming machines over the LAN, signed OS builds with A/B updates (built
+  weekly once v0.3.0 is out),
   and the quickstart guest on Ubuntu 26.04. The claim flow is designed so the
   fleet control plane can extend it later. Alongside it: the acceptance gates
   0.1.0 didn't close (V01–V04, below), WebSocket drain parity (F08,
@@ -649,9 +650,10 @@ what's shipped and what's scheduled.
 
 - **Acceptance gates 0.1.0 didn't close.** V01, the live catalogue on three
   independent runc nodes ([#286](https://github.com/reliaburger/reliaburger/issues/286));
-  the V02 leftovers, the snapshot uploader under power cuts and the
-  `v02-loops` bounds ([#287](https://github.com/reliaburger/reliaburger/issues/287)).
-  Both in 0.3.0. V04, the cold installs on Linux x86_64 and arm64
+  the V02 leftover, the snapshot uploader under power cuts
+  ([#287](https://github.com/reliaburger/reliaburger/issues/287); the
+  `v02-loops` bounds are [recorded](qualification/2026-11-12-v02-loops-bounds.md)),
+  in 0.3.0. V04, the cold installs on Linux x86_64 and arm64
   ([#288](https://github.com/reliaburger/reliaburger/issues/288)), passed on
   the published 0.2.8 on 12 November 2026: a ready cluster in a median 84.8 s
   and 83.2 s ([record](qualification/2026-11-12-v04-cold-installs-linux.md)).
@@ -674,8 +676,7 @@ what's shipped and what's scheduled.
 - **Whitepaper design ahead of the binary.** The [whitepaper](whitepaper.md)
   marks each of these as planned where it describes them: the reporting tree,
   resource-aware council selection, per-app rollups and remote-read
-  ([#364](https://github.com/reliaburger/reliaburger/issues/364)); an offline
-  root CA ([#709](https://github.com/reliaburger/reliaburger/issues/709));
+  ([#364](https://github.com/reliaburger/reliaburger/issues/364));
   keyless cosign ([#619](https://github.com/reliaburger/reliaburger/issues/619));
   fully leader-coordinated rollouts
   ([#1776](https://github.com/reliaburger/reliaburger/issues/1776)), static builds

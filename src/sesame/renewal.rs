@@ -231,3 +231,64 @@ pub(crate) fn validate_peer(
     }
     Ok(node_id)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sesame::types::SerialNumber;
+
+    const IKM: [u8; 32] = [7; 32];
+
+    fn leaf(hierarchy: &ca::CaHierarchy, node: &str, serial: u64) -> TlsPeerCertificate {
+        let (leaf, _, _) = ca::issue_node_cert(
+            node,
+            SerialNumber(serial),
+            &hierarchy.node.signing_keypair,
+            &hierarchy.node.certificate_params,
+        )
+        .unwrap();
+        TlsPeerCertificate(leaf.into())
+    }
+
+    fn retirement(node_id: &str) -> crate::cluster::retirement::NodeRetirement {
+        crate::cluster::retirement::NodeRetirement {
+            node_id: node_id.into(),
+            retired_by: "operator".into(),
+            reason: "replaced".into(),
+            retired_at_unix_ms: 30,
+            released_placements: Default::default(),
+            released_registry_writers: Default::default(),
+            released_node_fault: None,
+            released_endpoint_consumer: false,
+        }
+    }
+
+    /// The check `GET /v1/cluster/master-key` and renewal make themselves,
+    /// apart from the router's retired-peer layer: a retired node's leaf is
+    /// refused even though the CRL has never named its serial, and only that
+    /// node's.
+    #[test]
+    fn a_retired_node_s_unrevoked_leaf_fails_the_handler_s_own_check() {
+        let hierarchy = ca::generate_ca_hierarchy("renewal-retired", &IKM).unwrap();
+        let mut state = SecurityState {
+            certificate_authorities: vec![hierarchy.root.ca.clone(), hierarchy.node.ca.clone()],
+            ..Default::default()
+        };
+        let old = leaf(&hierarchy, "old-worker", 11);
+        assert_eq!(validate_peer(&old, &state).unwrap(), "old-worker");
+
+        state
+            .crl
+            .retired_nodes
+            .insert("old-worker".into(), retirement("old-worker"));
+        assert!(state.crl.entries.is_empty(), "nothing is revoked by serial");
+        assert!(matches!(
+            validate_peer(&old, &state),
+            Err(RenewalError::Identity(reason)) if reason == "node identity is retired"
+        ));
+        assert_eq!(
+            validate_peer(&leaf(&hierarchy, "new-worker", 12), &state).unwrap(),
+            "new-worker"
+        );
+    }
+}

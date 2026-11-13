@@ -1095,6 +1095,7 @@ echo "panics $(journalctl -u reliaburger --no-pager -q --cursor-file=/var/tmp/so
 # One clock source (#608): Lima's guest agent owns the clock, and every step
 # it takes since the last report is counted.
 echo "timesyncd $(systemctl is-active systemd-timesyncd.service 2>/dev/null)"
+echo "chrony $(systemctl is-active chrony.service 2>/dev/null)"
 echo "clock_steps $(journalctl -u lima-guestagent --no-pager -q --cursor-file=/var/tmp/soak-clock.cursor 2>/dev/null | grep -c 'SyncTime: system time synchronized')"
 # The agent loop stall watchdog's snapshots since the last report (#1707);
 # the checker cuts the blocks out and keeps them in loop-stalls.jsonl.

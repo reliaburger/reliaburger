@@ -67,26 +67,51 @@ pub const SYSTEM_PRINCIPAL: &str = "__system";
 /// as itself. Verification is the constrained path — algorithm, key id, issuer,
 /// audience, and `iat` are all checked — so a token minted for another cluster
 /// or purpose is refused.
+///
+/// The keys it accepts follow the council: [`refresh`](Self::refresh) takes
+/// the active signing key and every retiring one still inside its window,
+/// so a token signed before a rotation keeps working on every node (#709).
 #[derive(Clone)]
 pub struct WorkloadJwtVerifier {
-    config: Arc<super::types::OidcSigningConfig>,
+    // A `watch` so `verify`, which runs synchronously inside the auth
+    // middleware, reads the keys without a lock a refresh could hold.
+    keys: Arc<tokio::sync::watch::Sender<Vec<super::oidc::OidcVerifyingKey>>>,
     constraints: super::oidc::JwtConstraints,
 }
 
 impl WorkloadJwtVerifier {
-    /// Build a verifier from the cluster's OIDC config and trust-domain name.
+    /// Build a verifier from the cluster's OIDC config and trust-domain name,
+    /// accepting that config's key until the first refresh.
     pub fn new(config: super::types::OidcSigningConfig, cluster_name: &str) -> Self {
         let constraints = super::oidc::JwtConstraints::for_config(&config, cluster_name);
+        let keys = vec![super::oidc::OidcVerifyingKey::from(&config)];
         Self {
-            config: Arc::new(config),
+            keys: Arc::new(tokio::sync::watch::Sender::new(keys)),
             constraints,
         }
+    }
+
+    /// Accept the keys `state` signs and is retiring at `now` (Unix
+    /// seconds). A state with no signing key leaves the keys as they were,
+    /// as a replica that hasn't caught up would.
+    pub fn refresh(&self, state: &super::types::SecurityState, now: u64) {
+        if state.oidc_signing_config.is_none() {
+            return;
+        }
+        let keys = super::oidc::verifying_keys(state, now);
+        self.keys.send_if_modified(|current| {
+            let changed = *current != keys;
+            if changed {
+                *current = keys;
+            }
+            changed
+        });
     }
 
     /// Return the verified claims if `token` is a valid workload JWT for this
     /// cluster, else `None`.
     pub fn verify(&self, token: &str) -> Option<super::types::WorkloadJwtClaims> {
-        super::oidc::verify_jwt_with_constraints(token, &self.config, &self.constraints).ok()
+        super::oidc::verify_jwt_with_keys(token, &self.keys.borrow(), &self.constraints).ok()
     }
 }
 
@@ -1578,6 +1603,58 @@ mod tests {
         };
         let jwt = super::super::oidc::mint_jwt(&claims, &config, &ikm).unwrap();
         (jwt, config)
+    }
+
+    /// #709: a workload holding a JWT from before a signing-key rotation
+    /// keeps authenticating once the verifier refreshes, and the new key's
+    /// tokens authenticate beside it. Once the old key's window has passed,
+    /// its tokens are refused.
+    #[test]
+    fn workload_jwt_keeps_working_across_a_signing_key_rotation() {
+        let (old_jwt, old) = mint_test_workload_jwt("api", "team-a");
+        let verifier = WorkloadJwtVerifier::new(old.clone(), "test");
+        let ikm = b"test-oidc-wrapping-material-32b!".to_vec();
+        let new = super::super::oidc::generate_oidc_keypair("https://test.reliaburger.dev", &ikm)
+            .unwrap();
+        let mut state = super::super::types::SecurityState {
+            oidc_signing_config: Some(old),
+            ..Default::default()
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        super::super::oidc::rotate_signing_key(&mut state, new.clone(), now + 60, now).unwrap();
+
+        verifier.refresh(&state, now);
+        assert!(
+            verifier.verify(&old_jwt).is_some(),
+            "the old key's token stopped working"
+        );
+        let claims: super::super::types::WorkloadJwtClaims = {
+            let (jwt, _) = mint_test_workload_jwt("api", "team-a");
+            let parts: Vec<&str> = jwt.split('.').collect();
+            serde_json::from_slice(
+                &base64::Engine::decode(
+                    &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                    parts[1],
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        let new_jwt = super::super::oidc::mint_jwt(&claims, &new, &ikm).unwrap();
+        assert!(
+            verifier.verify(&new_jwt).is_some(),
+            "the new key's token didn't verify"
+        );
+
+        verifier.refresh(&state, now + 60);
+        assert!(
+            verifier.verify(&old_jwt).is_none(),
+            "a retired key's token still verified"
+        );
+        assert!(verifier.verify(&new_jwt).is_some());
     }
 
     #[test]

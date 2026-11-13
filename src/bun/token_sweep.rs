@@ -7,6 +7,10 @@
 //! decides what goes (see [`crate::sesame::token::tokens_to_sweep`]), never
 //! the last Admin and never the whole store, and the leader records one
 //! audit event per token it removed.
+//!
+//! The same tick retires OIDC signing keys a rotation replaced, once their
+//! window has ended (#709). Verifiers already refuse an expired key, so
+//! this too only keeps council state from collecting dead keys.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -77,6 +81,62 @@ pub async fn sweep_expired_tokens_once(
     Ok(removed)
 }
 
+/// Retire, as of `now`, every OIDC signing key whose window has ended, if
+/// this node leads; returns the retired key ids. Like the token sweep, it
+/// writes nothing when nothing is due.
+pub async fn retire_signing_keys_once(
+    council: &CouncilNode,
+    events: Option<&Arc<RwLock<EventStore>>>,
+    node: &str,
+    now: SystemTime,
+) -> Result<Vec<String>, CouncilError> {
+    // One round: the sweep asks again next tick (#1393).
+    if !council.is_leader().await {
+        return Ok(Vec::new());
+    }
+    let now_unix_secs = unix_secs(now);
+    let due: Vec<String> = council
+        .security_state()
+        .await
+        .retiring_oidc_keys
+        .into_iter()
+        .filter(|key| key.not_after <= now_unix_secs)
+        .map(|key| key.key_id)
+        .collect();
+    if due.is_empty() {
+        return Ok(Vec::new());
+    }
+    council
+        .write(RaftRequest::RetireOidcSigningKeys { now_unix_secs })
+        .await?;
+    if let Some(events) = events {
+        let mut store = events.write().await;
+        for key_id in &due {
+            store.record_audit(AuditEvent {
+                timestamp: now_unix_secs,
+                kind: EventKind::Identity,
+                severity: EventSeverity::Info,
+                action: "identity.signing_key_retired".to_string(),
+                principal: SWEEP_PRINCIPAL.to_string(),
+                principal_kind: crate::sesame::types::PrincipalKind::System,
+                app: None,
+                namespace: None,
+                node: Some(node.to_string()),
+                source_address: None,
+                details: std::collections::BTreeMap::from([("key_id".to_string(), key_id.clone())]),
+                message: format!("OIDC signing key {key_id} retired: its tokens no longer verify"),
+            });
+        }
+    }
+    Ok(due)
+}
+
+/// Seconds since the Unix epoch, zero for a time before it.
+fn unix_secs(at: SystemTime) -> u64 {
+    at.duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
 /// Sweep every [`TOKEN_SWEEP_INTERVAL`] until `shutdown`.
 pub async fn run_token_sweep_loop(
     council: Arc<CouncilNode>,
@@ -93,10 +153,12 @@ pub async fn run_token_sweep_loop(
             _ = shutdown.cancelled() => return,
             _ = ticker.tick() => {}
         }
-        if let Err(error) =
-            sweep_expired_tokens_once(&council, events.as_ref(), &node, SystemTime::now()).await
-        {
+        let now = SystemTime::now();
+        if let Err(error) = sweep_expired_tokens_once(&council, events.as_ref(), &node, now).await {
             eprintln!("bun: token expiry sweep failed: {error}");
+        }
+        if let Err(error) = retire_signing_keys_once(&council, events.as_ref(), &node, now).await {
+            eprintln!("bun: OIDC signing key retirement failed: {error}");
         }
     }
 }
@@ -126,7 +188,7 @@ mod tests {
         )
         .await
         .unwrap();
-        raft_router.register(1, node.raft().clone()).await;
+        raft_router.register(1, &node).await;
         let members = BTreeMap::from([(
             1,
             CouncilNodeInfo {
@@ -218,6 +280,74 @@ mod tests {
             .unwrap();
 
         assert!(removed.is_empty());
+        assert_eq!(council.metrics().borrow().last_applied, before);
+    }
+
+    /// A leader whose council has rotated its OIDC signing key once, at
+    /// `rotated_at`, with the old key verifying for `window` (#709).
+    async fn rotated_council(rotated_at: SystemTime, window: Duration) -> Arc<CouncilNode> {
+        let council = leader_council().await;
+        let ikm = [9u8; 32];
+        let old = crate::sesame::oidc::generate_oidc_keypair("https://sweep", &ikm).unwrap();
+        let new = crate::sesame::oidc::generate_oidc_keypair("https://sweep", &ikm).unwrap();
+        council
+            .write(RaftRequest::SecurityStateInit(Box::new(
+                crate::sesame::types::SecurityState {
+                    oidc_signing_config: Some(old),
+                    ..Default::default()
+                },
+            )))
+            .await
+            .unwrap();
+        let at = unix_secs(rotated_at);
+        council
+            .write(RaftRequest::RotateOidcSigningKey {
+                signing_key: new,
+                retire_after_unix_secs: at + window.as_secs(),
+                now_unix_secs: at,
+            })
+            .await
+            .unwrap();
+        council
+    }
+
+    #[tokio::test]
+    async fn the_leader_retires_a_signing_key_once_its_window_ends_and_audits_it() {
+        let now = SystemTime::now();
+        let council =
+            rotated_council(now - Duration::from_secs(7_200), Duration::from_secs(3_600)).await;
+        let retiring = council.security_state().await.retiring_oidc_keys[0]
+            .key_id
+            .clone();
+        let events = Arc::new(RwLock::new(EventStore::new()));
+
+        let retired = retire_signing_keys_once(&council, Some(&events), "node-1", now)
+            .await
+            .unwrap();
+
+        assert_eq!(retired, std::slice::from_ref(&retiring));
+        assert!(council.security_state().await.retiring_oidc_keys.is_empty());
+        let audit = events.read().await.recent(10, None, None);
+        assert_eq!(audit.len(), 1, "{audit:?}");
+        assert_eq!(
+            audit[0].action.as_deref(),
+            Some("identity.signing_key_retired")
+        );
+        assert_eq!(audit[0].details.get("key_id"), Some(&retiring));
+    }
+
+    #[tokio::test]
+    async fn a_signing_key_inside_its_window_is_kept_and_nothing_is_written() {
+        let now = SystemTime::now();
+        let council = rotated_council(now, Duration::from_secs(3_600)).await;
+        let before = council.metrics().borrow().last_applied;
+
+        let retired = retire_signing_keys_once(&council, None, "node-1", now)
+            .await
+            .unwrap();
+
+        assert!(retired.is_empty());
+        assert_eq!(council.security_state().await.retiring_oidc_keys.len(), 1);
         assert_eq!(council.metrics().borrow().last_applied, before);
     }
 

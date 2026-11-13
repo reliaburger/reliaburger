@@ -1,0 +1,13 @@
+{
+  "cohort": [
+    {
+      "count": 1,
+      "name": "small",
+      "template": {
+        "exec": "/bin/true",
+        "runtime": "process"
+      }
+    }
+  ],
+  "name": "mixed"
+}

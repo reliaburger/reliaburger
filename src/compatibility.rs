@@ -15,7 +15,9 @@ pub struct Compatibility {
     pub state: u32,
 }
 
-/// Supported formats, including the per-node `directive_retry` record in a
+/// Supported formats, including the appliance OS rollout
+/// (`DesiredState::os_rollout` and its history, `RaftRequest::OsRolloutUpdate`
+/// and `OsRolloutClear`), the per-node `directive_retry` record in a
 /// cluster upgrade, the 503 a node answers a directive with when the
 /// binary's registry is unavailable (the orchestrator retries it), and the
 /// nodes each app last ran on (`DesiredState::last_placed_nodes`), the
@@ -241,9 +243,15 @@ pub struct Compatibility {
 /// `clear_fault`, a proposal's `fault`, `AppSpec::restarted_at`, the
 /// blast radius's forecast fields, and a failed proposal's
 /// `blast_radius_grew` and `fault` reasons.
+///
+/// 0.3.0, Bare metal in an hour (59/75): the appliance OS rollout (a new Raft
+/// request and a new field in council state) and the cluster-wide council
+/// size (`RaftRequest::CouncilSize` and `DesiredState::council_size`).
+/// OIDC signing-key rotation (#709): `SecurityState::retiring_oidc_keys`, and
+/// the `RotateOidcSigningKey` and `RetireOidcSigningKeys` Raft requests.
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 58,
-    state: 74,
+    protocol: 59,
+    state: 75,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.
@@ -477,6 +485,35 @@ mod tests {
             ensure_state_compatible(directory.path()),
             Err(CompatibilityError::StateMismatch { found, expected, .. })
                 if found == BEFORE_TASK_ARRAYS.state && expected == CURRENT.state
+        ));
+        assert_eq!(std::fs::read_to_string(stamp).unwrap(), old);
+    }
+
+    /// The generations before the appliance OS rollout and the cluster-wide
+    /// council size: 0.2.4's extension point formats.
+    const BEFORE_APPLIANCE: Compatibility = Compatibility {
+        protocol: 55,
+        state: 72,
+    };
+
+    /// 0.2.2's and 0.2.3's generation.
+    const PATCH_TRAIN: Compatibility = Compatibility {
+        protocol: 53,
+        state: 70,
+    };
+
+    #[test]
+    fn peers_and_state_from_before_the_appliance_train_are_refused() {
+        assert!(BEFORE_APPLIANCE.require_current().is_err());
+        assert!(PATCH_TRAIN.require_current().is_err());
+        let directory = tempfile::tempdir().unwrap();
+        let stamp = directory.path().join(STATE_STAMP);
+        let old = format!(r#"{{"format":{}}}"#, BEFORE_APPLIANCE.state);
+        std::fs::write(&stamp, &old).unwrap();
+        assert!(matches!(
+            ensure_state_compatible(directory.path()),
+            Err(CompatibilityError::StateMismatch { found, expected, .. })
+                if found == BEFORE_APPLIANCE.state && expected == CURRENT.state
         ));
         assert_eq!(std::fs::read_to_string(stamp).unwrap(), old);
     }

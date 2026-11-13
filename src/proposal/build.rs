@@ -809,12 +809,26 @@ fn secret_field(spec: &AppSpec, path: &str) -> bool {
         .is_some_and(|value| !matches!(value, crate::config::types::EnvValue::Plain(_)))
 }
 
-fn image_of(revision: &AppRevision) -> String {
-    revision
-        .spec
-        .as_deref()
-        .and_then(|spec| spec.image.clone())
-        .unwrap_or_else(|| "its previous spec".to_string())
+/// How a summary names each end of a change between two specs, `before`
+/// and `after`: by image when the images differ, otherwise by revision
+/// (with the image, if there is one), so the two ends never read the same
+/// (#1875).
+fn ends_of(change: &AppChange) -> (String, String) {
+    let image = |end: &AppRevision| end.spec.as_deref().and_then(|spec| spec.image.clone());
+    let (before, after) = (image(&change.before), image(&change.after));
+    if let (Some(before), Some(after)) = (&before, &after)
+        && before != after
+    {
+        return (before.clone(), after.clone());
+    }
+    let named = |image: Option<String>, end: &AppRevision| {
+        let short = super::view::short(&end.revision);
+        match image {
+            Some(image) => format!("{image} at revision {short}"),
+            None => format!("revision {short}"),
+        }
+    };
+    (named(before, &change.before), named(after, &change.after))
 }
 
 fn plural(count: usize, word: &str) -> String {
@@ -856,24 +870,23 @@ fn summary(
             "Delete {}. Its instances' local state goes with it.",
             first.app
         ),
-        ProposalKind::Rollback => format!(
-            "Roll {} back from {} to {}.",
-            first.app,
-            image_of(&first.before),
-            image_of(&first.after)
-        ),
+        ProposalKind::Rollback => {
+            let (from, to) = ends_of(first);
+            format!("Roll {} back from {from} to {to}.", first.app)
+        }
         ProposalKind::Restart => format!(
             "Restart {}: replace its instances node by node, through its health checks, on \
              the same spec.",
             first.app
         ),
-        ProposalKind::CancelDeploy => format!(
-            "Cancel the rollout of {} to {}: put it back on {}, the last spec that finished \
-             rolling out; nodes already on the new spec roll back.",
-            first.app,
-            image_of(&first.before),
-            image_of(&first.after)
-        ),
+        ProposalKind::CancelDeploy => {
+            let (rolling_out, released) = ends_of(first);
+            format!(
+                "Cancel the rollout of {} to {rolling_out}: put it back on {released}, the \
+                 last spec that finished rolling out; nodes already on the new spec roll back.",
+                first.app
+            )
+        }
         // `clear_fault_proposal` writes a fault's summary; it changes no app.
         ProposalKind::ClearFault => format!("Clear a fault on {}.", first.app),
         ProposalKind::Apply => {
@@ -1058,11 +1071,7 @@ fn undo_effect(kind: ProposalKind, changes: &[AppChange], reversibility: Reversi
         ProposalKind::Stop => format!("starts {} again with the same spec", first.app.name),
         ProposalKind::Delete => format!("creates {} again from its spec", first.app.name),
         ProposalKind::Rollback => {
-            format!(
-                "puts {} back on {}",
-                first.app.name,
-                image_of(&first.before)
-            )
+            format!("puts {} back on {}", first.app.name, ends_of(first).0)
         }
         ProposalKind::Apply => {
             let created: Vec<&str> = changes
@@ -1085,7 +1094,7 @@ fn undo_effect(kind: ProposalKind, changes: &[AppChange], reversibility: Reversi
         ProposalKind::CancelDeploy => format!(
             "puts {} back on {}, which starts its rollout again",
             first.app.name,
-            image_of(&first.before)
+            ends_of(first).0
         ),
         ProposalKind::ClearFault => "a cleared fault can't be put back".to_string(),
         ProposalKind::Undo { of } => format!("puts proposal {of}'s change back"),

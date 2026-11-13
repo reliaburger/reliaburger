@@ -10,10 +10,20 @@ import tempfile
 import time
 import unittest
 
+import soak_slo
 import sustained_check as checker
 
 NOW = 1_790_000_000
 NODES = ["rb-a-1", "rb-a-2", "rb-a-3"]
+
+
+def quiet_slo_samples(evidence):
+    """A quiet cluster's API reads and one rollout. Every soak since 0.2.4
+    takes them, and the API and rollout SLOs are gated (#1405), so a run
+    without them would fail its tier on that alone."""
+    soak_slo.fold_reads(evidence, [dict(node=node, path="/v1/cluster/nodes", ms=40, ok=True) for node in NODES],
+                        None, set())
+    soak_slo.record_rollout(evidence, apply_ms=300, ready_ms=9000, starts=[2000, 2500, 3000])
 
 
 def wtf(critical=(), warnings=(), ok=("replicas",)):
@@ -1110,9 +1120,10 @@ class SoakPolicies(Evidence):
 class GuestClock(Evidence):
     """One clock source per guest: Lima's guest agent, not timesyncd as well (#608)."""
 
-    def clock(self, ts=NOW, timesyncd="inactive", steps=0):
+    def clock(self, ts=NOW, timesyncd="inactive", chrony="inactive", steps=0):
         return self.snapshot(ts=ts, **{"inventory__rb-a-1_txt":
-                                       INVENTORY + f"timesyncd {timesyncd}\nclock_steps {steps}\n"})
+                                       INVENTORY + f"timesyncd {timesyncd}\nchrony {chrony}\n"
+                                       f"clock_steps {steps}\n"})
 
     def test_a_guest_with_only_the_lima_agent_passes(self):
         _, verdict = self.evaluate(self.clock())
@@ -1124,6 +1135,13 @@ class GuestClock(Evidence):
         failure = next(item for item in verdict["findings"] if item["check"] == "guest-clock")
         self.assertEqual(failure["target"], "rb-a-1")
         self.assertIn("systemd-timesyncd", failure["detail"])
+
+    def test_chrony_running_beside_the_guest_agent_fails(self):
+        # Ubuntu 26.04 guests sync time with chrony, not timesyncd.
+        code, verdict = self.evaluate(self.clock(chrony="active"))
+        self.assertEqual(code, 1)
+        failure = next(item for item in verdict["findings"] if item["check"] == "guest-clock")
+        self.assertIn("chrony", failure["detail"])
 
     def test_clock_steps_outside_a_fault_window_warn_and_are_counted(self):
         _, verdict = self.evaluate(self.clock(steps=6))
@@ -1156,6 +1174,7 @@ class Record(Evidence):
             "soak_bun": "not supplied: upgrade slots skipped", "deviations": ["provision_isolated_workloads"],
             "cycles": 4, "ingress_rotation_secs": 300,
             "teardown": "`relish local destroy --yes` and `relish uninstall --yes` succeeded"}))
+        quiet_slo_samples(self.evidence)
         for offset, seconds in ((0, 40), (100, 60)):
             checker.append_event(self.evidence, ts=NOW + offset, phase="fault:bun-kill-follower", target="rb-a-2")
             checker.append_event(self.evidence, ts=NOW + offset + seconds, phase="fault:bun-kill-follower",
@@ -1341,6 +1360,7 @@ class ExecutionInventory(unittest.TestCase):
                    node_faults=job_final, cycles=8, ingress_rotation_secs=None, quiet_tail=QUIET)
         run.update(metadata)
         (self.evidence / "metadata.json").write_text(json.dumps(run))
+        quiet_slo_samples(self.evidence)
         if candidate is not None and "candidate" not in drop:
             (self.evidence / "candidate.json").write_bytes(candidate)
         (self.evidence / "jobs").mkdir()

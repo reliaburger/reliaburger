@@ -59,8 +59,8 @@ GATED_TIERS = ("fast", "final")
 # is their largest; a final's quiet tail gives millions.
 MIN_JOB_START_SAMPLES = 1000
 FAILURES_KEPT = 20
-RECORD_ONLY_NOTE = ("Record only from 28 October 2026 (#1400): no soak before 0.2.4 measured it. The threshold is "
-                    "provisional; the first 0.2.4 fast and final records set the gate.")
+RECORD_ONLY_NOTE = ("Record only (#1640): deploy history stamps a deploy's start when it finishes, so app start "
+                    "measures nothing yet. The threshold is provisional until it does.")
 
 
 @dataclass(frozen=True)
@@ -76,13 +76,16 @@ class Slo:
 
 
 SLOS = (
-    Slo("api-read", "API read p99", "API read", 1000, False, "probe",
+    # Gated from 6 November 2026 (#1405): two buckets above the worst fast or
+    # final record from 0.2.4 to 0.2.6 (read and write 1,500 ms, rolling
+    # update 50,000 ms). docs/testing.md has the table.
+    Slo("api-read", "API read p99", "API read", 3000, True, "probe",
         "`GET /v1/status?cluster=true` and `GET /v1/cluster/nodes` on every node, at every light check"),
-    Slo("api-write", "API write p99", "API write", 2000, False, "rollout",
+    Slo("api-write", "API write p99", "API write", 3000, True, "rollout",
         "`relish apply` of the soak workloads, from the call to the commit"),
     Slo("app-start", "App start p99", "app start", 5000, False, "rollout",
         "each node's deploy of a new `soak-identity` instance, from its start to the instance running"),
-    Slo("deploy-ready", "Rolling update p99", "rolling update", 30000, False, "rollout",
+    Slo("deploy-ready", "Rolling update p99", "rolling update", 100000, True, "rollout",
         "from `relish apply` returning to every node's `soak-identity` running the new spec"),
     Slo("job-start", "Job task start p99", "job task start", 256, True, "job",
         "a job task's start lag on a pooled executor, from the job campaign's buckets, in runs no fault "

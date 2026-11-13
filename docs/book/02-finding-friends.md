@@ -2664,6 +2664,45 @@ The wait was redundant anyway. The planner already refuses to promote a learner 
 
 The test needed a slow store, and `MemLogStore` already had one test hook, `fail_appends`, for the full-disk case. We added a second beside it, `slow_entry_writes`, which sleeps in `append` for each entry it writes. Both hooks are fields marked `#[cfg(test)]`, so they exist only when the crate is compiled for its own unit tests. A production build has neither the fields nor the code that reads them, unlike Go, where a test hook usually stays in the binary behind a flag. The delay is per entry rather than per call because catch-up time has to grow with the log gap, which is the thing we were testing.
 
+### Five voters, not seven
+
+For a long time the cap was a constant: `max_council_size`, seven. Then the appliance lab arrived, ten Dell Wyse thin clients with 2 GB of RAM each, and seven voters on ten small machines looked like the wrong trade. Every voter keeps the whole council log on disk and has to acknowledge writes for a majority to form. Five voters ride out two failures at once; seven ride out three. On a ten-node lab that third failure isn't worth two more machines doing council work. So a cluster can now choose its size.
+
+The first question was where the setting lives. The obvious place is each node's `node.toml`, next to the ports. But the reconciler only runs on the leader, and leadership moves. If node 1 said five and node 4 said seven, the council would grow or shrink depending on who won the last election. A setting every leader must agree on is cluster state, so it goes where cluster state goes: into the Raft log. A new request, `RaftRequest::CouncilSize`, sets `DesiredState::council_size`, and each reconciler tick reads it before it plans:
+
+```rust
+let selection = config.selection.sized(council.council_size().await);
+```
+
+`sized` returns a copy of the selection config with `max_council_size` capped at the cluster's size, and `min_council_size` lowered to match when the size is smaller than three, so a one-voter council isn't held to a floor it can never reach. Everything else, the planner and its invariants and the proptest that guards them, is unchanged: the planner already stops adding learners when the open seats run out, it just runs out sooner. `council_size()` reads the field through the state machine's lock without cloning the whole desired state, because the reconciler asks every two seconds.
+
+Getting the size into the log uses the path the security state already took. `relish cluster create --bare-metal` writes it into node 1's seed, the seed becomes `[cluster] council_size = 5` in node 1's `node.toml`, and when node 1 bootstraps a fresh council it commits the security state and then the size. Joining nodes never read it; they get it from the log like everything else. `RaftRequest` is encoded with bincode, which writes a variant's position rather than its name, so the new variant goes at the end of the enum, and the change bumps both the protocol and the state generation in `src/compatibility.rs`.
+
+The size itself is a newtype that refuses to exist with a bad value:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "u8", into = "u8")]
+pub struct CouncilSize(u8);
+
+impl CouncilSize {
+    pub fn new(voters: u8) -> Result<Self, CouncilSizeError> {
+        match voters {
+            0 => Err(CouncilSizeError::Zero),
+            v if v > Self::MAX => Err(CouncilSizeError::TooLarge(v)),
+            v if v % 2 == 0 => Err(CouncilSizeError::Even(v)),
+            v => Ok(Self(v)),
+        }
+    }
+}
+```
+
+The field is private (no `pub` inside the parentheses), so code outside the module can't write `CouncilSize(4)`; it has to go through `new`. The serde attribute closes the other door. `try_from = "u8"` tells serde to decode a plain number and then call `TryFrom<u8>`, which calls `new`, so an even size can't arrive through TOML, JSON or a Raft entry either. `into = "u8"` writes it back out as a plain number. `v if v > Self::MAX` is a *match guard*: the arm matches any value, binds it to `v`, and only fires when the condition holds. Arms are tried in order, so by the time the even check runs, zero and anything over seven are already gone. In Go you'd validate in a constructor and hope nobody builds the struct literal; in Python you'd validate in `__init__` and hope nobody unpickles one. Here the type can only hold 1, 3, 5 or 7.
+
+Why refuse even sizes rather than quietly round them? A council of four needs three votes, so it survives one failure, the same as a council of three, while making every commit wait for one more machine. An operator who types `--council-size 4` almost certainly expects it to survive two, and a clear refusal teaches that better than a silent rounding would. The message says so: `a council of 4 voters survives no more failures than one of 3; pick an odd size from 1 to 7`.
+
+The tests come at it from three sides. Unit tests check the type (1, 3, 5 and 7 accepted; 0, even numbers and anything over seven refused, also when decoding) and the planner (five healthy voters and five spares: `Nothing`; four voters: add the fifth). An in-memory council of five nodes, with the size committed at three, ticks the real reconciler until it has three voters and then keeps ticking, asserting that no fourth node ever joins, even as a learner. And the claimed-pair appliance test in CI checks the size end to end: `relish machines claim --create` records five in `fleet.json`, and `relish council --output json` reports five from council state once node 1 has bootstrapped.
+
 ## When the whole council dies
 
 Self-healing has a floor. It keeps the council alive while a majority survives, because every membership change it proposes has to commit through Raft, and Raft needs a quorum to commit anything. Kill two of three voters and the planner does exactly nothing: there's no majority left to vote a replacement in. Kill all three and the cluster is, on paper, dead. Workers keep running whatever they were running, but nothing can elect a leader, schedule a new app, or answer a query about cluster state. There's no quorum to heal from.
@@ -2964,6 +3003,50 @@ if let Some(committed) = committed.filter(|committed| committed.index >= first) 
 
 Why stop at the commit point and not the end of the log? Entries past it were never agreed by the dead council. Replaying one could resurrect a write whose client was told it failed. A follower's commit point can trail the leader's by a heartbeat, so recovering from a follower may lose the last write or two. That's the same honest cost as a backup's interval, just much smaller.
 
+### A replaced voter that comes back
+
+What happens when a voter the planner replaced while it was down comes back? It has its data and its log, but it missed its own removal, so its Raft state still says it's a voter. It does what a voter with no leader does: it campaigns. The other voters refuse it, because the leader's lease is still running, so no harm done yet. But a Raft candidate raises its term each time it campaigns, and the refusals don't lower it again.
+
+Then gossip sees the node again. To the reconciler it's just a live spare, so the leader adds it as a learner and starts replicating to it. The node answers with its higher term, and Raft's rule is that anyone who hears a higher term steps down, the leader included. The node can't win the election that follows, because its log is behind, so the cost is a few seconds without writes. That's every time a replaced voter returns.
+
+We found this by reading the code (#1524), and the test came before any fix: `a_replaced_voter_coming_back_joins_as_a_learner_without_an_election` in `tests/council_self_healing.rs`. The first version passed, and that was misleading. The returning node was added back within 200 ms, before its election timer had fired, so its term never rose. The version that counted waited until the node had campaigned, and then the leader stepped down every time.
+
+The fix had a cost to weigh: stopping a returning node from campaigning mustn't slow the election after a real leader failure. So it can't be "hold every voter while gossip shows a leader", which would make every failover wait for gossip to declare the leader dead. It has to single out the node that's *back*, and only until it has heard from a leader.
+
+Both halves turned out harder than they look. A node is "back" when it starts on a log store that already holds a vote: a fresh node has never voted. That's one storage call before openraft starts, and it lets us start openraft with elections already switched off, so there's no window in which the election timer could fire first:
+
+```rust
+let returning = log_store
+    .read_vote()
+    .await
+    .map_err(|e| CouncilError::Fatal(e.to_string()))?
+    .is_some();
+let mut openraft_config = config.to_openraft_config();
+openraft_config.enable_elect = !returning;
+```
+
+"Has heard from a leader" was the hard half. Our first attempt asked openraft's metrics, and a probe showed why that can't work: a restarted node restores its committed vote, so `current_leader` names the old leader at once, before anyone has said a word to it. Nothing in the metrics separates "I remember who led" from "the leader has spoken to me since I started". So the transport records it. Every AppendEntries a leader sends, over the TCP server or the in-memory router the tests use, notes a `LeaderContact` on the receiving node, unless the node refused it with a higher vote. `LeaderContact` is a `watch` channel of one `bool` behind an `Arc`, so the transport and the node's hold share it by cloning.
+
+The hold then ends at the first of three things, and the decision is a pure function:
+
+```rust
+pub fn return_hold_ends(
+    heard_from_leader: bool,
+    gossip_names_live_leader: bool,
+    now: Instant,
+    grace_until: Instant,
+    cap_until: Instant,
+) -> bool {
+    heard_from_leader || now >= cap_until || (now >= grace_until && !gossip_names_live_leader)
+}
+```
+
+A voter that is still a member hears from the leader within a heartbeat, so its hold is over almost before it starts. A replaced voter hears nothing until the reconciler adds it back as a learner, and then follows at its old term. After a whole-council restart somebody has to lead: openraft brings the old leader back at its old term, the others hear from it, and the leader's own hold ends when the startup grace (three election timeouts) passes with gossip naming no live leader. "Live" means the leader's own gossip hint, for a node gossip counts alive, not suspect. And a cap of ten election timeouts stops a stale hint about a dying leader from holding a node for long.
+
+The return hold shares `ElectionHold` with the handover hold from the next section, because both switch the same openraft setting. An `AtomicBool` records whether the return hold is still on. Each release switches elections back on only when the other hold isn't running, and both releases do it under the same `watch` write lock, so one can't switch elections on just as the other starts. `Ordering::SeqCst` on the atomic asks for the strongest ordering, which is the right default when you aren't measuring for speed.
+
+The reproducer changed with the fix. It now checks that the returning node's term doesn't move in the two seconds it spends outside the others' gossip, which is longer than it used to take to campaign. It then checks that leadership and the leader's term stay put once it's added back, and that the leader's replication ended the hold. It passed six runs out of six, and it runs in `make test-cluster` again.
+
 ### Resigning under disk pressure
 
 There's a slower failure worth heading off before it becomes a total loss: a voter whose disk is filling up. Raft can't make progress if a voter can't persist its log, so a voter drowning in disk pressure is a liability sitting in the quorum. Better it resigns and lets a healthy spare take the seat.
@@ -2988,6 +3071,8 @@ pub fn observe(&mut self, over_threshold: bool, now: Instant) -> ResignationVerd
 `get_or_insert(now)` reads the stored "pressure started at" time, or sets it to `now` the first time pressure crosses the threshold, in one move. Drop back under the threshold and the clock resets, so the next spell waits out the full window again. Only sustained pressure resigns.
 
 A resigning *follower* is easy: it becomes a new input to the self-healing planner, which treats it like a soft-dead voter: bring a replacement in first, promote it, then evict the pressured seat, never dropping below quorum. The planner's existing invariants (never remove the leader, never break quorum, one action per tick) are untouched; disk pressure is just one more reason a seat might open. The property test that guards those invariants got a new generated input (a random set of pressured voters) and still holds.
+
+"Bring a replacement in first" hid a gap that only showed on a full council. The planner gets its candidates from `select_council_candidates`, which hands out `max_council_size` minus the voters gossip can see. A pressured voter is alive, so gossip sees it. With seven voters seated, that's seven minus seven: no candidates, so no replacement, and the voter kept its seat until its disk filled and bun stopped. The planner's unit test passed its candidates in by hand, so it never went through the step that came back empty (#1523). Now the reconciler leaves pressured nodes out of both sides of that call. A pressured voter doesn't count as staying, which frees its seat, and no pressured node is offered as a candidate. A test drives `reconcile_council_once` on a full council: four nodes, a council size of three, then one follower's disk fills, and the spare must take its seat.
 
 A resigning *leader* is the hard case, and it's where openraft 0.9 fought us.
 

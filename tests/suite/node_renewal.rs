@@ -31,7 +31,7 @@ use tower::ServiceExt;
 
 use crate::bun_process;
 use bun_process::{
-    BunProcess, WAIT, assert_success, reserve_address, reserve_ports, run_relish,
+    BunProcess, WAIT, assert_success, reserve_address, reserve_ports, run_relish_init,
     spawn_bun_with_port_retry, wait_for_relish,
 };
 
@@ -56,7 +56,7 @@ async fn council(hierarchy: &ca::CaHierarchy, initialise: bool) -> Arc<CouncilNo
         .await
         .unwrap(),
     );
-    network.register(1, node.raft().clone()).await;
+    network.register(1, &node).await;
     if initialise {
         node.initialize(BTreeMap::from([(
             1,
@@ -145,6 +145,132 @@ async fn post(
         )
         .await
         .unwrap()
+}
+
+async fn get_master_key(router: Router) -> (StatusCode, serde_json::Value) {
+    let response = router
+        .oneshot(
+            Request::get("/v1/cluster/master-key")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    (status, serde_json::from_slice(&body).unwrap_or_default())
+}
+
+/// G1: a node that just joined fetches the master key with its certificate
+/// alone, and nothing else gets it.
+#[tokio::test]
+async fn a_member_certificate_and_only_that_gets_the_master_key() {
+    let hierarchy = ca::generate_ca_hierarchy("master-key", &IKM).unwrap();
+    let council = council(&hierarchy, true).await;
+
+    let (status, body) = get_master_key(router(council.clone(), Some(peer(&hierarchy, 10)))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["master_key"], hex::encode(IKM));
+
+    let (status, _) = get_master_key(router(council.clone(), None)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "no client certificate");
+
+    let foreign = peer(&ca::generate_ca_hierarchy("foreign", &IKM).unwrap(), 10);
+    let (status, _) = get_master_key(router(council.clone(), Some(foreign))).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "another cluster's certificate"
+    );
+
+    council
+        .write(RaftRequest::RevokeCertificate(CrlEntry {
+            serial: SerialNumber(10),
+            issuer: CaRole::Node,
+            revoked_at: SystemTime::now(),
+            reason: "lost stick".into(),
+            expires_at: None,
+        }))
+        .await
+        .unwrap();
+    let (status, _) = get_master_key(router(council.clone(), Some(peer(&hierarchy, 10)))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "a revoked certificate");
+}
+
+/// G1: a retired node's certificate gets no master key, even one that was
+/// never revoked. Retirement is by node id, so this is what stops a node
+/// that was decommissioned, but kept a valid leaf, fetching the key again.
+#[tokio::test]
+async fn a_retired_node_gets_no_master_key_even_with_an_unrevoked_certificate() {
+    use reliaburger::council::CouncilResponse;
+
+    let hierarchy = ca::generate_ca_hierarchy("master-key-retired", &IKM).unwrap();
+    let council = council(&hierarchy, true).await;
+    // A worker, not the council's own voter, which can't be retired.
+    let worker = |serial| {
+        let (leaf, _, _) = ca::issue_node_cert(
+            "old-worker",
+            SerialNumber(serial),
+            &hierarchy.node.signing_keypair,
+            &hierarchy.node.certificate_params,
+        )
+        .unwrap();
+        TlsPeerCertificate(leaf.into())
+    };
+    let (status, _) = get_master_key(router(council.clone(), Some(worker(10)))).await;
+    assert_eq!(status, StatusCode::OK, "before retirement");
+
+    let membership_log_id = *council.metrics().borrow().membership_config.log_id();
+    assert!(matches!(
+        council
+            .write(RaftRequest::DecommissionNode {
+                node_id: "old-worker".into(),
+                retired_by: "operator".into(),
+                reason: "replaced".into(),
+                retired_at_unix_ms: 30,
+                membership_log_id
+            })
+            .await
+            .unwrap(),
+        CouncilResponse::NodeDecommissioned { .. }
+    ));
+
+    // Serial 11 was never issued before, let alone revoked: only the
+    // retirement can refuse it.
+    let security = council.security_state().await;
+    assert!(
+        security
+            .crl
+            .entries
+            .iter()
+            .all(|entry| entry.serial != SerialNumber(11))
+    );
+    for serial in [10, 11] {
+        // The router's retired-peer layer refuses before the handler's own
+        // check, in plain text, so read the body as it comes.
+        let response = router(council.clone(), Some(worker(serial)))
+            .oneshot(
+                Request::get("/v1/cluster/master-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::FORBIDDEN, "serial {serial}: {body}");
+        assert!(
+            body.contains("node identity is retired"),
+            "serial {serial}: {body}"
+        );
+        assert!(!body.contains(&hex::encode(IKM)), "serial {serial}: {body}");
+    }
+    council.shutdown().await.unwrap();
 }
 
 /// #1508: the renewed leaf names the address the request came from, as an
@@ -1090,14 +1216,7 @@ fn secure_bun_renews_a_due_node_leaf_and_reuses_it_after_restart() {
     let root = tempfile::tempdir().unwrap();
     let cluster_dir = root.path().join("cluster");
     assert_success(
-        &run_relish(&[
-            "init",
-            cluster_dir.to_str().unwrap(),
-            "--cluster-name",
-            "renewal-startup",
-            "--node-id",
-            "node-01",
-        ]),
+        &run_relish_init(&cluster_dir, "renewal-startup", "node-01"),
         "initialise renewal fixture",
     );
     let node_path = cluster_dir.join("reliaburger.toml");

@@ -23,13 +23,16 @@ pub mod owner;
 pub mod proof;
 pub mod recovery;
 pub(crate) mod recovery_storage;
+pub mod return_hold;
 pub mod selection;
 pub mod state_machine;
 pub mod types;
 
 pub use apply::{config_to_desired_writes, config_to_leased_writes};
 pub use node::CouncilNode;
-pub use selection::{CouncilSelectionConfig, select_council_candidates};
+pub use selection::{
+    CouncilSelectionConfig, CouncilSize, CouncilSizeError, select_council_candidates,
+};
 pub use state_machine::SnapshotStoreError;
 pub use types::{
     CouncilConfig, CouncilNodeInfo, CouncilResponse, DesiredState, RaftRequest, TypeConfig,

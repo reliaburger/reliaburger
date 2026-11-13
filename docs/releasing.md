@@ -25,8 +25,8 @@ requests, main and manual candidate builds:
 | `relish-linux-x86_64` | Ubuntu 22.04 x86_64 | Linux CLI |
 | `relish-linux-aarch64` | Ubuntu 22.04 arm64 | Linux CLI |
 | `relish-macos-aarch64` | macOS 15 Apple silicon | Laptop CLI |
-| `reliaburger-guest-ubuntu-24.04-…-aarch64.qcow2` | Ubuntu 24.04 arm64 | Quickstart VM image |
-| `reliaburger-guest-ubuntu-24.04-…-x86_64.qcow2` | Ubuntu 24.04 x86_64 | Quickstart VM image |
+| `reliaburger-guest-ubuntu-26.04-…-aarch64.qcow2` | Ubuntu 24.04 arm64 | Quickstart VM image (Ubuntu 26.04) |
+| `reliaburger-guest-ubuntu-26.04-…-x86_64.qcow2` | Ubuntu 24.04 x86_64 | Quickstart VM image (Ubuntu 26.04) |
 
 Pull requests build the guest images only when `build_guest_image.sh`,
 `guest-images.json` or the workflow changes.
@@ -41,6 +41,18 @@ so the profile never compiles on the bench host. Pushes and manual runs
 build it, and pull requests only when the workflow changes. Its name matches
 neither the candidate job's `binaries-*` nor `candidate-*`, so it never
 reaches `candidate.json`, staging or promotion.
+
+The appliance OS images are built separately, by
+`.github/workflows/appliance.yml`. A publishing run releases them as
+`os-<version>-<arch>` with a signed `os-channel.json`, which is what `relish
+image download` and `relish os` read. Today only a manual dispatch with
+`publish` set publishes. The weekly scheduled build (Monday 04:00 UTC,
+`cron: "0 4 * * 1"`) is switched off until v0.3.0 is promoted (maintainer,
+7 October 2026), so the 0.3.0 train reaching main publishes nothing by
+itself. **After v0.3.0 is promoted, restore the `schedule` trigger** in
+`appliance.yml`. Its plan job already treats a scheduled run on main as a
+publishing one, and a build whose packages match the last release publishes
+nothing.
 
 There's no Intel macOS build. 0.2.1 was the last release with
 `relish-macos-x86_64` (maintainer decision, 17 October 2026,
@@ -623,6 +635,18 @@ before it records a run.
 
 The move is a fresh cluster, as [from 0.2.0](#upgrading-from-020), with the
 same steps and the same losses.
+
+The 0.3.0 appliance train carries everything up to 0.2.7 plus the appliance
+OS rollout and the cluster-wide council size, both new Raft requests and new
+fields in council state, so its builds are at protocol 58 and state format
+74, one past 0.2.7's 57/73. A 0.2.x leader offered a 0.3.0 development build
+refuses it before it records a run, and the move is a fresh cluster.
+On that fresh cluster the root CA is offline (#709): `relish init` writes the
+root's private key only into the backup you name with `--root-backup`, and
+without a terminal it needs `--passphrase-file` or `--recipient` too. The
+setups that run on your machine write it there, sealed to a fresh age
+identity, and print both paths. `relish ca backup` now only re-seals such a
+backup (`--from`).
 
 ### Upgrading from 0.2.6
 
@@ -1965,32 +1989,44 @@ need their own evidence after publication.
 ## Guest images and bootstrap installer
 
 Each quickstart VM boots from a guest image the release builds itself: the
-dated Ubuntu 24.04 cloud image named in `scripts/release/guest-images.json`
+dated Ubuntu 26.04 cloud image named in `scripts/release/guest-images.json`
 with that file's `packages` (runc, uidmap, btrfs-progs, nftables, iptables,
 iproute2, buildah) already installed. Without them baked in, every VM spent 15–40 s of
 its first boot in `apt-get update` and `install`, against Ubuntu's live mirrors
 ([measurements](qualification/2026-09-24-guest-image.md)).
 
+The guest runs the same Ubuntu release as the appliance OS (`image/mkosi.conf`),
+and its packages are the appliance's node packages plus Buildah, which only the
+guest needs. `scripts/release/test_guest_images.py` reads both files and fails
+when the two lists drift, so a package added to one is added to the other.
+
 Buildah is there so the five-minute tour can `relish build` on the cluster.
 With what it pulls in that the stock image lacks (`containers-common`, the CNI
 plugins and netavark, `fuse-overlayfs`), it adds about 75 MiB installed,
 going by Ubuntu 24.04's package sizes: 47 MiB of that is
-`containernetworking-plugins`. Expect the compressed image to grow by roughly
-25–40 MiB; record the real figure with the next image build.
+`containernetworking-plugins`. On Ubuntu 26.04 the packages need about
+270 MiB, and the aarch64 image built on 7 October 2026 was 1009 MiB, 107 MiB
+more than the stock cloud image.
 
 `scripts/release/build_guest_image.sh` builds one image, for the host's own
 architecture:
 
 ```sh
-sudo apt-get install -y qemu-utils
+sudo apt-get install -y qemu-utils cloud-guest-utils
 sudo scripts/release/build_guest_image.sh --output guest > guest-record.json
 ```
 
 It downloads the upstream image (or takes `--source FILE`) and refuses it unless
-its SHA-256 matches the pin. It converts it to a sparse raw file, loop-mounts
-the root and boot partitions, and runs `apt-get install` in a chroot, with
+its SHA-256 matches the pin. It converts it to a sparse raw file and adds 1 GiB
+to it, because Ubuntu 26.04's 2.5 GiB root filesystem has only about 160 MiB
+free. It grows the root partition and filesystem into that space
+(`growpart`, `resize2fs`), loop-mounts the root and boot partitions, and runs `apt-get install` in a chroot, with
 package indexes and downloads on a tmpfs so they never reach the image and with
-service starts blocked. Then it seals the image: an empty `/etc/machine-id`,
+service starts blocked. It disables chrony, Ubuntu 26.04's time daemon, because
+Lima's guest agent owns the guest clock (#608). It adds a systemd `.link` file
+naming the virtio NIC `eth0`: 26.04's initrd brings the NIC up as `enp0s1`,
+cloud-init can't rename an interface that's up, and without the file each new
+VM waited two minutes for an `eth0` that never appeared. Then it seals the image: an empty `/etc/machine-id`,
 `cloud-init clean`, no SSH host keys, random seed, logs or temporary files, so
 every VM still generates its own identity at first boot. `fstrim` returns freed
 blocks to the sparse file, and `qemu-img convert -c` writes a zlib-compressed
@@ -2028,7 +2064,8 @@ Update `guest-images.json` deliberately when changing the guest baseline (new
 upstream image date or package list); don't introduce an unpinned `current`
 fallback. Development runs (`--development-binaries`) have no release to take a
 built image from, so they boot the pinned upstream image and install the
-packages at first boot. The VM's provisioning script skips `apt` whenever every
+packages at first boot. The stock image has no `.link` file, so its first boot
+loses the NIC rename and setup restarts the VM once; later boots are fine. The VM's provisioning script skips `apt` whenever every
 package is already present, so both paths use the same script.
 
 Packaging generates `install.sh` with the exact native CLI checksums. The

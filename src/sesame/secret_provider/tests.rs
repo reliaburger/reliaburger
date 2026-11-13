@@ -494,3 +494,74 @@ async fn a_failed_entry_names_its_variable_and_never_a_secret() {
     );
     assert!(!format!("{error:?}").contains(SECRET));
 }
+
+/// A provider that records each call in `calls` and fails the first
+/// `failures` of them by exiting 1, then answers.
+fn flaky_provider(dir: &Path, failures: usize) -> (PathBuf, PathBuf) {
+    let calls = dir.join("calls");
+    let body = format!(
+        "echo call >> {calls}\n\
+         if [ \"$(wc -l < {calls})\" -le {failures} ]; then exit 1; fi\n\
+         printf '{{\"version\":1,\"value\":\"{SECRET}\"}}'",
+        calls = calls.display()
+    );
+    (script(dir, "provider", &body), calls)
+}
+
+fn call_count(calls: &Path) -> usize {
+    std::fs::read_to_string(calls).map_or(0, |text| text.lines().count())
+}
+
+#[tokio::test]
+async fn a_provider_that_fails_once_and_then_answers_lets_the_launch_succeed() {
+    // #1308: a provider that's restarting mustn't fail the instance's restart.
+    let dir = tempfile::tempdir().unwrap();
+    let (binary, calls) = flaky_provider(dir.path(), 1);
+    let env = vec!["DB_PASSWORD=PROVIDER[vault:secret/db#password]".to_string()];
+    let resolved = providers(&binary, |_| {})
+        .resolve_env(&env, &["DB_PASSWORD".to_string()], context())
+        .await
+        .unwrap();
+    assert_eq!(resolved, vec![format!("DB_PASSWORD={SECRET}")]);
+    assert_eq!(call_count(&calls), 2);
+}
+
+#[tokio::test]
+async fn a_provider_that_stays_down_fails_closed_after_its_attempts() {
+    let dir = tempfile::tempdir().unwrap();
+    let (binary, calls) = flaky_provider(dir.path(), 1000);
+    let env = vec!["DB_PASSWORD=PROVIDER[vault:secret/db#password]".to_string()];
+    let error = providers(&binary, |_| {})
+        .resolve_env(&env, &["DB_PASSWORD".to_string()], context())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "cannot resolve secret DB_PASSWORD: secret provider \"vault\" exited with status 1"
+    );
+    assert_eq!(call_count(&calls), RESOLVE_ATTEMPTS);
+}
+
+#[tokio::test]
+async fn a_provider_that_refuses_is_asked_only_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let calls = dir.path().join("calls");
+    let binary = script(
+        dir.path(),
+        "provider",
+        &format!(
+            "echo call >> {}\nprintf '{{\"version\":1,\"error\":\"no such path\"}}'",
+            calls.display()
+        ),
+    );
+    let env = vec!["DB_PASSWORD=PROVIDER[vault:secret/db#password]".to_string()];
+    let error = providers(&binary, |_| {})
+        .resolve_env(&env, &["DB_PASSWORD".to_string()], context())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error.problem, ProviderError::Refused { .. }),
+        "{error}"
+    );
+    assert_eq!(call_count(&calls), 1);
+}

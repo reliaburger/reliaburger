@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use openraft::error::ClientWriteError;
 use openraft::{ChangeMembers, Raft, RaftNetworkFactory};
@@ -16,6 +17,7 @@ use super::fence::{FenceSnapshot, RecoveryFence};
 use super::handover::{ElectionHold, campaign_round, leader_after_handover};
 #[cfg(test)]
 use super::log_store::MemLogStore;
+use super::return_hold::{LeaderContact, return_hold_cap, return_hold_grace};
 use super::state_machine::CouncilStateMachine;
 use super::types::{
     CouncilConfig, CouncilNodeInfo, CouncilResponse, DesiredState, RaftRequest, TypeConfig,
@@ -79,8 +81,14 @@ pub struct CouncilNode {
     /// should see them: a fenced node never claims a leader.
     fence: Option<(RecoveryFence, watch::Receiver<RaftMetrics>)>,
     /// Whether this voter is holding its elections while leadership moves
-    /// off it (#755).
+    /// off it (#755), or since it came back on its old log (#1524).
     election_hold: ElectionHold,
+    /// Whether a leader's AppendEntries has reached this node since it
+    /// started; the Raft transport notes it (#1524).
+    leader_contact: LeaderContact,
+    /// Whether this node's gossip view names a live leader other than
+    /// itself, as the cluster runtime reports it (#1524).
+    gossip_leader: watch::Sender<bool>,
     /// The leadership proof callers share, so a burst of requests doesn't
     /// send a burst of heartbeat rounds (#1441).
     leadership_proof: super::proof::SharedProof,
@@ -149,12 +157,22 @@ impl CouncilNode {
         N: RaftNetworkFactory<TypeConfig>,
         LS: openraft::storage::RaftLogStorage<TypeConfig>,
     {
+        // A saved vote means this node has been in a council before: it's
+        // back on its old log, and starts with its elections held (#1524).
+        let mut log_store = log_store;
+        let returning = log_store
+            .read_vote()
+            .await
+            .map_err(|e| CouncilError::Fatal(e.to_string()))?
+            .is_some();
+        let mut openraft_config = config.to_openraft_config();
+        openraft_config.enable_elect = !returning;
         let raft_config = Arc::new(
-            config
-                .to_openraft_config()
+            openraft_config
                 .validate()
                 .map_err(|e| CouncilError::InitError(e.to_string()))?,
         );
+        let election_timeout_max = Duration::from_millis(raft_config.election_timeout_max);
 
         let raft = Raft::new(
             raft_id,
@@ -166,11 +184,23 @@ impl CouncilNode {
         .await
         .map_err(|e| CouncilError::Fatal(e.to_string()))?;
 
-        let election_hold = ElectionHold::new(raft.clone(), raft_id);
+        let election_hold = ElectionHold::new(raft.clone(), raft_id, returning);
+        let leader_contact = LeaderContact::new();
+        let gossip_leader = watch::Sender::new(false);
+        if returning {
+            election_hold.hold_on_return(
+                leader_contact.subscribe(),
+                gossip_leader.subscribe(),
+                return_hold_grace(election_timeout_max),
+                return_hold_cap(election_timeout_max),
+            );
+        }
         Ok(Self {
             raft,
             raft_id,
             election_hold,
+            leader_contact,
+            gossip_leader,
             leadership_proof: super::proof::SharedProof::new(),
             leader_security_view: tokio::sync::RwLock::new(None),
             state_machine,
@@ -397,6 +427,27 @@ impl CouncilNode {
     /// ([`hold_elections_until`](Self::hold_elections_until)).
     pub fn elections_held(&self) -> bool {
         self.election_hold.is_held()
+    }
+
+    /// Whether this node is still holding the elections it started holding
+    /// because it came back on its old log (#1524, see
+    /// [`return_hold`](super::return_hold)).
+    pub fn elections_held_on_return(&self) -> bool {
+        self.election_hold.is_held_on_return()
+    }
+
+    /// The signal the Raft transport notes when a leader's AppendEntries
+    /// arrives. Hand it to the RPC server serving this node.
+    pub fn leader_contact(&self) -> LeaderContact {
+        self.leader_contact.clone()
+    }
+
+    /// Report whether this node's gossip view names a live leader other
+    /// than itself. While it does, a returning node keeps holding its
+    /// elections past the startup grace, up to the cap.
+    pub fn report_gossip_leader(&self, live_leader: bool) {
+        self.gossip_leader
+            .send_if_modified(|current| std::mem::replace(current, live_leader) != live_leader);
     }
 
     /// Campaign until a voter other than `previous` leads, and return it.
@@ -787,6 +838,15 @@ impl CouncilNode {
         }
     }
 
+    /// How many voters the council grows to, if the cluster was created
+    /// with a size. Borrows the state rather than cloning it, so the
+    /// reconciler can ask on every tick.
+    pub async fn council_size(&self) -> Option<crate::council::CouncilSize> {
+        self.state_machine
+            .read_desired(|state| state.council_size)
+            .await
+    }
+
     /// Whether an operator has permanently retired this node identity.
     /// Cheap enough to call on every request: it borrows, never clones.
     pub async fn is_node_retired(&self, node_id: &str) -> bool {
@@ -1049,7 +1109,7 @@ mod tests {
             let node = CouncilNode::new(id, fast_config(), network, log_store, sm, None)
                 .await
                 .unwrap();
-            router.register(id, node.raft().clone()).await;
+            router.register(id, &node).await;
             nodes.push(node);
         }
 
@@ -1361,7 +1421,7 @@ mod tests {
             )
             .await
             .unwrap();
-            router.register(id, node.raft().clone()).await;
+            router.register(id, &node).await;
             nodes.push(node);
         }
 
@@ -1420,7 +1480,7 @@ mod tests {
             )
             .await
             .unwrap();
-            router.register(id, node.raft().clone()).await;
+            router.register(id, &node).await;
             nodes.push(node);
         }
         nodes[0].add_learner(2, node_info(2)).await.unwrap();
@@ -1929,7 +1989,7 @@ mod tests {
         )
         .await
         .unwrap();
-        router.register(4, node4.raft().clone()).await;
+        router.register(4, &node4).await;
         nodes.push(node4);
 
         let leader = &nodes[(leader_id - 1) as usize];
@@ -1982,7 +2042,7 @@ mod tests {
         )
         .await
         .unwrap();
-        router.register(4, node4.raft().clone()).await;
+        router.register(4, &node4).await;
         nodes.push(node4);
 
         let leader = &nodes[(leader_id - 1) as usize];
@@ -2018,7 +2078,7 @@ mod tests {
         )
         .await
         .unwrap();
-        router.register(2, node2.raft().clone()).await;
+        router.register(2, &node2).await;
         nodes.push(node2);
         nodes[0].add_learner(2, node_info(2)).await.unwrap();
 
@@ -2116,7 +2176,7 @@ mod tests {
             )
             .await
             .unwrap();
-            router.register(id, node.raft().clone()).await;
+            router.register(id, &node).await;
             nodes.push(node);
         }
         init_cluster(&nodes[..1]).await;
@@ -2386,7 +2446,7 @@ mod tests {
         )
         .await
         .unwrap();
-        router.register(1, node.raft().clone()).await;
+        router.register(1, &node).await;
 
         let members = BTreeMap::from([(1, node_info(1))]);
         node.initialize(members).await.unwrap();
@@ -2419,6 +2479,7 @@ mod tests {
             join_tokens: vec![],
             next_serial: 10,
             oidc_signing_config: Some(oidc_config),
+            retiring_oidc_keys: Vec::new(),
             crl: crate::sesame::types::Crl::default(),
             secret_seals: std::collections::BTreeMap::new(),
             node_leaves: std::collections::BTreeMap::new(),
@@ -2632,6 +2693,178 @@ mod tests {
             "{error:?}"
         );
         for node in &nodes {
+            node.shutdown().await.unwrap();
+        }
+    }
+
+    /// A council of `n` whose log stores the caller keeps, so a node can be
+    /// restarted on its own log (#1524).
+    async fn create_cluster_keeping_stores(
+        n: u64,
+    ) -> (Vec<CouncilNode>, Vec<MemLogStore>, InMemoryRaftRouter) {
+        let router = InMemoryRaftRouter::new();
+        let mut nodes = Vec::new();
+        let mut stores = Vec::new();
+        for id in 1..=n {
+            let store = MemLogStore::new();
+            let node = CouncilNode::new(
+                id,
+                fast_config(),
+                InMemoryRaftNetworkFactory::new(id, router.clone()),
+                store.clone(),
+                CouncilStateMachine::new(),
+                None,
+            )
+            .await
+            .unwrap();
+            router.register(id, &node).await;
+            nodes.push(node);
+            stores.push(store);
+        }
+        (nodes, stores, router)
+    }
+
+    async fn restart(id: u64, store: &MemLogStore, router: &InMemoryRaftRouter) -> CouncilNode {
+        CouncilNode::new(
+            id,
+            fast_config(),
+            InMemoryRaftNetworkFactory::new(id, router.clone()),
+            store.clone(),
+            CouncilStateMachine::new(),
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn wait_for_release(node: &CouncilNode, within: Duration) -> bool {
+        tokio::time::timeout(within, async {
+            while node.elections_held_on_return() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    #[tokio::test]
+    async fn a_fresh_node_holds_no_elections() {
+        let (nodes, _router) = create_cluster(1).await;
+        assert!(!nodes[0].elections_held_on_return());
+        nodes[0].shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_restarted_voter_holds_its_elections_until_the_leader_replicates_to_it() {
+        let (mut nodes, stores, router) = create_cluster_keeping_stores(3).await;
+        init_cluster(&nodes).await;
+        let leader_id = wait_for_leader(&nodes, Duration::from_secs(5))
+            .await
+            .unwrap();
+        nodes[(leader_id - 1) as usize]
+            .write(RaftRequest::Noop)
+            .await
+            .unwrap();
+        let follower = (1..=3).find(|id| *id != leader_id).unwrap();
+        let index = (follower - 1) as usize;
+        nodes[index].shutdown().await.unwrap();
+
+        let returned = restart(follower, &stores[index], &router).await;
+        assert!(
+            returned.elections_held_on_return(),
+            "a voter back on its old log campaigns before it hears from the leader"
+        );
+        router.register(follower, &returned).await;
+        assert!(
+            wait_for_release(&returned, Duration::from_secs(2)).await,
+            "the leader's replication didn't end the hold"
+        );
+        assert!(returned.leader_contact().heard());
+        assert_eq!(
+            nodes[(leader_id - 1) as usize].current_leader().await,
+            Some(leader_id)
+        );
+        nodes[index] = returned;
+        for node in &nodes {
+            node.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn gossip_naming_a_live_leader_holds_a_returning_voter_until_the_cap() {
+        let (nodes, stores, router) = create_cluster_keeping_stores(3).await;
+        init_cluster(&nodes).await;
+        wait_for_leader(&nodes, Duration::from_secs(5))
+            .await
+            .unwrap();
+        nodes[0].write(RaftRequest::Noop).await.ok();
+        for node in &nodes {
+            node.shutdown().await.unwrap();
+        }
+        // Back alone: no leader replicates to it, and gossip still names one.
+        let alone = InMemoryRaftRouter::new();
+        let returned = restart(1, &stores[0], &alone).await;
+        returned.report_gossip_leader(true);
+        let timeout = Duration::from_millis(fast_config().election_timeout_max_ms);
+        tokio::time::sleep(crate::council::return_hold::return_hold_grace(timeout) * 2).await;
+        assert!(
+            returned.elections_held_on_return(),
+            "the hold ended while gossip named a live leader"
+        );
+        assert!(
+            wait_for_release(
+                &returned,
+                crate::council::return_hold::return_hold_cap(timeout)
+            )
+            .await,
+            "the hold outlived its cap"
+        );
+        returned.shutdown().await.unwrap();
+        drop(router);
+    }
+
+    #[tokio::test]
+    async fn a_whole_council_restart_commits_again() {
+        let (nodes, stores, _router) = create_cluster_keeping_stores(3).await;
+        init_cluster(&nodes).await;
+        wait_for_leader(&nodes, Duration::from_secs(5))
+            .await
+            .unwrap();
+        for node in &nodes {
+            node.shutdown().await.unwrap();
+        }
+        let router = InMemoryRaftRouter::new();
+        let mut restarted = Vec::new();
+        for (index, store) in stores.iter().enumerate() {
+            let node = restart(index as u64 + 1, store, &router).await;
+            router.register(index as u64 + 1, &node).await;
+            restarted.push(node);
+        }
+        assert!(restarted.iter().all(CouncilNode::elections_held_on_return));
+        // openraft brings the old leader back at its old term, so the
+        // others hear from it; gossip names no live leader, so the grace
+        // ends the leader's own hold.
+        let timeout = Duration::from_millis(fast_config().election_timeout_max_ms);
+        let within =
+            crate::council::return_hold::return_hold_grace(timeout) + Duration::from_secs(5);
+        let leader = wait_for_leader(&restarted, within)
+            .await
+            .expect("no leader after a whole-council restart");
+        tokio::time::timeout(
+            within,
+            restarted[(leader - 1) as usize].write(RaftRequest::Noop),
+        )
+        .await
+        .expect("no write committed after a whole-council restart")
+        .unwrap();
+        for node in &restarted {
+            assert!(
+                wait_for_release(node, within).await,
+                "node {} still holds its elections",
+                node.raft_id
+            );
+        }
+        for node in &restarted {
             node.shutdown().await.unwrap();
         }
     }

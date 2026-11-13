@@ -1269,7 +1269,7 @@ async fn runc_common_job_api_runs_encrypted_singletons_and_gates_hooks_on_accept
         .await
         .unwrap(),
     );
-    network.register(1, council.raft().clone()).await;
+    network.register(1, &council).await;
     council
         .initialize(BTreeMap::from([(
             1,
@@ -2335,7 +2335,7 @@ async fn runc_reusable_admission_preserves_warm_capacity_and_rechecks_queued_sec
         .await
         .unwrap(),
     );
-    network.register(1, council.raft().clone()).await;
+    network.register(1, &council).await;
     council
         .initialize(BTreeMap::from([(
             1,

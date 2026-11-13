@@ -464,6 +464,17 @@ bucket bound for the same reason we picked 256 ms: the record's number is then e
 one the gate compared. `soak_slo.py trend` lists every record's values side by side, which
 is the closest we'll come to a dashboard for now.
 
+Three releases of records later, that listing set the gates
+([#1405](https://github.com/reliaburger/reliaburger/issues/1405)). The API read, the API write
+and the rolling update are now gated at two buckets above the worst fast or final value: 3 s,
+3 s and 100 s. The same listing showed something else, which a dashboard would have shown
+at a glance. App start was 1 ms in every record, on machines that take seconds to start a
+container. "A start and a completion on that node's own clock" turned out to be one clock
+reading taken twice: every deploy-history writer filled both fields with `SystemTime::now()`
+as it wrote the entry ([#1640](https://github.com/reliaburger/reliaburger/issues/1640)). A
+number that never moves deserves suspicion. App start stays record only until its
+timestamps mean something.
+
 
 Here's a bug that a passing test hid for a while. Bun can run a workload as a plain host
 process, not just a container. You tell it a binary path and it runs it. Obviously you don't
@@ -9385,6 +9396,19 @@ The next step is OSS-Fuzz, which runs the same cargo-fuzz targets on
 Google's machines around the clock. That wants targets that have run clean
 nightly for a while first, so it's a follow-up.
 
+Three decoders missed the first cut, and they have targets now
+([#1414](https://github.com/reliaburger/reliaburger/issues/1414)). They are the task-array
+manifest, the chaos scenario file, and the council state inside a backup. The last one
+shows why one target per file isn't enough. `council_backup` already fuzzes the backup
+file, but its bytes are sealed with the master key, and random input never unseals. So the
+JSON a restore parses once it has unsealed a backup was never reached. `council_backup_state`
+starts after the seal. It also checks the one property a restore leans on: the backup name
+worked out from a state must parse back to the same position, because `relish council
+recover` refuses a state that doesn't sit where its name says. None of the three types
+derives `PartialEq`, and `DesiredState` holds `HashMap`s that re-encode in a different order
+each time. So each round trip compares `serde_json::Value`s, whose maps are ordered, rather
+than the structs.
+
 ## Did it happen in some order?
 
 Here's a history from three clients and one lease. Client 1 renews it through node A, and the
@@ -9480,6 +9504,16 @@ reads every write straight back through a different node. With that, the broken 
 three runs out of three, each time on a renew that returned one expiry and a read 3 ms later,
 through another node, that returned the one before. The honest build passed every run.
 
+A kill has a blind spot, though. A killed leader answers nothing, so it can't serve a stale
+read. The dangerous leader is the one that's alive and cut off, still sure it leads, while the
+others elect someone new. The fixture's nodes already carry the switch a `node-kill` fault
+throws: a `NodeTransportGate` that makes every cluster transport behave as if the node had
+gone, while its API keeps answering. So a second test quiesces the leader's gate instead of
+killing it, waits for one of the other two to win an election, leaves the old leader cut off
+ten seconds more, and heals it (#1415). It passes. The leader-confirmation check is what makes
+it pass: the old leader can't reach a quorum, so it can't prove it leads, and it refuses or
+forwards instead of answering from its copy.
+
 The checker's first finding wasn't that bug, though. It was in our model. On the honest
 build, a read during a release saw the lease *cleaning*, and the model said that couldn't
 happen: a release was one step, held one instant and free the next. But the council releases
@@ -9500,8 +9534,34 @@ hand on every exit path; here it's the type's job. The nodes come from the fixtu
 from Chapter 1: every field we don't name comes from the default.
 
 What doesn't this cover? Only what the clients do. The soak's apps, jobs and upgrades write to
-the council too, and the history sees none of it. The next step is the same check for job
-outcomes, where "every task-array chunk completes exactly once" is an invariant today.
+the council too, and the history sees none of it.
+
+### Every chunk exactly once
+
+Jobs are the next most important thing the soak writes. The council promises that every
+task-array chunk completes exactly once
+([#1415](https://github.com/reliaburger/reliaburger/issues/1415)). The leader grants a chunk
+to a node, and the node reports it done. If the node dies first, the leader grants the chunk
+again with the next attempt number, and that number fences off a late report from the dead
+node. So a chunk can *run* twice, but it must be *counted* once.
+
+The soak can't see grants: they live only in Raft state. What it can see is the accepted
+results, through `GET /v1/batch/{id}/results`. Each row there names the grant attempt that
+produced it, and that's enough for a model with two rules:
+
+1. **Counted once.** A chunk's rows hold each of its tasks exactly once, and every row comes
+   from the same grant. Rows from two grants in one chunk mean the council accepted the chunk
+   twice.
+2. **Run again only after a re-grant.** The audit runs already post one effect per execution
+   to a ledger outside the cluster. A task whose chunk was granted once can't have run more
+   often than its accepted attempts. Extra runs need a grant attempt above 1.
+
+Reading every row of a 262,144-task run after each drain would cost hundreds of requests. So
+`job_soak.py` reads the first chunk, the last chunk and six picked at random, from a generator
+seeded with the run's name, so a rerun reads the same ones. It reads small runs whole. Each
+checked chunk's grant goes into `chunk-history.jsonl` next to the campaign state, and the
+qualification record counts the chunks checked and how many of them were re-granted. A
+re-grant isn't a failure; it's the evidence that the soak's faults exercised the fence.
 
 ## Lessons learned: audit the evidence too
 

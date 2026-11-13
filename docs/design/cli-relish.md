@@ -68,7 +68,7 @@ The `relish routes` command queries the Wrapper ingress proxy for the current ro
 
 ### Sesame (security)
 
-`relish init`, `relish join`, `relish join-token`, `relish token`, `relish secret` and `relish sign` drive the Sesame security subsystem (PKI, identities, tokens, secret encryption, image signing). `relish ca` backs up the root CA (`relish ca backup`), checks a backup offline (`relish ca verify`) and rotates an intermediate (`relish ca rotate`). CA status and revocation are planned (#362). There is no workload-identity command: `relish identity` *(planned)*.
+`relish init`, `relish join`, `relish join-token`, `relish token`, `relish secret` and `relish sign` drive the Sesame security subsystem (PKI, identities, tokens, secret encryption, image signing). `relish ca` re-seals the root CA backup `relish init` wrote (`relish ca backup`), checks a backup offline (`relish ca verify`) and rotates an intermediate (`relish ca rotate`). CA status and revocation are planned (#362). `relish identity rotate-signing-key` replaces the key that signs workload JWTs, keeping the old one verifying until its tokens expire (#709).
 
 ---
 
@@ -680,7 +680,7 @@ relish exec <app> <cmd...>          # Run a command once inside a running instan
 relish exec <app> --namespace <ns> <cmd...>  # Scope to a namespace
 
 # Cluster lifecycle
-relish init [dir] --cluster-name <name> --node-id <id> # Generate config + PKI
+relish init [dir] --cluster-name <name> --node-id <id> --root-backup <file> [--passphrase-file <path> | --recipient <age1...>] # Generate config + PKI; the root key goes only into the backup
 relish init [dir] --development-plaintext              # Local-only plaintext transports (explicit opt-in; no cluster registry)
 relish nodes                        # Gossip state, council seat, version, usage and allocation, problems first
 relish nodes --unhealthy            # Only nodes not alive, cordoned, under disk pressure or not answering
@@ -700,7 +700,7 @@ relish secret pubkey --namespace <ns>               # A namespace's own key (sec
 relish secret rotate [--finalize] --namespace <ns>  # Rotate one namespace's key (unscoped Admin)
 
 # Root CA backup (offline) and intermediate rotation
-relish ca backup --out <file> [--dir <init-dir>] [--cluster-name <name>] [--recipient <age1...> | --passphrase-file <path>]
+relish ca backup --from <backup> --out <file> [--passphrase-file <path> | --identity <file>] [--recipient <age1...> | --new-passphrase-file <path>]
 relish ca verify <file> --fingerprint sha256:... [--passphrase-file <path> | --identity <path>]
 relish ca rotate --role <node|workload|ingress> --root-backup <file> [--passphrase-file <path> | --identity <path>]
 relish ca rotate --role <node|workload|ingress> --finalize   # Retire the old CA once nothing depends on it
@@ -1379,12 +1379,15 @@ Navigation:
 
 #### Cluster Lifecycle Commands
 
-**`relish init [dir] --cluster-name <name> --node-id <id>`**
+**`relish init [dir] --cluster-name <name> --node-id <id> --root-backup <file>`**
 
-Creates the output directory and writes `reliaburger.toml`, a sample
-`app.toml`, the CA hierarchy, sealed root backup, master key, initial security
-state and the first node's identity. It prints the one-use join token and root
-CA fingerprint. It does **not** start Bun. The operator starts the first node
+Writes the root CA backup to `--root-backup` first, sealed to a passphrase
+(asked twice at a terminal, or `--passphrase-file`) or to `--recipient`, and
+checks it; that's the root key's only copy (#709). Without a terminal it
+refuses unless both are given, and it never picks a default file. Then it
+creates the output directory and writes `reliaburger.toml`, a sample
+`app.toml`, the master key, initial security state and the first node's
+identity. It prints the root CA fingerprint. It does **not** start Bun. The operator starts the first node
 explicitly with `bun --cluster --config <dir>/reliaburger.toml`; the generated
 config requires mTLS unless `--development-plaintext` was explicitly used.
 `require_mtls` also defaults to `true` when a config omits it, so a hand-written
@@ -1819,7 +1822,7 @@ These events are visible in `relish history` and in the TUI/web events view. Sec
 
 Target: under 50ms from invocation to first API request.
 
-Relish is a single Rust binary. Linux release builds link glibc (`*-linux-gnu`); static musl builds are planned with 0.3.0 (#401). Startup consists of: argument parsing (clap, <1ms), config file loading (TOML parse, <2ms), API client construction (TLS context, <10ms), and the first HTTP request.
+Relish is a single Rust binary. Linux release builds link glibc (`*-linux-gnu`); static musl builds are planned ([#1774](https://github.com/reliaburger/reliaburger/issues/1774)). Startup consists of: argument parsing (clap, <1ms), config file loading (TOML parse, <2ms), API client construction (TLS context, <10ms), and the first HTTP request.
 
 For commands that don't contact the cluster (`compile`, `lint`, `fmt`, `diff`, `--version`), total execution time is typically under 20ms.
 
@@ -2048,7 +2051,7 @@ Relish is implemented in Rust. The following crates are used:
 | `rustls` | 0.23.x | TLS implementation (used by reqwest) for mTLS client certs |
 | `insta` | 1.x | Snapshot testing for TUI rendering (dev dependency) |
 
-Release builds pin every dependency in `Cargo.lock`. Linux builds link glibc dynamically; a static musl build is planned with 0.3.0 (#401).
+Release builds pin every dependency in `Cargo.lock`. Linux builds link glibc dynamically; a static musl build is planned ([#1774](https://github.com/reliaburger/reliaburger/issues/1774)).
 
 ---
 

@@ -49,6 +49,23 @@ Rootless Bun and macOS don't run the perimeter, so the setting has no effect
 there. The laptop quickstart doesn't need it either: it reaches each node's API
 through a port forward that arrives on the node's loopback.
 
+### Letting new nodes in
+
+A node that hasn't joined yet isn't a member, so the perimeter drops it unless
+it's in `bootstrap_peers`. List the nodes you know about, or the network that
+nodes you add later will join from:
+
+```toml
+[security]
+bootstrap_peers = ["192.168.0.101", "192.168.0.102", "192.168.0.0/24"]
+```
+
+- It opens the API and cluster ports (9117, 9443-9445) to them, not container
+  host ports. Joining still needs a join token, and every cluster port is mTLS.
+- Entries follow the `operator_cidrs` rules: bare addresses or CIDRs, IPv4 or
+  IPv6, no `/0` and no host bits set.
+- Releases up to 0.1.2 take bare addresses only.
+
 ## API tokens
 
 ```sh
@@ -862,9 +879,9 @@ What's recorded:
 |------|---------|
 | Workloads | `app.applied`, `app.stopped`, `app.deleted`, `app.exec`, `deploy.rolled_back`, `deploy.cancelled`, `snapshot.created`, `snapshot.restored`, `snapshot.deleted` |
 | Jobs and builds | `job.submitted`, `job.replayed`, `job.schedule_disabled`, `batch.submitted`, `array.submitted`, `batch.cancelled`, `build.submitted` |
-| The cluster | `upgrade.started`, `upgrade.aborted` (and `applied`, `resumed`, `rolled_back`, `cluster_rolled_back`), `node.decommissioned`, `council.elect`, `logs.exported`, `test_lease.created`, `test_lease.released`, `test_lease.retired` |
+| The cluster | `upgrade.started`, `upgrade.aborted` (and `applied`, `resumed`, `rolled_back`, `cluster_rolled_back`), `node.decommissioned`, `council.elect`, `os.staged`, `os.rollout_started` (and `rollout_resumed`, `rollout_aborted`), `perimeter.admitted`, `logs.exported`, `test_lease.created`, `test_lease.released`, `test_lease.retired` |
 | Policies | `policy.denied`, `policy.deleted`; an apply that writes a policy is `app.applied` with the policy names under `policies` |
-| Trust | `token.created`, `token.revoked`, `token.rotated`, `token.expired_swept`, `join_token.created`, `secret.rotated`, `secret.rotation_finalised`, `secret.namespace_key_created`, `ca.rotation_prepared`, `ca.rotation_begun`, `ca.rotation_finalised`, `identity.signed` |
+| Trust | `token.created`, `token.revoked`, `token.rotated`, `token.expired_swept`, `join_token.created`, `join_token.revoked`, `secret.rotated`, `secret.rotation_finalised`, `secret.namespace_key_created`, `ca.rotation_prepared`, `ca.rotation_begun`, `ca.rotation_finalised`, `identity.signed` |
 | Chaos | `fault.injected`, `fault.cleared`, `fault.cleared-by-service`, `fault.cleared-all-workload`, `fault.expired` |
 
 The cluster's own actions (a fault expiring, an expired token being swept)
@@ -1004,11 +1021,8 @@ names the offenders, while any stored secret still needs the old key. Plain
 `secret pubkey` follows the rotation; the offline form reads the file from
 `init`, which still holds the original key.
 
-Finalising retires the old keys, except the very first one: `relish init`
-sealed the root CA's private key to it, in `<cluster>-root-ca.age`, so that key
-stays (read-only, never used for new secrets) and the root backup keeps
-opening. Keep that file with the master key; together they're how you'd
-recover the root.
+Finalising retires every old key. Nothing else is sealed to them: the root CA
+backup is sealed to you, not to a cluster key (see "The root CA backup").
 
 ### A key per namespace
 
@@ -1152,46 +1166,76 @@ cannot resolve secret DB_PASSWORD: secret provider "vault" did not answer within
 ```
 
 A timeout kills the provider's whole process group. Only the apps that name
-that provider are affected; everything else on the node keeps starting. In a
-cluster, the node tries the deploy again with its usual backoff (5 seconds,
-doubling up to 5 minutes), so a provider that comes back is picked up. A
-restart the provider refuses leaves that instance failed, with the reason,
-rather than spending its restart budget on the same failure.
+that provider are affected; everything else on the node keeps starting.
+
+A provider that's down only briefly doesn't fail the launch. When it can't be
+run, times out or exits without an answer, the node asks it twice more, a
+quarter of a second and then half a second later, before it gives up. That
+covers a restart as well as a deploy. A provider that answers with an `error`
+has said no, so it isn't asked again. In a cluster, the node then tries a
+failed deploy again with its usual backoff (5 seconds, doubling up to 5
+minutes), so a provider that comes back is picked up. A restart that still
+fails leaves that instance failed, with the reason, rather than spending its
+restart budget on the same failure.
 
 The node keeps only the reference. The secret goes into the container's
 environment, the same way a decrypted `ENC[AGE:...]` value does, and every
 restart asks the provider again, so a secret you rotate at the source reaches
 the next restart without a redeploy.
 
-## Backing up the root CA
+## The root CA backup
 
-`<cluster>-root-ca.age` only opens with the master key and the cluster's own
-state, so it's a backup for the cluster rather than for you. Make your own
-copy of the root, one that opens with something only you hold. Run this on
-the node where `relish init` ran, since that's where the master key, the
-security state and the sealed root are:
+The root CA is offline. Its private key exists in one place: a backup that
+`relish init` writes for you, sealed to a passphrase or to your own age key.
+No node keeps it, the council never sees it, and nothing on the cluster can
+open it. You need it only to rotate an intermediate CA (below).
 
-```sh
-relish ca backup --out prod-root-backup.age --dir /etc/reliaburger
-```
-
-It asks for a passphrase twice (at least 12 characters) and writes the root's
-private key and certificate, with the cluster, trust domain, fingerprint and
-expiry, into an ASCII-armoured age file. The file is created owner-only, and
-an existing file is never overwritten. If the directory holds more than one
-cluster, add `--cluster-name`. To seal it to your own age key instead of a
-passphrase:
+`relish init` won't finish without somewhere to put it:
 
 ```sh
-relish ca backup --out prod-root-backup.age --recipient age1...
+relish init /etc/reliaburger --cluster-name prod \
+    --root-backup /media/usb/prod-root-backup.age
 ```
 
-`--passphrase-file PATH` reads the passphrase from the first line of a file,
-for scripts. The backup is never sealed to a cluster key: those rotate, and
-this file has to outlive them. Store it off the cluster, away from the
-passphrase or identity that opens it. The root's key never goes into the
-council or onto another node; rotating an intermediate (below) asks for this
-file rather than keep the root on the cluster.
+At a terminal it asks for a passphrase twice (at least 12 characters), and if
+you leave out `--root-backup` it asks where the backup goes. Without a
+terminal, as in a script or cloud-init, it refuses unless you pass
+`--root-backup` and either `--passphrase-file PATH` (the first line of the
+file) or `--recipient age1...` (your age public key). It never picks a file
+for you, because the default would be on the node.
+
+The backup holds the root's private key and certificate, with the cluster,
+trust domain, fingerprint and expiry, in an ASCII-armoured age file. It's
+created owner-only and never overwrites a file. `relish init` opens it again
+with the passphrase before it reports success; a backup sealed to a recipient
+it can't open, so it checks that the file is an age file sealed to one. If the
+backup can't be written, init writes nothing else: there's no cluster without
+its root. Move the backup off the node, and keep the passphrase or identity
+that opens it somewhere else.
+
+The setups that run on your own machine never ask anything, so an agent or a
+script can run them. `relish setup --ssh`, `relish cluster create --bare-metal`
+and the laptop quickstart (`relish setup --quickstart`, which `install.sh
+--laptop` runs) write the backup on that machine, sealed to a fresh age
+identity saved in a separate directory, `~/.reliaburger/root-backup-keys/`.
+They print both paths: move both offline, apart from each other. No node and
+no RBSEED stick ever gets either. On a laptop cluster the root is offline only
+in name, because your laptop is both you and the cluster's nodes; that's fine
+for a development cluster, and it's why the output says so. `relish local
+destroy` removes a laptop cluster's identity along with the cluster.
+
+To change what a backup is sealed to, re-seal it. `relish ca backup` reads
+only the backup you give it:
+
+```sh
+relish ca backup --from prod-root-backup.age --out prod-root-backup-2.age
+relish ca backup --from root-ca-backup.age --identity root-0123.age-identity \
+    --out prod-root-backup.age --recipient age1...
+```
+
+It asks for the old passphrase (or takes `--passphrase-file` or `--identity`),
+then a new passphrase twice (or `--new-passphrase-file`, or `--recipient`),
+checks the new copy opens, and never overwrites a file.
 
 Check a backup at any time, with no cluster running:
 
@@ -1275,6 +1319,40 @@ shows only its own service, `/v1/routes` only its own ingress routes, and
 `/v1/fault` only the faults on it. The routes that span every tenant refuse it
 outright: events, `/v1/logs/sql`, the raw metric store and
 `/v1/fault?cluster=true`, which also lists node faults.
+
+### Rotating the workload signing key
+
+One Ed25519 key signs every workload's JWT. Anything outside the cluster
+that checks those tokens, such as a cloud provider's workload identity
+federation, fetches the public key from `/v1/identity/jwks`. To replace the
+key, say on a schedule or after a node was compromised:
+
+```sh
+relish identity rotate-signing-key
+```
+
+```
+Workload identity tokens are now signed with key 3f9a12bc77de0a41.
+Key 8c21e0f4a9b35d07 keeps verifying until 2026-11-06 14:15:00 UTC; workloads pick up new tokens on their next refresh.
+```
+
+From then on, new tokens carry the new key's `kid`. Tokens signed with the old
+key keep verifying for 75 minutes: their one-hour lifetime, five minutes of
+clock skew and ten minutes for a workload whose refresh runs late. During
+that window `/v1/identity/jwks` lists both keys, so an outside verifier that
+caches the JWKS sees the new key before any token needs it. Nothing restarts.
+Each node picks up the rotation within five seconds, and workloads get new
+tokens on their usual refresh. Once the window ends, the leader's hourly
+sweep retires the old key, and its tokens are refused everywhere.
+
+It needs an Admin token with no scope and the cluster-wide `admin`
+permission, and it runs on the council leader. A follower answers 421 and
+changes nothing. The rotation is audited as `identity.signing_key_rotated`
+(with both key ids), and the retirement as `identity.signing_key_retired`.
+
+Rotating the signing key doesn't help if the master key leaked too: the
+master key unwraps the new key just as it unwrapped the old one. See "If the
+master key leaks" below.
 
 ## Signed images
 
@@ -1422,6 +1500,28 @@ new node joins with a single-use token and a certificate signing request, so
 its private key never leaves it. Every node needs the cluster's master key
 (`*-master.key` from `init`): it unwraps the CA keys and the secret keys, and
 seals council backups. Keep it safe and backed up.
+
+### If the master key leaks
+
+There's no way to change the master key yet, nor the cluster's own service
+token, which is derived from it, nor the key that signs workload identity
+tokens. Whoever has a copy can sign gossip every node accepts, call node APIs
+as the cluster, and unwrap the CA and secret keys, for as long as the cluster
+runs. So if a node's disk, a copy of a node, or root on any node may have
+exposed `master.key`, build a new cluster rather than rotating what you can:
+
+1. Create it: `relish init` on fresh or reinstalled machines, or
+   `relish machines claim --create` for appliances. It gets its own master
+   key and CAs.
+2. Encrypt your secrets again with `relish secret encrypt`, using the new
+   cluster's key from `relish secret pubkey`. The old ciphertexts still open
+   with the leaked key.
+3. Apply your configs to the new cluster and move traffic to it.
+4. Shut down every node of the old cluster and wipe its disks.
+
+The plan for rotating the master key in place is in the security design doc
+([`docs/design/security-sesame.md` §5.12](https://github.com/reliaburger/reliaburger/blob/main/docs/design/security-sesame.md),
+[#709](https://github.com/reliaburger/reliaburger/issues/709)).
 
 ### Cluster build signing authority
 

@@ -37,14 +37,18 @@ jobs:
   build-tests:
     # One nextest archive per platform. The loop jobs download it instead of
     # rebuilding; runners check out to the same path, so compiled-in paths
-    # still resolve after extraction.
+    # still resolve after extraction. It holds only the test binaries the
+    # loops select: the whole suite took more than an hour on macos-15 from a
+    # cold cache, and the arm runner was shut down mid-compile (#287).
+    # test_ci_workflow.py's V02LoopArchiveTests keeps this list in step with
+    # the loops' filters.
     name: build tests (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-15]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.0
@@ -56,7 +60,12 @@ jobs:
           # ubuntu-latest reuses the debug cache main already keeps for CI.
           shared-key: ${{ matrix.os == 'ubuntu-latest' && 'linux-debug' || format('v02-{0}', matrix.os) }}
           save-if: false
-      - run: cargo nextest archive --locked --archive-file tests.tar.zst
+      - run: >-
+          cargo nextest archive --locked --archive-file tests.tar.zst
+          --test self_upgrade --test self_upgrade_cluster
+          --test council_disaster_recovery --test cluster_failover
+          --test registry_recovery --test suite
+          --test test_storage
       - uses: actions/upload-artifact@v4
         with:
           name: nextest-archive-${{ matrix.os }}
@@ -169,17 +178,17 @@ jobs:
 
   leases:
     # C11 lease recovery after owner death, and the C03 exporter lock and
-    # checkpoint, each repeated a fixed number of times per platform.
+    # checkpoint, each repeated a fixed number of times per platform. Job
+    # test leases live in Raft with application leases since node-local jobs
+    # went (2560765c), so cluster_failover's lease tests loop them.
     name: ${{ matrix.case }} x${{ inputs.count || '200' }} (${{ matrix.os }})
     needs: build-tests
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-15]
-        case: [job-lease, registry-lease-expiry, registry-new-leader, export-lock-checkpoint]
+        case: [registry-lease-expiry, registry-new-leader, export-lock-checkpoint]
         include:
-          - case: job-lease
-            filter: binary(job_recovery) & test(=node_job_lease_reaps_a_surviving_process_after_bun_is_killed)
           - case: registry-lease-expiry
             filter: binary(registry_recovery) & test(=expired_registry_lease_recovers_after_bun_sigkill_and_preserves_shared_content)
           - case: registry-new-leader

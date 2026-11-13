@@ -453,11 +453,53 @@ Bun CPU per node, as a percentage of one core.
 
 What the soaks don't prove: they run three small VMs on one machine, so they say nothing about large clusters, real networks between machines or hardware failing. A VM forced off isn't a real power loss, the fault rates are a schedule, not production traffic, and zero failures in 25 runs only rules out failure rates above about 12%. [How each gate works](https://github.com/reliaburger/reliaburger/blob/main/docs/testing.md#before-a-release), and [how it compares with Kubernetes' release testing](https://reliaburger.com/compare/kubernetes#testing).
 
+## Netboot real machines
+
+Old mini PCs, thin clients, anything x86\_64 or arm64 with UEFI network boot: plug them into your switch and power them on. Your laptop serves the OS, they install themselves in under a minute, and one command makes them a cluster. No USB sticks, no distro, nothing to configure on each machine. Your router keeps handing out the addresses; relish only answers the boot part.
+
+Three machines with blank disks network-boot into Reliaburger and become one cluster. They’re QEMU VMs with UEFI firmware on a virtual switch, run by [scripts/demo/netboot.sh](https://github.com/reliaburger/reliaburger/blob/main/scripts/demo/netboot.sh) in CI, serving a lab build of the OS signed with that run’s own key. Idle time is cut to two seconds; every wait says how long it really took.
+
+Show the commands from blank disks to a cluster (0.3.0, not in 0.2.8)
+
+1.  In each machine’s firmware setup, turn on UEFI network boot and turn Secure Boot off. A blank disk falls through to the network by itself.
+
+2.  ```
+    relish image download --dir os
+    ```
+
+    Fetches the newest OS release for every architecture into `os/`, checked against the release key `relish` carries.
+
+3.  ```
+    sudo relish netboot os --mac d8:9e:f3:12:34:56 --mac d8:9e:f3:12:34:57 --mac d8:9e:f3:12:34:58
+    ```
+
+    Serves the boot part, for the machines you list and no others: iPXE over TFTP, then the installer and the image over HTTP. Leave it running and power the machines on. Each one installs, reboots into Reliaburger and shows a claim key on its screen. A disk that isn’t blank waits for your yes here first.
+
+4.  ```
+    relish machines
+    ```
+
+    Lists the machines on your network that are waiting to be claimed: address, MAC and architecture.
+
+5.  ```
+    relish machines claim ~/lab --create --name lab --operator 192.168.1.10 d8:9e:f3:12:34:56 d8:9e:f3:12:34:57 d8:9e:f3:12:34:58
+    ```
+
+    Makes them one cluster. For each machine, it asks whether the claim key it got is the one on that machine’s screen, then asks you to back up the cluster’s master key. `--operator` is your laptop’s address.
+
+6.  ```
+    relish nodes
+    ```
+
+    Three nodes alive. From here it’s the same cluster as the tour’s: deploy with `relish apply`, and update the OS with `relish os upgrade`, one node at a time.
+
+Serving from a Mac, an isolated switch, firmware quirks: [the appliance chapter of the manual](https://github.com/reliaburger/reliaburger/blob/main/docs/manual/17_appliance.md).
+
 ## Debug the platform, not just your app
 
 When something breaks, the bug may be in your app or in the platform under it. Your AI agent can tell which: it reads the cluster, the manual and the exact source its `relish` was built from. When the bug is ours, it proves a fix on a throwaway cluster and drafts the report for you to send. It never fixes your cluster for you.
 
-A real session: Claude Code with a read-only token on a 0.2.8 cluster (the published `relish`, and `bun` built from the v0.2.8 tag), recorded through the agent gym by [scripts/record/recording.py](https://github.com/reliaburger/reliaburger/blob/main/scripts/record/recording.py), which scored it correct. Still stretches are cut to two seconds, and each result says how long its call really took.
+A real session: Claude Code with a read-only token on a 0.2.8 cluster (the published `relish`, and `bun` built from the v0.2.8 tag), recorded through the agent gym by [scripts/record/recording.py](https://github.com/reliaburger/reliaburger/blob/main/scripts/record/recording.py), which scored it correct. Still stretches are cut to two seconds, and each result says how long its call really took. 
 
 1.  ```
     relish token create --name agent --role read-only --ttl-days 1
@@ -506,7 +548,7 @@ Last, it drafts a redacted bug report with the reproducer, the patch and what it
 
 Reading a cluster is safe. Changing one is where an agent needs a leash. An agent never changes the cluster itself: it asks. The cluster writes down what the change would do, a person or a policy you wrote says yes, and the undo is one command, shown before anything happens.
 
-A real session: Claude Code with an agent token on a 0.2.8 cluster (the published `relish`, and `bun` built from the v0.2.8 tag) proposes a rollback, then a person approves it and undoes it with their own token. Recorded through the agent gym by [scripts/record/recording.py](https://github.com/reliaburger/reliaburger/blob/main/scripts/record/recording.py), which scored it correct. Still stretches are cut to two seconds.
+A real session: Claude Code with an agent token on a 0.2.8 cluster (the published `relish`, and `bun` built from the v0.2.8 tag) proposes a rollback, then a person approves it and undoes it with their own token. Recorded through the agent gym by [scripts/record/recording.py](https://github.com/reliaburger/reliaburger/blob/main/scripts/record/recording.py), which scored it correct. Still stretches are cut to two seconds. 
 
 1.  ```
     relish token create --name holmes --agent --role deployer --namespaces shop --ttl 8h
@@ -602,7 +644,7 @@ A decision the records no longer hold comes back as `not_found`, which means unk
 
 ### Small enough to hold in your head, or a context window
 
-Reliaburger has 8 resource kinds and 189 commands and subcommands, counted from the CLI’s own definitions, hidden ones included. A test fails when either number moves, so a new concept is a line in a pull request that someone has to agree with.
+Reliaburger has 8 resource kinds and 209 commands and subcommands, counted from the CLI’s own definitions, hidden ones included. A test fails when either number moves, so a new concept is a line in a pull request that someone has to agree with.
 
 **How that compares with Kubernetes**
 
@@ -622,23 +664,23 @@ Four open models ran the agent gym in Ollama on our Mac Studio, at an 8K window,
 
 In progress, with its scope still being settled. Agent changes as proposals you review and can undo, trying a change on a copy of production, and a record of why an agent did what it did. Alongside them, a faster loop for building and releasing Reliaburger itself.
 
-[Milestone](https://github.com/reliaburger/reliaburger/milestone/30) 
+[Milestone](https://github.com/reliaburger/reliaburger/milestone/30)
 
 **0.3.0: Bare metal in an hour**
 
 After 0.2.8. An appliance OS, netbooting and claiming machines over the LAN, and signed A/B OS updates. The exit test: Dell Wyse thin clients from power-on to a cluster.
 
-[Milestone](https://github.com/reliaburger/reliaburger/milestone/6) 
+[Milestone](https://github.com/reliaburger/reliaburger/milestone/6)
 
 **0.4.0: Full container migration**
 
 Planned. Cordon, drain and uncordon, cold moves that carry volumes, and checkpoint moves that keep memory while connections reconnect.
 
-[Milestone](https://github.com/reliaburger/reliaburger/milestone/7) 
+[Milestone](https://github.com/reliaburger/reliaburger/milestone/7)
 
 ## Read the docs
 
-Documentation lives with the code. 
+Documentation lives with the code.
 
 START HERE
 
@@ -780,7 +822,7 @@ You’ll need Rust and your platform’s build tools. This runs `hello` as a hos
 
 For real OCI containers, use runc on Linux. On macOS, the managed laptop quickstart uses Linux VMs. Direct Apple Container is deferred beyond 0.2.8.
 
-[Build requirements & runtime setup](https://github.com/reliaburger/reliaburger/blob/main/docs/README.md) 
+[Build requirements & runtime setup](https://github.com/reliaburger/reliaburger/blob/main/docs/README.md)
 
 LOCAL DEVELOPMENT sh
 

@@ -52,7 +52,7 @@ async fn council(hierarchy: &ca::CaHierarchy, initialise: bool) -> Arc<CouncilNo
         .await
         .unwrap(),
     );
-    network.register(1, node.raft().clone()).await;
+    network.register(1, &node).await;
     if initialise {
         node.initialize(BTreeMap::from([(
             1,
@@ -1174,7 +1174,7 @@ async fn registry_forwarding_recovers_after_election_and_refuses_lost_quorum() {
             .await
             .unwrap(),
         );
-        network.register(id, node.raft().clone()).await;
+        network.register(id, &node).await;
         members.insert(
             id,
             CouncilNodeInfo::new(

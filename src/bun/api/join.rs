@@ -51,6 +51,53 @@ pub(super) async fn cluster_ca_handler(State(state): State<ApiState>) -> Respons
     .into_response()
 }
 
+/// Hand the cluster's master key to a member node (G1).
+///
+/// Every node needs the key (gossip HMAC, Raft encryption at rest, the
+/// service token), but a node that just joined has only its certificate: the
+/// service token is itself derived from the master key. So this route sits
+/// outside bearer authentication and admits exactly one thing, a TLS client
+/// certificate that chains to the cluster's Node CA, isn't revoked and
+/// names a node that isn't retired: the same checks as certificate renewal.
+/// Anyone who passes them is a cluster member, which already holds the key.
+pub(super) async fn master_key_handler(
+    peer: Option<axum::Extension<crate::sesame::renewal::TlsPeerCertificate>>,
+    State(state): State<ApiState>,
+) -> Response {
+    let Some(peer) = peer else {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "the master key needs a node's TLS client certificate"
+            })),
+        )
+            .into_response();
+    };
+    let Some(council) = &state.council else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no council available").into_response();
+    };
+    let security = council.security_state().await;
+    let node_id = match crate::sesame::renewal::validate_peer(&peer, &security) {
+        Ok(node_id) => node_id,
+        Err(error) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response();
+        }
+    };
+    let Some(key) = council.wrapping_ikm() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "this member has no master key" })),
+        )
+            .into_response();
+    };
+    eprintln!("bun: handed the master key to {node_id}");
+    Json(serde_json::json!({ "master_key": hex::encode(key) })).into_response()
+}
+
 /// Renew only the node authenticated on this connection. A follower refuses;
 /// forwarding would substitute the follower's TLS identity for the caller's.
 pub(super) async fn node_renewal_handler(

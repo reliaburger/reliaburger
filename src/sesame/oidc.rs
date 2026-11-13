@@ -10,13 +10,15 @@ use ring::rand::SystemRandom;
 use ring::signature::{self, Ed25519KeyPair, KeyPair};
 
 use super::crypto;
-use super::types::{OidcSigningConfig, WorkloadJwtClaims};
+use super::types::{OidcSigningConfig, RetiringOidcKey, SecurityState, WorkloadJwtClaims};
 
 /// Errors from OIDC operations.
 #[derive(Debug, thiserror::Error)]
 pub enum OidcError {
     #[error("failed to generate OIDC keypair: {0}")]
     KeyGenFailed(String),
+    #[error("the cluster has no OIDC signing key to rotate from")]
+    NoSigningKey,
     #[error("failed to sign JWT: {0}")]
     SignFailed(String),
     #[error("failed to verify JWT: {0}")]
@@ -51,8 +53,6 @@ pub struct JwtConstraints {
     pub expected_audience: String,
     /// The JOSE `alg` the header must declare. We only sign EdDSA.
     pub expected_algorithm: String,
-    /// If set, the JOSE `kid` the header must declare.
-    pub expected_key_id: Option<String>,
     /// Largest tolerated clock skew for a future `iat`, in seconds.
     pub max_clock_skew_secs: u64,
     /// Oldest tolerated `iat` (token age ceiling), in seconds.
@@ -61,19 +61,105 @@ pub struct JwtConstraints {
 
 impl JwtConstraints {
     /// Build the standard constraints for a token minted by `config`: the
-    /// config's issuer, `spiffe://<cluster>` audience, EdDSA, the config's
-    /// key id, and generous-but-bounded `iat` windows.
+    /// config's issuer, `spiffe://<cluster>` audience, EdDSA, and
+    /// generous-but-bounded `iat` windows. Which `kid`s are accepted is the
+    /// verifying key set's business ([`verify_jwt_with_keys`]).
     pub fn for_config(config: &OidcSigningConfig, cluster_name: &str) -> Self {
         Self {
             expected_issuer: config.issuer.clone(),
             expected_audience: format!("spiffe://{cluster_name}"),
             expected_algorithm: "EdDSA".to_string(),
-            expected_key_id: Some(config.key_id.clone()),
             // Five minutes of clock skew, one hour of token age (the mint TTL).
-            max_clock_skew_secs: 300,
-            max_age_secs: 3600,
+            max_clock_skew_secs: MAX_CLOCK_SKEW_SECS,
+            max_age_secs: MAX_TOKEN_AGE_SECS,
         }
     }
+}
+
+/// Largest tolerated clock skew for a JWT's future `iat`, in seconds.
+pub const MAX_CLOCK_SKEW_SECS: u64 = 300;
+
+/// Oldest tolerated JWT `iat`, in seconds: the mint TTL.
+pub const MAX_TOKEN_AGE_SECS: u64 = 3600;
+
+/// How long a replaced signing key keeps verifying after a rotation: the
+/// oldest token it could have signed, plus clock skew, plus ten minutes for
+/// a workload whose refresh ran late (#709).
+pub const RETIRING_KEY_WINDOW_SECS: u64 = MAX_TOKEN_AGE_SECS + MAX_CLOCK_SKEW_SECS + 600;
+
+/// What `POST /v1/identity/signing-key/rotate` answers (#709).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RotatedSigningKey {
+    /// The `kid` new workload JWTs carry.
+    pub key_id: String,
+    /// The `kid` that keeps verifying until `retire_after`.
+    pub retiring_key_id: String,
+    /// Unix seconds after which the retiring key's tokens are refused.
+    pub retire_after: u64,
+}
+
+/// A public key a verifier accepts, and the `kid` its tokens declare.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OidcVerifyingKey {
+    /// The JOSE `kid`.
+    pub key_id: String,
+    /// Ed25519 public key bytes.
+    pub public_key_der: Vec<u8>,
+}
+
+impl From<&OidcSigningConfig> for OidcVerifyingKey {
+    fn from(config: &OidcSigningConfig) -> Self {
+        Self {
+            key_id: config.key_id.clone(),
+            public_key_der: config.public_key_der.clone(),
+        }
+    }
+}
+
+/// Every key a JWT may be signed with at `now` (Unix seconds): the active
+/// one first, then each retiring key whose `not_after` hasn't passed.
+pub fn verifying_keys(state: &SecurityState, now: u64) -> Vec<OidcVerifyingKey> {
+    let active = state.oidc_signing_config.iter().map(OidcVerifyingKey::from);
+    let retiring = state
+        .retiring_oidc_keys
+        .iter()
+        .filter(|key| now < key.not_after)
+        .map(|key| OidcVerifyingKey {
+            key_id: key.key_id.clone(),
+            public_key_der: key.public_key_der.clone(),
+        });
+    active.chain(retiring).collect()
+}
+
+/// Replace the active signing key with `signing_key` (#709). The old key's
+/// public half moves to `retiring_oidc_keys` and verifies until
+/// `retire_after`; keys already past their window at `now` are dropped.
+/// Refused when there's no key to rotate from.
+pub fn rotate_signing_key(
+    state: &mut SecurityState,
+    signing_key: OidcSigningConfig,
+    retire_after: u64,
+    now: u64,
+) -> Result<(), OidcError> {
+    let Some(old) = state.oidc_signing_config.take() else {
+        return Err(OidcError::NoSigningKey);
+    };
+    retire_signing_keys(state, now);
+    state.retiring_oidc_keys.push(RetiringOidcKey {
+        public_key_der: old.public_key_der,
+        key_id: old.key_id,
+        not_after: retire_after,
+    });
+    state.oidc_signing_config = Some(signing_key);
+    Ok(())
+}
+
+/// Drop every retiring signing key whose `not_after` is at or before `now`.
+/// Returns how many it dropped.
+pub fn retire_signing_keys(state: &mut SecurityState, now: u64) -> usize {
+    let before = state.retiring_oidc_keys.len();
+    state.retiring_oidc_keys.retain(|key| now < key.not_after);
+    before - state.retiring_oidc_keys.len()
 }
 
 /// Generate an Ed25519 OIDC signing keypair.
@@ -152,7 +238,7 @@ pub fn mint_jwt(
 /// `exp`. Prefer [`verify_jwt_with_constraints`] for anything security-
 /// sensitive: this omits issuer/audience/algorithm/kid/iat checks.
 pub fn verify_jwt(token: &str, config: &OidcSigningConfig) -> Result<WorkloadJwtClaims, OidcError> {
-    let claims = verify_signature_and_decode(token, config)?;
+    let claims = verify_signature_and_decode(token, &config.public_key_der)?;
 
     let now = unix_now();
     if claims.exp < now {
@@ -174,6 +260,17 @@ pub fn verify_jwt_with_constraints(
     config: &OidcSigningConfig,
     constraints: &JwtConstraints,
 ) -> Result<WorkloadJwtClaims, OidcError> {
+    verify_jwt_with_keys(token, &[OidcVerifyingKey::from(config)], constraints)
+}
+
+/// [`verify_jwt_with_constraints`] against a key set: the token's `kid`
+/// picks the key, and a `kid` that isn't in `keys` is refused before any
+/// signature is checked (#709).
+pub fn verify_jwt_with_keys(
+    token: &str,
+    keys: &[OidcVerifyingKey],
+    constraints: &JwtConstraints,
+) -> Result<WorkloadJwtClaims, OidcError> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
         return Err(OidcError::InvalidFormat);
@@ -193,17 +290,19 @@ pub fn verify_jwt_with_constraints(
             want: constraints.expected_algorithm.clone(),
         });
     }
-    if let Some(expected_kid) = &constraints.expected_key_id {
-        let kid = header.get("kid").and_then(|v| v.as_str()).unwrap_or("");
-        if kid != expected_kid {
-            return Err(OidcError::UnexpectedKeyId {
-                got: kid.to_string(),
-                want: expected_kid.clone(),
-            });
-        }
-    }
+    let kid = header.get("kid").and_then(|v| v.as_str()).unwrap_or("");
+    let Some(key) = keys.iter().find(|key| key.key_id == kid) else {
+        return Err(OidcError::UnexpectedKeyId {
+            got: kid.to_string(),
+            want: keys
+                .iter()
+                .map(|key| key.key_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        });
+    };
 
-    let claims = verify_signature_and_decode(token, config)?;
+    let claims = verify_signature_and_decode(token, &key.public_key_der)?;
 
     // Issuer and audience: a token minted for a different issuer or audience
     // is not one we accept even if the signature checks out.
@@ -243,7 +342,7 @@ pub fn verify_jwt_with_constraints(
 /// Shared by both verify paths.
 fn verify_signature_and_decode(
     token: &str,
-    config: &OidcSigningConfig,
+    public_key_der: &[u8],
 ) -> Result<WorkloadJwtClaims, OidcError> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
@@ -255,7 +354,7 @@ fn verify_signature_and_decode(
         .decode(parts[2])
         .map_err(|_| OidcError::InvalidFormat)?;
 
-    let public_key = signature::UnparsedPublicKey::new(&signature::ED25519, &config.public_key_der);
+    let public_key = signature::UnparsedPublicKey::new(&signature::ED25519, public_key_der);
     public_key
         .verify(signing_input.as_bytes(), &sig_bytes)
         .map_err(|_| {
@@ -279,22 +378,35 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
+/// The JWKS for a cluster's security state at `now`: the active key and
+/// every retiring key still inside its window (#709). `None` when the
+/// cluster has no OIDC signing key.
+pub fn jwks_for_state(state: &SecurityState, now: u64) -> Option<serde_json::Value> {
+    state.oidc_signing_config.as_ref()?;
+    let keys: Vec<serde_json::Value> = verifying_keys(state, now)
+        .iter()
+        .map(|key| jwk(&key.key_id, &key.public_key_der))
+        .collect();
+    Some(serde_json::json!({ "keys": keys }))
+}
+
+fn jwk(key_id: &str, public_key_der: &[u8]) -> serde_json::Value {
+    serde_json::json!({
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "x": URL_SAFE_NO_PAD.encode(public_key_der),
+        "kid": key_id,
+        "use": "sig",
+        "alg": "EdDSA",
+    })
+}
+
 /// Build a JWKS response for the OIDC discovery endpoint.
 ///
 /// Returns a JSON object containing the Ed25519 public key in
 /// RFC 8037 OKP format, suitable for serving at `/.well-known/jwks.json`.
 pub fn jwks_response(config: &OidcSigningConfig) -> serde_json::Value {
-    let x = URL_SAFE_NO_PAD.encode(&config.public_key_der);
-    serde_json::json!({
-        "keys": [{
-            "kty": "OKP",
-            "crv": "Ed25519",
-            "x": x,
-            "kid": config.key_id,
-            "use": "sig",
-            "alg": "EdDSA",
-        }]
-    })
+    serde_json::json!({ "keys": [jwk(&config.key_id, &config.public_key_der)] })
 }
 
 #[cfg(test)]
@@ -531,13 +643,106 @@ mod tests {
 
     #[test]
     fn constrained_verify_rejects_an_unexpected_key_id() {
-        let (config, ikm, mut constraints) = constrained_setup();
-        constraints.expected_key_id = Some("not-the-real-kid".to_string());
-        let token = mint_jwt(&test_claims(), &config, &ikm).unwrap();
+        let (config, ikm, constraints) = constrained_setup();
+        let other = generate_oidc_keypair("https://test.reliaburger.dev", &ikm).unwrap();
+        let token = mint_jwt(&test_claims(), &other, &ikm).unwrap();
         assert!(matches!(
             verify_jwt_with_constraints(&token, &config, &constraints),
             Err(OidcError::UnexpectedKeyId { .. })
         ));
+    }
+
+    /// A key rotation (#709): the old key moves to `retiring_oidc_keys`, and
+    /// tokens it signed keep verifying until its `not_after`.
+    fn rotated() -> (SecurityState, OidcSigningConfig, OidcSigningConfig, Vec<u8>) {
+        let ikm = test_wrapping_ikm();
+        let old = generate_oidc_keypair("https://test.reliaburger.dev", &ikm).unwrap();
+        let new = generate_oidc_keypair("https://test.reliaburger.dev", &ikm).unwrap();
+        let mut state = SecurityState {
+            oidc_signing_config: Some(old.clone()),
+            ..SecurityState::default()
+        };
+        rotate_signing_key(&mut state, new.clone(), 2_000, 1_000).unwrap();
+        (state, old, new, ikm)
+    }
+
+    #[test]
+    fn a_rotation_signs_with_the_new_key_and_keeps_the_old_one_as_retiring() {
+        let (state, old, new, _) = rotated();
+        assert_eq!(state.oidc_signing_config.as_ref(), Some(&new));
+        assert_eq!(
+            state.retiring_oidc_keys,
+            vec![RetiringOidcKey {
+                public_key_der: old.public_key_der,
+                key_id: old.key_id,
+                not_after: 2_000,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_rotation_needs_a_key_to_rotate_from() {
+        let ikm = test_wrapping_ikm();
+        let new = generate_oidc_keypair("https://test.reliaburger.dev", &ikm).unwrap();
+        let mut state = SecurityState::default();
+        assert!(rotate_signing_key(&mut state, new, 2_000, 1_000).is_err());
+        assert!(state.oidc_signing_config.is_none());
+    }
+
+    #[test]
+    fn jwt_signed_with_a_retiring_key_verifies_until_not_after() {
+        let (state, old, _, ikm) = rotated();
+        let constraints = JwtConstraints::for_config(&old, "test");
+        let token = mint_jwt(&test_claims(), &old, &ikm).unwrap();
+        let before = verifying_keys(&state, 1_999);
+        assert!(verify_jwt_with_keys(&token, &before, &constraints).is_ok());
+        let after = verifying_keys(&state, 2_000);
+        assert!(matches!(
+            verify_jwt_with_keys(&token, &after, &constraints),
+            Err(OidcError::UnexpectedKeyId { .. })
+        ));
+    }
+
+    #[test]
+    fn jwt_signed_with_the_new_key_verifies_beside_the_retiring_one() {
+        let (state, _, new, ikm) = rotated();
+        let constraints = JwtConstraints::for_config(&new, "test");
+        let token = mint_jwt(&test_claims(), &new, &ikm).unwrap();
+        assert!(verify_jwt_with_keys(&token, &verifying_keys(&state, 1_500), &constraints).is_ok());
+    }
+
+    #[test]
+    fn jwt_signed_with_a_retired_key_is_refused() {
+        let (mut state, old, _, ikm) = rotated();
+        retire_signing_keys(&mut state, 2_000);
+        assert!(state.retiring_oidc_keys.is_empty());
+        let constraints = JwtConstraints::for_config(&old, "test");
+        let token = mint_jwt(&test_claims(), &old, &ikm).unwrap();
+        assert!(
+            verify_jwt_with_keys(&token, &verifying_keys(&state, 1_000), &constraints).is_err()
+        );
+    }
+
+    #[test]
+    fn retiring_keeps_keys_still_inside_their_window() {
+        let (mut state, _, _, _) = rotated();
+        retire_signing_keys(&mut state, 1_999);
+        assert_eq!(state.retiring_oidc_keys.len(), 1);
+    }
+
+    #[test]
+    fn jwks_lists_active_and_retiring_keys() {
+        let (state, old, new, _) = rotated();
+        let jwks = jwks_for_state(&state, 1_500).unwrap();
+        let kids: Vec<&str> = jwks["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|key| key["kid"].as_str().unwrap())
+            .collect();
+        assert_eq!(kids, [new.key_id.as_str(), old.key_id.as_str()]);
+        let later = jwks_for_state(&state, 2_000).unwrap();
+        assert_eq!(later["keys"].as_array().unwrap().len(), 1);
     }
 
     #[test]

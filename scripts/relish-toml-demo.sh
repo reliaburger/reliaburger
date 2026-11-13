@@ -40,7 +40,8 @@ section "Reliaburger Config Tooling Demo"
 
 cmd "building relish"
 cargo build --bin relish --manifest-path "${REPO_DIR}/Cargo.toml" --quiet
-RELISH="${REPO_DIR}/target/debug/relish"
+# Cargo's target directory: CARGO_TARGET_DIR if set, as for parallel agents (#1859).
+RELISH="${CARGO_TARGET_DIR:-${REPO_DIR}/target}/debug/relish"
 
 # -----------------------------------------------------------------------
 # 1. relish lint — validate config files

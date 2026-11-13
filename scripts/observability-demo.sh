@@ -29,7 +29,8 @@ cargo build --bin bun --manifest-path "${REPO_DIR}/Cargo.toml" --quiet
 
 # Start
 echo "--- starting bun ---"
-"${REPO_DIR}/target/debug/bun" &
+# Cargo's target directory: CARGO_TARGET_DIR if set, as for parallel agents (#1859).
+"${CARGO_TARGET_DIR:-${REPO_DIR}/target}/debug/bun" &
 BUN_PID=$!
 
 # Wait for health

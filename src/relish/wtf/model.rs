@@ -124,6 +124,12 @@ pub struct BuildObservation {
     pub commit: Option<String>,
     /// SHA-256 of the running binary, when the node hashes it.
     pub binary_sha256: Option<String>,
+    /// The appliance OS version; `None` off an appliance.
+    #[serde(default)]
+    pub os_version: Option<String>,
+    /// The node's OS update in progress, or how the last one ended.
+    #[serde(default)]
+    pub os_update: crate::os::rollout::OsUpdateState,
 }
 
 /// Current council composition and liveness.

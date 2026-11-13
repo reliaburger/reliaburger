@@ -131,6 +131,8 @@ means, the numbers that decide it and the line of code that does (see
 | `unreachable-nodes` | critical | A node's Bun API didn't answer |
 | `node-dead` | critical | Gossip marks a node dead or suspect |
 | `version-skew` | warning | Nodes run different `bun` builds |
+| `os-update-failed` | warning | An appliance couldn't update its OS; the rollout stopped there |
+| `os-skew` | warning | Appliances run different OS versions |
 | `council-recovery-split` | critical | Two recoveries claimed one epoch; both councils fenced themselves |
 | `council-fence-unpersisted` | warning | A recovery fence couldn't be written to disk |
 | `council-fenced` | critical | Nodes belong to a council `relish council recover` replaced |

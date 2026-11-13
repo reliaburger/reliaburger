@@ -969,6 +969,21 @@ The app never drops below its replica count during a deploy. If you have 3 repli
 
 "All connections are done" is trickier than it sounds once WebSockets are in play. A plain HTTP request is short: it arrives, gets a response, and it's gone. A WebSocket is a *long-lived splice* — the client and backend exchange frames for minutes or hours after the initial `101 Switching Protocols`. If the drain only counts HTTP requests, it declares "done" the instant the last request returns, then kills a container that still has a chat session or a live log tail flowing through it. So the tracker keeps two counts, and a backend isn't drained until *both* the HTTP count and the WebSocket count reach zero. The deadline asks the splice to stop; it does not substitute for those zero counts. We'll come back to exactly how the proxy keeps that WebSocket count honest.
 
+When the deadline does stop a WebSocket, the client should learn why. WebSocket has a word for it: a Close frame with status 1001, Going Away, which a client library treats as "reconnect", not "something broke". For a long time the proxy had the frame (`build_close_frame(1001)`, unit-tested) and never sent it, so clients saw a dropped connection instead (F08, [#369](https://github.com/reliaburger/reliaburger/issues/369)). Sending it raised a small Rust question. `copy_bidirectional` borrows both streams mutably for as long as it runs, so the termination branch of the `select!` can't write to the client stream while the copy future still exists. The fix is to decide first and act after:
+
+```rust
+let terminated = tokio::select! {
+    biased;
+    _ = super::draining::wait_for_termination(&terminate) => true,
+    _ = tokio::io::copy_bidirectional(&mut client_io, &mut backend_stream) => false,
+};
+if terminated {
+    // write the Close frame, bounded by a second
+}
+```
+
+When `select!` returns, it has dropped the losing future, and with it the borrow, so the writes after it compile. One limit remains, and the code says so: the splice copies bytes, not frames, so a deadline that lands in the middle of a backend frame leaves the client half a frame and then a Close. It sees a protocol error, which is what it saw before.
+
 ### Rate limiting
 
 Each client gets a token bucket. Tokens refill at a configured rate (requests per second). When the bucket is empty, the request gets a 429 Too Many Requests response with a `Retry-After` header telling the client exactly when to retry.
@@ -1149,6 +1164,22 @@ Half of this chapter's code needs root on Linux. But the interesting logic (IP c
 We spent two days trying to do DNS in-kernel with `cgroup/sendmsg4` and `cgroup/recvmsg4`. The hooks can modify the destination address but can't read the UDP payload. Can you see the problem? You can redirect a DNS query to your own server, but you can't parse which name was queried or synthesise a response. The BPF helper we'd need only works with `SK_MSG` programs, not cgroup socket address hooks.
 
 50 microseconds in userspace beats two weeks fighting kernel limitations. Pragmatism over purity.
+
+### Pin the instruction set, not just the source
+
+When the quickstart guest moved to Ubuntu 26.04 (Chapter 9), we built `bun` inside a 26.04 VM to try it, and every node crash-looped at start-up. The verifier on 26.04's kernel 7.0 refused `onion_connect`:
+
+```text
+231: (9c) w5 %= w3        ; R5=scalar()
+232: (26) if w5 > 0x1f goto pc+12
+...
+236: (0f) r0 += r4
+math between map_value pointer and register with unbounded min value is not allowed
+```
+
+That's the backend pick, `idx = (rr + i) % val->count` followed by `if (idx < MAX_BACKENDS ...)`. The `w` registers are the giveaway. They're the 32-bit halves of the `r` registers, and they only appear in BPF v3, which newer clang targets by default. Our release builds run on Ubuntu 22.04, whose clang 14 targets v1 and does all of that arithmetic in 64 bits. The VM had clang 21. After the 32-bit modulo the verifier knew nothing about `w5`. The bounds check then limited only its lower 32 bits, and the 64-bit copy that indexes the array was still unbounded as far as the verifier could tell. The released `bun` 0.1.6, built with clang 14, loaded on the same kernel without complaint.
+
+So the source hadn't changed and the kernel would take the program. What changed was the compiler's idea of which instructions to use. `build.rs` now passes `-mcpu=v1`, so every clang emits what the release builds always did. A test in `tests/ebpf.rs` opens each `.bpf.o` with the `object` crate and fails on any 32-bit ALU or jump instruction, the low three bits of each 8-byte opcode, so a toolchain upgrade can't quietly bring them back. It runs with `make test-linux`, beside the tests that load the programs into the kernel.
 
 ### AtomicU64 for round-robin
 

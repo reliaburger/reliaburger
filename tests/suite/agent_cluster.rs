@@ -67,7 +67,7 @@ async fn scheduler_repairs_a_catalogue_replaced_after_its_last_publication() {
         .await
         .unwrap(),
     );
-    router.register(1, council.raft().clone()).await;
+    router.register(1, &council).await;
     council
         .initialize(BTreeMap::from([(1, node_info(1, 9444))]))
         .await
@@ -212,7 +212,7 @@ async fn an_app_deploys_beside_a_job_filled_node_on_another_node() {
         .await
         .unwrap(),
     );
-    router.register(1, council.raft().clone()).await;
+    router.register(1, &council).await;
     council
         .initialize(BTreeMap::from([(1, node_info(1, 9445))]))
         .await
@@ -455,7 +455,7 @@ async fn agent_council_returns_raft_state() {
     )
     .await
     .unwrap();
-    router.register(1, council.raft().clone()).await;
+    router.register(1, &council).await;
 
     let mut members = BTreeMap::new();
     members.insert(1, node_info(1, 9444));

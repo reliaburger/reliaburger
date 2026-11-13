@@ -623,6 +623,26 @@ impl Drop for ScopedDir {
 
 This is RAII (Resource Acquisition Is Initialisation, the same idiom C++ uses), and in Rust it's the *default* way to manage a resource, not a pattern you reach for. The directory also gets a random suffix now (`<build_id>-<random>`), because the old path was derived from the context digest, so two concurrent builds of the same context fought over one directory. Distinct directories, cleaned on every path: two bugs closed by one type.
 
+That `Drop` had a cost we didn't see at first ([#1871](https://github.com/reliaburger/reliaburger/issues/1871)). The build runs in an `async fn`, so the value is dropped on a tokio worker thread, and `remove_dir_all` on a context with thousands of files can take most of a second. For that time every other task on the worker waits. The lint that catches blocking file calls in async code (`src/blocking_rule.rs`) can't see this one, because nothing calls `drop` by name: the compiler inserts the call. `Drop` can't be `async` either, so the fix hands the delete to tokio's blocking pool, a set of threads kept for exactly this kind of work:
+
+```rust
+fn drop(&mut self) {
+    let path = std::mem::take(&mut self.path);
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => {
+            runtime.spawn_blocking(move || {
+                let _ = std::fs::remove_dir_all(path);
+            });
+        }
+        Err(_) => {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+}
+```
+
+`Handle::try_current` asks whether this thread is running inside a tokio runtime. If it isn't, as in a plain `#[test]`, there's no worker to stall, so the delete runs inline. `std::mem::take` swaps an empty `PathBuf` into the field and hands back the old one. We need that because `drop` only gets `&mut self`, and the closure must own the path: `spawn_blocking` may run it after the `ScopedDir` is gone, so it can't borrow from it. `move` makes the closure take ownership of `path`. The test drops a 10,000-file directory on a single-threaded runtime while another task ticks every 5 ms. With the inline delete the ticker stalled for 440 ms; now it never stalls past 200 ms, and the directory still disappears.
+
 ### One table for "who may call this?"
 
 The batch/build authorization fixes above were done handler by handler, each route growing its own `require_system` or `authorize(Deployer)` line. That works, but it leaves the answer to a basic security question (*which principal may call this route?*) scattered across four thousand lines. That kind of rule drifts: add a route, forget the check, and nobody notices until a review, if then.

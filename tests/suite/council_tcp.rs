@@ -131,9 +131,21 @@ async fn make_node_tls(
     let listener = tokio::net::TcpListener::bind(addr(0)).await.unwrap();
     let bound = listener.local_addr().unwrap();
     let raft = council.raft().clone();
+    let contact = council.leader_contact();
     let sd = shutdown.clone();
     tokio::spawn(async move {
-        serve_raft_rpc(listener, raft, sd, acceptor, RecoveryFence::serving(0)).await;
+        reliaburger::council::network::serve_raft_rpc_with_node_gate(
+            listener,
+            raft,
+            contact,
+            sd,
+            acceptor,
+            RecoveryFence::serving(0),
+            reliaburger::smoker::node_fault::NodeTransportGate::new(),
+            None,
+            reliaburger::council::network::RaftBlocklist::default(),
+        )
+        .await;
     });
     (council, bound)
 }
@@ -227,6 +239,28 @@ async fn plaintext_raft_still_works_when_mtls_is_off() {
         "plaintext voters did not reach {{1,2,3}}"
     );
 
+    shutdown_all(&shutdown, nodes).await;
+}
+
+/// The TCP server notes a leader's AppendEntries on the follower, which is
+/// what ends a returning node's hold on its elections (#1524).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leaders_append_entries_over_tcp_reaches_the_followers_contact() {
+    let shutdown = CancellationToken::new();
+    let nodes = [
+        make_node(1, &shutdown).await,
+        make_node(2, &shutdown).await,
+        make_node(3, &shutdown).await,
+    ];
+    assert!(nodes.iter().all(|(node, _)| !node.leader_contact().heard()));
+    assert!(
+        grow_one_to_three(&nodes, 100).await,
+        "voters did not reach {{1,2,3}}"
+    );
+    assert!(
+        nodes[1].0.leader_contact().heard() && nodes[2].0.leader_contact().heard(),
+        "a follower's contact wasn't noted"
+    );
     shutdown_all(&shutdown, nodes).await;
 }
 
@@ -478,12 +512,14 @@ async fn raft_rpc_closes_an_open_connection_once_its_peer_is_revoked() {
     let listener = tokio::net::TcpListener::bind(addr(0)).await.unwrap();
     let bound = listener.local_addr().unwrap();
     let raft = council.raft().clone();
+    let contact = council.leader_contact();
     let serving = shutdown.clone();
     let serving_crl = crl.clone();
     tokio::spawn(async move {
         reliaburger::council::network::serve_raft_rpc_with_node_gate(
             listener,
             raft,
+            contact,
             serving,
             Some(acceptor),
             RecoveryFence::serving(0),
@@ -545,11 +581,13 @@ async fn raft_rpc_refuses_a_peer_its_partition_blocks() {
     let bound = listener.local_addr().unwrap();
     let raft = council.raft().clone();
     let serving = shutdown.clone();
+    let contact = council.leader_contact();
     let serving_blocklist = blocklist.clone();
     tokio::spawn(async move {
         reliaburger::council::network::serve_raft_rpc_with_node_gate(
             listener,
             raft,
+            contact,
             serving,
             None,
             RecoveryFence::serving(0),

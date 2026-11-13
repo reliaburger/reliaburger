@@ -46,7 +46,7 @@ Sesame is not a separate binary or sidecar. It is compiled into the single `reli
 ### 3.1 CA Hierarchy
 
 ```
-Root CA (offline after init, signs only intermediate CAs)
+Root CA (offline: only in the operator's backup, signs only intermediate CAs)
 |
 +-- Node CA         -- signs node certificates for inter-node mTLS
 |                      Lifetime: 5 years. Stored encrypted in Raft.
@@ -674,6 +674,14 @@ pub struct OidcSigningConfig {
     pub issuer: String,
 }
 
+/// A replaced signing key that still verifies until `not_after` (#709).
+/// `SecurityState::retiring_oidc_keys` holds them; the private key is gone.
+pub struct RetiringOidcKey {
+    pub public_key_der: Vec<u8>,
+    pub key_id: String,
+    pub not_after: u64, // Unix seconds
+}
+
 /// Claims embedded in a workload identity JWT.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkloadJwtClaims {
@@ -793,9 +801,21 @@ This is the single most security-critical operation. It generates all root key m
 8. Derive the HKDF wrapping key from the first node's certificate private key.
 9. Wrap all sensitive keys (intermediate CA private keys, age private key, OIDC signing key) with the wrapping key.
 10. Write the wrapped keys to the initial Raft log entry.
-11. Encrypt the root CA private key with the cluster's age public key.
-12. Write the sealed root CA backup to the admin's filesystem.
-13. Delete the root CA private key from memory.
+11. Seal the root CA private key and certificate into the operator's backup
+    (`RootBackup`, the `relish ca backup` format) and write it to
+    `--root-backup`, before any other file: to a passphrase (prompted twice at
+    a terminal, or `--passphrase-file`) or to `--recipient age1...`. Without a
+    terminal and without those flags, `relish init` refuses (#709). Open the
+    written file again and check it against the root's fingerprint (a
+    recipient seal can only be checked as an age file sealed to a recipient);
+    if anything fails, write nothing else.
+12. The root key is in no other file, in the Raft state or on the node. The
+    setups that run on the operator's machine (`relish setup --ssh`,
+    `--quickstart`, `relish dev create`, `relish cluster create --bare-metal`)
+    seal it instead to a fresh age identity written to
+    `~/.reliaburger/root-backup-keys/`, apart from the backup, and print both
+    paths. No node, seed or appliance ever receives either.
+13. Drop the root CA private key from memory.
 14. Write the first node config with `require_mtls = true`; when Bun starts
     with that file, it refuses to enter cluster mode without the identity and
     brings up the authenticated transports.
@@ -844,10 +864,11 @@ Cluster initialised.
   Workload CA:     serial 0x03, expires 2031-02-16
   Ingress CA:      serial 0x04, expires 2031-02-16
 
-  IMPORTANT: Back up the sealed root CA key:
-    ./prod-root-ca.age
+  IMPORTANT: The root CA key is only in this backup:
+    /media/usb/prod-root-backup.age
 
-  Losing this file means a full PKI re-bootstrap.
+  Move it off this node and keep it offline. Losing it means a
+  full PKI re-bootstrap the next time a CA needs the root.
 
   To enrol another node, start this one, then mint a token bound
   to that node's id:
@@ -1185,7 +1206,7 @@ An app env value `PROVIDER[name:path]` names a secret kept outside the cluster. 
 
 **Protocol, version 1.** Bun spawns the binary with `env_clear()`, a default `PATH` plus the configured `env`, cwd `/`, stderr discarded, `kill_on_drop` and its own process group. It writes one JSON object on one newline-terminated line to stdin and closes it: `{"version":1,"provider","path","namespace","app","instance","variable"}`. It reads at most `max_output_bytes + 1` bytes of stdout while waiting for exit, all inside `tokio::time::timeout(timeout_secs)`. Once the provider exits, reading gets 100 ms more rather than waiting for end-of-file, because a leftover child, or on macOS a process spawned concurrently that inherited the pipe before `FD_CLOEXEC` was set, can hold the write end open. The answer is `{"version":1,"value":"..."}` with exit 0, or `{"version":1,"error":"..."}`. Unknown fields are ignored.
 
-**Failure.** Every failure is a `ProviderError`: not configured, spawn failure, pipe I/O, timeout, output over the cap, unsuccessful exit (status or signal), malformed answer, unsupported version, a provider `error` (kept to one line of at most 200 characters), or a value holding NUL. A timeout or oversize answer `killpg`s the provider's group, so its children die too. The error, wrapped in `SecretResolutionError { variable, problem }`, becomes `LaunchProblem::SecretUnavailable`, the same launch refusal a missing binary produces (#881): the fresh path records it as the instance's `launch_failure`, shown as the instance `reason` in `/v1/status` and `relish wtf`; a restart refusal is terminal without spending the restart budget; a rollout's replacement fails the rollout and leaves the old instances serving. In a cluster the placement reconciler's deploy backoff retries a failed fresh deploy.
+**Failure.** Every failure is a `ProviderError`: not configured, spawn failure, pipe I/O, timeout, output over the cap, unsuccessful exit (status or signal), malformed answer, unsupported version, a provider `error` (kept to one line of at most 200 characters), or a value holding NUL. A timeout or oversize answer `killpg`s the provider's group, so its children die too. A spawn failure, pipe I/O error, timeout or unsuccessful exit is transient: `resolve_env` asks again up to `RESOLVE_ATTEMPTS` (3) times in all, pausing 250 ms and then 500 ms, and keeps the last error; every other failure is returned at once (#1308). The error, wrapped in `SecretResolutionError { variable, problem }`, becomes `LaunchProblem::SecretUnavailable`, the same launch refusal a missing binary produces (#881): the fresh path records it as the instance's `launch_failure`, shown as the instance `reason` in `/v1/status` and `relish wtf`; a restart refusal is terminal without spending the restart budget; a rollout's replacement fails the rollout and leaves the old instances serving. In a cluster the placement reconciler's deploy backoff retries a failed fresh deploy.
 
 **What never leaks.** Nothing in `secret_provider` logs. The response type isn't `Debug`. A JSON parse error's text isn't kept, because serde quotes the input; malformed answers carry a fixed reason. The provider's stderr is discarded. The resolved spec reaches disk only where an `ENC[AGE:...]` plaintext already does (5.5, step 5).
 
@@ -1229,6 +1250,42 @@ On each council node (intended design; step 1 differs today, see the status note
 
 **CRL propagation time:** The reporting tree distributes the CRL within seconds (measured at < 2 seconds in the target cluster size of ~200 nodes). The CRL is small -- just a list of serial numbers and metadata.
 
+### 5.7a Workload Signing-Key Rotation (#709)
+
+`SecurityState` holds one active OIDC signing key (`oidc_signing_config`) and
+zero or more retiring ones (`retiring_oidc_keys`).
+- **Rotate.** `POST /v1/identity/signing-key/rotate` (`relish identity
+  rotate-signing-key`) is leader only: an unscoped Admin with cluster-wide
+  `admin`, never the service principal, and a follower answers 421. The
+  leader generates the new Ed25519 key, because Raft apply must be
+  deterministic, wraps it like every other key, and proposes
+  `RotateOidcSigningKey { signing_key, retire_after_unix_secs, now_unix_secs }`.
+  Applying it moves the old key's public half to `retiring_oidc_keys` with
+  `not_after = retire_after`. It drops any retiring key already past its
+  window as of `now_unix_secs` (the proposer's clock, so every replica drops
+  the same ones), and it makes the new key active. It's refused when the
+  cluster has no key.
+- **The window.** `RETIRING_KEY_WINDOW_SECS` is 4,500 s: the JWT age ceiling
+  (3,600 s), clock skew (300 s) and 600 s for a late refresh. Every token the
+  old key signed has expired by then.
+- **Verify.** `oidc::verifying_keys` is the active key plus each retiring key
+  whose `not_after` hasn't passed. `verify_jwt_with_keys` picks the key by the
+  token's `kid`, and refuses an unknown `kid` before it checks any signature.
+  Each node's `WorkloadJwtVerifier` holds that set in a `watch` channel, so
+  the synchronous auth middleware reads it without a lock. Bun refreshes it
+  from the replica every 5 s.
+- **Publish.** `/v1/identity/jwks` lists the same set, active key first.
+- **Retire.** The leader's hourly token sweep proposes
+  `RetireOidcSigningKeys { now_unix_secs }` when a retiring key's window has
+  ended, and writes nothing when none has. Verifiers have already stopped
+  accepting the key by then, so the sweep only keeps state tidy.
+- **Audit.** `identity.signing_key_rotated` records both key ids and the
+  window's end; `identity.signing_key_retired` records the retired id, as the
+  system.
+
+Rotating the signing key doesn't help against a leaked master key, which
+unwraps the new key too (§5.12 is the plan for rotating the master key).
+
 ### 5.8 CA Rotation
 
 > **Status: intermediates implemented (F04 R1–R4, #362); root rotation planned.** The council state can hold
@@ -1258,9 +1315,13 @@ On each council node (intended design; step 1 differs today, see the status note
 > issuer; listeners read it on every handshake, so it applies without a
 > restart. The ingress resolver rebuilds when the active Ingress CA changes.
 >
-> The `relish ca` family has `ca backup` and `ca verify` (F04 R3): an
-> operator-held root backup sealed to a passphrase or an age recipient, checked
-> offline for key match, expiry and fingerprint. `ca rotate` rotates an
+> The `relish ca` family has `ca backup` and `ca verify` (F04 R3): the
+> operator-held root backup that `relish init` writes, sealed to a passphrase
+> or an age recipient and checked offline for key match, expiry and
+> fingerprint. `ca backup --from` only re-seals an existing backup; since
+> #709 nothing on a node can open the root, so there's nothing to read it
+> from. Finalising a secret rotation retires every old age key, generation 0
+> included. `ca rotate` rotates an
 > intermediate (F04 R4, below). There is no `ca rotate --root` yet (R5).
 > (Certificate *revocation* via the CRL — §5.7, `RaftRequest::RevokeCertificate`
 > — is separate and does ship.)
@@ -1382,6 +1443,95 @@ startup.
 - **Disk pressure (#798).** The audit directory counts toward task-data pressure (`disk_pressure::node_data_bytes`) alongside `{data}/task-arrays`, since both share the data filesystem.
 
 A call a follower forwards to the leader is recorded on both: the entry node with the client's address, the leader with the forwarder's. **Planned:** central retention (shipping records off the node, so a decommissioned node's history survives it) and tamper evidence (hash-chained records).
+
+### 5.12 Master-Key and Service-Token Rotation (plan, #709)
+
+> **Status: planned, not built.** Nothing rotates the cluster master key or
+> the service token today. A node that leaked the master key leaves the
+> cluster compromised for good, and the response is a rebuild (§7.7). This
+> section is the plan [#1654](https://github.com/reliaburger/reliaburger/issues/1654) implements.
+
+**What the master key keys.** One 32-byte key, `master.key` on every node, is
+the input to:
+
+| Use | Derivation | Where |
+|---|---|---|
+| The service token, the cluster's own bearer for node-to-node API calls | HKDF with a fixed salt (`SERVICE_TOKEN_SALT`), so it never changes | `sesame::token::derive_service_token` |
+| Gossip HMAC, which every datagram carries | HKDF | `sesame::mtls::gossip_hmac::derive_gossip_key` |
+| Raft log entries at rest | HKDF with a fresh salt per entry (§5.6) | `council::log_store` |
+| Every wrapped key in council state: the age keypairs, the intermediate CA keys, the OIDC signing key, namespace keys, GitOps credentials | HKDF per key (`sesame::crypto::wrap_key`) | `sesame::ca`, `sesame::secret`, `sesame::oidc`, `lettuce::types` |
+
+So a rotation has to change all four without a moment where nodes on the old
+key and nodes on the new key can't talk, and without losing a wrapped key or
+a log entry it can no longer open.
+
+**Shape: a versioned key with an epoch.** The master key becomes a set
+`{epoch → key}` with one *active* epoch and at most one *previous*. Every
+derived artefact records the epoch it was made under:
+- gossip datagrams carry the epoch beside the HMAC tag;
+- an encrypted log entry's envelope records it next to its salt;
+- a `WrappedKey` records it in its header.
+
+A reader looks the key up by epoch; a writer always uses the active one. The
+epoch only grows, and it's committed through Raft, so every node agrees which
+key is active.
+
+**The steps, each a Raft entry the leader proposes:**
+
+1. **Prepare.** An unscoped Admin runs `relish secret rotate-master-key`
+   (leader only, audited, never the service principal). The leader generates
+   the new key, and `MasterKeyPrepare { epoch }` commits that it exists. The
+   key itself never goes into Raft: the log is keyed by it.
+2. **Distribute.** Each node fetches the new key from the leader over mTLS,
+   the way an appliance node already fetches the master key at enrolment
+   (`GET /v1/cluster/master-key`, G1), and writes it beside the old one,
+   `0600`, before acknowledging. The leader waits for every live node's
+   acknowledgement (or an operator's `--force` naming the nodes it gives up
+   on, which then can't rejoin without a new enrolment).
+3. **Dual acceptance.** Once every node holds both keys, `MasterKeyActivate
+   { epoch }` makes the new epoch active. From then on, nodes sign gossip,
+   derive the service token and write log entries under the new key, and
+   still accept the previous epoch. The service token is then derived per
+   epoch, and both tokens authenticate until the next step.
+4. **Re-wrap.** The leader unwraps every `WrappedKey` in council state under
+   its old epoch and proposes the same keys wrapped under the new one, in
+   one entry, refused if any key changed since the leader read it (the
+   pattern `RotateSecretKey` already uses for namespace keys, §5.5).
+5. **Re-key the log.** Entries before activation stay under the old key until
+   a snapshot covers them, and a snapshot purges them. So the old key stays
+   needed until the first snapshot after activation, which the leader forces
+   (`trigger().snapshot()`) once the re-wrap commits.
+6. **Retire.** `MasterKeyRetire { epoch }` drops the previous epoch. Nodes
+   delete the old key file, stop accepting old-epoch gossip and the old
+   service token, and refuse any log entry or wrapped key still under it,
+   which by then nothing should be.
+
+**Failure and abort cases.**
+- **A node is down during distribute.** The rotation waits. `relish secret
+  rotate-master-key --abort` before activation deletes the new key everywhere
+  it reached, so nothing changed.
+- **The leader fails mid-rotation.** Every step is a committed entry, so the
+  new leader reads where the rotation stands and carries on. The new key is
+  on every node that acknowledged, so it doesn't need the old leader.
+- **A node misses activation.** It still accepts the previous epoch, so its
+  gossip keeps verifying until retire. A node that misses retire is refused
+  by everyone else's gossip from then on, and rejoins through enrolment.
+- **Abort after activation.** Not supported. It would mean activating the old
+  key again, which is just a second rotation.
+
+**What F03b changes.** The master key is the whole cluster's secret because
+every node holds it. Worker key separation (F03b on the roadmap) keeps the
+CA, age and OIDC keys on council nodes only, and gives each worker its own
+key for the log it doesn't keep and the gossip it does sign. A worker leak
+then rotates one worker's key, and only a council leak needs this whole
+procedure. The epoch scheme above is the same either way, so F03b doesn't
+have to wait for it, or it for F03b.
+
+**Tests the implementation starts from:** a gossip datagram signed under the
+previous epoch verifies until retire and is dropped after; a log entry
+written before activation reads back after it; the re-wrap entry is refused
+if a wrapped key changed underneath it; and a gated cluster test rotates the
+key on three nodes while writes and gossip keep flowing.
 
 ## 6. Configuration
 
@@ -1681,6 +1831,18 @@ council_size = 3
 
 **Mitigation:** The age private key is replicated across all council nodes via Raft. Losing all council nodes simultaneously is a catastrophic scenario that also loses all other cluster state. `relish init --import-key` allows bootstrapping a new cluster with a previously exported private key. Operators should maintain offline backups of the age private key for disaster recovery.
 
+### 7.7 Master Key Compromise
+
+**Scenario:** The cluster master key (`master.key`) has left a node: a stolen disk, a copied backup of the node, or root on any node.
+
+**Impact:** Everything §5.12 lists. The holder can sign gossip that every node accepts, call node APIs with the service token, read the Raft log at rest, and unwrap the age keys, the intermediate CA keys and the OIDC signing key from council state.
+
+**Response:** Rebuild the cluster. Neither the master key nor the service token can be rotated yet (§5.12), and rotating the keys that can be rotated doesn't help while the master key unwraps their replacements.
+1. Create a new cluster: `relish init` on fresh or reinstalled machines, or `relish machines claim --create` for appliances. It gets a new master key, CA, age key and OIDC key.
+2. Seal every secret again for the new cluster: `relish secret pubkey` gives its age public key for `relish secret encrypt`. Values sealed to the old cluster's key are readable by whoever holds the old master key.
+3. Apply your configs to the new cluster and move traffic to it.
+4. Shut down every node of the old cluster and wipe its disks. A node left running still accepts the leaked key.
+
 ---
 
 ## 8. Security Considerations
@@ -1739,7 +1901,7 @@ The threat model assumes:
 
 **What the attacker cannot do:**
 
-- Forge the root CA (private key is not on any cluster node).
+- Forge the root CA, unless this is the node `relish init` ran on. That node keeps the root key sealed beside `master.key`, so its root can recover it (#709 makes the root truly offline). On any other node the root key isn't there.
 - Act unilaterally if other council nodes are not compromised (Raft requires quorum for writes).
 - However, read-only access to the key material is sufficient for forging certificates and decrypting secrets.
 
@@ -1748,8 +1910,8 @@ The threat model assumes:
 1. Isolate the compromised council node immediately.
 2. Rotate all intermediate CAs: `relish ca rotate --role ROLE --root-backup FILE` for each role (§5.8).
 3. Rotate the age keypair: `relish secret rotate`.
-4. Rotate the OIDC signing keypair, re-minting all JWTs. **(Planned, [#709](https://github.com/reliaburger/reliaburger/issues/709): there's no OIDC key rotation yet.)**
-5. Rotate all API tokens.
+4. Rotate the workload signing key: `relish identity rotate-signing-key` (§5.7a). The old key keeps verifying for its 4,500 s window, so tokens the attacker minted before you rotate stay valid until it ends. The master key and the service token can't be rotated yet: there's no command for either ([#709](https://github.com/reliaburger/reliaburger/issues/709), §5.12). The node held both, so the attacker can sign gossip and call node APIs as the cluster for as long as the cluster lives. **Rebuild the cluster** (§7.7) rather than trusting rotations of the keys that can be rotated.
+5. If you must keep the cluster running while you rebuild, rotate what you can now: every API token except the service token (`relish token`), the intermediate CAs, the age keypair and the workload signing key (steps 2 to 4).
 6. Audit all cluster activity during the compromise window: `relish audit --cluster --since <start> --until <end>` lists every node's records, with the principal and source address of each action (§5.11). Read the compromised node's log before you rebuild it; there is no central copy yet.
 7. Investigate the attack vector and harden council node access.
 
