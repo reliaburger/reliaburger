@@ -97,8 +97,67 @@ class Screen(unittest.TestCase):
         said = plain(renderer.lines({"type": "assistant", "message": {"content": [
             {"type": "text", "text": "web v2 exits after five seconds."}]}}))
         self.assertEqual(said, ["claude ▸ web v2 exits after five seconds."])
-        ended = plain(renderer.lines({"type": "result", "num_turns": 9, "duration_ms": 75000}))
-        self.assertEqual(ended[-1], "# The session ended after 9 turns and 1 m 15 s.")
+        self.assertEqual(renderer.lines({"type": "result", "num_turns": 9, "duration_ms": 75000}), [])
+        self.assertEqual(plain(renderer.ending()), ["", "# The session ended after 9 turns and 1 m 15 s."])
+
+    def test_a_background_commands_notice_is_hidden(self):
+        # Claude Code's own bookkeeping, with a path under /private/tmp: the
+        # agent's next words say what's running.
+        clock = Clock()
+        renderer = stage.Renderer("debug", clock=clock)
+        renderer.lines(bash("1", "relish agent patch test ./fix"))
+        self.assertEqual(renderer.lines(result(
+            "1", "Command running in background with ID: b1. Output is being written to: "
+                 "/private/tmp/claude-501/x/tasks/b1.output")), [])
+        renderer.lines(bash("2", "relish agent patch build ./fix"))
+        clock.now = 600
+        # Moved to the background after a timeout: no "that took" either,
+        # since the build hadn't finished.
+        self.assertEqual(renderer.lines(result(
+            "2", [{"type": "text", "text": "Command did not complete within its 600s timeout and was "
+                                           "moved to the background (ID: b2). Output is being written "
+                                           "to: /private/tmp/b2.output"}])), [])
+
+    def test_a_resumed_session_ends_once_with_every_parts_turns_and_time(self):
+        # A background command's end resumes the session, and each part
+        # sends its own init and result: the screen names the model once and
+        # says the session ended once, at the very end, with the totals.
+        renderer = stage.Renderer("debug")
+        init = {"type": "system", "subtype": "init", "model": "m"}
+        self.assertEqual(plain(renderer.lines(init)), ["# Claude Code, model m"])
+        self.assertEqual(renderer.lines({"type": "result", "num_turns": 17, "duration_ms": 660000}), [])
+        self.assertEqual(renderer.lines(init), [])
+        self.assertEqual(renderer.lines({"type": "result", "num_turns": 5, "duration_ms": 20400}), [])
+        self.assertEqual(plain(renderer.ending()),
+                         ["", "# The session ended after 22 turns and 11 m 20 s."])
+
+    def test_saving_the_patch_is_its_own_chapter_not_the_fix_again(self):
+        renderer = stage.Renderer("debug")
+
+        def write(id_, name, path):
+            return plain(renderer.lines({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": id_, "name": name, "input": {"file_path": path}}]}}))
+
+        self.assertEqual(write("1", "Edit", "fix/src/relish/client.rs"),
+                         ["", "» Write the fix", "✎ edit fix/src/relish/client.rs"])
+        self.assertEqual(write("2", "Write", "/run/solver/fix.diff"),
+                         ["", "» Save the patch", "✎ write /run/solver/fix.diff"])
+        # Saving again straight away stays in the same chapter.
+        self.assertEqual(write("3", "Write", "out/change.patch"), ["✎ write out/change.patch"])
+        self.assertEqual(write("4", "Edit", "fix/src/relish/client.rs")[1], "» Write the fix (again)")
+        self.assertEqual(write("5", "Write", "fix.diff")[1], "» Save the patch (again)")
+
+    def test_a_session_with_no_result_has_no_ending(self):
+        self.assertEqual(stage.Renderer("act").ending(), [])
+
+    def test_a_chapter_opened_again_says_so(self):
+        renderer = stage.Renderer("debug")
+        titles = []
+        for index, command in enumerate(["build", "test", "try", "test", "try", "test"]):
+            shown = plain(renderer.lines(bash(str(index), f"relish agent patch {command} ./fix")))
+            titles.extend(line for line in shown if line.startswith("» "))
+        self.assertEqual(titles, ["» Build it", "» Test it", "» Try it", "» Test it (again)",
+                                  "» Try it (again)", "» Test it (again)"])
 
     def test_relish_words_skip_flags_variables_and_pipes(self):
         self.assertEqual(stage.relish_words("relish agent patch build ./fix --bun"),
@@ -129,6 +188,84 @@ class Markers(unittest.TestCase):
         out = [json.loads(line) for line in recording.post_process(self.cast(2))]
         self.assertEqual(out[2], [1.25, "m", "Build it"])
         self.assertEqual(out[3][0], 1.25)
+
+
+def event_text(lines):
+    """A cast's output, as plain lines."""
+    text = "".join(json.loads(line)[2] for line in lines[1:] if json.loads(line)[1] == "o")
+    return plain(text.split("\r\n"))
+
+
+class Tidy(unittest.TestCase):
+    """`recording.py tidy`: an existing cast, shown as stage.py shows a session now."""
+
+    DIM, BOLD, RESET = "\x1b[2m", "\x1b[1m", "\x1b[0m"
+
+    def say(self, text):
+        return f"{self.DIM}# {text}{self.RESET}\r\n"
+
+    def cast(self):
+        dim, bold, reset = self.DIM, self.BOLD, self.RESET
+        events = [
+            [0.1, "o", self.say("Claude Code, model m")],
+            [1.0, "m", "Test it"],
+            [0.0, "o", f"\r\n{bold}» Test it{reset}\r\n$ relish agent patch test ./fix\r\n"],
+            [2.0, "o", f"{dim}Command running in background with ID: b1. Output is being written to: "
+                       f"/private/tmp/claude-501/-User…{reset}\r\n"],
+            [0.5, "o", "claude ▸ The tests run in the background.\r\n"],
+            [0.25, "o", "\r\n" + self.say("The session ended after 17 turns and 11 m 00 s.")],
+            [0.5, "o", self.say("Claude Code, model m")],
+            [1.0, "m", "Test it"],
+            [0.0, "o", f"\r\n{bold}» Test it{reset}\r\n$ relish agent patch test ./fix\r\n"],
+            [3.0, "o", f"{dim}Command did not complete within its 600s timeout and was moved to the "
+                       f"background (ID: b2). Output is…{reset}\r\n"
+                       + self.say("that took 10 m 00 s; the recording cut the wait")],
+            [0.25, "o", "\r\n" + self.say("The session ended after 5 turns and 20 s.")],
+            [1.0, "m", "Write the fix"],
+            [0.0, "o", f"\r\n{bold}» Write the fix{reset}\r\n\x1b[32m{bold}✎{reset} write /run/fix.diff\r\n"],
+            [1.0, "m", "You read the draft"],
+            [0.0, "o", f"\r\n{bold}» You read the draft{reset}\r\n"],
+        ]
+        return [json.dumps({"version": 3, "title": "t"}), *(json.dumps(e) for e in events)]
+
+    def session(self):
+        return [{"type": "result", "num_turns": 17, "duration_ms": 660000},
+                {"type": "result", "num_turns": 5, "duration_ms": 20400}]
+
+    def test_notices_and_repeated_lines_go_and_repeated_chapters_say_again(self):
+        out = recording.tidy(self.cast(), self.session())
+        markers = [json.loads(line)[2] for line in out[1:] if json.loads(line)[1] == "m"]
+        self.assertEqual(markers, ["Test it", "Test it (again)", "Save the patch", "You read the draft"])
+        shown = [line for line in event_text(out) if line]
+        self.assertEqual(shown, [
+            "# Claude Code, model m",
+            "» Test it", "$ relish agent patch test ./fix",
+            "claude ▸ The tests run in the background.",
+            "» Test it (again)", "$ relish agent patch test ./fix",
+            "# The session ended after 22 turns and 11 m 20 s.",
+            "» Save the patch", "✎ write /run/fix.diff",
+            "» You read the draft",
+        ])
+
+    def test_a_dropped_events_wait_moves_to_the_next_so_the_timing_holds(self):
+        before = self.cast()
+        out = recording.tidy(before, self.session())
+        total = lambda lines: sum(json.loads(line)[0] for line in lines[1:])
+        self.assertAlmostEqual(total(out), total(before))
+        # The notice's 2 s now opens the agent's next line.
+        said = next(json.loads(line) for line in out[1:] if "claude ▸" in json.loads(line)[2])
+        self.assertAlmostEqual(said[0], 2.5)
+
+    def test_tidying_twice_changes_nothing_more(self):
+        once = recording.tidy(self.cast(), self.session())
+        self.assertEqual(recording.tidy(once, self.session()), once)
+
+    def test_a_v2_cast_keeps_its_absolute_times(self):
+        lines = [json.dumps({"version": 2}),
+                 json.dumps([1.0, "o", "\x1b[2mCommand running in background with ID: b1.\x1b[0m\r\n"]),
+                 json.dumps([1.5, "o", "next\r\n"])]
+        out = recording.tidy(lines, [])
+        self.assertEqual([json.loads(line) for line in out[1:]], [[1.5, "o", "next\r\n"]])
 
 
 class Session(unittest.TestCase):
