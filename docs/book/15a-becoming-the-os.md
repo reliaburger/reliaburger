@@ -844,9 +844,11 @@ pub fn next_step(seed: Option<&Seed>, disk: Disk) -> Step {
 
 Matching on a tuple is one of Rust's quiet pleasures. The compiler checks that the arms cover every combination of role and two booleans, so a case nobody thought of is a compile error rather than a machine stuck at boot. `_` matches anything, and `Seed::Legacy { .. }` matches that variant whatever its fields hold. The loop around it does the step, then asks again, until the answer is `Done`. Pull the plug half-way through enrolling and the next boot simply picks up where the disk says it was. And because `next_step` touches nothing, the tests are a table of inputs and the step each should give.
 
-A join seed's token buys a certificate, and the certificate buys the master key: `GET /v1/cluster/master-key` answers only a caller presenting a node certificate the cluster signed and hasn't retired. The token never sees the key.
+A join seed's token buys a certificate, and the certificate buys the master key: `GET /v1/cluster/master-key` answers only a caller presenting a node certificate the cluster signed and hasn't retired. The token never sees the key. "Hasn't retired" is about the node, not the certificate. Decommissioning a node records its id as retired, and its certificates stay valid until they expire. So the test retires a worker and then asks with two of its certificates, one it had before and one never issued, let alone revoked. Both are refused because the node is retired: the router's retired-peer layer turns them away before the handler's own check runs.
 
 A create seed is different: it carries the master key itself. Once its files are installed, the copy it came from has to go, and an unlink isn't enough, because it only drops the name and leaves the blocks readable. So `zero_and_remove` writes zeros over the whole file, `sync_all`s them, and only then removes it. That covers the seed file on an RBSEED stick and the seed a claim delivered. The claimed copy is also cleared on the boot that finds `node.toml` already in place, in case the power went between writing one and clearing the other. The tests watch through a hard link. A second name for the same file survives the unlink and still sees the same blocks, so it can check every byte is zero.
+
+A hard link proves the function, not the stick. A FAT stick has no hard links, and its delete only marks the directory entry and frees the clusters, so an unlinked seed is still sitting in the image. So CI's seeded pair boots node 1 from a real RBSEED stick: `make-seed-stick.sh` builds the FAT image, and QEMU plugs it in as a USB drive. Once the cluster is up, the test reads the raw image on the runner. `seed_wiped.py` looks for every 64-byte run of node 1's seed, and finding even one fails the run. Node 2 still gets its seed as a credential, so one run covers both ways in.
 
 ### Claiming over the network
 
@@ -881,6 +883,19 @@ impl ServerCertVerifier for ClaimKeyVerifier {
 The `'_` in `CertificateDer<'_>` is an elided lifetime: the certificate borrows bytes from the handshake, and `'_` says "some lifetime the compiler can work out", without our naming it. The verifier ignores the server name and the CA chain completely. The SHA-256 of the certificate is the whole identity. With `expected` unset, on the first look, it accepts anything but records what it saw in `seen`, an `Arc<Mutex<Option<String>>>` that relish reads once the request is done. That's a `std::sync::Mutex`, not tokio's, which [CLAUDE.md](https://github.com/reliaburger/reliaburger/blob/main/CLAUDE.md) normally frowns on. Here it's right: rustls calls the verifier synchronously, and the lock is held only long enough to store one string. Nothing awaits while holding it.
 
 Notice what the verifier doesn't skip. The certificate must still match the key that signed the handshake, so a machine that merely *copies* another's certificate can't finish connecting. The test for all this runs the real claim server on loopback: a post pinned to the wrong fingerprint never connects and the seed never lands, then the right one claims the machine.
+
+The pinning only helps if the human's answer is read properly, and at first nothing tested the question itself, because it read the real stdin. So the question became `confirm_with`, which takes the terminal flag, the input and the output as arguments:
+
+```rust
+fn confirm_with(
+    machines: &[(String, IpAddr, String)],
+    is_terminal: bool,
+    mut input: impl std::io::BufRead,
+    mut output: impl std::io::Write,
+) -> Result<(), RelishError>
+```
+
+`impl BufRead` in argument position means "any type that implements this trait", picked at compile time, much like a Go function taking an `io.Reader`, except that Rust builds a separate copy for each concrete type, so there's no interface dispatch at run time. The real command passes `stdin().lock()` and `stdout()`. A test passes a byte slice of typed answers (`&[u8]` implements `BufRead`) and a `Vec<u8>` that collects the prompts. The tests check that each machine is shown with its short key, that a "no" stops at that machine without asking about the next, that only `y`, `Y` and `yes` count (an empty answer or end of input is a no), and that without a terminal it refuses and points at `--trust-lan`.
 
 ### A window in the firewall
 
