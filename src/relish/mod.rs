@@ -304,7 +304,7 @@ pub enum RelishError {
     /// The operator's input ended before they confirmed the master-key
     /// backup.
     #[error(
-        "the master-key backup wasn't confirmed, so the cluster wasn't started: remove {} and create it again",
+        "the master-key backup wasn't confirmed, so the cluster wasn't created: relish removed what it had written to {}, so create it again",
         .directory.display()
     )]
     BackupNotConfirmed { directory: std::path::PathBuf },

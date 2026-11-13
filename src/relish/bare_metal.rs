@@ -11,7 +11,8 @@
 //! prepare`). Seeds go on a USB stick labelled `RBSEED` as
 //! `seeds/<mac>.seed`, so one stick serves the whole fleet.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -610,10 +611,66 @@ pub fn run_create(
     use std::io::IsTerminal;
     let secrets = options.directory.join("secrets");
     let check = backup_check(yes, std::io::stdin().is_terminal(), &secrets)?;
-    let created = create(options)?;
-    back_up(check, &secrets, output)?;
+    let created = create_confirmed(options, || back_up(check, &secrets, output))?;
     let context = adopt(&created, &options.directory)?;
     print_output(&ClusterCreated::new(&created, options, context), output)
+}
+
+/// [`create`], then `confirm` the master-key backup. If the operator
+/// doesn't confirm it (Ctrl-D, or a pipe that closes), remove everything
+/// `create` wrote: no seed has left this machine, so the cluster never
+/// existed, and keeping a master key nobody has a copy of helps no one. It
+/// also lets the same command run again, rather than finding a directory
+/// that "already holds a cluster". Anything the directory held before is
+/// left alone.
+pub fn create_confirmed(
+    options: &CreateOptions,
+    confirm: impl FnOnce() -> Result<(), RelishError>,
+) -> Result<Created, RelishError> {
+    let dir = &options.directory;
+    let before = match std::fs::read_dir(dir) {
+        Ok(entries) => Some(
+            entries
+                .map(|entry| entry.map(|entry| entry.file_name()))
+                .collect::<Result<BTreeSet<_>, _>>()?,
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let created = create(options)?;
+    if let Err(error) = confirm() {
+        remove_what_create_made(dir, before.as_ref());
+        return Err(error);
+    }
+    Ok(created)
+}
+
+/// Remove `dir` if it's new (`before` is `None`), or else only the entries
+/// that weren't in `before`. A failure is reported, not returned: the
+/// caller is already returning the reason it stopped.
+fn remove_what_create_made(dir: &Path, before: Option<&BTreeSet<OsString>>) {
+    let remove = |path: &Path| {
+        let removed = if path.is_dir() {
+            std::fs::remove_dir_all(path)
+        } else {
+            std::fs::remove_file(path)
+        };
+        if let Err(error) = removed {
+            eprintln!("warning: couldn't remove {}: {error}", path.display());
+        }
+    };
+    let Some(before) = before else {
+        remove(dir);
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !before.contains(&entry.file_name()) {
+            remove(&entry.path());
+        }
+    }
 }
 
 /// How a new cluster's master-key backup gets confirmed.
@@ -1211,5 +1268,75 @@ mod tests {
             assert!(message.starts_with(char::is_lowercase), "{message}");
             assert!(message.contains("/home/me/home-cluster"), "{message}");
         }
+    }
+
+    /// The operator pressing Ctrl-D at the backup question.
+    fn ctrl_d(secrets: &Path) -> Result<(), RelishError> {
+        confirm_backup(
+            &mut std::io::Cursor::new(Vec::new()),
+            &mut Vec::new(),
+            secrets,
+        )
+    }
+
+    const ONE_MACHINE: &[&str] = &["d8:9e:f3:00:00:01@192.168.1.51"];
+
+    #[test]
+    fn a_cluster_whose_backup_is_not_confirmed_leaves_nothing_behind() {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("home-cluster");
+        let mut asked_with_keys_written = false;
+        let error = create_confirmed(&options(&dir, ONE_MACHINE), || {
+            // The question comes once the keys exist, so the operator can
+            // copy them before answering.
+            asked_with_keys_written = dir.join("fleet.json").is_file()
+                && std::fs::read_dir(dir.join("secrets")).unwrap().count() > 0;
+            ctrl_d(&dir.join("secrets"))
+        })
+        .unwrap_err();
+        assert!(asked_with_keys_written);
+        assert!(
+            matches!(error, RelishError::BackupNotConfirmed { .. }),
+            "{error}"
+        );
+        assert!(!dir.exists(), "left behind: {:?}", std::fs::read_dir(&dir));
+        let message = error.to_string();
+        assert!(message.contains("create it again"), "{message}");
+
+        // So the same command works straight away, rather than finding
+        // "already holds a cluster".
+        create_confirmed(&options(&dir, ONE_MACHINE), || Ok(())).unwrap();
+        assert!(dir.join("fleet.json").is_file());
+    }
+
+    #[test]
+    fn a_refused_backup_removes_only_what_create_made_in_an_existing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.txt"), b"mine").unwrap();
+        std::fs::create_dir(dir.path().join("photos")).unwrap();
+
+        create_confirmed(&options(dir.path(), ONE_MACHINE), || {
+            ctrl_d(&dir.path().join("secrets"))
+        })
+        .unwrap_err();
+        let mut left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["notes.txt", "photos"]);
+        assert_eq!(
+            std::fs::read(dir.path().join("notes.txt")).unwrap(),
+            b"mine"
+        );
+    }
+
+    #[test]
+    fn a_confirmed_backup_keeps_the_cluster() {
+        let dir = tempfile::tempdir().unwrap();
+        let created = create_confirmed(&options(dir.path(), ONE_MACHINE), || Ok(())).unwrap();
+        assert_eq!(created.fleet.nodes.len(), 1);
+        assert!(dir.path().join("fleet.json").is_file());
+        assert!(dir.path().join("secrets").is_dir());
     }
 }

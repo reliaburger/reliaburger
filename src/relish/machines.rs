@@ -440,14 +440,22 @@ pub async fn run_claim(options: &ClaimOptions) -> Result<(), RelishError> {
             let keys = crate::relish::quickstart::security::root_backup_keys_in(
                 &crate::relish::local_context::root_directory()?,
             );
-            // BLOCKING-OK: relish CLI: a one-shot step before the command does anything long-lived
-            let created = bare_metal::create(&cluster.create_options(
+            let create_options = cluster.create_options(
                 &options.directory,
                 pairs,
                 options.token_ttl,
                 options.ssh_key.clone(),
                 keys,
-            ))?;
+            );
+            // A backup that isn't confirmed removes what create wrote, so
+            // nothing is claimed and the command can simply run again.
+            // BLOCKING-OK: relish CLI: a one-shot step before the command does anything long-lived
+            let created = bare_metal::create_confirmed(&create_options, || match backup {
+                Some(check) => {
+                    bare_metal::back_up(check, &secrets, crate::relish::output::OutputFormat::Human)
+                }
+                None => Ok(()),
+            })?;
             println!(
                 "The root CA key is only in {}, which {} opens. Move both offline, apart \
                  from each other: no machine holds either.",
@@ -461,9 +469,6 @@ pub async fn run_claim(options: &ClaimOptions) -> Result<(), RelishError> {
                 .cloned()
                 .zip(created.seeds.iter().cloned())
                 .collect::<Vec<_>>();
-            if let Some(check) = backup {
-                bare_metal::back_up(check, &secrets, crate::relish::output::OutputFormat::Human)?;
-            }
             (Some(created), seeds)
         }
         None => (None, {
