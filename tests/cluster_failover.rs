@@ -2451,6 +2451,185 @@ async fn a_proposal_applied_before_a_leader_change_is_undone_on_the_new_leader()
     fixture.root.cancel();
 }
 
+/// The audit records with `action` on `node`, as `bearer` reads them.
+async fn audit_records(node: &WiredNode, bearer: &str, action: &str) -> Vec<serde_json::Value> {
+    let response = reqwest::Client::new()
+        .get(format!(
+            "http://127.0.0.1:{}/v1/audit?action={action}",
+            node.api_port
+        ))
+        .bearer_auth(bearer)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await;
+    let Ok(response) = response else {
+        return Vec::new();
+    };
+    let body: serde_json::Value = response.json().await.unwrap_or_default();
+    body["records"].as_array().cloned().unwrap_or_default()
+}
+
+/// #1928: a follower that hasn't applied the entry creating a proposal
+/// still passes a decision on it to the leader, which has it. The follower
+/// here has stopped applying altogether (its Raft core is shut down, its API
+/// still answers), so it can never have the proposal: before the fix it
+/// answered 404 to approve, reject, withdraw and undo. The leader decides
+/// as the caller, so each audit record names the person or agent who asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host; run with make test-cluster"]
+async fn a_follower_that_has_not_applied_a_proposal_passes_each_decision_to_the_leader() {
+    assert!(cluster_tests_enabled());
+    let operator = admin_token("operator");
+    let mut fixture = Fixture::new();
+    let mut nodes = vec![
+        fixture
+            .start_node(740, vec![], false, Some(operator.token.clone()))
+            .await,
+    ];
+    for index in 741..743 {
+        let seed = fixture.gossip(740);
+        nodes.push(
+            fixture
+                .start_node(index, vec![seed], false, Some(operator.token.clone()))
+                .await,
+        );
+    }
+    let (leader, followers) = settled_roles(&nodes).await;
+    let scope = reliaburger::sesame::types::TokenScope {
+        apps: None,
+        namespaces: Some(vec!["shop".to_string()]),
+    };
+    let mut holmes = reliaburger::sesame::token::create_token(
+        "holmes",
+        reliaburger::sesame::types::ApiRole::Deployer,
+        scope.clone(),
+        None,
+    )
+    .unwrap();
+    holmes.token.kind = reliaburger::sesame::types::TokenKind::Agent;
+    grant(&nodes, &holmes.token).await;
+    let watson = reliaburger::sesame::token::create_token(
+        "watson",
+        reliaburger::sesame::types::ApiRole::Deployer,
+        scope,
+        None,
+    )
+    .unwrap();
+    grant(&nodes, &watson.token).await;
+
+    for app in ["web", "api", "db", "cache"] {
+        let spec: reliaburger::config::app::AppSpec = toml::from_str(&format!(
+            "image = \"{app}:v1\"\nreplicas = 1\nnamespace = \"shop\""
+        ))
+        .unwrap();
+        nodes[leader]
+            .council
+            .write(RaftRequest::AppSpec {
+                app_id: AppId::new(app, "shop"),
+                spec: Box::new(spec),
+            })
+            .await
+            .unwrap();
+    }
+
+    // The lagging follower stops applying; the other two still commit.
+    let (creator, lagging) = (&nodes[followers[0]], &nodes[followers[1]]);
+    lagging.council.shutdown().await.unwrap();
+
+    let mut ids = BTreeMap::new();
+    for app in ["web", "api", "db", "cache"] {
+        let (status, body) = post_json(
+            creator,
+            &holmes.plaintext,
+            "/v1/proposals",
+            &format!(
+                r#"{{"kind":"scale","namespace":"shop","app":"{app}","replicas":2,"reason":"drill"}}"#
+            ),
+        )
+        .await
+        .expect("the follower answers");
+        assert_eq!(status, 201, "{body}");
+        ids.insert(app, body["id"].as_u64().unwrap());
+    }
+    let id = reliaburger::proposal::ProposalId;
+    let local = lagging.council.desired_state().await;
+    assert!(
+        ids.values()
+            .all(|&each| local.proposals.get(id(each)).is_none()),
+        "the lagging follower has none of the proposals"
+    );
+
+    let decisions = [
+        ("approve", ids["web"], &watson, "applied"),
+        ("reject", ids["api"], &watson, "rejected"),
+        ("withdraw", ids["db"], &holmes, "withdrawn"),
+        ("undo", ids["web"], &watson, "undone"),
+        ("approve", ids["cache"], &watson, "applied"),
+    ];
+    for (decision, proposal, by, state) in decisions {
+        let body = if decision == "reject" {
+            r#"{"reason":"not now"}"#
+        } else {
+            ""
+        };
+        let (status, answer) = post_json(
+            lagging,
+            &by.plaintext,
+            &format!("/v1/proposals/{proposal}/{decision}"),
+            body,
+        )
+        .await
+        .expect("the lagging follower answers");
+        assert_eq!(status, 200, "{decision} {proposal}: {answer}");
+        assert_eq!(answer["state"], state, "{decision} {proposal}: {answer}");
+    }
+
+    // An agent's proposal to undo one, through the same follower, names an
+    // original only the leader is sure to hold.
+    let (status, body) = post_json(
+        lagging,
+        &holmes.plaintext,
+        "/v1/proposals",
+        &format!(
+            r#"{{"kind":"undo","of":{},"reason":"drill"}}"#,
+            ids["cache"]
+        ),
+    )
+    .await
+    .expect("the lagging follower answers");
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(body["state"], "pending", "{body}");
+
+    let decided = nodes[leader].council.desired_state().await;
+    for (app, state) in [("web", "undone"), ("api", "rejected"), ("db", "withdrawn")] {
+        let proposal = decided.proposals.get(id(ids[app])).unwrap();
+        assert_eq!(proposal.state.name(), state, "{app}");
+    }
+    assert_eq!(
+        decided.apps[&AppId::new("web", "shop")].replicas,
+        reliaburger::config::Replicas::Fixed(1),
+        "the undo put web back"
+    );
+
+    // The leader decided, as whoever asked the lagging follower.
+    for (action, token) in [
+        ("proposal.applied", "watson"),
+        ("proposal.rejected", "watson"),
+        ("proposal.withdrawn", "holmes"),
+        ("proposal.undone", "watson"),
+    ] {
+        let records = audit_records(&nodes[leader], &operator.plaintext, action).await;
+        assert!(
+            !records.is_empty()
+                && records
+                    .iter()
+                    .all(|record| record["details"]["token_name"] == token),
+            "{action} names {token}: {records:#?}"
+        );
+    }
+    fixture.root.cancel();
+}
+
 /// A browser's request to one node: the status, the page, and the session
 /// cookie it set, if any. Redirects aren't followed, so a decision's 303
 /// is visible.
