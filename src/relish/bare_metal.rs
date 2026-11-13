@@ -636,7 +636,8 @@ pub fn create_confirmed(
     let existed = dir.exists();
     let before = written_tree(dir)?;
     let created = create(options)?;
-    let written: Vec<PathBuf> = written_tree(dir)?.difference(&before).cloned().collect();
+    let after = written_tree(dir)?;
+    let written = written_between(&before, &after);
     if let Err(error) = confirm() {
         remove_written(dir, &written, existed);
         if let Err(problem) = std::fs::remove_file(&created.root_backup.identity) {
@@ -645,51 +646,100 @@ pub fn create_confirmed(
                 created.root_backup.identity.display()
             );
         }
+        let unchecked: BTreeSet<PathBuf> = before.skipped.union(&after.skipped).cloned().collect();
+        if let Some(warning) = unchecked_warning(dir, &unchecked) {
+            eprintln!("{warning}");
+        }
         return Err(error);
     }
     Ok(created)
 }
 
-/// Every file and directory under `dir`, relative to it; empty if `dir`
-/// doesn't exist. Symbolic links count as files and aren't followed.
+/// What a walk of the cluster directory found, relative to it.
+#[derive(Debug, Default)]
+struct Tree {
+    /// Every file and directory it could see.
+    found: BTreeSet<PathBuf>,
+    /// Directories it wasn't allowed to read, whose contents it can't know.
+    skipped: BTreeSet<PathBuf>,
+}
+
+/// Walk `dir`: every file and directory under it, relative to it; empty if
+/// `dir` doesn't exist. Symbolic links count as files and aren't followed.
 ///
-/// A directory it may not read, or an entry that vanishes while it looks,
-/// is skipped rather than failing `cluster create`: `create` writes only
-/// its own files, never into something it can't read, so what it can't
-/// list is never in the difference, and is never removed.
-fn written_tree(dir: &Path) -> std::io::Result<BTreeSet<PathBuf>> {
-    let skipped = |error: &std::io::Error| {
-        matches!(
-            error.kind(),
-            std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-        )
-    };
-    let mut found = BTreeSet::new();
+/// A directory it may not read is recorded as skipped rather than failing
+/// `cluster create`, and an entry that vanishes while it looks is passed
+/// over: there's nothing there.
+fn written_tree(dir: &Path) -> std::io::Result<Tree> {
+    use std::io::ErrorKind::{NotFound, PermissionDenied};
+    let mut tree = Tree::default();
+    let relative = |path: &Path| path.strip_prefix(dir).map(Path::to_path_buf).ok();
     let mut pending = vec![dir.to_path_buf()];
     while let Some(current) = pending.pop() {
         let entries = match std::fs::read_dir(&current) {
             Ok(entries) => entries,
-            Err(error) if skipped(&error) => continue,
+            Err(error) if error.kind() == NotFound => continue,
+            Err(error) if error.kind() == PermissionDenied => {
+                tree.skipped.extend(relative(&current));
+                continue;
+            }
             Err(error) => return Err(error),
         };
         for entry in entries {
             let path = match entry {
                 Ok(entry) => entry.path(),
-                Err(error) if skipped(&error) => continue,
+                Err(error) if matches!(error.kind(), NotFound | PermissionDenied) => continue,
                 Err(error) => return Err(error),
             };
             match std::fs::symlink_metadata(&path) {
                 Ok(metadata) if metadata.is_dir() => pending.push(path.clone()),
                 Ok(_) => {}
-                Err(error) if skipped(&error) => continue,
+                Err(error) if matches!(error.kind(), NotFound | PermissionDenied) => continue,
                 Err(error) => return Err(error),
             }
-            if let Ok(relative) = path.strip_prefix(dir) {
-                found.insert(relative.to_path_buf());
-            }
+            tree.found.extend(relative(&path));
         }
     }
-    Ok(found)
+    Ok(tree)
+}
+
+/// What `create` wrote: what the second walk found that the first didn't,
+/// except anything inside a directory either walk couldn't read. What such a
+/// directory held before is unknown: should its mode change between the
+/// walks, its old contents would look new. So a skip may only ever keep
+/// things.
+fn written_between(before: &Tree, after: &Tree) -> Vec<PathBuf> {
+    let unknown = |path: &PathBuf| {
+        before
+            .skipped
+            .iter()
+            .chain(&after.skipped)
+            .any(|skipped| path != skipped && path.starts_with(skipped))
+    };
+    after
+        .found
+        .difference(&before.found)
+        .filter(|path| !unknown(path))
+        .cloned()
+        .collect()
+}
+
+/// The warning for a refusal when a walk skipped directories: they may still
+/// hold files `create` wrote, the master key among them, which relish
+/// couldn't check and so left.
+fn unchecked_warning(dir: &Path, skipped: &BTreeSet<PathBuf>) -> Option<String> {
+    if skipped.is_empty() {
+        return None;
+    }
+    let paths: Vec<String> = skipped
+        .iter()
+        .map(|path| dir.join(path).display().to_string())
+        .collect();
+    Some(format!(
+        "warning: relish couldn't read {}, so it couldn't check them, and they may still hold \
+         files cluster create wrote, the master key among them; look there and remove them",
+        paths.join(", ")
+    ))
 }
 
 /// Remove the `written` paths under `dir`: files first, then directories
@@ -1346,6 +1396,7 @@ mod tests {
     fn everything_in(dir: &Path) -> Vec<String> {
         let mut found: Vec<String> = written_tree(dir)
             .unwrap()
+            .found
             .into_iter()
             .map(|path| path.display().to_string())
             .collect();
@@ -1445,6 +1496,92 @@ mod tests {
             std::fs::read(dir.path().join("notes.txt")).unwrap(),
             b"mine"
         );
+    }
+
+    fn tree(found: &[&str], skipped: &[&str]) -> Tree {
+        Tree {
+            found: found.iter().map(PathBuf::from).collect(),
+            skipped: skipped.iter().map(PathBuf::from).collect(),
+        }
+    }
+
+    #[test]
+    fn nothing_under_a_directory_the_first_walk_skipped_counts_as_written() {
+        // `locked` couldn't be read before create and could after (its
+        // mode changed between the walks): what it held then is unknown,
+        // so nothing under it may be taken for create's.
+        let before = tree(&["locked", "notes.txt"], &["locked"]);
+        let after = tree(
+            &[
+                "locked",
+                "locked/old.key",
+                "notes.txt",
+                "fleet.json",
+                "secrets",
+                "secrets/master.key",
+            ],
+            &[],
+        );
+        assert_eq!(
+            written_between(&before, &after),
+            [
+                PathBuf::from("fleet.json"),
+                PathBuf::from("secrets"),
+                PathBuf::from("secrets/master.key")
+            ]
+        );
+        // Skipped by the second walk only: likewise kept.
+        let before = tree(&["notes.txt"], &[]);
+        let after = tree(&["late", "late/x", "notes.txt"], &["late"]);
+        assert_eq!(written_between(&before, &after), [PathBuf::from("late")]);
+    }
+
+    #[test]
+    fn an_unreadable_secrets_directory_keeps_its_old_files_and_the_refusal_says_what_it_left() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = dir.path().join("secrets");
+        std::fs::create_dir(&secrets).unwrap();
+        std::fs::write(secrets.join("old.key"), b"an older key").unwrap();
+        // Writable and searchable, not listable: create writes master.key
+        // into it but can't list it, before or after, so the refusal leaves
+        // the new key there and says so.
+        std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o300)).unwrap();
+        let keys = tempfile::tempdir().unwrap();
+
+        let before = written_tree(dir.path()).unwrap();
+        let refused = create_confirmed(&options_keeping_keys_in(dir.path(), keys.path()), || {
+            ctrl_d(&secrets)
+        });
+        std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            matches!(refused, Err(RelishError::BackupNotConfirmed { .. })),
+            "{refused:?}"
+        );
+        assert_eq!(
+            std::fs::read(secrets.join("old.key")).unwrap(),
+            b"an older key"
+        );
+
+        // As root the walk reads it and nothing is skipped; otherwise the
+        // refusal names it as unchecked.
+        if before.skipped.is_empty() {
+            return;
+        }
+        let warning = unchecked_warning(dir.path(), &before.skipped).unwrap();
+        assert!(
+            warning.contains(&secrets.display().to_string()),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("may still hold files cluster create wrote"),
+            "{warning}"
+        );
+    }
+
+    #[test]
+    fn nothing_skipped_means_no_warning() {
+        assert_eq!(unchecked_warning(Path::new("/x"), &BTreeSet::new()), None);
     }
 
     #[test]
