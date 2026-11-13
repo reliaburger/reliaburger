@@ -300,6 +300,18 @@ jobs:
           ls -l "$RUNNER_TEMP/broken"
           echo "### Broken version for the fallback test: $broken" >> "$GITHUB_STEP_SUMMARY"
 
+      - name: No SSH server in a published image
+        # bun is the only way in (#401). The manifest lists what was really
+        # installed, dependencies included, so a published build fails here
+        # if anything brought an SSH server. A lab build must have the lab
+        # profile's openssh-server, which proves the check sees one.
+        run: |
+          set -euo pipefail
+          lab=()
+          [ "$PUBLISH" = true ] || lab=(--lab)
+          python3 image/tests/no_ssh_server.py manifest "${lab[@]}" \
+            "image/mkosi.output/reliaburger-os_$IMAGE_VERSION.manifest"
+
       - name: Record sizes
         run: |
           set -euo pipefail
