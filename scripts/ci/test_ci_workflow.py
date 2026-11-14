@@ -752,6 +752,53 @@ class S3Tests(unittest.TestCase):
             self.assertNotIn(name, self.job)
 
 
+class LinuxNextTests(unittest.TestCase):
+    """The Ubuntu 26.04 privileged job leaves evidence when it runs long
+    (#1943). Its timeouts kept no log: the runner never ran the cancellation,
+    so the test step stayed in progress and no post step ran."""
+
+    def setUp(self):
+        self.job = jobs((WORKFLOWS / "ci.yml").read_text())["linux-next"]
+        self.steps = steps(self.job)
+
+    def step(self, text):
+        found = [index for index, step in enumerate(self.steps) if text in step]
+        self.assertEqual(len(found), 1, text)
+        return found[0]
+
+    def minutes(self, text):
+        return int(re.search(r"(?m)^\s+timeout-minutes: (\d+)$", text).group(1))
+
+    def test_the_test_step_fails_inside_the_job_limit_with_room_for_the_evidence(self):
+        tests = self.step("make test-linux")
+        job = self.minutes(self.job.split("\n    steps:", 1)[0])
+        step = self.minutes(self.steps[tests])
+        # Successful runs took 22 to 31 minutes on 13-14 Nov 2026.
+        self.assertGreaterEqual(step, 40)
+        self.assertGreaterEqual(job - step, 6)
+
+    def test_the_tests_write_junit_and_a_log_that_are_kept_whatever_happens(self):
+        tests = self.steps[self.step("make test-linux")]
+        self.assertIn("NEXTEST_PROFILE=ci", tests)
+        self.assertIn("set -o pipefail", tests)
+        self.assertIn('| tee "$RUNNER_TEMP/linux-next-tests.log"', tests)
+        keep = self.step("name: linux-next-evidence")
+        self.assertGreater(keep, self.step("make test-linux"))
+        self.assertIn("if: always()", self.steps[keep])
+        for path in ("target/nextest/ci/junit.xml", "linux-next-tests.log", "linux-next-resources.log"):
+            self.assertIn(path, self.steps[keep])
+
+    def test_headroom_is_watched_from_before_the_tests_and_reported_after_them(self):
+        watch = self.step('> "$RUNNER_TEMP/linux-next-resources.log"')
+        report = self.step('kill "$(cat "$RUNNER_TEMP/linux-next-resources.pid")"')
+        tests = self.step("make test-linux")
+        self.assertLess(watch, tests)
+        self.assertGreater(report, tests)
+        self.assertIn("if: always()", self.steps[report])
+        # On a failed or timed-out step, the stuck processes' kernel stacks.
+        self.assertIn("/stack", self.steps[report])
+
+
 class ArtifactDownloadTests(unittest.TestCase):
     """A stalled artefact download fails fast and is retried once (#977).
 

@@ -59,32 +59,83 @@ mod tests {
 
     /// Each production line under `src/{dir}` that contains `call`, as
     /// `path:line: code`, unless the line before contains `explained_by`.
-    /// A file's inline test module is skipped.
     fn calls_in(dir: &str, call: &str, explained_by: Option<&str>) -> Vec<String> {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut sources = Vec::new();
         production_sources(&manifest.join("src").join(dir), &mut sources);
         let mut found = Vec::new();
         for path in sources {
-            let source = std::fs::read_to_string(&path).unwrap();
-            let lines: Vec<&str> = source.lines().collect();
-            for (index, line) in lines.iter().enumerate() {
-                let test_module = line.trim() == "#[cfg(test)]"
-                    && lines
-                        .get(index + 1)
-                        .is_some_and(|next| next.trim_start().starts_with("mod "));
-                if test_module {
-                    break;
-                }
-                let explained = index > 0
-                    && explained_by.is_some_and(|marker| lines[index - 1].contains(marker));
-                if line.contains(call) && !explained {
-                    let path = path.strip_prefix(manifest).unwrap_or(&path);
-                    found.push(format!("{}:{}: {}", path.display(), index + 1, line.trim()));
-                }
+            let shown = path.strip_prefix(manifest).unwrap_or(&path);
+            found.extend(calls_in_file(&path, shown, call, explained_by));
+        }
+        found
+    }
+
+    /// [`calls_in`] for one file, named `shown` in what it returns. The
+    /// scan stops at the file's inline test module, `#[cfg(test)]` and then
+    /// `mod name {`. A `mod name;` after `#[cfg(test)]` is a test module in
+    /// another file, and the production code after it is still scanned.
+    fn calls_in_file(
+        path: &std::path::Path,
+        shown: &std::path::Path,
+        call: &str,
+        explained_by: Option<&str>,
+    ) -> Vec<String> {
+        let source = std::fs::read_to_string(path).unwrap();
+        let lines: Vec<&str> = source.lines().collect();
+        let mut found = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            let test_module = line.trim() == "#[cfg(test)]"
+                && lines.get(index + 1).is_some_and(|next| {
+                    let next = next.trim();
+                    next.starts_with("mod ") && next.ends_with('{')
+                });
+            if test_module {
+                break;
+            }
+            let explained =
+                index > 0 && explained_by.is_some_and(|marker| lines[index - 1].contains(marker));
+            if line.contains(call) && !explained {
+                found.push(format!(
+                    "{}:{}: {}",
+                    shown.display(),
+                    index + 1,
+                    line.trim()
+                ));
             }
         }
         found
+    }
+
+    #[test]
+    fn the_scan_reads_past_an_out_of_line_test_module_and_stops_at_an_inline_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("handler.rs");
+        std::fs::write(
+            &path,
+            "fn a(c: &C) -> bool { c.is_leader() }\n\
+             #[cfg(test)]\n\
+             mod tests;\n\
+             fn b(c: &C) -> bool { c.is_leader() }\n\
+             #[cfg(test)]\n\
+             mod inline {\n\
+             fn c(c: &C) -> bool { c.is_leader() }\n\
+             }\n",
+        )
+        .unwrap();
+        let found = calls_in_file(
+            &path,
+            std::path::Path::new("handler.rs"),
+            ".is_leader()",
+            None,
+        );
+        assert_eq!(
+            found,
+            [
+                "handler.rs:1: fn a(c: &C) -> bool { c.is_leader() }",
+                "handler.rs:4: fn b(c: &C) -> bool { c.is_leader() }",
+            ]
+        );
     }
 
     /// No request handler in `src/bun/` decides with a single round: not
@@ -108,10 +159,11 @@ mod tests {
     const SINGLE_ROUND_READS_ALLOWED: &[(&str, usize, &str)] = &[
         (
             "src/council/node.rs",
-            3,
-            "is_leader, security_state_linearizable and \
-             desired_state_linearizable: the one-round reads themselves, which \
-             confirm_leadership and security_state_confirmed build on",
+            5,
+            "defines security_state_linearizable and desired_state_linearizable, \
+             and makes the three ensure_linearizable rounds: in is_leader, which \
+             confirm_leadership and security_state_confirmed build on, and in \
+             those two reads",
         ),
         (
             "src/council/backup.rs",
@@ -128,7 +180,7 @@ mod tests {
     /// many as it says.
     #[test]
     fn request_paths_confirm_leadership_before_a_linearizable_read() {
-        let found = calls_in("", "_linearizable()", None);
+        let found = calls_in("", "_linearizable(", None);
         let mut wrong = Vec::new();
         for call in &found {
             if !SINGLE_ROUND_READS_ALLOWED
