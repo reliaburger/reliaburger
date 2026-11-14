@@ -72,7 +72,7 @@ async fn issue_join_bundle(
 
     // Confirm the identity still has authority after consuming the token.
     let security_state = council
-        .security_state_linearizable()
+        .security_state_confirmed(crate::council::LEADER_CONFIRMATION)
         .await
         .map_err(|error| security_error(error.to_string()))?;
     let join_result = crate::sesame::join::sign_join_csr(

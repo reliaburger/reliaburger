@@ -22,6 +22,12 @@ use super::types::{
 };
 use crate::sesame::types::{CaRole, SerialNumber, SpiffeUri};
 
+/// How long a leader gets to prove it leads before a request it serves
+/// gives up: [`CouncilNode::confirm_leadership`]'s `within` on request
+/// paths. One heartbeat round isn't enough, since on a loaded host a
+/// settled leader's followers can answer it late (#1009, #1393, #1937).
+pub const LEADER_CONFIRMATION: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// How often [`CouncilNode::applied_api_token`] looks at the replica again.
 const API_TOKEN_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
@@ -901,7 +907,7 @@ impl CouncilNode {
         // serving this from stale local state would mint certificates against
         // a CA or CRL the cluster has already moved past, so the read has to
         // prove it's current or fail.
-        let security_state = self.security_state_linearizable().await?;
+        let security_state = self.security_state_confirmed(LEADER_CONFIRMATION).await?;
 
         // Get Workload CA
         let workload_ca = security_state
