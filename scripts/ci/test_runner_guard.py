@@ -74,7 +74,19 @@ class ProtectRunnerTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("could not protect Runner.Worker (pid 102)", result.stdout)
             self.assertIn("no Runner.Listener process found", result.stdout)
-            self.assertIn("no provjobd process found", result.stdout)
+            self.assertNotIn("no provjobd process found", result.stdout)
+
+    def test_a_missing_provjobd_is_expected_and_the_process_list_is_printed_once(self):
+        # Ubuntu 26.04 runners have no provjobd (#1948's run); the list says
+        # what their helpers are called instead.
+        with tempfile.TemporaryDirectory() as directory:
+            host = FakeHost(directory)
+            host.process(102, "Runner.Worker")
+            host.write_tool("ps", 'echo "ps $*"\n')
+            result = host.run(PROTECT, str(host.root / "runner-pids"))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("info: no provjobd process; Ubuntu 26.04 runners have none", result.stdout)
+            self.assertEqual(result.stdout.count("ps -eo pid,comm,args"), 1, result.stdout)
 
     def test_it_refuses_to_run_without_a_pid_file(self):
         result = subprocess.run([str(PROTECT)], capture_output=True, text=True)

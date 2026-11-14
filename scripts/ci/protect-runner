@@ -35,8 +35,16 @@ for name in Runner.Listener Runner.Worker provjobd; do
             echo "could not protect $name (pid $pid)"
         fi
     done
-    if [ "$found" = no ]; then
+    if [ "$found" = yes ]; then
+        continue
+    fi
+    if [ "$name" = provjobd ]; then
+        echo "info: no provjobd process; Ubuntu 26.04 runners have none"
+    else
         echo "no $name process found"
     fi
 done
+# What the runner's helper processes are called on this image (#1943).
+echo "Processes on this runner:"
+ps -eo pid,comm,args || true
 exit 0

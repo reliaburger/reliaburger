@@ -835,6 +835,14 @@ class LinuxNextTests(unittest.TestCase):
         self.assertIn("dmesg -T", report)
         self.assertIn("'oom|killed process'", report)
 
+    def test_no_sort_takes_an_attached_equals_separator(self):
+        # 26.04's Rust `sort` reads `-t=` as an empty separator and fails
+        # ("separator must be exactly one character long").
+        text = (WORKFLOWS / "ci.yml").read_text()
+        self.assertNotIn("sort -t=", text)
+        self.assertIn("sort -t '=' -k2 -n", self.job)
+        self.assertIn("sort -t '=' -k3 -n", self.job)
+
 
 class ArtifactDownloadTests(unittest.TestCase):
     """A stalled artefact download fails fast and is retried once (#977).

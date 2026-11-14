@@ -423,8 +423,8 @@ jobs:
         run: |
           kill "$(cat "$RUNNER_TEMP/oci-resources.pid")" 2>/dev/null || true
           echo "Lowest free disk and memory while the OCI interruptions ran:"
-          sort -t= -k2 -n "$RUNNER_TEMP/oci-resources.log" | head -1 || true
-          sort -t= -k3 -n "$RUNNER_TEMP/oci-resources.log" | head -1 || true
+          sort -t '=' -k2 -n "$RUNNER_TEMP/oci-resources.log" | head -1 || true
+          sort -t '=' -k3 -n "$RUNNER_TEMP/oci-resources.log" | head -1 || true
           if [ "${{ steps.oci_interruptions.outcome }}" != success ]; then
             ps -eo pid,ppid,pgid,stat,wchan:32,etime,args --forest || true
             # Kernel stacks of every uninterruptible task, and of every thread
@@ -547,8 +547,8 @@ jobs:
         run: |
           kill "$(cat "$RUNNER_TEMP/linux-next-resources.pid")" 2>/dev/null || true
           echo "Lowest free disk and memory while the privileged tests ran:"
-          grep ' disk_kb=' "$RUNNER_TEMP/linux-next-resources.log" | sort -t= -k2 -n | head -1 || true
-          grep ' disk_kb=' "$RUNNER_TEMP/linux-next-resources.log" | sort -t= -k3 -n | head -1 || true
+          grep ' disk_kb=' "$RUNNER_TEMP/linux-next-resources.log" | sort -t '=' -k2 -n | head -1 || true
+          grep ' disk_kb=' "$RUNNER_TEMP/linux-next-resources.log" | sort -t '=' -k3 -n | head -1 || true
           echo "Kernel OOM lines:"
           sudo dmesg -T | grep -iE 'oom|killed process' || echo "none"
           if [ "${{ steps.linux_next_tests.outcome }}" != success ]; then
