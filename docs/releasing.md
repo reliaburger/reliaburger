@@ -1577,7 +1577,12 @@ the real `curl … | sh` install against it on every host we advertise.
    and `unattended-upgrades` in the guests before it configures them, and
    refuses to start unless each guest shows them inactive: in the first
    0.2.8 memory run the daily unattended upgrade restarted Bun on all three
-   nodes at hour 16.7.
+   nodes at hour 16.7. It only asks the services to stop
+   (`systemctl stop --no-block`), because stopping `unattended-upgrades`
+   waits for an upgrade in progress, and never kills one. Before the
+   baseline it waits up to 30 minutes for every unit to be inactive, failed
+   or unknown (an `activating` oneshot is an upgrade still running), records
+   how long it waited, and fails at the deadline.
 
    ```sh
    scripts/release/qualify-jobs-sustained.sh --tier day \

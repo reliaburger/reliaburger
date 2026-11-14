@@ -2528,41 +2528,98 @@ class MallocPoints(Evidence):
         self.assertEqual([line.split(" ")[0] for line in lines[:3]], ["1", "2", "3"])
         for line in lines[:3]:
             self.assertIn("systemctl disable --now apt-daily.timer apt-daily-upgrade.timer", line)
+            self.assertIn("systemctl disable unattended-upgrades.service", line)
+            # gsh gives a call 120 s, and stopping unattended-upgrades waits for
+            # an upgrade in progress (TimeoutStopSec up to 30 min on 24.04): the
+            # services are only asked to stop; verify_guest_upgrades_off waits.
+            self.assertIn("systemctl stop --no-block apt-daily.service apt-daily-upgrade.service "
+                          "unattended-upgrades.service", line)
+            self.assertNotRegex(line, r"systemctl (stop|disable --now)(?! --no-block)[^;]*\.service")
+            self.assertNotRegex(line, r"\bkill\b")
         self.assertIn("unattended upgrades can't restart Bun", lines[3])
         # Every tier, before the nodes are resized or configured.
         start = script[script.index("    start_run\n"):]
         self.assertLess(start.index("stop_guest_upgrades"), start.index("configure_nodes"))
         self.assertLess(start.index("stop_guest_upgrades"), start.index("resize_nodes"))
 
-    def verify_upgrades(self, answer):
+    QUIET = ["apt-daily.timer inactive disabled", "apt-daily-upgrade.timer inactive disabled",
+             "apt-daily.service inactive static", "apt-daily-upgrade.service inactive static",
+             "unattended-upgrades.service inactive disabled"]
+
+    def verify_upgrades(self, answers, wait=60):
+        """Run verify_guest_upgrades_off against ANSWERS: for each node, the
+        unit lines its successive checks see (the last one repeats)."""
         import subprocess
         script = (Path(__file__).parent / "qualify-sustained.sh").read_text()
         function = script[script.index("verify_guest_upgrades_off() {"):]
         function = function[:function.index("\n}\n") + 3]
+        folder = Path(tempfile.mkdtemp(dir=self.temp.name))
+        for node, sequence in answers.items():
+            for index, lines in enumerate(sequence, 1):
+                (folder / f"answer-{node}-{index}").write_text("\n".join(lines) + "\n")
         notes = Path(self.temp.name) / "notes.txt"
-        stubs = (f"evidence={self.evidence}\nmkdir -p $evidence/snapshots\nvm=([1]=a [2]=b [3]=c)\n"
-                 f"gsh() {{ printf '%s\\n' {answer}; }}\nmeta() {{ echo \"meta $*\" >> {notes}; }}\n"
-                 "setup_fail() { echo \"failed: $*\"; exit 9; }\n")
+        stubs = f"""
+evidence={self.evidence}
+mkdir -p $evidence/snapshots
+vm=([1]=a [2]=b [3]=c)
+upgrade_wait_secs={wait}
+upgrade_poll_secs=0
+gsh() {{
+    local count=$(( $(cat {folder}/count-$1 2>/dev/null || echo 0) + 1 ))
+    echo $count > {folder}/count-$1
+    local file={folder}/answer-$1-$count
+    [ -f "$file" ] || file=$(ls {folder}/answer-$1-* | sort -t- -k3 -n | tail -n 1)
+    cat "$file"
+}}
+meta() {{ echo "meta $*" >> {notes}; }}
+setup_fail() {{ echo "failed: $*"; exit 9; }}
+"""
         result = subprocess.run(["bash", "-c", stubs + function + "verify_guest_upgrades_off"],
-                                stdout=subprocess.PIPE, text=True, timeout=30)
-        return result, notes.read_text() if notes.exists() else ""
+                                stdout=subprocess.PIPE, text=True, timeout=60)
+        checks = {node: int((folder / f"count-{node}").read_text()) for node in answers
+                  if (folder / f"count-{node}").exists()}
+        return result, notes.read_text() if notes.exists() else "", checks
 
     def test_the_soak_starts_only_once_every_guest_shows_upgrades_off(self):
-        quiet = ("'apt-daily.timer inactive disabled' 'apt-daily-upgrade.timer inactive disabled' "
-                 "'apt-daily.service inactive static' 'apt-daily-upgrade.service inactive static' "
-                 "'unattended-upgrades.service inactive enabled'")
-        result, notes = self.verify_upgrades(quiet)
+        result, notes, _ = self.verify_upgrades({node: [self.QUIET] for node in (1, 2, 3)})
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn("verified inactive on every node", notes)
+        self.assertIn("after waiting 0 s", notes)
         self.assertTrue((self.evidence / "snapshots" / "upgrades-verified-1.txt").exists())
-        busy = quiet.replace("'apt-daily-upgrade.timer inactive disabled'", "'apt-daily-upgrade.timer active enabled'")
-        result, _ = self.verify_upgrades(busy)
-        self.assertEqual(result.returncode, 9)
-        self.assertIn("apt-daily-upgrade.timer active enabled", result.stdout)
         script = (Path(__file__).parent / "qualify-sustained.sh").read_text()
         start = script[script.index("    start_run\n"):]
         self.assertLess(start.index("install_gdb"), start.index("verify_guest_upgrades_off"))
         self.assertLess(start.index("verify_guest_upgrades_off"), start.index("apply_workloads"))
+
+    def test_only_inactive_failed_or_unknown_units_count_as_off(self):
+        # A oneshot apt-daily-upgrade.service mid-upgrade is `activating`, and
+        # one being stopped is `deactivating`: neither is off.
+        for busy in ("apt-daily-upgrade.service activating static", "apt-daily-upgrade.service deactivating static",
+                     "apt-daily-upgrade.service active static", "apt-daily-upgrade.service reloading static",
+                     "apt-daily-upgrade.timer inactive enabled"):
+            lines = [busy if line.split()[0] == busy.split()[0] else line for line in self.QUIET]
+            result, _, _ = self.verify_upgrades({1: [self.QUIET], 2: [lines], 3: [self.QUIET]}, wait=0)
+            self.assertEqual(result.returncode, 9, busy)
+            self.assertIn(busy, result.stdout)
+        for off in ("apt-daily-upgrade.service failed static", "apt-daily-upgrade.service unknown static"):
+            lines = [off if line.split()[0] == off.split()[0] else line for line in self.QUIET]
+            result, _, _ = self.verify_upgrades({1: [self.QUIET], 2: [lines], 3: [self.QUIET]}, wait=0)
+            self.assertEqual(result.returncode, 0, off)
+
+    def test_an_upgrade_in_progress_is_waited_for_then_recorded(self):
+        upgrading = [line.replace("apt-daily-upgrade.service inactive", "apt-daily-upgrade.service activating")
+                     .replace("unattended-upgrades.service inactive", "unattended-upgrades.service deactivating")
+                     for line in self.QUIET]
+        result, notes, checks = self.verify_upgrades(
+            {1: [self.QUIET], 2: [upgrading, upgrading, self.QUIET], 3: [self.QUIET]})
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(checks[2], 3)
+        self.assertRegex(notes, r"after waiting \d+ s")
+        # At the deadline it fails closed, saying what was still running.
+        result, _, _ = self.verify_upgrades({1: [self.QUIET], 2: [upgrading], 3: [self.QUIET]}, wait=0)
+        self.assertEqual(result.returncode, 9)
+        self.assertIn("still active", result.stdout)
+        self.assertIn("apt-daily-upgrade.service activating", result.stdout)
 
     def test_the_plan_names_the_malloc_points_and_the_log_ab(self):
         import subprocess

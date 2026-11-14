@@ -841,25 +841,46 @@ stop_guest_upgrades() {
     local node
     for node in 1 2 3; do
         # Disabled, not only stopped: the day tier's resize restarts the VMs.
-        gsh "$node" 'systemctl disable --now apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service; systemctl stop apt-daily.service apt-daily-upgrade.service' \
+        # Only the timers stop here. Stopping unattended-upgrades waits for an
+        # upgrade in progress (TimeoutStopSec up to 30 minutes on 24.04), far
+        # past gsh's 120 s, so the services are only asked to stop and
+        # verify_guest_upgrades_off waits for them. An upgrade is never killed.
+        gsh "$node" 'systemctl disable --now apt-daily.timer apt-daily-upgrade.timer; systemctl disable unattended-upgrades.service; systemctl stop --no-block apt-daily.service apt-daily-upgrade.service unattended-upgrades.service' \
             > "$evidence/snapshots/upgrades-$node.log" 2>&1 || setup_fail "could not stop unattended upgrades on ${vm[node]}"
     done
     meta deviations+ "Ubuntu's apt-daily and apt-daily-upgrade timers stopped and disabled in each guest, so unattended upgrades can't restart Bun during the soak (#1417)"
 }
 
 # Just before the baseline, after anything that ran apt: every guest must
-# show its upgrade timers and services inactive, and the timers not enabled.
+# show its upgrade timers and services off (inactive, failed or unknown;
+# `activating` is a oneshot upgrade still running) and the timers not
+# enabled. An upgrade in progress is waited for, up to upgrade_wait_secs;
+# then the run fails closed rather than start with one running.
+upgrade_wait_secs=1800
+upgrade_poll_secs=15
 verify_guest_upgrades_off() {
-    local node file
-    for node in 1 2 3; do
-        file=$evidence/snapshots/upgrades-verified-$node.txt
-        gsh "$node" 'for unit in apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service unattended-upgrades.service; do echo "$unit $(systemctl is-active "$unit") $(systemctl is-enabled "$unit" 2>/dev/null)"; done' \
-            > "$file" 2>&1 || setup_fail "could not read the upgrade units on ${vm[node]}"
-        if grep -E ' active( |$)|\.timer [a-z]+ enabled' "$file" > /dev/null; then
-            setup_fail "unattended upgrades still active on ${vm[node]}: $(tr '\n' ';' < "$file")"
-        fi
+    local node file unit state enabled busy started deadline waiting
+    started=$(date +%s)
+    deadline=$(( started + upgrade_wait_secs ))
+    while :; do
+        waiting=
+        for node in 1 2 3; do
+            file=$evidence/snapshots/upgrades-verified-$node.txt
+            gsh "$node" 'for unit in apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service unattended-upgrades.service; do echo "$unit $(systemctl is-active "$unit") $(systemctl is-enabled "$unit" 2>/dev/null)"; done' \
+                > "$file" 2>&1 || setup_fail "could not read the upgrade units on ${vm[node]}"
+            busy=
+            while read -r unit state enabled; do
+                case $state in inactive|failed|unknown) ;; *) busy+="$unit $state ${enabled:-};" ;; esac
+                case $unit in *.timer) [ "$enabled" != enabled ] || busy+="$unit $state $enabled;" ;; esac
+            done < "$file"
+            [ -z "$busy" ] || waiting+="${vm[node]}: $busy "
+        done
+        [ -n "$waiting" ] || break
+        [ "$(date +%s)" -lt "$deadline" ] \
+            || setup_fail "unattended upgrades still active after $(( $(date +%s) - started )) s: $waiting"
+        sleep "$upgrade_poll_secs"
     done
-    meta deviations+ "apt-daily, apt-daily-upgrade and unattended-upgrades verified inactive on every node before the baseline (snapshots/upgrades-verified-N.txt)"
+    meta deviations+ "apt-daily, apt-daily-upgrade and unattended-upgrades verified inactive on every node before the baseline, after waiting $(( $(date +%s) - started )) s for any upgrade in progress (snapshots/upgrades-verified-N.txt)"
 }
 
 # The malloc points (#1417) call glibc functions inside Bun through gdb,
