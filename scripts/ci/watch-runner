@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Watch the runner while the privileged tests run (#800, #1943).
+#
+# Every few seconds, one line: free disk and memory, load, and whether each
+# runner process protect-runner recorded is still alive. Then any kernel log
+# lines about the OOM killer that weren't printed before, prefixed "kernel: ".
+# The resource lines keep the `disk_kb=... mem_kb=... load=...` order the
+# report step sorts on.
+#
+# OOM lines also appear on green runs: the tests kill their own memcg-limited
+# workloads on purpose. Only a killed `Runner.` process or `runners=...:gone`
+# means the runner died.
+#
+# Usage: watch-runner PIDFILE
+# WATCH_INTERVAL (seconds, default 5), WATCH_ROUNDS (default 0, forever) and
+# PROC_ROOT (standing in for /proc) exist for the tests.
+set -uo pipefail
+if [ $# -ne 1 ]; then
+    echo "usage: watch-runner PIDFILE" >&2
+    exit 2
+fi
+pidfile=$1
+proc=${PROC_ROOT:-/proc}
+interval=${WATCH_INTERVAL:-5}
+rounds=${WATCH_ROUNDS:-0}
+seen=0
+round=0
+while :; do
+    runners=""
+    while read -r name pid; do
+        [ -n "$name" ] || continue
+        if [ -d "$proc/$pid" ]; then state=up; else state=gone; fi
+        runners="$runners${runners:+,}$name:$pid:$state"
+    done < <(cat "$pidfile" 2>/dev/null)
+    disk=$(df -k --output=avail / 2>/dev/null | tail -1 | tr -d " ")
+    memory=$(awk '/^MemAvailable/ {print $2}' "$proc/meminfo" 2>/dev/null)
+    load=$(cut -d" " -f1 "$proc/loadavg" 2>/dev/null)
+    echo "$(date -u +%T) disk_kb=$disk mem_kb=$memory load=$load runners=${runners:-none}"
+
+    # The kernel log needs root on Ubuntu (kernel.dmesg_restrict).
+    hits=$(sudo -n dmesg -T 2>/dev/null | grep -iE 'oom|killed process')
+    count=$(printf '%s' "$hits" | grep -c '')
+    if [ "$count" -lt "$seen" ]; then
+        # The ring buffer wrapped: print what's there again.
+        seen=0
+    fi
+    if [ "$count" -gt "$seen" ]; then
+        printf '%s\n' "$hits" | tail -n +"$((seen + 1))" | sed 's/^/kernel: /'
+        seen=$count
+    fi
+
+    round=$((round + 1))
+    if [ "$rounds" -gt 0 ] && [ "$round" -ge "$rounds" ]; then
+        break
+    fi
+    sleep "$interval"
+done
