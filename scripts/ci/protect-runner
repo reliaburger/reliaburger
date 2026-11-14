@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Keep the GitHub runner's own processes out of the OOM killer's reach (#1943).
+#
+# The Ubuntu 26.04 privileged job died nine times in two days with its test
+# step still "in progress", no post step run and no log kept: the runner
+# itself stopped. An OOM kill of Runner.Worker, global or in the runner
+# service's cgroup, does exactly that. oom_score_adj -1000 exempts a process.
+# Best effort: a process this can't find or protect is logged, never fatal.
+#
+# Children inherit oom_score_adj, so every later step the worker starts runs
+# at -1000 too. Start anything big, such as the tests, under `choom -n 0` to
+# hand it back to the OOM killer.
+#
+# Usage: protect-runner PIDFILE
+# Writes one "NAME PID" line per process to PIDFILE, for watch-runner.
+# PROC_ROOT stands in for /proc in the tests.
+set -uo pipefail
+if [ $# -ne 1 ]; then
+    echo "usage: protect-runner PIDFILE" >&2
+    exit 2
+fi
+pidfile=$1
+proc=${PROC_ROOT:-/proc}
+: > "$pidfile"
+for name in Runner.Listener Runner.Worker provjobd; do
+    found=no
+    for comm in "$proc"/[0-9]*/comm; do
+        [ "$(cat "$comm" 2>/dev/null)" = "$name" ] || continue
+        found=yes
+        pid=$(basename "$(dirname "$comm")")
+        echo "$name $pid" >> "$pidfile"
+        if echo -1000 | sudo tee "$proc/$pid/oom_score_adj" > /dev/null; then
+            echo "protected $name (pid $pid): oom_score_adj $(cat "$proc/$pid/oom_score_adj" 2>/dev/null)"
+        else
+            echo "could not protect $name (pid $pid)"
+        fi
+    done
+    if [ "$found" = no ]; then
+        echo "no $name process found"
+    fi
+done
+exit 0

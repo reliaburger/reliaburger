@@ -504,12 +504,20 @@ jobs:
           key: test-images-${{ runner.arch }}-${{ hashFiles('tests/fixtures/pinned-images.txt') }}
       - name: Warm the pinned test images
         run: make test-images TEST_IMAGE_CACHE="$RUNNER_TEMP/test-images"
+      - name: Shield the runner from the OOM killer
+        # Nine times in two days this job ended at its limit with the test
+        # step "in progress" and no post step run, while the 24.04 job's
+        # same tests never did: the runner itself stopped (#1943). An OOM
+        # kill of Runner.Worker would do that. -1000 exempts the runner's
+        # processes; the tests below take back the default with `choom`.
+        run: scripts/ci/protect-runner "$RUNNER_TEMP/runner-pids"
       - name: Watch disk and memory during the privileged tests
         # As the `linux` job does for the OCI interruptions (#800): the
         # headroom every 5 s, so a run that ends badly shows whether the
-        # runner was short of memory or disk (#1943).
+        # runner was short of memory or disk, plus whether the runner's
+        # processes still live and any kernel OOM lines (#1943).
         run: |
-          nohup bash -c 'while :; do echo "$(date -u +%T) disk_kb=$(df -k --output=avail / | tail -1 | tr -d " ") mem_kb=$(awk "/^MemAvailable/ {print \$2}" /proc/meminfo) load=$(cut -d" " -f1 /proc/loadavg)"; sleep 5; done' > "$RUNNER_TEMP/linux-next-resources.log" 2>&1 < /dev/null &
+          nohup scripts/ci/watch-runner "$RUNNER_TEMP/runner-pids" > "$RUNNER_TEMP/linux-next-resources.log" 2>&1 < /dev/null &
           echo $! > "$RUNNER_TEMP/linux-next-resources.pid"
       - name: Run the provisioned Linux tests as root
         id: linux_next_tests
@@ -517,10 +525,21 @@ jobs:
         # (the `ci` profile, as `default`). This limit catches the rest, a
         # build or a nextest that stops making progress, while the runner
         # can still report it. The `ci` profile writes JUnit (#1943).
+        #
+        # The tests run as root in a transient systemd scope and a session
+        # of their own, out of the runner service's cgroup and process
+        # group, so nothing they do to either reaches the runner. Every
+        # cgroup they make is an absolute path under /sys/fs/cgroup, so the
+        # scope they start in doesn't matter to them. `choom` undoes the
+        # -1000 they inherit from Runner.Worker. The runner can't signal a
+        # root tree in another session, so `timeout` ends the tests inside
+        # this step's limit instead.
         timeout-minutes: 42
         run: |
           set -o pipefail
-          scripts/ci/as-root make test-linux NEXTEST_PROFILE=ci TEST_IMAGE_CACHE="$RUNNER_TEMP/test-images" 2>&1 \
+          scripts/ci/as-root systemd-run --scope --quiet -p Delegate=yes \
+            setsid --wait choom -n 0 -- timeout --kill-after=1m 40m \
+            make test-linux NEXTEST_PROFILE=ci TEST_IMAGE_CACHE="$RUNNER_TEMP/test-images" 2>&1 \
             | tee "$RUNNER_TEMP/linux-next-tests.log"
       - name: Report the privileged tests' headroom and leftovers
         if: always()
@@ -528,8 +547,10 @@ jobs:
         run: |
           kill "$(cat "$RUNNER_TEMP/linux-next-resources.pid")" 2>/dev/null || true
           echo "Lowest free disk and memory while the privileged tests ran:"
-          sort -t= -k2 -n "$RUNNER_TEMP/linux-next-resources.log" | head -1 || true
-          sort -t= -k3 -n "$RUNNER_TEMP/linux-next-resources.log" | head -1 || true
+          grep ' disk_kb=' "$RUNNER_TEMP/linux-next-resources.log" | sort -t= -k2 -n | head -1 || true
+          grep ' disk_kb=' "$RUNNER_TEMP/linux-next-resources.log" | sort -t= -k3 -n | head -1 || true
+          echo "Kernel OOM lines:"
+          sudo dmesg -T | grep -iE 'oom|killed process' || echo "none"
           if [ "${{ steps.linux_next_tests.outcome }}" != success ]; then
             ps -eo pid,ppid,pgid,stat,wchan:32,etime,args --forest || true
             # Kernel stacks of every uninterruptible task, and of every thread
