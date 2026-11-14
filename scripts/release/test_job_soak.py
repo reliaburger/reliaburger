@@ -719,8 +719,8 @@ class DayLoad(unittest.TestCase):
 
 
 
-def outcome(run, status="Succeeded", succeeded=1, failed=0, not_run=0):
-    return dict(run=run, started_at_epoch_secs=1000, finished_at_epoch_secs=1010, status=status,
+def outcome(run, status="Succeeded", succeeded=1, failed=0, not_run=0, started=1000):
+    return dict(run=run, started_at_epoch_secs=started, finished_at_epoch_secs=started+10, status=status,
                 succeeded=succeeded, failed=failed, not_run=not_run)
 
 
@@ -737,8 +737,27 @@ class NamedFixtures(unittest.TestCase):
     history of their last 10 outcomes (#1935)."""
 
     def state(self):
-        return {"coverage": {mode: {} for mode in jobs.MODES}, "discovered": {},
+        # The outcomes start at 1000 by default: this campaign's.
+        return {"started": 900, "coverage": {mode: {} for mode in jobs.MODES}, "discovered": {},
                 "progress": {mode: {} for mode in jobs.MODES}}
+
+    def test_an_earlier_campaigns_outcome_neither_credits_nor_fails_a_hook(self):
+        # Definitions keep their history across re-applies, so a cluster
+        # adopted with --home still holds the last campaign's hook runs.
+        state = self.state()
+        state["started"] = 100_000
+        earlier = 100_000 - jobs.HOOK_HISTORY_SKEW - 1
+        jobs.named_fixture_coverage([], [
+            definition("soak-job-hook-process", [outcome(41, started=earlier)]),
+            definition("soak-job-hook-runc", [outcome(42, "Failed", succeeded=0, failed=1, started=earlier)])], state)
+        self.assertNotIn("hook", state["coverage"]["process"])
+        self.assertNotIn("hook", state["coverage"]["runc"])
+        # Within the clock-skew allowance it is this campaign's.
+        jobs.named_fixture_coverage([], [definition("soak-job-hook-process", [outcome(43, started=earlier + 1)])], state)
+        self.assertTrue(state["coverage"]["process"]["hook"])
+        with self.assertRaisesRegex(jobs.InvalidEvidence, "release job fixture failed: soak-job-hook-runc"):
+            jobs.named_fixture_coverage([], [definition("soak-job-hook-runc", [
+                outcome(44, "Failed", succeeded=0, failed=1, started=earlier + 1)])], state)
 
     def test_a_hook_run_pruned_from_the_summaries_still_counts_from_its_definition(self):
         # The day tier never redeploys, and more than 20 runs finish in

@@ -942,6 +942,11 @@ def consume_faults(campaign):
 NAMED_FIXTURES = {f"soak-job-{kind}-{mode}": (mode, cover) for mode in MODES
                   for kind, cover in (("cron", "cron"), ("hook", "hook"), ("after", "published-job"))}
 OUTCOME_STATUSES = ("Succeeded", "CompletedWithFailures", "Failed", "Cancelled")
+# Definitions keep their history across re-applies, so on a cluster adopted
+# with --home a hook's history can hold an earlier campaign's runs. Only
+# outcomes that started after this campaign did count, give or take this much
+# clock skew between the host and the cluster.
+HOOK_HISTORY_SKEW = 300
 
 
 def named_fixture_coverage(rows, definitions, state, now=0, acknowledge=None):
@@ -1000,6 +1005,8 @@ def named_fixture_coverage(rows, definitions, state, now=0, acknowledge=None):
                 raise InvalidEvidence("invalid run outcome for " + label)
             number(outcome, "succeeded"); failed = number(outcome, "failed")
             if not number(outcome, "run"): raise InvalidEvidence("nonpositive run identity")
+            # An adopted cluster (--home) keeps an earlier campaign's history.
+            if number(outcome, "started_at_epoch_secs") < state["started"] - HOOK_HISTORY_SKEW: continue
             if failed or outcome["status"] in ("CompletedWithFailures", "Failed"):
                 raise InvalidEvidence("release job fixture failed: " + label)
             if outcome["status"] == "Succeeded":
