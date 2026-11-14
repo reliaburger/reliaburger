@@ -471,7 +471,11 @@ jobs:
     needs: changes
     if: needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-26.04
-    timeout-minutes: 40
+    # Successful runs take 22 to 31 minutes. Six hit a 40-minute limit on 13
+    # and 14 Nov with the test step still "in progress" and no post step run,
+    # so GitHub kept no log (#1943). The test step now has its own limit
+    # inside this one, leaving time to report and keep the evidence.
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.0
@@ -501,8 +505,54 @@ jobs:
           key: test-images-${{ runner.arch }}-${{ hashFiles('tests/fixtures/pinned-images.txt') }}
       - name: Warm the pinned test images
         run: make test-images TEST_IMAGE_CACHE="$RUNNER_TEMP/test-images"
+      - name: Watch disk and memory during the privileged tests
+        # As the `linux` job does for the OCI interruptions (#800): the
+        # headroom every 5 s, so a run that ends badly shows whether the
+        # runner was short of memory or disk (#1943).
+        run: |
+          nohup bash -c 'while :; do echo "$(date -u +%T) disk_kb=$(df -k --output=avail / | tail -1 | tr -d " ") mem_kb=$(awk "/^MemAvailable/ {print \$2}" /proc/meminfo) load=$(cut -d" " -f1 /proc/loadavg)"; sleep 5; done' > "$RUNNER_TEMP/linux-next-resources.log" 2>&1 < /dev/null &
+          echo $! > "$RUNNER_TEMP/linux-next-resources.pid"
       - name: Run the provisioned Linux tests as root
-        run: scripts/ci/as-root make test-linux TEST_IMAGE_CACHE="$RUNNER_TEMP/test-images"
+        id: linux_next_tests
+        # Each test already has a nextest slow-timeout with terminate-after
+        # (the `ci` profile, as `default`). This limit catches the rest, a
+        # build or a nextest that stops making progress, while the runner
+        # can still report it. The `ci` profile writes JUnit (#1943).
+        timeout-minutes: 42
+        run: |
+          set -o pipefail
+          scripts/ci/as-root make test-linux NEXTEST_PROFILE=ci TEST_IMAGE_CACHE="$RUNNER_TEMP/test-images" 2>&1 \
+            | tee "$RUNNER_TEMP/linux-next-tests.log"
+      - name: Report the privileged tests' headroom and leftovers
+        if: always()
+        timeout-minutes: 3
+        run: |
+          kill "$(cat "$RUNNER_TEMP/linux-next-resources.pid")" 2>/dev/null || true
+          echo "Lowest free disk and memory while the privileged tests ran:"
+          sort -t= -k2 -n "$RUNNER_TEMP/linux-next-resources.log" | head -1 || true
+          sort -t= -k3 -n "$RUNNER_TEMP/linux-next-resources.log" | head -1 || true
+          if [ "${{ steps.linux_next_tests.outcome }}" != success ]; then
+            ps -eo pid,ppid,pgid,stat,wchan:32,etime,args --forest || true
+            # Kernel stacks of every uninterruptible task, and of every thread
+            # of a test binary or Bun that outlived the step.
+            for pid in $(ps -eo pid=,stat=,args= | awk '$2 ~ /^D/ || /target\/debug\/(deps\/|bun)/ {print $1}'); do
+              for task in /proc/"$pid"/task/*; do
+                echo "== $task ($(sudo cat "$task"/comm 2>/dev/null), $(sudo cat "$task"/wchan 2>/dev/null))"
+                sudo cat "$task"/stack 2>/dev/null || true
+              done
+            done
+          fi
+      - name: Keep the privileged tests' JUnit and log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-next-evidence
+          path: |
+            target/nextest/ci/junit.xml
+            ${{ runner.temp }}/linux-next-tests.log
+            ${{ runner.temp }}/linux-next-resources.log
+          if-no-files-found: warn
+          retention-days: 14
 
   build-tests:
     outputs:

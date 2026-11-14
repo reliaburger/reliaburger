@@ -1,6 +1,7 @@
 """The published job demo must describe its actual uncompressed recording."""
 import json
 import pathlib
+import re
 import subprocess
 import shutil
 import unittest
@@ -8,6 +9,8 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 RELEASED=ROOT/'docs/qualification/2026-10-17-v0.2.0-job-throughput'
+# The homepage recording: the published v0.2.8 on the Mac Studio, 12 November 2026.
+RECORDING=ROOT/'docs/qualification/2026-11-12-v0.2.8-job-throughput-recording'
 SCENARIOS=('jobs-vm-baseline','jobs-containers','jobs-shared-containers','jobs-host-processes')
 
 def released_medians():
@@ -74,9 +77,19 @@ class JobDemo(unittest.TestCase):
             self.assertEqual(row['terminal_failures'],0)
             self.assertEqual(row['cleanup_failed_submissions'],[])
             self.assertEqual(len(row['post_cutoff_drain_proofs']),len(row['active_submissions']))
-        raw=ROOT/'docs/qualification/2026-10-09-timed-job-scenarios/current-build/packaged-bench-windows'
         for asset,evidence in [('job-throughput.cast','jobs.cast'),('job-throughput-report.json','report.json')]:
-            self.assertEqual((ROOT/'docs/website/assets'/asset).read_bytes(),(raw/evidence).read_bytes())
+            self.assertEqual((ROOT/'docs/website/assets'/asset).read_bytes(),(RECORDING/evidence).read_bytes())
+        # The caption names the release the recording ran, and each chapter
+        # button seeks to where the recorder started that scenario.
+        figure_text=page[figure:page.index('</figure>',figure)]
+        self.assertIn('Recorded on 0.2.8',figure_text)
+        starts=[float(value) for value in re.findall(r'data-start="([0-9.]+)"',figure_text)]
+        self.assertEqual(len(starts),4)
+        for start,chapter in zip(starts,report['chapters']):
+            self.assertAlmostEqual(start,chapter['start_seconds'],places=3)
+        poster=float(re.search(r'data-poster="npt:([0-9.]+)"',figure_text).group(1))
+        self.assertLessEqual(poster,report['recording_elapsed_seconds'])
+        self.assertGreater(poster,report['chapters'][-1]['start_seconds'])
         self.assertEqual(recording[0]['version'],2)
         self.assertEqual([row[0] for row in recording[1:]],sorted(row[0] for row in recording[1:]))
         for phrase in ['60 seconds','extrapolated','independent','repeatable','no isolation','VM baseline','durable ownership','published v0.2.0 binaries']:

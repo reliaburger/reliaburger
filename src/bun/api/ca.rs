@@ -5,6 +5,11 @@
 //! with the root key they hold and sends the certificate to `begin`; once
 //! every node has moved, `finalize` retires the old CA. The root key never
 //! reaches the cluster, and the new private key never leaves it.
+//!
+//! Prepare and begin read the security state, so the leader first gets
+//! [`crate::bun::leadership::LEADER_CONFIRMATION`] to prove it leads. One
+//! heartbeat round isn't enough: a settled leader whose followers answer it
+//! late would refuse `relish ca rotate` with a 503 (#1937).
 
 use super::*;
 use crate::sesame::ca_rotation::{self, PreparedRotation, RotationRole, SignedIntermediate};
@@ -102,7 +107,10 @@ pub(super) async fn ca_rotation_prepare_handler(
     let Some(ikm) = council.wrapping_ikm().copied() else {
         return error_response(StatusCode::SERVICE_UNAVAILABLE, "no wrapping key available");
     };
-    let security = match council.security_state_linearizable().await {
+    let security = match council
+        .security_state_confirmed(crate::bun::leadership::LEADER_CONFIRMATION)
+        .await
+    {
         Ok(security) => security,
         Err(error) => return error_response(StatusCode::SERVICE_UNAVAILABLE, error),
     };
@@ -200,7 +208,10 @@ pub(super) async fn ca_rotation_begin_handler(
                 );
             }
         };
-    let security = match council.security_state_linearizable().await {
+    let security = match council
+        .security_state_confirmed(crate::bun::leadership::LEADER_CONFIRMATION)
+        .await
+    {
         Ok(security) => security,
         Err(error) => return error_response(StatusCode::SERVICE_UNAVAILABLE, error),
     };
@@ -318,7 +329,7 @@ pub(super) async fn signing_key_rotate_handler(
     // Three seconds to prove it leads, as the job routes get (#1393), so a
     // late heartbeat round doesn't send the operator to another node.
     if !council
-        .confirm_leadership(std::time::Duration::from_secs(3))
+        .confirm_leadership(crate::bun::leadership::LEADER_CONFIRMATION)
         .await
     {
         return error_response(
@@ -329,7 +340,12 @@ pub(super) async fn signing_key_rotate_handler(
     let Some(ikm) = council.wrapping_ikm().copied() else {
         return error_response(StatusCode::SERVICE_UNAVAILABLE, "no wrapping key available");
     };
-    let security = match council.security_state_linearizable().await {
+    // The read proves leadership within the same bound rather than with one
+    // round, which a late heartbeat fails (#1937).
+    let security = match council
+        .security_state_confirmed(crate::bun::leadership::LEADER_CONFIRMATION)
+        .await
+    {
         Ok(security) => security,
         Err(error) => return error_response(StatusCode::SERVICE_UNAVAILABLE, error),
     };

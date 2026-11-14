@@ -29,7 +29,7 @@ pub mod state_machine;
 pub mod types;
 
 pub use apply::{config_to_desired_writes, config_to_leased_writes};
-pub use node::CouncilNode;
+pub use node::{CouncilNode, LEADER_CONFIRMATION};
 pub use selection::{
     CouncilSelectionConfig, CouncilSize, CouncilSizeError, select_council_candidates,
 };

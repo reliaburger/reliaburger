@@ -167,11 +167,12 @@ jobs-shared-containers` and its siblings rerun them on your own cluster, and
 release, 0.2.0 ran 12 hours on a three-VM laptop cluster with apps, faults
 and upgrades at 4,600 accepted jobs a second, against 1,158 for 100 million a
 day ([record](qualification/2026-10-17-v0.2.0-job-qualification.md), [#668](https://github.com/reliaburger/reliaburger/issues/668)).
-0.2.7 ran host jobs for one real 24-hour day on three 4-vCPU VMs and counted
-2,709,190,725, 31,352 a second, with every node's Bun under its memory target
-([record](qualification/2026-11-08-v0.2.7-memory-run.md)). One node's memory
-was still growing at the end
-([#1417](https://github.com/reliaburger/reliaburger/issues/1417)).
+0.2.8 ran host jobs for one real 24-hour day on three 4-vCPU VMs and counted
+2,649,391,295, 30,654 a second, with every node's Bun memory levelled off
+under its target and its leak check passing
+([record](qualification/2026-11-14-v0.2.8-memory-run.md)). The growth before
+it levelled was free memory the allocator kept after log queries, not live
+heap ([#1417](https://github.com/reliaburger/reliaburger/issues/1417)).
 
 **Self-upgrade.** `relish upgrade start` rolls a new `bun` across the cluster:
 workers first, then council members one at a time, leader last. The new binary

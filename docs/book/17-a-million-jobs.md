@@ -274,6 +274,12 @@ pub async fn leads(council: &CouncilNode) -> bool {
 
 Fixing a pattern once doesn't stop the next handler from repeating it, so a test in the same module reads every production file under `src/bun/`, not just the API modules, because the job, batch, task-array and build routes live beside them. It fails on any `.is_leader()` call whose line above doesn't name #1393 to explain it. Background loops may keep the single round, because a loop that skips a tick tries again on the next. Each one says so in a comment, and the test reads that comment. Widening the scan found one more caller that wasn't a loop: workload identity signing, which asked the leader transport (and so itself) whenever its followers answered late. It now uses `leads` too. `a_settled_leader_applies_stops_and_deletes_an_app_after_a_missed_heartbeat_round` puts the app routes through the same lagging-heartbeat harness as the job routes, and `a_settled_leader_serves_test_leases_tokens_and_build_signs_after_a_missed_heartbeat_round` does the same for a lease's create, renew and delete, its test token and a build-sign request. Without the change, its first request gets the 503.
 
+The lint looked for `.is_leader()`, and the next 503 came from a call it didn't know to look for ([#1937](https://github.com/reliaburger/reliaburger/issues/1937)). `relish ca rotate` got a 503 from `POST /v1/ca/rotation/begin` in a CI run. The begin and prepare routes read the security state with `security_state_linearizable`, and that is the same single `ensure_linearizable` round under another name. Chapter 2 left that function alone on purpose, because its callers each had their own budget to check. So we checked them. Every request path that called it had at least 10 seconds before its caller gave up: the CA routes, the registry image list, the three internal node routes, a join after it spends its token, Pickle's registry query, the security view, certificate renewal, trust acknowledgement and workload signing. Giving the leader 3 seconds to prove it leads fits inside every one, so they all call `security_state_confirmed(LEADER_CONFIRMATION)` now. The join was the worst of them. It consumed the join token and then read the security state, so a late heartbeat answered the joiner with a 503 after its single-use token was already spent. A 3-second confirmation only shrinks that window, so a second change reorders the join. It proves leadership and checks the token against that confirmed state first, so a leader that can't prove it refuses with the token unspent. It consumes the token after that check. Then it reads its own replica, which the consume has just updated, because openraft's `client_write` returns only once the leader has applied the entry. Nothing that can fail on a slow heartbeat runs after the token is spent. `a_leader_that_cannot_confirm_it_leads_leaves_the_join_token_for_a_retry` cuts the leader off, expects the join to fail, then heals the network and checks that the token still works, once. The constant moved from `src/bun/leadership.rs` to `src/council/node.rs`, because Sesame and Pickle sit below `bun` and need it too. `bun::leadership` re-exports it with `pub use`, so its callers didn't change.
+
+The new lint works the other way round from the first. A second test in `src/bun/leadership.rs` reads every production file under `src/`, not just `src/bun/`, and fails on any `_linearizable(` outside a short allowlist. It matches the open bracket rather than `()`, so a call written as `CouncilNode::security_state_linearizable(&council)` is caught as well. Each allowlist entry names a file, how many such calls it holds and why. There are two: `src/council/node.rs` with five (the two read functions it defines and the three `ensure_linearizable` rounds underneath everything), and `src/council/backup.rs` with one, an export loop that tries again on its next tick. The count is exact, so a sixth in `node.rs` fails the test just as a call in a new file does. An allowlist keeps the exceptions in one place, where a reviewer sees them all at once, and the count stops an entry from quietly covering more than it was written for. `a_settled_leader_prepares_begins_and_finalises_a_ca_rotation_after_a_missed_heartbeat_round` puts a whole rotation through the lagging-heartbeat harness. It prepares, signs the CSR with a root key only the test holds, then begins and finalises. Before the fix, prepare got the 503.
+
+A review found that both lints had been skipping code. Each stops reading a file at its inline test module, which it recognised as `#[cfg(test)]` followed by a line starting with `mod `. That also matches `mod tests;`, which only declares a test module kept in another file, and `src/bun/api.rs`, `src/bun/agent.rs`, `src/lib.rs` and the MCP and fuzz modules all have one partway down. Everything below it went unscanned. The scan now stops only when the `mod` line ends in `{`. A unit test writes a small file with one of each and checks that the scan reports the call after `mod tests;` but not the one inside `mod inline {`. Reading the skipped code found nothing new, but it does get read now.
+
 ### Definitions, runs and durable trigger identities
 
 A template and a count describe work, but not why it runs. A manually submitted
@@ -4003,6 +4009,65 @@ guard page. Every sample goes into `memory.jsonl`, and the record shows
 each node hour by hour, with one line naming the kind that grew most after
 the first hour. A heap that keeps climbing points at live data or
 fragmentation; arenas that fill and stop point at a cache warming up.
+
+That still couldn't tell live data from fragmentation, and the 0.2.7 run
+needed exactly that: node 2's heap was still climbing at hour 24. smaps
+counts pages the process has touched; it can't say whether malloc has
+handed them to the program or holds them free for later. Only malloc knows,
+and glibc will say if you ask from inside the process. So the day tier now
+attaches `gdb` to Bun at hours 6, 12, 18 and 24 and makes Bun call two
+glibc functions: `malloc_stats()`, which prints each arena's *system* bytes
+(taken from the kernel) and *in-use* bytes (held by the program), and
+`malloc_trim(0)`, which gives free pages back. A C programmer will know the
+trick; nothing in Rust is involved, because Rust's default global allocator
+on Linux is the C library's `malloc`, so every `Vec` and `Box` Bun frees goes
+back to glibc, which decides what to keep. The attach stops Bun for under a
+quarter of a second (`sustained/malloc-point.sh`, `malloc_points.py`).
+
+The answer, from the published 0.2.8's 24 hours (the
+[14 November record](../qualification/2026-11-14-v0.2.8-memory-run.md)):
+in-use bytes fell on every node, by about a third from hour 6 to hour 24,
+while the free memory glibc kept rose, on node 2 from 28 to 95 MiB, and
+each trim handed 30 to 56 MiB of it back late in the day. The growth was
+the allocator's high-water mark, not a leak. A second experiment said what
+raises it. The checks tail node 2's logs every 30 seconds, and a tail is a
+DataFusion query over every Parquet file in the store, so node 2's slowly
+filled store of 1,200 small files made each query a little bigger than the
+last. The run added a source of the same kind on node 3 that nothing ever
+reads. Its store filled file for file like node 2's, and node 3's memory
+stayed flat; node 2's rose with its store and levelled when the store
+stopped growing at hour 20. Getting there also took one trick: `relish
+logs` fans out to every node, so even "node 2's" tail had queried node 3's
+store, and the day tier now asks each node's own `/v1/logs/entries`.
+
+The run before that one taught a lesson about the test bed rather than
+Bun. Installing `gdb` meant an `apt-get update` in each guest, which gave
+Ubuntu's daily unattended upgrade something to install, and at 06:00 it
+upgraded systemd and friends and `needrestart` restarted Bun on all three
+nodes, 16.7 hours into a 24-hour run. Every soak now disables those timers
+and refuses to start until each guest shows them off. A soak's guests are
+part of the experiment, and anything on them that runs on its own clock is
+a fault you didn't schedule.
+
+Both 0.2.8 day runs still ended in FAIL, for a reason that had nothing to do
+with memory: "missing coverage: hook". The job campaign never saw the
+`shared-runc` and `process` deploy hooks finish. They had run, and they had
+succeeded. The controller looks for its named fixtures in
+`/v1/batch/summaries` every 30 seconds, but the task-array store keeps only
+the 20 newest finished runs in a namespace. At the day tier's load, more
+than 20 runs finish in `default` before the first scan, so the hooks were
+pruned before anyone looked. The gate tiers got away with it because their
+cycles redeploy, and every redeploy runs the hooks again; a day run deploys
+once. The fix leans on the same record the jobs card uses for schedules: a
+`run_before` definition stays for good and carries the outcomes of its last
+10 runs, so the controller now reads `/v1/jobs/definitions` in the same scan
+and counts a hook from either place. A failed outcome in that history fails
+the campaign, just as a failed row does (#1935). That history survives a
+re-apply, so on a cluster adopted with `--home` it can still hold the last
+campaign's runs; only outcomes that started after this campaign did, give or
+take five minutes of clock skew, count either way. One gap remains: a one-off
+`after` job has no definition, so its coverage still depends on catching its
+row before it's pruned.
 
 ### Soak jobs while the apps keep running
 
