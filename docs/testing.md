@@ -800,7 +800,9 @@ The seed corpus in [`fuzz/corpus/`](../fuzz/corpus) comes from the decoders'
 unit-test fixtures and the `examples/` configs
 ([`src/fuzz/seeds.rs`](../src/fuzz/seeds.rs)). `make fuzz-corpus-seed`
 rewrites it; run it after a protocol or state bump, since old gossip and Raft
-seeds then stop decoding. libFuzzer writes what it finds to
+seeds then stop decoding. `fuzz::tests` runs every checked-in fixture seed
+through its target and fails if one is refused, so a bump that leaves stale
+seeds fails `make test`. libFuzzer writes what it finds to
 `fuzz/target/corpus/`, never into the checked-in seeds.
 
 OSS-Fuzz is the follow-up: Google's continuous fuzzing runs Rust projects
