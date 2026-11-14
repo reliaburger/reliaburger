@@ -753,7 +753,11 @@ cat ~/reliaburger-nightly-key/release.pub
 ```
 
 `relish dev keygen` names its files `release.key` and `release.pub` whatever
-they're for. The `ed25519:…` line it printed goes into
+they're for. Its key is a PKCS#8 v2 document, with the public key after the
+seed, which the runners' OpenSSL 3.0 can't read, so every train build failed
+at signing until `package.py` learnt to turn it into the v1 document of the
+same key, after checking the public key it carries matches the seed
+([#1950](https://github.com/reliaburger/reliaburger/issues/1950)). The `ed25519:…` line it printed goes into
 `NIGHTLY_SIGNING_KEYS`. With an empty list, a train's build fails at signing
 with "signing key is not trusted by the binaries it signs". The maintainers
 created the key on 27 October 2026, and the 0.2.4 train carries its public
