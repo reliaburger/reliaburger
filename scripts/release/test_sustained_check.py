@@ -2586,7 +2586,8 @@ setup_fail() {{ echo "failed: $*"; exit 9; }}
         result, notes, _ = self.verify_upgrades({node: [self.QUIET] for node in (1, 2, 3)})
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn("verified inactive on every node", notes)
-        self.assertIn("after waiting 0 s", notes)
+        # Whole seconds: milliseconds of stubbed checks can straddle one.
+        self.assertRegex(notes, r"after waiting [01] s")
         self.assertTrue((self.evidence / "snapshots" / "upgrades-verified-1.txt").exists())
         script = (Path(__file__).parent / "qualify-sustained.sh").read_text()
         start = script[script.index("    start_run\n"):]
@@ -2617,7 +2618,8 @@ setup_fail() {{ echo "failed: $*"; exit 9; }}
         result, notes, checks = self.verify_upgrades({1: [noisy], 2: [self.QUIET], 3: [noisy]}, wait=0)
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertEqual(checks[1], 1)
-        self.assertIn("after waiting 0 s", notes)
+        # Whole seconds: milliseconds of stubbed checks can straddle one.
+        self.assertRegex(notes, r"after waiting [01] s")
         # A unit missing from the answer isn't proof that it's off.
         missing = [line for line in self.QUIET if not line.startswith("apt-daily-upgrade.service")]
         result, _, _ = self.verify_upgrades({1: [self.QUIET], 2: [missing], 3: [self.QUIET]}, wait=0)
