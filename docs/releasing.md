@@ -1579,10 +1579,12 @@ the real `curl … | sh` install against it on every host we advertise.
    0.2.8 memory run the daily unattended upgrade restarted Bun on all three
    nodes at hour 16.7. It only asks the services to stop
    (`systemctl stop --no-block`), because stopping `unattended-upgrades`
-   waits for an upgrade in progress, and never kills one. Before the
-   baseline it waits up to 30 minutes for every unit to be inactive, failed
-   or unknown (an `activating` oneshot is an upgrade still running), records
-   how long it waited, and fails at the deadline.
+   waits for an upgrade in progress, and never kills one. It then waits up
+   to 30 minutes for every unit to be inactive, failed or unknown (an
+   `activating` oneshot is an upgrade still running) twice: straight after
+   the stop, before any VM restart or apt of its own, and again before the
+   baseline. It judges only the units' own lines, records how long it
+   waited, and fails at the deadline.
 
    ```sh
    scripts/release/qualify-jobs-sustained.sh --tier day \

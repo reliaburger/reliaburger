@@ -2551,8 +2551,10 @@ class MallocPoints(Evidence):
         unit lines its successive checks see (the last one repeats)."""
         import subprocess
         script = (Path(__file__).parent / "qualify-sustained.sh").read_text()
-        function = script[script.index("verify_guest_upgrades_off() {"):]
-        function = function[:function.index("\n}\n") + 3]
+        function = ""
+        for name in ("wait_for_guest_upgrades() {", "verify_guest_upgrades_off() {"):
+            body = script[script.index(name):]
+            function += body[:body.index("\n}\n") + 3]
         folder = Path(tempfile.mkdtemp(dir=self.temp.name))
         for node, sequence in answers.items():
             for index, lines in enumerate(sequence, 1):
@@ -2605,6 +2607,32 @@ setup_fail() {{ echo "failed: $*"; exit 9; }}
             lines = [off if line.split()[0] == off.split()[0] else line for line in self.QUIET]
             result, _, _ = self.verify_upgrades({1: [self.QUIET], 2: [lines], 3: [self.QUIET]}, wait=0)
             self.assertEqual(result.returncode, 0, off)
+
+    def test_lines_that_are_not_upgrade_units_are_ignored(self):
+        # limactl and ssh can print warnings on the same stream; only the
+        # five units' own lines are judged.
+        noisy = (['time="2026-11-15T10:00:00Z" level=warning msg="treating lima version as unknown"',
+                  "Warning: Permanently added '[127.0.0.1]:50623' (ED25519) to the list of known hosts."]
+                 + self.QUIET + ["sudo: unable to resolve host lima-rb-1: Name or service not known"])
+        result, notes, checks = self.verify_upgrades({1: [noisy], 2: [self.QUIET], 3: [noisy]}, wait=0)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(checks[1], 1)
+        self.assertIn("after waiting 0 s", notes)
+        # A unit missing from the answer isn't proof that it's off.
+        missing = [line for line in self.QUIET if not line.startswith("apt-daily-upgrade.service")]
+        result, _, _ = self.verify_upgrades({1: [self.QUIET], 2: [missing], 3: [self.QUIET]}, wait=0)
+        self.assertEqual(result.returncode, 9)
+        self.assertIn("apt-daily-upgrade.service unreported", result.stdout)
+
+    def test_setup_waits_for_upgrades_before_resizing_or_installing_gdb(self):
+        # A VM restart would cut a running upgrade off, and gdb's apt-get
+        # would wait on its dpkg lock; the baseline check stays as well.
+        script = (Path(__file__).parent / "qualify-sustained.sh").read_text()
+        start = script[script.index("    start_run\n"):]
+        self.assertLess(start.index("stop_guest_upgrades"), start.index("wait_for_guest_upgrades"))
+        self.assertLess(start.index("wait_for_guest_upgrades"), start.index("resize_nodes"))
+        self.assertLess(start.index("wait_for_guest_upgrades"), start.index("install_gdb"))
+        self.assertLess(start.index("install_gdb"), start.index("verify_guest_upgrades_off"))
 
     def test_an_upgrade_in_progress_is_waited_for_then_recorded(self):
         upgrading = [line.replace("apt-daily-upgrade.service inactive", "apt-daily-upgrade.service activating")

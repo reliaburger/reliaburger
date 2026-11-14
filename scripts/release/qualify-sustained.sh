@@ -858,21 +858,30 @@ stop_guest_upgrades() {
 # then the run fails closed rather than start with one running.
 upgrade_wait_secs=1800
 upgrade_poll_secs=15
-verify_guest_upgrades_off() {
-    local node file unit state enabled busy started deadline waiting
+# Wait until every guest shows every upgrade unit off; STAGE names the
+# snapshots/upgrades-STAGE-N.txt files. Only the units' own lines are judged
+# (stderr goes to a .err beside them), and a unit missing from the answer
+# isn't off. Sets upgrade_waited to the seconds it took.
+wait_for_guest_upgrades() {
+    local stage=$1 node file unit state enabled busy seen started deadline waiting
+    local upgrade_units='apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service unattended-upgrades.service'
     started=$(date +%s)
     deadline=$(( started + upgrade_wait_secs ))
     while :; do
         waiting=
         for node in 1 2 3; do
-            file=$evidence/snapshots/upgrades-verified-$node.txt
-            gsh "$node" 'for unit in apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service unattended-upgrades.service; do echo "$unit $(systemctl is-active "$unit") $(systemctl is-enabled "$unit" 2>/dev/null)"; done' \
-                > "$file" 2>&1 || setup_fail "could not read the upgrade units on ${vm[node]}"
-            busy=
+            file=$evidence/snapshots/upgrades-$stage-$node.txt
+            gsh "$node" "for unit in $upgrade_units; do echo \"\$unit \$(systemctl is-active \"\$unit\") \$(systemctl is-enabled \"\$unit\" 2>/dev/null)\"; done" \
+                > "$file" 2> "$file.err" || setup_fail "could not read the upgrade units on ${vm[node]}"
+            busy= seen=
             while read -r unit state enabled; do
+                case " $upgrade_units " in *" $unit "*) seen+=" $unit" ;; *) continue ;; esac
                 case $state in inactive|failed|unknown) ;; *) busy+="$unit $state ${enabled:-};" ;; esac
                 case $unit in *.timer) [ "$enabled" != enabled ] || busy+="$unit $state $enabled;" ;; esac
             done < "$file"
+            for unit in $upgrade_units; do
+                case "$seen " in *" $unit "*) ;; *) busy+="$unit unreported;" ;; esac
+            done
             [ -z "$busy" ] || waiting+="${vm[node]}: $busy "
         done
         [ -n "$waiting" ] || break
@@ -880,7 +889,13 @@ verify_guest_upgrades_off() {
             || setup_fail "unattended upgrades still active after $(( $(date +%s) - started )) s: $waiting"
         sleep "$upgrade_poll_secs"
     done
-    meta deviations+ "apt-daily, apt-daily-upgrade and unattended-upgrades verified inactive on every node before the baseline, after waiting $(( $(date +%s) - started )) s for any upgrade in progress (snapshots/upgrades-verified-N.txt)"
+    upgrade_waited=$(( $(date +%s) - started ))
+}
+
+# The last check, just before the baseline, after anything that ran apt.
+verify_guest_upgrades_off() {
+    wait_for_guest_upgrades verified
+    meta deviations+ "apt-daily, apt-daily-upgrade and unattended-upgrades verified inactive on every node before the baseline, after waiting $upgrade_waited s for any upgrade in progress (snapshots/upgrades-verified-N.txt)"
 }
 
 # The malloc points (#1417) call glibc functions inside Bun through gdb,
@@ -2213,6 +2228,10 @@ import json, sys
 json.dump({"nodes": sys.argv[2:]}, open(sys.argv[1], "w"))
 PY
     stop_guest_upgrades
+    # Before any VM restart or apt of our own: a resize would cut a running
+    # upgrade off, and gdb's apt-get would wait on its dpkg lock.
+    wait_for_guest_upgrades stopped
+    meta notes+ "Unattended upgrades were off on every guest $upgrade_waited s after they were asked to stop (snapshots/upgrades-stopped-N.txt)"
     [ "$tier" != day ] || resize_nodes
     configure_nodes
     [ "$malloc_points" != true ] || install_gdb
