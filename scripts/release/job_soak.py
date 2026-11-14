@@ -1014,6 +1014,81 @@ def consume_faults(campaign):
     campaign.save()
 
 
+NAMED_FIXTURES = {f"soak-job-{kind}-{mode}": (mode, cover) for mode in MODES
+                  for kind, cover in (("cron", "cron"), ("hook", "hook"), ("after", "published-job"))}
+OUTCOME_STATUSES = ("Succeeded", "CompletedWithFailures", "Failed", "Cancelled")
+# Definitions keep their history across re-applies, so on a cluster adopted
+# with --home a hook's history can hold an earlier campaign's runs. Only
+# outcomes that started after this campaign did count, give or take this much
+# clock skew between the host and the cluster.
+HOOK_HISTORY_SKEW = 300
+
+
+def named_fixture_coverage(rows, definitions, state, now=0, acknowledge=None):
+    """Record what one scan shows of the named cron, hook and after fixtures in
+    `state`, and return the fixture rows it saw.
+
+    `rows` are `/v1/batch/summaries` rows and `definitions` the
+    `/v1/jobs/definitions` rows. The store keeps only 20 terminal runs a
+    namespace, so on the day tier, which never redeploys, more than 20 runs
+    finish in `default` before the first scan and a deploy hook's own row is
+    gone. A `run_before` definition stays, with its last 10 outcomes, so a hook
+    counts from either (#1935). A failed fixture, seen either way, fails the
+    campaign. Cron progress still comes from the rows only, and a one-off after
+    job has no definition, so it still needs its row."""
+    named = []
+    for value in rows:
+        label = value.get("name", "")
+        if label not in NAMED_FIXTURES or value.get("kind") == "schedule": continue
+        named.append(value)
+        key = str(value["batch_id"])
+        previous = state["discovered"].get(key)
+        validate_summary(value, previous)
+        if not drained(value):
+            state["discovered"][key] = copy.deepcopy(value)
+            if len(state["discovered"]) > 32: raise InvalidEvidence("unresolved named run budget exhausted")
+        if not value.get("unknown_owners") and drained(value):
+            state["discovered"].pop(key, None)
+        if value["failed"]: raise InvalidEvidence("release job fixture failed: " + label)
+        if value["done"] and value["succeeded"] == value["total"]:
+            mode, cover = NAMED_FIXTURES[label]
+            state["coverage"][mode][cover] = True
+            if cover == "cron":
+                progress = state["progress"][mode]
+                if value["batch_id"] > progress.get("last_cron_id", 0):
+                    progress.update(last_cron_id=value["batch_id"], last_cron_progress=now)
+        elif value.get("unknown_owners"):
+            # These named hook/cron fixtures only execute true. Acknowledgement
+            # is recorded as a test-operator action after observing the fence twice.
+            previous = previous or {}
+            if previous.get("unknown_owners") == value["unknown_owners"]:
+                for owner in value["unknown_owners"]:
+                    if not re.fullmatch(r"[a-f0-9]{64}", owner.get("grant_digest", "")) or not owner.get("node"):
+                        raise InvalidEvidence("named run lacks exact replay fence")
+                    if acknowledge: acknowledge(value["batch_id"], owner, "named true fixture, two identical fenced observations", now)
+        else:
+            state["discovered"].pop(key, None)
+    if not isinstance(definitions, list): raise InvalidEvidence("invalid job definitions")
+    for definition in definitions:
+        if not isinstance(definition, dict): raise InvalidEvidence("invalid job definition")
+        label = definition.get("name")
+        if definition.get("namespace") != "default" or NAMED_FIXTURES.get(label, (None, None))[1] != "hook": continue
+        history = definition.get("history", [])
+        if not isinstance(history, list): raise InvalidEvidence("invalid history for " + label)
+        for outcome in history:
+            if not isinstance(outcome, dict) or outcome.get("status") not in OUTCOME_STATUSES:
+                raise InvalidEvidence("invalid run outcome for " + label)
+            number(outcome, "succeeded"); failed = number(outcome, "failed")
+            if not number(outcome, "run"): raise InvalidEvidence("nonpositive run identity")
+            # An adopted cluster (--home) keeps an earlier campaign's history.
+            if number(outcome, "started_at_epoch_secs") < state["started"] - HOOK_HISTORY_SKEW: continue
+            if failed or outcome["status"] in ("CompletedWithFailures", "Failed"):
+                raise InvalidEvidence("release job fixture failed: " + label)
+            if outcome["status"] == "Succeeded":
+                state["coverage"][NAMED_FIXTURES[label][0]]["hook"] = True
+    return named
+
+
 def run(options):
     evidence=options.evidence
     nodes=json.loads(evidence.joinpath("jobs/nodes.json").read_text())
@@ -1076,42 +1151,12 @@ def run(options):
                 try: campaign.sample_raft(api.request("GET","/v1/cluster/council"),now)
                 except InvalidEvidence: pass
                 rows=api.request("GET","/v1/batch/summaries")["batches"]
-                for value in rows:
-                    label=value.get("name","")
-                    known={f"soak-job-{kind}-{mode}":(mode,cover) for mode in MODES for kind,cover in (("cron","cron"),("hook","hook"),("after","published-job"))}
-                    if label not in known or value.get("kind")=="schedule": continue
-                    key=str(value["batch_id"])
-                    previous=campaign.state["discovered"].get(key)
-                    validate_summary(value,previous)
-                    if not drained(value):
-                        campaign.state["discovered"][key]=copy.deepcopy(value)
-                        if len(campaign.state["discovered"])>32: raise InvalidEvidence("unresolved named run budget exhausted")
-                    if not value.get("unknown_owners") and drained(value):
-                        campaign.state["discovered"].pop(key,None)
-                    if value["failed"]: raise InvalidEvidence("release job fixture failed: "+label)
-                    if value["done"] and value["succeeded"]==value["total"]:
-                        mode,cover=known[label]
-                        campaign.state["coverage"][mode][cover]=True
-                        if cover=="cron":
-                            progress=campaign.state["progress"][mode]
-                            if value["batch_id"]>progress.get("last_cron_id",0):
-                                progress.update(last_cron_id=value["batch_id"],last_cron_progress=now)
-                    elif value.get("unknown_owners"):
-                        # These named hook/cron fixtures only execute true. Acknowledgement
-                        # is recorded as a test-operator action after observing the fence twice.
-                        key=str(value["batch_id"])
-                        previous=previous or {}
-                        if len(campaign.state["discovered"])>32: raise InvalidEvidence("unresolved named run budget exhausted")
-                        if previous.get("unknown_owners")==value["unknown_owners"]:
-                            for owner in value["unknown_owners"]:
-                                if not re.fullmatch(r"[a-f0-9]{64}",owner.get("grant_digest","")) or not owner.get("node"):
-                                    raise InvalidEvidence("named run lacks exact replay fence")
-                                campaign.acknowledge(value["batch_id"],owner,"named true fixture, two identical fenced observations",now)
-                    else:
-                        campaign.state["discovered"].pop(str(value["batch_id"]),None)
-                    if stop_requested and not drained(value): api.request("POST",f'/v1/batch/{value["batch_id"]}/cancel')
+                definitions=api.request("GET","/v1/jobs/definitions")["definitions"]
+                named=named_fixture_coverage(rows,definitions,campaign.state,now,campaign.acknowledge)
                 if stop_requested:
-                    finished=finished and all(drained(v) for v in rows if v.get("name") in known and v.get("kind")!="schedule")
+                    for value in named:
+                        if not drained(value): api.request("POST",f'/v1/batch/{value["batch_id"]}/cancel')
+                    finished=finished and all(drained(v) for v in named)
                 last_scan=now
             if stop_requested and finished:
                 campaign.state["stopped"]=True; campaign.save(); campaign.publish(now,fault)

@@ -1,0 +1,30 @@
+# The day tier's log-store A/B (#1417), appended to soak-workloads.toml by
+# qualify-sustained.sh for --tier day only.
+#
+# In the 0.2.7 memory run node 2's RSS grew with its log store, which the
+# volume writer fills slowly (about 8 lines a second, one small Parquet file
+# a minute), and every check tailed the writer's log. soak-quiet is the same
+# kind of source on node 3, pinned there by the Redis label, and nothing in
+# the harness ever asks for its lines. The day tier also sends each tail to
+# the node that holds the app's lines instead of fanning out to every node,
+# and pins the Redis client to node 1 (labelled `soak-logs = "client"`), so
+# node 3's store fills slowly but is never queried.
+
+# Logs `QUIET n` about eight times a second, like the writer's `ACK n`.
+[app.soak-quiet]
+image = "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028"
+command = ["/bin/sh", "-c", '''
+trap 'exit 0' TERM
+n=0
+while true; do
+  n=$((n + 1))
+  echo "QUIET $n"
+  sleep 0.125
+done
+''']
+
+[app.soak-quiet.placement]
+required = ["soak-volume=redis"]
+
+[app.soak-redis-client.placement]
+required = ["soak-logs=client"]

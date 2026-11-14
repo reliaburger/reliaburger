@@ -173,7 +173,7 @@ pub(super) async fn endpoint_withdrawal_receipt_handler(
     };
     let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         let security = council
-            .security_state_linearizable()
+            .security_state_confirmed(crate::council::LEADER_CONFIRMATION)
             .await
             .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
         let node_id = crate::sesame::renewal::validate_peer(&peer, &security)
@@ -244,7 +244,7 @@ pub(super) async fn workload_csr_handler(
     };
     let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         let security = council
-            .security_state_linearizable()
+            .security_state_confirmed(crate::council::LEADER_CONFIRMATION)
             .await
             .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
         let node_id = crate::sesame::renewal::validate_peer(&peer, &security)
@@ -318,7 +318,7 @@ pub(super) async fn producer_retirement_handler(
     };
     let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         let security = council
-            .security_state_linearizable()
+            .security_state_confirmed(crate::council::LEADER_CONFIRMATION)
             .await
             .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
         let node_id = crate::sesame::renewal::validate_peer(&peer, &security)

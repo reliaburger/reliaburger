@@ -67,7 +67,7 @@ pub async fn issue_renewal(
         .decode(&request.csr_b64)
         .map_err(|error| RenewalError::Request(error.to_string()))?;
     let state = council
-        .security_state_linearizable()
+        .security_state_confirmed(crate::council::LEADER_CONFIRMATION)
         .await
         .map_err(|error| RenewalError::Unavailable(error.to_string()))?;
     let node_id = validate_peer(peer, &state)?;
@@ -103,7 +103,7 @@ pub async fn issue_renewal(
         }
     };
     let state = council
-        .security_state_linearizable()
+        .security_state_confirmed(crate::council::LEADER_CONFIRMATION)
         .await
         .map_err(|error| RenewalError::Unavailable(error.to_string()))?;
     validate_peer(peer, &state)?;
@@ -158,7 +158,7 @@ pub async fn acknowledge_trust(
         )));
     }
     let state = council
-        .security_state_linearizable()
+        .security_state_confirmed(crate::council::LEADER_CONFIRMATION)
         .await
         .map_err(|error| RenewalError::Unavailable(error.to_string()))?;
     let node_id = validate_peer(peer, &state)?;

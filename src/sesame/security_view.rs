@@ -34,7 +34,7 @@ pub async fn issue_view(
     peer: &TlsPeerCertificate,
 ) -> Result<SecurityView, RenewalError> {
     let state = council
-        .security_state_linearizable()
+        .security_state_confirmed(crate::council::LEADER_CONFIRMATION)
         .await
         .map_err(|error| RenewalError::Unavailable(error.to_string()))?;
     validate_peer(peer, &state)?;
