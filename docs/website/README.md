@@ -213,6 +213,25 @@ every promoted release carries the four PDFs, and promotion marks it latest.
 The Build & Release workflow's `reliaburger-pdfs` artefact has newer copies
 from `main`; artefacts require GitHub sign-in and have limited retention.
 
+### Re-recording the job demo
+
+`assets/job-throughput.cast` and `assets/job-throughput-report.json` are
+byte copies of a recording's `jobs.cast` and `report.json` in
+`docs/qualification/`, and `scripts/ci/test_job_demo.py` names that
+directory (`RECORDING`), checks the copies, and checks that the caption
+says which release ran and that the chapter buttons and poster match the
+report. The [0.2.8 recording's README](../qualification/2026-11-12-v0.2.8-job-throughput-recording/README.md)
+is the method: on the quiet Studio, install the published release into a
+throwaway `RELIABURGER_HOME`, `relish setup --quickstart --nodes 1 --yes`,
+resize the VM to the section's 4 vCPU / 8 GiB with `limactl edit`, allowlist
+the pinned image's BusyBox for host jobs with `mount_isolation = false` and
+Bun on `--runtime mixed`, then run `scripts/demo/record-job-bench.py` inside
+the VM as root with the cluster's token and CA. Copy the output into a new
+dated directory, copy its two files over the assets, point `RECORDING` at
+it, and set the figure's `data-start` buttons to the report's chapter
+`start_seconds` and `data-poster` to just after the host-jobs summary line.
+The table under the recording keeps its own five-round medians.
+
 ### Recording the agent sessions
 
 Two slots on the homepage wait for a real agent session: `#agent-recording`

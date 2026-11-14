@@ -40,6 +40,7 @@ import calendar
 import hashlib
 import http.client
 import json
+import math
 import os
 from pathlib import Path
 import random
@@ -53,6 +54,7 @@ import time
 import tomllib
 import bun_memory
 import loop_stalls
+import malloc_points
 import job_soak
 import job_soak_inventory
 import soak_charts
@@ -220,6 +222,21 @@ def parse_runs(text, prefix):
         if match:
             runs.setdefault(match.group(1), []).append(int(match.group(2)))
     return runs
+
+
+def log_lines(answer):
+    """One node's `/v1/logs/entries` answer as the lines `parse_runs` reads:
+    `[instance] line`, in that node's ingest order. The day tier's tails ask
+    only the node that holds an app's lines, so no other node's store is
+    queried (#1417); anything but a JSON list leaves a note and no numbers."""
+    try:
+        entries = json.loads(answer)
+        if not isinstance(entries, list):
+            raise ValueError("not a list")
+        entries = sorted((entry for entry in entries if isinstance(entry, dict)), key=lambda entry: entry.get("sequence", 0))
+    except ValueError:
+        return f"log-lines: unreadable answer ({len(answer)} bytes)\n"
+    return "".join(f"[{entry.get('instance') or 'node'}] {entry.get('line', '')}\n" for entry in entries)
 
 
 def parse_inventory(text):
@@ -1976,7 +1993,8 @@ def render(evidence, record):
     metadata = json.loads((evidence / "metadata.json").read_text()) if (evidence / "metadata.json").exists() else {}
     state = load_state(evidence)
     events = read_events(evidence)
-    failures = failure_rows(evidence)
+    # A failure inside a malloc_stats/malloc_trim attach is the attach's (#1417).
+    failures = malloc_points.excuse(failure_rows(evidence), malloc_points.read(evidence))
     started = metadata.get("started_at") or (events[0]["ts"] if events else int(time.time()))
     finished = metadata.get("finished_at") or (events[-1]["ts"] if events else started)
     paused = sum(event.get("duration", 0) for event in events if event.get("phase") == "pause")
@@ -2161,6 +2179,7 @@ def render(evidence, record):
             lines.append(f"| {node} | {measure} | {entry['first']} | {entry.get('last', entry['first'])} | {entry['max']} |")
     lines.append("")
     lines += bun_memory.section(evidence)
+    lines += malloc_points.section(evidence)
     lines += loop_stalls.section(evidence)
     charts_directory = record.parent / f"{record.stem}-charts"
     lines += soak_charts.section(soak_charts.write_charts(evidence, charts_directory), charts_directory.name)
@@ -2365,6 +2384,15 @@ def main(argv=None):
     charts = commands.add_parser("render-charts", help="rebuild a record's charts from an existing evidence directory")
     charts.add_argument("evidence")
     charts.add_argument("directory")
+    point = commands.add_parser("malloc-point", help="keep one node's malloc_stats/malloc_trim report in malloc.jsonl (#1417)")
+    point.add_argument("evidence")
+    point.add_argument("--node", required=True)
+    point.add_argument("--hour", required=True, type=int)
+    point.add_argument("--report", required=True)
+    due = commands.add_parser("malloc-due", help="print the soak hour whose malloc point is due now, if any (#1417)")
+    due.add_argument("evidence")
+    due.add_argument("--now", type=int)
+    commands.add_parser("log-lines", help="one node's log entries (JSON on stdin) as `[instance] line`, in ingest order")
     args = parser.parse_args(argv)
 
     if args.command == "event":
@@ -2476,6 +2504,29 @@ def main(argv=None):
         return 0
     if args.command == "choose":
         print(choose(args.evidence, args.what, args.low, args.high))
+        return 0
+    if args.command == "malloc-point":
+        entry = malloc_points.row(args.node, args.hour, Path(args.report).read_text(errors="replace"))
+        malloc_points.append(args.evidence, entry)
+        start, end = entry["attach_start"], entry["attach_end"]
+        timed = isinstance(start, float) and isinstance(end, float)
+        append_event(args.evidence, phase="diagnostic:malloc-trim", target=args.node,
+                     ts=int(start) if timed else None, duration=math.ceil(end - start) if timed else None,
+                     exit=entry["gdb_exit"],
+                     detail=f"hour {args.hour}: RSS {entry['before'].get('rss_kb')} kB before the trim, "
+                            f"{entry['after'].get('rss_kb')} kB after; malloc in use {entry['in_use_bytes']} B")
+        return 0
+    if args.command == "malloc-due":
+        metadata_path = Path(args.evidence) / "metadata.json"
+        started = json.loads(metadata_path.read_text()).get("started_at") if metadata_path.exists() else None
+        if isinstance(started, int):
+            hour = malloc_points.due(malloc_points.read(args.evidence), load_state(args.evidence), started,
+                                     args.now if args.now is not None else int(time.time()))
+            if hour is not None:
+                print(hour)
+        return 0
+    if args.command == "log-lines":
+        print(log_lines(sys.stdin.read()), end="")
         return 0
     if args.command == "render-charts":
         directory = Path(args.directory)
