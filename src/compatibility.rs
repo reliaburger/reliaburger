@@ -249,6 +249,11 @@ pub struct Compatibility {
 /// size (`RaftRequest::CouncilSize` and `DesiredState::council_size`).
 /// OIDC signing-key rotation (#709): `SecurityState::retiring_oidc_keys`, and
 /// the `RotateOidcSigningKey` and `RetireOidcSigningKeys` Raft requests.
+///
+/// Bumping either number makes the checked-in gossip and Raft fuzz seeds
+/// stale: run `make fuzz-corpus-seed` in the same change (#1941). Keep the
+/// two fields directly inside the braces: the release scripts read them with
+/// a regex.
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 59,
     state: 75,

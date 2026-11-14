@@ -9373,9 +9373,10 @@ and another test only checked that each file was there. So when the protocol
 moved from 56 to 59, every gossip seed in `fuzz/corpus/` still had a 56 in its
 first byte, the Raft seeds were just as stale, and nothing failed. The gossip
 fuzzer started from five datagrams the decoder threw out at the version check
-and reached 66 edges; fresh seeds reach about 1,300 in twenty seconds. A
-weekend fuzzing campaign noticed in its first ten minutes. Now a third test runs each checked-in seed file through its target
-and wants it accepted, so a bump that leaves stale seeds fails `make ci`.
+and reached 66 edges; fresh seeds reach about 1,300 in seventeen seconds.
+A weekend fuzzing campaign noticed in its first ten minutes. Now a third
+test runs each checked-in seed file through its target and wants it
+accepted, so a bump that leaves stale seeds fails `make ci`.
 
 `make fuzz-smoke` runs every target for ten seconds. The `fuzz.yml` workflow
 runs each one for five minutes every night, and for thirty seconds on a pull
