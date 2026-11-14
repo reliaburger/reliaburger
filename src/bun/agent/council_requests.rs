@@ -35,6 +35,10 @@ fn security_error(reason: impl Into<String>) -> BunError {
 
 /// Validate a join token, consume it through the council, and sign the
 /// joiner's CSR. The consume is the one Raft write.
+///
+/// The leader proves it leads before the consume, not after: a join that
+/// failed once the single-use token was spent would leave the joiner with
+/// nothing to retry with (#1937).
 async fn issue_join_bundle(
     authority: JoinAuthority,
     token: String,
@@ -43,9 +47,13 @@ async fn issue_join_bundle(
     address: Option<std::net::IpAddr>,
 ) -> Result<crate::sesame::join::JoinBundle, BunError> {
     let council = &authority.council;
-    // Fast-fail check against the replicated state (unknown, expired or
-    // already consumed token). The authoritative consume happens below.
-    let security_state = council.security_state().await;
+    // A leader that can't prove it leads refuses here, with the token
+    // unspent. The check is current, so a token consumed or a node retired
+    // on another leader is refused too. The authoritative consume is below.
+    let security_state = council
+        .security_state_confirmed(crate::council::LEADER_CONFIRMATION)
+        .await
+        .map_err(|error| security_error(error.to_string()))?;
     let token_hash = crate::sesame::join::check_join_token(&token, &node_id, &security_state)
         .map_err(|e| security_error(format!("join validation failed: {e}")))?;
 
@@ -70,11 +78,10 @@ async fn issue_join_bundle(
         }
     };
 
-    // Confirm the identity still has authority after consuming the token.
-    let security_state = council
-        .security_state_confirmed(crate::council::LEADER_CONFIRMATION)
-        .await
-        .map_err(|error| security_error(error.to_string()))?;
+    // The write returns once this leader has applied it, so its own state is
+    // at least as new as the consume: a node retired before it is refused
+    // below, and no second leadership round can fail with the token spent.
+    let security_state = council.security_state().await;
     let join_result = crate::sesame::join::sign_join_csr(
         &csr_der,
         &node_id,
@@ -239,5 +246,146 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         answer
             .await
             .unwrap_or_else(|_| Err(security_error("signing task dropped its answer")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use super::*;
+    use crate::council::network::InMemoryRaftRouter;
+    use crate::sesame::types::{CertificateAuthority, SecurityState};
+
+    const IKM: [u8; 32] = [9; 32];
+
+    /// Three in-memory voters led by node 1, which holds [`IKM`], seeded
+    /// with a CA hierarchy and a join token for `node-9`. Returns the
+    /// voters, the network between them and the token's plaintext.
+    async fn council_with_a_join_token() -> (Vec<Arc<CouncilNode>>, InMemoryRaftRouter, String) {
+        use crate::council::log_store::MemLogStore;
+        use crate::council::network::InMemoryRaftNetworkFactory;
+        use crate::council::state_machine::CouncilStateMachine;
+        use crate::council::types::{CouncilConfig, CouncilNodeInfo};
+
+        let network = InMemoryRaftRouter::new();
+        let mut nodes = Vec::new();
+        let mut members = std::collections::BTreeMap::new();
+        for id in 1..=3u64 {
+            members.insert(
+                id,
+                CouncilNodeInfo {
+                    addr: std::net::SocketAddr::from(([127, 0, 0, 1], 7100 + id as u16)),
+                    name: format!("node-{id}"),
+                },
+            );
+            let node = Arc::new(
+                CouncilNode::new(
+                    id,
+                    CouncilConfig::default(),
+                    InMemoryRaftNetworkFactory::new(id, network.clone()),
+                    MemLogStore::new(),
+                    CouncilStateMachine::new(),
+                    (id == 1).then_some(IKM),
+                )
+                .await
+                .unwrap(),
+            );
+            network.register(id, node.raft().clone()).await;
+            nodes.push(node);
+        }
+        nodes[0].initialize(members).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !nodes[0].is_leader().await {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let hierarchy = crate::sesame::ca::generate_ca_hierarchy("join", &IKM).unwrap();
+        let (token, join_token) =
+            crate::sesame::join::create_join_token(Duration::from_secs(600), "node-9").unwrap();
+        let security = SecurityState {
+            certificate_authorities: vec![
+                CertificateAuthority {
+                    private_key_wrapped: None,
+                    ..hierarchy.root.ca.clone()
+                },
+                hierarchy.node.ca.clone(),
+                hierarchy.workload.ca.clone(),
+                hierarchy.ingress.ca.clone(),
+            ],
+            join_tokens: vec![join_token],
+            next_serial: 10,
+            ..SecurityState::default()
+        };
+        nodes[0]
+            .write(crate::council::RaftRequest::SecurityStateInit(Box::new(
+                security,
+            )))
+            .await
+            .unwrap();
+        (nodes, network, token)
+    }
+
+    fn authority(council: &Arc<CouncilNode>) -> JoinAuthority {
+        JoinAuthority {
+            council: council.clone(),
+            wrapping_ikm: IKM,
+            node_leaf_lifetime: Duration::from_secs(3600),
+        }
+    }
+
+    async fn join(
+        council: &Arc<CouncilNode>,
+        token: &str,
+    ) -> Result<crate::sesame::join::JoinBundle, BunError> {
+        let (csr_der, _key) = crate::sesame::ca::create_node_csr("node-9").unwrap();
+        issue_join_bundle(
+            authority(council),
+            token.into(),
+            "node-9".into(),
+            csr_der,
+            None,
+        )
+        .await
+    }
+
+    // #1937: a join consumed its single-use token first and proved
+    // leadership after, so a leader that couldn't prove it answered the
+    // joiner with an error after spending the token. The token must still
+    // be there for the retry.
+    #[tokio::test]
+    async fn a_leader_that_cannot_confirm_it_leads_leaves_the_join_token_for_a_retry() {
+        let (nodes, network, token) = council_with_a_join_token().await;
+        for node in &nodes {
+            node.hold_elections_until(Instant::now() + Duration::from_secs(60));
+        }
+        network.partition(1, 2).await;
+        network.partition(1, 3).await;
+
+        let refused = tokio::time::timeout(Duration::from_secs(8), join(&nodes[0], &token)).await;
+        assert!(
+            matches!(refused, Ok(Err(_))),
+            "the join should fail once the leader can't confirm it leads"
+        );
+
+        network.heal().await;
+        let security = nodes[0]
+            .security_state_confirmed(crate::council::LEADER_CONFIRMATION)
+            .await
+            .unwrap();
+        crate::sesame::join::check_join_token(&token, "node-9", &security)
+            .expect("the failed join spent the token");
+
+        join(&nodes[0], &token)
+            .await
+            .expect("the retry should join");
+        let again = join(&nodes[0], &token).await.unwrap_err();
+        assert!(again.to_string().contains("consumed"), "{again}");
+        for node in nodes {
+            node.shutdown().await.unwrap();
+        }
     }
 }
