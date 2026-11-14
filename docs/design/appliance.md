@@ -48,8 +48,11 @@ update never touches the cluster's state (§4.4).
 Lab builds add `openssh-server` for debugging. Published images don't have
 it, and `image/tests/no_ssh_server.py` checks it twice. Its unit test reads
 the mkosi configs, where only a `Profiles=lab` drop-in may name an SSH
-server. In CI it reads each built image's manifest, where a published build
-must list none and a lab build must list `openssh-server`.
+server, and where the image and every subimage must set `ManifestFormat=json`.
+In CI it reads each built image's manifest, where a published build must list
+none and a lab build must list `openssh-server`. The netboot installer's
+manifest must list none in either build: the lab profile's drop-in is the main
+image's alone (#1926).
 
 ## 2. `relish netboot`
 

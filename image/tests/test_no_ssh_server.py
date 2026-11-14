@@ -26,6 +26,9 @@ def run(*args):
 BASE = """[Distribution]
 Distribution=ubuntu
 
+[Output]
+ManifestFormat=json
+
 [Content]
 Packages=
         systemd
@@ -81,6 +84,27 @@ class Config(unittest.TestCase):
         done = run("config", self.image)
         self.assertEqual(done.returncode, 1)
         self.assertIn("tinysshd", done.stdout)
+
+    def test_an_image_or_subimage_without_a_manifest_fails(self):
+        # #1926: the manifest check is what catches an SSH server pulled in
+        # as a dependency, so every image has to write one.
+        installer = self.image / "mkosi.images" / "installer"
+        installer.mkdir(parents=True)
+        (installer / "mkosi.conf").write_text("[Content]\nPackages=curl\n")
+        done = run("config", self.image)
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("installer", done.stdout)
+        self.assertIn("ManifestFormat=json", done.stdout)
+        # A drop-in may set it.
+        (installer / "mkosi.conf.d").mkdir()
+        (installer / "mkosi.conf.d" / "20-manifest.conf").write_text("[Output]\nManifestFormat=json\n")
+        done = run("config", self.image)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        # The main image needs one too.
+        (self.image / "mkosi.conf").write_text(BASE.replace("ManifestFormat=json", "Format=disk"))
+        done = run("config", self.image)
+        self.assertEqual(done.returncode, 1)
+        self.assertIn(f"{self.image}: no ManifestFormat=json", done.stdout)
 
     def test_a_profile_besides_lab_does_not_excuse_it(self):
         (self.image / "mkosi.conf.d" / "40-debug.conf").write_text(

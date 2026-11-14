@@ -310,27 +310,34 @@ jobs:
         # bun is the only way in (#401). The manifest lists what was really
         # installed, dependencies included, so a published build fails here
         # if anything brought an SSH server. A lab build must have the lab
-        # profile's openssh-server, which proves the check sees one.
+        # profile's openssh-server, which proves the check sees one. The
+        # netboot installer never has one, lab build or not: the lab
+        # profile's drop-in is the main image's alone (#1926).
         run: |
           set -euo pipefail
           lab=()
           [ "$PUBLISH" = true ] || lab=(--lab)
           python3 image/tests/no_ssh_server.py manifest "${lab[@]}" \
             "image/mkosi.output/reliaburger-os_$IMAGE_VERSION.manifest"
+          python3 image/tests/no_ssh_server.py manifest \
+            "image/mkosi.output/reliaburger-os-installer_$IMAGE_VERSION.manifest"
 
       - name: Record sizes
         run: |
           set -euo pipefail
           cd image/mkosi.output
           ls -l
+          # The image's manifest; the installer has its own since #1926.
+          manifest="reliaburger-os_$IMAGE_VERSION.manifest"
           {
             echo "### Appliance $IMAGE_VERSION ($ARCH), built in ${BUILD_SECONDS} s"
             echo '```'
             ls -l
             echo '```'
-            echo "Packages: $(jq '.packages | length' *.manifest 2>/dev/null || echo '?')"
-            echo "Kernel: $(jq -r '.packages[] | select(.name | startswith("linux-image-")) | "\(.name) \(.version)"' *.manifest 2>/dev/null | tr '\n' ' ')"
-            echo "Firmware: $(jq -r '.packages[] | select(.name | startswith("linux-firmware")) | .name' *.manifest 2>/dev/null | tr '\n' ' ')"
+            echo "Packages: $(jq '.packages | length' "$manifest" 2>/dev/null || echo '?')"
+            echo "Installer packages: $(jq '.packages | length' "reliaburger-os-installer_$IMAGE_VERSION.manifest" 2>/dev/null || echo '?')"
+            echo "Kernel: $(jq -r '.packages[] | select(.name | startswith("linux-image-")) | "\(.name) \(.version)"' "$manifest" 2>/dev/null | tr '\n' ' ')"
+            echo "Firmware: $(jq -r '.packages[] | select(.name | startswith("linux-firmware")) | .name' "$manifest" 2>/dev/null | tr '\n' ' ')"
             du -sh ../mkosi.tools 2>/dev/null | sed 's/^/Tools tree: /' || true
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -369,7 +376,8 @@ jobs:
           set -euo pipefail
           cd image/mkosi.output
           sums="reliaburger-os_$IMAGE_VERSION.SHA256SUMS"
-          for f in "reliaburger-os-installer_$IMAGE_VERSION.efi" netboot/*; do
+          for f in "reliaburger-os-installer_$IMAGE_VERSION.efi" \
+                   "reliaburger-os-installer_$IMAGE_VERSION.manifest" netboot/*; do
             printf '%s  %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$(basename "$f")" >> "$sums"
           done
           cat "$sums"

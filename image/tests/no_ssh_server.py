@@ -7,7 +7,9 @@
 `config` reads the mkosi configs under <image dir> (mkosi.conf, its .conf.d
 drop-ins, and each subimage's, such as the netboot installer) and fails if an
 SSH server is in a Packages= anywhere but a file that only applies to the
-`lab` profile ([Match] Profiles=lab).
+`lab` profile ([Match] Profiles=lab). It also fails if the image or a
+subimage doesn't set ManifestFormat=json, since without a manifest the
+`manifest` check can't see an SSH server pulled in as a dependency (#1926).
 
 `manifest` reads the JSON manifests mkosi writes beside a built image, which
 list what was actually installed, dependencies included, and fails if one
@@ -23,20 +25,29 @@ from pathlib import Path
 SSH_SERVERS = re.compile(r"^(openssh-server|dropbear(-bin|-run)?|tinysshd|lsh-server)$")
 
 
+def image_roots(image):
+    """The image's directory and each subimage's."""
+    return [image, *sorted(p for p in (image / "mkosi.images").glob("*") if p.is_dir())]
+
+
+def root_files(root):
+    """One image's mkosi config files: its mkosi.conf and its drop-ins."""
+    if (root / "mkosi.conf").is_file():
+        yield root / "mkosi.conf"
+    yield from sorted((root / "mkosi.conf.d").glob("*.conf"))
+
+
 def config_files(image):
     """Every mkosi config file of the image and its subimages."""
-    roots = [image, *sorted(p for p in (image / "mkosi.images").glob("*") if p.is_dir())]
-    for root in roots:
-        if (root / "mkosi.conf").is_file():
-            yield root / "mkosi.conf"
-        yield from sorted((root / "mkosi.conf.d").glob("*.conf"))
+    for root in image_roots(image):
+        yield from root_files(root)
 
 
 def parse(path):
-    """The file's Match profiles and the packages its Packages= settings
-    name. Values continue on indented lines, separated by commas or
-    whitespace."""
-    profiles, packages = [], []
+    """The file's Match profiles, the packages its Packages= settings name,
+    and its ManifestFormat= formats. Values continue on indented lines,
+    separated by commas or whitespace."""
+    profiles, packages, manifests = [], [], []
     section = key = None
     for raw in path.read_text().splitlines():
         line = raw.split("#", 1)[0].rstrip()
@@ -56,21 +67,30 @@ def parse(path):
             profiles += words
         elif section == "Content" and key == "Packages":
             packages += words
-    return profiles, packages
+        elif section == "Output" and key == "ManifestFormat":
+            manifests += words
+    return profiles, packages, manifests
 
 
 def check_config(image):
-    found = []
-    for path in config_files(Path(image)):
-        profiles, packages = parse(path)
-        if profiles and set(profiles) == {"lab"}:
-            continue
-        found += [(path, p) for p in packages if SSH_SERVERS.match(p)]
+    found, unlisted = [], []
+    for root in image_roots(Path(image)):
+        manifest = False
+        for path in root_files(root):
+            profiles, packages, manifests = parse(path)
+            if profiles and set(profiles) == {"lab"}:
+                continue
+            found += [(path, p) for p in packages if SSH_SERVERS.match(p)]
+            manifest = manifest or "json" in manifests
+        if not manifest:
+            unlisted.append(root)
     for path, package in found:
         print(f"{path}: {package} would be in a published image; only the lab profile may have it")
-    if not found:
-        print(f"{image}: SSH servers only in the lab profile")
-    return 1 if found else 0
+    for root in unlisted:
+        print(f"{root}: no ManifestFormat=json, so no manifest shows what its packages pulled in")
+    if not found and not unlisted:
+        print(f"{image}: SSH servers only in the lab profile, and every image writes a manifest")
+    return 1 if found or unlisted else 0
 
 
 def check_manifests(paths, lab):

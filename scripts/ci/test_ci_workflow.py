@@ -1185,6 +1185,22 @@ class ApplianceTests(unittest.TestCase):
         self.assertTrue(uploads)
         self.assertTrue(all(position < i for i in uploads), uploads)
 
+    def test_the_installers_manifest_is_checked_listed_and_kept_out_of_the_size_summary(self):
+        # #1926: the netboot installer writes a manifest too. It never has
+        # an SSH server, lab build or not: the lab profile's drop-in is the
+        # main image's alone.
+        check = self.step("No SSH server in a published image")
+        self.assertIn('no_ssh_server.py manifest \\\n            "image/mkosi.output/'
+                      'reliaburger-os-installer_$IMAGE_VERSION.manifest"', check)
+        # The release's one signature covers it, like the installer's UKI.
+        sums = self.step("List the netboot files in SHA256SUMS")
+        self.assertIn('"reliaburger-os-installer_$IMAGE_VERSION.manifest"', sums)
+        # The summary's package, kernel and firmware lines are the image's,
+        # not the sum of both manifests.
+        sizes = self.step("Record sizes")
+        self.assertNotIn("*.manifest", sizes)
+        self.assertIn('"reliaburger-os_$IMAGE_VERSION.manifest"', sizes)
+
     def test_only_main_publishes(self):
         plan = self.jobs["plan"]
         self.assertIn('if [ "$GITHUB_REF" = refs/heads/main ]', plan)
