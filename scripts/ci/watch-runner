@@ -7,6 +7,10 @@
 # The resource lines keep the `disk_kb=... mem_kb=... load=...` order the
 # report step sorts on.
 #
+# OOM lines also appear on green runs: the tests kill their own memcg-limited
+# workloads on purpose. Only a killed `Runner.` process or `runners=...:gone`
+# means the runner died.
+#
 # Usage: watch-runner PIDFILE
 # WATCH_INTERVAL (seconds, default 5), WATCH_ROUNDS (default 0, forever) and
 # PROC_ROOT (standing in for /proc) exist for the tests.
