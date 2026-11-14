@@ -4047,6 +4047,26 @@ and refuses to start until each guest shows them off. A soak's guests are
 part of the experiment, and anything on them that runs on its own clock is
 a fault you didn't schedule.
 
+Both 0.2.8 day runs still ended in FAIL, for a reason that had nothing to do
+with memory: "missing coverage: hook". The job campaign never saw the
+`shared-runc` and `process` deploy hooks finish. They had run, and they had
+succeeded. The controller looks for its named fixtures in
+`/v1/batch/summaries` every 30 seconds, but the task-array store keeps only
+the 20 newest finished runs in a namespace. At the day tier's load, more
+than 20 runs finish in `default` before the first scan, so the hooks were
+pruned before anyone looked. The gate tiers got away with it because their
+cycles redeploy, and every redeploy runs the hooks again; a day run deploys
+once. The fix leans on the same record the jobs card uses for schedules: a
+`run_before` definition stays for good and carries the outcomes of its last
+10 runs, so the controller now reads `/v1/jobs/definitions` in the same scan
+and counts a hook from either place. A failed outcome in that history fails
+the campaign, just as a failed row does (#1935). That history survives a
+re-apply, so on a cluster adopted with `--home` it can still hold the last
+campaign's runs; only outcomes that started after this campaign did, give or
+take five minutes of clock skew, count either way. One gap remains: a one-off
+`after` job has no definition, so its coverage still depends on catching its
+row before it's pruned.
+
 ### Soak jobs while the apps keep running
 
 A fast command completing a million times tells us little about what happens

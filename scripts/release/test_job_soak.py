@@ -717,3 +717,115 @@ class DayLoad(unittest.TestCase):
         c.mark_hours(10**9)
         self.assertEqual(len(c.state["hour_marks"]),jobs.MAX_HOUR_MARKS)
 
+
+
+def outcome(run, status="Succeeded", succeeded=1, failed=0, not_run=0, started=1000):
+    return dict(run=run, started_at_epoch_secs=started, finished_at_epoch_secs=started+10, status=status,
+                succeeded=succeeded, failed=failed, not_run=not_run)
+
+
+def definition(name, history=None, namespace="default"):
+    value = dict(name=name, namespace=namespace, revision=1, count=1, cron=None,
+                 last_observed_minute=None, skipped=None, skipped_count=0)
+    if history is not None: value["history"] = history
+    return value
+
+
+class NamedFixtures(unittest.TestCase):
+    """The named cron, hook and after fixtures, seen through the run summaries and,
+    since the store prunes terminal runs past 20 a namespace, the definitions' own
+    history of their last 10 outcomes (#1935)."""
+
+    def state(self):
+        # The outcomes start at 1000 by default: this campaign's.
+        return {"started": 900, "coverage": {mode: {} for mode in jobs.MODES}, "discovered": {},
+                "progress": {mode: {} for mode in jobs.MODES}}
+
+    def test_an_earlier_campaigns_outcome_neither_credits_nor_fails_a_hook(self):
+        # Definitions keep their history across re-applies, so a cluster
+        # adopted with --home still holds the last campaign's hook runs.
+        state = self.state()
+        state["started"] = 100_000
+        earlier = 100_000 - jobs.HOOK_HISTORY_SKEW - 1
+        jobs.named_fixture_coverage([], [
+            definition("soak-job-hook-process", [outcome(41, started=earlier)]),
+            definition("soak-job-hook-runc", [outcome(42, "Failed", succeeded=0, failed=1, started=earlier)])], state)
+        self.assertNotIn("hook", state["coverage"]["process"])
+        self.assertNotIn("hook", state["coverage"]["runc"])
+        # Within the clock-skew allowance it is this campaign's.
+        jobs.named_fixture_coverage([], [definition("soak-job-hook-process", [outcome(43, started=earlier + 1)])], state)
+        self.assertTrue(state["coverage"]["process"]["hook"])
+        with self.assertRaisesRegex(jobs.InvalidEvidence, "release job fixture failed: soak-job-hook-runc"):
+            jobs.named_fixture_coverage([], [definition("soak-job-hook-runc", [
+                outcome(44, "Failed", succeeded=0, failed=1, started=earlier + 1)])], state)
+
+    def test_a_hook_run_pruned_from_the_summaries_still_counts_from_its_definition(self):
+        # The day tier never redeploys, and more than 20 runs finish in
+        # `default` before the first scan, so the hook's own row is gone.
+        state = self.state()
+        jobs.named_fixture_coverage([], [definition("soak-job-hook-process", [outcome(41)]),
+                                         definition("soak-job-hook-shared-runc", [outcome(42)])], state)
+        self.assertTrue(state["coverage"]["process"]["hook"])
+        self.assertTrue(state["coverage"]["shared-runc"]["hook"])
+        self.assertNotIn("hook", state["coverage"]["runc"])
+
+    def test_a_failed_hook_outcome_fails_the_campaign(self):
+        for status in ("CompletedWithFailures", "Failed"):
+            with self.subTest(status=status), self.assertRaisesRegex(
+                    jobs.InvalidEvidence, "release job fixture failed: soak-job-hook-process"):
+                jobs.named_fixture_coverage([], [definition("soak-job-hook-process", [
+                    outcome(40), outcome(41, status, succeeded=0, failed=1)])], self.state())
+
+    def test_no_row_and_no_finished_hook_means_no_hook_coverage(self):
+        for definitions in ([], [definition("soak-job-hook-process")],
+                            [definition("soak-job-hook-process", [outcome(41, "Cancelled", succeeded=0, not_run=1)])],
+                            [definition("soak-job-hook-process", [outcome(41)], namespace="elsewhere")],
+                            [definition("soak-job-cron-process", [outcome(41)])],
+                            [definition("soak-job-after-process", [outcome(41)])]):
+            with self.subTest(definitions=definitions):
+                state = self.state()
+                jobs.named_fixture_coverage([], definitions, state)
+                self.assertNotIn("hook", state["coverage"]["process"])
+
+    def test_a_malformed_definition_history_is_refused(self):
+        for history in ("Succeeded", [outcome(41, "Finished")], [outcome(41, succeeded=-1)],
+                        [{**outcome(41), "failed": True}], [outcome(0)]):
+            with self.subTest(history=history), self.assertRaises(jobs.InvalidEvidence):
+                jobs.named_fixture_coverage([], [definition("soak-job-hook-process", history)], self.state())
+        with self.assertRaises(jobs.InvalidEvidence):
+            jobs.named_fixture_coverage([], {"soak-job-hook-process": []}, self.state())
+
+    def test_a_finished_fixture_row_still_counts_as_before(self):
+        state = self.state()
+        rows = [summary(7, name="soak-job-hook-runc", total=1, succeeded=1, done=True, active_commands=0),
+                summary(9, name="soak-job-cron-process", total=1, succeeded=1, done=True, active_commands=0),
+                summary(8, name="work", total=1)]
+        named = jobs.named_fixture_coverage(rows, [], state, now=5000)
+        self.assertTrue(state["coverage"]["runc"]["hook"])
+        self.assertTrue(state["coverage"]["process"]["cron"])
+        self.assertEqual(state["progress"]["process"], {"last_cron_id": 9, "last_cron_progress": 5000})
+        self.assertEqual(state["discovered"], {})
+        self.assertEqual([value["batch_id"] for value in named], [7, 9])
+
+    def test_a_failed_fixture_row_still_fails_and_a_fenced_one_is_acknowledged_on_the_second_scan(self):
+        with self.assertRaisesRegex(jobs.InvalidEvidence, "release job fixture failed: soak-job-after-runc"):
+            jobs.named_fixture_coverage([summary(7, name="soak-job-after-runc", total=1, failed=1, done=True,
+                                                 active_commands=0)], [], self.state())
+        state = self.state()
+        jobs.named_fixture_coverage([summary(7, name="soak-job-hook-runc", total=1)], [], state)
+        self.assertEqual(state["discovered"], {})
+        owner = {"node": "node-1", "grant_digest": "a" * 64}
+        fenced = summary(7, name="soak-job-hook-runc", total=1, unknown_owners=[owner])
+        acknowledged = []
+        for _ in range(2):
+            jobs.named_fixture_coverage([copy.deepcopy(fenced)], [], state, now=60,
+                                        acknowledge=lambda *call: acknowledged.append(call))
+        self.assertIn("7", state["discovered"])
+        self.assertEqual(acknowledged, [(7, owner, "named true fixture, two identical fenced observations", 60)])
+        self.assertNotIn("hook", state["coverage"]["runc"])
+
+    def test_the_scan_reads_the_definitions_with_the_summaries(self):
+        import inspect
+        scan = inspect.getsource(jobs.run)
+        self.assertIn('api.request("GET","/v1/jobs/definitions")', scan)
+        self.assertLess(scan.index('"/v1/batch/summaries"'), scan.index("named_fixture_coverage("))
