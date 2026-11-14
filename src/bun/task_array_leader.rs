@@ -1315,6 +1315,7 @@ async fn is_leading(state: &ApiState) -> bool {
     }
 
     match &state.council {
+        // One round: the leader loop asks again next tick (#1393).
         Some(council) => council.is_leader().await,
         None => true,
     }

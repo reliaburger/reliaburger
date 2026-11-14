@@ -2080,9 +2080,11 @@ The answer is three sets, named in one list, `ALLOWLIST` in
   `benches/` (Cargo refuses a manifest whose declared benchmarks are missing,
   even for a plain build), `brioche/dist/`, `docs/manual/`, `examples/`, and
   the four files under `scripts/release/` that the code includes.
-- **The test set**: `tests/`, `proptest-regressions/`, the `Makefile` and
-  `.config/` (nextest's configuration). An agent that patches a function should
-  run that function's tests.
+- **The test set**: `tests/`, `proptest-regressions/`, `fuzz/` (the fuzz
+  targets and their corpus, which the stable-Rust fuzz tests replay), the
+  handful of files other tests read at run time, the `Makefile` and
+  `.config/` (nextest's configuration). An agent that patches a function
+  should run that function's tests.
 - **The read set**: `CLAUDE.md`, the design docs, the book, the whitepaper,
   the roadmap, the release log and the testing, releasing and flakes docs. The
   reasoning behind the code, at the same version as the code.
@@ -2856,6 +2858,167 @@ that cluster's own home, showed the sample app running. The more useful
 lesson is that `try` did exactly its job: a `bun` that wouldn't boot came
 back as an answer with the log attached, and `destroy` cleaned up the VM it
 left behind.
+
+### A hundred failures that weren't the patch's
+
+The first filtered `test` passed, so nobody ran the whole suite in a fresh
+workspace until the agent gym did, on 0.2.8. An agent fixed a planted bug,
+ran `patch test`, and got `ok: false` with ten failures
+([#1876](https://github.com/reliaburger/reliaburger/issues/1876)). None of
+them were about its fix. Three fuzz tests found no `fuzz/` directory: the
+bundle didn't carry it. Two job bench tests couldn't open the qualification
+report they read as a baseline: the bundle carried none of
+`docs/qualification/`. And five MCP tests about stored tokens failed for two
+reasons stacked on top of each other. They saw the agent's own read-only
+`RELIABURGER_TOKEN`, which the guide tells every agent to work with, and an
+exported token beats the one `relish mcp` makes for itself. Clear that, and
+four of them still failed, because they set process-wide state.
+
+So a correct patch could never answer `ok: true`, and an agent that reads
+`ok` (as it should) would go hunting for a bug it hadn't written. That's
+worse than no test at all.
+
+And ten wasn't all of it. Every one of the ten was in the library's unit
+tests, the first binary `cargo test` runs, and `cargo test` stops at the
+first test binary that fails. The binaries after it never ran, and `passed`
+counted only what had. With `--no-fail-fast` the same workspace failed about
+a hundred tests. Two in `relish`'s own tests wanted the concept budget and
+the released-CLI list. Seven dependency audit tests wanted
+`.cargo/audit.toml`, two documentation tests the READMEs and the Linux
+servers guide. Four Mayo memory tests count heap bytes through a global
+allocator, which only works with the process to themselves. The other
+ninety-odd were `tests/suite`'s repository checks: the website, the GitHub
+workflows and issue forms, the README hero, the devcontainer.
+
+That split the fix in two. A file a test of the *code* reads goes into the
+bundle: `fuzz/` (432 KB, whole), the one 1.6 KB bench report rather than all
+34 MB of qualification evidence, the concept budget, the released-CLI list,
+the audit exceptions, the READMEs and the Linux servers guide. Each path lives where its
+test can name it (`COMMITTED_RERUN_REPORT`, `BUDGET_FILE`) and a bundle test
+checks they're carried, so a rename can't leave the bundle behind.
+
+A test of the *repository* is another matter. Carrying the website alone
+would take the bundle past the 6 MB it's allowed, and none of those checks
+says anything about a patch to `src/`. So `patch test` skips them with
+libtest's `--skip` (a substring match on the test's name, given once per
+pattern after `--`), from one list, `REPOSITORY_CHECKS`. `not_run` names
+every module on it, and a test fails if the list names a module
+`tests/suite/main.rs` doesn't have, or one `not_run` leaves out. Skipping is
+fine. Skipping quietly isn't.
+
+The token was about what the test process inherits. `run_cargo` already
+removed `CARGO_TARGET_DIR` and the two variables a release build sets. It now
+removes every `RELIABURGER_*` in the session, through a small function the
+tests can call with a list of names instead of a real environment:
+
+```rust
+pub(super) fn session_variables(
+    names: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Vec<std::ffi::OsString> {
+    names
+        .into_iter()
+        .filter(|name| {
+            name == "CARGO_TARGET_DIR"
+                || name
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("RELIABURGER_"))
+        })
+        .collect()
+}
+```
+
+`impl IntoIterator<Item = OsString>` in argument position takes anything
+that iterates over owned `OsString`s: an array in the test,
+`std::env::vars_os().map(|(name, _)| name)` in `run_cargo`. Environment
+variable names are `OsString`, not `String`, because Unix allows any bytes in
+them; `to_str()` returns `None` for a name that isn't UTF-8, and
+`is_some_and` treats that as "not ours". Testing the function rather than the
+environment matters here. Setting a variable in a test is `unsafe` in Rust
+2024 (another thread may be reading the environment at the same time), and
+`cargo test` runs tests on threads.
+
+Removing them all, rather than the three a cluster uses, also drops the
+switches the gated suites look for, such as `RELIABURGER_RUNC_TESTS`. A
+session that happened to export one would otherwise turn a portable run into
+something `not_run` says it isn't.
+
+The process-wide state took a different fix. The CLI endpoint lives in a
+`OnceLock` (a static you can set exactly once; every later `set` is
+ignored), and the token `relish mcp` makes lives in a static `RwLock`. A
+comment in `client.rs` already admitted it: these tests rely on nextest,
+which runs every test in a process of its own. `patch test` runs plain
+`cargo test`, which runs them as threads of one process, so the first test
+to set the endpoint pointed every later one at its own stand-in cluster. The
+Mayo memory tests had the same problem with their counting allocator: four
+tests on four threads add up to one heap.
+
+Switching `patch test` to nextest would have meant a second output parser,
+and a second run for the doctests, which nextest doesn't run. Instead
+`tests/support/own_process.rs` has one helper, which `tests/mayo_memory.rs`
+pulls in with `#[path]` and so does the library's MCP test module (a module
+can live in any file `#[path]` names, even one under `tests/`). Each of those
+thirteen tests now opens with
+
+```rust
+if ran_in_its_own_process("a_token_the_cluster_still_accepts_is_kept").await {
+    return;
+}
+```
+
+Under nextest (`NEXTEST_EXECUTION_MODE=process-per-test`) it returns
+`false` at once and the body runs. Under `cargo test` it starts the test
+binary again with `--exact` and that one test's name, marks the child with an
+environment variable so the child runs the body, and asserts that the child
+passed exactly one test. `--exact` with a name that matches nothing passes
+zero tests and still exits 0, which is why the assertion looks for `1 passed`
+rather than trusting the exit status.
+
+The exit code stayed 0. The issue asked whether a failing run should exit
+non-zero, and the contract already answers that: every `relish agent`
+command exits 0 when it answered, and `data` holds the verdict. The fix was
+to make `ok` mean what it says, and to put "read `data.ok`" in the command's
+own help as well as the manual.
+
+### What the review of that fix found
+
+Re-running the gym's debug scenario on the branch turned up three more things
+([#1882](https://github.com/reliaburger/reliaburger/issues/1882)), all older
+than the fix.
+
+The first was the path. `patch init ./fix` prints `patch test ./fix` as its
+next step, and that step failed with "manifest path `./fix/Cargo.toml` does
+not exist". `run_cargo` hands cargo `--manifest-path dir.join("Cargo.toml")`
+and also starts it inside the workspace with `current_dir(dir)`. A relative
+`dir` is then read from inside itself, as `./fix/fix/Cargo.toml`. Every test
+used an absolute temporary directory, so none had ever passed it a relative
+one. Now `run_cargo` makes `dir` absolute first, with `std::path::absolute`.
+Unlike `canonicalize`, it doesn't touch the filesystem or resolve symbolic
+links. It only joins a relative path onto the working directory, which is all
+the fix needs. The new test builds a relative path to the fixture's workspace
+from `..` components, rather than changing the working directory. The working
+directory belongs to the whole process, and `cargo test` runs the other tests
+on threads of that same process.
+
+The second was what that failure looked like: `ok: false`, `failed: 0` and
+`errors: []`. The cause was only in `cargo_output`, a field an agent has no
+reason to read when it's looking for errors. When cargo stops before the
+compiler or a test says anything (a dependency it can't resolve, a lock file
+out of date, a manifest it can't find), `cargo_error` now turns its first
+`error:` line into an entry in `errors`. That entry has no file or line, and
+the end of what cargo printed is its `rendered` text. `ok: false` always comes
+with something to read.
+
+The third was the totals. A whole-suite run reported `filtered_out` as
+31,587, with no filter given. One TLS test in the library runs its own test
+binary four times, with `--exact` and one test's name, to get a fresh process
+each time, and it let each child print to the same stdout. Each child's
+`test result: ok. 1 passed; ... 7870 filtered out` line landed in cargo's
+output among the library's own, and the parser counted all five. The test now
+pipes its child's output and shows it only if the child fails. A test that
+reads the portable suite's sources fails if any other `current_exe()` re-run
+starts its child with `.spawn()` or `.status()` and never sets `.stdout(...)`.
+`own_process.rs` uses `.output()`, which pipes stdout by default, so it was
+never one of them.
 
 ### Unsigned on purpose
 
@@ -6128,7 +6291,8 @@ runner end to end against a fake cluster: the real shim and solvers, and a
 `relish` that answers from calls the baseline recorded on a real run
 (`gym.py fixture` turns a run's call log into one). It checks the baseline
 gets each recorded scenario right, that a planted bug the shipped binary also
-shows isn't scored, that a failed setup still stops the cluster, and that an
+shows isn't scored, that a failed setup still stops the cluster, that a
+tried patch's throwaway cluster is destroyed however the run ends, and that an
 outside solver which reads the injection, runs `relish delete web` and
 blames `billing` is `unsafe` three times over. `test_k8s.py` does the same for
 the Kubernetes side: it renders the lab's steps instead of running them
@@ -6418,6 +6582,20 @@ and answered with a patch it had never tested. Both prompts now say to run
 one `relish` command per call and that a refused call can be run again on
 its own. The second run built, tested and tried its patch, and drafted the
 report.
+
+It also left its throwaway cluster running (#1847). `relish agent patch try`
+keeps the cluster it boots until `patch destroy`, by design, so an agent can
+come back to it. Nothing in the gym called `destroy`, so the VM from that
+evening's dry run was still up 21 hours later. By then it was in the middle
+of the 0.2.8 release gate's soak, on a host that has to stay quiet. Now
+`run_once` destroys each patch workspace's cluster before it stops the gym's
+own. It finds a workspace by the state file `patch init` writes: anywhere in
+the first two levels of the solver's directory, or wherever a `patch try`
+call put it. It does this in the same `finally` that stops the cluster, so
+the cleanup runs after an answer, after a failure, and after Ctrl-C. The
+runner names each workspace instead of passing `--all`. Every throwaway
+cluster lives under `~/.reliaburger-patch`, and `--all` would destroy
+clusters that belong to other work on the same machine.
 
 `scripts/record/test_record.py` runs in `make test-ci-scripts`. It covers
 what each kind of event puts on screen, the chapter markers, the session's
@@ -7420,6 +7598,29 @@ people scoped to other namespaces, and reads the audit log back. And
 `tests/cluster_failover.rs` proposes through one follower, approves through
 the other, kills the leader, and undoes on the new one, checking the app is
 back at its exact `before` revision.
+
+That test once failed in a merge queue with a 404 (#1928). The approve
+handler checked the caller first and forwarded second, and checking the
+caller meant reading the proposal from the receiving node's own replica.
+The second follower hadn't yet applied the entry that created proposal 1,
+so it found nothing and said so, though the leader had it. Approve, reject,
+withdraw and undo now split their checks in two. What the token alone
+decides, an agent trying to approve or a read-only token, is still refused
+where it asked. Everything that reads the proposal happens after
+`decide_on_leader`, which sends the request on unless this node has proved
+it leads. The caller's own credential travels with it, so the leader
+repeats every check and writes the audit record as the caller. A
+follower's replica can lag, so only the leader may say "there's no
+proposal 1". An agent's `kind: undo` proposal reads its original the same
+way, after forwarding. The new test makes the lag certain rather than
+likely: it shuts down one follower's Raft core, leaving its API up, and
+makes every decision through it, then checks each audit record names
+whoever asked. It also checks the refusals still come from the leader. A
+person approving their own proposal through that follower gets the
+leader's 403 naming them as its author; the follower, which can't see the
+proposal, could only have said 404. A deployer scoped to another namespace
+gets 404, the answer for a proposal outside your scope, which says nothing
+about it.
 
 ### What the gym found first
 

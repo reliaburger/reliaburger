@@ -229,6 +229,8 @@ pub(super) enum DeployOp {
         new_ips: std::collections::HashMap<InstanceId, Option<std::net::Ipv4Addr>>,
         new_specs: std::collections::HashMap<InstanceId, crate::grill::oci::OciSpec>,
         now: Instant,
+        /// When the deploy of this app began: the history entry's start.
+        started_at: std::time::SystemTime,
         reply: oneshot::Sender<Result<(), BunError>>,
     },
     /// Publish one freshly-healthy replacement as a routable backend (M7).
@@ -1025,6 +1027,7 @@ impl DeployOps {
         new_ips: std::collections::HashMap<InstanceId, Option<std::net::Ipv4Addr>>,
         new_specs: std::collections::HashMap<InstanceId, crate::grill::oci::OciSpec>,
         now: Instant,
+        started_at: std::time::SystemTime,
     ) -> Result<(), BunError> {
         // The loop answers `StillRunning`, having changed nothing, while the
         // rolled-out service's journal write is in flight (#1336); ask again
@@ -1041,6 +1044,7 @@ impl DeployOps {
                     new_ips: new_ips.clone(),
                     new_specs: new_specs.clone(),
                     now,
+                    started_at,
                     reply,
                 },
                 Err(BunError::DeployFailed {
@@ -1674,12 +1678,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 new_ips,
                 new_specs,
                 now,
+                started_at,
                 reply,
             } => {
                 let result = self
                     .finalise_rolling_deploy(
                         &app_name, &namespace, &spec, &existing, &new_ids, &new_ports, &new_ips,
-                        new_specs, now,
+                        new_specs, now, started_at,
                     )
                     .await;
                 let _ = reply.send(result);

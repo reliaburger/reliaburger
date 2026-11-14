@@ -136,7 +136,11 @@ fn is_dropped(node: &Node) -> bool {
     if DROPPED_ELEMENTS.contains(&name) {
         return true;
     }
-    if attribute(node, "aria-hidden").as_deref() == Some("true") {
+    // A `hidden` element isn't on the page until a script reveals it, like
+    // a recording's speed buttons (#1906).
+    if attribute(node, "aria-hidden").as_deref() == Some("true")
+        || attribute(node, "hidden").is_some()
+    {
         return true;
     }
     attribute(node, "class").is_some_and(|classes| {
@@ -586,6 +590,28 @@ fn a_copy_keeps_the_words_and_drops_the_furniture() {
     ] {
         assert!(!copy.contains(gone), "{gone:?} survived: {copy}");
     }
+}
+
+/// Controls a script reveals, such as a recording's speed buttons, start
+/// `hidden`. Copied out they left a stray "speed" at the end of every
+/// recording's caption (#1906); a hidden element isn't on the page, so it
+/// isn't in the copy either.
+#[test]
+fn a_copy_leaves_out_hidden_controls() {
+    let html = r##"<!doctype html><html><head><title>T</title></head><body><main>
+<figure class="recording"><figcaption>
+<span class="recording-chapters" role="group" hidden></span>
+<span>The whole tour on a laptop cluster.</span>
+<span class="recording-speed" role="group" hidden>speed
+<button type="button" data-speed="1">1×</button></span>
+</figcaption></figure></main></body></html>"##;
+    let copy = markdown_copy("index.html", html);
+    assert!(
+        copy.contains("The whole tour on a laptop cluster."),
+        "{copy}"
+    );
+    assert!(!copy.contains("speed"), "a hidden control survived: {copy}");
+    assert!(!copy.contains("1×"), "a hidden control survived: {copy}");
 }
 
 #[test]

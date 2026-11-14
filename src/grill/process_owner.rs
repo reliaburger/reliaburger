@@ -175,6 +175,7 @@ pub fn current_boot_id() -> io::Result<Option<String>> {
     #[cfg(target_os = "linux")]
     let boot = {
         let mut bytes = String::new();
+        // BLOCKING-OK: a procfs read, answered from memory, not from a disk (#1887)
         File::open("/proc/sys/kernel/random/boot_id")?
             .take(64)
             .read_to_string(&mut bytes)?;

@@ -58,12 +58,6 @@ CONSENT
 
  I'm happy to share my information with the Reliaburger team
 
-FEEDBACK RECEIVED
-
-# Thank you! 🍔
-
-Found a bug? [Open an issue on GitHub](https://github.com/reliaburger/reliaburger/issues).
-
 ---
 
 The Markdown copy of <https://reliaburger.com/feedback/>.

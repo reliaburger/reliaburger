@@ -373,11 +373,16 @@ impl UpgradeManager {
     /// Upgrade ids this node attempted and reverted (recent history).
     /// The leader polls these to detect node-side reverts.
     pub fn reverted_upgrade_ids(&self) -> Vec<String> {
-        self.read_history()
-            .into_iter()
-            .filter(|entry| entry.outcome == UpgradeOutcome::Reverted)
-            .map(|entry| entry.upgrade_id)
-            .collect()
+        reverted_ids(self.read_history())
+    }
+
+    /// [`Self::reverted_upgrade_ids`], read on the blocking pool for async
+    /// callers (#1887).
+    async fn reverted_upgrade_ids_off_runtime(&self) -> Result<Vec<String>, UpgradeError> {
+        let path = self.history_path.clone();
+        tokio::task::spawn_blocking(move || reverted_ids(read_history_file(&path)))
+            .await
+            .map_err(|error| UpgradeError::Io(std::io::Error::other(error)))
     }
 
     /// Node-level status: running version, in-flight marker, recent history.
@@ -389,6 +394,15 @@ impl UpgradeManager {
             in_flight,
             history,
         }
+    }
+
+    /// The in-flight marker, read on a blocking thread: it is a file in the
+    /// data directory, and `prepare` runs on the async runtime (#1860).
+    async fn load_marker(&self) -> Result<Option<UpgradeMarker>, UpgradeError> {
+        let path = self.marker_path.clone();
+        tokio::task::spawn_blocking(move || UpgradeMarker::load(&path))
+            .await
+            .map_err(|error| UpgradeError::Io(std::io::Error::other(error)))?
     }
 
     // -----------------------------------------------------------------
@@ -406,7 +420,7 @@ impl UpgradeManager {
         directive: &UpgradeDirective,
         pre_upgrade_instances: Vec<InstanceInventory>,
     ) -> Result<Option<PreparedUpgrade>, UpgradeError> {
-        if let Some(existing) = UpgradeMarker::load(&self.marker_path)? {
+        if let Some(existing) = self.load_marker().await? {
             if existing.upgrade_id == directive.upgrade_id {
                 return Ok(None);
             }
@@ -418,7 +432,11 @@ impl UpgradeManager {
         // the marker is gone, so without this check a re-delivered (or
         // leader-retried) directive would crash-loop the node forever.
         // Retries get a fresh id (orchestrator::resume renames the run).
-        if self.reverted_upgrade_ids().contains(&directive.upgrade_id) {
+        if self
+            .reverted_upgrade_ids_off_runtime()
+            .await?
+            .contains(&directive.upgrade_id)
+        {
             return Err(UpgradeError::PreviouslyFailed {
                 upgrade_id: directive.upgrade_id.clone(),
             });
@@ -572,7 +590,7 @@ impl UpgradeManager {
         version: Option<BinaryVersion>,
         pre_upgrade_instances: Vec<InstanceInventory>,
     ) -> Result<Option<PreparedUpgrade>, UpgradeError> {
-        if let Some(existing) = UpgradeMarker::load(&self.marker_path)? {
+        if let Some(existing) = self.load_marker().await? {
             // A leader rolling itself back execs once its answer is written,
             // before it records sending the directive, so its successor sends
             // the same rollback again while this marker verifies (#526).
@@ -998,17 +1016,7 @@ impl UpgradeManager {
     }
 
     fn read_history(&self) -> Vec<UpgradeHistoryEntry> {
-        let Ok(contents) = std::fs::read_to_string(&self.history_path) else {
-            return Vec::new();
-        };
-        let mut entries: Vec<UpgradeHistoryEntry> = contents
-            .lines()
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .collect();
-        if entries.len() > STATUS_HISTORY_LIMIT {
-            entries.drain(..entries.len() - STATUS_HISTORY_LIMIT);
-        }
-        entries
+        read_history_file(&self.history_path)
     }
 }
 
@@ -1109,6 +1117,31 @@ fn adoption_source(adopt_from: Option<&Path>) -> std::io::Result<PathBuf> {
         Some(path) => std::fs::canonicalize(path),
         None => std::fs::canonicalize(std::env::current_exe()?),
     }
+}
+
+/// The last [`STATUS_HISTORY_LIMIT`] entries of the history file at `path`,
+/// or none if it can't be read.
+fn read_history_file(path: &Path) -> Vec<UpgradeHistoryEntry> {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut entries: Vec<UpgradeHistoryEntry> = contents
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    if entries.len() > STATUS_HISTORY_LIMIT {
+        entries.drain(..entries.len() - STATUS_HISTORY_LIMIT);
+    }
+    entries
+}
+
+/// The ids of the upgrades in `history` that this node reverted.
+fn reverted_ids(history: Vec<UpgradeHistoryEntry>) -> Vec<String> {
+    history
+        .into_iter()
+        .filter(|entry| entry.outcome == UpgradeOutcome::Reverted)
+        .map(|entry| entry.upgrade_id)
+        .collect()
 }
 
 #[cfg(test)]

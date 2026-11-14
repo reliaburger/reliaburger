@@ -162,6 +162,34 @@ pub fn last_lines(text: &str, count: usize) -> String {
     lines[lines.len().saturating_sub(count)..].join("\n")
 }
 
+/// Cargo's own failure, when it stopped before the compiler said anything:
+/// an unresolvable dependency, a lock file out of date, a manifest it
+/// couldn't find. The message is its first `error:` line, so an answer with
+/// `ok: false` always has an error to read (#1882); `rendered` is the end of
+/// what it printed.
+pub fn cargo_error(stderr: &str) -> CompilerError {
+    let message = stderr
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix("error: "))
+        .or_else(|| {
+            stderr
+                .lines()
+                .rev()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+        })
+        .unwrap_or("cargo failed and printed nothing");
+    let rendered = last_lines(stderr.trim_end(), 20);
+    CompilerError {
+        file: None,
+        line: None,
+        column: None,
+        code: None,
+        message: message.to_string(),
+        rendered: (!rendered.is_empty()).then_some(rendered),
+    }
+}
+
 /// What the test harness printed, added up over every test binary.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TestResults {
@@ -364,5 +392,79 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
     fn last_lines_keeps_the_end() {
         assert_eq!(last_lines("a\nb\nc\n", 2), "b\nc");
         assert_eq!(last_lines("a", 5), "a");
+    }
+
+    #[test]
+    fn cargos_own_error_is_its_first_error_line() {
+        let stderr = "    Updating crates.io index\n\
+                      error: failed to select a version for `tokio`\n\
+                      \x20   ... required by package `reliaburger`\n";
+        let error = cargo_error(stderr);
+        assert_eq!(error.message, "failed to select a version for `tokio`");
+        assert_eq!(error.rendered.as_deref(), Some(stderr.trim_end()));
+        assert_eq!((error.file, error.line, error.code), (None, None, None));
+    }
+
+    #[test]
+    fn cargo_failing_with_no_error_line_still_says_so() {
+        assert_eq!(cargo_error("").message, "cargo failed and printed nothing");
+        assert_eq!(cargo_error("Killed\n").message, "Killed");
+    }
+
+    /// A test that runs its own binary again with stdout inherited puts a
+    /// second `test result:` line in cargo's output, and `patch test` adds
+    /// it to the totals: four such children once made a whole-suite run
+    /// report `passed` 4 too high and `filtered_out` at 31,587 (#1882).
+    /// Every re-run in the portable suite's sources takes its child's
+    /// stdout: with `.stdout(...)`, or `.output()`, which pipes it.
+    #[test]
+    fn no_portable_test_lets_a_rerun_of_its_binary_print_into_the_totals() {
+        fn sources(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    sources(&path, found);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    found.push(path);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        for dir in ["src", "tests/suite", "tests/support"] {
+            sources(&root.join(dir), &mut files);
+        }
+        let mut leaking = Vec::new();
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            let lines: Vec<&str> = text.lines().collect();
+            for (index, line) in lines.iter().enumerate() {
+                // Split, so this line doesn't find itself.
+                if !line.contains(concat!("Command::new(std::env::", "current_exe()")) {
+                    continue;
+                }
+                let chain: Vec<&str> = lines[index..]
+                    .iter()
+                    .take(40)
+                    .copied()
+                    .take_while(|line| !line.contains(".spawn()") && !line.contains(".status()"))
+                    .collect();
+                let rest = &lines[index + chain.len()..];
+                let starts = rest
+                    .first()
+                    .is_some_and(|line| line.contains(".spawn()") || line.contains(".status()"));
+                let takes_stdout = chain
+                    .iter()
+                    .any(|line| line.contains(".stdout(") || line.contains(".output()"));
+                if starts && !takes_stdout {
+                    leaking.push(format!(
+                        "{}:{}",
+                        file.strip_prefix(root).unwrap().display(),
+                        index + 1
+                    ));
+                }
+            }
+        }
+        assert!(leaking.is_empty(), "{leaking:?}");
     }
 }

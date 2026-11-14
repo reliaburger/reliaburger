@@ -17,8 +17,12 @@
 //! history: queries with no lower bound, windows far behind the newest data,
 //! the council's rollup store, and the object-store backend.
 //!
-//! The counters are process-wide, so each test needs its own process, which
-//! is how nextest runs them (`make test`).
+//! The counters are process-wide, so each test needs its own process. nextest
+//! gives it one (`make test`); under plain `cargo test` each test runs itself
+//! again in a child (`own_process`, #1876).
+
+#[path = "support/own_process.rs"]
+mod own_process;
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::BTreeMap;
@@ -120,6 +124,9 @@ async fn periodic_cycle(store: &MayoStore, rollups: &RollupGenerator, now: u64) 
 
 #[tokio::test(flavor = "current_thread")]
 async fn periodic_reads_stay_flat_as_history_grows() {
+    if own_process::ran_in_its_own_process("periodic_reads_stay_flat_as_history_grows").await {
+        return;
+    }
     let directory = tempfile::tempdir().unwrap();
     let mut store = MayoStore::new(directory.path().to_path_buf());
     let keys = series_keys();
@@ -220,6 +227,13 @@ fn start_of_current_minute() -> u64 {
 /// be too.
 #[tokio::test(flavor = "current_thread")]
 async fn unbounded_and_old_window_reads_stay_flat_as_history_grows() {
+    if own_process::ran_in_its_own_process(
+        "unbounded_and_old_window_reads_stay_flat_as_history_grows",
+    )
+    .await
+    {
+        return;
+    }
     let directory = tempfile::tempdir().unwrap();
     let mut store = MayoStore::new(directory.path().to_path_buf());
     let keys = series_keys();
@@ -311,6 +325,9 @@ fn rollups_for_minute(keys: &[MetricKey], minute: u64) -> Vec<NodeRollup> {
 /// session loaded every one of them for each cluster query.
 #[tokio::test(flavor = "current_thread")]
 async fn rollup_reads_stay_flat_as_history_grows() {
+    if own_process::ran_in_its_own_process("rollup_reads_stay_flat_as_history_grows").await {
+        return;
+    }
     let directory = tempfile::tempdir().unwrap();
     let mut store = RollupStore::new(directory.path().to_path_buf());
     let keys = series_keys();
@@ -369,6 +386,9 @@ async fn rollup_reads_stay_flat_as_history_grows() {
 /// the periodic ones the local backend already bounded (#321).
 #[tokio::test(flavor = "current_thread")]
 async fn object_store_reads_stay_flat_as_history_grows() {
+    if own_process::ran_in_its_own_process("object_store_reads_stay_flat_as_history_grows").await {
+        return;
+    }
     let directory = tempfile::tempdir().unwrap();
     let bucket = tempfile::tempdir().unwrap();
     let url = url::Url::from_file_path(bucket.path()).unwrap().to_string();
