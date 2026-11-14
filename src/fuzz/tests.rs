@@ -124,6 +124,30 @@ fn fixture_seeds_are_in_the_checked_in_corpus() {
     }
 }
 
+/// A protocol or state bump makes the old gossip and Raft seeds undecodable,
+/// and libFuzzer then starts from inputs its target refuses at the first
+/// byte. The presence check above can't see that, since the file names stay
+/// the same, so check the checked-in bytes too.
+#[test]
+fn checked_in_fixture_seeds_are_still_accepted() {
+    for target in TARGETS {
+        let directory = fuzz_dir().join("corpus").join(target.name);
+        for seed in seeds::for_target(target.name) {
+            let path = directory.join(&seed.name);
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            assert_eq!(
+                (target.run)(&bytes),
+                Outcome::Accepted,
+                "{} refuses its checked-in seed {}: run make fuzz-corpus-seed",
+                target.name,
+                path.display()
+            );
+        }
+    }
+}
+
 /// Overwrite, insert or delete a few bytes: a crude libFuzzer.
 fn mutate(mut bytes: Vec<u8>, edits: &[(u8, usize, u8)]) -> Vec<u8> {
     for &(kind, position, value) in edits {
