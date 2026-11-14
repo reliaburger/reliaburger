@@ -46,6 +46,13 @@ def sample(inventory, node, now):
         if len(parts) == 3 and parts[1].isdigit():
             top.append([parts[0], int(parts[1]), parts[2]])
     row["top"] = top
+    # The log and metrics stores beside the memory: Bun's malloc followed a
+    # slowly filled log store in the 0.2.7 memory run (#1417).
+    sizes = dict(line.partition(" ")[::2] for line in inventory.get("disk", []))
+    for store in ("logs", "metrics"):
+        size = sizes.get(store, "")
+        row[store + "_kb"] = int(size) if size.isdigit() else None
+    row["log_files"] = number(inventory, "log_files")
     return row
 
 
@@ -165,4 +172,24 @@ def section(evidence):
                          f"{mib(row.get('heap_kb'))} | {arenas} | {mib(row.get('stack_kb'))} | "
                          f"{mib(row.get('other_anon_kb'))} | {mib(row.get('file_kb'))} | {threads} |")
         lines += ["", growth_line(node, rows), slope_line(node, rows), ""]
-    return lines
+    return lines + store_lines(nodes)
+
+
+def count(value):
+    return "n/a" if not isinstance(value, int) else f"{value:,}"
+
+
+def store_lines(nodes):
+    """Each node's log store (size and Parquet files) and metrics store
+    against its RSS, hourly; empty for a run whose rows don't carry them."""
+    if not any(isinstance(row.get("log_files"), int) for rows in nodes.values() for row in rows):
+        return []
+    lines = ["### Log stores against RSS", "",
+             "Each node's `disk logs` and `disk metrics` and the Parquet files in its log store, from the same "
+             "samples. RSS in MiB.", "",
+             "| Node | Time | RSS | Logs (KiB) | Log files | Metrics (KiB) |", "|---|---|---|---|---|---|"]
+    for node, rows in sorted(nodes.items()):
+        first = rows[0]["ts"]
+        lines += [f"| {node} | {elapsed(row['ts'] - first)} | {mib(row.get('rss_kb'))} | {count(row.get('logs_kb'))} | "
+                  f"{count(row.get('log_files'))} | {count(row.get('metrics_kb'))} |" for row in hourly(rows)]
+    return lines + [""]

@@ -1,0 +1,92 @@
+{
+  "application_probes": 60,
+  "application_failures": 0,
+  "resource_observations": [
+    {
+      "elapsed_seconds": 0.01058949999998049,
+      "cpu_ticks": [
+        423,
+        0,
+        704,
+        67904,
+        54,
+        0,
+        182,
+        0,
+        0,
+        0
+      ],
+      "storage": {
+        "/var/lib/reliaburger/data": {
+          "allocated_bytes_observed": 4685824,
+          "files_observed": 469,
+          "raced_entries": 0,
+          "complete": true,
+          "filesystem_available_bytes": 7026511872
+        }
+      },
+      "processes": [
+        {
+          "pid": 22707,
+          "start_ticks": 10563,
+          "complete": true,
+          "rss_bytes": 107909120,
+          "peak_rss_bytes": 107909120
+        },
+        {
+          "pid": 22890,
+          "start_ticks": 11537,
+          "complete": true,
+          "rss_bytes": 2011136,
+          "peak_rss_bytes": 2011136
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 30.051944555999995,
+      "cpu_ticks": [
+        2670,
+        0,
+        9516,
+        68773,
+        54,
+        0,
+        182,
+        0,
+        0,
+        0
+      ],
+      "storage": {
+        "/var/lib/reliaburger/data": {
+          "allocated_bytes_observed": 4685824,
+          "files_observed": 469,
+          "raced_entries": 0,
+          "complete": true,
+          "filesystem_available_bytes": 7026511872
+        }
+      },
+      "processes": [
+        {
+          "pid": 22707,
+          "start_ticks": 10563,
+          "complete": true,
+          "rss_bytes": 107925504,
+          "peak_rss_bytes": 107925504
+        },
+        {
+          "pid": 22890,
+          "start_ticks": 11537,
+          "complete": true,
+          "rss_bytes": 2011136,
+          "peak_rss_bytes": 2011136
+        }
+      ]
+    }
+  ],
+  "service_latency_ms": {
+    "samples": 60,
+    "maximum": 10.440500000015618,
+    "p95": 1.7239169999925252
+  },
+  "observation_boundary": "Service and resource observations span preparation, measured work and positive drain"
+}

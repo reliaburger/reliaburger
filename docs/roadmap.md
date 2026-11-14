@@ -378,10 +378,12 @@ migration and no feature gate
   ([#1381](https://github.com/reliaburger/reliaburger/issues/1381)). The day
   run's slow turn was fixed in 0.2.4
   ([#1419](https://github.com/reliaburger/reliaburger/issues/1419)); its
-  memory growth ([#1417](https://github.com/reliaburger/reliaburger/issues/1417),
-  0.2.8) and full disk
+  memory growth ([#1417](https://github.com/reliaburger/reliaburger/issues/1417))
+  turned out to be glibc keeping free memory after log queries, levelling off
+  in the 0.2.8 day run
+  ([record](qualification/2026-11-14-v0.2.8-memory-run.md)); its full disk
   ([#1418](https://github.com/reliaburger/reliaburger/issues/1418), 0.3.0)
-  are still open. It ships
+  is still open. It ships
   with the `zstd` 0.13 advisories under a reviewed exception
   ([#1367](https://github.com/reliaburger/reliaburger/pull/1367)). 0.2.3 keeps
   0.2.2's formats, the first release to do so, and a 0.2.2 cluster rolled onto

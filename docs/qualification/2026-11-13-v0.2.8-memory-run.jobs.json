@@ -1,0 +1,267 @@
+{
+ "accepted_successes": {
+  "process": 2451770213,
+  "runc": 182544,
+  "shared-runc": 10010937
+ },
+ "accepted_successes_per_second": 31171.59435813677,
+ "api_fallbacks": {
+  "answered": {
+   "rb-14ed3daacff1-2": 26
+  },
+  "missed": {
+   "rb-14ed3daacff1-1": 26
+  }
+ },
+ "audited_attempts": 24,
+ "complete": true,
+ "day": {
+  "day_equivalent": 2682074757,
+  "elapsed_seconds": 78981,
+  "first_hour": 31560.102777777778,
+  "floor_met": true,
+  "floor_rate": 11575,
+  "host_successes": 2451770213,
+  "host_successes_per_second": 31042.53191273851,
+  "hourly": [
+   31560.102777777778,
+   31715.873958911714,
+   31694.15897720956,
+   31572.93833333333,
+   31592.1599555679,
+   31679.327222222222,
+   31343.313142539595,
+   31397.827825604,
+   31640.38,
+   31332.01277422938,
+   31318.02834120589,
+   31308.856348985828,
+   31145.102222222224,
+   31073.771666666667,
+   31059.851193781233,
+   31103.769316286827,
+   29853.771666666667,
+   30451.921133018604,
+   30120.716111111113,
+   30108.15777777778,
+   29981.832268814218
+  ],
+  "last_hour": 29981.832268814218,
+  "per_node": {
+   "balanced": true,
+   "nodes": [
+    {
+     "fair_share_percent": 33.333333333333336,
+     "node": "rb-14ed3daacff1-1",
+     "over_fair_share": false,
+     "restarted": true,
+     "share_percent": 33.637409406265604,
+     "slots": 27,
+     "successes": 824694368
+    },
+    {
+     "fair_share_percent": 33.333333333333336,
+     "node": "rb-14ed3daacff1-2",
+     "over_fair_share": false,
+     "restarted": true,
+     "share_percent": 32.87038048157256,
+     "slots": 27,
+     "successes": 805888983
+    },
+    {
+     "fair_share_percent": 33.333333333333336,
+     "node": "rb-14ed3daacff1-3",
+     "over_fair_share": false,
+     "restarted": true,
+     "share_percent": 33.492210112161835,
+     "slots": 27,
+     "successes": 821134491
+    }
+   ],
+   "tolerance_percent": 20
+  },
+  "slowdown_ok": true,
+  "slowdown_percent": 10,
+  "target_met": true,
+  "target_rate": 23149.0
+ },
+ "elapsed_seconds": 78981,
+ "errors": [],
+ "fault_markers": 0,
+ "gate": {
+  "decision": "D18-C",
+  "fault_kinds": [],
+  "node_faults": false,
+  "nodes": 3,
+  "schedule": "none",
+  "soak_seconds": 78996,
+  "tier": "day"
+ },
+ "load": "day",
+ "m8": {
+  "api_node": "rb-14ed3daacff1-1",
+  "bun_rss_worst": {
+   "node": "rb-14ed3daacff1-2",
+   "peak_rss_mib": 331.05859375,
+   "steady_rss_mib": 303.62109375,
+   "target_mib": 384
+  },
+  "executor_overhead_cores_per_node": 0.29597589051853035,
+  "leader_cpu_cores": 0.7766182266636151,
+  "million_task_array_wall_seconds": {
+   "max": null,
+   "median": null,
+   "runs": 0
+  },
+  "node_ledger_mib_per_million_tasks": 0.3752054466730085,
+  "p99_start_lag_ms": 8,
+  "per_node": {
+   "rb-14ed3daacff1-1": {
+    "bun_cpu_cores": 0.7766182266636151,
+    "bun_peak_rss_mib": 331.77734375,
+    "bun_processes": [
+     {
+      "boot": "c2c021c5-fed6-4ab3-9664-34c33ae4b6e2",
+      "first_seen": 1794489822,
+      "image": "2644523548",
+      "peak_rss_mib": 262.69921875,
+      "pid": 3494,
+      "steady_rss_mib": 255.5,
+      "steady_samples": 197
+     },
+     {
+      "boot": "c2c021c5-fed6-4ab3-9664-34c33ae4b6e2",
+      "first_seen": 1794550017,
+      "image": "1740414708",
+      "peak_rss_mib": 331.77734375,
+      "pid": 1005381,
+      "steady_rss_mib": 310.52734375,
+      "steady_samples": 61
+     }
+    ],
+    "bun_rss_target_mib": 512,
+    "bun_steady_rss_mib": 310.52734375,
+    "executor_helper_cpu_cores": 0.2946533788408433,
+    "peak_task_array_storage_mib": 277.43359375,
+    "retained_log_mb": 9.05216
+   },
+   "rb-14ed3daacff1-2": {
+    "bun_cpu_cores": 0.7501183710315192,
+    "bun_peak_rss_mib": 331.05859375,
+    "bun_processes": [
+     {
+      "boot": "a0ec2b48-18b4-404d-af1f-d317d71d7958",
+      "first_seen": 1794489822,
+      "image": "1195864220",
+      "peak_rss_mib": 255.58984375,
+      "pid": 1820,
+      "steady_rss_mib": 235.69921875,
+      "steady_samples": 198
+     },
+     {
+      "boot": "a0ec2b48-18b4-404d-af1f-d317d71d7958",
+      "first_seen": 1794550320,
+      "image": "85379198",
+      "peak_rss_mib": 331.05859375,
+      "pid": 668576,
+      "steady_rss_mib": 303.62109375,
+      "steady_samples": 60
+     }
+    ],
+    "bun_rss_target_mib": 384,
+    "bun_steady_rss_mib": 303.62109375,
+    "executor_helper_cpu_cores": 0.284800868277731,
+    "peak_task_array_storage_mib": 318.30078125,
+    "retained_log_mb": 10.186752
+   },
+   "rb-14ed3daacff1-3": {
+    "bun_cpu_cores": 0.7196759059122702,
+    "bun_peak_rss_mib": 286.80859375,
+    "bun_processes": [
+     {
+      "boot": "47fb61bf-1a29-432f-a673-b57ece22da21",
+      "first_seen": 1794489822,
+      "image": "3297466559",
+      "peak_rss_mib": 221.75,
+      "pid": 1678,
+      "steady_rss_mib": 211.0703125,
+      "steady_samples": 199
+     },
+     {
+      "boot": "47fb61bf-1a29-432f-a673-b57ece22da21",
+      "first_seen": 1794550624,
+      "image": "172126190",
+      "peak_rss_mib": 286.80859375,
+      "pid": 1215187,
+      "steady_rss_mib": 263.7421875,
+      "steady_samples": 59
+     }
+    ],
+    "bun_rss_target_mib": 384,
+    "bun_steady_rss_mib": 263.7421875,
+    "executor_helper_cpu_cores": 0.29597589051853035,
+    "peak_task_array_storage_mib": 328.0078125,
+    "retained_log_mb": 9.818112
+   }
+  },
+  "quiet_p99_start_lag_ms": 8,
+  "quiet_start_lag_samples": 2458844000,
+  "raft_entries_per_second": 5.0499088422971745,
+  "raft_leaders": [
+   "rb-14ed3daacff1-2",
+   "rb-14ed3daacff1-1"
+  ],
+  "raft_state_bytes_max": 45343,
+  "retained_log_mb": 29.057024,
+  "start_lag_samples": 2458844000,
+  "targets": {
+   "bun_steady_rss_mib": {
+    "api_node": 512,
+    "other_nodes": 384
+   },
+   "executor_overhead_cores_per_node": 0.5,
+   "leader_cpu_cores": 1,
+   "million_task_array_wall_seconds": 600,
+   "node_ledger_mib_per_million_tasks": 64,
+   "p99_start_lag_ms": 1000,
+   "raft_entries_per_second": "recorded only; the batch target counts only task-array writes",
+   "raft_state_bytes_per_million_tasks": 262144,
+   "retained_log_mb": 50
+  }
+ },
+ "operator_replay_decisions": 10,
+ "retries": {
+  "process": 1,
+  "runc": 1,
+  "shared-runc": 1
+ },
+ "retry_causes": {
+  "process": {
+   "exit_code": 1,
+   "launch": 0,
+   "signal": 0,
+   "timeout": 0,
+   "unknown": 0,
+   "unrecorded": 0
+  },
+  "runc": {
+   "exit_code": 1,
+   "launch": 0,
+   "signal": 0,
+   "timeout": 0,
+   "unknown": 0,
+   "unrecorded": 0
+  },
+  "shared-runc": {
+   "exit_code": 1,
+   "launch": 0,
+   "signal": 0,
+   "timeout": 0,
+   "unknown": 0,
+   "unrecorded": 0
+  }
+ },
+ "schema": 1,
+ "target_met": true,
+ "target_rate": 23149.0
+}

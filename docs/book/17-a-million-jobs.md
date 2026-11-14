@@ -4004,6 +4004,45 @@ each node hour by hour, with one line naming the kind that grew most after
 the first hour. A heap that keeps climbing points at live data or
 fragmentation; arenas that fill and stop point at a cache warming up.
 
+That still couldn't tell live data from fragmentation, and the 0.2.7 run
+needed exactly that: node 2's heap was still climbing at hour 24. smaps
+counts pages the process has touched; it can't say whether malloc has
+handed them to the program or holds them free for later. Only malloc knows,
+and glibc will say if you ask from inside the process. So the day tier now
+attaches `gdb` to Bun at hours 6, 12, 18 and 24 and makes Bun call two
+glibc functions: `malloc_stats()`, which prints each arena's *system* bytes
+(taken from the kernel) and *in-use* bytes (held by the program), and
+`malloc_trim(0)`, which gives free pages back. A C programmer will know the
+trick; nothing in Rust is involved, because Rust's default global allocator
+on Linux is the C library's `malloc`, so every `Vec` and `Box` Bun frees goes
+back to glibc, which decides what to keep. The attach stops Bun for under a
+quarter of a second (`sustained/malloc-point.sh`, `malloc_points.py`).
+
+The answer, from the published 0.2.8's 24 hours (the
+[14 November record](../qualification/2026-11-14-v0.2.8-memory-run.md)):
+in-use bytes fell on every node, by about a third from hour 6 to hour 24,
+while the free memory glibc kept rose, on node 2 from 28 to 95 MiB, and
+each trim handed 30 to 56 MiB of it back late in the day. The growth was
+the allocator's high-water mark, not a leak. A second experiment said what
+raises it. The checks tail node 2's logs every 30 seconds, and a tail is a
+DataFusion query over every Parquet file in the store, so node 2's slowly
+filled store of 1,200 small files made each query a little bigger than the
+last. The run added a source of the same kind on node 3 that nothing ever
+reads. Its store filled file for file like node 2's, and node 3's memory
+stayed flat; node 2's rose with its store and levelled when the store
+stopped growing at hour 20. Getting there also took one trick: `relish
+logs` fans out to every node, so even "node 2's" tail had queried node 3's
+store, and the day tier now asks each node's own `/v1/logs/entries`.
+
+The run before that one taught a lesson about the test bed rather than
+Bun. Installing `gdb` meant an `apt-get update` in each guest, which gave
+Ubuntu's daily unattended upgrade something to install, and at 06:00 it
+upgraded systemd and friends and `needrestart` restarted Bun on all three
+nodes, 16.7 hours into a 24-hour run. Every soak now disables those timers
+and refuses to start until each guest shows them off. A soak's guests are
+part of the experiment, and anything on them that runs on its own clock is
+a fault you didn't schedule.
+
 ### Soak jobs while the apps keep running
 
 A fast command completing a million times tells us little about what happens
