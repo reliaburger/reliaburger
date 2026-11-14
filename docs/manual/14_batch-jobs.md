@@ -1110,13 +1110,18 @@ shares, with no failed tasks. It ran below the benchmark because three VMs fille
 the laptop's twelve cores for a whole day; plan from your own hardware's
 sustained rate, not a minute's peak. Bun's memory grew from about 200 MiB to
 up to 345 MiB over that day, still inside the 384 MiB (512 MiB on the node
-serving the API) job budget. Until
-[#1417](https://github.com/reliaburger/reliaburger/issues/1417) explains it,
-watch Bun's resident memory on nodes that run host jobs at full rate for days.
+serving the API) job budget. The 0.2.8 day run on a Mac Studio
+([record](../qualification/2026-11-14-v0.2.8-memory-run.md), #1417) showed
+what that growth is: free memory glibc's allocator keeps after log queries,
+not live heap. It levels off once a node's log store stops growing, so a
+node whose store fills slowly (a quiet app, many small files) takes longest
+to reach its plateau.
 
-The landing page's recording is an earlier development build's single run
-(`006aca5f`, [record](../qualification/2026-10-09-timed-job-scenarios/README.md)):
-3.55/s for fresh containers and 966.7/s for shared ones then.
+The landing page's recording is one run of the published 0.2.8 on an Apple
+M5 Max Mac Studio, in a 4-vCPU, 8 GiB VM
+([record](../qualification/2026-11-12-v0.2.8-job-throughput-recording/README.md)):
+18.0/s for fresh containers, 9,616.7/s for shared ones and 13,100/s for host
+jobs. Its rates come from a different host than the table above.
 An independent rerun on an older M1 Max laptop VM (five interleaved rounds per
 build) measured raw and host-job rates 14–23% lower and the container paths 1.7
 to 3 times higher. With about 13 ms of real CPU work per task, host jobs

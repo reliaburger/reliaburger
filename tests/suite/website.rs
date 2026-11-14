@@ -734,9 +734,9 @@ fn the_jobs_section_shows_the_day_run_s_memory_chart_from_its_record() {
     );
 }
 
-/// The newest whole day of jobs the page leads with: the published 0.2.7's
+/// The newest whole day of jobs the page leads with: the published 0.2.8's
 /// 24-hour run on the Mac Studio (#1417).
-const DAY_RUN_RECORD: &str = "2026-11-08-v0.2.7-memory-run";
+const DAY_RUN_RECORD: &str = "2026-11-14-v0.2.8-memory-run";
 
 /// The page a new cluster serves tells people what to type next, so every
 /// command on it has to parse.

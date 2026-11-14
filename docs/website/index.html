@@ -774,26 +774,28 @@ relish setup --quickstart</code></pre>
           million, on a schedule or on demand. Give each task a fresh container for full
           isolation, share a container across short tasks to start them faster, or run them
           straight on the host when speed matters more than the boundary.</p>
-        <p><strong>2,709,190,725 host-job tasks in one real day.</strong> The published
-          0.2.7 ran host jobs for 24 hours on three 4-vCPU VMs on one Mac Studio:
-          31,352 a second, counted as the council accepted them, not extrapolated from a
+        <p><strong>2,649,391,295 host-job tasks in one real day.</strong> The published
+          0.2.8 ran host jobs for 24 hours on three 4-vCPU VMs on one Mac Studio:
+          30,654 a second, counted as the council accepted them, not extrapolated from a
           minute. That’s more than the two billion a day we aimed for, with every node
-          within two points of its share. The rate eased from 32,045 a second in the first
-          hour to 30,790 in the last.
-          <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-08-v0.2.7-memory-run.md">Day-run record</a></p>
-        <p>Bun’s memory ended the day at 265.8, 265.4 and 225.4 MiB, against targets of
-          512, 384 and 384 MiB. Nodes 1 and 3 levelled off. Node 2 was still growing about
-          2 MiB an hour when the day ended, and its leak check flagged it 13 times, so the
-          run doesn’t close the memory work
+          within one point of its share. The rate held from 30,615 a second in the first
+          hour to 30,517 in the last.
+          <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-14-v0.2.8-memory-run.md">Day-run record</a></p>
+        <p>Bun’s memory levelled off on every node: 260.8, 268.4 and 217.4 MiB at the
+          end of the day, against targets of 512, 384 and 384 MiB, and its leak check
+          never fired. What grew wasn’t a leak. Bun’s live heap shrank by a third over the
+          day; the growth was free memory the allocator kept after log queries, and it
+          stopped when the queried log store stopped growing
           (<a href="https://github.com/reliaburger/reliaburger/issues/1417">#1417</a>).
           0.2.3’s day, on a laptop, reached 1.8 billion and grew Bun to 316–345 MiB
           (<a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-28-v0.2.3-day-run.md">its record</a>);
           the hardware differs, so that isn’t a like-for-like comparison.</p>
         <figure class="soak-chart">
           <a href="assets/day-run/rss.svg"><img src="assets/day-run/rss.svg" width="720" height="272" loading="lazy"
-            alt="Bun resident memory per node over the 24-hour day run of 0.2.7, growing from about 115 to 160 MiB at the start to about 265 MiB on nodes 1 and 2 and 225 MiB on node 3, against the 512 MiB target for node 1 and 384 MiB for the others"></a>
-          <figcaption>Bun memory per node over the day run, with the 512 and 384 MiB targets. The ✕ marks
-            are node 2’s leak check flagging its growth, not failed job tasks.</figcaption>
+            alt="Bun resident memory per node over the 24-hour day run of 0.2.8, rising from about 120 to 155 MiB at the start to about 260 MiB on nodes 1 and 2 and 217 MiB on node 3, with small drops every six hours, against the 512 MiB target for node 1 and 384 MiB for the others"></a>
+          <figcaption>Bun memory per node over the day run, with the 512 and 384 MiB targets. The
+            drops at hours 6, 12, 18 and 24 are the run’s own diagnostic: it asked the allocator
+            to hand its free memory back.</figcaption>
         </figure>
         <p>A million in one go? 0.2.8’s 8-hour release soak ran 64 arrays of 1,048,576
           tasks each while it broke things: the median took 145 seconds, the slowest 411.
