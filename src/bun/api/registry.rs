@@ -174,7 +174,10 @@ pub(super) async fn images_handler(
             }
         }
     } else if let Some(council) = &state.council {
-        if let Err(error) = council.security_state_linearizable().await {
+        if let Err(error) = council
+            .security_state_confirmed(REGISTRY_LEADER_CONFIRMATION)
+            .await
+        {
             return (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response();
         }
         council.manifest_catalog().await.images()

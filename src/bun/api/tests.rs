@@ -1807,6 +1807,18 @@ async fn council_and_network(
     Vec<Arc<crate::council::CouncilNode>>,
     crate::council::network::InMemoryRaftRouter,
 ) {
+    council_and_network_keyed(voters, None).await
+}
+
+/// [`council_and_network`], with node 1 holding `wrapping_ikm`, so the
+/// leader can unwrap the CA keys a test seeds.
+async fn council_and_network_keyed(
+    voters: u64,
+    wrapping_ikm: Option<[u8; 32]>,
+) -> (
+    Vec<Arc<crate::council::CouncilNode>>,
+    crate::council::network::InMemoryRaftRouter,
+) {
     use crate::council::CouncilNode;
     use crate::council::log_store::MemLogStore;
     use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
@@ -1831,7 +1843,7 @@ async fn council_and_network(
                 InMemoryRaftNetworkFactory::new(id, network.clone()),
                 MemLogStore::new(),
                 CouncilStateMachine::new(),
-                None,
+                if id == 1 { wrapping_ikm } else { None },
             )
             .await
             .unwrap(),
@@ -2755,6 +2767,107 @@ async fn a_settled_leader_serves_test_leases_tokens_and_build_signs_after_a_miss
     assert_eq!(status, StatusCode::CONFLICT, "build sign: {reply}");
 
     shutdown.cancel();
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+// #1937: the CA rotation routes read the security state with one round, so
+// the same lag answered `relish ca rotate` with a 503. Prepare and begin now
+// confirm leadership first; finalise only writes, and a write waits for its
+// quorum rather than giving up after one round.
+#[tokio::test]
+async fn a_settled_leader_prepares_begins_and_finalises_a_ca_rotation_after_a_missed_heartbeat_round()
+ {
+    use crate::sesame::types::{CaRole, CertificateAuthority, SecurityState, SerialNumber};
+    use base64::Engine as _;
+    const IKM: [u8; 32] = [7; 32];
+    let hierarchy = crate::sesame::ca::generate_ca_hierarchy("lagging", &IKM).unwrap();
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let (nodes, network) = council_and_network_keyed(3, Some(IKM)).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !nodes[0].is_leader().await {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // The operator holds the root key; the cluster never does.
+    let security = SecurityState {
+        certificate_authorities: vec![
+            CertificateAuthority {
+                private_key_wrapped: None,
+                ..hierarchy.root.ca.clone()
+            },
+            hierarchy.node.ca.clone(),
+            hierarchy.workload.ca.clone(),
+            hierarchy.ingress.ca.clone(),
+        ],
+        next_serial: 10,
+        ..SecurityState::default()
+    };
+    nodes[0]
+        .write(crate::council::RaftRequest::SecurityStateInit(Box::new(
+            security,
+        )))
+        .await
+        .unwrap();
+    for node in &nodes {
+        node.hold_elections_until(std::time::Instant::now() + std::time::Duration::from_secs(60));
+    }
+    let app = router_over(nodes[0].clone(), admin);
+    let leader = nodes[0].as_ref();
+
+    let (status, reply) = send_while_heartbeats_lag(
+        &app,
+        &network,
+        leader,
+        ("POST", "/v1/ca/rotation/prepare", r#"{"role":"Node"}"#),
+        &admin_key,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "prepare: {reply}");
+    let prepared: crate::sesame::ca_rotation::PreparedRotation =
+        serde_json::from_str(&reply).unwrap();
+    let certificate = crate::sesame::ca::sign_intermediate_csr(
+        &base64::engine::general_purpose::STANDARD
+            .decode(&prepared.csr_b64)
+            .unwrap(),
+        CaRole::Node,
+        "lagging",
+        SerialNumber(prepared.serial),
+        &hierarchy.root.private_key_der,
+        &hierarchy.root.ca.certificate_der,
+    )
+    .unwrap();
+    let signed = serde_json::to_string(&crate::sesame::ca_rotation::SignedIntermediate {
+        role: CaRole::Node,
+        certificate_b64: base64::engine::general_purpose::STANDARD.encode(certificate),
+    })
+    .unwrap();
+
+    let (status, reply) = send_while_heartbeats_lag(
+        &app,
+        &network,
+        leader,
+        ("POST", "/v1/ca/rotation/begin", signed.as_str()),
+        &admin_key,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "begin: {reply}");
+
+    // This council records no node leaves, so nothing still depends on the
+    // old CA and finalising succeeds.
+    let (status, reply) = send_while_heartbeats_lag(
+        &app,
+        &network,
+        leader,
+        ("POST", "/v1/ca/rotation/finalize", r#"{"role":"Node"}"#),
+        &admin_key,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "finalise: {reply}");
+
     for node in nodes {
         node.shutdown().await.unwrap();
     }
