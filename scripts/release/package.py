@@ -93,6 +93,43 @@ def openssl(*args):
 
 # PKCS#8 prefix for a bare 32-byte Ed25519 seed (RFC 8410).
 ED25519_PKCS8_SEED = bytes.fromhex("302e020100300506032b657004220420")
+# A PKCS#8 v2 Ed25519 document (RFC 5958) starts with this, after its outer
+# SEQUENCE header: version 1, the Ed25519 algorithm and the seed's header.
+ED25519_PKCS8_V2_BODY = bytes.fromhex("020101300506032b657004220420")
+# The public key field that follows the seed in a v2 document: [1] IMPLICIT
+# BIT STRING as RFC 8410 writes it and ring emits it, or the explicitly
+# tagged form some encoders write.
+ED25519_PKCS8_V2_PUBLIC = (bytes.fromhex("812100"), bytes.fromhex("a123032100"))
+
+
+def ed25519_v1_from_v2(raw, secret):
+    """A PKCS#8 v2 Ed25519 key as the v1 document OpenSSL 3.0 can read, or None if `raw` isn't one.
+
+    `relish dev keygen` writes ring's v2 document, with the public key after
+    the seed, and OpenSSL 3.0 refuses it as "unsupported" (#1950). The seed
+    alone is the key, so the v1 document is the same key. The public key the
+    document carried must be the one its seed derives, or the key is refused.
+    """
+    for public_field in ED25519_PKCS8_V2_PUBLIC:
+        length = len(ED25519_PKCS8_V2_BODY) + 32 + len(public_field) + 32
+        header = bytes([0x30, length])
+        if len(raw) != len(header) + length or not raw.startswith(header + ED25519_PKCS8_V2_BODY):
+            continue
+        seed_end = len(header) + len(ED25519_PKCS8_V2_BODY) + 32
+        if raw[seed_end:seed_end + len(public_field)] != public_field:
+            continue
+        v1 = ED25519_PKCS8_SEED + raw[seed_end - 32:seed_end]
+        embedded = raw[-32:]
+        with tempfile.TemporaryDirectory(prefix="reliaburger-key-") as temporary:
+            path = Path(temporary) / "key.der"
+            with path.open("xb") as stream:
+                os.chmod(path, 0o600)
+                stream.write(v1)
+            derived = openssl("pkey", "-inform", "DER", "-in", path, "-pubout", "-outform", "DER")
+        if derived != ED25519_SPKI + embedded:
+            raise ValueError(f"{secret} is a PKCS#8 v2 key whose public key doesn't match its private key")
+        return v1
+    return None
 
 
 def release_key_der(encoded, scratch, secret="RELIABURGER_RELEASE_KEY"):
@@ -100,7 +137,8 @@ def release_key_der(encoded, scratch, secret="RELIABURGER_RELEASE_KEY"):
 
     The secret should be base64 DER, but a base64 PEM file or a base64 raw
     32-byte seed are easy mistakes when setting it, so both are accepted and
-    converted. A key that is none of these fails with a description of what
+    converted. So is the PKCS#8 v2 document `relish dev keygen` writes, which
+    OpenSSL 3.0 can't read (#1950). A key that is none of these fails with a description of what
     was found, never with any of its bytes.
     """
     try:
@@ -124,6 +162,9 @@ def release_key_der(encoded, scratch, secret="RELIABURGER_RELEASE_KEY"):
         return result.stdout
     if len(raw) == 32:
         return ED25519_PKCS8_SEED + raw
+    v1 = ed25519_v1_from_v2(raw, secret)
+    if v1 is not None:
+        return v1
     if raw[:1] == b"\x30":
         return raw
     raise ValueError(
