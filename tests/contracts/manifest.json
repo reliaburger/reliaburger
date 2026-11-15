@@ -3496,6 +3496,33 @@
       ]
     },
     {
+      "id": "issue-1955-legacy-oci-owned_runc-a_memory_request_smaller_than_runc_init_does_not_hold_the_start",
+      "issue": 1955,
+      "promise": "Complete the exact retained legacy OCI case through its finite owned driver.",
+      "supported_paths": [
+        "Exact original ignored test identity and declared Make owner."
+      ],
+      "refused_paths": [
+        "No generic aliases or success from another test or owner."
+      ],
+      "boundaries": [
+        "Source binding only; real isolated Linux OCI execution and current receipt are required."
+      ],
+      "cases": [
+        {
+          "id": "legacy-oci-owned_runc-a_memory_request_smaller_than_runc_init_does_not_hold_the_start",
+          "binary": "reliaburger::owned_runc",
+          "test": "a_memory_request_smaller_than_runc_init_does_not_hold_the_start",
+          "requires": [
+            "oci-interruptions"
+          ],
+          "sources": [
+            "tests/owned_runc.rs"
+          ]
+        }
+      ]
+    },
+    {
       "id": "issue-555-legacy-oci-owned_runc-recovered_source_identity_belongs_to_the_container_not_its_launcher",
       "issue": 555,
       "promise": "Complete the exact retained legacy OCI case through its finite owned driver.",

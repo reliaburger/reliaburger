@@ -27,8 +27,6 @@ pub struct CgroupParams {
     pub cpu_weight: Option<u32>,
     /// `memory.max` in bytes (hard limit, triggers OOM kill).
     pub memory_max: Option<u64>,
-    /// `memory.high` in bytes (soft limit, triggers reclaim pressure).
-    pub memory_high: Option<u64>,
 }
 
 /// Build the cgroup directory path for a workload instance.
@@ -115,17 +113,15 @@ pub fn compute_cgroup_params(
         None => (None, None),
     };
 
-    let (memory_max, memory_high) = match memory {
-        Some(range) => (Some(range.limit), Some(range.request)),
-        None => (None, None),
-    };
+    // A memory request is a scheduling reservation, not a cgroup setting
+    // (#1955): the limit is the only memory file we compute.
+    let memory_max = memory.map(|range| range.limit);
 
     CgroupParams {
         path,
         cpu_max,
         cpu_weight,
         memory_max,
-        memory_high,
     }
 }
 
@@ -219,7 +215,6 @@ mod tests {
         assert_eq!(params.cpu_max, Some("100000 100000".to_string()));
         assert_eq!(params.cpu_weight, Some(50));
         assert_eq!(params.memory_max, Some(512 * 1024 * 1024));
-        assert_eq!(params.memory_high, Some(128 * 1024 * 1024));
     }
 
     #[test]
@@ -243,7 +238,6 @@ mod tests {
         let params = compute_cgroup_params("default", "web", 0, Some(&cpu), None);
         assert_eq!(params.cpu_max, Some("50000 100000".to_string()));
         assert!(params.memory_max.is_none());
-        assert!(params.memory_high.is_none());
     }
 
     #[test]
@@ -252,7 +246,6 @@ mod tests {
         assert!(params.cpu_max.is_none());
         assert!(params.cpu_weight.is_none());
         assert!(params.memory_max.is_none());
-        assert!(params.memory_high.is_none());
     }
 
     #[test]

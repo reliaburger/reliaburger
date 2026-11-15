@@ -1058,7 +1058,7 @@ before their Phase 15 cases can use this contract.
 2. Transition state to `Pending`.
 3. **Prepare image:** A digest-pinned image this node has already verified and unpacked resolves locally, with no registry or peer request (see §7.11). Otherwise, check Pickle local cache. If missing, fetch from Pickle peers (content-addressed, mTLS). If not in any Pickle node, pull from the external registry configured in `node.toml`. Transition to `Preparing`.
 4. **Allocate port:** Request a host port from PortAllocator. The allocator picks a random available port from the configured range (default 10000..32767), skips any port a TCP bind on the host shows is already taken, and marks it as in-use.
-5. **Create cgroup:** CgroupMgr creates a cgroup v2 hierarchy: `/sys/fs/cgroup/reliaburger/{namespace}/{app_name}/{instance}/`. The OCI spec carries the hard limits — `cpu.max` (from `cpu.limit`) and `memory.max` (from `memory.limit`) — and, when a workload declares a request, the request-derived soft controls `cpu.weight` and `memory.high` in the `linux.resources.unified` map (see §5.4). GPU device allow-listing via the cgroup `devices` controller is a follow-up (see §5.4 GPU note).
+5. **Create cgroup:** CgroupMgr creates a cgroup v2 hierarchy: `/sys/fs/cgroup/reliaburger/{namespace}/{app_name}/{instance}/`. The OCI spec carries the hard limits — `cpu.max` (from `cpu.limit`) and `memory.max` (from `memory.limit`) — and, when a workload declares a CPU request, the request-derived `cpu.weight` in the `linux.resources.unified` map (see §5.4). A memory request sets no cgroup file (#1955). GPU device allow-listing via the cgroup `devices` controller is a follow-up (see §5.4 GPU note).
 6. **Prepare network namespace:** Create a new network namespace. Configure the veth pair and port mapping (host port -> container internal port). Attach Onion eBPF programs to the namespace's sockets.
 7. **Decrypt secrets:** For any `EnvValue::Encrypted` in the env map, decrypt using the cluster's age private key in memory. Plaintext is never written to disk.
 8. **Prepare workload identity:** Generate a keypair, send CSR to the nearest council member, receive the signed X.509 certificate. Write cert, key, CA chain, and JWT to a tmpfs mount.
@@ -1221,13 +1221,17 @@ Bun uses cgroup v2 exclusively. The cgroup hierarchy is:
 
 - `memory.max` is the hard limit. When exceeded, the OOM killer activates. This maps to `memory.limit`. It is the only memory field written to the OCI spec (`OciMemoryResources { limit }`).
 
-> **Requests (`cpu.weight` / `memory.high`) — implemented.** When a workload
-> declares a request, Grill emits a `cpu.weight` (from `cpu.request`, via
-> `cpu_weight_from_millicores`) and a `memory.high` (from `memory.request`) into
-> the OCI `linux.resources.unified` map, so runc writes them to the container's
-> cgroup v2. This gives proportional CPU sharing under contention and graceful
-> memory-pressure reclaim before the hard `memory.max` OOM. A limit-only spec
-> (no request) emits no unified entries and is byte-identical to before.
+> **Requests (`cpu.weight`) — implemented.** When a workload declares a CPU
+> request, Grill emits a `cpu.weight` (from `cpu.request`, via
+> `cpu_weight_from_millicores`) into the OCI `linux.resources.unified` map, so
+> runc writes it to the container's cgroup v2. This gives proportional CPU
+> sharing under contention. A memory request is a scheduling reservation only
+> and sets no cgroup file. It used to become `memory.high`, which throttled
+> `runc init` itself (about 10 MiB of anonymous memory with runc 1.4) inside
+> the cgroup before the workload ran: with no swap the kernel can't reclaim
+> it, so an 8 MiB request held the start past Bun's 10 s deadline (#1955).
+> `memory.low` isn't used either, because our parent cgroups carry no
+> protection for it to draw on.
 
 **Process accounting (jobs, #741):**
 

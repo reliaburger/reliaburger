@@ -369,11 +369,10 @@ pub struct OciResources {
     ///   derived from the CPU request. Passing it here avoids runc's
     ///   lossy `cpu.shares` (2-262144) -> weight conversion, since our
     ///   value is already in the v2 range.
-    /// - `memory.high` (bytes): the soft limit. The kernel throttles and
-    ///   reclaims a workload that crosses it, before the hard
-    ///   `memory.max` triggers an OOM kill. There is no classic OCI field
-    ///   for it (`memory.reservation` maps to `memory.low`, a protection
-    ///   floor with the opposite meaning).
+    ///
+    /// A memory request writes nothing here: it's a scheduling reservation,
+    /// and as `memory.high` it throttled `runc init` itself, which runs in
+    /// the workload's cgroup before the workload does (#1955).
     ///
     /// `BTreeMap` keeps serialisation deterministic; empty maps are
     /// omitted so specs without requests are unchanged.
@@ -824,11 +823,17 @@ fn build_resources(spec: &AppSpec) -> Option<OciResources> {
 
 /// Build the OCI resource block from CPU and memory ranges.
 ///
-/// Hard limits go into the `cpu`/`memory` blocks; requests go into the
-/// `unified` map as `cpu.weight` and `memory.high`. A request is only
-/// emitted when it is actually declared (`request > 0`) — an app that
-/// sets only a limit (e.g. `cpu = "0-1000m"`) gets the ceiling without a
-/// weight or soft limit forced on it.
+/// Hard limits go into the `cpu`/`memory` blocks; a CPU request goes into
+/// the `unified` map as `cpu.weight`, and only when it is actually declared
+/// (`request > 0`), so an app that sets only a limit (e.g. `cpu = "0-1000m"`)
+/// gets the ceiling without a weight forced on it.
+///
+/// A memory request sets no cgroup file. The scheduler reserves it, and the
+/// limit is the only ceiling. It used to become `memory.high`, but `runc
+/// init` runs in the workload's cgroup first and holds about 10 MiB of
+/// anonymous memory with runc 1.4. With no swap the kernel can't reclaim
+/// that, so an 8 MiB request throttled the start past Bun's deadline
+/// (#1955).
 fn build_resources_from_ranges(
     cpu: Option<&ResourceRange>,
     memory: Option<&ResourceRange>,
@@ -846,13 +851,8 @@ fn build_resources_from_ranges(
         }
     });
 
-    let memory_res = memory.map(|range| {
-        if range.request > 0 {
-            unified.insert("memory.high".to_string(), range.request.to_string());
-        }
-        OciMemoryResources {
-            limit: range.limit as i64,
-        }
+    let memory_res = memory.map(|range| OciMemoryResources {
+        limit: range.limit as i64,
     });
 
     if cpu_res.is_some() || memory_res.is_some() {
@@ -1802,7 +1802,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_request_produces_high_in_unified() {
+    fn memory_request_sets_no_soft_limit() {
         let spec: AppSpec = toml::from_str(
             r#"
             image = "test:v1"
@@ -1822,12 +1822,12 @@ mod tests {
         );
 
         let resources = oci.linux.resources.unwrap();
-        // Hard ceiling stays the limit; the request becomes the soft limit.
+        // The limit is the only memory ceiling. A request is a reservation
+        // the scheduler counts, never a throttle: as `memory.high` it stalled
+        // `runc init` before the workload ran (#1955).
         assert_eq!(resources.memory.unwrap().limit, 512 * 1024 * 1024);
-        assert_eq!(
-            resources.unified.get("memory.high"),
-            Some(&(128 * 1024 * 1024).to_string())
-        );
+        assert_eq!(resources.unified.get("memory.high"), None);
+        assert!(resources.unified.is_empty());
     }
 
     #[test]
