@@ -37,7 +37,23 @@ const MIN_MESSAGE_LEN: usize = 300;
 
 /// PXE vendor option 6, `PXE_DISCOVERY_CONTROL`: bit 3 means "the offer
 /// names a boot file: download it, no menu, no boot server discovery".
+/// Only iPXE gets it: UEFI firmware built on EDK2 from before May 2013
+/// takes a reply carrying option 43 without a boot menu as "boot locally"
+/// and gives up without TFTP. The Wyse 3040 did (#1970), and pixiecore
+/// leaves it out for UEFI for the same reason.
 const DISCOVERY_CONTROL: [u8; 3] = [6, 1, 8];
+/// The vendor class a Raspberry Pi's own network bootloader sends.
+const RASPBERRY_PI_UNDI: &[u8] = b"UNDI:002001";
+/// The Raspberry Pi Foundation's and Raspberry Pi Ltd's MAC prefixes, for
+/// Pis whose bootloader sends a plainer class.
+const RASPBERRY_PI_OUIS: [[u8; 3]; 6] = [
+    [0xb8, 0x27, 0xeb],
+    [0xdc, 0xa6, 0x32],
+    [0xe4, 0x5f, 0x01],
+    [0x28, 0xcd, 0xc1],
+    [0xd8, 0x3a, 0xdd],
+    [0x2c, 0xcf, 0x67],
+];
 /// PXE vendor option 71, `PXE_BOOT_ITEM`, which a 4011 reply echoes.
 const BOOT_ITEM: u8 = 71;
 
@@ -117,6 +133,8 @@ pub enum Ignored {
     NotAllowed(MacAddress),
     /// Firmware this server has nothing for (BIOS, say).
     UnsupportedArch(MacAddress, Option<u16>),
+    /// A Raspberry Pi's own network bootloader, which isn't UEFI (#1971).
+    RaspberryPi(MacAddress),
     /// An architecture whose artefacts aren't in the served directory.
     NotServed(MacAddress, Arch),
 }
@@ -130,6 +148,9 @@ impl Ignored {
             Ignored::UnsupportedArch(mac, arch) => Some(format!(
                 "{mac}: ignored, {} firmware isn't supported (UEFI only)",
                 describe_arch(*arch)
+            )),
+            Ignored::RaspberryPi(mac) => Some(format!(
+                "{mac}: ignored, a Raspberry Pi's own network boot; Raspberry Pis aren't supported yet (#1971)"
             )),
             Ignored::NotServed(mac, arch) => Some(format!(
                 "{mac}: ignored, an {arch} machine and no {arch}/ artefacts are served"
@@ -170,7 +191,11 @@ pub fn answer(
         return Err(Ignored::NotAllowed(mac));
     }
     let client_arch = client_arch(request);
-    let file = boot_file(mac, client_arch, is_ipxe(request), http_client)?;
+    let ipxe = is_ipxe(request);
+    if matches!(client_arch, None | Some(0)) && !ipxe && is_raspberry_pi(mac, request) {
+        return Err(Ignored::RaspberryPi(mac));
+    }
+    let file = boot_file(mac, client_arch, ipxe, http_client)?;
     if let BootFile::Ipxe(arch) | BootFile::HttpIpxe(arch) = file
         && !context.architectures.contains(&arch)
     {
@@ -240,6 +265,15 @@ fn is_ipxe(request: &Message) -> bool {
     }
 }
 
+fn is_raspberry_pi(mac: MacAddress, request: &Message) -> bool {
+    let undi = class_identifier(request).is_some_and(|class| {
+        class
+            .windows(RASPBERRY_PI_UNDI.len())
+            .any(|w| w == RASPBERRY_PI_UNDI)
+    });
+    undi || RASPBERRY_PI_OUIS.iter().any(|oui| mac.0.starts_with(oui))
+}
+
 fn boot_file(
     mac: MacAddress,
     client_arch: Option<u16>,
@@ -277,7 +311,10 @@ fn build_reply(
         .set_giaddr(request.giaddr())
         .set_ciaddr(request.ciaddr())
         .set_yiaddr(Ipv4Addr::UNSPECIFIED)
-        .set_siaddr(context.server);
+        .set_siaddr(context.server)
+        // The boot server by name as well as in siaddr, as pixiecore and
+        // Tinkerbell's smee send it.
+        .set_sname(context.server.to_string().as_bytes());
     let name = file.name(context);
     // The BOOTP field holds 128 bytes; option 67 alone carries a longer URL.
     if name.len() < 128 {
@@ -295,7 +332,7 @@ fn build_reply(
     {
         options.insert(DhcpOption::ClientMachineIdentifier(uuid.clone()));
     }
-    if !http {
+    if *file == BootFile::Script {
         options.insert(DhcpOption::VendorExtensions(pxe_vendor_options(
             request, port,
         )));
@@ -303,8 +340,8 @@ fn build_reply(
     reply
 }
 
-/// Option 43 for a PXE reply: discovery control, plus the request's boot
-/// item echoed on 4011 (firmware doing boot server discovery checks it).
+/// Option 43 for iPXE: discovery control, plus the request's boot item
+/// echoed on 4011.
 fn pxe_vendor_options(request: &Message, port: ListenPort) -> Vec<u8> {
     let mut options = DISCOVERY_CONTROL.to_vec();
     if port == ListenPort::ProxyDhcp
@@ -574,13 +611,75 @@ mod tests {
             option(reply, OptionCode::ClassIdentifier),
             Some(&DhcpOption::ClassIdentifier(b"PXEClient".to_vec()))
         );
-        assert_eq!(
-            option(reply, OptionCode::VendorExtensions),
-            Some(&DhcpOption::VendorExtensions(vec![6, 1, 8, 255]))
-        );
         assert_eq!(bootfile(reply), b"ipxe-x86_64.efi");
         assert_eq!(reply.fname(), Some(&b"ipxe-x86_64.efi"[..]));
+        assert_eq!(reply.sname(), Some(&b"192.168.1.20"[..]));
         assert_eq!(answer.file, BootFile::Ipxe(Arch::X86_64));
+    }
+
+    /// Before May 2013, EDK2 sent a reply with option 43 and no boot menu
+    /// to the "local boot" item and gave up without TFTP; the Wyse 3040's
+    /// firmware still does (#1970). So firmware never gets option 43, on
+    /// either port.
+    #[test]
+    fn uefi_firmware_never_gets_option_43() {
+        for arch in [6, 7, 9, 11] {
+            let offer = answer(&pxe_discover(arch), ListenPort::Dhcp, &context())
+                .unwrap()
+                .reply;
+            assert_eq!(
+                option(&offer, OptionCode::VendorExtensions),
+                None,
+                "offer, architecture {arch}"
+            );
+            let mut proxy_request = pxe_discover(arch);
+            proxy_request
+                .opts_mut()
+                .insert(DhcpOption::MessageType(MessageType::Request));
+            proxy_request.set_ciaddr(Ipv4Addr::new(192, 168, 1, 51));
+            let ack = answer(&proxy_request, ListenPort::ProxyDhcp, &context())
+                .unwrap()
+                .reply;
+            assert_eq!(ack.opts().msg_type(), Some(MessageType::Ack));
+            assert_eq!(
+                option(&ack, OptionCode::VendorExtensions),
+                None,
+                "4011 ack, architecture {arch}"
+            );
+            assert_eq!(ack.siaddr(), SERVER);
+            assert!(!bootfile(&ack).is_empty());
+        }
+    }
+
+    /// The 4011 request the Wyse 3040 sent in the lab (#1970): ciaddr set,
+    /// no option 43, the firmware's UUID. The reply names the boot file and
+    /// the server, and leaves option 43 out.
+    #[test]
+    fn the_wyse_3040s_4011_request_gets_a_reply_without_option_43() {
+        let mut wyse = request(
+            MessageType::Request,
+            b"PXEClient:Arch:00007:UNDI:003016",
+            Some(7),
+        );
+        wyse.set_ciaddr(Ipv4Addr::new(10, 77, 0, 11));
+        let uuid = b"\x00DELLW\x00\x103\x80Z\xb6\xc0O3L2".to_vec();
+        wyse.opts_mut()
+            .insert(DhcpOption::ClientMachineIdentifier(uuid.clone()));
+        let reply = answer(&wyse, ListenPort::ProxyDhcp, &context())
+            .unwrap()
+            .reply;
+        let bytes = encode(&reply).unwrap();
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(option(&decoded, OptionCode::VendorExtensions), None);
+        assert_eq!(bootfile(&decoded), b"ipxe-x86_64.efi");
+        assert_eq!(decoded.siaddr(), SERVER);
+        // On the wire: sname at 44..108, file at 108..236, NUL-padded.
+        assert_eq!(&bytes[44..57], b"192.168.1.20\0");
+        assert_eq!(&bytes[108..124], b"ipxe-x86_64.efi\0");
+        assert_eq!(
+            option(&decoded, OptionCode::ClientMachineIdentifier),
+            Some(&DhcpOption::ClientMachineIdentifier(uuid))
+        );
     }
 
     #[test]
@@ -659,8 +758,20 @@ mod tests {
     }
 
     #[test]
-    fn a_request_on_4011_gets_an_ack_echoing_its_boot_item() {
-        let mut proxy_request = pxe_discover(7);
+    fn ipxe_gets_option_43_and_its_boot_item_echoed_on_4011() {
+        let mut ipxe_discover = pxe_discover(7);
+        ipxe_discover
+            .opts_mut()
+            .insert(DhcpOption::UserClass(b"iPXE".to_vec()));
+        let offer = answer(&ipxe_discover, ListenPort::Dhcp, &context())
+            .unwrap()
+            .reply;
+        assert_eq!(
+            option(&offer, OptionCode::VendorExtensions),
+            Some(&DhcpOption::VendorExtensions(vec![6, 1, 8, 255]))
+        );
+
+        let mut proxy_request = ipxe_discover;
         proxy_request
             .opts_mut()
             .insert(DhcpOption::MessageType(MessageType::Request));
@@ -750,6 +861,40 @@ mod tests {
             assert_eq!(error, Ignored::UnsupportedArch(mac, arch));
             assert!(error.describe().is_some());
         }
+    }
+
+    /// A Pi's own network bootloader says option 93 = 0, which would read
+    /// as BIOS; it gets a line that names it instead (#1971).
+    #[test]
+    fn a_raspberry_pis_network_boot_is_named_and_refused() {
+        let pi4 = [0xdc, 0xa6, 0x32, 0x01, 0x02, 0x03];
+        let mut pi_bootloader = request(
+            MessageType::Discover,
+            b"PXEClient:Arch:00000:UNDI:002001",
+            Some(0),
+        );
+        pi_bootloader.set_chaddr(&pi4);
+        let error = answer(&pi_bootloader, ListenPort::Dhcp, &context()).unwrap_err();
+        assert_eq!(error, Ignored::RaspberryPi(MacAddress(pi4)));
+        let line = error.describe().unwrap();
+        assert!(line.contains("Raspberry Pi"), "{line}");
+        assert!(line.contains("#1971"), "{line}");
+
+        // A Pi 5 by its MAC address alone, whatever its class string says.
+        let pi5 = [0x2c, 0xcf, 0x67, 0x0a, 0x0b, 0x0c];
+        let mut pi5_bootloader = request(MessageType::Discover, b"PXEClient", Some(0));
+        pi5_bootloader.set_chaddr(&pi5);
+        assert_eq!(
+            answer(&pi5_bootloader, ListenPort::Dhcp, &context()).unwrap_err(),
+            Ignored::RaspberryPi(MacAddress(pi5))
+        );
+
+        // An ordinary BIOS machine is still just BIOS.
+        let bios = request(MessageType::Discover, b"PXEClient", Some(0));
+        assert_eq!(
+            answer(&bios, ListenPort::Dhcp, &context()).unwrap_err(),
+            Ignored::UnsupportedArch(MacAddress(MAC), Some(0))
+        );
     }
 
     #[test]

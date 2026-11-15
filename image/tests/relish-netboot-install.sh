@@ -14,7 +14,9 @@
 # runner beside relish (with CI's bridge and subnet), owns UDP 67 and sends
 # option 60 PXEClient, and `relish netboot --mode-dhcp-proxy` answers on UDP
 # 4011 only. The test then also wants the firmware's and iPXE's requests
-# answered on 4011. A VM whose disk already holds a GPT
+# answered on 4011, and its VM has QEMU's e1000e NIC instead of virtio, so
+# the installer must drive an Intel NIC, as on most mini PCs (#1969). The
+# firmware gets no option 43 on either port (#1970). A VM whose disk already holds a GPT
 # and an ext4 filesystem, like a used Wyse with ThinOS on it, boots from the
 # network (disk first, so the second boot starts the installed system). The
 # installer reports the used disk, and relish wipes it because --wipe lists
@@ -68,6 +70,7 @@ if [ "$mode" = router ]; then
         --dhcp-range=10.42.0.100,10.42.0.200,12h --dhcp-option=3,10.42.0.1 \
         --pid-file="$work/dnsmasq.pid" --log-dhcp --log-facility="$work/dnsmasq.log"
     netboot_mode=()
+    nic=virtio-net-pci
 else
     # The lab Mac's file, moved onto CI's bridge and subnet: the runner is
     # the Mac, at the subnet's .1.
@@ -77,6 +80,7 @@ else
     sudo dnsmasq --conf-file="$work/lab-dnsmasq.conf" \
         --pid-file="$work/dnsmasq.pid" --log-facility="$work/dnsmasq.log"
     netboot_mode=(--mode-dhcp-proxy)
+    nic=e1000e
 fi
 
 # The layout relish netboot serves: <dir>/<arch>/, iPXE in netboot/.
@@ -107,7 +111,7 @@ boot_vm() {
         -drive if=none,id=d0,format=raw,file="$work/used.raw" \
         -device "virtio-blk-pci,drive=d0,bootindex=$2" \
         -netdev tap,id=n0,ifname=rbtap0,script=no,downscript=no \
-        -device "virtio-net-pci,netdev=n0,mac=$mac,bootindex=$3" \
+        -device "$nic,netdev=n0,mac=$mac,bootindex=$3" \
         -display none -serial "file:$1" &
     qemu=$!
 }

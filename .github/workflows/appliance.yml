@@ -318,6 +318,17 @@ jobs:
           python3 image/tests/no_ssh_server.py manifest "${lab[@]}" \
             "image/mkosi.output/reliaburger-os_$IMAGE_VERSION.manifest"
 
+      - name: Installer drivers
+        # mkosi follows hard module dependencies but not soft ones, and the
+        # Wyse 3040's installer shipped r8169 without the Realtek PHY driver
+        # it soft-depends on, so it never reached the network (#1969). QEMU
+        # can't emulate that NIC, so this reads the built installer instead:
+        # every soft dependency, the NIC and disk drivers mini PCs and thin
+        # clients need, and their firmware.
+        run: |
+          python3 image/tests/installer_modules.py \
+            "image/mkosi.output/reliaburger-os-installer_$IMAGE_VERSION.efi" "$ARCH"
+
       - name: Record sizes
         run: |
           set -euo pipefail
@@ -492,7 +503,8 @@ jobs:
       - name: relish netboot install, DHCP on the same machine (x86-64, KVM)
         # The isolated lab's split: the lab Mac's dnsmasq.conf on the runner
         # owns UDP 67 and sends option 60 PXEClient, and
-        # `relish netboot --mode-dhcp-proxy` answers on UDP 4011 only.
+        # `relish netboot --mode-dhcp-proxy` answers on UDP 4011 only. Its VM
+        # has an Intel e1000e NIC, so the installer's Intel driver boots too.
         if: matrix.arch == 'x86_64' && env.BROKEN_BUN != '1' && hashFiles('source-bin/relish-linux-x86_64') != ''
         timeout-minutes: 20
         run: |

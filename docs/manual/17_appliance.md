@@ -26,8 +26,14 @@ from power-on to a working cluster. Other firmware may still have surprises;
 
 - **Two or more machines**, ideally three or more:
   - x86_64 or arm64, with UEFI and network boot (PXE);
+  - a wired network card the installer has a driver for: Realtek RTL8111,
+    RTL8168 or RTL8125, Intel I219, I225, I226, I210 or I350, Broadcom
+    NetXtreme (`tg3`), or a USB Ethernet adapter;
   - at least 2 GiB of RAM and an 8 GB disk;
   - wired to the same network.
+
+  Raspberry Pis don't work yet: they boot through their own firmware, not
+  UEFI ("What's missing").
 
   **The installer erases the largest built-in disk.** A blank one goes
   without asking; one that holds anything else is wiped only after you say
@@ -265,8 +271,12 @@ caffeinate -i sudo relish netboot os --interface en7 --for 3h --mode-dhcp-proxy 
 [`image/lab/mac/README.md`](https://github.com/reliaburger/reliaburger/blob/main/image/lab/mac/README.md)
 sets up the address, dnsmasq and pf, and undoes them afterwards. The cluster
 then depends on the Mac for its route out, so keep the Mac awake and
-plugged in. If a machine's firmware takes dnsmasq's address but never asks
-relish on 4011, use the home network instead.
+plugged in. A Wyse 3040 on BIOS 1.2.3 follows dnsmasq to relish on 4011.
+If a machine's firmware takes dnsmasq's address but never asks relish on
+4011, use the home network instead. If it asks, relish logs `ack on 4011`,
+and then the firmware fetches nothing and moves on, the README's "If a
+machine won't boot from relish's reply" has dnsmasq name the boot file
+itself.
 
 Either way, time comes from Ubuntu's NTP servers through the router. That
 matters on second-hand machines, whose clock batteries may be flat: a node
@@ -754,6 +764,14 @@ across a cluster you care about.
   other, and to anything the release key signs.
 - **CI builds no next version for arm64**, only for x86_64.
 - **Secure Boot** has to be off.
+- **Raspberry Pis** aren't supported yet. A Pi boots through its own
+  firmware rather than UEFI, and Ubuntu runs it on a kernel of its own, so
+  the Pi 4 and Pi 5 need a second boot platform. It's planned (#1971). Until
+  then `relish netboot` names a Pi that asks it to boot, and leaves it alone.
+- **Other network cards.** A machine whose only wired NIC isn't in "What
+  you need" boots iPXE and the installer, which then can't reach the
+  network: its screen shows `reliaburger-install: FAILED: can't fetch …`.
+  A USB Ethernet adapter gets it going.
 - **Two machines can't roll a bun upgrade or an OS update.** Both are in
   the council, and taking one down would leave the other without a majority,
   so `relish upgrade start` and `relish os upgrade` refuse. Use three or more.
