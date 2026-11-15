@@ -696,6 +696,55 @@ async fn generated_cgroup_path_matches_the_actual_container_before_its_first_ins
     assert!(still_same, "runc replaced Bun's pre-programmed cgroup");
 }
 
+/// A memory request smaller than `runc init` itself must not hold the
+/// container's start: runc 1.4's init holds about 10 MiB of anonymous memory
+/// in the workload's cgroup, and as `memory.high` the burger demo's 8 MiB
+/// request throttled it past Bun's startup deadline (#1955).
+#[tokio::test]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
+async fn a_memory_request_smaller_than_runc_init_does_not_hold_the_start() {
+    let root = tempfile::tempdir().unwrap();
+    let id = instance(root.path());
+    let host_path = format!("/sys/fs/cgroup/{}", id.0);
+    let runtime = runtime(root.path());
+    let app: reliaburger::config::AppSpec = toml::from_str(
+        r#"
+        image = "test:v1"
+        memory = "4Mi-64Mi"
+        "#,
+    )
+    .unwrap();
+    let generated = reliaburger::grill::oci::generate_oci_spec(
+        "small", "default", &app, &id.0, None, &host_path, None, None,
+    );
+    let mut specification = spec(
+        root.path(),
+        "/bin/busybox touch /work/started; exec /bin/busybox sleep 60",
+    );
+    specification.linux.resources = generated.linux.resources;
+    specification.linux.cgroups_path =
+        Some(reliaburger::grill::oci::hierarchy_cgroup_path(&host_path));
+    runtime.create(&id, &specification).await.unwrap();
+    install_fixture(root.path(), &id);
+    let begun = std::time::Instant::now();
+    let started = runtime.start(&id).await;
+    let took = begun.elapsed();
+    let memory_high = std::fs::read_to_string(format!("{host_path}/memory.high"));
+    let memory_max = std::fs::read_to_string(format!("{host_path}/memory.max"));
+    if started.is_ok() {
+        wait_file(&root.path().join("shared/started")).await;
+    }
+    runtime.kill(&id).await.unwrap();
+    if Path::new(&host_path).exists() {
+        std::fs::remove_dir(&host_path).unwrap();
+    }
+    assert_absent(root.path(), &id);
+    started.unwrap();
+    assert!(took < Duration::from_secs(5), "start took {took:?}");
+    assert_eq!(memory_high.unwrap().trim(), "max");
+    assert_eq!(memory_max.unwrap().trim(), (64u64 << 20).to_string());
+}
+
 #[tokio::test]
 #[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 async fn recovered_source_identity_belongs_to_the_container_not_its_launcher() {
