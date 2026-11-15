@@ -1618,7 +1618,12 @@ async fn runc_reusable_commands_keep_the_container_but_retire_task_state_and_idl
     assert_eq!(runtime.state(&id).await.unwrap(), ContainerState::Running);
     assert_eq!(
         budget.available(),
-        Resources::new(390, 24 << 20, 0),
+        // The container helper's reservation includes room for runc init (#1957).
+        Resources::new(
+            390,
+            (24 << 20) - reliaburger::bun::reusable_executor::RUNC_INIT_MEMORY_BYTES,
+            0
+        ),
         "idle profile plus helper still owns capacity"
     );
     let next = runner.run(&task, Duration::from_secs(20), &cancel).await;
@@ -2230,7 +2235,13 @@ async fn runc_reusable_admission_preserves_warm_capacity_and_rechecks_queued_sec
         env!("CARGO_BIN_EXE_bun").into(),
     )
     .unwrap();
-    let capacity = Resources::new(110, 40 << 20, 0);
+    // One executor: 100m/32 MiB plus the container helper's 10m and its
+    // memory, which has room for runc init (#1957).
+    let capacity = Resources::new(
+        110,
+        (32 << 20) + reliaburger::bun::reusable_executor::CONTAINER_HELPER_MEMORY_BYTES,
+        0,
+    );
     let budget = ExecutionBudget::new(capacity);
     let mut template: reliaburger::config::job::JobSpec = toml::from_str(&format!(
         "image='{image}'\nnamespace='rbtest-reuse'\nruntime='shared-runc'\ncpu='100m'\nmemory='32Mi'"

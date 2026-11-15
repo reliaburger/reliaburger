@@ -90,6 +90,14 @@ class Admission(unittest.TestCase):
             self.assertEqual(ra["template"]["runtime"],mode)
             self.assertEqual("image" in ra["template"],mode!="process")
             self.assertEqual("exec" in ra["template"],mode=="process")
+    def test_limit_fixture_leaves_room_for_runc_init(self):
+        # #1957: a fresh runc job's limit covers runc init too, and Ubuntu
+        # 26.04's runc 1.4 init peaks at 12.7 MiB. At 8 MiB the container
+        # never started, so the fixture never ran into its own limit.
+        c=self.campaign()
+        for mode in jobs.MODES:
+            template=c.body(c.prepare(mode,"short","limit",100))["definition"]["template"]
+            self.assertGreaterEqual(int(template["memory"][:-2]),32,mode)
     def test_resume_rejects_different_cluster_or_audit_identity(self):
         c=self.campaign(); c.prepare("runc","short","work",100)
         with self.assertRaises(jobs.InvalidEvidence):

@@ -594,8 +594,9 @@ containers when that stronger separation matters. Reuse does not keep your
 Python interpreter, model or application process alive between commands.
 Resident inference workers are a separate feature (#641).
 
-An idle container retains its profile request plus 10 millicores and 8 MiB for
-the helper. It yields to waiting requests and expires after one idle second.
+An idle container retains its profile request plus 10 millicores and 24 MiB for
+the helper: 8 MiB for the helper and 16 MiB for `runc init`, which runs in the
+helper's cgroup before the helper starts. It yields to waiting requests and expires after one idle second.
 A timeout, cancellation, lost policy or uncertain receipt retires the whole
 container before its resources can be used again. Waiting for a compatible
 slot or resource admission does not consume the command's attempt timeout;
