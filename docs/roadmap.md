@@ -521,10 +521,8 @@ migration and no feature gate
   weekly once v0.3.0 is out),
   and the quickstart guest on Ubuntu 26.04. The claim flow is designed so the
   fleet control plane can extend it later. Alongside it: the acceptance gates
-  0.1.0 didn't close (V01–V04, below), WebSocket drain parity (F08,
-  [#369](https://github.com/reliaburger/reliaburger/issues/369)), and fault
-  pre-checks that read the leader's gossip view
-  ([#334](https://github.com/reliaburger/reliaburger/issues/334)). Exit test:
+  0.1.0 didn't close (V01–V04, below) and WebSocket drain parity (F08,
+  [#369](https://github.com/reliaburger/reliaburger/issues/369)). Exit test:
   three Dell Wyse 3040s from power-on to a cluster.
   Next. Its merge train is [#490](https://github.com/reliaburger/reliaburger/pull/490),
   which waited for the 0.2.x patch releases.

@@ -465,7 +465,3 @@ The data partition (`/etc`, `/var`, bun's state under
   ([#1774](https://github.com/reliaburger/reliaburger/issues/1774)).
 - **The Raft snapshot is stored in plaintext**; only the log is encrypted
   ([#1775](https://github.com/reliaburger/reliaburger/issues/1775)).
-- **Test gaps** that #1893 lists, among them:
-  - no test reads an `RBSEED` stick;
-  - the interactive claim comparison has no test;
-  - the 120-second counted-boot limit has no test.
