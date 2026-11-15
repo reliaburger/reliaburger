@@ -826,6 +826,15 @@ class LinuxNextTests(unittest.TestCase):
         inner = int(re.search(r"timeout --kill-after=1m (\d+)m", command).group(1))
         self.assertLessEqual(inner + 1, self.minutes(step) - 1)
 
+    def test_the_compile_gets_swap_before_the_tests_run(self):
+        # With the runner shielded, #1943 showed up as a global OOM: on
+        # 15 Nov rustc reached 10.6 GB resident building the lib tests while
+        # rust-lld linked, and the kernel killed it (run 43715574887).
+        swap = self.step("sudo swapon /ci-swapfile")
+        self.assertLess(swap, self.step("make test-linux"))
+        self.assertIn("swapon --show --noheadings", self.steps[swap])
+        self.assertNotIn("if: always()", self.steps[swap])
+
     def test_the_watcher_logs_kernel_oom_kills_and_whether_the_runner_lives(self):
         watch = self.steps[self.step("scripts/ci/watch-runner")]
         self.assertIn('scripts/ci/watch-runner "$RUNNER_TEMP/runner-pids"', watch)
