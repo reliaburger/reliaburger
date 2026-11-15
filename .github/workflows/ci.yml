@@ -511,6 +511,21 @@ jobs:
         # kill of Runner.Worker would do that. -1000 exempts the runner's
         # processes; the tests below take back the default with `choom`.
         run: scripts/ci/protect-runner "$RUNNER_TEMP/runner-pids"
+      - name: Give the compile swap
+        # The shield turned #1943's lost runners into a visible global OOM:
+        # on 15 Nov rustc, building the lib tests, reached 10.6 GB resident
+        # while rust-lld linked, and the kernel killed it. Swap lets that
+        # peak page out instead; skipped if the image already has swap.
+        run: |
+          if [ -z "$(swapon --show --noheadings)" ]; then
+            sudo fallocate -l 8G /ci-swapfile
+            sudo chmod 600 /ci-swapfile
+            sudo mkswap /ci-swapfile > /dev/null
+            sudo swapon /ci-swapfile
+          fi
+          free -h
+          swapon --show
+          df -h /
       - name: Watch disk and memory during the privileged tests
         # As the `linux` job does for the OCI interruptions (#800): the
         # headroom every 5 s, so a run that ends badly shows whether the
