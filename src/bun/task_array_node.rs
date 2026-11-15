@@ -2753,7 +2753,9 @@ mod tests {
     async fn reusable_advertisement_accounts_for_helper_overhead_and_pool_bound() {
         use crate::bun::reusable_executor::{DEFAULT_REUSABLE_CONCURRENCY, MAX_EXECUTOR_SLOTS};
         for (capacity, explicit, expected) in [
-            (crate::meat::Resources::new(300, 96 << 20, 0), None, 2),
+            // Two executors of 110m and 32 MiB plus the container helper's
+            // 24 MiB fit; a third doesn't (#1957).
+            (crate::meat::Resources::new(300, 128 << 20, 0), None, 2),
             (
                 crate::meat::Resources::new(256_000, 16 << 30, 0),
                 None,

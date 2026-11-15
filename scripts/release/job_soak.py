@@ -493,7 +493,10 @@ class Campaign:
             script = effect_script + "sleep 30 & wait"; tasks["task_timeout_secs"] = 3
         elif purpose == "limit":
             script = "exec \"$SOAK_BUSYBOX\" awk 'BEGIN { for(i=0;;i++) a[i]=sprintf(\"%01024d\",i) }'"
-            template["memory"] = "8Mi"; tasks["task_timeout_secs"] = 15
+            # The awk grows until the limit kills it. A fresh runc job's limit
+            # covers runc init too, which needs up to 12.7 MiB with Ubuntu
+            # 26.04's runc 1.4, so 8 MiB never got the fixture started (#1957).
+            template["memory"] = "32Mi"; tasks["task_timeout_secs"] = 15
         elif purpose == "cancel": script = effect_script+"sleep 20"
         elif mode=="runc" and profile=="long": script=effect_script+script
         if mode != "process":

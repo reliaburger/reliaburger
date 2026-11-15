@@ -2753,6 +2753,48 @@ doesn't count until the task cgroup is really gone, and setup creates it with
 test plants a killed cgroup at the next executor's path and checks the command
 runs in a fresh directory. A mocked launch would never have found any of this.
 
+### Room for runc to start
+
+The helper's cgroup had an 8 MiB `memory.max`, and for months that was
+plenty. The helper is a small static binary that waits on a socket. Then the
+0.3.0 rehearsal's soaks all failed at the same step: a `run_before` hook on the
+`shared-runc` runtime never ran, so the deploy it guarded was cancelled (#1957).
+Bun's log said `helper connection timed out`, and the guest's kernel log said
+why: `runc:[2:INIT]` was OOM-killed in the helper's cgroup.
+
+`runc init` is the process runc starts inside the new container's namespaces
+and cgroup to set it up, before it `exec`s the container's own program. Its
+memory is charged to the container's cgroup, not to Bun. 0.3.0 moved the
+quickstart guest from Ubuntu 24.04 to 26.04. Ubuntu 26.04's runc 1.4.0
+keeps a copy of its own 10.9 MB binary in that memory. (runc copies itself
+so that a container can't overwrite the host's runc through
+`/proc/self/exe`.) On a soak node, a bundle shaped like the helper peaked at
+13,266,944 bytes before the helper ran. With an 8, 10 or 12 MiB limit,
+runc refused with `container init was OOM-killed`. The runc 1.5.2 on our test
+VM needs about 4 MiB, which is why 0.2.8 and CI never saw it.
+
+This is the same trap as #1955, where an 8 MiB `memory.high` throttled an
+app's `runc init` (see Chapter 1). A container's limit covers the
+runtime's setup as well as the workload. So a shared-runc helper now gets
+`CONTAINER_HELPER_MEMORY_BYTES`, the helper's own 8 MiB plus 16 MiB for
+runc init, and the executor's reservation counts all of it. A
+reservation that left the 16 MiB out would let a node promise memory it
+doesn't have. A host executor's helper is a process Bun starts itself, with no
+runc involved, so it keeps the 8 MiB and the host job slots that buys.
+`ExecutorProfile` carries the value as `helper_memory`, and both places that
+set the limit read it from there: the OCI spec runc writes into the cgroup,
+and `prepare_cgroups`, which writes the cgroup before runc does. The helper's
+`memory.high` is now `max`, so nothing throttles runc init below the limit.
+
+With the fix in place, the soak's job campaign failed next, for the same
+reason. Its memory-limit fixture runs an `awk` that grows until the limit
+kills it, and expects exit 137. A fresh `runc` job's limit covers runc init
+as well, and the fixture asked for 8 MiB, so the container never started and
+the job failed as a launch, not a kill. That was the harness's mistake, not
+Bun's: a user who gives a job less memory than its runtime needs to start
+should see it fail. The fixture now asks for 32 MiB, which runc can start in
+and `awk` still outgrows.
+
 ### Native host executors
 
 Shared containers fixed the container setup. Host jobs still paid for their

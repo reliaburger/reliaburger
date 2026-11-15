@@ -27,7 +27,20 @@ pub(crate) const DEFAULT_REUSABLE_CONCURRENCY: u32 = 27;
 /// Explicit reservation for the container's idle command helper.
 pub const HELPER_CPU_REQUEST: u64 = 10;
 /// The helper is independently capped, outside each command's memory limit.
+/// This is the host helper's whole cap, and the helper's own share of a
+/// container helper's.
 pub const HELPER_MEMORY_BYTES: u64 = 8 << 20;
+/// Room for `runc init`, which runs in a container helper's cgroup before
+/// the helper does. Ubuntu 26.04's runc 1.4.0 keeps a copy of its own 10.9 MB
+/// binary there: memory.peak reached 13,266,944 bytes on a soak guest
+/// (#1957). Rounded up to 16 MiB for a runc a little bigger than that one.
+pub const RUNC_INIT_MEMORY_BYTES: u64 = 16 << 20;
+// The highest memory.peak measured for that runc init: lowering the room
+// below it fails the build.
+const _: () = assert!(RUNC_INIT_MEMORY_BYTES >= 13_266_944);
+/// A shared-runc executor's helper cap and reservation: the helper's own
+/// [`HELPER_MEMORY_BYTES`] plus [`RUNC_INIT_MEMORY_BYTES`].
+pub const CONTAINER_HELPER_MEMORY_BYTES: u64 = HELPER_MEMORY_BYTES + RUNC_INIT_MEMORY_BYTES;
 /// A command's `pids.max` when its job doesn't set `pids`.
 pub const DEFAULT_COMMAND_PIDS: u32 = 256;
 /// The helper's own `pids.max`, outside every command's limit.
@@ -43,6 +56,9 @@ pub(crate) struct ExecutorProfile {
     pub memory: ResourceRange,
     /// The command cgroup's `pids.max`.
     pub pids: u32,
+    /// The helper cgroup's `memory.max`: [`CONTAINER_HELPER_MEMORY_BYTES`]
+    /// for a shared-runc executor, [`HELPER_MEMORY_BYTES`] for a host one.
+    pub helper_memory: u64,
     pub reservation: Resources,
 }
 
@@ -194,13 +210,18 @@ impl ExecutorProfile {
                 "unsupported CPU or memory range",
             ));
         }
+        let helper_memory = if template.runtime == crate::config::job::JobRuntime::Process {
+            HELPER_MEMORY_BYTES
+        } else {
+            CONTAINER_HELPER_MEMORY_BYTES
+        };
         let reservation = Resources::new(
             cpu.request
                 .checked_add(HELPER_CPU_REQUEST)
                 .ok_or(ExecutorError::Configuration("CPU reservation overflow"))?,
             memory
                 .request
-                .checked_add(HELPER_MEMORY_BYTES)
+                .checked_add(helper_memory)
                 .ok_or(ExecutorError::Configuration("memory reservation overflow"))?,
             0,
         );
@@ -210,6 +231,7 @@ impl ExecutorProfile {
             pids: template
                 .pids
                 .map_or(DEFAULT_COMMAND_PIDS, crate::config::types::PidsLimit::get),
+            helper_memory,
             reservation,
         })
     }
@@ -484,9 +506,34 @@ mod tests {
         );
     }
     #[test]
+    fn a_container_helper_has_room_for_runc_init_and_a_host_helper_stays_small() {
+        // runc init runs in the helper's cgroup before the helper does.
+        // Ubuntu 26.04's runc 1.4.0 holds a copy of its 10.9 MB binary
+        // there: memory.peak reached 13,266,944 bytes on a soak guest, and an
+        // 8 MiB memory.max OOM-killed every shared-runc executor (#1957).
+        let container = ExecutorProfile::new(&template()).unwrap();
+        assert_eq!(container.helper_memory, (8 << 20) + RUNC_INIT_MEMORY_BYTES);
+        assert_eq!(
+            container.reservation.memory_bytes,
+            (32 << 20) + CONTAINER_HELPER_MEMORY_BYTES
+        );
+        // A host helper is a process Bun starts itself: no runc init, so it
+        // keeps the small cap and the host slots it buys.
+        let mut host = template();
+        host.runtime = crate::config::job::JobRuntime::Process;
+        host.image = None;
+        host.exec = Some("/bin/true".into());
+        let host = ExecutorProfile::new(&host).unwrap();
+        assert_eq!(host.helper_memory, HELPER_MEMORY_BYTES);
+        assert_eq!(host.reservation.memory_bytes, (32 << 20) + (8 << 20));
+    }
+    #[test]
     fn idle_profile_reservation_includes_the_helper_without_weakening_task_limits() {
         let profile = ExecutorProfile::new(&template()).unwrap();
-        assert_eq!(profile.reservation, Resources::new(110, 40 << 20, 0));
+        assert_eq!(
+            profile.reservation,
+            Resources::new(110, (32 << 20) + CONTAINER_HELPER_MEMORY_BYTES, 0)
+        );
         assert_eq!(profile.cpu.limit, 1000);
         assert_eq!(profile.memory.limit, 64 << 20);
         let mut invalid = template();
