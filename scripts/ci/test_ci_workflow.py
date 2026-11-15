@@ -798,6 +798,51 @@ class LinuxNextTests(unittest.TestCase):
         # On a failed or timed-out step, the stuck processes' kernel stacks.
         self.assertIn("/stack", self.steps[report])
 
+    def test_the_runner_is_shielded_from_the_oom_killer_before_anything_is_watched(self):
+        # The job died with its test step "in progress" nine times in two
+        # days while the 24.04 job running the same tests didn't: the runner
+        # itself stopped. An OOM kill of Runner.Worker would do that.
+        shield = self.step('scripts/ci/protect-runner "$RUNNER_TEMP/runner-pids"')
+        self.assertLess(shield, self.step("scripts/ci/watch-runner"))
+        self.assertLess(shield, self.step("make test-linux"))
+        self.assertNotIn("if: always()", self.steps[shield])
+
+    def test_the_tests_run_in_their_own_scope_and_session_back_in_the_oom_killers_reach(self):
+        step = self.steps[self.step("make test-linux")]
+        command = " ".join(re.sub(r"\\\n", " ", step.split("run: |", 1)[1]).split())
+        # Out of the runner's cgroup, so a memory limit or kill there misses
+        # the tests, and out of its session and process group.
+        wrapper = ["scripts/ci/as-root systemd-run --scope --quiet -p Delegate=yes",
+                   "setsid --wait",
+                   # Children inherit the runner's -1000; hand the tests back.
+                   "choom -n 0 --",
+                   "timeout --kill-after=1m",
+                   "make test-linux NEXTEST_PROFILE=ci"]
+        positions = [command.find(part) for part in wrapper]
+        self.assertNotIn(-1, positions, command)
+        self.assertEqual(positions, sorted(positions), command)
+        # The runner can't signal a root tree in its own session, so the
+        # tests stop themselves inside the step's limit.
+        inner = int(re.search(r"timeout --kill-after=1m (\d+)m", command).group(1))
+        self.assertLessEqual(inner + 1, self.minutes(step) - 1)
+
+    def test_the_watcher_logs_kernel_oom_kills_and_whether_the_runner_lives(self):
+        watch = self.steps[self.step("scripts/ci/watch-runner")]
+        self.assertIn('scripts/ci/watch-runner "$RUNNER_TEMP/runner-pids"', watch)
+        report = self.steps[self.step('kill "$(cat "$RUNNER_TEMP/linux-next-resources.pid")"')]
+        # The low-water marks sort only the resource lines, not kernel lines.
+        self.assertIn("grep ' disk_kb='", report)
+        self.assertIn("dmesg -T", report)
+        self.assertIn("'oom|killed process'", report)
+
+    def test_no_sort_takes_an_attached_equals_separator(self):
+        # 26.04's Rust `sort` reads `-t=` as an empty separator and fails
+        # ("separator must be exactly one character long").
+        text = (WORKFLOWS / "ci.yml").read_text()
+        self.assertNotIn("sort -t=", text)
+        self.assertIn("sort -t '=' -k2 -n", self.job)
+        self.assertIn("sort -t '=' -k3 -n", self.job)
+
 
 class ArtifactDownloadTests(unittest.TestCase):
     """A stalled artefact download fails fast and is retried once (#977).

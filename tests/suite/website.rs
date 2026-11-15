@@ -905,6 +905,64 @@ fn command_snippets_are_copyable_and_still_selectable_without_script() {
     assert!(!css.contains("user-select: none"));
 }
 
+/// Every innermost rule in a stylesheet, as `(selector, declarations)`.
+/// An `@media` block's own braces are skipped; the rules inside it count.
+fn css_rules(css: &str) -> Vec<(String, String)> {
+    let mut rules = Vec::new();
+    let mut selector_start = 0;
+    let mut open: Option<(String, usize)> = None;
+    for (index, character) in css.char_indices() {
+        match character {
+            '{' => {
+                open = Some((css[selector_start..index].trim().to_string(), index + 1));
+                selector_start = index + 1;
+            }
+            '}' => {
+                if let Some((selector, body_start)) = open.take() {
+                    rules.push((selector, css[body_start..index].to_string()));
+                }
+                selector_start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    rules
+}
+
+/// A box the site paints dark sets its own text colour, so nothing inside it
+/// inherits the page's dark ink. `.tour .copyable` once painted the wrapper
+/// that `copy.js` puts round every `<pre>` without one, and the commands under
+/// "Test your agent on your own cluster first", "Guardrails you write once"
+/// and "Ask the cluster why" showed as empty black boxes.
+#[test]
+fn every_dark_box_on_the_site_sets_its_own_text_colour() {
+    let dark = ["var(--ink)", "#303c32"];
+    for sheet in ["docs/website/style.css", "docs/website/comparisons.css"] {
+        let css = read(sheet);
+        let mut checked = 0;
+        for (selector, body) in css_rules(&css) {
+            let declarations: Vec<&str> = body.split(';').map(str::trim).collect();
+            let paints_dark = declarations.iter().any(|declaration| {
+                declaration
+                    .strip_prefix("background:")
+                    .is_some_and(|value| dark.contains(&value.trim()))
+            });
+            if !paints_dark {
+                continue;
+            }
+            checked += 1;
+            assert!(
+                declarations.iter().any(|d| d.starts_with("color:")),
+                "{sheet}: `{selector}` paints a dark background but sets no `color`, \
+                 so its text inherits the page's dark ink"
+            );
+        }
+        if sheet.ends_with("style.css") {
+            assert!(checked > 5, "found only {checked} dark rules in {sheet}");
+        }
+    }
+}
+
 /// Every release carries the PDFs, so the page links the stable "latest"
 /// release assets rather than sending people to CI artefacts (#280).
 #[test]
