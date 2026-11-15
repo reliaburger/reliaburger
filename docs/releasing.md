@@ -1155,7 +1155,13 @@ days) instead of `candidate-…`. It reuses the train's CI run exactly as a
 candidate build reuses main's. `stage.yml` with `channel=nightly` accepts only
 a successful manual build of a `release-X-Y-Z` branch whose record says
 nightly, and publishes it as the pre-release `nightly-v0.2.4-RUN_ID-ATTEMPT`,
-never marked latest. Nothing can mistake it for a release:
+never marked latest. It checks the guest images against the
+`guest-images.json` of the build's own commit, read through the GitHub API as
+data, because a train can pin other images than `main` until its gate PR
+merges: 0.3.0's moved to Ubuntu 26.04, and main's pins refused its nightly
+([#1952](https://github.com/reliaburger/reliaburger/issues/1952)). A release
+candidate is built on `main`, so it keeps `main`'s pins. Nothing can mistake
+it for a release:
 
 - promotion refuses any tag containing `nightly`, and `candidate.py`
   refuses a nightly record, run or artefact for a release;

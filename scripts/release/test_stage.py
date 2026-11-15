@@ -1,8 +1,10 @@
 """Staging publishes the qualified bytes as a pre-release that can never pass for the release."""
 import hashlib
+import io
 import json
 from pathlib import Path
 import re
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -288,6 +290,101 @@ class NightlyStagingTests(unittest.TestCase):
         self.assertIn("Nightly build", create[create.index("--title") + 1])
         for call in calls:
             self.assertIn("--latest=false", call)
+
+
+class StagingPinsTests(unittest.TestCase):
+    """A train's nightly is checked against its own guest image pins, a release against main's (#1952)."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.main_pins = self.pins_for("guest-24.04.qcow2", "4")
+        self.train_pins = self.pins_for("guest-26.04.qcow2", "6")
+        self.run = dict(id=123, run_attempt=1, head_sha="a" * 40, head_branch="release-0-3-0",
+                        event="workflow_dispatch", path=".github/workflows/build.yml",
+                        status="completed", conclusion="success",
+                        repository={"full_name": "reliaburger/reliaburger"},
+                        head_repository={"full_name": "reliaburger/reliaburger"})
+
+    @staticmethod
+    def pins_for(asset, digit):
+        source = {"file": "ubuntu.img", "url": "https://images.example/ubuntu.img", "sha256": digit * 64}
+        return {"packages": ["runc"], "images": {"fixture": {"asset": asset, "source": source}}}
+
+    @staticmethod
+    def contents_answer(pins):
+        import base64
+        return {"type": "file", "encoding": "base64",
+                "content": base64.encodebytes(json.dumps(pins).encode()).decode()}
+
+    def build(self, pins, channel):
+        """A built candidate whose guest image is the one `pins` names, and its digest."""
+        directory = self.root / f"built-{channel}"
+        directory.mkdir()
+        image = pins["images"]["fixture"]
+        metadata = {"schema": 1, "version": "v0.3.0", "images": {"fixture": {
+            "asset": image["asset"], "sha256": hashlib.sha256(b"guest").hexdigest(), "size": 5,
+            "signature": "c2ln", "source": {"url": image["source"]["url"],
+                                            "sha256": image["source"]["sha256"]}}}}
+        contents = {image["asset"]: b"guest", GUEST_METADATA: json.dumps(metadata).encode()}
+        for name in candidate_names(pins):
+            (directory / name).write_bytes(contents.get(name, name.encode()))
+        digest = record_candidate(directory, pins, channel=channel, source_digest="sha256:" + "c" * 64,
+                                  source_ci=dict(run_id=456, run_attempt=1), version="v0.3.0",
+                                  repository="reliaburger/reliaburger", commit="a" * 40,
+                                  run_id=123, run_attempt=1)
+        return directory, digest
+
+    def test_a_nightly_uses_the_pins_at_its_build_commit(self):
+        with mock.patch.object(candidate, "gh_json", return_value=self.contents_answer(self.train_pins)) as api:
+            pins = candidate.staging_pins("reliaburger/reliaburger", self.run, "nightly", self.main_pins)
+        self.assertEqual(pins, self.train_pins)
+        api.assert_called_once_with(
+            "repos/reliaburger/reliaburger/contents/scripts/release/guest-images.json?ref=" + "a" * 40)
+
+    def test_a_release_keeps_mains_pins_and_never_asks(self):
+        with mock.patch.object(candidate, "gh_json", side_effect=AssertionError("asked")):
+            pins = candidate.staging_pins("reliaburger/reliaburger", self.run, "release", self.main_pins)
+        self.assertEqual(pins, self.main_pins)
+
+    def test_pins_that_could_name_another_file_are_refused(self):
+        for asset in ("../candidate.json", "dir/guest.qcow2", "guest.img", ""):
+            bad = self.pins_for(asset, "6")
+            with self.subTest(asset=asset), \
+                    mock.patch.object(candidate, "gh_json", return_value=self.contents_answer(bad)), \
+                    self.assertRaises(ValueError):
+                candidate.staging_pins("reliaburger/reliaburger", self.run, "nightly", self.main_pins)
+        with mock.patch.object(candidate, "gh_json", return_value={"type": "file", "encoding": "none"}), \
+                self.assertRaises(ValueError):
+            candidate.staging_pins("reliaburger/reliaburger", self.run, "nightly", self.main_pins)
+
+    def stage_fetch(self, built, digest, channel, run, commit_pins):
+        def download(directory, *_):
+            directory.mkdir()
+            for path in built.iterdir():
+                (directory / path.name).write_bytes(path.read_bytes())
+        argv = ["candidate.py", "stage-fetch", "--directory", str(self.root / f"dist-{channel}"),
+                "--repository", "reliaburger/reliaburger", "--run-id", "123",
+                "--qualified-digest", digest, "--channel", channel]
+        with mock.patch.object(candidate, "candidate_run", return_value=run), \
+                mock.patch.object(candidate, "download_candidate", side_effect=download), \
+                mock.patch.object(candidate, "gh_json", return_value=self.contents_answer(commit_pins)), \
+                mock.patch.object(candidate, "local_pins", return_value=self.main_pins), \
+                mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(sys, "stdout", io.StringIO()) as out:
+            candidate.main()
+        return out.getvalue()
+
+    def test_a_train_nightly_with_other_guest_images_stages(self):
+        built, digest = self.build(self.train_pins, "nightly")
+        self.assertIn("verified candidate", self.stage_fetch(built, digest, "nightly", self.run, self.train_pins))
+
+    def test_a_release_whose_images_differ_from_mains_pins_still_fails(self):
+        built, digest = self.build(self.train_pins, "release")
+        run = dict(self.run, head_branch="main")
+        with self.assertRaisesRegex(ValueError, "inventory"):
+            self.stage_fetch(built, digest, "release", run, self.train_pins)
 
 
 class NightlyPruneTests(unittest.TestCase):
