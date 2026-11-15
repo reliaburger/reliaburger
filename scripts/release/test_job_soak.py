@@ -552,6 +552,14 @@ class TargetLoad(unittest.TestCase):
     def campaign(self, load="target", rate=jobs.DEFAULT_TARGET_RATE):
         return jobs.Campaign(self.path,self.api,[],"token",load=load,target_rate=rate)
 
+    def test_target_executors_leave_the_quickstart_apps_room_to_recover(self):
+        # #1958 made a shared-runc executor reserve 32 + 24 MiB, not 40. At
+        # 8 a node the jobs fast tier's executors took every MiB of a node's
+        # 1,438 after quorum loss, and redis couldn't be re-placed for 600 s
+        # (15 Nov rehearsal). Keep shared-runc's reservation at 0.2.8's
+        # 8 x 40 MiB, which left the apps about 100 MiB to recover in.
+        self.assertLessEqual(jobs.TARGET_CAPS["shared-runc"]*(32+24), 8*40)
+
     def test_target_load_turns_fast_short_runs_into_million_task_arrays(self):
         c=self.campaign()
         for mode in ("shared-runc","process"):

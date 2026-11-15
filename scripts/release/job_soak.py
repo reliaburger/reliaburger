@@ -58,7 +58,10 @@ TARGET_FLOOR = 1158
 DEFAULT_TARGET_RATE = 1390
 # Starting per-node caps for the target load; calibrate on the rig. Fresh
 # containers can't approach the target, so their runs keep the calibration mix.
-TARGET_CAPS = {"shared-runc": 8, "process": 16}
+# Five shared-runc executors at 56 MiB each (#1958) reserve less than 0.2.8's
+# eight at 40 MiB did, leaving the soak's apps room to be re-placed after a
+# quorum loss or power-off.
+TARGET_CAPS = {"shared-runc": 5, "process": 16}
 MILLION = 1 << 20
 # The day run (#1032): 2 billion accepted host-job tasks in one real day on
 # three nodes is 23,148.1 a second, so 23,149; a billion, the floor, is 11,575.
