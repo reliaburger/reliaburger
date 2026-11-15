@@ -290,6 +290,54 @@ fn validate_build(
 /// The built-in checks one app must pass, on their own. Policies run them
 /// again on an app their defaults filled in (#1118), so validation sees
 /// the final spec.
+/// Why a runc container with this memory range can't start, if it can't.
+///
+/// Refuses a limit below [`RUNC_MEMORY_LIMIT_FLOOR_BYTES`]: `runc init`
+/// runs in the container's cgroup first and is OOM-killed under it (#1959).
+/// Only the limit counts; a request is a reservation and sets no cgroup
+/// file (#1955).
+///
+/// [`RUNC_MEMORY_LIMIT_FLOOR_BYTES`]: crate::grill::oci::RUNC_MEMORY_LIMIT_FLOOR_BYTES
+pub(crate) fn runc_memory_floor_refusal(
+    memory: Option<&super::types::ResourceRange>,
+) -> Option<String> {
+    use crate::grill::oci::{RUNC_MEMORY_LIMIT_FLOOR_BYTES, render_memory};
+    let limit = memory?.limit;
+    (limit < RUNC_MEMORY_LIMIT_FLOOR_BYTES).then(|| {
+        format!(
+            "memory limit {} is below the {} a container needs to start: runc init \
+             runs inside the container's cgroup first and is OOM-killed under it",
+            render_memory(limit),
+            render_memory(RUNC_MEMORY_LIMIT_FLOOR_BYTES),
+        )
+    })
+}
+
+/// Refuse a container app or sidecar whose memory limit is below the runc floor.
+fn validate_app_memory_floor(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError> {
+    // A host app (exec or script, no image) runs without runc.
+    if app.image.is_none() {
+        return Ok(());
+    }
+    if let Some(reason) = runc_memory_floor_refusal(app.memory.as_ref()) {
+        return Err(ConfigError::Validation {
+            field: "memory".to_string(),
+            context: format!("app {name:?}"),
+            reason,
+        });
+    }
+    for sidecar in &app.sidecar {
+        if let Some(reason) = runc_memory_floor_refusal(sidecar.memory.as_ref()) {
+            return Err(ConfigError::Validation {
+                field: format!("sidecar.{}.memory", sidecar.name),
+                context: format!("app {name:?}"),
+                reason,
+            });
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_app_spec(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError> {
     validate_app(name, app)
 }
@@ -308,6 +356,7 @@ fn validate_app(name: &str, app: &super::app::AppSpec) -> Result<(), ConfigError
     )?;
     validate_app_ingress(name, app)?;
     validate_app_honoured_fields(name, app)?;
+    validate_app_memory_floor(name, app)?;
 
     if let Some(owner) = &app.owner
         && let Err(reason) = crate::council::owner::validate_owner(owner)
@@ -846,6 +895,13 @@ pub(crate) fn validate_job(name: &str, job: &super::job::JobSpec) -> Result<(), 
             context: format!("job {name:?}"),
             reason: reason.into(),
         })?;
+    if let Some(reason) = job.memory_floor_refusal() {
+        return Err(ConfigError::Validation {
+            field: "memory".into(),
+            context: format!("job {name:?}"),
+            reason,
+        });
+    }
     validate_job_policy(name, job)
 }
 
@@ -1487,6 +1543,40 @@ mod tests {
             config.validate(),
             Err(ConfigError::InvalidPort { .. })
         ));
+    }
+
+    #[test]
+    fn a_container_app_whose_memory_limit_is_below_the_runc_floor_is_refused() {
+        let app: AppSpec = toml::from_str("image = \"test:v1\"\nmemory = \"4Mi-8Mi\"").unwrap();
+        let err = config_with_app("tiny", app).validate().unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("8Mi"), "{message}");
+        assert!(message.contains("16Mi"), "{message}");
+    }
+
+    #[test]
+    fn a_container_app_may_request_below_the_runc_floor_if_its_limit_reaches_it() {
+        let app: AppSpec = toml::from_str("image = \"test:v1\"\nmemory = \"1Mi-16Mi\"").unwrap();
+        config_with_app("small", app).validate().unwrap();
+    }
+
+    #[test]
+    fn a_sidecar_whose_memory_limit_is_below_the_runc_floor_is_refused() {
+        let app: AppSpec =
+            toml::from_str("image = \"test:v1\"\n[[sidecar]]\nname = \"proxy\"\nmemory = \"8Mi\"")
+                .unwrap();
+        let message = config_with_app("web", app)
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("sidecar"), "{message}");
+        assert!(message.contains("16Mi"), "{message}");
+    }
+
+    #[test]
+    fn a_host_app_has_no_runc_memory_floor() {
+        let app: AppSpec = toml::from_str("script = \"sleep 1\"\nmemory = \"1Mi\"").unwrap();
+        config_with_app("host", app).validate().unwrap();
     }
 
     #[test]

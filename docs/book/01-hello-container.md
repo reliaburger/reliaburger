@@ -899,6 +899,46 @@ The quickstart's burger demo asks for `memory = "8Mi-32Mi"`. When its containers
 
 So a request no longer touches the cgroup. Couldn't we use `memory.low`, the kernel's protection floor, instead? Not here: a cgroup's `memory.low` only counts up to its parents' protection, and our `/reliaburger/{namespace}/{app}` parents have none, so it would be a setting that does nothing. Kubernetes reached the same answer by default: a pod's memory request schedules it and nothing else, unless you opt into the alpha Memory QoS feature. Even that derives `memory.high` from the *limit*, never the request, and turns the request into `memory.min`, which it also writes on every parent cgroup so the protection is real ([Kubernetes Memory QoS](https://kubernetes.io/blog/2023/05/05/qos-memory-resources/)). A workload that grows past its request now runs until its limit, and the limit is where the kernel says no.
 
+### A floor under the limit
+
+That fixed the request. The limit has the same problem in a blunter form ([#1959](https://github.com/reliaburger/reliaburger/issues/1959)). `runc init` still runs in the container's cgroup, and `memory.max` is a hard ceiling, so a limit below its footprint doesn't throttle it: the kernel kills it. On a soak node, runc 1.4's init peaked at 10.9 to 13.3 MB, and `runc create` failed at 8, 10 and 12 MiB with `container init was OOM-killed (memory limit too low?)`. runc 1.5 needs about 4 MiB, but a node can run either. Before this change, all you saw was a start failure, with runc's question mark buried in a log.
+
+So the floor gets a name and a home next to the code that writes `memory.max`, in `src/grill/oci.rs`:
+
+```rust
+pub const RUNC_MEMORY_LIMIT_FLOOR_BYTES: u64 = 16 << 20;
+
+// The floor must stay above the largest runc init peak we measured.
+const _: () = assert!(RUNC_MEMORY_LIMIT_FLOOR_BYTES >= 13_266_944);
+```
+
+`16 << 20` is 16 shifted left by 20 bits, which is 16 × 2²⁰, or 16 MiB. The second line is a compile-time assertion. A `const` item is evaluated by the compiler, and `assert!` inside one runs then, not when the program does. If someone lowers the floor below the measured peak, the crate doesn't build. Naming the constant `_` means we never refer to it; it exists only to be checked. C has `_Static_assert` for this; Go has nothing built in.
+
+Should `relish apply` warn about a small limit, or refuse it? We refuse. A warning makes sense when the config might work: here it can't, on the runc a node ships today. A warning scrolls past, the apply succeeds, and the user gets a start failure a minute later on some node, which is exactly what we set out to remove. Refusing fails fast, at the desk, with a message that says what to change:
+
+```
+memory in "app \"tiny\"": memory limit 8Mi is below the 16Mi a container needs to start: runc init runs inside the container's cgroup first and is OOM-killed under it
+```
+
+The check, `runc_memory_floor_refusal` in `src/config/validate.rs`, looks only at the limit. A request of 4 MiB under a 16 MiB limit is still fine, because after #1955 the request touches no cgroup file. It only applies where runc init really runs in the workload's cgroup: an app with an `image` and its sidecars, a fresh `runc` job and a task array's `runc` template. A host app or `process` job has no runc, and a `shared-runc` task is cloned straight into its task cgroup with `CLONE_INTO_CGROUP`, so runc init never runs there (Chapter 17 has the details).
+
+The function returns `Option<String>`: `None` means "fine", `Some(reason)` means "refuse, and here's why". Its body is three lines:
+
+```rust
+let limit = memory?.limit;
+(limit < RUNC_MEMORY_LIMIT_FLOOR_BYTES).then(|| format!(/* ... */))
+```
+
+The `?` works on `Option` as well as `Result`: if `memory` is `None` (no limit set), the function returns `None` right there. `bool::then` turns a condition into an `Option`, running the closure only when the condition is true. Go would write the same thing as an `if` and two returns; it's a matter of taste, and here the short form reads like the rule it states.
+
+Validation can't catch everything. A cluster can hold an app applied before this check existed, or a node can run a runc that needs even more. So Grill gets the second half. When `runc run` exits non-zero before the container ever ran, `owned_start` in `src/grill/runc/owned.rs` reads what runc wrote to stderr and hands it to `explain_runc_init_oom`. If runc said `OOM-killed`, the start fails with a `StartFailed` error that names the limit and the floor, instead of a bare exit:
+
+```
+runc init was OOM-killed before the workload started: it runs inside the container's cgroup and the memory limit of 8Mi is too small for it; give the app or job a memory limit of at least 16Mi
+```
+
+We match runc's text, which is fragile in principle: a future runc could reword it. The cost of that is small, though. If the match misses, we're back to the old generic failure, not a wrong answer. The pure function is tested on its own with runc's real message, and it works on any platform, like the cgroup helpers above.
+
 Notice that none of these functions touch the filesystem. They compute values and return them. The actual writing to `/sys/fs/cgroup` happens elsewhere, when we're running on Linux with the right permissions. This separation is deliberate. These functions are pure: same input, same output, no side effects. That makes them testable on any platform: your CI server, your macOS laptop, anywhere. We test the computation now and test the filesystem operations in integration tests on Linux later.
 
 ## Generating OCI specs

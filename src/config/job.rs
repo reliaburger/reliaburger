@@ -162,6 +162,19 @@ impl JobSpec {
             _ => Ok(()),
         }
     }
+
+    /// Why this job's memory limit is too small for runc to start it, if it is.
+    ///
+    /// Only a fresh runc job has the floor (#1959): `runc init` runs in its
+    /// container's cgroup first. A shared-runc task is cloned straight into
+    /// its task cgroup, so runc init never runs there, and a host job has no
+    /// runc at all.
+    pub fn memory_floor_refusal(&self) -> Option<String> {
+        if self.runtime != JobRuntime::Runc || self.image.is_none() {
+            return None;
+        }
+        super::validate::runc_memory_floor_refusal(self.memory.as_ref())
+    }
 }
 
 #[cfg(test)]
@@ -204,6 +217,34 @@ mod tests {
             .validate()
             .unwrap_err();
         assert!(error.to_string().contains("shared-runc"));
+    }
+
+    #[test]
+    fn a_fresh_runc_job_whose_memory_limit_is_below_the_runc_floor_is_refused() {
+        let job: JobSpec = toml::from_str("image='fixture:v1'\nmemory='8Mi'").unwrap();
+        let reason = job.memory_floor_refusal().unwrap();
+        assert!(reason.contains("8Mi"), "{reason}");
+        assert!(reason.contains("16Mi"), "{reason}");
+        let error = crate::config::Config::parse("[job.tiny]\nimage='fixture:v1'\nmemory='8Mi'")
+            .unwrap()
+            .validate()
+            .unwrap_err();
+        assert!(error.to_string().contains("16Mi"), "{error}");
+    }
+
+    #[test]
+    fn only_a_fresh_runc_job_has_the_runc_memory_floor() {
+        // A shared-runc task is cloned straight into its task cgroup, and a
+        // host job has no runc at all, so runc init never counts against
+        // their limits.
+        for source in [
+            "image='fixture:v1'\nruntime='shared-runc'\nmemory='8Mi'",
+            "runtime='process'\nscript='true'\nmemory='1Mi'",
+            "image='fixture:v1'\nmemory='1Mi-16Mi'",
+        ] {
+            let job: JobSpec = toml::from_str(source).unwrap();
+            assert_eq!(job.memory_floor_refusal(), None, "{source}");
+        }
     }
 
     #[test]

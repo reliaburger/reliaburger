@@ -61,6 +61,22 @@ fn failure(instance: &InstanceId, error: impl std::fmt::Display) -> GrillError {
     }
 }
 
+/// Read what the launcher (`runc run`) wrote to stderr, or nothing if it kept no log.
+async fn launcher_stderr(context: &ClaimedCommandExecutor) -> io::Result<String> {
+    let Some(stem) = context.role_log_stem(RuntimeRole::Launcher).await? else {
+        return Ok(String::new());
+    };
+    let path = stem.with_extension("stderr");
+    let read = tokio::task::spawn_blocking(move || crate::grill::capture::read_retained(&path))
+        .await
+        .map_err(io::Error::other)?;
+    match read {
+        Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(error),
+    }
+}
+
 impl RuncGrill {
     /// Retain the original rootful address before a publisher exposes it.
     pub(super) async fn owned_retain_network_reference(
@@ -336,75 +352,100 @@ impl RuncGrill {
     }
 
     /// Bind and activate the launcher, retaining ownership through startup inspection.
+    ///
+    /// A launcher that exits non-zero because runc init was OOM-killed in
+    /// the container's cgroup fails the start with a reason that names the
+    /// memory limit and the floor (#1959), instead of a bare exit.
     pub(super) async fn owned_start(&self, instance: &InstanceId) -> Result<(), GrillError> {
-        self.owned_operation(instance, |runtime, id, context| async move {
-            let intent = context.intent().await?;
-            if intent.from_previous_boot().await? {
-                return Err(io::Error::other(
-                    "runtime generation belongs to a previous kernel boot",
-                ));
-            }
-            if intent.phase != IntentPhase::Owned || intent.roles.launcher.is_some() {
-                return Err(io::Error::other(
-                    "runtime launcher is already bound or admission is sealed",
-                ));
-            }
-            let args = vec![
-                "--root".into(),
-                runtime
-                    .state_dir
-                    .to_str()
-                    .ok_or_else(|| io::Error::other("non-UTF-8 runc state directory"))?
-                    .into(),
-                "run".into(),
-                "--bundle".into(),
-                runtime
-                    .bundle_base
-                    .join(&id.0)
-                    .to_str()
-                    .ok_or_else(|| io::Error::other("non-UTF-8 bundle directory"))?
-                    .into(),
-                id.0.clone(),
-            ];
-            let result = async {
-                context
-                    .start_role(
-                        RuntimeRole::Launcher,
-                        &runtime.runc_program,
-                        &args,
-                        &BTreeMap::new(),
-                    )
-                    .await?;
-                if runtime.rootless {
-                    runtime.owned_open_rootless_gate(&context).await?;
+        let init_oom = self
+            .owned_operation(instance, |runtime, id, context| async move {
+                let intent = context.intent().await?;
+                let memory_limit = intent
+                    .spec
+                    .linux
+                    .resources
+                    .as_ref()
+                    .and_then(|resources| resources.memory.as_ref())
+                    .and_then(|memory| u64::try_from(memory.limit).ok());
+                if intent.from_previous_boot().await? {
+                    return Err(io::Error::other(
+                        "runtime generation belongs to a previous kernel boot",
+                    ));
                 }
-                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-                loop {
-                    if runtime.owned_running_pid(&id, &context).await?.is_some() {
-                        return Ok(());
-                    }
-                    if matches!(
-                        context.role_state(RuntimeRole::Launcher).await?,
-                        Some(CommandState::Retired { .. })
-                    ) {
-                        return Ok(());
-                    }
-                    if tokio::time::Instant::now() >= deadline {
-                        return Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "runc startup timed out",
-                        ));
-                    }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
+                if intent.phase != IntentPhase::Owned || intent.roles.launcher.is_some() {
+                    return Err(io::Error::other(
+                        "runtime launcher is already bound or admission is sealed",
+                    ));
                 }
-            }
-            .await;
-            if result.is_err() {
-                runtime.owned_cleanup_recovering(&id).await?;
-            }
-            result
-        })
-        .await
+                let args = vec![
+                    "--root".into(),
+                    runtime
+                        .state_dir
+                        .to_str()
+                        .ok_or_else(|| io::Error::other("non-UTF-8 runc state directory"))?
+                        .into(),
+                    "run".into(),
+                    "--bundle".into(),
+                    runtime
+                        .bundle_base
+                        .join(&id.0)
+                        .to_str()
+                        .ok_or_else(|| io::Error::other("non-UTF-8 bundle directory"))?
+                        .into(),
+                    id.0.clone(),
+                ];
+                let result = async {
+                    context
+                        .start_role(
+                            RuntimeRole::Launcher,
+                            &runtime.runc_program,
+                            &args,
+                            &BTreeMap::new(),
+                        )
+                        .await?;
+                    if runtime.rootless {
+                        runtime.owned_open_rootless_gate(&context).await?;
+                    }
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                    loop {
+                        if runtime.owned_running_pid(&id, &context).await?.is_some() {
+                            return Ok(None);
+                        }
+                        if let Some(CommandState::Retired { exit_code }) =
+                            context.role_state(RuntimeRole::Launcher).await?
+                        {
+                            if exit_code == Some(0) {
+                                return Ok(None);
+                            }
+                            let stderr = launcher_stderr(&context).await?;
+                            return Ok(crate::grill::oci::explain_runc_init_oom(
+                                &stderr,
+                                memory_limit,
+                            ));
+                        }
+                        if tokio::time::Instant::now() >= deadline {
+                            return Err(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "runc startup timed out",
+                            ));
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                }
+                .await;
+                if !matches!(result, Ok(None)) {
+                    runtime.owned_cleanup_recovering(&id).await?;
+                }
+                result
+            })
+            .await?;
+        match init_oom {
+            Some(reason) => Err(GrillError::StartFailed {
+                instance: instance.clone(),
+                reason,
+            }),
+            None => Ok(()),
+        }
     }
 
     async fn owned_cleanup_recovering(&self, id: &InstanceId) -> io::Result<()> {

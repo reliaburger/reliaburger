@@ -60,6 +60,14 @@ and the `m` suffix is millicores (`"250m"` is a quarter of a core). Memory takes
 `Ki`/`Mi`/`Gi`/`Ti`, and a bare number is bytes. A single value sets the request
 and the limit to the same thing.
 
+The request only reserves memory on a node; the limit is the container's
+ceiling. An app with an `image`, and each of its sidecars, needs a memory limit
+of at least 16 MiB. runc starts every container with its own `runc init`
+process inside the container's cgroup, and runc 1.4 needs up to 13 MB for it,
+so `relish apply` refuses `memory = "8Mi"` instead of letting the start fail.
+The request can still be smaller (`memory = "4Mi-16Mi"`). Host apps (`exec` or
+`script`) have no floor.
+
 Names (apps, jobs, namespaces) are lowercase DNS labels. Secrets go in `env`
 encrypted; see `security`. Ingress, firewall and egress rules are in
 `networking`, metrics scraping in `observability`. Every `[app.*]` field is
