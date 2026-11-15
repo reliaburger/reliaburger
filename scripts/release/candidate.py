@@ -18,6 +18,7 @@ It names, as `source_ci`, the `ci.yml` run whose pass the candidate rests on
 ran the suite itself. Qualification cites it from the record.
 """
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -281,6 +282,44 @@ def candidate_run(repository, run_id, commit=None, channel="release"):
     return run
 
 
+PINS_PATH = "scripts/release/guest-images.json"
+
+
+def local_pins():
+    """The guest image pins in this checkout: main's, in stage.yml and promote.yml."""
+    return json.loads(Path(__file__).with_name("guest-images.json").read_text())
+
+
+def staging_pins(repository, run, channel, pins):
+    """The guest image pins to check a staged build against.
+
+    A release candidate is built on main, so main's own pins (`pins`) are its
+    pins. A train's nightly is built from the train, which may pin other
+    guest images than main until its gate PR merges (0.3.0 moved to Ubuntu
+    26.04), so its pins are read from its build commit (#1952). They're data,
+    never code: they only name the image assets and their upstream digests,
+    and every byte is still checked against the digest-pinned record.
+    """
+    if channel != "nightly":
+        return pins
+    answer = gh_json(f"repos/{repository}/contents/{PINS_PATH}?ref={run['head_sha']}")
+    if answer.get("type") != "file" or answer.get("encoding") != "base64":
+        raise ValueError(f"{PINS_PATH} at the build commit is not a base64 file")
+    try:
+        commit_pins = json.loads(base64.b64decode(answer.get("content", ""), validate=False))
+        images = commit_pins["images"]
+        assets = [image["asset"] for image in images.values()]
+        sources = [image["source"]["sha256"] for image in images.values()]
+    except (ValueError, KeyError, TypeError, AttributeError):
+        raise ValueError(f"{PINS_PATH} at the build commit is not a set of guest image pins") from None
+    if not images or any(type(asset) is not str or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.qcow2", asset)
+                         for asset in assets):
+        raise ValueError(f"{PINS_PATH} at the build commit names a guest image that isn't a plain .qcow2 file")
+    if any(type(digest) is not str or not re.fullmatch(r"[0-9a-f]{64}", digest) for digest in sources):
+        raise ValueError(f"{PINS_PATH} at the build commit pins a source without a SHA-256")
+    return commit_pins
+
+
 def download_candidate(directory, repository, run, channel="release"):
     if directory.exists():
         raise FileExistsError("candidate download directory must be new")
@@ -434,7 +473,7 @@ def main():
         return
     if not args.repository:
         parser.error(f"{args.operation} requires --repository")
-    pins = json.loads(Path(__file__).with_name("guest-images.json").read_text())
+    pins = local_pins()
     digest = args.qualified_digest or ""
 
     if args.operation == "prune-nightly":
@@ -450,6 +489,7 @@ def main():
         # No tag exists yet and none is read: the run names the commit and the
         # digest-pinned record names the version.
         run = candidate_run(args.repository, args.run_id, channel=args.channel)
+        pins = staging_pins(args.repository, run, args.channel, pins)
         if args.operation == "stage-fetch":
             download_candidate(args.directory, args.repository, run, args.channel)
         document = verify_downloaded(args.directory, pins, args.repository, run, digest)
