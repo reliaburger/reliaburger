@@ -60,7 +60,7 @@ Reliaburger’s answer, and where each part stands on 10 November 2026
 
 ## Install it
 
-Kick the tyres With your agent Homebrew
+Kick the tyres With your agent Homebrew Real hardware
 
 INSTALL sh
 
@@ -98,6 +98,27 @@ From 0.2.7, Homebrew installs `relish` on a Mac with Apple silicon or on Linux, 
 Homebrew manages only the CLI. A cluster’s nodes still upgrade with `relish upgrade`, and `relish uninstall` leaves the Homebrew copy for `brew uninstall relish` to remove.
 
 [The tap](https://github.com/reliaburger/homebrew-tap) · [One node, CLI only, cleanup](https://github.com/reliaburger/reliaburger/blob/main/docs/quickstart.md)
+
+NETBOOT sh
+
+```
+relish image download --dir os
+```
+```
+sudo relish netboot os
+```
+```
+relish machines
+```
+```
+relish machines claim ~/lab --create --name lab --operator 192.168.1.10 192.168.1.51 192.168.1.52 192.168.1.53
+```
+
+New in 0.3.0, not in 0.2.8. Skip the laptop VMs and use real machines: your laptop serves the OS over the network, each machine installs itself in under a minute, and one command makes them a cluster. Leave `relish netboot` running, power the machines on, and claim them from a second terminal once each screen shows a claim key. No USB sticks and no distro.
+
+You’ll need two or more x86\_64 or arm64 machines with UEFI network boot, a supported wired network card, at least 2 GiB of RAM and an 8 GB disk, all on the same LAN, plus a laptop or spare box to serve them. Turn Secure Boot off. **The installer erases the largest built-in disk.** A disk that isn’t blank waits for your yes first.
+
+[Watch it, and what hardware works](https://reliaburger.com/#netboot) · [The appliance chapter of the manual](https://github.com/reliaburger/reliaburger/blob/main/docs/manual/17_appliance.md)
 
 **Where it stands**
 
@@ -456,6 +477,8 @@ What the soaks don't prove: they run three small VMs on one machine, so they say
 ## Netboot real machines
 
 Old mini PCs, thin clients, anything x86\_64 or arm64 with UEFI network boot: plug them into your switch and power them on. Your laptop serves the OS, they install themselves in under a minute, and one command makes them a cluster. No USB sticks, no distro, nothing to configure on each machine. Your router keeps handing out the addresses; relish only answers the boot part.
+
+What works: we test on the Dell Wyse 3040, and three of them have to go from power-on to a cluster before 0.3.0 ships. The installer drives Realtek RTL8111, RTL8168 and RTL8125, Intel I219, I225, I226, I210 and I350 and Broadcom tg3 network cards, plus USB Ethernet adapters. Secure Boot must be off. Raspberry Pis aren’t supported yet; they’re [planned](https://github.com/reliaburger/reliaburger/issues/1971).
 
 Three machines with blank disks network-boot into Reliaburger and become one cluster. They’re QEMU VMs with UEFI firmware on a virtual switch, run by [scripts/demo/netboot.sh](https://github.com/reliaburger/reliaburger/blob/main/scripts/demo/netboot.sh) in CI, serving a lab build of the OS signed with that run’s own key. Idle time is cut to two seconds; every wait says how long it really took.
 
