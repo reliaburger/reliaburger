@@ -1,0 +1,22 @@
+relish uninstall will remove:
+  /home/miko.guest/.reliaburger/bin/relish
+  /home/miko.guest/.reliaburger/tools
+  /home/miko.guest/.reliaburger/cache
+  /home/miko.guest/.reliaburger/lima
+  /home/miko.guest/.reliaburger/setup.lock
+  /home/miko.guest/.reliaburger/clusters
+  /home/miko.guest/.reliaburger/context.lock
+{
+  "home": "/home/miko.guest/.reliaburger",
+  "removed": [
+    "/home/miko.guest/.reliaburger/bin/relish",
+    "/home/miko.guest/.reliaburger/tools",
+    "/home/miko.guest/.reliaburger/cache",
+    "/home/miko.guest/.reliaburger/lima",
+    "/home/miko.guest/.reliaburger/setup.lock",
+    "/home/miko.guest/.reliaburger/clusters",
+    "/home/miko.guest/.reliaburger/context.lock"
+  ],
+  "kept": [],
+  "notes": []
+}

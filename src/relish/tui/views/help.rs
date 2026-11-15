@@ -124,6 +124,42 @@ mod tests {
     }
 
     #[test]
+    fn a_node_that_did_not_answer_makes_the_dashboard_say_partial() {
+        let app = TuiApp::with_test_data(TestScenario::NodeMissing);
+        let output = render_to_string(&app, 120, 40);
+        insta::assert_snapshot!("dashboard_partial", output);
+        assert!(
+            output.contains("2 nodes, partial (2 of 3 nodes)"),
+            "the header says it saw less: {output}"
+        );
+        assert!(
+            output.contains("2 alive, 0 suspect, 0 dead; partial (2 of 3 nodes)"),
+            "{output}"
+        );
+        assert!(output.contains("Cluster DEGRADED"), "{output}");
+    }
+
+    #[test]
+    fn a_missing_section_reads_unknown_and_the_dashboard_waits_for_a_summary() {
+        let mut app = TuiApp::with_test_data(TestScenario::HealthyCluster);
+        if let Some(summary) = app.data.summary.as_mut() {
+            summary.capacity = crate::bun::summary::Section::missing("leader: timed out");
+        }
+        let output = render_to_string(&app, 120, 40);
+        assert!(
+            output.contains("capacity   unknown: leader: timed out"),
+            "{output}"
+        );
+        assert!(output.contains("Cluster DEGRADED"), "{output}");
+        app.data.summary = None;
+        let output = render_to_string(&app, 120, 40);
+        assert!(
+            output.contains("waiting for the cluster summary"),
+            "{output}"
+        );
+    }
+
+    #[test]
     fn help_lists_keybindings() {
         let mut app = TuiApp::with_test_data(TestScenario::Empty);
         app.view_stack.push(View::Help);

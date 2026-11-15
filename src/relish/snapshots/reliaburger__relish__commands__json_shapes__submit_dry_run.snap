@@ -1,0 +1,9 @@
+---
+source: src/relish/commands.rs
+expression: "json(&ManifestCheck { valid: true, profiles: 2, tasks: 40, })"
+---
+{
+  "valid": true,
+  "profiles": 2,
+  "tasks": 40
+}

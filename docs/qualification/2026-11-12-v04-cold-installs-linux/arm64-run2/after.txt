@@ -1,0 +1,16 @@
+--- ~/.reliaburger
+find: ‘/home/miko.guest/.reliaburger’: No such file or directory
+--- ~/.local/bin/relish
+ls: cannot access '/home/miko.guest/.local/bin/relish': No such file or directory
+--- rc files (SHA-256)
+9b8726ae0172fa491906beb69ec79dffc91ae8737123c433cc208503da07241a  /home/miko.guest/.bashrc
+0cf2f6529b9502ff03400b7af9e428aa9b4885f79e3ed60dcb2582a23e85d668  /home/miko.guest/.profile
+absent  .bash_profile
+900d0c338b2c9789dffb4750c9c54c7c4fadbe7914a7d3a0a2423232fb469ab5  /home/miko.guest/.zshrc
+--- processes (qemu, limactl, bun)
+none
+--- listening TCP ports
+0.0.0.0:22
+127.0.0.53%lo:53
+127.0.0.54:53
+[::]:22

@@ -1,0 +1,41 @@
+r1-jobs-containers           rate=    13.6 steady=    14 done=816 complete=True fail=0 retry=0
+r1-jobs-host-processes       rate=  7500.0 steady=  7940 done=450000 complete=True fail=0 retry=0
+r1-jobs-shared-containers    rate=  6483.3 steady=  7221 done=389000 complete=True fail=0 retry=0
+r1-jobs-vm-baseline          rate= 17484.6 steady=     - done=0 complete=True fail=0 retry=0
+r2-jobs-containers           rate=    13.4 steady=    15 done=803 complete=True fail=0 retry=0
+r2-jobs-host-processes       rate=  7483.3 steady=  7940 done=449000 complete=True fail=0 retry=0
+r2-jobs-shared-containers    rate=  6483.3 steady=  7221 done=389000 complete=True fail=0 retry=0
+r2-jobs-vm-baseline          rate= 16995.5 steady=     - done=0 complete=True fail=0 retry=0
+r3-jobs-containers           rate=    13.2 steady=    14 done=791 complete=True fail=0 retry=0
+r3-jobs-host-processes       rate=  7383.3 steady=  7940 done=443000 complete=True fail=0 retry=0
+r3-jobs-shared-containers    rate=  6683.3 steady=  7612 done=401000 complete=True fail=0 retry=0
+r3-jobs-vm-baseline          rate= 16912.2 steady=     - done=0 complete=True fail=0 retry=0
+r4-jobs-containers           rate=    13.4 steady=    14 done=802 complete=True fail=0 retry=1
+r4-jobs-host-processes       rate=  7500.0 steady=  7940 done=450000 complete=True fail=0 retry=0
+r4-jobs-shared-containers    rate=  6333.3 steady=  7196 done=380000 complete=True fail=0 retry=0
+r4-jobs-vm-baseline          rate= 14324.8 steady=     - done=0 complete=True fail=0 retry=0
+r5-jobs-containers           rate=    13.4 steady=    14 done=803 complete=True fail=0 retry=2
+r5-jobs-host-processes       rate=  7500.0 steady=  7940 done=450000 complete=True fail=0 retry=0
+r5-jobs-shared-containers    rate=  6266.7 steady=  7072 done=376000 complete=True fail=0 retry=0
+r5-jobs-vm-baseline          rate= 13711.2 steady=     - done=0 complete=True fail=0 retry=0
+
+r1-jobs-containers       n=1 median=    13.6 range=13.6-13.6 steady-median=14
+r1-jobs-host-processes   n=1 median=  7500.0 range=7500.0-7500.0 steady-median=7940
+r1-jobs-shared-containers n=1 median=  6483.3 range=6483.3-6483.3 steady-median=7221
+r1-jobs-vm-baseline      n=1 median= 17484.6 range=17484.6-17484.6
+r2-jobs-containers       n=1 median=    13.4 range=13.4-13.4 steady-median=15
+r2-jobs-host-processes   n=1 median=  7483.3 range=7483.3-7483.3 steady-median=7940
+r2-jobs-shared-containers n=1 median=  6483.3 range=6483.3-6483.3 steady-median=7221
+r2-jobs-vm-baseline      n=1 median= 16995.5 range=16995.5-16995.5
+r3-jobs-containers       n=1 median=    13.2 range=13.2-13.2 steady-median=14
+r3-jobs-host-processes   n=1 median=  7383.3 range=7383.3-7383.3 steady-median=7940
+r3-jobs-shared-containers n=1 median=  6683.3 range=6683.3-6683.3 steady-median=7612
+r3-jobs-vm-baseline      n=1 median= 16912.2 range=16912.2-16912.2
+r4-jobs-containers       n=1 median=    13.4 range=13.4-13.4 steady-median=14
+r4-jobs-host-processes   n=1 median=  7500.0 range=7500.0-7500.0 steady-median=7940
+r4-jobs-shared-containers n=1 median=  6333.3 range=6333.3-6333.3 steady-median=7196
+r4-jobs-vm-baseline      n=1 median= 14324.8 range=14324.8-14324.8
+r5-jobs-containers       n=1 median=    13.4 range=13.4-13.4 steady-median=14
+r5-jobs-host-processes   n=1 median=  7500.0 range=7500.0-7500.0 steady-median=7940
+r5-jobs-shared-containers n=1 median=  6266.7 range=6266.7-6266.7 steady-median=7072
+r5-jobs-vm-baseline      n=1 median= 13711.2 range=13711.2-13711.2

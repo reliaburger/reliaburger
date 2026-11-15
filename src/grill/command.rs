@@ -144,6 +144,7 @@ impl OwnedCommands {
                     .iter()
                     .map(|(key, value)| format!("{key}={value}"))
                     .collect(),
+                provider_env: Vec::new(),
                 cwd: "/".into(),
                 user: OciUser { uid: 0, gid: 0 },
                 capabilities: None,
@@ -157,8 +158,12 @@ impl OwnedCommands {
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
             port_mapping: None,
+            stop: None,
+            runtime_knobs: None,
         };
         self.control.prepare(&id.0, &spec).await?;
         Ok(id)
@@ -205,7 +210,11 @@ impl OwnedCommands {
     /// Run an auxiliary command supervised by this command's independent owner.
     /// Cancelling the future closes its control socket and requests child retirement.
     /// Retirement of the main command waits for every accepted auxiliary command.
-    pub async fn exec(&self, id: &CommandId, command: &[String]) -> Result<String, CommandError> {
+    pub async fn exec(
+        &self,
+        id: &CommandId,
+        command: &[String],
+    ) -> Result<crate::grill::ExecOutput, CommandError> {
         Ok(self.control.exec(&id.0, command).await?)
     }
 

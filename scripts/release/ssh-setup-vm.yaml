@@ -1,0 +1,15 @@
+# A disposable machine for qualify-ssh-setup.sh: a plain Ubuntu server with
+# nothing of Reliaburger's on it, which relish setup --ssh then reaches over
+# SSH like any other. 20 GiB, because setup wants 10 GiB free under /var/lib.
+# user-v2 puts the VMs on one network, so they reach each other directly.
+images:
+  - location: "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-arm64.img"
+    arch: "aarch64"
+  - location: "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+    arch: "x86_64"
+cpus: 2
+memory: "3GiB"
+disk: "20GiB"
+mounts: []
+networks:
+  - lima: user-v2

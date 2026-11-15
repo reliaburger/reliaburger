@@ -8,7 +8,7 @@
 //! also keeps fenced nodes out of the reconciler's candidates, since a node
 //! that refuses every Raft RPC can never catch up.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::council::fence::{FenceSnapshot, FenceState, RecoveryFence};
 use crate::council::node::CouncilNode;
+use crate::council::types::RecoveryClaim;
 use crate::meat::types::NodeId;
 use crate::mustard::directory::NodeDirectory;
 use crate::mustard::membership::MembershipSnapshot;
@@ -101,23 +102,21 @@ impl ProbeWindow {
     }
 }
 
-/// Whether gossip has shown an advertised epoch (or the lack of one) for
-/// every peer in `peers`, the other voters of this node's persisted
-/// membership. `None` (a membership not loaded yet) is never complete. A
+/// Whether gossip has shown an advertised epoch (or the lack of one), in
+/// `claims` (the directory's `recovery_claims`), for every peer in `peers`,
+/// the other voters of this node's persisted membership. `None` (a membership not loaded yet) is never complete. A
 /// single-voter council has no peers to hear from, so it is complete once
 /// gossip has synced: a node with no seeds at all counts as synced at once,
 /// which keeps a single-node cluster's restart as quick as before.
 pub fn probe_complete(
-    directory: &NodeDirectory,
+    claims: &HashMap<NodeId, Option<RecoveryClaim>>,
     peers: Option<&BTreeSet<NodeId>>,
     gossip_synced: bool,
 ) -> bool {
     match peers {
         None => false,
         Some(peers) if peers.is_empty() => gossip_synced,
-        Some(peers) => peers
-            .iter()
-            .all(|peer| directory.recovery_claims.contains_key(peer)),
+        Some(peers) => peers.iter().all(|peer| claims.contains_key(peer)),
     }
 }
 
@@ -217,45 +216,49 @@ pub async fn supervise_recovery_fence(
             probe.open(now);
         }
         let mut wake = None;
-        {
-            let directory = directory_rx.borrow_and_update();
-            for claim in directory.recovery_claims.values().flatten() {
-                fence.observe_peer(*claim);
-            }
-            if fence.snapshot().state == FenceState::Probing {
-                let peers = peers();
-                let heard = probe_complete(&directory, peers.as_ref(), probe.is_open());
-                match probe.decide(now, heard) {
-                    ProbeVerdict::Serve { heard_every_peer } => {
-                        if !heard_every_peer {
-                            let missing: Vec<&str> = peers
-                                .iter()
-                                .flatten()
-                                .filter(|peer| !directory.recovery_claims.contains_key(peer))
-                                .map(|peer| peer.0.as_str())
-                                .collect();
-                            eprintln!(
-                                "council: recovery probe window ({}s after gossip synced) ended \
-                                 without hearing from every persisted peer (missing: {})",
-                                probe_window.as_secs(),
-                                if missing.is_empty() {
-                                    "none known".to_string()
-                                } else {
-                                    missing.join(", ")
-                                }
-                            );
-                        }
-                        fence.finish_probe();
+        // Copy the claims out and drop the directory borrow in this one
+        // statement. A `watch` borrow holds the channel's read lock, and
+        // `peers()` reads openraft's metrics channel, which the leader-target
+        // maintainer holds while it reads the directory. Holding both in
+        // opposite orders deadlocked four worker threads behind the two
+        // channels' queued writers (#1273).
+        let claims = directory_rx.borrow_and_update().recovery_claims.clone();
+        for claim in claims.values().flatten() {
+            fence.observe_peer(*claim);
+        }
+        if fence.snapshot().state == FenceState::Probing {
+            let peers = peers();
+            let heard = probe_complete(&claims, peers.as_ref(), probe.is_open());
+            match probe.decide(now, heard) {
+                ProbeVerdict::Serve { heard_every_peer } => {
+                    if !heard_every_peer {
+                        let missing: Vec<&str> = peers
+                            .iter()
+                            .flatten()
+                            .filter(|peer| !claims.contains_key(peer))
+                            .map(|peer| peer.0.as_str())
+                            .collect();
+                        eprintln!(
+                            "council: recovery probe window ({}s after gossip synced) ended \
+                             without hearing from every persisted peer (missing: {})",
+                            probe_window.as_secs(),
+                            if missing.is_empty() {
+                                "none known".to_string()
+                            } else {
+                                missing.join(", ")
+                            }
+                        );
                     }
-                    // Openraft loads the persisted membership in the
-                    // background and says nothing when it lands: look again
-                    // shortly rather than wait for an unrelated change.
-                    ProbeVerdict::Wait { until } if peers.is_none() => {
-                        let soon = now + MEMBERSHIP_RECHECK;
-                        wake = Some(until.map_or(soon, |until| until.min(soon)));
-                    }
-                    ProbeVerdict::Wait { until } => wake = until,
+                    fence.finish_probe();
                 }
+                // Openraft loads the persisted membership in the
+                // background and says nothing when it lands: look again
+                // shortly rather than wait for an unrelated change.
+                ProbeVerdict::Wait { until } if peers.is_none() => {
+                    let soon = now + MEMBERSHIP_RECHECK;
+                    wake = Some(until.map_or(soon, |until| until.min(soon)));
+                }
+                ProbeVerdict::Wait { until } => wake = until,
             }
         }
 
@@ -326,15 +329,20 @@ pub fn spawn_reconciler_membership_filter(
     fence: RecoveryFence,
     shutdown: CancellationToken,
 ) -> watch::Receiver<Vec<MembershipSnapshot>> {
-    let filter = move |membership: &[MembershipSnapshot], directory: &NodeDirectory| {
-        let stale = stale_epoch_members(directory, fence.snapshot().claimed_epoch());
-        membership
+    // Each channel is borrowed in its own statement: two `watch` borrows
+    // held at once can deadlock (#1273, #1433).
+    let filter = move |membership_rx: &watch::Receiver<Vec<MembershipSnapshot>>,
+                       directory_rx: &watch::Receiver<NodeDirectory>| {
+        let own_epoch = fence.snapshot().claimed_epoch();
+        let stale = stale_epoch_members(&directory_rx.borrow(), own_epoch);
+        membership_rx
+            .borrow()
             .iter()
             .filter(|member| !stale.contains(&member.node_id))
             .cloned()
             .collect::<Vec<_>>()
     };
-    let (tx, rx) = watch::channel(filter(&membership_rx.borrow(), &directory_rx.borrow()));
+    let (tx, rx) = watch::channel(filter(&membership_rx, &directory_rx));
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -342,7 +350,7 @@ pub fn spawn_reconciler_membership_filter(
                 changed = membership_rx.changed() => if changed.is_err() { break },
                 changed = directory_rx.changed() => if changed.is_err() { break },
             }
-            let filtered = filter(&membership_rx.borrow(), &directory_rx.borrow());
+            let filtered = filter(&membership_rx, &directory_rx);
             if tx.send(filtered).is_err() {
                 break;
             }
@@ -357,7 +365,6 @@ mod tests {
     use std::pin::Pin;
 
     use super::*;
-    use crate::council::types::RecoveryClaim;
 
     fn directory(epochs: &[(&str, Option<u64>)]) -> NodeDirectory {
         NodeDirectory {
@@ -379,22 +386,42 @@ mod tests {
     #[test]
     fn probe_completes_once_every_persisted_peer_has_advertised() {
         let partial = directory(&[("n2", Some(0))]);
-        assert!(!probe_complete(&partial, Some(&peers(&["n2", "n3"])), true));
+        assert!(!probe_complete(
+            &partial.recovery_claims,
+            Some(&peers(&["n2", "n3"])),
+            true
+        ));
         // A wiped peer advertises no epoch; that still answers the question.
         let full = directory(&[("n2", Some(0)), ("n3", None)]);
-        assert!(probe_complete(&full, Some(&peers(&["n2", "n3"])), false));
+        assert!(probe_complete(
+            &full.recovery_claims,
+            Some(&peers(&["n2", "n3"])),
+            false
+        ));
     }
 
     #[test]
     fn a_membership_not_loaded_yet_never_completes_the_probe() {
-        assert!(!probe_complete(&directory(&[("n2", Some(0))]), None, true));
+        assert!(!probe_complete(
+            &directory(&[("n2", Some(0))]).recovery_claims,
+            None,
+            true
+        ));
     }
 
     #[test]
     fn a_sole_voter_completes_the_probe_once_gossip_has_synced() {
         let alone = peers(&[]);
-        assert!(!probe_complete(&directory(&[]), Some(&alone), false));
-        assert!(probe_complete(&directory(&[]), Some(&alone), true));
+        assert!(!probe_complete(
+            &directory(&[]).recovery_claims,
+            Some(&alone),
+            false
+        ));
+        assert!(probe_complete(
+            &directory(&[]).recovery_claims,
+            Some(&alone),
+            true
+        ));
     }
 
     #[test]
@@ -537,6 +564,68 @@ mod tests {
         run_for(&mut supervisor, Duration::from_millis(10)).await;
         assert_eq!(rig.fence.snapshot().fenced_by(), Some(1));
         rig.shutdown.cancel();
+        supervisor.await;
+    }
+
+    // #1273: the supervisor read the persisted membership (openraft's
+    // metrics watch) while it still held its borrow of the gossip directory.
+    // The leader-target maintainer takes the same two locks the other way
+    // round, metrics first. Watch locks make a reader wait for a queued
+    // writer, so with openraft and gossip each waiting to publish, the four
+    // tasks blocked one another for good. On a four-core runner that was
+    // every worker thread, and the upgraded node never answered again.
+    // The membership read must find the directory free to write.
+    #[tokio::test]
+    async fn the_probe_reads_the_membership_without_holding_the_gossip_directory() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let (directory_tx, directory_rx) = watch::channel(NodeDirectory::default());
+        let directory_tx = Arc::new(directory_tx);
+        let (_synced_tx, gossip_synced_rx) = watch::channel(false);
+        let shutdown = CancellationToken::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let blocked = Arc::new(AtomicBool::new(false));
+
+        let writer = Arc::clone(&directory_tx);
+        let probe_calls = Arc::clone(&calls);
+        let probe_blocked = Arc::clone(&blocked);
+        let peers = move || {
+            if probe_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                // Gossip publishes from another thread while the membership
+                // is being read. A held directory borrow stalls it.
+                let (done_tx, done_rx) = std::sync::mpsc::channel();
+                let writer = Arc::clone(&writer);
+                std::thread::spawn(move || {
+                    writer.send_replace(NodeDirectory::default());
+                    let _ = done_tx.send(());
+                });
+                if done_rx.recv_timeout(Duration::from_secs(2)).is_err() {
+                    probe_blocked.store(true, Ordering::SeqCst);
+                }
+            }
+            Some(peers(&["n2", "n3"]))
+        };
+        let supervisor = supervise_recovery_fence(
+            probing_fence(None),
+            peers,
+            FenceSupervisorInputs {
+                directory_rx,
+                gossip_synced_rx,
+                probe_window: WINDOW,
+            },
+            shutdown.clone(),
+        );
+        tokio::pin!(supervisor);
+        let probed = run_until(&mut supervisor, Duration::from_secs(5), || {
+            calls.load(Ordering::SeqCst) > 0
+        })
+        .await;
+        assert!(probed, "the probe never read the membership");
+        assert!(
+            !blocked.load(Ordering::SeqCst),
+            "a gossip directory write waited for the membership read"
+        );
+        shutdown.cancel();
         supervisor.await;
     }
 

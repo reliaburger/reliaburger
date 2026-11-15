@@ -1,0 +1,81 @@
+total 9809
+100.00% incl  26.21% self  [libc.so.6]
+100.00% incl   0.00% self  <std::sys::thread::unix::Thread>::new::thread_start
+ 99.93% incl   0.00% self  tokio-rt-worker
+ 99.93% incl   0.00% self  std::sys::backtrace::__rust_begin_short_backtrace<<tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure}, ()>
+ 99.93% incl   0.00% self  <std::thread::lifecycle::spawn_unchecked<<tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure}, ()>::{closure} as core::ops::function::FnOnce<()>>:
+ 99.65% incl   0.00% self  tokio::runtime::task::raw::poll<tokio::runtime::blocking::task::BlockingTask<<tokio::runtime::scheduler::multi_thread::worker::Launch>::launch::{closure}>, toki
+ 99.65% incl   0.44% self  tokio::runtime::scheduler::multi_thread::worker::run
+ 92.51% incl   0.24% self  <tokio::runtime::scheduler::multi_thread::worker::Context>::run_task
+ 63.82% incl   0.11% self  tokio::runtime::task::raw::poll<reliaburger::lettuce::runner::spawn_gitops_sync::{closure}, alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::handle::Ha
+ 63.57% incl   0.57% self  reliaburger::lettuce::runner::spawn_gitops_sync::{closure}
+ 38.38% incl   0.06% self  <reliaburger::council::node::CouncilNode>::desired_state::{closure}
+ 38.32% incl   0.09% self  <reliaburger::council::state_machine::CouncilStateMachine>::desired_state::{closure}
+ 37.68% incl   1.15% self  <reliaburger::council::types::DesiredState as core::clone::Clone>::clone
+ 21.89% incl   8.01% self  malloc
+ 16.87% incl   0.16% self  core::ptr::drop_glue<reliaburger::council::types::DesiredState>
+ 12.73% incl   5.40% self  cfree
+ 12.43% incl   1.82% self  <alloc::string::String as core::clone::Clone>::clone
+ 11.28% incl   0.11% self  tokio::runtime::task::raw::poll<tracing::instrument::Instrumented<<openraft::core::raft_core::RaftCore<reliaburger::council::types::TypeConfig, reliaburger::cou
+ 11.08% incl   0.07% self  <tracing::instrument::Instrumented<<openraft::core::raft_core::RaftCore<reliaburger::council::types::TypeConfig, reliaburger::council::network::TcpRaftNetworkFa
+ 10.86% incl   0.03% self  <openraft::core::raft_core::RaftCore<reliaburger::council::types::TypeConfig, reliaburger::council::network::TcpRaftNetworkFactory, reliaburger::council::durabl
+ 10.83% incl   1.07% self  <openraft::core::raft_core::RaftCore<reliaburger::council::types::TypeConfig, reliaburger::council::network::TcpRaftNetworkFactory, reliaburger::council::durabl
+ 10.79% incl   0.02% self  <reliaburger::meat::task_array_store::TaskArrays as core::clone::Clone>::clone
+  9.75% incl   0.00% self  el0t_64_sync_handler
+  9.75% incl   0.00% self  el0t_64_sync
+  9.74% incl   0.35% self  el0_svc
+  8.69% incl   0.06% self  do_el0_svc
+  8.61% incl   0.04% self  el0_svc_common.constprop.0
+  8.59% incl   0.28% self  <hashbrown::map::HashMap<reliaburger::meat::types::AppId, reliaburger::config::app::AppSpec, std::hash::random::RandomState> as core::clone::Clone>::clone
+  8.39% incl   0.09% self  invoke_syscall
+  8.26% incl   0.19% self  tokio::runtime::task::raw::poll<reliaburger::bun::readiness::spawn_owned<reliaburger::cluster::runtime::spawn_supervised{closure}::{closure}, reliaburger::clust
+  7.89% incl   0.24% self  reliaburger::bun::readiness::spawn_owned<reliaburger::cluster::runtime::spawn_supervised{closure}::{closure}, reliaburger::cluster::runtime::spawn_supervised{cl
+  7.86% incl   0.09% self  <alloc::collections::btree::map::BTreeMap<_, _, _> as core::clone::Clone>::clone::clone_subtree<u64, reliaburger::meat::task_array_store::TaskArrayRecord, alloc
+  7.64% incl   0.96% self  reliaburger::cluster::runtime::spawn_supervised{closure}::{closure}
+  6.94% incl   0.25% self  syscall
+  6.41% incl   0.25% self  <reliaburger::meat::task_array_store::TaskArrayRecord as core::clone::Clone>::clone
+  6.06% incl   0.41% self  <reliaburger::pickle::types::ManifestCatalog as core::clone::Clone>::clone
+  5.89% incl   0.08% self  <tokio::runtime::scheduler::multi_thread::worker::Context>::park_internal
+  5.80% incl   0.53% self  <openraft::core::raft_core::RaftCore<reliaburger::council::types::TypeConfig, reliaburger::council::network::TcpRaftNetworkFactory, reliaburger::council::durabl
+  5.78% incl   0.03% self  __arm64_sys_futex
+  5.76% incl   0.04% self  do_futex
+  5.29% incl   0.06% self  core::ptr::drop_glue<reliaburger::meat::task_array_store::ArraysWire>
+  4.81% incl   0.75% self  <reliaburger::sesame::types::SecurityState as core::clone::Clone>::clone
+  4.76% incl   0.24% self  <reliaburger::council::node::CouncilNode>::is_leader::{closure}
+  4.62% incl   0.75% self  <alloc::vec::Vec<alloc::string::String> as core::clone::Clone>::clone
+  4.52% incl   0.03% self  schedule
+  4.50% incl   0.18% self  <openraft::raft::Raft<reliaburger::council::types::TypeConfig>>::ensure_linearizable::{closure}
+  4.44% incl   0.07% self  <tokio::sync::watch::big_notify::BigNotify>::notify_waiters
+  4.33% incl   3.55% self  __schedule
+  4.26% incl   1.22% self  <tokio::sync::notify::NotifyGuard>::notify_waiters
+  4.13% incl   0.05% self  tokio::runtime::task::raw::poll<<reliaburger::council::node::CouncilNode>::with_recovery_fence::{closure}, alloc::sync::Arc<tokio::runtime::scheduler::multi_thr
+  4.05% incl   0.72% self  <parking_lot::condvar::Condvar>::notify_one_slow
+  4.01% incl   0.29% self  <reliaburger::council::node::CouncilNode>::with_recovery_fence::{closure}
+  3.92% incl   0.07% self  core::ptr::drop_glue<reliaburger::pickle::types::ManifestCatalog>
+  3.81% incl   0.05% self  <parking_lot::condvar::Condvar>::wait_until_internal
+  3.81% incl   0.14% self  <tokio::sync::notify::Notified as core::future::future::Future>::poll
+  3.74% incl   0.04% self  core::ptr::drop_glue<alloc::collections::btree::map::BTreeMap<u64, reliaburger::meat::task_array_store::TaskArrayRecord>>
+  3.67% incl   2.97% self  <tokio::sync::notify::NotifiedProject>::poll_notified
+  3.60% incl   0.28% self  <openraft::raft::Raft<reliaburger::council::types::TypeConfig>>::ensure_linearizable::{closure}::{closure}
+  3.59% incl   0.24% self  <tokio::sync::watch::Sender<openraft::metrics::raft_metrics::RaftMetrics<u64, reliaburger::council::types::CouncilNodeInfo>>>::send
+  3.58% incl   0.82% self  <reliaburger::config::job::JobSpec as core::clone::Clone>::clone
+  3.50% incl   0.87% self  <reliaburger::config::app::AppSpec as core::clone::Clone>::clone
+  3.45% incl   0.03% self  core::ptr::drop_glue<reliaburger::meat::task_array_store::TaskArrayRecord>
+  3.16% incl   0.74% self  <reliaburger::pickle::types::ImageManifest as core::clone::Clone>::clone
+  3.11% incl   0.43% self  <tokio::sync::watch::Receiver<openraft::metrics::raft_metrics::RaftMetrics<u64, reliaburger::council::types::CouncilNodeInfo>>>::changed::{closure}
+  3.06% incl   0.03% self  futex_wait
+  3.05% incl   0.11% self  tokio::runtime::task::waker::wake_by_val
+  3.03% incl   0.04% self  __futex_wait
+  2.91% incl   0.02% self  futex_wait_queue
+  2.91% incl   0.24% self  <alloc::collections::btree::map::BTreeMap<_, _, _> as core::clone::Clone>::clone::clone_subtree<u64, reliaburger::meat::task_array_store::TaskManifest, alloc::a
+  2.74% incl   0.12% self  <tokio::runtime::scheduler::multi_thread::handle::Handle>::schedule_task
+  2.73% incl   0.44% self  <openraft::raft::Raft<reliaburger::council::types::TypeConfig>>::get_read_log_id::{closure}::{closure}
+  2.62% incl   0.19% self  <tokio::runtime::scheduler::multi_thread::handle::Handle>::schedule_task::{closure}
+  2.60% incl   0.07% self  futex_wake
+  2.56% incl   0.35% self  tokio::sync::watch::changed_impl<openraft::metrics::raft_metrics::RaftMetrics<u64, reliaburger::council::types::CouncilNodeInfo>>::{closure}
+  2.50% incl   0.03% self  wake_up_q
+  2.27% incl   2.26% self  try_to_wake_up
+  2.23% incl   0.71% self  <reliaburger::meat::task_array_store::TaskManifest as core::clone::Clone>::clone
+  2.21% incl   0.31% self  core::ptr::drop_glue<reliaburger::config::app::AppSpec>
+  2.11% incl   0.05% self  core::ptr::drop_glue<reliaburger::sesame::types::SecurityState>
+  2.11% incl   0.11% self  <openraft::core::raft_core::RaftCore<reliaburger::council::types::TypeConfig, reliaburger::council::network::TcpRaftNetworkFactory, reliaburger::council::durabl

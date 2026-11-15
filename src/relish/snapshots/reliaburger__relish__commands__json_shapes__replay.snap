@@ -1,0 +1,9 @@
+---
+source: src/relish/commands.rs
+expression: "json(&RunChange\n{ run: 42, change: RunChangeKind::ReplayAcknowledged, node: Some(\"node-2\"), })"
+---
+{
+  "run": 42,
+  "change": "replay_acknowledged",
+  "node": "node-2"
+}

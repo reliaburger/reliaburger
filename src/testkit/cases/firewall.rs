@@ -44,7 +44,7 @@ async fn can_reach(
         )
         .await
         .map_err(|error| format!("exec in {from_app} failed: {error}"))?;
-    Ok(out.contains("REACHED"))
+    Ok(out.output.contains("REACHED"))
 }
 
 async fn target_vip(ctx: &TestContext, app: &str) -> Result<(String, u16), String> {

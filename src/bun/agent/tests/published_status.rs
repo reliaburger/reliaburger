@@ -242,3 +242,17 @@ async fn an_exited_instance_reports_no_pid() {
     assert_eq!(statuses[0].pid, None, "{statuses:?}");
     assert!(!statuses[0].runtime_unknown, "{statuses:?}");
 }
+
+/// Each instance says how long ago the node created it, so `relish apps`
+/// can show an app's AGE without asking anything else.
+#[tokio::test(start_paused = true)]
+async fn status_says_how_old_each_instance_is() {
+    let (mut agent, _tx, _shutdown, _grill) = test_agent_with_grill();
+    expect_complete(&drain_deploy(&mut agent, replicated("web", 1)).await);
+    let reader = agent.status_reader();
+    agent.publish_status();
+    let statuses = reader.read().await.unwrap();
+    assert_eq!(statuses.len(), 1);
+    // Created moments ago: zero whole seconds, but known.
+    assert_eq!(statuses[0].age_seconds, Some(0));
+}

@@ -1,0 +1,81 @@
+total 6093
+100.00% incl  18.20% self  [libc.so.6]
+100.00% incl   0.00% self  <std::sys::thread::unix::Thread>::new::thread_start
+ 99.84% incl   0.00% self  <std::thread::lifecycle::spawn_unchecked<<tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure}, ()>::{closure} as core::ops::function::FnOnce<()>>:
+ 99.84% incl   0.03% self  std::sys::backtrace::__rust_begin_short_backtrace<<tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure}, ()>
+ 99.84% incl   0.00% self  tokio-rt-worker
+ 98.85% incl   0.00% self  tokio::runtime::task::raw::poll<tokio::runtime::blocking::task::BlockingTask<tokio::runtime::scheduler::multi_thread::worker::maybe_move_runtime::{closure}::{cl
+ 98.85% incl   0.33% self  tokio::runtime::scheduler::multi_thread::worker::run
+ 88.27% incl   0.15% self  <tokio::runtime::scheduler::multi_thread::worker::Context>::run_task
+ 74.91% incl   0.18% self  tokio::runtime::task::raw::poll<<reliaburger::bun::task_executor::TaskPool<reliaburger::bun::task_array_node::NodeRunner>>::resume_chunk_streaming::{closure}::{
+ 72.59% incl   0.26% self  <reliaburger::bun::task_executor::TaskPool<reliaburger::bun::task_array_node::NodeRunner>>::resume_chunk_streaming::{closure}::{closure}
+ 69.46% incl   0.13% self  <reliaburger::bun::task_runtime::OwnedRunner<reliaburger::grill::AnyGrill> as reliaburger::bun::task_executor::TaskRunner>::run::{closure}
+ 68.73% incl   0.79% self  <reliaburger::bun::reusable_executor::pool::ReusablePool<reliaburger::grill::AnyGrill>>::run<<reliaburger::bun::task_runtime::OwnedRunner<reliaburger::grill::An
+ 52.81% incl   0.00% self  el0t_64_sync_handler
+ 52.81% incl   0.00% self  el0t_64_sync
+ 52.62% incl   5.45% self  el0_svc
+ 46.23% incl   0.34% self  do_el0_svc
+ 45.79% incl   0.15% self  el0_svc_common.constprop.0
+ 44.25% incl   1.30% self  invoke_syscall
+ 19.14% incl   0.20% self  reliaburger::bun::reusable_executor::protocol::receive<tokio::net::unix::stream::UnixStream>::{closure}
+ 18.84% incl   0.25% self  <tokio::net::unix::stream::UnixStream>::poll_read_priv
+ 18.35% incl   0.05% self  <&mio::net::uds::stream::UnixStream as std::io::Read>::read
+ 18.30% incl   0.18% self  <&std::os::unix::net::stream::UnixStream as std::io::Read>::read
+ 18.00% incl   1.05% self  recv
+ 13.93% incl   0.10% self  __arm64_sys_recvfrom
+ 13.61% incl   0.08% self  __sys_recvfrom
+ 12.93% incl   0.11% self  sock_recvmsg
+ 12.59% incl   0.20% self  unix_stream_recvmsg
+ 12.24% incl   0.34% self  unix_stream_read_generic
+ 12.08% incl   0.02% self  reliaburger::bun::reusable_executor::pool::wait_empty_task::{closure}
+ 11.59% incl   0.10% self  std::fs::read_to_string::inner
+ 11.18% incl   0.07% self  tokio::runtime::task::raw::poll<reliaburger::bun::task_array_node::run_chunk::{closure}, alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::handle::Handl
+ 11.06% incl   0.43% self  reliaburger::bun::task_array_node::run_chunk::{closure}
+ 11.00% incl   0.03% self  <reliaburger::bun::task_namespace::TaskNamespacePolicy>::check::{closure}
+ 10.96% incl  10.78% self  __wake_up_sync_key
+ 10.91% incl   0.11% self  consume_skb
+ 10.68% incl   0.69% self  syscall
+ 10.39% incl   0.30% self  <reliaburger::bun::task_executor::TaskPool<reliaburger::bun::task_array_node::NodeRunner>>::resume_chunk_streaming::{closure}
+  9.49% incl   0.07% self  <tokio::runtime::scheduler::multi_thread::worker::Context>::park_internal
+  8.75% incl   0.05% self  skb_release_head_state
+  8.71% incl   0.05% self  unix_destruct_scm
+  8.67% incl   0.15% self  sock_wfree
+  8.49% incl   0.05% self  unix_write_space
+  7.78% incl   0.07% self  <tokio::net::unix::stream::UnixStream>::poll_write_priv
+  7.66% incl   0.02% self  <&mio::net::uds::stream::UnixStream as std::io::Write>::write
+  7.65% incl   0.02% self  <&std::os::unix::net::stream::UnixStream as std::io::Write>::write
+  7.63% incl   0.44% self  __send
+  7.62% incl   0.02% self  <tokio::runtime::time::Driver>::park_internal
+  6.89% incl   0.02% self  <tokio::runtime::time::Driver>::park_thread_timeout
+  6.89% incl   0.05% self  <reliaburger::onion::ebpf::loader::ownership::Ownership>::attached
+  6.88% incl   0.20% self  <tokio::runtime::io::driver::Driver>::turn
+  6.43% incl   0.08% self  <mio::poll::Poll>::poll
+  6.35% incl   0.20% self  epoll_pwait
+  6.27% incl   0.07% self  <std::sys::fs::unix::File>::open_c
+  6.24% incl   0.15% self  open64
+  6.07% incl   0.02% self  __arm64_sys_sendto
+  6.01% incl   0.08% self  __sys_sendto
+  5.76% incl   0.00% self  __arm64_sys_openat
+  5.76% incl   0.02% self  __sock_sendmsg
+  5.70% incl   0.02% self  do_sys_openat2
+  5.61% incl   0.13% self  unix_stream_sendmsg
+  5.35% incl   0.00% self  schedule
+  5.35% incl   5.09% self  finish_task_switch.isra.0
+  5.32% incl   0.07% self  __arm64_sys_epoll_pwait
+  5.22% incl   0.02% self  __arm64_sys_bpf
+  5.17% incl   0.02% self  do_epoll_pwait.part.0
+  5.15% incl   0.00% self  do_filp_open
+  5.15% incl   0.00% self  path_openat
+  5.14% incl   0.05% self  do_epoll_wait
+  4.92% incl   0.03% self  ep_poll
+  4.76% incl   0.10% self  __sys_bpf
+  4.63% incl   0.10% self  <tokio::io::util::read_int::ReadU8<&mut tokio::net::unix::stream::UnixStream> as core::future::future::Future>::poll
+  4.35% incl   0.08% self  <tokio::io::util::write_all::WriteAll<tokio::net::unix::stream::UnixStream> as core::future::future::Future>::poll
+  4.09% incl   0.07% self  schedule_hrtimeout_range
+  4.05% incl   1.36% self  cfree
+  4.02% incl   0.08% self  schedule_hrtimeout_range_clock
+  4.00% incl   0.41% self  link_path_walk.part.0.constprop.0
+  3.81% incl   1.49% self  malloc
+  3.81% incl   0.05% self  reliaburger::sesame::firewall::maps::read_firewall_state
+  3.69% incl   0.30% self  <alloc::raw_vec::RawVecInner<_>>::reserve::do_reserve_and_handle<alloc::alloc::Global>
+  3.63% incl   0.34% self  <alloc::raw_vec::RawVecInner>::finish_grow

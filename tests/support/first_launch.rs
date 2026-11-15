@@ -25,7 +25,10 @@
 //!
 //! Included with `#[path = "../support/first_launch.rs"] mod first_launch;`
 //! from a test binary, or `#[path = "../tests/support/first_launch.rs"]`
-//! under `#[cfg(test)]` from the library's unit tests.
+//! under `#[cfg(test)]` from the library's unit tests. `bun_process.rs`
+//! includes it too, for `bun_process::first_launch_binaries()` (#1149), so a
+//! binary that includes `bun_process.rs` reaches this module as
+//! `bun_process::first_launch` rather than declaring it a second time.
 #![allow(dead_code)]
 
 use std::collections::BTreeSet;

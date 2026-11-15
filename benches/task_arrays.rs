@@ -17,7 +17,9 @@
 ///   result index, broken down per file, failing above
 ///   `ACTIVE_STORAGE_BYTES_PER_TASK` while the run is active, then the
 ///   compacted results of the finished run, failing above
-///   `STORAGE_BYTES_PER_TASK`.
+///   `STORAGE_BYTES_PER_TASK`;
+/// - the same 64k-task writes on tmpfs (Linux), where fsync costs nothing,
+///   so the ledger and index code is measured without the runner's disk.
 ///
 /// Every benchmark reports tasks (or elements) per second.
 use std::collections::HashMap;
@@ -422,6 +424,22 @@ fn bench_storage(c: &mut Criterion) {
             write_outcomes(directory.path(), 65_536)
         })
     });
+    // The on-disk benchmark is mostly its 30-odd fsyncs, so it measures the
+    // runner's disk, whose speed varies several-fold within one CI job
+    // (#1038). On tmpfs an fsync is free, which leaves the cost of encoding,
+    // writing and indexing the records: what a change to the ledger can make
+    // slower. CI gates on this one and only reports the on-disk one.
+    let tmpfs = std::path::Path::new("/dev/shm");
+    if tmpfs.is_dir() {
+        group.bench_function("ledger_and_index_64k_tmpfs", |b| {
+            b.iter(|| {
+                let directory = tempfile::tempdir_in(tmpfs).unwrap();
+                write_outcomes(directory.path(), 65_536)
+            })
+        });
+    } else {
+        eprintln!("storage/ledger_and_index_64k_tmpfs: skipped, no tmpfs at /dev/shm");
+    }
     group.finish();
 }
 

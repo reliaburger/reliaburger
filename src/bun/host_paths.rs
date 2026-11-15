@@ -43,6 +43,10 @@ pub enum HostPathRefusal {
     /// to isn't valid UTF-8, so it can't be carried as one.
     #[error("host path {path:?} resolves to {resolved:?}, which isn't valid UTF-8")]
     NotUnicode { path: PathBuf, resolved: PathBuf },
+    /// The blocking thread that resolved the sources panicked, so nothing
+    /// was approved.
+    #[error("the host path check failed: {reason}")]
+    CheckFailed { reason: String },
 }
 
 /// A host path this node's policy approved: absolute, with every symlink in
@@ -182,6 +186,31 @@ impl HostPathPolicy {
         }
         Ok(Cow::Owned(approved))
     }
+
+    /// [`Self::approve_app`], with the symlink resolution on a blocking
+    /// thread.
+    ///
+    /// Resolving a source walks the filesystem, and a source on NFS or
+    /// autofs can take seconds to answer, so an async caller mustn't do it
+    /// on a runtime worker. An app with no host-path source does no I/O and
+    /// comes back borrowed, without leaving the caller's thread.
+    pub async fn approve_app_off_runtime<'a>(
+        &self,
+        spec: &'a AppSpec,
+    ) -> Result<Cow<'a, AppSpec>, HostPathRefusal> {
+        if spec.host_path_sources().next().is_none() {
+            return Ok(Cow::Borrowed(spec));
+        }
+        let policy = self.clone();
+        let spec = spec.clone();
+        let approved =
+            tokio::task::spawn_blocking(move || policy.approve_app(&spec).map(Cow::into_owned))
+                .await
+                .map_err(|error| HostPathRefusal::CheckFailed {
+                    reason: error.to_string(),
+                })??;
+        Ok(Cow::Owned(approved))
+    }
 }
 
 /// Resolve symlinks in the longest prefix of `path` that exists, keeping the
@@ -210,6 +239,60 @@ fn resolve(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn app_with_volume_source(source: PathBuf) -> AppSpec {
+        let mut app: AppSpec = toml::from_str("image = \"busybox:1.36\"\n").unwrap();
+        app.volumes = vec![crate::config::types::VolumeSpec {
+            path: "/data".into(),
+            source: Some(source),
+            size: None,
+        }];
+        app
+    }
+
+    #[test]
+    fn approving_host_paths_resolves_them_off_the_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        let import = root.path().join("import");
+        std::fs::create_dir_all(&import).unwrap();
+        let policy = policy(&[&import], &root.path().join("volumes"));
+        let app = app_with_volume_source(import.join("daily"));
+        let approved =
+            crate::off_runtime::assert_runs_on_blocking_pool(policy.approve_app_off_runtime(&app))
+                .unwrap();
+        assert_eq!(
+            approved.volumes[0].source,
+            Some(std::fs::canonicalize(&import).unwrap().join("daily"))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_app_without_host_paths_is_approved_in_one_poll() {
+        let root = tempfile::tempdir().unwrap();
+        let policy = policy(&[], &root.path().join("volumes"));
+        let app: AppSpec = toml::from_str("image = \"busybox:1.36\"\n").unwrap();
+
+        let first = futures_util::poll!(std::pin::pin!(policy.approve_app_off_runtime(&app)));
+
+        assert!(matches!(
+            first,
+            std::task::Poll::Ready(Ok(Cow::Borrowed(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_refusal_comes_back_from_the_blocking_thread() {
+        let root = tempfile::tempdir().unwrap();
+        let policy = policy(&[], &root.path().join("volumes"));
+        let app = app_with_volume_source(root.path().join("import"));
+
+        let error = policy.approve_app_off_runtime(&app).await.unwrap_err();
+
+        assert!(
+            matches!(error, HostPathRefusal::NotAllowed { .. }),
+            "{error}"
+        );
+    }
 
     fn policy(allowed: &[&Path], volumes: &Path) -> HostPathPolicy {
         HostPathPolicy::new(

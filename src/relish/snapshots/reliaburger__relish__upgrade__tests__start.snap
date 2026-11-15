@@ -1,0 +1,11 @@
+---
+source: src/relish/upgrade.rs
+expression: "json(&UpgradeStarted::from_answer(UpgradeScope::Cluster, &target,\n&serde_json::json!({\"status\": \"started\", \"upgrade_id\": \"u-1\"}),))"
+---
+{
+  "scope": "cluster",
+  "target_version": "v0.2.7",
+  "upgrade_id": "u-1",
+  "already_running": false,
+  "detail": null
+}

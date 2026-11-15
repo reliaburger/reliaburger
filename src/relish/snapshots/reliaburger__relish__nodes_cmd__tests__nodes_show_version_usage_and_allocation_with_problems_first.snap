@@ -1,0 +1,11 @@
+---
+source: src/relish/nodes_cmd.rs
+expression: render_nodes(&rows)
+---
+NODE                 ADDRESS                STATE            COUNCIL  LEADER  VERSION      CPU   MEM  DISK  ALLOCATED
+node-2               10.0.0.2:7946          alive,disk       yes      -       0.2.8        81%   25%   91%  cpu 75% mem 25%
+node-3               10.0.0.3:7946          suspect          yes      -       -              -     -     -  -
+node-4               10.0.0.4:7946          alive,cordoned   yes      -       0.2.8        12%   25%   20%  cpu 75% mem 25%
+node-1               10.0.0.1:7946          alive            yes      yes     0.2.8        34%   25%   40%  cpu 75% mem 25%
+
+node-3 didn't answer: no answer in 3 s

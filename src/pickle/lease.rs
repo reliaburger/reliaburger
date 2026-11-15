@@ -77,7 +77,7 @@ impl PickleState {
         }
         if let Some(council) = &self.council {
             let security = council
-                .security_state_linearizable()
+                .security_state_confirmed(crate::council::LEADER_CONFIRMATION)
                 .await
                 .map_err(|e| unavailable(e.to_string()))?;
             if security

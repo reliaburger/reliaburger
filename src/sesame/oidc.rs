@@ -444,6 +444,33 @@ mod tests {
         assert!(!encoded.contains('='));
     }
 
+    /// JWT segments and the JWKS `x` field are base64url without padding
+    /// (RFC 7515). The expected strings come from Python's `base64`, so a
+    /// base64 release that changed the alphabet or the padding would fail
+    /// here rather than change every token we mint (#1026).
+    #[test]
+    fn base64url_matches_the_rfc_4648_known_answers() {
+        let cases: [(&[u8], &str); 6] = [
+            (b"", ""),
+            (b"f", "Zg"),
+            (b"fo", "Zm8"),
+            (b"foo", "Zm9v"),
+            (&[0xfb, 0xff, 0xbf], "-_-_"),
+            (&[0, 1, 2, 3, 4], "AAECAwQ"),
+        ];
+        for (bytes, encoded) in cases {
+            assert_eq!(URL_SAFE_NO_PAD.encode(bytes), encoded);
+            assert_eq!(URL_SAFE_NO_PAD.decode(encoded).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn base64url_refuses_padding_and_the_standard_alphabet() {
+        for encoded in ["Zg==", "Zm8=", "+/+/"] {
+            assert!(URL_SAFE_NO_PAD.decode(encoded).is_err(), "{encoded}");
+        }
+    }
+
     // --- PKI10: constrained verification ---
 
     /// A config whose issuer + cluster name line up with `test_claims`.

@@ -214,6 +214,7 @@ pub fn process_start_time(pid: u32) -> Option<u64> {
         if pid == 0 {
             return None;
         }
+        // BLOCKING-OK: one procfs read, answered from memory, not from a disk (#1887)
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         stat_start_ticks(&stat)
     }
@@ -352,6 +353,7 @@ mod tests {
             host_process: false,
             initialiser: false,
             port_mapping: None,
+            stop: None,
             root: OciRoot {
                 path: "/tmp/test".to_string(),
                 readonly: false,
@@ -360,6 +362,7 @@ mod tests {
                 rlimits: Vec::new(),
                 args: vec!["sleep".to_string(), "60".to_string()],
                 env: vec![],
+                provider_env: Vec::new(),
                 cwd: "/".to_string(),
                 user: OciUser { uid: 0, gid: 0 },
                 capabilities: None,
@@ -373,7 +376,10 @@ mod tests {
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
+            runtime_knobs: None,
         }
     }
 
@@ -594,6 +600,24 @@ mod tests {
         let start = process_start_time(my_pid).unwrap();
         assert!(process_matches(my_pid, start + 2));
         assert!(!process_matches(my_pid, start + 3));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn absolute_start_time_is_unix_seconds() {
+        // sysinfo reports the start as seconds since the Unix epoch. Pin the
+        // unit, so a crate bump to milliseconds or to "seconds since boot"
+        // can't silently make every recorded process look like another one.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let start = process_start_time(std::process::id()).unwrap();
+        assert!(start <= now, "start {start} is after now {now}");
+        assert!(
+            now - start < 24 * 3600,
+            "start {start} is not a recent Unix time (now {now})"
+        );
     }
 
     // -- M23: adopted-pid reuse on the ECHILD liveness path ------------------

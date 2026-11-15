@@ -150,7 +150,7 @@ in two minutes require about 8,333 accepted successes/s, plus headroom for the
 app and control/storage work. A warm owned executor that
 launches children is the proposed command-job path; an explicit persistent
 worker protocol offers further savings with different isolation semantics.
-The [demo plan](../../plans/2026-10-04-plan-delegated-jobs.md#high-volume-container-jobs-on-the-landing-page)
+The [demo plan](../../plans/archive/2026-10-04-plan-delegated-jobs.md#high-volume-container-jobs-on-the-landing-page)
 records the end-to-end acceptance gate. Executor reuse remains unimplemented.
 
 ## 7 October rebase onto main

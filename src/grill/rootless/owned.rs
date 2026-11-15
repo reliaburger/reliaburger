@@ -160,8 +160,7 @@ pub fn run_helper(launcher: &Path, container_pid: u32, api_socket: &Path) -> io:
         ));
     }
     for namespace in [&user, &network] {
-        fcntl(namespace.as_raw_fd(), FcntlArg::F_SETFD(FdFlag::empty()))
-            .map_err(io::Error::other)?;
+        fcntl(namespace, FcntlArg::F_SETFD(FdFlag::empty())).map_err(io::Error::other)?;
     }
     let error = std::process::Command::new("slirp4netns")
         .args([

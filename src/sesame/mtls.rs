@@ -529,7 +529,7 @@ pub fn build_ca_pinned_client(trust: TrustSet) -> Result<reqwest::Client, MtlsEr
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();
-    reqwest::Client::builder()
+    crate::http_client::builder()
         .use_preconfigured_tls(tls)
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -567,7 +567,7 @@ fn cluster_http_client(
     bearer: Option<&str>,
 ) -> Result<reqwest::Client, MtlsError> {
     // Peer API authority is resolved explicitly; redirects must not replay receipts or tokens.
-    let mut builder = reqwest::Client::builder()
+    let mut builder = crate::http_client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .use_preconfigured_tls(tls);
     if let Some(headers) = bearer_default_headers(bearer)? {
@@ -598,7 +598,7 @@ fn bearer_default_headers(
 /// `Authorization: Bearer` header. Used for the registry replication client
 /// when the cluster is running without mTLS.
 pub fn build_bearer_http_client(bearer: Option<&str>) -> Result<reqwest::Client, MtlsError> {
-    let mut builder = reqwest::Client::builder();
+    let mut builder = crate::http_client::builder();
     if let Some(headers) = bearer_default_headers(bearer)? {
         builder = builder.default_headers(headers);
     }

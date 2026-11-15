@@ -1,0 +1,9 @@
+---
+source: src/relish/commands.rs
+expression: "json(&JoinTokenReport\n{ node_id: \"node-02\", ttl_secs: 900, token: \"rbj_secret\", })"
+---
+{
+  "node_id": "node-02",
+  "ttl_secs": 900,
+  "token": "rbj_secret"
+}

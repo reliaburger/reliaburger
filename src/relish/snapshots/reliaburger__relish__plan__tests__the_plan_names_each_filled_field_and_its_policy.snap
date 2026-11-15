@@ -1,0 +1,10 @@
+---
+source: src/relish/plan.rs
+expression: plan.to_string()
+---
+Relish apply plan:
+Plan: 0 to create, 0 to update, 1 unchanged.
+
+Policies:
+  FILL  policy team-label fills deploy.max_unavailable = 1 on app payments/web
+  FILL  policy team-label fills env.TEAM = "payments" on app payments/web

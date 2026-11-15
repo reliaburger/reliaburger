@@ -4,6 +4,7 @@
 //! this shows the log of the node relish talks to; with it, the node asks
 //! every live member and merges their answers by time.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::Serialize;
@@ -11,7 +12,7 @@ use serde::Serialize;
 use super::RelishError;
 use super::client::BunClient;
 use super::output::{OutputFormat, format_output};
-use crate::bun::audit::{AuditFilter, AuditListing, AuditRecord};
+use crate::bun::audit::{AuditFilter, AuditListing, AuditRecord, WorkloadList};
 
 /// The filters `relish audit` takes, as typed.
 #[derive(Debug, Clone, Default)]
@@ -24,8 +25,15 @@ pub struct AuditFlags {
     pub action: Option<String>,
     /// A principal id or token name.
     pub principal: Option<String>,
+    /// An app or job.
+    pub app: Option<String>,
     /// A namespace.
     pub namespace: Option<String>,
+    /// A kind of principal: human, agent, workload, system, policy or
+    /// unknown.
+    pub principal_kind: Option<crate::sesame::types::PrincipalKind>,
+    /// A proposal id.
+    pub proposal: Option<u64>,
     /// How many of the newest records to show.
     pub limit: Option<usize>,
     /// Ask every live node, not just this one.
@@ -47,7 +55,10 @@ impl AuditFlags {
             until: time("until", &self.until)?,
             action: self.action.clone(),
             principal: self.principal.clone(),
+            app: self.app.clone(),
             namespace: self.namespace.clone(),
+            principal_kind: self.principal_kind,
+            proposal: self.proposal,
             limit: self.limit,
         })
     }
@@ -91,23 +102,49 @@ impl fmt::Display for AuditReport {
         }
         write!(
             f,
-            "{:<20}  {:<12}  {:<16}  {:<26}  {:<24}  SOURCE",
-            "TIME (UTC)", "NODE", "WHO", "ACTION", "TARGET"
+            "{:<20}  {:<12}  {:<16}  {:<8}  {:<26}  {:<24}  SOURCE",
+            "TIME (UTC)", "NODE", "WHO", "KIND", "ACTION", "TARGET"
         )?;
         for record in &self.0.records {
             write!(
                 f,
-                "\n{:<20}  {:<12}  {:<16}  {:<26}  {:<24}  {}",
+                "\n{:<20}  {:<12}  {:<16}  {:<8}  {:<26}  {:<24}  {}",
                 format_time(record.timestamp),
                 record.node.as_deref().unwrap_or("-"),
                 who(record),
+                record.principal_kind.as_str(),
                 record.action,
-                target(record),
+                target(
+                    record.app.as_deref(),
+                    record.namespace.as_deref(),
+                    &record.details
+                ),
                 record.source_address.as_deref().unwrap_or("-"),
             )?;
+            if let Some(note) = proposal_note(&record.details) {
+                write!(f, "\n    {note}")?;
+            }
         }
         Ok(())
     }
+}
+
+/// The line under a record about a proposal: which one, whose, and its
+/// author's reason, marked as the author's own words because nothing has
+/// checked it (#1682).
+fn proposal_note(details: &BTreeMap<String, String>) -> Option<String> {
+    let proposal = details.get("proposal")?;
+    let author = details.get("author")?;
+    let kind = details
+        .get("author_kind")
+        .map(|kind| format!(" ({kind})"))
+        .unwrap_or_default();
+    let reason = details
+        .get("reason")
+        .filter(|reason| !reason.is_empty())
+        .map(|reason| format!(". Its reason (its own words, unverified): {reason}"))
+        .unwrap_or_default();
+    Some(format!("proposal {proposal} by {author}{kind}{reason}"))
 }
 
 /// The token name a record was made under, or its principal.
@@ -119,18 +156,53 @@ fn who(record: &AuditRecord) -> &str {
         .unwrap_or(&record.principal)
 }
 
-/// `app@namespace`, whichever of them the record has.
-fn target(record: &AuditRecord) -> String {
-    match (&record.app, &record.namespace) {
-        (Some(app), Some(namespace)) => format!("{app}@{namespace}"),
-        (Some(app), None) => app.clone(),
-        (None, Some(namespace)) => format!("@{namespace}"),
-        (None, None) => "-".to_string(),
+/// How many names of an apply's workload list the table shows. The rest
+/// are a count here and in the record's `details.workloads` under `-o json`.
+const MAX_TARGET_NAMES: usize = 8;
+
+/// `app@namespace`, whichever of them there are. An apply of several
+/// workloads has no single app, so it shows the ones it listed in `details`.
+pub(crate) fn target(
+    app: Option<&str>,
+    namespace: Option<&str>,
+    details: &BTreeMap<String, String>,
+) -> String {
+    match (app, namespace, WorkloadList::from_details(details)) {
+        (Some(app), Some(namespace), _) => format!("{app}@{namespace}"),
+        (Some(app), None, _) => app.to_string(),
+        (None, namespace, Some(list)) => list_target(&list, namespace),
+        (None, Some(namespace), None) => format!("@{namespace}"),
+        (None, None, None) => "-".to_string(),
     }
 }
 
+/// `web, api @default` when every workload shares `namespace`, and
+/// `web@a, api@b` when they don't, with any past the limit as a count.
+fn list_target(list: &WorkloadList<'_>, namespace: Option<&str>) -> String {
+    let shared = namespace.map(|namespace| format!("@{namespace}"));
+    let names: Vec<&str> = list
+        .listed
+        .iter()
+        .take(MAX_TARGET_NAMES)
+        .map(|workload| match &shared {
+            Some(suffix) => workload.strip_suffix(suffix.as_str()).unwrap_or(workload),
+            None => workload,
+        })
+        .collect();
+    let mut shown = names.join(", ");
+    let more = list.listed.len() + list.unlisted - names.len();
+    if more > 0 {
+        shown.push_str(&format!(" +{more} more"));
+    }
+    if let Some(suffix) = shared {
+        shown.push(' ');
+        shown.push_str(&suffix);
+    }
+    shown
+}
+
 /// `YYYY-MM-DD HH:MM:SS` in UTC.
-fn format_time(timestamp: u64) -> String {
+pub(crate) fn format_time(timestamp: u64) -> String {
     let Ok(seconds) = i64::try_from(timestamp) else {
         return timestamp.to_string();
     };
@@ -161,6 +233,7 @@ mod tests {
             severity: EventSeverity::Info,
             action: "app.deleted".to_string(),
             principal: "token-7f3a".to_string(),
+            principal_kind: crate::sesame::types::PrincipalKind::Human,
             app: Some("web".to_string()),
             namespace: Some("team-a".to_string()),
             node: Some("node-2".to_string()),
@@ -176,9 +249,11 @@ mod tests {
             since: Some("2h".to_string()),
             until: Some("1000".to_string()),
             action: Some("fault.*".to_string()),
+            app: Some("web".to_string()),
             ..AuditFlags::default()
         };
         let filter = flags.filter(10_000).unwrap();
+        assert_eq!(filter.app.as_deref(), Some("web"));
         assert_eq!(filter.since, Some(10_000 - 7200));
         assert_eq!(filter.until, Some(1000));
         assert_eq!(filter.action.as_deref(), Some("fault.*"));
@@ -197,6 +272,138 @@ mod tests {
         })
         .to_string();
         insta::assert_snapshot!(table);
+    }
+
+    /// #1682's design: an app record a proposal's apply wrote says which
+    /// proposal, whose, and why, with the reason marked as the author's own
+    /// words, as `relish proposal show` marks it.
+    #[test]
+    fn a_proposals_record_names_it_and_marks_the_reason_as_the_authors_words() {
+        let mut applied = record();
+        applied.action = "app.applied".to_string();
+        applied.details.extend([
+            ("proposal".to_string(), "17".to_string()),
+            ("author".to_string(), "holmes".to_string()),
+            ("author_kind".to_string(), "agent".to_string()),
+            ("reason".to_string(), "p99 over the SLO".to_string()),
+        ]);
+        let mut by_agent = record();
+        by_agent.action = "proposal.created".to_string();
+        by_agent.principal_kind = crate::sesame::types::PrincipalKind::Agent;
+        let table = AuditReport(AuditListing {
+            records: vec![applied, by_agent],
+            warnings: Vec::new(),
+        })
+        .to_string();
+        insta::assert_snapshot!(table);
+        assert!(
+            table.contains(
+                "proposal 17 by holmes (agent). Its reason (its own words, unverified): p99 over the SLO"
+            ),
+            "{table}"
+        );
+    }
+
+    /// The record a two-app apply in one namespace makes: no single app,
+    /// the names under `workloads` (#1501).
+    fn two_app_apply() -> AuditRecord {
+        AuditRecord {
+            action: "app.applied".to_string(),
+            app: None,
+            namespace: Some("default".to_string()),
+            details: [
+                ("token_name".to_string(), "alice".to_string()),
+                (
+                    "workloads".to_string(),
+                    "backend@default,frontend@default".to_string(),
+                ),
+                ("namespaces".to_string(), "default".to_string()),
+            ]
+            .into(),
+            message: "app.applied in default by alice".to_string(),
+            ..record()
+        }
+    }
+
+    fn shown_target(record: &AuditRecord) -> String {
+        target(
+            record.app.as_deref(),
+            record.namespace.as_deref(),
+            &record.details,
+        )
+    }
+
+    #[test]
+    fn the_table_names_every_app_a_multi_app_apply_touched() {
+        let table = AuditReport(AuditListing {
+            records: vec![two_app_apply()],
+            warnings: Vec::new(),
+        })
+        .to_string();
+        insta::assert_snapshot!(table);
+    }
+
+    #[test]
+    fn a_multi_namespace_apply_names_each_app_with_its_namespace() {
+        let mut record = two_app_apply();
+        record.namespace = None;
+        record.details.insert(
+            "workloads".to_string(),
+            "api@payments,web@team-a".to_string(),
+        );
+        assert_eq!(shown_target(&record), "api@payments, web@team-a");
+    }
+
+    /// A record listing `count` apps, as the server writes it: twenty
+    /// names, then a count of the rest.
+    fn apply_of(count: usize) -> AuditRecord {
+        let mut names: Vec<String> = (1..=count.min(20))
+            .map(|n| format!("app{n:02}@default"))
+            .collect();
+        if count > 20 {
+            names.push(format!("+{} more", count - 20));
+        }
+        let mut record = two_app_apply();
+        record
+            .details
+            .insert("workloads".to_string(), names.join(","));
+        record
+    }
+
+    #[test]
+    fn a_list_of_eight_apps_is_shown_whole() {
+        assert_eq!(
+            shown_target(&apply_of(8)),
+            "app01, app02, app03, app04, app05, app06, app07, app08 @default"
+        );
+    }
+
+    #[test]
+    fn a_longer_list_is_cut_short_with_a_count() {
+        assert_eq!(
+            shown_target(&apply_of(9)),
+            "app01, app02, app03, app04, app05, app06, app07, app08 +1 more @default"
+        );
+    }
+
+    #[test]
+    fn the_count_includes_apps_the_server_only_counted() {
+        assert_eq!(
+            shown_target(&apply_of(25)),
+            "app01, app02, app03, app04, app05, app06, app07, app08 +17 more @default"
+        );
+    }
+
+    #[test]
+    fn a_record_without_app_or_workloads_shows_its_namespace() {
+        let mut record = two_app_apply();
+        record.details.remove("workloads");
+        assert_eq!(shown_target(&record), "@default");
+    }
+
+    #[test]
+    fn a_single_app_record_keeps_its_app_at_namespace_form() {
+        assert_eq!(shown_target(&record()), "web@team-a");
     }
 
     #[test]

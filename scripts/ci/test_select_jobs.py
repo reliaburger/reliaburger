@@ -29,8 +29,11 @@ class Repository:
         self.git("init", "-q", "-b", "main")
         for path in ["src/lib.rs", "src/mustard/gossip.rs", "src/bun/task_array_leader.rs",
                      "src/bun/task_executor.rs", "benches/task_arrays.rs", "docs/design/gossip.md",
-                     "docs/manual/intro.md", "README.md", "docs/book/07-ship-it.md"]:
+                     "docs/manual/intro.md", "README.md", "docs/book/07-ship-it.md",
+                     "src/grill/apple.rs"]:
             self.write(path, f"{path}\n")
+        # A file with macOS-only code behind a cfg, as rustfmt writes it.
+        self.write("src/grill/process.rs", '#[cfg(target_os = "macos")]\nfn mac() {}\n')
         self.commit("base")
 
     def git(self, *args):
@@ -53,12 +56,14 @@ class Repository:
         self.git("checkout", "-q", "-b", name)
 
     def select(self, event="pull_request", base_ref="main", base_sha="", full_ci=False,
-               head_ref="feature"):
+               head_ref="feature", release_gate=False, macos=False):
         with tempfile.TemporaryDirectory() as scratch:
             output = Path(scratch) / "output"
             env = {**os.environ, **GIT_ENV, "GITHUB_OUTPUT": str(output), "EVENT": event,
                    "BASE_REF": base_ref, "BASE_SHA": base_sha, "HEAD_REF": head_ref,
-                   "FULL_CI": "true" if full_ci else "false"}
+                   "FULL_CI": "true" if full_ci else "false",
+                   "RELEASE_GATE": "true" if release_gate else "false",
+                   "MACOS_LABEL": "true" if macos else "false"}
             subprocess.run(["bash", str(SCRIPT)], cwd=self.root, env=env, check=True,
                            capture_output=True, text=True)
             pairs = (line.split("=", 1) for line in output.read_text().split())
@@ -94,17 +99,19 @@ class SelectJobsTests(unittest.TestCase):
         for event in ["push", "schedule", "workflow_dispatch", "merge_group"]:
             with self.subTest(event=event):
                 self.assertEqual(self.repo.select(event=event),
-                                 {"code": True, "gossip": True, "heavy": True, "task_arrays": True, "macos": True})
+                                 {"code": True, "gossip": True, "heavy": True, "task_arrays": True, "macos": True, "s3": True})
 
-    def test_a_code_change_into_main_runs_the_heavy_suites(self):
+    def test_a_code_change_into_main_runs_the_heavy_suites_but_not_macos(self):
+        # macOS runs only where it adds something (#1443): the heavy suites
+        # still run on every code PR into main.
         self.pull_request("src/lib.rs")
         self.assertEqual(self.repo.select(base_sha=self.main),
-                         {"code": True, "gossip": False, "heavy": True, "task_arrays": False, "macos": True})
+                         {"code": True, "gossip": False, "heavy": True, "task_arrays": False, "macos": False, "s3": False})
 
     def test_documentation_alone_skips_every_rust_job(self):
         self.pull_request("docs/design/gossip.md", "docs/book/07-ship-it.md")
         self.assertEqual(self.repo.select(base_sha=self.main),
-                         {"code": False, "gossip": False, "heavy": False, "task_arrays": False, "macos": False})
+                         {"code": False, "gossip": False, "heavy": False, "task_arrays": False, "macos": False, "s3": False})
 
     def test_the_website_counts_as_code_because_its_tests_read_it(self):
         self.pull_request("docs/website/assets/tour.cast")
@@ -117,6 +124,22 @@ class SelectJobsTests(unittest.TestCase):
                 self.assertTrue(self.repo.select(base_sha=self.main)["code"])
                 self.repo.git("checkout", "-q", "main")
                 self.repo.git("branch", "-q", "-D", "feature")
+
+    def test_the_policy_files_count_as_code_because_the_issue_form_tests_read_them(self):
+        for path in ["CONTRIBUTING.md", "SECURITY.md", "AGENTS.md"]:
+            with self.subTest(path=path):
+                self.pull_request(path)
+                self.assertTrue(self.repo.select(base_sha=self.main)["code"])
+                self.repo.git("checkout", "-q", "main")
+                self.repo.git("branch", "-q", "-D", "feature")
+
+    def test_the_feature_catalogue_counts_as_code_because_the_page_test_reads_it(self):
+        self.pull_request("docs/features.toml")
+        self.assertTrue(self.repo.select(base_sha=self.main)["code"])
+
+    def test_the_skill_counts_as_code_because_the_agent_docs_test_reads_it(self):
+        self.pull_request("plugins/reliaburger/skills/reliaburger/SKILL.md")
+        self.assertTrue(self.repo.select(base_sha=self.main)["code"])
 
     def test_the_manual_counts_as_code_because_relish_compiles_it_in(self):
         self.pull_request("docs/manual/intro.md")
@@ -141,7 +164,79 @@ class SelectJobsTests(unittest.TestCase):
                 repo.write(path, "changed\n")
                 repo.commit("change")
                 self.assertEqual(repo.select(base_sha=main),
-                                 {"code": True, "gossip": False, "heavy": True, "task_arrays": True, "macos": True})
+                                 {"code": True, "gossip": False, "heavy": True, "task_arrays": True, "macos": False, "s3": False})
+
+    def test_an_s3_client_change_runs_the_s3_round_trip(self):
+        # #1534: what `make test-s3` sends to its server, and the script
+        # that starts the server.
+        for path in ["src/ketchup/export.rs", "src/council/backup.rs",
+                     "src/object_storage.rs", "scripts/test-s3.sh"]:
+            with self.subTest(path=path):
+                repo = Repository(tempfile.mkdtemp(dir=self.tmp.name))
+                main = repo.git("rev-parse", "HEAD")
+                repo.branch("feature")
+                repo.write(path, "changed\n")
+                repo.commit("change")
+                self.assertEqual(repo.select(base_sha=main),
+                                 {"code": True, "gossip": False, "heavy": True, "task_arrays": False,
+                                  "macos": False, "s3": True})
+
+    def test_an_s3_change_into_a_train_waits_for_the_push_unless_labelled_full_ci(self):
+        base = self.stacked_base()
+        self.pull_request("src/object_storage.rs")
+        self.assertFalse(self.repo.select(base_ref="release-1-1-4", base_sha=base)["s3"])
+        self.assertTrue(self.repo.select(base_ref="release-1-1-4", base_sha=base, full_ci=True)["s3"])
+
+    def test_other_code_does_not_run_the_s3_round_trip(self):
+        self.pull_request("src/lib.rs", "src/ketchup/mod.rs")
+        self.assertFalse(self.repo.select(base_sha=self.main)["s3"])
+
+    def manifests(self, criterion, tokio):
+        self.repo.write("Cargo.toml",
+                        f'[dev-dependencies]\ncriterion = "{criterion}"\ntokio = "{tokio}"\n')
+        self.repo.write("Cargo.lock",
+                        f'[[package]]\nname = "criterion"\nversion = "{criterion}"\n\n'
+                        f'[[package]]\nname = "criterion-plot"\nversion = "0.5.0"\n\n'
+                        f'[[package]]\nname = "tokio"\nversion = "{tokio}"\n')
+
+    def test_a_criterion_bump_runs_both_benchmarks(self):
+        # #1151: the benchmarks' output format and filter syntax are
+        # criterion's, so bumping it must run the jobs that parse them.
+        self.manifests("0.5.1", "1.40.0")
+        main = self.repo.commit("manifests")
+        self.repo.branch("feature")
+        self.manifests("0.8.0", "1.40.0")
+        self.repo.commit("bump criterion")
+        selected = self.repo.select(base_sha=main)
+        self.assertTrue(selected["gossip"])
+        self.assertTrue(selected["task_arrays"])
+        # A full-ci PR into a train selects them too.
+        selected = self.repo.select(base_ref="release-0-2-3", base_sha=main, full_ci=True)
+        self.assertTrue(selected["gossip"])
+        self.assertTrue(selected["task_arrays"])
+
+    def test_a_criterion_bump_in_the_lockfile_alone_runs_both_benchmarks(self):
+        self.manifests("0.5.1", "1.40.0")
+        main = self.repo.commit("manifests")
+        self.repo.branch("feature")
+        self.repo.write("Cargo.lock",
+                        '[[package]]\nname = "criterion"\nversion = "0.5.2"\n\n'
+                        '[[package]]\nname = "criterion-plot"\nversion = "0.5.0"\n\n'
+                        '[[package]]\nname = "tokio"\nversion = "1.40.0"\n')
+        self.repo.commit("update criterion")
+        selected = self.repo.select(base_sha=main)
+        self.assertTrue(selected["gossip"])
+        self.assertTrue(selected["task_arrays"])
+
+    def test_another_dependency_bump_does_not_run_the_benchmarks(self):
+        self.manifests("0.5.1", "1.40.0")
+        main = self.repo.commit("manifests")
+        self.repo.branch("feature")
+        self.manifests("0.5.1", "1.41.0")
+        self.repo.commit("bump tokio")
+        selected = self.repo.select(base_sha=main)
+        self.assertFalse(selected["gossip"])
+        self.assertFalse(selected["task_arrays"])
 
     def test_a_gossip_change_does_not_run_the_task_array_benchmarks(self):
         self.pull_request("src/mustard/gossip.rs")
@@ -155,17 +250,17 @@ class SelectJobsTests(unittest.TestCase):
         # Git's rename detection lists only the destination, a docs path.
         self.pull_request(rename=("src/lib.rs", "docs/lib.md"))
         self.assertEqual(self.repo.select(base_sha=self.main),
-                         {"code": True, "gossip": False, "heavy": True, "task_arrays": False, "macos": True})
+                         {"code": True, "gossip": False, "heavy": True, "task_arrays": False, "macos": False, "s3": False})
 
     def test_moving_gossip_code_still_runs_the_benchmarks(self):
         self.pull_request(rename=("src/mustard/gossip.rs", "src/gossip.rs"))
         self.assertTrue(self.repo.select(base_sha=self.main)["gossip"])
 
-    def test_a_stacked_pull_request_skips_the_heavy_suites(self):
+    def test_a_stacked_pull_request_skips_the_heavy_suites_and_macos(self):
         base = self.stacked_base("src/lib.rs")
         self.pull_request("src/lib.rs")
         self.assertEqual(self.repo.select(base_ref="fix/base", base_sha=base),
-                         {"code": True, "gossip": False, "heavy": False, "task_arrays": False, "macos": True})
+                         {"code": True, "gossip": False, "heavy": False, "task_arrays": False, "macos": False, "s3": False})
 
     def test_a_pull_request_into_a_release_train_runs_only_the_light_set(self):
         # Each release collects its PRs on a `release-*` branch. The PR gets
@@ -174,7 +269,7 @@ class SelectJobsTests(unittest.TestCase):
         base = self.stacked_base("src/lib.rs")
         self.pull_request("src/lib.rs", "src/mustard/gossip.rs", "benches/task_arrays.rs")
         self.assertEqual(self.repo.select(base_ref="release-1-1-4", base_sha=base),
-                         {"code": True, "gossip": False, "heavy": False, "task_arrays": False, "macos": False})
+                         {"code": True, "gossip": False, "heavy": False, "task_arrays": False, "macos": False, "s3": False})
 
     def test_the_full_ci_label_on_a_release_train_pull_request_runs_the_heavy_suites_but_not_macos(self):
         # Most train PRs need full-ci for privileged Linux, cluster and
@@ -183,32 +278,91 @@ class SelectJobsTests(unittest.TestCase):
         base = self.stacked_base()
         self.pull_request("src/lib.rs", "src/mustard/gossip.rs")
         self.assertEqual(self.repo.select(base_ref="release-1-1-4", base_sha=base, full_ci=True),
-                         {"code": True, "gossip": True, "heavy": True, "task_arrays": False, "macos": False})
+                         {"code": True, "gossip": True, "heavy": True, "task_arrays": False, "macos": False, "s3": False})
 
-    def test_the_full_ci_label_still_runs_macos_outside_a_release_train(self):
+    def test_the_full_ci_label_runs_the_heavy_suites_but_not_macos_anywhere(self):
         base = self.stacked_base()
         self.pull_request("src/lib.rs")
         for base_ref, base_sha in [("main", self.main), ("fix/base", base)]:
             with self.subTest(base=base_ref):
                 self.assertEqual(self.repo.select(base_ref=base_ref, base_sha=base_sha, full_ci=True),
                                  {"code": True, "gossip": False, "heavy": True, "task_arrays": False,
-                                  "macos": True})
+                                  "macos": False, "s3": False})
 
-    def test_a_train_heading_into_another_train_runs_macos_even_with_full_ci(self):
+    def test_the_gate_pr_gets_the_light_set_on_each_push(self):
+        # The push to the train has just run everything on the same code;
+        # the gate PR's synchronize doesn't run it again (#1443).
         base = self.stacked_base()
-        self.pull_request("src/lib.rs")
-        self.assertTrue(self.repo.select(base_ref="release-1-1-5", base_sha=base, head_ref="release-1-1-4",
-                                         full_ci=True)["macos"])
-
-    def test_a_release_train_heading_anywhere_runs_everything(self):
-        # The gate PR (release-* into main) and any PR whose head is a train.
-        base = self.stacked_base()
-        self.pull_request("src/lib.rs")
+        self.pull_request("src/lib.rs", "src/grill/apple.rs", "src/mustard/gossip.rs")
         for base_ref in ["main", "release-1-1-5"]:
             with self.subTest(base=base_ref):
                 self.assertEqual(self.repo.select(base_ref=base_ref, base_sha=base, head_ref="release-1-1-4"),
-                                 {"code": True, "gossip": False, "heavy": True, "task_arrays": False,
-                                  "macos": True})
+                                 {"code": True, "gossip": False, "heavy": False, "task_arrays": False,
+                                  "macos": False, "s3": False})
+
+    def test_the_gate_pr_labelled_release_gate_runs_everything(self):
+        base = self.stacked_base()
+        self.pull_request("src/lib.rs")
+        self.assertEqual(self.repo.select(base_ref="main", base_sha=base, head_ref="release-1-1-4",
+                                          release_gate=True),
+                         {"code": True, "gossip": True, "heavy": True, "task_arrays": True, "macos": True, "s3": True})
+
+    def test_the_gate_pr_labelled_full_ci_runs_the_heavy_suites_without_macos(self):
+        base = self.stacked_base()
+        self.pull_request("src/lib.rs")
+        self.assertEqual(self.repo.select(base_ref="main", base_sha=base, head_ref="release-1-1-4", full_ci=True),
+                         {"code": True, "gossip": False, "heavy": True, "task_arrays": False, "macos": False, "s3": False})
+
+    def test_a_pull_request_touching_macos_code_runs_macos(self):
+        # The Apple runtime, any Rust file with macOS-only code, the
+        # installers and the demo scripts.
+        paths = ["src/grill/apple.rs", "src/grill/process.rs", "docs/website/install.sh",
+                 "scripts/release/install.sh.in", "scripts/demo/tour.sh"]
+        for base_ref in ["main", "release-1-1-4", "fix/base"]:
+            for path in paths:
+                with self.subTest(base=base_ref, path=path):
+                    repo = Repository(tempfile.mkdtemp(dir=self.tmp.name))
+                    main = repo.git("rev-parse", "HEAD")
+                    repo.branch("feature")
+                    existing = repo.root / path
+                    repo.write(path, (existing.read_text() if existing.exists() else "") + "changed\n")
+                    repo.commit("change")
+                    self.assertTrue(repo.select(base_ref=base_ref, base_sha=main)["macos"])
+
+    def test_removing_macos_code_runs_macos_too(self):
+        self.repo.branch("feature")
+        self.repo.write("src/grill/process.rs", "fn mac() {}\n")
+        self.repo.commit("drop the cfg")
+        self.assertTrue(self.repo.select(base_sha=self.main)["macos"])
+
+    def test_a_train_pull_request_touching_macos_code_keeps_the_light_set_otherwise(self):
+        base = self.stacked_base()
+        self.pull_request("src/grill/apple.rs")
+        self.assertEqual(self.repo.select(base_ref="release-1-1-4", base_sha=base),
+                         {"code": True, "gossip": False, "heavy": False, "task_arrays": False, "macos": True, "s3": False})
+
+    def test_the_macos_label_runs_macos_on_any_code_pull_request(self):
+        base = self.stacked_base()
+        self.pull_request("src/lib.rs")
+        for base_ref, base_sha, head_ref in [("main", self.main, "feature"), ("release-1-1-4", base, "feature"),
+                                             ("fix/base", base, "feature"), ("main", base, "release-1-1-4"),
+                                             ("main", self.main, "dependabot/cargo/tokio-1.41.0")]:
+            with self.subTest(base=base_ref, head=head_ref):
+                self.assertTrue(self.repo.select(base_ref=base_ref, base_sha=base_sha, head_ref=head_ref,
+                                                 macos=True)["macos"])
+
+    def test_the_macos_label_does_not_make_documentation_run_rust_jobs(self):
+        self.pull_request("docs/design/gossip.md")
+        self.assertFalse(self.repo.select(base_sha=self.main, macos=True)["macos"])
+
+    def test_dependabot_never_gets_macos(self):
+        # The nightly on main covers it (#1443).
+        self.repo.branch("dependabot/cargo/tokio-1.41.0")
+        self.repo.write("Cargo.lock", "changed\n")
+        self.repo.write("src/grill/apple.rs", "changed\n")
+        self.repo.commit("bump")
+        self.assertEqual(self.repo.select(base_sha=self.main, head_ref="dependabot/cargo/tokio-1.41.0"),
+                         {"code": True, "gossip": False, "heavy": True, "task_arrays": False, "macos": False, "s3": False})
 
     def test_a_branch_merely_named_like_a_train_is_not_one(self):
         base = self.stacked_base()
@@ -221,13 +375,13 @@ class SelectJobsTests(unittest.TestCase):
     def test_the_merge_queue_runs_everything(self):
         # merge_group carries no pull_request fields: no base, no label.
         self.assertEqual(self.repo.select(event="merge_group", base_ref="", head_ref=""),
-                         {"code": True, "gossip": True, "heavy": True, "task_arrays": True, "macos": True})
+                         {"code": True, "gossip": True, "heavy": True, "task_arrays": True, "macos": True, "s3": True})
 
     def test_documentation_into_a_release_train_skips_every_rust_job(self):
         base = self.stacked_base()
         self.pull_request("docs/design/gossip.md")
         self.assertEqual(self.repo.select(base_ref="release-1-1-4", base_sha=base),
-                         {"code": False, "gossip": False, "heavy": False, "task_arrays": False, "macos": False})
+                         {"code": False, "gossip": False, "heavy": False, "task_arrays": False, "macos": False, "s3": False})
 
     def test_the_full_ci_label_runs_the_heavy_suites_on_a_stacked_pull_request(self):
         base = self.stacked_base()
@@ -246,8 +400,8 @@ class SelectJobsTests(unittest.TestCase):
         self.pull_request("docs/design/gossip.md")
         before = self.repo.select(base_ref="fix/base", base_sha=base)
         after = self.repo.select(base_ref="main", base_sha=self.main)
-        self.assertEqual(before, {"code": False, "gossip": False, "heavy": False, "task_arrays": False, "macos": False})
-        self.assertEqual(after, {"code": True, "gossip": False, "heavy": True, "task_arrays": False, "macos": True})
+        self.assertEqual(before, {"code": False, "gossip": False, "heavy": False, "task_arrays": False, "macos": False, "s3": False})
+        self.assertEqual(after, {"code": True, "gossip": False, "heavy": True, "task_arrays": False, "macos": False, "s3": False})
 
 
 if __name__ == "__main__":

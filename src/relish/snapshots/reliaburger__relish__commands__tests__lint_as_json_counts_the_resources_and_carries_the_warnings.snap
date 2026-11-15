@@ -1,0 +1,11 @@
+---
+source: src/relish/commands.rs
+expression: "format_output(&report, OutputFormat::Json).unwrap()"
+---
+{
+  "apps": 2,
+  "jobs": 1,
+  "warnings": [
+    "app default/worker: init container command \"echo\" is a bare name, but it runs on the host, where allowed_binaries names binaries by full path; use the full path (`command -v echo` on the node prints it)"
+  ]
+}

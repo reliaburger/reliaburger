@@ -114,6 +114,19 @@ gets the first identity, and every other VM enrols with a join token and
 `relish join`, exactly as you would by hand. One less special case, and the dev
 cluster finally has a registry, which needs mTLS.
 
+Sharing the code at first meant sharing a name, too: every dev cluster's
+administrator token was called `laptop-admin`, which is right for the
+quickstart and puzzling in `relish token list` on a dev cluster (#930). The
+name is what the audit log records for every change made with the token, so
+it should say where the token came from. `prepare_in` now takes the name as
+a parameter. The quickstart passes its `QUICKSTART_ADMINISTRATOR` constant,
+`"laptop-admin"`, and `relish dev create` passes
+`format!("dev-{cluster_name}-admin")`. The parameter is a `&str`, a borrowed
+string, so the dev caller lends `prepare_in` a reference to a `String` it
+builds on the spot and still owns, and the quickstart lends one to a constant
+baked into the binary (its type is `&'static str`, a borrow that lasts the
+whole program). Neither copies anything into the function.
+
 The first mTLS dev cluster formed a healthy council and then failed every
 linearizable read on the leader. Pulls failed, and `relish wtf` said the leader
 wasn't the leader. The cause was a timing budget. Our Raft transport opens a
@@ -263,28 +276,38 @@ makes you say it. `#[derive(...)]` is the compiler writing that `impl` for
 you. Here we'd rather it didn't.
 
 Opening the file needs the right kind of key, and `age` tells you which kind
-from the header. We match on both at once:
+from the header. Since `age` 0.11 a passphrase is an identity like any other
+(`age::scrypt::Identity`), and the decryptor is one opaque type with an
+`is_scrypt()` question on it. We match on the answer and the opener at once:
 
 ```rust
-let mut reader = match (decryptor, with) {
-    (age::Decryptor::Passphrase(d), BackupOpener::Passphrase(passphrase)) => {
-        d.decrypt(passphrase, None).map_err(|e| open_failed(&e))?
+let mut reader = match (decryptor.is_scrypt(), with) {
+    (true, BackupOpener::Passphrase(passphrase)) => {
+        let identity = age::scrypt::Identity::new(passphrase.clone());
+        decryptor
+            .decrypt(std::iter::once(&identity as &dyn age::Identity))
+            .map_err(|e| open_failed(&e))?
     }
-    (age::Decryptor::Recipients(d), BackupOpener::Identity(identity)) => d
+    (false, BackupOpener::Identity(identity)) => decryptor
         .decrypt(std::iter::once(identity as &dyn age::Identity))
         .map_err(|e| open_failed(&e))?,
-    (age::Decryptor::Passphrase(_), BackupOpener::Identity(_)) => {
-        return Err(RootBackupError::NeedsPassphrase);
-    }
-    (age::Decryptor::Recipients(_), BackupOpener::Passphrase(_)) => {
-        return Err(RootBackupError::NeedsIdentity);
-    }
+    (true, BackupOpener::Identity(_)) => return Err(RootBackupError::NeedsPassphrase),
+    (false, BackupOpener::Passphrase(_)) => return Err(RootBackupError::NeedsIdentity),
 };
 ```
 
 Matching on a tuple lays out all four combinations as a table, and the
-compiler checks that the table has no holes. Add a third kind of seal and
-this stops compiling until you've said what happens.
+compiler checks that the table has no holes. Add a third kind of opener and
+this stops compiling until you've said what happens. Why check the header at
+all, when `decrypt` would just fail with the wrong key? Because "no matching
+key" doesn't tell an operator at 3am that they passed an identity file to a
+passphrase backup. The two `Needs...` errors do.
+
+`std::iter::once(&identity as &dyn age::Identity)` is worth a second look.
+`decrypt` takes any iterator of *trait objects*: references to "something that
+implements `Identity`", with the concrete type erased. `as &dyn age::Identity`
+does the erasing, and `once` makes a one-item iterator. It's how Go would pass
+an interface value, except that in Rust you ask for the indirection out loud.
 
 The passphrase itself travels as a `SecretString`, from the `secrecy` crate
 that `age` re-exports. It has no `Display`, its `Debug` prints nothing useful,
@@ -292,6 +315,19 @@ and it wipes its memory when dropped. Reading the value takes an explicit
 `.expose_secret()`, which is easy to search for. At the terminal, `relish`
 turns echo off with `termios` before asking, and turns it back on whether or
 not the read worked.
+
+### The backup has to outlive the library
+
+An operator files the backup away and may not open it for years, by which
+time we'll have bumped `age` a few more times. The 0.2.2 bump from `age` 0.10
+to 0.11 (by way of 0.12, as chapter 15 explains) rewrote the API we just walked through, so we checked in backups that
+an `age` 0.10 build sealed, one to a passphrase and one to a recipient, under
+`tests/fixtures/age/`. The tests `a_passphrase_backup_sealed_by_age_0_10_still_opens`
+and `a_recipient_backup_sealed_by_age_0_10_still_opens` open and verify them on
+every build. A round-trip test can't catch this: it seals and opens with the
+same version, so a format change on both sides passes. The same fixtures pin
+the `ENC[AGE:...]` secrets apps carry in their config and the
+`<cluster>-root-ca.age` file every node keeps.
 
 ### Verifying without a cluster
 
@@ -431,7 +467,48 @@ Because every node applies the log serially, exactly one entry for a given token
 
 The `Option<CouncilResponse>` return is Rust's way of saying "this entry might carry a verdict back to whoever proposed it". Most log entries return `None` (applied, nothing to report). This one returns `Some(...)` so the proposer learns which serial it won, or why it was turned away, without racing to read shared state back — the same pattern the plain serial allocator already used.
 
-One more thing changed while we were in here. The old code hard-coded the issuer's distinguished name as a string literal when it rebuilt the CA for signing. If that string ever drifted from the actual Node CA's subject, the issued leaf wouldn't chain. We now derive it straight from the stored CA certificate with rcgen's `CertificateParams::from_ca_cert_der`, so the issuer field always matches the CA that's really in the trust store.
+One more thing changed while we were in here. The old code hard-coded the issuer's distinguished name as a string literal when it rebuilt the CA for signing. If that string ever drifted from the actual Node CA's subject, the issued leaf wouldn't chain. We now derive it straight from the stored CA certificate with `ca::issuer_params_from_der`, so the issuer field always matches the CA that's really in the trust store.
+
+That helper used to be one call to rcgen's `CertificateParams::from_ca_cert_der`. rcgen 0.14 removed it in favour of `Issuer::from_ca_cert_der`, which is fine for signing but keeps the CA's name and validity private, and we need the validity to clamp each leaf. So we read what an issuer needs off the certificate ourselves with `x509-parser`: the subject name, the validity window and the subject key identifier. The name is the fiddly one. A verifier compares the leaf's issuer with the CA's subject byte for byte, so each attribute keeps its original ASN.1 string type (a `UTF8String` stays a `UTF8String`, a `PrintableString` stays printable). Re-encode one as the wrong type and the names look identical when printed but don't match. The test `a_leaf_signed_with_issuer_params_rebuilt_from_the_ca_der_chains_to_that_ca` compares the raw bytes and runs the chain through rustls's own verifier, because that's the kind of break that would otherwise only show up as a failed handshake.
+
+### Naming the issuer by key
+
+Our own clients never noticed the next bug. rustls chains certificates by name and signature, so every TLS test we had was green. Then a claims evaluation pointed a Python 3.13 client at the API and got this:
+
+```text
+certificate verify failed: Missing Authority Key Identifier
+```
+
+Python 3.13 turned on OpenSSL's strict X.509 mode by default, and strict mode holds you to RFC 5280: every certificate a CA issues must carry an authority key identifier (AKI), which is the issuer's subject key identifier (SKI) copied into the child. It's how a verifier picks the right parent when two CAs share a name, which is exactly what a CA rotation produces. We had the SKI on every CA. We just never asked for the AKI, because rcgen leaves `use_authority_key_identifier_extension` off unless you turn it on. Six functions signed certificates, and not one of them did.
+
+We could have set the flag in six places, and the seventh signer would have forgotten it. So there's now one way to issue:
+
+```rust
+pub(crate) fn sign_as_issuer(
+    mut params: CertificateParams,
+    subject_key: &impl rcgen::PublicKeyData,
+    issuer_params: &CertificateParams,
+    issuer_keypair: &KeyPair,
+) -> Result<rcgen::Certificate, rcgen::Error> {
+    params.use_authority_key_identifier_extension = true;
+    params.signed_by(
+        subject_key,
+        &Issuer::from_params(issuer_params, issuer_keypair),
+    )
+}
+```
+
+`mut params` takes the params by value and lets this function change its own copy; the caller gave them up, so nothing it holds changes underneath it. `&impl rcgen::PublicKeyData` means "a reference to any type that implements this trait", and the compiler generates one version of the function per type, much like a C++ template and unlike a Go interface, which dispatches at runtime. We need that because the subject key is a `KeyPair` when we made the key ourselves and a CSR's public key when a joining node did.
+
+Why not set the flag in the shared `node_cert_params`? Because it's also tempting to reuse params for a CSR, and rcgen refuses to serialise a CSR with the flag set. An AKI names the signer, and a CSR doesn't have one yet.
+
+The byte-for-byte promise holds after a restart because of the helper in the last section. `issuer_params_from_der` reads the SKI off the stored CA certificate and pre-specifies it as the key identifier, so rcgen copies those bytes instead of hashing the key again. That matters for a rotated intermediate too: its leaves name the new key, not the old one, and `leaves_from_a_rotated_intermediate_name_the_new_key_not_the_old_one` checks both directions.
+
+The unit tests parse every kind of issued certificate and compare the two identifiers. `tests/suite/strict_tls_verifier.rs` goes further and runs the real thing: `openssl verify -x509_strict` over the node, ingress and workload chains, and `openssl s_client -x509_strict` against a live API listener, trusting only the root. It first checks that the same `openssl` refuses a leaf with no AKI, because not every `openssl` on a developer's `PATH` is OpenSSL (macOS ships LibreSSL). An `openssl` that can't refuse the bad chain proves nothing when it accepts the good one, so the test says so and leans on the unit tests. (That control earned its keep immediately. The first draft read the error from the wrong stream, decided no strict `openssl` existed, and passed without checking anything.)
+
+There's a catch for clusters that already exist. A leaf picks up the extension at its next renewal, but the Node, Workload and Ingress CAs were signed at `relish init`, and they're in the chain too. Strict verification checks every certificate below the trust anchor, so a client that trusts only the root keeps refusing until `relish ca rotate` replaces the intermediate, or you start a fresh cluster.
+
+One thing the AKI doesn't change: a node certificate names the node, not its address. Python's default context also checks the hostname, so connect with `server_hostname` set to the node's id. Give it `127.0.0.1` and it now fails for an honest reason, `IP address mismatch`. `relish` doesn't hit this because it verifies the chain and never the name.
 
 ### Binding a connection to a node
 
@@ -449,6 +526,23 @@ if let Some(expected) = &self.expected_node_id {
 ```
 
 Now a valid certificate for node C, presented when we dialled node A, is rejected: the SAN says C, we expected A. A certificate with no node-id SAN at all is rejected too — under binding, absence is mismatch. The property jumps from "some valid node" to "the specific node I meant to reach". (The reporting transport dials by address without a target id to hand the verifier, so it keeps the CA-pin-plus-CRL guarantee; binding lives where the id is known.)
+
+### Naming the address, but only one we saw
+
+Fixing the authority key identifier got the same Python 3.13 client one error further. Strict mode also checks the server's name, and someone who connects with `https://10.0.0.5:9117` is asking for an address, so the certificate has to carry that address as an IP SAN. Ours carried the node-id URI and DNS names, and no address at all, so the client refused with "IP address mismatch" ([#1508](https://github.com/reliaburger/reliaburger/issues/1508)). `relish` never noticed because it binds to the node id, not the address.
+
+The tempting fix is to let the joiner say which address it has. That's the mistake from the workload signer again: a node that can choose its own SANs can claim another node's address, and a client that connects by address would then trust it. So the address comes from where the issuer saw the request come from, the TCP source the API server already records for the audit log, and never from the CSR:
+
+```rust
+let mut params = node_cert_params(node_id, serial, lifetime)?;
+if let Some(address) = address.filter(|address| names_a_machine(*address)) {
+    params.subject_alt_names.push(SanType::IpAddress(address));
+}
+```
+
+`address` is an `Option<IpAddr>`, and `filter` keeps it only when the closure says yes, so loopback and `0.0.0.0` never make it into a certificate: they'd name the client's own machine. A node behind NAT gets no IP SAN, and clients go on using the node id as the server name.
+
+Two cases needed more than that. The first node's certificate comes from `relish setup` before any peer has seen it, and it lasts a year, so waiting for a renewal would mean waiting a year. And the leader renews its own certificate through its own API, which it used to reach on loopback. Now Bun dials itself at the address it advertises, and its renewal worker renews once, early, whenever its certificate doesn't name that address. That catches the first node, and a node whose address has changed, with the same check. Once per address, because the issuer may still leave the address out (that NAT case), and a node that asked every second would never stop.
 
 ### Installing the bundle without half-doing it
 
@@ -578,6 +672,8 @@ impl rustls::client::ResolvesClientCert for LiveNodeIdentity {
 ```
 
 `impl Trait for Type` is how Rust attaches an interface to a type. Unlike Go, you say so explicitly, and here we implement a trait from someone else's crate (rustls) for our own type, which is how libraries let you plug in behaviour. `bool::then` turns `true` into `Some(value)` and `false` into `None`, running the closure only when needed. `Arc::clone` copies a pointer and bumps a reference count; the private key bytes never move. The two resolvers deliberately disagree about expiry. A server can refuse to present an expired leaf. A client returning `None` means "send no certificate", and our API accepts certificate-less clients (browsers, `relish`) because they authenticate with tokens. An expired *node* must not quietly become one of those, so the client side keeps presenting the old certificate and lets the peer refuse it. Session resumption is off everywhere, because a resumed TLS session skips the resolver and would keep yesterday's identity alive.
+
+The test for this behaviour was a flake for a while ([#1841](https://github.com/reliaburger/reliaburger/issues/1841)). It signed a client certificate valid for the next five seconds, ran one good handshake, slept six seconds and expected the second handshake to be refused. On a loaded machine the setup before the first handshake (key generation, writing the identity to disk with fsyncs, building the TLS configs) could take longer than the window, and the *first* handshake failed instead. A test with a real clock and a short window is a race against its own setup. `replace` won't publish a certificate that has already expired, so an integration test can't simply start with one. The test now lives in the module, `an_expired_identity_is_presented_so_optional_mtls_refuses_it` in `src/sesame/credentials.rs`, where it can see the private `watch` sender and publish an identity that expired an hour ago directly. It has no window and no sleep. If the client resolver ever starts returning `None` for an expired certificate, the server sees an anonymous client and the test fails.
 
 Replacement writes the new snapshot to disk first and publishes it to the `watch` channel second. It requires the same node ID, the same trust anchors and a newer serial, and a failed save leaves the live identity alone.
 
@@ -714,6 +810,26 @@ paths as well as refusals, unchanged Raft state and an acknowledged empty
 mutation queue. Its finite command actor records dispatch; actual child
 execution belongs to the ProcessGrill and owned-runc suites.
 
+### Tokens for a node with no seat
+
+Every node reads its tokens from its own Raft replica, and that's the trouble with a node that has no seat. A node outside the council isn't a voter or a learner, so nothing replicates to it, and its replica stays empty. With `require_mtls` on, a joining node keeps its API listener closed until tokens arrive, so it waited 30 seconds, gave up, and systemd started it again, forever ([#1477](https://github.com/reliaburger/reliaburger/issues/1477)). 0.2.5 brought spare nodes in as learners up to the council cap, which fixed two, four and six nodes, but `max_council_size` is seven by default, so the eighth node of any secure cluster still hit it. And tokens were only the visible part: the same empty replica meant no revocation list and no rotated CA ever reached that node either.
+
+We could have made every node a learner. That's a one-line change in the planner, but then every node replicates the whole log, which is the cost the council exists to avoid. Instead a node with no seat asks the leader for what it needs. The leader serves `/v1/cluster/security-view` from a linearizable read, so a deposed leader can't hand out a stale revocation list, and only to a caller presenting a current node certificate. What it sends is `SecurityState::node_view()`: the CA certificates, token hashes, the CRL and node leaf records, the wrapped age keys that decrypt the secrets of apps the node runs, and the wrapped Ingress CA key for its ingress leaves. It never sends the keys that issue identity (the root, Node and Workload CA keys, the OIDC signing key) or join tokens. The wrapped keys open only with the master key, which every node holds already.
+
+The receiving end is the part we liked. Nothing that reads tokens, the CRL or the trust set had to change, because the council handle answers for the node:
+
+```rust
+pub async fn security_state(&self) -> SecurityState {
+    let local = self.state_machine.desired_state().await.security_state;
+    if local.is_initialised() {
+        return local;
+    }
+    self.leader_security_view.read().await.clone().unwrap_or(local)
+}
+```
+
+`unwrap_or(local)` returns the empty local state when no view has arrived yet, so a reader never waits here. Bun's five-second security refresh fetches the view whenever its replica holds nothing, and keeps the last one if the leader can't be reached, the way a follower that can't reach quorum keeps its replica. A token revoked on the leader stops working on the node within one refresh.
+
 ### Evaluating a policy isn't enforcing it
 
 Roles and scopes are blunt. A `[permission]` block sharpens them: it names a token and lists what that token may do, and to which apps.
@@ -792,7 +908,7 @@ The `?` converts a `CryptoError` into a `RaftEncryptionError` on the way out, th
 
 Be clear about what this buys. The master key lives on the node, in `master.key`, because every node needs it to unwrap CA keys and authenticate gossip. So the encryption protects a stolen disk, a copied `log.redb` or a careless backup of the data directory. It doesn't protect against someone with root on a running node: they can read the master key as easily as Bun can. And it only covers log entries. The Raft snapshot, `snapshot.redb`, which holds token hashes, wrapped keys and the whole desired state, is written in plaintext, and so are Raft's vote and log-position records. A cluster started without a master key writes a plaintext log too.
 
-We decided to say exactly that rather than extend the encryption now. The snapshot would need the same key, which sits on the same host, so encrypting it with the master key would add work without changing who can read it. The real fix is a key the host's root account can't simply read, sealed to a TPM or derived from the node's hardware identity, and that's 0.3.0 appliance work ([#402](https://github.com/reliaburger/reliaburger/issues/402)).
+We decided to say exactly that rather than extend the encryption now. The snapshot would need the same key, which sits on the same host, so encrypting it with the master key would add work without changing who can read it. The real fix is a key the host's root account can't simply read, sealed to a TPM or derived from the node's hardware identity, and that's planned ([#1775](https://github.com/reliaburger/reliaburger/issues/1775)).
 
 ## eBPF firewall wiring
 
@@ -1066,7 +1182,7 @@ tokio::spawn(async move {
 });
 ```
 
-The `select!` is the idiom for "do this on a timer, but drop everything the moment we're told to shut down": whichever branch's future finishes first wins, and a cancelled `CancellationToken` resolves immediately. The five-second lag between creating a token and it being enforced is real, and deliberate — a poll is far simpler than threading a change-notification out of the Raft state machine, and five seconds is nothing for an operation you do by hand.
+The `select!` is the idiom for "do this on a timer, but drop everything the moment we're told to shut down": whichever branch's future finishes first wins, and a cancelled `CancellationToken` resolves immediately. The five-second lag between creating a token and it being enforced is real, and deliberate — a poll is far simpler than threading a change-notification out of the Raft state machine, and five seconds is nothing for an operation you do by hand. That last part stopped being true once agents arrived. An agent's token is created and used within the same second, and Chapter 10's "Every node at once" threads the notification out after all.
 
 Three problems, none of them the crypto. Attaching a middleware is trivial; deciding what happens during bootstrap, how the system talks to itself once locked, and how the lock learns about new keys is the actual work. Same lesson as before, one layer up: the wiring is the system.
 
@@ -1085,14 +1201,14 @@ Same master key on every node, same derived key, no key exchange. (The original 
 Signing happens in the transport, not in the forty-odd places that build a message. The `GossipMessage` already had a `hmac: [u8; 32]` field sitting zeroed "until Phase 4". The trick is what you sign over: the message *with that field zeroed*, so sender and receiver compute identical bytes.
 
 ```rust
-pub fn canonical_bytes(&self) -> Result<Vec<u8>, bincode::Error> {
+pub fn canonical_bytes(&self) -> Result<Vec<u8>, postcard::Error> {
     let mut canonical = self.clone();
     canonical.hmac = [0u8; 32];   // sign over the message minus the signature slot
-    bincode::serialize(&canonical)
+    postcard::to_stdvec(&canonical)
 }
 ```
 
-This carries a quiet load-bearing assumption: bincode has to produce the *same* bytes on both nodes. It does, but only because the payload is `Vec`s and scalars. The day someone adds a `HashMap` to a gossip message, its iteration order will differ per process, the bytes will differ, and every node will silently reject every other node's gossip — a cluster that dissolves for no visible reason. So `canonical_bytes` carries a comment that says, in effect: *if you put a map here, make it a `BTreeMap`.* The send path signs; the receive path drops anything that doesn't verify, reusing the exact `continue` that already skipped malformed datagrams. A node with the wrong master key now simply doesn't exist as far as its peers are concerned.
+This carries a quiet load-bearing assumption: postcard has to produce the *same* bytes on both nodes. It does, but only because the payload is `Vec`s and scalars. The day someone adds a `HashMap` to a gossip message, its iteration order will differ per process, the bytes will differ, and every node will silently reject every other node's gossip — a cluster that dissolves for no visible reason. So `canonical_bytes` carries a comment that says, in effect: *if you put a map here, make it a `BTreeMap`.* The send path signs; the receive path drops anything that doesn't verify, reusing the exact `continue` that already skipped malformed datagrams. A node with the wrong master key now simply doesn't exist as far as its peers are concerned.
 
 One honest caveat we wrote down rather than hid: during a rolling upgrade, a node that's learned to verify will drop gossip from a peer that hasn't yet learned to sign (it's still sending zeroes). Because signing and verifying ship in the same binary and the key was already on every node, a coordinated restart converges in seconds. If we ever needed zero-downtime upgrades, we'd add an "accept unsigned during the transition" flag. We didn't need it, so we didn't build it — but we said so.
 
@@ -1128,13 +1244,14 @@ The `ring` crate makes this even stricter. An `aead::LessSafeKey` can't be clone
 
 ## Tests
 
-Cryptography is a dream to unit-test and a nightmare to test any other way. The functions are pure: same input, same output, every time. HKDF is deterministic, AES-GCM round-trips, a tampered ciphertext always fails the tag check. None of it needs a network, a second node, or root. So Phase 4 is almost entirely unit-tested — 119 tests living next to the code in `src/sesame/`.
+Cryptography is a dream to unit-test and a nightmare to test any other way. The functions are pure: same input, same output, every time. HKDF is deterministic, AES-GCM round-trips, a tampered ciphertext always fails the tag check. None of it needs a network, a second node, or root. So Phase 4 is almost entirely unit-tested, with the tests living next to the code in `src/sesame/`.
 
 ### What the unit tests prove
 
 The roster maps directly onto the primitives in this chapter:
 
 - **CA hierarchy** — generation and chain validation: a node cert verifies against the Node CA, which verifies against the Root, and a Workload-CA-signed cert does *not* validate as a node cert.
+- **Key identifiers** — every intermediate and leaf carries an authority key identifier equal to its issuer's subject key identifier, including issuers rebuilt from stored DER and rotated intermediates.
 - **HKDF** — determinism (same `ikm`/salt/info gives the same key) and separation (different `info` gives unrelated keys).
 - **AES-256-GCM** — encrypt/decrypt round-trips, and the one that matters most: flip a byte of ciphertext and decryption returns an error, never plaintext.
 - **Key wrapping** — wrap an intermediate CA key, unwrap it, get the original back; unwrap with the wrong purpose string and it fails.
@@ -1153,8 +1270,6 @@ cargo test --lib sesame
 ```
 
 The one thing the unit tests *don't* cover is the full token-and-revocation lifecycle across a running cluster — single-use enforcement in the agent, secret rotation windows, certificate revocation lists. That needs `SecurityState` in Raft, so its integration test (`tests/suite/security_integration.rs`, labelled "Phase 10") arrives with Chapter 10. It drives the `sesame` library directly — no running agent — so it too runs under a plain `cargo test`.
-
-Phase 4 adds 85 tests to the suite, bringing the total to 795.
 
 ### Private files need private temporary files too
 

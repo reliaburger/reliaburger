@@ -52,6 +52,65 @@ pub fn format_output<T: Serialize + fmt::Display>(
     }
 }
 
+/// Print a progress line: to stdout for people, to stderr when stdout
+/// carries JSON or YAML, so the data stays parseable and the progress is
+/// still there to watch.
+pub fn progress(format: OutputFormat, line: impl fmt::Display) {
+    match format {
+        OutputFormat::Human => println!("{line}"),
+        OutputFormat::Json | OutputFormat::Yaml => eprintln!("{line}"),
+    }
+}
+
+/// Print one record of a stream: JSON Lines for `json` (one compact object
+/// per line), a `---`-separated YAML document for `yaml`, `Display` for
+/// people.
+pub fn print_record<T: Serialize + fmt::Display>(
+    value: &T,
+    format: OutputFormat,
+) -> Result<(), super::RelishError> {
+    match format {
+        OutputFormat::Human => println!("{value}"),
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string(value).map_err(super::RelishError::SerialiseJson)?
+        ),
+        OutputFormat::Yaml => print!(
+            "---\n{}",
+            yaml_serde::to_string(value).map_err(super::RelishError::SerialiseYaml)?
+        ),
+    }
+    Ok(())
+}
+
+/// A command's whole answer when the node answers in a sentence: `{"message":
+/// "..."}` as data, the sentence for people.
+#[derive(Debug, Serialize)]
+pub struct Message {
+    pub message: String,
+}
+
+impl fmt::Display for Message {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "{}", self.message)
+    }
+}
+
+/// Print `value` to stdout in `format`, for a value whose `Display` already
+/// ends each of its lines (a table, a report). JSON and YAML end with one
+/// newline.
+pub fn print_output<T: Serialize + fmt::Display>(
+    value: &T,
+    format: OutputFormat,
+) -> Result<(), super::RelishError> {
+    let text = format_output(value, format)?;
+    match format {
+        OutputFormat::Human => print!("{text}"),
+        OutputFormat::Json | OutputFormat::Yaml => println!("{}", text.trim_end()),
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

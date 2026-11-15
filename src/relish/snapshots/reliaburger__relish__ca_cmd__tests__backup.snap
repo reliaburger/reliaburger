@@ -1,0 +1,12 @@
+---
+source: src/relish/ca_cmd.rs
+expression: "crate::relish::output::format_output(&summary, OutputFormat::Json).unwrap()"
+---
+{
+  "result": "ok",
+  "path": "root-ca.backup",
+  "cluster": "prod",
+  "trust_domain": "prod.reliaburger",
+  "fingerprint": "sha256:ab12",
+  "expires_at": 2000000000
+}

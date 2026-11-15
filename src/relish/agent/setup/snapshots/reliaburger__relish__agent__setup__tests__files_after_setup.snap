@@ -1,0 +1,13 @@
+---
+source: src/relish/agent/setup/tests.rs
+expression: "after.iter().filter(|(path, text)| before.get(*path) !=\nSome(*text)).collect::<BTreeMap<_, _>>()"
+---
+{
+  ".claude.json": "{\n  \"numStartups\": 12,\n  \"mcpServers\": {\n    \"reliaburger\": {\n      \"args\": [\n        \"mcp\"\n      ],\n      \"command\": \"relish\",\n      \"env\": {},\n      \"type\": \"stdio\"\n    },\n    \"github\": {\n      \"command\": \"gh-mcp\",\n      \"env\": {\n        \"GITHUB_TOKEN\": \"ghp_not_for_the_diff\"\n      }\n    }\n  },\n  \"projects\": {}\n}\n",
+  ".claude/skills/reliaburger/SKILL.md": "---\nname: reliaburger\ndescription: test skill\n---\n\nRun relish agent context first.\n",
+  ".codex/config.toml": "# Codex\nmodel = \"gpt-5\"\n\n[mcp_servers.docs]\ncommand = \"docs-mcp\"\n\n[mcp_servers.reliaburger]\nargs = [\"mcp\"]\ncommand = \"relish\"\n",
+  ".config/goose/config.yaml": "GOOSE_PROVIDER: anthropic\nextensions:\n  developer:\n    enabled: true\n    type: builtin\n    name: developer\n  reliaburger:\n    args:\n    - mcp\n    cmd: relish\n    description: 'Reliaburger: read-only cluster status, diagnosis and logs'\n    enabled: true\n    envs: {}\n    name: reliaburger\n    timeout: 300\n    type: stdio\n",
+  ".cursor/mcp.json": "{\n  \"mcpServers\": {\n    \"reliaburger\": {\n      \"args\": [\n        \"mcp\"\n      ],\n      \"command\": \"relish\"\n    }\n  }\n}\n",
+  ".gemini/settings.json": "{\n  \"mcpServers\": {\n    \"reliaburger\": {\n      \"args\": [\n        \"mcp\"\n      ],\n      \"command\": \"relish\"\n    }\n  },\n  \"theme\": \"Dracula\"\n}\n",
+  "Library/Application Support/Code/User/mcp.json": "{\n  \"servers\": {\n    \"reliaburger\": {\n      \"args\": [\n        \"mcp\"\n      ],\n      \"command\": \"relish\",\n      \"type\": \"stdio\"\n    }\n  }\n}\n"
+}

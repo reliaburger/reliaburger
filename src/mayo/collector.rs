@@ -71,6 +71,18 @@ impl SystemCollector {
         self.disks.refresh(true);
     }
 
+    /// [`refresh`](Self::refresh) on a blocking thread, for async callers:
+    /// it reads `/proc` for every process on the host and `statvfs`es every
+    /// mount. The collector moves to that thread and comes back; the error
+    /// is a panic there, which loses it.
+    pub async fn refreshed(mut self) -> Result<Self, tokio::task::JoinError> {
+        tokio::task::spawn_blocking(move || {
+            self.refresh();
+            self
+        })
+        .await
+    }
+
     /// Collect node-level metrics (CPU, memory, disk, network).
     pub fn collect_node_metrics(&self) -> Vec<CollectedMetric> {
         let mut metrics = Vec::new();
@@ -243,6 +255,20 @@ impl Default for SystemCollector {
 
 #[cfg(test)]
 mod tests {
+    /// The collection loop refreshed sysinfo on a runtime worker every
+    /// tick: a read of several `/proc/<pid>` files for every process on the
+    /// host, and a `statvfs` of every mount. A node running host jobs has
+    /// thousands of processes. With the blocking pool held busy, a pending
+    /// first poll means the refresh waits for a blocking thread rather than
+    /// running inline (#1674).
+    #[test]
+    fn refreshing_runs_off_the_runtime() {
+        let collector = super::SystemCollector::new();
+        let collector =
+            crate::off_runtime::assert_runs_on_blocking_pool(collector.refreshed()).unwrap();
+        assert!(!collector.collect_node_metrics().is_empty());
+    }
+
     #[test]
     fn exited_processes_are_forgotten_on_refresh() {
         let mut collector = SystemCollector::new();
@@ -488,6 +514,130 @@ mod tests {
         collector.refresh();
         let metrics = collector.collect_node_metrics();
         assert!(!metrics.is_empty());
+    }
+
+    // -- Units pinned against the kernel, not against sysinfo --------------
+    //
+    // A sysinfo bump that changed bytes to KiB, or percent to a fraction,
+    // would still pass every "metric exists and is positive" test above.
+    // These compare with a figure read without sysinfo.
+
+    fn metric_value(metrics: &[CollectedMetric], name: &str) -> f64 {
+        metrics
+            .iter()
+            .find(|m| m.key.name.as_str() == name)
+            .unwrap_or_else(|| panic!("no {name} metric"))
+            .value
+    }
+
+    /// Installed RAM in bytes, as the kernel reports it.
+    fn kernel_memory_total_bytes() -> u64 {
+        #[cfg(target_os = "linux")]
+        {
+            let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap();
+            let line = meminfo
+                .lines()
+                .find(|line| line.starts_with("MemTotal:"))
+                .unwrap();
+            let kib: u64 = line.split_whitespace().nth(1).unwrap().parse().unwrap();
+            kib * 1024
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let output = std::process::Command::new("/usr/sbin/sysctl")
+                .args(["-n", "hw.memsize"])
+                .output()
+                .unwrap();
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap()
+        }
+    }
+
+    /// Resident set size of a process in bytes, from `ps` (which prints KiB).
+    fn ps_resident_bytes(pid: u32) -> u64 {
+        let output = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        let kib: u64 = String::from_utf8(output.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        kib * 1024
+    }
+
+    #[test]
+    fn node_memory_total_is_the_kernel_figure_in_bytes() {
+        let collector = SystemCollector::new();
+        let total = metric_value(&collector.collect_node_metrics(), "node_memory_total_bytes");
+        assert_eq!(total as u64, kernel_memory_total_bytes());
+    }
+
+    #[test]
+    fn node_memory_used_is_bytes_below_the_total() {
+        let mut collector = SystemCollector::new();
+        collector.refresh();
+        let metrics = collector.collect_node_metrics();
+        let used = metric_value(&metrics, "node_memory_used_bytes");
+        let total = metric_value(&metrics, "node_memory_total_bytes");
+        // Any running system uses more than 64 MiB; KiB would be far below.
+        assert!(used > (64 << 20) as f64, "used {used} is not bytes");
+        assert!(used <= total, "used {used} exceeds total {total}");
+    }
+
+    #[test]
+    fn process_memory_is_resident_bytes_not_kibibytes() {
+        let mut collector = SystemCollector::new();
+        collector.refresh();
+        let pid = std::process::id();
+        let (_, memory) = collector.process_usage(pid).unwrap();
+        let rss = ps_resident_bytes(pid);
+        // The two reads are moments apart, so allow drift, but not the
+        // factor of 1,024 a unit change would make.
+        let ratio = memory as f64 / rss as f64;
+        assert!(
+            (0.5..2.0).contains(&ratio),
+            "sysinfo says {memory} bytes, ps says {rss} bytes"
+        );
+    }
+
+    #[test]
+    fn process_cpu_is_percent_of_one_core_and_node_cpu_is_percent_of_all() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let mut collector = SystemCollector::new();
+        collector.refresh();
+        let stop = Arc::new(AtomicBool::new(false));
+        let spinner = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut n: u64 = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    n = std::hint::black_box(n.wrapping_add(1));
+                }
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        collector.refresh();
+        stop.store(true, Ordering::Relaxed);
+        spinner.join().unwrap();
+
+        let (cpu, _) = collector.process_usage(std::process::id()).unwrap();
+        let cpu = cpu.unwrap();
+        // One busy thread is near 100 on a per-core scale. A 0..1 fraction
+        // would stay at or below 1 even on an idle machine.
+        assert!(cpu > 5.0, "process cpu {cpu} is not a percentage");
+
+        let node = metric_value(&collector.collect_node_metrics(), "node_cpu_usage_percent");
+        assert!(
+            (0.0..=100.0).contains(&node),
+            "node cpu {node} is not a 0-100 percentage"
+        );
     }
 
     #[test]

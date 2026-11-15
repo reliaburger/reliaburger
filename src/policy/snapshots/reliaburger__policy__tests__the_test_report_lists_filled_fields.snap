@@ -1,0 +1,10 @@
+---
+source: src/policy/tests.rs
+expression: "report::render_test(&evaluation, 1, 0, 3)"
+---
+Checked 1 app(s) against 3 policy(ies).
+
+  FILL  app payments/web  team-label  deploy.max_unavailable = 1
+  FILL  app payments/web  team-label  env.TEAM = "payments"
+
+2 field(s) filled by defaults, 0 denial(s), 0 warning(s): an apply would be accepted.

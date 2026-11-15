@@ -1,0 +1,6 @@
+---
+source: src/relish/commands.rs
+expression: "render_logs(&lines, OutputFormat::Json).unwrap()"
+---
+{"at":"2026-09-21T14:13:20Z","node":"node-1","instance":"default__web-0","stream":"stdout","text":"listening on :8080"}
+{"at":"2026-09-21T14:13:21Z","node":"node-2","instance":"default__web-1","stream":"stderr","text":"{\"level\":\"error\",\"msg\":\"no \\\"db\\\"\"}"}

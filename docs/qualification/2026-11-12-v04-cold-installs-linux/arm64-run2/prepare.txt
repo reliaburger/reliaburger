@@ -1,0 +1,2 @@
+prepare_seconds: 26
+packages: qemu-system-arm qemu-efi-aarch64 qemu-utils

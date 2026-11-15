@@ -818,7 +818,9 @@ mod tests {
     }
 
     fn descendant_pid(pid_file: &Path) -> i32 {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // Generous: git spawning the hook's shell can take seconds on a
+        // loaded host, and the wait ends as soon as the file appears.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
             if let Ok(text) = fs::read_to_string(pid_file)
                 && let Ok(pid) = text.trim().parse()
@@ -898,16 +900,22 @@ mod tests {
             cancel: cancel.clone(),
         };
         let repo = GitRepo::clone_or_open_with_budget(&url, &clone_path, "main", budget).unwrap();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(500));
+        // Cancel once the hang has started, not after a fixed delay: on a
+        // loaded host git may not have spawned upload-pack within 500 ms,
+        // and a fetch cancelled before that leaves no descendant to check.
+        let watched = pid_file.clone();
+        let canceller = std::thread::spawn(move || {
+            let pid = descendant_pid(&watched);
+            let cancelled_at = std::time::Instant::now();
             cancel.cancel();
+            (pid, cancelled_at)
         });
 
-        let started = std::time::Instant::now();
         let error = repo.fetch().unwrap_err().to_string();
-        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let (pid, cancelled_at) = canceller.join().unwrap();
+        assert!(cancelled_at.elapsed() < std::time::Duration::from_secs(10));
         assert!(error.contains("cancelled"), "got: {error}");
-        assert!(wait_until_gone(descendant_pid(&pid_file)));
+        assert!(wait_until_gone(pid));
     }
 
     fn git_stdout(repo: &Path, args: &[&str]) -> String {

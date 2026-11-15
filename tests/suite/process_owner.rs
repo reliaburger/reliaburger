@@ -80,6 +80,15 @@ impl Owner {
         )
         .unwrap();
         let socket = process_owner::socket_path(&serde_json::from_value(spec).unwrap());
+        // On macOS the first `exec` of Bun in each test process waits for the
+        // host's executable assessment, 4 to 13 s for the debug build at load
+        // average 300 to 440, and longer when other worktrees' new binaries
+        // are queued ahead. Pay it here, under its own bound, so the phase
+        // deadlines below time the owner, not the queue (#1134).
+        crate::first_launch::first_launch(&[(
+            std::path::Path::new(env!("CARGO_BIN_EXE_bun")),
+            &["--version"],
+        )]);
         let child = Command::new(env!("CARGO_BIN_EXE_bun"))
             .args(["__process-owner", "--directory"])
             .arg(directory.path())
@@ -109,8 +118,8 @@ impl Owner {
     }
 
     fn wait_phase(&mut self, expected: &str) -> serde_json::Value {
-        // A fresh large debug binary can spend six seconds in macOS dyld
-        // before main. Retirement latency is tested separately after launch.
+        // `start` has already paid Bun's first launch, so this times only the
+        // owner and its gate. Retirement latency is tested separately.
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
             let record: serde_json::Value = serde_json::from_slice(

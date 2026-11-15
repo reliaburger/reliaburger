@@ -7,8 +7,10 @@ import subprocess
 import shutil
 import tempfile
 import unittest
+import zipfile
 
-from package import GUEST_METADATA, guest_image_statement, package_release
+from package import (GUEST_METADATA, MCPB_MANIFEST, PLATFORMS, guest_image_statement, mcpb_bundle,
+                     mcpb_name, package_release)
 
 # The installers promise `curl ... | sh`. CI's `sh` is dash; macOS's is bash in
 # POSIX mode. Run every installer test under each POSIX shell present.
@@ -27,7 +29,7 @@ class ReleasePackageTests(unittest.TestCase):
         self.trusted = ["ed25519:" + base64.b64encode(public[-32:]).decode()]
         self.assets = self.root / "assets"
         self.assets.mkdir()
-        for name in ("bun-linux-aarch64", "bun-linux-x86_64", "relish-linux-aarch64", "relish-linux-x86_64", "relish-macos-aarch64", "relish-macos-x86_64"):
+        for name in ("bun-linux-aarch64", "bun-linux-x86_64", "relish-linux-aarch64", "relish-linux-x86_64", "relish-macos-aarch64"):
             (self.assets / name).write_bytes(b"test binary: " + name.encode())
         self.pins = json.loads((Path(__file__).with_name("guest-images.json")).read_text())
         for image in self.pins["images"].values():
@@ -75,6 +77,7 @@ class ReleasePackageTests(unittest.TestCase):
             self.package()
         self.assertFalse((self.assets / "metadata.json").exists())
         self.assertFalse((self.assets / GUEST_METADATA).exists())
+        self.assertEqual(list(self.assets.glob("*.mcpb")), [], "no bundle before every artefact is signed")
 
     def test_metadata_keeps_bun_and_cli_selection_separate(self):
         self.package()
@@ -109,6 +112,17 @@ class ReleasePackageTests(unittest.TestCase):
         }
         bun = json.loads((self.assets / "metadata.json").read_text())
         self.assertEqual(bun["releases"][0]["compatibility"], expected)
+
+    def test_metadata_json_points_at_the_release_notes(self):
+        # `relish agent upgrade-check` passes this on, untrusted, so an agent
+        # can show a human where the notes are.
+        self.package()
+        for name in ("metadata.json", "cli-metadata.json"):
+            document = json.loads((self.assets / name).read_text())
+            self.assertEqual(
+                document["releases"][0]["notes"],
+                "Release notes: https://github.com/reliaburger/reliaburger/releases/tag/v0.1.0",
+            )
 
     def test_installer_pins_cli_hash_and_refuses_modified_download(self):
         self.package()
@@ -181,7 +195,7 @@ esac
             with self.subTest(shell=shell, script=script):
                 urls.unlink(missing_ok=True)
                 arguments.unlink(missing_ok=True)
-                result = subprocess.run([shell, str(script), "--nodes", "1"], env=env, capture_output=True)
+                result = subprocess.run([shell, str(script), "--laptop", "--nodes", "1"], env=env, capture_output=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 expected = [mirror + "/relish-macos-aarch64"]
                 if script == bootstrap:
@@ -216,9 +230,199 @@ exit 1
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.decode().splitlines(), ["installer:--nodes", "installer:1"])
                 for invalid in ["v0.1", "0.1.0", "v0.1.0\nv0.1.0", "v0.1.0;id", "v0.1.0 "]:
-                    result = subprocess.run([shell, str(BOOTSTRAP)], env=dict(env, RELIABURGER_VERSION=invalid), capture_output=True)
+                    result = subprocess.run([shell, str(BOOTSTRAP), "--laptop"], env=dict(env, RELIABURGER_VERSION=invalid), capture_output=True)
                     self.assertNotEqual(result.returncode, 0, invalid)
                     self.assertIn(b"invalid RELIABURGER_VERSION", result.stderr)
+
+    # --- Choosing what to install (#670) ------------------------------------
+
+    def arguments_tools(self, name):
+        """`recording_tools` plus a relish that writes its arguments to
+        $ARGUMENTS, so a test can see what the installer asked it to do."""
+        tools = self.recording_tools(name)
+        (self.assets / "relish-macos-aarch64").write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$ARGUMENTS"\n')
+        self.package()
+        return tools
+
+    def test_installer_without_a_mode_explains_the_choices_and_changes_nothing(self):
+        tools = self.arguments_tools("choices-tools")
+        for shell, script in [(shell, script) for shell in POSIX_SHELLS for script in [self.assets / "install.sh", BOOTSTRAP]]:
+            with self.subTest(shell=shell, script=script.parent.name):
+                home = self.root / f"choices-home-{shell}-{script.parent.name}"
+                home.mkdir()
+                calls, env = self.download_env(tools, home)
+                result = subprocess.run([shell, str(script)], env=env, capture_output=True)
+                # Non-zero: an old `curl | sh && relish ...` script must not
+                # carry on as if it had a cluster.
+                self.assertEqual(result.returncode, 2, result.stderr)
+                choices = result.stdout.decode()
+                for promise in ("--laptop", "Lima", "docs/linux-servers.md", "relish init", "relish join",
+                                "--install-only", "Netboot", "not for production",
+                                "curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop"):
+                    self.assertIn(promise, choices)
+                self.assertIn("Nothing was installed", choices)
+                self.assertFalse(calls.exists(), "the installer downloaded something without a mode")
+                self.assertFalse((home / ".reliaburger").exists(), "the installer made a store without a mode")
+
+    def test_bootstrap_and_installer_explain_the_choices_in_the_same_words(self):
+        def explanation(text):
+            start = text.index("explain_choices() {")
+            return text[start:text.index("\n}\n", start)]
+        self.assertEqual(explanation(BOOTSTRAP.read_text()),
+                         explanation(Path(__file__).with_name("install.sh.in").read_text()))
+
+    def test_installer_help_shows_the_choices_and_succeeds(self):
+        tools = self.arguments_tools("help-tools")
+        home = self.root / "help-home"
+        home.mkdir()
+        for shell in POSIX_SHELLS:
+            for flag in ("--help", "-h"):
+                with self.subTest(shell=shell, flag=flag):
+                    calls, env = self.download_env(tools, home)
+                    result = subprocess.run([shell, str(self.assets / "install.sh"), flag], env=env, capture_output=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("--laptop", result.stdout.decode())
+                    # How a stranger checks the files (#1583), with this
+                    # release's repository filled in.
+                    self.assertIn("gh attestation verify ~/.reliaburger/bin/relish --repo reliaburger/reliaburger",
+                                  result.stdout.decode())
+                    self.assertIn("--signer-workflow reliaburger/reliaburger/.github/workflows/build.yml",
+                                  result.stdout.decode())
+                    self.assertFalse(calls.exists())
+                    self.assertFalse((home / ".reliaburger").exists())
+
+    def test_laptop_installs_relish_and_builds_the_laptop_cluster(self):
+        tools = self.arguments_tools("laptop-tools")
+        arguments = self.root / "laptop-arguments"
+        mirror = "https://example.com/r"
+        cases = {
+            ("--laptop",): [],
+            ("--laptop", "--nodes", "1"): ["--nodes", "1"],
+            ("--no-modify-path", "--laptop", "--nodes", "1"): ["--nodes", "1"],
+            ("--laptop", "--no-modify-path", "--nodes", "1"): ["--nodes", "1"],
+        }
+        for shell in POSIX_SHELLS:
+            for number, (given, forwarded) in enumerate(cases.items()):
+                with self.subTest(shell=shell, arguments=given):
+                    home = self.root / f"laptop-home-{shell}-{number}"
+                    home.mkdir()
+                    arguments.unlink(missing_ok=True)
+                    _, env = self.download_env(tools, home)
+                    env = dict(env, ARGUMENTS=str(arguments))
+                    result = subprocess.run([shell, str(self.assets / "install.sh"), *given], env=env, capture_output=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(arguments.read_text().splitlines(),
+                                     ["setup", "--quickstart", "--release-mirror", mirror, *forwarded])
+
+    def test_installer_refuses_an_unknown_option_with_usage(self):
+        tools = self.arguments_tools("unknown-tools")
+        cases = [
+            ["--bogus"],
+            # Setup options go after --laptop, so alone they're unknown.
+            ["--nodes", "1"],
+            ["--install-only", "--nodes", "1"],
+            ["--laptop", "--install-only"],
+            ["--install-only", "--laptop"],
+            ["--ssh"],
+            ["--ssh", "u@a", "--laptop"],
+            ["--laptop", "--ssh", "u@a"],
+        ]
+        for shell in POSIX_SHELLS:
+            for number, given in enumerate(cases):
+                with self.subTest(shell=shell, arguments=given):
+                    home = self.root / f"unknown-home-{shell}-{number}"
+                    home.mkdir()
+                    calls, env = self.download_env(tools, home)
+                    result = subprocess.run([shell, str(self.assets / "install.sh"), *given], env=env, capture_output=True)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    stderr = result.stderr.decode()
+                    self.assertIn("usage:", stderr)
+                    self.assertIn("--laptop", stderr)
+                    self.assertFalse(calls.exists(), "a refused option reached a download")
+                    self.assertFalse((home / ".reliaburger").exists())
+
+    def test_ssh_installs_relish_and_builds_on_the_machines(self):
+        tools = self.arguments_tools("ssh-mode-tools")
+        arguments = self.root / "ssh-mode-arguments"
+        mirror = "https://example.com/r"
+        for shell in POSIX_SHELLS:
+            with self.subTest(shell=shell):
+                home = self.root / f"ssh-mode-home-{shell}"
+                home.mkdir()
+                arguments.unlink(missing_ok=True)
+                _, env = self.download_env(tools, home)
+                env = dict(env, ARGUMENTS=str(arguments))
+                result = subprocess.run([shell, str(self.assets / "install.sh"), "--ssh", "u@a,u@b", "--name", "lab"],
+                                        env=env, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(arguments.read_text().splitlines(),
+                                 ["setup", "--ssh", "u@a,u@b", "--release-mirror", mirror, "--name", "lab"])
+
+    def test_bootstrap_refuses_ssh_for_releases_from_before_it(self):
+        """The site's bootstrap goes live before 0.2.6 does, so --ssh has to
+        fail by name rather than as an unknown option, and before a download."""
+        import os
+        calls = self.root / "ssh-urls"
+        tools = self.root / "ssh-tools"
+        tools.mkdir()
+        (tools / "curl").write_text(f"#!/bin/sh\ntouch {calls}\n")
+        (tools / "curl").chmod(0o755)
+        env = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ["PATH"])
+        env.pop("RELIABURGER_RELEASE_BASE_URL", None)
+        for shell in POSIX_SHELLS:
+            for version in ("v0.2.4", "v0.2.5"):
+                with self.subTest(shell=shell, version=version):
+                    result = subprocess.run([shell, str(BOOTSTRAP), "--ssh", "u@a"], capture_output=True,
+                                            env=dict(env, RELIABURGER_VERSION=version))
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(f"--ssh arrived in 0.2.6, and this installs {version}", result.stderr.decode())
+                    self.assertFalse(calls.exists())
+
+    def test_bootstrap_drops_laptop_for_releases_from_before_it(self):
+        """0.2.1 and older build the laptop cluster without a flag and would
+        hand --laptop to `relish setup`, which refuses it. The Intel Mac
+        advice installs 0.2.1 this way."""
+        import os
+        tools = self.root / "old-release-tools"
+        tools.mkdir()
+        (tools / "curl").write_text("""#!/bin/sh
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o) printf '%s\\n' 'printf "installer:%s\\n" "$@"' > "$2"; shift ;;
+    https://*) printf '%s\\n' "$1" >> "$URLS" ;;
+  esac
+  shift
+done
+""")
+        (tools / "curl").chmod(0o755)
+        urls = self.root / "old-release-urls"
+        env = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ["PATH"], URLS=str(urls))
+        env.pop("RELIABURGER_RELEASE_BASE_URL", None)
+        cases = {
+            "v0.1.6": ["--nodes", "1"],
+            "v0.2.1": ["--nodes", "1"],
+            "v0.2.2": ["--laptop", "--nodes", "1"],
+            "v0.2.2-rc.1": ["--laptop", "--nodes", "1"],
+            "v0.3.0": ["--laptop", "--nodes", "1"],
+            "v1.0.0": ["--laptop", "--nodes", "1"],
+        }
+        for shell in POSIX_SHELLS:
+            for version, forwarded in cases.items():
+                with self.subTest(shell=shell, version=version):
+                    urls.unlink(missing_ok=True)
+                    result = subprocess.run([shell, "-s", "--", "--laptop", "--nodes", "1"], input=BOOTSTRAP.read_bytes(),
+                                            env=dict(env, RELIABURGER_VERSION=version), capture_output=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.decode().splitlines(), [f"installer:{a}" for a in forwarded])
+                    self.assertEqual(urls.read_text().splitlines(),
+                                     [f"https://github.com/reliaburger/reliaburger/releases/download/{version}/install.sh"])
+            with self.subTest(shell=shell, mirror=True):
+                # A mirror serves a candidate of this release, which knows the flag.
+                result = subprocess.run([shell, str(BOOTSTRAP), "--laptop"], capture_output=True,
+                                        env=dict(env, RELIABURGER_VERSION="v0.2.1",
+                                                 RELIABURGER_RELEASE_BASE_URL="https://example.com/r"))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.decode().splitlines(), ["installer:--laptop"])
 
     def flaky_tools(self, name, chunk):
         """Fake `curl` that delivers `chunk` more bytes per call and fails
@@ -432,6 +636,8 @@ esac
         summary_quote = "sed -n '/^where the time went/,$p' \"$evidence/install.log\""
         self.assertIn(mirror_check, qualify)
         self.assertIn(summary_quote, qualify)
+        # Without a mode the installer only explains the choices (#670).
+        self.assertIn("sh -s -- --laptop --timings", qualify)
         relish_output = ("using an explicit release mirror with checksum and signature verification\n"
                          "... check host\n"
                          "where the time went\n"
@@ -449,7 +655,7 @@ esac
             with self.subTest(shell=shell):
                 _, env = self.download_env(tools, home)
                 with log.open("wb") as output:
-                    result = subprocess.run([shell, str(BOOTSTRAP), "--timings"], env=env,
+                    result = subprocess.run([shell, str(BOOTSTRAP), "--laptop", "--timings"], env=env,
                                             stdout=output, stderr=subprocess.STDOUT)
                 self.assertEqual(result.returncode, 0, log.read_text())
                 env = dict(env, evidence=str(evidence))
@@ -482,6 +688,150 @@ esac
         if shutil.which("shellcheck"):
             result = subprocess.run(["shellcheck", "-s", "sh", *map(str, scripts)], capture_output=True)
             self.assertEqual(result.returncode, 0, result.stdout)
+
+    def test_cli_is_built_for_apple_silicon_only_on_macos(self):
+        # Maintainer decision, 17 October 2026 (#1018): 0.2.1 is the last
+        # release with an Intel macOS build.
+        self.package()
+        cli = json.loads((self.assets / "cli-metadata.json").read_text())
+        self.assertEqual(set(cli["releases"][0]["platforms"]), {"linux-aarch64", "linux-x86_64", "macos-aarch64"})
+        self.assertFalse((self.assets / "relish-macos-x86_64.sig").exists())
+        self.assertNotIn("macos-x86_64", (self.assets / "SHA256SUMS").read_text())
+        installer = (self.assets / "install.sh").read_text()
+        self.assertNotIn("@MACOS_X86_64", installer)
+        self.assertNotIn("platform=macos-x86_64", installer)
+
+    def intel_mac_tools(self, name, sysctl):
+        """A Mac whose uname says x86_64, with `sysctl` given by the caller."""
+        tools = self.root / name
+        tools.mkdir()
+        (tools / "uname").write_text('#!/bin/sh\ncase "$1" in -s) echo Darwin;; -m) echo x86_64;; esac\n')
+        (tools / "sysctl").write_text("#!/bin/sh\n" + sysctl)
+        (tools / "curl").write_text('#!/bin/sh\nfor argument; do printf "%s\\n" "$argument" >>"$CALLS"; done\n'
+                                    'while [ "$#" -gt 0 ]; do if [ "$1" = -o ]; then cp "$FIXTURE" "$2"; exit; fi; shift; done\nexit 1\n')
+        for tool in tools.iterdir():
+            tool.chmod(0o755)
+        return tools
+
+    def test_installer_refuses_an_intel_mac_and_says_what_to_use(self):
+        import os
+        self.package()
+        installer = self.assets / "install.sh"
+        intel = {
+            # An Intel Mac has no hw.optional.arm64 at all.
+            "missing": 'echo "sysctl: unknown oid \'hw.optional.arm64\'" >&2\nexit 1\n',
+            "zero": 'echo 0\n',
+        }
+        for shell in POSIX_SHELLS:
+            for case, sysctl in intel.items():
+                with self.subTest(shell=shell, sysctl=case):
+                    tools = self.intel_mac_tools(f"intel-{shell}-{case}", sysctl)
+                    home = self.root / f"intel-home-{shell}-{case}"
+                    home.mkdir()
+                    calls = self.root / f"intel-calls-{shell}-{case}"
+                    env = dict(os.environ, HOME=str(home), PATH=str(tools) + os.pathsep + os.environ["PATH"],
+                               CALLS=str(calls), FIXTURE=str(self.assets / "relish-macos-aarch64"))
+                    for arguments in (["--install-only"], ["--laptop"], [], ["--bogus"]):
+                        result = subprocess.run([shell, str(installer), *arguments], env=env, capture_output=True)
+                        self.assertEqual(result.returncode, 1, arguments)
+                        stderr = result.stderr.decode()
+                        self.assertIn("Intel Mac", stderr)
+                        self.assertIn("Apple silicon", stderr)
+                        self.assertIn("Linux", stderr)
+                        self.assertIn("RELIABURGER_VERSION=v0.2.1 sh -s -- --laptop", stderr)
+                        self.assertEqual(result.stdout, b"", "an Intel Mac was shown the choices")
+                        self.assertFalse(calls.exists(), "an Intel Mac reached a download")
+                        self.assertFalse((home / ".reliaburger").exists(), "an Intel Mac got a store")
+
+    def test_installer_gives_apple_silicon_under_rosetta_the_native_build(self):
+        # A shell running under Rosetta sees `uname -m` say x86_64 on an
+        # Apple silicon Mac; the hardware still says arm64.
+        import os
+        self.package()
+        installer = self.assets / "install.sh"
+        for shell in POSIX_SHELLS:
+            with self.subTest(shell=shell):
+                tools = self.intel_mac_tools(f"rosetta-{shell}", 'echo 1\n')
+                home = self.root / f"rosetta-home-{shell}"
+                home.mkdir()
+                calls = self.root / f"rosetta-calls-{shell}"
+                env = dict(os.environ, HOME=str(home), PATH=str(tools) + os.pathsep + os.environ["PATH"],
+                           CALLS=str(calls), FIXTURE=str(self.assets / "relish-macos-aarch64"))
+                result = subprocess.run([shell, str(installer), "--install-only"], env=env, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("https://github.com/reliaburger/reliaburger/releases/download/v0.1.0/relish-macos-aarch64",
+                              calls.read_text().splitlines())
+                self.assertEqual((home / ".reliaburger/bin/relish").read_bytes(),
+                                 (self.assets / "relish-macos-aarch64").read_bytes())
+
+    # --- MCP Bundles (#1695) ---------------------------------------------------
+
+    def test_each_relish_platform_gets_a_bundle_of_its_binary_and_the_manifest(self):
+        self.package()
+        template = json.loads(MCPB_MANIFEST.read_text())
+        sums = (self.assets / "SHA256SUMS").read_text()
+        for platform in PLATFORMS["relish"]:
+            with self.subTest(platform=platform):
+                path = self.assets / f"relish-{platform}.mcpb"
+                self.assertEqual(path.name, mcpb_name(platform))
+                with zipfile.ZipFile(path) as bundle:
+                    self.assertEqual(sorted(bundle.namelist()), ["manifest.json", "server/relish"])
+                    self.assertEqual(bundle.read("server/relish"),
+                                     (self.assets / f"relish-{platform}").read_bytes())
+                    executable = bundle.getinfo("server/relish").external_attr >> 16
+                    self.assertEqual(executable & 0o777, 0o755)
+                    manifest = json.loads(bundle.read("manifest.json"))
+                self.assertEqual(manifest["version"], "0.1.0")
+                expected = "darwin" if platform.startswith("macos-") else "linux"
+                self.assertEqual(manifest["compatibility"]["platforms"], [expected])
+                self.assertEqual(manifest["server"]["entry_point"], "server/relish")
+                for field in ("manifest_version", "name", "description", "server", "tools", "user_config"):
+                    self.assertEqual(manifest[field], template[field])
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                self.assertIn(f"{digest}  {path.name}\n", sums)
+
+    def test_each_bundle_is_signed_with_the_release_key_like_every_binary(self):
+        # The same envelope as `relish-<platform>.sig`. MCPB clients don't
+        # read it: they only recognise a certificate signature inside the
+        # bundle. It lets anyone check the bundle against the release key.
+        self.package()
+        for platform in PLATFORMS["relish"]:
+            with self.subTest(platform=platform):
+                path = self.assets / mcpb_name(platform)
+                envelope = json.loads(path.with_name(path.name + ".sig").read_text())
+                self.assertEqual(set(envelope), {"schema", "sha256", "embedded", "external"})
+                self.assertEqual(envelope["schema"], 1)
+                self.assertIsNone(envelope["external"])
+                self.assertEqual(envelope["sha256"], hashlib.sha256(path.read_bytes()).hexdigest())
+                self.assertTrue(self.verify_signature(path.read_bytes(), envelope["embedded"]))
+                self.assertFalse(self.verify_signature(path.read_bytes() + b"x", envelope["embedded"]))
+
+    def test_a_failed_bundle_signature_writes_no_bundle_or_signature(self):
+        (self.assets / "bun-linux-aarch64").unlink()
+        with self.assertRaises(ValueError):
+            self.package()
+        self.assertEqual(list(self.assets.glob("*.mcpb*")), [])
+
+    def test_bun_gets_no_bundle(self):
+        self.package()
+        self.assertEqual(sorted(path.name for path in self.assets.glob("*.mcpb")),
+                         sorted(mcpb_name(platform) for platform in PLATFORMS["relish"]))
+
+    def test_a_bundle_is_the_same_bytes_every_time(self):
+        # candidate.json records the bundle's digest, and the registry entry
+        # carries it, so packaging the same binary twice must agree.
+        template = json.loads(MCPB_MANIFEST.read_text())
+        binary = self.assets / "relish-linux-x86_64"
+        first = mcpb_bundle(binary, template, "v0.1.0", "linux-x86_64")
+        binary.touch()
+        self.assertEqual(first, mcpb_bundle(binary, template, "v0.1.0", "linux-x86_64"))
+        self.assertNotEqual(first, mcpb_bundle(binary, template, "v0.1.1", "linux-x86_64"))
+
+    def test_a_bundle_never_changes_the_committed_manifest(self):
+        template = json.loads(MCPB_MANIFEST.read_text())
+        before = json.dumps(template, sort_keys=True)
+        mcpb_bundle(self.assets / "relish-macos-aarch64", template, "v0.1.0", "macos-aarch64")
+        self.assertEqual(json.dumps(template, sort_keys=True), before)
 
     def test_untrusted_key_cannot_publish_metadata(self):
         self.trusted = ["ed25519:" + base64.b64encode(bytes(32)).decode()]

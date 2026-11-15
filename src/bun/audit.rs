@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
 use super::events::{AuditEvent, EventKind, EventSeverity};
+use crate::redact::redact_secrets;
 
 pub mod refusals;
 
@@ -81,6 +82,9 @@ pub struct AuditRecord {
     pub action: String,
     /// The authenticated principal that asked for the action.
     pub principal: String,
+    /// What kind of principal that is: `human`, `agent`, `workload`,
+    /// `system`, `policy` or `unknown` (#1682's design).
+    pub principal_kind: crate::sesame::types::PrincipalKind,
     /// Related app, when the action has one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app: Option<String>,
@@ -168,9 +172,19 @@ pub struct AuditFilter {
     /// A principal id, or the token name it was recorded under.
     #[serde(default)]
     pub principal: Option<String>,
+    /// An app or job the action touched.
+    #[serde(default)]
+    pub app: Option<String>,
     /// The namespace the action touched.
     #[serde(default)]
     pub namespace: Option<String>,
+    /// Only records whose principal is of this kind.
+    #[serde(default)]
+    pub principal_kind: Option<crate::sesame::types::PrincipalKind>,
+    /// Only records about this proposal: its own, and the app records its
+    /// apply wrote.
+    #[serde(default)]
+    pub proposal: Option<u64>,
     /// How many of the newest matching records to return.
     #[serde(default)]
     pub limit: Option<usize>,
@@ -200,10 +214,70 @@ impl AuditFilter {
                     || record.details.get("token_name").map(String::as_str) == Some(principal)
             })
             && self
-                .namespace
+                .app
                 .as_deref()
-                .is_none_or(|namespace| record.namespace.as_deref() == Some(namespace))
+                .is_none_or(|app| touched_app(record.app.as_deref(), &record.details, app))
+            && self.namespace.as_deref().is_none_or(|namespace| {
+                record.namespace.as_deref() == Some(namespace)
+                    || record
+                        .details
+                        .get("namespaces")
+                        .is_some_and(|listed| listed.split(',').any(|name| name == namespace))
+            })
+            && self
+                .principal_kind
+                .is_none_or(|kind| record.principal_kind == kind)
+            && self.proposal.is_none_or(|proposal| {
+                record.details.get("proposal").map(String::as_str)
+                    == Some(proposal.to_string().as_str())
+            })
     }
+}
+
+/// The workloads an apply lists under `details.workloads`, when it touched
+/// more than `app` can name.
+#[derive(Debug)]
+pub struct WorkloadList<'a> {
+    /// Each `name@namespace` the record kept, sorted.
+    pub listed: Vec<&'a str>,
+    /// How many more the apply touched, which the record only counted.
+    pub unlisted: usize,
+}
+
+impl<'a> WorkloadList<'a> {
+    /// The list in `details`, if there is one.
+    pub fn from_details(details: &'a BTreeMap<String, String>) -> Option<Self> {
+        let mut listed: Vec<&str> = details.get("workloads")?.split(',').collect();
+        let unlisted = listed
+            .last()
+            .and_then(|last| last.strip_prefix('+')?.strip_suffix(" more")?.parse().ok());
+        if unlisted.is_some() {
+            listed.pop();
+        }
+        Some(Self {
+            listed,
+            unlisted: unlisted.unwrap_or(0),
+        })
+    }
+
+    /// Whether `app` is in the list, or could be among those only counted.
+    fn may_name(&self, app: &str) -> bool {
+        self.unlisted > 0
+            || self.listed.iter().any(|workload| {
+                workload
+                    .split_once('@')
+                    .is_some_and(|(name, _)| name == app)
+            })
+    }
+}
+
+/// Whether the audited action with this `app` and `details` touched `wanted`.
+///
+/// A list that was cut short can't rule an app out, so it counts as a match:
+/// an audit search that hides a possible match is worse than one extra line.
+pub fn touched_app(app: Option<&str>, details: &BTreeMap<String, String>, wanted: &str) -> bool {
+    app == Some(wanted)
+        || WorkloadList::from_details(details).is_some_and(|list| list.may_name(wanted))
 }
 
 /// Keep the newest `limit` records of `records`, oldest first, ordered by
@@ -215,26 +289,6 @@ pub fn newest(mut records: Vec<AuditRecord>, limit: usize) -> Vec<AuditRecord> {
     let excess = records.len().saturating_sub(limit);
     records.drain(..excess);
     records
-}
-
-/// Replace anything shaped like a Reliaburger secret (API tokens and join
-/// tokens both start `rbrg_`) with a marker. Handlers never put secrets in a
-/// record; this is the second line of defence should one ever slip through.
-pub fn redact_secrets(text: &str) -> String {
-    const MARKER: &str = "rbrg_";
-    let mut redacted = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = rest.find(MARKER) {
-        redacted.push_str(&rest[..start]);
-        let after = &rest[start + MARKER.len()..];
-        let end = after
-            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-            .unwrap_or(after.len());
-        redacted.push_str("rbrg_[redacted]");
-        rest = &after[end..];
-    }
-    redacted.push_str(rest);
-    redacted
 }
 
 /// Facts a handler adds to the record its route's audit makes: the
@@ -591,7 +645,9 @@ impl SegmentWriter {
 }
 
 /// Turn an audit event into the record the log stores, scrubbing anything
-/// shaped like a secret.
+/// shaped like a secret. Handlers never put secrets in a record; the shared
+/// redaction rules in [`crate::redact`] are the second line of defence
+/// should one ever slip through.
 fn to_record(sequence: u64, event: AuditEvent) -> AuditRecord {
     AuditRecord {
         sequence,
@@ -600,6 +656,7 @@ fn to_record(sequence: u64, event: AuditEvent) -> AuditRecord {
         severity: event.severity,
         action: event.action,
         principal: event.principal,
+        principal_kind: event.principal_kind,
         app: event.app,
         namespace: event.namespace,
         node: event.node,
@@ -683,6 +740,7 @@ fn read_records(directory: &Path, filter: &AuditFilter) -> Result<Vec<AuditRecor
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sesame::types::PrincipalKind;
 
     fn event(action: &str, namespace: Option<&str>) -> AuditEvent {
         AuditEvent {
@@ -697,6 +755,7 @@ mod tests {
             source_address: Some("192.0.2.7:51234".parse().unwrap()),
             details: BTreeMap::from([("token_name".to_string(), "alice".to_string())]),
             message: format!("{action} by alice"),
+            principal_kind: PrincipalKind::Human,
         }
     }
 
@@ -911,6 +970,149 @@ mod tests {
         assert_eq!(query(newest_one).await, ["app.deleted"]);
     }
 
+    /// #1682's design: `relish audit --principal-kind agent` and
+    /// `--proposal 17`. The kind is a field every record has, and survives
+    /// the log's round trip through disk.
+    #[tokio::test]
+    async fn query_filters_by_principal_kind_and_proposal() {
+        let dir = tempfile::tempdir().unwrap();
+        let log =
+            AuditLog::open(dir.path().join("audit"), AuditLimits::from_total(1 << 20)).unwrap();
+        let mut proposed = event("proposal.created", Some("shop"));
+        proposed.principal_kind = PrincipalKind::Agent;
+        proposed
+            .details
+            .insert("proposal".to_string(), "17".to_string());
+        let mut applied = event("app.applied", Some("shop"));
+        applied
+            .details
+            .insert("proposal".to_string(), "17".to_string());
+        let mut other = event("app.applied", Some("shop"));
+        other
+            .details
+            .insert("proposal".to_string(), "171".to_string());
+        let mut swept = event("token.expired_swept", None);
+        swept.principal_kind = PrincipalKind::System;
+        for record in [proposed, applied, other, swept] {
+            assert!(log.submit(record).written().await);
+        }
+        let query = |filter: AuditFilter| {
+            let log = log.clone();
+            async move {
+                log.query(filter)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|record| (record.action, record.principal_kind))
+                    .collect::<Vec<_>>()
+            }
+        };
+        let agents = AuditFilter {
+            principal_kind: Some(PrincipalKind::Agent),
+            ..AuditFilter::default()
+        };
+        assert_eq!(
+            query(agents).await,
+            [("proposal.created".to_string(), PrincipalKind::Agent)]
+        );
+        let system = AuditFilter {
+            principal_kind: Some(PrincipalKind::System),
+            ..AuditFilter::default()
+        };
+        assert_eq!(
+            query(system).await,
+            [("token.expired_swept".to_string(), PrincipalKind::System)]
+        );
+        let one_proposal = AuditFilter {
+            proposal: Some(17),
+            ..AuditFilter::default()
+        };
+        assert_eq!(
+            query(one_proposal).await,
+            [
+                ("proposal.created".to_string(), PrincipalKind::Agent),
+                ("app.applied".to_string(), PrincipalKind::Human),
+            ]
+        );
+    }
+
+    /// The record an apply across two namespaces makes: no single app or
+    /// namespace, the names under `workloads` and `namespaces` (#1501).
+    fn multi_app_apply(workloads: &str) -> AuditRecord {
+        AuditRecord {
+            sequence: 1,
+            timestamp: 10,
+            kind: EventKind::Operation,
+            severity: EventSeverity::Info,
+            action: "app.applied".to_string(),
+            principal: "token:alice".to_string(),
+            app: None,
+            namespace: None,
+            node: None,
+            source_address: None,
+            details: BTreeMap::from([
+                ("workloads".to_string(), workloads.to_string()),
+                ("namespaces".to_string(), "payments,team-a".to_string()),
+            ]),
+            message: String::new(),
+            principal_kind: PrincipalKind::Human,
+        }
+    }
+
+    #[test]
+    fn a_namespace_filter_finds_an_apply_that_spanned_several_namespaces() {
+        let record = multi_app_apply("api@payments,web@team-a");
+        let filter = |namespace: &str| AuditFilter {
+            namespace: Some(namespace.to_string()),
+            ..AuditFilter::default()
+        };
+        assert!(filter("payments").matches(&record));
+        assert!(filter("team-a").matches(&record));
+        assert!(!filter("team").matches(&record));
+        assert!(!filter("team-b").matches(&record));
+    }
+
+    #[test]
+    fn an_app_filter_finds_every_app_a_multi_app_apply_listed() {
+        let record = multi_app_apply("api@payments,web@team-a");
+        let filter = |app: &str| AuditFilter {
+            app: Some(app.to_string()),
+            ..AuditFilter::default()
+        };
+        assert!(filter("api").matches(&record));
+        assert!(filter("web").matches(&record));
+        assert!(!filter("we").matches(&record));
+        assert!(!filter("payments").matches(&record));
+    }
+
+    #[test]
+    fn an_app_filter_matches_the_app_a_record_names_and_no_other() {
+        let record = AuditRecord {
+            app: Some("web".to_string()),
+            details: BTreeMap::new(),
+            ..multi_app_apply("")
+        };
+        let filter = |app: &str| AuditFilter {
+            app: Some(app.to_string()),
+            ..AuditFilter::default()
+        };
+        assert!(filter("web").matches(&record));
+        assert!(!filter("api").matches(&record));
+    }
+
+    #[test]
+    fn an_app_filter_keeps_a_record_whose_list_was_cut_short() {
+        // The app may be one of the five the record only counted, and an
+        // audit search that hides a possible match is worse than one extra
+        // line.
+        let record = multi_app_apply("api@payments,+5 more");
+        let filter = AuditFilter {
+            app: Some("zebra".to_string()),
+            ..AuditFilter::default()
+        };
+        assert!(filter.matches(&record));
+    }
+
     #[test]
     fn newest_merges_nodes_by_time_and_keeps_the_latest() {
         let record = |node: &str, sequence: u64, timestamp: u64| AuditRecord {
@@ -920,6 +1122,7 @@ mod tests {
             severity: EventSeverity::Info,
             action: "app.applied".to_string(),
             principal: "token:alice".to_string(),
+            principal_kind: crate::sesame::types::PrincipalKind::Human,
             app: None,
             namespace: None,
             node: Some(node.to_string()),
@@ -983,5 +1186,21 @@ mod tests {
             redact_secrets("token rbrg_0123abcd, then more"),
             "token rbrg_[redacted], then more"
         );
+    }
+
+    #[test]
+    fn a_record_is_scrubbed_of_every_secret_shape_the_shared_rules_know() {
+        let mut leaky = event("app.applied", None);
+        leaky.message = "applied with ENC[AGE:c2VjcmV0] from https://u:pw@git.example".to_string();
+        leaky
+            .details
+            .insert("identity".to_string(), "AGE-SECRET-KEY-1QYQSZQ".to_string());
+        let record = to_record(1, leaky);
+        assert_eq!(
+            record.message,
+            "applied with ENC[AGE:[redacted]] from https://[redacted]@git.example"
+        );
+        assert_eq!(record.details["identity"], "AGE-SECRET-KEY-1[redacted]");
+        assert_eq!(record.details["token_name"], "alice");
     }
 }

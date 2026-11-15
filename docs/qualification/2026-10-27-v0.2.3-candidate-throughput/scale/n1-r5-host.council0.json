@@ -1,0 +1,112 @@
+{
+  "summary": {
+    "epoch": 0,
+    "epochs": {
+      "0": [
+        "reliaburger-scale-1",
+        "reliaburger-scale-2",
+        "reliaburger-scale-3"
+      ]
+    },
+    "leaders": [
+      "reliaburger-scale-1"
+    ],
+    "fenced": [],
+    "voters": [
+      "reliaburger-scale-1",
+      "reliaburger-scale-2",
+      "reliaburger-scale-3"
+    ],
+    "voters_answering": [
+      "reliaburger-scale-1",
+      "reliaburger-scale-2",
+      "reliaburger-scale-3"
+    ],
+    "lagging": [],
+    "unanswered": [],
+    "fence_unpersisted": []
+  },
+  "nodes": [
+    {
+      "node_id": "reliaburger-scale-1",
+      "error": null,
+      "role": "leader",
+      "recovery_epoch": 0,
+      "fenced_by": null,
+      "split_with": null,
+      "fence_persist_error": null,
+      "leader": "reliaburger-scale-1",
+      "term": 4,
+      "last_applied": 987,
+      "last_log_index": 987,
+      "members": [
+        {
+          "name": "reliaburger-scale-1",
+          "voter": true
+        },
+        {
+          "name": "reliaburger-scale-2",
+          "voter": true
+        },
+        {
+          "name": "reliaburger-scale-3",
+          "voter": true
+        }
+      ]
+    },
+    {
+      "node_id": "reliaburger-scale-2",
+      "error": null,
+      "role": "follower",
+      "recovery_epoch": 0,
+      "fenced_by": null,
+      "split_with": null,
+      "fence_persist_error": null,
+      "leader": "reliaburger-scale-1",
+      "term": 4,
+      "last_applied": 987,
+      "last_log_index": 987,
+      "members": [
+        {
+          "name": "reliaburger-scale-1",
+          "voter": true
+        },
+        {
+          "name": "reliaburger-scale-2",
+          "voter": true
+        },
+        {
+          "name": "reliaburger-scale-3",
+          "voter": true
+        }
+      ]
+    },
+    {
+      "node_id": "reliaburger-scale-3",
+      "error": null,
+      "role": "follower",
+      "recovery_epoch": 0,
+      "fenced_by": null,
+      "split_with": null,
+      "fence_persist_error": null,
+      "leader": "reliaburger-scale-1",
+      "term": 4,
+      "last_applied": 987,
+      "last_log_index": 987,
+      "members": [
+        {
+          "name": "reliaburger-scale-1",
+          "voter": true
+        },
+        {
+          "name": "reliaburger-scale-2",
+          "voter": true
+        },
+        {
+          "name": "reliaburger-scale-3",
+          "voter": true
+        }
+      ]
+    }
+  ]
+}

@@ -15,6 +15,25 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+// A `#[path]` here is relative to this file's directory, so every binary that
+// includes this module gets the helper without declaring it itself. A binary
+// that also needs it directly reaches it as `bun_process::first_launch`.
+#[path = "first_launch.rs"]
+pub mod first_launch;
+
+/// Pay the first launch of `bun`, `relish` and `testapp` in this test
+/// process, all at once, before any helper starts a deadline (#1149). On
+/// macOS a launch that `syspolicyd` hasn't assessed yet waits in a host-wide
+/// queue, and nextest runs each test in a process of its own; see
+/// `first_launch.rs`. Later calls in the same process return at once.
+pub fn first_launch_binaries() {
+    first_launch::first_launch(&[
+        (Path::new(env!("CARGO_BIN_EXE_bun")), &["--version"]),
+        (Path::new(env!("CARGO_BIN_EXE_relish")), &["--version"]),
+        (Path::new(env!("CARGO_BIN_EXE_testapp")), &["--version"]),
+    ]);
+}
+
 /// Keep a readable Bun log unchanged, or expose only the failed read's kind.
 /// Error text and paths can contain sensitive fixture data and are omitted.
 pub fn bun_log_diagnostic(log_path: &Path) -> String {
@@ -88,6 +107,9 @@ fn safe_relish_phase(args: &[&str]) -> &'static str {
     if args.contains(&"council") {
         return "membership-council-command";
     }
+    if args.contains(&"apps") {
+        return "apps-command";
+    }
     if args.contains(&"status") {
         return "status-command";
     }
@@ -99,6 +121,34 @@ fn safe_relish_phase(args: &[&str]) -> &'static str {
 
 /// How long a helper waits for Bun or Relish before failing the test.
 pub const WAIT: Duration = Duration::from_secs(30);
+
+/// Stop a Mac idle-sleeping while the process `pid` runs.
+///
+/// A fixture's leases expire by the wall clock, which keeps running while
+/// the Mac sleeps, but the test's own deadlines are `Instant`s, which on
+/// macOS don't. A laptop that idles into sleep mid-test wakes with its
+/// leases expired and their cleanup done, and the test fails as if the
+/// product had lost its work (#1527). `caffeinate -i -w` holds an
+/// idle-sleep assertion until `pid` exits. A closed lid still sleeps; the
+/// runner's report names that case. Elsewhere this does nothing.
+fn keep_host_awake_while_running(pid: u32) {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let Ok(mut caffeinate) = Command::new("/usr/bin/caffeinate")
+        .args(["-i", "-w", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return;
+    };
+    // caffeinate exits once `pid` does; reap it then.
+    std::thread::spawn(move || {
+        let _ = caffeinate.wait();
+    });
+}
 
 /// A running `bun` child, terminated (SIGTERM, then SIGKILL) on drop.
 pub struct BunProcess {
@@ -120,6 +170,7 @@ impl BunProcess {
         log_path: PathBuf,
         runtime: &str,
     ) -> Self {
+        first_launch_binaries();
         let _phase = fixture_phase("bun-child-spawn");
         let log = std::fs::File::create(&log_path).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_bun"));
@@ -135,10 +186,9 @@ impl BunProcess {
         if clustered {
             command.arg("--cluster");
         }
-        Self {
-            child: command.spawn().unwrap(),
-            log_path,
-        }
+        let child = command.spawn().unwrap();
+        keep_host_awake_while_running(child.id());
+        Self { child, log_path }
     }
 
     /// Panic with Bun's log if the process has already exited.
@@ -240,11 +290,11 @@ impl PortBlockReservation {
 
 /// Reserve a block until its returned guard is dropped, including downtime.
 pub fn reserve_port_block_lease(count: u16) -> PortBlockReservation {
-    use rand::Rng;
+    use rand::RngExt;
     assert!(count > 0 && count < TEST_PORTS.end - TEST_PORTS.start);
-    let mut random = rand::thread_rng();
+    let mut random = rand::rng();
     for _ in 0..1_000 {
-        let base = random.gen_range(TEST_PORTS.start..TEST_PORTS.end - count);
+        let base = random.random_range(TEST_PORTS.start..TEST_PORTS.end - count);
         if let Some(reservation) = PortBlockReservation::try_reserve(base, count) {
             return reservation;
         }
@@ -430,6 +480,7 @@ pub fn assert_success(output: &Output, context: &str) {
 
 /// Retry a Relish command until it succeeds, failing if Bun exits first.
 pub fn wait_for_relish(bun: &mut BunProcess, args: &[&str]) -> Output {
+    first_launch_binaries();
     let _phase = fixture_phase("relish-endpoint-readiness");
     let deadline = Instant::now() + WAIT;
     loop {
@@ -453,6 +504,7 @@ pub fn wait_for_relish(bun: &mut BunProcess, args: &[&str]) -> Output {
 /// Retry a Relish command until it succeeds and its stdout contains
 /// `expected`, failing if Bun exits first.
 pub fn wait_for_relish_output(bun: &mut BunProcess, args: &[&str], expected: &str) -> Output {
+    first_launch_binaries();
     let deadline = Instant::now() + WAIT;
     loop {
         bun.assert_running();

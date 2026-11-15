@@ -1,0 +1,11 @@
+---
+source: src/relish/bench_jobs.rs
+expression: "render_human(&options, &report)"
+---
+jobs-host-processes: 1350000 unique accepted successes in 60 seconds (22500.0/s)
+0 failures, 0 retries; cleanup verified
+1.9B runs/day extrapolated — not an observed daily total
+per node (successes each node reported; fair share by slots, +20% allowed): balanced
+  node-1     7666.7/s   34.1% of successes, fair  33.3%, 27 slots
+  node-2     7500.0/s   33.3% of successes, fair  33.3%, 27 slots
+  node-3     7333.3/s   32.6% of successes, fair  33.3%, 27 slots

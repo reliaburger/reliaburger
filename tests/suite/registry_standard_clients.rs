@@ -225,9 +225,8 @@ async fn start_registry_at(address: std::net::IpAddr, node_name: &str) -> Regist
 /// like docker with the CA in `certs.d`.
 fn tls_client(root_ca_der: &[u8]) -> reqwest::Client {
     reqwest::Client::builder()
-        .use_rustls_tls()
-        .tls_built_in_root_certs(false)
-        .add_root_certificate(reqwest::Certificate::from_der(root_ca_der).unwrap())
+        .tls_backend_rustls()
+        .tls_certs_only([reqwest::Certificate::from_der(root_ca_der).unwrap()])
         .build()
         .unwrap()
 }

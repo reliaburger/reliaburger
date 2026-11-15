@@ -192,7 +192,8 @@ pub fn capability_refusal(
                 .into(),
         );
     }
-    let limits = template.is_some_and(|t| t.cpu.is_some() || t.memory.is_some());
+    let limits =
+        template.is_some_and(|t| t.cpu.is_some() || t.memory.is_some() || t.pids.is_some());
     if let Some(template) = template {
         if template.runtime == JobRuntime::SharedRunc {
             return (!capabilities.containers)
@@ -217,7 +218,8 @@ pub fn capability_refusal(
     }
     if limits && !capabilities.host_limits {
         return Some(
-            "the host process runtime cannot enforce CPU or memory limits; use image tasks".into(),
+            "the host process runtime cannot enforce CPU, memory or pids limits; use image tasks"
+                .into(),
         );
     }
     if !binary_allowed {
@@ -838,6 +840,15 @@ impl TaskArrayNode {
             .map_or(default, |cap| cap.min(default).max(1))
     }
 
+    /// What this node reports about the attempts it runs, for routing a
+    /// fault to them. Empty for runners that don't list attempts.
+    pub fn attempt_statuses(&self) -> Vec<super::live_attempts::AttemptStatus> {
+        match self.runner.as_ref() {
+            NodeRunner::Owned(runner) => runner.live_attempts().statuses(),
+            NodeRunner::Process(_) | NodeRunner::Fake(_) => Vec::new(),
+        }
+    }
+
     /// The kinds of job this node runs, as it advertises them over gossip
     /// (#788). [`capability_refusal`] turns them back into the verdict
     /// `admit` reaches, so the leader can judge a run without asking.
@@ -1151,7 +1162,8 @@ impl TaskArrayNode {
             let cancel = run.cancel.child_token();
             run.chunks.insert(chunk, (attempt, cancel.clone()));
             let work = ChunkWork {
-                template: assignment.template.clone(),
+                // Shared by every attempt of the chunk, not copied for each.
+                template: assignment.template.as_deref().cloned().map(Arc::new),
                 batch_id: assignment.batch_id,
                 spec: assignment.spec.clone(),
                 chunk: ChunkId(chunk),
@@ -1168,6 +1180,9 @@ impl TaskArrayNode {
                 .into_iter()
                 .filter(|r| r.grant_attempt == attempt)
                 .collect();
+            // Taken here, in grant and then chunk order, so the earliest
+            // held chunk takes slots first and finishes first (#1030).
+            let turn = run.pool.take_turn();
             tokio::spawn(run_chunk(
                 Arc::clone(&run.pool),
                 run.ledger.clone(),
@@ -1179,7 +1194,7 @@ impl TaskArrayNode {
                     syncs: Arc::clone(&self.output_syncs),
                 },
                 work,
-                resumed,
+                (resumed, turn),
                 cancel,
                 (Arc::clone(&self.telemetry), assignment.labels.clone()),
             ));
@@ -1606,7 +1621,7 @@ async fn run_chunk(
     array_cancel: CancellationToken,
     sink: OutputSink,
     work: ChunkWork,
-    resumed: Vec<TaskRecord>,
+    (resumed, turn): (Vec<TaskRecord>, super::task_executor::DispatchTurn),
     cancel: CancellationToken,
     (telemetry, labels): (
         Arc<crate::mayo::job_metrics::JobTelemetry>,
@@ -1656,7 +1671,7 @@ async fn run_chunk(
         result
     };
     let (outcome, persisted) = tokio::join!(
-        pool.resume_chunk_streaming(&work, resumed, &cancel, Some(sender)),
+        pool.resume_chunk_streaming(&work, resumed, &cancel, Some(sender), turn),
         stream_work
     );
     let durable = async {
@@ -2109,6 +2124,82 @@ mod tests {
         }
     }
 
+    /// A sync of array 1 holding `held`, at `term` and `index` of epoch 0.
+    fn sync_at(term: u64, index: u64, held: &[(u32, u64)]) -> NodeSyncRequest {
+        let mut sync = request(vec![assignment(1, 40, held)]);
+        sync.version = ControlVersion {
+            epoch: 0,
+            term,
+            index,
+        };
+        sync
+    }
+
+    fn refused_as_stale(answer: &NodeSyncResponse) -> bool {
+        answer.arrays[0]
+            .refused
+            .as_deref()
+            .is_some_and(|reason| reason.contains("stale control version"))
+    }
+
+    #[tokio::test]
+    async fn a_follow_up_and_the_next_ticks_request_pass_the_fence_but_a_late_older_call_does_not()
+    {
+        // #1360: a tick calls the node at the index it read, commits new
+        // grants, then calls again at once at the committed index. The
+        // next tick reads no older state, so it passes the fence too; a
+        // call from before the follow-up that turns up afterwards doesn't.
+        let root = tempfile::tempdir().unwrap();
+        let node = fake_node(root.path(), FakeRunner::always_succeeds());
+        let tick = node.sync(&sync_at(1, 5, &[])).await.unwrap();
+        assert!(!refused_as_stale(&tick));
+        let follow_up = sync_at(1, 6, &[(0, 1)]);
+        let progress = sync_until_finished(&node, &follow_up, 1).await;
+        assert_eq!(progress.finished[0].chunk, ChunkId(0));
+        let flushes = node.control_syncs();
+        // Nothing committed between the follow-up and the next tick.
+        let next = node.sync(&sync_at(1, 6, &[(0, 1)])).await.unwrap();
+        assert!(!refused_as_stale(&next));
+        assert_eq!(next.arrays[0].finished.len(), 1);
+        assert_eq!(node.control_syncs(), flushes, "an unchanged fence flushed");
+        let late = node.sync(&sync_at(1, 5, &[])).await.unwrap();
+        assert!(refused_as_stale(&late));
+        assert!(!refused_as_stale(
+            &node.sync(&sync_at(1, 7, &[(0, 1)])).await.unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_deposed_leaders_follow_up_is_refused_once_the_new_leader_has_called() {
+        // The old leader committed its tick in term 1 and lost leadership
+        // before its follow-up reached the node. The new leader (term 2)
+        // has already called, so the follow-up is refused and its grant
+        // never runs here.
+        let root = tempfile::tempdir().unwrap();
+        let node = fake_node(root.path(), FakeRunner::always_succeeds());
+        assert!(!refused_as_stale(
+            &node.sync(&sync_at(1, 5, &[])).await.unwrap()
+        ));
+        assert!(!refused_as_stale(
+            &node.sync(&sync_at(2, 7, &[])).await.unwrap()
+        ));
+        let deposed = node.sync(&sync_at(1, 7, &[(0, 1)])).await.unwrap();
+        assert!(refused_as_stale(&deposed));
+        assert!(deposed.arrays[0].finished.is_empty());
+
+        // The other order: the follow-up arrives first and is a committed
+        // grant like any other, and the new leader's call still passes.
+        let root = tempfile::tempdir().unwrap();
+        let node = fake_node(root.path(), FakeRunner::always_succeeds());
+        assert!(!refused_as_stale(
+            &node.sync(&sync_at(1, 5, &[])).await.unwrap()
+        ));
+        sync_until_finished(&node, &sync_at(1, 6, &[(0, 1)]), 1).await;
+        let new_leader = node.sync(&sync_at(2, 6, &[(0, 1)])).await.unwrap();
+        assert!(!refused_as_stale(&new_leader));
+        assert_eq!(new_leader.arrays[0].finished.len(), 1);
+    }
+
     #[tokio::test]
     async fn a_moving_fence_is_rewritten_in_place_without_a_rename() {
         // Under load the leader's applied index moves every tick, so the
@@ -2509,6 +2600,49 @@ mod tests {
             .collect();
         assert_eq!(finished, vec![(0, 1, 10), (2, 3, 5)]);
         assert_eq!(progress.counters.succeeded, 15);
+    }
+
+    #[tokio::test]
+    async fn held_chunks_run_one_after_another_and_the_first_is_reported_first() {
+        let root = tempfile::tempdir().unwrap();
+        // The order tasks finish in, not a count taken when the receipt
+        // arrives: the receipt waits for the ledger's fsync, so a count
+        // would time the runner's disk (it failed CI's coverage run).
+        // A std mutex: the runner's outcome is a synchronous callback, and
+        // the push is the whole critical section.
+        let finished_tasks = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = Arc::clone(&finished_tasks);
+        let runner = FakeRunner::new(Duration::from_millis(5), move |task| {
+            record.lock().unwrap().push(task.index);
+            AttemptOutcome::Exited { code: 0 }
+        });
+        let node = fake_node(root.path(), runner);
+        let held: Vec<(u32, u64)> = (0..8).map(|chunk| (chunk, 1)).collect();
+        let mut capped = assignment(1, 80, &held);
+        capped.spec.per_node_concurrency = Some(2);
+        let sync = request(vec![capped]);
+        let progress = sync_until_finished(&node, &sync, 1).await;
+        // Its receipt goes to the leader first, so the leader can top the
+        // node up while the other seven chunks still run.
+        assert_eq!(progress.finished[0].chunk, ChunkId(0), "{progress:?}");
+        let progress = sync_until_finished(&node, &sync, 8).await;
+        assert_eq!(progress.counters.succeeded, 80);
+
+        // Chunk N's tasks take both slots before chunk N+1's start, so all
+        // of chunk 0 is done before anything past chunk 1 finishes. Run in
+        // lockstep, every chunk finishes near the end.
+        let chunks: Vec<u32> = finished_tasks
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|index| index / 10)
+            .collect();
+        let last_of_first = chunks.iter().rposition(|&chunk| chunk == 0).unwrap();
+        let first_of_third = chunks.iter().position(|&chunk| chunk >= 2).unwrap();
+        assert!(
+            last_of_first < first_of_third,
+            "chunks finished interleaved: {chunks:?}"
+        );
     }
 
     #[tokio::test]

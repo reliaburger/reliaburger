@@ -1,0 +1,48 @@
+---
+source: src/relish/inspect.rs
+expression: "crate::relish::output::format_output(&inspection,\ncrate::relish::OutputFormat::Json).unwrap()"
+---
+{
+  "name": "hello",
+  "desired": [
+    {
+      "app": "hello",
+      "namespace": "default",
+      "desired_replicas": 3,
+      "scheduled_replicas": 3,
+      "placements": {
+        "node-1": 2,
+        "node-2": 1
+      },
+      "service_port": null
+    }
+  ],
+  "desired_error": null,
+  "nodes": [
+    {
+      "answer": "answered",
+      "node": "node-1",
+      "instances": [
+        {
+          "id": "default__hello-0",
+          "app_name": "hello",
+          "namespace": "default",
+          "state": "running",
+          "restart_count": 0,
+          "host_port": null,
+          "pid": 100
+        }
+      ]
+    },
+    {
+      "answer": "silent",
+      "node": "node-2",
+      "reason": "timed out after 10s"
+    },
+    {
+      "answer": "down",
+      "node": "node-3",
+      "state": "dead"
+    }
+  ]
+}

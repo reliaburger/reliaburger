@@ -286,6 +286,7 @@ pub async fn binary(
     cache: &Path,
     version: &BinaryVersion,
     name: &str,
+    arch: &str,
     downloader: &Downloader,
     step: &Step,
 ) -> Result<PathBuf> {
@@ -298,10 +299,10 @@ pub async fn binary(
         .metadata(&format!("{REPOSITORY}/{version}/{manifest}"))
         .await?;
     let artifact = metadata
-        .artifact_for(version, &format!("linux-{}", std::env::consts::ARCH))
+        .artifact_for(version, &format!("linux-{arch}"))
         .context("release has no binary for the requested guest architecture")?
         .clone();
-    let path = cache.join(format!("{name}-{version}-linux-{}", std::env::consts::ARCH));
+    let path = cache.join(format!("{name}-{version}-linux-{arch}"));
     downloader
         .fetch(
             &artifact.url,

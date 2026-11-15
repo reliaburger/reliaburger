@@ -15,7 +15,7 @@
 
 use std::collections::BTreeMap;
 
-use super::types::{FaultRequest, FaultSummary, FaultType, ReplicaEvidence};
+use super::types::{FaultRequest, FaultSummary, FaultType, ReplicaEvidence, WorkloadKind};
 
 /// One instance of the target service, as a node reported it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +26,10 @@ pub struct WorkloadInstance {
     pub instance_id: String,
     /// Whether the instance is running and so can be faulted.
     pub running: bool,
+    /// The task index, for an attempt of a job or task array.
+    pub task_index: Option<u32>,
+    /// What kind of workload the instance belongs to.
+    pub kind: WorkloadKind,
 }
 
 /// A fault request addressed to the node that owns its targets.
@@ -46,6 +50,58 @@ pub enum RoutingError {
     NoRunningSources { namespace: String, app: String },
     #[error("node {node} is not a live cluster member that could host a caller")]
     NoSuchCallerNode { node: String },
+    #[error("{job} is a job or task array, so --instance takes a task index, not {instance:?}")]
+    NotATaskIndex { job: String, instance: String },
+    #[error("{service} is an app; a task index only scopes a job or task array")]
+    TaskIndexOnApp { service: String },
+}
+
+/// Work out from what runs whether a workload fault targets an app or a job,
+/// and scope it to match. Returns the candidates to plan with.
+///
+/// `apps` are the instances of an app with the target's name and namespace;
+/// `attempts` are the running attempts of a job with that name and
+/// namespace. Apps and jobs can't share a name in one namespace, so at most
+/// one list has anything in it. The request's own `workload` is overwritten:
+/// a caller can't label an app as a job to step around the replica rail.
+///
+/// For a job, a numeric `target_instance` (`relish fault --instance 3`) is a
+/// task index and moves into `task_index`.
+pub fn scope_workload_fault(
+    request: &mut FaultRequest,
+    apps: Vec<WorkloadInstance>,
+    attempts: Vec<WorkloadInstance>,
+) -> Result<Vec<WorkloadInstance>, RoutingError> {
+    let Some(kind) = attempts
+        .first()
+        .filter(|_| apps.is_empty())
+        .map(|attempt| attempt.kind)
+    else {
+        request.workload = WorkloadKind::App;
+        if request.task_index.is_some() {
+            return Err(RoutingError::TaskIndexOnApp {
+                service: request.target_service.clone(),
+            });
+        }
+        return Ok(apps);
+    };
+    request.workload = kind;
+    scope_to_task(request)?;
+    Ok(attempts)
+}
+
+/// Move a job fault's numeric `--instance` into its task index.
+pub fn scope_to_task(request: &mut FaultRequest) -> Result<(), RoutingError> {
+    if let Some(instance) = request.target_instance.take() {
+        let index = instance
+            .parse::<u32>()
+            .map_err(|_| RoutingError::NotATaskIndex {
+                job: request.target_service.clone(),
+                instance: instance.clone(),
+            })?;
+        request.task_index = Some(index);
+    }
+    Ok(())
 }
 
 /// Split a workload fault into one request per node that owns a target.
@@ -62,11 +118,12 @@ pub fn plan_workload_fault(
     let mut candidates: Vec<&WorkloadInstance> = instances
         .iter()
         .filter(|instance| instance.running)
-        .filter(|instance| {
-            request
+        .filter(|instance| match request.task_index {
+            Some(index) => instance.task_index == Some(index),
+            None => request
                 .target_instance
                 .as_deref()
-                .is_none_or(|target| target == instance.instance_id)
+                .is_none_or(|target| target == instance.instance_id),
         })
         .filter(|instance| {
             request
@@ -221,6 +278,8 @@ mod tests {
 
     fn request(fault_type: FaultType) -> FaultRequest {
         FaultRequest {
+            workload: Default::default(),
+            task_index: None,
             fault_type,
             target_service: "web".to_string(),
             namespace: Some("default".to_string()),
@@ -240,6 +299,8 @@ mod tests {
             node: node.to_string(),
             instance_id: id.to_string(),
             running: true,
+            task_index: None,
+            kind: WorkloadKind::App,
         }
     }
 
@@ -400,6 +461,7 @@ mod tests {
     #[test]
     fn network_faults_do_not_count_as_unavailable_replicas() {
         let fault = |kind: &str| FaultSummary {
+            task_index: None,
             id: 1,
             fault_type: kind.to_string(),
             target_service: "web".to_string(),
@@ -422,6 +484,7 @@ mod tests {
     #[test]
     fn replica_evidence_counts_faults_from_every_node() {
         let fault = |service: &str| FaultSummary {
+            task_index: None,
             id: 1,
             fault_type: "pause".to_string(),
             target_service: service.to_string(),
@@ -450,6 +513,7 @@ mod tests {
     #[test]
     fn replica_evidence_ignores_pauses_in_another_namespace() {
         let pause = |namespace: &str| FaultSummary {
+            task_index: None,
             id: 1,
             fault_type: "pause".to_string(),
             target_service: "web".to_string(),
@@ -467,5 +531,67 @@ mod tests {
             &[pause("team-b"), pause("team-b"), pause("default")],
         );
         assert_eq!(evidence.faulted_replicas, 1);
+    }
+
+    fn attempt(node: &str, index: u32) -> WorkloadInstance {
+        WorkloadInstance {
+            node: node.to_string(),
+            instance_id: format!("render[{index}]"),
+            running: true,
+            task_index: Some(index),
+            kind: WorkloadKind::TaskArray,
+        }
+    }
+
+    #[test]
+    fn cluster_router_routes_a_task_fault_to_the_node_running_it() {
+        let mut targeted = request(FaultType::Pause);
+        targeted.target_service = "render".to_string();
+        targeted.target_instance = Some("2".to_string());
+        let attempts = vec![
+            attempt("node-1", 0),
+            attempt("node-1", 1),
+            attempt("node-2", 2),
+        ];
+
+        let candidates = scope_workload_fault(&mut targeted, Vec::new(), attempts).unwrap();
+        let plan = plan_workload_fault(&targeted, &candidates).unwrap();
+
+        assert_eq!(targeted.workload, WorkloadKind::TaskArray);
+        assert_eq!(targeted.task_index, Some(2));
+        assert_eq!(targeted.target_instance, None);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].node, "node-2");
+        assert_eq!(plan[0].request.task_index, Some(2));
+        assert_eq!(plan[0].request.workload, WorkloadKind::TaskArray);
+    }
+
+    #[test]
+    fn a_caller_cannot_label_an_app_as_a_job() {
+        let mut relabelled = request(FaultType::Kill { count: 0 });
+        relabelled.workload = WorkloadKind::Job;
+        scope_workload_fault(&mut relabelled, spread(), Vec::new()).unwrap();
+        assert_eq!(relabelled.workload, WorkloadKind::App);
+    }
+
+    #[test]
+    fn a_task_fault_needs_a_numeric_task_index() {
+        let mut targeted = request(FaultType::Kill { count: 1 });
+        targeted.target_service = "render".to_string();
+        targeted.target_instance = Some("default/render-0".to_string());
+        assert!(matches!(
+            scope_workload_fault(&mut targeted, Vec::new(), vec![attempt("node-1", 0)]),
+            Err(RoutingError::NotATaskIndex { .. })
+        ));
+    }
+
+    #[test]
+    fn a_task_index_on_an_app_is_refused() {
+        let mut targeted = request(FaultType::Kill { count: 1 });
+        targeted.task_index = Some(0);
+        assert!(matches!(
+            scope_workload_fault(&mut targeted, spread(), Vec::new()),
+            Err(RoutingError::TaskIndexOnApp { .. })
+        ));
     }
 }

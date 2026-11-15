@@ -5,8 +5,8 @@
 //! ```sh blocks) show the same tour. Every `relish …` line in them must parse
 //! with the real CLI definition: we run the compiled binary with
 //! `RELISH_PARSE_ONLY=1`, which parses the arguments and exits without doing
-//! anything. The two copies must list the same commands, and the demo
-//! manifest the tour applies must exist and be published by the Pages workflow.
+//! anything. The two copies must list the same commands, and the demo app
+//! the tour builds must exist and be published by the Pages workflow.
 //!
 //! `scripts/ci/select-jobs.sh` counts `docs/website/index.html` as code so an
 //! edit to the page alone still runs this test.
@@ -22,15 +22,19 @@ const PENDING: &[(&str, &str)] = &[];
 
 const DEMO_MANIFEST_PENDING: bool = false;
 
-const INSTALL_LINE: &str = "curl -fsSL https://reliaburger.com/install.sh | sh";
+/// The one-line install names its mode: without one the installer only
+/// explains the choices (#670).
+const INSTALL_LINE: &str = "curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop";
+/// The Kubernetes demo the manual's Kubernetes chapter applies. The tour
+/// used it until 0.2.3 (#1343); the site still publishes it.
 const DEMO_URL: &str = "https://reliaburger.com/demo/podinfo.yaml";
 const DEMO_SOURCE: &str = "examples/kubernetes/podinfo.yaml";
 
-fn repository() -> PathBuf {
+pub(crate) fn repository() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn read(path: &str) -> String {
+pub(crate) fn read(path: &str) -> String {
     std::fs::read_to_string(repository().join(path)).unwrap()
 }
 
@@ -102,8 +106,31 @@ fn relish_lines(commands: &[String]) -> Vec<String> {
     lines
 }
 
+/// A command line split into words as a shell would for the commands the
+/// site shows: on whitespace, with a double-quoted string as one word.
+fn shell_words(command: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quoted = false;
+    for c in command.chars() {
+        match c {
+            '"' => quoted = !quoted,
+            c if c.is_whitespace() && !quoted => {
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+            }
+            c => word.push(c),
+        }
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words
+}
+
 fn parses(command: &str) -> Result<(), String> {
-    let arguments: Vec<&str> = command.split_whitespace().skip(1).collect();
+    let arguments: Vec<String> = shell_words(command).into_iter().skip(1).collect();
     let output = Command::new(env!("CARGO_BIN_EXE_relish"))
         .args(&arguments)
         .env("RELISH_PARSE_ONLY", "1")
@@ -167,6 +194,50 @@ fn homepage_and_manual_show_the_same_tour() {
     );
 }
 
+/// Every place that shows someone how to pipe the installer to a shell
+/// names a mode, `--laptop` or `--install-only`. A bare `| sh` now only
+/// prints the choices, so a page showing one would leave its reader with
+/// nothing installed (#670).
+#[test]
+fn every_shown_install_line_names_a_mode() {
+    let mut pages = vec![
+        "README.md".to_string(),
+        "docs/website/index.html".to_string(),
+        "docs/website/README.md".to_string(),
+        "scripts/demo/tour.sh".to_string(),
+        "scripts/release/install.sh.in".to_string(),
+    ];
+    for directory in ["docs", "docs/manual", "docs/book"] {
+        for entry in std::fs::read_dir(repository().join(directory)).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|extension| extension == "md") {
+                let relative = path.strip_prefix(repository()).unwrap();
+                pages.push(relative.to_string_lossy().into_owned());
+            }
+        }
+    }
+    let mut failures = Vec::new();
+    for page in &pages {
+        for (number, line) in read(page).lines().enumerate() {
+            let Some(at) = line.find("reliaburger.com/install.sh |") else {
+                continue;
+            };
+            let rest = &line[at..];
+            if !["--laptop", "--install-only", "--ssh"]
+                .iter()
+                .any(|mode| rest.contains(&format!("sh -s -- {mode}")))
+            {
+                failures.push(format!("{page}:{}: {}", number + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "these install lines name no mode; add `sh -s -- --laptop`, `--ssh` or `--install-only`:\n{}",
+        failures.join("\n")
+    );
+}
+
 /// The recording's script (`scripts/demo/tour.sh`) reads its commands from
 /// the page, and knows how to run and wait for each one. A command added to
 /// the tour must be taught to the script too, or the recording drifts.
@@ -194,8 +265,7 @@ fn manual_tour_opens_the_tour_chapter() {
 
 #[test]
 fn the_demo_manifest_is_published_from_the_tested_example() {
-    let page = read("docs/website/index.html");
-    assert!(page.contains(DEMO_URL));
+    assert!(read("docs/manual/09_kubernetes.md").contains(DEMO_URL));
     let workflow = read(".github/workflows/static.yml");
     assert!(
         workflow.contains(&format!("cp {DEMO_SOURCE} docs/website/demo/podinfo.yaml")),
@@ -223,11 +293,36 @@ const BURGER_FILES: &[&str] = &[
     "batch.go",
     "batch_test.go",
     "burger.toml",
+    "cheese-v2.toml",
+    "counter.go",
+    "counter_test.go",
     "go.mod",
     "jobs.toml",
+    "layer.go",
+    "layer_test.go",
     "main.go",
-    "main_test.go",
+    "metrics.go",
+    "metrics_test.go",
+    "patty-v3.toml",
+    "render.go",
+    "render_test.go",
+    "triple-patty.toml",
 ];
+
+/// The burger's layers, top to bottom: one app each, named as the counter
+/// asks for them (`layerOrder` in `layer.go`).
+const BURGER_LAYERS: &[&str] = &[
+    "top-bun",
+    "lettuce",
+    "tomato",
+    "cheese",
+    "patty",
+    "bottom-bun",
+];
+
+fn burger_config(file: &str) -> reliaburger::config::Config {
+    reliaburger::config::Config::from_file(&repository().join(BURGER_SOURCE).join(file)).unwrap()
+}
 
 fn burger_files_on_disk() -> Vec<String> {
     let mut files: Vec<String> = std::fs::read_dir(repository().join(BURGER_SOURCE))
@@ -254,16 +349,74 @@ fn the_demo_app_is_published_from_the_tested_example() {
     );
     assert_eq!(burger_files_on_disk(), BURGER_FILES);
 
-    let config = reliaburger::config::Config::from_file(
-        &repository().join(BURGER_SOURCE).join("burger.toml"),
-    )
-    .unwrap();
+    let config = burger_config("burger.toml");
     let build = &config.build["burger"];
     assert_eq!(build.context, Path::new("."));
     assert_eq!(build.destination, "pickle://burger:v1");
-    // The app runs what the build pushed, by the bare name nodes resolve
-    // through Pickle.
-    assert_eq!(config.app["burger"].image.as_deref(), Some("burger:v1"));
+    // One image plays every part: each app runs what the build pushed, by
+    // the bare name nodes resolve through Pickle.
+    let mut apps: Vec<&str> = config.app.keys().map(String::as_str).collect();
+    apps.sort();
+    let mut expected = BURGER_LAYERS.to_vec();
+    expected.extend(["counter", "diner"]);
+    expected.sort();
+    assert_eq!(apps, expected);
+    for (name, app) in &config.app {
+        assert_eq!(app.image.as_deref(), Some("burger:v1"), "{name}");
+    }
+    for layer in BURGER_LAYERS {
+        let env = &config.app[*layer].env;
+        assert_eq!(
+            env.get("LAYER"),
+            Some(&reliaburger::config::EnvValue::Plain(layer.to_string())),
+            "{layer} must serve its own layer"
+        );
+        assert_eq!(
+            env.get("VERSION"),
+            Some(&reliaburger::config::EnvValue::Plain("v1".into()))
+        );
+    }
+    let counter = &config.app["counter"];
+    assert_eq!(
+        counter
+            .ingress
+            .as_ref()
+            .map(|ingress| ingress.host.as_str()),
+        Some("burger.localhost")
+    );
+}
+
+/// The tour changes one layer at a time with a small file each. Each must be
+/// `burger.toml`'s app with exactly the change the tour describes, so a later
+/// edit to `burger.toml` can't leave a step silently changing more.
+#[test]
+fn each_tour_change_file_changes_one_thing() {
+    use reliaburger::config::{EnvValue, Replicas};
+    let base = burger_config("burger.toml");
+    let changes: [(&str, &str, &str, Option<u32>); 3] = [
+        ("cheese-v2.toml", "cheese", "v2", None),
+        ("patty-v3.toml", "patty", "v3", None),
+        ("triple-patty.toml", "patty", "v1", Some(3)),
+    ];
+    for (file, app, version, replicas) in changes {
+        let config = burger_config(file);
+        let names: Vec<&String> = config.app.keys().collect();
+        assert_eq!(names, [app], "{file} should change {app} alone");
+        assert!(config.build.is_empty() && config.job.is_empty(), "{file}");
+        let mut expected = base.app[app].clone();
+        expected
+            .env
+            .insert("VERSION".into(), EnvValue::Plain(version.into()));
+        if let Some(replicas) = replicas {
+            expected.replicas = Replicas::Fixed(replicas);
+        }
+        assert_eq!(config.app[app], expected, "{file}");
+        let page = read("docs/website/index.html");
+        assert!(
+            page.contains(&format!("relish apply burger/{file}")),
+            "the tour doesn't apply {file}"
+        );
+    }
 }
 
 /// Most tasks the tour's jobs step may submit. Fresh containers run at about
@@ -273,7 +426,10 @@ const TOUR_JOBS_MAX: i64 = 16;
 
 /// Each cohort's `count` in the tour's job manifest, by cohort name.
 fn burger_job_counts() -> std::collections::BTreeMap<String, i64> {
-    let manifest: toml::Value = read(&format!("{BURGER_SOURCE}/jobs.toml")).parse().unwrap();
+    // `toml::from_str`, not `.parse::<toml::Value>()`: since toml 0.9,
+    // `Value`'s `FromStr` reads a single value, not a whole document.
+    let manifest: toml::Table =
+        toml::from_str(&read(&format!("{BURGER_SOURCE}/jobs.toml"))).unwrap();
     manifest["cohort"]
         .as_array()
         .unwrap()
@@ -427,6 +583,52 @@ fn readme_quick_start_is_part_of_the_tour() {
     assert!(lines.contains(&"relish build burger/burger.toml".to_string()));
 }
 
+/// Whitespace collapsed to single spaces, so where markup breaks a line
+/// doesn't count.
+fn normalise(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The README opens with the homepage's hero, word for word: the headline,
+/// the agents line and the lede. Only the logo and the title come before it.
+#[test]
+fn readme_hero_matches_the_homepage() {
+    let page = read("docs/website/index.html");
+    let element = |open: &str, close: &str| {
+        let start = page
+            .find(open)
+            .unwrap_or_else(|| panic!("index.html lost {open:?}"));
+        let body = &page[start..];
+        let body = &body[body.find('>').unwrap() + 1..];
+        let body = &body[..body.find(close).unwrap()];
+        decode(&strip_tags(&body.replace("<br>", " ")))
+    };
+    let homepage = normalise(
+        &[
+            element("<h1 id=\"title\"", "</h1>"),
+            element("<p class=\"headline-agents\"", "</p>"),
+            element("<p class=\"lede\"", "</p>"),
+        ]
+        .join(" "),
+    );
+    assert!(homepage.contains("served ready"), "{homepage:?}");
+
+    let readme = read("README.md");
+    let (start_marker, end_marker) = ("<!-- hero:start -->", "<!-- hero:end -->");
+    let start = readme.find(start_marker).expect("README lost its hero") + start_marker.len();
+    let end = readme.find(end_marker).expect("README's hero has no end");
+    let hero = normalise(&readme[start..end].replace("**", ""));
+    assert_eq!(
+        hero, homepage,
+        "the README's hero differs from index.html's"
+    );
+    assert_eq!(
+        normalise(&strip_tags(&readme[..start - start_marker.len()])),
+        "# Reliaburger",
+        "only the logo and the title may come before the hero"
+    );
+}
+
 /// The `id` of every `<section>` on the homepage, in page order.
 fn section_ids(page: &str) -> Vec<Option<String>> {
     page.match_indices("<section")
@@ -455,8 +657,11 @@ fn every_section_can_be_linked_to() {
     unique.dedup();
     assert_eq!(unique.len(), ids.len(), "duplicate section ids: {ids:?}");
     for id in [
+        "why",
         "install",
         "tour",
+        "debug",
+        "act",
         "start",
         "docs",
         "internals",
@@ -477,6 +682,77 @@ fn every_section_can_be_linked_to() {
         css.contains("scroll-margin-top"),
         "linked headings need scroll-margin-top"
     );
+}
+
+/// The page sets expectations before anyone installs, and the date it gives
+/// for 1.0.0 is the one the roadmap gives.
+#[test]
+fn the_status_box_says_who_it_is_for_and_when_1_0_0_is_due() {
+    let page = read("docs/website/index.html");
+    let start = page
+        .find("<aside class=\"status status-note\"")
+        .expect("the page has no status box");
+    let install = page.find("<section id=\"tour\"").unwrap();
+    assert!(start < install, "the status box should sit by the install");
+    let text = strip_tags(&page[start..start + page[start..].find("</aside>").unwrap()]);
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    for phrase in ["home labs", "dev clusters", "production until 1.0.0"] {
+        assert!(text.contains(phrase), "the status box lacks {phrase:?}");
+    }
+    assert!(text.contains("January 2027"));
+    assert!(read("docs/roadmap.md").contains("January 2027"));
+}
+
+/// The day run is the page's headline claim, so its memory chart stays beside
+/// it through later releases, in its own directory because a promotion empties
+/// `assets/soak/`. It's a copy of the record's chart, shown lazily like the rest.
+#[test]
+fn the_jobs_section_shows_the_day_run_s_memory_chart_from_its_record() {
+    let page = read("docs/website/index.html");
+    let start = page.find("<section id=\"job-throughput\"").unwrap();
+    let section = &page[start..start + page[start..].find("</section>").unwrap()];
+    let source = "assets/day-run/rss.svg";
+    let tag = img_tags(section)
+        .into_iter()
+        .find(|tag| attribute(tag, "src") == Some(source))
+        .expect("the jobs section doesn't show the day run's memory chart");
+    assert!(attribute(tag, "alt").is_some_and(|alt| !alt.trim().is_empty()));
+    assert_eq!(attribute(tag, "loading"), Some("lazy"));
+    for size in ["width", "height"] {
+        assert!(attribute(tag, size).is_some(), "the chart has no {size}");
+    }
+    assert_eq!(
+        read("docs/website/assets/day-run/rss.svg"),
+        read(&format!(
+            "docs/qualification/{DAY_RUN_RECORD}-charts/rss.svg"
+        )),
+        "the day run's chart differs from its record; copy it again"
+    );
+    assert!(
+        section.contains(&format!("docs/qualification/{DAY_RUN_RECORD}.md")),
+        "the jobs section doesn't link the day run's record"
+    );
+}
+
+/// The newest whole day of jobs the page leads with: the published 0.2.8's
+/// 24-hour run on the Mac Studio (#1417).
+const DAY_RUN_RECORD: &str = "2026-11-14-v0.2.8-memory-run";
+
+/// The page a new cluster serves tells people what to type next, so every
+/// command on it has to parse.
+#[test]
+fn every_command_on_the_welcome_page_parses_with_the_real_cli() {
+    let page = read("src/relish/quickstart/welcome.html");
+    let mut commands = Vec::new();
+    for block in page.split("<code>").skip(1) {
+        let block = decode(&strip_tags(&block[..block.find("</code>").unwrap()]));
+        commands.extend(block.lines().map(str::to_string));
+    }
+    let relish = relish_lines(&commands);
+    assert!(relish.len() >= 6, "too few commands found: {relish:?}");
+    for command in relish {
+        parses(&command).unwrap_or_else(|error| panic!("{command:?}: {error}"));
+    }
 }
 
 /// A release is published, so the page leads with the one-line install and keeps
@@ -516,8 +792,7 @@ fn the_site_and_docs_announce_the_version_the_installer_installs() {
 
     let page = read("docs/website/index.html");
     for expected in [
-        format!("{version} PROTOTYPE"),
-        format!("Install {version} "),
+        format!("APACHE 2.0 · {version}<"),
         format!("<strong>{version}: "),
         format!("href=\"{notes}\""),
     ] {
@@ -559,6 +834,64 @@ fn command_snippets_are_copyable_and_still_selectable_without_script() {
     assert!(script.contains("\"Copied\""));
     let css = read("docs/website/style.css");
     assert!(!css.contains("user-select: none"));
+}
+
+/// Every innermost rule in a stylesheet, as `(selector, declarations)`.
+/// An `@media` block's own braces are skipped; the rules inside it count.
+fn css_rules(css: &str) -> Vec<(String, String)> {
+    let mut rules = Vec::new();
+    let mut selector_start = 0;
+    let mut open: Option<(String, usize)> = None;
+    for (index, character) in css.char_indices() {
+        match character {
+            '{' => {
+                open = Some((css[selector_start..index].trim().to_string(), index + 1));
+                selector_start = index + 1;
+            }
+            '}' => {
+                if let Some((selector, body_start)) = open.take() {
+                    rules.push((selector, css[body_start..index].to_string()));
+                }
+                selector_start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    rules
+}
+
+/// A box the site paints dark sets its own text colour, so nothing inside it
+/// inherits the page's dark ink. `.tour .copyable` once painted the wrapper
+/// that `copy.js` puts round every `<pre>` without one, and the commands under
+/// "Test your agent on your own cluster first", "Guardrails you write once"
+/// and "Ask the cluster why" showed as empty black boxes.
+#[test]
+fn every_dark_box_on_the_site_sets_its_own_text_colour() {
+    let dark = ["var(--ink)", "#303c32"];
+    for sheet in ["docs/website/style.css", "docs/website/comparisons.css"] {
+        let css = read(sheet);
+        let mut checked = 0;
+        for (selector, body) in css_rules(&css) {
+            let declarations: Vec<&str> = body.split(';').map(str::trim).collect();
+            let paints_dark = declarations.iter().any(|declaration| {
+                declaration
+                    .strip_prefix("background:")
+                    .is_some_and(|value| dark.contains(&value.trim()))
+            });
+            if !paints_dark {
+                continue;
+            }
+            checked += 1;
+            assert!(
+                declarations.iter().any(|d| d.starts_with("color:")),
+                "{sheet}: `{selector}` paints a dark background but sets no `color`, \
+                 so its text inherits the page's dark ink"
+            );
+        }
+        if sheet.ends_with("style.css") {
+            assert!(checked > 5, "found only {checked} dark rules in {sheet}");
+        }
+    }
 }
 
 /// Every release carries the PDFs, so the page links the stable "latest"
@@ -706,15 +1039,16 @@ fn unreleased_label() -> String {
     released_cli().unreleased_label(upcoming)
 }
 
-/// The README with its generated command list cut out, and that list.
-fn readme_split() -> (String, String) {
-    use reliaburger::relish::command_reference::{END_MARKER, START_MARKER};
-    let readme = read("README.md");
-    let start = readme.find(START_MARKER).unwrap();
-    let end = readme.find(END_MARKER).unwrap();
+/// The manual's reference chapter with its generated command list cut out,
+/// and that list.
+fn reference_split() -> (String, String) {
+    use reliaburger::relish::command_reference::{END_MARKER, REFERENCE_CHAPTER, START_MARKER};
+    let reference = read(REFERENCE_CHAPTER);
+    let start = reference.find(START_MARKER).unwrap();
+    let end = reference.find(END_MARKER).unwrap();
     (
-        format!("{}{}", &readme[..start], &readme[end..]),
-        readme[start..end].to_string(),
+        format!("{}{}", &reference[..start], &reference[end..]),
+        reference[start..end].to_string(),
     )
 }
 
@@ -806,8 +1140,9 @@ fn homepage_mentions() -> Vec<(String, String)> {
 }
 
 /// A visitor installs the release `install.sh` names, so every command the
-/// site, the README and the tour offer must exist in it, or say which
-/// release adds it. The tour itself may only use released commands.
+/// site, the README, the tour and the manual's command list offer must exist
+/// in it, or say which release adds it. The tour itself may only use
+/// released commands.
 #[test]
 fn every_advertised_command_exists_in_the_installed_release() {
     let released = released_cli();
@@ -822,7 +1157,9 @@ fn every_advertised_command_exists_in_the_installed_release() {
     let label = unreleased_label();
     let mut failures = Vec::new();
 
-    let (readme, generated) = readme_split();
+    use reliaburger::relish::command_reference::{REFERENCE_CHAPTER, REGENERATE_COMMAND};
+    let readme = read("README.md");
+    let (reference, generated) = reference_split();
     let start = readme.find(INSTALL_LINE).unwrap();
     let end = start + readme[start..].find("```").unwrap();
     let quick_start: Vec<String> = readme[start..end]
@@ -849,16 +1186,20 @@ fn every_advertised_command_exists_in_the_installed_release() {
         match (released.check(synopsis), labelled) {
             (Ok(()), false) | (Err(_), true) => {}
             (Ok(()), true) => failures.push(format!(
-                "README labels `{synopsis}` ({label}), but {installer} has it"
+                "{REFERENCE_CHAPTER} labels `{synopsis}` ({label}), but {installer} has it"
             )),
             (Err(rejection), false) => failures.push(format!(
-                "README lists `{synopsis}` unlabelled: {rejection}; run `make readme-commands`"
+                "{REFERENCE_CHAPTER} lists `{synopsis}` unlabelled: {rejection}; run `{REGENERATE_COMMAND}`"
             )),
         }
     }
-    assert!(entries > 50, "found only {entries} README command entries");
+    assert!(
+        entries > 50,
+        "found only {entries} command entries in {REFERENCE_CHAPTER}"
+    );
 
     let mut mentions = markdown_mentions(&readme);
+    mentions.extend(markdown_mentions(&reference));
     mentions.extend(markdown_mentions(&read(
         "docs/manual/08_five-minute-tour.md",
     )));
@@ -874,6 +1215,7 @@ fn every_advertised_command_exists_in_the_installed_release() {
         "docs/website/index.html",
         "docs/manual/08_five-minute-tour.md",
         "docs/manual/14_batch-jobs.md",
+        REFERENCE_CHAPTER,
     ] {
         for found in stale.captures_iter(&read(path)) {
             if &found[2] != installed || &found[1] == installed {
@@ -990,7 +1332,9 @@ fn release_cards_use_roadmap_release_names() {
         );
         cards.push(version.to_string());
     }
-    for release in ["0.2.0", "0.3.0", "0.4.0"] {
+    // The installed release's card, wherever the installer's default points.
+    let installed = installer_default();
+    for release in [installed.trim_start_matches('v'), "0.3.0", "0.4.0"] {
         assert!(
             cards.iter().any(|card| card == release),
             "no {release} card"
@@ -1105,7 +1449,7 @@ fn the_release_testing_section_shows_the_installed_release() {
         assert!(
             version >= current,
             "the release-testing section names {version:?}, older than {installed}; \
-             refresh it (docs/releasing.md, step 9)"
+             refresh it (docs/releasing.md, step 10)"
         );
     }
     let log = read("docs/release-log.md");
@@ -1176,7 +1520,7 @@ fn the_release_testing_section_shows_the_installed_release_s_soak_charts() {
         assert!(
             record.contains(&format!("-{installed}-")),
             "{source} comes from another release's record, not {installed}'s; \
-             refresh the charts (docs/releasing.md, step 9)"
+             refresh the charts (docs/releasing.md, step 10)"
         );
         let copy = std::fs::read(repository().join("docs/website").join(source))
             .unwrap_or_else(|error| panic!("{source} isn't in docs/website: {error}"));
@@ -1283,5 +1627,827 @@ fn release_pipeline_steps_flow_as_one_paragraph() {
             !rule.contains("grid"),
             "a grid splits a step's title and text into separate cells: {rule}"
         );
+    }
+}
+
+/// The "Built differently" section: the `<section id="why">` element.
+fn why_section(page: &str) -> &str {
+    let start = page
+        .find("<section id=\"why\"")
+        .expect("the page has no #why section");
+    &page[start..start + page[start..].find("</section>").unwrap()]
+}
+
+/// The slides of the "Built differently" carousel, in order, each from its
+/// `<li>` to the next.
+fn why_slides(section: &str) -> Vec<&str> {
+    section.split("<li class=\"why-slide\"").skip(1).collect()
+}
+
+/// The number of slides as the prose around the carousel spells it.
+const SLIDE_COUNT_WORD: &str = "seven";
+
+/// The seven differences sit between the hero and the install, each a short
+/// punchline, two sentences and a drawing. The list works without script;
+/// `assets/why-carousel.js` turns it into a slideshow. The first, from 0.2.8,
+/// says it was built for AI agents from the start (#1731); the last, from
+/// 0.2.7, is the one about reading the recipe (#1578).
+#[test]
+fn seven_differences_come_just_before_the_install() {
+    let page = read("docs/website/index.html");
+    let ids: Vec<String> = section_ids(&page).into_iter().flatten().collect();
+    let position = |id: &str| ids.iter().position(|i| i == id).unwrap();
+    assert_eq!(position("why") + 1, position("install"), "{ids:?}");
+
+    let section = why_section(&page);
+    assert!(section.contains("data-carousel"));
+    let slides = why_slides(section);
+    assert_eq!(slides.len(), 7, "the section should show seven differences");
+    assert!(
+        slides[0].starts_with(" id=\"why-ai-agents\""),
+        "the first difference is the AI-agent one"
+    );
+    assert!(
+        slides[6].contains(">Your agent can read the recipe.</h3>"),
+        "the last difference is the recipe one"
+    );
+    for slide in slides {
+        assert_eq!(slide.matches("<h3 class=\"why-punchline\">").count(), 1);
+        assert_eq!(slide.matches("<p>").count(), 1);
+        assert_eq!(slide.matches("<svg").count(), 1);
+        let svg = &slide[slide.find("<svg").unwrap()..];
+        let svg = &svg[..svg.find('>').unwrap()];
+        assert!(
+            svg.contains("aria-hidden=\"true\"") && svg.contains("viewBox="),
+            "the drawing is decorative and scales: {svg}"
+        );
+        let text = &slide[slide.find("<p>").unwrap()..slide.find("</p>").unwrap()];
+        let text = decode(&strip_tags(text));
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let sentences = text.matches(". ").count() + usize::from(text.ends_with('.'));
+        assert_eq!(sentences, 2, "each difference is two sentences: {text:?}");
+    }
+}
+
+/// The page opens its case with why Reliaburger asks to be trusted: for
+/// scrutiny anyone can repeat, not for popularity. It sits between the hero
+/// and the differences, and every paragraph or table cell that quotes a
+/// number links where the number comes from, so nothing on it is a claim a
+/// reader has to take on trust. Each part of the answer also says what
+/// doesn't exist yet.
+#[test]
+fn the_scrutiny_section_comes_first_and_sources_every_number() {
+    let page = read("docs/website/index.html");
+    let ids: Vec<String> = section_ids(&page).into_iter().flatten().collect();
+    let position = |id: &str| ids.iter().position(|i| i == id).unwrap();
+    assert_eq!(position("intro") + 1, position("scrutiny"), "{ids:?}");
+    assert_eq!(position("scrutiny") + 1, position("why"), "{ids:?}");
+
+    let start = page.find("<section id=\"scrutiny\"").unwrap();
+    let section = &page[start..start + page[start..].find("</section>").unwrap()];
+    let mut checked = 0;
+    for (open, close) in [("<p", "</p>"), ("<td", "</td>")] {
+        for (at, _) in section.match_indices(open) {
+            let block = &section[at..at + section[at..].find(close).unwrap()];
+            let text = decode(&strip_tags(block));
+            if text.chars().any(|c| c.is_ascii_digit()) {
+                checked += 1;
+                assert!(
+                    block.contains("<a href=\"https://"),
+                    "a number with no source: {text:?}"
+                );
+            }
+        }
+    }
+    assert!(checked >= 5, "the section should quote its numbers");
+    let rows = section.matches("<tr><th scope=\"row\">").count();
+    assert_eq!(rows, 4, "the four parts of the answer");
+    assert_eq!(
+        section.matches("<td>").count(),
+        rows * 2,
+        "each part says what exists and what doesn't yet"
+    );
+}
+
+/// The first difference (#1731): Reliaburger was built for AI agents from the
+/// start, not retrofitted. `bun` is already "the one agent every node runs"
+/// on the slide after it, so every "agent" here is an AI agent, your agent or
+/// part of a `relish agent` command. It links the page for agents and the
+/// gym's exit-test record, and claims nothing 0.2.8 hasn't shipped: no
+/// proposals or guardrails (#1682).
+#[test]
+fn the_first_difference_is_that_it_was_built_for_ai_agents() {
+    let page = read("docs/website/index.html");
+    let section = why_section(&page);
+    let slide = why_slides(section)[0];
+    assert!(
+        slide.contains(
+            "<h3 class=\"why-punchline\">Native to AI agents from day one, not bolted on.</h3>"
+        ),
+        "{slide}"
+    );
+    assert!(
+        why_slides(section)[1].contains("the one agent every node runs"),
+        "the slide after it still calls bun the agent every node runs"
+    );
+
+    let record = "docs/qualification/2026-11-06-v0.2.7-exit-test.md";
+    for href in [
+        "agents#measuring-an-agent-on-your-cluster".to_string(),
+        format!("https://github.com/reliaburger/reliaburger/blob/main/{record}"),
+    ] {
+        assert!(
+            slide.contains(&format!("<a href=\"{href}\">")),
+            "the slide doesn't link {href}"
+        );
+    }
+    assert!(repository().join(record).is_file(), "{record} is missing");
+    assert!(read(record).contains("**Verdict: the exit test passes.**"));
+
+    // The split leaves the rest of the `<li>` tag at the front.
+    let text = decode(&strip_tags(&slide[slide.find('>').unwrap() + 1..]));
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    for command in ["relish agent", "relish mcp"] {
+        assert!(text.contains(command), "the slide doesn't name {command}");
+    }
+    for (at, _) in text.match_indices("agent") {
+        let before = &text[..at];
+        assert!(
+            ["AI ", "your ", "relish "]
+                .iter()
+                .any(|word| before.ends_with(word)),
+            "an ambiguous \"agent\" after {:?}",
+            &before[before.len().saturating_sub(30)..]
+        );
+    }
+    let lower = text.to_lowercase();
+    for unshipped in ["proposal", "guardrail", "relish gym"] {
+        assert!(!lower.contains(unshipped), "the slide claims {unshipped:?}");
+    }
+}
+
+/// The drawings are inline and animated by the site's own CSS, so nothing in
+/// the section loads from anywhere else, and reduced motion stills them. A
+/// slide may link out: a link loads nothing until it's followed.
+#[test]
+fn the_differences_load_nothing_and_respect_reduced_motion() {
+    let page = read("docs/website/index.html");
+    let section = why_section(&page);
+    let mut unlinked = String::new();
+    let mut rest = section;
+    while let Some(at) = rest.find("<a ") {
+        unlinked.push_str(&rest[..at]);
+        let tag = &rest[at..at + rest[at..].find('>').unwrap()];
+        let href = attribute(tag, "href").expect("a link with no href");
+        assert!(
+            href.starts_with("https://github.com/reliaburger/reliaburger/") || !href.contains(':'),
+            "a slide links outside the project: {href}"
+        );
+        rest = &rest[at + tag.len()..];
+    }
+    unlinked.push_str(rest);
+    for external in [
+        "http:", "https:", "//", "<img", "<script", "<link", "<use", "url(", "href=",
+    ] {
+        assert!(
+            !unlinked.contains(external),
+            "the #why section contains {external:?}"
+        );
+    }
+    assert!(page.contains("<script src=\"./assets/why-carousel.js\" defer></script>"));
+    let script = read("docs/website/assets/why-carousel.js");
+    for needle in [
+        "aria-live",
+        "prefers-reduced-motion",
+        "aria-roledescription",
+    ] {
+        assert!(script.contains(needle), "why-carousel.js lacks {needle:?}");
+    }
+    // Every class a drawing animates with has its rule in the stylesheet. The
+    // `<svg>` element's own classes only name the drawing, so they're skipped.
+    let style = read("docs/website/style.css");
+    for slide in why_slides(section) {
+        let svg = &slide[slide.find("<svg").unwrap()..slide.find("</svg>").unwrap()];
+        for classes in svg.split("class=\"").skip(2) {
+            for class in classes[..classes.find('"').unwrap()].split_whitespace() {
+                assert!(
+                    style.contains(&format!(".{class} ")) || style.contains(&format!(".{class},")),
+                    "style.css has no rule for .{class}"
+                );
+            }
+        }
+    }
+    let reduced = style
+        .split("@media (prefers-reduced-motion: reduce)")
+        .skip(1)
+        .any(|block| {
+            block[..block.find('}').unwrap()].contains(".why-art * { animation: none !important;")
+        });
+    assert!(
+        reduced,
+        "style.css should stop the drawings' animation for reduced motion"
+    );
+}
+
+/// The carousel script counts the slides it finds, so a new one needs no
+/// script change, and its Pause and Play button stays (#1552). The footer and
+/// the site's README say how many differences there are, so they follow the
+/// count; the script and the section's comment don't name one to go stale.
+#[test]
+fn the_carousel_counts_its_slides_and_keeps_pause_and_play() {
+    let page = read("docs/website/index.html");
+    let slides = why_slides(why_section(&page)).len();
+    let words = ["", "one", "two", "three", "four", "five", "six", "seven"];
+    assert_eq!(words[slides], SLIDE_COUNT_WORD);
+
+    let script = read("docs/website/assets/why-carousel.js");
+    assert!(script.contains("var slides = Array.prototype.slice.call(list.children);"));
+    assert!(script.contains("index + 1 + \" of \" + slides.length"));
+    for needle in [
+        "button(\"why-toggle\", \"Pause\")",
+        "stopped ? \"Play\" : \"Pause\"",
+        "aria-pressed",
+        "event.pointerType !== \"mouse\"",
+    ] {
+        assert!(script.contains(needle), "why-carousel.js lacks {needle:?}");
+    }
+    let comment = &page[page.find("<!-- ").unwrap()..page.find("<section id=\"why\"").unwrap()];
+    let comment = &comment[comment.rfind("<!--").unwrap()..];
+    for (name, text) in [
+        ("why-carousel.js", script.as_str()),
+        ("the comment", comment),
+    ] {
+        let text = text.to_lowercase();
+        for word in &words[2..] {
+            assert!(
+                !text.contains(&format!("all {word} "))
+                    && !text.contains(&format!("{word} differences")),
+                "{name} names a slide count ({word})"
+            );
+        }
+    }
+
+    let footer = &page[page.find("<footer>").unwrap()..];
+    assert!(
+        footer.contains(&format!("the {SLIDE_COUNT_WORD} differences")),
+        "the footer miscounts the differences"
+    );
+    let readme = read("docs/website/README.md");
+    for phrase in [
+        format!("plain list of {SLIDE_COUNT_WORD} architectural differences"),
+        format!("{SLIDE_COUNT_WORD} dots"),
+        format!("all {SLIDE_COUNT_WORD} stay stacked"),
+    ] {
+        assert!(
+            readme.contains(&phrase),
+            "docs/website/README.md lacks {phrase:?}"
+        );
+    }
+}
+
+/// The install section has two tabs (#1579): the one-line install, and one
+/// prompt for an agent that sends it to the playbook on `/agents`. They're
+/// radio buttons, so they switch without a script, and the one-line install
+/// is the one chosen when the page loads.
+#[test]
+fn the_install_section_offers_the_one_line_install_and_an_agent_prompt() {
+    let page = read("docs/website/index.html");
+    let section = &page[page.find("<section id=\"install\"").unwrap()..];
+    let section = &section[..section.find("</section>").unwrap()];
+    for tab in ["Kick the tyres", "With your agent"] {
+        assert!(
+            section.contains(&format!(">{tab}</label>")),
+            "no {tab:?} tab"
+        );
+    }
+    assert!(section.contains("id=\"install-tyres\" checked>"));
+    let prompt = &section[section.find("<code data-agent-prompt>").unwrap()..];
+    let prompt = &prompt["<code data-agent-prompt>".len()..prompt.find("</code>").unwrap()];
+    assert_eq!(
+        prompt,
+        "Set up a Reliaburger cluster for me. Start at https://reliaburger.com/agents."
+    );
+    // The page the prompt names is the one generated from the agent chapter,
+    // and it carries the playbook.
+    let agents = read("docs/website/agents.html");
+    assert!(agents.contains("Setting up a cluster for your human"));
+    assert!(!section.contains("<script"), "the tabs need no script");
+}
+
+/// A third tab installs the CLI with Homebrew (#1583): the tap, then the
+/// quickstart. The one-line install stays the first tab and the chosen one,
+/// and the Homebrew panel shows each tab its own style rule.
+#[test]
+fn the_install_section_offers_homebrew_after_the_one_line_install() {
+    let page = read("docs/website/index.html");
+    let section = &page[page.find("<section id=\"install\"").unwrap()..];
+    let section = &section[..section.find("</section>").unwrap()];
+    let tyres = section.find(">Kick the tyres</label>").unwrap();
+    let homebrew = section.find(">Homebrew</label>").expect("no Homebrew tab");
+    assert!(tyres < homebrew, "the one-line install comes first");
+    let panel = &section[section.find("install-panel-homebrew").unwrap()..];
+    let panel = &panel[..panel.find("</pre>").unwrap()];
+    let brew = panel.find("brew install reliaburger/tap/relish").unwrap();
+    let quickstart = panel.find("relish setup --quickstart").unwrap();
+    assert!(brew < quickstart, "install the CLI, then build the cluster");
+    let style = read("docs/website/style.css");
+    assert!(style.contains("#install-homebrew:checked ~ .install-panel-homebrew"));
+}
+
+// --- Built for humans and their agents (#1578) -----------------------------
+
+/// The text of every `<code ATTRIBUTE>` element on `page`, tags stripped
+/// and entities decoded.
+fn marked_commands(page: &str, attribute: &str) -> Vec<String> {
+    let open = format!("<code {attribute}>");
+    page.split(open.as_str())
+        .skip(1)
+        .map(|rest| decode(&strip_tags(&rest[..rest.find("</code>").unwrap()])))
+        .collect()
+}
+
+/// An agent reading the homepage meets its own page first: one line above
+/// the masthead that links `/agents`, its Markdown and `llms.txt`, all three
+/// of them files this directory publishes.
+#[test]
+fn the_homepage_opens_with_a_line_for_agents() {
+    let page = read("docs/website/index.html");
+    let start = page
+        .find("<aside class=\"agent-banner\"")
+        .expect("no agent banner");
+    assert!(
+        start < page.find("<header class=\"masthead\"").unwrap(),
+        "the agent banner should come before the masthead"
+    );
+    let banner = &page[start..start + page[start..].find("</aside>").unwrap()];
+    let text = decode(&strip_tags(banner));
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        text.starts_with("Are you an AI agent? Start here"),
+        "{text:?}"
+    );
+    for href in ["agents", "agents.md", "llms.txt"] {
+        assert!(
+            banner.contains(&format!("href=\"{href}\"")),
+            "the banner doesn't link {href}"
+        );
+        assert!(
+            published_file("index.html", href).is_some_and(|file| file.is_file()),
+            "{href} isn't published"
+        );
+    }
+    assert!(
+        banner.contains("<a href=\"agents\">Start here</a>"),
+        "\"Start here\" goes to /agents"
+    );
+    assert!(read("docs/website/llms.txt").starts_with("# Reliaburger\n"));
+}
+
+/// The 0.2.7 headline sits in the hero, under the title.
+#[test]
+fn the_hero_says_who_it_is_built_for() {
+    let page = read("docs/website/index.html");
+    let intro = &page[page.find("<section id=\"intro\"").unwrap()..];
+    let intro = &intro[..intro.find("</section>").unwrap()];
+    let headline = intro
+        .find("<p class=\"headline-agents\">Built for humans and their agents.</p>")
+        .expect("the hero lacks the headline");
+    assert!(intro.find("<h1 id=\"title\">").unwrap() < headline);
+}
+
+/// Every command the agent section shows parses with the real CLI. They're
+/// 0.2.7 commands, so the installed-release check wants the section to say
+/// so, which `every_advertised_command_exists_in_the_installed_release`
+/// covers.
+#[test]
+fn every_agent_section_command_parses_with_the_real_cli() {
+    let page = read("docs/website/index.html");
+    let start = page
+        .find("<section id=\"debug\"")
+        .expect("no #debug section");
+    let section = &page[start..start + page[start..].find("</section>").unwrap()];
+    let commands = marked_commands(section, "data-agent-command");
+    assert!(commands.len() >= 8, "too few commands: {commands:?}");
+    assert_eq!(
+        commands.len(),
+        marked_commands(&page, "data-agent-command").len(),
+        "data-agent-command belongs to the #debug section"
+    );
+    for command in &commands {
+        assert!(command.starts_with("relish "), "{command:?}");
+        parses(command).unwrap_or_else(|error| panic!("{command:?}: {error}"));
+    }
+    let heading = &section[section.find("<h2").unwrap()..section.find("</h2>").unwrap()];
+    assert!(
+        strip_tags(heading).contains("Debug the platform, not just your app"),
+        "{heading:?}"
+    );
+}
+
+/// The agent section's recording isn't made yet (#1579). Until it is, the slot
+/// says so and gives the player nothing to load; once it has a `data-cast`, it
+/// needs a screen for the player like every other recording.
+#[test]
+fn the_agent_recording_slot_says_plainly_whether_there_is_a_recording() {
+    let page = read("docs/website/index.html");
+    let start = page
+        .find("<figure id=\"agent-recording\"")
+        .expect("no agent recording slot");
+    let figure = &page[start..start + page[start..].find("</figure>").unwrap()];
+    let tag = &figure[..figure.find('>').unwrap()];
+    if tag.contains("data-cast=") {
+        assert!(figure.contains("<div class=\"recording-screen\"></div>"));
+        assert!(!figure.contains("recording-pending"));
+    } else {
+        assert!(
+            !figure.contains("recording-screen"),
+            "an empty screen with no cast"
+        );
+        assert!(figure.contains("class=\"recording-pending\""));
+        let text = decode(&strip_tags(figure));
+        assert!(text.contains("No recording yet"), "{text:?}");
+        assert!(figure.contains("https://github.com/reliaburger/reliaburger/issues/1579"));
+    }
+}
+
+/// `tour-player.js` sets up every figure with a cast the same way: it needs
+/// a screen to draw on and a speed group to show. The agent recordings
+/// arrived without a speed group, the script threw on them, and neither
+/// played (#1874). Each recording needs both.
+#[test]
+fn every_recording_has_a_screen_and_speed_buttons() {
+    let page = read("docs/website/index.html");
+    let mut figures = 0;
+    for (start, _) in page.match_indices("<figure ") {
+        let figure = &page[start..start + page[start..].find("</figure>").unwrap()];
+        let tag = &figure[..figure.find('>').unwrap()];
+        if !(tag.contains("class=\"recording\"") && tag.contains("data-cast=")) {
+            continue;
+        }
+        figures += 1;
+        assert!(
+            figure.contains("<div class=\"recording-screen\"></div>"),
+            "no screen: {tag}"
+        );
+        assert!(
+            figure.contains("class=\"recording-speed\"") && figure.contains("data-speed=\"1\""),
+            "no speed buttons: {tag}"
+        );
+    }
+    assert!(figures >= 4, "found only {figures} recordings");
+}
+
+/// The `#act` section of the homepage: what 0.2.8 lets an agent do (#1690).
+fn act_section(page: &str) -> &str {
+    let start = page.find("<section id=\"act\"").expect("no #act section");
+    &page[start..start + page[start..].find("</section>").unwrap()]
+}
+
+/// 0.2.8's showcase sits right after the agent debugging section, which it
+/// builds on, and every command it shows parses with the real CLI.
+#[test]
+fn every_act_section_command_parses_with_the_real_cli() {
+    let page = read("docs/website/index.html");
+    let ids: Vec<String> = section_ids(&page).into_iter().flatten().collect();
+    let debug = ids.iter().position(|id| id == "debug").unwrap();
+    assert_eq!(
+        ids.get(debug + 1).map(String::as_str),
+        Some("act"),
+        "#act should follow #debug: {ids:?}"
+    );
+    let section = act_section(&page);
+    let commands = marked_commands(section, "data-act-command");
+    assert!(commands.len() >= 10, "too few commands: {commands:?}");
+    assert_eq!(
+        commands.len(),
+        marked_commands(&page, "data-act-command").len(),
+        "data-act-command belongs to the #act section"
+    );
+    for command in &commands {
+        assert!(command.starts_with("relish "), "{command:?}");
+        parses(command).unwrap_or_else(|error| panic!("{command:?}: {error}"));
+    }
+}
+
+/// Like the debugging section's, the showcase's recording slot says so
+/// while there's no recording, and gives the player nothing to load.
+#[test]
+fn the_act_recording_slot_says_plainly_whether_there_is_a_recording() {
+    let page = read("docs/website/index.html");
+    let section = act_section(&page);
+    let start = section
+        .find("<figure id=\"act-recording\"")
+        .expect("no #act recording slot");
+    let figure = &section[start..start + section[start..].find("</figure>").unwrap()];
+    let tag = &figure[..figure.find('>').unwrap()];
+    if tag.contains("data-cast=") {
+        assert!(figure.contains("<div class=\"recording-screen\"></div>"));
+        assert!(!figure.contains("recording-pending"));
+    } else {
+        assert!(!figure.contains("recording-screen"));
+        assert!(figure.contains("class=\"recording-pending\""));
+        let text = decode(&strip_tags(figure));
+        assert!(text.contains("No recording yet"), "{text:?}");
+        assert!(figure.contains("https://github.com/reliaburger/reliaburger/issues/1690"));
+    }
+}
+
+/// What 0.2.8 hasn't measured yet has a slot that names its issue and quotes
+/// no number: the Kubernetes context comparison (#1679, for #1681).
+#[test]
+fn unmeasured_results_have_slots_that_claim_nothing() {
+    let page = read("docs/website/index.html");
+    let section = act_section(&page);
+    let slots: Vec<&str> = section
+        .split("<aside class=\"measure-pending\"")
+        .skip(1)
+        .map(|rest| &rest[..rest.find("</aside>").unwrap()])
+        .collect();
+    let link = "https://github.com/reliaburger/reliaburger/issues/1679";
+    let slot = slots
+        .iter()
+        .find(|slot| slot.contains(link))
+        .expect("no pending slot for #1679");
+    let text = decode(&strip_tags(slot));
+    assert!(text.contains("Not measured yet"), "{text:?}");
+    let without_issues = text.replace("#1679", "").replace("#1681", "");
+    assert!(
+        !without_issues.chars().any(|c| c.is_ascii_digit()),
+        "the #1679 slot quotes a number: {text:?}"
+    );
+}
+
+/// Every number in a piece of text, as written: digits, with any `.` or `,`
+/// that sits between two digits (`3.1`, `12,000`).
+fn numbers_in(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut numbers = Vec::new();
+    let mut current = String::new();
+    for (index, &c) in chars.iter().enumerate() {
+        let joins_digits = (c == '.' || c == ',')
+            && !current.is_empty()
+            && chars.get(index + 1).is_some_and(char::is_ascii_digit);
+        if c.is_ascii_digit() || joins_digits {
+            current.push(c);
+        } else if !current.is_empty() {
+            numbers.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        numbers.push(current);
+    }
+    numbers
+}
+
+#[test]
+fn numbers_in_keeps_decimals_and_thousands_together() {
+    assert_eq!(
+        numbers_in("Llama 3.1 8B got 7 of 36, 12,000 tokens. Done 9."),
+        ["3.1", "8", "7", "36", "12,000", "9"]
+    );
+}
+
+/// The local-model runs (#1687) are measured. Their slot names the record it
+/// quotes in `data-record` and links it, and every number it states is one
+/// that record holds, as the Kubernetes comparison page does with its record.
+#[test]
+fn the_local_model_slot_quotes_only_its_record() {
+    let page = read("docs/website/index.html");
+    let section = act_section(&page);
+    let start = section
+        .find("<aside class=\"measured\"")
+        .expect("no measured slot in #act");
+    let slot = &section[start..start + section[start..].find("</aside>").unwrap()];
+    assert!(slot.contains("https://github.com/reliaburger/reliaburger/issues/1687"));
+    let tag = &slot[..slot.find('>').unwrap()];
+    let record = attribute(tag, "data-record").expect("the slot names no data-record");
+    assert!(
+        record.starts_with("docs/qualification/") && record.ends_with(".md"),
+        "{record:?}"
+    );
+    assert!(
+        slot.contains(&format!(
+            "https://github.com/reliaburger/reliaburger/blob/main/{record}"
+        )),
+        "the slot should link {record}"
+    );
+    let held: std::collections::BTreeSet<String> = numbers_in(&read(record)).into_iter().collect();
+    let text = decode(&strip_tags(slot)).replace("#1687", "");
+    assert!(!text.contains("Not measured yet"), "{text:?}");
+    let quoted = numbers_in(&text);
+    assert!(
+        !quoted.is_empty(),
+        "a measured slot with no numbers: {text:?}"
+    );
+    for number in quoted {
+        assert!(
+            held.contains(&number),
+            "the slot says {number}, which {record} doesn't: {text:?}"
+        );
+    }
+}
+
+/// The concept counts the showcase quotes are the budget the test in
+/// `src/bin/relish.rs` holds the CLI to, so the page can't drift from it.
+#[test]
+fn the_act_section_quotes_the_concept_budget() {
+    let budget: serde_json::Value =
+        serde_json::from_str(&read("docs/testing/concept-budget.json")).unwrap();
+    let page = read("docs/website/index.html");
+    let text = decode(&strip_tags(act_section(&page)));
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    for (key, words) in [
+        ("resource_kinds", "resource kinds"),
+        ("commands", "commands"),
+    ] {
+        let count = budget[key]["budget"].as_u64().unwrap();
+        assert!(
+            text.contains(&format!("{count} {words}")),
+            "the #act section should say \"{count} {words}\""
+        );
+    }
+}
+
+/// The install buttons on `/agents` and in the README add the server `relish
+/// agent setup` writes, and the command they start parses with the real CLI.
+#[test]
+fn the_install_buttons_add_the_server_setup_writes() {
+    use reliaburger::relish::agent::{guide, setup};
+    let links = guide::install_links();
+    let escape = |text: &str| text.replace('&', "&amp;").replace('"', "&quot;");
+
+    let agents = read("docs/website/agents.html");
+    for (label, link) in [
+        ("Add to Cursor", &links.cursor),
+        ("Add to VS Code", &links.vscode),
+        ("Add to Goose", &links.goose),
+    ] {
+        assert!(
+            agents.contains(&format!("href=\"{}\">{label}</a>", escape(link))),
+            "/agents has no {label:?} button for {link}"
+        );
+    }
+    let shown = marked_commands(&agents, "data-install-command");
+    assert_eq!(shown, std::slice::from_ref(&links.claude_code));
+
+    let readme = read("README.md");
+    for link in [&links.cursor_web, &links.vscode_web] {
+        assert!(
+            readme.contains(&format!("]({link})")),
+            "README lacks {link}"
+        );
+    }
+    assert!(readme.contains(&format!("`{}`", links.claude_code)));
+    assert!(readme.contains("https://reliaburger.com/agents#add-to-your-agent"));
+
+    // What every button and the Claude Code line start.
+    let server = setup::MCP_COMMAND_LINE.join(" ");
+    assert!(links.claude_code.ends_with(&format!(" -- {server}")));
+    parses(&server).unwrap_or_else(|error| panic!("{server:?}: {error}"));
+}
+
+/// `/agents` links its own sections by the slugs the generator gives them, so
+/// every `#fragment` on it must land on an element with that `id`, and so must
+/// the homepage's links into it.
+#[test]
+fn every_link_into_the_agents_page_lands() {
+    let agents = read("docs/website/agents.html");
+    let lands = |fragment: &str| agents.contains(&format!("id=\"{fragment}\""));
+    let fragments: Vec<&str> = agents
+        .split("href=\"#")
+        .skip(1)
+        .map(|rest| &rest[..rest.find('"').unwrap()])
+        .collect();
+    assert!(fragments.len() > 20, "too few: {fragments:?}");
+    for fragment in fragments {
+        assert!(
+            lands(fragment),
+            "/agents links #{fragment}, which isn't there"
+        );
+    }
+    let page = read("docs/website/index.html");
+    for rest in page.split("href=\"agents#").skip(1) {
+        let fragment = &rest[..rest.find('"').unwrap()];
+        assert!(
+            lands(fragment),
+            "the homepage links /agents#{fragment}, which isn't there"
+        );
+    }
+    // "How we test" is a section of its own, and says what doesn't run.
+    let start = agents
+        .find("<section class=\"agents-section\" id=\"how-reliaburger-is-tested\">")
+        .expect("no how-we-test section");
+    let section = &agents[start..start + agents[start..].find("</section>").unwrap()];
+    for needle in [
+        "make ci",
+        "full-ci",
+        "make test-apple",
+        "What none of that proves",
+    ] {
+        assert!(section.contains(needle), "how-we-test lacks {needle:?}");
+    }
+}
+
+/// The file under `docs/website` that `href`, a link on `page`, lands on,
+/// or `None` when it leaves the site or stays on the page. GitHub Pages
+/// serves `NAME.html` at the bare `NAME` and `DIR/index.html` at `DIR/`,
+/// which is how the site links its pages.
+fn published_file(page: &str, href: &str) -> Option<PathBuf> {
+    let site = url::Url::parse("https://reliaburger.com/").unwrap();
+    let base = super::website_markdown::page_url(page);
+    let target = base.join(href).ok()?;
+    if target.origin() != site.origin() || href.starts_with('#') {
+        return None;
+    }
+    let path = target.path().trim_start_matches('/');
+    let path = if path.is_empty() || path.ends_with('/') {
+        format!("{path}index.html")
+    } else if Path::new(path).extension().is_some() {
+        path.to_string()
+    } else {
+        format!("{path}.html")
+    };
+    Some(repository().join("docs/website").join(path))
+}
+
+/// The `href` of every link and stylesheet in `html`.
+fn hrefs(html: &str) -> Vec<&str> {
+    html.split("href=\"")
+        .skip(1)
+        .map(|rest| &rest[..rest.find('"').unwrap()])
+        .collect()
+}
+
+/// Every link from one page of the site to another is bare (`agents`,
+/// `./compare/nomad`, `./compare/`), never `NAME.html`, and lands on a page
+/// that exists. Assets (`style.css`, `agents.md`) keep their extension.
+#[test]
+fn every_link_between_pages_is_bare_and_lands() {
+    let mut checked = 0;
+    for page in super::website_markdown::pages() {
+        let html = read(&format!("docs/website/{page}"));
+        for href in hrefs(&html) {
+            let href = href.replace("&amp;", "&");
+            let Some(file) = published_file(&page, &href) else {
+                continue;
+            };
+            let path = href.split(['#', '?']).next().unwrap_or_default();
+            assert!(
+                !path.ends_with(".html"),
+                "{page} links {href}; link the bare page instead"
+            );
+            assert!(file.is_file(), "{page} links {href}, which isn't there");
+            checked += 1;
+        }
+    }
+    assert!(checked > 100, "too few links checked: {checked}");
+}
+
+#[test]
+fn published_file_maps_bare_links_to_their_html() {
+    let site = repository().join("docs/website");
+    assert_eq!(
+        published_file("index.html", "agents#x"),
+        Some(site.join("agents.html"))
+    );
+    assert_eq!(
+        published_file("index.html", "./compare/"),
+        Some(site.join("compare/index.html"))
+    );
+    assert_eq!(
+        published_file("compare/nomad.html", "../"),
+        Some(site.join("index.html"))
+    );
+    assert_eq!(
+        published_file("compare/nomad.html", "./methodology"),
+        Some(site.join("compare/methodology.html"))
+    );
+    assert_eq!(
+        published_file("compare/nomad.html", "../style.css"),
+        Some(site.join("style.css"))
+    );
+    assert_eq!(published_file("index.html", "#install"), None);
+    assert_eq!(
+        published_file("index.html", "https://github.com/reliaburger"),
+        None
+    );
+}
+
+/// `/agents` loads the site's stylesheet and copy script and nothing else.
+#[test]
+fn the_agents_page_loads_only_the_site_s_own_files() {
+    let agents = read("docs/website/agents.html");
+    assert_eq!(agents.matches("<script").count(), 1);
+    assert!(agents.contains("<script src=\"assets/copy.js\" defer></script>"));
+    assert_eq!(agents.matches("rel=\"stylesheet\"").count(), 1);
+    assert!(agents.contains("<link rel=\"stylesheet\" href=\"style.css\">"));
+    let css = read("docs/website/style.css");
+    for rule in [
+        ".agents-page",
+        ".agents-install",
+        ".install-button",
+        ".agent-banner",
+    ] {
+        assert!(css.contains(rule), "style.css has no {rule} rule");
     }
 }

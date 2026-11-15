@@ -1,0 +1,12 @@
+---
+source: src/relish/commands.rs
+expression: "json(&RecoveryReport\n{\n    restored_apps: 4, api_tokens: 2, previous_epoch: 0, recovery_epoch: 1,\n    recovery_id: Some(\"r-1\".to_string()), data_dir:\n    PathBuf::from(\"/var/lib/reliaburger\"),\n})"
+---
+{
+  "restored_apps": 4,
+  "api_tokens": 2,
+  "previous_epoch": 0,
+  "recovery_epoch": 1,
+  "recovery_id": "r-1",
+  "data_dir": "/var/lib/reliaburger"
+}

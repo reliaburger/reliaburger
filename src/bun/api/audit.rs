@@ -56,6 +56,12 @@ pub(crate) const AUDITED_ROUTES: &[AuditedRoute] = &[
         "app.deleted",
         Operation,
     ),
+    audited(
+        Post,
+        "/v1/release/{app}/{namespace}",
+        "app.released",
+        Operation,
+    ),
     audited(Post, "/v1/exec/{app}/{namespace}", "app.exec", Operation),
     audited(
         Post,
@@ -119,6 +125,12 @@ pub(crate) const AUDITED_ROUTES: &[AuditedRoute] = &[
     audited(Post, "/v1/gitops/config", "gitops.configured", Operation),
     audited(
         Post,
+        "/v1/policies/{name}/delete",
+        "policy.deleted",
+        Operation,
+    ),
+    audited(
+        Post,
         "/v1/nodes/decommission",
         "node.decommissioned",
         Operation,
@@ -142,6 +154,10 @@ pub(crate) const AUDITED_ROUTES: &[AuditedRoute] = &[
         Operation,
     ),
     audited(Post, "/v1/logs/export", "logs.exported", Operation),
+    // A copy starts with this listing. It's the one read we record, because
+    // it hands someone every tenant's logs. The files that follow would only
+    // add a record each.
+    audited(Get, "/v1/logs/archive", "logs.exported", Operation),
     audited(Post, "/v1/identity/sign", "identity.signed", Identity),
 ];
 
@@ -159,6 +175,25 @@ pub(crate) const HANDLER_AUDITED_ROUTES: &[(RouteMethod, &str)] = &[
     (Post, "/v1/ca/rotation/prepare"),
     (Post, "/v1/ca/rotation/begin"),
     (Post, "/v1/ca/rotation/finalize"),
+    // A lease write's action depends on its outcome: a take of a lease the
+    // caller holds is a renewal, and a conflict is recorded too (#1686).
+    (Post, "/v1/leases"),
+    (Post, "/v1/leases/renew"),
+    (Post, "/v1/leases/release"),
+    (Post, "/v1/leases/break"),
+    // A proposal write's action depends on its outcome: approving records
+    // `proposal.applied` or `proposal.failed`, and a refusal names its rule
+    // (#1682).
+    (Post, "/v1/proposals"),
+    (Post, "/v1/proposals/{id}/approve"),
+    (Post, "/v1/proposals/{id}/reject"),
+    (Post, "/v1/proposals/{id}/withdraw"),
+    (Post, "/v1/proposals/{id}/undo"),
+    // The dashboard's decision forms call the three handlers above, which
+    // write the same records under the session's token.
+    (Post, "/ui/proposal/{id}/approve"),
+    (Post, "/ui/proposal/{id}/reject"),
+    (Post, "/ui/proposal/{id}/undo"),
 ];
 
 /// Mutating routes that are not audited, and why. A new `POST` or `DELETE`
@@ -337,12 +372,30 @@ async fn path_parameters(parts: &mut axum::http::request::Parts) -> Vec<(String,
 #[derive(Debug, Clone)]
 struct RefusedCaller {
     principal: String,
+    principal_kind: crate::sesame::types::PrincipalKind,
     token_name: String,
     app: Option<String>,
     namespace: Option<String>,
 }
 
-/// Attach a [`RefusedCaller`] to `response` if it refuses the request.
+/// Say that `response` refuses on behalf of `auth`, a credential the
+/// handler checked itself, rather than the one the request authenticated
+/// with. The dashboard's decision forms use it (#1682): the request rides
+/// a read-only session, but the person pasted an API token, and the
+/// refusal is that token's.
+pub(super) fn refused_as(response: &mut Response, auth: &crate::sesame::auth::AuthContext) {
+    let (principal, token_name) = audit_principal(Some(auth));
+    response.extensions_mut().insert(RefusedCaller {
+        principal,
+        principal_kind: super::audit_principal_kind(Some(auth)),
+        token_name,
+        app: None,
+        namespace: None,
+    });
+}
+
+/// Attach a [`RefusedCaller`] to `response` if it refuses the request,
+/// unless the handler already named the caller ([`refused_as`]).
 fn mark_refusal(
     response: &mut Response,
     auth: Option<&crate::sesame::auth::AuthContext>,
@@ -354,9 +407,15 @@ fn mark_refusal(
     ) {
         return;
     }
+    if let Some(named) = response.extensions_mut().get_mut::<RefusedCaller>() {
+        named.app = named.app.take().or(note.app);
+        named.namespace = named.namespace.take().or(note.namespace);
+        return;
+    }
     let (principal, token_name) = audit_principal(auth);
     response.extensions_mut().insert(RefusedCaller {
         principal,
+        principal_kind: super::audit_principal_kind(auth),
         token_name,
         app: note.app,
         namespace: note.namespace,
@@ -495,20 +554,24 @@ async fn record_refusal(state: &ApiState, refusal: Refusal) {
     if let Some(attempted) = route.attempted {
         details.insert("attempted".to_string(), attempted.to_string());
     }
-    let principal = match refused {
+    let (principal, principal_kind) = match refused {
         Some(refused) => {
             app = refused.app.or(app);
             namespace = refused.namespace.or(namespace);
             details.insert("token_name".to_string(), refused.token_name);
-            refused.principal
+            (refused.principal, refused.principal_kind)
         }
-        None => ANONYMOUS.to_string(),
+        None => (
+            ANONYMOUS.to_string(),
+            crate::sesame::types::PrincipalKind::Unknown,
+        ),
     };
     let now = unix_now_seconds();
     let verdict = state.refusals.lock().await.admit(
         crate::bun::audit::refusals::RefusalSource::Caller {
             address: caller.map(|address| address.ip()),
             principal: principal.clone(),
+            principal_kind,
         },
         now,
     );
@@ -529,6 +592,7 @@ async fn record_refusal(state: &ApiState, refusal: Refusal) {
             severity: crate::bun::events::EventSeverity::Warning,
             action: "api.refused".to_string(),
             principal,
+            principal_kind,
             app,
             namespace,
             node: Some(local_node_name(state)),
@@ -555,8 +619,12 @@ pub(super) fn suppressed_refusals_event(
         "window_seconds".to_string(),
         REFUSAL_WINDOW_SECONDS.to_string(),
     );
-    let (principal, from) = match summary.source {
-        RefusalSource::Caller { address, principal } => {
+    let (principal, principal_kind, from) = match summary.source {
+        RefusalSource::Caller {
+            address,
+            principal,
+            principal_kind,
+        } => {
             let from = match address {
                 Some(address) => {
                     details.insert("source".to_string(), address.to_string());
@@ -564,9 +632,14 @@ pub(super) fn suppressed_refusals_event(
                 }
                 None => principal.clone(),
             };
-            (principal, from)
+            (principal, principal_kind, from)
         }
-        RefusalSource::Overflow => ("*".to_string(), "other sources".to_string()),
+        // Many callers, of any kind.
+        RefusalSource::Overflow => (
+            "*".to_string(),
+            crate::sesame::types::PrincipalKind::Unknown,
+            "other sources".to_string(),
+        ),
     };
     crate::bun::events::AuditEvent {
         timestamp: now,
@@ -574,6 +647,7 @@ pub(super) fn suppressed_refusals_event(
         severity: crate::bun::events::EventSeverity::Warning,
         action: "api.refusals_suppressed".to_string(),
         principal,
+        principal_kind,
         app: None,
         namespace: None,
         node: Some(node),
@@ -704,6 +778,13 @@ pub(super) fn manifest_audit_note(config: &Config) -> AuditNote {
             namespaces.iter().copied().collect::<Vec<_>>().join(","),
         );
     }
+    // Every policy write is audited (#1117): the apply's record names them.
+    if !config.policy.is_empty() {
+        details.insert(
+            "policies".to_string(),
+            config.policy.keys().cloned().collect::<Vec<_>>().join(","),
+        );
+    }
     let single = |items: &[(String, String)]| match items {
         [(name, _)] => Some(name.clone()),
         _ => None,
@@ -744,7 +825,13 @@ pub(super) struct AuditQuery {
     #[serde(default)]
     principal: Option<String>,
     #[serde(default)]
+    app: Option<String>,
+    #[serde(default)]
     namespace: Option<String>,
+    #[serde(default)]
+    principal_kind: Option<crate::sesame::types::PrincipalKind>,
+    #[serde(default)]
+    proposal: Option<u64>,
     #[serde(default)]
     limit: Option<usize>,
     /// Merge every live node's log, not just this node's.
@@ -759,7 +846,10 @@ impl AuditQuery {
             until: self.until,
             action: self.action.clone(),
             principal: self.principal.clone(),
+            app: self.app.clone(),
             namespace: self.namespace.clone(),
+            principal_kind: self.principal_kind,
+            proposal: self.proposal,
             limit: self.limit,
         }
     }
@@ -845,7 +935,7 @@ const PEER_AUDIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 //
 // A plain function: the URL serialiser holds a non-`Send` reference, which
 // must not live across an `.await` in the handler.
-fn peer_audit_path(filter: &AuditFilter) -> String {
+pub(super) fn peer_audit_path(filter: &AuditFilter) -> String {
     let mut params = url::form_urlencoded::Serializer::new(String::new());
     if let Some(since) = filter.since {
         params.append_pair("since", &since.to_string());
@@ -859,8 +949,17 @@ fn peer_audit_path(filter: &AuditFilter) -> String {
     if let Some(principal) = &filter.principal {
         params.append_pair("principal", principal);
     }
+    if let Some(app) = &filter.app {
+        params.append_pair("app", app);
+    }
     if let Some(namespace) = &filter.namespace {
         params.append_pair("namespace", namespace);
+    }
+    if let Some(kind) = filter.principal_kind {
+        params.append_pair("principal_kind", kind.as_str());
+    }
+    if let Some(proposal) = filter.proposal {
+        params.append_pair("proposal", &proposal.to_string());
     }
     params.append_pair("limit", &filter.effective_limit().to_string());
     format!("/v1/audit?{}", params.finish())

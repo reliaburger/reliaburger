@@ -6,6 +6,9 @@ use std::time::Duration;
 use reliaburger::grill::command::{CommandState, OwnedCommands};
 
 fn commands(path: &Path) -> OwnedCommands {
+    // A command's owner is `bun`, which `start` gives 15 s to answer, so pay
+    // its first launch before that clock starts (#1149).
+    crate::bun_process::first_launch_binaries();
     OwnedCommands::new(path.to_path_buf(), env!("CARGO_BIN_EXE_bun").into())
 }
 

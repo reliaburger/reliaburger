@@ -1,0 +1,61 @@
+# Keep dependencies current (#1026). Minor and patch updates arrive as one
+# grouped PR a week per ecosystem.
+#
+# Cargo runs `lockfile-only`: the weekly PR is `cargo update`, moving
+# Cargo.lock within the ranges in Cargo.toml and never rewriting them.
+# Dependabot classifies a 0.x bump such as 0.13 -> 0.14 as "minor", but Cargo
+# treats it as breaking, so without this the group would mix breaking 0.x
+# bumps into the compatible ones. A crate a major version behind is a
+# deliberate, one-crate PR instead: it can change an API, a wire format or
+# durable state (a format change bumps `protocol` or `state` in `CURRENT`,
+# src/compatibility.rs). `make outdated`, and the weekly report in
+# security.yml, list those crates. Both ecosystems ignore semver-major
+# updates, or Dependabot opens a PR of its own for every major (#1288).
+#
+# The optimised cron contract crate (tests/contracts/cron) is left out on
+# purpose: it pins `time` and `thiserror` to exactly the versions in the main
+# Cargo.lock, and CI fails when the two differ. When a grouped PR moves either
+# crate, update the `=` pins in tests/contracts/cron/Cargo.toml and run
+# `cargo update --manifest-path tests/contracts/cron/Cargo.toml` in the same PR.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    versioning-strategy: lockfile-only
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - "version-update:semver-major"
+    groups:
+      cargo-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+    commit-message:
+      prefix: "Cargo"
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    # The toolchain action's tag is the compiler pin (1.97.0 for the MSRV
+    # job, 1.98.0 for release builds). Moving it is a policy change with its
+    # own requalification ("Compiler baseline" in docs/releasing.md).
+    ignore:
+      - dependency-name: dtolnay/rust-toolchain
+      - dependency-name: "*"
+        update-types:
+          - "version-update:semver-major"
+    groups:
+      actions-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+    commit-message:
+      prefix: "Actions"

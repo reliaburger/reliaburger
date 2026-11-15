@@ -13,9 +13,15 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <linux/sched.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#endif
 #if !defined(RB_EXECUTOR_HOST_FIXTURE) || defined(RB_EXECUTOR_HOST)
 #include <grp.h>
 #include <linux/capability.h>
@@ -144,13 +150,44 @@ static int pipes(int descriptors[2]) {
     }
     return 0;
 }
+/* A command's child runs in the helper's address space until it execs (see
+ * launch), so it reports a failure the way perror would, but without stdio's
+ * lock and buffer: one writev of constant strings. glibc's strerrordesc_np
+ * reads a static table, untranslated, so it neither allocates nor locks. */
+static void report(const char *what) {
+    int error = errno;
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || __GLIBC_MINOR__ >= 32)
+    const char *description = strerrordesc_np(error);
+#else
+    /* Only the forked macOS protocol fixture gets here: its own memory. */
+    const char *description = strerror(error);
+#endif
+    if (!description) description = "Unknown error";
+    struct iovec parts[4] = {{(void *)what, strlen(what)}, {": ", 2},
+                             {(void *)description, strlen(description)}, {"\n", 1}};
+    ssize_t written = writev(STDERR_FILENO, parts, 4);
+    (void)written;
+}
 #ifndef RB_EXECUTOR_HOST_FIXTURE
+/* glibc's setgroups, setgid and setuid apply credentials to every thread of
+ * a process (setxid): they take a lock and signal the other threads. The
+ * child shares the helper's memory, so it makes the plain system calls, as
+ * glibc's own posix_spawn does. Linux credentials belong to a thread, and
+ * the child is a single thread, so the effect is the same. */
+static int drop_groups(void) { return syscall(SYS_setgroups, 0, NULL) ? -1 : 0; }
+static int become(uint32_t uid, uint32_t gid) {
+    return syscall(SYS_setgid, gid) || syscall(SYS_setuid, uid) ? -1 : 0;
+}
+/* Every step below is a system call on the child's own kernel state: its
+ * credentials, capability sets, securebits, resource limits, mount and IPC
+ * namespaces and parent-death signal are per task, and clone3 gave it its
+ * own copy of each. None writes the shared address space except errno. */
 static void child_setup(uint32_t uid, uint32_t gid) {
 #ifdef RB_EXECUTOR_HOST
     /* Host commands keep the existing Bun-user privilege contract. They are
      * allowlisted trusted processes, not an OCI security boundary. */
-    if (setgroups(0, NULL) || setgid(gid) || setuid(uid) || prctl(PR_SET_PDEATHSIG, SIGKILL)) {
-        perror("host task credentials"); _exit(126);
+    if (drop_groups() || become(uid, gid) || prctl(PR_SET_PDEATHSIG, SIGKILL)) {
+        report("host task credentials"); _exit(126);
     }
 #else
     /* These capabilities exist only in this container's user namespace. A
@@ -160,38 +197,176 @@ static void child_setup(uint32_t uid, uint32_t gid) {
         mount("tmpfs", "/tmp", "tmpfs", MS_NOSUID | MS_NODEV, "mode=1777,size=16m") ||
         mount("tmpfs", "/dev/shm", "tmpfs", MS_NOSUID | MS_NODEV | MS_NOEXEC, "mode=1777,size=16m") ||
         mount(NULL, "/dev", NULL, MS_REMOUNT | MS_BIND | MS_RDONLY | MS_NOSUID | MS_NOEXEC, NULL)) {
-        perror("executor private scratch"); _exit(126);
+        report("executor private scratch"); _exit(126);
     }
 #endif
     struct rlimit file_size = {.rlim_cur = 1U << 20, .rlim_max = 1U << 20};
-    if (setrlimit(RLIMIT_FSIZE, &file_size) || setgroups(0, NULL) ||
+    if (setrlimit(RLIMIT_FSIZE, &file_size) || drop_groups() ||
         prctl(PR_SET_SECUREBITS, SECBIT_NOROOT | SECBIT_NOROOT_LOCKED |
               SECBIT_NO_SETUID_FIXUP | SECBIT_NO_SETUID_FIXUP_LOCKED) ||
         prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)) {
-        perror("executor task security"); _exit(126);
+        report("executor task security"); _exit(126);
     }
     for (unsigned capability = 0; capability <= CAP_LAST_CAP; ++capability) {
         if (prctl(PR_CAPBSET_DROP, capability, 0, 0, 0) && errno != EINVAL) {
-            perror("executor capability retirement"); _exit(126);
+            report("executor capability retirement"); _exit(126);
         }
     }
-    if (setgid(gid) || setuid(uid)) { perror("executor task credentials"); _exit(126); }
+    if (become(uid, gid)) { report("executor task credentials"); _exit(126); }
     struct __user_cap_header_struct header = {.version = _LINUX_CAPABILITY_VERSION_3};
     struct __user_cap_data_struct capabilities[2] = {{0}, {0}};
     if (syscall(SYS_capset, &header, capabilities) || prctl(PR_SET_PDEATHSIG, SIGKILL)) {
-        perror("executor task capabilities"); _exit(126);
+        report("executor task capabilities"); _exit(126);
     }
 #endif
 }
 #endif
-static pid_t launch(int directory) {
-#ifdef RB_EXECUTOR_HOST_FIXTURE
-    (void)directory;
-    return fork();
+/* What a command's child needs before it execs. It lives in run's frame,
+ * which stays put: the helper is suspended until the child execs or exits. */
+struct task {
+    int control, directory;
+    int outputs[2][2];
+    char **argv;
+    const char *cwd;
+    uint32_t argc, uid, gid;
+};
+/* The child of every command (#1030). On Linux it runs on child_stack in
+ * the helper's address space (CLONE_VM) while the helper waits (CLONE_VFORK),
+ * so until execve it must behave like a signal handler: only async-signal-safe
+ * calls, no allocation, no locks, no stdio and no writes to the helper's
+ * variables. errno is the one exception: it is the helper's thread-local
+ * errno, and the helper never reads errno after a spawn succeeds. */
+static int task_child(void *argument) {
+    const struct task *task = argument;
+    /* The child has its own copy of the signal handlers (no CLONE_SIGHAND).
+     * Drop the helper's SIGCHLD handler before closing the pipe it writes. */
+    struct sigaction reset = {.sa_handler = SIG_DFL};
+    sigemptyset(&reset.sa_mask);
+    if (sigaction(SIGCHLD, &reset, NULL)) _exit(126);
+    /* The descriptor table is the child's own (no CLONE_FILES): closing and
+     * duplicating here leaves the helper's descriptors alone. */
+    close(task->control); close(task->directory);
+    close(child_events[0]); close(child_events[1]);
+    int input = open("/dev/null", O_RDONLY);
+    if (input < 0 || dup2(input, STDIN_FILENO) < 0 ||
+        dup2(task->outputs[0][1], STDOUT_FILENO) < 0 ||
+        dup2(task->outputs[1][1], STDERR_FILENO) < 0) _exit(126);
+    if (input > STDERR_FILENO) close(input);
+    for (unsigned stream = 0; stream < 2; ++stream) {
+        close(task->outputs[stream][0]); close(task->outputs[stream][1]);
+    }
+#ifndef RB_EXECUTOR_HOST_FIXTURE
+    child_setup(task->uid, task->gid);
+#endif
+    if (chdir(task->cwd)) { report("executor working directory"); _exit(126); }
+    if (!task->argc) _exit(126);
+    /* run pointed environ at the task's environment for this spawn: execvp
+     * passes environ to execve and searches the PATH in it, so the task's
+     * own PATH decides, and the child assigns nothing. */
+    execvp(task->argv[0], task->argv);
+    report("executor command"); _exit(127);
+}
+#ifdef __linux__
+/* The child's stack. Under CLONE_VM it can't use the helper's: the helper's
+ * frames are live below the clone. Mapped once, below a guard page; the
+ * child uses it for setup and execvp's PATH buffer (one PATH plus one name,
+ * both inside a 64 KiB frame) and leaves it when it execs. */
+#define CHILD_STACK_SIZE (256U << 10)
+static unsigned char *child_stack;
+static int map_child_stack(void) {
+    long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) return -1;
+    unsigned char *mapping = mmap(NULL, CHILD_STACK_SIZE + (size_t)page, PROT_READ | PROT_WRITE,
+                                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
+    if (mapping == MAP_FAILED) return -1;
+    if (mprotect(mapping, (size_t)page, PROT_NONE)) return -1;
+    child_stack = mapping + page;
+    return 0;
+}
+/* clone3 has no libc wrapper that runs a function on a new stack (glibc's
+ * __clone3 is private), and the generic syscall() can't be used: the child
+ * would return from it on an empty stack. This is the same trampoline:
+ * rb_clone3(arguments, size, function, argument) returns the child's pid or
+ * -errno in the parent; the child, on the new stack, calls
+ * function(argument) and exits with its result. */
+long rb_clone3(struct clone_args *arguments, size_t size, int (*function)(void *), void *argument)
+    __attribute__((visibility("hidden")));
+#if defined(__x86_64__)
+_Static_assert(SYS_clone3 == 435 && SYS_exit == 60, "x86_64 system call numbers");
+/* syscall clobbers only rax, rcx and r11, so rdx (function) survives it and
+ * r8 carries the argument; the child starts with rax 0 on the new stack. */
+__asm__(".pushsection .text\n"
+        ".globl rb_clone3\n.hidden rb_clone3\n.type rb_clone3, @function\n"
+        "rb_clone3:\n"
+        "  endbr64\n"
+        "  mov %rcx, %r8\n"
+        "  mov $435, %eax\n"
+        "  syscall\n"
+        "  test %rax, %rax\n"
+        "  jz 1f\n"
+        "  ret\n"
+        "1:\n"
+        "  xor %ebp, %ebp\n"
+        "  and $-16, %rsp\n"
+        "  mov %r8, %rdi\n"
+        "  call *%rdx\n"
+        "  mov %eax, %edi\n"
+        "  mov $60, %eax\n"
+        "  syscall\n"
+        "  hlt\n"
+        ".size rb_clone3, .-rb_clone3\n"
+        ".popsection\n");
+#elif defined(__aarch64__)
+_Static_assert(SYS_clone3 == 435 && SYS_exit == 93, "aarch64 system call numbers");
+/* svc preserves every register but x0, so x2 (function) and x3 (argument)
+ * survive it; the child starts with x0 0 and sp at the new stack's top. */
+__asm__(".pushsection .text\n"
+        ".globl rb_clone3\n.hidden rb_clone3\n.type rb_clone3, %function\n"
+        ".p2align 2\n"
+        "rb_clone3:\n"
+        "  hint #34\n"
+        "  mov x8, #435\n"
+        "  svc #0\n"
+        "  cbz x0, 1f\n"
+        "  ret\n"
+        "1:\n"
+        "  mov x29, #0\n"
+        "  mov x30, #0\n"
+        "  mov x0, x3\n"
+        "  blr x2\n"
+        "  mov x8, #93\n"
+        "  svc #0\n"
+        "  brk #0\n"
+        ".size rb_clone3, .-rb_clone3\n"
+        ".popsection\n");
 #else
-    struct clone_args arguments = {.flags = CLONE_INTO_CGROUP, .exit_signal = SIGCHLD,
-                                   .cgroup = (uint64_t)directory};
-    return (pid_t)syscall(SYS_clone3, &arguments, sizeof(arguments));
+#error "the executor helper's clone3 trampoline supports x86_64 and aarch64 only"
+#endif
+#endif
+/* Start a command's child. On Linux, CLONE_VM | CLONE_VFORK makes this a
+ * vfork: no page tables are copied and nothing is write-protected, so
+ * neither process takes copy-on-write faults, and clone3 returns once the
+ * child has exec'd or exited. CLONE_INTO_CGROUP starts it in its task cgroup.
+ * The protocol fixture has no cgroup, and on macOS it forks. */
+static pid_t launch(int directory, struct task *task) {
+#ifdef __linux__
+    struct clone_args arguments = {.flags = CLONE_VM | CLONE_VFORK, .exit_signal = SIGCHLD,
+                                   .stack = (uint64_t)(uintptr_t)child_stack,
+                                   .stack_size = CHILD_STACK_SIZE};
+#ifndef RB_EXECUTOR_HOST_FIXTURE
+    arguments.flags |= CLONE_INTO_CGROUP;
+    arguments.cgroup = (uint64_t)directory;
+#else
+    (void)directory;
+#endif
+    long child = rb_clone3(&arguments, sizeof(arguments), task_child, task);
+    if (child < 0) { errno = (int)-child; return -1; }
+    return (pid_t)child;
+#else
+    (void)directory;
+    pid_t child = fork();
+    if (!child) task_child(task);
+    return child;
 #endif
 }
 #ifdef RB_EXECUTOR_HOST
@@ -251,35 +426,20 @@ static int run(int control, int directory, uint64_t sequence, uint32_t argc,
     int outputs[2][2];
     if (pipes(outputs[0])) return -1;
     if (pipes(outputs[1])) { close(outputs[0][0]); close(outputs[0][1]); return -1; }
-    pid_t child = launch(directory);
+    struct task task = {.control = control, .directory = directory, .argv = argv, .cwd = cwd,
+                        .argc = argc, .uid = uid, .gid = gid};
+    memcpy(task.outputs, outputs, sizeof(outputs));
+    char **inherited = environ;
+    environ = env;
+    pid_t child = launch(directory, &task);
+    int error = errno;
+    environ = inherited;
     if (child < 0) {
-        int error = errno;
         for (unsigned stream = 0; stream < 2; ++stream) {
             close(outputs[stream][0]); close(outputs[stream][1]);
         }
         if (event(control, 5, sequence) || send_word(control, (uint32_t)error)) return -1;
         return cleanup(control, sequence);
-    }
-    if (!child) {
-        close(control); close(directory);
-        close(child_events[0]); close(child_events[1]);
-        int input = open("/dev/null", O_RDONLY);
-        if (input < 0 || dup2(input, STDIN_FILENO) < 0 ||
-            dup2(outputs[0][1], STDOUT_FILENO) < 0 || dup2(outputs[1][1], STDERR_FILENO) < 0) _exit(126);
-        if (input > STDERR_FILENO) close(input);
-        for (unsigned stream = 0; stream < 2; ++stream) {
-            close(outputs[stream][0]); close(outputs[stream][1]);
-        }
-#ifndef RB_EXECUTOR_HOST_FIXTURE
-        child_setup(uid, gid);
-#else
-        (void)uid; (void)gid;
-#endif
-        environ = env;
-        if (chdir(cwd)) { perror("executor working directory"); _exit(126); }
-        if (!argc) _exit(126);
-        execvp(argv[0], argv);
-        perror("executor command"); _exit(127);
     }
     for (unsigned stream = 0; stream < 2; ++stream) close(outputs[stream][1]);
     int status = 0;
@@ -404,6 +564,9 @@ int main(int argc, char **argv) {
     if (syscall(SYS_capset, &header, capabilities) || prctl(PR_SET_DUMPABLE, 0)) return 125;
 #endif
     if (pipes(child_events) || fcntl(child_events[1], F_SETFL, O_NONBLOCK)) return 125;
+#ifdef __linux__
+    if (map_child_stack()) return 125;
+#endif
     struct sigaction notification = {.sa_handler = child_changed, .sa_flags = SA_NOCLDSTOP};
     sigemptyset(&notification.sa_mask);
     if (sigaction(SIGCHLD, &notification, NULL)) return 125;

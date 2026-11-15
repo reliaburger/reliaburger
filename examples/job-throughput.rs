@@ -263,7 +263,7 @@ mod linux {
                         } else {
                             let host = template.runtime == JobRuntime::Process;
                             let task = TaskInvocation {
-                                template: Some(Box::new(template)),
+                                template: Some(std::sync::Arc::new(template)),
                                 index,
                                 attempt: 1,
                                 program: executable,

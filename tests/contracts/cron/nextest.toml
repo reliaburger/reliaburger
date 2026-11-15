@@ -1,5 +1,6 @@
-# 0.9.145 fixes sibling capture-pipe inheritance on Apple platforms.
-nextest-version = "0.9.145"
+# 0.9.145 fixes sibling capture-pipe inheritance on Apple platforms. 0.9.151
+# is past GHSA-vc25-qg58-w57c, which needs run recording (not enabled here).
+nextest-version = "0.9.151"
 
 [store]
 dir = "target/nextest"

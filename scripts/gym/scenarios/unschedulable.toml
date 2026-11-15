@@ -1,0 +1,27 @@
+# An unschedulable deploy: reports requires a node label no node carries.
+id = "unschedulable"
+title = "An unschedulable deploy"
+nodes = 1
+
+prompt = """
+The `reports` app was deployed a minute ago and has never started. Find out
+what is wrong: which app and what kind of fault.
+"""
+
+[[setup]]
+apply = "apps/web-v1.toml"
+wait_running = "web"
+
+[[setup]]
+apply = "apps/reports-unplaceable.toml"
+
+[[setup]]
+settle = "15s"
+
+[truth]
+app = "reports"
+namespace = "default"
+fault_kind = "unschedulable"
+
+[score]
+checks = ["app", "fault_kind"]

@@ -1,0 +1,57 @@
+---
+source: src/relish/agent/patch/workspace.rs
+expression: value
+---
+{
+  "command": "patch diff",
+  "data": {
+    "base": "[id]",
+    "build_changes": [],
+    "builds": [],
+    "diff": "diff --git a/src/bin/tool.rs b/src/bin/tool.rs\ndeleted file mode 100644\nindex 1b7c1e7..0000000\n--- a/src/bin/tool.rs\n+++ /dev/null\n@@ -1,3 +0,0 @@\n-fn main() {\n-    println!(\"hi\");\n-}\ndiff --git a/src/lib.rs b/src/lib.rs\nindex b9babe5..f7bf66a 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1,2 @@\n pub mod client;\n+pub mod retry;\ndiff --git a/src/retry.rs b/src/retry.rs\nnew file mode 100644\nindex 0000000..d29c09b\n--- /dev/null\n+++ b/src/retry.rs\n@@ -0,0 +1 @@\n+pub fn retry() {}\n",
+    "dir": "[root]/work",
+    "files": [
+      {
+        "deletions": 3,
+        "insertions": 0,
+        "path": "src/bin/tool.rs",
+        "status": "deleted"
+      },
+      {
+        "deletions": 0,
+        "insertions": 1,
+        "path": "src/lib.rs",
+        "status": "modified"
+      },
+      {
+        "deletions": 0,
+        "insertions": 1,
+        "path": "src/retry.rs",
+        "status": "added"
+      }
+    ],
+    "source_commit": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+    "tests": [],
+    "tree": "[id]",
+    "version": "0.2.7"
+  },
+  "next": [
+    {
+      "read_only": false,
+      "run": "relish agent patch test [root]/work",
+      "why": "the portable suite against the change as it is now"
+    }
+  ],
+  "ok": true,
+  "relish": {
+    "commit": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+    "dirty": false,
+    "source_digest": "sha256:1639b607afe38bc2d97354cd49b82921653880e34c8d918491816b50df78c953",
+    "version": "0.2.7"
+  },
+  "schema": "relish.agent/v1",
+  "truncated": false,
+  "warnings": [
+    "no test ran against this version of the change; run patch test before reporting it"
+  ]
+}

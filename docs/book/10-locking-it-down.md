@@ -122,12 +122,13 @@ pub fn validate_and_sign_csr(
     params.not_before = time::OffsetDateTime::from(now - CLOCK_SKEW_BACKDATE);
     params.not_after = time::OffsetDateTime::from(now + WORKLOAD_CERT_LIFETIME);
 
-    let signed = params.signed_by(&csr_params.public_key, &ca_cert, workload_ca_keypair)?;
+    let issuer = Issuer::from_params(workload_ca_params, workload_ca_keypair);
+    let signed = params.signed_by(&csr_params.public_key, &issuer)?;
     Ok(signed.der().to_vec())
 }
 ```
 
-The `rcgen` crate gives us the CSR round-trip. We enabled the `x509-parser` feature on rcgen to get `CertificateSigningRequestParams::from_der()`, which parses the incoming CSR and extracts the public key and SANs. The three-argument `signed_by(public_key, issuer, issuer_key)` on `CertificateParams` is the key move: it builds a certificate from *our* parameters around *their* public key. The worker still has the only copy of the private key, the council has the CA key, and neither side ever sees the other's.
+The `rcgen` crate gives us the CSR round-trip. We enabled the `x509-parser` feature on rcgen to get `CertificateSigningRequestParams::from_der()`, which parses the incoming CSR and extracts the public key and SANs. `signed_by(public_key, issuer)` on `CertificateParams` is the key move: it builds a certificate from *our* parameters around *their* public key. The `Issuer` borrows the CA's params and keypair: its name and key identifier go into the leaf, its key signs it. (rcgen 0.13 took the issuer as a certificate plus a key, so we used to self-sign a throwaway copy of the CA just to hand it over. 0.14 dropped that dance.) The worker still has the only copy of the private key, the council has the CA key, and neither side ever sees the other's.
 
 The regression test (`smuggled_csr_sans_are_not_signed`) hand-builds a hostile CSR with two extra SANs, signs it, parses the issued DER, and asserts the SAN set contains exactly one URI — the expected one.
 
@@ -496,7 +497,7 @@ API tokens live in `SecurityState.api_tokens` and are managed through Raft. `rel
 
 `relish token list` used to print `created_at` exactly as the API sent it, Unix seconds, and ignored `expires_at` altogether, so the one thing you most want to know about a CI token (when does it stop working?) was missing. The client now deserialises the response into a typed `TokenSummary` with `expires_at: Option<u64>` instead of poking at a `serde_json::Value`, and the table shows UTC times plus `never`, `(in 30d)` or `(expired)`. The `time` crate, already a dependency for certificate validity windows, does the calendar arithmetic: `OffsetDateTime::from_unix_timestamp` returns a `Result`, because an `i64` of seconds can land outside the years it can represent. The rendering is a pure function of the token list and "now", so an `insta` inline snapshot pins the whole table, and a change in the output shows up as a diff in the test source rather than a vague assertion failure.
 
-Both list and revoke endpoints read from or write to the council's security state directly. The revoke endpoint writes a `RevokeApiToken` command to Raft, which removes the token from all council replicas immediately.
+The list endpoint reads the council's security state directly. The revoke endpoint writes a `RevokeApiToken` command to Raft, which removes the token from the state every replica applies. Authentication reads each node's token store, though, not that state, so a revoke has one more step ([below](#the-other-three-writes)).
 
 ### When was this token last used?
 
@@ -592,11 +593,141 @@ let previous_valid_until = now
 
 `filter` turns `Some(x)` into `None` when the closure says no, so a zero grace, or a token already past its expiry, ends the old secret at once with no special case.
 
-The node that took the request also installs the rotation in its own token store straight away, so the new secret works on the very next request there. The other nodes catch up on their five-second refresh from Raft, and since the old secret keeps working meanwhile, nobody notices the gap.
+The node you asked also installs the rotation in its own token store straight away, so the new secret works on the very next request there. The other nodes catch up on their five-second refresh from Raft, and since the old secret keeps working meanwhile, nobody notices the gap.
+
+### A create that works on any node
+
+`token create` didn't get that treatment at first, and a claims evaluation of 0.2.0 caught it twice over (#1496). On a follower the handler went straight to `council.write`, which refuses anywhere but the leader, so a script creating tokens on a three-node cluster failed about two times in three with `503`, depending on which node it reached. And a token that *was* created got a `401` for up to five seconds on the node that made it, because that node was waiting for its own refresh. Unlike a rotation, a new token has no old secret to fall back on, so here people really do notice the gap.
+
+The first half is the same fix as every other leader-only write: ask `council_to_forward_to` whether this node can prove it leads and, if it can't, hand the raw body to `forward_to_leader` with the caller's own `Authorization` header. The follower forwards before it looks at `[permission]` specs or picks a default lifetime, because those answers belong to the leader. Its replica might be a moment behind, and a spec it hasn't seen yet shouldn't change what a token inherits. The leader repeats the role checks against the caller's credential, so forwarding grants nothing.
+
+The second half is more interesting on a follower. On the leader, `council.write` returns once the entry is applied, so the token is right there to copy into the store. But the follower only sees the leader's answer, and that holds the plaintext, not the stored record. What should it install?
+
+We could have rebuilt an `ApiToken` from the answer, but that's a second copy of the record that can disagree with the first, and the next refresh would delete it if the replica was still behind. We could have had the leader send the record back, but that puts a hash in a response meant for a client. Instead the follower hashes the secret from the answer and waits for its own replica to apply a token with that hash:
+
+```rust
+pub async fn applied_api_token(
+    &self,
+    token_hash: &[u8],
+    within: std::time::Duration,
+) -> Option<crate::sesame::types::ApiToken> {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        let token = self
+            .state_machine
+            .read_desired(|state| {
+                state
+                    .security_state
+                    .api_tokens
+                    .iter()
+                    .find(|token| token.token_hash == token_hash)
+                    .cloned()
+            })
+            .await;
+        if token.is_some() || tokio::time::Instant::now() >= deadline {
+            return token;
+        }
+        tokio::time::sleep(API_TOKEN_POLL).await;
+    }
+}
+```
+
+`read_desired` takes a closure and runs it under the state machine's read lock, so we borrow the list and clone the one token we want, not the whole desired state. `.cloned()` turns the `Option<&ApiToken>` from `find` into an `Option<ApiToken>`, which is what lets the value outlive the lock. In Go you'd copy the struct by hand before unlocking, and nothing would stop you forgetting. Here the borrow checker refuses to let a reference escape the closure.
+
+Replication takes a few heartbeats, so the loop gives up after two seconds. A node lagging further than that still answers, since the token *is* committed, and it picks the token up on its next refresh. The only thing the caller loses in that case is the "at once".
+
+To read the leader's answer without losing it, the handler takes the `Response` apart:
+
+```rust
+let (mut parts, body) = answer.into_parts();
+let bytes = match axum::body::to_bytes(body, limit).await { /* ... */ };
+// ...parse the secret, install the token...
+Response::from_parts(parts, axum::body::Body::from(bytes))
+```
+
+`into_parts` consumes the response and hands back its status and headers separately from its body, and `to_bytes` reads the body into memory, up to a limit. A response body is a stream you can read once, so reading it means building a new response. The ownership rules make that obvious: after `into_parts` the original `answer` is gone, and using it again is a compile error.
+
+The other nodes still caught up on their five-second refresh, so a client behind a load balancer could land on a third node and get a `401` for a moment. The issue asked for the node you spoke to, and that's what the fix promised. "Every node at once" below closes the rest of the gap.
+
+### The other three writes
+
+`token create` wasn't alone. `token rotate`, `token revoke` and `join-token create` all went straight to `council.write` as well, so each answered `503` on a follower (#1506). Forwarding them is the same few lines, with one small helper, `forward_token_write`, wrapping `forward_to_leader` in a timeout. The follower forwards before it reads its replica or mints anything, so a rotation's new secret and a join token's plaintext only ever exist on the leader. What's worth a closer look is what happens after the leader answers, because the three writes differ.
+
+A rotation is the easy one. The answer holds the new secret, exactly like a create's, so `install_forwarded_token` works unchanged: hash the secret, find the record in this node's replica, copy it into the store. That record already says what became of the old secret, so `--grace-hours 0` ends a leaked secret on the follower with no special case. We dropped the leader's own `apply_rotation_locally` at the same time, since copying the record does the same job and now there's only one way in.
+
+A join token needs nothing at all. It lives in Raft, not in the token store, so the follower only hands the answer back.
+
+A revoke is the one that deserves the worry. A create that's late means someone gets a `401` and tries again. A revoke that's late means a token you just revoked *keeps working*, and revoke is what you run when something has gone wrong. Here's the embarrassing part: writing the test for the follower found the same bug on the leader. `token_revoke_handler` never touched the store at all, so on any node, leader included, a revoked token carried on working until the next refresh, up to five seconds after `relish token revoke` said it was gone. Nobody noticed, because you don't normally test a token right after killing it.
+
+So take it out of the store. That's one line, with `Vec::retain`, which keeps the elements its closure says yes to (`slices.DeleteFunc` is the Go equivalent, with the opposite sense):
+
+```rust
+store.write().await.retain(|token| token.name != name);
+```
+
+But *when*? Do it the moment the leader answers, and the five-second refresh can undo it. Remember what a refresh does: it copies the replica over the store, and on a follower the replica may not have applied the revoke yet. Taking a token out and having a refresh put it straight back is the failure we're fixing, with extra steps. So `drop_revoked_token` waits first, up to the same two seconds a create waits, until the replica holds no token by that name, and only then touches the store. After that, any refresh that starts finds the token gone.
+
+That leaves a refresh already in flight, which read the replica just before the revoke applied and is about to write. It's a tiny window, and it's the kind of window a soak finds at 3 a.m. The obvious fix is to hold the store's write lock across the replica read, and we decided against it: the read waits on the state machine's lock, and building a Raft snapshot holds that lock while it serialises everything, so every authenticated request on the node would queue behind a snapshot. Instead the refresh does a compare-and-swap by hand:
+
+```rust
+let seen = store.read().await.clone();
+let tokens = council.api_tokens().await;
+replace_tokens_unless_changed(store, &seen, tokens).await;
+```
+
+`replace_tokens_unless_changed` takes the write lock, and only writes if the store still equals `seen`. If a handler got in between, that tick does nothing and the next one, five seconds later, catches up. `ApiToken` derives `PartialEq`, and comparing a slice compares its elements one by one, so `current.as_slice() == seen` is all the comparison takes. `api_tokens()` is new too. It clones only the token list under the read lock, where `security_state()` clones the whole desired state to throw most of it away, and this runs on every tick on every node.
+
+What if the replica is more than two seconds behind? We can't wait for ever, and the write has committed, so the node drops the token from its store anyway and answers. A refresh from that lagging replica can bring it back until the replica catches up, though, and a silent "revoked" would be a lie. So the answer says so: `token ci revoked, but this node's replica is behind: it may accept the token again until it catches up`. Only a revoke gets that warning. A rotated secret on a lagging node just gets a `401` until it catches up, and the caller still has the secret. The one gap we left is a zero-grace rotation through a node that far behind: the old secret works there until the replica catches up, and the answer doesn't say so.
+
+The other timeout is the leader not answering at all, and here each route loses something different, so each caller of `forward_token_write` passes its own error. After 10 seconds the write may or may not have committed. A revoke loses nothing: revoking again is safe, because revoking a name that's gone is a no-op. A create or a rotation may have lost the only copy of a secret. A rotation is the nasty one, because the obvious reaction is wrong. A second rotation replaces the previous secret, so the secret your clients still hold stops at once, grace period or no grace period, and they get an outage instead of an overlap. The error tells you to look at the token's created time in `relish token list` first (a rotation moves it). And a join token may leave a hash behind that nobody has the plaintext for. Nothing can use it, and it expires by itself.
+
+Writing the join-token test turned up one more. `join_token_create_handler` matched `Ok(_)` and answered `200` with a plaintext, even when the state machine had refused the entry because the node is retired. The caller got a credential that existed nowhere. Now a refusal is a `409`, like everywhere else. `Ok` from `council.write` means "the entry applied", not "the state machine agreed", and `CouncilResponse::Refused` is the second question. The compiler can't ask it for you past a wildcard arm.
+
+### Every node at once
+
+The moment a token is created and the moment it's first used used to be minutes apart, with a human in between. Then agents arrived. The agent gym creates a read-only token for each run and hands it to the solver, which calls `relish agent context` straight away. `context` asks every node for its own diagnostics, events and faults, with the solver's token. On a local model's runs of the partitioned-node scenario, the answer listed sixteen `401: invalid token` errors from the two followers, and the model stopped there and blamed the wrong node.
+
+The partition looked like the obvious suspect, since a node cut off from the council can't apply a token created after the cut. But the healthy follower answered `401` too. Timing a fresh token on a healthy three-node cluster showed why: the leader accepted it at once, and both followers turned it away for between 2.5 and 4.8 seconds, until their next refresh. The partition had nothing to do with it. With the fix below, the same scenario's `context` shows no `401` from any node.
+
+So the state machine now says when the tokens change. Next to the GitOps trigger watch, `CouncilStateMachine` keeps a `watch::Sender<Vec<ApiToken>>`, and after each applied batch and each installed snapshot it does this:
+
+```rust
+fn publish_api_tokens(&self, state: &DesiredState) {
+    let tokens = &state.security_state.api_tokens;
+    self.api_tokens.send_if_modified(|current| {
+        if current == tokens {
+            false
+        } else {
+            current.clone_from(tokens);
+            true
+        }
+    });
+}
+```
+
+`send_if_modified` hands the closure a mutable borrow of the channel's value, and wakes the receivers only if the closure returns `true`. So an entry that doesn't touch the tokens costs one comparison of a list of tens of tokens and wakes nobody. `clone_from` copies into the existing `Vec`, reusing its allocation where it can. Why compare the lists, rather than match on the requests that change tokens? There are at least six today, counting the test-lease ones and a lease's cleanup, and the next one added next year would leave its change unannounced. The comparison can't miss one.
+
+Bun's refresh loop then waits for whichever comes first:
+
+```rust
+async fn next_security_refresh(
+    ticker: &mut tokio::time::Interval,
+    token_updates: &mut tokio::sync::watch::Receiver<Vec<ApiToken>>,
+) {
+    tokio::select! {
+        _ = ticker.tick() => {}
+        Ok(()) = token_updates.changed() => {}
+    }
+}
+```
+
+The `Ok(())` pattern matters. `changed()` returns an error once the sender is gone, and it returns it at once, every time. In `select!`, a branch whose result doesn't match its pattern is disabled for that call, and the other branches carry on. So a closed channel leaves the loop on its five-second tick, instead of spinning through refreshes as fast as the CPU allows. The test drives this with paused time: a change wakes the loop with no time passed, the next wait takes exactly one interval, and after the sender is dropped the one after that does too.
+
+The tick stays for what the replica doesn't announce. A node with no Raft seat reads the leader's view, and the CRL and trust set still ride the same tick. With the fix, the same timing shows a fresh token accepted on both followers within milliseconds of the leader. It closes the revoke gap on every other node too. A revoked token used to keep working on them for up to five seconds after `relish token revoke` said it was gone.
 
 ### A default lifetime, except for Admins
 
-Until now a token without `--ttl-days` lived forever, and forever is the default people actually get. Deployer and ReadOnly tokens now get 90 days unless you pass `--ttl-days` or, deliberately, `--no-expiry`. The node that answers reads the default from `[security.tokens] default_ttl`.
+Until now a token without `--ttl-days` lived forever, and forever is the default people actually get. Deployer and ReadOnly tokens now get 90 days unless you pass `--ttl-days` or, deliberately, `--no-expiry`. The leader reads the default from its own `[security.tokens] default_ttl`, whichever node you asked.
 
 Admin tokens are exempt, and the reason is the same trap the sweep avoids. If every Admin token expires, nobody can create the next one, and the bootstrap window doesn't reopen (the store isn't empty). A default lifetime on Admins would arm that trap for every cluster that forgot a calendar reminder. So Admins don't expire unless you say so, and `relish wtf` nags instead: it warns about an Admin token whose secret is more than 90 days old, and about any token that expires within 14 days. `relish token list` gives the 14-day warning too, on stderr so `-o json` stays parseable.
 
@@ -948,7 +1079,7 @@ The `unsafe` block turns raw bytes into a Rust type, so it deserves a closer loo
 
 Verifying a bearer and minting a token both go through one helper, `hash_off_heap`. Verification reads the variant, version, cost and salt from the stored hash, as the crate's own `verify_password` does, and compares the result with `password_hash::Output`'s `==`, which runs in constant time. A hash the crate made still verifies, a hash we mint still verifies with the crate, and a hash with other parameters verifies with its own. Unit tests pin all three, because a hand-rolled verifier that quietly accepted the wrong thing would be far worse than a fat heap.
 
-`tests/auth_memory.rs` is the test we wrote first. Like the upgrade and connection memory tests, it's a binary with a counting global allocator, so it sees every heap byte the check asks for. Checking a bearer against three stored tokens peaked at 19,922,944 heap bytes before the fix: one Argon2 block array, 19,456 KiB to the byte. After it, the same check stays under a 1 MiB ceiling, and so do refusing a wrong secret and minting a token.
+`tests/auth_memory.rs` was the test we wrote first. Like the upgrade and connection memory tests, it was a binary with a counting global allocator, so it sees every heap byte the check asks for. Checking a bearer against three stored tokens peaked at 19,922,944 heap bytes before the fix: one Argon2 block array, 19,456 KiB to the byte. After it, the same check stays under a 1 MiB ceiling, and so do refusing a wrong secret and minting a token.
 
 A heap test proves the bytes left the heap. It can't prove RSS, so we reproduced the soak in a two-CPU, 2 GiB Lima VM with swap off: one Bun, six job runs of the soak's calibration mix (262,144-task arrays and 512-task long runs on the process runtime), and the soak's request mix, each request a fresh `curl` through a forwarder that holds the connection open until Bun's idle timeout, as Lima's does. Thirty minutes, with a Bun restart at ten:
 
@@ -1048,7 +1179,32 @@ A layer driven by a table has the same weakness as the handlers it replaced: som
 
 ### Reading it back
 
-`GET /v1/audit` takes `since`, `until`, `action` (exact, or a family like `fault.*`), `principal` and `namespace`, and returns the newest matching records, oldest first. With `?cluster=true` the node asks every live member for its records and merges them by `(timestamp, node, sequence)`, naming any member that didn't answer. It forwards the *caller's* token rather than the cluster service token, so each node repeats the authorisation itself, and the service token never needs to be able to read the log. That matters: the log lists every principal and the addresses they work from, which is exactly the map an attacker holding a stolen node credential would want. Reading needs an unscoped Admin with `admin` across the cluster. `relish audit` wraps it, with `--since 2h` style times.
+`GET /v1/audit` takes `since`, `until`, `action` (exact, or a family like `fault.*`), `principal`, `app` and `namespace`, and returns the newest matching records, oldest first. With `?cluster=true` the node asks every live member for its records and merges them by `(timestamp, node, sequence)`, naming any member that didn't answer. It forwards the *caller's* token rather than the cluster service token, so each node repeats the authorisation itself, and the service token never needs to be able to read the log. That matters: the log lists every principal and the addresses they work from, which is exactly the map an attacker holding a stolen node credential would want. Reading needs an unscoped Admin with `admin` across the cluster. `relish audit` wraps it, with `--since 2h` style times.
+
+### The apply with no name
+
+Apply two apps in one manifest and what does the table say? For a long time, this:
+
+```text
+ACTION       TARGET
+app.applied  @default
+```
+
+The manual promised that each record names the app it touched, and for a one-app apply it did. With two, `manifest_audit_note` had no single name to put in `app`, so it left it empty and wrote `backend@default,frontend@default` under `details.workloads`. The table only knew about `app` and `namespace`. So the names were on disk and in `-o json`, and nowhere a person would look. Worse, the filters had the same blind spot. An apply across two namespaces has no `namespace` either, so `--namespace payments` skipped it, and `relish events --app backend` skipped every multi-app apply there was. `relish audit` had no `--app` at all.
+
+We could have written one record per app, and for a moment that looks tidier: `app` is always set, and every filter just works. But a record is one request. One person ran one command from one address, and it succeeded or failed as one. Ten records for that lie about how many things happened, make `--limit` count apps rather than actions, and let a 500-app manifest write 500 synced lines before answering. So a record stays one request, its JSON stays as it was, and the readers learn to read the list. `WorkloadList` parses it in one place:
+
+```rust
+pub fn from_details(details: &'a BTreeMap<String, String>) -> Option<Self> {
+    let mut listed: Vec<&str> = details.get("workloads")?.split(',').collect();
+    let unlisted = listed
+        .last()
+        .and_then(|last| last.strip_prefix('+')?.strip_suffix(" more")?.parse().ok());
+```
+
+The `'a` is a lifetime. It says the `&str`s in the list borrow from `details`, so the compiler won't let a `WorkloadList` outlive the map it points into, and we parse a list without copying a single name. In C you'd keep that rule in your head. Go's garbage collector would quietly keep the string alive for you, and Python's would too. Here it's written in the signature. The `?` inside the closure works too: the closure returns an `Option`, so a last entry that isn't shaped like `+5 more` just gives `None`.
+
+That `+5 more` is the awkward bit. `summarise_names` keeps twenty names so that one huge manifest can't make a huge record, which means `--app` can't know what the other five were. It has two choices: say no and maybe hide the apply you're hunting, or say yes and maybe show one line too many. After an incident, a false negative is the expensive one, so `may_name` says yes. The table has less room than the record, so it shows eight names and counts the rest.
 
 ### Recording the refusals
 
@@ -1878,6 +2034,8 @@ pub(super) fn replace_link(fd: &OwnedFd, new_program: RawFd, old_program: RawFd)
 
 This is a raw `bpf(2)` syscall, so it's `unsafe`: the compiler can't check what the kernel does with the pointer we pass. `UpdateAttributes` is `#[repr(C)]`, which tells Rust to lay the fields out in declaration order, exactly as the kernel's C struct expects (by default Rust may reorder them). `OwnedFd` is a file descriptor that closes itself when dropped, and `as_raw_fd()` borrows its integer for the call without giving up ownership. `BPF_F_REPLACE` makes this a compare-and-swap: if the link no longer runs `old_program`, the kernel refuses, so we can't overwrite a change we didn't expect.
 
+The two halves go through different code. The maps are aya's job: the loader is told which directory the pins live in (`EbpfLoader::default_map_pin_directory`), and for each map the C object marks as pinned by name it reuses the pin of that name or creates one there. Before aya 0.14 this method was called `map_pin_path`. That name now belongs to a different method, one that pins a single named map at an exact path, so the rename is one the compiler catches rather than one that quietly changes where pins go. The links are ours, in the raw syscalls above. When we wrote this, aya couldn't turn a cgroup socket-address attachment into a pinnable link at all. Aya 0.14 added that conversion, but its link update is internal to its XDP and TC code, so it still can't do the compare-and-swap on our pinned cgroup links, and that is the whole point. So the dependency bump changed one method name and left the pin and unpin paths alone. That matters, because a stale pinned program set once wedged every VIP connect in our VM.
+
 Keeping the kernel state alive is half the job. After a restart Bun also has to know *which workload* each piece of policy belongs to. Otherwise the next health check sees a protected workload with no binding and stops it, or a sweep mistakes the retained policy for an orphan. So before programming any policy, the agent writes a record to a private checkpoint: the instance, its original launch spec, its allowlist, its namespace identity, its cgroup id and the kernel's boot id. The cgroup id stays in the record after the runtime deletes the cgroup, so cleanup can remove the right map entries without guessing from a missing directory. The boot id stops a cgroup number from a previous boot being mistaken for the same number today. The resolved IP addresses are deliberately left out (`#[serde(skip)]` on that field): they're a DNS answer, not policy, so recovery resolves the recorded allowlist again, keeping enforcement on (deny everything) in the meantime. Each record stays in the file, marked `Retired`, until the identity files and adoption record are gone too, so a crash between those steps doesn't look like a lost checkpoint. And if a checkpoint write fails, Bun refuses further policy changes until a restart re-reads the file, because it can't know whether the old contents survived.
 
 On recovery, a surviving workload keeps running only if its original cgroup, boot id, hooks and enforcement flag all check out. Anything that doesn't match is refused rather than swept. We'd rather stop a workload than guess who owns a kernel entry.
@@ -1908,26 +2066,24 @@ Image signing (`src/pickle/signing.rs`) is the clearest example of testing a sec
 
 The per-instance lifecycle has its own regression suite spread across the layers it touches: `identity_mount_source_is_per_instance_not_per_app` (OCI spec), `two_replicas_of_one_app_get_distinct_identity_dirs_and_keys` (the overwrite bug), `deploy_prepares_and_stop_removes_per_instance_identity_dirs` and `rolling_redeploy_leaves_only_live_instances_identity_dirs` (agent lifecycle), and `adoption_restores_identity_and_rotation_schedule_from_disk` plus `adoption_sweeps_orphaned_identity_dirs` (restart safety). The tmpfs backing itself only shows up under Linux as root, so `identity_dir_is_tmpfs_backed_under_root` self-skips elsewhere and runs in the Lima rig. On the rotation side, the state machine's verify-before-retire behaviour is pinned by `finalize_refused_while_a_secret_is_sealed_under_an_old_generation`, `finalize_succeeds_after_secrets_re_encrypted_under_the_new_generation`, `concurrent_second_rotation_refused_until_finalised`, `same_generation_rotation_retry_is_idempotent`, and the compatibility fixture `legacy_secret_without_generation_metadata_blocks_finalize`; the API tests assert the refusals surface as `409`s.
 
-Token rotation is tested at three layers, and the tests came first. In `sesame/token.rs`, `the_old_secret_works_inside_the_grace_period_and_stops_after_it` drives `validate_token_at` with an injected `now` either side of the grace end, so no test sleeps for a day; `a_second_rotation_ends_the_first_old_secret` and `the_old_secret_never_outlives_the_old_expiry` pin the edges, and `admin_tokens_are_exempt_from_the_default_lifetime` pins decision 6. In `sesame/auth.rs`, `a_session_opened_with_the_old_secret_ends_with_its_grace_period` shows the principal doing the session work. And `bun/api/token_tests.rs` goes through the real router and a one-node council: the old secret works and the new one works at once, a zero-grace rotation ends the old secret *and* its dashboard session, the `[permission]` spec still binds the rotated token, the last Admin can rotate itself, a `token.rotated` event names the caller without ever containing the new secret, a token created without a lifetime gets 90 days, and a name with a spec needs `--inherit-permissions`. On the `wtf` side, `a_token_expiring_within_fourteen_days_is_a_warning` and `an_admin_token_older_than_ninety_days_without_an_expiry_is_a_warning` feed the pure diagnosis engine a fixed snapshot.
+Token rotation is tested at three layers, and the tests came first. In `sesame/token.rs`, `the_old_secret_works_inside_the_grace_period_and_stops_after_it` drives `validate_token_at` with an injected `now` either side of the grace end, so no test sleeps for a day; `a_second_rotation_ends_the_first_old_secret` and `the_old_secret_never_outlives_the_old_expiry` pin the edges, and `admin_tokens_are_exempt_from_the_default_lifetime` pins decision 6. In `sesame/auth.rs`, `a_session_opened_with_the_old_secret_ends_with_its_grace_period` shows the principal doing the session work. And `bun/api/token_tests.rs` goes through the real router and a one-node council: the old secret works and the new one works at once, a zero-grace rotation ends the old secret *and* its dashboard session, the `[permission]` spec still binds the rotated token, the last Admin can rotate itself, a `token.rotated` event names the caller without ever containing the new secret, a token created without a lifetime gets 90 days, a name with a spec needs `--inherit-permissions`, a created token works at once on a node that runs no refresh at all, a revoked one stops at once there, and a join token for a retired node is refused without a secret. In `tests/suite/api_tokens.rs`, `a_token_created_through_a_follower_works_on_both_nodes_at_once` runs two real API servers on an in-memory council, each with its own token store and neither refreshing, so the only way the secret can work on the follower is the install we just wrote; its neighbours cover a leased create, a refusal coming back unchanged and a request that was already forwarded. The same fixture drives the other three writes: a rotation with and without grace, a revoke (`a_token_revoked_through_a_follower_stops_working_on_both_nodes_at_once` is the test the whole section exists for), a join token, refusals, an Admin secret only the follower knows, which the leader turns away, and a silent leader, where each route's `504` has to name what it may have cost. Two tests put a learner behind the follower's API and cut it off from replication with the in-memory router's `partition`: a learner never campaigns, so it goes on naming the leader, and that's what a lagging node looks like. In `src/bin/bun.rs`, `a_refresh_that_read_before_a_revoke_leaves_the_store_alone` replays the race by hand. On the `wtf` side, `a_token_expiring_within_fourteen_days_is_a_warning` and `an_admin_token_older_than_ninety_days_without_an_expiry_is_a_warning` feed the pure diagnosis engine a fixed snapshot.
 
 ### Integration tests — the lifecycles
 
-Two integration files drive whole features through the library, no running agent required:
+One integration file drives whole features through the library, no running agent required:
 
 - **`tests/suite/security_integration.rs`** is the lifecycle suite: `join_token_single_use_enforced` and `join_token_expiry_enforced` (the loop we left open in Chapter 4), `secret_rotation_dual_key_window` and `secret_rotation_finalize_drops_old_key` (the dual-key window), and `crl_revoked_cert_rejected` / `crl_valid_cert_allowed` / `crl_empty_allows_all` (revocation).
-- **`tests/identity_demo.rs`** doubles as a runnable walkthrough. Each test is a stage of the SPIFFE story — `demo_cluster_init_and_ca_hierarchy`, `demo_csr_generation_and_signing`, `demo_oidc_jwt`, `demo_identity_bundle_and_tmpfs`, `demo_rotation_state_machine` — and they print as they go.
+
+There used to be a second, an `identity_demo` binary whose tests walked through the SPIFFE story stage by stage and printed as they went. We deleted it in July 2026. It read like a tour, but it checked nothing the unit tests in `sesame` didn't already check, and a test file that looks like coverage while adding none is worse than no file.
 
 ### Running them
 
-No gating — crypto needs only a CPU:
+No gating, since crypto needs only a CPU:
 
 ```sh
 cargo test --lib sesame pickle::signing               # unit tests
 cargo test --test suite security_integration::        # token / rotation / CRL lifecycle
-cargo test --test identity_demo -- --nocapture        # the SPIFFE walkthrough, printed
 ```
-
-The `--nocapture` on the last one is the point: it turns the test into a guided tour of cluster init, CSR signing, JWT minting, and rotation, printed to your terminal.
 
 ## Trust the image, or don't run it
 
@@ -1997,7 +2153,7 @@ The **EKU check** matters more than it looks. Extended Key Usage is the CA sayin
 
 We didn't reimplement any of the chain logic. `validate_chain_at` loops `verify_signature` and `check_validity_at` (the same helpers Phase 4's mTLS uses) over the chain with an injected clock, so a test can assert "this expires in exactly one hour" by moving the clock, not by sleeping.
 
-Writing the issuer-binding check flushed out a real latent bug, by the way. The build-signing path reconstructed the Workload CA's distinguished name from a `cluster_name` string the caller passed. When that string didn't match the CA's actual name, the signed leaf carried the wrong issuer DN. Nobody noticed because the old verifier never compared DNs. The fix reads the issuer straight off the real CA certificate with `CertificateParams::from_ca_cert_der` instead of trusting a string. The stronger check found the weaker code.
+Writing the issuer-binding check flushed out a real latent bug, by the way. The build-signing path reconstructed the Workload CA's distinguished name from a `cluster_name` string the caller passed. When that string didn't match the CA's actual name, the signed leaf carried the wrong issuer DN. Nobody noticed because the old verifier never compared DNs. The fix reads the issuer straight off the real CA certificate (today with `ca::issuer_params_from_der`) instead of trusting a string. The stronger check found the weaker code.
 
 ### Constraining the JWT
 

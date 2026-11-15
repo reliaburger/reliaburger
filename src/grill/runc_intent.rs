@@ -717,6 +717,7 @@ mod inventory_tests {
                 rlimits: Vec::new(),
                 args: vec!["sleep".into(), "60".into()],
                 env: vec![],
+                provider_env: Vec::new(),
                 cwd: "/".into(),
                 user: OciUser { uid: 0, gid: 0 },
                 capabilities: None,
@@ -730,8 +731,12 @@ mod inventory_tests {
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
             port_mapping: None,
+            stop: None,
+            runtime_knobs: None,
         }
     }
 

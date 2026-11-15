@@ -198,15 +198,13 @@ pub fn validate_and_sign_csr(
         }
     };
 
-    // Reconstruct the CA certificate object for signing
-    let ca_cert = workload_ca_params
-        .clone()
-        .self_signed(workload_ca_keypair)
-        .map_err(|e| IdentityError::SignFailed(format!("failed to reconstruct CA cert: {e}")))?;
-
-    let signed = params
-        .signed_by(&csr_params.public_key, &ca_cert, workload_ca_keypair)
-        .map_err(|e| IdentityError::SignFailed(e.to_string()))?;
+    let signed = super::ca::sign_as_issuer(
+        params,
+        &csr_params.public_key,
+        workload_ca_params,
+        workload_ca_keypair,
+    )
+    .map_err(|e| IdentityError::SignFailed(e.to_string()))?;
 
     Ok(signed.der().to_vec())
 }
@@ -315,6 +313,32 @@ pub fn prepare_identity_dir(dir: &Path) -> Result<(), IdentityError> {
     }
 
     Ok(())
+}
+
+/// [`prepare_identity_dir`] on a blocking thread, for async callers such as
+/// the agent loop: it may fork `mount` and wait for it.
+pub async fn prepare_identity_dir_off_runtime(dir: &Path) -> Result<(), IdentityError> {
+    let dir = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || prepare_identity_dir(&dir))
+        .await
+        .map_err(|error| IdentityError::WriteFailed(std::io::Error::other(error)))?
+}
+
+/// Prepare `dir` and write `identity` into it, owned by whatever `owner`
+/// reads from the prepared directory, all on a blocking thread: the writes
+/// fsync every file and its directory.
+pub async fn install_identity(
+    identity: WorkloadIdentity,
+    dir: &Path,
+    owner: fn(&Path) -> Option<(u32, u32)>,
+) -> Result<(), IdentityError> {
+    let dir = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        prepare_identity_dir(&dir)?;
+        write_identity_files(&identity, &dir, owner(&dir))
+    })
+    .await
+    .map_err(|error| IdentityError::WriteFailed(std::io::Error::other(error)))?
 }
 
 /// Remove an instance's identity directory, unmounting its tmpfs backing
@@ -986,6 +1010,33 @@ mod tests {
     }
 
     #[test]
+    fn workload_certificates_name_the_workload_ca_by_key_identifier() {
+        // The council signs workload CSRs with params rebuilt from the
+        // stored Workload CA certificate; `relish init` hands out fresh ones.
+        // Both must yield the authority key identifier strict verifiers
+        // require (#1497).
+        let uri = test_spiffe_uri();
+        let (ca_kp, fresh_params, workload_ca_der, _) = test_workload_ca();
+        let stored_params = ca::issuer_params_from_der(&workload_ca_der).unwrap();
+        for params in [&fresh_params, &stored_params] {
+            for usage in [CertUsage::Mtls, CertUsage::CodeSigning] {
+                let (csr_der, _) = create_workload_csr(&uri).unwrap();
+                let cert_der = validate_and_sign_csr(
+                    &csr_der,
+                    &uri,
+                    SerialNumber(100),
+                    usage,
+                    &ca_kp,
+                    params,
+                    SystemTime::now(),
+                )
+                .unwrap();
+                ca::key_identifier_checks::assert_names_issuer_by_key(&cert_der, &workload_ca_der);
+            }
+        }
+    }
+
+    #[test]
     fn build_identity_bundle_populates_all_fields() {
         let uri = test_spiffe_uri();
         let (csr_der, private_key_der) = create_workload_csr(&uri).unwrap();
@@ -1043,6 +1094,41 @@ mod tests {
             &[workload_ca_cert_der, root_ca_cert_der],
             jwt.to_string(),
         )
+    }
+
+    /// The agent loop prepared identity directories inline: a
+    /// `create_dir_all`, a read of `/proc/self/mounts` and, as root on
+    /// Linux, a `mount` subprocess, all on the loop's own task. With the
+    /// blocking pool held busy, work sent there can't finish inside the
+    /// first poll, and work done inline always does (#1674).
+    #[test]
+    fn preparing_an_identity_dir_runs_off_the_runtime() {
+        let volumes = tempfile::tempdir().unwrap();
+        let dir = instance_identity_dir(volumes.path(), "web-0");
+
+        crate::off_runtime::assert_runs_on_blocking_pool(prepare_identity_dir_off_runtime(&dir))
+            .unwrap();
+        assert!(dir.is_dir());
+    }
+
+    /// Storing a signed identity writes six files, each fsynced with its
+    /// directory, and the agent loop did it inline in an identity-signing
+    /// turn. The same blocking-pool check as above.
+    #[test]
+    fn installing_an_identity_runs_off_the_runtime() {
+        let identity = test_identity_bundle("my-jwt-token");
+        let volumes = tempfile::tempdir().unwrap();
+        let dir = instance_identity_dir(volumes.path(), "web-0");
+
+        crate::off_runtime::assert_runs_on_blocking_pool(install_identity(identity, &dir, |_| {
+            None
+        }))
+        .unwrap();
+        assert!(dir.join("key.pem").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("token")).unwrap(),
+            "my-jwt-token"
+        );
     }
 
     #[test]

@@ -77,6 +77,7 @@
       .rating { grid-template-columns: 1fr; }
     }
   </style>
+  <link rel="alternate" type="text/markdown" href="index.md">
 </head>
 <body>
   <a class="skip" href="#main">Skip to content</a>
@@ -94,7 +95,7 @@
       <form class="fb" id="fb" novalidate>
         <div class="eyebrow">STEP 06 · TELL US WHAT BROKE</div>
         <h1>How was your burger?</h1>
-        <p class="lede">Reliaburger is early in development at 0.1, your feedback helps us refine the recipe.</p>
+        <p class="lede">Reliaburger is early in development at <span data-release-minor>0.2</span>, your feedback helps us refine the recipe.</p>
 
         <fieldset>
           <legend>THE THREE QUESTIONS</legend>
@@ -222,6 +223,7 @@
       <span class="footer-note">This form sends your answers to our team, and keeps them in a spreadsheet. Nothing else.</span>
     </footer>
   </div>
+  <script src="../assets/copy.js" defer></script>
   <script>
   (function () {
     "use strict";

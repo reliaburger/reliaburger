@@ -151,6 +151,44 @@ def owner_problems(root):
     return problems
 
 
+def manifest_problems(root):
+    """Bound CI-owned ignored tests that no gate in the manifest requires.
+
+    The merge queue's evidence job accepts a bound test only when its owning
+    gate's envelope lists it, and an envelope lists only the cases
+    tests/contracts/manifest.json says that gate requires. A binding without
+    a manifest case therefore passes every PR check and fails only in the
+    queue (#1836), so catch it here, where `make ci` runs.
+    """
+    import json
+    import workflow_assembly
+    root = Path(root)
+    contracts = root / "tests" / "contracts"
+    manifest = json.loads((contracts / "manifest.json").read_text())
+    bindings = json.loads((contracts / "ignored-bindings.json").read_text())
+    aliases = json.loads((root / "scripts" / "ci" / "legacy-oci-aliases.json").read_text())
+    required = {}
+    for gate, command in workflow_assembly.OWNERS.items():
+        owner = ("make", command[1]) if command[0] == "make" else ("script", command[0])
+        required.setdefault(owner, set()).update(
+            (case["binary"], case["test"]) for family in manifest["contracts"]
+            for case in family["cases"] if gate in case["requires"])
+    for alias in aliases:
+        required.setdefault(tuple(alias["declared_owner"]), set()).add((alias["binary"], alias["test"]))
+    tests = {(test.path, test.name): test for test in find_ignored(root)}
+    problems = []
+    for row in bindings:
+        test = tests.get((row["source"], row["function"]))
+        if test is None:
+            continue
+        owned = [owner for owner in owners(test) if owner in required]
+        if owned and not any((row["binary"], row["test"]) in required[owner] for owner in owned):
+            gates = " or ".join(" ".join(owner) for owner in owned)
+            problems.append(f"{test}: bound to {gates}, but no case in tests/contracts/manifest.json "
+                            "requires it, so CI's evidence will not list it")
+    return problems
+
+
 def executed(reports):
     """Success-only diagnostic parser; NOT owner/context qualification.
 
@@ -210,7 +248,7 @@ def evidence_problems(root, reports, bindings=None, verified_gates=None):
 
 def main(argv):
     if argv[1:2] == ["reasons"] and len(argv) == 2:
-        problems = owner_problems(Path.cwd())
+        problems = owner_problems(Path.cwd()) + manifest_problems(Path.cwd())
     elif argv[1:2] == ["evidence"] and len(argv) > 3:
         import workflow_adapter
         # Supply explicit workflow context and trusted needs through its parser.

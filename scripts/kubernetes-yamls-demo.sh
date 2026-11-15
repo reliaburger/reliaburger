@@ -36,6 +36,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Every step asserts what it printed, so a regression fails the demo instead
+# of scrolling past (#703).
+fail() { echo -e "${YELLOW}FAIL: $1${RESET}" >&2; exit 1; }
+expect() {   # expect FILE TEXT: FILE must contain TEXT
+    grep -qF -- "$2" "$1" || fail "$(basename "$1") lacks: $2"
+}
+expect_not() {   # expect_not FILE TEXT: FILE must not contain TEXT
+    if grep -qF -- "$2" "$1"; then fail "$(basename "$1") unexpectedly has: $2"; fi
+}
+
 section "Reliaburger Kubernetes Migration Demo"
 
 # Build
@@ -127,13 +137,21 @@ note "Input YAML:"
 cat "${TMPDIR}/web-app.yaml"
 echo ""
 cmd "relish import -f web-app.yaml"
-"${RELISH}" import -f "${TMPDIR}/web-app.yaml" > "${TMPDIR}/web-app.toml" 2>"${TMPDIR}/web-report.txt" || true
+"${RELISH}" import -f "${TMPDIR}/web-app.yaml" > "${TMPDIR}/web-app.toml" 2>"${TMPDIR}/web-report.txt" \
+    || fail "import of web-app.yaml failed"
 echo ""
 note "Generated TOML:"
 cat "${TMPDIR}/web-app.toml"
 echo ""
 warn "Migration report:"
 cat "${TMPDIR}/web-report.txt"
+expect "${TMPDIR}/web-app.toml" '[app.web]'
+expect "${TMPDIR}/web-app.toml" 'image = "nginx:1.25-alpine"'
+expect "${TMPDIR}/web-app.toml" 'host = "myapp.example.com"'
+expect "${TMPDIR}/web-app.toml" 'path = "/healthz"'
+expect "${TMPDIR}/web-report.txt" 'Deployment/web → [app.web]'
+# The Service selects the Deployment by label, so it attaches silently.
+expect_not "${TMPDIR}/web-report.txt" 'Service/web'
 
 # -----------------------------------------------------------------------
 # Example 2: DaemonSet (monitoring agent)
@@ -166,10 +184,13 @@ note "Input YAML (DaemonSet — runs on every node):"
 cat "${TMPDIR}/monitoring.yaml"
 echo ""
 cmd "relish import -f monitoring.yaml"
-"${RELISH}" import -f "${TMPDIR}/monitoring.yaml" > "${TMPDIR}/monitoring.toml" 2>/dev/null || true
+"${RELISH}" import -f "${TMPDIR}/monitoring.yaml" > "${TMPDIR}/monitoring.toml" 2>/dev/null \
+    || fail "import of monitoring.yaml failed"
 echo ""
 note "Generated TOML (note: replicas = \"*\"):"
 cat "${TMPDIR}/monitoring.toml"
+expect "${TMPDIR}/monitoring.toml" '[app.node-exporter]'
+expect "${TMPDIR}/monitoring.toml" 'replicas = "*"'
 
 # -----------------------------------------------------------------------
 # Example 3: Job + CronJob
@@ -213,10 +234,15 @@ note "Input YAML (Job + CronJob):"
 cat "${TMPDIR}/jobs.yaml"
 echo ""
 cmd "relish import -f jobs.yaml"
-"${RELISH}" import -f "${TMPDIR}/jobs.yaml" > "${TMPDIR}/jobs.toml" 2>/dev/null || true
+"${RELISH}" import -f "${TMPDIR}/jobs.yaml" > "${TMPDIR}/jobs.toml" 2>/dev/null \
+    || fail "import of jobs.yaml failed"
 echo ""
-note "Generated TOML:"
+note "Generated TOML (note: backoffLimit 3 becomes max_attempts = 4):"
 cat "${TMPDIR}/jobs.toml"
+expect "${TMPDIR}/jobs.toml" '[job.db-migrate]'
+expect "${TMPDIR}/jobs.toml" 'max_attempts = 4'
+expect "${TMPDIR}/jobs.toml" '[job.cleanup]'
+expect "${TMPDIR}/jobs.toml" 'schedule = "0 3 * * *"'
 
 # -----------------------------------------------------------------------
 # Example 4: Deployment with HPA (autoscaling)
@@ -269,10 +295,13 @@ note "Input YAML (Deployment + HPA):"
 cat "${TMPDIR}/api.yaml"
 echo ""
 cmd "relish import -f api.yaml"
-"${RELISH}" import -f "${TMPDIR}/api.yaml" > "${TMPDIR}/api.toml" 2>/dev/null || true
+"${RELISH}" import -f "${TMPDIR}/api.yaml" > "${TMPDIR}/api.toml" 2>/dev/null \
+    || fail "import of api.yaml failed"
 echo ""
 note "Generated TOML (note: [autoscale] section):"
 cat "${TMPDIR}/api.toml"
+expect "${TMPDIR}/api.toml" '[app.api.autoscale]'
+expect "${TMPDIR}/api.toml" 'max = 20'
 
 # -----------------------------------------------------------------------
 # Example 5: Round-trip — export back to K8s YAML
@@ -281,16 +310,72 @@ cat "${TMPDIR}/api.toml"
 section "5. Round Trip: TOML → K8s YAML"
 
 cmd "relish export -f web-app.toml"
-"${RELISH}" export -f "${TMPDIR}/web-app.toml" > "${TMPDIR}/web-app-exported.yaml" 2>/dev/null || true
+"${RELISH}" export -f "${TMPDIR}/web-app.toml" > "${TMPDIR}/web-app-exported.yaml" 2>/dev/null \
+    || fail "export of web-app.toml failed"
 echo ""
 note "Exported K8s YAML:"
 cat "${TMPDIR}/web-app-exported.yaml"
+expect "${TMPDIR}/web-app-exported.yaml" 'kind: Deployment'
+expect "${TMPDIR}/web-app-exported.yaml" 'kind: Service'
+expect "${TMPDIR}/web-app-exported.yaml" 'kind: Ingress'
+expect "${TMPDIR}/web-app-exported.yaml" 'image: nginx:1.25-alpine'
+expect "${TMPDIR}/web-app-exported.yaml" 'NODE_ENV'
 
 # -----------------------------------------------------------------------
-# Example 6: Unknown resources are reported
+# Example 6: Services attach by label selector, not by name
 # -----------------------------------------------------------------------
 
-section "6. Unknown Resources: Handled Gracefully"
+section "6. Label Selectors: A Service Not Named After Its Deployment"
+
+cat > "${TMPDIR}/chart.yaml" << 'YAML'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shop
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: shop
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: shop
+    spec:
+      containers:
+      - name: shop
+        image: shop:v1
+        ports:
+        - containerPort: 8080
+        - containerPort: 9090
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: release-shop-http
+spec:
+  selector:
+    app.kubernetes.io/name: shop
+  ports:
+  - port: 9090
+YAML
+
+note "Input YAML (Helm-style Service name):"
+cat "${TMPDIR}/chart.yaml"
+echo ""
+cmd "relish import -f chart.yaml"
+"${RELISH}" import -f "${TMPDIR}/chart.yaml" > "${TMPDIR}/chart.toml" 2>"${TMPDIR}/chart-report.txt" \
+    || fail "import of chart.yaml failed"
+cat "${TMPDIR}/chart.toml"
+warn "Migration report:"
+cat "${TMPDIR}/chart-report.txt"
+expect "${TMPDIR}/chart.toml" 'port = 9090'
+expect "${TMPDIR}/chart-report.txt" 'clients must connect to shop:9090'
+
+# -----------------------------------------------------------------------
+# Example 7: Unknown resources are reported
+# -----------------------------------------------------------------------
+
+section "7. Unknown Resources: Reported, and Fatal Under --strict"
 
 cat > "${TMPDIR}/mixed.yaml" << 'YAML'
 apiVersion: apps/v1
@@ -328,13 +413,25 @@ note "Input YAML (Deployment + CRD + ServiceAccount):"
 cat "${TMPDIR}/mixed.yaml"
 echo ""
 cmd "relish import -f mixed.yaml"
-"${RELISH}" import -f "${TMPDIR}/mixed.yaml" 2>&1 || true
+"${RELISH}" import -f "${TMPDIR}/mixed.yaml" > "${TMPDIR}/mixed.toml" 2>"${TMPDIR}/mixed-report.txt" \
+    || fail "import of mixed.yaml failed"
+cat "${TMPDIR}/mixed-report.txt"
+expect "${TMPDIR}/mixed-report.txt" 'MyCustomResource/custom-thing'
+expect "${TMPDIR}/mixed-report.txt" 'ServiceAccount/worker-sa'
+expect "${TMPDIR}/mixed.toml" '[app.worker]'
+echo ""
+cmd "relish import --strict -f mixed.yaml"
+if "${RELISH}" import --strict -f "${TMPDIR}/mixed.yaml" > /dev/null 2>"${TMPDIR}/strict.txt"; then
+    fail "--strict passed although two resources were dropped"
+fi
+cat "${TMPDIR}/strict.txt"
+expect "${TMPDIR}/strict.txt" '2 dropped resource(s)'
 
 section "Demo Complete"
 
-echo "  - Deployments, DaemonSets, Services, Ingress → [app.*] sections"
+echo "  - Deployments, DaemonSets, Services (by label selector), Ingress → [app.*] sections"
 echo "  - Jobs, CronJobs → [job.*] sections"
 echo "  - HPAs → [app.*.autoscale] sections"
-echo "  - Unknown resources reported in migration report"
+echo "  - Unknown resources reported in migration report; --strict fails on them"
 echo "  - Round-trip: TOML → K8s YAML preserves key fields"
 echo ""

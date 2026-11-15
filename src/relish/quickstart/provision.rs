@@ -99,6 +99,38 @@ pub fn node_config(
     seed: Option<Ipv4Addr>,
     peers: &[Ipv4Addr],
 ) -> Result<String> {
+    let mut config = base_config(cluster, name, address, seed, peers)?;
+    // A laptop VM has a 10 GiB disk; the node default assumes a server's.
+    config.images.build_cache_max_bytes = LAPTOP_BUILD_CACHE_MAX_BYTES;
+    config.testing = laptop_test_policy();
+    Ok(toml::to_string_pretty(&config)?)
+}
+
+/// The configuration for a node on a machine reached over SSH.
+///
+/// Unlike a laptop VM it keeps the protected test policy and the server build
+/// cache, and `operator` is admitted to the API port so `relish` works from the
+/// machine that ran setup.
+pub fn server_node_config(
+    cluster: &str,
+    name: &str,
+    address: Ipv4Addr,
+    seed: Option<Ipv4Addr>,
+    peers: &[Ipv4Addr],
+    operator: Option<Ipv4Addr>,
+) -> Result<String> {
+    let mut config = base_config(cluster, name, address, seed, peers)?;
+    config.security.operator_cidrs = operator.iter().map(|ip| format!("{ip}/32")).collect();
+    Ok(toml::to_string_pretty(&config)?)
+}
+
+fn base_config(
+    cluster: &str,
+    name: &str,
+    address: Ipv4Addr,
+    seed: Option<Ipv4Addr>,
+    peers: &[Ipv4Addr],
+) -> Result<NodeConfig> {
     let mut config = NodeConfig::default();
     config.node.name = Some(name.to_owned());
     config.cluster.name = cluster.to_owned();
@@ -117,10 +149,7 @@ pub fn node_config(
     config.dns.enabled = true;
     config.dns.listen = format!("{address}:53");
     config.ingress.enabled = true;
-    // A laptop VM has a 10 GiB disk; the node default assumes a server's.
-    config.images.build_cache_max_bytes = LAPTOP_BUILD_CACHE_MAX_BYTES;
-    config.testing = laptop_test_policy();
-    Ok(toml::to_string_pretty(&config)?)
+    Ok(config)
 }
 
 /// The Buildah base-image cache a quickstart node keeps between builds:

@@ -71,6 +71,7 @@ pub async fn provision_namespace_keys_once(
     events: Option<&Arc<RwLock<EventStore>>>,
     node: &str,
 ) -> Result<Vec<String>, NamespaceKeyError> {
+    // One round: the loop asks again next tick (#1393).
     if !council.is_leader().await {
         return Ok(Vec::new());
     }
@@ -162,6 +163,7 @@ async fn record(
         severity: EventSeverity::Info,
         action: "secret.namespace_key_created".to_string(),
         principal: NAMESPACE_KEY_PRINCIPAL.to_string(),
+        principal_kind: crate::sesame::types::PrincipalKind::System,
         app: None,
         namespace: Some(namespace.to_string()),
         node: Some(node.to_string()),

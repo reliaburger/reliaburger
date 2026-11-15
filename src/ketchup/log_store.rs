@@ -291,6 +291,52 @@ impl IngestCheckpoint {
         checkpoint
     }
 
+    /// Drop, and return, the captures whose files are gone or replaced: a
+    /// retired job instance deletes its capture files, and a restarted
+    /// forwarder can't resume a file that isn't there. [`load`](Self::load)
+    /// does the same at startup; doing it on each flush keeps a node that
+    /// runs many printing jobs from holding every capture it ever read
+    /// (#1417). Runs on the blocking pool: one `stat` per capture.
+    fn forget_gone(&mut self) -> Vec<(PathBuf, FileIdentity)> {
+        let gone: Vec<(PathBuf, FileIdentity)> = self
+            .files
+            .iter()
+            .filter(|(file, identity)| {
+                std::fs::metadata(file)
+                    .map_or(true, |metadata| FileIdentity::of(&metadata) != **identity)
+            })
+            .map(|(file, identity)| (file.clone(), *identity))
+            .collect();
+        for (file, _) in &gone {
+            self.files.remove(file);
+            self.offsets.remove(file);
+        }
+        gone
+    }
+
+    /// Forget captures [`forget_gone`](Self::forget_gone) found gone, unless
+    /// the path has since been ingested again as a different file.
+    fn forget(&mut self, gone: Vec<(PathBuf, FileIdentity)>) {
+        for (file, identity) in gone {
+            if self.files.get(&file) == Some(&identity) {
+                self.files.remove(&file);
+                self.offsets.remove(&file);
+            }
+        }
+    }
+
+    /// The capture files this checkpoint has ingested far enough into to
+    /// reclaim some of: past the window a tail keeps (#1418). Small captures,
+    /// such as most jobs', never qualify, so a flush touches only the few
+    /// files of long-running, chatty instances.
+    fn reclaimable(&self) -> Vec<(PathBuf, FileIdentity, u64)> {
+        self.offsets
+            .iter()
+            .filter(|(_, offset)| **offset > crate::grill::capture::RETAINED_CAPTURE_BYTES)
+            .filter_map(|(file, offset)| Some((file.clone(), *self.files.get(file)?, *offset)))
+            .collect()
+    }
+
     /// Durably replace the checkpoint: a unique temp file, fsync, rename over
     /// the old one, then fsync the directory. A reader sees the old
     /// checkpoint or the new one, never half of either.
@@ -302,6 +348,23 @@ impl IngestCheckpoint {
             .map_err(|error| KetchupError::Io(std::io::Error::other(error.to_string())))?;
         crate::sesame::identity::atomic_write(&data_dir.join(CHECKPOINT_FILE), &bytes)?;
         Ok(())
+    }
+}
+
+/// Give back the disk blocks of capture-file prefixes a durable checkpoint
+/// covers (#1418). Without this a chatty instance's capture file held its
+/// whole output for as long as it ran, next to the store's own copy. A
+/// failure costs only disk space, so it is reported and the flush stands.
+fn reclaim_captures(reclaimable: &[(PathBuf, FileIdentity, u64)]) {
+    for (file, identity, ingested) in reclaimable {
+        match crate::grill::capture::reclaim_ingested(file, *identity, *ingested) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => {}
+            Err(error) => eprintln!(
+                "ketchup: cannot reclaim ingested capture {}: {error}",
+                file.display()
+            ),
+        }
     }
 }
 
@@ -367,6 +430,11 @@ pub struct LogPendingFlush {
     // inside the blocking task, including when its async caller is canceled.
     writing: Arc<tokio::sync::Mutex<()>>,
     completed: Arc<AtomicBool>,
+    /// Captures the flush found gone, for the store to forget once the
+    /// flush is complete. A std mutex: the blocking writer fills it and
+    /// `clear_completed_flush`, which is synchronous, empties it; neither
+    /// holds it across an `.await`.
+    gone: Arc<std::sync::Mutex<Vec<(PathBuf, FileIdentity)>>>,
     #[cfg(test)]
     test_gate: Arc<std::sync::Mutex<Option<Arc<LogFlushGate>>>>,
     #[cfg(test)]
@@ -457,8 +525,9 @@ pub async fn write_log_pending(pending: LogPendingFlush) -> Result<(), KetchupEr
         data_dir,
         path,
         batch,
-        checkpoint,
+        mut checkpoint,
         completed,
+        gone,
         ..
     } = pending;
     tokio::task::spawn_blocking(move || -> Result<(), KetchupError> {
@@ -479,6 +548,7 @@ pub async fn write_log_pending(pending: LogPendingFlush) -> Result<(), KetchupEr
             #[cfg(test)]
             test_parent_confirmation_fault.as_deref(),
         )?;
+        let forgotten = checkpoint.forget_gone();
         let tmp = path.with_extension("parquet.tmp");
         let file = std::fs::File::create(&tmp)?;
         let checkpoint_json = serde_json::to_string(&checkpoint)
@@ -517,8 +587,13 @@ pub async fn write_log_pending(pending: LogPendingFlush) -> Result<(), KetchupEr
                 released = gate.release.wait(released).unwrap();
             }
         }
+        let reclaimable = checkpoint.reclaimable();
         checkpoint.save(&data_dir)?;
+        *gone
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = forgotten;
         completed.store(true, Ordering::Release);
+        reclaim_captures(&reclaimable);
         Ok(())
     })
     .await
@@ -612,6 +687,17 @@ impl LogStore {
     /// The directory where Parquet files are stored.
     pub fn data_dir(&self) -> &std::path::Path {
         &self.data_dir
+    }
+
+    /// When the newest line this store ingested arrived, Unix milliseconds:
+    /// proof that log ingestion is live. `None` before the first line.
+    ///
+    /// Each line's sequence is its ingest time in nanoseconds, bumped by
+    /// one when two lines share a clock reading, and the checkpoint keeps
+    /// it across restarts, so this costs no extra bookkeeping.
+    pub fn newest_line_unix_ms(&self) -> Option<u64> {
+        let sequence = self.ingested.last_sequence;
+        (sequence > 0).then_some(sequence / 1_000_000)
     }
 
     /// Append a line the node itself wrote (not a workload's output).
@@ -738,12 +824,17 @@ impl LogStore {
     }
 
     fn clear_completed_flush(&mut self) {
-        if self
+        if let Some(pending) = self
             .pending
-            .as_ref()
-            .is_some_and(|pending| pending.completed.load(Ordering::Acquire))
+            .take_if(|pending| pending.completed.load(Ordering::Acquire))
         {
-            self.pending = None;
+            let gone = std::mem::take(
+                &mut *pending
+                    .gone
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            self.ingested.forget(gone);
         }
     }
 
@@ -802,6 +893,7 @@ impl LogStore {
             checkpoint: self.ingested.clone(),
             writing: Arc::new(tokio::sync::Mutex::new(())),
             completed: Arc::new(AtomicBool::new(false)),
+            gone: Arc::new(std::sync::Mutex::new(Vec::new())),
             #[cfg(test)]
             test_gate: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
@@ -870,7 +962,12 @@ impl LogStore {
         // MemTable before planning, so the OBS5 limit covered only aggregation,
         // not the dominant base scan. An empty directory registers an empty
         // table so the union view below always resolves.
-        if dir_has_parquet(&self.data_dir) {
+        // Listing the directory is a disk read: do it off the runtime (#1860).
+        let listed = self.data_dir.clone();
+        let has_parquet = tokio::task::spawn_blocking(move || dir_has_parquet(&listed))
+            .await
+            .unwrap_or(false);
+        if has_parquet {
             let url = ListingTableUrl::parse(self.data_dir.to_string_lossy().as_ref())
                 .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
             let options = ListingOptions::new(Arc::new(ParquetFormat::default()))
@@ -1160,6 +1257,17 @@ mod tests {
         assert!(!flush_shared(&store).await.unwrap(), "nothing to flush");
     }
 
+    #[test]
+    fn the_newest_line_time_follows_ingestion() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = LogStore::new(dir.path().to_path_buf());
+        assert_eq!(store.newest_line_unix_ms(), None);
+        store.append_at(1_700_000_000, "web", "default", LogStream::Stdout, "one");
+        assert_eq!(store.newest_line_unix_ms(), Some(1_700_000_000_000));
+        store.append_at(1_700_000_005, "web", "default", LogStream::Stdout, "two");
+        assert_eq!(store.newest_line_unix_ms(), Some(1_700_000_005_000));
+    }
+
     #[tokio::test]
     async fn append_and_query_without_flush() {
         let (mut store, _dir) = test_store();
@@ -1344,6 +1452,108 @@ mod tests {
         assert_eq!(lines, expected);
     }
 
+    /// #1493's shape: a quiet app beside a chatty one, an hour of flushes. A
+    /// quiet app's rows are a sliver of each file, and the row groups of the
+    /// busy one split every flush, yet its tail must follow every flush.
+    #[tokio::test]
+    async fn tail_follows_a_quiet_app_through_many_flushes() {
+        let (mut store, _dir) = test_store();
+        let mut acks = 0;
+        for flush in 0..40u64 {
+            let time = 1_793_000_000 + flush * 60;
+            // Past LOG_ROW_GROUP_SIZE, so a flush holds several row groups.
+            for line in 0..9_000 {
+                store.append_at(
+                    time,
+                    "spam",
+                    "default",
+                    LogStream::Stdout,
+                    &format!("{line}"),
+                );
+            }
+            for _ in 0..7 {
+                acks += 1;
+                let line = format!("ACK {acks}");
+                store.append_at(time, "writer", "default", LogStream::Stdout, &line);
+            }
+            store.flush().await.unwrap();
+
+            let tail = store
+                .query("writer", "default", None, None, None, Some(20))
+                .await
+                .unwrap();
+            let oldest = (acks - 19_i32).max(1);
+            let newest: Vec<String> = (oldest..=acks).map(|n| format!("ACK {n}")).collect();
+            assert_eq!(lines(&tail), newest, "after flush {flush}");
+        }
+    }
+
+    /// The newest lines sit in the buffer, or in a batch still being written.
+    /// A tail straddles both and the Parquet files behind them, with no line
+    /// twice and none missing.
+    #[tokio::test]
+    async fn tail_crosses_parquet_a_flush_in_flight_and_the_buffer() {
+        let (mut store, _dir) = test_store();
+        let add = |store: &mut LogStore, from: u32, to: u32| {
+            for n in from..=to {
+                store.append_at(
+                    7,
+                    "writer",
+                    "default",
+                    LogStream::Stdout,
+                    &format!("ACK {n}"),
+                );
+            }
+        };
+        add(&mut store, 1, 10);
+        store.flush().await.unwrap();
+        add(&mut store, 11, 20);
+        store.flush().await.unwrap();
+        add(&mut store, 21, 25);
+        let in_flight = store.take_flush_batch().unwrap().unwrap();
+        add(&mut store, 26, 30);
+
+        let expected: Vec<String> = (16..=30).map(|n| format!("ACK {n}")).collect();
+        let tail = store
+            .query("writer", "default", None, None, None, Some(15))
+            .await
+            .unwrap();
+        assert_eq!(lines(&tail), expected, "with the batch unwritten");
+
+        write_log_pending(in_flight).await.unwrap();
+        let tail = store
+            .query("writer", "default", None, None, None, Some(15))
+            .await
+            .unwrap();
+        assert_eq!(lines(&tail), expected, "with the batch on disk");
+    }
+
+    /// Disk pressure prunes the oldest files under a live store. What's left
+    /// still ends at the newest line.
+    #[tokio::test]
+    async fn tail_survives_the_oldest_files_being_pruned() {
+        let (mut store, dir) = test_store();
+        for n in 1..=30 {
+            store.append_at(
+                n,
+                "writer",
+                "default",
+                LogStream::Stdout,
+                &format!("ACK {n}"),
+            );
+            if n % 10 == 0 {
+                store.flush().await.unwrap();
+            }
+        }
+        std::fs::remove_file(dir.path().join("logs_000000.parquet")).unwrap();
+
+        let tail = store
+            .query("writer", "default", None, None, None, Some(3))
+            .await
+            .unwrap();
+        assert_eq!(lines(&tail), ["ACK 28", "ACK 29", "ACK 30"]);
+    }
+
     /// A writer logging ten lines a second puts ten rows under every
     /// one-second timestamp. Sorting on the timestamp alone left their order
     /// to DataFusion, which interleaved Parquet files (`ACK 968, 974, 969`).
@@ -1372,6 +1582,40 @@ mod tests {
             .collect();
         let expected: Vec<String> = (0..200).map(|i| format!("ACK {i}")).collect();
         assert_eq!(lines, expected);
+    }
+
+    #[tokio::test]
+    async fn the_checkpoint_forgets_captures_whose_files_are_gone() {
+        // #1417: every singleton job that printed added its capture file to
+        // the checkpoint, and only a restart dropped the files its retired
+        // instance had deleted. A node running thousands of such jobs held
+        // them all, and cloned and serialised them on every flush.
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        let mut store = LogStore::new(logs.clone());
+        let kept = capture_file(&dir, "kept.stdout");
+        assert!(store.ingest(&writer_line(&kept, 1)));
+        let mut retired = Vec::new();
+        for job in 0..200 {
+            let capture = capture_file(&dir, &format!("job-{job}.stdout"));
+            assert!(store.ingest(&writer_line(&capture, 1)));
+            retired.push(capture);
+        }
+        for capture in &retired {
+            std::fs::remove_file(capture).unwrap();
+        }
+        store.flush().await.unwrap();
+        // The capture that is still there keeps moving on.
+        assert!(store.ingest(&writer_line(&kept, 2)));
+        store.flush().await.unwrap();
+
+        let offsets = store.capture_offsets();
+        assert_eq!(offsets.0.keys().collect::<Vec<_>>(), vec![&kept]);
+        assert_eq!(offsets.1.keys().collect::<Vec<_>>(), vec![&kept]);
+        let saved: IngestCheckpoint =
+            serde_json::from_slice(&std::fs::read(logs.join(CHECKPOINT_FILE)).unwrap()).unwrap();
+        assert_eq!(saved.offsets.keys().collect::<Vec<_>>(), vec![&kept]);
+        assert_eq!(saved.offsets.get(&kept), Some(&(2 * LINE_BYTES)));
     }
 
     /// A line the writer app printed, as the forwarder hands it over: `ACK n`
@@ -2715,5 +2959,59 @@ mod tests {
         fault.failing.store(false, Ordering::Release);
         assert_parent_retry_has_one_durable_capture_copy(&mut fresh, &logs, &capture).await;
         assert_eq!(&*fault.visits.lock().unwrap(), &[logs.clone(), logs]);
+    }
+
+    /// #1418: the soak's log spammer grew its capture file by about 40 MiB an
+    /// hour on top of the store's own copy. Once a flush makes the lines
+    /// durable, the capture's ingested prefix is reclaimed, never before.
+    #[tokio::test]
+    async fn a_durable_flush_reclaims_the_ingested_capture_prefix() {
+        use std::os::unix::fs::MetadataExt;
+        let directory = tempfile::tempdir().unwrap();
+        let captures = tempfile::tempdir().unwrap();
+        let file = captures.path().join("spammer.stdout");
+        let line = "spam the quick brown fox jumps over the lazy dog\n";
+        let contents = line.repeat(4 * 1024 * 1024 / line.len());
+        std::fs::write(&file, &contents).unwrap();
+        let allocated = || std::fs::metadata(&file).unwrap().blocks() * 512;
+        let mut store = LogStore::new(directory.path().to_path_buf());
+        let mut reader =
+            crate::grill::capture::CaptureReader::new(LogStream::Stdout, Some(file.clone()));
+        loop {
+            let bytes = reader.read_chunk().await.unwrap();
+            if bytes.is_empty() {
+                break;
+            }
+            for line in reader.push(&bytes) {
+                store.ingest_at(
+                    100,
+                    &crate::ketchup::types::LogRecord {
+                        app: "spammer".into(),
+                        namespace: "default".into(),
+                        instance: "spammer-0".into(),
+                        stream: line.stream,
+                        line: line.line,
+                        position: line.position,
+                    },
+                );
+            }
+        }
+        assert!(
+            allocated() >= contents.len() as u64,
+            "nothing is reclaimed before the lines are durable"
+        );
+
+        store.flush().await.unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().len(),
+            contents.len() as u64
+        );
+        assert!(
+            allocated() <= crate::grill::capture::RETAINED_CAPTURE_BYTES + 256 * 1024,
+            "{} bytes of the capture are still allocated",
+            allocated()
+        );
+        assert_eq!(store.capture_offsets().0[&file], contents.len() as u64);
     }
 }

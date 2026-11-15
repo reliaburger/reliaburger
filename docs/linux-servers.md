@@ -8,6 +8,10 @@ workload.
 Often the VMs already exist, and you want to use the configuration and
 runtimes you've already got on them.
 
+From 0.2.6, `relish setup --ssh user@host,user@host,...` does
+everything in this guide from your laptop, so read this one when you want to
+choose each step yourself, or need to know what that command does.
+
 If you want an automated, disposable local cluster on macOS or Linux using
 managed Lima VMs instead, see the [quickstart guide](quickstart.md).
 
@@ -108,8 +112,8 @@ case "$ARCH" in
   *) echo "Unsupported architecture: $ARCH; the release has x86_64 and aarch64 builds" >&2 ;;
 esac
 
-# Release version to install (e.g. v0.2.0 or vX.Y.Z)
-VERSION="v0.2.0"
+# Release version to install (e.g. v0.2.8 or vX.Y.Z)
+VERSION="v0.2.8"
 BASE_URL="https://github.com/reliaburger/reliaburger/releases/download/${VERSION}"
 
 # Download binaries and SHA256SUMS into /tmp
@@ -136,7 +140,7 @@ relish --version
 ```
 
 Each prints its version and the commit it was built from, such as
-`bun 0.2.0 (RELEASE_COMMIT_0_2_0)`. Every node should print the same commit.
+`bun 0.2.8 (e423d46)`. Every node should print the same commit.
 
 *(Optional: If building from source instead of using pre-built releases, install
 `build-essential clang llvm libbpf-dev` (the static job executor helpers need a
@@ -535,7 +539,11 @@ Mac or a Windows PC, without keeping a shell open on the VMs.
 
 ### 5.1 Install Relish on your laptop
 
-#### On macOS (Apple silicon or Intel)
+#### On macOS (Apple silicon)
+
+Releases from 0.2.2 build `relish` for Apple silicon only. 0.2.1 is the last
+release with an Intel macOS build (`relish-macos-x86_64`); on an Intel Mac,
+manage the cluster from one of the Linux machines instead, or stay on 0.2.1.
 
 **Option A: Install script**
 ```sh
@@ -544,16 +552,11 @@ curl -fsSL https://reliaburger.com/install.sh | sh -s -- --install-only
 
 **Option B: Direct download from GitHub Releases**
 ```sh
-# Detect Apple silicon (arm64) vs Intel (x86_64)
-ARCH="$(uname -m)"
-case "$ARCH" in
-  arm64|aarch64) ARCH="aarch64" ;;
-  x86_64)        ARCH="x86_64" ;;
-  *) echo "Unsupported architecture: $ARCH; the release has x86_64 and aarch64 builds" >&2 ;;
-esac
+# The macOS build is Apple silicon only (arm64)
+ARCH="aarch64"
 
-# Release version to install (e.g. v0.2.0 or vX.Y.Z)
-VERSION="v0.2.0"
+# Release version to install (e.g. v0.2.8 or vX.Y.Z)
+VERSION="v0.2.8"
 BASE_URL="https://github.com/reliaburger/reliaburger/releases/download/${VERSION}"
 
 # Download relish binary and SHA256SUMS into /tmp
@@ -674,6 +677,10 @@ Expected output: 3 voter members with one active leader and a healthy consensus 
 relish status
 ```
 
+Expected output: `cluster: HEALTHY` on the first line, then one line per part
+of the cluster. A line that needs attention ends in the command that shows
+the detail.
+
 ---
 
 ## 7. Deploy and run the demo application
@@ -722,7 +729,7 @@ relish apply hello.toml
 Check the deployment status:
 
 ```sh
-relish status
+relish apps
 ```
 
 Inspect the running container instances across the cluster nodes:
@@ -776,7 +783,7 @@ Reliaburger is declarative: to scale the application to 6 replicas, edit `replic
 relish apply hello.toml
 ```
 
-Then check `relish status` to observe the new replicas being placed across the nodes.
+Then check `relish apps hello` to observe the new replicas being placed across the nodes.
 
 ### 8.2 Testing node communication failure and self-healing
 
@@ -796,7 +803,7 @@ sudo systemctl stop reliaburger.service
 From your laptop, observe the cluster behaviour:
 
 1. **Council quorum**: `relish council` confirms that `node-01` and `node-02` maintain quorum (2 out of 3 votes).
-2. **Workload rescheduling**: `relish status` shows the scheduler automatically moving workloads from `node-03` to the surviving nodes.
+2. **Workload rescheduling**: `relish status` reports the cluster `DEGRADED` with `node-03` suspect or dead, and `relish apps hello` shows the scheduler moving its instances to the surviving nodes.
 3. **Ingress continuity**: `curl -H "Host: hello.world.test" http://192.168.0.101/` continues serving traffic seamlessly.
 
 Restart Node 3:
@@ -900,7 +907,9 @@ names any node that's missing it.
 
 | Task | Command |
 |------|---------|
-| Check cluster & workload status | `relish status` |
+| Check the whole cluster at a glance | `relish status` |
+| List apps, problems first | `relish apps` |
+| List one app's instances | `relish apps hello` |
 | View cluster membership | `relish nodes` |
 | View Raft council status | `relish council` |
 | Inspect app or node details | `relish inspect <app-or-node>` |

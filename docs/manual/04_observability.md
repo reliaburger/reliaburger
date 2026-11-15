@@ -22,8 +22,9 @@ relish logs web --json-field level=warn
 for your shell. A pattern that won't compile is refused before anything is
 asked. `--since` and `--until` take epoch seconds or a duration before now
 (`30s`, `5m`, `2h`, `1d`); `--until` can't be combined with `-f`, since a
-followed stream has no end. `--stream` takes `stdout` or `stderr` and,
-for now, isn't offered with `-f` either. `--instance` takes an id as `relish status`
+followed stream has no end. A window prints only lines inside it, so an app
+that's been quiet for the last five minutes prints nothing for `--since 5m`. `--stream` takes `stdout` or `stderr` and,
+for now, isn't offered with `-f` either. `--instance` takes an id as `relish apps web`
 shows it, and works with `-f` too. With `-f` on a cluster, each line arrives
 as `[node instance] line`, and `--grep` sees that prefix, so anchor a
 pattern with `$` rather than `^`.
@@ -53,6 +54,23 @@ the reason, and you still get every other node's lines:
 
 `relish wtf` reports the same reasons in its log evidence.
 
+For a script or an agent, `-o json` prints one JSON object per line (JSON
+Lines), so you never have to parse the `[instance]` labels:
+
+```sh
+relish -o json logs web --since 10m --stream stderr
+```
+
+```json
+{"at":"2026-11-05T09:14:02Z","node":"rb-4f2a9c1e07b3-2","instance":"default__web-0","stream":"stderr","text":"db timeout"}
+```
+
+`at` is when the node stored the line, in UTC to the second. A line that came
+from the agent's own capture (an app the log store hasn't seen yet) has only
+its `text`; the other fields are `null` rather than guessed. `-o yaml` prints
+the same records as one list. `-f` doesn't take `-o json` yet: a followed
+line doesn't say when, or on which stream, it was written.
+
 Retention and export are node config:
 
 ```toml
@@ -75,6 +93,17 @@ its data directory, because such a cap would never prune before the disk
 filled. Singleton jobs stream their output into the log store, so a busy job
 node reaches the log cap well within the seven days.
 
+The store's caps cover the store. Each running instance also has its raw
+capture files under the data directory's `instances/`, which the app writes
+into directly. Once the store has saved a stretch of output to disk, Bun hands
+those bytes of the capture back to the filesystem. It keeps the last mebibyte
+of each stream, for `relish logs -f` to start from, and anything not saved
+yet (the store saves once a minute). So a chatty app costs its node the
+store's copy plus a mebibyte or so, not everything it ever printed. The capture file's size, as `ls` shows it, still counts everything;
+`du` shows what it really takes. This needs a filesystem that can punch holes
+in a file (ext4, XFS, Btrfs and APFS can); on one that can't, the capture
+grows until the instance stops.
+
 Exported Parquet archives answer SQL:
 
 ```sh
@@ -82,10 +111,26 @@ relish logs-export --dest ./archive
 relish logs-search ./archive "SELECT count(*) FROM logs WHERE line LIKE '%error%'"
 ```
 
+`--dest` is a directory on the machine running `relish`, however far away the
+node is. Relish fetches the Parquet files of the node it's talking to over the
+API and writes them to `./archive/<node>/`, so this works from a laptop. To
+archive another node, point `--endpoint` at it. It needs an unscoped Admin
+token, because a node's log store holds every tenant's logs. Files you already
+have are skipped, so running it again only fetches what's new. The copy stays
+yours: it isn't the node's own export, so it doesn't let the node prune
+anything.
+
+Give `--dest` an `s3://` or `gs://` URL and the node writes the files itself,
+with its own credentials, to `<url>/<node>/`. That counts as an export, and
+the output says which node shipped what to where. For an archive that keeps up
+by itself, and that lets a node prune under disk pressure, set
+`[logs] export_path` instead.
+
 To export a local store directly, including a custom store while its agent is
-stopped, use `relish logs-export --source /path/to/parquet --dest ./archive`.
-If files copy but the checkpoint cannot be saved, the command exits non-zero
-and explains that a later export may repeat them.
+stopped, run `relish logs-export --source /path/to/parquet --dest ./archive` on
+the node. This one uses the store's checkpoint and never contacts an agent. If
+files copy but the checkpoint cannot be saved, the command exits non-zero and
+explains that a later export may repeat them.
 
 ## Metrics
 
@@ -143,6 +188,7 @@ needn't be published:
 
 ```toml
 [app.web]
+image = "ghcr.io/example/web:1.0"
 port = 8080
 metrics = {}                     # http://<instance>:8080/metrics
 # metrics = { port = 9797, path = "/prom" }
@@ -184,7 +230,7 @@ exporter, list fixed URLs as `[[metrics.scrape_targets]]` with a `job` and a
 Each node evaluates five built-in rules against its own metrics every 30
 seconds: CPU above 90% for 5 minutes and memory above 85% for 2 minutes
 (critical); memory above 70% for 10 minutes, disk above 80% for 5 minutes and
-CPU below 5% for 30 minutes (warning). You can't define your own rules yet.
+CPU below 5% for 30 minutes (warning). You can't define your own rules yet ([#1773](https://github.com/reliaburger/reliaburger/issues/1773)).
 Webhooks deliver them, optionally signed with HMAC-SHA256:
 
 ```toml
@@ -210,10 +256,34 @@ fleet.
 ```sh
 relish                           # the terminal dashboard (TUI)
 relish dashboard                 # authenticated, read-only browser session
+relish events                    # the newest 100 events across the cluster
+relish events --app web --severity warning --limit 20
 ```
 
+`relish events` asks every live node for its events and merges them by time,
+oldest first, with each event's node; a node that doesn't answer is named on
+stderr. `--severity` keeps events at least that severe (`info`, `warning`,
+`critical`) and `-o json` prints the API's answer. `--app` also finds an apply
+that named the app alongside others, and the `TARGET` column lists them. A
+token scoped to some apps or namespaces sees only the events about them, and
+none that name no namespace (see `writing-a-controller`).
+
 The TUI shows apps, nodes, jobs, routes, live logs and events; press `?`
-inside for keys. It needs a terminal of at least 80×24.
+inside for keys. Its dashboard, the first screen, and the top of the web
+dashboard show what `relish status` shows: the verdict and one line per
+part of the cluster, read from the same cluster summary (`GET
+/v1/cluster/summary`). Neither runs `wtf`'s checks, so neither has a `wtf`
+line; `relish status` does. All three show an `agents` line: the agent
+leases held, naming the first holder and target (`1 lease held:
+app:shop/web by holmes`), and the proposals waiting for approval. Those are
+a note, pointing at `relish proposal list` or `relish lease list`, and the
+cluster stays `HEALTHY`. A stale proposal, one whose app changed after it
+was made so approving it would fail, makes the cluster `DEGRADED` until
+someone withdraws or rejects it. The TUI needs a terminal of at least 80×24. With no terminal on
+stdin or stdout (a pipe, a cron job, an AI agent's shell), `relish`, `relish
+manual` and `relish source` exit at once with an error that names the plain
+output command to use instead: `relish agent guide`, `relish agent manual` or
+`relish agent source`.
 
 Every view covers the whole cluster, whichever node the TUI talks to. Live
 logs follow every node that runs the app, like `relish logs -f`, and a node
@@ -221,7 +291,10 @@ that leaves shows as a `warning │` line where it happened. The jobs and events
 tables have a NODE column, and an app's Deploys tab lists one row per node
 that rolled each deploy out. When a node doesn't answer, the view keeps what
 the others sent and adds a yellow `incomplete: node … timed out` line, so a
-short list never passes for a complete one. On the web dashboard, a node's
+short list never passes for a complete one. The summary lines do the same
+in their own words: `2 alive, 0 suspect, 0 dead; partial (2 of 3 nodes)`,
+and the header's counts say `partial` too. If the web dashboard can't list
+every app, it says so above the table and still shows the summary. On the web dashboard, a node's
 page lists that node's apps (or says it didn't answer) and charts CPU and
 memory only on the node's own dashboard.
 
@@ -248,3 +321,13 @@ a node's API address in a browser directly (<http://127.0.0.1:9117/> on a
 source build): once the cluster has tokens, it asks you to paste one and gives
 you a read-only session for 12 hours, or until the token expires or is revoked
 if that comes first.
+
+The dashboard's Proposals page (`/ui/proposals`, also linked from the Cluster
+card's `agents` line) lists what agents have asked to change: waiting ones
+first, then recent ones, each with its kind, target, author, age, state and,
+if it's gone stale, why. A proposal's own page shows the cluster's summary,
+the field diff, the blast radius and the undo plan, then the author's reason
+in a box that marks it as the author's own words. A person whose token may
+decide gets approve, reject and undo buttons there, each asking for their
+API token, since the session cookie alone only reads; see the dashboard
+sessions part of `security`.

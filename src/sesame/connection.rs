@@ -701,6 +701,7 @@ mod tests {
             lifetime,
             &hierarchy.node.signing_keypair,
             &hierarchy.node.certificate_params,
+            None,
         )
         .unwrap();
         NodeIdentity {

@@ -1,0 +1,12 @@
+---
+source: src/policy/tests.rs
+expression: "report::render_audit(&audit)"
+---
+Checked 2 app(s) and 1 job(s) against 3 policy(ies) at generation 7.
+
+  DENY   app default/web      no-latest     pin a version
+  DENY   job default/nightly  no-latest     pin a version
+  WARN   app default/web      not-from-git  breaks policy not-from-git
+  AUDIT  app default/web      limits        breaks policy limits
+
+2 denial(s), 1 warning(s), 1 audit finding(s). Nothing was changed: each runs as it is until it's next applied.

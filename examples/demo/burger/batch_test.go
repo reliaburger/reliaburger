@@ -22,6 +22,22 @@ func TestBatchRetryHasStableResultAndIndexesDiffer(t *testing.T) {
 		t.Fatal("different task identities shared a result")
 	}
 }
+func TestACookedPattyIsReportedToTheCounter(t *testing.T) {
+	c := testCounter(wholeKitchen(t))
+	k := newKitchen(t)
+	k.serve("counter", c.routes())
+	if err := reportCooked(k.url("counter"), "7/small/3"); err != nil {
+		t.Fatal(err)
+	}
+	if c.ownTally() != 1 {
+		t.Errorf("the counter has %d patties", c.ownTally())
+	}
+	k.remove("counter")
+	if err := reportCooked(k.url("counter"), "7/small/4"); err == nil {
+		t.Error("a report nobody took succeeded")
+	}
+}
+
 func TestBatchRejectsInvalidWork(t *testing.T) {
 	for _, args := range [][]string{nil, {"huge", "0"}, {"small", "-1"}, {"large", "4294967296"}} {
 		if err := batch(args, &bytes.Buffer{}); err == nil {

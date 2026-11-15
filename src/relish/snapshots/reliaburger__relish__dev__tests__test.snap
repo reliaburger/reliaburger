@@ -1,0 +1,8 @@
+---
+source: src/relish/dev.rs
+expression: "json(&TestRun { filter: Some(\"gossip\"), passed: true, })"
+---
+{
+  "filter": "gossip",
+  "passed": true
+}

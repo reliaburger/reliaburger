@@ -1,6 +1,7 @@
 """The published job demo must describe its actual uncompressed recording."""
 import json
 import pathlib
+import re
 import subprocess
 import shutil
 import unittest
@@ -8,6 +9,8 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 RELEASED=ROOT/'docs/qualification/2026-10-17-v0.2.0-job-throughput'
+# The homepage recording: the published v0.2.8 on the Mac Studio, 12 November 2026.
+RECORDING=ROOT/'docs/qualification/2026-11-12-v0.2.8-job-throughput-recording'
 SCENARIOS=('jobs-vm-baseline','jobs-containers','jobs-shared-containers','jobs-host-processes')
 
 def released_medians():
@@ -74,9 +77,19 @@ class JobDemo(unittest.TestCase):
             self.assertEqual(row['terminal_failures'],0)
             self.assertEqual(row['cleanup_failed_submissions'],[])
             self.assertEqual(len(row['post_cutoff_drain_proofs']),len(row['active_submissions']))
-        raw=ROOT/'docs/qualification/2026-10-09-timed-job-scenarios/current-build/packaged-bench-windows'
         for asset,evidence in [('job-throughput.cast','jobs.cast'),('job-throughput-report.json','report.json')]:
-            self.assertEqual((ROOT/'docs/website/assets'/asset).read_bytes(),(raw/evidence).read_bytes())
+            self.assertEqual((ROOT/'docs/website/assets'/asset).read_bytes(),(RECORDING/evidence).read_bytes())
+        # The caption names the release the recording ran, and each chapter
+        # button seeks to where the recorder started that scenario.
+        figure_text=page[figure:page.index('</figure>',figure)]
+        self.assertIn('Recorded on 0.2.8',figure_text)
+        starts=[float(value) for value in re.findall(r'data-start="([0-9.]+)"',figure_text)]
+        self.assertEqual(len(starts),4)
+        for start,chapter in zip(starts,report['chapters']):
+            self.assertAlmostEqual(start,chapter['start_seconds'],places=3)
+        poster=float(re.search(r'data-poster="npt:([0-9.]+)"',figure_text).group(1))
+        self.assertLessEqual(poster,report['recording_elapsed_seconds'])
+        self.assertGreater(poster,report['chapters'][-1]['start_seconds'])
         self.assertEqual(recording[0]['version'],2)
         self.assertEqual([row[0] for row in recording[1:]],sorted(row[0] for row in recording[1:]))
         for phrase in ['60 seconds','extrapolated','independent','repeatable','no isolation','VM baseline','durable ownership','published v0.2.0 binaries']:
@@ -188,6 +201,35 @@ setImmediate(async()=>{
  assert.strictEqual(calls[3].options.startAt,250);
  assert.strictEqual(calls[3].options.autoPlay,true);
 });
+"""
+        subprocess.run(['node', '-e', program, str(ROOT / 'docs/website/assets/tour-player.js')], check=True)
+
+    @unittest.skipUnless(shutil.which('node'), 'requires Node for the browser script contract')
+    def test_marker_chapters_follow_the_recording(self):
+        program = r"""
+const fs = require('fs'), vm = require('vm'), assert = require('assert');
+const calls = [], speedButton = {getAttribute: () => '2', setAttribute: () => {}};
+const speeds = {hidden:true,querySelectorAll:()=>[speedButton],addEventListener:(_,callback)=>speeds.click=callback};
+const buttons = [], chapters = {hidden:true,addEventListener:()=>{},appendChild:b=>buttons.push(b)};
+const screen = {addEventListener:(event,callback)=>screen[event]=callback};
+const figure = {classList:{add:()=>{}},getAttribute:key=>({'data-cast':'tour.cast','data-chapters':'markers','data-poster-chapter':'One'})[key]||null,
+ querySelector:selector=>selector==='.recording-speed'?speeds:selector==='.recording-chapters'?chapters:screen};
+const document = {querySelectorAll:()=>[figure],
+ createElement:()=>({attributes:{},setAttribute(name,value){this.attributes[name]=value;}}),
+ head:{appendChild:element=>queueMicrotask(()=>element.onload())}};
+const window = {AsciinemaPlayer:{create:(cast,screen,options)=>{calls.push(options);return {dispose:()=>{},addEventListener:()=>{},getCurrentTime:()=>3.25};}}};
+const cast = ['{"version":3,"idle_time_limit":2}','[1,"m","One"]','[10,"o","x"]','','#note','[0.5,"m","Two"]'].join('\n');
+const fetch = async url => {assert.strictEqual(url,'tour.cast');return {ok:true,text:async()=>cast};};
+vm.runInNewContext(fs.readFileSync(process.argv[1],'utf8'),{document,window,Promise,Number,Object,String,Math,JSON,Error,Infinity,fetch});
+setTimeout(async()=>{
+ assert.strictEqual(chapters.hidden,false);
+ assert.deepStrictEqual(buttons.map(b=>[b.textContent,b.attributes['data-start']]),[['One','1'],['Two','11.5']]);
+ assert.strictEqual(calls.length,1);
+ assert.strictEqual(calls[0].poster,'npt:3.25');
+ screen.pointerdown();
+ speeds.click({target:{closest:()=>speedButton}});await new Promise(r=>setTimeout(r));
+ assert.strictEqual(calls[1].startAt,11.25);
+},20);
 """
         subprocess.run(['node', '-e', program, str(ROOT / 'docs/website/assets/tour-player.js')], check=True)
 

@@ -1,0 +1,16 @@
+{
+  "confiAg": {
+    "digest": "sha256:000000000000000000000000000ÿÿÿÿÿÿÿÿ0000000000000000000000000000000000000",
+    "mediaType": "application/vnd.oci.image.config.v1+json",
+    "size": 2
+  },
+  "layers": [
+    {
+      "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "size": 32
+    }
+  ],
+  "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+  "schemaVersion": 2
+}

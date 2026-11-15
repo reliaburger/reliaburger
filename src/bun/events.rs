@@ -59,6 +59,8 @@ pub struct AuditEvent {
     pub action: String,
     /// Stable authenticated credential principal.
     pub principal: String,
+    /// What kind of principal that is (#1682's design).
+    pub principal_kind: crate::sesame::types::PrincipalKind,
     /// Related app, when applicable.
     pub app: Option<String>,
     /// Related namespace, when applicable.
@@ -179,6 +181,32 @@ impl EventStore {
         node: Option<String>,
         message: String,
     ) -> u64 {
+        self.record_with_details(
+            timestamp,
+            kind,
+            severity,
+            app,
+            namespace,
+            node,
+            message,
+            BTreeMap::new(),
+        )
+    }
+
+    /// Record an event that carries machine-readable `details`, such as a
+    /// decision's rule and evidence ([`crate::bun::decisions`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_with_details(
+        &mut self,
+        timestamp: u64,
+        kind: EventKind,
+        severity: EventSeverity,
+        app: Option<String>,
+        namespace: Option<String>,
+        node: Option<String>,
+        message: String,
+        details: BTreeMap<String, String>,
+    ) -> u64 {
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.saturating_add(1);
         let event = ClusterEvent {
@@ -192,7 +220,7 @@ impl EventStore {
             action: None,
             principal: None,
             source_address: None,
-            details: BTreeMap::new(),
+            details,
             message,
         };
         if self.buffer.len() == EVENT_BUFFER_CAP {
@@ -249,7 +277,11 @@ impl EventStore {
             .buffer
             .iter()
             .rev()
-            .filter(|event| app.is_none_or(|name| event.app.as_deref() == Some(name)))
+            .filter(|event| {
+                app.is_none_or(|name| {
+                    crate::bun::audit::touched_app(event.app.as_deref(), &event.details, name)
+                })
+            })
             .filter(|event| min_severity.is_none_or(|level| event.severity >= level))
             .take(limit.min(EVENT_BUFFER_CAP))
             .cloned()
@@ -303,6 +335,31 @@ mod tests {
         assert_eq!(events[0].app.as_deref(), Some("web"));
     }
 
+    #[test]
+    fn recent_finds_a_multi_app_apply_by_any_app_it_listed() {
+        let mut store = EventStore::new();
+        store.record_audit(AuditEvent {
+            timestamp: 1,
+            kind: EventKind::Operation,
+            severity: EventSeverity::Info,
+            action: "app.applied".to_string(),
+            principal: "token:alice".to_string(),
+            principal_kind: crate::sesame::types::PrincipalKind::Human,
+            app: None,
+            namespace: Some("default".to_string()),
+            node: None,
+            source_address: None,
+            details: BTreeMap::from([(
+                "workloads".to_string(),
+                "backend@default,frontend@default".to_string(),
+            )]),
+            message: "app.applied in default by alice".to_string(),
+        });
+        assert_eq!(store.recent(10, Some("backend"), None).len(), 1);
+        assert_eq!(store.recent(10, Some("frontend"), None).len(), 1);
+        assert!(store.recent(10, Some("worker"), None).is_empty());
+    }
+
     #[tokio::test]
     async fn job_events_cannot_evict_audit_records() {
         let dir = tempfile::tempdir().unwrap();
@@ -319,6 +376,7 @@ mod tests {
             severity: EventSeverity::Info,
             action: "token.created".to_string(),
             principal: "token:admin".to_string(),
+            principal_kind: crate::sesame::types::PrincipalKind::Human,
             app: None,
             namespace: None,
             node: Some("node-1".to_string()),

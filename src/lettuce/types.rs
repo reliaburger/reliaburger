@@ -249,6 +249,8 @@ pub struct GitOpsOwnership {
     pub namespaces: BTreeSet<String>,
     /// Permissions GitOps wrote, by name.
     pub permissions: BTreeSet<String>,
+    /// Policies GitOps wrote, by name (#1117).
+    pub policies: BTreeSet<String>,
 }
 
 impl GitOpsOwnership {
@@ -266,13 +268,22 @@ impl GitOpsOwnership {
             .keys()
             .filter(|name| self.permissions.contains(*name))
             .map(|name| format!("permission '{name}'"));
+        let policies = config
+            .policy
+            .keys()
+            .filter(|name| self.policies.contains(*name))
+            .map(|name| format!("policy '{name}'"));
         let apps = config.app.iter().filter_map(|(name, spec)| {
             let namespace = spec.namespace.as_deref().unwrap_or("default");
             self.apps
                 .contains(&AppId::new(name, namespace))
                 .then(|| app_label(name, namespace))
         });
-        namespaces.chain(permissions).chain(apps).collect()
+        namespaces
+            .chain(permissions)
+            .chain(policies)
+            .chain(apps)
+            .collect()
     }
 }
 
@@ -400,7 +411,8 @@ pub fn is_secret_looking_key(key: &str) -> bool {
         || key.ends_with("_KEY")
 }
 
-/// One warning per app env value that looks secret but isn't encrypted.
+/// One warning per app or init container env value that looks secret but
+/// isn't encrypted.
 ///
 /// GitOps applies such a value anyway (D8): refusing would break existing
 /// repositories with no way to migrate. The warning names the app and the
@@ -409,8 +421,13 @@ pub fn plaintext_secret_warnings(config: &crate::config::Config) -> Vec<String> 
     let mut warnings = Vec::new();
     for (name, spec) in &config.app {
         let namespace = spec.namespace.as_deref().unwrap_or("default");
-        for (key, value) in &spec.env {
-            if is_secret_looking_key(key) && !value.is_encrypted() && !value.as_str().is_empty() {
+        let init_env = spec.init.iter().flat_map(|init| &init.env);
+        for (key, value) in spec.env.iter().chain(init_env) {
+            if is_secret_looking_key(key)
+                && !value.is_encrypted()
+                && !value.is_provider()
+                && !value.as_str().is_empty()
+            {
                 warnings.push(format!(
                     "app {namespace}/{name}: env {key} looks like a secret but is plaintext \
                      in git; encrypt it with `relish secret encrypt` (ENC[AGE:...])"
@@ -804,6 +821,26 @@ mod tests {
                 .unseal(Some(b"another-master-key-of-32-bytes!!"))
                 .is_err()
         );
+    }
+
+    /// #1498: an init container's own env is in Git too, so a plaintext
+    /// secret there gets the same warning as one in the app's.
+    #[test]
+    fn a_plaintext_secret_in_an_init_containers_env_warns() {
+        let config = crate::config::Config::parse(
+            r#"
+            [app.web]
+            image = "web:1"
+            [[app.web.init]]
+            command = ["migrate"]
+            env = { DB_PASSWORD = "hunter2", MODE = "migrate", TOKEN = "PROVIDER[vault:web/token]" }
+            "#,
+        )
+        .unwrap();
+        let warnings = plaintext_secret_warnings(&config);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("env DB_PASSWORD"), "{warnings:?}");
+        assert!(!warnings[0].contains("hunter2"), "{warnings:?}");
     }
 
     #[test]

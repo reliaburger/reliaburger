@@ -198,6 +198,24 @@ Admin                  New Node                  Cluster (any existing node)
   |                       |                              |
 ```
 
+A node certificate names the node id as a SPIFFE URI SAN and a DNS SAN, and,
+from 0.2.6, the address the issuer saw the join or renewal request come from
+as an IP SAN, so a strict client can connect by address
+([#1508](https://github.com/reliaburger/reliaburger/issues/1508)). Loopback and
+unspecified addresses are left out, and nothing in the CSR is used. A node
+whose certificate doesn't name its advertised address renews once to get it,
+which covers the first node and a node that moved; Bun reaches its own API at
+that address, so the leader's own renewal arrives from it too.
+
+A node with no Raft seat replicates no security state, so it fetches the
+leader's `SecurityState::node_view()` from `/v1/cluster/security-view` over
+mTLS on every security refresh (#1477). The leader reads its state
+linearizably and checks the caller's node certificate as renewal does. The
+view keeps the CA certificates, API token hashes, the CRL, node leaf records,
+the wrapped age keys and the wrapped Ingress CA key. It drops the root, Node
+and Workload CA keys, the OIDC signing key, join tokens, secret seals,
+pending intermediates and the serial counter.
+
 ---
 
 ## 4. Data Structures
@@ -398,7 +416,7 @@ pub struct ApiToken {
     pub scope: TokenScope,
 
     /// When the token expires; `None` means never. A Deployer or ReadOnly
-    /// token created without `--ttl-days` or `--no-expiry` gets the node's
+    /// token created without `--ttl-days` or `--no-expiry` gets the leader's
     /// `[security.tokens] default_ttl` (90 days); Admin tokens get none (§5.4).
     pub expires_at: Option<SystemTime>,
 
@@ -482,7 +500,7 @@ pub enum AgeKeyScope {
     /// Cluster-wide default keypair.
     ClusterWide,
 
-    /// Namespace-scoped keypair (planned — no code creates one yet; see §5.5).
+    /// Namespace-scoped keypair, for a namespace with `secret_key = true` (§5.5).
     Namespace(String),
 }
 ```
@@ -794,7 +812,9 @@ start with the command that fixes it, `relish init` on a bootstrap node or
 the setting. `relish dev create` builds an mTLS cluster the way
 `relish setup --quickstart` does, from the same bootstrap code: it generates the
 CA, master key and first identity on the host, then enrols every other Lima VM
-with a join token and `relish join`.
+with a join token and `relish join`. The bootstrap's administrator token is
+named by the caller: `laptop-admin` for the quickstart, `dev-<cluster>-admin`
+for a dev cluster (#930).
 
 Plaintext is an explicit opt-in, and there are only two: `relish init
 --development-plaintext`, and test fixtures that write `require_mtls = false`.
@@ -852,8 +872,11 @@ $ relish --endpoint https://leader.example:9117 \
 `1..=3600`, requires the Admin role, generates the secret on the leader and
 commits only its SHA-256 hash, expiry and attestation mode through
 `RaftRequest::CreateJoinToken`. The response carries the plaintext once. A
-follower returns `503` without the plaintext; retrying against the elected
-leader cannot create an orphan credential.
+follower forwards the request with the caller's own credential (#1506) and
+generates nothing itself; the leader repeats every check. If the leader doesn't
+answer within 10 seconds the caller gets a `504`, and a token may have
+committed: only its hash, which nobody holds the plaintext for, so it can't be
+used and it expires by itself. A retired node id gets a `409`.
 
 1. The joining node connects to the current leader over TLS (server-authenticated only at this stage, using the root CA certificate that was provided alongside the join token or downloaded via a trust-on-first-use pinning step).
 2. The joining node presents the join token.
@@ -912,6 +935,17 @@ $ relish token create --name ci-deploy --role deployer \
 4. Return the plaintext token to the user, with its expiry. It is never stored
    in plaintext.
 
+Only the leader mints. A follower forwards the request with the caller's own
+credential (#1496), and the leader repeats every check, so the `[permission]`
+check and the default lifetime are always the leader's. Once the write commits,
+the node the client spoke to copies the stored record from its own replica into
+its token store, so the secret works there on the next request. A follower
+finds the record by hashing the secret in the leader's answer and waits up to
+two seconds for its replica to apply it. A follower lagging further answers
+anyway and gets the token from the five-second refresh, as every other node
+does. A leader that doesn't answer a forwarded create within 10 seconds gets
+the caller a `504`; the token may have committed with its secret lost.
+
 **Verification.** `sesame::auth::authenticate` turns away a bearer that
 doesn't have the token shape with a string check. Otherwise it hashes the
 bearer once and compares the digest with every stored secret (each token's
@@ -944,7 +978,7 @@ The change alters the stored format, so 0.2.1 starts a fresh cluster (state
 `69`, see `src/compatibility.rs`) and tokens must be reissued.
 
 **Default lifetime (shipped, F05 I3).** Without `--ttl-days`, a Deployer or
-ReadOnly token expires after the answering node's `[security.tokens]
+ReadOnly token expires after the leader's `[security.tokens]
 default_ttl` (`"90d"` by default; `"12h"`-style hours and `"none"` are
 accepted, and a bad value fails config load). `--no-expiry` opts out
 explicitly and conflicts with `--ttl-days`. Admin tokens get no default
@@ -963,7 +997,11 @@ inherit it silently, for example after a revoke and re-create. `POST
 **Scope enforcement (shipped):** `--apps` and `--namespaces` restrict a token
 on every route that names an app and namespace (`authorize_scoped`), filter
 cluster-wide listings such as `/v1/status` and `/v1/images` to the scope, and
-refuse routes that need cluster-wide authority (`require_unscoped`). The Pickle
+refuse routes that need cluster-wide authority (`require_unscoped`).
+`/v1/events` filters too (#1125): a scoped token sees the events about apps
+its scope allows, or about a namespace it names when it isn't limited to some
+apps, and nothing that names no namespace. That's the stream a controller
+reads; the dashboard's `/v1/ws/events` still refuses a scoped token. The Pickle
 registry applies the same scope to repositories: a scoped token may push and
 (on a routable listener) pull only repositories named `<namespace>/<app>` whose
 namespace and app it covers, over Bearer and Basic alike; bare names such as
@@ -1042,8 +1080,10 @@ runtime, storage or observability startup in standalone mode.
 $ relish token rotate ci-deploy [--grace-hours 24]
 ```
 
-1. The node that takes `POST /v1/token/rotate {name, grace_hours}` generates a
-   new secret and hash, and reads the clock once.
+1. Only the leader mints. A follower forwards
+   `POST /v1/token/rotate {name, grace_hours}` with the caller's own credential
+   (#1506), and the leader repeats every check. The leader generates a new
+   secret and hash, and reads the clock once.
 2. It proposes `RaftRequest::RotateApiToken(TokenRotation)`, carrying the new
    SHA-256 digest, `rotated_at`, the new expiry (the token's previous lifetime
    length from now, or none) and `previous_valid_until` (now plus the grace,
@@ -1057,10 +1097,39 @@ $ relish token rotate ci-deploy [--grace-hours 24]
    authenticates as its own principal (the digest of its hash), so last use,
    audit events and browser sessions opened with it stay separate, and those
    sessions end when it does.
-5. The answering node installs the rotation in its own token store at once;
-   the others pick it up on their five-second refresh. The handler records a
-   `token.rotated` audit event with the caller and the grace end, never the
-   secret. Role, scope and the `[permission]` spec stay with the name.
+5. The node the client spoke to installs the rotation in its own token store
+   at once, by copying the stored record from its replica, so the record also
+   says what became of the old secret. A follower finds the record by hashing
+   the secret in the leader's answer and waits up to two seconds for its
+   replica. A follower lagging further answers anyway: the new secret gets a
+   `401` there, and the old one keeps working there even after a zero grace,
+   until its replica catches up. The others pick the rotation up on their
+   five-second refresh. The leader records a `token.rotated` audit event with
+   the caller and the grace end, never the secret. Role, scope and the
+   `[permission]` spec stay with the name.
+
+If the leader doesn't answer a forwarded rotation within 10 seconds the caller
+gets a `504`, and the rotation may have committed with its new secret lost.
+Rotating again isn't a clean retry: the lost secret becomes the previous one,
+so the secret clients still hold stops at once whatever the grace. The error
+says to check the token's created time in `relish token list` first.
+
+**Revocation (forwarded by #1506):** `POST /v1/token/revoke {name}` commits
+`RaftRequest::RevokeApiToken` on the leader; a follower forwards it with the
+caller's own credential. Authentication reads each node's token store, so the
+node the client spoke to also drops the token from its store before it answers
+(`drop_revoked_token`), by name, as the state machine does. It first waits up
+to two seconds for its replica to apply the removal, because the five-second
+refresh copies the replica over the store and would otherwise put the token
+back. The refresh leaves the store alone if the store changed after it read the
+replica (`replace_tokens_unless_changed`), which covers a refresh already in
+flight; it doesn't hold the store's lock across that read, because every
+authenticated request would then wait on the state machine's. A follower
+lagging past the two seconds still drops the token, but a refresh can restore
+it until its replica catches up, so the answer says the node is behind. The
+other nodes drop the token on their refresh, within five seconds. A forwarded
+revoke the leader doesn't answer within 10 seconds is a `504`, and repeating it
+is safe.
 
 **Expiry:** A token with a set `expires_at` is rejected at authentication time once that time has passed (a `401 token expired`). A token with no expiry is never rejected on age grounds. Revocation is explicit via `relish token revoke`.
 
@@ -1104,6 +1173,22 @@ The `relish` CLI uses the age public key to encrypt. No cluster access required.
 4. The operator (or CI) re-encrypts all secrets with the new public key and commits to git. Each applied `AppSpec` records which generation seals its encrypted values (`SecurityState.secret_seals`, keyed `namespace/app/ENV_KEY`) — age ciphertext does not disclose its recipient, so write time is the only moment this is knowable.
 5. Once all `ENC[AGE:...]` values use the new key, the operator runs `relish secret rotate --finalize` to delete the old keypair. Finalise verifies the seal records first: any secret still sealed under an older generation — or with no record at all — refuses the retirement and is named in the error, so the key that can decrypt it is never deleted early.
 
+### 5.5a Exec Secret Providers (#1123)
+
+An app env value `PROVIDER[name:path]` names a secret kept outside the cluster. `config::EnvValue::Provider` holds the parsed `sesame::secret_provider::SecretReference`; a value starting with `PROVIDER[` that doesn't parse fails deserialisation, so apply refuses it, and `validate_job` refuses provider values in jobs (the job runtimes don't call providers). The reference, not a secret, is what Raft stores.
+
+**Node config.** `[secret_providers.<name>]` in `node.toml` (`SecretProviderConfig`): an absolute `binary`, `timeout_secs` (default 5, 1..=60), `max_output_bytes` (default 64 KiB, up to 1 MiB) and the provider's `env`. The table is the allowlist; `NodeConfig::validate` checks each entry at startup. `SecretProviders` (an `Arc`'d map) goes to the agent through `set_secret_providers`.
+
+**Placement.** `NodeCapabilities::secret_providers` lists the names a node runs, in its capability report. `WorkloadRequirements::secret_providers` collects the names an app's env uses, and `meat::filter::node_can_run` requires them to be a subset, so the scheduler only places a provider-backed app where its providers exist (`UnplacedReason::NoCapableNode` otherwise).
+
+**Resolution at launch.** `grill::oci::build_env_with_decryptor` passes a provider value through as `KEY=PROVIDER[...]`. Just before the runtime creates the instance, on the deploy worker or restart task (never the agent loop), `bun::agent::launch::create_with_secrets` resolves each such entry through `SecretProviders::resolve_env` and hands the runtime a resolved copy. The supervisor keeps the unresolved spec, so every restart calls the provider again. Init containers get the resolved environment of the app they precede, and a reference in an init container's own `env` resolves the same way on the deploy worker.
+
+**Protocol, version 1.** Bun spawns the binary with `env_clear()`, a default `PATH` plus the configured `env`, cwd `/`, stderr discarded, `kill_on_drop` and its own process group. It writes one JSON object on one newline-terminated line to stdin and closes it: `{"version":1,"provider","path","namespace","app","instance","variable"}`. It reads at most `max_output_bytes + 1` bytes of stdout while waiting for exit, all inside `tokio::time::timeout(timeout_secs)`. Once the provider exits, reading gets 100 ms more rather than waiting for end-of-file, because a leftover child, or on macOS a process spawned concurrently that inherited the pipe before `FD_CLOEXEC` was set, can hold the write end open. The answer is `{"version":1,"value":"..."}` with exit 0, or `{"version":1,"error":"..."}`. Unknown fields are ignored.
+
+**Failure.** Every failure is a `ProviderError`: not configured, spawn failure, pipe I/O, timeout, output over the cap, unsuccessful exit (status or signal), malformed answer, unsupported version, a provider `error` (kept to one line of at most 200 characters), or a value holding NUL. A timeout or oversize answer `killpg`s the provider's group, so its children die too. The error, wrapped in `SecretResolutionError { variable, problem }`, becomes `LaunchProblem::SecretUnavailable`, the same launch refusal a missing binary produces (#881): the fresh path records it as the instance's `launch_failure`, shown as the instance `reason` in `/v1/status` and `relish wtf`; a restart refusal is terminal without spending the restart budget; a rollout's replacement fails the rollout and leaves the old instances serving. In a cluster the placement reconciler's deploy backoff retries a failed fresh deploy.
+
+**What never leaks.** Nothing in `secret_provider` logs. The response type isn't `Debug`. A JSON parse error's text isn't kept, because serde quotes the input; malformed answers carry a fixed reason. The provider's stderr is discarded. The resolved spec reaches disk only where an `ENC[AGE:...]` plaintext already does (5.5, step 5).
+
 ### 5.6 Raft Log Encryption
 
 > **Status: log entries encrypted, keyed by the master key; snapshot plaintext.**
@@ -1118,7 +1203,7 @@ The `relish` CLI uses the age public key to encrypt. No cluster access required.
 > plaintext entry (leading `{`) still decodes, so plaintext and encrypted logs
 > interoperate and a keyless/dev cluster stays plaintext. An encrypted entry
 > opened without the key errors rather than reading as empty (CP3-safe). Vote and
-> log-id metadata remain plaintext bincode (not app data). The HKDF *wrapping* of
+> log-id metadata remain plaintext postcard (not app data). The HKDF *wrapping* of
 > sensitive keys inside the log (step 5) ships as before. TPM sealing (step 2) is
 > still not implemented.
 
@@ -1183,7 +1268,7 @@ On each council node (intended design; step 1 differs today, see the status note
 **Intermediate CA rotation (`relish ca rotate --role node|workload|ingress --root-backup <file>`, F04 R4):**
 
 1. **Prepare** (`POST /v1/ca/rotation/prepare {role}`). The leader generates the new P-256 key, wraps it with the master key and proposes `RaftRequest::CaRotationPrepare { role, generation, csr_der, private_key_wrapped }`. Applying it stores a `PendingIntermediate` (one per role; a second prepare replaces the first) and allocates the certificate's serial from `next_serial`, so it can't collide with a revoked serial. Refused for the root, for a role mid-rotation and for a generation other than the active one's plus one. The answer carries the CSR, generation, serial and the active root's fingerprint.
-2. **Sign** (on the operator's machine). `relish` opens the R3 backup, checks its fingerprint against the one the council sent, and signs the CSR with `ca::sign_intermediate_csr`: only the CSR's public key is used; name, path length 0, key usages and five-year lifetime are fixed per role and clamped to the root's validity. The root key never reaches the cluster.
+2. **Sign** (on the operator's machine). `relish` opens the R3 backup, checks its fingerprint against the one the council sent, and signs the CSR with `ca::sign_intermediate_csr`: only the CSR's public key is used; name, path length 0, key usages and five-year lifetime are fixed per role and clamped to the root's validity. Like every issued certificate, it carries an authority key identifier equal to its issuer's subject key identifier. The root key never reaches the cluster.
 3. **Begin** (`POST /v1/ca/rotation/begin {role, certificate_b64}`). The leader checks the certificate with `ca_rotation::intermediate_from_signed` (pending CSR for the role, same public key, allocated serial, CA certificate, signed by the active root), builds the `CertificateAuthority` with the pending wrapped key and proposes `CaRotationBegin`, which clears the pending CSR. Both CAs are trusted; new leaves come from the new one.
 4. **Re-issue.**
    - *Node:* each node's renewal worker checks its replica every 5 s. Once its live identity holds exactly the council's trust set it sends `POST /v1/cluster/trust-ack {node_ca_fingerprints}` (node-to-node, TLS-peer authenticated); the leader refuses unless every trusted Node CA is listed, then proposes `AcknowledgeNodeTrust { node_id, generation }`, which raises `NodeLeafRecord::trust_generation` (never lowers it; a join starts at the active generation). When every live node has acknowledged, nodes renew early (`ca_rotation::early_renewal_due`) one at a time in node-id order, each after every earlier node holds a new-CA leaf, or after its slot (`EARLY_RENEWAL_STAGGER`, 60 s per place from the new CA's issue time) if one is stuck.
@@ -1288,7 +1373,7 @@ startup.
 - **Durability.** One dedicated writer thread owns the files, fed by a bounded `mpsc` queue, so no Tokio worker blocks on disk. It appends and `sync_data`s each record and replies on a oneshot; the API waits for that (at most `AUDIT_WRITE_TIMEOUT`, 5 s) before answering. Audit traffic is a few records a second, so one sync per record is cheap. On open, a half-written last line is ended with a newline and skipped on read.
 - **Bound.** `[storage] audit_max_bytes` (64 MiB default, 64 KiB minimum) is shared by eight segments. A record that would push the newest segment past its share starts a new one; when the total passes the bound the oldest segment is deleted, never the newest.
 - **Failure.** A failed write (or a full queue) is printed to stderr and counted (`AuditLog::failures`); the action still happens. `GET /v1/audit` reports the count as a warning.
-- **No secrets.** Handlers never put one in a record; as a backstop the writer replaces anything shaped like `rbrg_…` (API and join tokens) with `rbrg_[redacted]`.
+- **No secrets.** Handlers never put one in a record; as a backstop the writer runs every `message` and `details` value through the shared redaction rules in `crate::redact` (#1083): `rbrg_…` tokens become `rbrg_[redacted]`, `ENC[AGE:…]` values `ENC[AGE:[redacted]]`, age identities `AGE-SECRET-KEY-1[redacted]`, PEM private-key blocks lose their body, and URL user information becomes `scheme://[redacted]@host`. The same module cleans the text `relish agent` wraps in `untrusted` objects.
 - **Coverage.** One route layer (`bun::api::audit::audit_layer`, inside the auth layer) records every route in `AUDITED_ROUTES` that answers 2xx, with the caller's principal, the address from `ConnectInfo`, and `{app}`/`{namespace}` from the path. Handlers that know more add it through `bun::audit::annotate` (a manifest's namespace and workloads, a decommission's target, an upgrade's version), carried in a task-local for the request. Token, CA, secret and fault handlers record their own, richer events; the agent records `fault.expired` and the token sweep and namespace-key loops record as `system`. A test (`every_mutating_route_is_audited_or_exempt`) makes every `POST`/`DELETE` route in the authorisation matrix choose: layer-audited, self-audited or exempt with a reason (node-to-node plumbing, heartbeats, reads).
 - **Read.** `GET /v1/audit?since&until&action&principal&namespace&limit` (newest `limit`, default 100, at most 10,000, oldest first) needs an unscoped Admin with the cluster-wide `admin` permission, and refuses the service principal. `?cluster=true` asks every live member under the caller's own credential (not the service token), so each repeats the check, and merges by `(timestamp, node, sequence)` with a warning per member that didn't answer. `relish audit` wraps it.
 - **Ring.** `EventStore::record_audit` still puts each record in the ring and the live stream, so the TUI and `relish events` show it as it happens.
@@ -1542,7 +1627,7 @@ council_size = 3
 
 **Response:**
 
-1. Immediately run `relish ca rotate` for the compromised CA. **(Planned — CA rotation is not implemented yet, §5.8. Until it ships, the practical response is CRL-revoking affected certificates and, in the worst case, re-bootstrapping the PKI.)**
+1. Immediately run `relish ca rotate --role ROLE --root-backup FILE` for the compromised intermediate CA (§5.8). Root rotation is planned ([#362](https://github.com/reliaburger/reliaburger/issues/362)).
 2. Revoke all certificates issued by the compromised CA (via the CRL, §5.7).
 3. The dual-signing period ensures existing legitimate certificates continue working during the transition.
 4. Investigate how the key was exfiltrated. Council nodes should have restricted access. At-rest encryption covers Raft log entries only, under the master key on the same host (§5.6); TPM sealing is planned hardening, not yet active.
@@ -1661,9 +1746,9 @@ The threat model assumes:
 **Response:**
 
 1. Isolate the compromised council node immediately.
-2. Rotate all intermediate CAs: `relish ca rotate`. **(Planned — not implemented, §5.8.)**
+2. Rotate all intermediate CAs: `relish ca rotate --role ROLE --root-backup FILE` for each role (§5.8).
 3. Rotate the age keypair: `relish secret rotate`.
-4. Rotate the OIDC signing keypair (re-minting all JWTs).
+4. Rotate the OIDC signing keypair, re-minting all JWTs. **(Planned, [#709](https://github.com/reliaburger/reliaburger/issues/709): there's no OIDC key rotation yet.)**
 5. Rotate all API tokens.
 6. Audit all cluster activity during the compromise window: `relish audit --cluster --since <start> --until <end>` lists every node's records, with the principal and source address of each action (§5.11). Read the compromised node's log before you rebuild it; there is no central copy yet.
 7. Investigate the attack vector and harden council node access.

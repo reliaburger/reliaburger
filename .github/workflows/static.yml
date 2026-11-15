@@ -27,18 +27,18 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Setup Pages
         uses: actions/configure-pages@v5
       - name: Publish the tutorial's demo manifest and app
-        # The homepage tour applies https://reliaburger.com/demo/podinfo.yaml.
-        # Copying the tested example at deploy time means the site can never
-        # serve a different manifest from the one CI imports.
         # The tour's build step downloads https://reliaburger.com/demo/burger.tar.gz,
-        # packed here from the example directory for the same reason.
+        # packed here from the example directory, so the site can never serve
+        # a different app from the one CI tests. The manual's Kubernetes
+        # chapter applies https://reliaburger.com/demo/podinfo.yaml, copied
+        # from the tested example for the same reason.
         # Both come from the release install.sh installs, not from main: the
         # person running the tour has that release, and main's examples may
         # need features it doesn't have (tests/suite/website.rs checks this).
@@ -51,7 +51,22 @@ jobs:
           mkdir -p docs/website/demo
           cp examples/kubernetes/podinfo.yaml docs/website/demo/podinfo.yaml
           tar -czf docs/website/demo/burger.tar.gz -C examples/demo burger
+      - name: Stamp the released version into the feedback page
+        # "early in development at 0.2" follows the release install.sh
+        # installs, shown as major.minor.
+        run: |
+          tag=$(sed -n 's/.*RELIABURGER_VERSION:-\(v[0-9][0-9.]*\)}.*/\1/p' docs/website/install.sh)
+          minor=$(echo "${tag#v}" | cut -d. -f1,2)
+          test -n "$minor"
+          sed -i "s|<span data-release-minor>[^<]*</span>|<span data-release-minor>$minor</span>|" docs/website/feedback/index.html
+          grep -q "<span data-release-minor>$minor</span>" docs/website/feedback/index.html
+          # The page's Markdown copy (#1582) says the same, without the span.
+          sed -i "s|early in development at [0-9][0-9.]*[0-9],|early in development at $minor,|" docs/website/feedback/index.md
+          grep -q "early in development at $minor," docs/website/feedback/index.md
       - name: Upload artifact
+        # v3 packs dot-directories, so /.well-known/agent-skills/ is
+        # published. v4 leaves them out unless include-hidden-files is true
+        # (tests/suite/agent_docs.rs checks this).
         uses: actions/upload-pages-artifact@v3
         with:
           # Publish only the static website assets

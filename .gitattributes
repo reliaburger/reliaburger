@@ -1,0 +1,2 @@
+# Byte-exact fixtures: the CRLF line endings are what the tests check.
+tests/fixtures/pem/*.pem -text

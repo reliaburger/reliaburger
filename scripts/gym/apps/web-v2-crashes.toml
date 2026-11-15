@@ -1,0 +1,14 @@
+# Version 2 of web, deployed without the setting it needs: it starts, runs
+# for a few seconds, then exits with an error, and Bun restarts it, again and
+# again. It lives long enough for the deploy to count it started, so Bun
+# doesn't roll it back; there's no health check to say otherwise.
+
+[app.web]
+script = """
+echo "web v2: starting"
+sleep 5
+echo "web v2: fatal: DATABASE_URL is not set" >&2
+exit 1
+"""
+port = @APP_PORT@
+env = { VERSION = "v2" }

@@ -173,7 +173,7 @@ pub(super) async fn endpoint_withdrawal_receipt_handler(
     };
     let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         let security = council
-            .security_state_linearizable()
+            .security_state_confirmed(crate::council::LEADER_CONFIRMATION)
             .await
             .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
         let node_id = crate::sesame::renewal::validate_peer(&peer, &security)
@@ -244,7 +244,7 @@ pub(super) async fn workload_csr_handler(
     };
     let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         let security = council
-            .security_state_linearizable()
+            .security_state_confirmed(crate::council::LEADER_CONFIRMATION)
             .await
             .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
         let node_id = crate::sesame::renewal::validate_peer(&peer, &security)
@@ -318,11 +318,24 @@ pub(super) async fn producer_retirement_handler(
     };
     let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         let security = council
-            .security_state_linearizable()
+            .security_state_confirmed(crate::council::LEADER_CONFIRMATION)
             .await
             .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
         let node_id = crate::sesame::renewal::validate_peer(&peer, &security)
             .map_err(|error| (StatusCode::FORBIDDEN, error.to_string()))?;
+        // A producer asks again every 500 ms while it waits for the other
+        // nodes (#1355). Once the fence has committed, the read above has
+        // proved this state current, and a repeat write would change
+        // nothing, so answer from it rather than commit a no-op (#1440).
+        if let Some(released) = council
+            .committed_producer_release(&node_id, &receipt.execution)
+            .await
+        {
+            return Ok((
+                node_id,
+                crate::council::CouncilResponse::EndpointExecutionRetired { released },
+            ));
+        }
         council
             .write(crate::council::RaftRequest::RetireEndpointExecution {
                 node_id: node_id.clone(),
@@ -406,16 +419,39 @@ fn node_assignments(
     apps
 }
 
+/// Whether this request reaches a plaintext cluster that has no credential
+/// anywhere: no authenticated caller, no service token (so no master key),
+/// plain HTTP and no API token yet. That's the bootstrap window, where the
+/// API already admits anonymous callers, and a node has nothing to present.
+pub(super) async fn credential_free_development_cluster(
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    state: &ApiState,
+) -> bool {
+    auth.is_none()
+        && state.service_token.is_none()
+        && state.cluster_http.scheme() == "http"
+        && match &state.token_store {
+            Some(tokens) => tokens.read().await.is_empty(),
+            None => true,
+        }
+}
+
 /// `POST /v1/rollouts/failed` — a node's placement reconciler reports that
 /// its rollout of an app failed (#692, D11-B). The leader commits
 /// `RolloutFailed`, and stops handing that spec to nodes until a different
 /// one is applied. Only the leader can answer: the report goes to it.
+///
+/// A credential-free development cluster has no service token for the node
+/// to present, so there the report is taken without one, but only for a
+/// node the app is placed on (#1067).
 pub(super) async fn rollout_failed_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Json(report): Json<crate::cluster::rollout::RolloutFailureReport>,
 ) -> Response {
-    if let Err(response) = crate::sesame::auth::require_system(auth.as_deref()) {
+    let credential_free = credential_free_development_cluster(auth.as_deref(), &state).await;
+    if !credential_free && let Err(response) = crate::sesame::auth::require_system(auth.as_deref())
+    {
         return response;
     }
     let Some(council) = &state.council else {
@@ -432,8 +468,27 @@ pub(super) async fn rollout_failed_handler(
         )
             .into_response();
     }
+    let app_id = crate::meat::AppId::new(&report.app_name, &report.namespace);
+    // Nobody vouches for an unauthenticated report, so it can speak only for
+    // a node that has the app to fail.
+    if credential_free {
+        let node = crate::meat::NodeId::new(&report.node);
+        let placed = council
+            .desired_state()
+            .await
+            .scheduling
+            .get(&app_id)
+            .is_some_and(|placements| placements.iter().any(|p| p.node_id == node));
+        if !placed {
+            return (
+                StatusCode::FORBIDDEN,
+                "an unauthenticated rollout failure must name a node the app is placed on",
+            )
+                .into_response();
+        }
+    }
     let request = crate::council::RaftRequest::RolloutFailed {
-        app_id: crate::meat::AppId::new(&report.app_name, &report.namespace),
+        app_id,
         failure: crate::meat::deploy_types::RolloutFailure {
             fingerprint: report.fingerprint,
             node: report.node,
@@ -470,13 +525,8 @@ pub(super) async fn placements_handler(
     // Credential-free development clusters already expose placements. Adding
     // a retained consumer cannot authorise cleanup; receipt endpoints must
     // separately authenticate permission to discharge that obligation.
-    let development_without_credentials = auth.is_none()
-        && state.service_token.is_none()
-        && state.cluster_http.scheme() == "http"
-        && match &state.token_store {
-            Some(tokens) => tokens.read().await.is_empty(),
-            None => true,
-        };
+    let development_without_credentials =
+        credential_free_development_cluster(auth.as_deref(), &state).await;
     if !development_without_credentials
         && let Err(response) = crate::sesame::auth::require_system(auth.as_deref())
     {

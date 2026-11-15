@@ -1,0 +1,37 @@
+mode	release
+date	2026-11-12
+command	scripts/release/qualify-profile.sh --candidate https://github.com/reliaburger/reliaburger/releases/download/v0.2.8 --qualified-digest d9d04a7708e06fb444e8ca880a73321539e2300f29bb141ba80e7781a4bbe9f8
+started_at	2026-11-12T04:50:44Z
+candidate_version	v0.2.8
+candidate_commit	e423d469a93b04d7bdc64582be1922ac5f453fd1
+candidate_profiling	artefact profiling-build-e423d469a93b04d7bdc64582be1922ac5f453fd1-1 of build run 43017213259
+candidate_bun_sha256	8a212344a4ccfc8fdefeff608ec3e74ce4f6bcbbe51bccda0da4a99a51c5568b
+candidate_relish_sha256	546d297331cc895e0d11360cb001c8a8ae3b529e6dfed854767792b2828923ae
+previous_version	v0.2.7
+previous_commit	ace072c73c2d5a5d7124f3a4f879c88bf9c33839
+previous_profiling	artefact profiling-build-ace072c73c2d5a5d7124f3a4f879c88bf9c33839-1 of build run 42320339626
+previous_bun_sha256	bb17a820861d084be4f6d162a57f9eca29b3eac8de68fdc2bc0f0843623e9155
+previous_relish_sha256	8c663056cfce5f55c6b2741498b570dcc31822a8d35474651a1d67679109a8df
+candidate_source	https://github.com/reliaburger/reliaburger/releases/download/v0.2.8
+previous_source	https://github.com/reliaburger/reliaburger/releases/download/v0.2.7
+qualified_digest	d9d04a7708e06fb444e8ca880a73321539e2300f29bb141ba80e7781a4bbe9f8
+scenarios	raw,host,shared,idle
+window	60
+rounds_planned	3
+rounds_run	3
+rounds_dropped	0
+estimate_seconds	4192
+host_model	Mac17,14
+host_cpu	Apple M5 Max, 18 cores
+host_memory	128 GiB
+host_os	macOS 27.2 (Darwin 27.2.0)
+lima_version	2.2.1
+vm_name	rb-profile-ffca5922
+vm_shape	VZ, 4 vCPU, 8 GiB, 60 GiB disk, template:ubuntu-24.04, no mounts
+guest_os	Ubuntu 24.04.5 LTS aarch64
+guest_kernel	6.8.0-142-generic
+runc_version	runc version 1.5.2
+perf_version	perf version 6.8.12
+busybox_sha256	52151e7f322f926b64049cdaa1410dc3ea6485525e0624b05813791c219ae933
+finished_at	2026-11-12T05:53:22Z
+wall_seconds	3758

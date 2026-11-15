@@ -1,0 +1,7 @@
+---
+source: src/relish/lease_cmd.rs
+expression: "render_lease_list(&[view(\"app:shop/web\", \"holmes\", 87, None),\nview(\"namespace:billing\", \"alice\", 840, Some(17)),])"
+---
+TARGET             HOLDER  LEFT   PURPOSE
+app:shop/web       holmes    87s  investigating
+namespace:billing  alice    840s  (proposal 17) investigating

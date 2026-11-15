@@ -1,0 +1,37 @@
+mode	release
+date	2026-10-30
+command	scripts/release/qualify-profile.sh --candidate https://github.com/reliaburger/reliaburger/releases/download/v0.2.4 --qualified-digest 340eaeba513c9740f058e51684713654f3df7c392ea8f19993ae1b5d12727d09 --previous v0.2.3
+started_at	2026-10-30T07:23:35Z
+candidate_version	v0.2.4
+candidate_commit	964b56a2c41e2b43fb48aadef7d01839155c0dca
+candidate_profiling	artefact profiling-build-964b56a2c41e2b43fb48aadef7d01839155c0dca-1 of build run 40870779000
+candidate_bun_sha256	bbb0679db09ac43e4d49bf98b9c32a35dbd634fa71db0cae00c6eae45b25e1eb
+candidate_relish_sha256	5a60ddd20d3fd8120341ac13d1493370fedeadf6d7c92b7bde2d58bb2bc97fbd
+previous_version	v0.2.3
+previous_commit	d387d569bb1f18264382ffcffebe3bbf45fb7ed3
+previous_profiling	none: perf ran on the stripped release build, so it names no Bun frame
+previous_bun_sha256	3d15e567c682b0aaaa662d03e9656bb4105e651617cf38c269054b9ac0dff4ba
+previous_relish_sha256	71d2e3cc0c9cd0d1b5adbe1aa121d33905d81bbc502d7164e6ef96719060a582
+candidate_source	https://github.com/reliaburger/reliaburger/releases/download/v0.2.4
+previous_source	https://github.com/reliaburger/reliaburger/releases/download/v0.2.3
+qualified_digest	340eaeba513c9740f058e51684713654f3df7c392ea8f19993ae1b5d12727d09
+scenarios	raw,host,shared,idle
+window	60
+rounds_planned	3
+rounds_run	3
+rounds_dropped	0
+estimate_seconds	4192
+host_model	Mac14,5
+host_cpu	Apple M2 Max, 12 cores
+host_memory	32 GiB
+host_os	macOS 26.3.1 (Darwin 25.3.0)
+lima_version	2.1.0
+vm_name	rb-profile-63f679c4
+vm_shape	VZ, 4 vCPU, 8 GiB, 60 GiB disk, template:ubuntu-24.04, no mounts
+guest_os	Ubuntu 24.04.4 LTS aarch64
+guest_kernel	6.8.0-101-generic
+runc_version	runc version 1.4.0
+perf_version	perf version 6.8.12
+busybox_sha256	52151e7f322f926b64049cdaa1410dc3ea6485525e0624b05813791c219ae933
+finished_at	2026-10-30T08:14:03Z
+wall_seconds	3028

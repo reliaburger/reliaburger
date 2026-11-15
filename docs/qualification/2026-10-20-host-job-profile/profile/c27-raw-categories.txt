@@ -1,0 +1,13 @@
+samples 39921
+  7.64%      19.9 us/task  idle (no runnable work)
+ 15.68%      40.8 us/task  Bun: GitOps loop (DesiredState clone/drop per Raft metrics change)
+  3.77%       9.8 us/task  Bun: Raft core and log
+  0.00%       0.0 us/task  Bun: per task, rest of ReusablePool::run (slots lock, timers, logs)
+  5.12%      13.3 us/task  Bun: other (runtime, timers, wakeups, other subsystems)
+  5.16%      13.4 us/task  helper/child: execve
+ 12.83%      33.4 us/task  helper/child: exit and address-space teardown
+ 10.22%      26.6 us/task  helper/child: page faults
+ 12.55%      32.7 us/task  busybox `true`: user space and other kernel
+ 23.86%      62.1 us/task  relish (raw scenario spawner and bench client)
+  3.16%       8.2 us/task  other processes and kernel threads
+other by command: ksoftirqd/ 2.01%, migration/ 0.43%, kworker/2:4-eve 0.12%, kworker/3:1-eve 0.11%, kworker/0:0-eve 0.10%, kworker/1:0-eve 0.10%, perf 0.09%, rcu_preempt 0.06%, exe 0.05%, lima-guestagent 0.05%, containerd 0.02%, bash 0.01%

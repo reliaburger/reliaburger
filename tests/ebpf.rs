@@ -691,6 +691,8 @@ async fn agent_drop_fault_refuses_vip_with_eperm() {
             reservation: None,
             replica_evidence: None,
             request: FaultRequest {
+                workload: Default::default(),
+                task_index: None,
                 fault_type: FaultType::Drop { probability: 100 },
                 target_service: name.clone(),
                 namespace: Some("default".into()),
@@ -909,6 +911,8 @@ async fn partition_answers_only_once_every_source_instance_is_covered() {
             reservation: None,
             replica_evidence: None,
             request: FaultRequest {
+                workload: Default::default(),
+                task_index: None,
                 fault_type: FaultType::Partition {
                     source_app: Some(source.clone()),
                 },
@@ -958,6 +962,133 @@ async fn partition_answers_only_once_every_source_instance_is_covered() {
         "the partition was reported in place before it covered {missing:?}"
     );
     shutdown.cancel();
+}
+
+/// #704: a job's attempt is a caller like an app's instance. A partition
+/// `--from` the job keys the attempt's own cgroup in `fault_connect_map`, so
+/// the kernel refuses its connections to the target.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
+async fn partition_from_an_array_attempt_blocks_its_cgroup() {
+    use reliaburger::bun::agent::AgentCommand;
+    use reliaburger::bun::live_attempts::{AttemptHandle, LiveAttempt};
+    use reliaburger::config::Config;
+    use reliaburger::grill::mock::MockGrill;
+    use reliaburger::grill::port::PortAllocator;
+    use reliaburger::grill::{Grill, InstanceId};
+    use reliaburger::smoker::bpf_maps;
+    use reliaburger::smoker::bpf_types::partition_fault_key;
+    use reliaburger::smoker::types::{FaultRequest, FaultType};
+    use std::sync::Arc;
+    use tokio::sync::{Mutex, mpsc, oneshot};
+
+    let ebpf = Arc::new(Mutex::new(load_ebpf()));
+    let grill = MockGrill::new();
+    grill.set_honours_cgroup_path(true);
+    let (cmd_tx, cmd_rx) = mpsc::channel(64);
+    let shutdown = CancellationToken::new();
+    let volumes = TestVolumes::new();
+    let mut agent = test_agent(
+        grill.clone(),
+        PortAllocator::new(42800, 43000),
+        cmd_rx,
+        shutdown.clone(),
+        volumes.path(),
+    );
+    let target = root_app_name("store", volumes.path());
+    let _target_cgroups = AppCgroups::new("default", &target);
+
+    // The attempt: a runtime instance with a cgroup of its own, as a fresh
+    // task container has.
+    let relative = format!("/rbtest-704-attempt-{}", std::process::id());
+    let cgroup = std::path::PathBuf::from(format!("/sys/fs/cgroup{relative}"));
+    std::fs::create_dir_all(&cgroup).unwrap();
+    let job: reliaburger::config::job::JobSpec =
+        toml::from_str("runtime='process'\nexec='/bin/sh'").unwrap();
+    let spec =
+        reliaburger::grill::oci::generate_job_oci_spec("task", "default", &job, &relative, None);
+    let attempt_id = InstanceId("default__executor-704-0".into());
+    grill.create(&attempt_id, &spec).await.unwrap();
+    let _listing = agent.live_attempts().register(LiveAttempt {
+        namespace: "default".into(),
+        job: "render".into(),
+        batch_id: 704,
+        task_count: 8,
+        index: 5,
+        attempt: 1,
+        handle: AttemptHandle::Instance(attempt_id.clone()),
+        cgroup: Some(cgroup.clone()),
+        shared_executor: None,
+    });
+
+    agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
+    let agent_task = tokio::spawn(async move { agent.run().await });
+    let _tasks = TestTasks::new(shutdown.clone(), vec![agent_task]);
+
+    let target_port: u16 = 6380;
+    let config = Config::parse(&format!(
+        "[app.{target}]\nimage = \"mock:image\"\nport = {target_port}\n"
+    ))
+    .unwrap();
+    let (ev_tx, mut ev_rx) = mpsc::channel(64);
+    cmd_tx
+        .send(AgentCommand::Deploy {
+            config,
+            events: ev_tx,
+        })
+        .await
+        .unwrap();
+    while let Some(event) = ev_rx.recv().await {
+        assert!(
+            !matches!(event, reliaburger::bun::agent::ApplyEvent::Error { .. }),
+            "deployment failed: {event:?}"
+        );
+    }
+
+    let (response, answer) = oneshot::channel();
+    cmd_tx
+        .send(AgentCommand::InjectFault {
+            reservation: None,
+            replica_evidence: None,
+            request: FaultRequest {
+                workload: Default::default(),
+                task_index: None,
+                fault_type: FaultType::Partition {
+                    source_app: Some("render".into()),
+                },
+                target_service: target.clone(),
+                namespace: Some("default".into()),
+                target_instance: None,
+                target_node: None,
+                duration: Duration::from_secs(60),
+                injected_by: "test".into(),
+                reason: None,
+                include_leader: false,
+                override_safety: false,
+                acknowledged: true,
+            },
+            response,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), answer)
+        .await
+        .expect("the partition was never answered")
+        .unwrap()
+        .expect("a job's attempt is a partition source");
+
+    let vip = VirtualIP::from_service_id(&ServiceId::new("default", target.as_str()));
+    let cgroup_id = Grill::workload_cgroup(&grill, &attempt_id)
+        .await
+        .unwrap()
+        .expect("the attempt has a cgroup");
+    let key = partition_fault_key(vip.to_network_byte_order(), target_port.to_be(), cgroup_id);
+    let keyed = bpf_maps::read_connect_fault(&mut ebpf.lock().await.bpf, &key)
+        .unwrap()
+        .is_some();
+    shutdown.cancel();
+    let _ = std::fs::remove_dir(&cgroup);
+    assert!(keyed, "the partition didn't key the attempt's cgroup");
 }
 
 // ---------------------------------------------------------------------------
@@ -1498,7 +1629,8 @@ fn isolate_probe(
     )
     .unwrap();
     let mut keys = std::collections::HashSet::new();
-    firewall::reconcile_destination_map(&mut ebpf.bpf, entries, &mut keys).unwrap();
+    firewall::reconcile_destination_map(&mut ebpf.bpf, entries, &mut keys, &mut Default::default())
+        .unwrap();
     keys
 }
 
@@ -1509,7 +1641,13 @@ fn release_probe(
     mut keys: std::collections::HashSet<reliaburger::onion::types::DestinationKey>,
 ) {
     use reliaburger::sesame::firewall;
-    firewall::reconcile_destination_map(&mut ebpf.bpf, &Default::default(), &mut keys).unwrap();
+    firewall::reconcile_destination_map(
+        &mut ebpf.bpf,
+        &Default::default(),
+        &mut keys,
+        &mut Default::default(),
+    )
+    .unwrap();
     firewall::delete_cgroup_firewall_state(&mut ebpf.bpf, probe.id).unwrap();
 }
 
@@ -1834,6 +1972,172 @@ async fn exec_workload_is_held_to_its_namespace() {
     );
 }
 
+/// #1426: a sidecar runs in a cgroup of its own, beside its app's. The agent
+/// binds it to the app's namespace and grants it the app's `allow_from`, so
+/// a sidecar is refused another namespace, and reaches what its app may.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1; run with make test-linux"]
+async fn a_sidecar_is_held_to_its_apps_namespace() {
+    use reliaburger::bun::agent::AgentCommand;
+    use reliaburger::config::Config;
+    use reliaburger::grill::mock::MockGrill;
+    use reliaburger::grill::port::PortAllocator;
+    use reliaburger::onion::types::{DestinationKey, DestinationValue};
+    use std::sync::Arc;
+    use tokio::sync::{Mutex, mpsc};
+
+    let ebpf = Arc::new(Mutex::new(load_ebpf()));
+    let volumes = TestVolumes::new();
+    let web = root_app_name("sidecarweb", volumes.path());
+    let db = root_app_name("sidecardb", volumes.path());
+    let _web_cgroups = AppCgroups::new("tenant-a", &web);
+    let _db_cgroups = AppCgroups::new("tenant-b", &db);
+
+    // `db` in tenant-b grants tenant-a's `web`; `vault` grants nobody. Their
+    // real addresses are written as tenant-b and vault destinations.
+    let mut services = ServiceMap::new();
+    let db_id = ServiceId::new("tenant-b", &db);
+    services
+        .register(&db_id, 8080, Some(vec![format!("tenant-a/{web}")]))
+        .unwrap();
+    let db_app_id = services.resolve(&db_id).unwrap().app_id;
+    let (_granted, granted) = private_listener(78);
+    let (_foreign, foreign) = private_listener(79);
+    let key_of = |address: SocketAddr| {
+        let SocketAddr::V4(v4) = address else {
+            unreachable!()
+        };
+        DestinationKey::new(*v4.ip(), address.port())
+    };
+    let destinations = [
+        (key_of(granted), db_app_id, "tenant-b"),
+        (key_of(foreign), 7, "vault"),
+    ];
+    {
+        let mut e = ebpf.lock().await;
+        for (key, app_id, namespace) in destinations {
+            reliaburger::sesame::firewall::write_destination_entry(
+                &mut e.bpf,
+                key,
+                DestinationValue {
+                    app_id,
+                    namespace_id: reliaburger::onion::vip::name_to_id(namespace),
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    let grill = MockGrill::new();
+    grill.set_honours_cgroup_path(true);
+    let (cmd_tx, cmd_rx) = mpsc::channel(64);
+    let shutdown = CancellationToken::new();
+    let mut agent = test_agent(
+        grill.clone(),
+        PortAllocator::new(42700, 42800),
+        cmd_rx,
+        shutdown.clone(),
+        volumes.path(),
+    );
+    agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
+    let agent_task = tokio::spawn(async move { agent.run().await });
+    let _tasks = TestTasks::new(shutdown.clone(), vec![agent_task]);
+
+    let config = Config::parse(&format!(
+        r#"
+        [app.{web}]
+        namespace = "tenant-a"
+        image = "mock:image"
+        command = ["sleep", "600"]
+
+        [[app.{web}.sidecar]]
+        name = "proxy"
+
+        [app.{db}]
+        namespace = "tenant-b"
+        image = "mock:image"
+        port = 8080
+
+        [app.{db}.firewall]
+        allow_from = ["tenant-a/{web}"]
+    "#
+    ))
+    .unwrap();
+    let (events, mut event_rx) = mpsc::channel(64);
+    cmd_tx
+        .send(AgentCommand::Deploy { config, events })
+        .await
+        .unwrap();
+    while let Some(event) = event_rx.recv().await {
+        assert!(
+            !matches!(event, reliaburger::bun::agent::ApplyEvent::Error { .. }),
+            "sidecar deploy failed: {event:?}"
+        );
+    }
+
+    // The mock runtime runs nothing, so the sidecar's cgroup is made here,
+    // where the runtime would put it; a probe then connects from inside it.
+    let sidecar = grill
+        .calls()
+        .into_iter()
+        .find(|(op, id)| op == "create" && id.0.ends_with("__sidecar-proxy"))
+        .map(|(_, id)| id)
+        .expect("the agent never created the sidecar");
+    let path = grill
+        .created_spec(&sidecar)
+        .and_then(|spec| spec.linux.host_cgroup_path())
+        .expect("the sidecar has no cgroup path");
+    std::fs::create_dir_all(&path).unwrap();
+    let probe = ProbeCgroup::at(path);
+
+    // The agent binds it on a later tick.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let bound = loop {
+        let keys = {
+            let mut e = ebpf.lock().await;
+            reliaburger::sesame::firewall::list_cgroup_namespace_keys(&mut e.bpf).unwrap()
+        };
+        if keys.contains(&probe.id) || tokio::time::Instant::now() > deadline {
+            break keys.contains(&probe.id);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let refused = probe.connect(foreign);
+    let reached = probe.connect(granted);
+
+    let (reply, stopped) = tokio::sync::oneshot::channel();
+    cmd_tx
+        .send(AgentCommand::Stop {
+            app_name: web.clone(),
+            namespace: "tenant-a".into(),
+            response: reply,
+        })
+        .await
+        .unwrap();
+    stopped.await.unwrap().unwrap();
+    shutdown.cancel();
+    {
+        let mut e = ebpf.lock().await;
+        for (key, _, _) in destinations {
+            reliaburger::sesame::firewall::delete_destination_entry(&mut e.bpf, key).unwrap();
+        }
+        reliaburger::sesame::firewall::delete_cgroup_firewall_state(&mut e.bpf, probe.id).ok();
+    }
+
+    assert!(
+        denied(&refused),
+        "a sidecar reached another namespace: {refused:?}"
+    );
+    assert!(
+        bound,
+        "the sidecar's cgroup was never bound to its namespace"
+    );
+    assert!(
+        reached.is_ok(),
+        "a sidecar lost its app's allow_from grant: {reached:?}"
+    );
+}
+
 /// Whitepaper §10: an allowlist implicitly permits DNS. Every allowlist the
 /// agent programs carries the node's resolver on port 53, and the kernel
 /// then lets UDP and TCP through to it, and nothing else unlisted.
@@ -2029,6 +2333,7 @@ async fn allow_from_can_name_a_delegated_job_as_its_source() {
             &mut e.bpf,
             &firewall::destination_entries(&entries, &Default::default(), &[]),
             &mut destination_keys,
+            &mut Default::default(),
         )
         .unwrap();
         for (key, value) in &grants {
@@ -2083,8 +2388,13 @@ async fn allow_from_can_name_a_delegated_job_as_its_source() {
         for (key, _) in &grants {
             firewall::delete_firewall_entry(&mut e.bpf, *key).unwrap();
         }
-        firewall::reconcile_destination_map(&mut e.bpf, &Default::default(), &mut destination_keys)
-            .unwrap();
+        firewall::reconcile_destination_map(
+            &mut e.bpf,
+            &Default::default(),
+            &mut destination_keys,
+            &mut Default::default(),
+        )
+        .unwrap();
     }
     drop(probes);
     drop(policy);
@@ -4281,6 +4591,7 @@ fn firewall_reconciliation_retains_refused_cleanup_for_repeated_attempts() {
             )],
             &mut namespaces,
             &mut rules,
+            &mut Default::default(),
         )
         .unwrap();
         freeze_egress_map(&ebpf, frozen);
@@ -4291,6 +4602,7 @@ fn firewall_reconciliation_retains_refused_cleanup_for_repeated_attempts() {
                 &[],
                 &mut namespaces,
                 &mut rules,
+                &mut Default::default(),
             );
             let retained =
                 firewall::read_firewall_state(&mut ebpf.bpf, cgroup, key.dst_app_id).unwrap();
@@ -4340,6 +4652,7 @@ fn firewall_reconciliation_retains_partial_publication_and_unrelated_entries() {
         )],
         &mut namespaces,
         &mut rules,
+        &mut Default::default(),
     );
     let state = firewall::read_firewall_state(&mut ebpf.bpf, cgroup, key.dst_app_id).unwrap();
     let unrelated = firewall::read_firewall_state(&mut ebpf.bpf, other, 0).unwrap();
@@ -4381,11 +4694,19 @@ fn firewall_reconciliation_forgets_confirmed_removals_only() {
         )],
         &mut namespaces,
         &mut rules,
+        &mut Default::default(),
     )
     .unwrap();
     for _ in 0..2 {
-        firewall::reconcile_firewall_maps(&mut ebpf.bpf, &[], &[], &mut namespaces, &mut rules)
-            .unwrap();
+        firewall::reconcile_firewall_maps(
+            &mut ebpf.bpf,
+            &[],
+            &[],
+            &mut namespaces,
+            &mut rules,
+            &mut Default::default(),
+        )
+        .unwrap();
         assert!(namespaces.is_empty() && rules.is_empty());
         let state = firewall::read_firewall_state(&mut ebpf.bpf, cgroup, key.dst_app_id).unwrap();
         assert_eq!(state.source_namespace_id, None);

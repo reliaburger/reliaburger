@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::bun::agent::{ClusterInstanceStatus, CouncilStatus, NodeStatus};
 use crate::bun::cluster_view::{ClusterDeployHistory, ClusterEvents, ClusterJobs};
+use crate::bun::summary::ClusterSummary;
 use crate::mayo::rollup::MetricsQueryResult;
 use crate::relish::client::BunClient;
 use crate::wrapper::types::RouteInfo;
@@ -38,6 +39,7 @@ impl From<crate::relish::RelishError> for ProviderError {
 
 /// All data and stream operations used by the event loop.
 pub trait DataProvider: Send + Sync + 'static {
+    fn summary(&self) -> impl Future<Output = Result<ClusterSummary, ProviderError>> + Send;
     fn status(
         &self,
     ) -> impl Future<Output = Result<Vec<ClusterInstanceStatus>, ProviderError>> + Send;
@@ -83,6 +85,9 @@ pub struct HttpDataProvider {
 }
 
 impl DataProvider for HttpDataProvider {
+    async fn summary(&self) -> Result<ClusterSummary, ProviderError> {
+        self.client.cluster_summary().await.map_err(Into::into)
+    }
     async fn status(&self) -> Result<Vec<ClusterInstanceStatus>, ProviderError> {
         self.client.cluster_status().await.map_err(Into::into)
     }
@@ -147,6 +152,12 @@ pub struct MockDataProvider {
 }
 
 impl DataProvider for MockDataProvider {
+    async fn summary(&self) -> Result<ClusterSummary, ProviderError> {
+        self.scenario.data().summary.ok_or(ProviderError::Api {
+            status: 404,
+            body: "no summary in this scenario".to_string(),
+        })
+    }
     async fn status(&self) -> Result<Vec<ClusterInstanceStatus>, ProviderError> {
         Ok(self.scenario.data().instances)
     }
@@ -226,7 +237,8 @@ impl DataProvider for MockDataProvider {
 /// Spawn a complete fetch and send one message per result.
 pub fn spawn_refresh<P: DataProvider>(provider: Arc<P>, tx: mpsc::Sender<super::msg::Msg>) {
     tokio::spawn(async move {
-        let (status, nodes, council, alerts, routes, jobs, events) = tokio::join!(
+        let (summary, status, nodes, council, alerts, routes, jobs, events) = tokio::join!(
+            provider.summary(),
             provider.status(),
             provider.nodes(),
             provider.council(),
@@ -236,6 +248,7 @@ pub fn spawn_refresh<P: DataProvider>(provider: Arc<P>, tx: mpsc::Sender<super::
             provider.recent_events(100)
         );
         for update in [
+            super::msg::DataUpdate::Summary(summary.map(Box::new)),
             super::msg::DataUpdate::Status(status),
             super::msg::DataUpdate::Nodes(nodes),
             super::msg::DataUpdate::Council(council),

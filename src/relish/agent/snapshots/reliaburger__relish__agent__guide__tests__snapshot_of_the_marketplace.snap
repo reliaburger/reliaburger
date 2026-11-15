@@ -1,0 +1,19 @@
+---
+source: src/relish/agent/guide.rs
+expression: "artefact(paths::MARKETPLACE)"
+---
+{
+  "description": "Reliaburger's own Claude Code plugin, from its repository.",
+  "name": "reliaburger",
+  "owner": {
+    "name": "Miko Pawlikowski",
+    "url": "https://github.com/reliaburger/reliaburger"
+  },
+  "plugins": [
+    {
+      "description": "Reliaburger is an orchestrator. Its CLI is `relish`.",
+      "name": "reliaburger",
+      "source": "./plugins/reliaburger"
+    }
+  ]
+}

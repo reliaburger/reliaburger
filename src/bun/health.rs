@@ -14,8 +14,17 @@ use crate::grill::state::ContainerState;
 
 /// Seconds between probes when `health.interval` is unset.
 pub const DEFAULT_HEALTH_INTERVAL_SECS: u64 = 10;
-/// Seconds a probe may take when `health.timeout` is unset.
+/// Seconds a probe may take when `health.timeout` is unset, unless the
+/// interval is shorter: see [`timeout_secs`].
 pub const DEFAULT_HEALTH_TIMEOUT_SECS: u64 = 5;
+
+/// The probe timeout, in seconds, for a check that probes every
+/// `interval_secs`: the `timeout` the user wrote, or else
+/// [`DEFAULT_HEALTH_TIMEOUT_SECS`] cut to the interval, so an app that sets
+/// only `interval = 2` isn't refused over a 5 s timeout it never wrote.
+pub fn timeout_secs(timeout: Option<u64>, interval_secs: u64) -> u64 {
+    timeout.unwrap_or(DEFAULT_HEALTH_TIMEOUT_SECS.min(interval_secs))
+}
 
 /// Resolved health check configuration with defaults applied.
 ///
@@ -60,12 +69,13 @@ impl HealthCheckConfig {
     }
 
     fn with_port(spec: &HealthSpec, port: u16) -> Self {
+        let interval = spec.interval.unwrap_or(DEFAULT_HEALTH_INTERVAL_SECS);
         Self {
             path: spec.path.clone(),
             port,
             protocol: spec.protocol,
-            interval: Duration::from_secs(spec.interval.unwrap_or(DEFAULT_HEALTH_INTERVAL_SECS)),
-            timeout: Duration::from_secs(spec.timeout.unwrap_or(DEFAULT_HEALTH_TIMEOUT_SECS)),
+            interval: Duration::from_secs(interval),
+            timeout: Duration::from_secs(timeout_secs(spec.timeout, interval)),
             threshold_unhealthy: spec.threshold_unhealthy.unwrap_or(3),
             threshold_healthy: spec.threshold_healthy.unwrap_or(1),
             initial_delay: Duration::from_secs(spec.initial_delay.unwrap_or(0)),
@@ -331,6 +341,43 @@ mod tests {
         assert_eq!(config.threshold_unhealthy, 3);
         assert_eq!(config.threshold_healthy, 1);
         assert_eq!(config.initial_delay, Duration::ZERO);
+    }
+
+    #[test]
+    fn an_interval_alone_caps_the_default_timeout_at_the_interval() {
+        // The gym's health-restart scenario set only `interval = 2` and was
+        // refused over a 5 s timeout it never wrote.
+        for (interval, timeout) in [(1, 1), (2, 2), (5, 5), (10, 5)] {
+            let spec = HealthSpec {
+                interval: Some(interval),
+                ..make_spec("/healthz")
+            };
+            let config = HealthCheckConfig::from_spec(&spec, 8080);
+            assert_eq!(config.interval, Duration::from_secs(interval));
+            assert_eq!(
+                config.timeout,
+                Duration::from_secs(timeout),
+                "interval {interval}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_timeout_is_kept_as_written() {
+        let spec = HealthSpec {
+            interval: Some(2),
+            timeout: Some(2),
+            ..make_spec("/healthz")
+        };
+        let config = HealthCheckConfig::from_spec(&spec, 8080);
+        assert_eq!(config.timeout, Duration::from_secs(2));
+        let spec = HealthSpec {
+            interval: Some(30),
+            timeout: Some(20),
+            ..make_spec("/healthz")
+        };
+        let config = HealthCheckConfig::from_spec(&spec, 8080);
+        assert_eq!(config.timeout, Duration::from_secs(20));
     }
 
     #[test]

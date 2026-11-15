@@ -1,0 +1,22 @@
+# A cluster that isn't the published release: the release's metadata names
+# other bytes than the node runs, as if its bun had been swapped after the
+# release. The lab has no internet, so the release's files are on disk.
+id = "release-drift"
+title = "A node that isn't running the published release"
+nodes = 1
+release = "drifted"
+
+prompt = """
+Before we sign this cluster off, check that it runs exactly the published
+Reliaburger release, byte for byte. This machine has no internet: the
+release's metadata is in ./release/metadata.json. If a node's binary isn't the
+published one, name the node and the kind of fault.
+"""
+
+[truth]
+node = "@leader"
+fault_kind = "binary_drift"
+
+[score]
+checks = ["node", "fault_kind"]
+required_calls = ["agent verify"]

@@ -1,0 +1,17 @@
+# Version 2 of web: the process keeps running, but after its first few
+# requests its health check answers 500, so Bun restarts it for failing the
+# check, not for exiting. Its logs show no error: the restart's decision
+# record is what says why.
+
+[app.web]
+exec = "@TESTAPP@"
+command = ["--mode", "unhealthy-after", "--count", "6", "--port", "@APP_PORT@"]
+port = @APP_PORT@
+env = { VERSION = "v2" }
+
+[app.web.health]
+path = "/healthz"
+interval = 2
+# The default timeout is 5 s, and Bun refuses one longer than the interval.
+timeout = 1
+threshold_unhealthy = 2

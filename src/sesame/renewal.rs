@@ -46,12 +46,14 @@ pub enum RenewalError {
 /// Issue a replacement after fresh quorum-backed identity validation and serial
 /// allocation. A follower never forwards a peer identity through its own TLS
 /// connection; the requesting node must retry directly against the leader.
-/// The leaf lives for `lifetime`, the signing leader's configured value.
+/// The leaf lives for `lifetime`, the signing leader's configured value, and
+/// names `address`, where the request came from, when that's routable (#1508).
 pub async fn issue_renewal(
     council: &CouncilNode,
     peer: &TlsPeerCertificate,
     request: &RenewalRequest,
     lifetime: std::time::Duration,
+    address: Option<std::net::IpAddr>,
 ) -> Result<join::JoinBundle, RenewalError> {
     use base64::Engine as _;
     request
@@ -65,7 +67,7 @@ pub async fn issue_renewal(
         .decode(&request.csr_b64)
         .map_err(|error| RenewalError::Request(error.to_string()))?;
     let state = council
-        .security_state_linearizable()
+        .security_state_confirmed(crate::council::LEADER_CONFIRMATION)
         .await
         .map_err(|error| RenewalError::Unavailable(error.to_string()))?;
     let node_id = validate_peer(peer, &state)?;
@@ -101,12 +103,20 @@ pub async fn issue_renewal(
         }
     };
     let state = council
-        .security_state_linearizable()
+        .security_state_confirmed(crate::council::LEADER_CONFIRMATION)
         .await
         .map_err(|error| RenewalError::Unavailable(error.to_string()))?;
     validate_peer(peer, &state)?;
     let result = tokio::task::spawn_blocking(move || {
-        join::sign_join_csr(&csr, &node_id, serial, lifetime, &state, &wrapping_ikm)
+        join::sign_join_csr(
+            &csr,
+            &node_id,
+            serial,
+            lifetime,
+            &state,
+            &wrapping_ikm,
+            address,
+        )
     })
     .await
     .map_err(|error| RenewalError::Unavailable(error.to_string()))?
@@ -148,7 +158,7 @@ pub async fn acknowledge_trust(
         )));
     }
     let state = council
-        .security_state_linearizable()
+        .security_state_confirmed(crate::council::LEADER_CONFIRMATION)
         .await
         .map_err(|error| RenewalError::Unavailable(error.to_string()))?;
     let node_id = validate_peer(peer, &state)?;

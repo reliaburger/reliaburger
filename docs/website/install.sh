@@ -1,8 +1,9 @@
 #!/bin/sh
 # Reliaburger bootstrap. HTTPS authenticates the versioned installer; that
 # installer pins the CLI checksum, and Relish verifies signed guest binaries.
-# POSIX sh, so `curl -fsSL https://reliaburger.com/install.sh | sh` works with
-# dash, bash, zsh and busybox alike. Pass installer options with `sh -s --`.
+# POSIX sh, so `curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop`
+# works with dash, bash, zsh and busybox alike. Installer options go after
+# `sh -s --`; with none, it explains the choices and downloads nothing.
 #
 # Everything lives in main(), called on the last line: a piped shell reads the
 # script as it arrives, and a truncated download must not run half a script.
@@ -68,16 +69,86 @@ download() {
   done
 }
 
+# What each mode does, shown when none is given and for --help. The website
+# bootstrap carries the same function, word for word (test_package.py checks),
+# so `curl | sh` with no flag explains the choices before downloading anything.
+explain_choices() {
+  cat <<'CHOICES'
+Reliaburger installs in one of three ways. Pick one and run the installer again:
+
+  --laptop        a development cluster on this computer: relish, then three
+                  Linux VMs in Lima, running real containers with runc.
+                    curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop
+
+  --ssh MACHINES  a cluster on Linux machines you already have, from 0.2.6:
+                  relish here, then a node on each machine over SSH. They need
+                  Ubuntu or Debian, and passwordless sudo.
+                    curl -fsSL https://reliaburger.com/install.sh | sh -s -- --ssh ubuntu@10.0.0.1,ubuntu@10.0.0.2,ubuntu@10.0.0.3
+
+  --install-only  just the relish CLI, for a cluster on Linux machines you
+                  set up by hand: install bun on each, run `relish init` on
+                  the first and `relish join` on the rest. The walkthrough is
+                  https://github.com/reliaburger/reliaburger/blob/main/docs/linux-servers.md
+                    curl -fsSL https://reliaburger.com/install.sh | sh -s -- --install-only
+
+Netbooting a set of machines into a cluster is planned, but not built yet.
+
+Until 1.0.0, Reliaburger is good enough for home labs and dev clusters,
+not for production.
+CHOICES
+}
+
+# --ssh arrived in 0.2.6, and an older release would only call it unknown.
+knows_ssh_flag() {
+  numbers=${1#v}
+  numbers=${numbers%%-*}
+  major=${numbers%%.*}
+  rest=${numbers#*.}
+  minor=${rest%%.*}
+  patch=${rest#*.}
+  [ "$major" -gt 0 ] || [ "$minor" -gt 2 ] || { [ "$minor" -eq 2 ] && [ "$patch" -ge 6 ]; }
+}
+
+# Releases before 0.2.2 build the laptop cluster without a flag and hand any
+# option they don't know to `relish setup`, which refuses --laptop. Installing
+# one of those (0.2.1 is the advice for Intel Macs), drop the flag.
+knows_laptop_flag() {
+  numbers=${1#v}
+  numbers=${numbers%%-*}
+  major=${numbers%%.*}
+  rest=${numbers#*.}
+  minor=${rest%%.*}
+  patch=${rest#*.}
+  [ "$major" -gt 0 ] || [ "$minor" -gt 2 ] || { [ "$minor" -eq 2 ] && [ "$patch" -ge 2 ]; }
+}
+
 main() {
   umask 077
+  if [ "$#" -eq 0 ]; then
+    explain_choices
+    printf '\nNothing was installed.\n'
+    exit 2
+  fi
   command -v curl >/dev/null 2>&1 || fail 'curl is required'
-  version=${RELIABURGER_VERSION:-v0.2.0}
+  version=${RELIABURGER_VERSION:-v0.2.8}
   # The character gate rejects newlines, so the grep below sees exactly one line.
   case $version in
     ''|*[!A-Za-z0-9.-]*) fail 'invalid RELIABURGER_VERSION' ;;
   esac
   printf '%s\n' "$version" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$' \
     || fail 'invalid RELIABURGER_VERSION'
+  for argument do
+    if [ "$argument" = --ssh ] && ! knows_ssh_flag "$version"; then
+      fail "--ssh arrived in 0.2.6, and this installs $version"
+    fi
+  done
+  # A mirror serves a candidate of this release, which knows the flag.
+  if [ -z "${RELIABURGER_RELEASE_BASE_URL:-}" ] && ! knows_laptop_flag "$version"; then
+    for argument do
+      shift
+      [ "$argument" = --laptop ] || set -- "$@" "$argument"
+    done
+  fi
   release_base=${RELIABURGER_RELEASE_BASE_URL:-https://github.com/reliaburger/reliaburger/releases/download/$version}
   case $release_base in
     https:///*|*[?#@\\[:space:]]*) fail 'release mirror must be an HTTPS URL without credentials, query or fragment' ;;
@@ -85,6 +156,15 @@ main() {
     *) fail 'release mirror must be an HTTPS URL without credentials, query or fragment' ;;
   esac
   release_base=${release_base%/}
+  # A release train's nightly build is unreleased code signed with the
+  # nightly key, which no release trusts. It exists for qualification, and
+  # only qualification asks for it.
+  case ${release_base##*/} in
+    nightly-*)
+      [ "${RELIABURGER_ACCEPT_NIGHTLY:-}" = 1 ] \
+        || fail "$release_base is a nightly build of unreleased code, for release qualification only; install a release instead"
+      ;;
+  esac
   staging=$(mktemp -d "${TMPDIR:-/tmp}/reliaburger-install.XXXXXXXX") || fail 'could not create a staging directory'
   trap 'rm -rf "$staging"' EXIT
   trap 'exit 130' INT

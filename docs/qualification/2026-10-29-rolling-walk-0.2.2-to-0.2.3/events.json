@@ -1,0 +1,85 @@
+{
+  "events": [
+    {
+      "sequence": 1,
+      "timestamp": 1793232059,
+      "kind": "stop",
+      "severity": "info",
+      "app": "hello",
+      "namespace": "default",
+      "node": "rb-84540b90e55a-2",
+      "message": "stopped app hello"
+    },
+    {
+      "sequence": 2,
+      "timestamp": 1793232084,
+      "kind": "deploy",
+      "severity": "info",
+      "app": "hello",
+      "namespace": "default",
+      "node": "rb-84540b90e55a-2",
+      "message": "deployed app hello (1 instances)"
+    },
+    {
+      "sequence": 1,
+      "timestamp": 1793232096,
+      "kind": "stop",
+      "severity": "info",
+      "app": "hello",
+      "namespace": "default",
+      "node": "rb-84540b90e55a-3",
+      "message": "stopped app hello"
+    },
+    {
+      "sequence": 1,
+      "timestamp": 1793232123,
+      "kind": "job-completed",
+      "severity": "info",
+      "app": "tick",
+      "namespace": "default",
+      "node": "rb-84540b90e55a-1",
+      "message": "job default/tick run 4 succeeded: 1 tasks"
+    },
+    {
+      "sequence": 2,
+      "timestamp": 1793232125,
+      "kind": "deploy",
+      "severity": "info",
+      "app": "hello",
+      "namespace": "default",
+      "node": "rb-84540b90e55a-3",
+      "message": "deployed app hello (1 instances)"
+    },
+    {
+      "sequence": 3,
+      "timestamp": 1793232126,
+      "kind": "deploy",
+      "severity": "info",
+      "app": "hello",
+      "namespace": "default",
+      "node": "rb-84540b90e55a-2",
+      "message": "deployed app hello (2 instances)"
+    },
+    {
+      "sequence": 2,
+      "timestamp": 1793232142,
+      "kind": "stop",
+      "severity": "info",
+      "app": "hello",
+      "namespace": "default",
+      "node": "rb-84540b90e55a-1",
+      "message": "stopped app hello"
+    },
+    {
+      "sequence": 3,
+      "timestamp": 1793232184,
+      "kind": "job-completed",
+      "severity": "info",
+      "app": "tick",
+      "namespace": "default",
+      "node": "rb-84540b90e55a-1",
+      "message": "job default/tick run 5 succeeded: 1 tasks"
+    }
+  ],
+  "warnings": []
+}

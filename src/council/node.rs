@@ -22,6 +22,15 @@ use super::types::{
 };
 use crate::sesame::types::{CaRole, SerialNumber, SpiffeUri};
 
+/// How long a leader gets to prove it leads before a request it serves
+/// gives up: [`CouncilNode::confirm_leadership`]'s `within` on request
+/// paths. One heartbeat round isn't enough, since on a loaded host a
+/// settled leader's followers can answer it late (#1009, #1393, #1937).
+pub const LEADER_CONFIRMATION: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How often [`CouncilNode::applied_api_token`] looks at the replica again.
+const API_TOKEN_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
 /// Result of signing a workload CSR.
 #[derive(Debug, Clone)]
 pub struct CsrSignResult {
@@ -78,10 +87,53 @@ pub struct CouncilNode {
     /// Whether this voter is holding its elections while leadership moves
     /// off it (#755).
     election_hold: ElectionHold,
+    /// The leadership proof callers share, so a burst of requests doesn't
+    /// send a burst of heartbeat rounds (#1441).
+    leadership_proof: super::proof::SharedProof,
+    /// The leader's [`node_view`](crate::sesame::types::SecurityState::node_view)
+    /// of the security state, for a node whose own replica holds none
+    /// because it has no Raft seat (#1477). `None` until it has fetched one.
+    leader_security_view: tokio::sync::RwLock<Option<crate::sesame::types::SecurityState>>,
     /// Test hook: writes and linearizable reads never return, as they don't
     /// on a leader that has lost its quorum and not yet stepped down.
     #[cfg(test)]
     writes_hang: std::sync::atomic::AtomicBool,
+    /// Test hook: every write that hung, with the moment it arrived.
+    #[cfg(test)]
+    hung_writes: std::sync::Mutex<Vec<(tokio::time::Instant, RaftRequest)>>,
+    /// Test hook: how many times [`Self::desired_state`] cloned the whole
+    /// desired state, so a loop can be shown not to (#1030).
+    #[cfg(test)]
+    full_desired_reads: std::sync::atomic::AtomicU64,
+    /// Test hook: how many leadership proofs this node has run (#1441).
+    #[cfg(test)]
+    leadership_proofs: std::sync::atomic::AtomicU64,
+    /// Test hook: leadership proofs running now, and the most ever at once.
+    #[cfg(test)]
+    proofs_in_flight: (std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64),
+}
+
+/// Test hook: counts a leadership proof while it runs, including one a
+/// caller's timeout cancels (#1441).
+#[cfg(test)]
+struct ProofInFlight<'a>(&'a std::sync::atomic::AtomicU64);
+
+#[cfg(test)]
+impl<'a> ProofInFlight<'a> {
+    fn start(node: &'a CouncilNode) -> Self {
+        use std::sync::atomic::Ordering;
+        node.leadership_proofs.fetch_add(1, Ordering::SeqCst);
+        let (now, most) = &node.proofs_in_flight;
+        most.fetch_max(now.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+        Self(now)
+    }
+}
+
+#[cfg(test)]
+impl Drop for ProofInFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl CouncilNode {
@@ -125,6 +177,8 @@ impl CouncilNode {
             raft,
             raft_id,
             election_hold,
+            leadership_proof: super::proof::SharedProof::new(),
+            leader_security_view: tokio::sync::RwLock::new(None),
             state_machine,
             node_fault_membership: tokio::sync::Mutex::new(()),
             consumer_contacts: tokio::sync::Mutex::new(crate::onion::lease::ConsumerContacts::new(
@@ -134,6 +188,14 @@ impl CouncilNode {
             fence: None,
             #[cfg(test)]
             writes_hang: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            hung_writes: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            full_desired_reads: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            leadership_proofs: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            proofs_in_flight: Default::default(),
         })
     }
 
@@ -192,6 +254,29 @@ impl CouncilNode {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Test hook: the writes that have hung since [`Self::hang_writes`], in
+    /// arrival order.
+    #[cfg(test)]
+    pub(crate) fn hung_writes(&self) -> Vec<(tokio::time::Instant, RaftRequest)> {
+        self.hung_writes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    #[cfg(test)]
+    async fn hang_write_if_asked(&self, request: &RaftRequest) {
+        if self.writes_hang.load(std::sync::atomic::Ordering::SeqCst) {
+            // A plain mutex in a test hook: the guard is a temporary,
+            // dropped before the await below.
+            self.hung_writes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((tokio::time::Instant::now(), request.clone()));
+            std::future::pending::<()>().await;
+        }
+    }
+
     #[cfg(test)]
     async fn hang_if_asked(&self) {
         if self.writes_hang.load(std::sync::atomic::Ordering::SeqCst) {
@@ -219,7 +304,7 @@ impl CouncilNode {
     /// Returns `ForwardToLeader` if this node is not the leader.
     pub async fn write(&self, request: RaftRequest) -> Result<CouncilResponse, CouncilError> {
         #[cfg(test)]
-        self.hang_if_asked().await;
+        self.hang_write_if_asked(&request).await;
         if let Some(error) = self.fenced_error() {
             return Err(error);
         }
@@ -253,12 +338,23 @@ impl CouncilNode {
         self.raft.current_leader().await
     }
 
-    /// Return `true` if this node is the current leader.
+    /// Return `true` if this node is the current leader, proved by a quorum
+    /// answering a heartbeat sent after this call.
+    ///
+    /// Concurrent callers share one proof at a time (#1441): a caller that
+    /// arrives while one runs waits for the next, which every caller that
+    /// arrived meanwhile shares.
     pub async fn is_leader(&self) -> bool {
         if self.fenced_error().is_some() {
             return false;
         }
-        self.raft.ensure_linearizable().await.is_ok()
+        self.leadership_proof
+            .run(|| async {
+                #[cfg(test)]
+                let _in_flight = ProofInFlight::start(self);
+                self.raft.ensure_linearizable().await.is_ok()
+            })
+            .await
     }
 
     /// Return `true` once this node proves it leads, trying until `within`
@@ -390,9 +486,28 @@ impl CouncilNode {
         self.state_machine.gitops_trigger_updates()
     }
 
+    /// Observe the API tokens this node's replica has applied: a receiver
+    /// sees each change as it's applied. A node with no Raft seat reads the
+    /// leader's view instead (see [`Self::api_tokens`]), which this doesn't
+    /// announce.
+    pub fn api_token_updates(&self) -> watch::Receiver<Vec<crate::sesame::types::ApiToken>> {
+        self.state_machine.api_token_updates()
+    }
+
     /// Read the current desired state from the state machine.
     pub async fn desired_state(&self) -> DesiredState {
+        #[cfg(test)]
+        self.full_desired_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.state_machine.desired_state().await
+    }
+
+    /// Test hook: how many whole-state clones [`Self::desired_state`] has
+    /// made on this node.
+    #[cfg(test)]
+    pub(crate) fn full_desired_reads(&self) -> u64 {
+        self.full_desired_reads
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Borrow the local desired state for `read`, without cloning all of
@@ -572,8 +687,110 @@ impl CouncilNode {
     /// ticker, fast-fail pre-checks whose authoritative decision goes through
     /// Raft anyway). For a read that *is* the security decision, use
     /// [`Self::security_state_linearizable`].
+    ///
+    /// A node with no Raft seat has nothing applied; it gets the leader's view
+    /// instead, once it has fetched one (#1477).
     pub async fn security_state(&self) -> crate::sesame::types::SecurityState {
-        self.state_machine.desired_state().await.security_state
+        let local = self.state_machine.desired_state().await.security_state;
+        if local.is_initialised() {
+            return local;
+        }
+        self.leader_security_view
+            .read()
+            .await
+            .clone()
+            .unwrap_or(local)
+    }
+
+    /// Whether this node's own replica holds the security state. A node with
+    /// no Raft seat doesn't, and fetches the leader's view (#1477).
+    pub async fn holds_security_state(&self) -> bool {
+        self.state_machine
+            .read_desired(|state| state.security_state.is_initialised())
+            .await
+    }
+
+    /// Keep the leader's view of the security state, for a node whose replica
+    /// holds none (#1477). Ignored once the replica holds its own.
+    pub async fn adopt_leader_security_view(&self, view: crate::sesame::types::SecurityState) {
+        *self.leader_security_view.write().await = Some(view);
+    }
+
+    /// The API token stored under `token_hash` in this node's replica,
+    /// waiting up to `within` for the replica to apply it. `None` when it
+    /// hasn't by then, which on a follower only means it's still lagging.
+    pub async fn applied_api_token(
+        &self,
+        token_hash: &[u8],
+        within: std::time::Duration,
+    ) -> Option<crate::sesame::types::ApiToken> {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let token = self
+                .state_machine
+                .read_desired(|state| {
+                    state
+                        .security_state
+                        .api_tokens
+                        .iter()
+                        .find(|token| token.token_hash == token_hash)
+                        .cloned()
+                })
+                .await;
+            if token.is_some() || tokio::time::Instant::now() >= deadline {
+                return token;
+            }
+            tokio::time::sleep(API_TOKEN_POLL).await;
+        }
+    }
+
+    /// Every API token this node's replica has applied. Copies only the
+    /// tokens, where [`Self::security_state`] copies the whole desired state.
+    ///
+    /// A node with no Raft seat gets the tokens in the leader's view (#1477).
+    pub async fn api_tokens(&self) -> Vec<crate::sesame::types::ApiToken> {
+        let local = self
+            .state_machine
+            .read_desired(|state| {
+                state
+                    .security_state
+                    .is_initialised()
+                    .then(|| state.security_state.api_tokens.clone())
+            })
+            .await;
+        match local {
+            Some(tokens) => tokens,
+            None => self
+                .leader_security_view
+                .read()
+                .await
+                .as_ref()
+                .map(|view| view.api_tokens.clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Whether this node's replica holds no token called `name`, waiting up
+    /// to `within` for it to apply the removal. `false` means it still held
+    /// one at the deadline, which on a follower only means it's lagging.
+    pub async fn api_token_removal_applied(&self, name: &str, within: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let removed = self
+                .state_machine
+                .read_desired(|state| {
+                    !state
+                        .security_state
+                        .api_tokens
+                        .iter()
+                        .any(|token| token.name == name)
+                })
+                .await;
+            if removed || tokio::time::Instant::now() >= deadline {
+                return removed;
+            }
+            tokio::time::sleep(API_TOKEN_POLL).await;
+        }
     }
 
     /// Whether an operator has permanently retired this node identity.
@@ -581,6 +798,21 @@ impl CouncilNode {
     pub async fn is_node_retired(&self, node_id: &str) -> bool {
         self.state_machine
             .read_desired(|state| state.security_state.crl.retired_nodes.contains_key(node_id))
+            .await
+    }
+
+    /// What a repeated producer retirement of `execution` would answer,
+    /// read from this node's applied state instead of committing a no-op
+    /// entry (#1440). See [`DesiredState::committed_producer_release`].
+    /// Current only after a linearizable read, such as
+    /// [`Self::security_state_linearizable`], on the leader.
+    pub async fn committed_producer_release(
+        &self,
+        node_id: &str,
+        execution: &crate::grill::RuntimeExecution,
+    ) -> Option<bool> {
+        self.state_machine
+            .read_desired(|state| state.committed_producer_release(node_id, execution))
             .await
     }
 
@@ -604,6 +836,30 @@ impl CouncilNode {
             .ensure_linearizable()
             .await
             .map_err(|e| CouncilError::ReadFailed(e.to_string()))?;
+        Ok(self.state_machine.desired_state().await.security_state)
+    }
+
+    /// [`Self::security_state_linearizable`], but a leader gets `within` to
+    /// prove it leads, as [`Self::confirm_leadership`] does.
+    ///
+    /// One leadership round gives each follower a single heartbeat interval
+    /// to answer, so on a loaded host a settled leader can fail it and refuse
+    /// a read it should serve (#1009). A follower, or a node that names no
+    /// leader, fails at once.
+    pub async fn security_state_confirmed(
+        &self,
+        within: std::time::Duration,
+    ) -> Result<crate::sesame::types::SecurityState, CouncilError> {
+        #[cfg(test)]
+        self.hang_if_asked().await;
+        if let Some(error) = self.fenced_error() {
+            return Err(error);
+        }
+        if !self.confirm_leadership(within).await {
+            return Err(CouncilError::ReadFailed(
+                "this node can't prove it leads the council".into(),
+            ));
+        }
         Ok(self.state_machine.desired_state().await.security_state)
     }
 
@@ -651,7 +907,7 @@ impl CouncilNode {
         // serving this from stale local state would mint certificates against
         // a CA or CRL the cluster has already moved past, so the read has to
         // prove it's current or fail.
-        let security_state = self.security_state_linearizable().await?;
+        let security_state = self.security_state_confirmed(LEADER_CONFIRMATION).await?;
 
         // Get Workload CA
         let workload_ca = security_state
@@ -684,10 +940,10 @@ impl CouncilNode {
         // leaf carries must match the actual Workload CA's subject exactly —
         // image verification now checks issuer binding (IMG3), so a DN derived
         // from a caller-supplied `cluster_name` that differs from the CA's own
-        // name would produce a leaf that fails the binding. `from_ca_cert_der`
-        // reads the subject straight off the certificate.
-        let ca_cert_der_pki = rustls::pki_types::CertificateDer::from(workload_ca_cert_der.clone());
-        let ca_params = rcgen::CertificateParams::from_ca_cert_der(&ca_cert_der_pki)
+        // name would produce a leaf that fails the binding.
+        // `issuer_params_from_der` reads the subject straight off the
+        // certificate.
+        let ca_params = crate::sesame::ca::issuer_params_from_der(&workload_ca_cert_der)
             .map_err(|e| CouncilError::SecurityError(format!("invalid CA cert DER: {e}")))?;
 
         // Allocate serial via Raft, reading the assigned value straight from the
@@ -832,6 +1088,8 @@ mod tests {
             boot_id: "test-boot".into(),
             cleanup_after_unix_ms: 1,
             request: FaultRequest {
+                workload: Default::default(),
+                task_index: None,
                 fault_type: FaultType::NodeKill {
                     kill_containers: false,
                 },
@@ -995,6 +1253,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn applied_api_token_finds_a_committed_token_and_gives_up_on_a_missing_one() {
+        let (nodes, _router) = create_cluster(1).await;
+        init_cluster(&nodes).await;
+        wait_for_leader(&nodes, Duration::from_secs(5)).await;
+        let created = crate::sesame::token::create_token(
+            "ci",
+            crate::sesame::types::ApiRole::Deployer,
+            Default::default(),
+            None,
+        )
+        .unwrap();
+
+        let started = tokio::time::Instant::now();
+        let missing = nodes[0]
+            .applied_api_token(&created.token.token_hash, Duration::from_millis(60))
+            .await;
+        assert!(missing.is_none());
+        assert!(started.elapsed() >= Duration::from_millis(60));
+
+        nodes[0]
+            .write(RaftRequest::CreateApiToken(created.token.clone()))
+            .await
+            .unwrap();
+        let found = nodes[0]
+            .applied_api_token(&created.token.token_hash, Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(found.name, "ci");
+    }
+
+    #[tokio::test]
+    async fn api_tokens_reads_the_applied_tokens() {
+        let (nodes, _router) = create_cluster(1).await;
+        init_cluster(&nodes).await;
+        wait_for_leader(&nodes, Duration::from_secs(5)).await;
+        assert!(nodes[0].api_tokens().await.is_empty());
+        let created = crate::sesame::token::create_token(
+            "ci",
+            crate::sesame::types::ApiRole::Deployer,
+            Default::default(),
+            None,
+        )
+        .unwrap();
+        nodes[0]
+            .write(RaftRequest::CreateApiToken(created.token.clone()))
+            .await
+            .unwrap();
+        assert_eq!(nodes[0].api_tokens().await, vec![created.token]);
+    }
+
+    #[tokio::test]
+    async fn api_token_removal_gives_up_on_a_token_still_there_and_sees_one_gone() {
+        let (nodes, _router) = create_cluster(1).await;
+        init_cluster(&nodes).await;
+        wait_for_leader(&nodes, Duration::from_secs(5)).await;
+        let created = crate::sesame::token::create_token(
+            "ci",
+            crate::sesame::types::ApiRole::Deployer,
+            Default::default(),
+            None,
+        )
+        .unwrap();
+        nodes[0]
+            .write(RaftRequest::CreateApiToken(created.token))
+            .await
+            .unwrap();
+
+        let started = tokio::time::Instant::now();
+        assert!(
+            !nodes[0]
+                .api_token_removal_applied("ci", Duration::from_millis(60))
+                .await
+        );
+        assert!(started.elapsed() >= Duration::from_millis(60));
+
+        nodes[0]
+            .write(RaftRequest::RevokeApiToken { name: "ci".into() })
+            .await
+            .unwrap();
+        assert!(
+            nodes[0]
+                .api_token_removal_applied("ci", Duration::ZERO)
+                .await
+        );
+    }
+
+    #[tokio::test]
     async fn single_node_grows_to_three() {
         let (mut nodes, router) = create_cluster(1).await;
         init_cluster(&nodes[..1]).await;
@@ -1153,6 +1498,106 @@ mod tests {
         };
         let (confirmed, ()) = tokio::join!(leader.confirm_leadership(Duration::from_secs(5)), heal);
         assert!(confirmed, "a settled leader gave up after one missed round");
+    }
+
+    #[tokio::test]
+    async fn settled_leader_serves_security_state_after_its_quorum_misses_a_heartbeat_round() {
+        let (nodes, router) = create_cluster(3).await;
+        init_cluster(&nodes).await;
+        let leader_id = wait_for_leader(&nodes, Duration::from_secs(5))
+            .await
+            .unwrap();
+        // Slow heartbeats, not a lost leader: the followers must not depose
+        // it while it can't reach them (#1009).
+        for node in &nodes {
+            node.hold_elections_until(std::time::Instant::now() + Duration::from_secs(30));
+        }
+        let leader = &nodes[(leader_id - 1) as usize];
+        for follower in (1..=3).filter(|id| *id != leader_id) {
+            router.partition(leader_id, follower).await;
+        }
+        // One confirmation round can't reach a quorum, so the single-round
+        // read the registry routes used to make answers 503.
+        assert!(leader.security_state_linearizable().await.is_err());
+
+        let healer = router.clone();
+        let heal = async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            healer.heal().await;
+        };
+        let (read, ()) = tokio::join!(
+            leader.security_state_confirmed(Duration::from_secs(5)),
+            heal
+        );
+        assert!(
+            read.is_ok(),
+            "a settled leader refused a security read after one missed round"
+        );
+
+        let follower = &nodes[if leader_id == 1 { 1 } else { 0 }];
+        let started = std::time::Instant::now();
+        assert!(
+            follower
+                .security_state_confirmed(Duration::from_secs(5))
+                .await
+                .is_err()
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    // #1441: every request a loaded leader serves asks it to confirm it
+    // leads. Each used to run its own proof, a heartbeat to every follower,
+    // in parallel and every heartbeat interval, multiplying heartbeat traffic
+    // just when the followers were slow to answer it.
+    #[tokio::test]
+    async fn concurrent_confirmations_share_one_proof_at_a_time() {
+        use std::sync::atomic::Ordering;
+
+        let (nodes, router) = create_cluster(3).await;
+        init_cluster(&nodes).await;
+        let leader_id = wait_for_leader(&nodes, Duration::from_secs(5))
+            .await
+            .unwrap();
+        for node in &nodes {
+            node.hold_elections_until(std::time::Instant::now() + Duration::from_secs(30));
+        }
+        let leader = &nodes[(leader_id - 1) as usize];
+        // Requests that share a proof all get its answer.
+        let answers = futures_util::future::join_all(
+            (0..50).map(|_| leader.confirm_leadership(Duration::from_secs(5))),
+        )
+        .await;
+        assert!(answers.iter().all(|confirmed| *confirmed));
+
+        for follower in (1..=3).filter(|id| *id != leader_id) {
+            router.partition(leader_id, follower).await;
+        }
+        let window = Duration::from_millis(600);
+
+        // How many proofs one request runs while the followers can't answer.
+        let before = leader.leadership_proofs.load(Ordering::SeqCst);
+        assert!(!leader.confirm_leadership(window).await);
+        let alone = leader.leadership_proofs.load(Ordering::SeqCst) - before;
+
+        // Fifty requests at once.
+        let before = leader.leadership_proofs.load(Ordering::SeqCst);
+        let confirmations = (0..50).map(|_| leader.confirm_leadership(window));
+        let answers = futures_util::future::join_all(confirmations).await;
+        let together = leader.leadership_proofs.load(Ordering::SeqCst) - before;
+        assert!(answers.iter().all(|confirmed| !confirmed));
+        assert_eq!(
+            leader.proofs_in_flight.1.load(Ordering::SeqCst),
+            1,
+            "two leadership proofs ran at once"
+        );
+        // A failed proof ends at once and each request sleeps its own retry
+        // pause, so requests that wake just after a round start the next:
+        // fifty run a few times as many as one. Unshared, they ran fifty
+        // times as many.
+        assert!(
+            together <= 10 * alone,
+            "fifty requests ran {together} proofs; one alone ran {alone}"
+        );
     }
 
     #[tokio::test]

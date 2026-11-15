@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 
 use std::collections::BTreeMap;
 
-use oci_distribution::manifest::OciDescriptor;
+use oci_client::manifest::OciDescriptor;
 
 use super::oci_pull::retry_registry_read;
 
@@ -116,11 +116,11 @@ impl ImageReference {
         }
     }
 
-    /// Convert to an `oci_distribution::Reference` for the client.
-    pub fn to_oci_reference(&self) -> Result<oci_distribution::Reference, ImageError> {
+    /// Convert to an `oci_client::Reference` for the client.
+    pub fn to_oci_reference(&self) -> Result<oci_client::Reference, ImageError> {
         self.full_reference()
             .parse()
-            .map_err(|e: oci_distribution::ParseError| {
+            .map_err(|e: oci_client::ParseError| {
                 ImageError::InvalidReference(format!("{}: {e}", self.full_reference()))
             })
     }
@@ -591,19 +591,17 @@ impl ImageStore {
         // local development registries and the hermetic test fixture do not
         // need a certificate merely to move bytes within the same host.
         let protocol = if is_loopback_registry(&source.registry) {
-            oci_distribution::client::ClientProtocol::HttpsExcept(vec![source.registry.clone()])
+            oci_client::client::ClientProtocol::HttpsExcept(vec![source.registry.clone()])
         } else {
-            oci_distribution::client::ClientProtocol::Https
+            oci_client::client::ClientProtocol::Https
         };
 
-        // The default ClientConfig also includes a platform resolver that
-        // picks the current host's architecture from manifest lists.
-        let client_config = oci_distribution::client::ClientConfig {
-            protocol,
-            ..Default::default()
-        };
-        let client = oci_distribution::Client::new(client_config);
-        let auth = oci_distribution::secrets::RegistryAuth::Anonymous;
+        let client =
+            super::oci_pull::registry_client(protocol).map_err(|e| ImageError::ManifestPull {
+                image: source.full_reference(),
+                reason: format!("cannot build registry client: {e}"),
+            })?;
+        let auth = oci_client::secrets::RegistryAuth::Anonymous;
 
         let oci_ref = source.to_oci_reference()?;
 
@@ -811,7 +809,7 @@ impl ImageStore {
         image_ref: &ImageReference,
         rootfs: &Path,
     ) -> Option<PulledImage> {
-        use oci_distribution::manifest::OciManifest;
+        use oci_client::manifest::OciManifest;
         if !image_ref.tag.starts_with("sha256:") {
             return None;
         }
@@ -879,10 +877,8 @@ impl ImageStore {
 /// Flush every dirty page of the filesystem holding `path` to disk.
 #[cfg(target_os = "linux")]
 fn sync_filesystem(path: &Path) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd as _;
     let directory = std::fs::File::open(path)?;
-    // `directory` stays open for the whole call, so the descriptor is valid.
-    nix::unistd::syncfs(directory.as_raw_fd()).map_err(std::io::Error::from)
+    nix::unistd::syncfs(&directory).map_err(std::io::Error::from)
 }
 
 /// Flush every dirty page to disk. macOS has no per-filesystem sync.
@@ -1354,6 +1350,28 @@ mod tests {
         let first = store.rootfs_generation_path(root, &[PathBuf::from("/blobs/aaaa/data")]);
         let second = store.rootfs_generation_path(root, &[PathBuf::from("/blobs/bbbb/data")]);
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn rootfs_generation_path_matches_its_known_answer() {
+        let store = ImageStore::new(PathBuf::from("/tmp/images"));
+        let generation = store.rootfs_generation_path(
+            Path::new("/rootfs/tag"),
+            &[
+                PathBuf::from("/blobs/aaaa/data"),
+                PathBuf::from("/blobs/bbbb/data"),
+            ],
+        );
+        // The first 16 hex digits of SHA-256("aaaa\nbbbb\n").
+        assert_eq!(generation, Path::new("/rootfs/tag/gen-1200d291bac880a1"));
+    }
+
+    #[test]
+    fn layer_sha256_hex_matches_the_fips_known_answer() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     #[test]
@@ -2891,12 +2909,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// A loopback address nothing listens on: any request to it is refused.
-    fn unreachable_registry() -> String {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap().to_string()
-    }
-
     /// `fixture`'s image under another registry host, and a mirror map
     /// sending that host to `mirror`.
     fn mirrored(fixture: &RegistryFixture, origin: &str, mirror: &str) -> (String, ImageMirrors) {
@@ -2955,8 +2967,9 @@ mod tests {
     #[tokio::test]
     async fn a_mirror_serves_digest_pinned_pulls_without_the_origin() {
         let mirror = start_registry_fixture().await;
-        let (reference, mirrors) =
-            mirrored(&mirror, &unreachable_registry(), registry_host(&mirror));
+        // The origin refuses every request (#1844).
+        let origin = crate::refused_address::refused_address();
+        let (reference, mirrors) = mirrored(&mirror, &origin.to_string(), registry_host(&mirror));
         let tmp = tempfile::tempdir().unwrap();
         let store = ImageStore::new(tmp.path().to_path_buf()).with_mirrors(mirrors);
         let rootfs = store.pull_and_unpack(&reference).await.unwrap().rootfs;
@@ -3018,8 +3031,8 @@ mod tests {
     async fn pull_through_reads_digest_pinned_images_from_a_loopback_mirror() {
         use crate::pickle::upstream::{OciUpstream, UpstreamRegistry};
         let mirror = start_registry_fixture().await;
-        let (reference, mirrors) =
-            mirrored(&mirror, &unreachable_registry(), registry_host(&mirror));
+        let origin = crate::refused_address::refused_address();
+        let (reference, mirrors) = mirrored(&mirror, &origin.to_string(), registry_host(&mirror));
         // The HTTPS client still reaches a loopback mirror over plain HTTP.
         let upstream = OciUpstream::new(Default::default()).with_mirrors(mirrors);
         let reference = ImageReference::parse(&reference).unwrap();

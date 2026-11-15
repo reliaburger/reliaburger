@@ -1,9 +1,10 @@
-"""Real nextest lists: three hash shards run every test of the unsharded list once.
+"""Real nextest lists: the hash shards run every test of the unsharded list once.
 
-The portable macOS owner runs as three `--partition hash:K/3` shards, and
-the evidence gate merges their lists with contracts.partitioned. This builds
-a small throwaway crate and checks that merge against what the pinned nextest
-actually prints. CI's own merge then checks the real suite on every run.
+The portable macOS owner runs as `--partition hash:K/N` shards (one job, so
+`hash:1/1`, since F1 of plan 2026-11-06), and the evidence gate merges their
+lists with contracts.partitioned. This builds a small throwaway crate and
+checks that merge against what the pinned nextest actually prints, for the
+count CI uses. CI's own merge then checks the real suite on every run.
 """
 from pathlib import Path
 import json

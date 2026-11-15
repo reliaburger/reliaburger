@@ -12,8 +12,10 @@ on:
     # train run everything.
     branches: [main, "codex/**", "fix/**", "release-*"]
     # labeled lets a `full-ci` label start the heavy suites on any PR (on a
-    # PR into a train, everything but the macOS shards).
-    types: [opened, synchronize, reopened, labeled]
+    # PR into a train, everything but portable macOS). closed starts a
+    # no-op run in the PR's concurrency group, which cancels the run still
+    # working on the closed (or merged) PR; every other job skips it.
+    types: [opened, synchronize, reopened, labeled, closed]
   merge_group:
     # The merge queue on release-* tests each batch, merged onto the train,
     # with every job before any of it lands. It requires one check:
@@ -24,8 +26,9 @@ on:
     - cron: "17 3 * * *"
 
 # A newer push to a PR, or to a merge train, supersedes the older run: the
-# newer commit contains the older one. Main, merge-queue and called runs each
-# keep their own group; the queue cancels its own groups when it re-forms.
+# newer commit contains the older one, and closing a PR supersedes its run.
+# Main, merge-queue and called runs each keep their own group; the queue
+# cancels its own groups when it re-forms.
 # Fixed prefixes also keep reusable source CI separate from its release caller,
 # and github.workflow (the caller's name when called) keeps a retarget run
 # (ci-retarget.yml) from cancelling the pull request's own run.
@@ -61,16 +64,29 @@ env:
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
+  closed-pull-request:
+    # A closed PR's run exists only to cancel the older run in its
+    # concurrency group. Every job that doesn't need select jobs has its own
+    # guard; the rest are skipped with select jobs.
+    name: closed pull request
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - run: echo "The pull request was closed; its older CI run is cancelled."
+
   changes:
     # Which job groups this run needs; see scripts/ci/select-jobs.sh.
     name: select jobs
-    runs-on: ubuntu-latest
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-24.04
     outputs:
       code: ${{ steps.select.outputs.code }}
       gossip: ${{ steps.select.outputs.gossip }}
       heavy: ${{ steps.select.outputs.heavy }}
       task_arrays: ${{ steps.select.outputs.task_arrays }}
       macos: ${{ steps.select.outputs.macos }}
+      s3: ${{ steps.select.outputs.s3 }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -85,6 +101,10 @@ jobs:
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           FULL_CI: ${{ contains(github.event.pull_request.labels.*.name, 'full-ci') }}
+          # The gate PR runs everything only once labelled release-gate, and
+          # a macos label asks for portable macOS on any PR (#1443).
+          RELEASE_GATE: ${{ contains(github.event.pull_request.labels.*.name, 'release-gate') }}
+          MACOS_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'macos') }}
         run: scripts/ci/select-jobs.sh
 
   ci-policy:
@@ -92,15 +112,16 @@ jobs:
     # keeping) and the rule that every #[ignore] names who runs it. Cheap,
     # so it runs on every change, documentation included.
     name: CI policy
-    runs-on: ubuntu-latest
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      # test_shard_partition.py checks the macOS shard merge against what
+      # test_shard_partition.py checks the macOS partition merge against what
       # the pinned nextest really lists, on a throwaway crate.
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest@0.9.145
+          tool: cargo-nextest@0.9.151
       - name: Test the CI scripts
         run: make test-ci-scripts
       - name: Every ignored test names its owner
@@ -108,7 +129,8 @@ jobs:
 
   dependency-audit:
     name: dependency advisory audit
-    runs-on: ubuntu-latest
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: taiki-e/install-action@cargo-audit
@@ -120,13 +142,17 @@ jobs:
     name: lint
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: rustfmt, clippy
+      # rustfmt builds nothing, so it runs before the cache restore and the
+      # apt step: a format slip fails the job within a minute (#1724).
+      - name: Format
+        run: make fmt-check
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: lint
@@ -136,8 +162,6 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq clang libbpf-dev llvm
-      - name: Format
-        run: make fmt-check
       - name: Lint every target, with all features and with none
         run: make lint
 
@@ -147,7 +171,7 @@ jobs:
     name: demo app
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -168,7 +192,7 @@ jobs:
     name: minimum Rust 1.97.0
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -188,16 +212,67 @@ jobs:
       - name: Check every target without default features
         run: cargo check --locked --all-targets --no-default-features
 
+  source-bundle:
+    # relish embeds the source it was built from (pack::ALLOWLIST in
+    # src/relish/source_bundle/pack.rs, #1570). This makes the claim honest:
+    # extract the bundle from a built relish into an empty directory and
+    # build every binary there, packing the bundle again from the extracted
+    # tree. A new include_str! of a file the allowlist leaves out fails here,
+    # not on a user's machine, and so does a pack that isn't reproducible.
+    # The extracted build shares this checkout's target directory, so only
+    # the crate itself compiles twice; it restores the build-tests cache and
+    # never saves one.
+    name: source bundle builds
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-debug
+          save-if: false
+      # Debug builds read the checkout instead of embedding the bundle, so
+      # a book or test edit doesn't rebuild the crate; the feature embeds it.
+      - name: Build relish with the source embedded
+        run: cargo build --locked --bin relish --features embed-source
+      - name: Test the source bundle as relish embeds it
+        run: cargo test --locked --lib --features embed-source relish::source
+      - name: Extract the embedded source into an empty directory
+        run: target/debug/relish agent source extract "$RUNNER_TEMP/source-bundle" --offline | tee "$RUNNER_TEMP/first-extract.json"
+      # Both builds have the same package id, so drop the crate's own
+      # artefacts: nothing of the checkout's build can stand in for it.
+      - name: Build every binary from the extracted source alone
+        working-directory: ${{ runner.temp }}/source-bundle
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target
+        run: |
+          cargo clean --package reliaburger
+          cargo build --locked --bins --features embed-source
+      - name: The rebuilt relish carries the same source, digest for digest
+        run: |
+          target/debug/relish agent source extract "$RUNNER_TEMP/source-again" --offline | tee "$RUNNER_TEMP/second-extract.json"
+          first=$(jq -r .data.digest "$RUNNER_TEMP/first-extract.json")
+          second=$(jq -r .data.digest "$RUNNER_TEMP/second-extract.json")
+          test "$first" != null && test -n "$first" && test "$first" = "$second"
+
   portable:
     outputs:
       portable_linux_sha256: ${{ steps.portable_linux.outputs.portable_linux_sha256 }}
     # The Linux portable suite runs once, instrumented: the same run is the
-    # test gate, the coverage gate and the JUnit source.
+    # test gate, the coverage gate and the JUnit source. It's every train
+    # PR's critical path, so it does nothing else: the doctests and the
+    # nightly-signing test run beside it, and the HTML report waits for main.
     name: portable Linux
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 40
+    runs-on: ubuntu-24.04
+    # About 25 minutes, but 35 to 41 on a slow runner (#1421), before the
+    # doctests and two report passes left it (#1723). nextest's per-test
+    # timeouts catch a hung test, so this only catches a stuck runner.
+    timeout-minutes: 62
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.0
@@ -205,7 +280,7 @@ jobs:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest@0.9.145,cargo-llvm-cov@0.9.1
+          tool: cargo-nextest@0.9.151,cargo-llvm-cov@0.9.1
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: portable
@@ -232,8 +307,12 @@ jobs:
           path: target/contracts/linux/portable-linux
           if-no-files-found: error
           retention-days: 14
-      - name: Doctests
-        run: make test-doc
+      # The evidence owner's one report wrote the lcov file and checked the
+      # floor. The HTML is for reading, so only main and the nightly write
+      # it (D5 in plan 2026-11-06), from the same profiles.
+      - name: HTML coverage report
+        if: github.ref == 'refs/heads/main'
+        run: make coverage-html
       - name: Upload coverage
         if: always()
         uses: actions/upload-artifact@v4
@@ -243,6 +322,32 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  doctests:
+    # Doctests and the nightly-signing key test build the crate without
+    # instrumentation, so they never shared the coverage run's build. On
+    # portable Linux they added about six minutes to every train PR's
+    # critical path; here they finish well inside it (#1723).
+    name: doctests and feature tests
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-debug
+          save-if: false
+      - name: Doctests
+        run: make test-doc
+      # A train's nightly build trusts the nightly key instead of every
+      # release key (#1363). The test that says so only compiles with the
+      # feature, so no other run has it (#1442). The doctests have just
+      # built the dependencies for this profile; only the crate rebuilds.
+      - name: Nightly-signing key trust
+        run: 'cargo test --locked --lib --features nightly-signing upgrade::keys::'
+
   linux:
     outputs:
       rootless_linux_sha256: ${{ steps.rootless_linux.outputs.rootless_linux_sha256 }}
@@ -251,14 +356,14 @@ jobs:
     name: privileged Linux
     needs: changes
     if: needs.changes.outputs.heavy == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.0
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest@0.9.145
+          tool: cargo-nextest@0.9.151
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: linux-privileged
@@ -318,8 +423,8 @@ jobs:
         run: |
           kill "$(cat "$RUNNER_TEMP/oci-resources.pid")" 2>/dev/null || true
           echo "Lowest free disk and memory while the OCI interruptions ran:"
-          sort -t= -k2 -n "$RUNNER_TEMP/oci-resources.log" | head -1 || true
-          sort -t= -k3 -n "$RUNNER_TEMP/oci-resources.log" | head -1 || true
+          sort -t '=' -k2 -n "$RUNNER_TEMP/oci-resources.log" | head -1 || true
+          sort -t '=' -k3 -n "$RUNNER_TEMP/oci-resources.log" | head -1 || true
           if [ "${{ steps.oci_interruptions.outcome }}" != success ]; then
             ps -eo pid,ppid,pgid,stat,wchan:32,etime,args --forest || true
             # Kernel stacks of every uninterruptible task, and of every thread
@@ -342,7 +447,7 @@ jobs:
       - name: Run only provisioned Linux tests
         id: linux_root_storage
         run: |
-          sudo -E env PATH="$PATH" python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate linux-root-storage --host linux --directory target/contracts/linux/linux-root-storage --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
+          scripts/ci/as-root python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate linux-root-storage --host linux --directory target/contracts/linux/linux-root-storage --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
       - name: Restore root-storage evidence ownership
         if: always()
         run: |
@@ -357,26 +462,155 @@ jobs:
           path: target/contracts/linux/linux-root-storage
           if-no-files-found: error
           retention-days: 14
+  linux-next:
+    # The privileged suite on the newest Ubuntu LTS too (#1559): Linux 7.0's
+    # verifier and sudo-rs both broke things 24.04 never showed (#1557). The
+    # `linux` job owns the evidence envelopes; this one only has to pass.
+    name: privileged Linux (Ubuntu 26.04)
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
+    runs-on: ubuntu-26.04
+    # Successful runs take 22 to 31 minutes. Six hit a 40-minute limit on 13
+    # and 14 Nov with the test step still "in progress" and no post step run,
+    # so GitHub kept no log (#1943). The test step now has its own limit
+    # inside this one, leaving time to report and keep the evidence.
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.151
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-privileged-2604
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
+      - name: Install runtime and kernel test dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq btrfs-progs buildah busybox-static gcc clang iproute2 libbpf-dev linux-headers-$(uname -r) llvm nftables runc slirp4netns uidmap
+      - name: Mount persistent BPF storage for kernel recovery tests
+        run: mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
+      - name: Permit rootless runc on Ubuntu AppArmor hosts
+        run: |
+          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Restore the pinned test images
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/test-images
+          key: test-images-${{ runner.arch }}-${{ hashFiles('tests/fixtures/pinned-images.txt') }}
+      - name: Warm the pinned test images
+        run: make test-images TEST_IMAGE_CACHE="$RUNNER_TEMP/test-images"
+      - name: Shield the runner from the OOM killer
+        # Nine times in two days this job ended at its limit with the test
+        # step "in progress" and no post step run, while the 24.04 job's
+        # same tests never did: the runner itself stopped (#1943). An OOM
+        # kill of Runner.Worker would do that. -1000 exempts the runner's
+        # processes; the tests below take back the default with `choom`.
+        run: scripts/ci/protect-runner "$RUNNER_TEMP/runner-pids"
+      - name: Give the compile swap
+        # The shield turned #1943's lost runners into a visible global OOM:
+        # on 15 Nov rustc, building the lib tests, reached 10.6 GB resident
+        # while rust-lld linked, and the kernel killed it. Swap lets that
+        # peak page out instead; skipped if the image already has swap.
+        run: |
+          if [ -z "$(swapon --show --noheadings)" ]; then
+            sudo fallocate -l 8G /ci-swapfile
+            sudo chmod 600 /ci-swapfile
+            sudo mkswap /ci-swapfile > /dev/null
+            sudo swapon /ci-swapfile
+          fi
+          free -h
+          swapon --show
+          df -h /
+      - name: Watch disk and memory during the privileged tests
+        # As the `linux` job does for the OCI interruptions (#800): the
+        # headroom every 5 s, so a run that ends badly shows whether the
+        # runner was short of memory or disk, plus whether the runner's
+        # processes still live and any kernel OOM lines (#1943).
+        run: |
+          nohup scripts/ci/watch-runner "$RUNNER_TEMP/runner-pids" > "$RUNNER_TEMP/linux-next-resources.log" 2>&1 < /dev/null &
+          echo $! > "$RUNNER_TEMP/linux-next-resources.pid"
+      - name: Run the provisioned Linux tests as root
+        id: linux_next_tests
+        # Each test already has a nextest slow-timeout with terminate-after
+        # (the `ci` profile, as `default`). This limit catches the rest, a
+        # build or a nextest that stops making progress, while the runner
+        # can still report it. The `ci` profile writes JUnit (#1943).
+        #
+        # The tests run as root in a transient systemd scope and a session
+        # of their own, out of the runner service's cgroup and process
+        # group, so nothing they do to either reaches the runner. Every
+        # cgroup they make is an absolute path under /sys/fs/cgroup, so the
+        # scope they start in doesn't matter to them. `choom` undoes the
+        # -1000 they inherit from Runner.Worker. The runner can't signal a
+        # root tree in another session, so `timeout` ends the tests inside
+        # this step's limit instead.
+        timeout-minutes: 42
+        run: |
+          set -o pipefail
+          scripts/ci/as-root systemd-run --scope --quiet -p Delegate=yes \
+            setsid --wait choom -n 0 -- timeout --kill-after=1m 40m \
+            make test-linux NEXTEST_PROFILE=ci TEST_IMAGE_CACHE="$RUNNER_TEMP/test-images" 2>&1 \
+            | tee "$RUNNER_TEMP/linux-next-tests.log"
+      - name: Report the privileged tests' headroom and leftovers
+        if: always()
+        timeout-minutes: 3
+        run: |
+          kill "$(cat "$RUNNER_TEMP/linux-next-resources.pid")" 2>/dev/null || true
+          echo "Lowest free disk and memory while the privileged tests ran:"
+          grep ' disk_kb=' "$RUNNER_TEMP/linux-next-resources.log" | sort -t '=' -k2 -n | head -1 || true
+          grep ' disk_kb=' "$RUNNER_TEMP/linux-next-resources.log" | sort -t '=' -k3 -n | head -1 || true
+          echo "Kernel OOM lines:"
+          sudo dmesg -T | grep -iE 'oom|killed process' || echo "none"
+          if [ "${{ steps.linux_next_tests.outcome }}" != success ]; then
+            ps -eo pid,ppid,pgid,stat,wchan:32,etime,args --forest || true
+            # Kernel stacks of every uninterruptible task, and of every thread
+            # of a test binary or Bun that outlived the step.
+            for pid in $(ps -eo pid=,stat=,args= | awk '$2 ~ /^D/ || /target\/debug\/(deps\/|bun)/ {print $1}'); do
+              for task in /proc/"$pid"/task/*; do
+                echo "== $task ($(sudo cat "$task"/comm 2>/dev/null), $(sudo cat "$task"/wchan 2>/dev/null))"
+                sudo cat "$task"/stack 2>/dev/null || true
+              done
+            done
+          fi
+      - name: Keep the privileged tests' JUnit and log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-next-evidence
+          path: |
+            target/nextest/ci/junit.xml
+            ${{ runner.temp }}/linux-next-tests.log
+            ${{ runner.temp }}/linux-next-resources.log
+          if-no-files-found: warn
+          retention-days: 14
+
   build-tests:
     outputs:
       archive_sha256: ${{ steps.archive.outputs.archive_sha256 }}
       archive_origin_sha256: ${{ steps.archive.outputs.archive_origin_sha256 }}
       archive_runtime_sha256: ${{ steps.archive.outputs.archive_runtime_sha256 }}
-    # Compile the portable test binaries once. The acceptance jobs download
-    # this nextest archive instead of each rebuilding every test binary.
+    # Compile the test binaries the cluster and acceptance jobs run, once.
+    # They fetch this nextest archive instead of each rebuilding them.
+    # ARCHIVED_BINARIES in scripts/ci/workflow_assembly.py names them: all
+    # 47 binaries made a 3.0 GB archive that was slow to download (#977).
     # Runners check out to the same path, so the archive's compiled-in binary
     # paths still resolve after extraction.
     name: build tests
     needs: changes
     if: needs.changes.outputs.heavy == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.0
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest@0.9.145
+          tool: cargo-nextest@0.9.151
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: linux-debug
@@ -404,25 +638,49 @@ jobs:
     name: multi-node cluster
     needs: [changes, build-tests]
     if: needs.changes.outputs.heavy == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
-    env:
-      ARCHIVED: cargo nextest run --archive-file tests.tar.zst --extract-to . --extract-overwrite --workspace-remap . --profile ci --no-tests=fail
+    # actions: read lets the archive fetch list this run's artefacts.
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.0
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest@0.9.145
-      - uses: actions/download-artifact@v4
-        with:
-          name: nextest-archive
+          tool: cargo-nextest@0.9.151
+      - name: Fetch the test archive
+        # actions/download-artifact took 33 s to almost 5 minutes for the
+        # 3 GB archive, logged nothing while it ran, and a retry after its
+        # 5-minute limit started again from the first byte, so a slow runner
+        # failed both attempts (#977). This resumes a dropped or stalled
+        # transfer where it stopped, gives up on an attempt only after 60 s
+        # without a byte, logs its progress and stops at 13 minutes.
+        timeout-minutes: 14
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 scripts/ci/fetch_artifact.py --repository "$GITHUB_REPOSITORY"
+          --run-id "$GITHUB_RUN_ID" --name nextest-archive --destination .
+          --deadline 780 --stall 60
+      - name: Extract the test archive once for every suite
+        id: extract_archive
+        # Each suite used to extract the archive twice, to list its
+        # tests and to run them (#1050). This checks the archive against the
+        # build job's digest and extracts it once; every suite then reuses
+        # the extracted build through nextest's build-reuse flags, naming
+        # this step's receipt digest in its evidence.
+        run: |
+          mkdir -p target
+          printf '%s\n' '${{ toJSON(needs) }}' > target/workflow-needs.json
+          python3 scripts/ci/workflow_adapter.py extract --root . --host linux --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
       - name: Multi-node cluster suites
         id: cluster_tests
         run: |
           mkdir -p target
           printf '%s\n' '${{ toJSON(needs) }}' > target/workflow-needs.json
-          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate cluster-tests --host linux --directory target/contracts/linux/cluster-tests --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
+          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate cluster-tests --host linux --directory target/contracts/linux/cluster-tests --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT" --archive-extraction "${{ steps.extract_archive.outputs.archive_extraction_sha256 }}"
       - name: Retain cluster-tests current execution envelope
         if: always()
         uses: actions/upload-artifact@v4
@@ -443,25 +701,49 @@ jobs:
     name: acceptance
     needs: [changes, build-tests]
     if: needs.changes.outputs.heavy == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 40
-    env:
-      ARCHIVED: cargo nextest run --archive-file tests.tar.zst --extract-to . --extract-overwrite --workspace-remap . --profile ci --no-tests=fail
+    # actions: read lets the archive fetch list this run's artefacts.
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.0
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest@0.9.145
-      - uses: actions/download-artifact@v4
-        with:
-          name: nextest-archive
+          tool: cargo-nextest@0.9.151
+      - name: Fetch the test archive
+        # actions/download-artifact took 33 s to almost 5 minutes for the
+        # 3 GB archive, logged nothing while it ran, and a retry after its
+        # 5-minute limit started again from the first byte, so a slow runner
+        # failed both attempts (#977). This resumes a dropped or stalled
+        # transfer where it stopped, gives up on an attempt only after 60 s
+        # without a byte, logs its progress and stops at 13 minutes.
+        timeout-minutes: 14
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 scripts/ci/fetch_artifact.py --repository "$GITHUB_REPOSITORY"
+          --run-id "$GITHUB_RUN_ID" --name nextest-archive --destination .
+          --deadline 780 --stall 60
+      - name: Extract the test archive once for every suite
+        id: extract_archive
+        # Each suite used to extract the archive twice, to list its
+        # tests and to run them (#1050). This checks the archive against the
+        # build job's digest and extracts it once; every suite then reuses
+        # the extracted build through nextest's build-reuse flags, naming
+        # this step's receipt digest in its evidence.
+        run: |
+          mkdir -p target
+          printf '%s\n' '${{ toJSON(needs) }}' > target/workflow-needs.json
+          python3 scripts/ci/workflow_adapter.py extract --root . --host linux --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
       - name: Wall-clock acceptance
         id: slow_tests
         run: |
           mkdir -p target
           printf '%s\n' '${{ toJSON(needs) }}' > target/workflow-needs.json
-          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate slow-tests --host linux --directory target/contracts/linux/slow-tests --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
+          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate slow-tests --host linux --directory target/contracts/linux/slow-tests --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT" --archive-extraction "${{ steps.extract_archive.outputs.archive_extraction_sha256 }}"
       - name: Retain slow-tests current execution envelope
         if: always()
         uses: actions/upload-artifact@v4
@@ -476,7 +758,7 @@ jobs:
         run: |
           mkdir -p target
           printf '%s\n' '${{ toJSON(needs) }}' > target/workflow-needs.json
-          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate upgrade-node --host linux --directory target/contracts/linux/upgrade-node --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
+          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate upgrade-node --host linux --directory target/contracts/linux/upgrade-node --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT" --archive-extraction "${{ steps.extract_archive.outputs.archive_extraction_sha256 }}"
       - name: Retain upgrade-node current execution envelope
         if: always()
         uses: actions/upload-artifact@v4
@@ -491,7 +773,7 @@ jobs:
         run: |
           mkdir -p target
           printf '%s\n' '${{ toJSON(needs) }}' > target/workflow-needs.json
-          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate upgrade-cluster --host linux --directory target/contracts/linux/upgrade-cluster --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
+          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate upgrade-cluster --host linux --directory target/contracts/linux/upgrade-cluster --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT" --archive-extraction "${{ steps.extract_archive.outputs.archive_extraction_sha256 }}"
       - name: Retain upgrade-cluster current execution envelope
         if: always()
         uses: actions/upload-artifact@v4
@@ -525,7 +807,7 @@ jobs:
         run: |
           mkdir -p target
           printf '%s\n' '${{ toJSON(needs) }}' > target/workflow-needs.json
-          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate standard-clients --host linux --directory target/contracts/linux/standard-clients --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
+          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate standard-clients --host linux --directory target/contracts/linux/standard-clients --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT" --archive-extraction "${{ steps.extract_archive.outputs.archive_extraction_sha256 }}"
       - name: Retain standard-clients current execution envelope
         if: always()
         uses: actions/upload-artifact@v4
@@ -538,7 +820,7 @@ jobs:
     name: optimized contract boundaries
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       optimized_cron_sha256: ${{ steps.optimized_cron.outputs.optimized_cron_sha256 }}
     steps:
@@ -546,7 +828,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.98.0
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest@0.9.145
+          tool: cargo-nextest@0.9.151
       - name: Actual-source optimized cron boundaries
         id: optimized_cron
         run: |
@@ -560,15 +842,47 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  s3:
+    # make test-s3 (#1534): log export and a council backup round trip
+    # through the throwaway SeaweedFS that scripts/test-s3.sh starts, exactly
+    # as on a laptop: the pinned binary, checked against its digest, with
+    # telemetry off. Nightly on main, on pushes, and on pull requests that
+    # touch what the tests send (select-jobs.sh). Its two tests aren't bound
+    # evidence cases: every evidence mode is a fixed set of owners, and this
+    # job is chosen by path. The final gate checks this job's own result.
+    name: S3 round trip
+    needs: changes
+    if: needs.changes.outputs.s3 == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.151
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: s3
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
+      - name: Prepare portable build host
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang libbpf-dev llvm
+      - name: Export logs and round-trip a council backup through SeaweedFS
+        run: make test-s3
+
   ignored-evidence:
     # The final gate, and the one check the merge queue requires: it waits
     # for every other job, fails if any of them failed, and then checks that
     # every selected evidence owner completed its exact cases this run. It
-    # always reports, so a skipped owner can never stand in for a pass.
+    # always reports, so a skipped owner can never stand in for a pass. A
+    # closed PR's run has nothing to report.
     name: ignored-test evidence
-    needs: [changes, ci-policy, dependency-audit, lint, demo-app, minimum-rust, portable, linux, build-tests, cluster, acceptance, contract-boundaries, macos, benchmarks, task-array-benchmarks]
-    if: ${{ always() }}
-    runs-on: ubuntu-latest
+    needs: [changes, ci-policy, dependency-audit, lint, demo-app, minimum-rust, source-bundle, portable, doctests, linux, linux-next, build-tests, cluster, acceptance, contract-boundaries, macos, benchmarks, task-array-benchmarks, s3]
+    if: ${{ always() && github.event.action != 'closed' }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -577,37 +891,53 @@ jobs:
           mkdir -p target
           printf '%s\n' '${{ toJSON(needs) }}' > target/workflow-needs.json
           python3 scripts/ci/every_job.py --needs target/workflow-needs.json --event "$GITHUB_EVENT_NAME"
-      - uses: actions/download-artifact@v4
+      - name: Download every evidence envelope
+        id: evidence
         if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
+        uses: actions/download-artifact@v4
+        timeout-minutes: 5
+        continue-on-error: true
+        with:
+          pattern: contract-*
+          path: incoming
+          merge-multiple: false
+      - name: Retry downloading every evidence envelope
+        if: ${{ !cancelled() && steps.evidence.outcome == 'failure' }}
+        uses: actions/download-artifact@v4
+        timeout-minutes: 5
         with:
           pattern: contract-*
           path: incoming
           merge-multiple: false
       - name: Every selected owner and exact required case completed this run
         if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}
+        env:
+          # The release gate PR qualifies only with every owner (#1443).
+          RELEASE_GATE: ${{ contains(github.event.pull_request.labels.*.name, 'release-gate') }}
         run: |
           python3 scripts/ci/workflow_adapter.py aggregate --root . \
             --manifest tests/contracts/manifest.json --directory incoming \
             --ignored-bindings tests/contracts/ignored-bindings.json \
             --needs target/workflow-needs.json --commit "$EXPECTED_CHECKOUT_COMMIT" \
-            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --event "$GITHUB_EVENT_NAME"
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --event "$GITHUB_EVENT_NAME" \
+            --release-gate "$RELEASE_GATE"
 
   macos:
     outputs:
       portable_darwin_1_sha256: ${{ steps.portable_darwin.outputs.portable_darwin_1_sha256 }}
-      portable_darwin_2_sha256: ${{ steps.portable_darwin.outputs.portable_darwin_2_sha256 }}
-      portable_darwin_3_sha256: ${{ steps.portable_darwin.outputs.portable_darwin_3_sha256 }}
-    # The portable suite on macOS, split three ways by nextest hash partition
-    # (SHARDS in scripts/ci/workflow_assembly.py). Each shard sets only its own
-    # output; ignored-test evidence proves the three ran every test once.
-    name: portable macOS (${{ matrix.shard }}/3)
+    # Bun ships for Linux only, so macOS builds and tests relish and the
+    # code only macOS compiles (#1720): the lint compile-checks bun, `make
+    # test-macos` runs relish's tests and the macOS-only ones (partition
+    # hash:1/1, SHARDS in scripts/ci/workflow_assembly.py), and the doctests
+    # are relish's. Bun, grill, cluster and eBPF tests run on Linux. The whole
+    # portable suite took a 66-minute median here; relish alone took 31 from
+    # a cold cache (#1699). It's one job, not three shards that each compiled
+    # the same suite (plan 2026-11-06, F1). scripts/release/ci_reuse.py waits
+    # for this job by name.
+    name: portable macOS
     needs: changes
     if: needs.changes.outputs.macos == 'true'
     runs-on: macos-15
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [1, 2, 3]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.98.0
@@ -615,44 +945,41 @@ jobs:
           components: clippy
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest@0.9.145
+          tool: cargo-nextest@0.9.151
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: macos
-          # Three shards would save the same cache three times.
-          save-if: ${{ github.ref == 'refs/heads/main' && matrix.shard == 1 }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
       - name: Clear restored execution envelopes
         run: rm -rf -- target/contracts
       # One pass, all features: the macOS-only code is in it, and the lint
       # job runs the no-features pass on Linux (see lint-macos in Makefile).
-      # One shard runs it.
-      - name: Lint every target, with all features
-        if: matrix.shard == 1
+      - name: Lint the library, relish and bun (bun's compile check), all features
         run: make lint-macos
-      - name: Portable tests
+      - name: Relish and macOS-only tests
         id: portable_darwin
         run: |
-          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate portable-darwin --shard "${{ matrix.shard }}/3" --host darwin --directory "target/contracts/darwin/portable-darwin-${{ matrix.shard }}" --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
+          python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate portable-darwin --shard "1/1" --host darwin --directory "target/contracts/darwin/portable-darwin-1" --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
       - name: Retain portable-darwin current execution envelope
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: contract-darwin-portable-darwin-${{ matrix.shard }}
-          path: target/contracts/darwin/portable-darwin-${{ matrix.shard }}
+          name: contract-darwin-portable-darwin-1
+          path: target/contracts/darwin/portable-darwin-1
           if-no-files-found: error
           retention-days: 14
-      # Doctests run on another shard than the lint, to even them out.
-      - name: Doctests
-        if: matrix.shard == 2
-        run: make test-doc
+      # Linux runs every doctest; this one compiles the crate's doctests and
+      # runs relish's.
+      - name: Relish's doctests
+        run: 'cargo test --locked --doc -- relish::'
   benchmarks:
     # Criterion output is uploaded, not gated, so pull requests only pay for
     # the release build when they touch the gossip protocol or its benches.
     name: benchmarks
     needs: changes
     if: needs.changes.outputs.gossip == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -680,12 +1007,14 @@ jobs:
     # only when one is more than twice as slow as the rest, or the run's
     # median is more than twice as slow (#857). A benchmark over that limit
     # is measured once more on its own, and fails only when it's over the
-    # limit both times, so one disk stall isn't a regression (#936). The full
-    # Criterion output is kept for the trend #668 reads.
+    # limit both times, so one disk stall isn't a regression (#936). The
+    # on-disk ledger benchmark measures this runner's disk, which can stay
+    # slow for the whole job, so it's report only; its tmpfs variant is gated
+    # (#1038). The full Criterion output is kept for the trend #668 reads.
     name: task-array benchmarks
     needs: changes
     if: needs.changes.outputs.task_arrays == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -703,7 +1032,7 @@ jobs:
           restore-keys: task-array-bench-
       - run: make bench-task-arrays
       - name: Compare with main's baseline
-        run: python3 scripts/ci/bench_baseline.py compare --criterion target/criterion --baseline target/task-array-baseline/baseline.json --max-ratio 2 --summary "$GITHUB_STEP_SUMMARY" --remeasure 'cargo bench --bench task_arrays --'
+        run: python3 scripts/ci/bench_baseline.py compare --criterion target/criterion --baseline target/task-array-baseline/baseline.json --max-ratio 2 --summary "$GITHUB_STEP_SUMMARY" --remeasure 'cargo bench --bench task_arrays --' --report-only storage/ledger_and_index_64k
       - name: Record this run as main's baseline
         if: github.ref == 'refs/heads/main'
         run: python3 scripts/ci/bench_baseline.py save --criterion target/criterion --baseline target/task-array-baseline/baseline.json

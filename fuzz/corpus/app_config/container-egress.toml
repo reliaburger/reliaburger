@@ -1,0 +1,27 @@
+# Real container: an egress allowlist that still resolves names
+#
+# The job may reach one host, example.com on port 443, and nothing else.
+# It resolves the name through the node's DNS responder, which every
+# allowlist permits on port 53, then fetches the page. A second request, to
+# a host the list doesn't name, is refused.
+#
+# Requires rootful runc on Linux with [ebpf] and [dns] enabled (what
+# `sudo relish init` writes there; on macOS, use the managed Linux VM from
+# `relish setup --quickstart`). Other nodes refuse the allowlist rather than
+# run it unenforced.
+#
+# Deploy with:
+#   sudo target/debug/bun --runtime runc --config <node.toml with [ebpf] and [dns]>
+#   target/debug/relish apply examples/phase-1/container-egress.toml
+#   target/debug/relish logs egress-check
+
+[job.egress-check]
+image = "alpine:latest"
+command = [
+  "/bin/sh",
+  "-c",
+  "wget -q -O /dev/null https://example.com/ && echo 'allowed: example.com:443' ; wget -q -T 5 -O /dev/null https://example.org/ || echo 'refused: example.org:443'",
+]
+
+[job.egress-check.egress]
+allow = ["example.com:443"]

@@ -1904,6 +1904,7 @@ mod tests {
 
     fn template() -> Box<JobSpec> {
         Box::new(JobSpec {
+            pids: None,
             runtime: crate::config::job::JobRuntime::Process,
             image: None,
             command: None,
@@ -1921,6 +1922,7 @@ mod tests {
             task_timeout_secs: None,
             overlap: None,
             replay_unknown: false,
+            provenance: None,
         })
     }
 
@@ -3249,5 +3251,629 @@ mod tests {
             .apply(&manifest_write("retry-2", 4), &mut allocate)
             .unwrap();
         assert_ne!(other, first);
+    }
+
+    /// Generated lifecycles through the store's own transitions (#1060): the
+    /// writes a leader and the API commit, in any order, with the invariants
+    /// every replica relies on checked after each one.
+    mod lifecycle {
+        use super::super::super::job::{
+            CronPolicy, JobDefinition, JobWrite, MissedRunPolicy, OverlapPolicy, RunTrigger,
+        };
+        use super::super::super::task_array_state::{NodeSlots, plan_grants};
+        use super::*;
+        use proptest::prelude::*;
+
+        const NODES: [&str; 3] = ["n1", "n2", "n3"];
+        const NAMESPACE: &str = "default";
+        /// The manual job every request names.
+        const JOB: &str = "work";
+        /// The scheduled job.
+        const SCHEDULED: &str = "nightly";
+        /// Short, so generated sequences see runs pruned.
+        const RETENTION_SECS: u64 = 120;
+        const START: u64 = 600_000;
+
+        /// How stale a generated completion is.
+        #[derive(Debug, Clone, Copy)]
+        enum Report {
+            /// From the holder, at the current grant attempt.
+            Current,
+            /// From the holder, at another attempt.
+            OtherAttempt,
+            /// From a node that doesn't hold the chunk.
+            OtherNode,
+        }
+
+        #[derive(Debug, Clone)]
+        enum Step {
+            /// A manual run under an `Idempotency-Key`; `variant` picks its content.
+            Request {
+                key: u8,
+                variant: u8,
+            },
+            /// Define (or redefine) the scheduled job.
+            Schedule {
+                forbid_overlap: bool,
+            },
+            /// The leader observes the current minute and fires the schedule.
+            Fire,
+            /// One leader tick of grants for every active run.
+            Grant,
+            Complete {
+                run: usize,
+                node: usize,
+                pick: usize,
+                report: Report,
+            },
+            /// A node went quiet.
+            Lose {
+                run: usize,
+                node: usize,
+            },
+            /// A node's outcome couldn't be established.
+            Unknown {
+                run: usize,
+                node: usize,
+            },
+            /// An operator acknowledges replay, with the current or a wrong digest.
+            Replay {
+                run: usize,
+                node: usize,
+                current: bool,
+            },
+            Cancel {
+                run: usize,
+            },
+            Advance {
+                secs: u16,
+            },
+            Prune,
+            /// Serialise and reopen, as a snapshot or the standalone store does.
+            Reopen,
+        }
+
+        fn step() -> impl Strategy<Value = Step> {
+            let report = prop_oneof![
+                3 => Just(Report::Current),
+                1 => Just(Report::OtherAttempt),
+                1 => Just(Report::OtherNode),
+            ];
+            prop_oneof![
+                3 => (0u8..4, 0u8..3).prop_map(|(key, variant)| Step::Request { key, variant }),
+                1 => any::<bool>().prop_map(|forbid_overlap| Step::Schedule { forbid_overlap }),
+                2 => Just(Step::Fire),
+                4 => Just(Step::Grant),
+                6 => (0usize..8, 0usize..3, 0usize..8, report).prop_map(
+                    |(run, node, pick, report)| Step::Complete { run, node, pick, report }
+                ),
+                1 => (0usize..8, 0usize..3).prop_map(|(run, node)| Step::Lose { run, node }),
+                1 => (0usize..8, 0usize..3).prop_map(|(run, node)| Step::Unknown { run, node }),
+                1 => (0usize..8, 0usize..3, any::<bool>())
+                    .prop_map(|(run, node, current)| Step::Replay { run, node, current }),
+                1 => (0usize..8).prop_map(|run| Step::Cancel { run }),
+                2 => (0u16..200).prop_map(|secs| Step::Advance { secs }),
+                1 => Just(Step::Prune),
+                1 => Just(Step::Reopen),
+            ]
+        }
+
+        /// Request content: the task count and whether lost work replays
+        /// on its own. Changing either changes the request.
+        fn definition(variant: u8) -> JobDefinition {
+            let mut definition = JobDefinition::from_spec(*template());
+            definition.tasks = TaskArraySpec {
+                chunk_size: 2,
+                ..TaskArraySpec::with_count([5, 5, 9][usize::from(variant % 3)])
+            };
+            definition.replay_unknown = variant == 1;
+            definition
+        }
+
+        fn scheduled(forbid_overlap: bool) -> JobDefinition {
+            let mut definition = definition(0);
+            definition.cron = Some(CronPolicy {
+                expression: "* * * * *".into(),
+                overlap: if forbid_overlap {
+                    OverlapPolicy::Forbid
+                } else {
+                    OverlapPolicy::Allow
+                },
+                missed: MissedRunPolicy::Skip,
+            });
+            definition
+        }
+
+        /// What the model expects of the store, kept beside it.
+        #[derive(Default)]
+        struct Model {
+            /// Allocator high-water mark: every id ever handed out.
+            next_id: u64,
+            /// Each request key's run and the content it was accepted with.
+            requests: BTreeMap<u8, (u64, u8)>,
+            /// Tasks each run has had accepted as succeeded.
+            succeeded: BTreeMap<u64, u64>,
+            /// Runs seen terminal; they must stay so while retained.
+            terminal: BTreeSet<u64>,
+        }
+
+        use std::collections::BTreeSet;
+
+        /// Apply `write` as a replica does. A refusal must leave the store
+        /// exactly as it was and must not take an id.
+        fn apply(
+            store: &mut TaskArrays,
+            model: &mut Model,
+            write: &TaskArrayWrite,
+        ) -> Result<TaskArrayApplied, TaskArrayStoreError> {
+            let before = store.clone();
+            let mut allocated = 0;
+            let next = &mut model.next_id;
+            let result = store.apply(write, || {
+                allocated += 1;
+                *next += 1;
+                *next
+            });
+            if result.is_err() {
+                assert_eq!(*store, before, "a refused {write:?} changed the store");
+                assert_eq!(allocated, 0, "a refused write took an id");
+            }
+            result
+        }
+
+        fn pick(store: &TaskArrays, run: usize) -> Option<u64> {
+            let ids = store.ids();
+            (!ids.is_empty()).then(|| ids[run % ids.len()])
+        }
+
+        fn unknown_owners(store: &TaskArrays, id: u64) -> BTreeSet<NodeId> {
+            store
+                .jobs()
+                .run(id)
+                .map(|run| run.unknown_owners.clone())
+                .unwrap_or_default()
+        }
+
+        /// What every replica relies on, whatever happened before.
+        fn check(store: &TaskArrays, model: &mut Model) {
+            let mut triggers = BTreeSet::new();
+            for (id, record) in store.iter() {
+                let summary = record.state.summary();
+                assert_eq!(
+                    summary.succeeded
+                        + summary.failed
+                        + summary.not_run
+                        + summary.queued
+                        + summary.held,
+                    summary.total,
+                    "run {id} lost or duplicated tasks"
+                );
+                assert_eq!(
+                    summary.succeeded,
+                    model.succeeded.get(&id).copied().unwrap_or(0),
+                    "run {id} counted a result the model didn't accept"
+                );
+                record.state.validate_snapshot().unwrap();
+                if summary.status.is_terminal() {
+                    model.terminal.insert(id);
+                } else {
+                    assert!(
+                        !model.terminal.contains(&id),
+                        "run {id} left a terminal state"
+                    );
+                }
+                let owners = unknown_owners(store, id);
+                for owner in &owners {
+                    assert!(
+                        record.state.held_by(owner).is_some(),
+                        "run {id}: unknown owner {owner} no longer holds its grant"
+                    );
+                }
+                if let Some(run) = store.jobs().run(id) {
+                    assert!(
+                        triggers.insert(serde_json::to_string(&(&run.name, &run.trigger)).unwrap()),
+                        "two runs share {:?}",
+                        run.trigger
+                    );
+                }
+            }
+            for (key, (id, _)) in &model.requests {
+                if let Some(run) = store.jobs().run(*id) {
+                    assert_eq!(
+                        run.trigger,
+                        RunTrigger::Manual {
+                            request_id: format!("key-{key}")
+                        }
+                    );
+                }
+            }
+            assert!(store.ids().iter().all(|id| *id <= model.next_id));
+        }
+
+        fn run_step(store: &mut TaskArrays, model: &mut Model, now: &mut u64, step: Step) {
+            let nodes: Vec<NodeSlots> = NODES
+                .iter()
+                .zip([2, 4, 1])
+                .map(|(name, slots)| NodeSlots {
+                    node: node(name),
+                    slots,
+                })
+                .collect();
+            match step {
+                Step::Request { key, variant } => {
+                    let write = TaskArrayWrite::Job(Box::new(JobWrite::Put {
+                        name: JOB.into(),
+                        namespace: NAMESPACE.into(),
+                        definition: Box::new(definition(variant)),
+                        trigger: Some(RunTrigger::Manual {
+                            request_id: format!("key-{key}"),
+                        }),
+                        now_epoch_secs: *now,
+                    }));
+                    let retained = model
+                        .requests
+                        .get(&key)
+                        .copied()
+                        .filter(|(id, _)| store.jobs().run(*id).is_some());
+                    let fenced = store.active().any(|(id, _)| {
+                        store.jobs().run(id).is_some_and(|run| run.name == JOB)
+                            && !unknown_owners(store, id).is_empty()
+                    });
+                    let before = model.next_id;
+                    let result = apply(store, model, &write);
+                    match retained {
+                        // A retry finds the same run.
+                        Some((id, accepted)) if accepted == variant => {
+                            assert_eq!(result, Ok(TaskArrayApplied::Registered { batch_id: id }))
+                        }
+                        // The same key never names different work.
+                        Some(_) => assert!(result.is_err(), "changed request admitted"),
+                        None if fenced => {
+                            assert!(result.is_err(), "admitted past an unknown outcome")
+                        }
+                        None => {
+                            assert_eq!(
+                                result,
+                                Ok(TaskArrayApplied::Registered {
+                                    batch_id: before + 1
+                                }),
+                                "a new request gets the next identity"
+                            );
+                            model.requests.insert(key, (before + 1, variant));
+                        }
+                    }
+                }
+                Step::Schedule { forbid_overlap } => {
+                    let write = TaskArrayWrite::Job(Box::new(JobWrite::Put {
+                        name: SCHEDULED.into(),
+                        namespace: NAMESPACE.into(),
+                        definition: Box::new(scheduled(forbid_overlap)),
+                        trigger: None,
+                        now_epoch_secs: *now,
+                    }));
+                    assert_eq!(
+                        apply(store, model, &write),
+                        Ok(TaskArrayApplied::JobRecorded)
+                    );
+                }
+                Step::Fire => {
+                    let minute = i64::try_from(*now / 60).unwrap();
+                    apply(store, model, &TaskArrayWrite::CronObserve { minute }).unwrap();
+                    let Some(record) = store.jobs().definition(NAMESPACE, SCHEDULED) else {
+                        return;
+                    };
+                    let (revision, claimed) = (
+                        record.revision,
+                        record
+                            .last_observed_minute
+                            .is_some_and(|seen| seen >= minute),
+                    );
+                    let forbids_overlap = record
+                        .definition
+                        .cron
+                        .as_ref()
+                        .is_some_and(|cron| cron.overlap == OverlapPolicy::Forbid);
+                    let fenced = store.iter().any(|(id, _)| {
+                        store.jobs().run(id).is_some_and(|run| {
+                            run.name == SCHEDULED && !run.unknown_owners.is_empty()
+                        })
+                    });
+                    let overlapping = forbids_overlap
+                        && store.active().any(|(_, record)| record.name == SCHEDULED);
+                    let before = model.next_id;
+                    let write = TaskArrayWrite::Job(Box::new(JobWrite::Fire {
+                        name: SCHEDULED.into(),
+                        namespace: NAMESPACE.into(),
+                        revision,
+                        minute,
+                        now_epoch_secs: *now,
+                    }));
+                    let result = apply(store, model, &write);
+                    if claimed {
+                        // A minute fires once, however often the leader asks.
+                        assert_eq!(result, Ok(TaskArrayApplied::JobRecorded));
+                        assert_eq!(model.next_id, before);
+                    }
+                    if fenced {
+                        // An unknown outcome blocks the next occurrence.
+                        assert_eq!(model.next_id, before, "fired past an unknown outcome");
+                    }
+                    if overlapping {
+                        assert_eq!(model.next_id, before, "fired over a forbidden overlap");
+                    }
+                    if !claimed && !fenced && !overlapping {
+                        // Nothing holds the occurrence back, so it runs, or
+                        // it's recorded as skipped for want of room.
+                        let skipped = store
+                            .jobs()
+                            .definition(NAMESPACE, SCHEDULED)
+                            .and_then(|record| record.skipped.as_ref())
+                            .is_some_and(|skip| skip.minute == minute);
+                        assert!(
+                            matches!(result, Ok(TaskArrayApplied::Registered { .. })) || skipped,
+                            "a free occurrence neither ran nor was skipped: {result:?}"
+                        );
+                        if !skipped {
+                            assert_eq!(model.next_id, before + 1);
+                        }
+                    }
+                }
+                Step::Grant => {
+                    let writes: Vec<TaskArrayWrite> = store
+                        .active()
+                        .filter_map(|(id, record)| {
+                            let lookahead =
+                                store.jobs().run(id).is_none_or(|run| run.replay_unknown);
+                            let grants = plan_grants(&record.state, &nodes, lookahead);
+                            (!grants.is_empty()).then(|| TaskArrayWrite::Sync {
+                                now_epoch_secs: *now,
+                                batch_id: id,
+                                results: Vec::new(),
+                                grants,
+                            })
+                        })
+                        .collect();
+                    if writes.is_empty() {
+                        return;
+                    }
+                    assert_eq!(
+                        apply(store, model, &TaskArrayWrite::Tick { writes }),
+                        Ok(TaskArrayApplied::Ticked {
+                            refused: Vec::new()
+                        })
+                    );
+                }
+                Step::Complete {
+                    run,
+                    node: which,
+                    pick: chosen,
+                    report,
+                } => {
+                    let Some(id) = pick(store, run) else { return };
+                    let holder = node(NODES[which]);
+                    let state = &store.get(id).unwrap().state;
+                    let held: Vec<u32> = state
+                        .held_by(&holder)
+                        .map(|set| set.iter().collect())
+                        .unwrap_or_default();
+                    let Some(&chunk) = held.get(chosen % held.len().max(1)) else {
+                        return;
+                    };
+                    let current = state.attempt_of(ChunkId(chunk));
+                    let range = state.spec.chunk_range(ChunkId(chunk)).unwrap();
+                    let tasks = range.end() - range.start() + 1;
+                    let (reporter, attempt) = match report {
+                        Report::Current => (holder, current),
+                        Report::OtherAttempt if current > 1 => (holder, current - 1),
+                        Report::OtherAttempt => (holder, current + 1),
+                        Report::OtherNode => (node(NODES[(which + 1) % NODES.len()]), current),
+                    };
+                    let write = sync(
+                        id,
+                        vec![(reporter, finished(chunk, attempt, tasks))],
+                        vec![],
+                    );
+                    let accepted = matches!(report, Report::Current);
+                    assert_eq!(
+                        apply(store, model, &write),
+                        Ok(TaskArrayApplied::Synced {
+                            results_applied: u32::from(accepted),
+                            results_refused: u32::from(!accepted),
+                            grants_applied: 0,
+                            grants_refused: 0,
+                        })
+                    );
+                    if accepted {
+                        *model.succeeded.entry(id).or_default() += u64::from(tasks);
+                    }
+                }
+                Step::Lose { run, node: which } => {
+                    let Some(id) = pick(store, run) else { return };
+                    let lost = node(NODES[which]);
+                    let needs_acknowledgement =
+                        store.jobs().run(id).is_some_and(|run| !run.replay_unknown);
+                    let write = TaskArrayWrite::Requeue {
+                        batch_id: id,
+                        node: lost.clone(),
+                        now_epoch_secs: *now,
+                    };
+                    let result = apply(store, model, &write);
+                    if needs_acknowledgement {
+                        assert!(
+                            result.is_err(),
+                            "lost work replayed without acknowledgement"
+                        );
+                    } else {
+                        assert!(result.is_ok());
+                        assert!(store.get(id).unwrap().state.held_by(&lost).is_none());
+                    }
+                }
+                Step::Unknown { run, node: which } => {
+                    let Some(id) = pick(store, run) else { return };
+                    let owner = node(NODES[which]);
+                    let holds = store.get(id).unwrap().state.held_by(&owner).is_some();
+                    let result = apply(
+                        store,
+                        model,
+                        &TaskArrayWrite::Unknown {
+                            batch_id: id,
+                            node: owner.clone(),
+                        },
+                    );
+                    if holds && store.jobs().run(id).is_some() {
+                        assert!(result.is_ok());
+                        assert!(unknown_owners(store, id).contains(&owner));
+                    } else {
+                        assert!(result.is_err());
+                    }
+                }
+                Step::Replay {
+                    run,
+                    node: which,
+                    current,
+                } => {
+                    let Some(id) = pick(store, run) else { return };
+                    let owner = node(NODES[which]);
+                    let unknown = unknown_owners(store, id).contains(&owner);
+                    let grant_digest = if current {
+                        store.owner_fingerprint(id, &owner).unwrap_or_default()
+                    } else {
+                        "0".repeat(64)
+                    };
+                    let result = apply(
+                        store,
+                        model,
+                        &TaskArrayWrite::Replay {
+                            batch_id: id,
+                            node: owner.clone(),
+                            grant_digest,
+                            now_epoch_secs: *now,
+                        },
+                    );
+                    if unknown && current {
+                        assert!(result.is_ok());
+                        assert!(!unknown_owners(store, id).contains(&owner));
+                        assert!(store.get(id).unwrap().state.held_by(&owner).is_none());
+                    } else {
+                        assert!(result.is_err(), "replay without a current acknowledgement");
+                    }
+                }
+                Step::Cancel { run } => {
+                    let Some(id) = pick(store, run) else { return };
+                    let write = TaskArrayWrite::Cancel {
+                        batch_id: id,
+                        now_epoch_secs: *now,
+                    };
+                    assert_eq!(apply(store, model, &write), Ok(TaskArrayApplied::Cancelled));
+                    assert!(store.get(id).unwrap().state.stop_reason().is_some());
+                }
+                Step::Advance { secs } => *now += u64::from(secs),
+                Step::Prune => {
+                    let active: Vec<u64> = store.active().map(|(id, _)| id).collect();
+                    let write = TaskArrayWrite::Prune {
+                        now_epoch_secs: *now,
+                        retention_secs: RETENTION_SECS,
+                    };
+                    apply(store, model, &write).unwrap();
+                    for id in active {
+                        assert!(store.get(id).is_some(), "pruned active run {id}");
+                    }
+                }
+                Step::Reopen => {
+                    let bytes = serde_json::to_vec(&*store).unwrap();
+                    let reopened: TaskArrays = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(reopened, *store, "reopening changed the store");
+                    *store = reopened;
+                }
+            }
+        }
+
+        proptest! {
+            #[test]
+            fn generated_lifecycles_keep_identity_conservation_and_fences(
+                steps in proptest::collection::vec(step(), 1..80),
+            ) {
+                let mut store = TaskArrays::default();
+                let mut model = Model::default();
+                let mut now = START;
+                for step in steps {
+                    run_step(&mut store, &mut model, &mut now, step);
+                    check(&store, &mut model);
+                }
+            }
+        }
+    }
+
+    /// The #1032 day run: 2,000,000,000 host-job tasks in 24 hours on three
+    /// nodes, as the biggest arrays the API accepts, one every 12 minutes.
+    /// Each array's counters stay within its own count, the cluster-wide sum
+    /// is a `u64`, and retention keeps only the last hour of finished runs
+    /// however many the day finishes.
+    #[test]
+    fn a_two_billion_task_day_counts_every_task_and_keeps_only_the_last_hour() {
+        use crate::meat::task_array::{MAX_CHUNK_SIZE, MAX_TASK_COUNT};
+        const DAY: u64 = 2_000_000_000;
+        let chunks = MAX_TASK_COUNT / MAX_CHUNK_SIZE;
+        let runs = DAY.div_ceil(u64::from(MAX_TASK_COUNT));
+        let nodes = [node("a"), node("b"), node("c")];
+        let mut arrays = TaskArrays::default();
+        let mut succeeded = 0u64;
+        let mut peak_terminal = 0;
+        let mut peak_bytes = 0;
+        for run in 0..runs {
+            let at = run * 720;
+            let id = registered(
+                &mut arrays,
+                &register(MAX_TASK_COUNT, MAX_CHUNK_SIZE, at),
+                run + 1,
+            );
+            let mut held = [
+                IndexRangeSet::new(),
+                IndexRangeSet::new(),
+                IndexRangeSet::new(),
+            ];
+            for chunk in 0..chunks {
+                held[chunk as usize % 3].insert(chunk);
+            }
+            let granted = TaskArrayWrite::Sync {
+                now_epoch_secs: at,
+                batch_id: id,
+                results: Vec::new(),
+                grants: nodes.iter().cloned().zip(held).collect(),
+            };
+            arrays.apply(&granted, || 0).unwrap();
+            let results = (0..chunks)
+                .map(|chunk| {
+                    (
+                        nodes[chunk as usize % 3].clone(),
+                        finished(chunk, 1, MAX_CHUNK_SIZE),
+                    )
+                })
+                .collect();
+            let retired = TaskArrayWrite::Sync {
+                now_epoch_secs: at + 600,
+                batch_id: id,
+                results,
+                grants: Vec::new(),
+            };
+            arrays.apply(&retired, || 0).unwrap();
+            let summary = arrays.get(id).unwrap().state.summary();
+            assert_eq!(summary.status, TaskArrayStatus::Succeeded);
+            assert_eq!(summary.succeeded, u64::from(MAX_TASK_COUNT));
+            succeeded += summary.succeeded;
+            let terminal = arrays
+                .iter()
+                .filter(|(_, record)| record.state.status().is_terminal())
+                .count();
+            peak_terminal = peak_terminal.max(terminal);
+            peak_bytes = peak_bytes.max(serde_json::to_vec(&arrays).unwrap().len());
+        }
+        assert!(succeeded >= DAY, "{succeeded} succeeded");
+        assert_eq!(succeeded, runs * u64::from(MAX_TASK_COUNT));
+        // An hour's window at one run every 12 minutes holds five or six
+        // finished runs, far under the cap, and the state stays small.
+        assert!(peak_terminal <= 7, "{peak_terminal} finished runs kept");
+        assert!(peak_terminal <= MAX_TERMINAL_ARRAYS);
+        assert!(peak_bytes < 256 * 1024, "{peak_bytes} bytes of state");
     }
 }

@@ -1,0 +1,16 @@
+--- ~/.reliaburger
+find: ‘/home/runner/.reliaburger’: No such file or directory
+--- ~/.local/bin/relish
+ls: cannot access '/home/runner/.local/bin/relish': No such file or directory
+--- rc files (SHA-256)
+342099da4dd28c394d3f8782d90d7465cb2eaa611193f8f378d6918261cb9bb8  /home/runner/.bashrc
+28b4a453b68dde64f814e94bab14ee651f4f162e15dd9920490aa1d49f05d2a4  /home/runner/.profile
+76f0dec93ebe1097fd8e052275139779e3f0ef8b15220d97eabf9a0084c0d9ca  /home/runner/.bash_profile
+absent  .zshrc
+--- processes (qemu, limactl, bun)
+none
+--- listening TCP ports
+0.0.0.0:22
+127.0.0.53%lo:53
+127.0.0.54:53
+[::]:22

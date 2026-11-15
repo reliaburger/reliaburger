@@ -30,6 +30,8 @@ impl Drop for TerminalGuard {
 
 Panics need one extra precaution. A panic hook restores the terminal before chaining to the previous hook, so the panic message appears on a normal screen. We don't call `process::exit` from the TUI because that would skip destructors entirely. The unexciting clean-up code is doing important work.
 
+What if there's no terminal to own? Run `relish` from a pipe, a cron job or an AI agent's shell and `enable_raw_mode` fails with `Device not configured (os error 6)`, which tells you nothing about what to do next; where it gets further, the reader waits for keys that will never come. So `tui::run`, `manual::run` and `source::run` each start with `FullScreen::require_terminal()` (#1569), which asks `std::io::IsTerminal` about stdin and stdout and refuses with an error naming the plain-output command to run instead. `IsTerminal` is a trait the standard library implements for `Stdin`, `Stdout` and files, so `std::io::stdin().is_terminal()` only compiles once the trait is in scope with `use std::io::IsTerminal;`. That's a Rust rule worth knowing: a trait's methods are invisible until you import the trait, even on a type you already have. The decision itself is a pure `check_terminal(interactive: bool)`, so the unit tests don't need a terminal, and a test in `tests/suite/relish_cli.rs` runs the real binary with stdin from `/dev/null` and a 20-second deadline, so a reader that hangs fails the test instead of stalling the run.
+
 ## Immediate-mode rendering
 
 Ratatui uses immediate-mode rendering. On every frame we describe the whole screen from the current state. There is no persistent tree of mutable widgets and no DOM to reconcile.
@@ -129,7 +131,7 @@ Every recorded event also goes to a Tokio `broadcast` channel. A broadcast sende
 
 The agent emits deploy, restart, unhealthy, stop, job-completed and job-failed events. Node membership and alert transitions live outside the agent task, so they remain deferred. We say that plainly rather than inventing data.
 
-The new `/v1/jobs` endpoint follows the same rule. It exposes the supervisor's raw state, restart count and age. It doesn't manufacture a cron schedule or a duration that the supervisor never stored.
+The new `/v1/jobs` endpoint followed the same rule. It exposed the supervisor's raw state, restart count and age, and didn't manufacture a cron schedule or a duration that the supervisor never stored. Since 0.2.0 it reads the leader's task arrays instead, because that's where every job lives now (Chapter 17), and the web dashboard shows the same runs and schedules in its job card (Chapter 11).
 
 ## Upgrading the connection
 
@@ -205,17 +207,21 @@ Once documents-in-the-binary machinery exists, a stranger idea becomes a small d
 
 The whole feature is one new module because the reader from the previous section doesn't care what it's showing. Each file becomes a document whose first line is its styled path, so one fuzzy query matches paths and contents alike. No new key bindings, no new search code, no markdown involved.
 
-The cost is binary size, and rust-embed softens it twice. Its `compression` feature compresses each embedded file in release builds (source code deflates well), and in debug builds it doesn't embed at all — assets load from disk at runtime, so `cargo test` iterations don't pay for a 5 MB copy of `src/` on every link. That split, incidentally, is why an embed-backed test can pass in debug and still deserve a release-build check in CI.
+The cost is binary size, and rust-embed's `compression` feature softened it by compressing each embedded file in release builds (source code deflates well): 3.9 MB for `src/`.
+
+That version had a hole, though: `src/` alone can't be built. No `Cargo.toml`, no `Cargo.lock`, no `build.rs`, none of the eBPF programs or the files the code pulls in with `include_str!`. In 0.2.7 `relish source` moved onto a single zstd tarball of the build, test and read set, only 0.8 MB bigger than the per-file embed despite carrying 60% more, and which CI proves can rebuild every binary. [Chapter 19](19-built-for-agents.md#carrying-the-source) tells that story.
 
 ## The command list writes itself
 
 The manual explains how to use relish, but people landing on the repository want something shorter first: what can this thing do? The README answered that with nothing, and `docs/README.md` answered it with a hand-kept table of nearly a hundred rows that had already started to disagree with `--help`. A third copy in the README would have made three places to forget.
 
-We already had one list that can't be wrong, because it *is* the parser. Chapter 1 showed how clap's derive turns the `Command` enum and its `///` comments into argument parsing and help text. The same derive also implements clap's `CommandFactory` trait for `Cli`, which adds an associated function (Rust's name for a function attached to a type rather than to a value, like a static method in Java or a `@classmethod` in Python): `Cli::command()` returns the whole command tree as data. `src/relish/command_reference.rs` walks it with `get_subcommands()`, `get_positionals()` and `get_about()`, skips anything marked `hide = true`, and writes a collapsible Markdown list: one line per command, its required flags and positional arguments, and the first line of its doc comment.
+We already had one list that can't be wrong, because it *is* the parser. Chapter 1 showed how clap's derive turns the `Command` enum and its `///` comments into argument parsing and help text. The same derive also implements clap's `CommandFactory` trait for `Cli`, which adds an associated function (Rust's name for a function attached to a type rather than to a value, like a static method in Java or a `@classmethod` in Python): `Cli::command()` returns the whole command tree as data. `src/relish/command_reference.rs` walks it with `get_subcommands()`, `get_positionals()` and `get_about()`, skips anything marked `hide = true`, and writes a Markdown list: one line per command, its required flags and positional arguments, and the first line of its doc comment.
 
 The one thing clap doesn't know is how a human would group the commands. That lives in a small `GROUPS` table next to the renderer, each group linking to the manual chapter that goes deeper. `render` returns a `Result`, and forgetting to place a new command in a group is an error that names the command, not a silent omission.
 
-Keeping the README honest is a test in the relish binary. It renders the tree, splices it between the `<!-- relish-commands:start -->` and `<!-- relish-commands:end -->` markers, and fails if the file would change, telling you to run `make readme-commands`. That target runs the same test with `RELIABURGER_UPDATE_README` set, and the test writes the file instead of comparing it: the approach `insta` takes with `INSTA_UPDATE`, without a hidden subcommand shipping in every binary. The test carries `#[cfg(feature = "kubernetes")]`, conditional compilation that removes it from builds without the default feature, because `import` and `export` only exist there and the README describes the default build.
+Keeping the list honest is a test in the relish binary. It renders the tree, splices it between the `<!-- relish-commands:start -->` and `<!-- relish-commands:end -->` markers, and fails if the file would change, telling you to run `make reference-commands`. That target runs the same test with `RELIABURGER_UPDATE_REFERENCE` set, and the test writes the file instead of comparing it: the approach `insta` takes with `INSTA_UPDATE`, without a hidden subcommand shipping in every binary. The test carries `#[cfg(feature = "kubernetes")]`, conditional compilation that removes it from builds without the default feature, because `import` and `export` only exist there and the list describes the default build.
+
+The list started life folded inside a `<details>` element in the README. By 0.2.7 it ran to two hundred lines, and the README around it had grown a feature essay, a comparison table and a limits list besides, so a visitor had to scroll past all of it to learn what the project was. We trimmed the README to the website's hero, the five-minute tour, one line per feature and a page of links, and moved the list to the end of the manual's reference chapter, `docs/manual/13_reference.md`. Nothing about the generator changed except where it writes: `REFERENCE_CHAPTER` names the file, the group links became relative to `docs/manual`, and each group became a `###` heading rather than bold text, because `relish manual` renders Markdown in a terminal and can't fold HTML. The note telling contributors to run `make reference-commands` went into an HTML comment, which GitHub and `relish manual` both leave out. The list now also ships inside the binary, so `relish manual reference` and `relish agent manual search` find it offline.
 
 We considered a hand-written section plus a test that every command appears in it. That catches a missing command, but not a stale description or a changed argument, and it still leaves someone typing the list. Generating it cost about as much code as checking it.
 
@@ -362,6 +368,18 @@ timestamp is there because sequences are per process: a member that restarts
 counts from one again, and without it its first new events would look like
 ones the backlog already sent. `the_live_event_stream_merges_every_members_events`
 checks both halves against a fake peer.
+
+The manual, meanwhile, told operators three times to run `relish events`, a
+command that didn't exist: the merged listing had an API and a client method,
+and only the TUI called them. The 0.2.2 CLI review (D36) added the command.
+It's thin on purpose. `EventsFilter` turns `--app`, `--severity` and
+`--limit` into the `/v1/events` query, the node does the filtering and the
+fan-out, and `EventsReport` renders the answer as a table with the same
+`TIME (UTC)` and target columns as `relish audit`, through the same `target`
+function. A `#[serde(transparent)]`
+newtype is how one value gets two faces: `Serialize` passes straight through to
+the API's `ClusterEvents`, so `-o json` prints exactly what the API sent,
+while `Display` belongs to the wrapper and draws the table.
 
 The NODE column exposed one thing the views hadn't been ready for. Pressing
 Enter on a job opened `View::JobDetail { name, namespace }`, and the page

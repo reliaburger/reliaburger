@@ -117,7 +117,7 @@ Each PING/ACK message piggybacks a bounded number of membership updates (new joi
 
 **Refutation first.** The dissemination queue sends this node's own refutation (Alive about itself at a raised incarnation) ahead of everything else, then Dead/Left, Suspect and Alive about others. A newer update about a node supersedes any queued older one (incarnation first, then state), which is then discarded unsent. Without both rules, a falsely suspected node's refutation waited behind a rack failure's backlog of Suspect and Dead rumours, and it flapped.
 
-**Anti-entropy push-pull.** Piggybacking alone is not enough. Each update is re-broadcast a bounded number of times (`3 * ceil(log2(N))`, minimum 6), and nothing guarantees those broadcasts reach every node: in the five-node ring simulation, 73 of 100,000 random probe schedules spent every re-broadcast about some member before one particular node heard it. Once the dissemination queues drain, PINGs carry nothing new and the gap is permanent. So, like HashiCorp's memberlist, Mustard runs a periodic push-pull:
+**Anti-entropy push-pull.** Piggybacking alone is not enough. Each update is re-broadcast a bounded number of times (`3 * ceil(log2(N))`, minimum 6), and nothing guarantees those broadcasts reach every node: in the five-node ring simulation, 82 of 100,000 random probe schedules spent every re-broadcast about some member before one particular node heard it. Once the dissemination queues drain, PINGs carry nothing new and the gap is permanent. So, like HashiCorp's memberlist, Mustard runs a periodic push-pull:
 
 ```
 Node A                                   Node B (random live peer)
@@ -206,6 +206,8 @@ The leader selects council members from the general node pool. Selection criteri
 
 **Odd voter counts (D12, #694).** The planner (`plan_council_action`) targets the largest odd number of voters not above the live nodes (live voters, live learners and live spare candidates) nor `max_council_size`. An even council tolerates no more failures than the odd one below it and adds a write acknowledgement, so no planner action ever lands on an even count:
 
+**Nodes past the cap (#1477).** A node the planner never seats has an empty replica, so it reads the leader's view of the security state instead (`/v1/cluster/security-view`, refreshed every five seconds). Its API tokens, CRL, trust set and age keys come from there. `docs/design/security-sesame.md` lists what the view holds.
+
 | Live nodes | Voters |
 |---|---|
 | 1-2 | 1 |
@@ -213,20 +215,20 @@ The leader selects council members from the general node pool. Selection criteri
 | 5-6 | 5 |
 | 7+ | 7 |
 
-Growth promotes two caught-up learners in one joint-consensus change (`PromotePair`, 1 to 3 or 3 to 5). A dead or disk-pressured voter is replaced by swapping a caught-up learner in for it in one change (`Replace`), so the count never passes through an even number. With no replacement, two dead voters leave together (`RemoveVoterPair`, 5 to 3, never below `min_council_size`). An even council found on entry (left by an older release, or by a decommission) goes back to odd: up by one (`Promote`) when a caught-up learner exists and the live nodes allow it, otherwise down by one (`RemoveVoter`), a dead voter first, while quorum allows. Extra eligible nodes stay workers or learners. A two-node cluster therefore has one voter: losing the other node is survivable, losing the voter stops the control plane until it returns or is recovered. The upgrade planner's refusal of a two-voter council (`src/upgrade/plan.rs`) stays as a guard.
+Growth promotes two caught-up learners in one joint-consensus change (`PromotePair`, 1 to 3 or 3 to 5). A dead or disk-pressured voter is replaced by swapping a caught-up learner in for it in one change (`Replace`), so the count never passes through an even number. With no replacement, two dead voters leave together (`RemoveVoterPair`, 5 to 3, never below `min_council_size`). An even council found on entry (left by an older release, or by a decommission) goes back to odd: up by one (`Promote`) when a caught-up learner exists and the live nodes allow it, otherwise down by one (`RemoveVoter`), a dead voter first, while quorum allows. Spare eligible nodes join as learners up to `max_council_size`, and only nodes past that stay plain workers. A learner has the replicated state, and an mTLS node needs it: its API opens only once the API tokens reach it through Raft (#1477). A two-node cluster therefore has one voter and one learner: losing the other node is survivable, losing the voter stops the control plane until it returns or is recovered. The upgrade planner's refusal of a two-voter council (`src/upgrade/plan.rs`) stays as a guard.
 
 Council replacement flow:
 
 ```
-Council member C departs (detected via Raft heartbeat timeout)
-     │
-     ▼
-Remaining council members detect departure
+Council member C departs
      │
      ├── Was C the leader?
-     │     YES: Raft election among remaining members (<5s)
-     │           New leader emerges
+     │     YES: the followers miss its Raft heartbeats and elect a
+     │           new leader among the remaining members (<5s)
      │     NO:  Current leader continues
+     │
+     ▼
+Gossip declares C dead; the leader's HealthTracker stops counting it alive
      │
      ▼
 Leader evaluates candidate pool via Mustard membership
@@ -606,10 +608,10 @@ struct EncryptedRecoveryCandidateList {
 
 | Layer | Transport | Encoding | Max Message Size |
 |-------|-----------|----------|------------------|
-| Mustard gossip (PING/ACK/PING-REQ, including join via seed PING) | UDP | bincode (serde) | 1400 bytes (avoids IP fragmentation); piggybacked updates fill the room left after the header and directory extension |
-| Mustard anti-entropy (Sync push-pull) | UDP | bincode (serde) | 1400 bytes per datagram, at most 8 datagrams (64 entries) per side per exchange |
+| Mustard gossip (PING/ACK/PING-REQ, including join via seed PING) | UDP | postcard (serde) | 1400 bytes (avoids IP fragmentation); piggybacked updates fill the room left after the header and directory extension |
+| Mustard anti-entropy (Sync push-pull) | UDP | postcard (serde) | 1400 bytes per datagram, at most 8 datagrams (64 entries) per side per exchange |
 | Raft (AppendEntries, Vote, InstallSnapshot) | TCP + mTLS, connections pooled and reused across RPCs (§3.3) | JSON (serde), length-prefixed, in an envelope carrying the compatibility version and recovery epoch | 64 MiB per frame (snapshots can be large) |
-| Reporting tree (StateReports) | TCP + mTLS | bincode | 1 MiB (bounded by max events per report) |
+| Reporting tree (StateReports) | TCP + mTLS | postcard | 1 MiB (bounded by max events per report) |
 
 All TCP connections use mTLS via Sesame's Node CA certificates.
 
@@ -847,7 +849,7 @@ fn select_council_candidates(
     // (seeded by leader node_id + current term)
     let top = candidates.iter().take(needed * 3).collect::<Vec<_>>();
     let mut rng = StdRng::seed_from_u64(hash(leader_id, current_term));
-    let selected = top.choose_multiple(&mut rng, needed);
+    let selected = top.sample(&mut rng, needed);
 
     selected.map(|n| n.node_id).collect()
 }
@@ -997,7 +999,7 @@ When the entire Raft council is lost simultaneously (all 3-7 members fail at onc
 
 **If no recovery candidates survive:**
 
-All nodes remain in read-only mode. Apps continue running. No new deploys are accepted. Manual intervention via `relish recover` bootstraps a new council from any surviving node. This is the true catastrophic case and manual intervention is appropriate.
+All nodes remain in read-only mode. Apps continue running. No new deploys are accepted. Manual intervention via `relish council recover` bootstraps a new council from any surviving node. This is the true catastrophic case and manual intervention is appropriate.
 
 ### 5.6 Split-Brain Prevention
 
@@ -1023,29 +1025,33 @@ Split-brain can occur during a network partition where two groups each believe t
 
 ### 5.7 Membership Changes (Raft)
 
-Council membership changes use the single-server-at-a-time approach (Raft's joint consensus is complex and error-prone). The leader issues one AddNode or RemoveNode Raft log entry at a time and waits for it to commit before issuing another.
+The council reconciler on the leader makes one membership change at a time. Each tick it plans a single action (`plan_council_action`, `src/council/selection.rs`), and its change-in-flight gate holds the next until the current one has committed.
 
 ```
 Add member flow:
-1. Leader selects candidate C via council selection algorithm.
-2. Leader appends AddNode(C) to the Raft log.
-3. Once committed, leader begins sending AppendEntries to C.
-4. C enters LEARNER state, receiving log entries but not voting.
-5. Once C's log is within a configurable threshold of the leader's log:
-   C transitions to FOLLOWER and becomes a voting member.
-6. Leader broadcasts updated council membership via Mustard.
+1. The planner takes the best-ranked candidate C (select_council_candidates).
+2. AddLearner(C): a learner membership entry commits, and the leader
+   replicates the log to C. C receives entries but doesn't vote.
+3. Once C's replicated index is within max_promotion_lag (64) entries of
+   the leader's, the planner may promote it. Growth promotes two caught-up
+   learners together (PromotePair), so the voter count stays odd.
+4. Gossip carries the new council membership to every node.
 
 Remove member flow:
-1. Leader detects member M is unhealthy (Raft heartbeat timeout).
-2. Leader appends RemoveNode(M) to the Raft log.
-3. Once committed, M is no longer counted for quorum.
-4. Leader selects a replacement (loops back to Add member flow).
-5. Leader broadcasts updated council membership via Mustard.
+1. The leader's HealthTracker, fed by gossip, reports voter M dead, or M is
+   under sustained disk pressure. (A voter an operator retired is different:
+   the reconciler takes it out of the voter set straight away.)
+2. Add before remove: if a caught-up learner L exists, the planner swaps L
+   in for M in one change (Replace). M stops counting for quorum when the
+   change commits.
+3. With no replacement, two dead voters leave together (RemoveVoterPair),
+   never below min_council_size.
+4. Gossip carries the new council membership to every node.
 ```
 
 In the implementation, promotion and eviction go through openraft's joint consensus (`change_membership`): a joint configuration commits first, then the uniform one. The caller's future proposes the second step, so a caller that times out or a leader that fails over between the steps leaves a committed joint configuration behind. The council reconciler finishes it before planning anything else (`CouncilNode::finish_membership_change`), proposing the joint configuration's target voter set; otherwise its change-in-flight gate would hold every later membership change (#673).
 
-Each reconciler operation runs under a five-second bound and costs a fixed number of commits: a guard no-op that makes earlier node-fault grants visible, then one membership entry (add or remove a learner) or two (the joint and uniform steps of a voter change). Step 5's catch-up is not part of any operation. Adding a learner returns once its membership entry commits, without openraft's blocking wait, which holds until the learner trails by at most 5,000 entries and so grows with the log gap (on a large council log, it includes installing a snapshot). Replication carries on between ticks, and the planner promotes the learner only once its replicated index is within `max_promotion_lag` (64) entries of the leader's. With a log store that takes 20 ms per entry, the guard no-op took 46 ms, adding a learner 90 ms and a promotion 147 ms (#779).
+Each reconciler operation runs under a five-second bound and costs a fixed number of commits: a guard no-op that makes earlier node-fault grants visible, then one membership entry (add or remove a learner) or two (the joint and uniform steps of a voter change). The catch-up in step 3 of the add flow is not part of any operation. Adding a learner returns once its membership entry commits, without openraft's blocking wait, which holds until the learner trails by at most 5,000 entries and so grows with the log gap (on a large council log, it includes installing a snapshot). Replication carries on between ticks, and the planner promotes the learner only once its replicated index is within `max_promotion_lag` (64) entries of the leader's. With a log store that takes 20 ms per entry, the guard no-op took 46 ms, adding a learner 90 ms and a promotion 147 ms (#779).
 
 ---
 
@@ -1081,7 +1087,8 @@ reporting_port = 9445
 The council sizing constants below are compile-time defaults in `CouncilSelectionConfig` (`src/council/selection.rs`), shown here for reference — they are **not** a `[council]` TOML section:
 
 ```text
-# Minimum council size (below this, the cluster enters degraded mode).
+# Minimum council size: the planner's target never drops below it, and
+# it never removes voters past it.
 min_council_size = 3
 
 # Maximum council size. The council holds the largest odd number of
@@ -1143,9 +1150,9 @@ candidate_refresh_interval = "5m"
 
 ### 7.2 Council Member Departure (Non-Leader)
 
-**Detection:** Leader detects missing Raft heartbeat response within a few heartbeat intervals (~500ms).
+**Detection:** Gossip declares the member dead, and the leader's `HealthTracker` stops counting it as alive. Raft's own heartbeats don't decide it.
 
-**Recovery:** Leader issues RemoveNode, selects a replacement from the general pool, issues AddNode. The new member catches up via Raft log replication. Workers assigned to the departed member's subtree in the reporting tree re-hash to remaining council members.
+**Recovery:** Add before remove. If a caught-up learner exists, the planner swaps it in for the departed voter in one membership change (`Replace`). With none, the leader adds the best-ranked candidate as a learner, which catches up by Raft log replication, and the swap waits for it. Two dead voters with no replacement leave together (`RemoveVoterPair`), never below `min_council_size`. Workers assigned to the departed member's subtree in the reporting tree re-hash to remaining council members.
 
 **Data plane impact:** None. Workers transparently reroute their reports.
 
@@ -1420,7 +1427,7 @@ There is no production-quality Rust equivalent of HashiCorp's `memberlist` (Go).
 
 | Crate | Purpose |
 |-------|---------|
-| [`bincode`](https://crates.io/crates/bincode) | Binary serialisation for wire protocol messages. Compact and fast. |
+| [`postcard`](https://crates.io/crates/postcard) | Binary serialisation for gossip datagrams and reporting frames: compact varints over serde. Replaced the unmaintained `bincode` in 0.2.2 (RUSTSEC-2025-0141). |
 | [`serde`](https://crates.io/crates/serde) | Serialisation framework. All data structures derive Serialize/Deserialize. |
 | [`ring`](https://crates.io/crates/ring) | HMAC-SHA256 for gossip message authentication. SHA-256 for spec hashing. |
 | [`age`](https://crates.io/crates/age) | Encryption for the recovery candidate list and Raft log at-rest encryption. |

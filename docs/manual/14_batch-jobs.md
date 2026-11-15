@@ -134,7 +134,7 @@ those exact unknown grants; repeating an old acknowledgement can't authorise a
 later unknown attempt. The cluster service principal cannot make this decision.
 
 Singleton status and logs use `run-ID`, a stable identifier independent of the
-worker's reusable runtime slot. `relish status` reports a live singleton's PID;
+worker's reusable runtime slot. `relish apps --instances` reports a live singleton's PID;
 indexed batches stay in summary views. Select `--instance run-ID` when several
 retained runs share a logical name. Live logs follow the owning worker and
 completed singleton output remains bounded by the task-output retention policy.
@@ -306,6 +306,9 @@ Every node exports Mayo series for the attempts it ran itself, so they survive
 a leader change. Each carries only `namespace`, `definition` (the job or array
 name), `profile` (a manifest's resource profile, `default` otherwise) and
 `node`, never a task index or run ID. A node keeps at most 1,024 label sets.
+A label set drops out of the samples 15 minutes after its last attempt ended,
+and comes back with its old totals if the definition runs again, so a
+finished array doesn't keep adding rows to the metrics store.
 
 | Series | Meaning |
 |--------|---------|
@@ -331,6 +334,26 @@ can go unannounced; its outcome is still in the definition's history.
 `relish top` lists running array tasks as one row per definition and profile
 on each node, with the number of tasks in the PID column (`tasks:27`) and
 their CPU and memory. A singleton run keeps its own `run-ID` row.
+
+## Testing failure
+
+Smoker's workload faults reach running attempts, so you can watch a job's
+retry policy work before a real failure does it for you:
+
+```sh
+relish fault kill render --instance 41 --acknowledge
+relish fault pause migrate --duration 2m --acknowledge
+relish batch results 42 --failed --limit 20
+```
+
+A killed attempt behaves like a crash: a failed attempt that retries under
+`max_attempts` in a reusable executor, and an `Unknown` outcome in a container
+or process of its own, which runs again only with `replay_unknown = true` (or
+after `relish batch replay`). A paused attempt meets its `task_timeout_secs`,
+which is how you see a timeout become `Unknown` or a retry. `--instance`
+takes a task index. Commands in a reusable executor
+(`shared-runc`, or process jobs with Linux limits) take kill and pause only;
+see `relish manual chaos` for what reaches one task and which rails apply.
 
 ## Execution and capacity limits
 
@@ -529,7 +552,15 @@ its attempt has positively retired.
 ## Reusable containers
 
 For short image commands, select `runtime = "shared-runc"` explicitly
-in the job or profile template. The default remains `runc`.
+in the job or profile template, or pass `--runtime shared-runc` to
+`relish run --batch`. The default remains `runc`.
+`examples/phase-8/container-shared-runc-array.toml` is a 1,000-task array on
+reusable containers, with both forms in its header:
+
+```sh
+relish batch submit examples/phase-8/container-shared-runc-array.toml --dry-run
+relish batch submit examples/phase-8/container-shared-runc-array.toml
+```
 
 ```toml
 [job.prepare-record]
@@ -550,7 +581,8 @@ journal, bundle and route files, and at startup it sweeps any an interrupted
 retirement left behind, so executor metadata doesn't grow with every namespace
 that ever ran a job.
 
-The command is born in its task cgroup, with independent CPU and memory limits.
+The command is born in its task cgroup, with independent CPU, memory and
+process limits.
 It receives its own mount and IPC namespaces, empty environment before explicit
 image/job variables, and fresh 16 MiB `/tmp` and `/dev/shm` filesystems. Its root
 is read-only; regular files have a 1 MiB size limit. No command receives the
@@ -589,10 +621,32 @@ in both fresh and reused execution. A job exceeding its RAM limit can be OOM-kil
 spill into swap and consume unaccounted disk I/O. Choose the memory range for
 the actual working set, including model weights.
 
-Some limits are fixed rather than derived from the profile. Each command's
-task cgroup allows 256 processes and threads (`pids.max`); threads count, so a
-JVM or another heavily threaded command may need fresh containers instead. The
-helper's own cgroup allows 16, outside the command's limits. `/tmp` and
+Each command's task cgroup allows 256 processes and threads (`pids.max`)
+unless the job sets `pids`. Threads count, so give a JVM or another heavily
+threaded command more:
+
+```toml
+[job.index-build]
+image = "registry.example.com/indexer@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+runtime = "shared-runc"
+command = ["/usr/bin/java", "-jar", "/opt/indexer.jar"]
+memory = "512Mi-1Gi"
+pids = 2048
+```
+
+`pids` takes 1 to 32768; 0, anything larger, and anything that isn't a whole
+number are refused when the job is applied or submitted. The limit is part of
+the executor profile, like CPU and memory, so jobs with different limits never
+share a container. It doesn't reserve anything: processes aren't a scheduled
+resource. A fresh `runc` job gets the limit as its container's `pids.max` when
+it sets one, and no limit when it doesn't, the same as an omitted `cpu` or
+`memory`. Host jobs need the native executor to enforce it; a node on the
+fallback process backend refuses a host job that sets `pids`, as it refuses
+CPU and memory ranges. Kubernetes export reports `pids` as unsupported: a Pod
+spec has no process limit, only the kubelet's per-node `podPidsLimit`.
+
+Some limits are fixed rather than derived from the profile. The helper's own
+cgroup allows 16 processes, outside the command's limits. `/tmp` and
 `/dev/shm` are 16 MiB tmpfs mounts, and regular files written anywhere are
 capped at 1 MiB.
 
@@ -600,7 +654,7 @@ Reusable executors need Linux 5.8 or later, the same minimum as the rest of
 the node. Bun checks the kernel the first time it is asked for an executor and
 logs what it found. On an older kernel the pools are off: `shared-runc` jobs
 fail with a reason, and host jobs use the original owned process backend,
-which refuses explicit CPU and memory ranges. A kernel without `cgroup.kill`
+which refuses explicit CPU and memory ranges and `pids`. A kernel without `cgroup.kill`
 (before 5.14, such as Debian 11's 5.10) keeps its pools: retirement freezes the
 task cgroup and kills each process in it instead. Native host executors also
 need `CONFIG_PROC_CHILDREN`, which every mainstream distribution kernel
@@ -615,7 +669,7 @@ decrypt with live keys for the job's namespace. Decrypted configuration stays
 execution-local; captured output uses normal scoped retention. Host jobs require the owned process runtime, an absolute
 allowlisted binary (or `/bin/sh` for scripts) and disabled mount isolation.
 Rootful Linux process jobs use bounded native executors and accept explicit
-CPU/memory ranges. Each fresh command is born inside its limited task cgroup;
+CPU/memory ranges and `pids`. Each fresh command is born inside its limited task cgroup;
 helper overhead stays reserved while its executor is idle. Commands retain
 Bun's user, privileges and host filesystem access: under a root Bun they run
 as root with every capability, and nothing sets `no_new_privs`. Use trusted
@@ -626,7 +680,7 @@ environment, then the job's own `env`. Other Bun variables, such as cloud
 credentials, never reach a command. `relish exec` into a host workload gets
 that workload's environment, as `docker exec` would.
 Other platforms retain the original owned process backend and refuse explicit
-resource ranges. This change applies to jobs; host applications keep their
+resource ranges and `pids`. This change applies to jobs; host applications keep their
 existing runtime contract. GPU jobs remain refused;
 GPU placement is tracked separately in #359. Test-lease workloads retain their
 lease-aware admission; unowned lease namespaces and images are refused here.
@@ -833,6 +887,16 @@ relish bench --scenario jobs-host-processes --report before.json
 relish bench --scenario jobs-host-processes --compare before.json --tolerance 15
 ```
 
+The report also breaks the window's successes down per node, from the
+counters each node reported to the leader, with the same cutoff as the total.
+Each node's fair share is its slots as a fraction of every node's. A node more
+than 20% over its fair share (above 40% on three equal nodes, 60% on two) makes
+the run fail, because a total that one node carries doesn't show the work
+spreading. A node whose counter went backwards restarted inside the window and
+is flagged. JSON reports carry the breakdown as `per_node`; reports from
+before 0.2.3 don't have it, still work as `--compare` baselines, and print
+`per node: not recorded`.
+
 A baseline from another scenario, or one that didn't complete and clean up,
 is refused before anything runs. A different window, concurrency, CPU
 request, image or executable makes the verdict informational: it's printed
@@ -1028,9 +1092,36 @@ Fresh receipt chunks contain one job; fast paths use 1,000 jobs. This reporting
 choice makes slow progress visible and amortises fast outcomes, so the rate gap
 also includes receipt granularity. Chunk size never decides how many jobs fit.
 
-The landing page's recording is an earlier development build's single run
-(`006aca5f`, [record](../qualification/2026-10-09-timed-job-scenarios/README.md)):
-3.55/s for fresh containers and 966.7/s for shared ones then.
+## Measured on 0.2.3: host jobs for a day
+
+0.2.3's candidate was measured on the same M2 Max host, on 4-vCPU / 6 GiB
+Ubuntu 24.04 VMs, with host jobs running Ubuntu's statically linked BusyBox
+`true`, 27 slots per node and 1,000-task chunks:
+
+| Run | Nodes | Host jobs a second | Record |
+|---|---:|---:|---|
+| `relish bench --scenario jobs-host-processes` | 1 | 14,916.7 | [throughput record](../qualification/2026-10-27-v0.2.3-candidate-throughput/README.md) |
+| The same, scaled out | 3 | 29,350.0 | same record |
+| A real 24-hour day (`qualify-jobs-sustained.sh --tier day`) | 3 | 20,920.0: 1,807,742,226 in 24 h | [day-run record](../qualification/2026-10-28-v0.2.3-day-run.md) |
+
+The day run is a count, not an extrapolation: every task was accepted by the
+council within the 24 hours, the three nodes within a point of their fair
+shares, with no failed tasks. It ran below the benchmark because three VMs filled
+the laptop's twelve cores for a whole day; plan from your own hardware's
+sustained rate, not a minute's peak. Bun's memory grew from about 200 MiB to
+up to 345 MiB over that day, still inside the 384 MiB (512 MiB on the node
+serving the API) job budget. The 0.2.8 day run on a Mac Studio
+([record](../qualification/2026-11-14-v0.2.8-memory-run.md), #1417) showed
+what that growth is: free memory glibc's allocator keeps after log queries,
+not live heap. It levels off once a node's log store stops growing, so a
+node whose store fills slowly (a quiet app, many small files) takes longest
+to reach its plateau.
+
+The landing page's recording is one run of the published 0.2.8 on an Apple
+M5 Max Mac Studio, in a 4-vCPU, 8 GiB VM
+([record](../qualification/2026-11-12-v0.2.8-job-throughput-recording/README.md)):
+18.0/s for fresh containers, 9,616.7/s for shared ones and 13,100/s for host
+jobs. Its rates come from a different host than the table above.
 An independent rerun on an older M1 Max laptop VM (five interleaved rounds per
 build) measured raw and host-job rates 14–23% lower and the container paths 1.7
 to 3 times higher. With about 13 ms of real CPU work per task, host jobs

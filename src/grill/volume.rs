@@ -718,7 +718,6 @@ fn chown_tree(
     use nix::fcntl::{AtFlags, OFlag};
     use nix::sys::stat::{Mode, SFlag, fstat, fstatat};
     use nix::unistd::{Gid, Uid, fchown, fchownat};
-    use std::os::fd::AsRawFd;
     use std::rc::Rc;
 
     let directory_flags =
@@ -750,10 +749,10 @@ fn chown_tree(
     let io = |errno: Errno| VolumeError::Io(std::io::Error::from(errno));
 
     let top = Dir::open(root, directory_flags, Mode::empty()).map_err(io)?;
-    let stat = fstat(top.as_raw_fd()).map_err(io)?;
+    let stat = fstat(&top).map_err(io)?;
     if let Some(owner) = new_owner(owner_of(&stat)) {
         fchown(
-            top.as_raw_fd(),
+            &top,
             Some(Uid::from_raw(owner.uid)),
             Some(Gid::from_raw(owner.gid)),
         )
@@ -761,8 +760,7 @@ fn chown_tree(
     }
     let mut pending = children(top).map_err(io)?;
     while let Some((parent, name)) = pending.pop() {
-        let parent_fd = Some(parent.as_raw_fd());
-        let stat = match fstatat(parent_fd, name.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
+        let stat = match fstatat(&*parent, name.as_c_str(), AtFlags::AT_SYMLINK_NOFOLLOW) {
             Ok(stat) => stat,
             // Deleted by the running container since we listed it.
             Err(Errno::ENOENT) => continue,
@@ -770,7 +768,7 @@ fn chown_tree(
         };
         if let Some(owner) = new_owner(owner_of(&stat)) {
             match fchownat(
-                parent_fd,
+                &*parent,
                 name.as_c_str(),
                 Some(Uid::from_raw(owner.uid)),
                 Some(Gid::from_raw(owner.gid)),
@@ -783,7 +781,7 @@ fn chown_tree(
         if !is_directory(&stat) {
             continue;
         }
-        match Dir::openat(parent_fd, name.as_c_str(), directory_flags, Mode::empty()) {
+        match Dir::openat(&*parent, name.as_c_str(), directory_flags, Mode::empty()) {
             Ok(directory) => pending.extend(children(directory).map_err(io)?),
             // Swapped for a symlink or a file, or removed: not ours to walk.
             Err(Errno::ELOOP | Errno::ENOTDIR | Errno::ENOENT) => continue,

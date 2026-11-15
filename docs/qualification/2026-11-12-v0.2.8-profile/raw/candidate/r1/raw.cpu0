@@ -1,0 +1,64 @@
+## clock
+1794460307.476858673
+## proc_stat
+cpu  501 0 271 15234 44 0 88 0 0 0
+## bun_stat
+28 23 1 3
+## bun_status
+hwm_kb 112136
+rss_kb 112136
+threads 16
+ctxt 9342
+## cgroups
+/sys/fs/cgroup/sys-fs-fuse-connections.mount 920
+/sys/fs/cgroup/sys-kernel-config.mount 1398
+/sys/fs/cgroup 8625000
+/sys/fs/cgroup/sys-kernel-debug.mount 1567
+/sys/fs/cgroup/dev-mqueue.mount 1547
+/sys/fs/cgroup/user.slice/user-501.slice 699251
+/sys/fs/cgroup/user.slice/user-501.slice/user@501.service 270735
+/sys/fs/cgroup/user.slice/user-501.slice/session-4.scope 283264
+/sys/fs/cgroup/user.slice 701682
+/sys/fs/cgroup/sys-kernel-tracing.mount 530
+/sys/fs/cgroup/init.scope 642709
+/sys/fs/cgroup/system.slice/system-systemd\x2dfsck.slice 8489
+/sys/fs/cgroup/system.slice/systemd-networkd.service 10787
+/sys/fs/cgroup/system.slice/systemd-udevd.service 312137
+/sys/fs/cgroup/system.slice/systemd-udevd.service/udev 312137
+/sys/fs/cgroup/system.slice/cron.service 1750
+/sys/fs/cgroup/system.slice/lxd-installer.socket 177
+/sys/fs/cgroup/system.slice/system-serial\x2dgetty.slice 1367
+/sys/fs/cgroup/system.slice/system-serial\x2dgetty.slice/serial-getty@hvc0.service 1367
+/sys/fs/cgroup/system.slice/lima-guestagent.service 524347
+/sys/fs/cgroup/system.slice/boot.mount 1449
+/sys/fs/cgroup/system.slice/ssh.socket 280
+/sys/fs/cgroup/system.slice/polkit.service 16304
+/sys/fs/cgroup/system.slice 6021015
+/sys/fs/cgroup/system.slice/multipathd.service 9728
+/sys/fs/cgroup/system.slice/system-modprobe.slice 8363
+/sys/fs/cgroup/system.slice/ModemManager.service 22690
+/sys/fs/cgroup/system.slice/systemd-journald.service 50287
+/sys/fs/cgroup/system.slice/ssh.service 48058
+/sys/fs/cgroup/system.slice/rsyslog.service 36247
+/sys/fs/cgroup/system.slice/boot-efi.mount 1511
+/sys/fs/cgroup/system.slice/cloud-config.service 170310
+/sys/fs/cgroup/system.slice/snapd.socket 138
+/sys/fs/cgroup/system.slice/rb-bun.service 722780
+/sys/fs/cgroup/system.slice/systemd-resolved.service 28147
+/sys/fs/cgroup/system.slice/udisks2.service 16514
+/sys/fs/cgroup/system.slice/dbus.service 64172
+/sys/fs/cgroup/system.slice/systemd-timesyncd.service 11035
+/sys/fs/cgroup/system.slice/system-getty.slice 1973
+/sys/fs/cgroup/system.slice/system-getty.slice/getty@tty1.service 1973
+/sys/fs/cgroup/system.slice/systemd-logind.service 30171
+/sys/fs/cgroup/proc-sys-fs-binfmt_misc.mount 1507
+/sys/fs/cgroup/reliaburger 3321
+/sys/fs/cgroup/reliaburger/default 3321
+/sys/fs/cgroup/reliaburger/default/web 3321
+/sys/fs/cgroup/dev-hugepages.mount 1645
+## ctxt
+ctxt 163276
+processes 2081
+## psi_cpu
+some avg10=0.05 avg60=0.21 avg300=0.06 total=337608
+full avg10=0.00 avg60=0.00 avg300=0.00 total=0

@@ -3,10 +3,20 @@
 /// When the `ebpf` feature is enabled on Linux, compiles the eBPF
 /// C programs in `ebpf/` to `.bpf.o` object files using clang.
 /// On other platforms or without the feature, this is a no-op.
-use std::path::Path;
+///
+/// It also packs the source bundle `relish` embeds (#1570).
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
+// The packing code lives in the library, which tests it; a build script
+// can't depend on the crate it builds, so it compiles the same file.
+#[path = "src/relish/source_bundle/pack.rs"]
+mod pack;
+
 fn main() {
+    embed_source();
+    find_gym_scenarios();
+
     // Cargo exposes TARGET only to build scripts. Re-export it so Phase 15
     // evidence can distinguish otherwise identical cross-compiled binaries.
     if let Ok(target) = std::env::var("TARGET") {
@@ -29,6 +39,98 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") && cfg!(feature = "ebpf") {
         compile_ebpf();
     }
+}
+
+/// Set `gym_scenarios` when `scripts/gym/relish-scenarios.rs` is there, so
+/// `src/relish/gym/catalogue.rs` includes it. It's the gym's answer key and
+/// stays out of the source bundle (#1687), so a build from the bundle alone
+/// has no scenarios. A release build (`RELIABURGER_REQUIRE_CLEAN_SOURCE=1`)
+/// fails without them rather than ship a `relish gym run` with nothing to
+/// run. The cfg also gates the scorer's parity tests, whose shared fixture
+/// is under `scripts/gym/` too: it marks a checkout that has the gym's
+/// files, and `every_included_file_is_in_the_bundle_or_behind_its_cfg`
+/// holds every other include to the bundle (#1691).
+fn find_gym_scenarios() {
+    println!("cargo:rustc-check-cfg=cfg(gym_scenarios)");
+    println!("cargo:rerun-if-env-changed=RELIABURGER_REQUIRE_CLEAN_SOURCE");
+    let root = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("Cargo manifest dir"));
+    let gym = root.join("scripts/gym");
+    let scenarios = gym.join("relish-scenarios.rs");
+    if scenarios.is_file() {
+        println!("cargo:rerun-if-changed={}", scenarios.display());
+        println!("cargo:rustc-cfg=gym_scenarios");
+        return;
+    }
+    // A file added to the directory changes its modification time, so a
+    // checkout that gains the scenarios sets the cfg on the next build.
+    if gym.is_dir() {
+        println!("cargo:rerun-if-changed={}", gym.display());
+    }
+    if std::env::var("RELIABURGER_REQUIRE_CLEAN_SOURCE").as_deref() == Ok("1") {
+        panic!(
+            "RELIABURGER_REQUIRE_CLEAN_SOURCE is set, but {} is missing: this relish would \
+             have no gym scenarios",
+            scenarios.display()
+        );
+    }
+}
+
+/// Pack the build, test and read set into `$OUT_DIR/source.tar.zst` for
+/// `relish` to embed, and record its digest, compression level and dirty
+/// flag as `RELIABURGER_SOURCE_*` environment variables for the crate.
+///
+/// Only release builds and builds with the `embed-source` feature embed it.
+/// The rest skip all of this, and `relish source` reads the checkout at run
+/// time: watching the allowlist made every book or test edit rebuild the
+/// whole crate (0.5 s to 21 s for a warm `cargo build --bin relish`).
+fn embed_source() {
+    println!("cargo:rustc-check-cfg=cfg(source_bundle_embedded)");
+    let release = std::env::var("PROFILE").as_deref() == Ok("release");
+    if !release && std::env::var_os("CARGO_FEATURE_EMBED_SOURCE").is_none() {
+        return;
+    }
+    println!("cargo:rustc-cfg=source_bundle_embedded");
+
+    let root = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("Cargo manifest dir"));
+    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo output directory"));
+    // Cargo watches a directory recursively, by modification time.
+    for entry in pack::ALLOWLIST {
+        println!("cargo:rerun-if-changed={entry}");
+    }
+    println!("cargo:rerun-if-env-changed=RELIABURGER_REQUIRE_CLEAN_SOURCE");
+
+    let files = pack::list_files(&root, pack::ALLOWLIST).expect("list the source bundle's files");
+    let tar = pack::write_tar(&root, &files).expect("pack the source bundle");
+    // Level 19 squeezes the most out for what we ship, in seconds; level 3
+    // compresses a dev build's copy in a fraction of one.
+    let level = if release { 19 } else { 3 };
+    let bundle =
+        zstd::stream::encode_all(tar.as_slice(), level).expect("compress the source bundle");
+    std::fs::write(out_dir.join("source.tar.zst"), bundle).expect("write the source bundle");
+
+    let dirty = pack::dirty(&root, pack::ALLOWLIST);
+    let require_clean = std::env::var("RELIABURGER_REQUIRE_CLEAN_SOURCE").as_deref() == Ok("1");
+    if require_clean && dirty != Some(false) {
+        panic!(
+            "RELIABURGER_REQUIRE_CLEAN_SOURCE is set, but git {} changes in the embedded source",
+            if dirty.is_none() {
+                "can't check for"
+            } else {
+                "lists"
+            }
+        );
+    }
+    let dirty = match dirty {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "unknown",
+    };
+    println!(
+        "cargo:rustc-env=RELIABURGER_SOURCE_DIGEST={}",
+        pack::digest(&tar)
+    );
+    println!("cargo:rustc-env=RELIABURGER_SOURCE_DIRTY={dirty}");
+    println!("cargo:rustc-env=RELIABURGER_SOURCE_LEVEL={level}");
 }
 
 /// The checkout's HEAD commit, or `None` when git can't say (no git, not a

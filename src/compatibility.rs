@@ -140,9 +140,110 @@ pub struct Compatibility {
 /// couldn't start, so a refused scale-up moves only those (#971).
 /// The Raft `log.redb` and `snapshot.redb` files are redb's v3 file format
 /// (redb 4), which can't open the v2 files redb 2 wrote (#1024).
+///
+/// 0.2.2, UX patch (53/70): one bump for the whole release, made when the
+/// train opened. Each 0.2.2 change to the wire or durable state adds its
+/// line below this one, not another bump.
+/// An exec answer, from `POST /v1/exec` and from a process owner's
+/// exec socket, carries the command's `exit_code` beside its `output` (#522).
+/// `JobSpec::pids`, the per-command process limit, in Raft desired state,
+/// task-array templates and node syncs, and the OCI `linux.resources.pids`
+/// block in fresh job containers' specs and their owner records (#741).
+/// `FaultRequest`, `FaultRule` and routed workload faults carry a `workload`
+/// kind and a `task_index`, `FaultSummary` a `task_index`, and nodes answer
+/// `GET /v1/fault/attempts` with their running job attempts (#704).
+/// Gossip datagrams, reporting frames and the Raft log's vote, log ids and
+/// encrypted-entry envelope are postcard, not bincode (#1026).
+///
+/// 0.2.4, Extension points (55/72): one bump for the whole release, made by its first wire or state change. Each later 0.2.4 change adds its line below this one, not another bump.
+/// A node's capability report lists the secret providers it runs
+/// (`NodeCapabilities::secret_providers`), and an app's env value
+/// `PROVIDER[name:path]` is a provider reference in Raft desired state,
+/// not plain text (#1123).
+/// An app's `stop_signal`, `stop_grace`, `pre_stop` and `pre_stop_timeout`
+/// in Raft desired state and node syncs, and the `stop` policy in OCI
+/// specs, instance records, runtime intents and process owner records (#1121).
+/// Policies in the council: the `PolicySpec`, `PolicyDelete` and
+/// `PolicyFenced` Raft requests, the `PolicyGenerationMoved` response,
+/// `DesiredState::policies` and `policy_generation`, the GitOps ownership
+/// set's `policies`, `[policy.*]` in applied configs, `GET /v1/policies`
+/// and the 422 `PolicyRefusal` body of a refused apply (#1117).
+/// Fill-only policy defaults: `PolicySpec::deny` is optional and a
+/// policy may carry a `default` table, `PolicyFenced` carries the
+/// declared spec, and `DesiredState::declared_apps` keeps it beside the
+/// effective one (#1118).
+/// Policies for jobs and the audit action: `PolicySpec::applies_to`,
+/// `PolicyAction::Audit`, a finding's `kind` and `workload` in API JSON,
+/// `Verdict::audits`, and `GET /v1/policies/audit` (#1119).
+/// An app's `[runtime]` knobs in Raft desired state and node syncs, the
+/// knobs and the OCI `linux.sysctl`, `linux.devices` and device rules in OCI
+/// specs and instance records, and the node's knob allowlist in its
+/// capability report (`NodeCapabilities::runtime_knobs`) (#1122).
+/// An app's `sidecar` list in Raft desired state, node syncs and instance
+/// records, and `NodeCapabilities::shared_network` in the capability report
+/// (#1120).
+/// An app's and a job's `provenance` (the template and `use` that made it)
+/// in Raft desired state, node syncs, job definitions and the apply API,
+/// and `[template.*]` and `[use.*]` in applied configs (#1124).
+/// An app's `owner` in Raft desired state, the `AppRelease` Raft request,
+/// the owner checks the state machine applies to app writes, `owner` in
+/// `GET /v1/diagnostics/apps`, and `GET /v1/events` answering scoped tokens
+/// with their own namespaces' events (#1125).
+/// A runtime knob no longer parses with a `CAP_NET_*` capability (#1427)
+/// or the `m` device permission, and a device's permissions default to
+/// `rw`, not `rwm` (#1442), in desired state, OCI specs, instance records
+/// and the node's knob allowlist.
+/// A runtime knob no longer parses with a capability the kernel checks
+/// against the node's own user namespace (`HOST_CAPABILITIES`, 22 of them,
+/// `CAP_SYS_TIME`, `CAP_SYS_NICE` and `CAP_IPC_LOCK` among them), and only
+/// `CAP_SYS_ADMIN`, `CAP_SYS_BOOT` and `CAP_SYS_PTRACE` are escape hatches
+/// (#1474), in desired state, OCI specs, instance records and the node's
+/// knob allowlist.
+///
+/// 0.2.5, bugs an outside evaluation found (56/73): one bump for the whole
+/// release, made by its first wire or state change. Each later 0.2.5 change
+/// adds its line below this one, not another bump.
+/// An init container's `env` in Raft desired state and node syncs (#1498).
+/// `InitContainerSpec` refuses unknown fields, so a 0.2.4 node can't decode
+/// an app that sets it.
+///
+/// 0.2.6, the rest of the evaluation's bugs (57/73): one protocol bump for
+/// the whole release; the durable state doesn't change. Each later 0.2.6
+/// change adds its line below this one.
+/// A node with no Raft seat fetches the leader's view of the security state
+/// from `/v1/cluster/security-view` (#1477), which a 0.2.5 leader doesn't
+/// serve, so such a node would wait for API tokens that never come.
+///
+/// 0.2.8, agents you can trust (58/74): one bump for the whole release,
+/// made by its first wire or state change. Each later 0.2.8 change adds its
+/// line below this one, not another bump.
+/// Agent leases (#1686): `DesiredState::agent_leases`, the `LeaseTake`,
+/// `LeaseRenew`, `LeaseRelease`, `LeaseBreak` and `LeaseExpire` Raft
+/// requests and the `AgentLease` council response.
+/// A state report's `ResourceUsage` carries `gpu_used` as a `u32` and a new
+/// `gpu_total`, so the leader counts GPUs instead of assuming none
+/// (`GET /v1/cluster/summary`).
+/// Agent proposals (#1682): `DesiredState::proposals`, the `Proposal*` Raft
+/// requests, the `Proposal` council response, and `ApiToken::kind`.
+/// Lease fences (#1686): the `LeaseFenced` Raft request and the
+/// `LeaseGenerationMoved` council response.
+/// An instance status carries `age_seconds`, and the relay forwards
+/// `/v1/cluster/summary/node`, for `relish apps` and `relish nodes`.
+/// The summary's council section names `other_leaders`, a split brain.
+/// Guardrails (#1682): a policy's `applies_to = "proposals"` and `action =
+/// "approve"`, and a finding's `kind = "proposal"`.
+/// The summary's leader view carries the live leases and the waiting
+/// proposals, and the summary an `agents` section (#1682).
+/// Every audit record carries `principal_kind` (#1682): a node's audit log
+/// and `GET /v1/audit`, which `--cluster` asks every peer for, so an older
+/// node's records or answer don't parse.
+/// More proposal kinds (#1682): `restart`, `cancel_deploy` and
+/// `clear_fault`, a proposal's `fault`, `AppSpec::restarted_at`, the
+/// blast radius's forecast fields, and a failed proposal's
+/// `blast_radius_grew` and `fault` reasons.
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 52,
-    state: 69,
+    protocol: 58,
+    state: 74,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use super::api::ApiState;
 use super::batch::{forward_get_to_leader, forward_to_leader};
+use super::leadership::council_to_forward_to;
 use super::task_array_leader::{NodeView, TaskArrayWriteError, read_task_arrays, write_task_array};
 use super::task_array_node::{MAX_RESULT_ROWS, NodeSyncRequest, TaskArrayNodeError, TaskResultRow};
 use crate::config::job::JobSpec;
@@ -64,6 +65,9 @@ pub struct TaskArraySubmitResponse {
     pub count: u32,
     /// Chunks the tasks are grouped into.
     pub chunks: u32,
+    /// What the `warn` policies said about the array (#1424).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policy_warnings: Vec<String>,
 }
 
 /// `GET /v1/batch/{id}/results` query.
@@ -143,15 +147,6 @@ fn validate_submission(request: &mut TaskArraySubmitRequest) -> Result<String, S
     Ok(namespace)
 }
 
-async fn follower_council(state: &ApiState) -> Option<&crate::council::CouncilNode> {
-    let council = state.council.as_deref()?;
-    if council.is_leader().await {
-        None
-    } else {
-        Some(council)
-    }
-}
-
 /// `POST /v1/batch/array`: submit a task array.
 pub async fn submit_handler(
     State(state): State<ApiState>,
@@ -178,7 +173,7 @@ pub async fn submit_handler(
         return response;
     }
     crate::bun::audit::annotate_workload(&request.name, &namespace);
-    if let Some(council) = follower_council(&state).await {
+    if let Some(council) = council_to_forward_to(&state).await {
         return forward_to_leader(&state, council, "/v1/batch/array", body, &headers).await;
     }
     let count = request.spec.count;
@@ -195,7 +190,7 @@ pub async fn submit_handler(
         replay_unknown: true,
         hook: false,
     };
-    if let Err(response) = super::job_api::admit_definition(
+    let policy_warnings = match super::job_api::admit_definition(
         &state,
         auth,
         binder.as_deref(),
@@ -203,11 +198,13 @@ pub async fn submit_handler(
         &namespace,
         &mut definition,
         None,
+        super::job_api::PolicyCheck::Judge,
     )
     .await
     {
-        return response;
-    }
+        Ok(warnings) => warnings,
+        Err(response) => return response,
+    };
     let trigger = if definition.cron.is_some() {
         None
     } else {
@@ -231,10 +228,17 @@ pub async fn submit_handler(
                 batch_id,
                 count,
                 chunks,
+                policy_warnings,
             }),
         )
             .into_response(),
-        Ok(None) => (StatusCode::ACCEPTED, Json(serde_json::json!({"batch_id":null,"count":count,"chunks":chunks,"schedule_registered":true}))).into_response(),
+        Ok(None) => {
+            let mut answer = serde_json::json!({"batch_id":null,"count":count,"chunks":chunks,"schedule_registered":true});
+            if !policy_warnings.is_empty() {
+                answer["policy_warnings"] = serde_json::json!(policy_warnings);
+            }
+            (StatusCode::ACCEPTED, Json(answer)).into_response()
+        }
         Err(e) => write_error(e),
     }
 }
@@ -302,9 +306,10 @@ pub async fn manifest_handler(
         }
         cohort.template = array.template;
     }
-    if let Some(council) = follower_council(&state).await {
+    if let Some(council) = council_to_forward_to(&state).await {
         return forward_to_leader(&state, council, "/v1/batch/manifest", body, &headers).await;
     }
+    let mut policy_warnings = Vec::new();
     for cohort in &mut request.cohort {
         let mut definition = crate::meat::job::JobDefinition {
             template: cohort.template.clone(),
@@ -313,7 +318,7 @@ pub async fn manifest_handler(
             replay_unknown: true,
             hook: false,
         };
-        if let Err(response) = super::job_api::admit_definition(
+        match super::job_api::admit_definition(
             &state,
             auth,
             binder.as_deref(),
@@ -321,10 +326,12 @@ pub async fn manifest_handler(
             &request.namespace,
             &mut definition,
             None,
+            super::job_api::PolicyCheck::Judge,
         )
         .await
         {
-            return response;
+            Ok(warnings) => policy_warnings.extend(warnings),
+            Err(response) => return response,
         }
         cohort.template = definition.template;
     }
@@ -340,11 +347,13 @@ pub async fn manifest_handler(
         submitted_at_epoch_secs: epoch_now_secs(),
     };
     match write_task_array(&state, write).await {
-        Ok(Some(batch_id)) => (
-            StatusCode::ACCEPTED,
-            Json(serde_json::json!({"batch_id": batch_id})),
-        )
-            .into_response(),
+        Ok(Some(batch_id)) => {
+            let mut answer = serde_json::json!({"batch_id": batch_id});
+            if !policy_warnings.is_empty() {
+                answer["policy_warnings"] = serde_json::json!(policy_warnings);
+            }
+            (StatusCode::ACCEPTED, Json(answer)).into_response()
+        }
         Ok(None) => error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "manifest admission returned no identity",
@@ -447,6 +456,12 @@ pub async fn cancel_handler(
     AxumPath(batch_id): AxumPath<u64>,
     headers: HeaderMap,
 ) -> Response {
+    // Forward before looking the run up: a lagging replica doesn't know
+    // every run, and the leader authorises the forwarded caller itself.
+    if let Some(council) = council_to_forward_to(&state).await {
+        let path = format!("/v1/batch/{batch_id}/cancel");
+        return forward_to_leader(&state, council, &path, String::new(), &headers).await;
+    }
     let auth = auth.as_deref();
     if let Err(response) =
         crate::sesame::auth::authorize(auth, crate::sesame::types::ApiRole::Deployer)
@@ -513,10 +528,6 @@ pub async fn cancel_handler(
         ) {
             return response;
         }
-    }
-    if let Some(council) = follower_council(&state).await {
-        let path = format!("/v1/batch/{batch_id}/cancel");
-        return forward_to_leader(&state, council, &path, String::new(), &headers).await;
     }
     match write_task_array(&state, write).await {
         Ok(_) => (
@@ -1015,6 +1026,15 @@ pub async fn results_handler(
         .limit
         .unwrap_or(DEFAULT_RESULT_ROWS)
         .min(MAX_RESULT_ROWS);
+    if let Some(council) = council_to_forward_to(&state).await {
+        let path = format!(
+            "/v1/batch/{batch_id}/results?failed={}&limit={limit}{}{}",
+            query.failed,
+            query.after.map_or(String::new(), |a| format!("&after={a}")),
+            query.index.map_or(String::new(), |i| format!("&index={i}"))
+        );
+        return forward_get_to_leader(&state, council, &path, &headers).await;
+    }
     let arrays = read_task_arrays(&state).await;
     let Some(record) = arrays.get(batch_id) else {
         return error(
@@ -1026,15 +1046,6 @@ pub async fn results_handler(
         crate::sesame::auth::authorize_scoped(auth.as_deref(), &record.name, &record.namespace)
     {
         return response;
-    }
-    if let Some(council) = follower_council(&state).await {
-        let path = format!(
-            "/v1/batch/{batch_id}/results?failed={}&limit={limit}{}{}",
-            query.failed,
-            query.after.map_or(String::new(), |a| format!("&after={a}")),
-            query.index.map_or(String::new(), |i| format!("&index={i}"))
-        );
-        return forward_get_to_leader(&state, council, &path, &headers).await;
     }
     let (start, end, owners) = result_window(record, &query);
     let mut per_node = Vec::new();
@@ -1120,6 +1131,10 @@ pub async fn logs_handler(
     AxumPath((batch_id, index)): AxumPath<(u64, u32)>,
     headers: HeaderMap,
 ) -> Response {
+    if let Some(council) = council_to_forward_to(&state).await {
+        let path = format!("/v1/batch/{batch_id}/tasks/{index}/logs");
+        return forward_get_to_leader(&state, council, &path, &headers).await;
+    }
     let arrays = read_task_arrays(&state).await;
     let Some(record) = arrays.get(batch_id) else {
         return error(
@@ -1141,10 +1156,6 @@ pub async fn logs_handler(
         &permissions,
     ) {
         return response;
-    }
-    if let Some(council) = follower_council(&state).await {
-        let path = format!("/v1/batch/{batch_id}/tasks/{index}/logs");
-        return forward_get_to_leader(&state, council, &path, &headers).await;
     }
     let Some(chunk) = record.state.spec.chunk_of(index) else {
         return error(
@@ -1316,6 +1327,7 @@ mod tests {
 
     fn template() -> JobSpec {
         JobSpec {
+            pids: None,
             runtime: crate::config::job::JobRuntime::Process,
             image: None,
             command: Some(vec!["{index}".to_string()]),
@@ -1333,6 +1345,7 @@ mod tests {
             task_timeout_secs: None,
             overlap: None,
             replay_unknown: false,
+            provenance: None,
         }
     }
 

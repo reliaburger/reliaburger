@@ -19,6 +19,22 @@ pub(super) fn take_whole_entry_withdrawals() -> Vec<crate::onion::vip::VirtualIP
     WHOLE_ENTRY_WITHDRAWALS.with_borrow_mut(std::mem::take)
 }
 
+#[cfg(all(test, not(all(feature = "ebpf", target_os = "linux"))))]
+thread_local! {
+    /// The services each kernel publication on this thread would have
+    /// written under one hold of the eBPF handle's lock, so tests without
+    /// the eBPF data path can count the holds (#1622).
+    static KERNEL_PUBLICATIONS: std::cell::RefCell<Vec<Vec<crate::onion::service_id::ServiceId>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Drain the kernel publications recorded on this thread, one list of
+/// services per hold of the eBPF handle's lock.
+#[cfg(all(test, not(all(feature = "ebpf", target_os = "linux"))))]
+pub(super) fn take_kernel_publications() -> Vec<Vec<crate::onion::service_id::ServiceId>> {
+    KERNEL_PUBLICATIONS.with_borrow_mut(std::mem::take)
+}
+
 impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Republish the current `DnsNxdomain` fault set to the DNS responder.
     ///
@@ -49,7 +65,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .send(crate::onion::dns::DnsFaultState::from_faults(faults));
     }
 
-    /// Require successful kernel publication before acknowledging deployment.
+    /// Journal and publish `service_map`'s entry for `id`, waiting for the
+    /// write inline. Every loop writer now journals within its turn's
+    /// deadline (#1263, #1336); tests use this to publish a fixture.
+    #[cfg(test)]
     pub(super) async fn publish_backend_ebpf(
         &mut self,
         id: &crate::onion::service_id::ServiceId,
@@ -58,13 +77,26 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.publish_backend_snapshot(id, &services).await
     }
 
-    /// Journal attempted routing before acknowledging its kernel publication.
+    /// Journal `services` and wait for the write inline, then publish `id`
+    /// to the kernel, for tests that set up a publication directly.
+    #[cfg(test)]
     pub(super) async fn publish_backend_snapshot(
         &mut self,
         id: &crate::onion::service_id::ServiceId,
         services: &crate::onion::service_map::ServiceMap,
     ) -> Result<(), BunError> {
         self.persist_discovery_publication(id, services).await?;
+        self.publish_journalled_backends(id, services).await
+    }
+
+    /// Publish a candidate the discovery journal already records: to the
+    /// kernel, or, while the consumer controls the views, by marking its
+    /// view stale.
+    pub(super) async fn publish_journalled_backends(
+        &mut self,
+        id: &crate::onion::service_id::ServiceId,
+        services: &crate::onion::service_map::ServiceMap,
+    ) -> Result<(), BunError> {
         if self.consumer_controls_views() {
             return self.mark_consumer_view_stale();
         }
@@ -88,37 +120,69 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// Publish a validated candidate before exposing it to userspace readers.
-    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     pub(super) async fn publish_backend_kernel(
         &self,
         id: &crate::onion::service_id::ServiceId,
         services: &crate::onion::service_map::ServiceMap,
     ) -> Result<(), BunError> {
+        self.publish_backends_kernel(std::slice::from_ref(id), services)
+            .await
+    }
+
+    /// Publish each of `ids`' validated candidates from `services` to the
+    /// kernel under one hold of the eBPF handle's lock. Job tasks take that
+    /// lock thousands of times a second and tokio's lock is fair, so taking
+    /// it once per service would queue behind them once per service (#1622).
+    /// Stops at the first write that fails, as one write at a time did.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    pub(super) async fn publish_backends_kernel(
+        &self,
+        ids: &[crate::onion::service_id::ServiceId],
+        services: &crate::onion::service_map::ServiceMap,
+    ) -> Result<(), BunError> {
         let Some(handle) = self.onion_ebpf.as_ref() else {
             return Ok(());
         };
-        let Some(entry) = services.resolve(id).cloned() else {
+        let entries: Vec<_> = ids
+            .iter()
+            .filter_map(|id| services.resolve(id).map(|entry| (id, entry)))
+            .collect();
+        if entries.is_empty() {
             return Ok(());
-        };
+        }
         let bpf = crate::onion::ebpf::maps::BpfServiceMap::for_consumer(
             self.cluster
                 .as_ref()
                 .map_or("", |cluster| cluster.local_node_id.0.as_str()),
         );
         let mut ebpf = self.lock_kernel(handle).await;
-        bpf.update_backends_bpf(&mut ebpf, entry.vip, entry.port, &entry)
-            .map_err(|error| BunError::BackendPublication {
-                service: id.clone(),
-                reason: error.to_string(),
-            })
+        for (id, entry) in entries {
+            bpf.update_backends_bpf(&mut ebpf, entry.vip, entry.port, entry)
+                .map_err(|error| BunError::BackendPublication {
+                    service: id.clone(),
+                    reason: error.to_string(),
+                })?;
+        }
+        Ok(())
     }
 
     #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
-    pub(super) async fn publish_backend_kernel(
+    pub(super) async fn publish_backends_kernel(
         &self,
-        _id: &crate::onion::service_id::ServiceId,
+        _ids: &[crate::onion::service_id::ServiceId],
         _services: &crate::onion::service_map::ServiceMap,
     ) -> Result<(), BunError> {
+        #[cfg(test)]
+        {
+            let published: Vec<_> = _ids
+                .iter()
+                .filter(|id| _services.resolve(id).is_some())
+                .cloned()
+                .collect();
+            if !published.is_empty() {
+                KERNEL_PUBLICATIONS.with_borrow_mut(|holds| holds.push(published));
+            }
+        }
         Ok(())
     }
 
@@ -127,56 +191,63 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// A no-op without the eBPF data path loaded.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     pub(super) async fn withdraw_service_ebpf(
-        &self,
+        &mut self,
         id: &crate::onion::service_id::ServiceId,
     ) -> Result<(), BunError> {
         // Read the VIP + port straight from the live entry: the VIP is
         // whatever the map allocated (which may have probed off the natural
         // hash on a collision), so we must not re-derive it here.
-        let Some(entry) = self.service_map.resolve(id) else {
+        let Some(entry) = self.service_map.resolve(id).cloned() else {
             return Ok(());
         };
-        self.withdraw_discovery_entry(entry).await
+        self.withdraw_discovery_entry(&entry).await
     }
 
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     pub(super) async fn withdraw_discovery_entry(
-        &self,
+        &mut self,
         entry: &crate::onion::types::ServiceEntry,
     ) -> Result<(), BunError> {
-        let Some(handle) = self.onion_ebpf.as_ref() else {
+        let Some(handle) = self.onion_ebpf.clone() else {
             return Ok(());
         };
         let id = crate::onion::service_id::ServiceId::new(&entry.namespace, &entry.app_name);
         let (vip, port, destination) = (entry.vip, entry.port, entry.app_id);
         let bpf = crate::onion::ebpf::maps::BpfServiceMap::new();
-        let mut ebpf = self.lock_kernel(handle).await;
+        let mut ebpf = self.lock_kernel(&handle).await;
         bpf.remove_backends_bpf(&mut ebpf, vip, port)
             .map_err(|error| BunError::BackendRetirement {
                 service: id.clone(),
                 reason: error.to_string(),
             })?;
-        crate::sesame::firewall::delete_destination_firewall_state(&mut ebpf.bpf, destination)
-            .map_err(|error| BunError::DestinationRetirement {
-                service: id.clone(),
-                reason: error.to_string(),
-            })
+        // Whatever this deleted, the reconcile must write again if the
+        // destination comes back, even with the same grants.
+        let deleted =
+            crate::sesame::firewall::delete_destination_firewall_state(&mut ebpf.bpf, destination);
+        drop(ebpf);
+        self.firewall_writes
+            .firewall
+            .forget_where(|key| key.dst_app_id == destination);
+        deleted.map_err(|error| BunError::DestinationRetirement {
+            service: id.clone(),
+            reason: error.to_string(),
+        })
     }
 
     #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     pub(super) async fn withdraw_service_ebpf(
-        &self,
+        &mut self,
         id: &crate::onion::service_id::ServiceId,
     ) -> Result<(), BunError> {
-        let Some(entry) = self.service_map.resolve(id) else {
+        let Some(entry) = self.service_map.resolve(id).cloned() else {
             return Ok(());
         };
-        self.withdraw_discovery_entry(entry).await
+        self.withdraw_discovery_entry(&entry).await
     }
 
     #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     pub(super) async fn withdraw_discovery_entry(
-        &self,
+        &mut self,
         _entry: &crate::onion::types::ServiceEntry,
     ) -> Result<(), BunError> {
         #[cfg(test)]
@@ -218,18 +289,21 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // is what stops same-named apps in different namespaces from sharing a
         // firewall rule or a namespace mapping (H9). Collect the pairs first so
         // the `list_instances` borrow is released before the async workload-identity lookups.
-        let pairs: Vec<((String, String), InstanceId, bool)> = self
-            .supervisor
-            .list_instances()
-            .into_iter()
-            .map(|i| {
-                (
-                    (i.namespace.clone(), i.app_name.clone()),
-                    i.id.clone(),
-                    i.is_being_created(),
-                )
-            })
-            .collect();
+        // A sidecar's cgroup is its own, beside its app's, so it is bound
+        // under its app's identity: the same namespace and the same
+        // `allow_from` grants (#1426). Only sidecars that should be running
+        // beside a started instance are asked about.
+        let mut pairs: Vec<((String, String), InstanceId, bool)> = Vec::new();
+        let mut sidecar_ids: Vec<((String, String), InstanceId)> = Vec::new();
+        for instance in self.supervisor.list_instances() {
+            let key = (instance.namespace.clone(), instance.app_name.clone());
+            if sidecars::runs_beside(instance.state) {
+                for sidecar in self.sidecars.running_beside(&instance.id) {
+                    sidecar_ids.push((key.clone(), sidecar));
+                }
+            }
+            pairs.push((key, instance.id.clone(), instance.is_being_created()));
+        }
         let mut cgroup_ids: std::collections::HashMap<(String, String), Vec<u64>> =
             std::collections::HashMap::new();
         // Until a sync completes, the tick tries again (#351, stage 3).
@@ -263,6 +337,32 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 Err(_) => {
                     eprintln!(
                         "sesame: source identity for {id} did not arrive within the turn; the next tick retries"
+                    );
+                    return;
+                }
+            }
+        }
+
+        // A sidecar whose cgroup isn't there yet (still being created, or
+        // just restarted) is bound on a later tick: until then it keeps the
+        // sync stale, so the tick tries again.
+        let mut sidecar_unbound = false;
+        for (key, id) in sidecar_ids {
+            let cgroup =
+                tokio::time::timeout_at(deadline, self.supervisor.grill().workload_cgroup(&id))
+                    .await;
+            match cgroup {
+                Ok(Ok(Some(cgroup))) => cgroup_ids.entry(key).or_default().push(cgroup),
+                Ok(Ok(None)) | Ok(Err(crate::grill::GrillError::NotFound { .. })) => {
+                    sidecar_unbound = true;
+                }
+                Ok(Err(error)) => {
+                    eprintln!("sesame: source identity for sidecar {id} is unavailable: {error}");
+                    return;
+                }
+                Err(_) => {
+                    eprintln!(
+                        "sesame: source identity for sidecar {id} did not arrive within the turn; the next tick retries"
                     );
                     return;
                 }
@@ -336,19 +436,21 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             &fw_entries,
             &mut self.cgroup_ns_bpf_keys,
             &mut self.firewall_bpf_keys,
+            &mut self.firewall_writes,
         )
         .and_then(|()| {
             crate::sesame::firewall::reconcile_destination_map(
                 &mut ebpf.bpf,
                 &addresses,
                 &mut self.destination_bpf_keys,
+                &mut self.firewall_writes.destinations,
             )
         });
         drop(ebpf);
         if let Err(error) = reconciled {
             eprintln!("sesame: firewall reconciliation failed: {error}");
         } else {
-            self.namespace_firewall_stale = false;
+            self.namespace_firewall_stale = sidecar_unbound;
         }
         self.apply_isolation_rules(isolation);
     }
@@ -634,8 +736,56 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .await)
     }
 
+    /// Journal `candidate` as `id`'s publication for a deploy op, then
+    /// publish it to the kernel. The journal write, and any write already in
+    /// flight, holds the turn only until its deadline (#1263):
+    /// `StillRunning` means nothing was published, and the deploy worker's
+    /// next ask publishes once the journal records `candidate`. The landing
+    /// turn is named `deploy_op (detail)`.
+    pub(super) async fn publish_backend_within_turn(
+        &mut self,
+        id: &crate::onion::service_id::ServiceId,
+        candidate: &crate::onion::service_map::ServiceMap,
+        detail: &'static str,
+    ) -> Result<(), BunError> {
+        let landing = self
+            .journal_publication_within_turn(id, candidate, LoopBranch::DeployOp, detail)
+            .await?;
+        discovery_ownership::still_running_unless_landed(landing, || {
+            format!("journalling {id}'s publication")
+        })?;
+        self.publish_journalled_backends(id, candidate).await
+    }
+
+    /// Register a local service, journal it and publish it to the kernel,
+    /// for a deploy op. A journal write still in flight at the turn's
+    /// deadline leaves `service_map` as it was and answers `StillRunning`
+    /// (#1263): registering again on the next ask gives the same entry,
+    /// which the journal then records.
+    pub(super) async fn register_and_publish_service(
+        &mut self,
+        id: &crate::onion::service_id::ServiceId,
+        port: u16,
+        firewall: Option<Vec<String>>,
+        detail: &'static str,
+    ) -> Result<(), BunError> {
+        let before = self.service_map.clone();
+        self.register_local_service(id, port, firewall)?;
+        let candidate = self.service_map.clone();
+        let published = self
+            .publish_backend_within_turn(id, &candidate, detail)
+            .await;
+        if let Err(BunError::StillRunning { .. }) = &published {
+            self.service_map = before;
+        }
+        published?;
+        self.sync_firewall_ebpf().await;
+        Ok(())
+    }
+
     /// Add one freshly-healthy replacement to the service map and rebuild the
     /// routing table, so traffic moves onto it before anything old retires (M7).
+    /// The journal write holds the turn only until its deadline (#1263).
     pub(super) async fn publish_new_backend(
         &mut self,
         app_name: &str,
@@ -663,7 +813,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 service: service_id.clone(),
                 reason: error.to_string(),
             })?;
-        self.publish_backend_snapshot(&service_id, &candidate)
+        self.publish_backend_within_turn(&service_id, &candidate, "publish_new_backend/landed")
             .await?;
         self.service_map = candidate;
         self.rebuild_routing_table().await;

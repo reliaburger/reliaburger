@@ -1,0 +1,15 @@
+---
+source: src/relish/commands.rs
+expression: "format_output(&routes, OutputFormat::Json).unwrap()"
+---
+[
+  {
+    "host": "shop.example.com",
+    "path": "/",
+    "app_name": "web",
+    "namespace": "default",
+    "healthy_backends": 2,
+    "total_backends": 3,
+    "websocket": true
+  }
+]

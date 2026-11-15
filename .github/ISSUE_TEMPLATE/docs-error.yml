@@ -1,0 +1,51 @@
+name: Documentation error
+description: The manual, the book, a README or the website says something that isn't true.
+title: "docs: "
+labels: ["documentation"]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The release the docs describe, or the output of `relish --version` if you followed them.
+    validations:
+      required: true
+  - type: input
+    id: location
+    attributes:
+      label: Where
+      description: A link to the page and section, or the `relish manual` chapter.
+    validations:
+      required: true
+  - type: textarea
+    id: reproducer
+    attributes:
+      label: Reproducer
+      description: What the docs say, and what happened when you followed them. Paste the commands and output.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: correction
+    attributes:
+      label: What it should say
+    validations:
+      required: false
+  - type: textarea
+    id: not_tested
+    attributes:
+      label: What was not tested
+      description: Platforms or versions you didn't check the docs against.
+    validations:
+      required: true
+  - type: dropdown
+    id: ai_disclosure
+    attributes:
+      label: AI assistance
+      description: Did an AI tool help write this report? See the AI-assistance policy in CONTRIBUTING.md.
+      options:
+        - No AI assistance
+        - An AI tool helped, and a human checked every line
+        - An AI agent drafted it, and a human checked every line
+    validations:
+      required: true

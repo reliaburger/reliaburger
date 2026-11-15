@@ -16,6 +16,7 @@ pub mod membership;
 pub mod message;
 pub mod protocol;
 pub mod state;
+pub mod stats;
 pub mod transport;
 
 pub use config::GossipConfig;

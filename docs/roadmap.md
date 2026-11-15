@@ -18,7 +18,7 @@ with it.
 
 Patch releases (0.1.x) fix and harden without a headline. Each minor release
 after that ships one headline feature, with a single exit test that proves it.
-Until 1.0.0 every release is a development release: an incompatible format
+1.0.0 is expected in January 2027. Until then every release is a development release: an incompatible format
 change bumps the compatibility generation and needs a fresh cluster, with no
 migration and no feature gate
 ([compatibility before 1.0.0](releasing.md#compatibility-before-100)).
@@ -296,7 +296,7 @@ migration and no feature gate
   - [x] compact task arrays, a template and a count rather than a record per
     task ([#266](https://github.com/reliaburger/reliaburger/pull/266), #588);
   - [x] the common job lifecycle (#638, [#642](https://github.com/reliaburger/reliaburger/pull/642),
-    [plan](plans/2026-10-07-plan-common-job-lifecycle.md),
+    [plan](plans/archive/2026-10-07-plan-common-job-lifecycle.md),
     [qualification](qualification/2026-10-07-common-jobs/README.md));
   - [x] fresh, shared and host executors, and the timed throughput scenarios in
     `relish bench` ([#654](https://github.com/reliaburger/reliaburger/pull/654),
@@ -323,14 +323,195 @@ migration and no feature gate
   ([upgrading from 0.1.6](releasing.md#upgrading-from-016)). The September
   plan is [archived](plans/archive/2026-09-28-plan-million-jobs.md).
   [Chapter 17](book/17-a-million-jobs.md).
-- [ ] **0.2.1: cluster safety**
+- [x] **0.2.1: cluster safety.** [Released](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.1)
+  on 21 October 2026
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/16)). The
   bug-fix release after 0.2.0, as 0.1.5 was: the data-loss and availability
-  bugs the 10 October audit found that predate jobs.
-- [ ] **0.2.2: UX polish**
-  ([milestone](https://github.com/reliaburger/reliaburger/milestone/15)). The
+  bugs the 10 October audit found that predate jobs. It's the first release on
+  the shorter gate, one 8-hour jobs final in place of separate V02 and job
+  finals ([#991](https://github.com/reliaburger/reliaburger/issues/991)).
+  Candidate 9 passed it
+  ([record](qualification/2026-10-21-v0.2.1-job-qualification.md), [closure](qualification/2026-10-21-v0.2.1-release-closure.md),
+  [release log](release-log.md#021-cluster-safety)), with slow agent-loop
+  turns from fsync'd discovery journal writes accepted as known issues
+  ([#1255](https://github.com/reliaburger/reliaburger/issues/1255),
+  [#1266](https://github.com/reliaburger/reliaburger/issues/1266)). It ships
+  with RUSTSEC-2026-0381 to -0383, which 0.2.0 has too
+  ([#1269](https://github.com/reliaburger/reliaburger/issues/1269)); both are
+  fixed in 0.2.2. 0.2.1 changes the cluster's formats, so a 0.2.0 cluster
+  can't roll to it: recreate the cluster
+  ([upgrading from 0.2.0](releasing.md#upgrading-from-020)).
+- [x] **0.2.2: UX polish.** [Released](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.2)
+  on 25 October 2026
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/15),
+  [plan](plans/archive/2026-10-16-plan-0.2.2-ux-patch.md)). The
   CLI review pass ([#522](https://github.com/reliaburger/reliaburger/issues/522)),
-  Kubernetes import and export fidelity, demos, examples and doc fixes.
+  with `relish events`, Kubernetes import and export fidelity, chaos for jobs
+  and task arrays, demos, examples and doc fixes, and no more Intel macOS build
+  ([#1018](https://github.com/reliaburger/reliaburger/issues/1018)). Candidate 4
+  passed the gate
+  ([record](qualification/2026-10-25-v0.2.2-job-qualification.md), [closure](qualification/2026-10-25-v0.2.2-release-closure.md),
+  [release log](release-log.md#022-ux-polish)), with four slow agent-loop turns
+  in host disk stalls accepted by the maintainer; the two writes behind them
+  move off the loop in 0.2.3
+  ([#1263](https://github.com/reliaburger/reliaburger/issues/1263),
+  [#1340](https://github.com/reliaburger/reliaburger/issues/1340)). It ships
+  with RUSTSEC-2026-0387 under a reviewed exception
+  ([#1318](https://github.com/reliaburger/reliaburger/pull/1318)), which 0.2.3
+  removes. 0.2.2 changes the cluster's formats, so a 0.2.1 cluster can't roll
+  to it: recreate the cluster
+  ([upgrading from 0.2.1](releasing.md#upgrading-from-021)).
+- [x] **0.2.3: two billion a day.** [Released](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.3)
+  on 28 October 2026
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/17),
+  [plan](plans/archive/2026-10-20-plan-0.2.3.md)). One node runs 14,917
+  host-job tasks a second and three run 29,350
+  ([record](qualification/2026-10-27-v0.2.3-candidate-throughput/README.md)),
+  and one real 24-hour day on three nodes counted 1,807,742,226: 1.81 billion
+  against the 2 billion target, above the 1 billion floor, accepted by the
+  maintainer ([day run](qualification/2026-10-28-v0.2.3-day-run.md)). Plus the
+  CI, soak and test follow-ups from the CI and test efficiency plan. Candidate
+  1 passed the gate
+  ([closure](qualification/2026-10-28-v0.2.3-release-closure.md),
+  [release log](release-log.md#023-two-billion-a-day)), with one slow
+  `upgrade_verify` turn in a host disk stall accepted by the maintainer
+  ([#1381](https://github.com/reliaburger/reliaburger/issues/1381)). The day
+  run's slow turn was fixed in 0.2.4
+  ([#1419](https://github.com/reliaburger/reliaburger/issues/1419)); its
+  memory growth ([#1417](https://github.com/reliaburger/reliaburger/issues/1417))
+  turned out to be glibc keeping free memory after log queries, levelling off
+  in the 0.2.8 day run
+  ([record](qualification/2026-11-14-v0.2.8-memory-run.md)); its full disk
+  ([#1418](https://github.com/reliaburger/reliaburger/issues/1418), 0.3.0)
+  is still open. It ships
+  with the `zstd` 0.13 advisories under a reviewed exception
+  ([#1367](https://github.com/reliaburger/reliaburger/pull/1367)). 0.2.3 keeps
+  0.2.2's formats, the first release to do so, and a 0.2.2 cluster rolled onto
+  it in place on 29 October
+  ([record](qualification/2026-10-29-rolling-walk-0.2.2-to-0.2.3.md),
+  [#1444](https://github.com/reliaburger/reliaburger/issues/1444)).
+- [x] **0.2.4: extension points.** [Released](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.4)
+  on 30 October 2026
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/19),
+  [research](plans/2026-10-19-research-extension-points.md),
+  [plan](plans/archive/2026-10-23-plan-0.2.4.md)). One missing
+  feature shouldn't rule Reliaburger out, and the answer isn't CRDs or
+  webhooks. Policies stored in the council (CEL deny, warn and audit,
+  fill-only defaults, `relish policy audit`) on the one apply path that
+  `relish apply` and GitOps share; sidecars, stop hooks and gated runtime
+  knobs; an exec secret provider; templates that expand to ordinary apps, and
+  a contract for running your own controller, with
+  [Chapter 18](book/18-bending-without-forking.md) to explain them. The exit
+  test, four common policies, a template and a controller on a real cluster,
+  passes ([#1126](https://github.com/reliaburger/reliaburger/issues/1126)).
+  Also a restarting node keeps its replicas
+  ([#1449](https://github.com/reliaburger/reliaburger/issues/1449)), and the
+  soak gates on a job-start SLO
+  ([#1400](https://github.com/reliaburger/reliaburger/issues/1400)) and checks
+  the council's history for linearizability. Candidate 1 passed the full gate
+  ([closure](qualification/2026-10-30-v0.2.4-release-closure.md),
+  [release log](release-log.md#024-extension-points)): the 8-hour jobs final
+  ran 6,899.6 accepted jobs a second against the 1,390 target, with a
+  job-start p99 of 32 ms over 137 million quiet tasks
+  ([record](qualification/2026-10-30-v0.2.4-job-qualification.md)). Both fast
+  tiers first failed on a harness bug, a p99 judged on 20 samples
+  ([#1485](https://github.com/reliaburger/reliaburger/issues/1485)), and pass
+  with the fixed checker. It ships with the `zstd` 0.13 advisories under the
+  exception 0.2.3 took, which expires on 18 November 2026
+  ([#1366](https://github.com/reliaburger/reliaburger/issues/1366), in 0.3.0).
+  The profile after the tag found 0.2.4 4.5% faster on host jobs than 0.2.3
+  ([record](qualification/2026-10-30-v0.2.4-profile/README.md)). The 24-hour
+  memory run failed at hour 21 when the Mac lost its forwards to the VMs; up
+  to hour 20 it found no slowdown and Bun's memory levelling off
+  ([record](qualification/2026-10-30-v0.2.4-day-run.md)). What's still open
+  moved to 0.2.5 and 0.3.0. 0.2.4
+  changes the cluster's formats, so a 0.2.3 cluster can't roll to it:
+  recreate the cluster
+  ([upgrading from 0.2.3](releasing.md#upgrading-from-023)).
+- [x] **0.2.5: bugs an outside evaluation found.** [Released](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.5)
+  on 3 November 2026
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/27),
+  [plan](plans/archive/2026-10-31-plan-0.2.5.md)). A patch release for the
+  product bugs that an external evaluation of 0.2.0
+  ([#1080](https://github.com/reliaburger/reliaburger/pull/1080)) found and
+  that were still on `main`, and the stale `relish logs --tail` that 0.2.4's
+  day run found ([#1493](https://github.com/reliaburger/reliaburger/issues/1493)).
+  Spare nodes also join as Raft learners up to the council cap
+  ([#1494](https://github.com/reliaburger/reliaburger/pull/1494)). Candidate 1
+  passed the full gate but for one 1,077 ms `health_tick` turn in the 8-hour
+  final, on a Mac that logged thermal emergencies that night, which the
+  maintainer accepted as a host stall
+  ([closure](qualification/2026-11-03-v0.2.5-release-closure.md),
+  [release log](release-log.md#025-bugs-an-outside-evaluation-found)).
+  0.2.5 changes the cluster's formats, so a 0.2.4 cluster can't roll to it:
+  recreate the cluster
+  ([upgrading from 0.2.4](releasing.md#upgrading-from-024)).
+- [x] **0.2.6: the rest of the evaluation's bugs, and setup over SSH.** [Released](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.6)
+  on 6 November 2026
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/28),
+  [plan](plans/archive/2026-11-03-plan-0.2.6.md)). What 0.2.5 left of [#1477](https://github.com/reliaburger/reliaburger/issues/1477)
+  (secure clusters past the council cap) and
+  [#1500](https://github.com/reliaburger/reliaburger/issues/1500) (delete then
+  re-apply on real multi-node runc), `relish setup --ssh` for clusters on
+  Linux machines you already have
+  ([#1529](https://github.com/reliaburger/reliaburger/issues/1529)), the S3
+  and Apple Container tests in CI
+  ([#1534](https://github.com/reliaburger/reliaburger/issues/1534),
+  [#1535](https://github.com/reliaburger/reliaburger/issues/1535)), and the
+  known flakes. #1500 closed as not reproduced in 60 cycles; #1535 and the
+  flakes moved to 0.2.7. Candidate 2 passed the full gate, the first on the
+  Mac Studio, but for two failures in the 8-hour final that the maintainer
+  accepted as known issues: a refused partition fault
+  ([#1601](https://github.com/reliaburger/reliaburger/issues/1601)) and one
+  1,232 ms compaction turn
+  ([#1606](https://github.com/reliaburger/reliaburger/issues/1606))
+  ([closure](qualification/2026-11-06-v0.2.6-release-closure.md),
+  [release log](release-log.md#026-the-rest-of-the-evaluations-bugs-and-setup-over-ssh)).
+  0.2.6 moves the protocol, so a 0.2.5 cluster can't roll to it: recreate
+  the cluster ([upgrading from 0.2.5](releasing.md#upgrading-from-025)).
+- [x] **0.2.7: "Built for humans and their agents".** [Released](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.7)
+  on 7 November 2026
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/29),
+  [plan](plans/archive/2026-11-04-plan-0.2.7.md)). The read-only half of the AI SRE
+  work, brought forward from 0.4.2: a JSON-only `relish agent` command family
+  over the exact source the binary was built from, a patch-and-try loop on a
+  throwaway cluster, redacted reports a human posts, `relish mcp`, an agent
+  page and "With your agent" getting started on the website, and the loop
+  that turns agent sessions into fixes released in days. No LLM inside `bun`.
+  Exit test: Claude Code with a read-only token diagnoses three Smoker
+  scenarios and finds a planted Reliaburger bug in the source
+  ([#1093](https://github.com/reliaburger/reliaburger/issues/1093)). It
+  passed on 6 November
+  ([record](qualification/2026-11-06-v0.2.7-exit-test.md)). Candidate 1
+  passed the full gate but for one 1,215 ms journal turn in the 8-hour final,
+  which the maintainer accepted as a known issue
+  ([#1707](https://github.com/reliaburger/reliaburger/issues/1707), still
+  open in 0.2.8; [closure](qualification/2026-11-07-v0.2.7-release-closure.md),
+  [release log](release-log.md#027-built-for-humans-and-their-agents)). The
+  agent debugging recording
+  ([#1678](https://github.com/reliaburger/reliaburger/issues/1678)) follows
+  the tag. 0.2.7 keeps 0.2.6's cluster formats, so a 0.2.6 cluster can roll
+  onto it in place
+  ([upgrading from 0.2.6](releasing.md#upgrading-from-026)).
+- [x] **0.2.8: "Agents you can trust, built faster".** [Released](https://github.com/reliaburger/reliaburger/releases/tag/v0.2.8)
+  on 12 November 2026
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/30),
+  [plan](plans/archive/2026-11-07-plan-0.2.8.md)). Agent changes become proposals a
+  person or a policy approves and can undo, behind short leases
+  ([#1682](https://github.com/reliaburger/reliaburger/issues/1682),
+  [#1686](https://github.com/reliaburger/reliaburger/issues/1686)), with
+  `relish verify`, `relish timeline`, a one-screen `relish status` and
+  `relish gym run` beside them; and a faster loop for us, from macOS CI that
+  builds only `relish` to candidates that reuse `main`'s CI. Candidates 1 and
+  2 each failed a tier on a product bug
+  ([#1849](https://github.com/reliaburger/reliaburger/issues/1849),
+  [#1853](https://github.com/reliaburger/reliaburger/issues/1853),
+  [#1857](https://github.com/reliaburger/reliaburger/issues/1857)), and
+  candidate 3 passed the full gate clean, with no known issue found by the
+  gate ([closure](qualification/2026-11-11-v0.2.8-release-closure.md),
+  [release log](release-log.md#028-agents-you-can-trust-built-faster)).
+  0.2.8 changes the cluster formats, so a 0.2.7 cluster starts afresh
+  ([upgrading from 0.2.7](releasing.md#upgrading-from-027)).
 - [ ] **0.3.0: "Bare metal in an hour"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/6),
   research and spikes in [#218](https://github.com/reliaburger/reliaburger/pull/218)
@@ -339,25 +520,46 @@ migration and no feature gate
   claiming machines over the LAN, weekly signed OS builds with A/B updates,
   and the quickstart guest on Ubuntu 26.04. The claim flow is designed so the
   fleet control plane can extend it later. Alongside it: the acceptance gates
-  0.1.0 didn't close (V01–V04, below), WebSocket drain parity and ACME (F08,
+  0.1.0 didn't close (V01–V04, below), WebSocket drain parity (F08,
   [#369](https://github.com/reliaburger/reliaburger/issues/369)), and fault
   pre-checks that read the leader's gossip view
   ([#334](https://github.com/reliaburger/reliaburger/issues/334)). Exit test:
-  ten Dell Wyse 3040s from power-on to a cluster.
-  Its merge train is [#490](https://github.com/reliaburger/reliaburger/pull/490),
-  which waits for the 0.2.x patch releases.
+  three Dell Wyse 3040s from power-on to a cluster.
+  Next. Its merge train is [#490](https://github.com/reliaburger/reliaburger/pull/490),
+  which waited for the 0.2.x patch releases.
 - [ ] **0.4.0 and 0.4.1: "Full container migration"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/7),
   [plan](plans/2026-10-09-plan-container-migration.md),
   [#268](https://github.com/reliaburger/reliaburger/pull/268)). 0.4.0 is planned
   maintenance: cordon, drain and uncordon, cold moves that carry volumes, and
   checkpoint moves that keep memory while connections reconnect, with a Redis
-  demo. 0.4.1 is maintenance without downtime: moves across appliance builds,
+  demo. 0.4.0 also brings ACME certificates for the ingress
+  ([#1667](https://github.com/reliaburger/reliaburger/issues/1667)). 0.4.1 is maintenance without downtime: moves across appliance builds,
   and 0.3.0's A/B OS updates draining and rebooting each node in turn. Moves join
   the V02 soak's fault kinds rather than getting a soak of their own.
   Managed-volume retirement and the Apple runtime (F10,
-  [#367](https://github.com/reliaburger/reliaburger/issues/367)) ship in 0.4.x,
+  [#367](https://github.com/reliaburger/reliaburger/issues/367)) ship in 0.4.3,
   outside the migration plan.
+- [ ] **0.4.2: "Let the AI SRE help"**
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/18),
+  [research](plans/2026-10-18-research-ai-sre.md)). The read-only half moved
+  to 0.2.7. What stays: human-approved mutations through proposals, agent
+  tokens labelled in audit, a merged incident timeline, log patterns in
+  Ketchup, agent-ready webhooks and a larger eval. No LLM inside `bun`.
+- [ ] **0.4.3, 0.4.4 and 0.4.5: "Stronger walls"**
+  ([0.4.3](https://github.com/reliaburger/reliaburger/milestone/20),
+  [0.4.4](https://github.com/reliaburger/reliaburger/milestone/21),
+  [0.4.5](https://github.com/reliaburger/reliaburger/milestone/22),
+  [research](plans/2026-10-19-research-vm-runtime.md)). A `vm` runtime: change
+  an app to `runtime = "vm"` and it runs as a Linux VM on Cloud Hypervisor,
+  from the same OCI image, scheduled on the same hosts as containers. 0.4.3
+  ships VM apps, with service discovery, logs, exec, secrets and volumes
+  working as they do for runc, and brings back the Apple runtime (F10) on
+  macOS with cold moves only. 0.4.4 moves VMs (cold and checkpoint) through the
+  0.4.0 move plan and enforces egress policy for them. 0.4.5 boots cloud
+  images, persistent root disks and ISOs. Five spikes come first. Exit test
+  for 0.4.3: one Redis config switches from runc to vm on the quickstart and
+  keeps its data, discovery, logs, exec and health checks.
 - [ ] **After 0.4.0: book v2 and the full CLI tour.** Book v2: a distilled
   rewrite alongside v1; v1 keeps collecting until then. The rewrite reads
   properly from beginning to end: it cuts the fluff, keeps the design
@@ -374,31 +576,90 @@ migration and no feature gate
   addresses, live TCP handoff, pre-copy, and PostgreSQL keeping an open
   transaction across a move with the source switched off afterwards. It happens
   only if the network-ownership spike (S11) passes; otherwise it comes off this
-  page.
+  page. VMs are its first target if the VM migration spike passes first
+  ([#1185](https://github.com/reliaburger/reliaburger/issues/1185)).
+- [ ] **0.6.0: "GPUs"**
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/23),
+  [research](plans/2026-10-11-research-llm-workloads.md#060-gpus)). GPUs as
+  devices with identities: per-device placement for apps and jobs, CDI
+  injection, topology inside a node, shared memory and memlock, a driver and
+  CUDA compatibility check, GPU health that cordons on errors, per-container
+  GPU metrics, `relish gpus` and existing MIG instances as devices. It takes
+  F01 ([#359](https://github.com/reliaburger/reliaburger/issues/359)) from "Later". Exit test: a tensor-parallel
+  vLLM and a fine-tune share an eight-GPU node with their own devices, and an
+  injected GPU fault cordons the node within two minutes.
+- [ ] **0.7.0: "LLMs"**
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/24),
+  [research](plans/2026-10-11-research-llm-workloads.md#070-llms)). From a
+  model name to an OpenAI-compatible endpoint: `[model.*]` and
+  `relish model run`, weights as OCI artifacts in Pickle with resumable peer
+  pulls and placement next to them, startup and generate-based readiness,
+  inference-aware routing in Wrapper, autoscaling on engine metrics and scale
+  to zero, API keys and token limits. Exit test: peer-loaded replicas start at
+  least five times faster than the first, prefix routing doubles shared-prefix
+  throughput, and a model scales to zero and back.
+- [ ] **0.7.1: GPU dev environments**
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/25),
+  [research](plans/2026-10-11-research-llm-workloads.md#071-gpu-dev-environments)).
+  `relish dev`: a GPU container over SSH or VS Code with a persistent home and
+  an idle timeout.
+- [ ] **0.8.0: "Groups"**
+  ([milestone](https://github.com/reliaburger/reliaburger/milestone/26),
+  [research](plans/2026-10-11-research-llm-workloads.md#080-groups)).
+  Multi-node work as one unit: all-or-nothing placement with ranks, roles,
+  topology domains, RDMA, checkpoint-aware restarts, hot spares and health
+  checks around every run. Exit test: a two-node fine-tune survives a dead
+  node on a spare within five minutes, and a verl RL job runs as one group.
+- [ ] **0.9.0: "Pipelines"** (no milestone yet;
+  [research](plans/2026-10-11-research-llm-workloads.md#090-pipelines)).
+  Jobs that wait for jobs (all of, element by element, or a success ratio),
+  partial success, a Python client and OpenAPI spec, an Airflow provider and
+  a Nextflow executor in this repository, and an OpenAI-compatible batch API
+  over resident model workers ([#641](https://github.com/reliaburger/reliaburger/issues/641)). Exit test: Nextflow and
+  Airflow each run a three-stage pipeline through a node failure. No issues
+  yet: the maintainer revisits it after 0.8.0 ships.
+- [ ] **0.10.0: "Fair share"** (no milestone yet;
+  [research](plans/2026-10-11-research-llm-workloads.md#0100-fair-share)).
+  Queues with weighted, decaying fair share, backfill, priority classes and
+  preemption with grace periods, node selectors for arrays, retries by
+  failure kind, and usage by queue. Exit test: an under-share team gets its
+  half of a flooded cluster within a minute, and no service loses a replica.
+  No issues yet: the maintainer revisits it after 0.8.0 ships.
 - [ ] **Later**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/9)). The
-  fleet control plane ([#265](https://github.com/reliaburger/reliaburger/pull/265));
-  GPU capacity and cached-image placement (F01,
-  [#359](https://github.com/reliaburger/reliaburger/issues/359)); rootless
+  fleet control plane ([#265](https://github.com/reliaburger/reliaburger/pull/265)); rootless
   clusters (F02, [#360](https://github.com/reliaburger/reliaburger/issues/360));
   PromQL and the full metrics architecture (F06,
   [#364](https://github.com/reliaburger/reliaburger/issues/364)); bandwidth
   faults (F09, [#366](https://github.com/reliaburger/reliaburger/issues/366));
-  and the remaining Kubernetes translations (F11,
-  [#368](https://github.com/reliaburger/reliaburger/issues/368)).
+  the remaining Kubernetes translations (F11,
+  [#368](https://github.com/reliaburger/reliaburger/issues/368)); gVisor for
+  hosts without KVM ([#1186](https://github.com/reliaburger/reliaburger/issues/1186));
+  Windows Server guests
+  ([#1187](https://github.com/reliaburger/reliaburger/issues/1187)); and, for
+  LLMs, an external endpoint picker ([#1232](https://github.com/reliaburger/reliaburger/issues/1232)),
+  disaggregated prefill and decode ([#1233](https://github.com/reliaburger/reliaburger/issues/1233)), LoRA adapters
+  from Pickle ([#1234](https://github.com/reliaburger/reliaburger/issues/1234)), AMD GPUs
+  ([#1235](https://github.com/reliaburger/reliaburger/issues/1235)) and GB200 compute domains
+  ([#1236](https://github.com/reliaburger/reliaburger/issues/1236)).
 
 ## Known gaps
 
-What 0.1.0 shipped without, each with an issue. The
+What's still missing, with its issue where one exists. The
 [whitepaper](whitepaper.md) describes the full vision; this page tracks only
 what's shipped and what's scheduled.
 
 - **Acceptance gates 0.1.0 didn't close.** V01, the live catalogue on three
   independent runc nodes ([#286](https://github.com/reliaburger/reliaburger/issues/286));
   the V02 leftovers, the snapshot uploader under power cuts and the
-  `v02-loops` bounds ([#287](https://github.com/reliaburger/reliaburger/issues/287));
-  V04, cold installs on Intel macOS, Linux x86_64 and Linux arm64
-  ([#288](https://github.com/reliaburger/reliaburger/issues/288)). All in 0.3.0.
+  `v02-loops` bounds ([#287](https://github.com/reliaburger/reliaburger/issues/287)).
+  Both in 0.3.0. V04, the cold installs on Linux x86_64 and arm64
+  ([#288](https://github.com/reliaburger/reliaburger/issues/288)), passed on
+  the published 0.2.8 on 12 November 2026: a ready cluster in a median 84.8 s
+  and 83.2 s ([record](qualification/2026-11-12-v04-cold-installs-linux.md)).
+  Intel macOS left V04 when 0.2.2 dropped its build: 0.2.1 is the last release
+  with `relish-macos-x86_64`
+  ([#1018](https://github.com/reliaburger/reliaburger/issues/1018)).
 - **Missing capabilities F01–F11**, one issue each, placed in
   [0.1.3](https://github.com/reliaburger/reliaburger/milestone/4) (F07 part 1, landed),
   [0.1.4](https://github.com/reliaburger/reliaburger/milestone/8) (F07 part 2
@@ -407,28 +668,32 @@ what's shipped and what's scheduled.
   [0.1.6](https://github.com/reliaburger/reliaburger/milestone/12) (F03a,
   F04 R1–R4, F05 I3–I4, landed),
   [0.3.0](https://github.com/reliaburger/reliaburger/milestone/6) (F08),
-  [0.4.0](https://github.com/reliaburger/reliaburger/milestone/7) (F10) and
-  [Later](https://github.com/reliaburger/reliaburger/milestone/9) (F01, F02,
-  F06, F09, F11, and the rest of F03–F05).
+  [0.4.3](https://github.com/reliaburger/reliaburger/milestone/20) (F10) and
+  [Later](https://github.com/reliaburger/reliaburger/milestone/9) (F02,
+  F06, F09, F11, and the rest of F03–F05). F01
+  ([#359](https://github.com/reliaburger/reliaburger/issues/359)) moves to
+  [0.6.0](https://github.com/reliaburger/reliaburger/milestone/23).
 - **Whitepaper design ahead of the binary.** The [whitepaper](whitepaper.md)
   marks each of these as planned where it describes them: the reporting tree,
   resource-aware council selection, per-app rollups and remote-read
-  ([#364](https://github.com/reliaburger/reliaburger/issues/364)); node-by-node
-  rollouts ([#692](https://github.com/reliaburger/reliaburger/issues/692));
-  GitOps config in Raft ([#693](https://github.com/reliaburger/reliaburger/issues/693));
-  a real live-voter guard and odd council sizes
-  ([#694](https://github.com/reliaburger/reliaburger/issues/694)); faults that
-  revert after a Bun crash ([#699](https://github.com/reliaburger/reliaburger/issues/699));
-  OOM protection and host resolvers ([#700](https://github.com/reliaburger/reliaburger/issues/700));
-  init-container images and GPU refusal ([#701](https://github.com/reliaburger/reliaburger/issues/701));
-  selector-based Kubernetes import ([#703](https://github.com/reliaburger/reliaburger/issues/703));
-  an offline root CA ([#709](https://github.com/reliaburger/reliaburger/issues/709));
-  static builds ([#401](https://github.com/reliaburger/reliaburger/issues/401));
-  Raft snapshot encryption ([#402](https://github.com/reliaburger/reliaburger/issues/402));
-  keyless cosign ([#619](https://github.com/reliaburger/reliaburger/issues/619)).
+  ([#364](https://github.com/reliaburger/reliaburger/issues/364)); an offline
+  root CA ([#709](https://github.com/reliaburger/reliaburger/issues/709));
+  keyless cosign ([#619](https://github.com/reliaburger/reliaburger/issues/619));
+  fully leader-coordinated rollouts
+  ([#1776](https://github.com/reliaburger/reliaburger/issues/1776)), static builds
+  ([#1774](https://github.com/reliaburger/reliaburger/issues/1774)) and Raft
+  snapshot encryption ([#1775](https://github.com/reliaburger/reliaburger/issues/1775)).
+- **Custom alert rules.** Each node evaluates five built-in rules; you can't
+  define your own yet ([#1773](https://github.com/reliaburger/reliaburger/issues/1773), planned for 0.4.0).
+- **Scale beyond three nodes.** Every release is soaked on three nodes. The
+  [hollow-node record](qualification/2026-10-28-hollow-nodes.md) found limits
+  at 500 and 1,000 nodes
+  ([#1411](https://github.com/reliaburger/reliaburger/issues/1411),
+  [#1412](https://github.com/reliaburger/reliaburger/issues/1412),
+  [#1413](https://github.com/reliaburger/reliaburger/issues/1413)).
 - **Known bugs and flakes.** The bugs the 10 October audit
   ([#674](https://github.com/reliaburger/reliaburger/issues/674)) found outside
-  jobs are in [0.2.1](https://github.com/reliaburger/reliaburger/milestone/16)
+  jobs were fixed in [0.2.1](https://github.com/reliaburger/reliaburger/milestone/16)
   and [0.2.2](https://github.com/reliaburger/reliaburger/milestone/15); any open
   flake is in the [known flakes register](flakes.md)
   ([#318](https://github.com/reliaburger/reliaburger/issues/318)).
@@ -467,5 +732,7 @@ the item-by-item history.
 Deferred beyond the 0.x releases; the whitepaper (§22) has the reasoning and
 the [frozen roadmap](plans/archive/roadmap-to-0.1.0.md#future-v2) the detail:
 TPM sealing of the master secret, external secret managers, multi-cluster
-federation (Franchise), IPv6, sidecars, fractional GPU scheduling and a
-PromQL-to-SQL compatibility layer.
+federation (Franchise, which doesn't schedule batch work across clusters),
+IPv6, sidecars, GPU sharing beyond pre-partitioned MIG instances
+(time-slicing, MPS, changing MIG layouts) and a PromQL-to-SQL compatibility
+layer.

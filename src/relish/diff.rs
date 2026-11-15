@@ -93,6 +93,16 @@ pub fn diff_configs(old: &Config, new: &Config) -> ConfigDiff {
         &mut removed,
     );
 
+    // Diff policies
+    diff_resource_map(
+        &old.policy,
+        &new.policy,
+        "policy",
+        &mut added,
+        &mut modified,
+        &mut removed,
+    );
+
     // Diff builds
     diff_resource_map(
         &old.build,
@@ -150,6 +160,15 @@ fn diff_resource_map<T: Serialize>(
             });
         }
     }
+}
+
+/// The fields that differ between two app specs, by dotted path, in path
+/// order. A proposal's field diff (#1682) is built from this.
+pub fn diff_app_specs(
+    old: &crate::config::app::AppSpec,
+    new: &crate::config::app::AppSpec,
+) -> Vec<FieldDiff> {
+    diff_values(old, new)
 }
 
 /// Diff two serialisable values by comparing their TOML representations.
@@ -430,5 +449,25 @@ mod tests {
         let diff = diff_configs(&old, &new);
         let json = serde_json::to_string(&diff).unwrap();
         assert!(json.contains("app.web"));
+    }
+
+    /// #1124: `relish diff` reads files the way `apply` does, templates
+    /// expanded, so a changed parameter shows as the change it makes to
+    /// the app, not as a change to a `use` table.
+    #[test]
+    fn a_changed_template_parameter_diffs_as_a_change_to_the_expanded_app() {
+        let manifest = |size: &str| {
+            crate::relish::manifest::parse(&format!(
+                "[template.db]\nparams = {{ size = 'string' }}\nbody = \"\"\"\n[app.orders-db]\nimage = 'postgres:17'\n[[app.orders-db.volumes]]\npath = '/data'\nsize = '${{size}}'\n\"\"\"\n[use.orders]\ntemplate = 'db'\nsize = '{size}'\n"
+            ))
+            .unwrap()
+            .config
+        };
+        let diff = diff_configs(&manifest("5Gi"), &manifest("50Gi"));
+        let output = diff.to_string();
+        assert_eq!(diff.modified.len(), 1, "got:\n{output}");
+        assert!(output.contains("~ app.orders-db"), "got:\n{output}");
+        assert!(output.contains("50Gi"), "got:\n{output}");
+        assert!(!output.contains("use."), "got:\n{output}");
     }
 }

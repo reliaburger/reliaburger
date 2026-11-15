@@ -66,6 +66,11 @@ pub struct PlanEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ApplyPlan {
     pub entries: Vec<PlanEntry>,
+    /// What the policies said about this config's apps (#1117): the
+    /// cluster's policies when one answered, with the config's own
+    /// replacing any of the same name.
+    #[serde(skip_serializing_if = "PolicyPlan::is_empty")]
+    pub policy: PolicyPlan,
     pub to_create: usize,
     pub to_update: usize,
     /// Resources running on the cluster but absent from this config —
@@ -90,6 +95,44 @@ pub struct CurrentResource {
     pub image: Option<String>,
     /// Complete effective desired-spec fingerprint, when known.
     pub fingerprint: Option<String>,
+}
+
+/// The policy section of a plan: one line per filled field, per denial
+/// and per warning.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct PolicyPlan {
+    /// Fields a policy default would fill in, as `policy … fills … on
+    /// app …` (#1118).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub filled: Vec<String>,
+    /// Policies that would refuse the apply, as `policy … denies app …`.
+    pub denials: Vec<String>,
+    /// Policies that would only warn.
+    pub warnings: Vec<String>,
+    /// `audit` policies that would record a finding (#1119).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub audits: Vec<String>,
+}
+
+impl PolicyPlan {
+    /// Whether the policies said nothing.
+    pub fn is_empty(&self) -> bool {
+        self.filled.is_empty()
+            && self.denials.is_empty()
+            && self.warnings.is_empty()
+            && self.audits.is_empty()
+    }
+
+    /// The plan section for `evaluation`.
+    pub fn from_evaluation(evaluation: &crate::policy::Evaluation) -> Self {
+        let verdict = &evaluation.verdict;
+        PolicyPlan {
+            filled: evaluation.filled.iter().map(ToString::to_string).collect(),
+            denials: verdict.denials.iter().map(ToString::to_string).collect(),
+            warnings: verdict.warnings.iter().map(ToString::to_string).collect(),
+            audits: verdict.audits.iter().map(ToString::to_string).collect(),
+        }
+    }
 }
 
 /// Generate an apply plan from a parsed config.
@@ -135,6 +178,9 @@ pub fn generate_plan(config: &Config, current: Option<&[CurrentResource]>) -> Ap
         if let Some(ref namespace) = app.namespace {
             summary.push(("namespace".to_string(), namespace.clone()));
         }
+        if let Some(ref provenance) = app.provenance {
+            summary.push(("from".to_string(), provenance.to_string()));
+        }
 
         let action = match current_map.get(resource_key.as_str()) {
             None => PlanAction::Create,
@@ -169,6 +215,9 @@ pub fn generate_plan(config: &Config, current: Option<&[CurrentResource]>) -> Ap
         }
         if let Some(ref schedule) = job.schedule {
             summary.push(("schedule".to_string(), schedule.clone()));
+        }
+        if let Some(ref provenance) = job.provenance {
+            summary.push(("from".to_string(), provenance.to_string()));
         }
 
         let action = match current_map.get(resource_key.as_str()) {
@@ -229,6 +278,30 @@ pub fn generate_plan(config: &Config, current: Option<&[CurrentResource]>) -> Ap
         });
     }
 
+    // Policies
+    for name in config.policy.keys() {
+        let resource_key = format!("policy.{name}");
+        desired_resources.insert(resource_key.clone());
+
+        let action = match current_map.get(resource_key.as_str()) {
+            Some(existing) => compare_spec(
+                existing,
+                crate::config::fingerprint::spec_fingerprint(&config.policy[name]),
+                None,
+            ),
+            None => PlanAction::Create,
+        };
+
+        entries.push(PlanEntry {
+            resource: resource_key,
+            action,
+            summary: vec![(
+                "action".to_string(),
+                config.policy[name].action.as_str().to_string(),
+            )],
+        });
+    }
+
     // Resources in current state but absent from this config. Apply is
     // additive, so these are informational — not a promise of removal.
     if let Some(current_list) = current {
@@ -267,6 +340,7 @@ pub fn generate_plan(config: &Config, current: Option<&[CurrentResource]>) -> Ap
     ApplyPlan {
         unknown,
         comparison_available: current.is_some(),
+        policy: PolicyPlan::default(),
         entries,
         to_create,
         to_update,
@@ -302,7 +376,7 @@ impl fmt::Display for ApplyPlan {
                     "\nNo live comparison was available; creates are an offline assumption."
                 )?;
             }
-            return Ok(());
+            return self.fmt_policy(f);
         }
 
         writeln!(f, "Relish apply plan:")?;
@@ -343,6 +417,33 @@ impl fmt::Display for ApplyPlan {
                 "\n{} running resource(s) not in this config (apply leaves them; `relish stop` removes).",
                 self.not_in_config
             )?;
+        }
+        self.fmt_policy(f)
+    }
+}
+
+impl ApplyPlan {
+    /// The policy section: every denial and warning, and whether the
+    /// policies would refuse the apply.
+    fn fmt_policy(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.policy.is_empty() {
+            return Ok(());
+        }
+        write!(f, "\n\nPolicies:")?;
+        for filled in &self.policy.filled {
+            write!(f, "\n  FILL  {filled}")?;
+        }
+        for denial in &self.policy.denials {
+            write!(f, "\n  DENY  {denial}")?;
+        }
+        for warning in &self.policy.warnings {
+            write!(f, "\n  WARN  {warning}")?;
+        }
+        for audit in &self.policy.audits {
+            write!(f, "\n  AUDIT {audit}")?;
+        }
+        if !self.policy.denials.is_empty() {
+            write!(f, "\nThe cluster's policies would refuse this apply.")?;
         }
         Ok(())
     }
@@ -411,6 +512,140 @@ apps = ["web"]
         let plan = generate_plan(&changed, Some(&current));
         assert_eq!(plan.to_update, 4, "{plan:?}");
         assert_eq!(plan.unchanged, 0);
+    }
+
+    /// #1117: the plan names every denial and warning, judged by the
+    /// cluster's policies with the config's own replacing any of the same
+    /// name, and says the apply would be refused.
+    #[test]
+    fn the_plan_names_policy_denials_and_warnings() {
+        let committed = parse_config(
+            r#"
+[policy.prod-needs-limits]
+match = "app.namespace == 'prod'"
+deny = "!has(app.memory)"
+message = "apps in prod need a memory limit"
+"#,
+        )
+        .policy;
+        let config = parse_config(
+            r#"
+[policy.no-latest]
+deny = "app.image.endsWith(':latest')"
+action = "warn"
+
+[app.web]
+image = "web:latest"
+namespace = "prod"
+"#,
+        );
+        let mut plan = generate_plan(&config, None);
+        plan.policy = crate::relish::commands::plan_policies(&committed, &config);
+        insta::assert_snapshot!(plan.to_string());
+        let json = serde_json::to_value(&plan).unwrap();
+        assert_eq!(json["policy"]["denials"].as_array().unwrap().len(), 1);
+    }
+
+    /// #1118: the plan shows each field a default would fill in, and the
+    /// policy that fills it. The app itself is unchanged: the cluster
+    /// answers with the fingerprint of the spec as declared, so filled
+    /// fields aren't an update.
+    #[test]
+    fn the_plan_names_each_filled_field_and_its_policy() {
+        let committed = parse_config(
+            r#"
+[policy.team-label]
+match = "app.namespace == 'payments'"
+
+[policy.team-label.default]
+env.TEAM = "payments"
+deploy.max_unavailable = 1
+"#,
+        )
+        .policy;
+        let config = parse_config(
+            r#"
+[app.web]
+image = "web:v1"
+namespace = "payments"
+"#,
+        );
+        let current = [CurrentResource {
+            resource: "app.payments/web".into(),
+            image: Some("web:v1".into()),
+            fingerprint: crate::config::fingerprint::app_fingerprint(&config.app["web"]),
+        }];
+        let mut plan = generate_plan(&config, Some(&current));
+        plan.policy = crate::relish::commands::plan_policies(&committed, &config);
+        assert_eq!(plan.unchanged, 1, "{plan:?}");
+        insta::assert_snapshot!(plan.to_string());
+        let json = serde_json::to_value(&plan).unwrap();
+        assert_eq!(json["policy"]["filled"].as_array().unwrap().len(), 2);
+    }
+
+    /// #1124: the plan shows what the templates expanded to, ordinary apps
+    /// with the `use` that made each, and the policies judge those apps.
+    /// Planned again against the cluster, the expanded app is unchanged.
+    #[test]
+    fn the_plan_shows_the_expanded_apps_and_where_they_came_from() {
+        let manifest = r#"
+[template.postgres]
+params = { name = "string", size = "string", replicas = { type = "int", default = 1 } }
+body = """
+[app.${name}]
+image = "postgres:17"
+replicas = ${replicas}
+[[app.${name}.volumes]]
+path = "/var/lib/postgresql/data"
+size = "${size}"
+"""
+
+[use.orders-db]
+template = "postgres"
+name = "orders-db"
+size = "50Gi"
+
+[use.users-db]
+template = "postgres"
+name = "users-db"
+size = "5Gi"
+replicas = 2
+
+[app.web]
+image = "web:v1"
+"#;
+        let config = crate::relish::manifest::parse(manifest).unwrap().config;
+        let committed = parse_config(
+            r#"
+[policy.db-standby]
+match = "has(app.provenance) && app.provenance.template == 'postgres'"
+deny = "app.replicas < 2"
+message = "a database needs a standby"
+"#,
+        )
+        .policy;
+        let mut plan = generate_plan(&config, None);
+        plan.policy = crate::relish::commands::plan_policies(&committed, &config);
+        insta::assert_snapshot!(plan.to_string());
+
+        let current: Vec<CurrentResource> = config
+            .app
+            .iter()
+            .map(|(name, app)| CurrentResource {
+                resource: format!("app.{name}"),
+                image: app.image.clone(),
+                fingerprint: crate::config::fingerprint::app_fingerprint(app),
+            })
+            .collect();
+        let again = generate_plan(&config, Some(&current));
+        assert_eq!((again.unchanged, again.to_update), (3, 0), "{again:?}");
+    }
+
+    #[test]
+    fn a_plan_without_policy_findings_has_no_policy_section() {
+        let plan = generate_plan(&parse_config("[app.web]\nimage = 'web:v1'\n"), None);
+        assert!(!plan.to_string().contains("Policies:"));
+        assert!(serde_json::to_value(&plan).unwrap().get("policy").is_none());
     }
 
     #[test]

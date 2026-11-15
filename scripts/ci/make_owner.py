@@ -47,7 +47,7 @@ def capture_tools(environment, run):
         observed = run(command, env=environment, capture_output=True, text=True)
         c.require(observed.returncode == 0, 'actual owner tool version failed')
         version = observed.stdout.strip()
-        pattern = r'cargo-nextest 0\.9\.145(?:\s|$)' if name == 'nextest' else name + r' 1\.98\.[01](?:\s|$)'
+        pattern = r'cargo-nextest 0\.9\.151(?:\s|$)' if name == 'nextest' else name + r' 1\.98\.[01](?:\s|$)'
         c.require(re.match(pattern, version) is not None, 'owner tool version requires audit')
         result[name] = dict(path=path, realpath=str(Path(path).resolve()), sha256=c.digest(path),
                             version=version, version_command=command, exit_code=0)
@@ -68,7 +68,7 @@ def validate_tools(tools):
         )
         query = [observed['path'], '--version'] + (['--verbose'] if name != 'nextest' else [])
         c.require(observed['version_command'] == query, 'wrong actual tool observation command')
-        pattern = r'cargo-nextest 0\.9\.145(?:\s|$)' if name == 'nextest' else name + r' 1\.98\.[01](?:\s|$)'
+        pattern = r'cargo-nextest 0\.9\.151(?:\s|$)' if name == 'nextest' else name + r' 1\.98\.[01](?:\s|$)'
         c.require(re.match(pattern, observed['version']) is not None, 'actual tool version requires audit')
         c.require(re.fullmatch('[0-9a-f]{64}', observed['sha256']) is not None, 'invalid actual tool hash')
     for name in ('cargo', 'rustc'):
@@ -210,6 +210,8 @@ def execute(root, directory, context, entry, *, tools=None, environment=None, ru
     c.require(entry['owner_command'] == w.OWNERS[entry['gate']], 'wrong Make owner command')
     c.require(entry['gate'] not in ('portable-linux', 'oci-interruptions'),
               'gate needs its dedicated owner')
+    c.require((entry.get('archive_origin') is None) == (entry.get('archive_extraction') is None),
+              "archived owner needs its job's archive extraction")
     gates.candidate_sources(root, context['commit'], run, entry['source_files'])
     try:
         directory.mkdir(mode=0o700, parents=True, exist_ok=False)

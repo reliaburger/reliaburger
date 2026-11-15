@@ -1,0 +1,24 @@
+relish uninstall will remove:
+  /home/runner/.local/bin/relish
+  /home/runner/.reliaburger/bin/relish
+  /home/runner/.reliaburger/tools
+  /home/runner/.reliaburger/cache
+  /home/runner/.reliaburger/lima
+  /home/runner/.reliaburger/setup.lock
+  /home/runner/.reliaburger/clusters
+  /home/runner/.reliaburger/context.lock
+{
+  "home": "/home/runner/.reliaburger",
+  "removed": [
+    "/home/runner/.local/bin/relish",
+    "/home/runner/.reliaburger/bin/relish",
+    "/home/runner/.reliaburger/tools",
+    "/home/runner/.reliaburger/cache",
+    "/home/runner/.reliaburger/lima",
+    "/home/runner/.reliaburger/setup.lock",
+    "/home/runner/.reliaburger/clusters",
+    "/home/runner/.reliaburger/context.lock"
+  ],
+  "kept": [],
+  "notes": []
+}

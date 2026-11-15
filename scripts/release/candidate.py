@@ -1,6 +1,24 @@
 #!/usr/bin/env python3
-"""Record, verify, stage and promote an exact release candidate; never compile or sign."""
+"""Record, verify, stage and promote an exact release candidate; never compile or sign.
+
+`--channel nightly` handles a release train's nightly build instead (#1363):
+built by a manual Build & Release run on a `release-*` branch, signed with the
+nightly key, recorded with `"channel": "nightly"`, uploaded as the
+`nightly-<commit>-<attempt>` artefact and staged under a `nightly-` tag.
+Promotion never takes one.
+
+The record also names the source bundle every `relish` embeds (#1570) by its
+`source_digest`, so anyone can match a binary's `relish.source_digest` against
+the release it came from (#1694). Each build job reads the digest from the
+`relish` it built (`bundle-digest`); the candidate job requires every platform
+to agree (`agreed-source-digest`) before recording it.
+
+It names, as `source_ci`, the `ci.yml` run whose pass the candidate rests on
+(#1722): the run `ci_reuse.py` found on main, or the build's own run when it
+ran the suite itself. Qualification cites it from the record.
+"""
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -9,12 +27,23 @@ import re
 import subprocess
 import sys
 
-from package import GUEST_METADATA, PLATFORMS, sha256
+from package import GUEST_METADATA, PLATFORMS, mcpb_name, sha256
 
 RECORD = "candidate.json"
 # Staging tags start with this, so nothing that expects a `v1.2.3` release tag
 # (promotion, `v*` tag rules, version parsers) can mistake one for a release.
 STAGING_PREFIX = "staging-"
+# A train's nightly builds are staged under this prefix instead. The website
+# bootstrap refuses a mirror whose last path segment starts with it.
+NIGHTLY_PREFIX = "nightly-"
+CHANNELS = ("release", "nightly")
+# The Actions artefact each channel's build uploads, before `-<commit>-<attempt>`.
+ARTEFACTS = {"release": "candidate", "nightly": "nightly"}
+TAG_PREFIXES = {"release": STAGING_PREFIX, "nightly": NIGHTLY_PREFIX}
+# The branches a channel's build may come from: main, or a release's merge train.
+BRANCHES = {"release": r"main", "nightly": r"release-\d+-\d+-\d+"}
+# How `relish` names its source bundle: the SHA-256 of the uncompressed tarball.
+SOURCE_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 PDFS = {"building-reliaburger.pdf", "reliaburger-design-docs.pdf",
         "reliaburger-roadmap.pdf", "reliaburger-whitepaper.pdf"}
 
@@ -23,7 +52,9 @@ def candidate_names(pins):
     names = {f"{binary}-{platform}" for binary, platforms in PLATFORMS.items() for platform in platforms}
     return names | {name + ".sig" for name in names} | PDFS | {
         "metadata.json", "cli-metadata.json", "SHA256SUMS", "install.sh", GUEST_METADATA,
-    } | {image["asset"] for image in pins["images"].values()}
+    } | {image["asset"] for image in pins["images"].values()} | {
+        mcpb_name(platform) + suffix for platform in PLATFORMS["relish"] for suffix in ("", ".sig")
+    }
 
 
 def identity(version, repository, commit, run_id, run_attempt):
@@ -52,6 +83,61 @@ def check_guest_images(directory, pins, assets):
             raise ValueError("candidate guest image does not match its metadata or its pinned source")
 
 
+def check_source_digest(value):
+    """Return `value` when it names a source bundle the way `relish` does."""
+    if not isinstance(value, str) or not SOURCE_DIGEST.fullmatch(value):
+        raise ValueError(f"source digest must be sha256:<64 lower-case hex digits>, not {value!r}")
+    return value
+
+
+def check_source_ci(value):
+    """A record's `source_ci`: exactly a positive run id and attempt."""
+    if (type(value) is not dict or set(value) != {"run_id", "run_attempt"}
+            or any(type(value[key]) is not int or value[key] < 1 for key in value)):
+        raise ValueError("source CI must name a ci.yml run id and attempt")
+    return dict(value)
+
+
+def bundle_digest(answer):
+    """The source digest a clean release `relish` reports, from the envelope
+    `relish agent source version --offline` printed.
+
+    The build job already makes build.rs refuse a dirty tree; refusing one
+    here too means a build that stopped asking can't reach a candidate.
+    """
+    try:
+        envelope = json.loads(answer)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"relish agent source version did not print JSON: {error}") from None
+    if not isinstance(envelope, dict) or envelope.get("ok") is not True \
+            or envelope.get("command") != "source version":
+        raise ValueError("relish agent source version did not answer")
+    build = envelope.get("relish") or {}
+    if build.get("dirty") is not False:
+        raise ValueError(f"the embedded source must come from a clean tree, but dirty is {build.get('dirty')!r}")
+    digest = check_source_digest(build.get("source_digest"))
+    if (envelope.get("data") or {}).get("digest") != digest:
+        raise ValueError("the envelope and the bundle disagree on the source digest")
+    return digest
+
+
+def agreed_source_digest(directory):
+    """The one source digest every platform's `relish` reported.
+
+    `directory` holds one `relish-<platform>` file per platform, each the
+    digest its build job read. All three are built from one commit, and the
+    bundle is deterministic, so they must agree.
+    """
+    expected = {f"relish-{platform}" for platform in PLATFORMS["relish"]}
+    paths = {path.name: path for path in directory.iterdir()}
+    if set(paths) != expected:
+        raise ValueError(f"expected a source digest from exactly {sorted(expected)}, got {sorted(paths)}")
+    digests = {check_source_digest(paths[name].read_text().strip()) for name in sorted(expected)}
+    if len(digests) != 1:
+        raise ValueError(f"the platforms embed different source: {sorted(digests)}")
+    return digests.pop()
+
+
 def inventory(directory, pins, recorded=False):
     expected = candidate_names(pins) | ({RECORD} if recorded else set())
     paths = list(directory.iterdir())
@@ -65,12 +151,22 @@ def inventory(directory, pins, recorded=False):
     return assets
 
 
-def record_candidate(directory, pins, **expected):
+def channel_fields(channel):
+    """What a record adds for its channel: nothing for a release, so its format never changed."""
+    if channel not in CHANNELS:
+        raise ValueError(f"unknown channel {channel!r}")
+    return {} if channel == "release" else {"channel": channel}
+
+
+def record_candidate(directory, pins, channel="release", *, source_digest, source_ci, **expected):
     expected = identity(**expected)
+    source_digest = check_source_digest(source_digest)
+    source_ci = check_source_ci(source_ci)
     path = directory / RECORD
     if path.exists() or path.is_symlink():
         raise FileExistsError("candidate record already exists")
-    document = dict(schema=1, **expected, assets=inventory(directory, pins))
+    document = dict(schema=1, **expected, **channel_fields(channel), source_digest=source_digest,
+                    source_ci=source_ci, assets=inventory(directory, pins))
     encoded = (json.dumps(document, indent=2, sort_keys=True) + "\n").encode()
     with path.open("xb") as output:
         output.write(encoded)
@@ -79,7 +175,13 @@ def record_candidate(directory, pins, **expected):
     return hashlib.sha256(encoded).hexdigest()
 
 
-def verify_candidate(directory, pins, qualified_digest, **expected):
+def verify_candidate(directory, pins, qualified_digest, channel="release", source_digest=None,
+                     source_ci=None, **expected):
+    """Verify the record and every asset; `source_digest` and `source_ci`, when given, must be the recorded ones.
+
+    Staging and promotion pass neither: the record hashes to the qualified
+    digest, so what it names is what the build recorded.
+    """
     expected = identity(**expected)
     if not re.fullmatch(r"[0-9a-f]{64}", qualified_digest):
         raise ValueError("qualification must supply the candidate record's SHA-256")
@@ -87,27 +189,40 @@ def verify_candidate(directory, pins, qualified_digest, **expected):
     if path.is_symlink() or not path.is_file() or sha256(path) != qualified_digest:
         raise ValueError("candidate record differs from the qualified digest")
     document = json.loads(path.read_text())
-    if document != dict(schema=1, **expected, assets=inventory(directory, pins, recorded=True)):
+    recorded = check_source_digest(document.get("source_digest"))
+    if source_digest is not None and recorded != source_digest:
+        raise ValueError("candidate source digest differs from the build's")
+    recorded_ci = check_source_ci(document.get("source_ci"))
+    if source_ci is not None and recorded_ci != source_ci:
+        raise ValueError("candidate source CI run differs from the build's")
+    if document != dict(schema=1, **expected, **channel_fields(channel), source_digest=recorded,
+                        source_ci=recorded_ci, assets=inventory(directory, pins, recorded=True)):
         raise ValueError("candidate identity or bytes differ from qualification")
     return document
 
 
-def verify_run(run, repository, commit, run_id):
-    """Only a successful main-branch manual build can supply a candidate."""
-    expected = dict(id=run_id, head_sha=commit, head_branch="main", event="workflow_dispatch",
+def verify_run(run, repository, commit, run_id, channel="release"):
+    """Only a successful manual build of main can supply a candidate, and of a train a nightly."""
+    expected = dict(id=run_id, head_sha=commit, event="workflow_dispatch",
                     path=".github/workflows/build.yml", status="completed", conclusion="success")
-    if any(run.get(key) != value for key, value in expected.items()):
-        raise ValueError("candidate run is not a successful manual main build of this tag's commit")
+    if (any(run.get(key) != value for key, value in expected.items())
+            or not re.fullmatch(BRANCHES[channel], str(run.get("head_branch")))):
+        raise ValueError(f"candidate run is not a successful manual {channel} build of this commit")
     if any(run.get(key, {}).get("full_name") != repository for key in ("repository", "head_repository")):
         raise ValueError("candidate run belongs to another repository")
     if type(run.get("run_attempt")) is not int or run["run_attempt"] < 1:
         raise ValueError("candidate run attempt is invalid")
 
 
-def staging_tag(version, run_id, run_attempt):
-    """The pre-release tag a candidate is staged under: never a release tag."""
+def staging_tag(version, run_id, run_attempt, channel="release"):
+    """The pre-release tag a candidate or nightly is staged under: never a release tag."""
     identity(version, "reliaburger/reliaburger", "0" * 40, run_id, run_attempt)
-    return f"{STAGING_PREFIX}{version}-{run_id}-{run_attempt}"
+    return f"{TAG_PREFIXES[channel]}{version}-{run_id}-{run_attempt}"
+
+
+def artefact_name(channel, commit, run_attempt):
+    """The Actions artefact holding a channel's signed build of `commit`."""
+    return f"{ARTEFACTS[channel]}-{commit}-{run_attempt}"
 
 
 def staging_step(release, tag):
@@ -155,7 +270,7 @@ def gh(*arguments):
     subprocess.run(["gh", *arguments], check=True, stdout=sys.stderr)
 
 
-def candidate_run(repository, run_id, commit=None):
+def candidate_run(repository, run_id, commit=None, channel="release"):
     """Fetch a build run and require a successful manual main build of `commit`.
 
     Staging has no tag yet, so it takes the commit from the run itself; the
@@ -163,29 +278,71 @@ def candidate_run(repository, run_id, commit=None):
     has to match every byte.
     """
     run = gh_json(f"repos/{repository}/actions/runs/{run_id}")
-    verify_run(run, repository, run.get("head_sha") if commit is None else commit, run_id)
+    verify_run(run, repository, run.get("head_sha") if commit is None else commit, run_id, channel)
     return run
 
 
-def download_candidate(directory, repository, run):
+PINS_PATH = "scripts/release/guest-images.json"
+
+
+def local_pins():
+    """The guest image pins in this checkout: main's, in stage.yml and promote.yml."""
+    return json.loads(Path(__file__).with_name("guest-images.json").read_text())
+
+
+def staging_pins(repository, run, channel, pins):
+    """The guest image pins to check a staged build against.
+
+    A release candidate is built on main, so main's own pins (`pins`) are its
+    pins. A train's nightly is built from the train, which may pin other
+    guest images than main until its gate PR merges (0.3.0 moved to Ubuntu
+    26.04), so its pins are read from its build commit (#1952). They're data,
+    never code: they only name the image assets and their upstream digests,
+    and every byte is still checked against the digest-pinned record.
+    """
+    if channel != "nightly":
+        return pins
+    answer = gh_json(f"repos/{repository}/contents/{PINS_PATH}?ref={run['head_sha']}")
+    if answer.get("type") != "file" or answer.get("encoding") != "base64":
+        raise ValueError(f"{PINS_PATH} at the build commit is not a base64 file")
+    try:
+        commit_pins = json.loads(base64.b64decode(answer.get("content", ""), validate=False))
+        images = commit_pins["images"]
+        assets = [image["asset"] for image in images.values()]
+        sources = [image["source"]["sha256"] for image in images.values()]
+    except (ValueError, KeyError, TypeError, AttributeError):
+        raise ValueError(f"{PINS_PATH} at the build commit is not a set of guest image pins") from None
+    if not images or any(type(asset) is not str or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.qcow2", asset)
+                         for asset in assets):
+        raise ValueError(f"{PINS_PATH} at the build commit names a guest image that isn't a plain .qcow2 file")
+    if any(type(digest) is not str or not re.fullmatch(r"[0-9a-f]{64}", digest) for digest in sources):
+        raise ValueError(f"{PINS_PATH} at the build commit pins a source without a SHA-256")
+    return commit_pins
+
+
+def download_candidate(directory, repository, run, channel="release"):
     if directory.exists():
         raise FileExistsError("candidate download directory must be new")
     gh("run", "download", str(run["id"]), "--repo", repository,
-       "--name", f"candidate-{run['head_sha']}-{run['run_attempt']}", "--dir", str(directory))
+       "--name", artefact_name(channel, run["head_sha"], run["run_attempt"]), "--dir", str(directory))
 
 
 def verify_downloaded(directory, pins, repository, run, qualified_digest, version=None):
     """Verify a downloaded candidate against its run and the qualified digest.
 
-    Without a tag, the version comes from the record, which is safe only
-    because the record itself must hash to the operator's qualified digest.
+    Without a tag, the version and channel come from the record, which is
+    safe only because the record itself must hash to the operator's
+    qualified digest. Promotion passes its tag's version, and so only ever
+    accepts a release record.
     """
+    channel = "release"
     if version is None:
         path = directory / RECORD
         if path.is_symlink() or not path.is_file() or sha256(path) != qualified_digest:
             raise ValueError("candidate record differs from the qualified digest")
-        version = json.loads(path.read_text()).get("version", "")
-    return verify_candidate(directory, pins, qualified_digest, version=version,
+        record = json.loads(path.read_text())
+        version, channel = record.get("version", ""), record.get("channel", "release")
+    return verify_candidate(directory, pins, qualified_digest, channel=channel, version=version,
                             repository=repository, commit=run["head_sha"],
                             run_id=run["id"], run_attempt=run["run_attempt"])
 
@@ -203,6 +360,19 @@ def find_release(repository, tag):
 
 def staging_notes(document, tag, qualified_digest):
     base = f"https://github.com/{document['repository']}/releases/download/{tag}"
+    if document.get("channel") == "nightly":
+        return (
+            f"**Nightly build of a release train, not a release.** Unreleased code at commit "
+            f"{document['commit']}, from build run {document['run_id']} (attempt "
+            f"{document['run_attempt']}), signed with the nightly key, which no released "
+            f"Reliaburger trusts. It exists so the nightly qualification can install the train's "
+            f"tip, and a later nightly staging deletes it. Every version string inside says "
+            f"{document['version']}.\n\n"
+            f"`candidate.json` SHA-256: `{qualified_digest}`\n\n"
+            f"The website installer refuses it unless qualification asks for it:\n\n"
+            f"```sh\ncurl -fsSL https://reliaburger.com/install.sh | RELIABURGER_ACCEPT_NIGHTLY=1 "
+            f"RELIABURGER_RELEASE_BASE_URL={base} sh -s -- --laptop\n```\n"
+        )
     return (
         f"**Staging candidate, not a release.** These are the unchanged signed "
         f"{document['version']} candidate files from build run {document['run_id']} "
@@ -212,14 +382,15 @@ def staging_notes(document, tag, qualified_digest):
         f"`candidate.json` SHA-256: `{qualified_digest}`\n\n"
         f"Qualification only:\n\n"
         f"```sh\ncurl -fsSL https://reliaburger.com/install.sh | "
-        f"RELIABURGER_RELEASE_BASE_URL={base} sh\n```\n"
+        f"RELIABURGER_RELEASE_BASE_URL={base} sh -s -- --laptop\n```\n"
     )
 
 
 def stage(directory, document, qualified_digest):
     """Publish a verified candidate as a pre-release under its staging tag, or
     re-verify the one an earlier run published. Never marks anything latest."""
-    tag = staging_tag(document["version"], document["run_id"], document["run_attempt"])
+    channel = document.get("channel", "release")
+    tag = staging_tag(document["version"], document["run_id"], document["run_attempt"], channel)
     repository = document["repository"]
     record_size = (directory / RECORD).stat().st_size
     step = staging_step(find_release(repository, tag), tag)
@@ -228,9 +399,10 @@ def stage(directory, document, qualified_digest):
         # installed from it, so start it again rather than patch it up.
         gh("release", "delete", tag, "--repo", repository, "--yes")
     if step in ("create", "resume"):
+        what = "Nightly build" if channel == "nightly" else "Staging candidate"
         gh("release", "create", tag, "--repo", repository, "--target", document["commit"],
            "--draft", "--prerelease", "--latest=false",
-           "--title", f"Staging candidate {document['version']} (run {document['run_id']}, "
+           "--title", f"{what} {document['version']} (run {document['run_id']}, "
                       f"attempt {document['run_attempt']})",
            "--notes", staging_notes(document, tag, qualified_digest),
            *sorted(str(path) for path in directory.iterdir()))
@@ -245,28 +417,84 @@ def stage(directory, document, qualified_digest):
     return tag
 
 
+def nightly_tags_to_delete(releases, keep):
+    """The nightly pre-releases beyond the newest `keep`, newest first; nothing else is ever named."""
+    nightlies = [release for release in releases
+                 if release.get("tag_name", "").startswith(NIGHTLY_PREFIX) and release.get("prerelease") is True]
+    nightlies.sort(key=lambda release: release["created_at"], reverse=True)
+    return [release["tag_name"] for release in nightlies[keep:]]
+
+
+def list_releases(repository):
+    """Every release, drafts included, as {tag_name, prerelease, created_at}."""
+    result = subprocess.run(["gh", "api", "--paginate", f"repos/{repository}/releases?per_page=100",
+                             "--jq", ".[] | {tag_name, prerelease, created_at}"],
+                            check=True, capture_output=True, text=True)
+    return [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+
+
+def prune_nightly(repository, keep):
+    """Delete nightly pre-releases, and their tags, beyond the newest `keep`."""
+    if keep < 1:
+        raise ValueError("keep at least the newest nightly")
+    doomed = nightly_tags_to_delete(list_releases(repository), keep)
+    for tag in doomed:
+        gh("release", "delete", tag, "--repo", repository, "--cleanup-tag", "--yes")
+    return doomed
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("operation", choices=["record", "verify", "fetch", "verify-upload",
-                                              "stage-fetch", "stage"])
+                                              "stage-fetch", "stage", "prune-nightly",
+                                              "bundle-digest", "agreed-source-digest"])
     parser.add_argument("--directory", type=Path, default=Path("dist"))
     parser.add_argument("--version", help="release tag; staging reads it from the record")
-    parser.add_argument("--repository", required=True)
+    parser.add_argument("--repository", help="required by every operation but the digest ones")
     parser.add_argument("--commit", help="candidate commit; staging reads it from the run")
-    parser.add_argument("--run-id", type=int, required=True)
+    parser.add_argument("--run-id", type=int)
     parser.add_argument("--run-attempt", type=int, default=1)
     parser.add_argument("--qualified-digest")
+    parser.add_argument("--channel", choices=CHANNELS, default="release",
+                        help="release (a build of main) or nightly (a build of a release-* train)")
+    parser.add_argument("--keep", type=int, default=7, help="prune-nightly: how many nightlies to keep")
+    parser.add_argument("--source-digest", help="record and verify: the source bundle's sha256: digest")
+    parser.add_argument("--source-ci-run", type=int,
+                        help="record and verify: the ci.yml run the candidate's source CI rests on")
+    parser.add_argument("--source-ci-attempt", type=int, help="record and verify: that run's attempt")
     args = parser.parse_args()
-    pins = json.loads(Path(__file__).with_name("guest-images.json").read_text())
+
+    # The digest operations read only their input: no record, run or repository.
+    if args.operation == "bundle-digest":
+        print(bundle_digest(sys.stdin.read()))
+        return
+    if args.operation == "agreed-source-digest":
+        print(agreed_source_digest(args.directory))
+        return
+    if not args.repository:
+        parser.error(f"{args.operation} requires --repository")
+    pins = local_pins()
     digest = args.qualified_digest or ""
+
+    if args.operation == "prune-nightly":
+        for tag in prune_nightly(args.repository, args.keep):
+            print(f"deleted {tag}")
+        return
+    if args.run_id is None:
+        parser.error(f"{args.operation} requires --run-id")
+    if args.channel == "nightly" and args.operation in ("fetch", "verify-upload"):
+        parser.error("a nightly build is never promoted")
 
     if args.operation in ("stage-fetch", "stage"):
         # No tag exists yet and none is read: the run names the commit and the
         # digest-pinned record names the version.
-        run = candidate_run(args.repository, args.run_id)
+        run = candidate_run(args.repository, args.run_id, channel=args.channel)
+        pins = staging_pins(args.repository, run, args.channel, pins)
         if args.operation == "stage-fetch":
-            download_candidate(args.directory, args.repository, run)
+            download_candidate(args.directory, args.repository, run, args.channel)
         document = verify_downloaded(args.directory, pins, args.repository, run, digest)
+        if document.get("channel", "release") != args.channel:
+            raise ValueError(f"the record is not a {args.channel} build")
         if args.operation == "stage-fetch":
             print(f"verified candidate {run['head_sha']} from run {args.run_id}, "
                   f"attempt {run['run_attempt']}")
@@ -278,12 +506,19 @@ def main():
     if not args.version or not args.commit:
         parser.error(f"{args.operation} requires --version and --commit")
     expected = identity(args.version, args.repository, args.commit, args.run_id, args.run_attempt)
+    source_ci = None
+    if args.source_ci_run is not None or args.source_ci_attempt is not None:
+        source_ci = dict(run_id=args.source_ci_run, run_attempt=args.source_ci_attempt)
     if args.operation == "record":
-        print(record_candidate(args.directory, pins, **expected))
+        if not args.source_digest or source_ci is None:
+            parser.error("record requires --source-digest, --source-ci-run and --source-ci-attempt")
+        print(record_candidate(args.directory, pins, args.channel, source_digest=args.source_digest,
+                               source_ci=source_ci, **expected))
         return
 
     if args.operation == "verify":
-        verify_candidate(args.directory, pins, digest, **expected)
+        verify_candidate(args.directory, pins, digest, args.channel, args.source_digest, source_ci,
+                         **expected)
         print(f"verified local candidate {args.commit}")
         return
 

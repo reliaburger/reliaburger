@@ -2,27 +2,27 @@
 source: src/relish/tui/views/help.rs
 expression: "render_to_string(&app, 120, 40)"
 ---
- RELISH  0 nodes · 0 apps · leader - · CONNECTED                                                                        
+ RELISH  3 nodes · 0 apps · leader node-1 · CONNECTED                                                                   
                                                                                                                         
 ┌dashboard─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│Apps                                                                                                                  │
-│no apps deployed — relish apply <path>                                                                                │
+│Cluster HEALTHY, no problems (node-1 answered at 15:06:40)                                                            │
 │                                                                                                                      │
-│Nodes                                                                                                                 │
-│single-node mode — no gossip peers                                                                                    │
+│nodes      3 alive, 0 suspect, 0 dead                                                                                 │
+│council    leader node-1 (term 4), 3/3 voters, quorum ok, 0 lagging                                                   │
+│gossip     3 members, last change 10 m ago, 1,204 updates received                                                    │
+│versions   bun 0.2.8 on 3 nodes                                                                                       │
+│capacity   cpu 0% allocated (0 of 24 cores), memory 0%                                                                │
+│usage      cpu 21%, memory 40%, disk 30%; newest sample 5 s old                                                       │
+│apps       none deployed                                                                                              │
+│instances  0 of 0 running                                                                                             │
+│jobs       none running or finished in the last hour                                                                  │
+│logs       newest line 2 s old                                                                                        │
+│faults     none active                                                                                                │
+│alerts     none firing                                                                                                │
+│certs      none tracked                                                                                               │
+│agents     no leases held, no proposals waiting                                                                       │
 │                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
-│                                                                                                                      │
+│Recent events                                                                                                         │
 │                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │

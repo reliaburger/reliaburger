@@ -1,0 +1,335 @@
+{
+  "schema": "relish.agent/v1",
+  "command": "status",
+  "ok": true,
+  "relish": {
+    "version": "0.2.8",
+    "commit": "e423d469a93b04d7bdc64582be1922ac5f453fd1",
+    "dirty": false,
+    "source_digest": "sha256:b59ee0524065462e5497d90d7e637260ce76f5301f83d49b4919eb581c9d354c"
+  },
+  "data": {
+    "verdict": "healthy",
+    "problems": 0,
+    "lines": [
+      {
+        "section": "nodes",
+        "text": "3 alive, 0 suspect, 0 dead",
+        "mark": "quiet",
+        "next": null
+      },
+      {
+        "section": "council",
+        "text": "leader rb-7e5b25951952-1 (term 1), 3/3 voters, quorum ok, 0 lagging",
+        "mark": "quiet",
+        "next": null
+      },
+      {
+        "section": "gossip",
+        "text": "3 members, last change 11 s ago, 23 updates received",
+        "mark": "quiet",
+        "next": null
+      },
+      {
+        "section": "versions",
+        "text": "bun v0.2.8 on 3 nodes",
+        "mark": "quiet",
+        "next": null
+      },
+      {
+        "section": "capacity",
+        "text": "cpu 0% allocated (0 of 4 cores), memory 0%",
+        "mark": "quiet",
+        "next": null
+      },
+      {
+        "section": "usage",
+        "text": "cpu 1% (busiest rb-7e5b25951952-1 1%), memory 17%, disk 22%; newest sample 1 s old",
+        "mark": "quiet",
+        "next": null
+      },
+      {
+        "section": "apps",
+        "text": "1: 1 running",
+        "mark": "quiet",
+        "next": null
+      },
+      {
+        "section": "instances",
+        "text": "1 of 1 running",
+        "mark": "quiet",
+        "next": null
+      },
+      {
+        "section": "jobs",
+        "text": "none running or finished in the last hour",
+        "mark": "quiet",
+        "next": null
+      },
+      {
+        "section": "logs",
+        "text": "newest line 4 s old, slowest node 21 s (rb-7e5b25951952-2)",
+        "mark": "quiet",
+        "next": null
+      },
+      {
+        "section": "faults",
+        "text": "none active",
+        "mark": "quiet",
+        "next": null
+      },
+      {
+        "section": "alerts",
+        "text": "none firing",
+        "mark": "quiet",
+        "next": null
+      },
+      {
+        "section": "certs",
+        "text": "soonest expiry 364 days (node rb-7e5b25951952-1)",
+        "mark": "quiet",
+        "next": null
+      },
+      {
+        "section": "agents",
+        "text": "no leases held, no proposals waiting",
+        "mark": "quiet",
+        "next": null
+      },
+      {
+        "section": "wtf",
+        "text": "0 critical, 3 warnings",
+        "mark": "note",
+        "next": "relish wtf"
+      }
+    ],
+    "wtf": {
+      "outcome": "checked",
+      "critical": 0,
+      "warning": 3,
+      "unknown": 0,
+      "first_critical": null
+    },
+    "summary": {
+      "generated_at_unix_ms": 1794465639242,
+      "answered_by": "rb-7e5b25951952-1",
+      "version": "v0.2.8",
+      "scoped": false,
+      "nodes": {
+        "source": "complete",
+        "coverage": {
+          "answered": 3,
+          "asked": 3
+        },
+        "value": {
+          "alive": 3,
+          "suspect": 0,
+          "dead": 0,
+          "left": 0,
+          "cordoned": 0,
+          "disk_pressure": 0
+        }
+      },
+      "council": {
+        "source": "complete",
+        "coverage": {
+          "answered": 3,
+          "asked": 3
+        },
+        "value": {
+          "leader": "rb-7e5b25951952-1",
+          "term": 1,
+          "voters": 3,
+          "voters_answering": 3,
+          "quorum_ok": true,
+          "lagging": 0
+        }
+      },
+      "gossip": {
+        "source": "complete",
+        "value": {
+          "members": 3,
+          "updates_received": 23,
+          "last_change_unix_ms": 1794465627407
+        }
+      },
+      "versions": {
+        "source": "complete",
+        "coverage": {
+          "answered": 3,
+          "asked": 3
+        },
+        "value": {
+          "versions": [
+            {
+              "version": "v0.2.8",
+              "nodes": 3
+            }
+          ],
+          "upgrade_in_progress": false
+        }
+      },
+      "capacity": {
+        "source": "complete",
+        "coverage": {
+          "answered": 3,
+          "asked": 3
+        },
+        "value": {
+          "nodes_reporting": 3,
+          "cpu_allocated_millicores": 0,
+          "cpu_total_millicores": 4500,
+          "memory_allocated_mb": 0,
+          "memory_total_mb": 4347,
+          "gpu_allocated": 0,
+          "gpu_total": 0
+        }
+      },
+      "usage": {
+        "source": "complete",
+        "coverage": {
+          "answered": 3,
+          "asked": 3
+        },
+        "value": {
+          "cpu_percent": 0.7176850636800131,
+          "memory_percent": 17.492451481394703,
+          "disk_percent": 22.413550050952686,
+          "busiest": [
+            {
+              "node": "rb-7e5b25951952-1",
+              "percent": 0.951903760433197
+            },
+            {
+              "node": "rb-7e5b25951952-2",
+              "percent": 0.6503251791000366
+            },
+            {
+              "node": "rb-7e5b25951952-3",
+              "percent": 0.5508262515068054
+            }
+          ],
+          "newest_sample_unix_ms": 1794465638000
+        }
+      },
+      "apps": {
+        "source": "complete",
+        "coverage": {
+          "answered": 3,
+          "asked": 3
+        },
+        "value": {
+          "total": 1,
+          "running": 1,
+          "degraded": 0,
+          "down": 0,
+          "unknown": 0,
+          "stopped": 0,
+          "unschedulable": 0,
+          "worst": []
+        }
+      },
+      "instances": {
+        "source": "complete",
+        "coverage": {
+          "answered": 3,
+          "asked": 3
+        },
+        "value": {
+          "running": 1,
+          "desired": 1,
+          "not_running": 0
+        }
+      },
+      "jobs": {
+        "source": "complete",
+        "value": {
+          "running": 0,
+          "tasks_queued": 0,
+          "tasks_running": 0,
+          "succeeded_last_hour": 0,
+          "failed_last_hour": 0,
+          "scheduled": 0
+        }
+      },
+      "logs": {
+        "source": "complete",
+        "coverage": {
+          "answered": 3,
+          "asked": 3
+        },
+        "value": {
+          "newest_unix_ms": 1794465634373,
+          "slowest": {
+            "node": "rb-7e5b25951952-2",
+            "unix_ms": 1794465618059
+          }
+        }
+      },
+      "faults": {
+        "source": "complete",
+        "coverage": {
+          "answered": 3,
+          "asked": 3
+        },
+        "value": {
+          "active": 0,
+          "soonest": []
+        }
+      },
+      "alerts": {
+        "source": "complete",
+        "coverage": {
+          "answered": 3,
+          "asked": 3
+        },
+        "value": {
+          "firing": 0,
+          "first": []
+        }
+      },
+      "certs": {
+        "source": "complete",
+        "coverage": {
+          "answered": 3,
+          "asked": 3
+        },
+        "value": {
+          "count": 3,
+          "soonest": {
+            "subject": "node rb-7e5b25951952-1",
+            "not_after_unix_seconds": 1826001610
+          }
+        }
+      },
+      "gitops": {
+        "source": "complete",
+        "value": {
+          "configured": false,
+          "commit": null,
+          "synced_at_unix_seconds": null,
+          "error": null
+        }
+      },
+      "agents": {
+        "source": "complete",
+        "value": {
+          "leases": 0,
+          "first_leases": [],
+          "waiting": 0,
+          "stale": 0,
+          "first_proposals": []
+        }
+      }
+    }
+  },
+  "truncated": false,
+  "next": [
+    {
+      "run": "relish wtf",
+      "why": "wtf: 0 critical, 3 warnings",
+      "read_only": true
+    }
+  ],
+  "warnings": []
+}

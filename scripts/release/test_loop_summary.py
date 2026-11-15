@@ -19,7 +19,7 @@ WORKFLOW = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "v02-
 CANDIDATE = "0123456789abcdef0123456789abcdef01234567"
 TEST = "reliaburger::suite::log_export::lock"
 
-# The shape nextest 0.9.145 writes for `--stress-count 3`: one testsuite per iteration.
+# The shape nextest 0.9.151 writes for `--stress-count 3`: one testsuite per iteration.
 JUNIT = """<?xml version="1.0" encoding="UTF-8"?>
 <testsuites name="nextest-run" tests="3">
   <testsuite name="reliaburger::suite@stress-0" tests="1">

@@ -294,6 +294,111 @@ pub struct WorkloadJwtClaims {
 // API tokens
 // ---------------------------------------------------------------------------
 
+/// Whose token it is: a person's, or an agent's (#1682).
+///
+/// An agent token authenticates with the read-only role on every route
+/// except the proposal and lease routes, which read its granted role, so
+/// it can propose a change but never make one. "Human" describes the
+/// token, not who's typing: an agent using a person's token is that
+/// person, as far as the cluster can tell.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenKind {
+    /// A person's token, and every token made without `--agent`.
+    #[default]
+    Human,
+    /// An agent's token, made with `relish token create --agent`.
+    Agent,
+}
+
+impl TokenKind {
+    /// `human` or `agent`, as audit records and listings spell it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TokenKind::Human => "human",
+            TokenKind::Agent => "agent",
+        }
+    }
+}
+
+/// What kind of principal an audit record names (#1682's design), so
+/// `relish audit --principal-kind agent` lists everything agents did.
+///
+/// It comes from what the API knows about the caller, never from a name:
+/// a token's [`TokenKind`], the node's own service principal, or a
+/// workload's verified identity. Like the token kind, it's a label for the
+/// audit, not a security boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrincipalKind {
+    /// A person's token, a browser session, or a node with no tokens yet.
+    Human,
+    /// An agent's token.
+    Agent,
+    /// A workload's identity token.
+    Workload,
+    /// The cluster itself: the nodes' service principal, and background
+    /// work such as expiry and sweeps.
+    System,
+    /// A guardrail policy that approved a proposal.
+    Policy,
+    /// No valid credential, or a summary of many callers.
+    Unknown,
+}
+
+impl PrincipalKind {
+    /// Every kind, in the order `relish audit --help` lists them.
+    pub const ALL: [PrincipalKind; 6] = [
+        PrincipalKind::Human,
+        PrincipalKind::Agent,
+        PrincipalKind::Workload,
+        PrincipalKind::System,
+        PrincipalKind::Policy,
+        PrincipalKind::Unknown,
+    ];
+
+    /// The kind as audit records spell it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PrincipalKind::Human => "human",
+            PrincipalKind::Agent => "agent",
+            PrincipalKind::Workload => "workload",
+            PrincipalKind::System => "system",
+            PrincipalKind::Policy => "policy",
+            PrincipalKind::Unknown => "unknown",
+        }
+    }
+}
+
+impl From<TokenKind> for PrincipalKind {
+    fn from(kind: TokenKind) -> Self {
+        match kind {
+            TokenKind::Human => PrincipalKind::Human,
+            TokenKind::Agent => PrincipalKind::Agent,
+        }
+    }
+}
+
+impl std::str::FromStr for PrincipalKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        PrincipalKind::ALL
+            .into_iter()
+            .find(|kind| kind.as_str() == value)
+            .ok_or_else(|| {
+                let names: Vec<&str> = PrincipalKind::ALL
+                    .iter()
+                    .map(|kind| kind.as_str())
+                    .collect();
+                format!(
+                    "unknown principal kind {value:?}: use one of {}",
+                    names.join(", ")
+                )
+            })
+    }
+}
+
 /// The role granted to an API token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ApiRole {
@@ -348,6 +453,9 @@ pub struct ApiToken {
     pub token_hash: Vec<u8>,
     /// The role granted to this token.
     pub role: ApiRole,
+    /// A person's token or an agent's (#1682).
+    #[serde(default)]
+    pub kind: TokenKind,
     /// Optional scope restrictions.
     pub scope: TokenScope,
     /// When the token expires.
@@ -620,6 +728,38 @@ impl SecurityState {
         cas
     }
 
+    /// What a node outside the council needs from this state to do its own
+    /// job (#1477), for the leader to serve it. It keeps what verifies (CA
+    /// certificates, token hashes, the CRL, node leaf records), the wrapped
+    /// age keys that decrypt the secrets of apps the node runs, and the
+    /// wrapped Ingress CA key that signs its ingress leaves. Every wrapped key
+    /// opens only with the master key, which every node already holds.
+    ///
+    /// It drops what issues identity: the root, Node and Workload CA keys, the
+    /// OIDC signing key, join tokens, secret seals, pending intermediates and
+    /// the serial counter.
+    pub fn node_view(&self) -> SecurityState {
+        let certificate_authorities = self
+            .certificate_authorities
+            .iter()
+            .map(|ca| CertificateAuthority {
+                private_key_wrapped: ca
+                    .private_key_wrapped
+                    .clone()
+                    .filter(|_| ca.role == CaRole::Ingress),
+                ..ca.clone()
+            })
+            .collect();
+        SecurityState {
+            certificate_authorities,
+            age_keypairs: self.age_keypairs.clone(),
+            api_tokens: self.api_tokens.clone(),
+            crl: self.crl.clone(),
+            node_leaves: self.node_leaves.clone(),
+            ..SecurityState::default()
+        }
+    }
+
     /// The CA a role is rotating away from, if a rotation is in progress.
     pub fn retiring_ca(&self, role: CaRole) -> Option<&CertificateAuthority> {
         self.certificate_authorities
@@ -703,6 +843,66 @@ impl SecurityState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1477: the view a node outside the council gets holds nothing that
+    /// issues identity: no CA key but the Ingress CA's, no OIDC signing key,
+    /// no join tokens, seals or pending intermediates.
+    #[test]
+    fn a_node_view_keeps_what_verifies_and_drops_what_issues() {
+        let init = crate::sesame::init::initialize_cluster(
+            "view",
+            "node-1",
+            tempfile::tempdir().unwrap().path(),
+        )
+        .unwrap();
+        let mut state = init.security_state;
+        state.join_tokens.push(JoinToken {
+            token_hash: [7; 32],
+            expires_at: std::time::SystemTime::now(),
+            consumed: false,
+            attestation_mode: AttestationMode::None,
+            node_id: "node-2".into(),
+        });
+        assert!(state.oidc_signing_config.is_some());
+        assert!(
+            state
+                .certificate_authorities
+                .iter()
+                .any(|ca| ca.role != CaRole::Ingress && ca.private_key_wrapped.is_some()),
+            "the fixture should hold an issuing key to drop"
+        );
+
+        let view = state.node_view();
+
+        for (kept, original) in view
+            .certificate_authorities
+            .iter()
+            .zip(&state.certificate_authorities)
+        {
+            let expected =
+                original.role == CaRole::Ingress && original.private_key_wrapped.is_some();
+            assert_eq!(
+                kept.private_key_wrapped.is_some(),
+                expected,
+                "{:?}",
+                original.role
+            );
+            assert_eq!(kept.certificate_der, original.certificate_der);
+        }
+        assert_eq!(
+            view.certificate_authorities.len(),
+            state.certificate_authorities.len()
+        );
+        assert!(view.oidc_signing_config.is_none());
+        assert!(view.join_tokens.is_empty());
+        assert!(view.secret_seals.is_empty());
+        assert!(view.pending_intermediates.is_empty());
+        assert_eq!(view.next_serial, 0);
+        assert_eq!(view.api_tokens, state.api_tokens);
+        assert_eq!(view.age_keypairs, state.age_keypairs);
+        assert_eq!(view.crl, state.crl);
+        assert!(view.is_initialised());
+    }
 
     #[test]
     fn serial_number_display_hex() {

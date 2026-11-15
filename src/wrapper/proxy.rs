@@ -48,6 +48,59 @@ pub struct ProxyState {
     /// the cluster. A lapsed lease routes only to this node's own backends:
     /// the remote addresses in that view may already belong to something else.
     pub view_lease: Option<Arc<crate::onion::lease::ViewLease>>,
+    /// Rate-limits the line logged when a route has no routable backend.
+    pub empty_pool_log: tokio::sync::Mutex<EmptyPoolLog>,
+}
+
+/// The shortest gap between two empty-pool lines for one route.
+const EMPTY_POOL_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Most routes the empty-pool log remembers; past it, routes whose last line
+/// is older than the interval are forgotten.
+const EMPTY_POOL_LOG_ROUTES: usize = 1024;
+
+/// When each route last logged that it answered 502 with no routable
+/// backend, and how many it answered since.
+///
+/// Without it a node's ingress turned clients away with no trace in its own
+/// journal (#1855). A pool can stay empty for a while under load, so each
+/// route logs at most once per [`EMPTY_POOL_LOG_INTERVAL`].
+#[derive(Debug, Default)]
+pub struct EmptyPoolLog {
+    routes: std::collections::HashMap<super::routing::RouteKey, (std::time::Instant, u64)>,
+}
+
+impl EmptyPoolLog {
+    /// Count a 502 for `route`. Returns the line to log, or `None` while
+    /// the route's last line is too recent.
+    fn record(
+        &mut self,
+        now: std::time::Instant,
+        route: &super::routing::RouteKey,
+    ) -> Option<String> {
+        if let Some((last, unreported)) = self.routes.get_mut(route) {
+            if now.duration_since(*last) < EMPTY_POOL_LOG_INTERVAL {
+                *unreported += 1;
+                return None;
+            }
+            let line = format!(
+                "wrapper: answered 502 for {}{}: no routable backend ({} more since the last line)",
+                route.host, route.path_prefix, unreported
+            );
+            *last = now;
+            *unreported = 0;
+            return Some(line);
+        }
+        if self.routes.len() >= EMPTY_POOL_LOG_ROUTES {
+            self.routes
+                .retain(|_, (last, _)| now.duration_since(*last) < EMPTY_POOL_LOG_INTERVAL);
+        }
+        self.routes.insert(route.clone(), (now, 0));
+        Some(format!(
+            "wrapper: answered 502 for {}{}: no routable backend",
+            route.host, route.path_prefix
+        ))
+    }
 }
 
 /// Largest number of backends the proxy will try for one request: the primary
@@ -187,7 +240,7 @@ pub async fn bind_proxy_with_tls(
     view_lease: Option<Arc<crate::onion::lease::ViewLease>>,
     shutdown: CancellationToken,
 ) -> Result<BoundProxy, WrapperError> {
-    let client = reqwest::Client::builder()
+    let client = crate::http_client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(std::time::Duration::from_secs(30))
         .read_timeout(std::time::Duration::from_secs(30))
@@ -195,7 +248,7 @@ pub async fn bind_proxy_with_tls(
         .pool_idle_timeout(UPSTREAM_POOL_IDLE_TIMEOUT)
         .build()
         .map_err(|e| WrapperError::ProxyFailed(format!("failed to build http client: {e}")))?;
-    let fresh_client = reqwest::Client::builder()
+    let fresh_client = crate::http_client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(std::time::Duration::from_secs(30))
         .read_timeout(std::time::Duration::from_secs(30))
@@ -212,6 +265,7 @@ pub async fn bind_proxy_with_tls(
         max_request_body_bytes: config.max_request_body_bytes,
         drains,
         view_lease,
+        empty_pool_log: Default::default(),
     });
 
     let http_listener = bind(config.http_port).await?;
@@ -564,7 +618,17 @@ async fn do_proxy(
     let backend = match (candidates.first(), scope) {
         (Some((_id, addr)), _) => *addr,
         (None, BackendScope::LocalOnly) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        (None, BackendScope::Cluster) => return StatusCode::BAD_GATEWAY.into_response(),
+        (None, BackendScope::Cluster) => {
+            let line = state
+                .empty_pool_log
+                .lock()
+                .await
+                .record(std::time::Instant::now(), &route_key);
+            if let Some(line) = line {
+                eprintln!("{line}");
+            }
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
     };
 
     // WebSocket: delegate to the upgrade handler (no body buffering). The
@@ -629,6 +693,13 @@ async fn do_proxy(
             || n.eq_ignore_ascii_case("x-request-id")
             || name == axum::http::header::CONTENT_LENGTH
         {
+            continue;
+        }
+        if name == axum::http::header::COOKIE {
+            let kept = value.to_str().ok().and_then(without_session_cookie);
+            if let Some(Ok(kept)) = kept.map(|kept| axum::http::HeaderValue::from_str(&kept)) {
+                forward_headers.push((name.clone(), kept));
+            }
             continue;
         }
         forward_headers.push((name.clone(), value.clone()));
@@ -908,6 +979,26 @@ pub(super) fn is_forwarded_header(name: &str) -> bool {
         || name.eq_ignore_ascii_case("forwarded")
 }
 
+/// A client's `Cookie` header without the dashboard's session cookie, or
+/// `None` when nothing else is left in it.
+///
+/// A browser sends cookies by host, not by port, so a request to an app
+/// served on the same host as a node's API carries the node's dashboard
+/// session too. That cookie is the node's, not the app's: the proxy never
+/// hands it to a backend.
+pub(super) fn without_session_cookie(value: &str) -> Option<String> {
+    let kept: Vec<&str> = value
+        .split(';')
+        .map(str::trim)
+        .filter(|pair| !pair.is_empty())
+        .filter(|pair| {
+            pair.split_once('=').map_or(*pair, |(name, _)| name.trim())
+                != crate::sesame::session::SESSION_COOKIE
+        })
+        .collect();
+    (!kept.is_empty()).then(|| kept.join("; "))
+}
+
 /// The `X-Forwarded-*` headers the proxy sets from its own view of the
 /// connection. A client cannot influence these — we already stripped any it
 /// sent — so a backend can trust them (ING5).
@@ -987,6 +1078,20 @@ mod tests {
         let req_uri: Uri = "/".parse().unwrap();
         let upstream = build_upstream_uri(&addr, &req_uri).unwrap();
         assert_eq!(upstream.to_string(), "http://10.0.2.2:30001/");
+    }
+
+    #[test]
+    fn the_dashboard_session_cookie_is_taken_out_and_the_rest_kept() {
+        assert_eq!(
+            without_session_cookie("theme=dark; rb_session=abc; lang=en").as_deref(),
+            Some("theme=dark; lang=en")
+        );
+        assert_eq!(without_session_cookie("rb_session=abc"), None);
+        assert_eq!(without_session_cookie(" rb_session = abc ;"), None);
+        assert_eq!(
+            without_session_cookie("rb_session_other=1").as_deref(),
+            Some("rb_session_other=1")
+        );
     }
 
     #[test]
@@ -1172,7 +1277,9 @@ mod tests {
     /// ING5: a client that supplies its own `X-Forwarded-For`/`-Proto` has
     /// them replaced with the proxy's view, so a backend can't be lied to.
     /// A backend echoes the headers it received; the proxy must show the real
-    /// client IP and the scheme it terminated, not the client's claims.
+    /// client IP and the scheme it terminated, not the client's claims. The
+    /// dashboard's session cookie, which a browser sends to every port on
+    /// the host, is taken out too.
     #[tokio::test]
     async fn proxy_replaces_client_forwarded_headers() {
         use crate::onion::types::BackendInstance;
@@ -1253,10 +1360,16 @@ mod tests {
             .header("host", "web.test")
             .header("x-forwarded-for", "1.2.3.4")
             .header("x-forwarded-proto", "https")
+            .header("cookie", "rb_session=nodesecret0; theme=dark")
             .send()
             .await
             .unwrap();
         let echoed = resp.text().await.unwrap().to_lowercase();
+
+        // The node's dashboard session never reaches an app; its own
+        // cookies do.
+        assert!(!echoed.contains("nodesecret0"), "{echoed}");
+        assert!(echoed.contains("cookie: theme=dark"), "{echoed}");
 
         // The client's lie is gone; the proxy's real view is present.
         assert!(
@@ -1981,14 +2094,22 @@ mod tests {
     }
 
     /// ING2: stalled TLS handshakes are bounded and reclaimed on the deadline.
-    /// We open more silent connections than the handshake cap and never send a
-    /// TLS ClientHello. If the handshakes weren't bounded and deadlined, a real
-    /// TLS client afterwards would be starved; instead the stalled ones drop on
-    /// their timeout and the real handshake succeeds.
+    ///
+    /// Two silent connections fill both handshake slots without sending a
+    /// ClientHello. While they hold them, a real rustls client is refused,
+    /// which proves the bound. Once the deadline passes the server closes the
+    /// silent sockets, and the same client then completes a real handshake and
+    /// gets an HTTP response, which proves the slots were reclaimed. Without
+    /// the bound the first real request succeeds; without the deadline the
+    /// silent sockets never close and the slots stay full.
     #[tokio::test]
     async fn stalled_tls_handshakes_are_bounded_and_reclaimed() {
         use std::time::Duration;
-        use tokio::io::AsyncWriteExt;
+        use tokio::io::AsyncReadExt;
+
+        // Long enough that the refused request below lands well inside it,
+        // even on a loaded runner.
+        const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(2);
 
         let routing_table = Arc::new(RwLock::new(RoutingTable::new()));
         let shutdown = CancellationToken::new();
@@ -1997,7 +2118,7 @@ mod tests {
                 http_port: 0,
                 https_port: 0,
                 max_tls_handshakes: 2,
-                tls_handshake_timeout: Duration::from_millis(200),
+                tls_handshake_timeout: HANDSHAKE_DEADLINE,
                 ..WrapperConfig::default()
             },
             routing_table,
@@ -2010,36 +2131,62 @@ mod tests {
             bound.serve().await.ok();
         });
 
-        // Open several silent connections that hold a handshake slot without
-        // ever sending a ClientHello.
+        // The listener accepts in arrival order, so these two take both slots
+        // before the real client below connects.
         let mut stalled = Vec::new();
-        for _ in 0..5 {
-            if let Ok(sock) = tokio::net::TcpStream::connect(("127.0.0.1", https_port)).await {
-                stalled.push(sock);
-            }
+        for _ in 0..2 {
+            stalled.push(
+                tokio::net::TcpStream::connect(("127.0.0.1", https_port))
+                    .await
+                    .unwrap(),
+            );
         }
 
-        // Wait past the handshake deadline so the stalled slots are reclaimed.
-        tokio::time::sleep(Duration::from_millis(400)).await;
-
-        // A real TLS ClientHello now gets a response (the handshake proceeds,
-        // even though the self-signed cert won't validate — we only need the
-        // server to engage, proving capacity wasn't exhausted).
-        let mut real = tokio::net::TcpStream::connect(("127.0.0.1", https_port))
-            .await
+        // The proxy serves a self-signed `localhost` certificate.
+        let client = crate::http_client::builder()
+            .danger_accept_invalid_certs(true)
+            .pool_max_idle_per_host(0)
+            .timeout(Duration::from_secs(10))
+            .build()
             .unwrap();
-        // Minimal TLS record header for a ClientHello handshake message. The
-        // server should respond (or at least not hang); we just assert the
-        // write path is accepted and the connection is live.
-        let client_hello_prefix = [0x16u8, 0x03, 0x01, 0x00, 0x2f];
-        assert!(
-            real.write_all(&client_hello_prefix).await.is_ok(),
-            "server refused a real handshake after stalled ones — capacity exhausted"
-        );
+        let url = format!("https://127.0.0.1:{https_port}/");
 
-        for s in stalled {
-            drop(s);
+        let refused = client.get(&url).header("host", "web.test").send().await;
+        assert!(
+            refused.is_err(),
+            "a real handshake succeeded while both slots were held: the bound is missing"
+        );
+        // The refusal must come from the full slots, not from the deadline
+        // having already reclaimed them.
+        for sock in &stalled {
+            let mut probe = [0u8; 1];
+            assert!(
+                matches!(sock.try_read(&mut probe), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+                "a stalled handshake was already closed when the real one was refused"
+            );
         }
+
+        // Past the deadline the server drops each silent socket: the read
+        // ends with EOF or a reset rather than hanging.
+        for mut sock in stalled {
+            let mut buf = [0u8; 16];
+            let closed = tokio::time::timeout(HANDSHAKE_DEADLINE * 5, sock.read(&mut buf)).await;
+            assert!(
+                matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+                "a stalled handshake was never reclaimed: {closed:?}"
+            );
+        }
+
+        // The reclaimed slots now admit a real handshake and request. An
+        // empty routing table answers 404, which proves HTTP flowed over TLS.
+        let response = client
+            .get(&url)
+            .header("host", "web.test")
+            .send()
+            .await
+            .expect("a real handshake after the deadline must succeed");
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+
         shutdown.cancel();
     }
 
@@ -2961,5 +3108,36 @@ mod tests {
     #[tokio::test]
     async fn fresh_upstream_waits_for_headers_and_stalled_body_reads_remain_bounded() {
         assert_upstream_inactivity_is_bounded(true).await;
+    }
+
+    /// A 502 for an empty pool used to leave no trace on the node that
+    /// answered it: #1855 could only be explained from another node's
+    /// journal. Each route logs its first one, then at most one line per
+    /// interval, counting the ones in between.
+    #[test]
+    fn an_empty_pool_is_logged_at_most_once_per_interval_per_route() {
+        use super::super::routing::RouteKey;
+        let route = |host: &str| RouteKey {
+            host: host.into(),
+            path_prefix: "/".into(),
+        };
+        let mut log = EmptyPoolLog::default();
+        let start = std::time::Instant::now();
+
+        let first = log.record(start, &route("web.example")).unwrap();
+        assert!(first.contains("web.example"), "{first}");
+        assert!(first.contains("502"), "{first}");
+        assert_eq!(log.record(start, &route("web.example")), None);
+        assert_eq!(
+            log.record(start + EMPTY_POOL_LOG_INTERVAL / 2, &route("web.example")),
+            None
+        );
+        // Another route has its own budget.
+        assert!(log.record(start, &route("api.example")).is_some());
+
+        let later = log
+            .record(start + EMPTY_POOL_LOG_INTERVAL, &route("web.example"))
+            .unwrap();
+        assert!(later.contains("2 more since"), "{later}");
     }
 }

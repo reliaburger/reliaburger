@@ -1,0 +1,41 @@
+# A partitioned node on Kubernetes: the port of scenarios/partitioned-node.toml.
+# The lab drops every packet between one agent node and both of its peers, as
+# Smoker's CouncilPartition cuts a follower off from both of its peers. The
+# control plane stays reachable, as Reliaburger's quorum does.
+id = "partitioned-node"
+title = "A partitioned node"
+platform = "k8s"
+nodes = 3
+ported = """
+Kubernetes has no fault injector, so the partition is iptables on the node:
+DROP rules in a chain of the lab's own, for each peer's address, in both
+directions. That cuts more than Smoker does (pod traffic too, not only the
+gossip and Raft transports), because a k3s agent has no separate control
+transport to cut. The partitioned node is an agent, never the server, as the
+Reliaburger one is a follower, never the leader. The node controller marks it
+NotReady after its 50-second grace period, so the settle is 70 seconds instead
+of 30.
+"""
+
+prompt = """
+The cluster has three nodes. One of them seems to have dropped out in the last
+minute, though nobody touched it. Find out what is wrong: which node, and what
+kind of fault.
+"""
+
+[[setup]]
+apply = "k8s/manifests/web-v1.yaml"
+wait_running = "web"
+
+[[setup]]
+fault = { kind = "node_partition", target = "@worker", duration = "10m" }
+
+[[setup]]
+settle = "70s"
+
+[truth]
+node = "@worker"
+fault_kind = "node_partitioned"
+
+[score]
+checks = ["node", "fault_kind"]

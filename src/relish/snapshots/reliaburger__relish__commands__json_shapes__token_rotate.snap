@@ -1,0 +1,10 @@
+---
+source: src/relish/commands.rs
+expression: "json(&IssuedTokenReport\n{\n    name: \"ci\", role: None, apps: None, namespaces: None, token:\n    \"rbt_new_secret\", expires_at: None, previous_valid_until:\n    Some(1_790_000_000),\n})"
+---
+{
+  "name": "ci",
+  "token": "rbt_new_secret",
+  "expires_at": null,
+  "previous_valid_until": 1790000000
+}

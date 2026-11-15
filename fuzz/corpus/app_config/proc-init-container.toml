@@ -1,0 +1,30 @@
+# App with an init container.
+#
+# Init containers run sequentially before the main app starts.
+# If any init container fails, the app transitions to Failed.
+# Here, the init runs /bin/echo (succeeds), then the main app starts. An init
+# container of an `exec` app that names no image of its own runs on the
+# host, like its app, so the node's allowed_binaries must name its binary
+# by path (examples/node/process-runtime.toml allows /bin/echo). One with an
+# image needs a container runtime.
+#
+# Build first:  cargo build
+# Start Bun with the process runtime and the node config that allows
+# testapp, from the repository root:
+#   target/debug/bun --runtime process --config examples/node/process-runtime.toml
+# Deploy with:  cargo run --bin relish -- apply examples/phase-1/proc-init-container.toml
+
+[app.web]
+exec = "target/debug/testapp"
+command = ["--mode", "healthy", "--port", "8080"]
+port = 8080
+
+[[app.web.init]]
+command = ["/bin/echo", "initialising database"]
+
+[app.web.health]
+path = "/healthz"
+interval = 5
+timeout = 2
+threshold_unhealthy = 3
+threshold_healthy = 1

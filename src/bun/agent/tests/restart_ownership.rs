@@ -166,6 +166,7 @@ async fn a_retired_restart_drops_its_late_result() {
         .begin_instance_retirement(&id)
         .await
         .unwrap()
+        .restart
         .expect("the retirement didn't take the instance from its restart");
     let settling =
         tokio::spawn(async move { taken.settle(std::time::Duration::from_secs(5)).await });

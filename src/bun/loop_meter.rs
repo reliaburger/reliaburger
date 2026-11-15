@@ -12,11 +12,14 @@
 //! that broke the rule never finishes.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::mayo::collector::CollectedMetric;
 use crate::mayo::types::MetricKey;
+
+use super::loop_watchdog::LoopHeartbeat;
 
 /// The metric name the histogram is exported under.
 pub const TURN_METRIC: &str = "bun_agent_loop_turn_seconds";
@@ -89,6 +92,11 @@ impl LoopBranch {
     fn index(self) -> usize {
         self as usize
     }
+
+    /// The branch whose `as u8` is `index`, for the watchdog's heartbeat.
+    pub(crate) fn from_index(index: u8) -> Option<LoopBranch> {
+        Self::ALL.get(usize::from(index)).copied()
+    }
 }
 
 /// A slow await inside a turn that the meter times, so a slow turn's log
@@ -98,6 +106,13 @@ impl LoopBranch {
 pub enum TurnPart {
     /// An fsync'd discovery journal write.
     JournalWrite,
+    /// Waiting for a discovery journal write that an earlier turn left in
+    /// flight off the loop. The write's own time was that earlier turn's
+    /// journal write; this is the wait a later turn paid for it (#1100).
+    InFlightWrite,
+    /// An fsync'd egress owners checkpoint write, which programming a
+    /// workload's egress before it starts waits for (#1266).
+    EgressWrite,
     /// A read of the runtime's launch inventory.
     RuntimeInventory,
     /// Waiting for the eBPF handle's lock, which job tasks, faults and
@@ -111,8 +126,10 @@ pub enum TurnPart {
 
 impl TurnPart {
     /// Every part, in the order a slow turn's line lists them.
-    const ALL: [TurnPart; 5] = [
+    const ALL: [TurnPart; 7] = [
         TurnPart::JournalWrite,
+        TurnPart::InFlightWrite,
+        TurnPart::EgressWrite,
         TurnPart::RuntimeInventory,
         TurnPart::KernelLock,
         TurnPart::ViewInstall,
@@ -123,6 +140,8 @@ impl TurnPart {
     fn label(self) -> &'static str {
         match self {
             TurnPart::JournalWrite => "journal write",
+            TurnPart::InFlightWrite => "wait for a write in flight",
+            TurnPart::EgressWrite => "egress owners write",
             TurnPart::RuntimeInventory => "runtime inventory",
             TurnPart::KernelLock => "kernel lock wait",
             TurnPart::ViewInstall => "view install",
@@ -219,31 +238,42 @@ impl std::fmt::Display for TurnRecord {
     }
 }
 
-/// Per-branch histogram: a count per bucket (not cumulative), plus the
-/// running sum and count Prometheus histograms carry.
+/// Per-branch histogram: a count per bucket (not cumulative), the last one
+/// for turns past every bound, plus the running sum Prometheus histograms
+/// carry.
+///
+/// There is no separate turn count. A scrape runs on another thread while
+/// turns finish, and reading a count apart from the buckets let one scrape
+/// see a turn in `le="1"` but not in `+Inf` (#1419). The count is the sum of
+/// the buckets one scrape read, so it can't disagree with them.
 struct BranchHistogram {
-    buckets: [AtomicU64; BUCKET_BOUNDS.len()],
+    buckets: [AtomicU64; BUCKET_BOUNDS.len() + 1],
     sum_nanos: AtomicU64,
-    count: AtomicU64,
 }
 
 impl BranchHistogram {
     const fn new() -> Self {
         Self {
-            buckets: [const { AtomicU64::new(0) }; BUCKET_BOUNDS.len()],
+            buckets: [const { AtomicU64::new(0) }; BUCKET_BOUNDS.len() + 1],
             sum_nanos: AtomicU64::new(0),
-            count: AtomicU64::new(0),
         }
     }
 
     fn observe(&self, took: Duration) {
         let seconds = took.as_secs_f64();
-        if let Some(bucket) = BUCKET_BOUNDS.iter().position(|bound| seconds <= *bound) {
-            self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
-        }
+        let bucket = BUCKET_BOUNDS
+            .iter()
+            .position(|bound| seconds <= *bound)
+            .unwrap_or(BUCKET_BOUNDS.len());
+        self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
         let nanos = u64::try_from(took.as_nanos()).unwrap_or(u64::MAX);
         self.sum_nanos.fetch_add(nanos, Ordering::Relaxed);
-        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Each bucket's count, read once, so every number a scrape exports
+    /// comes from the same reading.
+    fn counts(&self) -> [u64; BUCKET_BOUNDS.len() + 1] {
+        std::array::from_fn(|bucket| self.buckets[bucket].load(Ordering::Relaxed))
     }
 }
 
@@ -254,6 +284,8 @@ pub struct LoopTurnMeter {
     /// The timed parts of the turn in progress. The loop runs one turn at a
     /// time, so one set serves every turn, and `begin` clears it.
     parts: PartTimes,
+    /// What the stall watchdog reads: the turn in progress (#1707).
+    heartbeat: Arc<LoopHeartbeat>,
     /// Test-only: the longest finished turn and the turn in progress. A
     /// `std` mutex is fine here: it guards a copy and is never held across
     /// an `await`.
@@ -278,6 +310,7 @@ impl LoopTurnMeter {
         Self {
             branches: [const { BranchHistogram::new() }; LoopBranch::ALL.len()],
             parts: PartTimes::new(),
+            heartbeat: Arc::new(LoopHeartbeat::new()),
             #[cfg(test)]
             worst: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -291,6 +324,7 @@ impl LoopTurnMeter {
     /// op it handles, for the slow-turn log.
     pub fn begin(&self, branch: LoopBranch, detail: Option<&'static str>) -> Turn {
         self.parts.clear();
+        self.heartbeat.begin(branch, detail);
         let turn = Turn {
             branch,
             detail,
@@ -303,6 +337,11 @@ impl LoopTurnMeter {
         turn
     }
 
+    /// The heartbeat the stall watchdog watches.
+    pub fn heartbeat(&self) -> Arc<LoopHeartbeat> {
+        Arc::clone(&self.heartbeat)
+    }
+
     /// Add `took` to what `part` has cost the turn in progress.
     pub fn add_part(&self, part: TurnPart, took: Duration) {
         self.parts.add(part, took);
@@ -310,6 +349,7 @@ impl LoopTurnMeter {
 
     /// Record a finished turn, and log it when it ran long.
     pub fn finish(&self, turn: Turn) {
+        self.heartbeat.finish();
         let took = turn.started.elapsed();
         self.branches[turn.branch.index()].observe(took);
         if took >= SLOW_TURN_LOG_THRESHOLD {
@@ -363,7 +403,8 @@ impl LoopTurnMeter {
         let mut samples = Vec::new();
         for branch in LoopBranch::ALL {
             let histogram = &self.branches[branch.index()];
-            let count = histogram.count.load(Ordering::Relaxed);
+            let counts = histogram.counts();
+            let count: u64 = counts.iter().sum();
             if count == 0 {
                 continue;
             }
@@ -376,8 +417,8 @@ impl LoopTurnMeter {
                 labels
             };
             let mut cumulative = 0;
-            for (bound, bucket) in BUCKET_BOUNDS.iter().zip(&histogram.buckets) {
-                cumulative += bucket.load(Ordering::Relaxed);
+            for (bound, bucket) in BUCKET_BOUNDS.iter().zip(counts) {
+                cumulative += bucket;
                 samples.push(CollectedMetric {
                     key: MetricKey::with_labels(
                         format!("{TURN_METRIC}_bucket"),
@@ -446,6 +487,27 @@ impl LoopTurnMeter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_turn_stamps_the_watchdogs_heartbeat_while_it_runs() {
+        let meter = LoopTurnMeter::new();
+        let heartbeat = meter.heartbeat();
+        assert_eq!(heartbeat.current(), None);
+        let turn = meter.begin(LoopBranch::DeployOp, Some("health_probe_result"));
+        let stamp = heartbeat.current().unwrap();
+        assert_eq!(stamp.branch, LoopBranch::DeployOp);
+        assert_eq!(stamp.detail, Some("health_probe_result"));
+        meter.finish(turn);
+        assert_eq!(heartbeat.current(), None);
+    }
+
+    #[test]
+    fn every_branch_round_trips_through_its_heartbeat_index() {
+        for branch in LoopBranch::ALL {
+            assert_eq!(LoopBranch::from_index(branch as u8), Some(branch));
+        }
+        assert_eq!(LoopBranch::from_index(u8::MAX), None);
+    }
 
     fn value(samples: &[CollectedMetric], name: &str, labels: &[(&str, &str)]) -> Option<f64> {
         samples
@@ -563,6 +625,42 @@ mod tests {
         assert_eq!(last.part(TurnPart::ViewInstall), None);
     }
 
+    /// The 0.2.1 candidate 9 soak logged `2493 ms in deploy_op
+    /// (apply_network_pre_start)` and nothing else (#1266). A workload's
+    /// start can wait for two fsync'd stores and the eBPF lock; its line
+    /// now says which.
+    #[test]
+    fn a_slow_start_line_names_its_egress_owners_write() {
+        let meter = LoopTurnMeter::new();
+        let mut turn = meter.begin(LoopBranch::DeployOp, Some("apply_network_pre_start"));
+        turn.started -= Duration::from_millis(2493);
+        meter.add_part(TurnPart::KernelLock, Duration::from_millis(3));
+        meter.add_part(TurnPart::EgressWrite, Duration::from_millis(1990));
+        meter.add_part(TurnPart::JournalWrite, Duration::from_millis(500));
+        assert_eq!(
+            meter.slow_turn_line(&turn, Duration::from_millis(2493)),
+            "bun: agent loop turn took 2493 ms in deploy_op (apply_network_pre_start): \
+             journal write 500 ms, egress owners write 1990 ms, kernel lock wait 3 ms"
+        );
+        meter.finish(turn);
+    }
+
+    /// The 0.2.1 soak logged `4987 ms in deploy_op (health_probe_result):
+    /// journal write 22 ms` (#1100): the other 4.96 s went to waiting for a
+    /// write an earlier turn left in flight, and the line didn't say so.
+    #[test]
+    fn a_slow_turn_line_names_a_wait_for_a_write_in_flight() {
+        let meter = LoopTurnMeter::new();
+        let turn = meter.begin(LoopBranch::DeployOp, Some("health_probe_result"));
+        meter.add_part(TurnPart::InFlightWrite, Duration::from_millis(4965));
+        meter.add_part(TurnPart::JournalWrite, Duration::from_millis(22));
+        assert_eq!(
+            meter.slow_turn_line(&turn, Duration::from_millis(4987)),
+            "bun: agent loop turn took 4987 ms in deploy_op (health_probe_result): \
+             journal write 22 ms, wait for a write in flight 4965 ms"
+        );
+    }
+
     #[test]
     fn a_slow_turn_without_timed_parts_logs_as_before() {
         let meter = LoopTurnMeter::new();
@@ -584,5 +682,59 @@ mod tests {
         let last = meter.last_turn().unwrap();
         assert_eq!(last.branch, LoopBranch::HealthTick);
         assert_eq!(last.part(TurnPart::JournalWrite), None);
+    }
+
+    /// #1419: the 0.2.3 day run failed on "1 follow_up turn over the 1 s
+    /// budget" on node 3, and no slow-turn line named it. No turn was slow.
+    /// One scrape read the turn count, then a short turn finished, then the
+    /// scrape read the buckets, so `le="1"` (105,877) came out above `+Inf`
+    /// (105,876), and the soak checker counted the next, honest,
+    /// scrape as a new slow turn. Each scrape must be one consistent
+    /// histogram: buckets never shrink as `le` grows, and `+Inf` and `_count`
+    /// are the same number, however turns finish while it's read.
+    #[test]
+    fn a_scrape_racing_finished_turns_is_one_consistent_histogram() {
+        let meter = std::sync::Arc::new(LoopTurnMeter::new());
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let meter = meter.clone();
+            let done = done.clone();
+            std::thread::spawn(move || {
+                while !done.load(Ordering::Relaxed) {
+                    meter.branches[LoopBranch::FollowUp.index()].observe(Duration::from_millis(3));
+                }
+            })
+        };
+        let bounds: Vec<String> = BUCKET_BOUNDS
+            .iter()
+            .map(|bound| bound.to_string())
+            .chain(["+Inf".to_string()])
+            .collect();
+        let mut torn = 0;
+        for _ in 0..20_000 {
+            let samples = meter.samples();
+            let bucket = |le: &str| {
+                value(
+                    &samples,
+                    "bun_agent_loop_turn_seconds_bucket",
+                    &[("branch", "follow_up"), ("le", le)],
+                )
+            };
+            let Some(total) = bucket("+Inf") else {
+                continue;
+            };
+            let cumulative: Vec<f64> = bounds.iter().filter_map(|le| bucket(le)).collect();
+            let count = value(
+                &samples,
+                "bun_agent_loop_turn_seconds_count",
+                &[("branch", "follow_up")],
+            );
+            if cumulative.windows(2).any(|pair| pair[0] > pair[1]) || count != Some(total) {
+                torn += 1;
+            }
+        }
+        done.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+        assert_eq!(torn, 0, "{torn} of 20,000 scrapes were torn");
     }
 }

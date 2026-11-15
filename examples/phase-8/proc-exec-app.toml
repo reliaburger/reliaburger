@@ -1,14 +1,26 @@
-# Example: process workload using a host binary.
+# An app that runs a host binary directly (process runtime).
 #
-# This app runs a host binary directly (no container image needed).
-# The binary must be in the node's process_workloads.allowed_binaries
-# list: host execution is deny-by-default, so an empty list allows nothing.
+# `exec` names a binary on the node; no container image is involved. Host
+# execution is deny-by-default: the node runs only binaries listed in its
+# `[process_workloads] allowed_binaries`, and an empty list refuses
+# everything. On Linux it also needs `mount_isolation = false`, because host
+# workloads can't run under mount isolation yet (#714).
 #
-# Deploy: relish apply examples/phase-8/proc-exec-app.toml
+# examples/node/process-runtime.toml allows target/debug/testapp and turns
+# mount isolation off. From the repository root:
+#
+#   cargo build --locked --bins
+#   target/debug/bun --runtime process --config examples/node/process-runtime.toml
+#   target/debug/relish apply examples/phase-8/proc-exec-app.toml
+#   curl localhost:9090/metrics
+#
+# For your own binary, add its absolute path to allowed_binaries and put it
+# in `exec`. The process runs with Bun's user and privileges, so allow only
+# binaries you trust.
 
 [app.metrics-exporter]
-exec = "/usr/local/bin/metrics-exporter"
-command = ["--port", "9090", "--interval", "10s"]
+exec = "target/debug/testapp"
+command = ["--mode", "healthy", "--port", "9090"]
 port = 9090
 replicas = 1
 

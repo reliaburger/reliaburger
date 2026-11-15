@@ -1,0 +1,36 @@
+# Version 2 of web, deployed without the setting it needs: the port of
+# apps/web-v2-crashes.toml, line for line. It starts, runs for a few seconds,
+# then exits with an error, and the kubelet restarts it with a growing
+# back-off (CrashLoopBackOff). There's no readiness probe, as there's no
+# health check on the Reliaburger side, so the rollout counts it available
+# once it runs and scales v1 down: nothing is left serving.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: default
+  labels: {app: web}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: web}
+  template:
+    metadata:
+      labels: {app: web}
+    spec:
+      containers:
+        - name: web
+          image: "@IMAGE@"
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - |
+              echo "web v2: starting"
+              sleep 5
+              echo "web v2: fatal: DATABASE_URL is not set" >&2
+              exit 1
+          ports:
+            - containerPort: 8080
+          env:
+            - {name: VERSION, value: v2}

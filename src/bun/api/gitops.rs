@@ -118,9 +118,10 @@ async fn admit_gitops_webhook(
                 directory
                     .as_ref()
                     .and_then(|axum::Extension(LeaderDirectory(directory))| {
-                        let metrics = council.metrics();
-                        let metrics = metrics.borrow();
-                        crate::cluster::directory::leader_api_address(&metrics, &directory.borrow())
+                        crate::cluster::directory::leader_api_address(
+                            Some(&council.metrics()),
+                            directory,
+                        )
                     });
             let leader = match advertised {
                 Some(address) => state.cluster_http.url(&address.to_string(), ""),

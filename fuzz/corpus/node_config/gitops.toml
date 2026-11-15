@@ -1,0 +1,25 @@
+# A [gitops] section: the cluster syncs its apps from a Git repository.
+#
+# Put it in a council node's node.toml to seed the cluster's configuration
+# on first start, or hand it to a running cluster (an admin token):
+#
+#   relish gitops set examples/node/gitops.toml
+#   relish gitops status
+#
+# The configuration then lives in Raft, so every council member syncs the
+# same repository. GitOps owns only what it wrote: apps you deployed with
+# `relish apply` stay put. examples/gitops/repository/ is a repository to
+# start from, and scripts/demo/gitops.sh runs the whole thing on a one-node
+# cluster with a file:// repository.
+
+[gitops]
+# Any URL `git clone` takes. Credentials go in the URL
+# (https://deploy-bot:TOKEN@git.example.com/org/infra.git) and are sealed
+# with the cluster master key before they reach Raft. A local bare
+# repository works too: file:///srv/git/infra.git
+repo = "https://git.example.com/org/infra.git"
+branch = "main"
+# The watched directory: its subdirectories name namespaces.
+path = "/"
+# Poll every 10 seconds (default 30). A webhook syncs on push instead.
+poll_interval_secs = 10

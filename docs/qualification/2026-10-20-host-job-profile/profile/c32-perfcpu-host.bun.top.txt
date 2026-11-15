@@ -1,0 +1,81 @@
+total 11924
+100.00% incl   0.00% self  <std::sys::thread::unix::Thread>::new::thread_start
+100.00% incl  24.24% self  [libc.so.6]
+ 99.94% incl   0.00% self  <std::thread::lifecycle::spawn_unchecked<<tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure}, ()>::{closure} as core::ops::function::FnOnce<()>>:
+ 99.94% incl   0.00% self  tokio-rt-worker
+ 99.94% incl   0.00% self  std::sys::backtrace::__rust_begin_short_backtrace<<tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure}, ()>
+ 98.09% incl   0.00% self  tokio::runtime::task::raw::poll<tokio::runtime::blocking::task::BlockingTask<<tokio::runtime::scheduler::multi_thread::worker::Launch>::launch::{closure}>, toki
+ 98.08% incl   0.50% self  tokio::runtime::scheduler::multi_thread::worker::run
+ 91.01% incl   0.21% self  <tokio::runtime::scheduler::multi_thread::worker::Context>::run_task
+ 43.72% incl   0.09% self  tokio::runtime::task::raw::poll<reliaburger::lettuce::runner::spawn_gitops_sync::{closure}, alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::handle::Ha
+ 43.58% incl   0.26% self  reliaburger::lettuce::runner::spawn_gitops_sync::{closure}
+ 28.45% incl   0.12% self  <reliaburger::council::node::CouncilNode>::desired_state::{closure}
+ 28.33% incl   0.06% self  <reliaburger::council::state_machine::CouncilStateMachine>::desired_state::{closure}
+ 27.94% incl   0.70% self  <reliaburger::council::types::DesiredState as core::clone::Clone>::clone
+ 24.42% incl   0.00% self  el0t_64_sync
+ 24.42% incl   0.00% self  el0t_64_sync_handler
+ 24.37% incl   1.77% self  el0_svc
+ 21.93% incl   0.10% self  do_el0_svc
+ 21.77% incl   0.13% self  el0_svc_common.constprop.0
+ 21.65% incl   0.08% self  tokio::runtime::task::raw::poll<<reliaburger::bun::task_executor::TaskPool<reliaburger::bun::task_array_node::NodeRunner>>::resume_chunk_streaming::{closure}::{
+ 21.08% incl   0.35% self  invoke_syscall
+ 21.06% incl   0.21% self  <reliaburger::bun::task_executor::TaskPool<reliaburger::bun::task_array_node::NodeRunner>>::resume_chunk_streaming::{closure}::{closure}
+ 19.52% incl   0.07% self  <reliaburger::bun::task_runtime::OwnedRunner<reliaburger::grill::AnyGrill> as reliaburger::bun::task_executor::TaskRunner>::run::{closure}
+ 19.30% incl   0.38% self  <reliaburger::bun::reusable_executor::pool::ReusablePool<reliaburger::grill::AnyGrill>>::run<<reliaburger::bun::task_runtime::OwnedRunner<reliaburger::grill::An
+ 18.53% incl   5.35% self  malloc
+ 10.90% incl   0.06% self  core::ptr::drop_glue<reliaburger::council::types::DesiredState>
+ 10.48% incl   0.14% self  <reliaburger::meat::task_array_store::TaskArrays as core::clone::Clone>::clone
+  9.97% incl   4.22% self  cfree
+  9.16% incl   0.44% self  syscall
+  8.88% incl   1.15% self  <alloc::string::String as core::clone::Clone>::clone
+  8.27% incl   0.21% self  <hashbrown::map::HashMap<reliaburger::meat::types::AppId, reliaburger::config::app::AppSpec, std::hash::random::RandomState> as core::clone::Clone>::clone
+  7.95% incl   0.03% self  tokio::runtime::task::raw::poll<tracing::instrument::Instrumented<<openraft::core::raft_core::RaftCore<reliaburger::council::types::TypeConfig, reliaburger::cou
+  7.86% incl   0.11% self  <tracing::instrument::Instrumented<<openraft::core::raft_core::RaftCore<reliaburger::council::types::TypeConfig, reliaburger::council::network::TcpRaftNetworkFa
+  7.67% incl   0.08% self  <openraft::core::raft_core::RaftCore<reliaburger::council::types::TypeConfig, reliaburger::council::network::TcpRaftNetworkFactory, reliaburger::council::durabl
+  7.60% incl   0.44% self  <openraft::core::raft_core::RaftCore<reliaburger::council::types::TypeConfig, reliaburger::council::network::TcpRaftNetworkFactory, reliaburger::council::durabl
+  7.24% incl   0.02% self  __arm64_sys_futex
+  7.20% incl   0.06% self  do_futex
+  6.85% incl   0.12% self  <alloc::collections::btree::map::BTreeMap<_, _, _> as core::clone::Clone>::clone::clone_subtree<u64, reliaburger::meat::task_array_store::TaskArrayRecord, alloc
+  6.25% incl   1.00% self  <parking_lot::condvar::Condvar>::notify_one_slow
+  6.00% incl   0.20% self  <reliaburger::meat::task_array_store::TaskArrayRecord as core::clone::Clone>::clone
+  5.38% incl   0.24% self  tokio::runtime::task::raw::poll<reliaburger::bun::readiness::spawn_owned<reliaburger::cluster::runtime::spawn_supervised{closure}::{closure}, reliaburger::clust
+  5.38% incl   0.14% self  <tokio::runtime::scheduler::multi_thread::worker::Context>::park_internal
+  5.23% incl   0.34% self  <openraft::core::raft_core::RaftCore<reliaburger::council::types::TypeConfig, reliaburger::council::network::TcpRaftNetworkFactory, reliaburger::council::durabl
+  5.07% incl   0.15% self  reliaburger::bun::readiness::spawn_owned<reliaburger::cluster::runtime::spawn_supervised{closure}::{closure}, reliaburger::cluster::runtime::spawn_supervised{cl
+  5.04% incl   0.03% self  core::ptr::drop_glue<reliaburger::meat::task_array_store::ArraysWire>
+  4.95% incl   0.03% self  reliaburger::bun::reusable_executor::protocol::receive<tokio::net::unix::stream::UnixStream>::{closure}
+  4.92% incl   0.60% self  reliaburger::cluster::runtime::spawn_supervised{closure}::{closure}
+  4.91% incl   0.08% self  <tokio::net::unix::stream::UnixStream>::poll_read_priv
+  4.89% incl   0.10% self  futex_wake
+  4.77% incl   0.03% self  <&std::os::unix::net::stream::UnixStream as std::io::Read>::read
+  4.77% incl   0.00% self  <&mio::net::uds::stream::UnixStream as std::io::Read>::read
+  4.75% incl   0.07% self  wake_up_q
+  4.73% incl   0.29% self  recv
+  4.73% incl   0.06% self  <tokio::sync::watch::big_notify::BigNotify>::notify_waiters
+  4.61% incl   0.81% self  <tokio::sync::notify::NotifyGuard>::notify_waiters
+  4.57% incl   4.55% self  try_to_wake_up
+  4.07% incl   0.07% self  <tokio::sync::watch::Sender<openraft::metrics::raft_metrics::RaftMetrics<u64, reliaburger::council::types::CouncilNodeInfo>>>::send
+  3.92% incl   0.12% self  tokio::runtime::task::waker::wake_by_val
+  3.65% incl   0.03% self  __arm64_sys_recvfrom
+  3.61% incl   0.04% self  __sys_recvfrom
+  3.60% incl   0.03% self  core::ptr::drop_glue<alloc::collections::btree::map::BTreeMap<u64, reliaburger::meat::task_array_store::TaskArrayRecord>>
+  3.56% incl   0.14% self  <tokio::runtime::scheduler::multi_thread::handle::Handle>::schedule_task
+  3.50% incl   0.04% self  sock_recvmsg
+  3.49% incl   0.23% self  <alloc::collections::btree::map::BTreeMap<_, _, _> as core::clone::Clone>::clone::clone_subtree<u64, reliaburger::meat::task_array_store::TaskManifest, alloc::a
+  3.42% incl   0.06% self  unix_stream_recvmsg
+  3.41% incl   0.19% self  <tokio::runtime::scheduler::multi_thread::handle::Handle>::schedule_task::{closure}
+  3.40% incl   0.05% self  core::ptr::drop_glue<reliaburger::meat::task_array_store::TaskArrayRecord>
+  3.37% incl   0.15% self  unix_stream_read_generic
+  3.35% incl   0.02% self  reliaburger::bun::reusable_executor::pool::wait_empty_task::{closure}
+  3.33% incl   0.74% self  <reliaburger::config::job::JobSpec as core::clone::Clone>::clone
+  3.31% incl   0.47% self  <alloc::vec::Vec<alloc::string::String> as core::clone::Clone>::clone
+  3.15% incl   0.01% self  std::fs::read_to_string::inner
+  3.10% incl   0.52% self  <reliaburger::meat::task_array_store::TaskManifest as core::clone::Clone>::clone
+  3.02% incl   0.09% self  schedule
+  3.01% incl   2.89% self  __wake_up_sync_key
+  2.97% incl   0.13% self  <reliaburger::pickle::types::ManifestCatalog as core::clone::Clone>::clone
+  2.94% incl   0.02% self  tokio::runtime::task::raw::poll<reliaburger::bun::task_array_node::run_chunk::{closure}, alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::handle::Handl
+  2.92% incl   0.10% self  reliaburger::bun::task_array_node::run_chunk::{closure}
+  2.91% incl   0.02% self  consume_skb
+  2.87% incl   1.53% self  __schedule
+  2.80% incl   0.10% self  <tokio::future::maybe_done::MaybeDone<<reliaburger::bun::task_executor::TaskPool<reliaburger::bun::task_array_node::NodeRunner>>::resume_chunk_streaming::{closu

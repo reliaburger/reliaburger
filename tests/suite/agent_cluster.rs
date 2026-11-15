@@ -283,7 +283,7 @@ async fn an_app_deploys_beside_a_job_filled_node_on_another_node() {
     let (_members, membership_rx) = watch::channel(members);
     let (_reports, reports_rx) = watch::channel(reports);
     let shutdown = CancellationToken::new();
-    let _admission = spawn_leader_scheduler(
+    let admission = spawn_leader_scheduler(
         council.clone(),
         membership_rx,
         reports_rx,
@@ -319,6 +319,34 @@ async fn an_app_deploys_beside_a_job_filled_node_on_another_node() {
         }
     })
     .await;
+
+    // #1682: a proposal's forecast asks the same live loop for a dry run.
+    // The idle node holds four 1000m replicas and web already has one
+    // there, so a scale to 3 places both new ones on it, and a scale to 6
+    // can't place 2 of its 5 new ones. Nothing is committed.
+    let scaled = |replicas: u32| reliaburger::cluster::capacity::ForecastApp {
+        app_id: app.clone(),
+        spec: Some(
+            toml::from_str(&format!(
+                "image = 'example:v1'\ncpu = '1000m'\nreplicas = {replicas}"
+            ))
+            .unwrap(),
+        ),
+        stopped: false,
+    };
+    let three = admission.forecast(vec![scaled(3)]).await.unwrap();
+    assert_eq!(three[0].1.nodes, [NodeId::new("idle"), NodeId::new("idle")]);
+    assert_eq!(three[0].1.unplaced, 0);
+    let six = admission.forecast(vec![scaled(6)]).await.unwrap();
+    assert_eq!(six[0].1.nodes.len(), 3);
+    assert_eq!(six[0].1.unplaced, 2);
+    assert!(six[0].1.reason.is_some());
+    assert_eq!(
+        council.desired_state().await.scheduling[&app].len(),
+        1,
+        "a forecast commits nothing"
+    );
+
     shutdown.cancel();
     council.shutdown().await.unwrap();
     assert_eq!(placed.expect("the app was never placed"), ["idle"]);

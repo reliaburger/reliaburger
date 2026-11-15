@@ -230,9 +230,17 @@ fn build_upgrade_request(
         if super::proxy::is_forwarded_header(name.as_str()) {
             continue; // Replaced with the proxy's own view below.
         }
-        if let Ok(v) = value.to_str() {
-            request.push_str(&format!("{}: {v}\r\n", name.as_str()));
+        let Ok(v) = value.to_str() else {
+            continue;
+        };
+        if name == header::COOKIE {
+            // The node's dashboard session is never the backend's.
+            if let Some(kept) = super::proxy::without_session_cookie(v) {
+                request.push_str(&format!("cookie: {kept}\r\n"));
+            }
+            continue;
         }
+        request.push_str(&format!("{}: {v}\r\n", name.as_str()));
     }
     for (name, value) in super::proxy::forwarded_headers(remote, over_tls) {
         request.push_str(&format!("{name}: {value}\r\n"));
@@ -382,5 +390,20 @@ mod tests {
         assert!(raw.contains("x-forwarded-proto: https\r\n"));
         // Exactly one x-forwarded-for line (no duplicate from the client).
         assert_eq!(raw.matches("x-forwarded-for:").count(), 1);
+    }
+
+    #[test]
+    fn build_upgrade_request_never_forwards_the_dashboard_session_cookie() {
+        let req = Request::builder()
+            .uri("/ws")
+            .header(header::UPGRADE, "websocket")
+            .header(header::COOKIE, "rb_session=abc123; theme=dark")
+            .body(Body::empty())
+            .unwrap();
+        let backend: SocketAddr = "10.0.2.2:8080".parse().unwrap();
+        let remote: SocketAddr = "203.0.113.7:5000".parse().unwrap();
+        let raw = build_upgrade_request(&req, backend, remote, false);
+        assert!(!raw.contains("rb_session"), "{raw}");
+        assert!(raw.contains("cookie: theme=dark\r\n"), "{raw}");
     }
 }

@@ -1402,10 +1402,8 @@ pub fn spawn_cluster_lease_reaper(
                 continue;
             }
             let now = now_unix_millis();
-            let due: Vec<String> = council
-                .desired_state()
-                .await
-                .test_leases
+            let leases = council.desired_state().await.test_leases;
+            let due: Vec<String> = leases
                 .values()
                 .filter(|lease| {
                     lease.expires_at_unix_ms <= now
@@ -1413,6 +1411,17 @@ pub fn spawn_cluster_lease_reaper(
                 })
                 .map(|lease| lease.lease_id.clone())
                 .collect();
+            // An owner still running when its lease expires loses what the
+            // lease held: say so once, when the reaper takes it (#1527).
+            for lease in leases.values().filter(|lease| {
+                lease.expires_at_unix_ms <= now && matches!(lease.state, TestLeaseState::Active)
+            }) {
+                eprintln!(
+                    "bun: test lease {} expired {} ms ago; reclaiming it and everything it holds",
+                    lease.lease_id,
+                    now - lease.expires_at_unix_ms
+                );
+            }
             for lease_id in due {
                 if let Err(error) = cleanup_cluster_lease(&council, &lease_id, None).await
                     && !matches!(error, LeaseError::CleanupPending)

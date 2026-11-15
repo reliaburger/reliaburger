@@ -1,0 +1,8 @@
+# The gym's web app, version 1: healthy. The runner replaces @TESTAPP@ and
+# @APP_PORT@ before it applies the file.
+
+[app.web]
+exec = "@TESTAPP@"
+command = ["--mode", "healthy", "--port", "@APP_PORT@"]
+port = @APP_PORT@
+env = { VERSION = "v1" }

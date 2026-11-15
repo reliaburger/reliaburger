@@ -1,0 +1,38 @@
+---
+source: src/relish/agent/guide.rs
+expression: "artefact(paths::CHAPTER)"
+---
+# Working with an AI agent
+
+<!-- agent-summary:start -->
+Reliaburger is an orchestrator.
+Its CLI is `relish`.
+<!-- agent-summary:end -->
+
+Intro paragraph.
+
+## In brief
+
+<!-- agent-brief:start -->
+- **Run `relish agent guide` first.**
+<!-- agent-brief:end -->
+
+## Commands
+
+<!-- agent-commands:start -->
+| Command | What it does |
+|---|---|
+| `relish agent guide` | This chapter, as Markdown sections. |
+| `relish agent source grep` | Search it \| quickly. |
+<!-- agent-commands:end -->
+
+```sh
+## not a heading inside a fence
+relish agent guide
+```
+
+## Sending us a fix
+
+<!-- agent-rules:start -->
+- **Disclose.**
+<!-- agent-rules:end -->

@@ -19,6 +19,8 @@ pub mod handover;
 pub mod log_store;
 pub mod network;
 pub mod node;
+pub mod owner;
+pub mod proof;
 pub mod recovery;
 pub(crate) mod recovery_storage;
 pub mod selection;
@@ -26,7 +28,7 @@ pub mod state_machine;
 pub mod types;
 
 pub use apply::{config_to_desired_writes, config_to_leased_writes};
-pub use node::CouncilNode;
+pub use node::{CouncilNode, LEADER_CONFIRMATION};
 pub use selection::{CouncilSelectionConfig, select_council_candidates};
 pub use state_machine::SnapshotStoreError;
 pub use types::{

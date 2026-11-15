@@ -1,0 +1,39 @@
+# Real containers: a batch of named jobs, submitted in one go.
+#
+# A finite batch admits up to 64 named jobs in one Raft entry. Each job
+# becomes a one-task run on the same lifecycle as task arrays: the leader
+# grants each task to a node with room for its CPU and memory requests, and
+# each node starts it under its own concurrency cap. Nothing is bin-packed
+# up front; a node takes work as it has room.
+#
+# Each job can set its own run policy, using the manifest's field names:
+# max_attempts, task_timeout_secs and replay_unknown.
+#
+# Requires runc on Linux (on macOS, use the managed Linux VM from
+# `relish setup --quickstart`).
+#
+# Submit: relish batch examples/phase-8/container-batch-jobs.toml
+# relish prints an idempotency key first. If the submission times out,
+# retry with --idempotency-key KEY to get the same runs back. Then:
+#   relish batch-status <ID> --wait
+#   relish logs etl-chunk-0
+
+[job.etl-chunk-0]
+image = "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028"
+command = ["/bin/sh", "-c", "echo processing chunk 0 of 3; sleep 2; echo done"]
+cpu = "100m-200m"
+memory = "16Mi-32Mi"
+task_timeout_secs = 900
+
+[job.etl-chunk-1]
+image = "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028"
+command = ["/bin/sh", "-c", "echo processing chunk 1 of 3; sleep 2; echo done"]
+cpu = "100m-200m"
+memory = "16Mi-32Mi"
+
+[job.etl-chunk-2]
+image = "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028"
+command = ["/bin/sh", "-c", "echo processing chunk 2 of 3; sleep 2; echo done"]
+cpu = "100m-200m"
+memory = "16Mi-32Mi"
+max_attempts = 2

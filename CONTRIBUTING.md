@@ -4,7 +4,7 @@ Thanks for helping build Reliaburger. This repository is both a working `Rust` p
 
 ## Before You Start
 
-Read the project [documentation](docs/README.md) and [roadmap](docs/roadmap.md) before starting substantial work. 0.2.0 is released; the open work is in the roadmap's release list and known gaps, and in the GitHub milestones and issues they link.
+Read the project [documentation](docs/README.md) and [roadmap](docs/roadmap.md) before starting substantial work. 0.2.8 is released; the open work is in the roadmap's release list and known gaps, and in the GitHub milestones and issues they link.
 
 For a new feature or a change to public behaviour:
 
@@ -15,9 +15,46 @@ For a new feature or a change to public behaviour:
 
 Small fixes, documentation improvements, and tests can go straight to a pull request when the intended change is clear.
 
+## Reporting A Bug
+
+Open an issue with one of the [issue forms](https://github.com/reliaburger/reliaburger/issues/new/choose). Every form asks for the version, a reproducer, what you didn't test and whether an AI tool helped:
+
+- **Bug report**: something doesn't do what it should, and you can show it.
+- **Agent-drafted bug**: a draft from `relish agent report`, which your agent writes and you read, check and post. Its fields match the draft one to one.
+- **Documentation error**: the manual, the book, a README or the website is wrong.
+- **Test request**: behaviour no test covers, such as a surviving mutant or a flake, with the failing test attached or a plain statement that you couldn't write one.
+
+Questions and ideas go to [Discussions](https://github.com/reliaburger/reliaburger/discussions); issues are for bugs with evidence. A report with no reproducer may be closed. If you can't reproduce something, say so: we'd rather have an honest `unverified` report than a confident guess.
+
+Search the issues before you open one. A draft from `relish agent report` carries a fingerprint (the version, the error code and the finding id); if an issue already has it, add your evidence there.
+
+### Labels
+
+Triage uses these labels, and the maintainer reads `has-reproducer` and `patch-tested` reports first:
+
+| Label | Meaning |
+|---|---|
+| `agent-drafted` | An agent drafted the report and a human posted it |
+| `has-reproducer` | The report has a reproducer that we ran |
+| `patch-tested` | The report comes with a fix and a test that fails without it |
+| `unverified` | No reproducer yet; it may be closed if none turns up |
+| `missed-mutant` | A mutant survived the tests, so a test is missing |
+
+## AI Assistance
+
+You're welcome to use AI tools, and so are we. Our own commits say so with a `Co-Authored-By` trailer naming the model. The rules are the same for everyone:
+
+- **Disclose it.** Add a `Co-Authored-By` trailer to commits an AI tool helped write, and answer the AI-assistance question on the issue form.
+- **A human answers for every line.** Read and understand everything you submit: code, tests and prose alike. "The agent wrote it" doesn't answer a review question.
+- **Agents never post on their own.** An agent may draft an issue, a comment or a pull request, but a human reads it and sends it. `relish agent report` writes a draft and never posts.
+- **Every bug fix carries its test.** A bug-fix pull request adds or changes a test that fails before the fix and passes after it. Say which tests you ran, and what you couldn't run.
+- **Evidence over volume.** A report with no reproducer may be closed, and so may a pull request nobody has read.
+
+If the repository's limit on open pull requests from accounts without write access stops you, open an issue and ask to be exempted.
+
 ## Development Setup
 
-You need a current `Rust` toolchain and Cargo. The project uses `Rust` edition 2024. On Linux, `build.rs` also compiles the static job executor helpers with `cc -static`, so install a C compiler and a static libc (`build-essential` on Debian and Ubuntu, `gcc glibc-static` on Fedora). Some ignored acceptance suites additionally require Linux, runc, Buildah, network namespaces, eBPF support, or Apple Container; portable checks should not depend on those tools.
+You need `Rust` 1.97 or later and Cargo. The project uses `Rust` edition 2024. On Linux, `build.rs` also compiles the static job executor helpers with `cc -static`, so install a C compiler and a static libc (`build-essential` on Debian and Ubuntu, `gcc glibc-static` on Fedora). Some ignored acceptance suites additionally require Linux, runc, Buildah, network namespaces, eBPF support, or Apple Container; portable checks should not depend on those tools.
 
 Build the binaries with:
 
@@ -26,6 +63,33 @@ cargo build --bins
 ```
 
 The repository's `Makefile` contains the supported development commands. Run `make help` to see them all.
+
+Or skip the set-up: [`.devcontainer/`](.devcontainer) builds an Ubuntu 24.04 environment with the Rust and nextest versions CI pins, the C compiler, static libc, clang, LLVM and libbpf the build needs, Python 3.12 and cargo-mutants. Open the repository in VS Code's Dev Containers, a GitHub Codespace or any tool that reads the [Dev Container spec](https://containers.dev/) and run `make ci`; give it 4 CPUs and 16 GB of memory. GitHub's Copilot coding agent gets the same toolchain from [`copilot-setup-steps.yml`](.github/workflows/copilot-setup-steps.yml). Only the portable suite runs in either: the gated targets need root, runc, eBPF or a Mac, so when you say tests passed there, say it was the portable set ([docs/testing.md](docs/testing.md#the-development-container)).
+
+### Run it from source
+
+This runs a process workload with no container runtime, on macOS or Linux. The
+process runtime runs host binaries the node allows, not images, so start Bun
+with the example node config that allows the `testapp` workload:
+
+```sh
+git clone https://github.com/reliaburger/reliaburger
+cd reliaburger
+cargo build --locked --bins
+target/debug/bun --runtime process --config examples/node/process-runtime.toml
+
+# In another terminal
+target/debug/relish apply examples/phase-1/proc-first-run.toml
+target/debug/relish status
+target/debug/relish apps
+target/debug/relish            # terminal UI
+open http://127.0.0.1:9117/    # web dashboard
+```
+
+For real containers and secure multi-node clusters, read the
+[documentation](docs/README.md#running) or run `relish manual`. The manual's
+[reference](docs/manual/13_reference.md#every-relish-command) lists every
+`relish` command.
 
 ## Tests First
 
@@ -41,6 +105,8 @@ make lint                 # Clippy, all features and none, warnings as errors
 ```
 
 `make ci` runs the standard portable CI checks together, including `make check-ignored`, which fails when an `#[ignore]` reason doesn't name the target or script that runs it (see [who runs an ignored test](docs/testing.md#who-runs-an-ignored-test)). Use the specialised targets for ignored acceptance suites when your environment supports them: `make test-linux`, `make test-cluster`, `make test-upgrade`, `make test-standard-clients` and `make test-apple`.
+
+Looking for a first contribution? Take an issue labelled [`missed-mutant`](https://github.com/reliaburger/reliaburger/labels/missed-mutant). Each one is a small change to the code (cargo-mutants' *mutant*) that no test noticed, with the line, the change and the command that checks it, such as `cargo mutants --file src/onion/dns.rs --re '...'`. Write a test that fails with the mutant, run the command again, and it's done when cargo-mutants reports the mutant `caught`. A pull request that touches `src/` gets the same check on the lines it changes, as a non-blocking job whose summary lists what it missed ([mutation testing](docs/testing.md#mutation-testing)).
 
 Tests should describe behaviour in their names, cover failure and boundary cases, and avoid relying on timing or external services unless the test is an explicit integration or acceptance test. Unit tests belong beside the code; cross-subsystem tests belong in `tests/suite/` as a module of the single portable integration binary. Add a separate `tests/*.rs` binary only for gated, heavy or process-isolated suites (see `docs/design/test-harness.md`).
 
@@ -79,6 +145,7 @@ A pull request should be small enough to review and should explain:
 - what problem it solves and what behaviour changed;
 - which tests or checks you ran, including any environment-specific limits;
 - which documentation, design, or book material was updated;
+- whether an AI tool helped, as the [AI-assistance policy](#ai-assistance) asks;
 - any follow-up work that is deliberately out of scope.
 
 Keep commits focused and use clear commit messages. Do not commit generated build artefacts, credentials, cluster data, or local machine configuration.
@@ -99,6 +166,6 @@ For existing commits, use `git commit --amend -s` or rebase as appropriate. The 
 
 ## Questions And Security
 
-For design questions, open an issue with the relevant subsystem and a concrete example. Do not disclose security vulnerabilities in a public issue. Report them privately to the maintainers with enough detail to reproduce and assess the impact.
+For design questions, start a [discussion](https://github.com/reliaburger/reliaburger/discussions) naming the subsystem, with a concrete example. Don't disclose a security vulnerability in a public issue: report it privately as [SECURITY.md](SECURITY.md) describes. There's no bug bounty.
 
 ## End

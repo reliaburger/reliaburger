@@ -1,0 +1,31 @@
+---
+source: src/relish/quickstart/lifecycle.rs
+expression: "crate::relish::output::format_output(&status, OutputFormat::Json).unwrap()"
+---
+{
+  "cluster": "laptop",
+  "nodes": [
+    {
+      "name": "rb-laptop-1",
+      "condition": {
+        "state": "ready"
+      }
+    },
+    {
+      "name": "rb-laptop-2",
+      "condition": {
+        "state": "api_not_ready",
+        "reason": "council not formed"
+      }
+    },
+    {
+      "name": "rb-laptop-3",
+      "condition": {
+        "state": "not_running",
+        "vm_state": "Stopped"
+      }
+    }
+  ],
+  "fault_policy": "fault policy: workload faults allowed",
+  "ready": false
+}

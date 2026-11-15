@@ -1,0 +1,9 @@
+---
+source: src/relish/ca_cmd.rs
+expression: "crate::relish::output::format_output(&CaRotation\n{\n    role: \"node\", stage: RotationStage::Begun, message:\n    \"node CA rotation begun\".to_string(),\n}, OutputFormat::Json).unwrap()"
+---
+{
+  "role": "node",
+  "stage": "begun",
+  "message": "node CA rotation begun"
+}

@@ -472,6 +472,26 @@ pub fn spawn_leader_scheduler(
             }
             crate::meat::filter::apply_upgrade_cordon(&mut cache, desired.active_upgrade.as_ref());
 
+            let pass_members = PassMembers {
+                unheard: unheard_nodes(&alive, &reports, stale_node_grace),
+                suspect: nodes_in_state(&members, NodeState::Suspect),
+                lapsed: lapsed_nodes(&alive, &reports, stale_node_grace),
+                alive: alive.clone(),
+            };
+            // A forecast (#1682) plans from the view the real pass starts
+            // from, and costs this tick one pass: the real one runs on the
+            // next tick, a second later.
+            let capacity_request = match capacity_request {
+                Some(super::capacity::SchedulerRequest::Forecast(request)) => {
+                    let forecast =
+                        forecast_pass(cache, &desired, &pass_members, dns_required, &request.apps);
+                    let _ = request.response.send(Ok(forecast));
+                    continue;
+                }
+                Some(super::capacity::SchedulerRequest::Admit(request)) => Some(*request),
+                None => None,
+            };
+
             // Quotas come from desired-state namespaces (12b.2 T6). A
             // cluster with no declared namespace budgets gets an empty
             // ledger that admits everything; declaring a namespace with a
@@ -479,16 +499,11 @@ pub fn spawn_leader_scheduler(
             // deploy time, with the reason surfaced through the log.
             let mut quotas = crate::meat::quota::ledger_from_namespaces(&desired.namespaces);
 
-            let pass_members = PassMembers {
-                unheard: unheard_nodes(&alive, &reports),
-                suspect: nodes_in_state(&members, NodeState::Suspect),
-                lapsed: lapsed_nodes(&alive, &reports, stale_node_grace),
-                alive: alive.clone(),
-            };
             let PassPlan {
                 decisions,
                 quota_blocked,
                 unschedulable,
+                provenance,
             } = plan_pass(
                 &mut cache,
                 &desired,
@@ -577,28 +592,132 @@ pub fn spawn_leader_scheduler(
                     Err(_) => eprintln!(
                         "scheduler: placement acknowledgement timed out; outcome unknown; next tick replans from committed state"
                     ),
-                    _ => {}
+                    // Committed: say why each app's new replicas went where
+                    // they did, once, where the decision was made.
+                    Ok(Ok(_)) => {
+                        record_placement_events(provenance_events(provenance), events.as_ref())
+                            .await
+                    }
                 }
             }
             // Why an app isn't placed is durable council state, so any node
             // can answer `relish status`. Written only when it changes.
-            if let Some(update) = quota_blocked_update(&desired.quota_blocked, &quota_blocked)
-                && let Err(e) = council.write(update).await
-            {
-                eprintln!("scheduler: failed to record quota-blocked apps: {e}");
+            if let Some(update) = quota_blocked_update(&desired.quota_blocked, &quota_blocked) {
+                match council.write(update).await {
+                    Ok(_) => {
+                        let blocked = quota_blocked_events(&desired.quota_blocked, &quota_blocked);
+                        record_placement_events(blocked, events.as_ref()).await
+                    }
+                    Err(e) => eprintln!("scheduler: failed to record quota-blocked apps: {e}"),
+                }
             }
             // A short app is logged and raised as an event when its shortfall
             // starts, changes or clears, not every tick (#702).
             let changes = shortfall_changes(&desired.unschedulable, &unschedulable, &desired);
             if let Some(update) = unschedulable_update(&desired.unschedulable, &unschedulable) {
                 match council.write(update).await {
-                    Ok(_) => record_shortfall_changes(&changes, events.as_ref()).await,
+                    Ok(_) => {
+                        record_placement_events(shortfall_events(&changes), events.as_ref()).await
+                    }
                     Err(e) => eprintln!("scheduler: failed to record unschedulable apps: {e}"),
                 }
             }
         }
     });
     admission
+}
+
+/// The scheduler's dry run for a proposal (#1682): the placement pass run
+/// over a copy of `desired` with `apps` as the proposal would leave them,
+/// from `cache` as the real pass starts from it. For each app, the nodes
+/// its new placements would go to, and how many instances it couldn't
+/// place beyond any it was already short of. Nothing is reserved or
+/// committed; this is the same pure function the real pass is, so the
+/// forecast and the placement agree unless the cluster changes between
+/// them.
+pub fn forecast_pass(
+    mut cache: ClusterStateCache,
+    desired: &crate::council::types::DesiredState,
+    members: &PassMembers,
+    dns_required: bool,
+    apps: &[super::capacity::ForecastApp],
+) -> Vec<(crate::meat::types::AppId, super::capacity::AppForecast)> {
+    let mut changed = desired.clone();
+    for app in apps {
+        match &app.spec {
+            Some(spec) => {
+                changed.apps.insert(app.app_id.clone(), spec.clone());
+            }
+            None => {
+                changed.apps.remove(&app.app_id);
+                changed.scheduling.remove(&app.app_id);
+            }
+        }
+        if app.stopped {
+            changed.stopped_apps.insert(app.app_id.clone());
+        } else {
+            changed.stopped_apps.remove(&app.app_id);
+        }
+    }
+    let mut quotas = crate::meat::quota::ledger_from_namespaces(&changed.namespaces);
+    let plan = plan_pass(&mut cache, &changed, members, &mut quotas, dns_required);
+    apps.iter()
+        .map(|app| {
+            let id = &app.app_id;
+            let previous = desired.scheduling.get(id);
+            let previous_ordinals: HashSet<u32> = previous
+                .into_iter()
+                .flatten()
+                .map(|placement| placement.ordinal)
+                .collect();
+            let nodes = plan
+                .decisions
+                .iter()
+                .filter(|decision| &decision.app_id == id)
+                .flat_map(|decision| &decision.placements)
+                .filter(|placement| !previous_ordinals.contains(&placement.ordinal))
+                .map(|placement| placement.node_id.clone())
+                .collect();
+            let already_short = desired
+                .unschedulable
+                .get(id)
+                .map_or(0, |short| short.wanted.saturating_sub(short.placed));
+            let mut forecast = super::capacity::AppForecast {
+                nodes,
+                ..Default::default()
+            };
+            if let Some(blocked) = plan.quota_blocked.get(id) {
+                let fixed = |spec: Option<&AppSpec>, stopped: bool| match spec.map(|s| s.replicas) {
+                    Some(Replicas::Fixed(count)) if !stopped => count,
+                    _ => 0,
+                };
+                let wanted = fixed(app.spec.as_ref(), app.stopped);
+                let placed = u32::try_from(previous.map_or(0, Vec::len)).unwrap_or(u32::MAX);
+                // What the quota already kept out before this change isn't
+                // this change's to answer for, as `already_short` below.
+                let already_blocked = if desired.quota_blocked.contains_key(id) {
+                    fixed(desired.apps.get(id), desired.stopped_apps.contains(id))
+                        .saturating_sub(placed)
+                } else {
+                    0
+                };
+                forecast.unplaced = wanted
+                    .saturating_sub(placed)
+                    .saturating_sub(already_blocked);
+                forecast.reason = Some(blocked.to_string());
+            } else if let Some(short) = plan.unschedulable.get(id) {
+                forecast.unplaced = short
+                    .wanted
+                    .saturating_sub(short.placed)
+                    .saturating_sub(already_short);
+                forecast.reason = Some(short.reason.to_string());
+            }
+            if forecast.unplaced == 0 {
+                forecast.reason = None;
+            }
+            (id.clone(), forecast)
+        })
+        .collect()
 }
 
 /// Plan placements for one scheduling tick against a single mutable
@@ -651,7 +770,8 @@ pub struct PassMembers {
     /// Members gossip suspects: they missed a probe but may refute it.
     pub suspect: HashSet<NodeId>,
     /// Alive members whose state report arrived but whose readiness or
-    /// capability report hasn't yet (see [`unheard_nodes`]).
+    /// capability report hasn't yet, or that are still starting (see
+    /// [`unheard_nodes`]).
     pub unheard: HashSet<NodeId>,
     /// Alive members whose reports went stale longer than the stale-node
     /// grace ago (see [`lapsed_nodes`]). Their placements move.
@@ -669,6 +789,9 @@ pub struct PassPlan {
     /// Fixed-size apps the pass placed only part of, with how many and why
     /// (#702). Ordered so the Raft write is deterministic.
     pub unschedulable: BTreeMap<crate::meat::types::AppId, crate::meat::types::Unschedulable>,
+    /// Why each app in `decisions` went where it did: the decision the
+    /// leader records once the placements commit.
+    pub provenance: BTreeMap<crate::meat::types::AppId, crate::bun::decisions::Decision>,
 }
 
 /// The `QuotaBlocked` write that brings the recorded reasons in line with
@@ -775,36 +898,122 @@ fn shortfall_changes(
     changes
 }
 
-/// Log each change in which apps are short, and record an event when one
-/// starts or stops being short.
-async fn record_shortfall_changes(
-    changes: &[ShortfallChange],
-    events: Option<&Arc<tokio::sync::RwLock<crate::bun::events::EventStore>>>,
-) {
-    use crate::bun::events::{EventKind, EventSeverity};
+/// One placement event the leader records, with its decision when it has one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlacementEvent {
+    app_id: crate::meat::types::AppId,
+    severity: crate::bun::events::EventSeverity,
+    message: String,
+    details: BTreeMap<String, String>,
+}
 
+/// Log each change in which apps are short, and the event to record when one
+/// starts or stops being short: a start carries its `placement.short`
+/// decision.
+fn shortfall_events(changes: &[ShortfallChange]) -> Vec<PlacementEvent> {
+    use crate::bun::events::EventSeverity;
+
+    let mut events = Vec::new();
     for change in changes {
         eprintln!("scheduler: {change}");
-        let (app_id, severity) = match change {
-            ShortfallChange::Started(app_id, _) => (app_id, EventSeverity::Warning),
-            ShortfallChange::Cleared(app_id) => (app_id, EventSeverity::Info),
+        let (app_id, severity, details) = match change {
+            ShortfallChange::Started(app_id, short) => {
+                let reason = serde_json::to_value(short.reason)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_string))
+                    .unwrap_or_default();
+                let decision = crate::bun::decisions::Decision::new("placement.short")
+                    .with("reason", reason)
+                    .with("placed", short.placed)
+                    .with("wanted", short.wanted);
+                (app_id, EventSeverity::Warning, decision.into_details())
+            }
+            ShortfallChange::Cleared(app_id) => (app_id, EventSeverity::Info, BTreeMap::new()),
             ShortfallChange::Changed(..) => continue,
         };
-        let Some(events) = events else {
-            continue;
-        };
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_secs())
-            .unwrap_or_default();
-        events.write().await.record(
-            now,
-            EventKind::Placement,
+        events.push(PlacementEvent {
+            app_id: app_id.clone(),
             severity,
-            Some(app_id.name.clone()),
-            Some(app_id.namespace.clone()),
+            message: change.to_string(),
+            details,
+        });
+    }
+    events
+}
+
+/// The events for apps whose namespace quota newly has no room for them,
+/// each with its `placement.quota_blocked` decision.
+fn quota_blocked_events(
+    recorded: &HashMap<crate::meat::types::AppId, crate::meat::quota::QuotaError>,
+    planned: &BTreeMap<crate::meat::types::AppId, crate::meat::quota::QuotaError>,
+) -> Vec<PlacementEvent> {
+    planned
+        .iter()
+        .filter(|(app_id, reason)| recorded.get(*app_id) != Some(*reason))
+        .map(|(app_id, reason)| PlacementEvent {
+            app_id: app_id.clone(),
+            severity: crate::bun::events::EventSeverity::Warning,
+            message: format!("cannot place {app_id}: {reason}"),
+            details: crate::bun::decisions::Decision::new("placement.quota_blocked")
+                .with("reason", reason)
+                .into_details(),
+        })
+        .collect()
+}
+
+/// The events for committed placements, each with the decision that says
+/// why the new replicas went where they did.
+fn provenance_events(
+    provenance: BTreeMap<crate::meat::types::AppId, crate::bun::decisions::Decision>,
+) -> Vec<PlacementEvent> {
+    provenance
+        .into_iter()
+        .map(|(app_id, decision)| {
+            let details = decision.into_details();
+            let placed: Vec<String> = details
+                .iter()
+                .filter(|(key, _)| key.contains("__"))
+                .map(|(key, value)| {
+                    let node = value.split(':').next().unwrap_or(value);
+                    format!("{key} on {node}")
+                })
+                .collect();
+            PlacementEvent {
+                message: format!("placed {app_id}: {}", placed.join(", ")),
+                app_id,
+                severity: crate::bun::events::EventSeverity::Info,
+                details,
+            }
+        })
+        .collect()
+}
+
+/// Record `placement` events on this node.
+async fn record_placement_events(
+    placement: Vec<PlacementEvent>,
+    events: Option<&Arc<tokio::sync::RwLock<crate::bun::events::EventStore>>>,
+) {
+    let Some(events) = events else {
+        return;
+    };
+    if placement.is_empty() {
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default();
+    let mut store = events.write().await;
+    for event in placement {
+        store.record_with_details(
+            now,
+            crate::bun::events::EventKind::Placement,
+            event.severity,
+            Some(event.app_id.name.clone()),
+            Some(event.app_id.namespace.clone()),
             None,
-            change.to_string(),
+            event.message,
+            event.details,
         );
     }
 }
@@ -902,6 +1111,7 @@ pub fn plan_pass(
     let mut decisions = Vec::new();
     let mut quota_blocked = BTreeMap::new();
     let mut unschedulable = BTreeMap::new();
+    let mut provenance = BTreeMap::new();
     // A stable order so a pass is deterministic (HashMap iteration isn't).
     let mut app_ids: Vec<_> = desired.apps.keys().cloned().collect();
     app_ids.sort_by_key(|a| a.to_string());
@@ -1061,6 +1271,7 @@ pub fn plan_pass(
                 placement.resources = per_replica;
             }
         }
+        let mut from_home: Vec<crate::meat::types::Placement> = Vec::new();
         if let Replicas::Fixed(_) = effective_spec.replicas {
             // An app with no placement left (it was stopped, or is starting
             // again) goes back to the nodes that hold its managed volumes.
@@ -1074,7 +1285,10 @@ pub fn plan_pass(
                     dns_required,
                 };
                 match home.reserve(app_id, spec, desired.last_placed_nodes.get(app_id), want) {
-                    HomeOutcome::Placed(placements) => kept = placements,
+                    HomeOutcome::Placed(placements) => {
+                        from_home = placements.clone();
+                        kept = placements;
+                    }
                     HomeOutcome::Wait { node, reason } => {
                         eprintln!(
                             "scheduler: {app_id} waits for {node}, which holds its volumes: {reason}"
@@ -1096,7 +1310,11 @@ pub fn plan_pass(
         let mut scheduler = Scheduler::new(std::mem::take(cache))
             .with_dns_required(dns_required)
             .with_daemon_credit(committed_footprints(desired, app_id));
-        let Placed { decision, unplaced } = scheduler.place_app(app_id, &effective_spec);
+        let Placed {
+            decision,
+            unplaced,
+            choices,
+        } = scheduler.place_app(app_id, &effective_spec);
         *cache = scheduler.cluster;
         if let Some(unplaced) = unplaced {
             unschedulable.insert(
@@ -1121,10 +1339,29 @@ pub fn plan_pass(
             stranded.truncate(unplaced.missing as usize);
             kept.extend(stranded);
         }
-        let placements = number_placements(previous, kept, decision.placements);
+        let kept_count = kept.len() - from_home.len().min(kept.len());
+        let added_nodes: Vec<NodeId> = decision
+            .placements
+            .iter()
+            .map(|p| p.node_id.clone())
+            .collect();
+        let (placements, added_ordinals) = number_placements(previous, kept, decision.placements);
         // A short app plans the same placements tick after tick; committing
         // them again would only grow the Raft log.
         if !same_placements(previous, &placements) {
+            let added: Vec<(u32, NodeId)> = added_ordinals.into_iter().zip(added_nodes).collect();
+            let why = PlacementWhy {
+                app_id,
+                daemon: matches!(effective_spec.replicas, Replicas::DaemonSet),
+                want,
+                kept: kept_count,
+                home: &from_home,
+                added: &added,
+                choices: &choices,
+            };
+            if let Some(decision) = placement_provenance(&why) {
+                provenance.insert(app_id.clone(), decision);
+            }
             decisions.push(crate::meat::types::SchedulingDecision {
                 app_id: app_id.clone(),
                 placements,
@@ -1135,7 +1372,67 @@ pub fn plan_pass(
         decisions,
         quota_blocked,
         unschedulable,
+        provenance,
     }
+}
+
+/// What one app's pass decided, for [`placement_provenance`].
+struct PlacementWhy<'a> {
+    app_id: &'a crate::meat::types::AppId,
+    /// Whether it's a daemon set.
+    daemon: bool,
+    /// Replicas it wants.
+    want: usize,
+    /// Replicas that stayed where they were.
+    kept: usize,
+    /// Placements that went back to the nodes holding its volumes.
+    home: &'a [crate::meat::types::Placement],
+    /// The scheduler's new placements: final ordinal and node, in the
+    /// scheduler's order.
+    added: &'a [(u32, NodeId)],
+    /// Why each of `added` went where it did, in the same order. Empty for
+    /// a daemon set.
+    choices: &'a [crate::meat::scheduler::ReplicaChoice],
+}
+
+/// The decision a committed placement records: the rule that placed the new
+/// replicas and, per instance, the evidence. `None` when the pass placed
+/// nothing new (a resize in place, or a short app keeping what it had).
+fn placement_provenance(why: &PlacementWhy<'_>) -> Option<crate::bun::decisions::Decision> {
+    use crate::bun::decisions::Decision;
+    let instance = |ordinal: u32| {
+        crate::grill::InstanceIdentity::new(&why.app_id.namespace, &why.app_id.name, ordinal)
+            .instance_id()
+            .0
+    };
+    if why.daemon {
+        let mut decision = Decision::new("placement.daemon").with("eligible", why.added.len());
+        for (ordinal, node) in why.added {
+            decision = decision.with(instance(*ordinal), node);
+        }
+        return Some(decision);
+    }
+    if why.added.is_empty() && why.home.is_empty() {
+        return None;
+    }
+    let mut decision = if why.added.is_empty() {
+        Decision::new("placement.volume_home")
+    } else {
+        Decision::new("placement.scored")
+            .with("wanted", why.want)
+            .with("kept", why.kept)
+    };
+    for placement in why.home {
+        decision = decision.with(
+            instance(placement.ordinal),
+            format!("{}: holds its volumes", placement.node_id),
+        );
+    }
+    for ((ordinal, node), choice) in why.added.iter().zip(why.choices) {
+        debug_assert_eq!(node, &choice.node);
+        decision = decision.with(instance(*ordinal), choice);
+    }
+    Some(decision)
 }
 
 /// One app's place in a pass: what it wants, and whether it already has it.
@@ -1172,15 +1469,19 @@ fn same_placements(
 /// set's replica on a node numbered as it was when the set is re-placed
 /// whole. Any other takes the lowest free ordinal: the one a lost replica
 /// gave up, or the next one up on a scale-up.
+///
+/// Also returns the ordinal each of `added` got, in `added`'s order, so the
+/// scheduler's reasons can be matched to the instances they name.
 fn number_placements(
     previous: &[crate::meat::types::Placement],
     kept: Vec<crate::meat::types::Placement>,
     added: Vec<crate::meat::types::Placement>,
-) -> Vec<crate::meat::types::Placement> {
+) -> (Vec<crate::meat::types::Placement>, Vec<u32>) {
     let mut taken: HashSet<u32> = kept.iter().map(|p| p.ordinal).collect();
     let mut placements = kept;
+    let mut ordinals = vec![0u32; added.len()];
     let mut unnumbered = Vec::new();
-    for mut placement in added {
+    for (index, mut placement) in added.into_iter().enumerate() {
         let held = previous
             .iter()
             .find(|p| p.node_id == placement.node_id && !taken.contains(&p.ordinal));
@@ -1188,19 +1489,21 @@ fn number_placements(
             Some(held) => {
                 placement.ordinal = held.ordinal;
                 taken.insert(held.ordinal);
+                ordinals[index] = held.ordinal;
                 placements.push(placement);
             }
-            None => unnumbered.push(placement),
+            None => unnumbered.push((index, placement)),
         }
     }
     let mut free = (0u32..).filter(|ordinal| !taken.contains(ordinal));
-    for mut placement in unnumbered {
+    for (index, mut placement) in unnumbered {
         // `free` is endless: there are fewer placements than u32 ordinals.
         placement.ordinal = free.next().unwrap_or(u32::MAX);
+        ordinals[index] = placement.ordinal;
         placements.push(placement);
     }
     placements.sort_by_key(|p| p.ordinal);
-    placements
+    (placements, ordinals)
 }
 
 /// Record in `cache` exactly the replicas of `app_id` that `kept` places on
@@ -1342,7 +1645,8 @@ impl VolumeHome<'_> {
 ///
 /// A live node that hasn't reported to this leader yet keeps its placements,
 /// and so does one in `unheard`, whose state report has arrived but whose
-/// readiness or capability evidence hasn't. A new leader hears from nodes
+/// readiness or capability evidence hasn't, or whose readiness says it is
+/// still in its first start (a Bun that just restarted, #1449). A new leader hears from nodes
 /// over several seconds, one report at a time, and a node whose report went
 /// to a council member that just died can take longer still; "not heard from
 /// yet" is not evidence of trouble, and moving its replicas would restart
@@ -1574,20 +1878,63 @@ fn nodes_in_state(members: &[MembershipSnapshot], state: NodeState) -> HashSet<N
 }
 
 /// Live nodes whose state report is fresh but whose readiness or capability
-/// report this leader hasn't received yet. The three travel separately, and a
-/// new leader starts with none of them, so for a moment a healthy node looks
-/// unready. That's reason enough not to place anything new there, but not to
-/// move what it already runs.
-fn unheard_nodes(alive: &HashSet<NodeId>, reports: &AggregatedState) -> HashSet<NodeId> {
+/// report this leader hasn't received yet, or whose readiness says they are
+/// still starting (see [`still_starting`]). The three reports travel
+/// separately, and a new leader starts with none of them, so for a moment a
+/// healthy node looks unready; a Bun that has just restarted reports before
+/// its API, DNS, ingress and registry are up (#1449). That's reason enough
+/// not to place anything new there, but not to move what it already runs.
+fn unheard_nodes(
+    alive: &HashSet<NodeId>,
+    reports: &AggregatedState,
+    grace: Duration,
+) -> HashSet<NodeId> {
     alive
         .iter()
         .filter(|node| reports.reports.contains_key(*node))
         .filter(|node| !reports.stale_nodes.contains(*node))
         .filter(|node| {
-            !reports.readiness.contains_key(*node) || !reports.capabilities.contains_key(*node)
+            match (
+                reports.readiness.get(*node),
+                reports.capabilities.get(*node),
+            ) {
+                (Some(readiness), Some(_)) => still_starting(&readiness.evidence, grace),
+                _ => true,
+            }
         })
         .cloned()
         .collect()
+}
+
+/// Whether a node that isn't ready is only coming up: every critical
+/// subsystem it is waiting on is in its first start (`Starting`, never
+/// rebuilt) and has been for less than `grace`. Both timestamps are the
+/// node's own, so clock skew between nodes doesn't enter. A degraded or
+/// stopped subsystem, one being rebuilt after a failure, or a start that
+/// outlasts the grace is evidence the node can't run its work.
+fn still_starting(
+    evidence: &crate::bun::readiness::NodeReadinessEvidence,
+    grace: Duration,
+) -> bool {
+    use crate::bun::readiness::SubsystemState;
+    if evidence.ready {
+        return false;
+    }
+    let grace_ms = u64::try_from(grace.as_millis()).unwrap_or(u64::MAX);
+    let mut waiting = evidence
+        .subsystems
+        .iter()
+        .filter(|subsystem| subsystem.critical && subsystem.state != SubsystemState::Ready)
+        .peekable();
+    waiting.peek().is_some()
+        && waiting.all(|subsystem| {
+            subsystem.state == SubsystemState::Starting
+                && subsystem.restart_count == 0
+                && evidence
+                    .observed_at_unix_ms
+                    .saturating_sub(subsystem.state_since_unix_ms)
+                    < grace_ms
+        })
 }
 
 /// The per-replica resources an app requests, for quota accounting. Mirrors
@@ -1932,7 +2279,7 @@ fn build_cluster_cache(
             allocatable: Resources {
                 cpu_millicores: u64::from(usage.cpu_total_millicores),
                 memory_bytes: u64::from(usage.memory_total_mb) * 1024 * 1024,
-                gpus: 0,
+                gpus: usage.gpu_total,
             },
             // App requests plus what task attempts and reusable executors
             // hold in the same node budget. Apps and jobs share one ledger
@@ -1942,7 +2289,7 @@ fn build_cluster_cache(
                     .saturating_add(report.job_reservations.cpu_millicores),
                 memory_bytes: (u64::from(usage.memory_used_mb) * 1024 * 1024)
                     .saturating_add(report.job_reservations.memory_bytes),
-                gpus: 0,
+                gpus: usage.gpu_used,
             },
             labels: member.labels.clone(),
             ready: reports
@@ -2085,14 +2432,10 @@ async fn poll_consumer(
     io_timeout: Duration,
 ) -> Option<ConsumerPoll> {
     let client = cluster_http.client();
-    let leader_url = {
-        let metrics = metrics_rx.borrow();
-        let directory = directory_rx.borrow();
-        crate::cluster::directory::resolve_leader(&metrics, &directory, raft_to_api_offset, 0)
+    let leader_url =
+        crate::cluster::directory::resolve_leader(metrics_rx, directory_rx, raft_to_api_offset, 0)
             .and_then(|view| view.api_address)
-            .map(|address| cluster_http.url(&address.to_string(), ""))
-    };
-    let leader_url = leader_url?;
+            .map(|address| cluster_http.url(&address.to_string(), ""))?;
 
     let url = format!("{leader_url}/v1/placements/{node_name}");
     let mut request = client.get(&url);
@@ -2374,6 +2717,11 @@ fn spawn_placement_reconciler_with_io_timeout(
                 // ordinals the leader gave it.
                 spec.replicas = Replicas::Fixed(assignment.ordinals.len() as u32);
                 spec.ordinals = Some(assignment.ordinals.clone());
+                // Who manages an app is the council's business, not the
+                // node's: a controller claiming it mustn't redeploy it (#1125).
+                // Nor does the node need to know which template made it (#1124).
+                spec.owner = None;
+                spec.provenance = None;
                 let fingerprint = serde_json::to_string(&spec).unwrap_or_default();
                 if matches!(applied.get(&key), Some(AssignmentState::Applied { fingerprint: previous }) if previous == &fingerprint)
                 {
@@ -2865,14 +3213,24 @@ const DEPLOY_TERMINAL_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// How long the reconciler waits for a deploy of `spec` (this node's share)
 /// to finish: [`DEPLOY_TERMINAL_TIMEOUT`] for image pulls and the like, plus
-/// a health wait and a drain for every replica, twice over, since an aborted
+/// a health wait, a drain and the stop hooks for every replica, twice over, since an aborted
 /// rollout restores the previous spec at the same pace (#692). A fixed five
 /// minutes gave up on a ten-replica share with a one-minute health timeout
 /// while it was still rolling.
 fn deploy_terminal_timeout(spec: &AppSpec) -> Duration {
     let config = crate::meat::deploy_types::DeployConfig::for_app(spec);
     let share = spec.replica_ordinals().len() as u32;
-    let per_replica = config.health_timeout.saturating_add(config.drain_timeout);
+    // An old replica's own stop hooks (#1121) come on top of its drain.
+    let stop = crate::grill::stop::StopPolicy::from_app(spec).map_or(Duration::ZERO, |stop| {
+        let pre_stop = stop
+            .pre_stop
+            .map_or(Duration::ZERO, |pre_stop| pre_stop.timeout);
+        stop.grace.unwrap_or_default().saturating_add(pre_stop)
+    });
+    let per_replica = config
+        .health_timeout
+        .saturating_add(config.drain_timeout)
+        .saturating_add(stop);
     DEPLOY_TERMINAL_TIMEOUT.saturating_add(per_replica.saturating_mul(share.saturating_mul(2)))
 }
 
@@ -2923,6 +3281,12 @@ async fn deploy_outcome(
                 reason,
                 ..
             } => {
+                // The abort says what happened to the instances; the first
+                // error says why. The leader's mark needs both (#1111).
+                let reason = match failure {
+                    Some(DeployWaitError::Failed(cause)) => format!("{cause}; {reason}"),
+                    _ => reason,
+                };
                 failure = Some(DeployWaitError::RolloutAborted {
                     rolled_back,
                     reason,
@@ -3764,6 +4128,7 @@ mod tests {
                             pid: Some(1),
                             runtime_unknown: false,
                             status_age_ms: None,
+                            age_seconds: None,
                             reason: None,
                         }]);
                     }
@@ -4384,6 +4749,7 @@ image = "busybox:latest"
             pid: Some(42),
             runtime_unknown: false,
             status_age_ms: None,
+            age_seconds: None,
             reason: None,
         };
         let mut asked = Vec::new();
@@ -4706,6 +5072,7 @@ image = "busybox:latest"
                 pid: Some(42),
                 runtime_unknown: false,
                 status_age_ms: None,
+                age_seconds: None,
                 reason: None,
             },
             crate::bun::agent::InstanceStatus {
@@ -4719,6 +5086,7 @@ image = "busybox:latest"
                 pid: None,
                 runtime_unknown: false,
                 status_age_ms: None,
+                age_seconds: None,
                 reason: None,
             },
         ];
@@ -4809,6 +5177,61 @@ image = "busybox:latest"
         assert!(matches!(
             deploy_outcome(rx, Duration::from_secs(5)).await,
             Err(DeployWaitError::RolloutAborted { rolled_back: true, ref reason })
+                if reason.ends_with("rolled back — old instances preserved")
+        ));
+    }
+
+    /// #1111: the abort alone says only that the node rolled back. The
+    /// error before it says why, and the leader's `RolloutFailed` mark and
+    /// `relish wtf` need that too.
+    #[tokio::test]
+    async fn a_rollout_abort_reason_keeps_the_first_error() {
+        let (tx, rx) = mpsc::channel(8);
+        for event in [
+            ApplyEvent::Error {
+                message: "node capacity cannot admit cpu=100m mem=32Mi".into(),
+            },
+            ApplyEvent::Error {
+                message: "a later error".into(),
+            },
+            ApplyEvent::RolloutAborted {
+                app: "web".into(),
+                rolled_back: true,
+                reason: "rolled back — old instances preserved".into(),
+            },
+            ApplyEvent::Error {
+                message: "rolled back — old instances preserved".into(),
+            },
+        ] {
+            tx.send(event).await.unwrap();
+        }
+        drop(tx);
+        let Err(DeployWaitError::RolloutAborted { reason, .. }) =
+            deploy_outcome(rx, Duration::from_secs(5)).await
+        else {
+            panic!("the abort must be the outcome");
+        };
+        assert_eq!(
+            reason,
+            "node capacity cannot admit cpu=100m mem=32Mi; rolled back — old instances preserved"
+        );
+    }
+
+    /// An abort with no error before it keeps its own reason.
+    #[tokio::test]
+    async fn a_rollout_abort_without_an_earlier_error_keeps_its_reason() {
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(ApplyEvent::RolloutAborted {
+            app: "web".into(),
+            rolled_back: true,
+            reason: "rolled back — old instances preserved".into(),
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        assert!(matches!(
+            deploy_outcome(rx, Duration::from_secs(5)).await,
+            Err(DeployWaitError::RolloutAborted { ref reason, .. })
                 if reason == "rolled back — old instances preserved"
         ));
     }
@@ -4831,6 +5254,22 @@ image = "busybox:latest"
         assert_eq!(
             deploy_terminal_timeout(&spec(10)),
             DEPLOY_TERMINAL_TIMEOUT + Duration::from_secs(1800)
+        );
+    }
+
+    /// #1121: retiring an old replica also waits out its pre-stop bound and
+    /// its own stop grace, so the deadline grows by both.
+    #[test]
+    fn deploy_terminal_timeout_counts_the_stop_hooks() {
+        let spec: AppSpec = toml::from_str(
+            "image = \"web:v1\"\nstop_grace = \"45s\"\npre_stop = [\"drain\"]\n\
+             pre_stop_timeout = \"15s\"\n[deploy]\nhealth_timeout = \"60s\"\n\
+             drain_timeout = \"30s\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            deploy_terminal_timeout(&spec),
+            DEPLOY_TERMINAL_TIMEOUT + Duration::from_secs(2 * (60 + 30 + 45 + 15))
         );
     }
 
@@ -4917,6 +5356,7 @@ image = "busybox:latest"
                 memory_used_mb: 256,
                 disk_used_mb: 0,
                 gpu_used: 0,
+                gpu_total: 0,
                 allocated_ports: vec![],
                 cpu_total_millicores: cpu_total,
                 memory_total_mb: 8192,
@@ -4999,6 +5439,31 @@ image = "busybox:latest"
     }
 
     #[test]
+    fn cache_carries_the_gpus_a_node_reports() {
+        let members = vec![member("gpu", 1)];
+        let mut gpu = report(4000, 0);
+        gpu.resource_usage.gpu_total = 4;
+        gpu.resource_usage.gpu_used = 1;
+        let mut reports = AggregatedState {
+            leadership_epoch: None,
+            receive_deadlines: Default::default(),
+            reports: HashMap::from([(NodeId::new("gpu"), gpu)]),
+            stale_nodes: vec![],
+            stale_since: Default::default(),
+            capabilities: HashMap::new(),
+            readiness: HashMap::new(),
+        };
+        reports.receive_deadlines = HashMap::from([(
+            NodeId::new("gpu"),
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        )]);
+        let cache = build_cluster_cache(&members, &reports);
+        let node = cache.get_node(&NodeId::new("gpu")).unwrap();
+        assert_eq!(node.allocatable.gpus, 4);
+        assert_eq!(node.allocated.gpus, 1);
+    }
+
+    #[test]
     fn cache_preserves_live_egress_capability() {
         let members = vec![member("guarded", 1)];
         let guarded = report(4000, 0);
@@ -5015,6 +5480,9 @@ image = "busybox:latest"
                 dns: Default::default(),
                 process: Default::default(),
                 containers: true,
+                secret_providers: Default::default(),
+                runtime_knobs: Default::default(),
+                shared_network: false,
             },
             egress_enforcement: Vec::new(),
             egress_degraded: false,
@@ -5399,6 +5867,79 @@ image = "busybox:latest"
         );
     }
 
+    /// A report that names no execution is taken as it stands: the leader
+    /// doesn't lend it the committed backend's. A restart keeps the node,
+    /// address, port and replica, so a lent execution would be the
+    /// predecessor's. Fencing the running generation then left that
+    /// backend in the catalogue and confirmed the release while consumers
+    /// still routed to its port. A backend with no execution is withdrawn
+    /// by the fence, and the release waits for every consumer (#1855).
+    #[test]
+    fn a_fence_of_the_running_generation_withdraws_a_backend_reported_without_one() {
+        use crate::onion::catalog::CatalogBackend;
+
+        let mut desired = crate::council::types::DesiredState::default();
+        desired.apps.insert(
+            crate::meat::types::AppId::new("web", "default"),
+            spec_from_toml("[app.web]\nimage = \"x:1\"\nport = 80\n"),
+        );
+        let execution = |generation: &str| -> crate::grill::RuntimeExecution {
+            serde_json::from_value(serde_json::json!({
+                "instance_id": "default__web-0", "generation": generation.repeat(64)
+            }))
+            .unwrap()
+        };
+        let (predecessor, running) = (execution("a"), execution("b"));
+        desired.endpoint_catalog =
+            build_endpoint_catalog(&[], &AggregatedState::default(), &desired).unwrap();
+        desired
+            .endpoint_catalog
+            .services
+            .get_mut("default__web")
+            .unwrap()
+            .backends = vec![CatalogBackend {
+            execution: Some(predecessor),
+            node_id: "a".into(),
+            node_ip: "127.0.0.1".parse().unwrap(),
+            host_port: 30001,
+            healthy: true,
+        }];
+        // The restarted replica's report names no execution yet.
+        let mut app = running_app("default", "web", 30001, true);
+        app.execution = None;
+        let mut report = report(4000, 0);
+        report.running_apps = vec![app];
+        let mut reports = AggregatedState::default();
+        reports.reports.insert(NodeId::new("a"), report);
+
+        let catalog = build_endpoint_catalog(&[member("a", 1)], &reports, &desired).unwrap();
+        let backends = &catalog.services["default__web"].backends;
+        assert_eq!(backends.len(), 1);
+        assert_eq!(
+            backends[0].execution, None,
+            "the predecessor's execution was lent to its replacement"
+        );
+
+        let retirements = desired
+            .producer_retirements
+            .plan_retirement("a", &running)
+            .unwrap();
+        let withdrawn = retirements.withdraw(&catalog);
+        assert!(withdrawn.services["default__web"].backends.is_empty());
+        let withdrawals = desired
+            .endpoint_withdrawals
+            .plan_publication(
+                &catalog,
+                &withdrawn,
+                &std::collections::BTreeSet::from(["b".to_string()]),
+            )
+            .unwrap();
+        assert!(
+            !retirements.release_confirmed("a", &running, &withdrawals),
+            "the release must wait for node b to drop the backend"
+        );
+    }
+
     #[test]
     fn build_endpoint_catalog_skips_portless_and_unknown_apps() {
         // A running app with no host port, and one with no desired spec, are
@@ -5600,6 +6141,104 @@ image = "busybox:latest"
             "second app must not double-book: {decisions:?}"
         );
         assert_eq!(decisions[0].app_id, a);
+    }
+
+    /// #1682: a proposal's forecast is the placement pass run over its
+    /// `after` specs. A scale from 1 to 3 on three nodes places its two new
+    /// instances on the two nodes the app isn't on; a scale past the
+    /// cluster's room says how many it can't place, and why; nothing is
+    /// committed.
+    #[test]
+    fn a_forecast_places_new_instances_and_counts_what_wont_fit() {
+        let web = AppId::new("web", "shop");
+        let mut desired = DesiredState::default();
+        desired.apps.insert(web.clone(), app_spec(1000, 1));
+        desired
+            .scheduling
+            .insert(web.clone(), placed_as(&app_spec(1000, 1), &[("n1", 0)]));
+        let (cache, alive) = three_node_cache();
+        let members = PassMembers {
+            alive,
+            ..PassMembers::default()
+        };
+        let scaled = |replicas| super::super::capacity::ForecastApp {
+            app_id: web.clone(),
+            spec: Some(app_spec(1000, replicas)),
+            stopped: false,
+        };
+
+        let forecast = forecast_pass(cache.clone(), &desired, &members, false, &[scaled(3)]);
+        let (app, three) = &forecast[0];
+        assert_eq!(app, &web);
+        let mut nodes: Vec<&str> = three.nodes.iter().map(|node| node.0.as_str()).collect();
+        nodes.sort_unstable();
+        assert_eq!(nodes, ["n2", "n3"]);
+        assert_eq!(three.unplaced, 0);
+        assert_eq!(three.reason, None);
+
+        // Three nodes of 4000m hold twelve 1000m replicas, no more.
+        let forecast = forecast_pass(cache, &desired, &members, false, &[scaled(14)]);
+        let fourteen = &forecast[0].1;
+        assert_eq!(fourteen.nodes.len(), 11);
+        assert_eq!(fourteen.unplaced, 2);
+        assert!(fourteen.reason.is_some());
+        assert_eq!(desired.apps[&web].replicas, Replicas::Fixed(1));
+    }
+
+    /// #1682: an app the quota already keeps out isn't this change's
+    /// shortfall. Changing its image adds nothing unplaceable, so the
+    /// forecast says 0, and rule 3 doesn't hold the proposal for it; asking
+    /// for more replicas counts only the new ones.
+    #[test]
+    fn a_forecast_counts_only_the_quota_shortfall_a_change_adds() {
+        let web = AppId::new("web", "prod");
+        let mut desired = DesiredState::default();
+        desired.namespaces.insert(
+            "prod".to_string(),
+            crate::config::NamespaceSpec {
+                cpu: Some("1000m".to_string()),
+                memory: None,
+                gpu: None,
+                max_apps: None,
+                max_replicas: None,
+                secret_key: false,
+            },
+        );
+        desired.apps.insert(web.clone(), app_spec(800, 2));
+        let (cache, alive) = three_node_cache();
+        let members = PassMembers {
+            alive,
+            ..PassMembers::default()
+        };
+        let mut quotas = crate::meat::quota::ledger_from_namespaces(&desired.namespaces);
+        let plan = plan_pass(&mut cache.clone(), &desired, &members, &mut quotas, false);
+        let blocked = plan.quota_blocked.get(&web).cloned().unwrap();
+        desired.quota_blocked.insert(web.clone(), blocked);
+
+        let mut new_image = app_spec(800, 2);
+        new_image.image = Some("x:2".to_string());
+        let changed = |spec| super::super::capacity::ForecastApp {
+            app_id: web.clone(),
+            spec: Some(spec),
+            stopped: false,
+        };
+        let forecast = forecast_pass(
+            cache.clone(),
+            &desired,
+            &members,
+            false,
+            &[changed(new_image)],
+        );
+        assert_eq!(forecast[0].1.unplaced, 0);
+        assert_eq!(forecast[0].1.reason, None);
+        let forecast = forecast_pass(
+            cache,
+            &desired,
+            &members,
+            false,
+            &[changed(app_spec(800, 3))],
+        );
+        assert_eq!(forecast[0].1.unplaced, 1);
     }
 
     fn placed_on(names: &[&str]) -> Vec<crate::meat::types::Placement> {
@@ -5848,6 +6487,147 @@ image = "busybox:latest"
 
     /// Two nodes where the scheduler, left to itself, prefers `busy`: it
     /// bin-packs onto the fuller node. The volume app last ran on `home`.
+    fn provenance_of(
+        cache: &mut ClusterStateCache,
+        desired: &DesiredState,
+        alive: HashSet<NodeId>,
+    ) -> PassPlan {
+        let members = PassMembers {
+            alive,
+            ..PassMembers::default()
+        };
+        plan_pass(cache, desired, &members, &mut QuotaLedger::default(), false)
+    }
+
+    /// A placement records why each new replica went where it did, under
+    /// the instance it names, and the replicas that stayed aren't decided
+    /// again.
+    #[test]
+    fn a_replacement_records_why_it_went_where_it_did() {
+        let app = AppId::new("frontend", "default");
+        let spec = app_spec(100, 3);
+        let mut desired = DesiredState::default();
+        desired.scheduling.insert(
+            app.clone(),
+            placed_as(&spec, &[("n1", 0), ("n2", 1), ("n3", 2)]),
+        );
+        desired.apps.insert(app.clone(), spec);
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(sched_node("n1", 4000, BTreeMap::new()));
+        cache.set_node(sched_node("n3", 4000, BTreeMap::new()));
+        cache.set_node(sched_node("n4", 4000, BTreeMap::new()));
+        let alive = HashSet::from([NodeId::new("n1"), NodeId::new("n3"), NodeId::new("n4")]);
+
+        let plan = provenance_of(&mut cache, &desired, alive);
+
+        let details = plan.provenance[&app].clone().into_details();
+        assert_eq!(details["rule"], "placement.scored");
+        assert_eq!(details["wanted"], "3");
+        assert_eq!(details["kept"], "2");
+        let why = &details["default__frontend-1"];
+        assert!(
+            why.starts_with("n4: 0 of its replicas there, score "),
+            "{why}"
+        );
+        assert!(why.contains("3 nodes passed the filter"), "{why}");
+        assert!(!details.contains_key("default__frontend-0"), "{details:?}");
+        let events = provenance_events(plan.provenance);
+        assert_eq!(
+            events[0].message,
+            "placed default/frontend: default__frontend-1 on n4"
+        );
+    }
+
+    #[test]
+    fn a_daemon_set_records_its_nodes_without_scores() {
+        let app = AppId::new("agent", "default");
+        let mut spec = app_spec(100, 1);
+        spec.replicas = Replicas::DaemonSet;
+        let mut desired = DesiredState::default();
+        desired.apps.insert(app.clone(), spec);
+        let (mut cache, alive) = three_node_cache();
+
+        let plan = provenance_of(&mut cache, &desired, alive);
+
+        let details = plan.provenance[&app].clone().into_details();
+        assert_eq!(details["rule"], "placement.daemon");
+        assert_eq!(details["eligible"], "3");
+        let nodes: HashSet<&str> = (0..3)
+            .map(|ordinal| details[&format!("default__agent-{ordinal}")].as_str())
+            .collect();
+        assert_eq!(nodes, HashSet::from(["n1", "n2", "n3"]));
+    }
+
+    #[test]
+    fn a_returning_volume_app_records_its_volume_home() {
+        let (desired, mut cache) = stopped_and_applied_again(app_with_volume(100));
+        let alive = HashSet::from([NodeId::new("busy"), NodeId::new("home")]);
+
+        let plan = provenance_of(&mut cache, &desired, alive);
+
+        let details = plan.provenance[&AppId::new("db", "default")]
+            .clone()
+            .into_details();
+        assert_eq!(details["rule"], "placement.volume_home");
+        assert_eq!(details["default__db-0"], "home: holds its volumes");
+    }
+
+    #[test]
+    fn a_converged_app_records_no_decision() {
+        let app = AppId::new("frontend", "default");
+        let spec = app_spec(100, 3);
+        let mut desired = DesiredState::default();
+        desired.scheduling.insert(
+            app.clone(),
+            placed_as(&spec, &[("n1", 0), ("n2", 1), ("n3", 2)]),
+        );
+        desired.apps.insert(app, spec);
+        let (mut cache, alive) = three_node_cache();
+
+        let plan = provenance_of(&mut cache, &desired, alive);
+
+        assert!(plan.decisions.is_empty());
+        assert!(plan.provenance.is_empty());
+    }
+
+    #[test]
+    fn a_shortfall_start_records_its_reason_and_a_clear_records_none() {
+        let app = AppId::new("web", "default");
+        let short = crate::meat::types::Unschedulable {
+            placed: 1,
+            wanted: 3,
+            reason: crate::meat::types::UnplacedReason::NoRoom,
+        };
+        let events = shortfall_events(&[
+            ShortfallChange::Started(app.clone(), short),
+            ShortfallChange::Changed(app.clone(), short),
+            ShortfallChange::Cleared(app.clone()),
+        ]);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].details["rule"], "placement.short");
+        assert_eq!(events[0].details["reason"], "no_room");
+        assert_eq!(events[0].details["placed"], "1");
+        assert_eq!(events[0].details["wanted"], "3");
+        assert!(events[1].details.is_empty());
+    }
+
+    #[test]
+    fn a_quota_block_is_recorded_once_when_it_starts() {
+        let app = AppId::new("web", "default");
+        let error = crate::meat::quota::QuotaError::MaxAppsExceeded {
+            namespace: "default".to_string(),
+            current: 4,
+            limit: 4,
+        };
+        let planned = BTreeMap::from([(app.clone(), error.clone())]);
+        let events = quota_blocked_events(&HashMap::new(), &planned);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].details["rule"], "placement.quota_blocked");
+        assert_eq!(events[0].details["reason"], error.to_string());
+        let recorded = HashMap::from([(app, error)]);
+        assert!(quota_blocked_events(&recorded, &planned).is_empty());
+    }
+
     fn stopped_and_applied_again(spec: AppSpec) -> (DesiredState, ClusterStateCache) {
         let app = AppId::new("db", "default");
         let mut desired = DesiredState::default();
@@ -6077,7 +6857,7 @@ image = "busybox:latest"
             })
             .collect();
         let mut cache = build_cluster_cache(&members, &reports);
-        let unheard = unheard_nodes(&alive, &reports);
+        let unheard = unheard_nodes(&alive, &reports, Duration::from_secs(300));
 
         let decisions = plan_scheduling_pass_with_dns(
             &mut cache,
@@ -6742,13 +7522,148 @@ image = "busybox:latest"
         }
         reports.stale_nodes.push(NodeId::new("stale"));
 
-        let unheard = unheard_nodes(&alive, &reports);
+        let unheard = unheard_nodes(&alive, &reports, Duration::from_secs(300));
 
         assert_eq!(
             unheard,
             HashSet::from([NodeId::new("no-readiness"), NodeId::new("no-capability")]),
             "a stale node lost its evidence; a silent one isn't in the cache at all"
         );
+    }
+
+    /// Readiness evidence from a Bun that is still coming up: `agent` is
+    /// running, `api` has been in its first start for `starting_for_ms`,
+    /// after `restarts` earlier attempts.
+    fn starting_readiness(
+        name: &str,
+        starting_for_ms: u64,
+        restarts: u32,
+    ) -> crate::reporting::types::NodeReadinessReport {
+        use crate::bun::readiness::{SubsystemEvidence, SubsystemState};
+        let observed_at_unix_ms = 1_800_000_000_000;
+        let subsystem = |name: &str, state| SubsystemEvidence {
+            name: name.to_string(),
+            critical: true,
+            state,
+            state_since_unix_ms: observed_at_unix_ms - starting_for_ms,
+            last_error: None,
+            last_error_unix_ms: None,
+            restart_count: 0,
+        };
+        let mut api = subsystem("api", SubsystemState::Starting);
+        api.restart_count = restarts;
+        crate::reporting::types::NodeReadinessReport {
+            node_id: NodeId::new(name),
+            evidence: crate::bun::readiness::NodeReadinessEvidence {
+                ready: false,
+                observed_at_unix_ms,
+                subsystems: vec![subsystem("agent", SubsystemState::Ready), api],
+            },
+        }
+    }
+
+    /// Fresh reports from `n1`, `n2` and `n3`, each with a capability
+    /// report; `n3`'s readiness is `n3_readiness`, the others are ready.
+    fn reports_with_n3_readiness(
+        n3_readiness: crate::reporting::types::NodeReadinessReport,
+    ) -> (Vec<MembershipSnapshot>, AggregatedState) {
+        let members = vec![member("n1", 1), member("n2", 2), member("n3", 3)];
+        let mut reports = AggregatedState::default();
+        for name in ["n1", "n2", "n3"] {
+            reports.reports.insert(NodeId::new(name), report(4000, 0));
+            reports.capabilities.insert(
+                NodeId::new(name),
+                crate::reporting::types::NodeCapabilityReport {
+                    node_id: NodeId::new(name),
+                    capabilities: crate::meat::cluster_state::NodeCapabilities::container_runtime(),
+                    egress_enforcement: Vec::new(),
+                    egress_degraded: false,
+                    egress_affected_workloads: Vec::new(),
+                },
+            );
+            reports.receive_deadlines.insert(
+                NodeId::new(name),
+                tokio::time::Instant::now() + Duration::from_secs(30),
+            );
+        }
+        for name in ["n1", "n2"] {
+            reports
+                .readiness
+                .insert(NodeId::new(name), readiness(name, true));
+        }
+        reports.readiness.insert(NodeId::new("n3"), n3_readiness);
+        (members, reports)
+    }
+
+    /// #1449: a Bun that restarts (a crash, `systemctl restart`, an upgrade
+    /// exec) adopts its running replicas, and its first report goes out
+    /// while its API, DNS, ingress and registry are still starting, so it
+    /// says "not ready". The leader took that as evidence and moved the
+    /// node's replica, and the node then retired the replica it had just
+    /// adopted. A node still in its first start hasn't failed anything: it
+    /// keeps what it runs, and gets nothing new until it is ready.
+    #[test]
+    fn a_restarting_node_keeps_its_replicas_while_its_subsystems_start() {
+        let app = AppId::new("hello", "default");
+        let mut desired = DesiredState::default();
+        desired.apps.insert(app.clone(), app_spec(100, 3));
+        desired
+            .scheduling
+            .insert(app.clone(), placed_on(&["n1", "n2", "n3"]));
+        let (members, reports) = reports_with_n3_readiness(starting_readiness("n3", 500, 0));
+        let alive: HashSet<NodeId> = members.iter().map(|m| m.node_id.clone()).collect();
+        let mut cache = build_cluster_cache(&members, &reports);
+        let unheard = unheard_nodes(&alive, &reports, Duration::from_secs(300));
+
+        let decisions = plan_scheduling_pass_with_dns(
+            &mut cache,
+            &desired,
+            &alive,
+            &HashSet::new(),
+            &mut QuotaLedger::default(),
+            false,
+            &unheard,
+        );
+
+        assert!(decisions.is_empty(), "{decisions:?}");
+        assert!(
+            !cache.get_node(&NodeId::new("n3")).unwrap().ready,
+            "nothing new lands on a node that is still starting"
+        );
+    }
+
+    /// Starting is only a reprieve while it is a first start, and only for
+    /// the stale-node grace. A subsystem being rebuilt after a failure, one
+    /// that hasn't come up within the grace, or a degraded one is evidence:
+    /// those nodes' replicas move.
+    #[test]
+    fn only_a_first_start_within_the_grace_counts_as_unheard() {
+        let grace = Duration::from_secs(300);
+        let cases = [
+            (
+                "first start, just begun",
+                starting_readiness("n3", 500, 0),
+                true,
+            ),
+            (
+                "first start, past the grace",
+                starting_readiness("n3", 300_000, 0),
+                false,
+            ),
+            (
+                "rebuilt after a failure",
+                starting_readiness("n3", 500, 1),
+                false,
+            ),
+            ("degraded", readiness("n3", false), false),
+        ];
+        for (case, evidence, kept) in cases {
+            let (members, reports) = reports_with_n3_readiness(evidence);
+            let alive: HashSet<NodeId> = members.iter().map(|m| m.node_id.clone()).collect();
+            let unheard = unheard_nodes(&alive, &reports, grace);
+            assert_eq!(unheard.contains(&NodeId::new("n3")), kept, "{case}");
+            assert!(!unheard.contains(&NodeId::new("n1")), "{case}");
+        }
     }
 
     #[test]

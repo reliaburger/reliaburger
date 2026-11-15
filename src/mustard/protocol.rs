@@ -29,9 +29,8 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use rand::SeedableRng;
 use rand::rngs::StdRng;
-use rand::seq::SliceRandom;
+use rand::seq::IndexedRandom;
 use tokio_util::sync::CancellationToken;
 
 use tokio::sync::watch;
@@ -246,6 +245,8 @@ pub struct MustardNode<T: MustardTransport> {
     /// Whether we've already said that our directory extension is too big
     /// to send, so the line appears once rather than on every datagram.
     oversize_extension_logged: bool,
+    /// Updates received and the last membership change, for the API.
+    stats: super::stats::GossipStats,
 }
 
 impl<T: MustardTransport> MustardNode<T> {
@@ -299,14 +300,20 @@ impl<T: MustardTransport> MustardNode<T> {
             directory: NodeDirectory::default(),
             directory_watch: None,
             node_gate: crate::smoker::node_fault::NodeTransportGate::new(),
-            rng: StdRng::from_entropy(),
+            rng: rand::make_rng(),
             next_push_pull: Instant::now(),
             sync_cursor: 0,
             sequences: HashMap::new(),
             pending_relays: VecDeque::new(),
             send_failures: SendFailureLog::default(),
             oversize_extension_logged: false,
+            stats: super::stats::GossipStats::default(),
         }
+    }
+
+    /// A handle on this node's gossip counters, which the API reads.
+    pub fn stats(&self) -> super::stats::GossipStats {
+        self.stats.clone()
     }
 
     /// Share the Smoker node-kill switch that also gates this node's
@@ -650,6 +657,7 @@ impl<T: MustardTransport> MustardNode<T> {
         let snapshot = self.membership.snapshot();
         let digest = membership_digest(&snapshot);
         if digest != self.last_published_digest {
+            self.stats.record_change(super::stats::now_unix_ms());
             if let Some(tx) = &self.membership_watch {
                 let _ = tx.send(snapshot);
             }
@@ -926,6 +934,7 @@ impl<T: MustardTransport> MustardNode<T> {
         }
 
         // Process piggybacked updates
+        self.stats.record_updates(message.payload.updates().len());
         for update in message.payload.updates() {
             let changed = self.membership.apply_update(update, now);
             if changed {
@@ -1236,7 +1245,7 @@ impl<T: MustardTransport> MustardNode<T> {
 
         let count = self.config.indirect_probe_count.min(candidates.len());
         candidates
-            .choose_multiple(&mut self.rng, count)
+            .sample(&mut self.rng, count)
             .map(|m| m.address)
             .collect()
     }
@@ -1245,6 +1254,7 @@ impl<T: MustardTransport> MustardNode<T> {
     /// exactly one probe schedule.
     #[cfg(test)]
     fn seed_rng(&mut self, seed: u64) {
+        use rand::SeedableRng;
         self.rng = StdRng::seed_from_u64(seed);
     }
 
@@ -1845,6 +1855,34 @@ mod tests {
         assert!(node2.membership.get(&NodeId::new("n3")).is_some());
     }
 
+    #[tokio::test]
+    async fn received_updates_are_counted_and_a_membership_change_is_stamped() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let t2 = net.register(addr(2)).await;
+        let node1 = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        let mut node2 = MustardNode::new(NodeId::new("n2"), addr(2), fast_config(), t2);
+        let stats = node2.stats();
+        node2.publish_membership();
+        let first_change = stats.last_change_unix_ms();
+        assert!(first_change.is_some(), "joining is the first change");
+
+        let updates = vec![MembershipUpdate {
+            node_id: NodeId::new("n3"),
+            address: addr(3),
+            state: NodeState::Alive,
+            incarnation: 1,
+        }];
+        let ping = GossipMessage::new(NodeId::new("n1"), 1, GossipPayload::Ping { updates });
+        node1.transport.send(addr(2), &ping).await.unwrap();
+        let (from, message) = node2.transport.recv().await.unwrap();
+        node2.handle_message(from, message).await;
+        node2.publish_membership();
+
+        assert_eq!(stats.updates_received(), 1);
+        assert!(stats.last_change_unix_ms() >= first_change);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn ping_timeout_triggers_ping_req() {
         // 3 nodes: A, B, C. Partition A↔B. When A probes B, the direct
@@ -2095,11 +2133,12 @@ mod tests {
         // under parallel test load; see tokio #3709), and use try_recv()
         // to drain messages without timers.
         //
-        // Before anti-entropy, 73 schedules in 100,000 stranded a member for
+        // Before anti-entropy, 82 schedules in 100,000 stranded a member for
         // good: every update about it spent its bounded re-broadcasts before
         // reaching some node, the queues drained, and no later round helped.
-        // With push-pull all 100,000 converged by round 23, three rounds
-        // after the first exchange. So this runs 2,000 fresh schedules every
+        // With push-pull all 100,000 converged by round 22, two rounds
+        // after the first exchange. (Measured with rand 0.10; under 0.8 the
+        // same seeds gave 73 and round 23.) So this runs 2,000 fresh schedules every
         // time, from an OS-random base, and allows two exchanges' worth of
         // rounds; a failure prints the seed that replays it.
         let base: u64 = rand::random();
@@ -2115,17 +2154,19 @@ mod tests {
 
     #[tokio::test]
     async fn a_stranding_schedule_is_rescued_by_push_pull() {
-        // Seed 830 is the first of the 73 schedules in 0..100,000 that
-        // stranded a member permanently with piggybacking alone. The
+        // Seed 160 is the first of the 82 schedules in 0..100,000 that
+        // strand a member permanently with piggybacking alone. (It was 830
+        // until rand 0.10 changed how `choose` turns random bits into an
+        // index, which reshuffled every seeded schedule.) The
         // simulation leaves the first exchange until round 20, so up to then
         // this replays the stranding schedule exactly, and push-pull has to
         // do the rescue.
         assert_eq!(
-            converge_five_node_ring(830, None).await,
+            converge_five_node_ring(160, None).await,
             None,
-            "seed 830 no longer strands without anti-entropy; pick another stranding seed"
+            "seed 160 no longer strands without anti-entropy; pick another stranding seed"
         );
-        let rounds = converge_five_node_ring(830, Some(PUSH_PULL_EVERY_ROUNDS)).await;
+        let rounds = converge_five_node_ring(160, Some(PUSH_PULL_EVERY_ROUNDS)).await;
         assert!(
             rounds.is_some_and(|round| round >= PUSH_PULL_EVERY_ROUNDS),
             "push-pull did not rescue the stranded member: {rounds:?}"

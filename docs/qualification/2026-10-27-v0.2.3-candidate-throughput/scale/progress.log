@@ -1,0 +1,23 @@
+2026-10-26T22:00:11Z dev create done
+2026-10-26T22:00:13Z configure: 3 eligible
+2026-10-26T22:02:10Z n3-r1-host exit 0
+2026-10-26T22:03:22Z n3-r2-host exit 0
+2026-10-26T22:04:34Z n3-r3-host exit 0
+2026-10-26T22:05:46Z n3-r4-host exit 0
+2026-10-26T22:06:58Z n3-r5-host exit 0
+2026-10-26T22:07:08Z configure: 2 eligible
+2026-10-26T22:09:15Z n2-r1-host exit 0
+2026-10-26T22:10:27Z n2-r2-host exit 0
+2026-10-26T22:11:39Z n2-r3-host exit 0
+2026-10-26T22:12:52Z n2-r4-host exit 0
+2026-10-26T22:14:04Z n2-r5-host exit 0
+2026-10-26T22:14:14Z configure: 1 eligible
+2026-10-26T22:16:26Z n1-r1-host exit 0
+2026-10-26T22:17:38Z n1-r2-host exit 0
+2026-10-26T22:18:50Z n1-r3-host exit 0
+2026-10-26T22:20:02Z n1-r4-host exit 0
+2026-10-26T22:21:14Z n1-r5-host exit 0
+2026-10-26T22:21:24Z DONE
+2026-10-26T22:24:24Z n3-probe-host done
+2026-10-26T22:24:49Z discarded probe window: the reconfigure didn't run, so only node 1 was eligible (kept as discarded-n1-probe-host.*)
+2026-10-26T22:27:06Z n3-probe-host done

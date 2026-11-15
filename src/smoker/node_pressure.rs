@@ -233,7 +233,15 @@ impl NodePressureController {
                 .as_ref()
                 .ok_or_else(|| "node-pressure helper executable is unavailable".to_string())?;
             let cgroup = Path::new(NODE_PRESSURE_CGROUP_ROOT).join(id.to_string());
-            let (_memory_ceiling_bytes, cores) = prepare_fault_cgroup(&cgroup, memory_percentage)?;
+            // Setting up writes cgroupfs, and a failed setup removes the
+            // cgroup, which retries with a sleep: off the runtime (#1860).
+            // The await is before the creator's thread is recorded below.
+            let prepared = cgroup.clone();
+            let (_memory_ceiling_bytes, cores) = tokio::task::spawn_blocking(move || {
+                prepare_fault_cgroup(&prepared, memory_percentage)
+            })
+            .await
+            .map_err(|e| format!("cgroup setup task panicked: {e}"))??;
 
             // No await may move this task to another worker between recording
             // the creator and spawn: Linux ties PDEATHSIG to this exact thread.
@@ -260,20 +268,20 @@ impl NodePressureController {
             let mut child = match command.spawn() {
                 Ok(child) => child,
                 Err(error) => {
-                    let _ = remove_fault_cgroup(&cgroup);
+                    let _ = remove_fault_cgroup_async(cgroup.clone()).await;
                     return Err(format!("failed to start node-pressure helper: {error}"));
                 }
             };
             let Some(stdout) = child.stdout.take() else {
                 let _ = child.kill().await;
                 let _ = child.wait().await;
-                let _ = remove_fault_cgroup(&cgroup);
+                let _ = remove_fault_cgroup_async(cgroup.clone()).await;
                 return Err("node-pressure helper stdout was not captured".to_string());
             };
             let Some(stderr) = child.stderr.take() else {
                 let _ = child.kill().await;
                 let _ = child.wait().await;
-                let _ = remove_fault_cgroup(&cgroup);
+                let _ = remove_fault_cgroup_async(cgroup.clone()).await;
                 return Err("node-pressure helper stderr was not captured".to_string());
             };
             let (mut stderr_tasks, diagnostic) = capture_helper_stderr(stderr);
@@ -313,12 +321,16 @@ impl NodePressureController {
                 } else {
                     ""
                 };
+                // BLOCKING-OK: cgroupfs reads, answered from memory, for a failed helper's diagnostic
                 let memory_events =
                     std::fs::read_to_string(cgroup.join("memory.events")).unwrap_or_default();
+                // BLOCKING-OK: cgroupfs, answered from memory
                 let memory_current =
                     std::fs::read_to_string(cgroup.join("memory.current")).unwrap_or_default();
+                // BLOCKING-OK: cgroupfs, answered from memory
                 let memory_peak =
                     std::fs::read_to_string(cgroup.join("memory.peak")).unwrap_or_default();
+                // BLOCKING-OK: cgroupfs, answered from memory
                 let memory_max =
                     std::fs::read_to_string(cgroup.join("memory.max")).unwrap_or_default();
                 let reason = format!(
@@ -332,7 +344,7 @@ impl NodePressureController {
                     memory_max.trim(),
                     memory_events.trim(),
                 );
-                let _ = remove_fault_cgroup(&cgroup);
+                let _ = remove_fault_cgroup_async(cgroup.clone()).await;
                 return Err(reason);
             }
 
@@ -340,6 +352,7 @@ impl NodePressureController {
             // workers run unthrottled for at most this one round-trip; the
             // memory ceiling has bounded the allocation since before spawn.
             if cpu_percentage > 0
+                // BLOCKING-OK: cgroupfs, an in-memory kernel interface: no disk behind it
                 && let Err(error) = write_control(
                     &cgroup,
                     "cpu.max",
@@ -348,7 +361,7 @@ impl NodePressureController {
             {
                 let _ = child.kill().await;
                 let _ = child.wait().await;
-                let _ = remove_fault_cgroup(&cgroup);
+                let _ = remove_fault_cgroup_async(cgroup.clone()).await;
                 return Err(error);
             }
 

@@ -369,6 +369,15 @@ impl RegistryForwarder {
         .map_err(|_| unavailable("registry ownership query timed out"))?
     }
 
+    /// The leader's advertised API endpoint. `metrics` is `None` on a node
+    /// without a council handle, which has only the gossip hint.
+    fn leader_address(
+        &self,
+        metrics: Option<&crate::cluster::directory::MetricsReceiver>,
+    ) -> Option<std::net::SocketAddr> {
+        crate::cluster::directory::leader_api_address(metrics, &self.directory)
+    }
+
     async fn send_request<T: Serialize, R: serde::de::DeserializeOwned>(
         &self,
         council: Option<&Arc<CouncilNode>>,
@@ -378,17 +387,9 @@ impl RegistryForwarder {
         if self.requires_mtls() {
             return Err(PickleError::RegistryNeedsMtls);
         }
-        let address = {
-            let directory = self.directory.borrow();
-            if let Some(council) = council {
-                let metrics = council.metrics();
-                let metrics = metrics.borrow();
-                crate::cluster::directory::leader_api_address(&metrics, &directory)
-            } else {
-                directory.leader.as_ref().map(|leader| leader.api_address)
-            }
-        }
-        .ok_or_else(|| unavailable("no advertised registry leader endpoint"))?;
+        let address = self
+            .leader_address(council.map(|council| council.metrics()).as_ref())
+            .ok_or_else(|| unavailable("no advertised registry leader endpoint"))?;
         let bearer = self
             .http
             .bearer()
@@ -574,12 +575,11 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn forwarding_bounds_chunked_responses_and_the_whole_deadline() {
-        use axum::{body::Body, response::Response};
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let hanging = Arc::new(AtomicBool::new(false));
-        let mode = hanging.clone();
+    /// A stand-in leader that answers every proposal with `body`, and a
+    /// forwarder pointed at it.
+    async fn leader_answering_with(
+        body: fn() -> axum::body::Body,
+    ) -> (RegistryForwarder, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -587,58 +587,73 @@ mod tests {
                 listener,
                 Router::new().route(
                     REGISTRY_PROPOSAL_PATH,
-                    post(move || {
-                        let mode = mode.clone();
-                        async move {
-                            let body = if mode.load(Ordering::SeqCst) {
-                                Body::from_stream(futures_util::stream::pending::<
-                                    Result<axum::body::Bytes, std::io::Error>,
-                                >())
-                            } else {
-                                Body::from_stream(futures_util::stream::iter((0..=1024).map(
-                                    |_| {
-                                        Ok::<_, std::io::Error>(axum::body::Bytes::from(vec![
-                                            b'x';
-                                            8192
-                                        ]))
-                                    },
-                                )))
-                            };
-                            Response::new(body)
-                        }
-                    }),
+                    post(move || async move { axum::response::Response::new(body()) }),
                 ),
             )
             .await
             .unwrap();
         });
         let (_tx, rx) = watch::channel(directory(address));
-        // The stalled body never completes, so a two-second deadline proves
-        // the same bound as the production ten; the chunked limit case
-        // finishes long before either.
         let forwarder = RegistryForwarder::new(
             crate::cluster::ClusterHttp::plaintext().with_bearer(Some("internal".into())),
             rx,
         )
-        .against_plaintext_stand_in()
-        .with_timeout(Duration::from_secs(2));
+        .against_plaintext_stand_in();
+        (forwarder, server)
+    }
+
+    /// A chunked answer one chunk past the control-message limit is refused
+    /// for its size. The verdict counts bytes, not time: the exchange runs
+    /// without the whole-exchange deadline, so a loaded machine that streams
+    /// the 8 MiB slowly still reaches the limit (#1145). A forwarder that
+    /// read past the limit would parse the whole body and fail differently.
+    #[tokio::test]
+    async fn forwarding_refuses_a_chunked_response_over_the_size_limit() {
+        fn over_the_limit() -> axum::body::Body {
+            const CHUNK: usize = 8192;
+            let chunks = MAX_REGISTRY_PROPOSAL_BYTES / CHUNK + 1;
+            axum::body::Body::from_stream(futures_util::stream::iter(
+                (0..chunks)
+                    .map(|_| Ok::<_, std::io::Error>(axum::body::Bytes::from(vec![b'x'; CHUNK]))),
+            ))
+        }
+        let (forwarder, server) = leader_answering_with(over_the_limit).await;
+        let proposal = RegistryProposal {
+            compatibility: crate::compatibility::CURRENT,
+            mutation: report(),
+        };
+        let error = forwarder
+            .send_request::<_, CouncilResponse>(None, REGISTRY_PROPOSAL_PATH, &proposal)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(
-            forwarder
-                .write(None, report())
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("limit")
+            error.contains("exceeds the control-message limit"),
+            "{error}"
         );
-        hanging.store(true, Ordering::SeqCst);
-        assert!(
-            forwarder
-                .write(None, report())
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("timed out")
-        );
+        server.abort();
+        let _ = server.await;
+    }
+
+    /// A leader whose answer never completes can't hold a write past the
+    /// whole-exchange deadline. The body never ends, so a two-second
+    /// deadline proves the same bound as the production ten, however slow
+    /// the machine.
+    #[tokio::test]
+    async fn forwarding_bounds_a_stalled_response_with_the_whole_deadline() {
+        fn stalled() -> axum::body::Body {
+            axum::body::Body::from_stream(futures_util::stream::pending::<
+                Result<axum::body::Bytes, std::io::Error>,
+            >())
+        }
+        let (forwarder, server) = leader_answering_with(stalled).await;
+        let forwarder = forwarder.with_timeout(Duration::from_secs(2));
+        let error = forwarder
+            .write(None, report())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("timed out"), "{error}");
         server.abort();
         let _ = server.await;
     }
@@ -808,5 +823,24 @@ mod tests {
         assert!(message.starts_with("the registry needs mTLS"), "{message}");
         assert!(message.contains("relish init"), "{message}");
         assert!(message.contains("relish join"), "{message}");
+    }
+
+    // #1433: a follower forwarding a registry write held the gossip
+    // directory while it read openraft's metrics, the reverse of the
+    // leader-target maintainer's order. With both channels' writers queued
+    // that is #1273's deadlock, reached through Pickle.
+    #[test]
+    fn forwarding_reads_the_metrics_without_holding_the_gossip_directory() {
+        let waited = crate::cluster::directory::directory_write_waits_for_metrics_read(
+            |metrics, directory| {
+                let forwarder =
+                    RegistryForwarder::new(crate::cluster::ClusterHttp::plaintext(), directory);
+                forwarder.leader_address(Some(&metrics));
+            },
+        );
+        assert!(
+            !waited,
+            "a gossip directory write waited for the metrics read"
+        );
     }
 }

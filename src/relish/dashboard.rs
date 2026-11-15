@@ -13,7 +13,7 @@ use axum::extract::{Request, State};
 use axum::http::{Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
-use rand::RngCore;
+use rand::TryRng;
 use tokio_util::sync::CancellationToken;
 
 use super::{RelishError, client::BunClient};
@@ -31,22 +31,24 @@ struct DashboardSession {
 }
 
 impl DashboardSession {
-    fn new(client: BunClient, address: SocketAddr) -> Self {
-        let token = || {
+    /// Fails only if the operating system's random source does: the two
+    /// tokens are secrets, so they come straight from `SysRng`.
+    fn new(client: BunClient, address: SocketAddr) -> std::io::Result<Self> {
+        let token = || -> std::io::Result<String> {
             let mut bytes = [0u8; 32];
-            rand::rngs::OsRng.fill_bytes(&mut bytes);
-            hex::encode(bytes)
+            rand::rngs::SysRng.try_fill_bytes(&mut bytes)?;
+            Ok(hex::encode(bytes))
         };
-        Self {
+        Ok(Self {
             client,
             authority: address.to_string(),
             origin: format!("http://{address}"),
-            launch_token: token(),
-            session_token: token(),
+            launch_token: token()?,
+            session_token: token()?,
             cookie_name: format!("rb_dashboard_{}", address.port()),
             launch_used: Arc::new(AtomicBool::new(false)),
             shutdown: CancellationToken::new(),
-        }
+        })
     }
 }
 
@@ -174,7 +176,7 @@ pub async fn run(port: u16, no_open: bool) -> Result<(), RelishError> {
     let client = BunClient::default_local();
     client.health().await?;
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
-    let session = DashboardSession::new(client, listener.local_addr()?);
+    let session = DashboardSession::new(client, listener.local_addr()?)?;
     let url = format!(
         "{}/_reliaburger/open/{}",
         session.origin, session.launch_token
@@ -248,7 +250,8 @@ mod tests {
         let session = DashboardSession::new(
             BunClient::new_with_token(&format!("http://{address}"), Some("upstream-only")),
             "127.0.0.1:18117".parse().unwrap(),
-        );
+        )
+        .unwrap();
         let cookie = format!("{}={}", session.cookie_name, session.session_token);
         let app = router(session);
         let request = |path: &str| {
@@ -280,6 +283,7 @@ mod tests {
             ),
             "127.0.0.1:18117".parse().unwrap(),
         )
+        .unwrap()
     }
 
     #[tokio::test]

@@ -24,6 +24,14 @@ pub struct NodeConfig {
     pub logs: LogsSection,
     pub alerts: AlertsSection,
     pub process_workloads: super::process_workloads::ProcessWorkloadsConfig,
+    /// `[secret_providers.<name>]`: the exec secret providers this node runs
+    /// for `PROVIDER[name:path]` env values, and the allowlist of their
+    /// binaries (#1123). Empty by default: a node runs no provider.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub secret_providers: BTreeMap<
+        crate::sesame::secret_provider::ProviderName,
+        crate::sesame::secret_provider::SecretProviderConfig,
+    >,
     pub security: SecuritySection,
     /// GitOps configuration (optional — only needed if GitOps is enabled).
     #[serde(default)]
@@ -128,17 +136,42 @@ impl SmokerSection {
 pub struct RuntimeSection {
     /// Seconds each stop or kill confirmation step may take. Default 10.
     pub stop_confirmation_timeout_secs: u64,
+    /// Capabilities an app's `[app.x.runtime] capabilities` may add on
+    /// this node (#1122). Empty by default: none. Each is named; there is
+    /// no wildcard.
+    #[serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub allowed_capabilities: std::collections::BTreeSet<crate::grill::knobs::Capability>,
+    /// Namespaced sysctls an app may set on this node: exact names, or a
+    /// `net.` or `fs.mqueue.` prefix ending in `.*`. Empty by default.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub allowed_sysctls: Vec<crate::grill::knobs::SysctlPattern>,
+    /// Host devices an app may pass in on this node, by path under `/dev`.
+    /// Empty by default.
+    #[serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub allowed_devices: std::collections::BTreeSet<crate::grill::knobs::DevicePath>,
 }
 
 impl Default for RuntimeSection {
     fn default() -> Self {
         Self {
             stop_confirmation_timeout_secs: 10,
+            allowed_capabilities: Default::default(),
+            allowed_sysctls: Vec::new(),
+            allowed_devices: Default::default(),
         }
     }
 }
 
 impl RuntimeSection {
+    /// The runtime knobs this node's `[runtime]` section allows (#1122).
+    pub fn knob_allowlist(&self) -> crate::grill::knobs::RuntimeAllowlist {
+        crate::grill::knobs::RuntimeAllowlist {
+            capabilities: self.allowed_capabilities.clone(),
+            sysctls: self.allowed_sysctls.clone(),
+            devices: self.allowed_devices.clone(),
+        }
+    }
+
     /// The per-step deadline for confirming a stop or force-kill.
     pub fn stop_confirmation_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.stop_confirmation_timeout_secs)
@@ -608,13 +641,35 @@ impl Default for UpgradeSection {
 }
 
 /// Node identity and labels.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NodeSection {
     /// Node name. Defaults to `node-<gossip_port>` if omitted.
     pub name: Option<String>,
     /// Arbitrary key-value labels for placement constraints.
     pub labels: BTreeMap<String, String>,
+    /// How long, in milliseconds, one turn of Bun's agent loop may run
+    /// before a watchdog thread writes a snapshot of every Bun thread to the
+    /// journal (#1707). Default 750; 0 turns the watchdog off. A written
+    /// node.toml leaves the default out.
+    #[serde(skip_serializing_if = "is_default_loop_stall_snapshot_ms")]
+    pub loop_stall_snapshot_ms: u64,
+}
+
+const DEFAULT_LOOP_STALL_SNAPSHOT_MS: u64 = 750;
+
+fn is_default_loop_stall_snapshot_ms(value: &u64) -> bool {
+    *value == DEFAULT_LOOP_STALL_SNAPSHOT_MS
+}
+
+impl Default for NodeSection {
+    fn default() -> Self {
+        Self {
+            name: None,
+            labels: BTreeMap::new(),
+            loop_stall_snapshot_ms: DEFAULT_LOOP_STALL_SNAPSHOT_MS,
+        }
+    }
 }
 
 /// Cluster membership configuration.
@@ -1309,6 +1364,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_loop_stall_snapshot_threshold_defaults_to_the_watchdogs_and_parses() {
+        let config = NodeConfig::parse("").unwrap();
+        assert_eq!(
+            u128::from(config.node.loop_stall_snapshot_ms),
+            crate::bun::loop_watchdog::DEFAULT_STALL_THRESHOLD.as_millis()
+        );
+        let set = NodeConfig::parse("[node]\nloop_stall_snapshot_ms = 400\n").unwrap();
+        assert_eq!(set.node.loop_stall_snapshot_ms, 400);
+        let off = NodeConfig::parse("[node]\nloop_stall_snapshot_ms = 0\n").unwrap();
+        assert_eq!(off.node.loop_stall_snapshot_ms, 0);
+    }
+
+    #[test]
     fn allowed_host_paths_defaults_to_empty() {
         let config = NodeConfig::parse("").unwrap();
         assert!(config.storage.allowed_host_paths.is_empty());
@@ -1321,6 +1389,47 @@ mod tests {
             listed.storage.allowed_host_paths,
             vec![PathBuf::from("/srv/import")]
         );
+    }
+
+    #[test]
+    fn secret_providers_default_to_none_and_parse_from_their_tables() {
+        let config = NodeConfig::parse("").unwrap();
+        assert!(config.secret_providers.is_empty());
+        assert!(
+            !toml::to_string(&config)
+                .unwrap()
+                .contains("secret_providers")
+        );
+
+        let config = NodeConfig::parse(
+            "[secret_providers.vault]\nbinary = \"/usr/local/bin/vault-provider\"\ntimeout_secs = 3\n",
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let names: Vec<&str> = config
+            .secret_providers
+            .keys()
+            .map(|name| name.as_str())
+            .collect();
+        assert_eq!(names, ["vault"]);
+        assert_eq!(
+            config
+                .secret_providers
+                .values()
+                .next()
+                .unwrap()
+                .timeout_secs,
+            3
+        );
+    }
+
+    #[test]
+    fn a_secret_provider_with_a_relative_binary_fails_node_validation() {
+        let config =
+            NodeConfig::parse("[secret_providers.vault]\nbinary = \"vault-provider\"\n").unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("secret_providers.vault"), "{error}");
+        assert!(error.contains("absolute"), "{error}");
     }
 
     #[test]

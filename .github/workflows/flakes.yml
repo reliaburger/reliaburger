@@ -26,7 +26,7 @@ permissions:
 jobs:
   register:
     name: every open flake links an open issue
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4

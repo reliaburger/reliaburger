@@ -46,6 +46,8 @@ pub enum RefusalSource {
         address: Option<IpAddr>,
         /// The authenticated principal, or `anonymous`.
         principal: String,
+        /// What kind of principal that is.
+        principal_kind: crate::sesame::types::PrincipalKind,
     },
     /// Every source that arrived while the table was full.
     Overflow,
@@ -180,6 +182,7 @@ mod tests {
         RefusalSource::Caller {
             address: Some(address.parse().unwrap()),
             principal: principal.to_string(),
+            principal_kind: crate::sesame::types::PrincipalKind::Human,
         }
     }
 
@@ -258,6 +261,7 @@ mod tests {
                 RefusalSource::Caller {
                     address: Some(address.into()),
                     principal: "anonymous".to_string(),
+                    principal_kind: crate::sesame::types::PrincipalKind::Unknown,
                 },
                 T0,
             );

@@ -1,0 +1,117 @@
+# The contract `relish agent report` (#1575) writes to. Its issue.md uses
+# each field's label as a `### ` heading, in this order, and a pre-filled
+# form URL uses the ids. tests/suite/issue_forms.rs pins both; change the
+# form and the report together.
+name: Agent-drafted bug
+description: A redacted draft from `relish agent report`, read and posted by a human.
+title: "agent: "
+labels: ["bug", "agent-drafted"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Paste each section of the `issue.md` that `relish agent report` wrote into the matching field. Agents never post on their own: a human reads the draft, checks the redaction manifest and answers for every line.
+        Search the issues for the fingerprint first. If it's already reported, add your evidence to that issue instead.
+        A draft with no reproducer says "unverified" in its title and gets the `unverified` label.
+  - type: input
+    id: fingerprint
+    attributes:
+      label: Fingerprint
+      description: The draft's fingerprint (version, error code, finding id), used to find duplicates.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The output of `relish --version`, and of `bun --version` if the nodes run a different build.
+    validations:
+      required: true
+  - type: input
+    id: fix_status
+    attributes:
+      label: Fix status
+      description: Whether a fix is already on main or in a release, from the draft.
+    validations:
+      required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened
+      description: The symptom, what was expected and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproducer
+    attributes:
+      label: Reproducer
+      description: The commands that show the bug on a throwaway cluster, or "none". Without one the report is unverified.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: The redacted findings and output from the draft. Log lines appear only if the human asked for them.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: source
+    attributes:
+      label: Suspected source
+      description: The function and file at this version, from `relish agent source`, with permalinks.
+    validations:
+      required: false
+  - type: textarea
+    id: patch
+    attributes:
+      label: Patch
+      description: The fix, if one was tried, and the test that failed before it and passes after.
+      render: diff
+    validations:
+      required: false
+  - type: textarea
+    id: not_tested
+    attributes:
+      label: What was not tested
+      description: What the agent couldn't build, run or reproduce. Say so explicitly.
+    validations:
+      required: true
+  - type: textarea
+    id: should_have_caught
+    attributes:
+      label: How this should have been caught
+      description: The test, the gate, or a Smoker fault we don't inject yet.
+    validations:
+      required: true
+  - type: textarea
+    id: redaction
+    attributes:
+      label: Redaction
+      description: Which redaction rules fired and how often, from the draft's MANIFEST.json.
+    validations:
+      required: true
+  - type: dropdown
+    id: ai_disclosure
+    attributes:
+      label: AI assistance
+      description: Did an AI tool help write this report? See the AI-assistance policy in CONTRIBUTING.md.
+      options:
+        - No AI assistance
+        - An AI tool helped, and a human checked every line
+        - An AI agent drafted it, and a human checked every line
+    validations:
+      required: true
+  - type: checkboxes
+    id: human_review
+    attributes:
+      label: Human review
+      options:
+        - label: I'm a human, I read this whole report and I answer for it.
+          required: true
+        - label: I checked the redaction manifest and nothing private is left.
+          required: true
+        - label: I searched the issues for the fingerprint.
+          required: true

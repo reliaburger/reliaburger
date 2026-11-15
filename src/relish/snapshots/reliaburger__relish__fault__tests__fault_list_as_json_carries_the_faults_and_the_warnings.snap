@@ -1,0 +1,22 @@
+---
+source: src/relish/fault.rs
+expression: "crate::relish::output::format_output(&FaultList(listing),\nOutputFormat::Json).unwrap()"
+---
+{
+  "faults": [
+    {
+      "id": 1,
+      "fault_type": "kill",
+      "target_service": "web",
+      "namespace": "default",
+      "target_instance": null,
+      "target_node": "node-1",
+      "remaining_secs": 0,
+      "injected_by": "ops",
+      "node": "node-1"
+    }
+  ],
+  "warnings": [
+    "node-3 did not answer"
+  ]
+}

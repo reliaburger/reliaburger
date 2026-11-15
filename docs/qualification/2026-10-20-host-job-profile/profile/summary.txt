@@ -1,0 +1,16 @@
+c27-perfcpu-host             rate=  4566.7 steady=  5161 done=274000 complete=True fail=0 retry=0 busy=154.1cpu-s util=67% iow=0.3% sys/busy=57% bun=74.6s forks/s=4688 ctxt/s=87001 cpu-ms/fork=0.530 bun-ms/fork=0.257 vm[r=14.0 us=29 sy=40 id=31 wa=0 cs=88827]
+c27-perfcpu-raw              rate= 15886.7 steady=     - done=0 complete=True fail=0 retry=0 busy=220.6cpu-s util=93% iow=0.0% sys/busy=62% bun=60.5s forks/s=15376 ctxt/s=108219 cpu-ms/fork=0.231 bun-ms/fork=0.064 vm[r=8.7 us=35 sy=58 id=7 wa=0 cs=109906]
+c27-perfoff-host             rate=  4950.0 steady=  5556 done=297000 complete=True fail=0 retry=0 busy=164.4cpu-s util=70% iow=0.3% sys/busy=60% bun=73.2s forks/s=4915 ctxt/s=82176 cpu-ms/fork=0.539 bun-ms/fork=0.240 vm[r=17.2 us=28 sy=44 id=28 wa=0 cs=82138]
+c27-perfsched-host           rate=  5100.0 steady=  5161 done=306000 complete=True fail=0 retry=0 busy=154.1cpu-s util=65% iow=0.3% sys/busy=56% bun=77.5s forks/s=4946 ctxt/s=91929 cpu-ms/fork=0.502 bun-ms/fork=0.253 vm[r=15.5 us=29 sy=38 id=32 wa=0 cs=92873]
+c27-r1-host                  rate=  2166.7 steady=  2549 done=130000 complete=True fail=0 retry=0 busy=117.7cpu-s util=57% iow=1.5% sys/busy=57% bun=66.8s forks/s=2248 ctxt/s=54870 cpu-ms/fork=0.844 bun-ms/fork=0.479 vm[r=19.3 us=25 sy=36 id=38 wa=1 cs=58561]
+c27-r2-host                  rate=  4700.0 steady=  5297 done=282000 complete=True fail=0 retry=0 busy=154.4cpu-s util=65% iow=0.3% sys/busy=57% bun=75.4s forks/s=4818 ctxt/s=87462 cpu-ms/fork=0.517 bun-ms/fork=0.253 vm[r=13.8 us=28 sy=40 id=31 wa=0 cs=87700]
+c32-perfcpu-host             rate=  4833.3 steady=  5149 done=290000 complete=True fail=0 retry=0 busy=155.4cpu-s util=67% iow=0.3% sys/busy=56% bun=75.9s forks/s=4947 ctxt/s=91216 cpu-ms/fork=0.506 bun-ms/fork=0.248 vm[r=18.3 us=29 sy=39 id=31 wa=0 cs=92797]
+c32-perfcpu-raw              rate= 17109.8 steady=     - done=0 complete=True fail=0 retry=0 busy=222.4cpu-s util=94% iow=0.0% sys/busy=62% bun=60.8s forks/s=16560 ctxt/s=115433 cpu-ms/fork=0.217 bun-ms/fork=0.059 vm[r=9.2 us=36 sy=58 id=6 wa=0 cs=118991]
+
+c27-host                 n=2 median=  3433.3 range=2166.7-4700.0 steady-median=3923 cpu-ms/fork median=0.681 util median=61%
+c27-perfcpu-host         n=1 median=  4566.7 range=4566.7-4566.7 steady-median=5161 cpu-ms/fork median=0.530 util median=67%
+c27-perfcpu-raw          n=1 median= 15886.7 range=15886.7-15886.7 cpu-ms/fork median=0.231 util median=93%
+c27-perfoff-host         n=1 median=  4950.0 range=4950.0-4950.0 steady-median=5556 cpu-ms/fork median=0.539 util median=70%
+c27-perfsched-host       n=1 median=  5100.0 range=5100.0-5100.0 steady-median=5161 cpu-ms/fork median=0.502 util median=65%
+c32-perfcpu-host         n=1 median=  4833.3 range=4833.3-4833.3 steady-median=5149 cpu-ms/fork median=0.506 util median=67%
+c32-perfcpu-raw          n=1 median= 17109.8 range=17109.8-17109.8 cpu-ms/fork median=0.217 util median=94%

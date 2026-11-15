@@ -1,26 +1,85 @@
 #!/usr/bin/env python3
-"""Sign release binaries and guest images, and emit the schema-1 metadata.
+"""Sign release binaries and guest images, emit the schema-1 metadata, and bundle `relish mcp`.
+
+Each relish platform also gets `relish-<platform>.mcpb`, an MCP Bundle
+(https://github.com/modelcontextprotocol/mcpb) of `mcpb-manifest.json` and
+that platform's relish, which the MCP Registry entry points at (#1695), with
+a `.sig` envelope like every binary's.
 
 OpenSSL 3 performs Ed25519 operations. The private key is PKCS#8 DER, matching
 `relish dev keygen`. This script never creates or rotates the release identity.
+
+`--channel nightly` signs a release train's nightly build (#1363) with the
+nightly key instead: `RELIABURGER_NIGHTLY_KEY`, checked against
+`NIGHTLY_SIGNING_KEYS` in src/upgrade/keys.rs, which only a nightly build
+trusts. Each channel refuses the other's keys, and a nightly refuses to run
+at all where the release key is in the environment.
 """
 import argparse
 import base64
+import copy
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import re
 import subprocess
 import tempfile
+import zipfile
 
+# macOS is Apple silicon only: 0.2.1 was the last release with an Intel macOS
+# build (#1018).
 PLATFORMS = {
     "bun": ("linux-aarch64", "linux-x86_64"),
-    "relish": ("linux-aarch64", "linux-x86_64", "macos-aarch64", "macos-x86_64"),
+    "relish": ("linux-aarch64", "linux-x86_64", "macos-aarch64"),
 }
 GUEST_METADATA = "guest-image-metadata.json"
+# The MCP Bundle manifest for `relish mcp`, written by `make agent-docs` from
+# the same tool list `relish mcp` serves (src/relish/agent/guide.rs).
+MCPB_MANIFEST = Path(__file__).with_name("mcpb-manifest.json")
+# Where a bundle keeps its relish; the manifest's entry_point says the same.
+MCPB_ENTRY_POINT = "server/relish"
+# A zip entry's timestamp is part of its bytes. A fixed one makes a bundle of
+# the same binary the same file, so its digest means the binary's.
+MCPB_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 # SubjectPublicKeyInfo header for a 32-byte Ed25519 public key (RFC 8410).
 ED25519_SPKI = bytes.fromhex("302a300506032b6570032100")
+# What each channel signs with: the Actions secret holding the private key,
+# and the list in src/upgrade/keys.rs holding the public keys its builds trust.
+CHANNELS = {
+    "release": ("RELIABURGER_RELEASE_KEY", "EMBEDDED_RELEASE_KEYS"),
+    "nightly": ("RELIABURGER_NIGHTLY_KEY", "NIGHTLY_SIGNING_KEYS"),
+}
+
+
+def trusted_keys(source, channel):
+    """The `ed25519:` keys in one channel's list in the text of keys.rs."""
+    name = CHANNELS[channel][1]
+    match = re.search(rf"pub const {name}: &\[&str\] =\s*&\[(.*?)\];", source, re.S)
+    if not match:
+        raise ValueError(f"cannot find {name} in src/upgrade/keys.rs")
+    return re.findall(r'"(ed25519:[A-Za-z0-9+/=]+)"', match.group(1))
+
+
+def verify_signature(public_key, data, signature):
+    """Whether `signature` (base64) is `public_key`'s (`ed25519:BASE64`) Ed25519 signature of `data`."""
+    try:
+        raw = base64.b64decode(public_key.removeprefix("ed25519:"), validate=True)
+        decoded = base64.b64decode(signature, validate=True)
+    except ValueError:
+        return False
+    if not public_key.startswith("ed25519:") or len(raw) != 32 or len(decoded) != 64:
+        return False
+    with tempfile.TemporaryDirectory(prefix="reliaburger-verify-") as temporary:
+        directory = Path(temporary)
+        (directory / "key.der").write_bytes(ED25519_SPKI + raw)
+        (directory / "data").write_bytes(data)
+        (directory / "signature").write_bytes(decoded)
+        result = subprocess.run(["openssl", "pkeyutl", "-verify", "-pubin", "-keyform", "DER", "-rawin",
+                                 "-inkey", str(directory / "key.der"), "-in", str(directory / "data"),
+                                 "-sigfile", str(directory / "signature")], capture_output=True)
+    return result.returncode == 0
 
 
 def openssl(*args):
@@ -36,7 +95,7 @@ def openssl(*args):
 ED25519_PKCS8_SEED = bytes.fromhex("302e020100300506032b657004220420")
 
 
-def release_key_der(encoded, scratch):
+def release_key_der(encoded, scratch, secret="RELIABURGER_RELEASE_KEY"):
     """Return the release key as PKCS#8 DER.
 
     The secret should be base64 DER, but a base64 PEM file or a base64 raw
@@ -47,7 +106,7 @@ def release_key_der(encoded, scratch):
     try:
         raw = base64.b64decode("".join(encoded.split()), validate=True)
     except ValueError:
-        raise ValueError("RELIABURGER_RELEASE_KEY is not valid base64") from None
+        raise ValueError(f"{secret} is not valid base64") from None
     if raw.lstrip().startswith(b"-----BEGIN"):
         pem = scratch / "key.pem"
         with pem.open("xb") as stream:
@@ -59,7 +118,7 @@ def release_key_der(encoded, scratch):
         pem.unlink()
         if result.returncode:
             raise ValueError(
-                "RELIABURGER_RELEASE_KEY decodes to a PEM block OpenSSL cannot read as a "
+                f"{secret} decodes to a PEM block OpenSSL cannot read as a "
                 "private key: " + result.stderr.decode(errors="replace").strip()[:300]
             )
         return result.stdout
@@ -68,7 +127,7 @@ def release_key_der(encoded, scratch):
     if raw[:1] == b"\x30":
         return raw
     raise ValueError(
-        f"RELIABURGER_RELEASE_KEY decodes to {len(raw)} bytes that are neither PKCS#8 DER, "
+        f"{secret} decodes to {len(raw)} bytes that are neither PKCS#8 DER, "
         "a PEM private key nor a 32-byte Ed25519 seed"
     )
 
@@ -114,6 +173,41 @@ def guest_image_metadata(directory, version, key, pins):
     return {"schema": 1, "version": version, "images": images}
 
 
+def mcpb_name(platform):
+    """The release asset holding `relish mcp` for `platform` as an MCP Bundle."""
+    return f"relish-{platform}.mcpb"
+
+
+def mcpb_bundle(binary, manifest, version, platform):
+    """The `.mcpb` for one platform: its `manifest.json` and that platform's relish, as zip bytes.
+
+    `manifest` is the committed template, left unchanged. The bundle's copy
+    takes the release's version and names only the operating system this
+    binary runs on, as the MCP Bundle format's `compatibility.platforms`
+    spells it (`darwin`, `linux`).
+    """
+    manifest = copy.deepcopy(manifest)
+    manifest["version"] = version.removeprefix("v")
+    system = "darwin" if platform.startswith("macos-") else "linux"
+    manifest.setdefault("compatibility", {})["platforms"] = [system]
+    if manifest["server"]["entry_point"] != MCPB_ENTRY_POINT:
+        raise ValueError(f"{MCPB_MANIFEST.name} must start {MCPB_ENTRY_POINT}")
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as bundle:
+        for name, data, mode in (
+            ("manifest.json", (json.dumps(manifest, indent=2) + "\n").encode(), 0o644),
+            (MCPB_ENTRY_POINT, binary.read_bytes(), 0o755),
+        ):
+            entry = zipfile.ZipInfo(name, MCPB_TIMESTAMP)
+            entry.compress_type = zipfile.ZIP_DEFLATED
+            # Unix permissions live in the top 16 bits; unzip and MCP
+            # clients restore the executable bit from them.
+            entry.external_attr = (0o100000 | mode) << 16
+            entry.create_system = 3
+            bundle.writestr(entry, data)
+    return buffer.getvalue()
+
+
 def compatibility_pair(source):
     """The cluster formats (protocol, state) in `CURRENT` of src/compatibility.rs."""
     match = re.search(r"pub const CURRENT: Compatibility = Compatibility \{\s*protocol: (\d+),\s*state: (\d+),", source)
@@ -122,7 +216,17 @@ def compatibility_pair(source):
     return {"protocol": int(match.group(1)), "state": int(match.group(2))}
 
 
-def package_release(directory, version, repository, key, trusted_keys, pins):
+def package_release(directory, version, repository, key, trusted, pins, forbidden_keys=(), manifest=None):
+    """Sign every artefact with `key`, which must be in `trusted` and not in `forbidden_keys`.
+
+    `trusted` is the signing channel's list in keys.rs and `forbidden_keys`
+    the other channel's, so a key that somehow landed in both lists still
+    can't sign: the release key never signs a nightly, nor the nightly key a
+    release.
+
+    `manifest` is the MCP Bundle manifest template; by default the committed
+    `mcpb-manifest.json`.
+    """
     if not re.fullmatch(r"v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?", version):
         raise ValueError("release tag must be a version prefixed with v")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
@@ -141,8 +245,10 @@ def package_release(directory, version, repository, key, trusted_keys, pins):
     if len(public) != 44 or not public.startswith(ED25519_SPKI):
         raise ValueError("release key must be Ed25519")
     encoded = "ed25519:" + base64.b64encode(public[12:]).decode("ascii")
-    if encoded not in trusted_keys:
-        raise ValueError("signing key is not trusted by the release binaries")
+    if encoded in forbidden_keys:
+        raise ValueError("signing key belongs to the other channel; the release and nightly keys never mix")
+    if encoded not in trusted:
+        raise ValueError("signing key is not trusted by the binaries it signs")
 
     # Published per release so `relish upgrade check` can tell an operator
     # that a release with other formats needs a fresh cluster.
@@ -172,16 +278,40 @@ def package_release(directory, version, repository, key, trusted_keys, pins):
             }
             checksums.append(f"{digest}  {path.name}\n")
         name = "metadata.json" if binary == "bun" else "cli-metadata.json"
-        release = {"version": version, "compatibility": compatibility, "platforms": artifacts}
+        # The notes themselves are written on the release page after packaging;
+        # `relish agent upgrade-check` passes this pointer on, untrusted.
+        notes = f"Release notes: https://github.com/{repository}/releases/tag/{version}"
+        release = {"version": version, "compatibility": compatibility, "notes": notes,
+                   "platforms": artifacts}
         outputs[name] = {"schema": 1, "latest": version, "releases": [release]}
     outputs[GUEST_METADATA] = guest_image_metadata(directory, version, key, pins)
     for image in outputs[GUEST_METADATA]["images"].values():
         checksums.append(f"{image['sha256']}  {image['asset']}\n")
+    # One MCP Bundle per relish platform, for the MCP Registry (#1695). The
+    # binary inside is the signed one above, byte for byte. The bundle gets
+    # the same `.sig` envelope as every binary, and SHA256SUMS,
+    # candidate.json and the build attestation cover it too. MCPB clients
+    # don't read the `.sig`: they only recognise a PKCS#7 signature from an
+    # OS-trusted code-signing certificate inside the bundle (`mcpb sign`).
+    if manifest is None:
+        manifest = json.loads(MCPB_MANIFEST.read_text())
+    bundles = {mcpb_name(platform): mcpb_bundle(directory / f"relish-{platform}", manifest, version, platform)
+               for platform in PLATFORMS["relish"]}
+    for name, data in bundles.items():
+        digest = hashlib.sha256(data).hexdigest()
+        outputs[name + ".sig"] = {
+            "schema": 1, "sha256": digest, "embedded": sign_bytes(key, data), "external": None,
+        }
+        checksums.append(f"{digest}  {name}\n")
 
     # No metadata is written until every expected artefact has been signed.
     for name, document in outputs.items():
         temporary = directory / (name + ".tmp")
         temporary.write_text(json.dumps(document, indent=2) + "\n")
+        temporary.replace(directory / name)
+    for name, data in bundles.items():
+        temporary = directory / (name + ".tmp")
+        temporary.write_bytes(data)
         temporary.replace(directory / name)
     (directory / "SHA256SUMS").write_text("".join(checksums))
 
@@ -196,24 +326,32 @@ def package_release(directory, version, repository, key, trusted_keys, pins):
     (directory / "install.sh").write_text(template)
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--directory", type=Path, required=True)
     parser.add_argument("--version", required=True)
     parser.add_argument("--repository", required=True)
-    args = parser.parse_args()
+    parser.add_argument("--channel", choices=sorted(CHANNELS), default="release",
+                        help="release (main) or nightly (a release-* train's nightly build)")
+    args = parser.parse_args(argv)
+    secret = CHANNELS[args.channel][0]
+    if args.channel == "nightly" and "RELIABURGER_RELEASE_KEY" in os.environ:
+        raise ValueError("RELIABURGER_RELEASE_KEY is set; a nightly build never runs beside the release key")
     root = Path(__file__).resolve().parents[2]
-    trusted = re.findall(r'"(ed25519:[A-Za-z0-9+/=]+)"', (root / "src/upgrade/keys.rs").read_text())
-    encoded_key = os.environ.pop("RELIABURGER_RELEASE_KEY", None)
+    source = (root / "src/upgrade/keys.rs").read_text()
+    trusted = trusted_keys(source, args.channel)
+    forbidden = [key for channel in CHANNELS if channel != args.channel for key in trusted_keys(source, channel)]
+    encoded_key = os.environ.pop(secret, None)
     if not encoded_key:
-        raise ValueError("RELIABURGER_RELEASE_KEY must contain the base64 PKCS#8 release key")
+        raise ValueError(f"{secret} must contain the base64 PKCS#8 {args.channel} signing key")
     with tempfile.TemporaryDirectory(prefix="reliaburger-signing-") as temporary:
         key = Path(temporary) / "key.der"
         with key.open("xb") as stream:
             os.chmod(key, 0o600)
-            stream.write(release_key_der(encoded_key, Path(temporary)))
+            stream.write(release_key_der(encoded_key, Path(temporary), secret))
         pins = json.loads(Path(__file__).with_name("guest-images.json").read_text())
-        package_release(args.directory, args.version, args.repository, key, trusted, pins)
+        package_release(args.directory, args.version, args.repository, key, trusted, pins,
+                        forbidden_keys=forbidden)
 
 
 if __name__ == "__main__":

@@ -323,17 +323,23 @@ mod tests {
     /// Desired state with nothing in it.
     fn empty_state() -> CurrentState<'static> {
         static APPS: std::sync::OnceLock<HashMap<AppId, AppSpec>> = std::sync::OnceLock::new();
+        static DECLARED: std::sync::OnceLock<HashMap<AppId, AppSpec>> = std::sync::OnceLock::new();
         static NAMESPACES: std::sync::OnceLock<
             std::collections::BTreeMap<String, crate::config::NamespaceSpec>,
         > = std::sync::OnceLock::new();
         static PERMISSIONS: std::sync::OnceLock<
             std::collections::BTreeMap<String, crate::config::PermissionSpec>,
         > = std::sync::OnceLock::new();
+        static POLICIES: std::sync::OnceLock<
+            std::collections::BTreeMap<String, crate::config::PolicySpec>,
+        > = std::sync::OnceLock::new();
         static OWNED: std::sync::OnceLock<GitOpsOwnership> = std::sync::OnceLock::new();
         CurrentState {
             apps: APPS.get_or_init(HashMap::new),
+            declared_apps: DECLARED.get_or_init(HashMap::new),
             namespaces: NAMESPACES.get_or_init(Default::default),
             permissions: PERMISSIONS.get_or_init(Default::default),
+            policies: POLICIES.get_or_init(Default::default),
             owned: OWNED.get_or_init(Default::default),
         }
     }
@@ -646,6 +652,7 @@ mod tests {
         );
         let namespaces = std::collections::BTreeMap::new();
         let permissions = std::collections::BTreeMap::new();
+        let policies = std::collections::BTreeMap::new();
         let owned = crate::lettuce::types::GitOpsOwnership {
             apps: current.keys().cloned().collect(),
             ..Default::default()
@@ -656,8 +663,10 @@ mod tests {
             &config,
             &CurrentState {
                 apps: &current,
+                declared_apps: &HashMap::new(),
                 namespaces: &namespaces,
                 permissions: &permissions,
+                policies: &policies,
                 owned: &owned,
             },
             &[],
@@ -932,29 +941,55 @@ mod tests {
     const BASIC_NEW: &str = "[app.web]\nreplicas = 1\nscript = \"echo new\"\n";
     const NO_SCRIPT: &str = "[app.web]\nimage = \"web:v1\"\n";
 
-    /// B13: every way of changing a script, relative to an applied commit,
-    /// is refused unsigned and admitted with a trusted signature. The old
-    /// check only saw an added diff line containing `script`, so editing a
-    /// multiline body or deleting the script slipped through unsigned.
+    /// B13: a change from `before` to `after`, relative to an applied
+    /// commit, is refused unsigned and admitted with a trusted signature.
+    /// The old check only saw an added diff line containing `script`, so
+    /// editing a multiline body or deleting the script slipped through
+    /// unsigned. Each case is its own test: one case makes a key, a
+    /// repository and three signed or unsigned commits, and five in a row
+    /// passed the 60 s timeout on a loaded host (#1555).
+    fn assert_script_change_needs_a_trusted_signature(case: &str, before: &str, after: &str) {
+        let mut repo = SigningRepo::new();
+        let applied = repo.commit_apps(before, true);
+
+        repo.commit_apps(after, false);
+        assert_refused(&repo.sync(Some(&applied)), case);
+
+        repo.commit_apps(after, true);
+        assert_admitted(&repo.sync(Some(&applied)), case);
+    }
+
     #[test]
-    fn every_script_change_needs_a_trusted_signature() {
-        let cases = [
-            ("multiline body edit", MULTILINE_OLD, MULTILINE_NEW),
-            ("literal string body edit", LITERAL_OLD, LITERAL_NEW),
-            ("basic string edit", BASIC_OLD, BASIC_NEW),
-            ("script deleted", MULTILINE_OLD, NO_SCRIPT),
-            ("script added", NO_SCRIPT, BASIC_NEW),
-        ];
-        for (case, before, after) in cases {
-            let mut repo = SigningRepo::new();
-            let applied = repo.commit_apps(before, true);
+    fn a_multiline_script_body_edit_needs_a_trusted_signature() {
+        assert_script_change_needs_a_trusted_signature(
+            "multiline body edit",
+            MULTILINE_OLD,
+            MULTILINE_NEW,
+        );
+    }
 
-            repo.commit_apps(after, false);
-            assert_refused(&repo.sync(Some(&applied)), case);
+    #[test]
+    fn a_literal_string_script_edit_needs_a_trusted_signature() {
+        assert_script_change_needs_a_trusted_signature(
+            "literal string body edit",
+            LITERAL_OLD,
+            LITERAL_NEW,
+        );
+    }
 
-            repo.commit_apps(after, true);
-            assert_admitted(&repo.sync(Some(&applied)), case);
-        }
+    #[test]
+    fn a_basic_string_script_edit_needs_a_trusted_signature() {
+        assert_script_change_needs_a_trusted_signature("basic string edit", BASIC_OLD, BASIC_NEW);
+    }
+
+    #[test]
+    fn deleting_a_script_needs_a_trusted_signature() {
+        assert_script_change_needs_a_trusted_signature("script deleted", MULTILINE_OLD, NO_SCRIPT);
+    }
+
+    #[test]
+    fn adding_a_script_needs_a_trusted_signature() {
+        assert_script_change_needs_a_trusted_signature("script added", NO_SCRIPT, BASIC_NEW);
     }
 
     /// B13 negative control: an unsigned commit that leaves every script
@@ -1084,30 +1119,43 @@ mod tests {
         }
     }
 
-    #[test]
-    fn gitops_refuses_migration_prerequisites_and_standalone_jobs() {
-        for manifest in [
-            "[job.migrate]\nimage = 'migrate:v1'\n",
-            "[app.web]\nimage = 'web:v1'\n[job.migrate]\nimage = 'migrate:v1'\nrun_before = ['app.web']\n",
-            "[job.migrate]\nimage = 'migrate:v1'\nschedule = '* * * * *'\n",
-        ] {
-            let mut repository = SigningRepo::new();
-            // A job-only watched tree must also refuse, even with no app diff.
-            std::fs::remove_file(repository.work.join("base.toml")).unwrap();
-            repository.commit_apps(manifest, false);
-            let outcome = repository.sync(None);
-            let SyncResult::Failure { error } = &outcome.result else {
-                panic!(
-                    "unsupported migration/jobs reported success: {:?}",
-                    outcome.result
-                );
-            };
-            assert!(
-                error.contains("GitOps does not reconcile jobs") && error.contains("job.migrate"),
-                "{error}"
+    /// GitOps refuses a watched tree that declares a job, even a job-only
+    /// tree with no app diff. Each case is its own test: one makes a key, a
+    /// repository and a commit, and three in a row ran out of the 60 s
+    /// timeout on a loaded host (#1641), as five did in #1555.
+    fn assert_gitops_refuses_jobs(manifest: &str) {
+        let mut repository = SigningRepo::new();
+        std::fs::remove_file(repository.work.join("base.toml")).unwrap();
+        repository.commit_apps(manifest, false);
+        let outcome = repository.sync(None);
+        let SyncResult::Failure { error } = &outcome.result else {
+            panic!(
+                "unsupported migration/jobs reported success: {:?}",
+                outcome.result
             );
-            assert!(outcome.changes.is_empty());
-            assert!(outcome.diff_summary.is_none());
-        }
+        };
+        assert!(
+            error.contains("GitOps does not reconcile jobs") && error.contains("job.migrate"),
+            "{error}"
+        );
+        assert!(outcome.changes.is_empty());
+        assert!(outcome.diff_summary.is_none());
+    }
+
+    #[test]
+    fn gitops_refuses_a_standalone_job() {
+        assert_gitops_refuses_jobs("[job.migrate]\nimage = 'migrate:v1'\n");
+    }
+
+    #[test]
+    fn gitops_refuses_a_migration_prerequisite() {
+        assert_gitops_refuses_jobs(
+            "[app.web]\nimage = 'web:v1'\n[job.migrate]\nimage = 'migrate:v1'\nrun_before = ['app.web']\n",
+        );
+    }
+
+    #[test]
+    fn gitops_refuses_a_scheduled_job() {
+        assert_gitops_refuses_jobs("[job.migrate]\nimage = 'migrate:v1'\nschedule = '* * * * *'\n");
     }
 }

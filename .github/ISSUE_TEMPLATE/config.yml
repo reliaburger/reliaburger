@@ -1,0 +1,11 @@
+# Every issue goes through a form, so every report carries a version, a
+# reproducer and what wasn't tested. tests/suite/issue_forms.rs checks the
+# forms against that contract.
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and ideas
+    url: https://github.com/reliaburger/reliaburger/discussions
+    about: Ask a question or float an idea in Discussions. Issues are for bugs with evidence.
+  - name: Report a security vulnerability
+    url: https://github.com/reliaburger/reliaburger/security/advisories/new
+    about: Report it privately, never in a public issue. See SECURITY.md; there's no bounty.

@@ -1,0 +1,9 @@
+# A person's own change to web v1: the same app with a new VERSION. The
+# proposal scenarios apply it as the person, to change web under an agent's
+# feet (stale-proposal) or to take web over from one (two-agents).
+
+[app.web]
+exec = "@TESTAPP@"
+command = ["--mode", "healthy", "--port", "@APP_PORT@"]
+port = @APP_PORT@
+env = { VERSION = "v1.1" }

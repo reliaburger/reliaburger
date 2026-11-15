@@ -1,0 +1,7 @@
+---
+source: src/relish/commands.rs
+expression: "json(&super::super::output::Message\n{ message: \"token ci revoked\".to_string(), })"
+---
+{
+  "message": "token ci revoked"
+}

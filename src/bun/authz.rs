@@ -161,6 +161,8 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Get, "/ui/fragment/apps", AnyToken),
     route(Get, "/ui/fragment/batches", AnyToken),
     route(Get, "/ui/fragment/nodes", AnyToken),
+    // The summary scopes itself, like `/v1/cluster/summary`.
+    route(Get, "/ui/fragment/summary", AnyToken),
     gated(Get, "/ui/fragment/alerts", AnyToken, Cluster(METRICS)),
     route(
         Get,
@@ -168,6 +170,14 @@ pub const ROUTE_MATRIX: &[Route] = &[
         AnyToken,
     ),
     route(Get, "/ui/app/{app}/{namespace}/env", AnyToken),
+    // The Proposals pages (#1682) filter by scope like `/v1/proposals`. The
+    // decision forms take a browser session whose token may decide, plus
+    // its anti-forgery token, and make the same checks as the API.
+    route(Get, "/ui/proposals", AnyToken),
+    route(Get, "/ui/proposal/{id}", AnyToken),
+    gated(Post, "/ui/proposal/{id}/approve", Deployer, Body(DEPLOY)),
+    gated(Post, "/ui/proposal/{id}/reject", Deployer, Body(DEPLOY)),
+    gated(Post, "/ui/proposal/{id}/undo", Deployer, Body(DEPLOY)),
     // Workload lifecycle.
     gated(Post, "/v1/apply", Deployer, Body(DEPLOY)),
     route(Get, "/v1/status", AnyToken),
@@ -194,6 +204,7 @@ pub const ROUTE_MATRIX: &[Route] = &[
     gated(Get, "/v1/top", AnyToken, Filtered(METRICS)),
     gated(Post, "/v1/stop/{app}/{namespace}", Deployer, App(SCALE)),
     gated(Post, "/v1/delete/{app}/{namespace}", Deployer, App(DEPLOY)),
+    gated(Post, "/v1/release/{app}/{namespace}", Deployer, App(DEPLOY)),
     gated(Get, "/v1/logs/{app}/{namespace}", AnyToken, App(LOGS)),
     gated(
         Get,
@@ -208,6 +219,8 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Post, "/v1/cluster/renew", System),
     // As does a trust acknowledgement (F04 R4).
     route(Post, "/v1/cluster/trust-ack", System),
+    // And the security view a node with no Raft seat reads (#1477).
+    route(Get, "/v1/cluster/security-view", System),
     route(Post, "/v1/cluster/workload-csr", System),
     route(Post, "/v1/registry/propose", System),
     route(Post, "/v1/registry/query", System),
@@ -223,6 +236,14 @@ pub const ROUTE_MATRIX: &[Route] = &[
     gated(Post, "/v1/test/leases/{id}/renew", Deployer, Cluster(ADMIN)),
     gated(Delete, "/v1/test/leases/{id}", Deployer, Cluster(ADMIN)),
     route(Get, "/v1/cluster/nodes", AnyToken),
+    // The summary is scoped in its handler: a scoped token sees its own
+    // apps and jobs, and the cluster-wide sections come back `missing`.
+    route(Get, "/v1/cluster/summary", AnyToken),
+    // The shares the summary is built from, and the capacity behind it,
+    // cover every tenant: the handlers refuse a scoped token.
+    route(Get, "/v1/cluster/summary/node", AnyToken),
+    route(Get, "/v1/cluster/summary/leader", AnyToken),
+    route(Get, "/v1/cluster/capacity", AnyToken),
     // The relay only authenticates; the target node applies the forwarded
     // route's own requirement to the caller's credential.
     route(Get, "/v1/nodes/{node}/relay/{*path}", AnyToken),
@@ -243,6 +264,30 @@ pub const ROUTE_MATRIX: &[Route] = &[
     // changing the cluster's configuration is an Admin operation (#693).
     route(Get, "/v1/gitops", AnyToken),
     gated(Post, "/v1/gitops/config", Admin, Cluster(ADMIN)),
+    // Policies (#1117): anyone may read them; deleting one is an Admin
+    // operation, like writing one through `relish apply`.
+    route(Get, "/v1/policies", AnyToken),
+    route(Get, "/v1/policies/audit", AnyToken),
+    gated(Post, "/v1/policies/{name}/delete", Admin, Cluster(ADMIN)),
+    // Agent leases (#1686): anyone may read them, filtered by scope;
+    // taking, renewing, releasing or breaking one needs `deploy` on the app,
+    // or on every app in the namespace, named in the body.
+    route(Get, "/v1/leases", AnyToken),
+    gated(Post, "/v1/leases", Deployer, Body(DEPLOY)),
+    gated(Post, "/v1/leases/renew", Deployer, Body(DEPLOY)),
+    gated(Post, "/v1/leases/release", Deployer, Body(DEPLOY)),
+    gated(Post, "/v1/leases/break", Deployer, Body(DEPLOY)),
+    // Agent proposals (#1682): anyone may read them, filtered by scope. A
+    // deployer of either kind proposes, with `deploy` (or `scale`) on every
+    // app; a person who covers every touched app approves, rejects or
+    // undoes; the author withdraws, which needs no `[permission]` action.
+    route(Get, "/v1/proposals", AnyToken),
+    gated(Post, "/v1/proposals", Deployer, Body(DEPLOY)),
+    route(Get, "/v1/proposals/{id}", AnyToken),
+    gated(Post, "/v1/proposals/{id}/approve", Deployer, Body(DEPLOY)),
+    gated(Post, "/v1/proposals/{id}/reject", Deployer, Body(DEPLOY)),
+    route(Post, "/v1/proposals/{id}/withdraw", Deployer),
+    gated(Post, "/v1/proposals/{id}/undo", Deployer, Body(DEPLOY)),
     // Chaos.
     route(Post, "/v1/chaos/reserve", System),
     route(Post, "/v1/chaos/fence", System),
@@ -275,6 +320,7 @@ pub const ROUTE_MATRIX: &[Route] = &[
     gated(Post, "/v1/fault", Deployer, Body(FAULT)),
     gated(Delete, "/v1/fault", Deployer, Body(FAULT)),
     route(Get, "/v1/fault", AnyToken),
+    route(Get, "/v1/fault/attempts", AnyToken),
     gated(Delete, "/v1/fault/{id}", Deployer, Body(FAULT)),
     // Discovery + routing.
     route(Post, "/v1/discovery/retire", System),
@@ -306,6 +352,8 @@ pub const ROUTE_MATRIX: &[Route] = &[
     gated(Get, "/v1/alerts", AnyToken, Cluster(METRICS)),
     gated(Get, "/v1/logs/sql", AnyToken, Cluster(LOGS)),
     gated(Post, "/v1/logs/export", Admin, Cluster(ADMIN)),
+    gated(Get, "/v1/logs/archive", Admin, Cluster(ADMIN)),
+    gated(Get, "/v1/logs/archive/{name}", Admin, Cluster(ADMIN)),
     route(Get, "/v1/deploys/active", AnyToken),
     route(Get, "/v1/deploys/operations", AnyToken),
     gated(
@@ -435,6 +483,11 @@ mod tests {
                 "{path} must be a node-to-node route"
             );
         }
+        assert_eq!(
+            required_principal(Method::Get, "/v1/cluster/security-view"),
+            Some(RoutePrincipal::System),
+            "the security view must be a node-to-node route"
+        );
     }
 
     /// Every `System` row's handler must call `require_system`, or the
@@ -646,16 +699,20 @@ mod tests {
         include_str!("api/identity.rs"),
         include_str!("api/internal.rs"),
         include_str!("api/join.rs"),
+        include_str!("api/leases.rs"),
+        include_str!("api/proposals.rs"),
         include_str!("api/logs.rs"),
         include_str!("api/metrics.rs"),
         include_str!("api/node_info.rs"),
         include_str!("api/nodes.rs"),
+        include_str!("api/policies.rs"),
         include_str!("api/registry.rs"),
         include_str!("api/secrets.rs"),
         include_str!("api/snapshots.rs"),
         include_str!("api/status.rs"),
         include_str!("api/test_leases.rs"),
         include_str!("api/ui.rs"),
+        include_str!("api/ui_proposals.rs"),
         include_str!("api/upgrade.rs"),
     ];
 
@@ -995,19 +1052,24 @@ mod tests {
         );
     }
 
-    /// Audit events span every tenant and their routes name no app, so the
-    /// per-app scan above can't see them. Both the listing and its live
-    /// stream must refuse a scoped token; the stream once didn't.
+    /// Events span every tenant and their routes name no app, so the
+    /// per-app scan above can't see them. The listing filters each event by
+    /// the caller's scope, so a controller reads its own namespace's
+    /// (#1125); the dashboard's live stream refuses a scoped token, which
+    /// it once didn't.
     #[test]
-    fn both_event_routes_refuse_scoped_tokens() {
+    fn both_event_routes_keep_a_scoped_token_to_its_own_events() {
         let source = include_str!("api.rs");
-        for handler in ["events_handler", "ws_events_handler"] {
-            let body = mounted_handler_body(source, handler).expect(handler);
-            assert!(
-                body.contains("require_unscoped"),
-                "{handler} serves every tenant's events to a scoped token"
-            );
-        }
+        let listing = mounted_handler_body(source, "events_handler").expect("events_handler");
+        assert!(
+            listing.matches("event_visible").count() >= 2,
+            "events_handler must filter both the listing and the live feed by scope"
+        );
+        let stream = mounted_handler_body(source, "ws_events_handler").expect("ws_events_handler");
+        assert!(
+            stream.contains("require_unscoped"),
+            "ws_events_handler serves every tenant's events to a scoped token"
+        );
     }
 
     /// F05 I1: the routes that change who can do what record who called

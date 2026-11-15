@@ -468,6 +468,36 @@ mod tests {
         assert_eq!(parsed.contents(), root.ca.certificate_der);
     }
 
+    // A root CA certificate written by `der_to_pem` under the `pem` 3 crate
+    // (Reliaburger 0.2.1 and earlier). Nodes keep PEM files on disk across
+    // upgrades, so every later `pem` release has to read them back and write
+    // the same bytes (#1026). The encoder ignores the label, so a
+    // certificate covers keys too, without checking a private key in.
+    const PEM_3_CERTIFICATE: &str = include_str!("../../tests/fixtures/pem/root-ca.crt.pem");
+
+    #[test]
+    fn pem_files_written_by_pem_3_parse_and_rewrite_byte_for_byte() {
+        let certificate = ::pem::parse(PEM_3_CERTIFICATE).unwrap();
+        assert_eq!(certificate.tag(), "CERTIFICATE");
+        // CRLF line endings and 64-column lines are part of the stored
+        // format: a change here rewrites every PEM file a node owns.
+        assert_eq!(
+            der_to_pem(certificate.contents(), "CERTIFICATE"),
+            PEM_3_CERTIFICATE
+        );
+        let parsed = parse_certificate(certificate.contents()).unwrap();
+        assert_eq!(parsed.serial, 1);
+    }
+
+    #[test]
+    fn pem_files_written_by_pem_3_still_parse_with_lf_line_endings() {
+        // An operator who edits or copies a file can turn CRLF into LF.
+        let crlf = ::pem::parse(PEM_3_CERTIFICATE).unwrap();
+        let lf = ::pem::parse(PEM_3_CERTIFICATE.replace("\r\n", "\n")).unwrap();
+        assert_eq!(lf.tag(), crlf.tag());
+        assert_eq!(lf.contents(), crlf.contents());
+    }
+
     /// Issue a leaf under the workload CA with the given EKU set and URI SANs.
     fn issue_leaf(
         hierarchy: &ca::CaHierarchy,

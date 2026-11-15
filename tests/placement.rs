@@ -92,6 +92,8 @@ async fn partition(
     inject_node_fault_once_council_settles(
         node,
         &reliaburger::smoker::types::FaultRequest {
+            workload: Default::default(),
+            task_index: None,
             fault_type: reliaburger::smoker::types::FaultType::CouncilPartition {
                 peers: peers.to_vec(),
             },
@@ -250,6 +252,7 @@ async fn start_node_with(
         task_arrays: None,
         task_arrays_on_agent_budget: None,
         process_only,
+        council_size_cap: None,
     })
     .await;
 
@@ -571,6 +574,148 @@ async fn cluster_stop_scales_to_zero_until_apply_and_delete_removes_the_app() {
             c.shutdown().await.ok();
         }
         let _ = &n.name;
+    }
+}
+
+/// Every instance of `apps` on `nodes`, as `node/id:state`, or why a node
+/// didn't answer.
+async fn app_instances(nodes: &[&Node], apps: &[&str]) -> Result<Vec<String>, String> {
+    let mut found = Vec::new();
+    for node in nodes {
+        let statuses = node
+            .client
+            .status()
+            .await
+            .map_err(|error| format!("{}: {error}", node.name))?;
+        found.extend(
+            statuses
+                .iter()
+                .filter(|s| apps.contains(&s.app_name.as_str()))
+                .map(|s| format!("{}/{}:{}", node.name, s.id, s.state)),
+        );
+    }
+    found.sort();
+    Ok(found)
+}
+
+/// #1500: deleting two services and re-applying them straight away, before
+/// the deleted incarnation has retired, converges every cycle: each app is
+/// back at its replica count, every instance running, every node resolves
+/// the full set of backends, and nothing of the deleted incarnation is left
+/// stopped or stopping. The evaluation's fourth cycle wedged until Bun
+/// restarted.
+///
+/// This guards the lifecycle only. Process nodes have no discovery journal,
+/// so the wedge itself can't happen here: its reproduction is the agent test
+/// `a_reapplied_app_under_a_new_vip_converges_without_a_restart`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
+async fn deleted_apps_reapplied_at_once_converge_every_cycle() {
+    const CYCLES: usize = 6;
+    let shutdown = CancellationToken::new();
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let n1 = start_node("reapply1", base, vec![], &shutdown).await;
+    let n2 = start_node("reapply2", base + 4, vec![local(base)], &shutdown).await;
+    let n3 = start_node("reapply3", base + 8, vec![local(base)], &shutdown).await;
+    let nodes = [&n1, &n2, &n3];
+    let ready = wait_until(Duration::from_secs(30), || {
+        nodes.iter().any(|n| *n.thinks_leader.borrow())
+    })
+    .await;
+    assert!(ready, "no leader elected");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let config = reliaburger::config::Config::parse(
+        r#"
+        [app.backend]
+        script = "exec sleep 600"
+        replicas = 2
+        port = 9898
+
+        [app.frontend]
+        script = "exec sleep 600"
+        replicas = 3
+        port = 9898
+        [app.frontend.ingress]
+        host = "fixture.reapply.test"
+    "#,
+    )
+    .unwrap();
+    let apps = [("backend", 2), ("frontend", 3)];
+    let names = ["backend", "frontend"];
+    let converged = async |cycle: usize| {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            let mut why = None;
+            match app_instances(&nodes, &names).await {
+                Ok(instances) => {
+                    for (app, replicas) in apps {
+                        let mine: Vec<_> = instances
+                            .iter()
+                            .filter(|i| i.contains(&format!("/default__{app}-")))
+                            .collect();
+                        if mine.len() != replicas || mine.iter().any(|i| !i.ends_with(":running")) {
+                            why = Some(format!("{instances:?}"));
+                        }
+                    }
+                }
+                Err(error) => why = Some(error),
+            }
+            if why.is_none() {
+                for node in nodes {
+                    for (app, replicas) in apps {
+                        let healthy = node
+                            .client
+                            .resolve(app)
+                            .await
+                            .map(|r| r.healthy_backends)
+                            .unwrap_or(0);
+                        if healthy != replicas {
+                            why = Some(format!(
+                                "{} resolves {app} to {healthy} healthy backends",
+                                node.name
+                            ));
+                        }
+                    }
+                }
+            }
+            let Some(why) = why else {
+                return;
+            };
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "cycle {cycle} never converged: {why}"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    };
+
+    tokio::time::timeout(Duration::from_secs(15), n1.client.apply(&config))
+        .await
+        .expect("apply did not hang")
+        .expect("apply succeeded");
+    converged(0).await;
+    for cycle in 1..=CYCLES {
+        for app in names {
+            tokio::time::timeout(Duration::from_secs(15), n1.client.delete(app, "default"))
+                .await
+                .expect("delete did not hang")
+                .expect("delete succeeded");
+        }
+        // Straight back, while the deleted incarnation is still retiring.
+        tokio::time::timeout(Duration::from_secs(15), n1.client.apply(&config))
+            .await
+            .expect("apply did not hang")
+            .expect("apply succeeded");
+        converged(cycle).await;
+    }
+
+    shutdown.cancel();
+    for n in nodes {
+        if let Some(council) = &n.handle.council {
+            council.shutdown().await.ok();
+        }
     }
 }
 
@@ -1472,6 +1617,11 @@ fn peer_state(observer: &Node, target: &str) -> Option<reliaburger::mustard::sta
 /// probes and its peers mark it Dead. Healing clears the blocklists and
 /// the node rejoins. This drives the binary path: a council partition fault
 /// on the isolated node, membership observed through the peers' watch.
+///
+/// The partition must hold in both directions on Raft as well (#1810). The
+/// blocklists only stopped the isolated node's own RPCs, so the leader's
+/// AppendEntries still reached it and it kept applying the log. A write
+/// made on the leader during the partition must not reach q3 until the heal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 #[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
 async fn partition_isolates_a_node_for_real() {
@@ -1540,11 +1690,82 @@ async fn partition_isolates_a_node_for_real() {
         peer_state(&n1, "q3")
     );
 
+    // A write on the leader, which q1 and q2 elect between them if q3 led.
+    let marker = reliaburger::sesame::token::create_token(
+        "written-during-partition",
+        reliaburger::sesame::types::ApiRole::ReadOnly,
+        reliaburger::sesame::types::TokenScope::default(),
+        None,
+    )
+    .unwrap()
+    .token;
+    let holds_marker = |node: &Node| {
+        let council = node.handle.council.clone();
+        async move {
+            let council = council.expect("every test node holds a council seat");
+            council
+                .api_tokens()
+                .await
+                .iter()
+                .any(|token| token.name == "written-during-partition")
+        }
+    };
+    let mut written = false;
+    for _ in 0..60 {
+        for node in [&n1, &n2] {
+            let council = node.handle.council.as_ref().expect("council seat");
+            if !written
+                && council
+                    .write(reliaburger::council::types::RaftRequest::CreateApiToken(
+                        marker.clone(),
+                    ))
+                    .await
+                    .is_ok()
+            {
+                written = true;
+            }
+        }
+        if written {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(
+        written,
+        "neither q1 nor q2 accepted a write during the partition"
+    );
+    for _ in 0..40 {
+        if holds_marker(&n1).await && holds_marker(&n2).await {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(holds_marker(&n1).await && holds_marker(&n2).await);
+    // Five seconds is many heartbeats: a leader still reaching q3 would have
+    // replicated the entry long before.
+    for _ in 0..50 {
+        assert!(
+            !holds_marker(&n3).await,
+            "the partitioned q3 applied a write made on the leader during its partition"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
     // Heal: clear q3's blocklists and it should rejoin and be Alive again.
     n3.client
         .clear_fault(fault.id, Some("q3"), true)
         .await
         .expect("heal should succeed");
+
+    let mut caught_up = false;
+    for _ in 0..300 {
+        if holds_marker(&n3).await {
+            caught_up = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(caught_up, "q3 never applied the write after the heal");
 
     let recovered = wait_until(Duration::from_secs(30), || {
         peer_state(&n1, "q3") == Some(NodeState::Alive)
@@ -1619,6 +1840,8 @@ async fn authenticated_node_kill_fails_and_restores_a_real_cluster_member() {
         .copied()
         .expect("follower exists");
     let request = FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type: FaultType::NodeKill {
             kill_containers: false,
         },
@@ -1987,6 +2210,8 @@ async fn a_killed_worker_has_its_replica_rescheduled_on_the_survivors() {
     let summary = inject_node_fault_once_council_settles(
         entry,
         &FaultRequest {
+            workload: Default::default(),
+            task_index: None,
             fault_type: FaultType::NodeKill {
                 kill_containers: true,
             },
@@ -2116,6 +2341,8 @@ async fn a_kill_sent_to_one_node_kills_a_replica_on_another() {
     let (bystander_pid, _) = web_process(bystander).await.expect("bystander runs web");
 
     let kill = |count, node: Option<&str>| FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type: FaultType::Kill { count },
         target_service: "web".to_string(),
         namespace: None,
@@ -2207,6 +2434,8 @@ async fn a_network_fault_sent_to_one_node_is_installed_where_every_caller_runs()
     let summary = entry
         .client
         .inject_fault(&FaultRequest {
+            workload: Default::default(),
+            task_index: None,
             fault_type: FaultType::DnsNxdomain,
             target_service: "web".to_string(),
             namespace: None,
@@ -2598,6 +2827,89 @@ async fn wtf_and_path_reach_every_node_through_the_entry_node() {
     }
 }
 
+/// An app its namespace's quota can't fit isn't placed, and Brioche's app
+/// page on every node says why, from the council's reason, whatever the
+/// shared rollup (#1789) calls its state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
+async fn brioche_says_why_a_quota_blocked_app_isnt_placed_on_every_node() {
+    let shutdown = CancellationToken::new();
+    let cluster_ports = lease_cluster_ports();
+    let base = cluster_ports.base;
+    let n1 = start_node("quota1", base, vec![], &shutdown).await;
+    let n2 = start_node("quota2", base + 4, vec![local(base)], &shutdown).await;
+    let n3 = start_node("quota3", base + 8, vec![local(base)], &shutdown).await;
+    let nodes = [&n1, &n2, &n3];
+    let config = reliaburger::config::Config::parse(
+        r#"
+        [namespace.shop]
+        cpu = "1"
+
+        [app.big]
+        namespace = "shop"
+        script = "exec sleep 600"
+        replicas = 2
+        cpu = "1000m-1000m"
+    "#,
+    )
+    .unwrap();
+    let mut pages = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut last_apply = tokio::time::Instant::now() - Duration::from_secs(8);
+    while tokio::time::Instant::now() < deadline {
+        if last_apply.elapsed() >= Duration::from_secs(8) {
+            let _ = tokio::time::timeout(Duration::from_secs(5), n1.client.apply(&config)).await;
+            last_apply = tokio::time::Instant::now();
+        }
+        pages.clear();
+        for node in nodes {
+            let response = node
+                .client
+                .http()
+                .unwrap()
+                .get(format!("{}/ui/app/big/shop", node.client.base_url()))
+                .send()
+                .await;
+            if let Ok(response) = response
+                && response.status().is_success()
+            {
+                pages.push(response.text().await.unwrap_or_default());
+            }
+        }
+        if pages.len() == nodes.len()
+            && pages
+                .iter()
+                .all(|html| html.contains("Not placed, blocked:"))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert_eq!(pages.len(), nodes.len(), "every node serves the page");
+    for html in &pages {
+        assert!(html.contains("Not placed, blocked:"), "{html}");
+        assert!(html.contains("would exceed CPU quota"), "{html}");
+        assert!(html.contains("Instances: <strong>0/2</strong>"), "{html}");
+    }
+    for node in nodes {
+        let placed = node
+            .client
+            .status()
+            .await
+            .expect("node must serve status")
+            .iter()
+            .filter(|s| s.app_name == "big")
+            .count();
+        assert_eq!(placed, 0, "{} placed none", node.name);
+    }
+    shutdown.cancel();
+    for node in nodes {
+        if let Some(council) = &node.handle.council {
+            council.shutdown().await.ok();
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 #[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
 async fn ingress_reaches_nodes_without_local_replicas() {
@@ -2791,6 +3103,8 @@ async fn concurrent_node_kills_and_leader_change_preserve_reserved_capacity() {
         .copied()
         .collect();
     let request = |target: &Node, duration| FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type: FaultType::NodeKill {
             kill_containers: false,
         },
@@ -3807,7 +4121,7 @@ async fn three_node_one_per_node_app_keeps_two_replicas_serving_during_redeploy(
         replicas = 3
 
         [[app.web.init]]
-        command = ["sleep", "3"]
+        command = ["/bin/sleep", "3"]
 
         [app.web.deploy]
         max_surge = 0

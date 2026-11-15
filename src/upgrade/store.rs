@@ -369,7 +369,7 @@ mod tests {
         store
             .stage_file(
                 &v("0.2.0"),
-                tempfile::TempPath::from_path(&incoming),
+                tempfile::TempPath::try_from_path(&incoming).unwrap(),
                 &envelope(),
             )
             .unwrap();

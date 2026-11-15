@@ -43,10 +43,13 @@ fn desired_app_diagnostics_filter_to_the_token_scope() {
         token_name: "tenant-a".to_string(),
         principal_id: "token:test".to_string(),
         role: crate::sesame::types::ApiRole::ReadOnly,
+        kind: crate::sesame::types::TokenKind::Human,
+        granted_role: crate::sesame::types::ApiRole::ReadOnly,
         scoped_apps: Some(vec!["api".to_string()]),
         scoped_namespaces: Some(vec!["tenant-a".to_string()]),
     };
     let evidence = |app: &str, namespace: &str| crate::bun::diagnostics::DesiredAppEvidence {
+        owner: None,
         app: app.to_string(),
         namespace: namespace.to_string(),
         desired_replicas: 1,
@@ -241,6 +244,17 @@ async fn test_setup_with_timed_metrics(
 /// real `SecurityState` (four CAs, an age keypair, an OIDC config). `tag`
 /// labels a private temp dir; repeated tags cannot collide across processes.
 pub(super) async fn seeded_council(tag: &str) -> Arc<crate::council::CouncilNode> {
+    seeded_council_with_log(tag).await.0
+}
+
+/// [`seeded_council`], with a handle on its Raft log so a test can read
+/// what was written.
+async fn seeded_council_with_log(
+    tag: &str,
+) -> (
+    Arc<crate::council::CouncilNode>,
+    crate::council::log_store::MemLogStore,
+) {
     use std::collections::BTreeMap;
 
     use crate::council::log_store::MemLogStore;
@@ -248,13 +262,14 @@ pub(super) async fn seeded_council(tag: &str) -> Arc<crate::council::CouncilNode
     use crate::council::state_machine::CouncilStateMachine;
     use crate::council::types::{CouncilConfig, CouncilNodeInfo, RaftRequest};
 
+    let log = MemLogStore::new();
     let raft_router = InMemoryRaftRouter::new();
     let network = InMemoryRaftNetworkFactory::new(1, raft_router.clone());
     let node = crate::council::CouncilNode::new(
         1,
         CouncilConfig::default(),
         network,
-        MemLogStore::new(),
+        log.clone(),
         CouncilStateMachine::new(),
         None,
     )
@@ -290,7 +305,7 @@ pub(super) async fn seeded_council(tag: &str) -> Arc<crate::council::CouncilNode
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    Arc::new(node)
+    (Arc::new(node), log)
 }
 
 /// Send a GET to `uri` against `app` and return (status, body bytes).
@@ -694,6 +709,8 @@ pub(super) fn workload_fault_static_capabilities() -> crate::bun::capabilities::
 
 fn workload_fault_body(acknowledged: bool, injected_by: &str) -> String {
     serde_json::to_string(&crate::smoker::types::FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type: crate::smoker::types::FaultType::DnsNxdomain,
         target_service: "web".to_string(),
         namespace: None,
@@ -711,6 +728,8 @@ fn workload_fault_body(acknowledged: bool, injected_by: &str) -> String {
 
 fn council_partition_body(acknowledged: bool) -> String {
     serde_json::to_string(&crate::smoker::types::FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type: crate::smoker::types::FaultType::CouncilPartition {
             peers: vec!["node-b".to_string()],
         },
@@ -730,6 +749,8 @@ fn council_partition_body(acknowledged: bool) -> String {
 
 fn node_kill_body(acknowledged: bool) -> String {
     serde_json::to_string(&crate::smoker::types::FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type: crate::smoker::types::FaultType::NodeKill {
             kill_containers: false,
         },
@@ -749,6 +770,8 @@ fn node_kill_body(acknowledged: bool) -> String {
 
 fn node_pressure_body(acknowledged: bool) -> String {
     serde_json::to_string(&crate::smoker::types::FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type: crate::smoker::types::FaultType::NodePressure {
             cpu_percentage: 80,
             memory_percentage: 90,
@@ -1773,6 +1796,29 @@ pub(super) fn serve_recording_leader(
 
 /// An in-memory council with `voters` voters, led by node 1.
 async fn council_of(voters: u64) -> Vec<Arc<crate::council::CouncilNode>> {
+    council_and_network(voters).await.0
+}
+
+/// An in-memory council with `voters` voters, led by node 1, and the
+/// network that joins them, so a test can cut and heal links.
+async fn council_and_network(
+    voters: u64,
+) -> (
+    Vec<Arc<crate::council::CouncilNode>>,
+    crate::council::network::InMemoryRaftRouter,
+) {
+    council_and_network_keyed(voters, None).await
+}
+
+/// [`council_and_network`], with node 1 holding `wrapping_ikm`, so the
+/// leader can unwrap the CA keys a test seeds.
+async fn council_and_network_keyed(
+    voters: u64,
+    wrapping_ikm: Option<[u8; 32]>,
+) -> (
+    Vec<Arc<crate::council::CouncilNode>>,
+    crate::council::network::InMemoryRaftRouter,
+) {
     use crate::council::CouncilNode;
     use crate::council::log_store::MemLogStore;
     use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
@@ -1797,7 +1843,7 @@ async fn council_of(voters: u64) -> Vec<Arc<crate::council::CouncilNode>> {
                 InMemoryRaftNetworkFactory::new(id, network.clone()),
                 MemLogStore::new(),
                 CouncilStateMachine::new(),
-                None,
+                if id == 1 { wrapping_ikm } else { None },
             )
             .await
             .unwrap(),
@@ -1813,7 +1859,7 @@ async fn council_of(voters: u64) -> Vec<Arc<crate::council::CouncilNode>> {
     })
     .await
     .unwrap();
-    nodes
+    (nodes, network)
 }
 
 /// The appliance lab's two-node cluster (#259): start and a cluster
@@ -1849,6 +1895,19 @@ async fn a_two_voter_council_refuses_to_roll_and_three_voters_can() {
 /// the council nodes to shut down.
 async fn follower_of_a_recording_leader(
     token: crate::sesame::types::ApiToken,
+) -> (
+    Router,
+    Arc<tokio::sync::Mutex<Vec<SeenAtLeader>>>,
+    Vec<Arc<crate::council::CouncilNode>>,
+) {
+    follower_with_history_of_a_recording_leader(token, None).await
+}
+
+/// [`follower_of_a_recording_leader`], with `history` as the follower's
+/// own deploy records.
+async fn follower_with_history_of_a_recording_leader(
+    token: crate::sesame::types::ApiToken,
+    history: Option<Arc<RwLock<Vec<DeployHistoryEntry>>>>,
 ) -> (
     Router,
     Arc<tokio::sync::Mutex<Vec<SeenAtLeader>>>,
@@ -1908,7 +1967,7 @@ async fn follower_of_a_recording_leader(
         commands,
         None,
         None,
-        None,
+        history,
         None,
         None,
         Some(nodes[1].clone()),
@@ -1921,6 +1980,97 @@ async fn follower_of_a_recording_leader(
         None,
     );
     (follower, seen, nodes)
+}
+
+/// #1442: a follower forwards stop, delete and release as the caller, not
+/// as its own service identity, so the leader checks the app's owner
+/// against its own desired state and the caller's token. A follower's
+/// replica can lag a claim, and the leader used to wave the forwarded
+/// request through as the system principal.
+#[tokio::test]
+async fn a_follower_forwards_app_changes_to_the_leader_with_the_callers_token() {
+    let (deployer, deployer_key) = a_user_token(crate::sesame::types::ApiRole::Deployer);
+    let (follower, seen, nodes) = follower_of_a_recording_leader(deployer).await;
+    let calls = [
+        "/v1/stop/db/pg",
+        "/v1/delete/db/pg",
+        "/v1/delete/db/pg?force=true",
+        "/v1/release/db/pg",
+    ];
+    for path in calls {
+        let (status, reply) =
+            send_bounded(follower.clone(), "POST", path, &deployer_key, "", &[]).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{path}: {reply}");
+    }
+    let seen = seen.lock().await.clone();
+    assert_eq!(seen.len(), calls.len(), "{seen:?}");
+    assert!(
+        seen.iter().all(|(_, bearer, marked, _)| *marked
+            && bearer.as_deref() == Some(format!("Bearer {deployer_key}").as_str())),
+        "each forward carries the caller's token and the forwarded mark: {seen:?}"
+    );
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// #1310: a rollback re-applies the previous spec through `cluster_apply`,
+/// so a follower forwards it as an apply. It goes as the caller, bearer and
+/// all, so the leader audits it under the caller's token name and a policy
+/// sees the caller's role, not the follower's service identity.
+#[tokio::test]
+async fn a_follower_forwards_a_rollback_to_the_leader_with_the_callers_token() {
+    let (deployer, deployer_key) = a_user_token(crate::sesame::types::ApiRole::Deployer);
+    // No spec in Raft and no gossip peers, so the follower's own records
+    // choose the target: the newest is the current version, the one before
+    // it is what the rollback re-applies.
+    let deployed = |id: u64, image: &str| DeployHistoryEntry {
+        id: crate::meat::deploy_types::DeployId(id),
+        created_at: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(id),
+        spec: Some(Box::new(
+            toml::from_str(&format!("image = \"{image}\"")).unwrap(),
+        )),
+        ..sample_history_entry(image)
+    };
+    let history = Arc::new(RwLock::new(vec![
+        deployed(1, "nginx:1.26"),
+        deployed(2, "nginx:1.27"),
+    ]));
+    let (follower, seen, nodes) =
+        follower_with_history_of_a_recording_leader(deployer, Some(history)).await;
+
+    let (status, reply) = send_bounded(
+        follower,
+        "POST",
+        "/v1/rollback/web/default",
+        &deployer_key,
+        "",
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{reply}");
+    assert!(reply.contains("recorded by the leader"), "{reply}");
+
+    let seen = seen.lock().await.clone();
+    let [(path, bearer, marked, body)] = seen.as_slice() else {
+        panic!("one forward to the leader: {seen:?}");
+    };
+    assert_eq!(path, "/v1/apply");
+    assert_eq!(
+        bearer.as_deref(),
+        Some(format!("Bearer {deployer_key}").as_str()),
+        "the leader must see the caller's token"
+    );
+    assert!(marked, "a forwarded rollback carries the forwarded mark");
+    let config: Config = toml::from_str(body).unwrap();
+    assert_eq!(
+        config.app.get("web").and_then(|spec| spec.image.as_deref()),
+        Some("nginx:1.26"),
+        "the forward re-applies the previous version: {body}"
+    );
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -2239,7 +2389,590 @@ const LEADER_ONLY_CALLS: &[(&str, &str, &str)] = &[
     ),
     ("POST", "/v1/upgrade/abort", ""),
     ("GET", "/v1/diagnostics/apps", ""),
+    ("POST", "/v1/batch/1/cancel", ""),
+    ("GET", "/v1/batch/1/results", ""),
+    ("GET", "/v1/batch/1/tasks/0/logs", ""),
 ];
+
+/// A run's cancel, results and task logs: a node that doesn't hold the run
+/// must ask the leader, not answer "not found" from its own replica (#1192).
+const RUN_CALLS: &[(&str, &str)] = &[
+    ("POST", "/v1/batch/1/cancel"),
+    ("GET", "/v1/batch/1/results"),
+    ("GET", "/v1/batch/1/tasks/0/logs"),
+];
+
+/// Node 2's router over `council`, with `token` in its store.
+fn router_over(
+    council: Arc<crate::council::CouncilNode>,
+    token: crate::sesame::types::ApiToken,
+) -> Router {
+    let (commands, _receiver) = mpsc::channel(4);
+    let store = crate::sesame::auth::new_token_store();
+    store.try_write().unwrap().push(token);
+    router(
+        commands,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(council),
+        Some(store),
+        Some("internal".into()),
+        None,
+        None,
+        None,
+        0,
+        None,
+    )
+}
+
+#[tokio::test]
+async fn a_follower_without_the_run_forwards_cancel_results_and_logs_to_the_leader() {
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let (follower, seen, nodes) = follower_of_a_recording_leader(admin).await;
+
+    // The follower's replica has no run 1; only the leader can say.
+    for (method, path) in RUN_CALLS {
+        let (status, reply) =
+            send_bounded(follower.clone(), method, path, &admin_key, "", &[]).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{method} {path}: {reply}");
+        assert!(reply.contains("recorded by the leader"), "{path}: {reply}");
+    }
+    let seen = seen.lock().await.clone();
+    assert_eq!(
+        seen.iter()
+            .map(|(path, ..)| path.as_str())
+            .collect::<Vec<_>>(),
+        RUN_CALLS.iter().map(|(_, path)| *path).collect::<Vec<_>>()
+    );
+    assert!(
+        seen.iter().all(|(_, bearer, marked, _)| *marked
+            && bearer.as_deref() == Some(format!("Bearer {admin_key}").as_str())),
+        "each forward carries the caller's token and the forwarded mark: {seen:?}"
+    );
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_node_with_no_leader_or_a_closed_fence_answers_run_calls_503_not_404() {
+    use crate::council::CouncilNode;
+    use crate::council::fence::RecoveryFence;
+    use crate::council::log_store::MemLogStore;
+    use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+    use crate::council::state_machine::CouncilStateMachine;
+    use crate::council::types::{CouncilConfig, CouncilNodeInfo, RecoveryClaim};
+
+    async fn council(initialised: bool, fence: RecoveryFence) -> Arc<CouncilNode> {
+        let network = InMemoryRaftRouter::new();
+        let node = CouncilNode::new(
+            1,
+            CouncilConfig::default(),
+            InMemoryRaftNetworkFactory::new(1, network.clone()),
+            MemLogStore::new(),
+            CouncilStateMachine::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        network.register(1, node.raft().clone()).await;
+        if initialised {
+            let info = CouncilNodeInfo::new("127.0.0.1:9444".parse().unwrap(), "node-1");
+            node.initialize(std::collections::BTreeMap::from([(1, info)]))
+                .await
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while !node.is_leader().await {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        Arc::new(node.with_recovery_fence(fence))
+    }
+
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    // Back from a whole-cluster stop before any election: no leader known.
+    let leaderless = council(false, RecoveryFence::serving(0)).await;
+    // A leader whose recovery fence a newer epoch closed.
+    let fence = RecoveryFence::serving(0);
+    let fenced = council(true, fence.clone()).await;
+    fence.observe_peer(RecoveryClaim { epoch: 1, id: None });
+
+    for node in [leaderless, fenced] {
+        let app = router_over(node.clone(), admin.clone());
+        for (method, path) in RUN_CALLS {
+            let (status, reply) =
+                send_bounded(app.clone(), method, path, &admin_key, "", &[]).await;
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{method} {path}: {reply}"
+            );
+        }
+        node.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_confirmed_leader_answers_404_for_a_run_it_does_not_hold() {
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let nodes = council_of(1).await;
+    let app = router_over(nodes[0].clone(), admin);
+    for (method, path) in RUN_CALLS {
+        let (status, reply) = send_bounded(app.clone(), method, path, &admin_key, "", &[]).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path}: {reply}");
+    }
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// A request path, its body and the extra headers it carries.
+type Submission = (
+    &'static str,
+    &'static str,
+    &'static [(&'static str, &'static str)],
+);
+
+/// Job and task-array submissions a settled leader must serve after one
+/// heartbeat round its followers answer late. The runs submission carries
+/// the forwarded marker, as it does when a follower sent it on (#1253).
+const JOB_SUBMISSIONS: &[Submission] = &[
+    (
+        "/v1/batch/array",
+        r#"{"name":"bulk","namespace":"default","template":{"runtime":"process","exec":"/bin/true"},"spec":{"count":1}}"#,
+        &[],
+    ),
+    (
+        "/v1/batch/manifest",
+        r#"{"name":"mixed","namespace":"default","cohort":[{"name":"small","count":1,"template":{"runtime":"process","exec":"/bin/true"}}]}"#,
+        &[],
+    ),
+    (
+        "/v1/jobs/runs",
+        r#"{"name":"nightly","namespace":"ops","definition":{"template":{"runtime":"process","exec":"/bin/true"},"cron":{"expression":"0 0 1 1 *"}}}"#,
+        &[(super::LEADER_FORWARDED_HEADER, "1")],
+    ),
+];
+
+#[tokio::test]
+async fn a_settled_leader_accepts_job_submissions_after_its_quorum_misses_a_heartbeat_round() {
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let (nodes, network) = council_and_network(3).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !nodes[0].is_leader().await {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // Slow heartbeats, not a lost leader: the followers must not depose it
+    // while it can't reach them.
+    for node in &nodes {
+        node.hold_elections_until(std::time::Instant::now() + std::time::Duration::from_secs(60));
+    }
+    let app = router_over(nodes[0].clone(), admin);
+
+    for (path, body, extra) in JOB_SUBMISSIONS {
+        network.partition(1, 2).await;
+        network.partition(1, 3).await;
+        // One confirmation round can't reach a quorum.
+        assert!(!nodes[0].is_leader().await);
+        let healer = {
+            let network = network.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                network.heal().await;
+            })
+        };
+        let (status, reply) =
+            send_bounded(app.clone(), "POST", path, &admin_key, body, extra).await;
+        healer.await.unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED, "{path}: {reply}");
+    }
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// Send `method path` to a leader whose followers miss its first heartbeat
+/// round: the links heal 300 ms after the request starts.
+async fn send_while_heartbeats_lag(
+    app: &Router,
+    network: &crate::council::network::InMemoryRaftRouter,
+    leader: &crate::council::CouncilNode,
+    request: (&str, &str, &str),
+    bearer: &str,
+) -> (StatusCode, String) {
+    let (method, path, body) = request;
+    network.partition(1, 2).await;
+    network.partition(1, 3).await;
+    // One confirmation round can't reach a quorum.
+    assert!(!leader.is_leader().await, "{method} {path}");
+    let healer = {
+        let network = network.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            network.heal().await;
+        })
+    };
+    let mut request = axum::http::Request::builder()
+        .method(method)
+        .uri(path)
+        .header("authorization", format!("Bearer {bearer}"));
+    if path != "/v1/apply" && !body.is_empty() {
+        request = request.header("content-type", "application/json");
+    }
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        app.clone()
+            .oneshot(request.body(Body::from(body.to_string())).unwrap()),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("{method} {path} didn't answer in 30 s"))
+    .unwrap();
+    healer.await.unwrap();
+    let status = response.status();
+    // A job apply streams its progress until the jobs finish, which these
+    // never do: the status is what this test is about.
+    let body = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        response.into_body().collect(),
+    )
+    .await
+    .map(|body| String::from_utf8_lossy(&body.unwrap().to_bytes()).to_string())
+    .unwrap_or_else(|_| "(still streaming)".to_string());
+    (status, body)
+}
+
+// #1441: the batch, apply, replay, disable and stop routes confirm
+// leadership the same way as the submissions above (#1253), but nothing
+// tested them. A settled leader whose followers answer one round late must
+// serve each, not refuse it with "can't confirm it with a quorum".
+//
+// #1393: the app routes (apply, stop, delete) decided with one round too, so
+// the same lag refused them. They now confirm leadership like the job routes.
+#[tokio::test]
+async fn a_settled_leader_applies_stops_and_deletes_an_app_after_a_missed_heartbeat_round() {
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let (nodes, network) = council_and_network(3).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !nodes[0].is_leader().await {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    for node in &nodes {
+        node.hold_elections_until(std::time::Instant::now() + std::time::Duration::from_secs(60));
+    }
+    let app = router_over(nodes[0].clone(), admin);
+    let leader = nodes[0].as_ref();
+
+    for (method, path, body) in [
+        ("POST", "/v1/apply", "[app.web]\nimage = \"x:1\"\n"),
+        ("POST", "/v1/stop/web/default", ""),
+        ("POST", "/v1/delete/web/default", ""),
+    ] {
+        let (status, reply) =
+            send_while_heartbeats_lag(&app, &network, leader, (method, path, body), &admin_key)
+                .await;
+        assert!(status.is_success(), "{method} {path}: {status} {reply}");
+    }
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+// #1393: the test-lease routes, a lease's test token and the build-sign
+// request decided with one round as well, so the same lag refused them.
+#[tokio::test]
+async fn a_settled_leader_serves_test_leases_tokens_and_build_signs_after_a_missed_heartbeat_round()
+{
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let service = "lagging-service-secret";
+    let (nodes, network) = council_and_network(3).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !nodes[0].is_leader().await {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    for node in &nodes {
+        node.hold_elections_until(std::time::Instant::now() + std::time::Duration::from_secs(60));
+    }
+    let (app, shutdown) = setup_with_auth_leases_events_and_council(
+        vec![admin],
+        Some(service.into()),
+        crate::bun::readiness::ReadinessTracker::new(),
+        lease_static_capabilities(),
+        None,
+        None,
+        Some(nodes[0].clone()),
+    )
+    .await;
+    let leader = nodes[0].as_ref();
+
+    let (status, reply) = send_while_heartbeats_lag(
+        &app,
+        &network,
+        leader,
+        ("POST", "/v1/test/leases", r#"{"ttl_seconds":60}"#),
+        &admin_key,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create lease: {reply}");
+    let lease: crate::testkit::lease::TestLease = serde_json::from_str(&reply).unwrap();
+
+    let renew = format!("/v1/test/leases/{}/renew", lease.lease_id);
+    let token = serde_json::json!({
+        "name": format!("{}-ci", lease.namespace),
+        "role": "deployer",
+        "namespaces": [lease.namespace],
+        "lease_id": lease.lease_id,
+    })
+    .to_string();
+    let delete = format!("/v1/test/leases/{}", lease.lease_id);
+    for (method, path, body) in [
+        ("POST", renew.as_str(), r#"{"ttl_seconds":60}"#),
+        ("POST", "/v1/token/create", token.as_str()),
+        ("DELETE", delete.as_str(), ""),
+    ] {
+        let (status, reply) =
+            send_while_heartbeats_lag(&app, &network, leader, (method, path, body), &admin_key)
+                .await;
+        assert!(status.is_success(), "{method} {path}: {status} {reply}");
+    }
+
+    // The build isn't running, so a leader that confirms it leads answers
+    // 409; one that trusted the single round would answer 503.
+    let (status, reply) = send_while_heartbeats_lag(
+        &app,
+        &network,
+        leader,
+        (
+            "POST",
+            "/v1/build/sign",
+            r#"{"build_id":1,"namespace":"default","digests":[]}"#,
+        ),
+        service,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "build sign: {reply}");
+
+    shutdown.cancel();
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+// #1937: the CA rotation routes read the security state with one round, so
+// the same lag answered `relish ca rotate` with a 503. Prepare and begin now
+// confirm leadership first; finalise only writes, and a write waits for its
+// quorum rather than giving up after one round.
+#[tokio::test]
+async fn a_settled_leader_prepares_begins_and_finalises_a_ca_rotation_after_a_missed_heartbeat_round()
+ {
+    use crate::sesame::types::{CaRole, CertificateAuthority, SecurityState, SerialNumber};
+    use base64::Engine as _;
+    const IKM: [u8; 32] = [7; 32];
+    let hierarchy = crate::sesame::ca::generate_ca_hierarchy("lagging", &IKM).unwrap();
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let (nodes, network) = council_and_network_keyed(3, Some(IKM)).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !nodes[0].is_leader().await {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // The operator holds the root key; the cluster never does.
+    let security = SecurityState {
+        certificate_authorities: vec![
+            CertificateAuthority {
+                private_key_wrapped: None,
+                ..hierarchy.root.ca.clone()
+            },
+            hierarchy.node.ca.clone(),
+            hierarchy.workload.ca.clone(),
+            hierarchy.ingress.ca.clone(),
+        ],
+        next_serial: 10,
+        ..SecurityState::default()
+    };
+    nodes[0]
+        .write(crate::council::RaftRequest::SecurityStateInit(Box::new(
+            security,
+        )))
+        .await
+        .unwrap();
+    for node in &nodes {
+        node.hold_elections_until(std::time::Instant::now() + std::time::Duration::from_secs(60));
+    }
+    let app = router_over(nodes[0].clone(), admin);
+    let leader = nodes[0].as_ref();
+
+    let (status, reply) = send_while_heartbeats_lag(
+        &app,
+        &network,
+        leader,
+        ("POST", "/v1/ca/rotation/prepare", r#"{"role":"Node"}"#),
+        &admin_key,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "prepare: {reply}");
+    let prepared: crate::sesame::ca_rotation::PreparedRotation =
+        serde_json::from_str(&reply).unwrap();
+    let certificate = crate::sesame::ca::sign_intermediate_csr(
+        &base64::engine::general_purpose::STANDARD
+            .decode(&prepared.csr_b64)
+            .unwrap(),
+        CaRole::Node,
+        "lagging",
+        SerialNumber(prepared.serial),
+        &hierarchy.root.private_key_der,
+        &hierarchy.root.ca.certificate_der,
+    )
+    .unwrap();
+    let signed = serde_json::to_string(&crate::sesame::ca_rotation::SignedIntermediate {
+        role: CaRole::Node,
+        certificate_b64: base64::engine::general_purpose::STANDARD.encode(certificate),
+    })
+    .unwrap();
+
+    let (status, reply) = send_while_heartbeats_lag(
+        &app,
+        &network,
+        leader,
+        ("POST", "/v1/ca/rotation/begin", signed.as_str()),
+        &admin_key,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "begin: {reply}");
+
+    // This council records no node leaves, so nothing still depends on the
+    // old CA and finalising succeeds.
+    let (status, reply) = send_while_heartbeats_lag(
+        &app,
+        &network,
+        leader,
+        ("POST", "/v1/ca/rotation/finalize", r#"{"role":"Node"}"#),
+        &admin_key,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "finalise: {reply}");
+
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_settled_leader_serves_batch_apply_replay_disable_and_stop_after_a_missed_heartbeat_round()
+ {
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let (nodes, network) = council_and_network(3).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !nodes[0].is_leader().await {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    for node in &nodes {
+        node.hold_elections_until(std::time::Instant::now() + std::time::Duration::from_secs(60));
+    }
+    let app = router_over(nodes[0].clone(), admin);
+    let leader = nodes[0].as_ref();
+
+    // A scheduled definition, for disable and stop. Its first occurrence is
+    // a year away, so it has no run yet; replay uses the batch below.
+    let (status, reply) = send_bounded(
+        app.clone(),
+        "POST",
+        "/v1/jobs/runs",
+        &admin_key,
+        r#"{"name":"nightly","namespace":"ops","definition":{"template":{"runtime":"process","exec":"/bin/true"},"cron":{"expression":"0 0 1 1 *"}}}"#,
+        &[(super::LEADER_FORWARDED_HEADER, "1")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{reply}");
+
+    let batch = r#"{"jobs":[{"name":"render","namespace":"default","spec":{"image":"x:1","command":["true"]}}]}"#;
+    let (status, reply) = send_while_heartbeats_lag(
+        &app,
+        &network,
+        leader,
+        ("POST", "/v1/batch", batch),
+        &admin_key,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "POST /v1/batch: {reply}");
+    let batch: serde_json::Value = serde_json::from_str(&reply).unwrap();
+    let batch = batch["batch_id"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{reply}"));
+    // The batch is a manifest; replay takes the run of its one cohort.
+    let (_, reply) = send_bounded(
+        app.clone(),
+        "GET",
+        &format!("/v1/batch/{batch}"),
+        &admin_key,
+        "",
+        &[],
+    )
+    .await;
+    let status: serde_json::Value = serde_json::from_str(&reply).unwrap();
+    let cohort = status["cohorts"][0]["batch_id"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{reply}"));
+
+    let calls: Vec<(&str, String, &str, StatusCode)> = vec![
+        ("GET", format!("/v1/batch/{batch}"), "", StatusCode::OK),
+        (
+            "POST",
+            "/v1/apply".into(),
+            "[job.report]\nimage = \"test:v1\"\n",
+            StatusCode::OK,
+        ),
+        // The batch has no worker of unknown fate, so the leader's state
+        // machine refuses the replay: a 409 the leader decided itself, not
+        // a 503 for want of a quorum.
+        (
+            "POST",
+            format!("/v1/jobs/runs/{cohort}/replay"),
+            r#"{"acknowledged":true,"node":"n9","grant_digest":"none"}"#,
+            StatusCode::CONFLICT,
+        ),
+        (
+            "POST",
+            "/v1/jobs/definitions/nightly/ops/disable".into(),
+            "",
+            StatusCode::OK,
+        ),
+        (
+            "POST",
+            "/v1/stop/nightly/ops".into(),
+            "",
+            StatusCode::ACCEPTED,
+        ),
+    ];
+    for (method, path, body, expected) in calls {
+        let (status, reply) =
+            send_while_heartbeats_lag(&app, &network, leader, (method, &path, body), &admin_key)
+                .await;
+        assert_eq!(status, expected, "{method} {path}: {reply}");
+    }
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
 
 #[tokio::test]
 async fn a_leader_without_quorum_answers_503_instead_of_forwarding_to_itself() {
@@ -2627,7 +3360,7 @@ async fn placements_expose_only_the_consumers_original_withdrawal_generations() 
     use crate::onion::catalog::{CatalogBackend, EndpointCatalog};
     use crate::onion::service_id::ServiceId;
 
-    let council = seeded_council("withdrawal-instructions").await;
+    let (council, log) = seeded_council_with_log("withdrawal-instructions").await;
     let (app, shutdown) = setup_with_auth_leases_events_and_council(
         vec![],
         Some("internal".into()),
@@ -2703,6 +3436,10 @@ async fn placements_expose_only_the_consumers_original_withdrawal_generations() 
         }
     }
     let before = council.desired_state().await;
+    let before_index = last_log_index(&log).await;
+    // The router's leader loop records the cron minute on its own timer, so
+    // judge what was written rather than compare log positions (#1331).
+    observe_a_later_minute(&council).await;
     for (consumer, expected) in [
         ("worker", vec![1, 2]),
         ("other-worker", vec![1, 2]),
@@ -2741,7 +3478,11 @@ async fn placements_expose_only_the_consumers_original_withdrawal_generations() 
         assert_eq!(serde_json::to_value(decoded).unwrap(), body);
     }
     let after = council.desired_state().await;
-    assert_eq!(before.last_applied_log, after.last_applied_log);
+    assert_eq!(
+        writes_after(&log, before_index).await,
+        Vec::<String>::new(),
+        "serving instructions wrote to the council"
+    );
     assert_eq!(
         before.endpoint_withdrawals, after.endpoint_withdrawals,
         "serving instructions is not a cleanup acknowledgement"
@@ -2805,24 +3546,66 @@ async fn unparseable_peer_identity_is_refused_before_any_route() {
     council.shutdown().await.unwrap();
 }
 
-/// Wait until `council`'s applied log index has stopped moving for 200 ms,
-/// so a test can count the writes its own requests make.
-async fn wait_for_quiet_log(council: &crate::council::CouncilNode) {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    let mut last = council.desired_state().await.last_applied_log;
-    loop {
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        let now = council.desired_state().await.last_applied_log;
-        if now == last || tokio::time::Instant::now() >= deadline {
-            return;
-        }
-        last = now;
-    }
+/// Every entry in `log` past `index`, except the task-array leader loop's
+/// cron clock, each named by its log id and payload.
+///
+/// The router spawns that loop, and it commits `CronObserve` on its first
+/// tick and again on each new wall-clock minute, on its own timer. Nothing
+/// orders that entry against a test's requests, so counting entries around
+/// a request sees it at random (#1331); this judges what was written.
+async fn writes_after(log: &crate::council::log_store::MemLogStore, index: u64) -> Vec<String> {
+    use openraft::storage::RaftLogReader;
+    log.clone()
+        .try_get_log_entries(..)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|entry| {
+            entry.log_id.index > index
+                && !matches!(
+                    &entry.payload,
+                    openraft::EntryPayload::Normal(crate::council::RaftRequest::TaskArray(write))
+                        if matches!(**write, crate::meat::task_array_store::TaskArrayWrite::CronObserve { .. })
+                )
+        })
+        .map(|entry| match entry.payload {
+            openraft::EntryPayload::Normal(request) => format!("{}: {request:?}", entry.log_id),
+            other => format!("{}: {other:?}", entry.log_id),
+        })
+        .collect()
+}
+
+/// The index of the newest entry in `log`, or 0 when it holds none.
+async fn last_log_index(log: &crate::council::log_store::MemLogStore) -> u64 {
+    use openraft::storage::RaftLogReader;
+    log.clone()
+        .try_get_log_entries(..)
+        .await
+        .unwrap()
+        .last()
+        .map_or(0, |entry| entry.log_id.index)
+}
+
+/// Commit the cron clock's entry for the minute after the wall clock's, as
+/// the leader loop would on reaching it, so a test meets that stray entry
+/// on every run rather than once in a few hundred.
+async fn observe_a_later_minute(council: &crate::council::CouncilNode) {
+    let minute = i64::try_from(crate::meat::batch_ids::epoch_now_secs() / 60).unwrap() + 1;
+    let response = council
+        .write(crate::council::RaftRequest::TaskArray(Box::new(
+            crate::meat::task_array_store::TaskArrayWrite::CronObserve { minute },
+        )))
+        .await
+        .unwrap();
+    assert!(
+        !matches!(response, crate::council::CouncilResponse::Refused { .. }),
+        "the cron observation was refused: {response:?}"
+    );
 }
 
 #[tokio::test]
 async fn placements_serve_plaintext_discovery_without_registering_a_consumer() {
-    let council = seeded_council("endpoint-consumer").await;
+    let (council, log) = seeded_council_with_log("endpoint-consumer").await;
     let (token, user_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
     let (app, shutdown) = setup_with_auth_leases_events_and_council(
         vec![token],
@@ -2834,10 +3617,6 @@ async fn placements_serve_plaintext_discovery_without_registering_a_consumer() {
         Some(council.clone()),
     )
     .await;
-    // The router's leader loops write to Raft once as they start. Token
-    // checks used to take long enough (Argon2) to hide that; now they don't,
-    // so wait for the log to settle before counting writes.
-    wait_for_quiet_log(&council).await;
     let path = "/v1/placements/worker";
     assert_eq!(
         get_authenticated(app.clone(), path, &user_key).await.0,
@@ -2872,14 +3651,17 @@ async fn placements_serve_plaintext_discovery_without_registering_a_consumer() {
             .endpoint_consumers
             .contains("imposter")
     );
-    let applied = council.desired_state().await.last_applied_log;
+    let applied = last_log_index(&log).await;
+    // The router's leader loop records the cron minute on its own timer, so
+    // judge what was written rather than count entries (#1331).
+    observe_a_later_minute(&council).await;
     assert_eq!(
         get_authenticated(app, path, "internal").await.0,
         StatusCode::OK
     );
     assert_eq!(
-        council.desired_state().await.last_applied_log,
-        applied,
+        writes_after(&log, applied).await,
+        Vec::<String>::new(),
         "an unchanged placement poll must not write another registration"
     );
     shutdown.cancel();
@@ -4307,6 +5089,80 @@ async fn setup_scoped_with_role(
     (app, shutdown, created.plaintext)
 }
 
+/// #1125: a controller's token is scoped to its namespace, and the event
+/// list answers it with that namespace's events only: not another
+/// tenant's, and not cluster events that name no namespace.
+#[tokio::test]
+async fn a_scoped_token_reads_only_its_own_namespaces_events() {
+    use crate::bun::events::{EventKind, EventSeverity, EventStore};
+    let (cmd_tx, _cmd_rx) = mpsc::channel(32);
+    let scope = crate::sesame::types::TokenScope {
+        apps: None,
+        namespaces: Some(vec!["team-a".to_string()]),
+    };
+    let created = crate::sesame::token::create_token(
+        "controller",
+        crate::sesame::types::ApiRole::Deployer,
+        scope,
+        None,
+    )
+    .unwrap();
+    let store = crate::sesame::auth::new_token_store();
+    store.write().await.push(created.token);
+    let mut events = EventStore::new();
+    let mut record = |app: Option<&str>, namespace: Option<&str>, message: &str| {
+        events.record(
+            1,
+            EventKind::Health,
+            EventSeverity::Warning,
+            app.map(str::to_string),
+            namespace.map(str::to_string),
+            Some("node-1".into()),
+            message.to_string(),
+        );
+    };
+    record(Some("db"), Some("team-a"), "ours");
+    record(Some("db"), Some("team-b"), "theirs");
+    record(None, Some("team-a"), "our namespace");
+    record(None, None, "the cluster's");
+    let app = router(
+        cmd_tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(store),
+        None,
+        None,
+        None,
+        None,
+        9117,
+        Some(Arc::new(RwLock::new(events))),
+    );
+    let response = app
+        .oneshot(
+            axum::http::Request::get("/v1/events?limit=10")
+                .header("Authorization", format!("Bearer {}", created.plaintext))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let view: crate::bun::cluster_view::ClusterEvents = serde_json::from_slice(&body).unwrap();
+    let messages: Vec<&str> = view
+        .events
+        .iter()
+        .map(|event| event.message.as_str())
+        .collect();
+    assert_eq!(messages, vec!["ours", "our namespace"]);
+}
+
 /// Every route that upgrades, rolls back or re-elects the cluster.
 const CLUSTER_ADMIN_ROUTES: [&str; 7] = [
     "/v1/upgrade/apply",
@@ -4471,6 +5327,8 @@ fn deployer_context() -> crate::sesame::auth::AuthContext {
         token_name: "ci".into(),
         principal_id: "ci-credential".into(),
         role: crate::sesame::types::ApiRole::Deployer,
+        kind: crate::sesame::types::TokenKind::Human,
+        granted_role: crate::sesame::types::ApiRole::Deployer,
         scoped_apps: None,
         scoped_namespaces: None,
     }
@@ -5006,6 +5864,66 @@ async fn managed_volume_needs_only_deploy() {
     );
 }
 
+const RUNTIME_KNOBS: &str = "[app.lb]\nimage = \"test:v1\"\n\
+    [app.lb.runtime]\ncapabilities = [\"IPC_OWNER\"]\n";
+
+/// #1122: the token gate on its own. A deployer whose permission block
+/// grants `deploy` but not `host-exec` can't apply an app with a runtime
+/// knob, and the refusal names the field, the value and the gate. Nothing
+/// reaches Raft.
+#[tokio::test]
+async fn a_runtime_knob_needs_host_exec_and_the_refusal_names_the_token_gate() {
+    let (app, council, _commands) = workload_admission_fixture("knob-deploy-only").await;
+    council
+        .write(crate::council::RaftRequest::PermissionSpec {
+            name: "ci".into(),
+            spec: Box::new(crate::config::PermissionSpec {
+                actions: vec!["deploy".into()],
+                apps: vec!["*".into()],
+                namespaces: None,
+            }),
+        })
+        .await
+        .unwrap();
+    let mut request = axum::http::Request::post("/v1/apply")
+        .body(Body::from(RUNTIME_KNOBS))
+        .unwrap();
+    request.extensions_mut().insert(deployer_context());
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let message = String::from_utf8_lossy(&body);
+    assert!(
+        message.contains("runtime.capabilities CAP_IPC_OWNER"),
+        "{message}"
+    );
+    assert!(message.contains("token gate"), "{message}");
+    assert!(message.contains("host-exec"), "{message}");
+    assert!(council.desired_state().await.apps.is_empty());
+    council.shutdown().await.unwrap();
+
+    assert_ne!(
+        apply_under_permission_block("knob-host-exec", &["deploy", "host-exec"], RUNTIME_KNOBS)
+            .await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[test]
+fn apply_notes_each_runtime_knob_needs_a_node_allowlist_entry() {
+    let config = crate::config::Config::parse(RUNTIME_KNOBS).unwrap();
+    let notes = super::apply::runtime_knob_notes(&config);
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].contains("app.lb"), "{notes:?}");
+    assert!(
+        notes[0].contains("runtime.capabilities CAP_IPC_OWNER"),
+        "{notes:?}"
+    );
+    assert!(notes[0].contains("allowed_capabilities"), "{notes:?}");
+}
+
 #[test]
 fn apply_notes_each_host_path_source_needs_a_node_allowlist_entry() {
     let config = crate::config::Config::parse(HOST_PATH_VOLUME).unwrap();
@@ -5319,21 +6237,16 @@ async fn scoped_token_is_refused_streaming_another_namespaces_logs() {
     let _ = server.await;
 }
 
-/// Audit events span every namespace, so `/v1/events` refuses a scoped
-/// token (C3). The live stream of the same events, `/v1/ws/events`, checked
-/// nothing: route authorisation lets any token through, and the handler
-/// upgraded straight away, so a token scoped to `team-a` streamed every
-/// tenant's events. It must refuse the upgrade the same way.
+/// The dashboard's live stream, `/v1/ws/events`, carries every tenant's
+/// events. It checked nothing: route authorisation lets any token through,
+/// and the handler upgraded straight away, so a token scoped to `team-a`
+/// streamed every tenant's events. It must refuse the upgrade. A scoped
+/// token reads its own events from `/v1/events` instead (#1125).
 #[tokio::test]
 async fn scoped_token_is_refused_the_live_event_stream() {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
     let (app, shutdown, tok) = setup_scoped_to_namespace("team-a").await;
-    assert_eq!(
-        get_status(app.clone(), "/v1/events", Some(&tok)).await,
-        StatusCode::FORBIDDEN,
-        "the HTTP route already refuses"
-    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let serving = shutdown.clone();
@@ -5589,6 +6502,151 @@ async fn logs_export_ships_parquet_and_persists_the_checkpoint() {
     assert_eq!(outcome["files_exported"], 0, "{outcome}");
 }
 
+/// The log archive hands every tenant's logs to whoever asks, so like the
+/// export it is Admin-only.
+#[tokio::test]
+async fn logs_archive_requires_admin() {
+    let (app, shutdown, tok) = setup_with_role(
+        "logs-archive-deployer",
+        crate::sesame::types::ApiRole::Deployer,
+    )
+    .await;
+    for uri in ["/v1/logs/archive", "/v1/logs/archive/logs_000000.parquet"] {
+        let status = get_status(app.clone(), uri, Some(&tok)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+    }
+    shutdown.cancel();
+}
+
+/// A token scoped to one namespace can't have a store that holds everyone's
+/// logs, whatever its role: there's no filtering a Parquet file.
+#[tokio::test]
+async fn logs_archive_refuses_a_scoped_admin_token() {
+    let created = crate::sesame::token::create_token(
+        "logs-archive-scoped-admin",
+        crate::sesame::types::ApiRole::Admin,
+        crate::sesame::types::TokenScope {
+            apps: None,
+            namespaces: Some(vec!["a".to_string()]),
+        },
+        None,
+    )
+    .unwrap();
+    let (app, shutdown) = setup_with_auth(vec![created.token], None).await;
+    for uri in ["/v1/logs/archive", "/v1/logs/archive/logs_000000.parquet"] {
+        let status = get_status(app.clone(), uri, Some(&created.plaintext)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}");
+    }
+    shutdown.cancel();
+}
+
+/// A router over a log store holding one flushed Parquet file.
+async fn router_with_one_parquet_file() -> (Router, tempfile::TempDir) {
+    let (cmd_tx, _cmd_rx) = mpsc::channel(32);
+    let store_dir = tempfile::tempdir().unwrap();
+    let mut store = crate::ketchup::log_store::LogStore::new(store_dir.path().to_path_buf());
+    store.append(
+        "web",
+        "default",
+        crate::ketchup::types::LogStream::Stdout,
+        "hello",
+    );
+    store.flush().await.unwrap();
+    let app = router(
+        cmd_tx,
+        None,
+        Some(Arc::new(RwLock::new(store))),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        9117,
+        None,
+    );
+    (app, store_dir)
+}
+
+async fn get_bytes(app: Router, uri: &str) -> (StatusCode, Vec<u8>) {
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 16 * 1024 * 1024)
+        .await
+        .unwrap();
+    (status, bytes.to_vec())
+}
+
+/// #1499: `relish logs-export` copies a node's archive to the operator's
+/// machine through these two routes. The listing names each Parquet file
+/// with its size and SHA-256, the file route serves those exact bytes, and
+/// neither touches the node's own export checkpoint.
+#[tokio::test]
+async fn logs_archive_lists_each_parquet_file_and_serves_its_bytes() {
+    let (app, store_dir) = router_with_one_parquet_file().await;
+    let (status, body) = get_bytes(app.clone(), "/v1/logs/archive").await;
+    assert_eq!(status, StatusCode::OK);
+    let listing: crate::ketchup::export::ArchiveListing = serde_json::from_slice(&body).unwrap();
+    assert_eq!(listing.node_id, "local");
+    assert_eq!(listing.files.len(), 1, "{listing:?}");
+    let file = &listing.files[0];
+    let on_disk = std::fs::read(store_dir.path().join(&file.name)).unwrap();
+    assert_eq!(file.size, on_disk.len() as u64);
+    assert_eq!(
+        file.sha256,
+        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&on_disk))
+    );
+
+    let (status, served) = get_bytes(app, &format!("/v1/logs/archive/{}", file.name)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(served, on_disk);
+    assert!(
+        !store_dir
+            .path()
+            .join(crate::ketchup::export::CHECKPOINT_FILENAME)
+            .exists()
+    );
+}
+
+/// The file route serves only a Parquet file in the store itself: not the
+/// checkpoint, not a path that climbs out, not a file that isn't there.
+#[tokio::test]
+async fn logs_archive_serves_nothing_but_the_stores_parquet_files() {
+    let (app, store_dir) = router_with_one_parquet_file().await;
+    std::fs::write(store_dir.path().join("_export_checkpoint.json"), b"{}").unwrap();
+    for (uri, expected) in [
+        (
+            "/v1/logs/archive/_export_checkpoint.json",
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/v1/logs/archive/..%2Fescape.parquet",
+            StatusCode::BAD_REQUEST,
+        ),
+        ("/v1/logs/archive/..", StatusCode::BAD_REQUEST),
+        ("/v1/logs/archive/missing.parquet", StatusCode::NOT_FOUND),
+    ] {
+        let (status, body) = get_bytes(app.clone(), uri).await;
+        assert_eq!(
+            status,
+            expected,
+            "{uri}: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+}
+
 /// AUTH1 for faults: a Deployer scoped to one namespace clears the role
 /// gate but is refused injecting a fault into another tenant's same-named
 /// service, before the safety policy is even consulted. `/v1/fault` carries
@@ -5614,11 +6672,12 @@ async fn scoped_token_is_refused_faulting_another_namespace() {
     shutdown.cancel();
 }
 
-/// The cluster-wide metrics and events endpoints read across every app and
-/// namespace, so — like `/v1/logs/sql` — a scoped token is refused (C3)
-/// rather than served every tenant's data.
+/// The cluster-wide metrics endpoints read across every app and namespace,
+/// so — like `/v1/logs/sql` — a scoped token is refused (C3) rather than
+/// served every tenant's data. `/v1/events` used to be on this list; it now
+/// answers a scoped token with its own events only (#1125).
 #[tokio::test]
-async fn scoped_token_is_refused_cluster_wide_metrics_and_events() {
+async fn scoped_token_is_refused_cluster_wide_metrics() {
     for path in [
         "/v1/metrics?name=node_cpu_usage_percent",
         "/v1/metrics/summary",
@@ -5626,7 +6685,6 @@ async fn scoped_token_is_refused_cluster_wide_metrics_and_events() {
         "/v1/metrics/rollup",
         "/v1/metrics/rollup/owned",
         "/v1/metrics/cluster",
-        "/v1/events",
     ] {
         let (app, shutdown, tok) = setup_scoped_to_namespace("team-a").await;
         let status = get_status(app, path, Some(&tok)).await;
@@ -6675,7 +7733,7 @@ async fn namespace_scoped_token_lists_only_its_namespace_images() {
 }
 
 /// #326: the council's record of why an app isn't placed reaches every
-/// reader of desired-app evidence (`relish status`, `inspect`, `wtf`
+/// reader of desired-app evidence (`relish apps`, `inspect`, `wtf`
 /// and the dashboard).
 #[test]
 fn council_app_evidence_carries_the_quota_block() {
@@ -6826,7 +7884,7 @@ fn council_app_evidence_names_the_nodes_holding_an_apps_volume() {
 }
 
 #[test]
-fn dashboard_shows_desired_replicas_and_counts_only_running_instances() {
+fn dashboard_states_come_from_the_shared_app_rollup() {
     let mut running: InstanceStatus = serde_json::from_value(serde_json::json!({
         "id":"web-0", "app_name":"web", "namespace":"default", "state":"running",
         "restart_count":0,"host_port":null,"pid":null
@@ -6837,6 +7895,7 @@ fn dashboard_shows_desired_replicas_and_counts_only_running_instances() {
     failed.state = "failed".into();
     let desired = vec![
         crate::bun::diagnostics::DesiredAppEvidence {
+            owner: None,
             app: "web".into(),
             namespace: "default".into(),
             desired_replicas: 3,
@@ -6850,6 +7909,7 @@ fn dashboard_shows_desired_replicas_and_counts_only_running_instances() {
             volume_homes: Vec::new(),
         },
         crate::bun::diagnostics::DesiredAppEvidence {
+            owner: None,
             app: "pending".into(),
             namespace: "default".into(),
             desired_replicas: 2,
@@ -6863,19 +7923,39 @@ fn dashboard_shows_desired_replicas_and_counts_only_running_instances() {
             volume_homes: Vec::new(),
         },
     ];
-    let rows = statuses_to_dashboard_apps(&[running.clone(), failed], &desired);
+    let rows = statuses_to_dashboard_apps(&[running.clone(), failed.clone()], &desired);
     let web = rows.iter().find(|row| row.name == "web").unwrap();
     assert_eq!((web.instances_running, web.instances_desired), (1, 3));
-    assert_ne!(web.state, "running");
+    assert_eq!(web.state, "degraded", "the word relish apps and status use");
     let pending = rows.iter().find(|row| row.name == "pending").unwrap();
     assert_eq!(
         (pending.instances_running, pending.instances_desired),
         (0, 2)
     );
-    assert_eq!(pending.state, "pending");
+    assert_eq!(pending.state, "down");
 
-    // #326: an app the namespace quota keeps off every node reads as
-    // blocked, not as waiting for room.
+    // Every replica running reads `running`, even beside a failed extra.
+    let mut second = running.clone();
+    second.id = "web-2".into();
+    let mut third = running.clone();
+    third.id = "web-3".into();
+    let rows = statuses_to_dashboard_apps(&[running.clone(), second, third, failed], &desired);
+    assert_eq!(
+        rows.iter().find(|row| row.name == "web").unwrap().state,
+        "running"
+    );
+
+    // An app that wants no replicas is stopped.
+    let mut stopped = desired.clone();
+    stopped[1].desired_replicas = 0;
+    let rows = statuses_to_dashboard_apps(&[running.clone()], &stopped);
+    assert_eq!(
+        rows.iter().find(|row| row.name == "pending").unwrap().state,
+        "stopped"
+    );
+
+    // #326, #423: an app the quota or a missing volume home holds back is
+    // `down` in the table, as in `relish apps`; its page says why.
     let mut quota_blocked = desired.clone();
     quota_blocked[1].blocked = Some(crate::meat::quota::QuotaError::MaxAppsExceeded {
         namespace: "default".into(),
@@ -6883,15 +7963,10 @@ fn dashboard_shows_desired_replicas_and_counts_only_running_instances() {
         limit: 1,
     });
     let rows = statuses_to_dashboard_apps(&[running.clone()], &quota_blocked);
-    let pending = rows.iter().find(|row| row.name == "pending").unwrap();
-    assert_eq!(pending.state, "blocked");
-
-    // #423: so does a volume app waiting for the node that holds its data.
-    let mut waiting = desired.clone();
-    waiting[1].volume_home_away = Some("node-2".into());
-    let rows = statuses_to_dashboard_apps(&[running.clone()], &waiting);
-    let pending = rows.iter().find(|row| row.name == "pending").unwrap();
-    assert_eq!(pending.state, "blocked");
+    assert_eq!(
+        rows.iter().find(|row| row.name == "pending").unwrap().state,
+        "down"
+    );
 
     running.state = "stopped".into();
     let rows = statuses_to_dashboard_apps(&[running], &desired);
@@ -7024,6 +8099,70 @@ async fn exec_nonexistent_app_returns_404() {
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     shutdown.cancel();
+}
+
+/// An exec router whose agent answers each exec with the next of `answers`.
+fn exec_answering_router(
+    answers: Vec<Result<crate::grill::ExecOutput, crate::bun::BunError>>,
+) -> Router {
+    let (tx, mut rx) = mpsc::channel(4);
+    tokio::spawn(async move {
+        let mut answers = answers.into_iter();
+        while let Some(command) = rx.recv().await {
+            if let AgentCommand::Exec { response, .. } = command
+                && let Some(answer) = answers.next()
+            {
+                let _ = response.send(answer);
+            }
+        }
+    });
+    router(
+        tx, None, None, None, None, None, None, None, None, None, None, None, 9117, None,
+    )
+}
+
+async fn post_exec(app: &Router) -> (StatusCode, serde_json::Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/exec/web/default")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"command":["false"]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
+/// D34: a command that ran and exited non-zero answers 200 with its exit
+/// code; only a failure to run it is an HTTP error, and each keeps its own
+/// status instead of all becoming 404.
+#[tokio::test]
+async fn exec_answers_with_the_exit_code_and_distinct_failure_statuses() {
+    let app = exec_answering_router(vec![
+        Ok(crate::grill::ExecOutput {
+            output: "boom\n".into(),
+            exit_code: 3,
+        }),
+        Err(crate::bun::BunError::ExecTimeout { seconds: 300 }),
+        Err(crate::bun::BunError::AppNotFound {
+            app_name: "web".into(),
+            namespace: "default".into(),
+        }),
+    ]);
+    let (status, body) = post_exec(&app).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["exit_code"], 3);
+    assert_eq!(body["output"], "boom\n");
+    let (status, _) = post_exec(&app).await;
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+    let (status, _) = post_exec(&app).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -8241,7 +9380,7 @@ async fn apply_uses_committed_namespace_context_before_any_resource_write() {
     let before_builds = council.desired_state().await;
     for (namespace, expected) in [("existing", true), ("ghost", false)] {
         let build = crate::config::Config::parse(&format!(
-            "[build.web]\ncontext = '.'\ndestination = 'pickle://web:v1'\nnamespace = '{namespace}'\n"
+            "[build.web]\ncontext = '.'\ndestination = 'pickle://{namespace}/web:v1'\nnamespace = '{namespace}'\n"
         )).unwrap();
         let result = client.apply(&build).await;
         assert_eq!(
@@ -8419,6 +9558,8 @@ async fn dry_run_endpoint_preserves_namespace_identity_and_caller_scope() {
         token_name: "team-reader".into(),
         principal_id: "token:test".into(),
         role: crate::sesame::types::ApiRole::ReadOnly,
+        kind: crate::sesame::types::TokenKind::Human,
+        granted_role: crate::sesame::types::ApiRole::ReadOnly,
         scoped_apps: Some(vec!["web".into()]),
         scoped_namespaces: Some(vec!["team".into()]),
     };
@@ -8645,83 +9786,82 @@ async fn cluster_scheduled_apply_commits_apps_and_a_definition_without_an_immedi
     council.shutdown().await.unwrap();
 }
 
-/// Actual Raft writes with the lost-quorum test hook; synthetic results are
-/// transition evidence only. Owned runtime tests separately qualify exits.
-#[derive(Clone, Copy)]
-enum HangingPrerequisiteWrite {
-    Begin,
-    Commit,
-    KnownFailed,
-}
+/// The deployment the hung-write tests share: one app gated behind one hook.
+const HUNG_DEPLOYMENT_ID: &str = "55555555555555555555555555555555";
+const HUNG_DEPLOYMENT_MANIFEST: &str =
+    "[app.web]\nimage='web:v2'\n[job.migrate]\nimage='migration:v1'\nrun_before=['app.web']\n";
 
-async fn assert_hung_prerequisite_write_has_a_bounded_error(boundary: HangingPrerequisiteWrite) {
+/// Begin the shared deployment and drive its `migrate` hook to a terminal
+/// result through real Raft writes. Synthetic results are transition evidence
+/// only; owned runtime tests separately qualify exits. Returns the hook's run.
+async fn seed_finished_hook(council: &crate::council::CouncilNode, failed: bool) -> u64 {
     use crate::council::{CouncilResponse, RaftRequest};
     use crate::meat::task_array_store::TaskArrayWrite;
-    let council = seeded_council("common-hung-deployment").await;
-    let operation_id = "55555555555555555555555555555555";
-    let manifest =
-        "[app.web]\nimage='web:v2'\n[job.migrate]\nimage='migration:v1'\nrun_before=['app.web']\n";
-    if !matches!(boundary, HangingPrerequisiteWrite::Begin) {
-        let result = council
-            .write(RaftRequest::TaskArray(Box::new(
-                TaskArrayWrite::DeployBegin {
-                    operation_id: operation_id.into(),
-                    config: Box::new(crate::config::Config::parse(manifest).unwrap()),
-                    now_epoch_secs: 1,
-                },
-            )))
-            .await
-            .unwrap();
-        assert!(!matches!(result, CouncilResponse::Refused { .. }));
-        let arrays = council.desired_state().await.task_arrays;
-        let run = arrays.deployment(operation_id).unwrap().hook_runs["migrate"];
-        let owner = crate::meat::NodeId::new("worker");
-        let result = council
-            .write(RaftRequest::TaskArray(Box::new(TaskArrayWrite::Sync {
-                batch_id: run,
-                now_epoch_secs: 2,
-                results: vec![],
-                grants: vec![(
-                    owner.clone(),
-                    crate::meat::index_set::IndexRangeSet::from_range(0..=0),
-                )],
-            })))
-            .await
-            .unwrap();
-        assert!(!matches!(result, CouncilResponse::Refused { .. }));
-        let failed = matches!(boundary, HangingPrerequisiteWrite::KnownFailed);
-        let result = council
-            .write(RaftRequest::TaskArray(Box::new(TaskArrayWrite::Sync {
-                batch_id: run,
-                now_epoch_secs: 3,
-                grants: vec![],
-                results: vec![(
-                    owner,
-                    crate::meat::task_array_state::ChunkResult {
-                        chunk: crate::meat::task_array::ChunkId(0),
-                        attempt: 1,
-                        succeeded: u32::from(!failed),
-                        failed_count: u32::from(failed),
-                        failed_indices: if failed {
-                            crate::meat::index_set::IndexRangeSet::from_range(0..=0)
-                        } else {
-                            Default::default()
-                        },
-                        not_run: 0,
-                        retried: 0,
-                        retry_causes: Default::default(),
-                        duration_counts: [0; 16],
+    let result = council
+        .write(RaftRequest::TaskArray(Box::new(
+            TaskArrayWrite::DeployBegin {
+                operation_id: HUNG_DEPLOYMENT_ID.into(),
+                config: Box::new(crate::config::Config::parse(HUNG_DEPLOYMENT_MANIFEST).unwrap()),
+                now_epoch_secs: 1,
+            },
+        )))
+        .await
+        .unwrap();
+    assert!(!matches!(result, CouncilResponse::Refused { .. }));
+    let arrays = council.desired_state().await.task_arrays;
+    let run = arrays.deployment(HUNG_DEPLOYMENT_ID).unwrap().hook_runs["migrate"];
+    let owner = crate::meat::NodeId::new("worker");
+    let result = council
+        .write(RaftRequest::TaskArray(Box::new(TaskArrayWrite::Sync {
+            batch_id: run,
+            now_epoch_secs: 2,
+            results: vec![],
+            grants: vec![(
+                owner.clone(),
+                crate::meat::index_set::IndexRangeSet::from_range(0..=0),
+            )],
+        })))
+        .await
+        .unwrap();
+    assert!(!matches!(result, CouncilResponse::Refused { .. }));
+    let result = council
+        .write(RaftRequest::TaskArray(Box::new(TaskArrayWrite::Sync {
+            batch_id: run,
+            now_epoch_secs: 3,
+            grants: vec![],
+            results: vec![(
+                owner,
+                crate::meat::task_array_state::ChunkResult {
+                    chunk: crate::meat::task_array::ChunkId(0),
+                    attempt: 1,
+                    succeeded: u32::from(!failed),
+                    failed_count: u32::from(failed),
+                    failed_indices: if failed {
+                        crate::meat::index_set::IndexRangeSet::from_range(0..=0)
+                    } else {
+                        Default::default()
                     },
-                )],
-            })))
-            .await
-            .unwrap();
-        assert!(!matches!(result, CouncilResponse::Refused { .. }));
-    }
-    let before = council.desired_state().await;
-    council.hang_writes();
+                    not_run: 0,
+                    retried: 0,
+                    retry_causes: Default::default(),
+                    duration_counts: [0; 16],
+                },
+            )],
+        })))
+        .await
+        .unwrap();
+    assert!(!matches!(result, CouncilResponse::Refused { .. }));
+    run
+}
+
+/// A stand-in agent for the hung-write tests: it answers the deploy-operations
+/// query and forwards every other command, so a test can prove none arrived.
+fn hung_write_router(
+    council: Arc<crate::council::CouncilNode>,
+    task_arrays: Option<Arc<crate::bun::task_array_leader::TaskArrayService>>,
+) -> (axum::Router, mpsc::Receiver<AgentCommand>) {
     let (tx, mut incoming) = mpsc::channel(16);
-    let (trace, mut commands) = mpsc::channel(16);
+    let (trace, commands) = mpsc::channel(16);
     tokio::spawn(async move {
         while let Some(command) = incoming.recv().await {
             match command {
@@ -8737,14 +9877,15 @@ async fn assert_hung_prerequisite_write_has_a_bounded_error(boundary: HangingPre
             }
         }
     });
-    let app = router(
+    let app = router_with_upgrade(
         tx,
         None,
         None,
         None,
         None,
         None,
-        Some(council.clone()),
+        Some(council),
+        None,
         None,
         None,
         None,
@@ -8752,15 +9893,61 @@ async fn assert_hung_prerequisite_write_has_a_bounded_error(boundary: HangingPre
         None,
         0,
         None,
+        None,
+        None,
+        "default".into(),
+        None,
+        crate::bun::build_runner::BuildSettings::with_timeout(900),
+        crate::cluster::ClusterHttp::plaintext(),
+        5050,
+        "http",
+        256 * 1024 * 1024,
+        false,
+        crate::bun::capabilities::StaticCapabilities::default(),
+        crate::bun::readiness::ReadinessTracker::new(),
+        None,
+        None,
+        None,
+        task_arrays,
     );
-    let request = if matches!(boundary, HangingPrerequisiteWrite::Begin) {
+    (app, commands)
+}
+
+/// The operator-facing write a hung-quorum test sends over HTTP.
+#[derive(Clone, Copy)]
+enum HungOperatorWrite {
+    /// `POST /v1/apply` begins a deployment.
+    Begin,
+    /// `POST .../cancel` after the hook succeeded.
+    CancelAfterSuccess,
+    /// `POST .../cancel` after the hook failed.
+    CancelAfterFailure,
+}
+
+async fn assert_hung_operator_write_has_a_bounded_error(boundary: HungOperatorWrite) {
+    let council = seeded_council("common-hung-deployment").await;
+    match boundary {
+        HungOperatorWrite::Begin => {}
+        HungOperatorWrite::CancelAfterSuccess => {
+            seed_finished_hook(&council, false).await;
+        }
+        HungOperatorWrite::CancelAfterFailure => {
+            seed_finished_hook(&council, true).await;
+        }
+    }
+    let before = council.desired_state().await;
+    council.hang_writes();
+    let (app, mut commands) = hung_write_router(council.clone(), None);
+    let request = if matches!(boundary, HungOperatorWrite::Begin) {
         axum::http::Request::post("/v1/apply")
-            .body(Body::from(manifest))
+            .body(Body::from(HUNG_DEPLOYMENT_MANIFEST))
             .unwrap()
     } else {
-        axum::http::Request::post(format!("/v1/deploys/operations/{operation_id}/cancel"))
-            .body(Body::empty())
-            .unwrap()
+        axum::http::Request::post(format!(
+            "/v1/deploys/operations/{HUNG_DEPLOYMENT_ID}/cancel"
+        ))
+        .body(Body::empty())
+        .unwrap()
     };
     let response = tokio::time::timeout(std::time::Duration::from_secs(15), app.oneshot(request))
         .await
@@ -8773,39 +9960,177 @@ async fn assert_hung_prerequisite_write_has_a_bounded_error(boundary: HangingPre
         after.task_arrays, before.task_arrays,
         "uncertain publication or cancellation discarded durable intent"
     );
-    assert!(matches!(
-        commands.try_recv(),
-        Ok(AgentCommand::DeployOperations { .. }) | Err(_)
-    ));
     assert!(commands.try_recv().is_err());
     council.shutdown().await.unwrap();
 }
 
 #[tokio::test]
 async fn hung_common_begin_returns_bounded_unavailability_without_publication() {
-    assert_hung_prerequisite_write_has_a_bounded_error(HangingPrerequisiteWrite::Begin).await;
+    assert_hung_operator_write_has_a_bounded_error(HungOperatorWrite::Begin).await;
 }
 #[tokio::test]
-async fn hung_common_commit_preserves_the_exact_successful_hook_and_app_gate() {
-    assert_hung_prerequisite_write_has_a_bounded_error(HangingPrerequisiteWrite::Commit).await;
+async fn hung_cancel_after_a_successful_hook_preserves_the_exact_intent_and_app_gate() {
+    assert_hung_operator_write_has_a_bounded_error(HungOperatorWrite::CancelAfterSuccess).await;
 }
 #[tokio::test]
-async fn hung_failed_hook_settlement_preserves_the_exact_failure_and_app_gate() {
-    assert_hung_prerequisite_write_has_a_bounded_error(HangingPrerequisiteWrite::KnownFailed).await;
+async fn hung_cancel_after_a_failed_hook_preserves_the_exact_failure_and_app_gate() {
+    assert_hung_operator_write_has_a_bounded_error(HungOperatorWrite::CancelAfterFailure).await;
 }
 
+/// The settlement write the leader issues on its own once a deployment's
+/// hook has finished. No operator request carries either one.
+#[derive(Clone, Copy, PartialEq)]
+enum StalledSettlement {
+    /// The hook succeeded: `JobApplyCommit` publishes the apps.
+    Commit,
+    /// The hook failed: `DeployCancel` settles the deployment.
+    FailedHook,
+}
+
+/// Stall the leader's real settlement write and prove it is bounded: the
+/// leader abandons the hung write at its write timeout (`WRITE_TIMEOUT` in
+/// production, one second here) and tries again on a later tick, rather
+/// than wedging its loop. Meanwhile the durable intent
+/// stays exactly as it was, no agent is told to publish, and a failed hook
+/// never even attempts publication.
+async fn assert_stalled_settlement_is_bounded(settlement: StalledSettlement) {
+    use crate::bun::task_array_leader::TaskArrayService;
+    use crate::council::RaftRequest;
+    use crate::meat::task_array_state::TaskArrayStatus;
+    use crate::meat::task_array_store::TaskArrayWrite;
+
+    let council = seeded_council("stalled-settlement").await;
+    let failed = settlement == StalledSettlement::FailedHook;
+    let run = seed_finished_hook(&council, failed).await;
+    let before = council.desired_state().await;
+    let record = before.task_arrays.deployment(HUNG_DEPLOYMENT_ID).unwrap();
+    assert!(!record.apps_committed && !record.cancelled && !record.completed);
+    assert_eq!(
+        before.task_arrays.get(run).unwrap().state.status(),
+        if failed {
+            TaskArrayStatus::CompletedWithFailures
+        } else {
+            TaskArrayStatus::Succeeded
+        }
+    );
+
+    council.hang_writes();
+    // The router starts the leader loop, whose first tick settles.
+    let write_timeout = std::time::Duration::from_secs(1);
+    let service = Arc::new(TaskArrayService::new(None).with_write_timeout(write_timeout));
+    let (_app, mut commands) = hung_write_router(council.clone(), Some(service));
+
+    let is_commit = |request: &RaftRequest| {
+        matches!(request, RaftRequest::JobApplyCommit { operation_id, .. }
+            if operation_id == HUNG_DEPLOYMENT_ID)
+    };
+    let is_cancel = |request: &RaftRequest| {
+        matches!(request, RaftRequest::TaskArray(write)
+            if matches!(write.as_ref(), TaskArrayWrite::DeployCancel { operation_id, .. }
+                if operation_id == HUNG_DEPLOYMENT_ID))
+    };
+    let attempts = || {
+        council
+            .hung_writes()
+            .into_iter()
+            .filter(|(_, request)| match settlement {
+                StalledSettlement::Commit => is_commit(request),
+                StalledSettlement::FailedHook => is_cancel(request),
+            })
+            .map(|(at, _)| at)
+            .collect::<Vec<_>>()
+    };
+    // The second attempt can only come once the first is abandoned. The rest
+    // of the tick hangs for one more write timeout in between (its
+    // `CronObserve` write), so a healthy leader retries after about two;
+    // the bound leaves room for a loaded runner.
+    let bound = write_timeout * 10;
+    let started = tokio::time::Instant::now();
+    while attempts().len() < 2 {
+        let seen = attempts().len();
+        assert!(
+            started.elapsed() < bound,
+            "{} (waited {bound:?})",
+            if seen == 0 {
+                "the leader never attempted the settlement write"
+            } else {
+                "the leader never retried its hung settlement write: the stall wedged settlement"
+            }
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let attempts = attempts();
+    assert!(
+        attempts[1] - attempts[0] >= write_timeout,
+        "the leader gave up on the settlement write before its write timeout: {:?}",
+        attempts[1] - attempts[0]
+    );
+    if failed {
+        assert!(
+            !council
+                .hung_writes()
+                .iter()
+                .any(|(_, request)| is_commit(request)),
+            "a failed hook must never attempt app publication"
+        );
+    }
+
+    let after = council.desired_state().await;
+    assert_eq!(after.apps, before.apps, "the app gate opened");
+    assert_eq!(
+        after.task_arrays, before.task_arrays,
+        "a stalled settlement changed the durable intent"
+    );
+    assert!(
+        commands.try_recv().is_err(),
+        "an agent was told to act while settlement was stalled"
+    );
+    council.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn hung_common_commit_is_bounded_and_preserves_the_exact_successful_hook_and_app_gate() {
+    assert_stalled_settlement_is_bounded(StalledSettlement::Commit).await;
+}
+#[tokio::test]
+async fn hung_failed_hook_settlement_is_bounded_and_preserves_the_exact_failure_and_app_gate() {
+    assert_stalled_settlement_is_bounded(StalledSettlement::FailedHook).await;
+}
+
+/// Commit `request` the way the planner does, against the log position read
+/// just before it. The router's task-array loop commits its cron clock on
+/// its own timer, and an entry landing in between makes the state machine
+/// refuse the plan with "admission revision changed" (#735, #1331), so the
+/// fixture plans again, as `tests/suite/admission_fixture.rs` does. Every
+/// other response is returned unchanged.
 async fn write_admission_fixture(
     council: &crate::council::CouncilNode,
-    mut request: crate::council::RaftRequest,
+    request: crate::council::RaftRequest,
 ) -> Result<crate::council::CouncilResponse, crate::council::CouncilError> {
-    let previous = council.desired_state().await.last_applied_log;
-    if let crate::council::RaftRequest::SchedulingDecision(decision) = &request {
-        request = crate::council::RaftRequest::SchedulingDecisions {
-            expected_log_id: previous,
-            decisions: vec![decision.clone()],
+    const MAX_PLANS: usize = 8;
+    let mut plans = 0;
+    loop {
+        plans += 1;
+        let previous = council.desired_state().await.last_applied_log;
+        let planned = match request.clone() {
+            crate::council::RaftRequest::SchedulingDecision(decision) => {
+                crate::council::RaftRequest::SchedulingDecisions {
+                    expected_log_id: previous,
+                    decisions: vec![decision],
+                }
+            }
+            other => other,
+        };
+        let response = council.write(planned).await?;
+        match &response {
+            crate::council::CouncilResponse::Refused { reason }
+                if reason == "admission revision changed" && plans < MAX_PLANS =>
+            {
+                continue;
+            }
+            _ => return Ok(response),
         }
     }
-    council.write(request).await
 }
 
 #[tokio::test]

@@ -20,6 +20,9 @@
 /* ---------- Constants --------------------------------------------------- */
 
 #define MAX_BACKENDS        32
+/* onion_connect bounds a backend index by masking it with MAX_BACKENDS - 1. */
+_Static_assert((MAX_BACKENDS & (MAX_BACKENDS - 1)) == 0,
+               "MAX_BACKENDS must be a power of two");
 #define VIP_PREFIX          0x7F800000  /* 127.128.0.0 */
 #define VIP_MASK            0xFFFF0000  /* /16 */
 #define FIREWALL_DENY       0

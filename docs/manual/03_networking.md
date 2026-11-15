@@ -9,7 +9,8 @@ a healthy backend, wherever it runs. Services are TCP-only. The hook rewrites
 backend, and published host ports are DNAT'd for TCP alone.
 
 ```sh
-relish resolve web        # VIP and healthy backends for an app
+relish resolve web                    # VIP and healthy backends for an app
+relish resolve web --namespace shop   # needed when two namespaces both run a web
 ```
 
 With rootful runc on Linux you can also enable the `.internal` DNS zone, and
@@ -87,6 +88,9 @@ the node always could.
 Egress is open unless an app lists what it may reach. Every entry needs a port:
 
 ```toml
+[app.api]
+image = "ghcr.io/example/api:1.4.2"
+
 [app.api.egress]
 allow = ["api.stripe.com:443", "10.0.0.0/8:5432", "[2001:db8::1]:443"]
 ```
@@ -99,6 +103,12 @@ and Bun refuses to deploy an app with one anywhere else rather than run it
 unguarded. `allow_franchise` (cross-cluster egress) parses, but `relish apply` refuses it.
 Jobs take the same `[job.NAME.egress]` and `[job.NAME.firewall]` tables (see
 [Batch jobs](14_batch-jobs.md)).
+
+Two examples show these on a cluster with rootful runc and eBPF (the
+quickstart's VMs have both): `examples/phase-1/container-allow-from.toml` opens
+one path from `shop` into `storage` and shows a third namespace refused, and
+`examples/phase-1/container-egress.toml` is a job that resolves and reaches the
+one host its allowlist names and is refused everywhere else.
 
 ## Ingress
 
@@ -128,6 +138,7 @@ relish routes             # the live routing table
 Omitting `tls` makes the route deliberately plain HTTP. With `tls` set, plain
 HTTP redirects to HTTPS. `cluster` serves certificates signed by the cluster's
 own ingress CA, which renew themselves; your clients need to trust that CA.
+`examples/phase-1/container-tls-ingress.toml` serves podinfo this way.
 `explicit` uses the `tls_cert` and `tls_key` PEM files from this node's
 `[ingress]` section, reloaded when they change; Bun rejects a half-configured
 pair. There's no ACME: `relish apply` and `relish lint` refuse `auto` and

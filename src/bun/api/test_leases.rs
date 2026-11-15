@@ -101,7 +101,7 @@ pub(super) async fn test_lease_create_handler(
         }
     }
     if let Some(council) = &state.council
-        && !council.is_leader().await
+        && !crate::bun::leadership::leads(council).await
     {
         let created = forward_test_lease_request(
             &state,
@@ -305,7 +305,7 @@ pub(super) async fn test_lease_renew_handler(
         Err(response) => return response,
     };
     if let Some(council) = &state.council
-        && !council.is_leader().await
+        && !crate::bun::leadership::leads(council).await
     {
         return forward_test_lease_request(
             &state,
@@ -375,7 +375,7 @@ pub(super) async fn test_lease_release_handler(
         return response;
     }
     if let Some(council) = &state.council
-        && !council.is_leader().await
+        && !crate::bun::leadership::leads(council).await
     {
         return forward_test_lease_request::<()>(
             &state,

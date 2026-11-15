@@ -6,12 +6,17 @@ use super::{
     lima::{GuestFile, Lima},
     progress::{Progress, Stage, Step, Timings},
     provision,
+    report::{LaptopFacts, SetupReport},
     security::{self, Bootstrap},
     state::{ClusterSpec, NodePhase, NodeState, Operation},
 };
 use crate::{
     bun::agent::CouncilStatus,
-    relish::{client::BunClient, local_context::LocalContext},
+    relish::{
+        client::BunClient,
+        local_context::LocalContext,
+        output::{self, OutputFormat},
+    },
     upgrade::BinaryVersion,
 };
 use anyhow::{Context, Result, bail};
@@ -39,6 +44,23 @@ pub struct Options {
     pub release_mirror: Option<String>,
     /// Print every step's timing, not just the per-stage summary.
     pub timings: bool,
+    /// Lines for people, or the [`SetupReport`] as JSON or YAML with the
+    /// progress on standard error.
+    pub output: OutputFormat,
+}
+
+/// The API endpoint in the saved context, when it can be read.
+pub(super) async fn saved_endpoint(path: &Path) -> Option<String> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        LocalContext::load(&path)
+            .ok()
+            .flatten()
+            .map(|context| context.endpoint)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// How long a download attempt may go without receiving a byte before it is
@@ -50,6 +72,8 @@ const DOWNLOAD_STALL: Duration = Duration::from_secs(30);
 const DOWNLOAD_DEADLINE: Duration = Duration::from_secs(30 * 60);
 
 /// Budget for everything after the downloads: VMs, nodes, quorum and demo.
+/// A laptop's VMs run its own architecture.
+const ARCH: &str = std::env::consts::ARCH;
 const CLUSTER_DEADLINE: Duration = Duration::from_secs(300);
 
 /// Refuse to fetch release binaries for a development build.
@@ -59,7 +83,7 @@ const CLUSTER_DEADLINE: Duration = Duration::from_secs(300);
 /// published one speaks older formats, so there is nothing right to
 /// download: such a build has to bring its own nodes. A pre-release from an
 /// explicit mirror (a release candidate) is fine.
-fn check_release_source(
+pub(super) fn check_release_source(
     version: &BinaryVersion,
     development_binaries: bool,
     release_mirror: bool,
@@ -101,33 +125,11 @@ pub async fn run(options: Options) -> Result<()> {
         api_port: options.api_port,
         ingress_port: options.ingress_port,
         registry_port: options.registry_port,
+        ssh: Vec::new(),
     };
-    let operation_root = root.clone();
-    let (mut operation, bootstrap, _setup_lock) =
-        tokio::task::spawn_blocking(move || -> Result<_> {
-            let operation = Operation::open(&operation_root, &spec)?;
-            let mut lock_options = std::fs::OpenOptions::new();
-            lock_options.read(true).write(true).create(true).truncate(false);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                lock_options.mode(0o600);
-            }
-            let setup_lock = crate::file_lock::FileLock::try_lock(
-                lock_options.open(operation_root.join("setup.lock"))?,
-            )
-            .context("another managed setup is using this state directory")?;
-            if LocalContext::load(&operation_root.join("context.json"))?
-                .is_some_and(|context| context.owner != operation.state.id)
-            {
-                bail!("another cluster owns the active context; use a separate RELIABURGER_HOME for a second cluster");
-            }
-            let bootstrap = security::prepare(&operation)?;
-            Ok((operation, bootstrap, setup_lock))
-        })
-        .await??;
+    let (mut operation, bootstrap, _setup_lock) = open_operation(&root, spec).await?;
     super::preflight::socket_paths(&root, operation.state.nodes.iter().map(|node| &node.name))?;
-    let progress = Progress::stdout();
+    let progress = Progress::for_output(options.output);
     let result = setup(
         &root,
         &mut operation,
@@ -138,9 +140,12 @@ pub async fn run(options: Options) -> Result<()> {
     )
     .await;
     let timings = progress.finish().await;
-    println!("{}", timings.summary());
+    output::progress(options.output, timings.summary());
     if options.timings {
-        println!("every step (duration, start offset):\n{}", timings.table());
+        output::progress(
+            options.output,
+            format!("every step (duration, start offset):\n{}", timings.table()),
+        );
     }
     let report = TimingsReport {
         schema: 1,
@@ -155,27 +160,26 @@ pub async fn run(options: Options) -> Result<()> {
     let timings_path = operation.directory.join("timings.json");
     // Timings are a diagnostic; failing to save them mustn't fail setup.
     match save_timings(&timings_path, &report).await {
-        Ok(()) => println!("timings saved to {}", timings_path.display()),
+        Ok(()) => output::progress(
+            options.output,
+            format!("timings saved to {}", timings_path.display()),
+        ),
         Err(error) => eprintln!("could not save timings: {error:#}"),
     }
     match result {
         Ok(()) => {
-            println!(
-                "cluster {} ready in {:.1}s",
-                operation.state.spec.name, timings.total_seconds
-            );
-            println!(
-                "  app: http://localhost:{}",
-                operation.state.spec.ingress_port
-            );
+            let context = root.join("context.json");
             // Straight after install.sh, `relish` may not be on PATH yet.
             let relish = crate::relish::install::invocation();
-            println!("  next: {relish} manual tour   (the five-minute tour of this cluster)");
-            println!("  or: {relish} status; {relish} logs hello; {relish} dashboard");
-            println!(
-                "  lifecycle: {relish} local status|stop|start|destroy --name {}",
-                operation.state.spec.name
-            );
+            let report = SetupReport::laptop(LaptopFacts {
+                operation: &operation,
+                timings: &timings,
+                api: saved_endpoint(&context).await,
+                context,
+                timings_file: timings_path,
+                relish: &relish,
+            });
+            output::print_output(&report, options.output)?;
             Ok(())
         }
         Err(error) => Err(error.context(format!(
@@ -183,6 +187,37 @@ pub async fn run(options: Options) -> Result<()> {
             operation.directory.display()
         ))),
     }
+}
+
+/// Lock an operation, refuse another cluster's context, and prepare credentials
+/// once. The returned lock keeps a second setup out of this state directory.
+pub(super) async fn open_operation(
+    root: &Path,
+    spec: ClusterSpec,
+) -> Result<(Operation, Bootstrap, crate::file_lock::FileLock)> {
+    let operation_root = root.to_owned();
+    tokio::task::spawn_blocking(move || -> Result<_> {
+        let operation = Operation::open(&operation_root, &spec)?;
+        let mut lock_options = std::fs::OpenOptions::new();
+        lock_options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            lock_options.mode(0o600);
+        }
+        let setup_lock = crate::file_lock::FileLock::try_lock(
+            lock_options.open(operation_root.join("setup.lock"))?,
+        )
+        .context("another managed setup is using this state directory")?;
+        if LocalContext::load(&operation_root.join("context.json"))?
+            .is_some_and(|context| context.owner != operation.state.id)
+        {
+            bail!("another cluster owns the active context; use a separate RELIABURGER_HOME for a second cluster");
+        }
+        let bootstrap = security::prepare(&operation)?;
+        Ok((operation, bootstrap, setup_lock))
+    })
+    .await?
 }
 
 /// What `timings.json` in the cluster directory holds after every run.
@@ -280,10 +315,13 @@ async fn prepare_artifacts(
         let bun = progress.step(Stage::Download, "download bun");
         let relish = progress.step(Stage::Download, "download relish");
         tokio::try_join!(
-            async { bun.record(artifacts::binary(&cache, version, "bun", downloader, &bun).await) },
             async {
-                relish
-                    .record(artifacts::binary(&cache, version, "relish", downloader, &relish).await)
+                bun.record(artifacts::binary(&cache, version, "bun", ARCH, downloader, &bun).await)
+            },
+            async {
+                relish.record(
+                    artifacts::binary(&cache, version, "relish", ARCH, downloader, &relish).await,
+                )
             }
         )
     };
@@ -444,10 +482,10 @@ async fn build_cluster(
     quorum.record(wait_for_quorum(&client, &names).await)?;
     let demo_step = progress.step(Stage::Verify, "run hello through ingress");
     let result = async {
-        let demo = demo_config();
+        let demo = demo_config(spec.ingress_port, "localhost");
         tokio::fs::write(operation.directory.join("hello.toml"), &demo).await?;
         client.apply(&crate::config::Config::parse(&demo)?).await?;
-        probe_demo(spec.ingress_port).await
+        probe_demo(spec.ingress_port, "localhost").await
     }
     .await;
     demo_step.record(result)?;
@@ -482,16 +520,16 @@ struct NodeSetup<'a> {
 }
 
 /// Host files installed on every node.
-struct NodeSources<'a> {
-    bun: &'a Path,
-    relish: &'a Path,
-    service: &'a Path,
+pub(super) struct NodeSources<'a> {
+    pub(super) bun: &'a Path,
+    pub(super) relish: &'a Path,
+    pub(super) service: &'a Path,
     /// The private bootstrap directory: master key and first identity.
-    security: &'a Path,
+    pub(super) security: &'a Path,
 }
 
 /// Save one node's checkpoint while other nodes configure concurrently.
-async fn checkpoint(
+pub(super) async fn checkpoint(
     operation: &tokio::sync::Mutex<&mut Operation>,
     index: usize,
     phase: NodePhase,
@@ -505,7 +543,11 @@ async fn checkpoint(
 /// The files a node needs, in install order. The first node also gets the
 /// cluster's bootstrap identity, with its commit marker last, just as the
 /// local identity store writes it.
-fn node_files(sources: &NodeSources<'_>, index: usize, config: PathBuf) -> Vec<GuestFile> {
+pub(super) fn node_files(
+    sources: &NodeSources<'_>,
+    index: usize,
+    config: PathBuf,
+) -> Vec<GuestFile> {
     let mut files = vec![
         GuestFile::executable(sources.bun.to_owned(), "/usr/local/bin/bun"),
         GuestFile::executable(sources.relish.to_owned(), "/usr/local/bin/relish"),
@@ -797,15 +839,22 @@ async fn record_boot(
     Ok(())
 }
 
+/// A full council of owned nodes: one member per machine, up to the council's
+/// cap of seven, every one of them a machine this setup owns, and an owned
+/// leader. Machines past the cap run without a seat.
 fn quorum_ready(names: &[String], council: &CouncilStatus) -> bool {
+    let seats = names
+        .len()
+        .min(crate::council::selection::CouncilSelectionConfig::default().max_council_size);
     council
         .leader
         .as_ref()
         .is_some_and(|leader| names.contains(leader))
-        && council.members.len() == names.len()
-        && names
+        && council.members.len() == seats
+        && council
+            .members
             .iter()
-            .all(|name| council.members.iter().any(|member| &member.name == name))
+            .all(|member| names.contains(&member.name))
 }
 
 pub(super) async fn wait_for_quorum(client: &BunClient, names: &[String]) -> Result<()> {
@@ -829,11 +878,17 @@ pub(super) async fn wait_for_quorum(client: &BunClient, names: &[String]) -> Res
     Ok(())
 }
 
-fn demo_config() -> String {
+/// The page `hello` serves: what a first visitor sees in the browser.
+const WELCOME_PAGE: &str = include_str!("welcome.html");
+/// The heading `probe_demo` looks for, so a page some other app served
+/// doesn't count as `hello` answering.
+const WELCOME_HEADING: &str = "<h1>Reliaburger is running</h1>";
+
+pub(super) fn demo_config(ingress_port: u16, host: &str) -> String {
     format!(
         r#"[app.hello]
 image = "{}"
-command = ["/bin/sh", "-c", "echo hello-started; mkdir -p /tmp/www; printf 'Reliaburger is running\\n' > /tmp/www/index.html; exec httpd -f -p 8080 -h /tmp/www"]
+command = ["/bin/sh", "-c", "echo hello-started; exec httpd -f -p 8080 -h /www"]
 port = 8080
 replicas = 1
 [app.hello.health]
@@ -842,34 +897,59 @@ interval = 1
 timeout = 1
 threshold_healthy = 1
 [app.hello.ingress]
-host = "localhost"
+host = "{}"
 [app.hello.env]
 PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+[[app.hello.config_file]]
+path = "/www/index.html"
+content = '''
+{}'''
 "#,
         crate::testkit::PINNED_TEST_WORKLOAD_IMAGE.replacen(
             "docker.io/library/",
             "public.ecr.aws/docker/library/",
             1
-        )
+        ),
+        host,
+        WELCOME_PAGE.replace("{{SEE_THE_BURGER}}", &see_the_burger(ingress_port, host))
     )
 }
 
-async fn probe_demo(port: u16) -> Result<()> {
-    let client = reqwest::Client::builder()
+/// The welcome page's pointer to the burger example. `burger.localhost`
+/// resolves only on the machine running the browser, which is the cluster
+/// on a laptop; on servers, `host` is a machine's address, and the burger is
+/// reached through its ingress with the burger's host name.
+fn see_the_burger(ingress_port: u16, host: &str) -> String {
+    if host == "localhost" {
+        return format!(
+            "open\n      <a href=\"http://burger.localhost:{ingress_port}\">burger.localhost:{ingress_port}</a>"
+        );
+    }
+    let address = match ingress_port {
+        80 => format!("http://{host}"),
+        port => format!("http://{host}:{port}"),
+    };
+    format!(
+        "ask any machine's ingress for it:\n      <code>curl -H 'Host: burger.localhost' {address}</code>"
+    )
+}
+
+pub(super) async fn probe_demo(port: u16, host: &str) -> Result<()> {
+    let client = crate::http_client::builder()
         .timeout(Duration::from_secs(3))
         .build()?;
     tokio::time::timeout(Duration::from_secs(45), async {
         loop {
             if let Ok(response) = client
                 .get(format!("http://127.0.0.1:{port}/"))
-                .header("Host", "localhost")
+                .header("Host", host)
                 .send()
                 .await
                 && response.status().is_success()
                 && response
                     .text()
                     .await
-                    .is_ok_and(|body| body.trim() == "Reliaburger is running")
+                    .is_ok_and(|body| body.contains(WELCOME_HEADING))
             {
                 return;
             }
@@ -923,6 +1003,38 @@ mod tests {
         assert!(quorum_ready(&names, &council));
         council.leader = Some("foreign".into());
         assert!(!quorum_ready(&names, &council));
+    }
+
+    /// The council caps at seven members, so an eight-machine setup waited
+    /// for an eighth seat that never comes and gave up after 45 s, with the
+    /// cluster healthy. Seven owned members are a full council; a foreign
+    /// one, or fewer than seven, still aren't.
+    #[test]
+    fn readiness_of_more_machines_than_the_council_cap_wants_a_full_council() {
+        let names: Vec<String> = (1..=8).map(|index| format!("node-{index}")).collect();
+        let member = |name: &str| CouncilMemberInfo {
+            raft_id: 0,
+            name: name.into(),
+            address: "192.168.104.1:9444".into(),
+            voter: true,
+        };
+        let mut council = CouncilStatus {
+            leader: Some("node-1".into()),
+            members: names
+                .iter()
+                .filter(|name| *name != "node-3")
+                .map(|name| member(name))
+                .collect(),
+            ..Default::default()
+        };
+        assert!(quorum_ready(&names, &council));
+        council.members.pop();
+        assert!(!quorum_ready(&names, &council), "six of seven seats");
+        council.members.push(member("foreign"));
+        assert!(
+            !quorum_ready(&names, &council),
+            "a member setup doesn't own"
+        );
     }
 
     #[test]
@@ -1116,7 +1228,7 @@ esac
 
     #[test]
     fn demo_is_a_pinned_container_with_health_and_browser_ingress() {
-        let config = crate::config::Config::parse(&demo_config()).unwrap();
+        let config = crate::config::Config::parse(&demo_config(18080, "localhost")).unwrap();
         let app = &config.app["hello"];
         assert!(
             app.image
@@ -1134,7 +1246,54 @@ esac
     /// parses can still stop the quickstart at its last step.
     #[test]
     fn demo_passes_the_validation_the_api_applies() {
-        let config = crate::config::Config::parse(&demo_config()).unwrap();
+        let config = crate::config::Config::parse(&demo_config(18080, "localhost")).unwrap();
         config.validate_intrinsic().unwrap();
+    }
+
+    #[test]
+    fn hello_serves_the_welcome_page_from_a_config_file() {
+        let config = crate::config::Config::parse(&demo_config(18080, "localhost")).unwrap();
+        let app = &config.app["hello"];
+        assert!(app.command[2].contains("-h /www"));
+        let [page] = app.config_file.as_slice() else {
+            panic!("hello needs exactly one config file");
+        };
+        assert_eq!(page.path, std::path::Path::new("/www/index.html"));
+        assert!(page.content.as_ref().unwrap().contains(WELCOME_HEADING));
+    }
+
+    #[test]
+    fn the_welcome_page_links_the_burger_on_this_clusters_ingress_port() {
+        let demo = demo_config(28080, "localhost");
+        assert!(demo.contains("http://burger.localhost:28080"));
+        assert!(!demo.contains("INGRESS_PORT"));
+        assert!(!demo.contains("{{"));
+    }
+
+    /// `burger.localhost` only resolves on the machine running the browser,
+    /// so on a cluster of servers the page shows how to reach the burger
+    /// through a machine's address instead of a link that can't work.
+    #[test]
+    fn the_welcome_page_on_servers_reaches_the_burger_through_a_machine() {
+        let demo = demo_config(80, "10.0.0.1");
+        assert!(
+            demo.contains("curl -H 'Host: burger.localhost' http://10.0.0.1"),
+            "{demo}"
+        );
+        assert!(!demo.contains("href=\"http://burger.localhost"));
+        assert!(!demo.contains("{{"));
+        crate::config::Config::parse(&demo).unwrap();
+    }
+
+    /// The page may link out, but it has to render whole on a laptop with no
+    /// network, so nothing on it loads from anywhere else.
+    #[test]
+    fn the_welcome_page_loads_nothing_from_elsewhere() {
+        for external in ["src=", "<link", "<script", "url(", "@import"] {
+            assert!(
+                !WELCOME_PAGE.contains(external),
+                "the welcome page has {external:?}"
+            );
+        }
     }
 }

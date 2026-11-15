@@ -1,0 +1,29 @@
+# A GitOps repository, as Lettuce reads it (process runtime).
+#
+# Copy this directory into a Git repository and point the cluster at it with
+# a [gitops] section (examples/node/gitops.toml). The leader merges every
+# .toml file under the watched path, the way `relish compile` does:
+#
+#   _defaults.toml       fills in fields the apps below leave unset
+#   shop/storefront.toml app `storefront` in namespace `shop`
+#   ops/status-page.toml app `status-page` in namespace `ops`
+#
+# Each subdirectory's name is the namespace of the apps inside it. Check what
+# the cluster will get before you push:
+#
+#   relish compile examples/gitops/repository
+#
+# scripts/demo/gitops.sh pushes this tree to a file:// repository, turns
+# GitOps on for a one-node cluster, shows an app applied by hand surviving
+# every sync, and deletes `storefront` from the repository to show GitOps
+# deleting it from the cluster.
+#
+# The apps run testapp as host `exec` workloads, so start Bun from the
+# repository root with the process runtime and a node config that allows
+# target/debug/testapp (examples/node/process-runtime.toml does).
+
+[env]
+LOG_LEVEL = "info"
+
+[deploy]
+health_timeout = "30s"

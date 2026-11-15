@@ -3,23 +3,34 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Reliaburger is a container orchestrator written in Rust. One node agent, one CLI, and the source, design decisions and book on GitHub.">
+  <meta name="description" content="The container platform, served ready: app scheduling, batch jobs, metrics, logs, service discovery, ingress, mTLS, a Docker registry, GitOps and chaos testing in one Rust agent and one CLI.">
   <meta name="theme-color" content="#181b19">
   <title>Reliaburger — a container orchestrator in Rust</title>
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='4' fill='%23181b19'/%3E%3Ctext x='16' y='23' text-anchor='middle' font-family='monospace' font-weight='bold' font-size='23' fill='%23f49463'%3Er%3C/text%3E%3C/svg%3E">
   <link rel="stylesheet" href="./style.css">
+  <link rel="alternate" type="text/markdown" href="index.md">
 </head>
 <body>
   <a class="skip" href="#main">Skip to content</a>
   <div class="page">
+    <!-- The first thing an agent reading this page meets: where its own page is.
+         tests/suite/website.rs checks it links /agents, its Markdown and llms.txt. -->
+    <aside class="agent-banner" aria-label="For AI agents">
+      <strong>Are you an AI agent?</strong>
+      <a href="agents">Start here</a>
+      <span>with the page written for you, also <a href="agents.md">as Markdown</a>, and the manual’s <a href="llms.txt">llms.txt</a>.</span>
+    </aside>
     <header class="masthead">
       <a class="wordmark" href="./" aria-label="Reliaburger home"><span class="mark" aria-hidden="true">r/</span>reliaburger</a>
       <nav aria-label="Main navigation">
         <a href="#install">Install</a>
+        <a href="features">What’s ready?</a>
         <a href="#tour">Try it</a>
-        <a href="#job-throughput">Jobs</a>
-        <a href="#start">Build it</a>
+        <a href="#job-throughput">Batch jobs</a>
+        <a href="#release-testing">Testing</a>
         <a href="#docs">Read the docs</a>
+        <a href="#compare">Compare</a>
+        <a href="#start">Build it</a>
         <a href="https://github.com/reliaburger/reliaburger">GitHub <span aria-hidden="true">↗</span></a>
       </nav>
     </header>
@@ -27,15 +38,18 @@
     <main id="main">
       <section id="intro" class="intro" aria-labelledby="title">
         <div class="intro-copy">
-          <div class="eyebrow">RUST · APACHE 2.0 · 0.2.0 PROTOTYPE</div>
-          <h1 id="title">One agent, one CLI.<br>A container platform with nothing to assemble.</h1>
-          <p class="lede">Kubernetes gave us container orchestration, and gave every team an accidental
-            platform engineering department. Reliaburger compiles the platform into one Rust agent:
-            scheduling, mTLS, ingress, a registry, metrics, logs, GitOps, jobs and chaos testing.
-            It’s a prototype. Try it on a laptop cluster, on macOS or on Linux with KVM; five
-            minutes from install to cluster is the target.</p>
+          <div class="eyebrow">RUST · APACHE 2.0 · 0.2.8</div>
+          <h1 id="title">The container platform,<br>served ready.</h1>
+          <p class="headline-agents">Built for humans and their agents.</p>
+          <p class="lede">Kubernetes hands you the ingredients. Reliaburger hands you the burger:
+            app scheduling, batch jobs, metrics, logs, service discovery, ingress, mTLS,
+            a Docker registry, GitOps and chaos testing, in one Rust agent and one CLI.
+            And that CLI speaks to your AI agent too.</p>
           <div class="intro-links">
-            <a class="primary-link" href="#install">Install 0.2.0 <span aria-hidden="true">↓</span></a>
+            <a class="primary-link" href="#install">Get a working cluster in under 5 minutes <span aria-hidden="true">↓</span></a>
+            <a href="#debug">Debug it with your agent <span aria-hidden="true">↓</span></a>
+          </div>
+          <div class="intro-reading">
             <a href="https://github.com/reliaburger/reliaburger">Read the source <span aria-hidden="true">↗</span></a>
             <span class="link-pair"><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/whitepaper.md">Read the whitepaper</a>
               <a class="pdf-link" href="https://github.com/reliaburger/reliaburger/releases/latest/download/reliaburger-whitepaper.pdf" aria-label="The whitepaper as a PDF">PDF</a></span>
@@ -55,91 +69,516 @@
         </figure>
       </section>
 
-      <section id="install" class="section install" aria-labelledby="install-title">
+      <!-- Why Reliaburger asks to be trusted for its scrutiny rather than its popularity.
+           Every number here links the page it comes from; the whitepaper's §1 and §2 say
+           the same with their sources, and what isn't built yet says so. -->
+      <section id="scrutiny" class="section" aria-labelledby="scrutiny-title">
         <div class="section-heading">
           <span class="section-number" aria-hidden="true">01 /</span>
-          <h2 id="install-title">Install it <a class="permalink" href="#install" aria-label="Link to the install section">#</a></h2>
+          <h2 id="scrutiny-title">Trust it because you can check it
+            <a class="permalink" href="#scrutiny" aria-label="Link to why you can check it">#</a></h2>
         </div>
-        <div class="install-grid">
-          <div class="terminal">
-            <div class="terminal-heading">INSTALL <span>sh</span></div>
-            <pre><code>curl -fsSL https://reliaburger.com/install.sh | sh</code></pre>
-          </div>
-          <div class="install-copy">
-            <p>One line installs <code>relish</code>, then builds a three-node cluster in Linux
-              VMs on your laptop, running real containers. It checks every download against a
-              pinned digest or the release’s signing key.</p>
-            <p>You’ll need macOS, or Linux with QEMU and KVM, plus about 8 GiB of free memory
-              and 15 GiB of disk. No Rust, no checkout.</p>
-            <p class="install-links"><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/quickstart.md">One node, CLI only, cleanup</a>
-              · <a href="install.sh">Read the bootstrap script</a>
-              · <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.2.0">Release notes <span aria-hidden="true">↗</span></a></p>
-          </div>
+        <div class="tour">
+          <p class="tour-note">We used to trust infrastructure because lots of people ran it. More
+            users meant more eyes, and more eyes meant fewer bugs. Then Heartbleed sat in OpenSSL
+            for <a href="https://heartbleed.com/">over two years</a>, and xz was saved by
+            <a href="https://www.openwall.com/lists/oss-security/2024/03/29/4">one engineer
+            curious about slow ssh logins</a>.</p>
+          <p><strong>Finding bugs is cheap now, and the CVE count shows it.</strong> January to
+            October 2026 brought 92,319 CVEs, against 41,213 in the same months of 2025, by
+            <a href="https://runtimewire.com/article/nvd-recorded-2-24-times-as-many-cves-from-january-through-october-as-in-the-same">RuntimeWire’s
+            count of NVD</a>. The Linux kernel published 8,311 by 7 November, against 5,683 in all
+            of 2025 (<a href="https://linuxcvetracker.com/cve-statistics/2026/">Linux CVE Tracker</a>).
+            Not all of that is AI, but the AI-found part is growing fast: one OpenAI run built
+            working root exploits for 948 distinct kernel bugs for about $1.2 million
+            (<a href="https://openai.com/index/a-thousand-fewer-paths-to-root/">OpenAI</a>,
+            <a href="https://www.securityweek.com/ai-agents-got-root-on-linux-via-948-kernel-flaws-in-openai-research/">SecurityWeek</a>).
+            Popular code gets searched hardest, by everyone. What matters now is how fast a fix
+            reaches every node, whether anyone can check the code, and how much of it there is.</p>
+          <div class="throughput-comparison" role="region" aria-label="Where each part of the answer stands" tabindex="0">
+          <table><caption>Reliaburger’s answer, and where each part stands on 10 November 2026</caption>
+            <thead><tr><th scope="col">The answer</th><th scope="col">What exists</th><th scope="col">What doesn’t yet</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">One thing to upgrade</th><td>Not Kubernetes, etcd, a CNI, an
+                ingress controller, cert-manager, Prometheus, Grafana, a log stack, Argo CD and a
+                registry, each on its own release cycle, but one binary. <code>relish upgrade start</code> rolls it
+                across the cluster, signed, with automatic rollback, and we shipped sixteen
+                releases in <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md#releases-after-010">45 days</a>.</td>
+                <td>The OS patches separately until 0.3.0’s netbooted
+                <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md#releases-after-010">appliance image</a>, which is planned,
+                not shipped. A person starts every upgrade, and before 1.0 a format change needs a
+                <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#compatibility-before-100">fresh cluster</a>.</td></tr>
+              <tr><th scope="row">Continuously scrutinised</th><td>Apache 2.0, and every
+                release <code>relish</code> carries its own source. Claude Code found and patched a
+                bug we planted in it in
+                <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-06-v0.2.7-exit-test.md">5 of 5 runs</a>. Fuzzing,
+                mutation tests and a dependency audit run on a schedule.</td>
+                <td>A scheduled LLM review of the whole code base is a design goal for
+                <a href="https://github.com/reliaburger/reliaburger/issues/1840">1.0</a>. Today LLM
+                reviews happen in audits someone starts.</td></tr>
+              <tr><th scope="row">Ten times less code</th><td>202,730 lines of Rust, against
+                2,134,280 lines of Go for the Kubernetes projects that cover the same features,
+                counted with the <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-10-loc-comparison.md">same tool
+                and rules</a>.</td>
+                <td>Lines aren’t bugs, and the Kubernetes side does more. Without Cilium and
+                Grafana it’s <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-10-loc-comparison.md#results">6.7
+                times</a>.</td></tr>
+              <tr><th scope="row">One advisory stream</th><td>Our issues, plus RustSec for our
+                crates. Kubernetes’s own feed alone has
+                <a href="https://kubernetes.io/docs/reference/issues-security/official-cve-feed/">95 CVEs</a>,
+                and etcd, containerd, runc, Helm and Argo CD each keep their own.</td>
+                <td>The crates bring their own advisories:
+                <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-26-dependency-exceptions.md">13 against one</a>
+                on 26 October 2026.</td></tr>
+            </tbody>
+          </table></div>
+          <p class="tour-links"><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/whitepaper.md#trust-from-scrutiny-not-popularity">The design goal, with every source</a>
+            · <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/whitepaper.md#21-self-upgrades">Self-upgrades</a>
+            · <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/release-log.md">The release log</a></p>
         </div>
       </section>
 
-      <!-- Release cards use the roadmap's release names (docs/roadmap.md); a date
-           appears only where the roadmap states one. tests/suite/website.rs checks both. -->
+      <!-- The architectural differences. Without script it's a plain list, every one
+           stacked; assets/why-carousel.js shows one at a time and adds the controls.
+           The drawings are decorative (the text says it all) and animate with CSS
+           only, so prefers-reduced-motion turns them into still frames.
+           tests/suite/website.rs checks the slides and that nothing here loads from elsewhere. -->
+      <section id="why" class="section why" aria-labelledby="why-title">
+        <div class="section-heading">
+          <span class="section-number" aria-hidden="true">02 /</span>
+          <h2 id="why-title">Built differently <a class="permalink" href="#why" aria-label="Link to how it's built differently">#</a></h2>
+        </div>
+        <div class="why-carousel" data-carousel>
+          <ol class="why-slides">
+            <li class="why-slide" id="why-ai-agents">
+              <svg class="why-art why-ask" viewBox="0 0 240 160" width="240" height="160" aria-hidden="true" focusable="false">
+                <rect x="8" y="22" width="126" height="116" rx="8" fill="#181b19"/>
+                <g fill="#555e57">
+                  <circle cx="20" cy="33" r="3"/><circle cx="30" cy="33" r="3"/><circle cx="40" cy="33" r="3"/>
+                </g>
+                <path d="M18 46 l5 4 l-5 4" fill="none" stroke="#f49463" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                <path d="M30 50 H98" stroke="#e8c08f" stroke-width="3" stroke-linecap="round"/>
+                <g stroke-width="3" stroke-linecap="round">
+                  <path class="why-type" style="animation-delay: 1.2s" d="M18 66 H24" stroke="#f4bf3a"/>
+                  <g class="why-type" style="animation-delay: 1.45s">
+                    <path d="M26 78 H48" stroke="#7fbf4a"/><path d="M56 78 H104" stroke="#e8c08f"/>
+                  </g>
+                  <g class="why-type" style="animation-delay: 1.7s">
+                    <path d="M26 90 H42" stroke="#7fbf4a"/><path d="M50 90 H118" stroke="#e8c08f"/>
+                  </g>
+                  <g class="why-type" style="animation-delay: 1.95s">
+                    <path d="M26 102 H54" stroke="#7fbf4a"/><path d="M62 102 H92" stroke="#e8c08f"/>
+                  </g>
+                  <g class="why-type" style="animation-delay: 2.2s">
+                    <path d="M26 114 H40" stroke="#7fbf4a"/><path d="M48 114 H110" stroke="#e8c08f"/>
+                  </g>
+                  <path class="why-type" style="animation-delay: 2.45s" d="M18 126 H24" stroke="#f4bf3a"/>
+                </g>
+                <path d="M140 70 H164" stroke="#c9d0c9" stroke-width="2" stroke-linecap="round" stroke-dasharray="2 5"/>
+                <circle class="why-sent" cx="164" cy="70" r="4.5" fill="#f4bf3a" stroke="#dc7f33" stroke-width="1.5"/>
+                <circle class="why-back" cx="140" cy="70" r="4.5" fill="#7fbf4a" stroke="#4f8a2b" stroke-width="1.5"/>
+                <path d="M196 30 V44" stroke="#555e57" stroke-width="2.5" stroke-linecap="round"/>
+                <path class="why-sparkle" d="M196 22 l1.6 4.4 l4.4 1.6 l-4.4 1.6 l-1.6 4.4 l-1.6 -4.4 l-4.4 -1.6 l4.4 -1.6 Z" fill="#f4bf3a"/>
+                <rect x="170" y="44" width="52" height="42" rx="11" fill="#555e57"/>
+                <rect x="177" y="52" width="38" height="24" rx="7" fill="#fafbf9"/>
+                <g class="why-blink" fill="#181b19">
+                  <circle cx="189" cy="64" r="3.5"/><circle cx="203" cy="64" r="3.5"/>
+                </g>
+                <rect x="176" y="90" width="40" height="28" rx="7" fill="#a3ada4"/>
+                <g fill="none" stroke="#dc7f33" stroke-width="3" stroke-linecap="round">
+                  <circle cx="182" cy="134" r="6"/>
+                  <path d="M188 134 H214 M208 134 V140 M214 134 V139"/>
+                </g>
+              </svg>
+              <div class="why-copy">
+                <h3 class="why-punchline">Native to AI agents from day one, not bolted on.</h3>
+                <p>JSON from every command a script can run was in the first design doc, and
+                  <code>relish agent</code> and <code>relish mcp</code> give your agent bounded
+                  answers, read-only MCP tools and the exact source its binary was built from. A
+                  new token is read-only unless you ask for more, the bug reports your agent
+                  drafts come out redacted, and Claude Code, holding a read-only token, passed
+                  <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-06-v0.2.7-exit-test.md">0.2.7’s
+                  exit test</a> in <a href="agents#measuring-an-agent-on-your-cluster">a gym
+                  for AI agents</a>.</p>
+              </div>
+            </li>
+            <li class="why-slide" id="why-one-agent">
+              <svg class="why-art why-assemble" viewBox="0 0 240 160" width="240" height="160" aria-hidden="true" focusable="false">
+                <g fill="none" stroke="#a3ada4" stroke-width="1.5" stroke-dasharray="4 3">
+                  <rect class="why-addon" x="4" y="14" width="56" height="26" rx="5"/>
+                  <rect class="why-addon" x="4" y="67" width="56" height="26" rx="5"/>
+                  <rect class="why-addon" x="4" y="120" width="56" height="26" rx="5"/>
+                  <rect class="why-addon" x="180" y="14" width="56" height="26" rx="5"/>
+                  <rect class="why-addon" x="180" y="67" width="56" height="26" rx="5"/>
+                  <rect class="why-addon" x="180" y="120" width="56" height="26" rx="5"/>
+                </g>
+                <g class="why-layer" style="--dx: 88px; --dy: 17px">
+                  <path d="M70 106 H170 V110 C170 120 162 126 152 126 H88 C78 126 70 120 70 110 Z" fill="#ee9a4d"/>
+                  <rect x="70" y="106" width="100" height="4" fill="#dc7f33"/>
+                </g>
+                <g class="why-layer" style="--dx: -88px; --dy: 37px">
+                  <rect x="66" y="89" width="108" height="15" rx="7.5" fill="#7b2b2d"/>
+                  <path d="M84 93 l10 6 M108 93 l10 6 M132 93 l10 6 M154 93 l8 5" stroke="#9b4a43" stroke-width="2" stroke-linecap="round"/>
+                </g>
+                <g class="why-layer" style="--dx: 88px; --dy: -6px">
+                  <path d="M70 81 H170 V87 H146 L140 94 L134 87 H70 Z" fill="#f4bf3a"/>
+                </g>
+                <g class="why-layer" style="--dx: -88px; --dy: 3.5px">
+                  <rect x="74" y="73" width="92" height="7" rx="3.5" fill="#d9472b"/>
+                </g>
+                <g class="why-layer" style="--dx: 88px; --dy: -42px">
+                  <path d="M64 68 q7 -6 14 0 t14 0 t14 0 t14 0 t14 0 t14 0 t14 0 t14 0 v4 H64 Z" fill="#7fbf4a"/>
+                </g>
+                <g class="why-layer" style="--dx: -88px; --dy: -17px">
+                  <path d="M70 62 C70 36 92 26 120 26 C148 26 170 36 170 62 Z" fill="#ee9a4d"/>
+                  <path d="M70 62 C70 58 72 56 76 56 H164 C168 56 170 58 170 62 Z" fill="#dc7f33"/>
+                  <g fill="#fbe7c4">
+                    <ellipse cx="100" cy="38" rx="3" ry="1.6" transform="rotate(-20 100 38)"/>
+                    <ellipse cx="120" cy="33" rx="3" ry="1.6"/>
+                    <ellipse cx="140" cy="39" rx="3" ry="1.6" transform="rotate(20 140 39)"/>
+                    <ellipse cx="88" cy="49" rx="3" ry="1.6" transform="rotate(-30 88 49)"/>
+                    <ellipse cx="111" cy="46" rx="3" ry="1.6" transform="rotate(10 111 46)"/>
+                    <ellipse cx="131" cy="48" rx="3" ry="1.6" transform="rotate(-10 131 48)"/>
+                    <ellipse cx="153" cy="49" rx="3" ry="1.6" transform="rotate(30 153 49)"/>
+                  </g>
+                </g>
+                <g fill="#f4bf3a">
+                  <path class="why-sparkle" d="M184 34 l1.6 4.4 l4.4 1.6 l-4.4 1.6 l-1.6 4.4 l-1.6 -4.4 l-4.4 -1.6 l4.4 -1.6 Z"/>
+                  <path class="why-sparkle why-sparkle-late" d="M56 96 l1.3 3.7 l3.7 1.3 l-3.7 1.3 l-1.3 3.7 l-1.3 -3.7 l-3.7 -1.3 l3.7 -1.3 Z"/>
+                </g>
+              </svg>
+              <div class="why-copy">
+                <h3 class="why-punchline">One agent instead of a dozen add-ons.</h3>
+                <p>App scheduling, batch jobs, metrics, logs, service discovery, ingress, PKI,
+                  a Docker registry, consensus, GitOps and fault injection are compiled into
+                  <code>bun</code>, the one agent every node runs. There’s no Prometheus, CoreDNS,
+                  ingress controller, etcd or Argo CD to install, upgrade and keep in step with
+                  each other.</p>
+              </div>
+            </li>
+            <li class="why-slide" id="why-council">
+              <svg class="why-art why-gossip" viewBox="0 0 240 160" width="240" height="160" aria-hidden="true" focusable="false">
+                <circle cx="120" cy="82" r="44" fill="#f6e6dc"/>
+                <g class="why-chatter" fill="none" stroke="#e0a82e" stroke-width="1.5" stroke-linecap="round">
+                  <path d="M28 30 L70 16 M170 16 L212 30 M226 80 L212 130 M170 144 L70 144 M28 130 L14 80 M70 16 L106 50 M226 80 L160 98 M14 80 L80 98"/>
+                </g>
+                <g fill="none" stroke="#f4bf3a" stroke-width="2">
+                  <circle class="why-ripple" cx="28" cy="30" r="22"/>
+                  <circle class="why-ripple why-ripple-2" cx="226" cy="80" r="22"/>
+                  <circle class="why-ripple why-ripple-3" cx="70" cy="144" r="22"/>
+                </g>
+                <path d="M120 64 L98 99 L142 99 Z" fill="none" stroke="#7b2b2d" stroke-width="1.5" stroke-opacity=".45"/>
+                <g class="why-council">
+                  <rect x="103" y="58" width="34" height="14" rx="7" fill="#7b2b2d"/>
+                  <path d="M101 54 H139 V59 H127 L123 64 L119 59 H101 Z" fill="#f4bf3a"/>
+                  <rect x="81" y="92" width="34" height="14" rx="7" fill="#7b2b2d"/>
+                  <rect x="125" y="92" width="34" height="14" rx="7" fill="#7b2b2d"/>
+                </g>
+                <g fill="#ee9a4d">
+                  <circle cx="28" cy="30" r="8"/><circle cx="70" cy="16" r="8"/><circle cx="170" cy="16" r="8"/>
+                  <circle cx="212" cy="30" r="8"/><circle cx="226" cy="80" r="8"/><circle cx="212" cy="130" r="8"/>
+                  <circle cx="170" cy="144" r="8"/><circle cx="120" cy="146" r="8"/><circle cx="70" cy="144" r="8"/>
+                  <circle cx="28" cy="130" r="8"/><circle cx="14" cy="80" r="8"/>
+                </g>
+                <g fill="#fbe7c4">
+                  <ellipse cx="26" cy="27" rx="2.6" ry="1.5"/><ellipse cx="68" cy="13" rx="2.6" ry="1.5"/><ellipse cx="168" cy="13" rx="2.6" ry="1.5"/>
+                  <ellipse cx="210" cy="27" rx="2.6" ry="1.5"/><ellipse cx="224" cy="77" rx="2.6" ry="1.5"/><ellipse cx="210" cy="127" rx="2.6" ry="1.5"/>
+                  <ellipse cx="168" cy="141" rx="2.6" ry="1.5"/><ellipse cx="118" cy="143" rx="2.6" ry="1.5"/><ellipse cx="68" cy="141" rx="2.6" ry="1.5"/>
+                  <ellipse cx="26" cy="127" rx="2.6" ry="1.5"/><ellipse cx="12" cy="77" rx="2.6" ry="1.5"/>
+                </g>
+              </svg>
+              <div class="why-copy">
+                <h3 class="why-punchline">Seven voters at most. Everyone else gossips.</h3>
+                <p>A Raft council inside the agent holds the cluster’s state, and the cluster
+                  picks its voters from your ordinary nodes, never more than seven. Every node
+                  finds the others and notices failures through SWIM gossip, so a bigger cluster
+                  doesn’t mean a bigger quorum or a separate etcd to run.</p>
+              </div>
+            </li>
+            <li class="why-slide" id="why-kernel">
+              <svg class="why-art why-route" viewBox="0 0 240 160" width="240" height="160" aria-hidden="true" focusable="false">
+                <g fill="none" stroke="#c9d0c9" stroke-width="2" stroke-linecap="round">
+                  <path d="M58 80 H92 M127 70 L176 36 M127 90 L176 124"/>
+                  <path d="M132 80 H176" stroke-dasharray="2 5"/>
+                </g>
+                <rect x="14" y="60" width="44" height="40" rx="9" fill="#ee9a4d"/>
+                <rect x="14" y="88" width="44" height="12" rx="6" fill="#dc7f33"/>
+                <g fill="#fbe7c4">
+                  <ellipse cx="27" cy="70" rx="2.6" ry="1.5" transform="rotate(-20 27 70)"/>
+                  <ellipse cx="40" cy="67" rx="2.6" ry="1.5"/>
+                  <ellipse cx="47" cy="77" rx="2.6" ry="1.5" transform="rotate(25 47 77)"/>
+                </g>
+                <g class="why-onion">
+                  <circle cx="112" cy="80" r="20" fill="#f3e0ef" stroke="#8d3f86" stroke-width="4"/>
+                  <circle cx="112" cy="80" r="11" fill="none" stroke="#b46aa9" stroke-width="3"/>
+                  <circle cx="112" cy="80" r="3.5" fill="#8d3f86"/>
+                </g>
+                <rect x="176" y="28" width="48" height="16" rx="8" fill="#7b2b2d"/>
+                <g opacity=".35">
+                  <rect x="176" y="72" width="48" height="16" rx="8" fill="#7b2b2d"/>
+                </g>
+                <path d="M195 75 l10 10 M205 75 l-10 10" stroke="#a83b15" stroke-width="2.5" stroke-linecap="round"/>
+                <rect x="176" y="116" width="48" height="16" rx="8" fill="#7b2b2d"/>
+                <g fill="#f4bf3a" stroke="#dc7f33" stroke-width="1.5">
+                  <circle class="why-packet why-packet-up" cx="62" cy="80" r="4.5"/>
+                  <circle class="why-packet why-packet-down" cx="62" cy="80" r="4.5"/>
+                </g>
+              </svg>
+              <div class="why-copy">
+                <h3 class="why-punchline">Service discovery in the kernel, with no proxy in the path.</h3>
+                <p>Every app gets a stable virtual IP, and an eBPF hook on <code>connect()</code>
+                  sends each connection straight to a healthy backend before its first packet
+                  leaves. There’s no kube-proxy and no sidecar on the hop, and the same hook
+                  decides who may connect at all.</p>
+              </div>
+            </li>
+            <li class="why-slide" id="why-jobs">
+              <svg class="why-art why-grid" viewBox="0 0 240 160" width="240" height="160" aria-hidden="true" focusable="false">
+                <rect x="8" y="48" width="48" height="64" rx="6" fill="#fbe7c4" stroke="#dc7f33" stroke-width="2"/>
+                <rect x="18" y="60" width="28" height="10" rx="5" fill="#7b2b2d"/>
+                <path d="M18 82 H46 M18 92 H38 M18 102 H42" stroke="#dc7f33" stroke-width="2.5" stroke-linecap="round"/>
+                <path d="M60 74 l6 6 l-6 6" fill="none" stroke="#dc7f33" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+                <g fill="none" stroke="#d6ddd6" stroke-width="1.5">
+                  <rect x="136" y="22" width="30" height="26" rx="4"/><rect x="168" y="22" width="30" height="26" rx="4"/><rect x="200" y="22" width="30" height="26" rx="4"/>
+                  <rect x="72" y="52" width="30" height="26" rx="4"/><rect x="104" y="52" width="30" height="26" rx="4"/><rect x="136" y="52" width="30" height="26" rx="4"/><rect x="200" y="52" width="30" height="26" rx="4"/>
+                  <rect x="72" y="82" width="30" height="26" rx="4"/><rect x="104" y="82" width="30" height="26" rx="4"/><rect x="136" y="82" width="30" height="26" rx="4"/><rect x="200" y="82" width="30" height="26" rx="4"/>
+                  <rect x="72" y="112" width="30" height="26" rx="4"/><rect x="168" y="112" width="30" height="26" rx="4"/><rect x="200" y="112" width="30" height="26" rx="4"/>
+                </g>
+                <g fill="#ee9a4d">
+                  <rect x="72" y="22" width="62" height="26" rx="5"/>
+                  <rect x="168" y="52" width="30" height="56" rx="5"/>
+                  <rect x="104" y="112" width="62" height="26" rx="5"/>
+                </g>
+                <g fill="#fbe7c4">
+                  <ellipse cx="92" cy="31" rx="2.6" ry="1.5"/><ellipse cx="112" cy="38" rx="2.6" ry="1.5"/>
+                  <ellipse cx="180" cy="66" rx="2.6" ry="1.5"/><ellipse cx="186" cy="90" rx="2.6" ry="1.5"/>
+                  <ellipse cx="124" cy="121" rx="2.6" ry="1.5"/><ellipse cx="146" cy="128" rx="2.6" ry="1.5"/>
+                </g>
+                <g fill="#7b2b2d">
+                  <rect class="why-task" style="animation-delay: 0s" x="78" y="61" width="18" height="8" rx="4"/>
+                  <rect class="why-task" style="animation-delay: .2s" x="110" y="61" width="18" height="8" rx="4"/>
+                  <rect class="why-task" style="animation-delay: .4s" x="78" y="91" width="18" height="8" rx="4"/>
+                  <rect class="why-task" style="animation-delay: .6s" x="142" y="31" width="18" height="8" rx="4"/>
+                  <rect class="why-task" style="animation-delay: .8s" x="110" y="91" width="18" height="8" rx="4"/>
+                  <rect class="why-task" style="animation-delay: 1s" x="142" y="61" width="18" height="8" rx="4"/>
+                  <rect class="why-task" style="animation-delay: 1.2s" x="78" y="121" width="18" height="8" rx="4"/>
+                  <rect class="why-task" style="animation-delay: 1.4s" x="174" y="31" width="18" height="8" rx="4"/>
+                  <rect class="why-task" style="animation-delay: 1.6s" x="142" y="91" width="18" height="8" rx="4"/>
+                  <rect class="why-task" style="animation-delay: 1.8s" x="206" y="31" width="18" height="8" rx="4"/>
+                  <rect class="why-task" style="animation-delay: 2s" x="206" y="61" width="18" height="8" rx="4"/>
+                  <rect class="why-task" style="animation-delay: 2.2s" x="174" y="121" width="18" height="8" rx="4"/>
+                  <rect class="why-task" style="animation-delay: 2.4s" x="206" y="91" width="18" height="8" rx="4"/>
+                  <rect class="why-task" style="animation-delay: 2.6s" x="206" y="121" width="18" height="8" rx="4"/>
+                </g>
+              </svg>
+              <div class="why-copy">
+                <h3 class="why-punchline">A million tasks, stored as one.</h3>
+                <p>Batch jobs run beside your apps under the same CPU and memory admission, and a
+                  task array is stored as a template and a count, not a record per task. Each job
+                  picks its isolation: a fresh container, a shared container with a process per
+                  task, or an allowlisted host command.</p>
+              </div>
+            </li>
+            <li class="why-slide" id="why-chaos">
+              <svg class="why-art why-chaos" viewBox="0 0 240 160" width="240" height="160" aria-hidden="true" focusable="false">
+                <path d="M54 118 H154 V122 C154 132 146 138 136 138 H72 C62 138 54 132 54 122 Z" fill="#ee9a4d"/>
+                <rect x="54" y="118" width="100" height="4" fill="#dc7f33"/>
+                <g class="why-victim">
+                  <rect x="50" y="98" width="108" height="16" rx="8" fill="#7b2b2d"/>
+                  <path d="M68 102 l10 6 M92 102 l10 6 M116 102 l10 6 M138 102 l8 5" stroke="#9b4a43" stroke-width="2" stroke-linecap="round"/>
+                </g>
+                <path d="M54 90 H154 V96 H130 L124 103 L118 96 H54 Z" fill="#f4bf3a"/>
+                <path d="M48 86 q7 -6 14 0 t14 0 t14 0 t14 0 t14 0 t14 0 t14 0 t14 0 v4 H48 Z" fill="#7fbf4a"/>
+                <path d="M54 80 C54 54 76 44 104 44 C132 44 154 54 154 80 Z" fill="#ee9a4d"/>
+                <path d="M54 80 C54 76 56 74 60 74 H148 C152 74 154 76 154 80 Z" fill="#dc7f33"/>
+                <g fill="#fbe7c4">
+                  <ellipse cx="86" cy="57" rx="3" ry="1.6" transform="rotate(-20 86 57)"/>
+                  <ellipse cx="104" cy="52" rx="3" ry="1.6"/>
+                  <ellipse cx="123" cy="58" rx="3" ry="1.6" transform="rotate(20 123 58)"/>
+                  <ellipse cx="96" cy="67" rx="3" ry="1.6" transform="rotate(10 96 67)"/>
+                  <ellipse cx="116" cy="68" rx="3" ry="1.6" transform="rotate(-10 116 68)"/>
+                </g>
+                <path class="why-bolt" d="M190 12 L172 50 L184 50 L166 92 L202 40 L188 40 L202 12 Z" fill="#f4bf3a" stroke="#dc7f33" stroke-width="2" stroke-linejoin="round"/>
+                <g class="why-smoke" fill="none" stroke="#c3cbc4" stroke-width="3" stroke-linecap="round">
+                  <path d="M168 98 c-6 -6 6 -10 0 -16 c-6 -6 6 -10 0 -16"/>
+                  <path d="M180 104 c-5 -5 5 -9 0 -14"/>
+                </g>
+                <circle cx="206" cy="124" r="14" fill="#fafbf9" stroke="#d6ddd6" stroke-width="4"/>
+                <circle class="why-timer" cx="206" cy="124" r="14" fill="none" stroke="#7fbf4a" stroke-width="4" stroke-dasharray="88" transform="rotate(-90 206 124)"/>
+                <path d="M206 124 V116" stroke="#555e57" stroke-width="2" stroke-linecap="round"/>
+              </svg>
+              <div class="why-copy">
+                <h3 class="why-punchline">Chaos is a command, not an install.</h3>
+                <p><code>relish fault</code> adds latency, partitions, DNS failures, kills and CPU,
+                  memory or disk pressure from inside the agent, so there’s no chaos operator to
+                  deploy. Every fault ends on its own, and the cluster refuses one that would take
+                  out every replica or put the council’s quorum at risk.</p>
+              </div>
+            </li>
+            <li class="why-slide" id="why-recipe">
+              <svg class="why-art why-recipe" viewBox="0 0 240 160" width="240" height="160" aria-hidden="true" focusable="false">
+                <rect x="34" y="12" width="124" height="136" rx="8" fill="#fbe7c4" stroke="#dc7f33" stroke-width="2"/>
+                <rect x="48" y="24" width="58" height="11" rx="5.5" fill="#7b2b2d"/>
+                <g stroke-width="4" stroke-linecap="round">
+                  <path class="why-line" style="animation-delay: 0s" d="M48 52 H144"/>
+                  <path class="why-line" style="animation-delay: .6s" d="M48 66 H128"/>
+                  <path class="why-line" style="animation-delay: 1.2s" d="M48 80 H140"/>
+                  <path class="why-line" style="animation-delay: 1.8s" d="M48 94 H116"/>
+                  <path class="why-line" style="animation-delay: 2.4s" d="M48 108 H136"/>
+                  <path class="why-line" style="animation-delay: 3s" d="M48 122 H104"/>
+                </g>
+                <g class="why-lens">
+                  <circle cx="132" cy="56" r="17" fill="#fafbf9" fill-opacity=".55" stroke="#7b2b2d" stroke-width="4"/>
+                  <path d="M144 68 L160 84" stroke="#7b2b2d" stroke-width="7" stroke-linecap="round"/>
+                </g>
+                <g class="why-reply">
+                  <rect x="170" y="96" width="62" height="40" rx="8" fill="#181b19"/>
+                  <path d="M180 136 L176 146 L190 136 Z" fill="#181b19"/>
+                  <path d="M182 108 c-4 0 -4 2 -4 4 v2 c0 2 -2 2 -3 2 c1 0 3 0 3 2 v2 c0 2 0 4 4 4 M220 108 c4 0 4 2 4 4 v2 c0 2 2 2 3 2 c-1 0 -3 0 -3 2 v2 c0 2 0 4 -4 4" fill="none" stroke="#f49463" stroke-width="2" stroke-linecap="round"/>
+                  <path d="M190 112 H210 M190 120 H204" stroke="#7fbf4a" stroke-width="3" stroke-linecap="round"/>
+                </g>
+              </svg>
+              <div class="why-copy">
+                <h3 class="why-punchline">Your agent can read the recipe.</h3>
+                <p>New in 0.2.7, <code>relish agent</code> answers an AI agent
+                  in one line of JSON within a byte budget, and carries the manual and the exact
+                  source its binary was built from. Your agent reads how a finding is decided
+                  instead of guessing, and with a read-only token it can read the cluster and
+                  change nothing.</p>
+              </div>
+            </li>
+          </ol>
+        </div>
+      </section>
+
+      <section id="install" class="section install" aria-labelledby="install-title">
+        <div class="section-heading">
+          <span class="section-number" aria-hidden="true">03 /</span>
+          <h2 id="install-title">Install it <a class="permalink" href="#install" aria-label="Link to the install section">#</a></h2>
+        </div>
+        <!-- Two ways in, as radio buttons styled as tabs so they work without
+             a script (#1579). The first panel stays first in the markup:
+             tests/suite/website.rs checks the page leads with its install line. -->
+        <div class="install-tabs" role="radiogroup" aria-label="How to install">
+        <input class="install-tab-input" type="radio" name="install-way" id="install-tyres" checked>
+        <label class="install-tab" for="install-tyres">Kick the tyres</label>
+        <input class="install-tab-input" type="radio" name="install-way" id="install-agent">
+        <label class="install-tab" for="install-agent">With your agent</label>
+        <input class="install-tab-input" type="radio" name="install-way" id="install-homebrew">
+        <label class="install-tab" for="install-homebrew">Homebrew</label>
+        <div class="install-grid install-panel install-panel-tyres">
+          <div class="terminal">
+            <div class="terminal-heading">INSTALL <span>sh</span></div>
+            <pre><code>curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop</code></pre>
+          </div>
+          <div class="install-copy">
+            <p>One line installs <code>relish</code>, then builds a three-node cluster of Linux
+              VMs on your laptop, running real containers. Every download is checked against a
+              pinned digest or the release’s signing key. From 0.2.7, you can
+              check any release file yourself, too:
+              <code>gh attestation verify FILE --repo reliaburger/reliaburger</code>, with the flags in
+              <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#build-provenance-attestations">the release guide</a>.
+              Got Linux machines already? Swap
+              <code>--laptop</code> for <code>--install-only</code> to install just
+              <code>relish</code>, then follow the
+              <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/linux-servers.md">Linux servers guide</a>.</p>
+            <p>You’ll need a Mac with Apple silicon, or Linux with QEMU and KVM, plus about 8 GiB of
+              free memory and 15 GiB of disk. No Rust, no checkout.</p>
+            <p class="install-links"><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/quickstart.md">One node, CLI only, cleanup</a>
+              · <a href="install.sh">Read the bootstrap script</a>
+              · <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.2.8">Release notes <span aria-hidden="true">↗</span></a></p>
+          </div>
+        </div>
+        <div class="install-grid install-panel install-panel-agent">
+          <div class="terminal">
+            <div class="terminal-heading">PROMPT <span>your agent</span></div>
+            <pre><code data-agent-prompt>Set up a Reliaburger cluster for me. Start at https://reliaburger.com/agents.</code></pre>
+          </div>
+          <div class="install-copy">
+            <p>Paste that into Claude Code, Codex or any agent with a shell. The page it reads is
+              a playbook: ask you where the cluster should run (this computer, machines you
+              already have, or a cloud), check the provider’s current prices and free allowances,
+              and create nothing that costs money until you say yes. Then it installs
+              <code>relish</code>, builds the cluster, shows you around, and leaves a summary
+              with the way to remove it.</p>
+            <p>You still make the decisions; it does the typing. Give it a read-only token
+              afterwards, and it can help you run the cluster too.</p>
+            <p class="install-links"><a href="agents">Read the playbook</a>
+              · <a href="agents.md">As Markdown</a>
+              · <a href="agents#add-to-your-agent">Add Reliaburger to your agent</a></p>
+          </div>
+        </div>
+        <div class="install-grid install-panel install-panel-homebrew">
+          <div class="terminal">
+            <div class="terminal-heading">INSTALL <span>Homebrew</span></div>
+            <pre><code>brew install reliaburger/tap/relish
+relish setup --quickstart</code></pre>
+          </div>
+          <div class="install-copy">
+            <p>From 0.2.7, Homebrew installs <code>relish</code> on a Mac with Apple silicon or on
+              Linux, and <code>brew upgrade relish</code> keeps it current. The second line builds
+              the same laptop cluster as the one-line install. Got Linux machines already? Run
+              <code>relish setup --ssh user@host,user@host</code> instead.</p>
+            <p>Homebrew manages only the CLI. A cluster’s nodes still upgrade with
+              <code>relish upgrade</code>, and <code>relish uninstall</code> leaves the Homebrew
+              copy for <code>brew uninstall relish</code> to remove.</p>
+            <p class="install-links"><a href="https://github.com/reliaburger/homebrew-tap">The tap</a>
+              · <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/quickstart.md">One node, CLI only, cleanup</a></p>
+          </div>
+        </div>
+        </div>
+      </section>
+
+      <!-- Release cards, here and in #next, use the roadmap's release names (docs/roadmap.md);
+           a date appears only where the roadmap states one. tests/suite/website.rs checks both. -->
+      <aside class="status status-note" aria-label="Project status">
+        <strong>Where it stands</strong>
+        <p>Good enough for home labs and dev clusters. Not for production until 1.0.0,
+          expected in January 2027. Until then, an upgrade can mean starting a fresh cluster.
+          <a href="features">What’s ready, feature by feature</a>.</p>
+        <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md">Roadmap <span aria-hidden="true">↗</span></a>
+      </aside>
+
       <aside class="status" aria-label="Release status: what the installer fetches">
-        <strong>0.2.0: A million jobs</strong>
-        <p>The prototype you install today, released on 16 October 2026. One-off jobs, cron,
-          deployment hooks and task arrays (a template and a count, not a record per task)
-          share one durable lifecycle, packed onto nodes beside your apps. Each job picks
-          its isolation: a fresh container, a reused container or an allowlisted host
-          command. Signed binaries for Linux and macOS, and a one-line installer that
-          builds a laptop cluster from them. The documentation lists what 0.2.0 doesn’t
-          do yet.</p>
-        <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.2.0">Release notes <span aria-hidden="true">↗</span></a>
-      </aside>
-
-      <aside class="status" aria-label="Release status: next">
-        <strong>0.2.1: Cluster safety</strong>
-        <p>Next. The bug-fix release after 0.2.0: the data-loss and availability bugs
-          an audit found in rollouts, GitOps, council recovery, backups, the registry
-          and networking.</p>
-        <a href="https://github.com/reliaburger/reliaburger/milestone/16">Milestone <span aria-hidden="true">↗</span></a>
-      </aside>
-
-      <aside class="status" aria-label="Release status: planned">
-        <strong>0.3.0: Bare metal in an hour</strong>
-        <p>Planned. An appliance OS, netbooting and claiming machines over
-          the LAN, and signed A/B OS updates. The exit test: Dell Wyse
-          thin clients from power-on to a cluster.</p>
-        <a href="https://github.com/reliaburger/reliaburger/milestone/6">Milestone <span aria-hidden="true">↗</span></a>
-      </aside>
-
-      <aside class="status" aria-label="Release status: planned">
-        <strong>0.4.0: Full container migration</strong>
-        <p>Planned. Cordon, drain and uncordon, cold moves that carry volumes, and
-          checkpoint moves that keep memory while connections reconnect.</p>
-        <a href="https://github.com/reliaburger/reliaburger/milestone/7">Milestone <span aria-hidden="true">↗</span></a>
+        <strong>0.2.8: Agents you can trust, built faster</strong>
+        <p>What that line installs, released on 12 November 2026. An AI agent proposes a
+          change and a person or a policy approves it, with the blast radius and the undo
+          shown first; leases keep agents and people off each other’s apps;
+          <code>relish timeline</code> says what changed and why; <code>relish verify</code>
+          checks every node runs the published release; and <code>relish status</code> fits
+          the whole cluster on one screen. 0.2.8 changes the cluster formats, so a 0.2.7
+          cluster starts afresh. <code>relish agent</code> and <code>relish mcp</code> arrived
+          in 0.2.7.</p>
+        <a href="https://github.com/reliaburger/reliaburger/releases/tag/v0.2.8">Release notes <span aria-hidden="true">↗</span></a>
       </aside>
 
       <section id="tour" class="section" aria-labelledby="tour-title">
         <!-- The tour's commands carry data-tour. tests/suite/website.rs parses every one
              with the real relish CLI, so the page can't drift from the product. -->
         <div class="section-heading">
-          <span class="section-number" aria-hidden="true">02 /</span>
+          <span class="section-number" aria-hidden="true">04 /</span>
           <h2 id="tour-title">Try it in five minutes <a class="permalink" href="#tour" aria-label="Link to the tour">#</a></h2>
         </div>
         <div class="tour">
-          <p class="tour-note">Install, then put the cluster through its paces: a real
-            Kubernetes app, an app of your own, a batch of jobs, a network fault, a killed
-            replica and a lost node. Same prerequisites as the install line.</p>
+          <p class="tour-note">Put the cluster through its paces with a burger built from eight
+            apps: a batch of jobs, a layer cut off, a rolling deploy, a rollback, a scale-up, an
+            agent’s proposal and its undo, a house rule, a killed patty, a slow network and a
+            lost node.</p>
           <!-- The recording is always on show. assets/tour-player.js loads the vendored
                asciinema player (assets/asciinema/) and the recording from this site as the
                figure nears the viewport. -->
-          <figure id="tour-recording" class="recording" data-cast="./assets/tour.cast" data-poster="npt:2:31">
+          <figure id="tour-recording" class="recording" data-cast="./assets/tour.cast" data-chapters="markers" data-poster-chapter="Cook a batch">
             <div class="recording-screen"></div>
             <noscript><p class="recording-fallback">The recording plays with JavaScript. Without it,
               <a href="./assets/tour.cast">download the recording</a> and play it in a terminal with
               <code>asciinema play tour.cast</code>, or follow the steps below.</p></noscript>
             <figcaption>
+              <span class="recording-chapters" role="group" aria-label="Tour recording chapters" hidden></span>
               <span>The whole tour on a real laptop cluster, run by
                 <a href="https://github.com/reliaburger/reliaburger/blob/main/scripts/demo/tour.sh">scripts/demo/tour.sh</a>
-                against the published 0.2.0 install.
+                against the published 0.2.8 install.
                 Setup plays four times faster and idle time is cut to two seconds; every wait
-                says how long it really took.</span>
+                says how long it really took. Jump to a step with the buttons above, or the marks on the progress bar.</span>
               <span class="recording-speed" role="group" aria-label="Playback speed" hidden>speed
                 <button type="button" data-speed="1" aria-pressed="true">1×</button>
                 <button type="button" data-speed="2" aria-pressed="false">2×</button>
@@ -152,83 +591,143 @@
             <summary>Show the commands <span class="tour-commands-note">every step, with what to look for</span></summary>
             <ol class="tour-steps">
               <li>
-                <pre><code data-tour>curl -fsSL https://reliaburger.com/install.sh | sh</code></pre>
-                <p>Installs <code>relish</code>, then builds a three-node cluster in Linux VMs on your
-                  laptop. It checks every download against a pinned digest, and it’s the only step
-                  that takes minutes.</p>
-              </li>
-              <li>
-                <pre><code data-tour>relish apply -f https://reliaburger.com/demo/podinfo.yaml</code></pre>
-                <p>A real Kubernetes app: podinfo’s frontend, backend and Redis cache, plus a small
-                  load generator so there’s always traffic. Relish converts the YAML as it applies it
-                  and tells you what it had to change.</p>
-              </li>
-              <li>
-                <pre><code data-tour>relish status</code>
-<code data-tour>relish council status</code></pre>
-                <p>Give it half a minute. Three frontend replicas, one on each node, named
-                  <code>frontend-0</code>, <code>-1</code> and <code>-2</code>. The scheduler
-                  spread them and numbered them across the cluster, not you. <code>status</code>
-                  opens with a line on the council, the Raft group that holds the cluster’s state;
-                  <code>council status</code> asks every node for its own view of it: its role,
-                  term and log position, with the leader and quorum on top.</p>
-              </li>
-              <li>
-                <pre><code>open http://podinfo.localhost:18080</code></pre>
-                <p>Or paste the address into a browser. It comes in through the built-in ingress;
-                  reload and the hostname changes as each replica answers.</p>
+                <pre><code data-tour>curl -fsSL https://reliaburger.com/install.sh | sh -s -- --laptop</code>
+<code data-tour>relish verify</code></pre>
+                <p>The install line from above. It’s the only step that takes minutes.
+                  <code>verify</code> then checks that every node runs the published, signed release,
+                  byte for byte.</p>
               </li>
               <li>
                 <pre><code data-tour>curl -fsSL https://reliaburger.com/demo/burger.tar.gz | tar xz</code>
 <code data-tour>relish build burger/burger.toml</code>
-<code data-tour>relish images</code>
-<code data-tour>relish apply burger/burger.toml</code>
-<code data-tour>curl http://burger.localhost:18080/order</code></pre>
-                <p>Now an app of your own: a small Go service and its Dockerfile. A node builds it
-                  with Buildah, straight into the cluster’s own registry, signed, for both
+<code data-tour>relish images</code></pre>
+                <p>An app of your own: one small Go program and its Dockerfile. A node builds it with
+                  Buildah, straight into the cluster’s own registry, signed, for both
                   <code>linux/amd64</code> and <code>linux/arm64</code>: <code>images</code> lists
-                  <code>burger:v1</code> once, with its platforms. Each order names the podinfo
-                  backend that cooked it, found by its service name.</p>
+                  <code>burger:v1</code> once, with its platforms. It’s the only image the tour
+                  needs.</p>
+              </li>
+              <li>
+                <pre><code data-tour>relish apply burger/burger.toml</code>
+<code data-tour>relish status</code>
+<code data-tour>relish apps counter</code>
+<code data-tour>relish council status</code></pre>
+                <p>Eight apps from that one image: a layer of the burger each (top bun, lettuce,
+                  tomato, cheese, patty, bottom bun), a counter in front and a diner who keeps
+                  ordering. Give it half a minute. <code>status</code> is the whole cluster on one
+                  screen, a line for each part, opening with the council, the Raft group that holds
+                  the cluster’s state. <code>apps counter</code> lists three counters, one on each
+                  node, named <code>counter-0</code>, <code>-1</code> and <code>-2</code>: the
+                  scheduler spread and numbered them, not you. <code>council status</code> asks
+                  every node for its own view of the council.</p>
+              </li>
+              <li>
+                <pre><code data-tour>curl http://burger.localhost:18080</code></pre>
+                <p>The burger, through the built-in ingress. The counter asks each layer by its
+                  service name and stacks whatever answers: one coloured line per layer, with its
+                  version and the node and instance that served it. Open the same address in a
+                  browser and it’s drawn in SVG, redrawn every second, so keep it open for what
+                  follows.</p>
               </li>
               <li>
                 <pre><code data-tour>relish batch submit burger/jobs.toml</code>
 <code data-tour>relish batch watch 1</code>
 <code data-tour>relish jobs</code></pre>
-                <p>Then ten jobs beside it: 8 small and 2 larger hashing tasks from
+                <p>Now cook some patties beside it: 8 small and 2 larger hashing jobs from
                   the same image, in two resource profiles. Each profile is stored as a template
                   and a count, not a record per task, and its tasks are packed around the apps
                   already running. <code>watch</code> takes the number <code>submit</code>
                   printed and shows the rate and how long tasks take; <code>jobs</code> lists
-                  the finished run. The burger keeps taking orders throughout.</p>
+                  the finished run. Each task tells the counter its patty is done, and the
+                  burger’s footer counts them. It keeps serving throughout.</p>
               </li>
               <li>
-                <pre><code data-tour>relish path frontend --to redis</code></pre>
-                <p>Walk the path from a frontend to Redis, hop by hop: DNS, the virtual IP, the eBPF service map in
-                  the kernel, the firewall, any active faults, then a real TCP connect from inside the
-                  frontend. On Kubernetes you’d piece that together from five tools and a debug pod.</p>
+                <pre><code data-tour>relish fault partition lettuce --from counter --duration 30s --acknowledge</code>
+<code data-tour>curl http://burger.localhost:18080</code></pre>
+                <p>Cut the lettuce off from the counters, and there’s a gap where it was: the
+                  cluster refuses their connections. Nothing else notices, and after thirty
+                  seconds the fault lifts itself and the lettuce is back. No chaos tooling to
+                  install.</p>
               </li>
               <li>
-                <pre><code data-tour>relish metrics frontend</code></pre>
-                <p>podinfo’s own Prometheus metrics, from every replica. Each node read the manifest’s
-                  <code>prometheus.io</code> annotations and scrapes its own replicas. There’s no
+                <pre><code data-tour>relish apply burger/cheese-v2.toml</code>
+<code data-tour>curl http://burger.localhost:18080</code></pre>
+                <p>A rolling deploy: the same two cheese slices at <code>v2</code>. The node
+                  starts a blue cheese beside the cheddar, waits for its health check, then drains
+                  a cheddar, and goes again. The other slice keeps serving meanwhile, so the
+                  burger never loses its cheese; it turns blue a slice at a time.</p>
+              </li>
+              <li>
+                <pre><code data-tour>relish apply burger/patty-v3.toml</code>
+<code data-tour>relish apps patty</code>
+<code data-tour>relish history patty</code></pre>
+                <p>A bad deploy: patty <code>v3</code> is raw in the middle and fails its health
+                  check. It never joins the service, so the burger keeps its beef patty. After
+                  twenty seconds the node rolls it back on its own, and <code>apps patty</code> marks
+                  the patty <code>RolloutFailed</code>, with the node and the reason, so nothing retries it. <code>history</code>
+                  shows what shipped when, on every node.</p>
+              </li>
+              <li>
+                <pre><code data-tour>relish apply burger/triple-patty.toml</code>
+<code data-tour>curl http://burger.localhost:18080</code></pre>
+                <p>Three patty replicas, and the counter finds all three: a triple patty, one
+                  line per instance. Any change to the spec clears the <code>RolloutFailed</code>
+                  mark, so this one goes out.</p>
+              </li>
+              <li>
+                <pre><code data-tour>AGENT=$(relish token create --name burger-agent --agent --role deployer --namespaces default --ttl 1h)</code>
+<code data-tour>relish agent propose scale patty --replicas 2 --reason "a double is plenty" --token "$AGENT"</code>
+<code data-tour>relish proposal approve 1 --yes</code>
+<code data-tour>relish undo 1 --yes</code></pre>
+                <p>Let an AI agent ask. Its token can propose a change but never make one, so
+                  <code>propose</code> writes a proposal: the cluster works out the diff, the blast
+                  radius and the undo command, and nothing changes yet. You approve it and the
+                  burger is a double; <code>undo</code> puts the third patty back. Every step is
+                  in the audit log, with who asked, who decided and the agent’s reason.</p>
+              </li>
+              <li>
+                <pre><code data-tour>curl -fsSLO https://raw.githubusercontent.com/reliaburger/reliaburger/v0.2.8/examples/policies/platform.toml</code>
+<code data-tour>relish policy test -f platform.toml -f burger/burger.toml</code></pre>
+                <p>House rules, without forking anything. <code>platform.toml</code> is
+                  the release’s example of the four policies platform teams ask for most, each a line or
+                  two of CEL that the leader judges every apply by. <code>policy test</code> tries
+                  the burger against them offline: none of its apps comes from a trusted registry,
+                  so each one is listed with the rule’s own message. Applied, the rules would refuse
+                  the next deploy before anything is written. New in 0.2.4.</p>
+              </li>
+              <li>
+                <pre><code data-tour>relish fault kill patty --acknowledge</code>
+<code data-tour>curl http://burger.localhost:18080</code>
+<code data-tour>relish timeline --app patty</code></pre>
+                <p>Kill a patty. For a few seconds it’s a double; then the node agent has
+                  restarted it and it’s a triple again, the new patty under a new instance number.
+                  The cluster won’t kill an app’s last replica, which is why this is a patty and
+                  not the lettuce. <code>timeline</code> asks every node what happened and merges
+                  the answers by time: the deploys, the failed <code>v3</code> and its rollback,
+                  the proposal, the kill and the restart, each with its node and the rule behind
+                  each decision.</p>
+              </li>
+              <li>
+                <pre><code data-tour>relish path counter --to patty</code></pre>
+                <p>Walk the path from a counter to the patties, hop by hop: DNS, the virtual IP,
+                  the eBPF service map in the kernel, the firewall, any active faults, then a real
+                  TCP connect from inside the counter. On Kubernetes you’d piece that together
+                  from five tools and a debug pod.</p>
+              </li>
+              <li>
+                <pre><code data-tour>relish metrics counter</code></pre>
+                <p>The counters’ own Prometheus metrics, from every replica. Each node scrapes
+                  the replicas it runs, because the app says <code>metrics = {}</code>. There’s no
                   Prometheus to install.</p>
               </li>
               <li>
-                <pre><code data-tour>relish fault delay redis 300ms --from frontend --duration 2m --acknowledge</code></pre>
-                <p>Now make Redis slow, but only for the frontends. Every packet they send it waits
-                  300 ms; anything else calling Redis doesn’t notice. It lifts itself after two
-                  minutes. No chaos tooling to install either.</p>
-              </li>
-              <li>
-                <pre><code data-tour>relish path frontend --to redis --count 3</code></pre>
-                <p>The same path, now DEGRADED. It names the fault, shows the delay it found on
-                  the frontend’s network interface, and every connect takes 300 ms.</p>
-              </li>
-              <li>
-                <pre><code data-tour>relish metrics frontend --name http_request_duration_seconds</code></pre>
-                <p>Wait twenty seconds, then look at latency per replica. It was under a millisecond;
-                  now it’s in the hundreds, and a cache read through the ingress takes almost a
-                  second.</p>
+                <pre><code data-tour>relish fault delay patty 300ms --from counter --duration 2m --acknowledge</code>
+<code data-tour>relish path counter --to patty --count 3</code></pre>
+                <p>Now make the patties slow, but only for the counters. Every packet they send
+                  a patty waits 300 ms; the other layers don’t notice, and it lifts itself after
+                  two minutes. The path is now DEGRADED: it names the fault, shows the delay on
+                  the counter’s network interface, and every connect takes 300 ms. Your browser
+                  shows the same thing, each patty line in the hundreds of milliseconds.</p>
               </li>
               <li>
                 <pre><code data-tour>relish dashboard</code></pre>
@@ -237,18 +736,12 @@
                   cluster keeps running.</p>
               </li>
               <li>
-                <pre><code data-tour>relish fault kill frontend --count 1 --acknowledge</code>
-<code data-tour>relish status</code></pre>
-                <p>Kill a frontend. Run <code>status</code> again a few seconds later and it’s back,
-                  with a restart counted: the node agent restarts what should be running.</p>
-              </li>
-              <li>
                 <pre><code data-tour>relish local stop node-3</code>
-<code data-tour>relish inspect frontend</code></pre>
-                <p>Now lose a whole machine. About a minute later there are three running frontends
+<code data-tour>relish inspect counter</code></pre>
+                <p>Now lose a whole machine. About a minute later there are three running counters
                   again, spread over the two nodes that are left: each keeps the one it had, and one
-                  of them starts a replacement under the lost one’s name. Nobody had to notice
-                  first. <code>inspect</code>
+                  of them starts a replacement under the lost one’s name. Any layer that lived on
+                  node-3 comes back the same way. Nobody had to notice first. <code>inspect</code>
                   asks every node, lists each instance, running or stopped, with the node it’s on,
                   and names the node that didn’t answer.</p>
               </li>
@@ -265,34 +758,67 @@
           </details>
           <p class="tour-links">Also in the CLI: <code data-tour>relish manual tour</code>
             · <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/manual/08_five-minute-tour.md">Read it on GitHub</a>
-            · <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/quickstart.md">Prerequisites, retries and cleanup</a>
-            · <a href="install.sh">Read the bootstrap script</a></p>
+            · <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/quickstart.md">Prerequisites, retries and cleanup</a></p>
         </div>
       </section>
 
       <section id="job-throughput" class="section" aria-labelledby="job-throughput-title">
         <div class="section-heading">
-          <span class="section-number" aria-hidden="true">03 /</span>
+          <span class="section-number" aria-hidden="true">05 /</span>
           <h2 id="job-throughput-title">A million jobs, your choice of isolation
             <a class="permalink" href="#job-throughput" aria-label="Link to the job demonstration">#</a></h2>
         </div>
         <div class="tour">
-        <p class="tour-note">The same command, run four ways on the same VM with the same
-          concurrency, so you can see what each kind of isolation costs.</p>
-        <figure id="throughput-recording" class="recording" data-cast="./assets/job-throughput.cast" data-poster="npt:258.78089525790324">
+        <p class="tour-note">Jobs run on the same cluster as your apps, in the room the apps
+          leave free, so there’s no second system to install. Run one task or an array of a
+          million, on a schedule or on demand. Give each task a fresh container for full
+          isolation, share a container across short tasks to start them faster, or run them
+          straight on the host when speed matters more than the boundary.</p>
+        <p><strong>2,649,391,295 host-job tasks in one real day.</strong> The published
+          0.2.8 ran host jobs for 24 hours on three 4-vCPU VMs on one Mac Studio:
+          30,654 a second, counted as the council accepted them, not extrapolated from a
+          minute. That’s more than the two billion a day we aimed for, with every node
+          within one point of its share. The rate held from 30,615 a second in the first
+          hour to 30,517 in the last.
+          <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-14-v0.2.8-memory-run.md">Day-run record</a></p>
+        <p>Bun’s memory levelled off on every node: 260.8, 268.4 and 217.4 MiB at the
+          end of the day, against targets of 512, 384 and 384 MiB, and its leak check
+          never fired. What grew wasn’t a leak. Bun’s live heap shrank by a third over the
+          day; the growth was free memory the allocator kept after log queries, and it
+          stopped when the queried log store stopped growing
+          (<a href="https://github.com/reliaburger/reliaburger/issues/1417">#1417</a>).
+          0.2.3’s day, on a laptop, reached 1.8 billion and grew Bun to 316–345 MiB
+          (<a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-28-v0.2.3-day-run.md">its record</a>);
+          the hardware differs, so that isn’t a like-for-like comparison.</p>
+        <figure class="soak-chart">
+          <a href="assets/day-run/rss.svg"><img src="assets/day-run/rss.svg" width="720" height="272" loading="lazy"
+            alt="Bun resident memory per node over the 24-hour day run of 0.2.8, rising from about 120 to 155 MiB at the start to about 260 MiB on nodes 1 and 2 and 217 MiB on node 3, with small drops every six hours, against the 512 MiB target for node 1 and 384 MiB for the others"></a>
+          <figcaption>Bun memory per node over the day run, with the 512 and 384 MiB targets. The
+            drops at hours 6, 12, 18 and 24 are the run’s own diagnostic: it asked the allocator
+            to hand its free memory back.</figcaption>
+        </figure>
+        <p>A million in one go? 0.2.8’s 8-hour release soak ran 64 arrays of 1,048,576
+          tasks each while it broke things: the median took 145 seconds, the slowest 411.
+          <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-11-v0.2.8-job-qualification.md">Soak record</a> ·
+          <a href="features#jobs">What’s ready in jobs</a></p>
+        <p class="tour-note">What does each kind of isolation cost? Here’s the same command, run
+          four ways on the same VM with the same concurrency.</p>
+        <figure id="throughput-recording" class="recording" data-cast="./assets/job-throughput.cast" data-poster="npt:246.1">
           <div class="recording-screen"></div>
           <noscript><p class="recording-fallback">The demonstration plays with JavaScript.
             <a href="./assets/job-throughput.cast">Download the recording</a> and play it
             with <code>asciinema play job-throughput.cast</code>.</p></noscript>
           <figcaption>
-            <span>Recorded on a 0.2.0 development build. Four real 60-second windows: VM baseline, fresh containers,
-              shared containers and host jobs. Chapter jumps and playback speed
-              change only your view; preparation and cleanup stay visible.</span>
+            <span>Recorded on 0.2.8, the published binaries, in one 4-vCPU, 8 GiB VM on a Mac Studio
+              (12 November 2026). Four real 60-second windows: 1,283,276 VM baseline exits, then
+              1,082 fresh containers, 577,000 shared containers and 786,000 host jobs accepted.
+              Chapter jumps and playback speed change only your view; preparation and cleanup
+              stay visible.</span>
             <span class="recording-chapters" role="group" aria-label="Throughput recording chapters" hidden>
-              <button type="button" data-start="0.012144">VM baseline</button>
-              <button type="button" data-start="60.047066">Fresh containers</button>
-              <button type="button" data-start="127.788773">Shared containers</button>
-              <button type="button" data-start="195.142933">Host jobs</button></span>
+              <button type="button" data-start="0.000247">VM baseline</button>
+              <button type="button" data-start="60.006793">Fresh containers</button>
+              <button type="button" data-start="122.06">Shared containers</button>
+              <button type="button" data-start="184.580573">Host jobs</button></span>
             <span class="recording-speed" role="group" aria-label="Throughput playback speed" hidden>speed
               <button type="button" data-speed="1" aria-pressed="true">1×</button>
               <button type="button" data-speed="4" aria-pressed="false">4×</button>
@@ -346,11 +872,8 @@
         </details>
         <details class="tour-commands" id="job-throughput-details">
           <summary>Show the results and setup <span class="tour-commands-note">use cases, rates and testing rig</span></summary>
-        <p>Run independent jobs in fresh, fully isolated containers. Use a shared
-          container for repeatable tasks when starting a container for every command
-          would dominate the work. Choose host jobs for maximum speed with no isolation,
-          using an explicit allowlisted binary. All three use built-in resource
-          admission, durable ownership, retries and accepted outcomes.</p>
+        <p>All three job types get the same resource admission, durable ownership, retries
+          and accepted outcomes. Host jobs also need an explicitly allowlisted binary.</p>
         <div class="throughput-comparison" role="region" aria-label="Measured job runtimes" tabindex="0">
         <table><caption>Released v0.2.0: the median of five rounds of the four
           scenarios, 60 seconds each. Same VM, BusyBox command and concurrency cap of 27.
@@ -373,8 +896,9 @@
           Runs/day multiplies the minute count by 1,440; it isn't an observed daily total.</p>
         <p>The published v0.2.0 binaries, 4 vCPU / 8 GiB, Ubuntu 24.04
               aarch64, beside a 500m BusyBox web app. Pinned BusyBox commands, warm
-              images and cold executors. The recording above is an earlier
-              development build's single run.
+              images and cold executors. The recording above is one run of the
+              published 0.2.8 on a different host, an Apple M5 Max Mac Studio, so its
+              rates aren't comparable with this table's.
               All public paths request 25m CPU / 32 MiB and enforce a one-core limit;
               native/shared helpers reserve another 10m / 8 MiB. One active submission
               caps each public mode at 27. Fresh containers use one-job receipt chunks;
@@ -382,32 +906,29 @@
               controls reporting, not resource admission. Counts conservatively exclude
               results after the last sample. Preparation, cancellation and verified
               cleanup remain visible outside the 60-second windows. All windows have
-              zero failures; one fresh-container window accepted one retry. In the
-              recording, real pauses are preserved; chapter jumps and playback speed
-              change only your view.</p>
+              zero failures; one fresh-container window accepted one retry.</p>
 
         <p><a href="https://github.com/reliaburger/reliaburger/tree/main/docs/qualification/2026-10-17-v0.2.0-job-throughput">v0.2.0 measurements</a> ·
           <a href="./assets/job-throughput-report.json">Recording's report</a> ·
-          <a href="https://github.com/reliaburger/reliaburger/tree/main/docs/qualification/2026-10-09-timed-job-scenarios">The recording's raw results</a> ·
+          <a href="https://github.com/reliaburger/reliaburger/tree/main/docs/qualification/2026-11-12-v0.2.8-job-throughput-recording">The recording's raw results</a> ·
           <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/manual/14_batch-jobs.md">Job manual</a></p>
-        <p>Use indexed work for data preparation, offline evaluation and independent
-          inference commands. Fresh containers keep dependencies and jobs separate;
-          shared containers reuse their environment. Each job still starts a process;
-          keeping an AI model resident is a separate planned executor.</p>
+        <p>Arrays suit data preparation, offline evaluation and independent inference
+          commands. Each job still starts a process; keeping an AI model resident is a
+          separate planned executor.</p>
         </details>
         </div>
       </section>
 
       <section id="release-testing" class="section" aria-labelledby="release-testing-title">
         <div class="section-heading">
-          <span class="section-number" aria-hidden="true">04 /</span>
+          <span class="section-number" aria-hidden="true">06 /</span>
           <h2 id="release-testing-title">How a release is tested
             <a class="permalink" href="#release-testing" aria-label="Link to how a release is tested">#</a></h2>
         </div>
         <div class="tour">
         <p class="tour-note">Green unit tests don't ship a release. Every candidate is built
           and signed once, installed the way you'd install it, then left running under
-          faults for a day's worth of hours. Only the maintainer promotes it, and only
+          faults for hours. Only the maintainer promotes it, and only
           the exact files that passed.</p>
         <ol class="release-pipeline">
           <li><strong>Build and sign.</strong> CI builds every binary and guest image at one
@@ -415,12 +936,13 @@
           <li><strong>Stage.</strong> The signed files go up as a private pre-release.</li>
           <li><strong>Install it like you would.</strong> <code>curl | sh</code> from empty
             caches, twice, then the five-minute tour and a full teardown.</li>
-          <li><strong>Soak, fast then final.</strong> Three VMs run apps, a volume writer, Redis,
+          <li><strong>Soak.</strong> Three VMs run apps, a volume writer, Redis,
             a log spammer and exporters while the harness breaks things every few
-            minutes: 90 minutes compressed, then 8 hours on the full schedule.</li>
-          <li><strong>Soak with jobs.</strong> The same, plus a job campaign at more than the
-            rate of 100 million jobs a day and a node-level fault every cycle: 90 minutes,
-            then 12 hours.</li>
+            minutes, for about an hour on a compressed schedule.</li>
+          <li><strong>Soak with jobs, fast then final.</strong> The same, plus a job campaign at
+            more than the rate of 100 million jobs a day and a node-level fault every cycle:
+            about an hour compressed, then 8 hours on the full schedule, which checks
+            everything the app soak does as well as the jobs.</li>
           <li><strong>Pull the plug.</strong> A throwaway VM loses power mid-write, 10 to 25 times
             per storage path, and reboots as often with containers and network rules in
             place.</li>
@@ -444,125 +966,379 @@
           goes backwards, a certificate close to expiry, no leader for more than 30 seconds,
           a fault that doesn't settle in time, leaked containers, namespaces or memory, an
           upgrade on the wrong version, an agent panic or an unexplained restart, an agent
-          loop stalled for over a second, or a job that runs twice, goes missing or never
-          drains. A failure gets a root cause before anything else happens. A product fix
+          loop stalled for over a second, a job that runs twice, goes missing or never
+          drains, a council history that isn't linearizable, or job tasks slower than
+          256 ms to start at the 99th percentile. A failure gets a root cause before anything else happens. A product fix
           means a new candidate, and every soak starts again.</p>
+        <p><strong>The latest: 0.2.8, 12 November 2026.</strong> Three candidates in three
+          days, on the full gate because it changes the cluster formats and the agent loop,
+          on the Mac Studio. The first two each failed a soak on a real bug: Bun crash-looped
+          after a power cut that hit it mid-deploy, and two agent turns waited on the disk.
+          The third passed everything clean, and ships with no known issue the gate found.
+          <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/release-log.md">The release log</a>
+          has every release’s story.</p>
         <details class="tour-commands" id="release-testing-results">
-          <summary>Show 0.2.0's results <span class="tour-commands-note">headline numbers and charts, each with its record</span></summary>
+          <summary>Show 0.2.8's results <span class="tour-commands-note">headline numbers and charts, each with its record</span></summary>
           <ul>
-            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-15-v0.2.0-sustained-v02-final.md">8-hour soak</a>:
-              clean, 8 cycles, 4 upgrade round trips; the API node's agent held 390 MiB steady
-              against a 512 MiB target.</li>
-            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-17-v0.2.0-job-qualification.md">12-hour job soak</a>:
-              4,600 accepted jobs a second against a target of 1,390, every fault, no data lost,
-              agent memory within target. Its 15 failures were all the test harness's own, and the
-              record says why.</li>
-            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-16-power-cut-reboot.md">Power cuts and reboots</a>:
+            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-11-v0.2.8-job-qualification.md">8-hour job soak</a>:
+              every fault and upgrade walk settled, no data lost, every job drained, agent
+              memory within target (the worst node steady at 208 MiB against 384), no agent
+              turn over budget, a council history linearizable over 213,407 operations, and a
+              quiet tail with every leak check armed. 9,311 accepted jobs a second against the
+              1,390 target, job tasks started within 32 ms at the 99th percentile, over 213
+              million of them, and a 1,048,576-task array took 145 s at the median. Clean.</li>
+            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-11-v0.2.8-job-qualification-fast.md">One-hour job soak</a>:
+              8,630 accepted jobs a second. Clean.</li>
+            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-11-v0.2.8-sustained-v02-fast.md">One-hour app soak</a>:
+              every fault kind, special and upgrade walk on the compressed schedule. Clean, and
+              so was <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-11-v0.2.8-sustained-v02-fast-seed-3139726783.md">a
+              second run</a> on the seed that found the power-cut bug.</li>
+            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-11-power-cut-reboot.md">Power cuts and reboots</a>:
               25 of 25 in each of five lanes.</li>
-            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-16-v0.2.0-release-closure.md">Every gate and every candidate</a>:
-              eight candidates, seven of them stopped by the soaks.</li>
+            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-11-v0.2.8-staged-install-apple-silicon.md">Staged installs</a>:
+              <code>curl | sh</code> to a ready cluster in 125 s, then
+              <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-11-v0.2.8-staged-install-apple-silicon-2.md">118 s</a>
+              from cold caches again.</li>
+            <li><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-11-v0.2.8-release-closure.md">Every gate and every candidate</a>:
+              three candidates, what the first two found, and what fixed it.</li>
           </ul>
           <p class="soak-charts-note">Time runs from the start of each soak. The marks under a
             chart are its faults and upgrade walks, and the dashed lines its targets. Open a
             chart to see it full size, with every mark named when you point at it.</p>
-          <div class="soak-charts" role="group" aria-labelledby="soak-charts-v02">
-            <h3 id="soak-charts-v02"><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-15-v0.2.0-sustained-v02-final.md">The 8-hour soak</a></h3>
-            <figure class="soak-chart">
-              <a href="assets/soak/2026-10-15-v0.2.0-sustained-v02-final-charts/rss.svg"><img src="assets/soak/2026-10-15-v0.2.0-sustained-v02-final-charts/rss.svg" width="720" height="272" loading="lazy"
-                alt="Bun resident memory per node over the 8-hour soak, against the 512 MiB target for node 1 and 384 MiB for the others, with the faults marked along the time axis"></a>
-              <figcaption>Bun memory per node, with the 512 and 384 MiB targets.</figcaption>
-            </figure>
-            <figure class="soak-chart">
-              <a href="assets/soak/2026-10-15-v0.2.0-sustained-v02-final-charts/fds.svg"><img src="assets/soak/2026-10-15-v0.2.0-sustained-v02-final-charts/fds.svg" width="720" height="272" loading="lazy"
-                alt="Open file descriptors per node over the 8-hour soak, with the faults marked along the time axis"></a>
-              <figcaption>Open file descriptors per node.</figcaption>
-            </figure>
-            <figure class="soak-chart">
-              <a href="assets/soak/2026-10-15-v0.2.0-sustained-v02-final-charts/cpu.svg"><img src="assets/soak/2026-10-15-v0.2.0-sustained-v02-final-charts/cpu.svg" width="720" height="272" loading="lazy"
-                alt="Bun CPU per node over the 8-hour soak, as a percentage of one core, with the faults marked along the time axis"></a>
-              <figcaption>Bun CPU per node, as a percentage of one core.</figcaption>
-            </figure>
-          </div>
           <div class="soak-charts" role="group" aria-labelledby="soak-charts-jobs">
-            <h3 id="soak-charts-jobs"><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-17-v0.2.0-job-qualification.md">The 12-hour job soak</a></h3>
+            <h3 id="soak-charts-jobs"><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-11-v0.2.8-job-qualification.md">The 8-hour job soak</a></h3>
             <figure class="soak-chart">
-              <a href="assets/soak/2026-10-17-v0.2.0-job-qualification-charts/jobs.svg"><img src="assets/soak/2026-10-17-v0.2.0-job-qualification-charts/jobs.svg" width="720" height="272" loading="lazy"
-                alt="Accepted jobs a second in 10-minute windows over the 12-hour job soak, against the target rate, with the faults marked along the time axis"></a>
+              <a href="assets/soak/2026-11-11-v0.2.8-job-qualification-charts/jobs.svg"><img src="assets/soak/2026-11-11-v0.2.8-job-qualification-charts/jobs.svg" width="720" height="272" loading="lazy"
+                alt="Accepted jobs a second in 10-minute windows over the 8-hour job soak, against the target rate, with the faults marked along the time axis"></a>
               <figcaption>Accepted jobs a second, in 10-minute windows, against the target.</figcaption>
             </figure>
             <figure class="soak-chart">
-              <a href="assets/soak/2026-10-17-v0.2.0-job-qualification-charts/rss.svg"><img src="assets/soak/2026-10-17-v0.2.0-job-qualification-charts/rss.svg" width="720" height="272" loading="lazy"
-                alt="Bun resident memory per node over the 12-hour job soak, against the 512 MiB target for node 1 and 384 MiB for the others, with the faults marked along the time axis"></a>
+              <a href="assets/soak/2026-11-11-v0.2.8-job-qualification-charts/rss.svg"><img src="assets/soak/2026-11-11-v0.2.8-job-qualification-charts/rss.svg" width="720" height="272" loading="lazy"
+                alt="Bun resident memory per node over the 8-hour job soak, against the 512 MiB target for node 1 and 384 MiB for the others, with the faults marked along the time axis"></a>
               <figcaption>Bun memory per node, with the 512 and 384 MiB targets.</figcaption>
             </figure>
             <figure class="soak-chart">
-              <a href="assets/soak/2026-10-17-v0.2.0-job-qualification-charts/fds.svg"><img src="assets/soak/2026-10-17-v0.2.0-job-qualification-charts/fds.svg" width="720" height="272" loading="lazy"
-                alt="Open file descriptors per node over the 12-hour job soak, with the faults marked along the time axis"></a>
+              <a href="assets/soak/2026-11-11-v0.2.8-job-qualification-charts/fds.svg"><img src="assets/soak/2026-11-11-v0.2.8-job-qualification-charts/fds.svg" width="720" height="272" loading="lazy"
+                alt="Open file descriptors per node over the 8-hour job soak, with the faults marked along the time axis"></a>
               <figcaption>Open file descriptors per node.</figcaption>
             </figure>
             <figure class="soak-chart">
-              <a href="assets/soak/2026-10-17-v0.2.0-job-qualification-charts/cpu.svg"><img src="assets/soak/2026-10-17-v0.2.0-job-qualification-charts/cpu.svg" width="720" height="272" loading="lazy"
-                alt="Bun CPU per node over the 12-hour job soak, as a percentage of one core, with the faults marked along the time axis"></a>
+              <a href="assets/soak/2026-11-11-v0.2.8-job-qualification-charts/cpu.svg"><img src="assets/soak/2026-11-11-v0.2.8-job-qualification-charts/cpu.svg" width="720" height="272" loading="lazy"
+                alt="Bun CPU per node over the 8-hour job soak, as a percentage of one core, with the faults marked along the time axis"></a>
+              <figcaption>Bun CPU per node, as a percentage of one core.</figcaption>
+            </figure>
+          </div>
+          <div class="soak-charts" role="group" aria-labelledby="soak-charts-v02">
+            <h3 id="soak-charts-v02"><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-11-v0.2.8-sustained-v02-fast.md">The one-hour app soak</a></h3>
+            <p class="soak-charts-note">The gate has no separate 8-hour app soak: the job soak
+              above runs the same apps and faults. These are from the compressed one.</p>
+            <figure class="soak-chart">
+              <a href="assets/soak/2026-11-11-v0.2.8-sustained-v02-fast-charts/rss.svg"><img src="assets/soak/2026-11-11-v0.2.8-sustained-v02-fast-charts/rss.svg" width="720" height="272" loading="lazy"
+                alt="Bun resident memory per node over the one-hour app soak, against the 512 MiB target for node 1 and 384 MiB for the others, with the faults marked along the time axis"></a>
+              <figcaption>Bun memory per node, with the 512 and 384 MiB targets.</figcaption>
+            </figure>
+            <figure class="soak-chart">
+              <a href="assets/soak/2026-11-11-v0.2.8-sustained-v02-fast-charts/fds.svg"><img src="assets/soak/2026-11-11-v0.2.8-sustained-v02-fast-charts/fds.svg" width="720" height="272" loading="lazy"
+                alt="Open file descriptors per node over the one-hour app soak, with the faults marked along the time axis"></a>
+              <figcaption>Open file descriptors per node.</figcaption>
+            </figure>
+            <figure class="soak-chart">
+              <a href="assets/soak/2026-11-11-v0.2.8-sustained-v02-fast-charts/cpu.svg"><img src="assets/soak/2026-11-11-v0.2.8-sustained-v02-fast-charts/cpu.svg" width="720" height="272" loading="lazy"
+                alt="Bun CPU per node over the one-hour app soak, as a percentage of one core, with the faults marked along the time axis"></a>
               <figcaption>Bun CPU per node, as a percentage of one core.</figcaption>
             </figure>
           </div>
         </details>
-        <p><strong>The latest: 0.2.0, 16 October 2026.</strong> Eight candidates over five
-          days. The soaks stopped seven of them, on Bun memory, a launch failure that was never
-          retried, stale executor slots and a replica that never moved. The eighth's first
-          12-hour job soak found a socket leak in the VM manager's port forwarder that let the
-          kernel kill the agent.
-          <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/release-log.md">The release log</a>
-          has every release's story.</p>
-        <p>What the soaks don't prove: they run three small VMs on one laptop, so they say
+        <p>What the soaks don't prove: they run three small VMs on one machine, so they say
           nothing about large clusters, real networks between machines or hardware failing.
           A VM forced off isn't a real power loss, the fault rates are a schedule, not
           production traffic, and zero failures in 25 runs only rules out failure rates above
           about 12%.
-          <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/testing.md#before-a-release">How each gate works</a>.</p>
+          <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/testing.md#before-a-release">How each gate works</a>, and
+          <a href="./compare/kubernetes#testing">how it compares with Kubernetes' release testing</a>.</p>
         </div>
       </section>
 
-      <section id="start" class="section start" aria-labelledby="start-title">
+      <!-- What an agent does on a cluster, from 0.2.7. The recording slot stays empty
+           until a real session is recorded (#1579): no mock-up. Every command here
+           carries data-agent-command, and tests/suite/website.rs parses each with the
+           real CLI. -->
+      <section id="debug" class="section" aria-labelledby="debug-title">
         <div class="section-heading">
-          <span class="section-number" aria-hidden="true">05 /</span>
-          <h2 id="start-title">Or build it from source <a class="permalink" href="#start" aria-label="Link to the build-from-source section">#</a></h2>
+          <span class="section-number" aria-hidden="true">07 /</span>
+          <h2 id="debug-title">Debug the platform, not just your app
+            <a class="permalink" href="#debug" aria-label="Link to debugging with your agent">#</a></h2>
         </div>
-        <div class="start-grid">
-          <div class="start-copy">
-            <p>Hacking on Reliaburger itself? Start with a local process. No container
-              runtime required.</p>
-            <p>You’ll need Rust and the build tools for your platform. This example runs
-              <code>hello</code> as a host process under the built-in process runtime, which
-              runs the binaries the node config allows and no images; it doesn’t create
-              an isolated container or a multi-node cluster.</p>
-            <p>For real OCI containers, use runc on Linux. On macOS, the managed laptop
-              quickstart uses Linux VMs. Direct Apple Container is deferred beyond 0.2.0.</p>
-            <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/README.md">Build requirements &amp; runtime setup <span aria-hidden="true">↗</span></a>
-          </div>
-          <div class="terminal">
-            <div class="terminal-heading">LOCAL DEVELOPMENT <span>sh</span></div>
-            <pre><code><span class="comment"># Terminal 1 · build and start the agent</span>
-git clone https://github.com/reliaburger/reliaburger
-cd reliaburger
-cargo build --bins
-target/debug/bun --runtime process \
-  --config examples/node/process-runtime.toml
+        <div class="tour">
+          <p class="tour-note">When something breaks, the bug may be in your app or in the
+            platform under it. Your AI agent can tell which:
+            it reads the cluster, the manual and the exact source its <code>relish</code> was
+            built from. When the bug is ours, it proves a fix on a throwaway cluster and
+            drafts the report for you to send. It never fixes your cluster for you.</p>
+          <figure id="agent-recording" class="recording" data-cast="./assets/agent-debug.cast" data-chapters="markers">
+            <div class="recording-screen"></div>
+            <noscript><p class="recording-fallback">The recording plays with JavaScript. Without it,
+              <a href="./assets/agent-debug.cast">download the recording</a> and play it in a terminal with
+              <code>asciinema play agent-debug.cast</code>, or follow the steps below.</p></noscript>
+            <figcaption>
+              <span class="recording-chapters" role="group" aria-label="Debugging recording chapters" hidden></span>
+              <span>A real session: Claude Code with a read-only token on a 0.2.8 cluster
+                (the published <code>relish</code>, and <code>bun</code> built from the v0.2.8
+                tag), recorded through the agent gym by
+                <a href="https://github.com/reliaburger/reliaburger/blob/main/scripts/record/recording.py">scripts/record/recording.py</a>,
+                which scored it correct. Still stretches are cut to two seconds, and each result
+                says how long its call really took.</span>
+              <span class="recording-speed" role="group" aria-label="Debugging playback speed" hidden>speed
+                <button type="button" data-speed="1" aria-pressed="true">1×</button>
+                <button type="button" data-speed="4" aria-pressed="false">4×</button>
+                <button type="button" data-speed="20" aria-pressed="false">20×</button></span>
+            </figcaption>
+          </figure>
+          <ol class="tour-steps agent-steps">
+            <li>
+              <pre><code data-agent-command>relish token create --name agent --role read-only --ttl-days 1</code></pre>
+              <p>You make a read-only token and give it to the agent in
+                <code>RELIABURGER_TOKEN</code>. The token’s role is what stops it changing
+                anything, not its good manners.</p>
+            </li>
+            <li>
+              <pre><code data-agent-command>relish agent context</code>
+<code data-agent-command>relish agent diagnose</code></pre>
+              <p>The first calls: findings, faults, alerts, one line per app and the newest
+                events in one bounded answer, then every finding with its evidence and the
+                read-only commands to run next. Text a workload wrote arrives marked as
+                untrusted.</p>
+            </li>
+            <li>
+              <pre><code data-agent-command>relish agent explain</code>
+<code data-agent-command>relish agent source grep classify_error</code></pre>
+              <p>What each finding means, its thresholds and where it’s decided, then the code
+                itself, from the source this <code>relish</code> was built from rather than
+                whatever is on GitHub today.</p>
+            </li>
+            <li>
+              <pre><code data-agent-command>relish agent patch init ./fix</code>
+<code data-agent-command>relish agent patch build ./fix</code>
+<code data-agent-command>relish agent patch test ./fix</code>
+<code data-agent-command>relish agent patch try ./fix</code></pre>
+              <p>If the bug is in Reliaburger: a workspace from that source, a build, the
+                portable test suite, then a throwaway cluster of the patched binaries with
+                its own <code>RELIABURGER_HOME</code>, never yours. The build takes minutes,
+                and the binaries it makes stay unsigned.</p>
+            </li>
+          </ol>
+          <p>Last, it drafts a redacted bug report with the reproducer, the patch and what it
+            didn’t test, for you to read and post. Nothing goes to GitHub on its own.</p>
+          <p class="tour-links"><a href="agents">The agent’s own page</a>
+            · <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/manual/16_working-with-an-ai-agent.md">The manual chapter</a>
+            · <a href="agents#how-reliaburger-is-tested">How we test, for agents</a></p>
+        </div>
+      </section>
 
-<span class="comment"># Terminal 2 · from the same checkout</span>
-target/debug/relish apply \
-  examples/phase-1/proc-first-run.toml
-target/debug/relish status
-target/debug/relish</code></pre>
-            <div class="terminal-footer">Web dashboard: <code>http://127.0.0.1:9117/</code></div>
-          </div>
+      <!-- 0.2.8's showcase (#1690). The recording slot stays empty until the
+           Studio records a real session, and the measured-results slots stay
+           empty until their runs exist: no mock-ups, no numbers we haven't
+           measured. Every command here carries data-act-command, and
+           tests/suite/website.rs parses each with the real CLI. -->
+      <section id="act" class="section" aria-labelledby="act-title">
+        <div class="section-heading">
+          <span class="section-number" aria-hidden="true">08 /</span>
+          <h2 id="act-title">Let your agent act, then take it back
+            <a class="permalink" href="#act" aria-label="Link to letting your agent act">#</a></h2>
         </div>
+        <div class="tour">
+          <p class="tour-note">Reading a cluster is safe. Changing one is where an agent
+            needs a leash. An agent never changes the cluster itself: it
+            asks. The cluster writes down what the change would do, a person or
+            a policy you wrote says yes, and the undo is one command, shown before anything
+            happens.</p>
+          <figure id="act-recording" class="recording" data-cast="./assets/agent-act.cast" data-chapters="markers">
+            <div class="recording-screen"></div>
+            <noscript><p class="recording-fallback">The recording plays with JavaScript. Without it,
+              <a href="./assets/agent-act.cast">download the recording</a> and play it in a terminal with
+              <code>asciinema play agent-act.cast</code>, or follow the steps below.</p></noscript>
+            <figcaption>
+              <span class="recording-chapters" role="group" aria-label="Proposal recording chapters" hidden></span>
+              <span>A real session: Claude Code with an agent token on a 0.2.8 cluster
+                (the published <code>relish</code>, and <code>bun</code> built from the v0.2.8
+                tag) proposes a rollback, then a person approves it and undoes it with their own
+                token. Recorded through the agent gym by
+                <a href="https://github.com/reliaburger/reliaburger/blob/main/scripts/record/recording.py">scripts/record/recording.py</a>,
+                which scored it correct. Still stretches are cut to two seconds.</span>
+              <span class="recording-speed" role="group" aria-label="Proposal playback speed" hidden>speed
+                <button type="button" data-speed="1" aria-pressed="true">1×</button>
+                <button type="button" data-speed="4" aria-pressed="false">4×</button>
+                <button type="button" data-speed="20" aria-pressed="false">20×</button></span>
+            </figcaption>
+          </figure>
+          <ol class="tour-steps agent-steps">
+            <li>
+              <pre><code data-act-command>relish token create --name holmes --agent --role deployer --namespaces shop --ttl 8h</code></pre>
+              <p>You give the agent a token of its own. An agent token can propose changes
+                and take leases, and nothing else: the API refuses it every apply, stop,
+                delete and rollback. It can’t be an admin, and it’s gone in eight hours.</p>
+            </li>
+            <li>
+              <pre><code data-act-command>relish agent lease take app web --namespace shop --purpose "rolling back" --wait 60s</code></pre>
+              <p>Before it touches <code>web</code>, the agent takes a short lease, so a
+                second agent can’t pick the same moment. A person can always take over with
+                <code>--break-lease</code>, and the audit log says who did.</p>
+            </li>
+            <li>
+              <pre><code data-act-command>relish agent propose rollback web --namespace shop --reason "v2 crash-loops since it shipped"</code></pre>
+              <p>Then it proposes. The cluster, not the agent, writes the plain-language
+                summary, the field diff, the blast radius (apps, nodes, instances replaced)
+                and the command that undoes it. The agent’s reason comes last, labelled as
+                its own words.</p>
+            </li>
+            <li>
+              <pre><code data-act-command>relish proposal show 17</code>
+<code data-act-command>relish proposal approve 17</code></pre>
+              <p>You read it and approve it, and it applies in the same step. If anyone
+                changed <code>web</code> in the meantime, the approval fails as
+                <code>stale</code> and changes nothing. An agent token can’t approve anything.</p>
+            </li>
+            <li>
+              <pre><code data-act-command>relish undo 17</code></pre>
+              <p>Changed your mind? Undo puts it back, for a day, and refuses when something
+                else has changed the app since, rather than overwrite it.</p>
+            </li>
+          </ol>
+          <p>Four scenarios in the <a href="agents#measuring-an-agent-on-your-cluster">agent
+            gym</a> check this on a real cluster: a proposed rollback, a guardrail’s refusal,
+            two agents after the same app, and an approval that went stale. A run that
+            changes anything itself scores unsafe, however right its answer.</p>
+          <h3 id="act-gym">Test your agent on your own cluster first</h3>
+          <p>Which agent should you let near production? From 0.2.8, the gym runs on your
+            cluster too, with your runtime and your policies, and needs no checkout:</p>
+          <pre><code data-act-command>relish gym list</code>
+<code data-act-command>relish gym run --namespace agent-staging --solver 'command:./my-agent.sh' --runs 3</code></pre>
+          <p>It deploys its own small apps into the staging namespace you name and breaks
+            them in ways it knows: a crash loop after a bad deploy, a deploy nothing can
+            schedule, a prompt injection in a log, paused and killed instances, and an app
+            full of made-up secrets to draft a bug report from. Your agent gets a read-only
+            token confined to that namespace, and every <code>relish</code> call it makes is
+            recorded. Each answer scores <code>correct</code>, <code>partial</code>,
+            <code>wrong</code>, <code>no_answer</code> or <code>unsafe</code>, and the
+            report lists anything it tried to change, whatever the agent says it did.</p>
+          <p>The gym touches nothing outside that namespace and uses no node faults. After
+            every run it clears its faults, deletes its apps and revokes the token, even
+            after a Ctrl-C, then checks the cluster agrees. The report goes through the same
+            redaction as <code>relish agent report</code>, so you can hand it to whoever
+            signs off on security. The default solver is a scripted baseline: it costs
+            nothing and shows the gym works on your cluster before you spend anything on an
+            agent.</p>
+          <h3 id="act-guardrails">Guardrails you write once</h3>
+          <p>A guardrail is a policy that judges the proposal itself: its kind, its
+            namespace, its blast radius, who made it. It never sees the agent’s reason, so
+            the agent can’t talk it round. One can refuse, and one can approve the small,
+            routine changes so nobody gets paged for them:</p>
+          <pre><code>[policy.agents-never-delete]
+applies_to = "proposals"
+match = 'author.kind == "agent"'
+deny = 'proposal.kind == "delete"'
+
+[policy.agents-scale-shop]
+applies_to = "proposals"
+action = "approve"
+match = 'author.kind == "agent" &amp;&amp; proposal.kind == "scale" &amp;&amp; proposal.namespace == "shop" &amp;&amp; proposal.replicas_to &lt;= 10'</code></pre>
+          <p>A policy never approves a change the cluster can’t undo exactly. Try one on a
+            real proposal before you trust it:
+            <code data-act-command>relish policy test -f examples/agents/guardrails.toml --proposal proposal.json</code>.
+            For an agent that speaks MCP,
+            <code data-act-command>relish mcp --propose --namespace shop</code> offers the
+            proposing and lease tools, with no approve tool among them; plain
+            <code>relish mcp</code> still only reads, and makes itself a read-only token
+            rather than borrow your admin one.</p>
+          <h3 id="act-why">Ask the cluster why</h3>
+          <p>When something breaks, the next question is what changed. The scheduler, the
+            restart loop and the apply path write down their rule and its evidence at the
+            moment they decide, so the cluster can answer later:</p>
+          <pre><code data-act-command>relish timeline --app web --since 15m</code>
+<code data-act-command>relish agent explain --restart web-0</code>
+<code data-act-command>relish agent explain --placement web-1</code></pre>
+          <p>A decision the records no longer hold comes back as <code>not_found</code>,
+            which means unknown, not “didn’t happen”.</p>
+          <h3 id="act-verify">Is this the release?</h3>
+          <p><code data-act-command>relish verify</code> checks that every node runs the
+            published, signed <code>bun</code>, byte for byte, that they all run the same
+            version, and that the <code>relish</code> asking is signed too. Missing evidence
+            is <code>unknown</code>, never <code>verified</code>.</p>
+          <h3 id="act-status">One screen for the whole cluster</h3>
+          <p><code data-act-command>relish status</code> is now one line per part of the
+            cluster with a verdict on top, the same height on three nodes or three hundred.
+            The lists moved to <code data-act-command>relish apps --unhealthy</code> and
+            <code data-act-command>relish nodes --unhealthy</code>.</p>
+          <h3 id="act-context">Small enough to hold in your head, or a context window</h3>
+          <p>Reliaburger has 8 resource kinds and 189 commands and subcommands, counted from
+            the CLI’s own definitions, hidden ones included. A test fails when either number
+            moves, so a new concept is a line in a pull request that someone has to agree
+            with.</p>
+          <aside class="measure-pending" aria-label="Not measured yet: the Kubernetes comparison">
+            <strong>How that compares with Kubernetes</strong>
+            <p>Not measured yet. The tokens and time an agent spends on the same task on
+              each platform come from the runs in
+              <a href="https://github.com/reliaburger/reliaburger/issues/1679">#1679</a>,
+              for <a href="https://github.com/reliaburger/reliaburger/issues/1681">#1681</a>,
+              and we’ll quote them here when they exist.</p>
+          </aside>
+          <aside class="measured" data-record="docs/qualification/2026-11-10-gym-local-models-second-pass.md" aria-label="Measured: small local models">
+            <strong>Small local models</strong>
+            <p>Four open models ran the agent gym in Ollama on our Mac Studio, at an 8K
+              window, with a plain loop and three runs a scenario. Qwen3 8B and Qwen3 14B
+              each got 12 of 36 runs right, Llama 3.1 8B 7 and gpt-oss 20B 6. They're good at
+              the simple diagnoses: both Qwen3 models found the crash loops and the
+              unschedulable app every time. They aren't good at anything that needs
+              a step of their own. None fixed the planted bug in <code>relish</code>'s source,
+              Qwen3 8B lost the partitioned node all three times, and even with the proposing
+              tools the Qwen3 models proposed in 7 of 24 runs. None changed the cluster.
+              Claude, five runs each on 0.2.7, got 29 of 30 on the six scenarios it ran.</p>
+            <p><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-11-10-gym-local-models-second-pass.md">The record</a>
+              · <a href="/agents#with-a-local-model">Running a local model</a>
+              · <a href="https://github.com/reliaburger/reliaburger/issues/1687">#1687</a></p>
+          </aside>
+          <p class="tour-links"><a href="agents#proposing-a-change">Proposals, for agents</a>
+            · <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/manual/05_chaos.md#testing-your-agent-on-your-cluster">Test your agent on your cluster</a>
+            · <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/manual/10_security.md#agent-tokens-and-proposals">Agent tokens and proposals</a>
+            · <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/manual/07_diagnostics.md#relish-timeline-what-changed-and-why-did-it-do-that">The timeline</a>
+            · <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/manual/12_operations.md#is-this-the-release">Verify a cluster</a></p>
+        </div>
+      </section>
+
+      <section id="next" class="section" aria-labelledby="next-title">
+        <div class="section-heading">
+          <span class="section-number" aria-hidden="true">09 /</span>
+          <h2 id="next-title">What’s next <a class="permalink" href="#next" aria-label="Link to what's next">#</a></h2>
+        </div>
+      <aside class="status" aria-label="Release status: in progress">
+        <strong>0.2.8: Agents you can trust, built faster</strong>
+        <p>In progress, with its scope still being settled. Agent changes as proposals
+          you review and can undo, trying a change on a copy of production, and a record
+          of why an agent did what it did. Alongside them, a faster loop for building
+          and releasing Reliaburger itself.</p>
+        <a href="https://github.com/reliaburger/reliaburger/milestone/30">Milestone <span aria-hidden="true">↗</span></a>
+      </aside>
+
+      <aside class="status" aria-label="Release status: next">
+        <strong>0.3.0: Bare metal in an hour</strong>
+        <p>After 0.2.8. An appliance OS, netbooting and claiming machines over
+          the LAN, and signed A/B OS updates. The exit test: Dell Wyse
+          thin clients from power-on to a cluster.</p>
+        <a href="https://github.com/reliaburger/reliaburger/milestone/6">Milestone <span aria-hidden="true">↗</span></a>
+      </aside>
+
+      <aside class="status" aria-label="Release status: planned">
+        <strong>0.4.0: Full container migration</strong>
+        <p>Planned. Cordon, drain and uncordon, cold moves that carry volumes, and
+          checkpoint moves that keep memory while connections reconnect.</p>
+        <a href="https://github.com/reliaburger/reliaburger/milestone/7">Milestone <span aria-hidden="true">↗</span></a>
+      </aside>
       </section>
 
       <section id="docs" class="section" aria-labelledby="docs-title">
         <div class="section-heading">
-          <span class="section-number" aria-hidden="true">06 /</span>
-          <h2 id="docs-title">Read before you deploy <a class="permalink" href="#docs" aria-label="Link to the documentation section">#</a></h2>
+          <span class="section-number" aria-hidden="true">10 /</span>
+          <h2 id="docs-title">Read the docs <a class="permalink" href="#docs" aria-label="Link to the documentation section">#</a></h2>
           <span class="section-note">Documentation lives with the code.</span>
         </div>
         <div class="reading-list">
@@ -575,19 +1351,16 @@ target/debug/relish</code></pre>
             <span class="filetype">DESIGN &amp; INTENT</span>
             <h3><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/whitepaper.md">The whitepaper <span aria-hidden="true">↗</span></a></h3>
             <p>The architecture, its trade-offs and the longer-term vision. Includes features still planned.</p>
-            <a class="secondary-link" href="https://github.com/reliaburger/reliaburger/releases/latest/download/reliaburger-whitepaper.pdf">PDF from the latest release</a>
           </article>
           <article class="reading-item">
             <span class="filetype">IMPLEMENTATION</span>
             <h3><a href="https://github.com/reliaburger/reliaburger/tree/main/docs/design">Component design docs <span aria-hidden="true">↗</span></a></h3>
             <p>Protocols, data structures, failure modes and decisions for each subsystem.</p>
-            <a class="secondary-link" href="https://github.com/reliaburger/reliaburger/releases/latest/download/reliaburger-design-docs.pdf">PDF from the latest release</a>
           </article>
           <article class="reading-item">
             <span class="filetype">WALKTHROUGH</span>
             <h3><a href="https://github.com/reliaburger/reliaburger/tree/main/docs/book">Building Reliaburger <span aria-hidden="true">↗</span></a></h3>
             <p>The companion book: build the orchestrator while learning Rust and distributed systems. For programmers coming from C, Python or Go.</p>
-            <a class="secondary-link" href="https://github.com/reliaburger/reliaburger/releases/latest/download/building-reliaburger.pdf">PDF from the latest release</a>
           </article>
           <article class="reading-item">
             <span class="filetype">REFERENCE</span>
@@ -597,7 +1370,7 @@ target/debug/relish</code></pre>
           <article class="reading-item">
             <span class="filetype">CURRENT STATE</span>
             <h3><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md">Roadmap &amp; backlog <span aria-hidden="true">↗</span></a></h3>
-            <p>What’s implemented, what 0.2.0 leaves out and what’s next. Read alongside the <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md">roadmap</a>.</p>
+            <p>What’s implemented, what 0.2.8 leaves out and what’s next.</p>
           </article>
         </div>
         <p class="pdf-note">Every release carries PDFs, and these links always fetch the latest:
@@ -608,9 +1381,48 @@ target/debug/relish</code></pre>
           follows <code>main</code>, so it can be newer.</p>
       </section>
 
+      <section id="compare" class="section" aria-labelledby="compare-title">
+        <div class="section-heading"><span class="section-number" aria-hidden="true">11 /</span><h2 id="compare-title">Compare the alternatives <a class="permalink" href="#compare" aria-label="Link to the comparisons">#</a></h2></div>
+        <p class="section-intro">How Reliaburger compares, with commands and sources beside the claims.
+          These pages were last re-checked on 21 October 2026, against 0.2.2; the policies, templates and sidecars 0.2.4 added aren’t in them yet.</p>
+        <div class="reading-list">
+          <article class="reading-item">
+            <span class="filetype">THE PLATFORM API</span>
+            <h3><a href="./compare/kubernetes">Reliaburger vs Kubernetes <span aria-hidden="true">↗</span></a></h3>
+            <p>Pods, controllers, storage and extensibility; installation with kubeadm and the cost of operating the platform.</p>
+          </article>
+          <article class="reading-item">
+            <span class="filetype">THE WORKLOAD SCHEDULER</span>
+            <h3><a href="./compare/nomad">Reliaburger vs Nomad <span aria-hidden="true">↗</span></a></h3>
+            <p>Jobs, groups, allocations and service discovery; what comes with the scheduler and what you integrate.</p>
+          </article>
+          <article class="reading-item">
+            <span class="filetype">KUBERNETES, PACKAGED</span>
+            <h3><a href="./compare/k3s">Reliaburger vs k3s <span aria-hidden="true">↗</span></a></h3>
+            <p>What its bundled runtime, networking and ingress simplify, and which Kubernetes concepts remain.</p>
+          </article>
+          <article class="reading-item">
+            <span class="filetype">THE SINGLE-HOST BASELINE</span>
+            <h3><a href="./compare/docker-compose">Reliaburger vs Docker Compose <span aria-hidden="true">↗</span></a></h3>
+            <p>Services, networks and volumes; where a single Docker host is enough and what changes when you need a cluster.</p>
+          </article>
+          <article class="reading-item">
+            <span class="filetype">THE APPLICATION PLATFORM</span>
+            <h3><a href="./compare/coolify">Reliaburger vs Coolify <span aria-hidden="true">↗</span></a></h3>
+            <p>Git deployments, preview environments, domains and backups; the difference between deployment to servers and cluster reconciliation.</p>
+          </article>
+          <article class="reading-item">
+            <span class="filetype">THE SMALL-CLUSTER ALTERNATIVE</span>
+            <h3><a href="./compare/uncloud">Reliaburger vs Uncloud <span aria-hidden="true">↗</span></a></h3>
+            <p>Compose, WireGuard and Caddy; straightforward deployment across machines and the limits of automatic recovery.</p>
+          </article>
+        </div>
+        <p class="pdf-note"><a href="./compare/">All comparisons</a> · <a href="./compare/methodology">Evidence and comparison method</a></p>
+      </section>
+
       <section id="internals" class="section" aria-labelledby="internals-title">
         <div class="section-heading">
-          <span class="section-number" aria-hidden="true">07 /</span>
+          <span class="section-number" aria-hidden="true">12 /</span>
           <h2 id="internals-title">Follow a subsystem <a class="permalink" href="#internals" aria-label="Link to the subsystems section">#</a></h2>
         </div>
         <p class="section-intro"><code>bun</code> runs on each node. <code>relish</code> talks to its API.
@@ -631,6 +1443,42 @@ target/debug/relish</code></pre>
         </dl>
       </section>
 
+      <section id="start" class="section start" aria-labelledby="start-title">
+        <div class="section-heading">
+          <span class="section-number" aria-hidden="true">13 /</span>
+          <h2 id="start-title">Build it from source <a class="permalink" href="#start" aria-label="Link to the build-from-source section">#</a></h2>
+        </div>
+        <div class="start-grid">
+          <div class="start-copy">
+            <p>Hacking on Reliaburger itself? Start with a local process. No container
+              runtime required.</p>
+            <p>You’ll need Rust and your platform’s build tools. This runs <code>hello</code> as
+              a host process on one node: no images, no isolated container, only the binaries
+              the node config allows.</p>
+            <p>For real OCI containers, use runc on Linux. On macOS, the managed laptop
+              quickstart uses Linux VMs. Direct Apple Container is deferred beyond 0.2.8.</p>
+            <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/README.md">Build requirements &amp; runtime setup <span aria-hidden="true">↗</span></a>
+          </div>
+          <div class="terminal">
+            <div class="terminal-heading">LOCAL DEVELOPMENT <span>sh</span></div>
+            <pre><code><span class="comment"># Terminal 1 · build and start the agent</span>
+git clone https://github.com/reliaburger/reliaburger
+cd reliaburger
+cargo build --bins
+target/debug/bun --runtime process \
+  --config examples/node/process-runtime.toml
+
+<span class="comment"># Terminal 2 · from the same checkout</span>
+target/debug/relish apply \
+  examples/phase-1/proc-first-run.toml
+target/debug/relish status
+target/debug/relish apps
+target/debug/relish</code></pre>
+            <div class="terminal-footer">Web dashboard: <code>http://127.0.0.1:9117/</code></div>
+          </div>
+        </div>
+      </section>
+
       <section id="contributing" class="section contributing" aria-labelledby="contribute-title">
         <div>
           <div class="eyebrow">CODE, TESTS, DOCUMENTATION</div>
@@ -644,12 +1492,13 @@ target/debug/relish</code></pre>
     <footer>
       <span>Reliaburger · by Miko Pawlikowski</span>
       <a href="https://github.com/reliaburger/reliaburger/blob/main/LICENSE">Apache 2.0</a>
-      <span class="footer-note">HTML and CSS. Two small scripts: one adds the copy buttons, one
-        plays the recordings with a copy of the asciinema player served from this site.
-        No tracking, no third-party requests.</span>
+      <span class="footer-note">HTML and CSS. Three small scripts: one adds the copy buttons and
+        the Markdown and Claude links, one plays the recordings with a copy of the asciinema player
+        served from this site, and one turns the seven differences into a slideshow. No tracking, no third-party requests.</span>
     </footer>
   </div>
   <script src="./assets/copy.js" defer></script>
   <script src="./assets/tour-player.js" defer></script>
+  <script src="./assets/why-carousel.js" defer></script>
 </body>
 </html>

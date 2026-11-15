@@ -10,7 +10,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use super::*;
-use crate::grill::capture::{CAPTURE_CHUNK_BYTES, CaptureReader};
+use crate::grill::capture::{
+    CaptureReader, FOLLOW_POLL, SourceWatch, UNKNOWN_SOURCE_LIMIT, follow_capture,
+};
 use crate::grill::command::{
     ClaimedCommandExecutor, CommandOutput, CommandState, RuntimeCommandExecutor,
 };
@@ -257,7 +259,9 @@ impl RuncGrill {
                 .await
                 .insert(id.clone(), context.clone());
             let result = async {
-                let index = if runtime.rootless {
+                // A sidecar joins its parent's namespace and address, so it
+                // reserves none of its own (#1120).
+                let index = if runtime.rootless || spec.joined_network().is_some() {
                     None
                 } else {
                     Some(
@@ -589,8 +593,10 @@ impl RuncGrill {
             ) {
                 return runtime.owned_cleanup(&id, &context).await;
             }
+            // The app's own stop signal (#1121), from its original intent.
+            let signal = context.intent().await?.spec.stop_signal().name();
             let output = runtime
-                .owned_runc_command(&context, &["kill", &id.0, "SIGTERM"])
+                .owned_runc_command(&context, &["kill", &id.0, signal])
                 .await?;
             if output.exit_code != Some(0) {
                 if matches!(
@@ -1065,12 +1071,6 @@ impl RuncGrill {
                     "runtime intent conflicts with adoption record",
                 ));
             }
-            let stem = context.role_log_stem(RuntimeRole::Launcher).await?;
-            if stem.is_none() || adoption.log_stem != stem {
-                return Err(io::Error::other(
-                    "adoption log identity conflicts with runtime generation",
-                ));
-            }
             if matches!(intent.phase, IntentPhase::Retired { .. }) {
                 return Ok(false);
             }
@@ -1079,6 +1079,20 @@ impl RuncGrill {
                 // gone or go now; a retained discovery address stays held until
                 // the caller's confirmed withdrawal releases it. Refusing here
                 // left the agent unable to start at all.
+                runtime.owned_cleanup(&id, &context).await?;
+                return Ok(false);
+            }
+            // The record and the launcher binding are written at different
+            // moments, and a power cut can keep one without the other. A record
+            // that names no launch, or another launch's logs, no longer
+            // describes this generation: it's stale, like one naming another
+            // process below. Retire the generation so the instance starts
+            // again. Refusing stopped Bun at every start (#1849).
+            let stem = context.role_log_stem(RuntimeRole::Launcher).await?;
+            if stem.is_none() || adoption.log_stem != stem {
+                eprintln!(
+                    "runc: {id}: adoption record names other logs than the generation's launcher; retiring the generation"
+                );
                 runtime.owned_cleanup(&id, &context).await?;
                 return Ok(false);
             }
@@ -1092,6 +1106,7 @@ impl RuncGrill {
             // adoption record naming another process is stale: retire the
             // generation so the instance starts again. Refusing here took
             // the agent, and every workload on the node, down with it (#607).
+            // BLOCKING-OK: procfs, answered from memory
             if adoption.pid != launcher_pid || !crate::grill::records::is_live(&adoption) {
                 eprintln!(
                     "runc: {id}: adoption record names another process than the running launcher {launcher_pid}; retiring the generation"
@@ -1155,9 +1170,12 @@ impl RuncGrill {
         };
         let mut output = String::new();
         for extension in ["stdout", "stderr"] {
-            let bytes = tokio::fs::read(stem.with_extension(extension))
-                .await
-                .map_err(|error| failure(instance, error))?;
+            let path = stem.with_extension(extension);
+            let bytes =
+                tokio::task::spawn_blocking(move || crate::grill::capture::read_retained(&path))
+                    .await
+                    .map_err(|error| failure(instance, error))?
+                    .map_err(|error| failure(instance, error))?;
             output.push_str(&String::from_utf8_lossy(&bytes));
         }
         Ok(output)
@@ -1168,7 +1186,7 @@ impl RuncGrill {
         &self,
         instance: &InstanceId,
         command: &[String],
-    ) -> Result<String, GrillError> {
+    ) -> Result<crate::grill::ExecOutput, GrillError> {
         if command.is_empty() {
             return Err(failure(instance, "no command specified"));
         }
@@ -1206,62 +1224,49 @@ impl RuncGrill {
         sender: tokio::sync::mpsc::Sender<CapturedLine>,
         resume: &crate::ketchup::types::CaptureOffsets,
     ) {
-        let source = self
-            .owned_operation(instance, |_runtime, _id, context| async move {
-                let stem = context.role_log_stem(RuntimeRole::Launcher).await?;
-                let retired = matches!(context.intent().await?.phase, IntentPhase::Retired { .. });
-                // Immutable retired logs need no lifecycle claim. A slow reader
-                // must not retain the lock required to prepare the next generation.
-                Ok((stem, if retired { None } else { Some(context) }))
-            })
-            .await;
-        let Ok((Some(stem), context)) = source else {
-            return;
+        // One failed start would leave this instance out of the log store
+        // until Bun restarted, as a failed check later on would (#1493).
+        let mut watch = SourceWatch::new(UNKNOWN_SOURCE_LIMIT);
+        let (stem, context) = loop {
+            let source = self
+                .owned_operation(instance, |_runtime, _id, context| async move {
+                    let stem = context.role_log_stem(RuntimeRole::Launcher).await?;
+                    let retired =
+                        matches!(context.intent().await?.phase, IntentPhase::Retired { .. });
+                    // Immutable retired logs need no lifecycle claim. A slow reader
+                    // must not retain the lock required to prepare the next generation.
+                    Ok((stem, if retired { None } else { Some(context) }))
+                })
+                .await;
+            match source {
+                Ok((Some(stem), context)) => break (stem, context),
+                Ok((None, _)) | Err(GrillError::NotFound { .. }) => return,
+                Err(error) => {
+                    if sender.is_closed() || watch.check_failed(tokio::time::Instant::now()) {
+                        eprintln!("ketchup: not following {instance}: {error}");
+                        return;
+                    }
+                    tokio::time::sleep(FOLLOW_POLL).await;
+                }
+            }
         };
-        let mut terminal = context.is_none();
-        let mut readers = [
+        let readers = [
             CaptureReader::resume(LogStream::Stdout, stem.with_extension("stdout"), resume).await,
             CaptureReader::resume(LogStream::Stderr, stem.with_extension("stderr"), resume).await,
         ];
-        loop {
-            // A capture with no checkpoint replays from byte 0. Bounded
-            // chunks, each read behind an `.await`, keep that replay from
-            // holding a runtime worker (it once starved startup adoption).
-            let mut backlog = false;
-            for reader in &mut readers {
-                let Ok(bytes) = reader.read_chunk().await else {
-                    continue;
+        // Follow the captured generation, never a successor using its name.
+        follow_capture(readers, sender, UNKNOWN_SOURCE_LIMIT, || {
+            let context = context.as_ref();
+            async move {
+                let Some(context) = context else {
+                    return Ok(false);
                 };
-                backlog |= bytes.len() == CAPTURE_CHUNK_BYTES;
-                for line in reader.push(&bytes) {
-                    if sender.send(line).await.is_err() {
-                        return;
-                    }
-                }
+                Ok(matches!(
+                    context.role_state(RuntimeRole::Launcher).await?,
+                    Some(CommandState::Running { .. })
+                ))
             }
-            if backlog {
-                continue;
-            }
-            if terminal || sender.is_closed() {
-                for reader in &mut readers {
-                    if let Some(line) = reader.finish() {
-                        let _ = sender.send(line).await;
-                    }
-                }
-                return;
-            }
-            // Follow the captured generation, never a successor using its name.
-            // A lost source ends this log stream without asserting runtime absence.
-            terminal = match &context {
-                Some(context) => !matches!(
-                    context.role_state(RuntimeRole::Launcher).await,
-                    Ok(Some(CommandState::Running { .. }))
-                ),
-                None => true,
-            };
-            if !terminal {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        }
+        })
+        .await;
     }
 }

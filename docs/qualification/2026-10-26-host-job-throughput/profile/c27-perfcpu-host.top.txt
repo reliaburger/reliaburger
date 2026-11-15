@@ -1,0 +1,61 @@
+total 39913
+ 58.43% incl   0.00% self  swapper
+ 58.43% incl   0.00% self  cpu_startup_entry
+ 58.42% incl   0.02% self  do_idle
+ 58.18% incl  57.02% self  cpuidle_idle_call
+ 43.85% incl   0.00% self  secondary_start_kernel
+ 43.85% incl   0.00% self  __secondary_switched
+ 31.19% incl   0.00% self  el0t_64_sync_handler
+ 31.19% incl   0.00% self  el0t_64_sync
+ 26.20% incl   1.60% self  el0_svc
+ 23.96% incl   0.05% self  do_el0_svc
+ 23.86% incl   0.05% self  el0_svc_common.constprop.0
+ 23.45% incl   0.37% self  invoke_syscall
+ 17.39% incl   0.00% self  :
+ 14.58% incl   0.00% self  rest_init
+ 14.58% incl   0.00% self  start_kernel
+ 14.58% incl   0.00% self  __primary_switched
+ 14.58% incl   0.00% self  arch_call_rest_init
+ 13.84% incl   0.00% self  helper
+ 11.64% incl   3.58% self  [busybox]
+ 10.37% incl   0.00% self  _start
+ 10.37% incl   0.10% self  main
+  9.35% incl   0.00% self  __libc_start_call_main
+  9.35% incl   0.00% self  __libc_start_main_impl
+  9.21% incl   1.44% self  [libc.so.6]
+  8.18% incl   0.00% self  <std::sys::thread::unix::Thread>::new::thread_start
+  8.14% incl   0.00% self  std::sys::backtrace::__rust_begin_short_backtrace<<tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure}, ()>
+  8.14% incl   0.00% self  tokio-rt-worker
+  8.14% incl   0.00% self  <std::thread::lifecycle::spawn_unchecked<<tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure}, ()>::{closure} as core::ops::function::FnOnce<()>>:
+  7.94% incl   0.00% self  tokio::runtime::task::raw::poll<tokio::runtime::blocking::task::BlockingTask<<tokio::runtime::scheduler::multi_thread::worker::Launch>::launch::{closure}>, toki
+  7.94% incl   0.05% self  tokio::runtime::scheduler::multi_thread::worker::run
+  7.03% incl   0.01% self  <tokio::runtime::scheduler::multi_thread::worker::Context>::run_task
+  6.95% incl   0.03% self  rb_clone3
+  5.82% incl   0.01% self  tokio::runtime::task::raw::poll<<reliaburger::bun::task_executor::TaskPool<reliaburger::bun::task_array_node::NodeRunner>>::resume_chunk_streaming::{closure}::{
+  5.66% incl   0.02% self  <reliaburger::bun::task_executor::TaskPool<reliaburger::bun::task_array_node::NodeRunner>>::resume_chunk_streaming::{closure}::{closure}
+  5.38% incl   0.02% self  <reliaburger::bun::task_runtime::OwnedRunner<reliaburger::grill::AnyGrill> as reliaburger::bun::task_executor::TaskRunner>::run::{closure}
+  5.32% incl   0.07% self  <reliaburger::bun::reusable_executor::pool::ReusablePool<reliaburger::grill::AnyGrill>>::run<<reliaburger::bun::task_runtime::OwnedRunner<reliaburger::grill::An
+  5.25% incl   0.00% self  __arm64_sys_execve
+  5.23% incl   0.01% self  do_execveat_common.isra.0
+  4.88% incl   0.14% self  handle_mm_fault
+  4.80% incl   0.02% self  do_mem_abort
+  4.77% incl   0.00% self  __arm64_sys_exit_group
+  4.76% incl   0.00% self  do_group_exit
+  4.76% incl   0.07% self  do_page_fault
+  4.74% incl   0.02% self  do_exit
+  4.72% incl   0.03% self  __handle_mm_fault
+  4.38% incl   0.00% self  task_child
+  4.36% incl   0.00% self  bprm_execve
+  4.32% incl   0.02% self  handle_pte_fault
+  4.31% incl   0.05% self  bprm_execve.part.0
+  4.25% incl   0.01% self  do_translation_fault
+  3.77% incl   0.01% self  do_pte_missing
+  3.54% incl   0.00% self  exit_mm
+  3.51% incl   0.00% self  mmput
+  3.51% incl   0.00% self  __mmput
+  3.46% incl   0.01% self  exit_mmap
+  3.41% incl   3.22% self  finish_task_switch.isra.0
+  3.04% incl   0.01% self  __execve
+  2.91% incl   0.03% self  do_read_fault
+  2.89% incl   0.00% self  exec_binprm
+  2.88% incl   0.00% self  search_binary_handler

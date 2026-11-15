@@ -64,7 +64,9 @@ async fn abandoned_registry_upload_is_reclaimed_after_bun_sigkill() {
         false,
         root.path().join("upload-competing.log"),
     );
-    let status = tokio::time::timeout(Duration::from_secs(5), async {
+    // Startup waits up to ten seconds for a busy lock before refusing, so a
+    // child forked just before a self-upgrade exec can let go (#1198).
+    let status = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             if let Some(status) = competing.child.try_wait().unwrap() {
                 break status;
@@ -107,6 +109,28 @@ async fn expired_registry_lease_recovers_after_bun_sigkill_and_preserves_shared_
 #[tokio::test]
 async fn new_leader_retains_registry_cleanup_until_the_killed_writer_returns() {
     qualify_registry_owner_crash(true).await;
+}
+
+/// GET a registry manifest, retrying its fail-closed 503 for up to 30 s.
+///
+/// A manifest GET reads the council's catalogue, and a registry that can't
+/// confirm that catalogue with the leader answers 503 rather than a stale
+/// view: while the killed writer rejoins, or while a loaded leader misses a
+/// heartbeat round. That 503 is the documented retryable answer, like the
+/// lease leader's; any other status is the registry's answer. Blob GETs read
+/// local content-addressed files and need no retry.
+async fn get_retrying_unconfirmed_catalogue(
+    http: &reqwest::Client,
+    url: &str,
+) -> reqwest::Response {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let response = http.get(url).send().await.unwrap();
+        if response.status() != 503 || Instant::now() >= deadline {
+            return response;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 async fn qualify_registry_owner_crash(with_followers: bool) {
@@ -589,25 +613,12 @@ async fn qualify_registry_owner_crash(with_followers: bool) {
         .registry
         .unwrap();
     let http = observer.registry_http_client(&registry).unwrap();
-    assert_eq!(
-        http.get(format!(
-            "{registry}/v2/{repository}/manifests/{}",
-            image.manifest_digest
-        ))
-        .send()
-        .await
-        .unwrap()
-        .status(),
-        404
-    );
-    let ordinary = http
-        .get(format!(
-            "{registry}/v2/ordinary/manifests/{}",
-            image.manifest_digest
-        ))
-        .send()
-        .await
-        .unwrap();
+    let manifest_digest = &image.manifest_digest;
+    let leased_url = format!("{registry}/v2/{repository}/manifests/{manifest_digest}");
+    let leased = get_retrying_unconfirmed_catalogue(&http, &leased_url).await;
+    assert_eq!(leased.status(), 404);
+    let ordinary_url = format!("{registry}/v2/ordinary/manifests/{manifest_digest}");
+    let ordinary = get_retrying_unconfirmed_catalogue(&http, &ordinary_url).await;
     assert_eq!(ordinary.status(), 200);
     assert_eq!(ordinary.bytes().await.unwrap().as_ref(), image.manifest);
     for (digest, expected) in [

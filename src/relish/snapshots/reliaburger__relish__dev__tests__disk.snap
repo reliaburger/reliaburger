@@ -1,0 +1,9 @@
+---
+source: src/relish/dev.rs
+expression: "json(&BuildVmReport\n{\n    vm: TEST_VM_NAME, exists: true, output:\n    \"=== Filesystem ===\\n\".to_string(),\n})"
+---
+{
+  "vm": "reliaburger-test",
+  "exists": true,
+  "output": "=== Filesystem ===\n"
+}

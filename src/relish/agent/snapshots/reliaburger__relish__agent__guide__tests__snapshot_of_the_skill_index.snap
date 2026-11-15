@@ -1,0 +1,16 @@
+---
+source: src/relish/agent/guide.rs
+expression: "artefact(paths::SKILL_INDEX)"
+---
+{
+  "$schema": "https://schemas.agentskills.io/discovery/0.2.0/schema.json",
+  "skills": [
+    {
+      "description": "Use when operating, debugging or upgrading a Reliaburger cluster, or when you suspect a bug in Reliaburger itself. Reliaburger is an orchestrator. Its CLI is `relish`.",
+      "digest": "sha256:17cafc18f31ac3b0f1ba6cf1f81dbf5b2812b129296c1c8d7b08484f4d54544a",
+      "name": "reliaburger",
+      "type": "skill-md",
+      "url": "/.well-known/agent-skills/reliaburger/SKILL.md"
+    }
+  ]
+}

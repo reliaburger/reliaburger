@@ -1,0 +1,13 @@
+# App `storefront` in namespace `shop`: the directory names the namespace.
+# See ../_defaults.toml for how the repository fits together.
+
+[app.storefront]
+exec = "target/debug/testapp"
+command = ["--mode", "healthy", "--port", "8081"]
+port = 8081
+env = { VERSION = "storefront-v1" }
+
+[app.storefront.health]
+path = "/healthz"
+interval = 2
+timeout = 1

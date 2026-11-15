@@ -1,0 +1,16 @@
+# Node config for trying Reliaburger from source with `--runtime process`.
+#
+# The process runtime runs host workloads only: `exec` and `script` apps.
+# It runs no images; an app that names one needs a container runtime, and
+# this node refuses it. Host execution is deny-by-default, so this file
+# allows the binaries the `examples/phase-1/proc-*` apps and jobs run.
+#
+# From the repository root, after `cargo build --locked --bins`:
+#   target/debug/bun --runtime process --config examples/node/process-runtime.toml
+
+[process_workloads]
+# `target/debug/testapp` is relative, so start Bun from the repository root.
+allowed_binaries = ["target/debug/testapp", "/bin/echo", "/bin/false"]
+# Host workloads can't run under mount isolation yet (#714). It's on by
+# default on Linux, so turn it off: these processes aren't isolated.
+mount_isolation = false

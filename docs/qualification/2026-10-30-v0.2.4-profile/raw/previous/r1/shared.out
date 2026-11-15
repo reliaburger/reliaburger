@@ -1,0 +1,77 @@
+jobs-shared-containers: 60 seconds, concurrency 27 per node; submission and cold startup are inside the window; positive drain follows it
+0.0s: 0 unique accepted successes, 0 failures, 0 retries; 0.0/s
+5.1s: 2000 unique accepted successes, 0 failures, 0 retries; 393.8/s
+10.1s: 24000 unique accepted successes, 0 failures, 0 retries; 2372.5/s
+15.1s: 69000 unique accepted successes, 0 failures, 0 retries; 4555.0/s
+20.2s: 114000 unique accepted successes, 0 failures, 0 retries; 5647.7/s
+25.2s: 159000 unique accepted successes, 0 failures, 0 retries; 6304.3/s
+30.3s: 204000 unique accepted successes, 0 failures, 0 retries; 6743.0/s
+35.3s: 249000 unique accepted successes, 0 failures, 0 retries; 7055.1/s
+40.3s: 294000 unique accepted successes, 0 failures, 0 retries; 7289.4/s
+45.4s: 339000 unique accepted successes, 0 failures, 0 retries; 7472.1/s
+50.4s: 384000 unique accepted successes, 0 failures, 0 retries; 7617.8/s
+55.4s: 429000 unique accepted successes, 0 failures, 0 retries; 7736.9/s
+{
+  "schema_version": 1,
+  "scenario": "jobs-shared-containers",
+  "started_at": "2026-10-30T07:28:26Z",
+  "requested_seconds": 60,
+  "concurrency": 27,
+  "cpu_request_millicores": 25,
+  "cpu_limit_millicores": 1000,
+  "memory_bytes": 33554432,
+  "receipt_chunk_size": 1000,
+  "image": "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028",
+  "executable": null,
+  "executable_sha256": null,
+  "measurement_boundary": "configured cluster; concurrency is per node; unique accepted outcomes received before the monotonic cutoff; submission and cold executor/image startup are included; 10m/8Mi helper reservation for shared/host; remote host executable hash is unknown; compare on the same node and byte-identical BusyBox",
+  "unique_accepted_successes": 475000,
+  "verified_successes": 0,
+  "terminal_failures": 0,
+  "accepted_retries": 0,
+  "post_cutoff_drained": 0,
+  "batch_ids": [
+    3
+  ],
+  "active_submissions": [
+    3
+  ],
+  "drain_proofs": [
+    {
+      "batch_id": 3,
+      "done": true,
+      "held": 0,
+      "active_commands": 0
+    }
+  ],
+  "last_accepted_sample_seconds": 59.981254627,
+  "submission_names": [
+    "bench-jobs-ff88ab70e1234dedeb45a2b6777891dd"
+  ],
+  "measurement_complete": true,
+  "interrupted": false,
+  "cleanup_verified": true,
+  "cleanup_failed_submissions": [],
+  "error": null,
+  "elapsed_including_drain_seconds": 61.769700868,
+  "successes_per_second": 7916.666666666667,
+  "extrapolated_runs_per_day": 684000000.0,
+  "daily_projection": "extrapolation from this window; not an observed daily total",
+  "qualified_100m_per_day": false,
+  "per_node": {
+    "tolerance_percent": 20,
+    "balanced": true,
+    "nodes": [
+      {
+        "node": "node-01",
+        "slots": 27,
+        "successes": 476741,
+        "successes_per_second": 7945.683333333333,
+        "share_percent": 100.0,
+        "fair_share_percent": 100.0,
+        "over_fair_share": false,
+        "counters_restarted": false
+      }
+    ]
+  }
+}

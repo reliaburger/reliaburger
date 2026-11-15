@@ -10,12 +10,17 @@ use crate::grill::mock::MockGrill;
 #[cfg(target_os = "linux")]
 mod cgroup_faults;
 mod fault_coverage;
+mod job_faults;
 mod loop_harness;
 mod loop_rule;
 mod namespace_secrets;
 mod published_status;
 mod restart_ownership;
+mod runtime_knobs;
 mod runtime_metadata;
+mod secret_providers;
+mod sidecars;
+mod stop_hooks;
 mod upgrade_answer;
 
 #[test]
@@ -142,6 +147,8 @@ async fn a_trace_lists_only_the_faults_that_act_on_its_own_path() {
         agent
             .fault_registry
             .insert(&FaultRequest {
+                workload: Default::default(),
+                task_index: None,
                 fault_type,
                 target_service: service.to_string(),
                 namespace: Some(namespace.to_string()),
@@ -567,6 +574,173 @@ async fn reporting_binds_execution_to_the_original_runtime_specification() {
             assert!(report.instances[0].execution.is_none());
         }
     }
+}
+
+/// An inventory read that misses the report's deadline must not strip the
+/// executions from the report. The leader drops a backend with no
+/// execution on any node with retirement history, so one slow read emptied
+/// every service on the node for a report interval while its containers
+/// kept serving (#1855). The report reuses the execution it last knew,
+/// until something launches the instance again or a complete read
+/// contradicts it.
+#[tokio::test]
+async fn a_slow_inventory_read_reports_the_last_known_execution() {
+    let (mut agent, _, _, grill) = test_agent_with_grill();
+    expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+    let id = InstanceId("default__web-0".into());
+    let spec = agent
+        .supervisor
+        .get_instance(&id)
+        .unwrap()
+        .oci_spec
+        .clone()
+        .unwrap();
+    let launch = crate::grill::RuntimeLaunch {
+        instance_id: id.clone(),
+        spec: spec.clone(),
+        generation: crate::grill::RuntimeGeneration::process("first"),
+        network_reference: None,
+    };
+    let known = crate::grill::RuntimeExecution {
+        instance_id: id.clone(),
+        generation: launch.generation.clone(),
+    };
+    let reported = reported_execution;
+    grill.set_launch_inventory(vec![launch.clone()]).await;
+    assert_eq!(reported(&mut agent).await, Some(known.clone()));
+
+    // The next read takes longer than the loop's patience.
+    grill.set_inventory_delay(Some(LOOP_RUNTIME_INVENTORY_TIMEOUT * 3));
+    assert_eq!(
+        reported(&mut agent).await,
+        Some(known.clone()),
+        "a timed-out read must not erase the execution"
+    );
+
+    // Launching the instance again replaces what the report knows.
+    let restarted = crate::grill::RuntimeGeneration::process("restarted");
+    agent
+        .record_launch_execution(
+            &id,
+            &super::launch_evidence::LaunchExecution::Generation(restarted.clone()),
+        )
+        .unwrap();
+    assert_eq!(
+        reported(&mut agent).await,
+        Some(crate::grill::RuntimeExecution {
+            instance_id: id.clone(),
+            generation: restarted,
+        })
+    );
+
+    // A complete read that no longer finds it is believed, and a later slow
+    // read has nothing to reuse.
+    grill.set_inventory_delay(None);
+    grill.set_launch_inventory(Vec::new()).await;
+    assert_eq!(reported(&mut agent).await, None);
+    grill.set_inventory_delay(Some(LOOP_RUNTIME_INVENTORY_TIMEOUT * 3));
+    assert_eq!(reported(&mut agent).await, None);
+}
+
+/// The execution the node's next state report names for its only instance.
+async fn reported_execution(agent: &mut TestAgent) -> Option<crate::grill::RuntimeExecution> {
+    let (tx, rx) = oneshot::channel();
+    agent
+        .handle_snapshot_request(CollectSnapshotRequest { response: tx })
+        .await;
+    rx.await.unwrap().instances[0].execution.clone()
+}
+
+/// Deploy `web`, report its first launch from a complete inventory, crash
+/// it, and hand the loop its restart's steps until the Start step is in
+/// flight. Every inventory read from then on misses the report's deadline.
+async fn restart_with_a_slow_inventory() -> (TestAgent, MockGrill, InstanceId) {
+    let (mut agent, _, _, grill) = test_agent_with_grill();
+    expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+    let id = InstanceId("default__web-0".into());
+    let spec = agent
+        .supervisor
+        .get_instance(&id)
+        .unwrap()
+        .oci_spec
+        .clone()
+        .unwrap();
+    grill
+        .set_launch_inventory(vec![crate::grill::RuntimeLaunch {
+            instance_id: id.clone(),
+            spec,
+            generation: crate::grill::RuntimeGeneration::process("first"),
+            network_reference: None,
+        }])
+        .await;
+    assert!(reported_execution(&mut agent).await.is_some());
+
+    grill.set_inventory_delay(Some(LOOP_RUNTIME_INVENTORY_TIMEOUT * 3));
+    loop_harness::crash(&grill);
+    agent.check_apps().await;
+    agent.begin_restart_launches().await;
+    while agent.restart_step_of(&id) != Some(super::restarts::RestartStep::Start) {
+        let outcome = agent
+            .restart_steps
+            .join_next_with_id()
+            .await
+            .expect("the restart stopped before its start");
+        agent.finish_restart_step(outcome).await;
+    }
+    assert_eq!(
+        agent.supervisor.get_instance(&id).unwrap().state,
+        ContainerState::Starting
+    );
+    (agent, grill, id)
+}
+
+/// A restart replaces the launch its report named. Until the replacement's
+/// own execution is recorded, a report whose inventory read misses its
+/// deadline names none, as it did before the report kept executions. The
+/// predecessor's would survive a fence of the replacement's generation:
+/// the leader withdraws a backend by the generation it names, and confirms
+/// the release while consumers still route to the port (#1855).
+#[tokio::test]
+async fn a_restart_forgets_the_execution_its_predecessor_reported() {
+    let (mut agent, _grill, id) = restart_with_a_slow_inventory().await;
+    assert_eq!(
+        reported_execution(&mut agent).await,
+        None,
+        "a starting replacement was reported as its predecessor"
+    );
+
+    // The replacement's launch left no execution to record.
+    agent
+        .record_launch_execution(&id, &super::launch_evidence::LaunchExecution::Unrecorded)
+        .unwrap();
+    assert_eq!(reported_execution(&mut agent).await, None);
+}
+
+/// A retirement that takes an instance back from its restart owns it from
+/// then on, and the restart's own launch is never recorded. A report whose
+/// inventory read misses its deadline names no execution for it.
+#[tokio::test]
+async fn a_restart_taken_back_reports_no_execution() {
+    let (mut agent, _grill, id) = restart_with_a_slow_inventory().await;
+    agent
+        .record_launch_execution(
+            &id,
+            &super::launch_evidence::LaunchExecution::Generation(
+                crate::grill::RuntimeGeneration::process("restarted"),
+            ),
+        )
+        .unwrap();
+    assert!(reported_execution(&mut agent).await.is_some());
+
+    let taken = agent
+        .take_back_from_restart(&id)
+        .expect("the restart was no longer in flight");
+    taken
+        .settle(std::time::Duration::from_secs(5))
+        .await
+        .unwrap();
+    agent.settle_restart_steps().await;
+    assert_eq!(reported_execution(&mut agent).await, None);
 }
 
 /// #476: a retired Runc intent keeps environment names, not values. Its
@@ -1074,6 +1248,173 @@ async fn a_rollout_finishes_while_the_old_instance_waits_for_remote_release() {
     let _ = confirmed.await;
 }
 
+/// The states the node's next report would give every instance, by host port.
+async fn reported_states(
+    agent: &mut TestAgent,
+) -> std::collections::BTreeMap<Option<u16>, ContainerState> {
+    let (tx, rx) = oneshot::channel();
+    agent
+        .handle_snapshot_request(CollectSnapshotRequest { response: tx })
+        .await;
+    rx.await
+        .unwrap()
+        .instances
+        .into_iter()
+        .map(|instance| (instance.port, instance.container_state))
+        .collect()
+}
+
+/// #1353: the leader builds the service catalogue from node reports, and a
+/// report counts an instance healthy only when it's Running. A rolling
+/// replacement stayed Starting until the rollout finalised, after the old
+/// instance had drained and stopped, so for that whole stretch the report
+/// had no healthy instance and every other node's connect hook refused the
+/// service. Once its health wait passed and its backend is published, the
+/// replacement serves traffic, and the report has to say so before the old
+/// instance's withdrawal goes out.
+#[tokio::test]
+async fn a_published_rolling_replacement_reports_running_before_the_old_instance_retires() {
+    let (mut agent, _tx, _shutdown, _grill) = test_agent_with_grill();
+    expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+    let old = InstanceId("default__web-0".into());
+    let old_port = agent.supervisor.get_instance(&old).unwrap().host_port;
+
+    // What the deploy worker asks the loop for, step by step, up to the
+    // moment it starts retiring the old instance.
+    let spec = Config::parse("[app.web]\nimage = 'myapp:v2'\nport = 8080\n")
+        .unwrap()
+        .app
+        .remove("web")
+        .unwrap();
+    let new = crate::grill::InstanceIdentity::canary("default", "web", 1, 0).instance_id();
+    let new_port = agent
+        .reserve_rolling_instance(&new, "web", "default", &spec)
+        .await
+        .unwrap();
+    agent
+        .prepare_rolling_instance(&new, "web", "default", &spec, new_port)
+        .await
+        .unwrap();
+    agent
+        .transition_deploy_state(&new, ContainerState::Starting)
+        .await
+        .unwrap();
+    assert_eq!(
+        reported_states(&mut agent).await,
+        std::collections::BTreeMap::from([
+            (old_port, ContainerState::Running),
+            (new_port, ContainerState::Starting),
+        ]),
+        "an unpublished replacement isn't serving yet"
+    );
+
+    agent
+        .publish_new_backend("web", "default", &new, new_port, None, true)
+        .await
+        .unwrap();
+    agent.begin_instance_retirement(&old).await.unwrap();
+    assert_eq!(
+        reported_states(&mut agent).await,
+        std::collections::BTreeMap::from([
+            (old_port, ContainerState::Stopping),
+            (new_port, ContainerState::Running),
+        ]),
+        "the report must name a healthy instance while the old one drains"
+    );
+}
+
+/// #1355: a retiring instance's drain waited only for this node's ingress
+/// connections. Other nodes connect to its backend directly, and they only
+/// drop it once their next view arrives, so a server that exits on SIGTERM
+/// could stop while they still routed to it, and their callers got
+/// `ECONNREFUSED`. The leader's producer release answers exactly "every
+/// node has dropped this backend", but it was asked only after the stop.
+/// Now the old instance keeps running until the leader confirms (or the
+/// patience runs out), and only then gets its stop signal.
+#[tokio::test]
+async fn a_rolling_retirement_stops_the_old_instance_only_after_other_nodes_drop_it() {
+    let grill = MockGrill::new();
+    grill.set_pid(std::process::id());
+    let allocator = PortAllocator::new(30000, 30010);
+    let (_, receiver) = mpsc::channel(8);
+    let mut agent = BunAgent::new(
+        grill.clone(),
+        allocator.clone(),
+        receiver,
+        CancellationToken::new(),
+    );
+    let root = tempfile::tempdir().unwrap();
+    agent.set_volumes_dir(root.path().join("volumes"));
+    agent.set_records_dir(root.path().join("records"));
+    agent
+        .enable_fresh_discovery_ownership(&root.path().join("discovery"))
+        .await
+        .unwrap();
+    expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+    let old = InstanceId("default__web-0".into());
+    let original = agent.supervisor.get_instance(&old).unwrap();
+    let execution = crate::grill::RuntimeExecution {
+        instance_id: old.clone(),
+        generation: crate::grill::RuntimeGeneration::process("original"),
+    };
+    grill
+        .set_launch_inventory(vec![crate::grill::RuntimeLaunch {
+            instance_id: old.clone(),
+            generation: execution.generation.clone(),
+            spec: original.oci_spec.clone().unwrap(),
+            network_reference: None,
+        }])
+        .await;
+    let (mut clustered, _, _) = test_cluster_fault_agent().await;
+    agent.cluster = clustered.cluster.take();
+
+    // The leader waits for one other node's receipt (202), then confirms.
+    // Each request notes whether the old instance had already been told to
+    // stop when it arrived.
+    let confirmation = serde_json::json!({"node_id": "test", "execution": execution}).to_string();
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::<bool>::new()));
+    let (client, leader) = crate::cluster::producer::test_scripted_fixture({
+        let requests = requests.clone();
+        let grill = grill.clone();
+        let old = old.clone();
+        move || {
+            let stopped = grill
+                .calls()
+                .iter()
+                .any(|(operation, id)| operation == "stop" && *id == old);
+            let mut requests = requests.lock().unwrap();
+            requests.push(stopped);
+            if requests.len() < 2 {
+                (axum::http::StatusCode::ACCEPTED, String::new())
+            } else {
+                (axum::http::StatusCode::OK, confirmation.clone())
+            }
+        }
+    })
+    .await;
+    agent.set_producer_release_client(client);
+
+    let replacement = Config::parse("[app.web]\nimage = 'web:v2'\nport = 8080\n").unwrap();
+    expect_complete(&drain_deploy(&mut agent, replacement).await);
+
+    let requests = requests.lock().unwrap().clone();
+    assert!(
+        requests.len() >= 2 && !requests[0] && !requests[1],
+        "the old instance must keep serving until the leader confirms every \
+         node has dropped it; stopped at each release request: {requests:?}"
+    );
+    assert!(
+        grill
+            .calls()
+            .iter()
+            .any(|(operation, id)| operation == "stop" && *id == old),
+        "the old instance was never stopped"
+    );
+    assert!(agent.supervisor.get_instance(&old).is_none());
+    leader.abort();
+    let _ = leader.await;
+}
+
 #[tokio::test]
 async fn slow_producer_release_does_not_stall_the_agent_loop() {
     let grill = MockGrill::new();
@@ -1307,6 +1648,160 @@ async fn a_producer_release_still_pending_after_the_patience_fails_the_retiremen
     assert!(attempts.load(std::sync::atomic::Ordering::SeqCst) >= 29);
 }
 
+/// #1355, #1442: the wait before an old instance's stop, for every node to
+/// drop its backend, gives up at its 5 s patience when a node never
+/// confirms, and the stop goes ahead.
+#[tokio::test(start_paused = true)]
+async fn the_wait_for_remote_withdrawal_gives_up_at_its_patience() {
+    use super::deploy_ops::{PRODUCER_RELEASE_PATIENCE, REMOTE_WITHDRAWAL_RETRY};
+
+    let (tx, mut rx) = mpsc::channel(4);
+    let ops = DeployOps { tx };
+    let id = InstanceId("default__web-0".into());
+    let started = tokio::time::Instant::now();
+    let mut asked = 0u32;
+    // The loop's side answers "pending" for ever, as it does while a lost
+    // node holds the withdrawal up. Driven in this task, not spawned, so
+    // the paused clock only moves when both sides wait.
+    let wait = ops.await_remote_withdrawal(&id);
+    tokio::pin!(wait);
+    loop {
+        tokio::select! {
+            () = &mut wait => break,
+            Some(op) = rx.recv() => {
+                let DeployOp::AwaitRemoteWithdrawal { reply, .. } = op else {
+                    panic!("unexpected op {}", op.name());
+                };
+                asked += 1;
+                let _ = reply.send(Err(pending_release()));
+            }
+        }
+    }
+    let waited = started.elapsed();
+
+    assert!(
+        waited + REMOTE_WITHDRAWAL_RETRY >= PRODUCER_RELEASE_PATIENCE,
+        "gave up before its patience: {waited:?}"
+    );
+    assert!(
+        waited <= PRODUCER_RELEASE_PATIENCE,
+        "waited past its patience: {waited:?}"
+    );
+    assert!(asked >= 9, "asked only {asked} times");
+}
+
+/// #1440: retiring a batch of old instances (a scale-down, the surplus a
+/// rollout leaves, all of blue) overlaps their waits for other nodes to
+/// drop them. With a node that never confirms, the batch costs one
+/// patience, not one per instance.
+#[tokio::test(start_paused = true)]
+async fn a_batch_of_retirements_waits_out_the_patience_once() {
+    use super::deploy_ops::PRODUCER_RELEASE_PATIENCE;
+
+    let (agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    let (ops_tx, mut ops_rx) = mpsc::channel(64);
+    let worker = DeployWorker {
+        grill,
+        ops: DeployOps { tx: ops_tx },
+        drains: agent.drains.clone(),
+        operation: None,
+        stop_confirmation_timeout: agent.stop_confirmation_timeout,
+        egress: agent.egress_resolver(),
+        secrets: agent.secret_providers.clone(),
+    };
+    let ids: Vec<InstanceId> = (0..6)
+        .map(|n| InstanceId(format!("default__web-{n}")))
+        .collect();
+    let started = tokio::time::Instant::now();
+    // The loop's side: every retirement begins, and every node but one
+    // confirms nothing, for ever. Driven in this task, as above.
+    let retire = worker.retire_old_instances(&ids, std::time::Duration::ZERO);
+    tokio::pin!(retire);
+    let outcomes = loop {
+        tokio::select! {
+            outcomes = &mut retire => break outcomes,
+            Some(op) = ops_rx.recv() => match op {
+                DeployOp::BeginRetire { reply, .. } => {
+                    let _ = reply.send(Ok(super::retirement::BegunRetirement {
+                        restart: None,
+                        stop: None,
+                        sidecars: Vec::new(),
+                    }));
+                }
+                DeployOp::AwaitRemoteWithdrawal { reply, .. } => {
+                    let _ = reply.send(Err(pending_release()));
+                }
+                other => panic!("unexpected op {}", other.name()),
+            },
+        }
+    };
+    let waited = started.elapsed();
+
+    assert_eq!(outcomes.len(), ids.len());
+    assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
+    assert!(
+        waited < PRODUCER_RELEASE_PATIENCE * 2,
+        "{} retirements waited {waited:?}, one patience each",
+        ids.len()
+    );
+}
+
+/// #1440: one retirement in a batch failing doesn't stop the others; each
+/// instance gets its own outcome, in the order given.
+#[tokio::test(start_paused = true)]
+async fn a_failed_retirement_in_a_batch_leaves_the_others_retired() {
+    let (agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    let (ops_tx, mut ops_rx) = mpsc::channel(64);
+    let ids: Vec<InstanceId> = (0..3)
+        .map(|n| InstanceId(format!("default__web-{n}")))
+        .collect();
+    // The runtime can't say whether the middle one exited, so its stop is
+    // unconfirmed.
+    grill.set_instance_inspection_failure(&ids[1], true);
+    let worker = DeployWorker {
+        grill: grill.clone(),
+        ops: DeployOps { tx: ops_tx },
+        drains: agent.drains.clone(),
+        operation: None,
+        stop_confirmation_timeout: agent.stop_confirmation_timeout,
+        egress: agent.egress_resolver(),
+        secrets: agent.secret_providers.clone(),
+    };
+    let retire = worker.retire_old_instances(&ids, std::time::Duration::ZERO);
+    tokio::pin!(retire);
+    let outcomes = loop {
+        tokio::select! {
+            outcomes = &mut retire => break outcomes,
+            Some(op) = ops_rx.recv() => match op {
+                DeployOp::BeginRetire { reply, .. } => {
+                    let _ = reply.send(Ok(super::retirement::BegunRetirement {
+                        restart: None,
+                        stop: None,
+                        sidecars: Vec::new(),
+                    }));
+                }
+                DeployOp::AwaitRemoteWithdrawal { reply, .. } => {
+                    let _ = reply.send(Ok(()));
+                }
+                other => panic!("unexpected op {}", other.name()),
+            },
+        }
+    };
+
+    let failed: Vec<bool> = outcomes.iter().map(Result::is_err).collect();
+    assert_eq!(failed, vec![false, true, false], "{outcomes:?}");
+    for id in [&ids[0], &ids[2]] {
+        assert!(
+            grill
+                .calls()
+                .iter()
+                .any(|(call, called)| call == "stop" && called == id),
+            "{} was never stopped",
+            id.0
+        );
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_refused_producer_release_is_not_retried() {
     let attempts = std::sync::atomic::AtomicU32::new(0);
@@ -1503,16 +1998,20 @@ async fn failed_runtime_reference_checkpoint_prevents_start_and_retains_the_addr
         let events = drain_deploy(&mut agent, basic_config()).await;
         (agent, events)
     });
-    tokio::time::timeout(std::time::Duration::from_secs(2), grill.wait_for_creates(1))
+    // These bounds only stop a hang: nothing here is timed. The deploy
+    // journals a fresh discovery checkpoint before it creates, and on a
+    // loaded host that took more than the 2 s this once allowed (#1623).
+    let patience = std::time::Duration::from_secs(30);
+    tokio::time::timeout(patience, grill.wait_for_creates(1))
         .await
-        .unwrap();
+        .expect("the deploy never reached its create");
     let checkpoint = path.join("discovery.json");
     std::fs::remove_file(&checkpoint).unwrap();
     std::fs::create_dir(&checkpoint).unwrap();
     grill.release_creates(1);
-    let (_agent, events) = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+    let (_agent, events) = tokio::time::timeout(patience, task)
         .await
-        .unwrap()
+        .expect("the deploy never finished")
         .unwrap();
     assert!(
         events
@@ -2671,6 +3170,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             operation: None,
             stop_confirmation_timeout: self.stop_confirmation_timeout,
             egress: self.egress_resolver(),
+            secrets: self.secret_providers.clone(),
         };
         let events = events.clone();
         let mut task = tokio::spawn(async move { worker.run_deploy(config, events).await });
@@ -2681,7 +3181,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
                 Some(outcome) = self.identity_signing_tasks.join_next_with_id(),
                     if !self.identity_signing_tasks.is_empty() => {
-                    self.finish_identity_provision(outcome);
+                    self.finish_identity_provision(outcome).await;
                 }
                 result = &mut task => {
                     let _ = result;
@@ -3578,6 +4078,7 @@ async fn a_restore_is_refused_while_an_instance_awaits_its_restart() {
             identity: None,
             identity_mount: None,
             launch_failure: None,
+            restart_cause: None,
         },
     );
     agent
@@ -5690,6 +6191,101 @@ async fn real_process_restart_stays_eligible_and_fails_at_once_without_its_execu
     agent.stop_app("retry", "default").await.unwrap();
 }
 
+/// Every restart records one `restart` event, whether the exit was seen
+/// with no backoff owed (restarted at once by `observe_app_exit`) or the
+/// restart waited out its backoff (`retry_restart`). Without it, `relish
+/// wtf` counted too few restarts to name a crash loop (#1652).
+#[tokio::test]
+async fn every_restart_after_an_exit_records_one_restart_event() {
+    let (mut agent, _, _, grill) = test_agent_with_grill();
+    let events = Arc::new(tokio::sync::RwLock::new(
+        crate::bun::events::EventStore::new(),
+    ));
+    agent.set_event_store(Arc::clone(&events));
+    expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+    let id = agent.supervisor.list_instances()[0].id.clone();
+    let restart_events = |events: &crate::bun::events::EventStore| {
+        events
+            .recent(100, None, None)
+            .iter()
+            .filter(|event| event.kind == crate::bun::events::EventKind::Restart)
+            .count()
+    };
+
+    // Three exits, each seen once its backoff is over: restarted at once.
+    for attempt in 1..=3 {
+        if let Some(instance) = agent.supervisor.get_instance_mut(&id)
+            && instance.last_restart.is_some()
+        {
+            instance.last_restart = Some(Instant::now() - std::time::Duration::from_secs(600));
+        }
+        grill.set_state(&id, ContainerState::Stopped);
+        agent.check_apps().await;
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().restart_count,
+            attempt
+        );
+        agent.drive_pending_restarts_to_completion().await;
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Running
+        );
+        assert_eq!(restart_events(&*events.read().await), attempt as usize);
+    }
+
+    // A fourth exit inside its backoff waits, records nothing yet, then
+    // records exactly one event when the backoff ends.
+    grill.set_state(&id, ContainerState::Stopped);
+    agent.check_apps().await;
+    assert_eq!(
+        agent.supervisor.get_instance(&id).unwrap().state,
+        ContainerState::Stopped
+    );
+    agent.drive_pending_restarts_to_completion().await;
+    assert_eq!(restart_events(&*events.read().await), 3);
+    agent.supervisor.get_instance_mut(&id).unwrap().last_restart =
+        Some(Instant::now() - std::time::Duration::from_secs(600));
+    agent.drive_pending_restarts_to_completion().await;
+    agent.drive_pending_restarts_to_completion().await;
+    let instance = agent.supervisor.get_instance(&id).unwrap();
+    assert_eq!(instance.state, ContainerState::Running);
+    assert_eq!(instance.restart_count, 4);
+    assert_eq!(restart_events(&*events.read().await), 4);
+    agent.stop_app("web", "default").await.unwrap();
+}
+
+/// An exit that finds the restart budget spent fails the instance and says
+/// so, as a restart that waited out its backoff does.
+#[tokio::test]
+async fn an_exit_past_the_restart_budget_records_the_exhausted_budget() {
+    let (mut agent, _, _, grill) = test_agent_with_grill();
+    let events = Arc::new(tokio::sync::RwLock::new(
+        crate::bun::events::EventStore::new(),
+    ));
+    agent.set_event_store(Arc::clone(&events));
+    expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+    let id = agent.supervisor.list_instances()[0].id.clone();
+    agent
+        .supervisor
+        .get_instance_mut(&id)
+        .unwrap()
+        .restart_policy
+        .max_restarts = Some(0);
+    grill.set_state(&id, ContainerState::Stopped);
+    agent.check_apps().await;
+    let instance = agent.supervisor.get_instance(&id).unwrap();
+    assert_eq!(instance.state, ContainerState::Failed);
+    assert!(!instance.retry_pending);
+    let recorded = events.read().await.recent(100, None, None);
+    assert!(
+        recorded.iter().any(|event| {
+            event.kind == crate::bun::events::EventKind::JobFailed
+                && event.message.contains("exhausted its restart budget")
+        }),
+        "no exhausted-budget event: {recorded:?}"
+    );
+}
+
 #[tokio::test]
 async fn redeployed_instance_restarts_after_a_crash() {
     let (_tx, rx) = mpsc::channel(32);
@@ -7545,7 +8141,9 @@ async fn rollout_retirement_fences_the_crash_restart_driver() {
         agent.check_apps().await;
         let old = agent.supervisor.get_instance(&old_id).unwrap();
         let observed = (old.state, old.restart_count, old.retry_pending);
-        grill.release_kills(1);
+        // Blue-green retires all of blue at once (#1440), so every old
+        // replica's kill may be held here, not just the first.
+        grill.release_kills(replicas as usize);
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(3), async {
             let mut events = Vec::new();
             loop {
@@ -9094,6 +9692,7 @@ fn adoption_record(
             host_process: false,
             initialiser: false,
             port_mapping: None,
+            stop: None,
             root: crate::grill::oci::OciRoot {
                 path: "/tmp/test".to_string(),
                 readonly: false,
@@ -9102,6 +9701,7 @@ fn adoption_record(
                 rlimits: Vec::new(),
                 args: vec!["sleep".to_string(), "60".to_string()],
                 env: vec![],
+                provider_env: Vec::new(),
                 cwd: "/".to_string(),
                 user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
                 capabilities: None,
@@ -9115,7 +9715,10 @@ fn adoption_record(
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
+            runtime_knobs: None,
         },
         rootless_network: None,
     }
@@ -9315,6 +9918,142 @@ async fn instances_are_created_with_their_assigned_ordinals() {
         })
         .collect();
     assert_eq!(ordinals, [2, 4, 5], "{rolled:?}");
+}
+
+/// The calls `grill` saw that stop or kill one of `ids`.
+fn stops_of(grill: &MockGrill, ids: &[&str]) -> Vec<(String, InstanceId)> {
+    grill
+        .calls()
+        .into_iter()
+        .filter(|(call, id)| (call == "stop" || call == "kill") && ids.contains(&id.0.as_str()))
+        .collect()
+}
+
+/// Whether any of the deploy's progress lines says it rolled the app.
+fn rolled(events: &[ApplyEvent]) -> bool {
+    events.iter().any(|event| {
+        matches!(event, ApplyEvent::Progress { message } if message.contains("rolling redeploy"))
+    })
+}
+
+/// #1111: when the leader moves one of a node's replicas elsewhere and
+/// gives it another, the version is the same, so only the two ordinals
+/// change hands. It used to roll every replica on the node to a new
+/// generation of the same spec.
+#[tokio::test]
+async fn a_moved_replica_starts_the_arriving_ordinal_and_retires_the_departing_one() {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    grill.set_pid(std::process::id());
+    expect_complete(&drain_deploy(&mut agent, web_with_ordinals(&[0, 2])).await);
+
+    let events = drain_deploy(&mut agent, web_with_ordinals(&[0, 3])).await;
+
+    expect_complete(&events);
+    assert!(!rolled(&events), "a share move must not roll: {events:?}");
+    assert_eq!(live_web_ids(&agent), ["default__web-0", "default__web-3"]);
+    assert_eq!(
+        agent.supervisor.list_instances().len(),
+        2,
+        "the departing replica is gone"
+    );
+    assert!(stops_of(&grill, &["default__web-0"]).is_empty());
+    assert!(!stops_of(&grill, &["default__web-2"]).is_empty());
+}
+
+/// #1111: a share that loses a replica stops only that one.
+#[tokio::test]
+async fn a_shrunk_share_retires_only_the_departing_replica() {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    grill.set_pid(std::process::id());
+    expect_complete(&drain_deploy(&mut agent, web_with_ordinals(&[0, 1, 2])).await);
+
+    let events = drain_deploy(&mut agent, web_with_ordinals(&[0, 2])).await;
+
+    expect_complete(&events);
+    assert!(
+        !rolled(&events),
+        "a smaller share must not roll: {events:?}"
+    );
+    assert_eq!(live_web_ids(&agent), ["default__web-0", "default__web-2"]);
+    assert!(stops_of(&grill, &["default__web-0", "default__web-2"]).is_empty());
+    let backends = agent
+        .service_map
+        .resolve(&crate::onion::service_id::ServiceId::new("default", "web"))
+        .map(|entry| entry.backends.len())
+        .unwrap_or(0);
+    assert_eq!(backends, 2, "the retired replica stops serving");
+}
+
+/// #1111: a node whose whole share is swapped for other ordinals of the
+/// same version starts the new ones under their own ordinals, without a
+/// generation.
+#[tokio::test]
+async fn a_swapped_share_starts_the_new_ordinals_without_a_new_generation() {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    grill.set_pid(std::process::id());
+    expect_complete(&drain_deploy(&mut agent, web_with_ordinals(&[0, 2])).await);
+
+    let events = drain_deploy(&mut agent, web_with_ordinals(&[1, 3])).await;
+
+    expect_complete(&events);
+    assert!(
+        !rolled(&events),
+        "a swapped share must not roll: {events:?}"
+    );
+    assert_eq!(live_web_ids(&agent), ["default__web-1", "default__web-3"]);
+    assert_eq!(agent.supervisor.list_instances().len(), 2);
+}
+
+/// #1111: a share that moves in the same deploy as a new version still
+/// rolls every replica, under the new assignment.
+#[tokio::test]
+async fn a_moved_share_with_a_new_version_still_rolls() {
+    let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+    grill.set_pid(std::process::id());
+    expect_complete(&drain_deploy(&mut agent, web_with_ordinals(&[0, 2])).await);
+
+    let mut changed = web_with_ordinals(&[0, 3]);
+    changed.app.get_mut("web").unwrap().image = Some("myapp:v2".into());
+    let events = drain_deploy(&mut agent, changed).await;
+
+    expect_complete(&events);
+    assert!(rolled(&events), "{events:?}");
+    let ordinals: Vec<u32> = live_web_ids(&agent)
+        .iter()
+        .map(|id| {
+            let identity = crate::grill::InstanceIdentity::parse(id).unwrap();
+            assert!(identity.generation.is_some(), "{id} was not rolled");
+            identity.ordinal
+        })
+        .collect();
+    assert_eq!(ordinals, [0, 3]);
+}
+
+/// `budgeted_web` under the ordinals the leader assigned this node.
+fn budgeted_web_with_ordinals(image: &str, ordinals: &[u32]) -> Config {
+    let mut config = budgeted_web(image, ordinals.len() as u32);
+    config.app.get_mut("web").unwrap().ordinals = Some(ordinals.to_vec());
+    config
+}
+
+/// #1111, from the 0.2.1 jobs soak (#1110): on a full node, a rolling
+/// redeploy needs room for a new replica before an old one goes, so moving
+/// a replica failed and rolled back. Retiring the departing replica first
+/// frees the room the arriving one needs.
+#[tokio::test]
+async fn a_replica_moves_onto_a_full_node_where_a_redeploy_would_not_fit() {
+    let (mut agent, _, _, grill) = test_agent_with_grill();
+    grill.set_runtime_kind(crate::grill::records::RuntimeKind::Runc);
+    let budget = agent.execution_budget();
+    budget.set_capacity(crate::meat::Resources::new(1000, 1 << 30, 0));
+    expect_complete(&drain_deploy(&mut agent, budgeted_web_with_ordinals("web:v1", &[0, 2])).await);
+
+    let events = drain_deploy(&mut agent, budgeted_web_with_ordinals("web:v1", &[0, 3])).await;
+
+    expect_complete(&events);
+    assert_eq!(live_web_ids(&agent), ["default__web-0", "default__web-3"]);
+    assert!(stops_of(&grill, &["default__web-0"]).is_empty());
+    assert!(reported_refusals(&mut agent).await.is_empty());
 }
 
 #[tokio::test]
@@ -9543,6 +10282,7 @@ pub(super) fn limited_adoption_record(
     let mut record = adoption_record(instance, app, false);
     record.oci_spec.linux.cgroups_path = Some(format!("/reliaburger/default/{app}/0"));
     record.oci_spec.linux.resources = Some(crate::grill::oci::OciResources {
+        pids: None,
         cpu: Some(crate::grill::oci::OciCpuResources {
             quota: 50_000,
             period: 100_000,
@@ -9554,6 +10294,7 @@ pub(super) fn limited_adoption_record(
             "memory.high".to_string(),
             "33554432".to_string(),
         )]),
+        devices: Vec::new(),
     });
     record
 }
@@ -10257,11 +10998,13 @@ async fn retire_waits_for_in_flight_request_before_kill() {
     drains.increment_connections(&id.0).await;
 
     // Kick off the retire on a task; it must block on the drain.
+    let stop = InstanceStop::for_policy(None, std::time::Duration::from_secs(30));
     let retire = drain_and_stop_instance(
         &drains,
         &grill,
         &id,
         std::time::Duration::from_secs(30),
+        &stop,
         std::time::Duration::from_secs(10),
     );
     tokio::pin!(retire);
@@ -10317,11 +11060,13 @@ async fn retire_waits_for_in_flight_websocket_before_kill() {
     drains.increment_connections(&id.0).await;
     drains.increment_websocket(&id.0).await;
 
+    let stop = InstanceStop::for_policy(None, std::time::Duration::from_secs(30));
     let retire = drain_and_stop_instance(
         &drains,
         &grill,
         &id,
         std::time::Duration::from_secs(30),
+        &stop,
         std::time::Duration::from_secs(10),
     );
     tokio::pin!(retire);
@@ -10690,6 +11435,8 @@ fn register_fault(
     agent
         .fault_registry
         .insert(&crate::smoker::types::FaultRequest {
+            workload: Default::default(),
+            task_index: None,
             fault_type,
             target_service: String::new(),
             namespace: None,
@@ -10715,6 +11462,8 @@ async fn dns_fault_refuses_unknown_namespace_or_instance_scope_without_recording
                 reservation: None,
                 replica_evidence: None,
                 request: crate::smoker::types::FaultRequest {
+                    workload: Default::default(),
+                    task_index: None,
                     fault_type: crate::smoker::types::FaultType::DnsNxdomain,
                     target_service: "redis".into(),
                     namespace,
@@ -10744,6 +11493,8 @@ async fn workload_fault_without_a_namespace_is_refused_before_recording() {
             reservation: None,
             replica_evidence: None,
             request: crate::smoker::types::FaultRequest {
+                workload: Default::default(),
+                task_index: None,
                 fault_type: crate::smoker::types::FaultType::Pause,
                 target_service: "web".into(),
                 namespace: None,
@@ -10807,6 +11558,8 @@ async fn dns_fault_keeps_its_namespace_and_each_owner_until_clear() {
                 reservation: None,
                 replica_evidence: None,
                 request: crate::smoker::types::FaultRequest {
+                    workload: Default::default(),
+                    task_index: None,
                     fault_type: crate::smoker::types::FaultType::DnsNxdomain,
                     target_service: "redis".into(),
                     namespace: Some("red".into()),
@@ -10856,6 +11609,8 @@ async fn node_fault_fence_reverses_before_acknowledging_and_blocks_late_activati
     };
     let (mut agent, gate, _) = test_cluster_fault_agent().await;
     let request = FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type: FaultType::NodeKill {
             kill_containers: false,
         },
@@ -10932,6 +11687,8 @@ async fn clearing_a_reserved_node_fault_reports_its_reservation_until_fenced() {
     };
     let (mut agent, gate, _) = test_cluster_fault_agent().await;
     let request = FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type: FaultType::NodeKill {
             kill_containers: false,
         },
@@ -11310,6 +12067,8 @@ async fn kill_all_is_refused_for_the_last_replica_without_a_cluster() {
     // `--count 0` means "all replicas"; killing all of a single-replica
     // service leaves zero survivors.
     let request = crate::smoker::types::FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type: crate::smoker::types::FaultType::Kill { count: 0 },
         target_service: "web".into(),
         namespace: Some("default".into()),
@@ -11347,6 +12106,8 @@ async fn cluster_replica_evidence_replaces_the_local_count() {
     while ev_rx.recv().await.is_some() {}
 
     let request = crate::smoker::types::FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type: crate::smoker::types::FaultType::Kill { count: 1 },
         target_service: "web".into(),
         namespace: Some("default".into()),
@@ -11764,8 +12525,17 @@ async fn durable_consumer_waits_for_http_and_websocket_release_then_recovers_rec
     let retry = reply.await.unwrap().unwrap();
     assert!(!retry.published);
     assert_eq!(retry.receipts, vec![1]);
-    recovered.confirm_consumer_receipt(1).await.unwrap();
-    recovered.confirm_consumer_receipt(1).await.unwrap();
+    // Confirmed twice: the second finds it already forgotten.
+    for _ in 0..2 {
+        let (response, reply) = oneshot::channel();
+        recovered
+            .handle_command(AgentCommand::ConfirmConsumerReceipt {
+                generation: 1,
+                response,
+            })
+            .await;
+        reply.await.unwrap().unwrap();
+    }
     drop(recovered);
     let journal = crate::bun::discovery_owners::DiscoveryJournal::open(&path).unwrap();
     let consumer = journal.inventory().consumer.as_ref().unwrap();
@@ -12176,6 +12946,7 @@ async fn failed_rollout_finalisation_keeps_the_reservation_retirement_needs() {
             &[(replacement.clone(), None)].into_iter().collect(),
             Default::default(),
             Instant::now(),
+            std::time::SystemTime::now(),
         )
         .await;
     assert!(
@@ -12191,6 +12962,330 @@ async fn failed_rollout_finalisation_keeps_the_reservation_retirement_needs() {
         .remove_backend(&service, &replacement.0)
         .unwrap();
     agent.retire_discovery_service(&service).await.unwrap();
+}
+
+/// Run `config` through the loop's own deploy admission, as the reconciler
+/// does, pumping what the loop would: the deploy's ops and any stop it set
+/// off. Returns the deploy's events.
+async fn deploy_through_admission(
+    agent: &mut BunAgent<MockGrill>,
+    config: Config,
+) -> Vec<ApplyEvent> {
+    let (sender, mut receiver) = mpsc::channel(256);
+    agent.begin_deploy(config, sender).await;
+    let mut events = Vec::new();
+    loop {
+        tokio::select! {
+            Some(op) = agent.deploy_ops_rx.recv() => agent.handle_deploy_op(op).await,
+            Some(outcome) = agent.stop_waits.join_next_with_id(),
+                if !agent.stop_waits.is_empty() => agent.complete_app_stop(outcome).await,
+            event = receiver.recv() => match event {
+                Some(event) => events.push(event),
+                None => break,
+            },
+        }
+    }
+    // A stop the refused deploy set off finishes after the deploy's answer.
+    while let Some(outcome) = agent.stop_waits.join_next_with_id().await {
+        agent.complete_app_stop(outcome).await;
+    }
+    events
+}
+
+/// What #1500's evaluation hit. `web` runs here at its committed VIP, and
+/// `relish delete` retires it: the replica stops, but its address waits for
+/// the other nodes' withdrawal receipts. An immediate `relish apply` comes
+/// back before they arrive, so the council can't reuse the old VIP, which
+/// it reserves until every consumer has confirmed, and commits another one.
+/// Returns the agent ready to deploy `web` again, the fixture's directory,
+/// the old and new VIPs and the original network reference.
+async fn reapplied_under_a_new_vip() -> (
+    BunAgent<MockGrill>,
+    tempfile::TempDir,
+    crate::onion::vip::VirtualIP,
+    crate::onion::vip::VirtualIP,
+    crate::grill::runc_intent::NetworkReference,
+) {
+    use crate::onion::service_id::ServiceId;
+    let (mut agent, root, catalog) = clustered_allocation_fixture().await;
+    let grill = agent.supervisor.grill().clone();
+    grill.set_pid(std::process::id());
+    grill.set_container_ip("10.0.2.5".parse().unwrap());
+    let web = ServiceId::new("default", "web");
+    let remote_id = ServiceId::new("default", "remote");
+    let remote = catalog.services["default__remote"].clone();
+    let remote_entry = || (remote_id.clone(), remote.port, remote.backends.clone());
+    let (_, ingress) = cluster_publication_fixture();
+
+    let placed = catalog
+        .reconcile([remote_entry(), (web.clone(), 8080, vec![])])
+        .unwrap();
+    let old_vip = placed.resolve(&web).unwrap().vip;
+    agent
+        .synchronise_consumer(2, placed.clone(), ingress.clone(), vec![])
+        .await
+        .unwrap();
+    agent
+        .renew_view_lease(crate::onion::lease::boot_clock_ns())
+        .await;
+    let reference = original_test_network_reference();
+    grill.set_network_reference(reference.clone()).await;
+    expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+    let spec = agent
+        .supervisor
+        .get_instance(&reference.instance_id)
+        .unwrap()
+        .oci_spec
+        .clone()
+        .unwrap();
+    grill
+        .set_launch_inventory(vec![crate::grill::RuntimeLaunch {
+            generation: crate::grill::RuntimeGeneration::runc(reference.generation.as_str()),
+            instance_id: reference.instance_id.clone(),
+            spec,
+            network_reference: Some(crate::grill::runc_intent::NetworkReferenceState::Held(
+                reference.clone(),
+            )),
+        }])
+        .await;
+
+    // `relish delete`: the allocation leaves the catalogue, and the retiring
+    // replica waits on the other nodes' receipts.
+    let deleted = placed.reconcile([remote_entry()]).unwrap();
+    agent
+        .synchronise_consumer(3, deleted.clone(), ingress.clone(), vec![])
+        .await
+        .unwrap();
+    agent
+        .renew_view_lease(crate::onion::lease::boot_clock_ns())
+        .await;
+    let (client, pending) =
+        crate::cluster::producer::test_fixture(axum::http::StatusCode::ACCEPTED, String::new())
+            .await;
+    agent.set_producer_release_client(client);
+    let (reply, retired) = oneshot::channel();
+    agent
+        .request_app_stop("web".into(), "default".into(), StopPurpose::Retire, reply)
+        .await;
+    while let Some(outcome) = agent.stop_waits.join_next_with_id().await {
+        agent.complete_app_stop(outcome).await;
+    }
+    assert!(
+        matches!(
+            retired.await.unwrap(),
+            Err(BunError::ProducerReleasePending { .. })
+        ),
+        "the retirement should wait for the other nodes"
+    );
+    pending.abort();
+    let _ = pending.await;
+
+    // `relish apply`, straight back: the old VIP is still reserved.
+    let reapplied = deleted
+        .reconcile_reserving(
+            [remote_entry(), (web.clone(), 8080, vec![])],
+            [old_vip, remote.vip],
+        )
+        .unwrap();
+    let new_vip = reapplied.resolve(&web).unwrap().vip;
+    assert_ne!(old_vip, new_vip);
+    agent
+        .synchronise_consumer(4, reapplied, ingress, vec![])
+        .await
+        .unwrap();
+    agent
+        .renew_view_lease(crate::onion::lease::boot_clock_ns())
+        .await;
+    (agent, root, old_vip, new_vip, reference)
+}
+
+/// #1500: once every node has confirmed, the deleted incarnation retires
+/// and the re-applied app comes up under its new VIP, with nothing wedged
+/// in between and no restart of Bun.
+#[tokio::test]
+async fn a_reapplied_app_under_a_new_vip_converges_without_a_restart() {
+    let (mut agent, root, _old_vip, new_vip, reference) = reapplied_under_a_new_vip().await;
+    let grill = agent.supervisor.grill().clone();
+    let service = crate::onion::service_id::ServiceId::new("default", "web");
+    let execution = serde_json::json!({
+        "node_id": "test",
+        "execution": {
+            "instance_id": reference.instance_id,
+            "generation": crate::grill::RuntimeGeneration::runc(reference.generation.as_str()),
+        },
+    })
+    .to_string();
+    let (client, leader) =
+        crate::cluster::producer::test_fixture(axum::http::StatusCode::OK, execution).await;
+    agent.set_producer_release_client(client);
+
+    // The reconciler sends the deploy again each tick until it completes.
+    let mut last = Vec::new();
+    for _ in 0..4 {
+        last = deploy_through_admission(&mut agent, basic_config()).await;
+        if matches!(last.last(), Some(ApplyEvent::Complete { .. })) {
+            break;
+        }
+    }
+    leader.abort();
+    let _ = leader.await;
+    assert!(
+        matches!(last.last(), Some(ApplyEvent::Complete { .. })),
+        "the re-apply never converged: {last:?}"
+    );
+    assert_eq!(agent.service_map.resolve(&service).unwrap().vip, new_vip);
+    assert_eq!(
+        grill
+            .network_reference(&reference.instance_id)
+            .await
+            .unwrap(),
+        None,
+        "the runtime still holds the old incarnation's address"
+    );
+    drop(agent);
+    let journal =
+        crate::bun::discovery_owners::DiscoveryJournal::open(&root.path().join("discovery"))
+            .unwrap();
+    let owner = journal
+        .inventory()
+        .services
+        .iter()
+        .find(|owner| owner.entry.app_name == "web")
+        .unwrap();
+    assert_eq!(owner.entry.vip, new_vip);
+}
+
+/// #1500's safety half: while the other nodes haven't confirmed, nothing of
+/// the new incarnation starts here. The old replica keeps its address, the
+/// journal keeps the old VIP, and the deploy says why and leaves the retry
+/// to the reconciler.
+#[tokio::test]
+async fn a_new_allocation_waits_here_until_the_old_incarnation_has_retired() {
+    let (mut agent, root, old_vip, _new_vip, reference) = reapplied_under_a_new_vip().await;
+    let grill = agent.supervisor.grill().clone();
+    let (client, pending) =
+        crate::cluster::producer::test_fixture(axum::http::StatusCode::ACCEPTED, String::new())
+            .await;
+    agent.set_producer_release_client(client);
+
+    let events = deploy_through_admission(&mut agent, basic_config()).await;
+    pending.abort();
+    let _ = pending.await;
+
+    match events.as_slice() {
+        [ApplyEvent::Error { message }] => assert!(
+            message.contains("new service allocation"),
+            "unexpected refusal: {message}"
+        ),
+        other => panic!("the deploy went ahead: {other:?}"),
+    }
+    assert_eq!(
+        grill
+            .calls()
+            .iter()
+            .filter(|(operation, _)| operation == "create")
+            .count(),
+        1,
+        "started a replica before the old incarnation retired"
+    );
+    assert_eq!(
+        grill
+            .network_reference(&reference.instance_id)
+            .await
+            .unwrap(),
+        Some(reference.clone()),
+        "released the address before the other nodes confirmed"
+    );
+    assert!(
+        agent
+            .supervisor
+            .get_instance(&reference.instance_id)
+            .is_some()
+    );
+    drop(agent);
+    let journal =
+        crate::bun::discovery_owners::DiscoveryJournal::open(&root.path().join("discovery"))
+            .unwrap();
+    let owner = journal
+        .inventory()
+        .services
+        .iter()
+        .find(|owner| owner.entry.app_name == "web")
+        .unwrap();
+    assert_eq!(owner.entry.vip, old_vip);
+}
+
+/// Only a replaced allocation sends a deploy through retirement. A rollout
+/// under the allocation the node already has stays a rollout, or every
+/// ordinary `apply` would stop the app.
+#[tokio::test]
+async fn a_deploy_under_the_same_allocation_supersedes_nothing() {
+    let (agent, _root, _vip) = consumer_web_fixture().await;
+    assert_eq!(agent.superseded_target(&basic_config()), None);
+}
+
+/// A changed port replaces the allocation as much as a changed VIP does:
+/// the journal refuses either until the old one has retired.
+#[tokio::test]
+async fn a_changed_port_supersedes_the_old_allocation() {
+    use crate::onion::service_id::ServiceId;
+    let (mut agent, _root, _vip) = consumer_web_fixture().await;
+    let web = ServiceId::new("default", "web");
+    let mut moved = agent
+        .consumer_owner()
+        .unwrap()
+        .publications
+        .last()
+        .unwrap()
+        .catalog
+        .clone();
+    moved.services.get_mut("default__web").unwrap().port = 9090;
+    let (_, ingress) = cluster_publication_fixture();
+    agent
+        .synchronise_consumer(4, moved, ingress, vec![])
+        .await
+        .unwrap();
+    assert_eq!(
+        agent
+            .superseded_target(&basic_config())
+            .map(|target| target.name),
+        Some(web.name)
+    );
+}
+
+/// A reservation with nothing of the app left here has no stop to run, so
+/// it can't hold a deploy up.
+#[tokio::test]
+async fn a_reservation_without_instances_supersedes_nothing() {
+    let (mut agent, _root, _catalog) = clustered_allocation_fixture().await;
+    let (reply, result) = oneshot::channel();
+    agent
+        .handle_deploy_op(DeployOp::RegisterServiceApp {
+            app_name: "remote".into(),
+            namespace: "default".into(),
+            port: 8080,
+            firewall: None,
+            reply,
+        })
+        .await;
+    result.await.unwrap().unwrap();
+    let mut moved = agent
+        .consumer_owner()
+        .unwrap()
+        .publications
+        .last()
+        .unwrap()
+        .catalog
+        .clone();
+    moved.services.get_mut("default__remote").unwrap().vip =
+        crate::onion::vip::VirtualIP("127.128.43.43".parse().unwrap());
+    let (_, ingress) = cluster_publication_fixture();
+    agent
+        .synchronise_consumer(2, moved, ingress, vec![])
+        .await
+        .unwrap();
+    let config = Config::parse("[app.remote]\nimage = 'test:v1'\nport = 8080\n").unwrap();
+    assert_eq!(agent.superseded_target(&config), None);
 }
 
 #[tokio::test]
@@ -12868,7 +13963,7 @@ async fn concurrent_requests_for_one_identity_share_one_signing() {
     .await
     .unwrap()
     .unwrap();
-    agent.finish_identity_provision(outcome);
+    agent.finish_identity_provision(outcome).await;
     for answered in [first_answered, second_answered] {
         answered.await.expect("a waiter was dropped unanswered");
     }
@@ -12912,12 +14007,10 @@ async fn signed_identity_is_stored_only_for_a_live_instance() {
             task,
             super::identity_signing::IdentitySigning::for_test(id.clone()),
         );
-        let outcome = agent
-            .identity_signing_tasks
-            .join_next_with_id()
-            .await
-            .unwrap();
-        agent.finish_identity_provision(outcome);
+        // The signature, then the write of its files (#1853).
+        while let Some(outcome) = agent.identity_signing_tasks.join_next_with_id().await {
+            agent.finish_identity_provision(outcome).await;
+        }
     }
 
     let instance = agent.supervisor.get_instance(&live).unwrap();
@@ -12997,6 +14090,7 @@ fn runtime_unknown_is_serialised_only_when_set() {
         pid: Some(7),
         runtime_unknown: false,
         status_age_ms: None,
+        age_seconds: None,
         reason: None,
     };
     let plain = serde_json::to_value(&status).unwrap();
@@ -13121,6 +14215,170 @@ async fn adopted_placement_query_is_answered_on_the_command_channel() {
             .unwrap()
             .unwrap()
     );
+    shutdown.cancel();
+    task.await.unwrap();
+}
+
+/// A partitioned node sees every peer it blocked go Dead, and gossip then
+/// stops listing them. Clearing the fault without the leader's fence must
+/// still unblock them, so the heal can't depend on looking peers up in the
+/// live membership (#1820).
+#[tokio::test]
+async fn council_partition_heals_after_its_peers_leave_the_membership() {
+    let peer = |name: &str, port: u16| crate::mustard::membership::MembershipSnapshot {
+        node_id: crate::meat::NodeId::new(name),
+        address: std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        state: crate::mustard::state::NodeState::Alive,
+        incarnation: 1,
+        is_council: true,
+        is_leader: false,
+        labels: Default::default(),
+        first_seen: std::time::Instant::now(),
+        resources: None,
+    };
+    let (membership_tx, membership_rx) =
+        tokio::sync::watch::channel(vec![peer("q2", 7002), peer("q3", 7003)]);
+    let gossip = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new()));
+    let raft = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new()));
+    let (mut agent, _, _) = test_cluster_fault_agent().await;
+    if let Some(cluster) = agent.cluster.as_mut() {
+        cluster.membership_rx = membership_rx;
+        cluster.partition_blocklists.gossip = Some(gossip.clone());
+        cluster.partition_blocklists.raft = Some(raft.clone());
+        cluster.partition_blocklists.raft_port_offset = 100;
+    }
+    let rule = register_fault(
+        &mut agent,
+        crate::smoker::types::FaultType::CouncilPartition {
+            peers: vec!["q2".to_string(), "q3".to_string()],
+        },
+        std::time::Duration::from_secs(30),
+    );
+
+    agent.apply_fault(&rule).await.unwrap();
+    assert_eq!(gossip.read().await.len(), 2, "gossip must block both peers");
+    assert_eq!(raft.read().await.len(), 2, "raft must block both peers");
+
+    // The blocked peers go Dead and drop out of the live membership.
+    membership_tx.send_replace(Vec::new());
+
+    let stored = agent.fault_registry.get(rule.id).cloned().unwrap();
+    agent.reverse_fault(&stored).await;
+    let gossip_left = gossip.read().await.clone();
+    let raft_left = raft.read().await.clone();
+    assert!(
+        gossip_left.is_empty(),
+        "gossip still blocks peers after the heal: {gossip_left:?}"
+    );
+    assert!(
+        raft_left.is_empty(),
+        "raft still blocks peers after the heal: {raft_left:?}"
+    );
+}
+
+/// #1640: a deploy history entry's `created_at` is when this node's deploy
+/// of the app began, so `completed_at - created_at` is how long it took.
+/// Every writer used to stamp both with the same `SystemTime::now()` as it
+/// wrote the entry, so a deploy always looked instant.
+#[tokio::test]
+async fn deploy_history_spans_the_time_the_deploy_took() {
+    const CREATE_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+    const SLACK: std::time::Duration = std::time::Duration::from_millis(5);
+    let (agent, tx, shutdown, grill) = test_agent_with_grill();
+    grill.set_pid(std::process::id());
+    let history = agent.deploy_history_handle();
+    let mut agent = agent;
+    let task = tokio::spawn(async move {
+        agent.run().await;
+    });
+    grill.set_call_delay(crate::grill::mock::MockCall::Create, Some(CREATE_DELAY));
+
+    // The fresh deploy, a rolling redeploy, a blue-green redeploy, an
+    // in-place share change and a rollout that halts after its 1 s health
+    // wait each write one entry.
+    let halted = crate::grill::InstanceIdentity::canary("default", "web", 3, 0).instance_id();
+    let deploys = [
+        (
+            "fresh",
+            "[app.web]\nimage = 'web:v1'\nport = 8080\n",
+            CREATE_DELAY,
+            None,
+        ),
+        (
+            "rolling",
+            "[app.web]\nimage = 'web:v2'\nport = 8080\n",
+            CREATE_DELAY,
+            None,
+        ),
+        (
+            "blue-green",
+            "[app.web]\nimage = 'web:v3'\nport = 8080\n\
+             [app.web.deploy]\nstrategy = 'blue-green'\n",
+            CREATE_DELAY,
+            None,
+        ),
+        // Only the replica count changes, so the second replica starts
+        // beside the first through `change_share_in_place`.
+        (
+            "share change",
+            "[app.web]\nimage = 'web:v3'\nport = 8080\nreplicas = 2\n\
+             [app.web.deploy]\nstrategy = 'blue-green'\n",
+            CREATE_DELAY,
+            None,
+        ),
+        (
+            "halted",
+            "[app.web]\nimage = 'web:v4'\nport = 8080\nreplicas = 2\n\
+             [app.web.deploy]\nauto_rollback = false\nhealth_timeout = '1s'\n",
+            CREATE_DELAY + std::time::Duration::from_secs(1),
+            Some(halted),
+        ),
+    ];
+    for (name, config, at_least, failing) in deploys {
+        if let Some(id) = &failing {
+            grill.set_state(id, ContainerState::Failed);
+        }
+        let before = history.read().await.len();
+        let began = std::time::Instant::now();
+        let events = send_deploy(&tx, Config::parse(config).unwrap()).await;
+        let took = began.elapsed();
+        if failing.is_none() {
+            expect_complete(&events);
+        }
+        if name == "share change" {
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    ApplyEvent::Progress { message } if message.contains("beside the running ones")
+                )),
+                "the replica must start in place, not roll: {events:?}"
+            );
+        }
+        let entries = history.read().await.clone();
+        assert_eq!(
+            entries.len(),
+            before + 1,
+            "{name}: one new entry, {events:?}"
+        );
+        let entry = entries.last().unwrap();
+        let span = entry
+            .completed_at
+            .duration_since(entry.created_at)
+            .expect("a deploy can't finish before it starts");
+        // The entry's span comes from the wall clock (`SystemTime`), the
+        // bounds from `Instant` and the mock's sleeps, which are monotonic.
+        // The two clocks can disagree by a little, and retries are 0, so
+        // both bounds allow a few milliseconds of slack.
+        assert!(
+            span + SLACK >= at_least,
+            "{name}: the entry spans {span:?}, but the deploy took at least {at_least:?}"
+        );
+        assert!(
+            span <= took + SLACK,
+            "{name}: the entry spans {span:?}, longer than the {took:?} the deploy took"
+        );
+    }
+
     shutdown.cancel();
     task.await.unwrap();
 }

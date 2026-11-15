@@ -1,0 +1,142 @@
+{
+  "schema": 1,
+  "version": "0.2.8",
+  "os": "linux",
+  "arch": "x86_64",
+  "nodes": 3,
+  "development_binaries": false,
+  "succeeded": true,
+  "total_seconds": 83.906188625,
+  "steps": [
+    {
+      "label": "check host",
+      "stage": "host",
+      "start_seconds": 5.8e-7,
+      "seconds": 0.009995776,
+      "outcome": "done"
+    },
+    {
+      "label": "install Lima 2.2.1",
+      "stage": "download",
+      "start_seconds": 0.010060663,
+      "seconds": 0.826887133,
+      "outcome": "done",
+      "bytes": 24498098
+    },
+    {
+      "label": "download guest image",
+      "stage": "download",
+      "start_seconds": 0.010072611,
+      "seconds": 18.868498462,
+      "outcome": "done",
+      "bytes": 676540416
+    },
+    {
+      "label": "download bun",
+      "stage": "download",
+      "start_seconds": 0.010183117,
+      "seconds": 4.779531774,
+      "outcome": "done",
+      "bytes": 140644728
+    },
+    {
+      "label": "download relish",
+      "stage": "download",
+      "start_seconds": 0.010188225,
+      "seconds": 2.493969282,
+      "outcome": "done",
+      "bytes": 129721968
+    },
+    {
+      "label": "boot VM 1",
+      "stage": "boot",
+      "start_seconds": 18.955418841,
+      "seconds": 33.617941562,
+      "outcome": "done"
+    },
+    {
+      "label": "boot VM 2",
+      "stage": "boot",
+      "start_seconds": 19.207661136,
+      "seconds": 32.910300014,
+      "outcome": "done"
+    },
+    {
+      "label": "boot VM 3",
+      "stage": "boot",
+      "start_seconds": 19.207744301,
+      "seconds": 32.838954654,
+      "outcome": "done"
+    },
+    {
+      "label": "install files on node 1",
+      "stage": "configure",
+      "start_seconds": 52.574452392,
+      "seconds": 1.772996419,
+      "outcome": "done"
+    },
+    {
+      "label": "start node 1",
+      "stage": "configure",
+      "start_seconds": 54.72115096,
+      "seconds": 1.170302191,
+      "outcome": "done"
+    },
+    {
+      "label": "install files on node 2",
+      "stage": "configure",
+      "start_seconds": 55.891461263,
+      "seconds": 3.520903289,
+      "outcome": "done"
+    },
+    {
+      "label": "install files on node 3",
+      "stage": "configure",
+      "start_seconds": 55.891573453,
+      "seconds": 3.8927369130000002,
+      "outcome": "done"
+    },
+    {
+      "label": "enrol node 2",
+      "stage": "configure",
+      "start_seconds": 59.690549798,
+      "seconds": 1.5791453500000001,
+      "outcome": "done"
+    },
+    {
+      "label": "enrol node 3",
+      "stage": "configure",
+      "start_seconds": 59.785419831,
+      "seconds": 1.4786439900000001,
+      "outcome": "done"
+    },
+    {
+      "label": "start node 3",
+      "stage": "configure",
+      "start_seconds": 61.264788927,
+      "seconds": 0.77057692,
+      "outcome": "done"
+    },
+    {
+      "label": "start node 2",
+      "stage": "configure",
+      "start_seconds": 61.270315866,
+      "seconds": 0.753799706,
+      "outcome": "done"
+    },
+    {
+      "label": "form council quorum",
+      "stage": "verify",
+      "start_seconds": 62.035369323,
+      "seconds": 8.053472026,
+      "outcome": "done"
+    },
+    {
+      "label": "run hello through ingress",
+      "stage": "verify",
+      "start_seconds": 70.088842932,
+      "seconds": 13.816256909,
+      "outcome": "done"
+    }
+  ]
+}

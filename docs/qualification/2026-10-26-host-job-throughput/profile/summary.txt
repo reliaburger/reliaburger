@@ -1,0 +1,9 @@
+c27-perfcpu-host             rate=  7500.0 steady=  7940 done=450000 complete=True fail=0 retry=0 busy=98.5cpu-s util=41% iow=0.2% sys/busy=78% bun=20.1s forks/s=7488 ctxt/s=89428 cpu-ms/fork=0.212 bun-ms/fork=0.043 vm[r=0.6 us=10 sy=33 id=57 wa=0 cs=94778]
+c27-perfcpu-raw              rate= 28224.2 steady=     - done=0 complete=True fail=0 retry=0 busy=210.2cpu-s util=89% iow=0.1% sys/busy=82% bun=0.4s forks/s=27315 ctxt/s=142839 cpu-ms/fork=0.124 bun-ms/fork=0.000 vm[r=6.6 us=17 sy=73 id=10 wa=0 cs=145293]
+c27-perfoff-host             rate=  7466.7 steady=  7916 done=448000 complete=True fail=0 retry=0 busy=98.7cpu-s util=41% iow=0.2% sys/busy=77% bun=20.5s forks/s=7488 ctxt/s=89081 cpu-ms/fork=0.213 bun-ms/fork=0.044 vm[r=15.3 us=10 sy=33 id=57 wa=0 cs=94716]
+c27-probe-host               rate=  7500.0 steady=  7940 done=450000 complete=True fail=0 retry=0 busy=98.3cpu-s util=40% iow=0.2% sys/busy=77% bun=20.7s forks/s=7513 ctxt/s=89152 cpu-ms/fork=0.211 bun-ms/fork=0.044 vm[r=15.1 us=10 sy=33 id=57 wa=0 cs=94808] lag p50<=1ms p99<=8ms
+
+c27-perfcpu-host         n=1 median=  7500.0 range=7500.0-7500.0 steady-median=7940 cpu-ms/fork median=0.212 util median=41%
+c27-perfcpu-raw          n=1 median= 28224.2 range=28224.2-28224.2 cpu-ms/fork median=0.124 util median=89%
+c27-perfoff-host         n=1 median=  7466.7 range=7466.7-7466.7 steady-median=7916 cpu-ms/fork median=0.213 util median=41%
+c27-probe-host           n=1 median=  7500.0 range=7500.0-7500.0 steady-median=7940 cpu-ms/fork median=0.211 util median=40%

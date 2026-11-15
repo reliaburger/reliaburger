@@ -9,6 +9,10 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use tokio::sync::mpsc;
+use tokio::time::Instant;
 
 use crate::ketchup::types::{
     CaptureFileIdentity, CaptureOffsets, CapturePosition, CapturedLine, LogStream,
@@ -22,6 +26,138 @@ use crate::ketchup::types::{
 /// holding a runtime worker: on a two-vCPU node one long synchronous split
 /// starved startup adoption for eleven minutes.
 pub const CAPTURE_CHUNK_BYTES: usize = 64 * 1024;
+
+/// How often a follower looks for new output.
+pub const FOLLOW_POLL: Duration = Duration::from_millis(200);
+
+/// How long a follower carries on when it can't tell whether its source still
+/// runs and the source has written nothing either (#1493).
+///
+/// A failed check says nothing about the workload, so a follower never stops
+/// on one: an owner that's slow to answer on a busy node is the usual reason.
+/// This limit only stops a follower outliving an instance whose records have
+/// gone, which no check can answer for again. It's far longer than any stall
+/// a loaded node has shown, and output resets it, so a workload that keeps
+/// writing is never dropped.
+pub const UNKNOWN_SOURCE_LIMIT: Duration = Duration::from_secs(600);
+
+/// Tells a follower when it has gone [`UNKNOWN_SOURCE_LIMIT`] without news of
+/// its source.
+#[derive(Debug)]
+pub struct SourceWatch {
+    limit: Duration,
+    unknown_since: Option<Instant>,
+}
+
+impl SourceWatch {
+    /// A watch that gives up after `limit` without news.
+    pub fn new(limit: Duration) -> Self {
+        Self {
+            limit,
+            unknown_since: None,
+        }
+    }
+
+    /// The source answered or wrote something, so it's still accounted for.
+    pub fn confirm(&mut self) {
+        self.unknown_since = None;
+    }
+
+    /// A check failed at `now`. True once checks have failed, with no news
+    /// between them, for the whole limit.
+    pub fn check_failed(&mut self, now: Instant) -> bool {
+        let since = *self.unknown_since.get_or_insert(now);
+        now.duration_since(since) >= self.limit
+    }
+}
+
+/// Follow two capture files into `sender` until their source ends.
+///
+/// `running` says whether the source still runs. `Ok(false)` is positive
+/// evidence that it has stopped: the follower reads what's left, hands on any
+/// unfinished last line and returns. An error is only a failed check, so the
+/// follower keeps reading. It stops on errors alone when the capture files
+/// have gone, or after `limit` with no answer and no output.
+///
+/// This is the only thing that moves a running instance's lines into the log
+/// store, and nothing starts another until the instance or Bun restarts, so
+/// returning early silently freezes the instance's logs.
+pub async fn follow_capture<Checked>(
+    mut readers: [CaptureReader; 2],
+    sender: mpsc::Sender<CapturedLine>,
+    limit: Duration,
+    mut running: impl FnMut() -> Checked,
+) where
+    Checked: Future<Output = io::Result<bool>>,
+{
+    let mut watch = SourceWatch::new(limit);
+    let mut terminal = false;
+    loop {
+        // A capture with no checkpoint replays from byte 0. Bounded chunks,
+        // each read behind an `.await`, keep that replay from holding a
+        // runtime worker (it once starved startup adoption).
+        let mut backlog = false;
+        for reader in &mut readers {
+            let Ok(bytes) = reader.read_chunk().await else {
+                continue;
+            };
+            backlog |= bytes.len() == CAPTURE_CHUNK_BYTES;
+            if !bytes.is_empty() {
+                watch.confirm();
+            }
+            for line in reader.push(&bytes) {
+                if sender.send(line).await.is_err() {
+                    return;
+                }
+            }
+        }
+        if backlog {
+            continue;
+        }
+        if terminal || sender.is_closed() {
+            for reader in &mut readers {
+                if let Some(line) = reader.finish() {
+                    let _ = sender.send(line).await;
+                }
+            }
+            return;
+        }
+        terminal = match running().await {
+            Ok(still_running) => {
+                watch.confirm();
+                !still_running
+            }
+            Err(error) => {
+                let lost = capture_gone(&readers).await || watch.check_failed(Instant::now());
+                if lost {
+                    let file = readers[0].file().map(Path::display);
+                    eprintln!(
+                        "ketchup: no longer following {}: {error}",
+                        file.map_or_else(|| "a capture".to_string(), |file| file.to_string())
+                    );
+                }
+                lost
+            }
+        };
+        if !terminal {
+            tokio::time::sleep(FOLLOW_POLL).await;
+        }
+    }
+}
+
+/// Whether every file these readers follow has gone: the instance was cleaned
+/// up, so no check will ever answer for it.
+async fn capture_gone(readers: &[CaptureReader]) -> bool {
+    for reader in readers {
+        let Some(file) = reader.file() else {
+            return false;
+        };
+        if tokio::fs::try_exists(file).await.unwrap_or(true) {
+            return false;
+        }
+    }
+    true
+}
 
 /// Read at most [`CAPTURE_CHUNK_BYTES`] of `path`, starting at `offset`.
 ///
@@ -40,6 +176,169 @@ pub async fn read_capture_chunk(path: &Path, offset: u64) -> io::Result<Vec<u8>>
         .read_to_end(&mut chunk)
         .await?;
     Ok(chunk)
+}
+
+/// How much of a capture file's end stays on disk after its ingested prefix
+/// is reclaimed: the window a tail snapshot reads (#1418).
+pub const RETAINED_CAPTURE_BYTES: u64 = 1024 * 1024;
+
+/// Free the disk blocks holding the start of a capture file the log store
+/// has already ingested, keeping the file's length and identity (#1418).
+///
+/// A capture file is append-only and the workload holds it open for as long
+/// as it runs, so it can't be rotated without losing lines or moving every
+/// offset the store has checkpointed. Punching a hole instead hands the
+/// blocks back to the filesystem while the file keeps its length: offsets
+/// still name the same lines, and the writer's `O_APPEND` writes carry on at
+/// the end. The last [`RETAINED_CAPTURE_BYTES`] stay for tail snapshots, and
+/// nothing past `ingested_through` is ever touched.
+///
+/// Returns where the reclaimed prefix ends; everything before it reads as
+/// zeros. Nothing is freed when `path` has gone or is no longer the file
+/// `identity` names. A filesystem that can't punch holes reports
+/// [`io::ErrorKind::Unsupported`].
+pub fn reclaim_ingested(
+    path: &Path,
+    identity: CaptureFileIdentity,
+    ingested_through: u64,
+) -> io::Result<u64> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let file = match std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata()?;
+    if CaptureFileIdentity::of(&metadata) != identity {
+        return Ok(0);
+    }
+    let block = metadata.blksize().max(1);
+    let end = ingested_through.min(metadata.len().saturating_sub(RETAINED_CAPTURE_BYTES));
+    let end = end - end % block;
+    let start = data_start(&file, 0)?;
+    let start = start - start % block;
+    if start < end {
+        punch_hole(&file, start, end - start)?;
+    }
+    Ok(end.max(start))
+}
+
+/// Where the first byte of data at or after `offset` lives: past any hole
+/// [`reclaim_ingested`] punched. A file with no data there (or a filesystem
+/// that can't say) answers `offset`.
+fn data_start(file: &impl std::os::fd::AsFd, offset: u64) -> io::Result<u64> {
+    use nix::unistd::{Whence, lseek};
+    let Ok(signed) = i64::try_from(offset) else {
+        return Ok(offset);
+    };
+    match lseek(file, signed, Whence::SeekData) {
+        Ok(found) => Ok(u64::try_from(found).unwrap_or(offset)),
+        // ENXIO: no data at or after `offset`, which is past the end.
+        Err(nix::errno::Errno::ENXIO | nix::errno::Errno::EINVAL) => Ok(offset),
+        Err(errno) => Err(errno.into()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn punch_hole(file: &std::fs::File, offset: u64, length: u64) -> io::Result<()> {
+    use nix::fcntl::{FallocateFlags, fallocate};
+    let (Ok(offset), Ok(length)) = (i64::try_from(offset), i64::try_from(length)) else {
+        return Ok(());
+    };
+    fallocate(
+        file,
+        FallocateFlags::FALLOC_FL_PUNCH_HOLE | FallocateFlags::FALLOC_FL_KEEP_SIZE,
+        offset,
+        length,
+    )
+    .map_err(|errno| match errno {
+        nix::errno::Errno::EOPNOTSUPP => io::Error::from(io::ErrorKind::Unsupported),
+        errno => errno.into(),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn punch_hole(file: &std::fs::File, offset: u64, length: u64) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let (Ok(offset), Ok(length)) = (i64::try_from(offset), i64::try_from(length)) else {
+        return Ok(());
+    };
+    let hole = nix::libc::fpunchhole_t {
+        fp_flags: 0,
+        reserved: 0,
+        fp_offset: offset,
+        fp_length: length,
+    };
+    // SAFETY: `file` is an open descriptor for the call's duration, and
+    // F_PUNCHHOLE reads one `fpunchhole_t`, which `hole` is and outlives the
+    // call. The kernel does not keep the pointer.
+    let result = unsafe { nix::libc::fcntl(file.as_raw_fd(), nix::libc::F_PUNCHHOLE, &hole) };
+    if result == -1 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(nix::libc::ENOTSUP) {
+            return Err(io::ErrorKind::Unsupported.into());
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn punch_hole(_file: &std::fs::File, _offset: u64, _length: u64) -> io::Result<()> {
+    Err(io::ErrorKind::Unsupported.into())
+}
+
+/// Open a capture file and read its metadata, or `None` when it has gone.
+/// Blocking: call it from a blocking worker.
+fn open_capture(path: &Path) -> io::Result<Option<(std::fs::File, std::fs::Metadata)>> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let metadata = file.metadata()?;
+    Ok(Some((file, metadata)))
+}
+
+/// Read at most [`CAPTURE_CHUNK_BYTES`] of an open capture file from
+/// `offset`, or from past a reclaimed prefix if `offset` is inside one
+/// (#1418): a store that lost its checkpoint reads from byte 0, and would
+/// otherwise hand on zeros. Returns where the read started, and the bytes.
+/// Blocking: call it from a blocking worker.
+fn read_capture_from(mut file: std::fs::File, offset: u64) -> io::Result<(u64, Vec<u8>)> {
+    use std::io::{Read, Seek};
+    let start = data_start(&file, offset)?;
+    file.seek(io::SeekFrom::Start(start))?;
+    let mut chunk = Vec::with_capacity(CAPTURE_CHUNK_BYTES);
+    file.take(CAPTURE_CHUNK_BYTES as u64)
+        .read_to_end(&mut chunk)?;
+    Ok((start, chunk))
+}
+
+/// Read a whole capture file, minus any prefix [`reclaim_ingested`] freed.
+///
+/// The line the reclaimed prefix ends in may have lost its start, so the
+/// answer begins after its newline. The store already holds every line
+/// in that range.
+pub fn read_retained(path: &Path) -> io::Result<Vec<u8>> {
+    use std::io::{Read, Seek};
+    let mut file = std::fs::File::open(path)?;
+    let start = data_start(&file, 0)?;
+    file.seek(io::SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    if start > 0 {
+        let cut = bytes
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(bytes.len(), |newline| newline + 1);
+        bytes.drain(..cut);
+    }
+    Ok(bytes)
 }
 
 /// A bounded tail and the exact complete-line positions from the same snapshot.
@@ -88,7 +387,7 @@ impl TailSnapshot {
             let Ok(meta) = file.metadata().await else {
                 continue;
             };
-            let start = meta.len().saturating_sub(1024 * 1024);
+            let start = meta.len().saturating_sub(RETAINED_CAPTURE_BYTES);
             if file.seek(io::SeekFrom::Start(start)).await.is_err() {
                 continue;
             }
@@ -116,9 +415,16 @@ pub struct CaptureReader {
     consumed: u64,
     /// Bytes read past the last newline, waiting for the rest of their line.
     partial: Vec<u8>,
+    /// Dropping bytes up to the next newline: the read skipped a reclaimed
+    /// prefix, so the line in progress lost its start.
+    discarding: bool,
     identity: Option<CaptureFileIdentity>,
     #[cfg(test)]
     read_test_gate: Option<std::sync::Arc<CaptureReadGate>>,
+    /// How long the blocking part of a read stalls, standing in for a
+    /// `SEEK_DATA` lseek under writeback (#1857).
+    #[cfg(test)]
+    blocking_stall: Option<std::time::Duration>,
 }
 
 impl CaptureReader {
@@ -130,9 +436,12 @@ impl CaptureReader {
             file,
             consumed: 0,
             partial: Vec::new(),
+            discarding: false,
             identity: None,
             #[cfg(test)]
             read_test_gate: None,
+            #[cfg(test)]
+            blocking_stall: None,
         }
     }
 
@@ -168,9 +477,12 @@ impl CaptureReader {
             file: Some(file),
             consumed,
             partial: Vec::new(),
+            discarding: false,
             identity,
             #[cfg(test)]
             read_test_gate: None,
+            #[cfg(test)]
+            blocking_stall: None,
         }
     }
 
@@ -178,17 +490,22 @@ impl CaptureReader {
     ///
     /// No reader state changes until every await has completed. Cancellation
     /// cannot discard a partial line or bind it to an unrelated replacement.
+    ///
+    /// The file calls run on a blocking worker, together. They block in the
+    /// kernel: under writeback a `SEEK_DATA` lseek waits for the inode lock
+    /// for as long as the appender's journal wait, and made inline it held a
+    /// runtime worker that long, stranding whatever task was queued on it,
+    /// the agent loop included (#1857).
     pub async fn read_chunk(&mut self) -> io::Result<Vec<u8>> {
-        use tokio::io::{AsyncReadExt, AsyncSeekExt};
-        let Some(path) = self.file.as_ref() else {
+        let Some(path) = self.file.clone() else {
             return Ok(Vec::new());
         };
-        let mut file = match tokio::fs::File::open(path).await {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(error),
+        let opened = tokio::task::spawn_blocking(move || open_capture(&path))
+            .await
+            .map_err(io::Error::other)??;
+        let Some((file, metadata)) = opened else {
+            return Ok(Vec::new());
         };
-        let metadata = file.metadata().await?;
         let identity = CaptureFileIdentity::of(&metadata);
         let replaced = self.identity.is_some_and(|old| old != identity);
         let reset = replaced || metadata.len() < self.read_offset();
@@ -198,14 +515,26 @@ impl CaptureReader {
             gate.entered.notify_one();
             gate.release.notified().await;
         }
-        file.seek(io::SeekFrom::Start(offset)).await?;
-        let mut chunk = Vec::with_capacity(CAPTURE_CHUNK_BYTES);
-        file.take(CAPTURE_CHUNK_BYTES as u64)
-            .read_to_end(&mut chunk)
-            .await?;
+        #[cfg(test)]
+        let stall = self.blocking_stall;
+        let (start, chunk) = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some(stall) = stall {
+                std::thread::sleep(stall);
+            }
+            read_capture_from(file, offset)
+        })
+        .await
+        .map_err(io::Error::other)??;
         if reset {
             self.consumed = 0;
             self.partial.clear();
+            self.discarding = false;
+        }
+        if start > offset {
+            self.consumed = start;
+            self.partial.clear();
+            self.discarding = true;
         }
         self.identity = Some(identity);
         Ok(chunk)
@@ -230,6 +559,17 @@ impl CaptureReader {
     /// newline, so only the new ones are searched, and the finished lines
     /// leave the buffer in one step at the end.
     pub fn push(&mut self, bytes: &[u8]) -> Vec<CapturedLine> {
+        let bytes = if self.discarding {
+            let Some(newline) = bytes.iter().position(|byte| *byte == b'\n') else {
+                self.consumed += bytes.len() as u64;
+                return Vec::new();
+            };
+            self.consumed += newline as u64 + 1;
+            self.discarding = false;
+            &bytes[newline + 1..]
+        } else {
+            bytes
+        };
         let mut search_from = self.partial.len();
         self.partial.extend_from_slice(bytes);
         let mut lines = Vec::new();
@@ -282,6 +622,182 @@ struct CaptureReadGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stdout_and_stderr(dir: &Path) -> [CaptureReader; 2] {
+        [
+            CaptureReader::new(LogStream::Stdout, Some(dir.join("web.stdout"))),
+            CaptureReader::new(LogStream::Stderr, Some(dir.join("web.stderr"))),
+        ]
+    }
+
+    fn append(path: &Path, bytes: &[u8]) {
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
+    }
+
+    async fn next_line(lines: &mut mpsc::Receiver<CapturedLine>) -> Option<String> {
+        tokio::time::timeout(Duration::from_secs(5), lines.recv())
+            .await
+            .expect("the follower went quiet")
+            .map(|captured| captured.line)
+    }
+
+    fn timed_out() -> io::Error {
+        io::Error::new(io::ErrorKind::TimedOut, "process owner request timed out")
+    }
+
+    /// #1493: a check that fails says nothing about the workload, so lines
+    /// written after it must still arrive.
+    #[tokio::test]
+    async fn a_failed_check_does_not_end_the_follow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stdout = tmp.path().join("web.stdout");
+        append(&stdout, b"before\n");
+        let (sender, mut lines) = mpsc::channel(8);
+        let mut checks = 0;
+        let follow = follow_capture(
+            stdout_and_stderr(tmp.path()),
+            sender,
+            UNKNOWN_SOURCE_LIMIT,
+            || {
+                checks += 1;
+                let check = checks;
+                let stdout = stdout.clone();
+                async move {
+                    match check {
+                        1 => Err(timed_out()),
+                        2 => {
+                            append(&stdout, b"after\n");
+                            Ok(true)
+                        }
+                        _ => Ok(false),
+                    }
+                }
+            },
+        );
+        let reader = async {
+            assert_eq!(next_line(&mut lines).await.as_deref(), Some("before"));
+            assert_eq!(next_line(&mut lines).await.as_deref(), Some("after"));
+            assert_eq!(next_line(&mut lines).await, None);
+        };
+        tokio::join!(follow, reader);
+    }
+
+    /// Positive evidence ends the follow, after what's left is read, the
+    /// unfinished last line included.
+    #[tokio::test]
+    async fn a_stopped_source_ends_the_follow_with_its_last_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stdout = tmp.path().join("web.stdout");
+        append(&stdout, b"one\n");
+        let (sender, mut lines) = mpsc::channel(8);
+        let follow = follow_capture(
+            stdout_and_stderr(tmp.path()),
+            sender,
+            UNKNOWN_SOURCE_LIMIT,
+            || {
+                let stdout = stdout.clone();
+                async move {
+                    append(&stdout, b"two\nunfinished");
+                    Ok(false)
+                }
+            },
+        );
+        let reader = async {
+            assert_eq!(next_line(&mut lines).await.as_deref(), Some("one"));
+            assert_eq!(next_line(&mut lines).await.as_deref(), Some("two"));
+            assert_eq!(next_line(&mut lines).await.as_deref(), Some("unfinished"));
+            assert_eq!(next_line(&mut lines).await, None);
+        };
+        tokio::join!(follow, reader);
+    }
+
+    /// An instance cleaned up under the follower takes its records and its
+    /// capture files with it. Nothing will ever answer, so waiting out the
+    /// limit would keep a dead task polling for ten minutes.
+    #[tokio::test]
+    async fn checks_failing_with_the_capture_files_gone_end_the_follow_at_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (sender, _lines) = mpsc::channel(8);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            follow_capture(
+                stdout_and_stderr(tmp.path()),
+                sender,
+                UNKNOWN_SOURCE_LIMIT,
+                || async { Err(timed_out()) },
+            ),
+        )
+        .await
+        .expect("the follower outlived its capture files");
+    }
+
+    #[tokio::test]
+    async fn checks_that_keep_failing_with_no_output_end_the_follow_at_the_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        append(&tmp.path().join("web.stdout"), b"");
+        let (sender, _lines) = mpsc::channel(8);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            follow_capture(
+                stdout_and_stderr(tmp.path()),
+                sender,
+                Duration::from_millis(300),
+                || async { Err(timed_out()) },
+            ),
+        )
+        .await
+        .expect("the follower outlived the limit");
+    }
+
+    /// An owner that stays broken must not cost a workload still writing its
+    /// logs: output is news of the source, whatever the checks say.
+    #[tokio::test]
+    async fn output_keeps_a_follow_going_past_the_limit_while_checks_fail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stdout = tmp.path().join("web.stdout");
+        append(&stdout, b"");
+        let (sender, mut lines) = mpsc::channel(8);
+        let limit = FOLLOW_POLL / 2;
+        let mut checks = 0;
+        let follow = follow_capture(stdout_and_stderr(tmp.path()), sender, limit, || {
+            checks += 1;
+            let check = checks;
+            let stdout = stdout.clone();
+            async move {
+                if check <= 4 {
+                    append(&stdout, format!("line {check}\n").as_bytes());
+                }
+                Err(timed_out())
+            }
+        });
+        let reader = async {
+            for check in 1..=4 {
+                let expected = format!("line {check}");
+                assert_eq!(next_line(&mut lines).await, Some(expected));
+            }
+            assert_eq!(next_line(&mut lines).await, None);
+        };
+        tokio::join!(follow, reader);
+    }
+
+    #[test]
+    fn a_watch_gives_up_only_after_the_limit_without_news() {
+        let start = Instant::now();
+        let limit = Duration::from_secs(600);
+        let mut watch = SourceWatch::new(limit);
+        assert!(!watch.check_failed(start));
+        assert!(!watch.check_failed(start + limit - Duration::from_secs(1)));
+        watch.confirm();
+        assert!(!watch.check_failed(start + limit));
+        assert!(watch.check_failed(start + limit + limit));
+    }
 
     fn file_reader() -> CaptureReader {
         CaptureReader::new(LogStream::Stdout, Some(PathBuf::from("/logs/web.stdout")))
@@ -506,6 +1022,40 @@ mod tests {
         );
     }
 
+    /// A capture read's file calls block in the kernel, and under writeback
+    /// a `SEEK_DATA` lseek waits for the inode lock for as long as the
+    /// appender's journal wait. Made inline, it held a runtime worker that
+    /// long, and the agent loop's task was stranded on that worker past its
+    /// turn deadline (#1857). On a one-thread runtime, a timer must still
+    /// fire while a read is stalled.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stalled_capture_read_does_not_hold_the_runtime_thread() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("app.stdout");
+        std::fs::write(&file, b"one\ntwo\n").unwrap();
+        let mut reader = CaptureReader::new(LogStream::Stdout, Some(file));
+        let stall = std::time::Duration::from_millis(600);
+        reader.blocking_stall = Some(stall);
+        let started = std::time::Instant::now();
+        let read = reader.read_chunk();
+        tokio::pin!(read);
+        let timer = tokio::time::sleep(std::time::Duration::from_millis(20));
+        tokio::pin!(timer);
+        let mut timer_fired = None;
+        let bytes = loop {
+            tokio::select! {
+                bytes = &mut read => break bytes.unwrap(),
+                () = &mut timer, if timer_fired.is_none() => timer_fired = Some(started.elapsed()),
+            }
+        };
+        let timer_fired = timer_fired.expect("the timer never fired before the read finished");
+        assert!(
+            timer_fired < stall / 2,
+            "a 20 ms timer fired after {timer_fired:?}: the read blocked the runtime thread"
+        );
+        assert_eq!(bytes, b"one\ntwo\n");
+    }
+
     #[tokio::test]
     async fn canceling_a_capture_read_preserves_partial_bytes_and_identity_until_retry() {
         let directory = tempfile::tempdir().unwrap();
@@ -548,5 +1098,177 @@ mod tests {
             Some(CaptureFileIdentity::of(&std::fs::metadata(&file).unwrap()))
         );
         drop(held_old_inode);
+    }
+
+    /// A capture of `lines` numbered lines, each 32 bytes with its newline.
+    fn numbered_capture(path: &Path, lines: usize) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(lines * 32);
+        for index in 0..lines {
+            bytes.extend_from_slice(format!("spam {index:09} quick brown fox.\n").as_bytes());
+        }
+        std::fs::write(path, &bytes).unwrap();
+        bytes
+    }
+
+    fn allocated_bytes(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).unwrap().blocks() * 512
+    }
+
+    fn identity_of(path: &Path) -> CaptureFileIdentity {
+        CaptureFileIdentity::of(&std::fs::metadata(path).unwrap())
+    }
+
+    /// #1418: a chatty app's capture file grew by its whole output for as
+    /// long as it ran. Once the store holds the lines, their blocks go back
+    /// to the filesystem, while the length (and so every offset) stays.
+    #[test]
+    fn reclaiming_frees_ingested_bytes_but_keeps_the_length_and_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("spammer.stdout");
+        let contents = numbered_capture(&path, 256 * 1024);
+        let identity = identity_of(&path);
+        assert!(allocated_bytes(&path) >= contents.len() as u64);
+
+        let reclaimed = reclaim_ingested(&path, identity, contents.len() as u64).unwrap();
+
+        assert!(reclaimed > 0, "nothing was reclaimed");
+        assert!(reclaimed <= contents.len() as u64 - RETAINED_CAPTURE_BYTES);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            contents.len() as u64
+        );
+        assert_eq!(identity_of(&path), identity);
+        assert!(
+            allocated_bytes(&path) <= RETAINED_CAPTURE_BYTES + 256 * 1024,
+            "{} bytes still allocated",
+            allocated_bytes(&path)
+        );
+        // Reclaiming again is a no-op that reports the same boundary.
+        assert_eq!(
+            reclaim_ingested(&path, identity, contents.len() as u64).unwrap(),
+            reclaimed
+        );
+    }
+
+    #[test]
+    fn reclaiming_never_frees_bytes_the_store_has_not_ingested() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("spammer.stdout");
+        let contents = numbered_capture(&path, 256 * 1024);
+        let identity = identity_of(&path);
+        let ingested = 2 * 1024 * 1024;
+
+        let reclaimed = reclaim_ingested(&path, identity, ingested).unwrap();
+
+        assert!(reclaimed <= ingested);
+        let mut file = std::fs::File::open(&path).unwrap();
+        let mut rest = Vec::new();
+        use std::io::{Read, Seek};
+        file.seek(io::SeekFrom::Start(ingested)).unwrap();
+        file.read_to_end(&mut rest).unwrap();
+        assert_eq!(rest, contents[ingested as usize..]);
+    }
+
+    #[test]
+    fn reclaiming_a_replaced_file_frees_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("spammer.stdout");
+        numbered_capture(&path, 256 * 1024);
+        let old = identity_of(&path);
+        let replacement = tmp.path().join("replacement");
+        let contents = numbered_capture(&replacement, 256 * 1024);
+        std::fs::rename(&replacement, &path).unwrap();
+
+        assert_eq!(
+            reclaim_ingested(&path, old, contents.len() as u64).unwrap(),
+            0
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), contents);
+        // A file that has gone is not an error either.
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(reclaim_ingested(&path, old, 1 << 30).unwrap(), 0);
+    }
+
+    /// A tail snapshot reads the last mebibyte, which reclaiming keeps.
+    #[tokio::test]
+    async fn a_tail_after_reclaiming_is_whole_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stem = tmp.path().join("spammer");
+        let path = stem.with_extension("stdout");
+        let contents = numbered_capture(&path, 256 * 1024);
+        reclaim_ingested(&path, identity_of(&path), contents.len() as u64).unwrap();
+
+        let snapshot = TailSnapshot::files(&stem).await;
+
+        assert!(!snapshot.text.contains('\0'));
+        let last = snapshot.text.lines().last().unwrap();
+        assert_eq!(last, "spam 000262143 quick brown fox.");
+        assert_eq!(snapshot.offsets.0[&path], contents.len() as u64);
+    }
+
+    /// A store that lost its checkpoint reads the file from byte 0 again. The
+    /// reclaimed prefix is skipped, not handed on as one line of zeros, and
+    /// the line it cut in half is dropped rather than stored as a fragment.
+    #[tokio::test]
+    async fn a_reader_from_byte_zero_skips_a_reclaimed_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("spammer.stdout");
+        let contents = numbered_capture(&path, 256 * 1024);
+        let reclaimed = reclaim_ingested(&path, identity_of(&path), contents.len() as u64).unwrap();
+        assert!(reclaimed > 0);
+
+        let mut reader = CaptureReader::new(LogStream::Stdout, Some(path.clone()));
+        let mut lines = Vec::new();
+        loop {
+            let chunk = reader.read_chunk().await.unwrap();
+            if chunk.is_empty() {
+                break;
+            }
+            lines.extend(reader.push(&chunk));
+        }
+
+        let first = &lines[0];
+        let end = first.position.as_ref().unwrap().end_offset;
+        // The line the prefix ends in may have lost its start, so it is
+        // dropped too: the first line read is the one after it.
+        assert!(
+            end > reclaimed && end - reclaimed <= 64,
+            "first line ends at {end}"
+        );
+        assert_eq!(end % 32, 0, "the first line is a whole line");
+        assert_eq!(
+            first.line,
+            format!("spam {:09} quick brown fox.", end / 32 - 1)
+        );
+        assert!(lines.iter().all(|line| !line.line.contains('\0')));
+        assert_eq!(lines.len() as u64, (contents.len() as u64 - end) / 32 + 1);
+        assert_eq!(reader.read_offset(), contents.len() as u64);
+    }
+
+    #[test]
+    fn read_retained_skips_the_reclaimed_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("spammer.stdout");
+        let contents = numbered_capture(&path, 256 * 1024);
+        let reclaimed = reclaim_ingested(&path, identity_of(&path), contents.len() as u64).unwrap();
+
+        let retained = read_retained(&path).unwrap();
+
+        assert!(!retained.contains(&0));
+        // Everything after the first newline past the reclaimed prefix: the
+        // line the prefix ends in may have lost its start.
+        let cut = reclaimed as usize;
+        let start = cut
+            + contents[cut..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .unwrap()
+            + 1;
+        assert_eq!(retained, contents[start..]);
+        // A capture nothing was reclaimed from reads whole.
+        let small = tmp.path().join("small.stdout");
+        std::fs::write(&small, b"one\ntwo\n").unwrap();
+        assert_eq!(read_retained(&small).unwrap(), b"one\ntwo\n");
     }
 }

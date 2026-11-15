@@ -1,0 +1,78 @@
+Downloading the Reliaburger v0.2.8 installer...
+Downloaded 14823 bytes (14.5 KiB) in 0 s
+Downloading relish v0.2.8 for linux-x86_64 (123.7 MiB)...
+Downloaded 129721968 bytes (123.7 MiB) in 1 s
+Installed Relish v0.2.8 in /home/runner/.reliaburger/bin
+Linked /home/runner/.local/bin/relish to it; that directory is on your PATH
+... check host
+... install Lima 2.2.1
+[ ok ] check host                       0.0s
+... download guest image
+... download bun
+... download relish
+[ ok ] install Lima 2.2.1               0.8s  23.4 MiB / 23.4 MiB  28.3 MiB/s
+[ ok ] download relish                  2.5s  123.7 MiB / 123.7 MiB  49.6 MiB/s
+[ ok ] download bun                     4.8s  134.1 MiB / 134.1 MiB  28.1 MiB/s
+[ ok ] download guest image            18.9s  645.2 MiB / 645.2 MiB  34.2 MiB/s
+... boot VM 1
+... boot VM 2
+... boot VM 3
+[ ok ] boot VM 2                       32.9s
+[ ok ] boot VM 3                       32.8s
+... install files on node 1
+[ ok ] boot VM 1                       33.6s
+[ ok ] install files on node 1          1.8s
+... start node 1
+... install files on node 2
+... install files on node 3
+[ ok ] start node 1                     1.2s
+[ ok ] install files on node 2          3.5s
+... enrol node 2
+... enrol node 3
+[ ok ] install files on node 3          3.9s
+... start node 3
+[ ok ] enrol node 3                     1.5s
+... start node 2
+[ ok ] enrol node 2                     1.6s
+... form council quorum
+[ ok ] start node 3                     0.8s
+[ ok ] start node 2                     0.8s
+... run hello through ingress
+[ ok ] form council quorum              8.1s
+  app hello: committed to the cluster
+[ ok ] run hello through ingress       13.8s
+where the time went (83.9s in total):
+  host checks          0.0s
+  downloads           18.9s  926.4 MiB at 49.1 MiB/s
+  VM boot             33.6s
+  node setup           9.5s
+  cluster checks      21.9s
+
+every step (duration, start offset):
+      0.0s +   0.0s  check host                   Done
+      0.8s +   0.0s  install Lima 2.2.1           Done
+     18.9s +   0.0s  download guest image         Done
+      4.8s +   0.0s  download bun                 Done
+      2.5s +   0.0s  download relish              Done
+     33.6s +  19.0s  boot VM 1                    Done
+     32.9s +  19.2s  boot VM 2                    Done
+     32.8s +  19.2s  boot VM 3                    Done
+      1.8s +  52.6s  install files on node 1      Done
+      1.2s +  54.7s  start node 1                 Done
+      3.5s +  55.9s  install files on node 2      Done
+      3.9s +  55.9s  install files on node 3      Done
+      1.6s +  59.7s  enrol node 2                 Done
+      1.5s +  59.8s  enrol node 3                 Done
+      0.8s +  61.3s  start node 3                 Done
+      0.8s +  61.3s  start node 2                 Done
+      8.1s +  62.0s  form council quorum          Done
+     13.8s +  70.1s  run hello through ingress    Done
+
+timings saved to /home/runner/.reliaburger/clusters/laptop/timings.json
+cluster laptop ready in 83.9s
+  app: http://localhost:18080
+  next: relish manual tour                   (the five-minute tour of this cluster)
+  next: relish status                        (every app and node)
+  next: relish logs hello                    (the demo app's logs)
+  next: relish local status --name laptop    (each VM and its API)
+  remove it: relish local destroy --name laptop --yes

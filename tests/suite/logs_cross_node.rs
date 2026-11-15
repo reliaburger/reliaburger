@@ -126,6 +126,55 @@ async fn tail_after_an_app_moves_back_includes_the_nodes_it_ran_on_meanwhile() {
     assert_eq!(timestamps, vec![201, 202]);
 }
 
+/// #1493: replicas of one app on two nodes, each with lines across several
+/// Parquet files and its unflushed buffer. The fan-out asks each node for its
+/// own tail; the merge must end on the newest lines of the cluster, in order.
+#[tokio::test]
+async fn cluster_tail_merges_each_nodes_parquet_and_buffer() {
+    async fn replica(times: &[u64]) -> (Arc<RwLock<LogStore>>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = LogStore::new(dir.path().to_path_buf());
+        for (index, time) in times.iter().enumerate() {
+            let line = format!("line {time}");
+            store.append_at(*time, "web", "default", LogStream::Stdout, &line);
+            // Every line but the last few reaches Parquet, a file at a time.
+            if index % 3 == 2 && index < times.len() - 2 {
+                store.flush().await.unwrap();
+            }
+        }
+        (Arc::new(RwLock::new(store)), dir)
+    }
+    let odd: Vec<u64> = (1..=40).filter(|time| time % 2 == 1).collect();
+    let even: Vec<u64> = (1..=40).filter(|time| time % 2 == 0).collect();
+    let (first, _dir1) = replica(&odd).await;
+    let (second, _dir2) = replica(&even).await;
+    let url1 = start_server(test_router(first)).await;
+    let url2 = start_server(test_router(second)).await;
+
+    let tail = 6;
+    let query = LogQuery {
+        app: "web".to_string(),
+        namespace: "default".to_string(),
+        tail: Some(tail),
+        ..Default::default()
+    };
+    let result = fan_out_query(
+        &query,
+        &nodes(&[url1, url2]),
+        &reqwest::Client::new(),
+        std::time::Duration::from_secs(5),
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(result.failures.is_empty());
+    let mut entries = result.entries;
+    let newest = entries.split_off(entries.len().saturating_sub(tail));
+    let times: Vec<u64> = newest.iter().map(|entry| entry.timestamp).collect();
+    assert_eq!(times, [35, 36, 37, 38, 39, 40]);
+}
+
 /// 3 nodes with disjoint timestamps. All lines should appear in the
 /// merged result, sorted by timestamp.
 #[tokio::test]

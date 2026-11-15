@@ -14,11 +14,18 @@ import contracts as c
 class WorkflowAdapter(unittest.TestCase):
     def setUp(self):
         self.a = importlib.import_module('workflow_adapter')
+        # CI runs portable macOS as one partition (SHARDS is 1). The merge
+        # is written for any count, and only several shards can overlap or
+        # leave gaps, so these tests split it three ways; the test of one
+        # shard that lists everything checks the real count.
+        shards = patch.dict(self.a.w.SHARDS, {'portable-darwin': 3})
+        shards.start()
+        self.addCleanup(shards.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name).resolve()
         self.incoming = self.root / 'incoming'
         self.context = dict(commit='a' * 40, run_id='123', attempt='2')
-        self.root.joinpath('Makefile').write_text('coverage:\n\ttrue\ntest:\n\ttrue\ntest-contract-boundaries:\n\ttrue\n')
+        self.root.joinpath('Makefile').write_text('coverage:\n\ttrue\ntest-macos:\n\ttrue\ntest-contract-boundaries:\n\ttrue\n')
         self.root.joinpath('src').mkdir()
         self.root.joinpath('src/contract.rs').write_text('synthetic actual source')
         self.manifest = dict(schema_version=1, gates={}, contracts=[])
@@ -57,7 +64,7 @@ class WorkflowAdapter(unittest.TestCase):
                    manifest_sha256=c.digest(self.manifest_path),
                    files={name: c.digest(directory / name) for name in names})
         if shard is not None:
-            row['shard'] = [shard, 3]
+            row['shard'] = [shard, self.a.w.SHARDS[gate]]
         (directory / 'gate-seal.json').write_text(json.dumps(row))
         output = self.a.output_name(gate, label or shard)
         self.needs[self.a.JOBS[gate]]['outputs'][output] = c.digest(directory / 'gate-seal.json')
@@ -80,17 +87,19 @@ class WorkflowAdapter(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def oracle(self, manifest, gate, context, approved, directory, shard=None):
+    def oracle(self, manifest, gate, context, approved, directory, shard=None, archive=None):
         self.assertEqual(approved, {'synthetic': gate, 'shard': shard})
+        # Archived owners are checked against the builder's archive digest.
+        self.assertEqual(archive, self.a.builder_archive(gate, self.needs))
         required = self.a.required_cases(manifest, gate)
         if shard is None:
             return required
         return required & c.partitioned(c.read_json(Path(directory) / 'discovery.json'))[0]
 
-    def aggregate(self, event='pull_request'):
+    def aggregate(self, event='pull_request', release_gate=False):
         with patch.object(self.a.gates, 'candidate_sources'), patch.object(self.a, 'verify_owner', self.oracle):
             return self.a.aggregate(self.root, self.manifest_path, self.incoming, self.context, self.needs,
-                                    event=event)
+                                    event=event, release_gate=release_gate)
 
     def test_selected_portable_hosts_and_optimized_gate_all_complete(self):
         self.assertEqual(len(self.aggregate()), 3)
@@ -99,6 +108,22 @@ class WorkflowAdapter(unittest.TestCase):
         verified = self.aggregate()
         self.assertEqual(verified[('portable-darwin', 'darwin')], {self.darwin})
         self.assertEqual(set(self.a.w.SHARDS), {'portable-darwin'})
+
+    def test_ci_runs_portable_macos_as_one_shard_that_lists_everything(self):
+        with patch.dict(self.a.w.SHARDS, {'portable-darwin': 1}):
+            self.assertEqual(self.a.owner_units({('portable-darwin', 'darwin')}), [('portable-darwin', 'darwin', 1)])
+            self.assertEqual(self.a.parse_shard('portable-darwin', '1/1'), 1)
+            for text in ('1/3', '2/1', '0/1'):
+                with self.subTest(text=text), self.assertRaises(c.Invalid):
+                    self.a.parse_shard('portable-darwin', text)
+            for shard in (1, 2, 3):
+                shutil.rmtree(self.incoming / ('contract-darwin-portable-darwin-' + str(shard)))
+            self.needs['macos']['outputs'] = {}
+            everything = {1: set().union(*self.lists.values())}
+            self.envelope('portable-darwin', 'darwin', 1, discovery=self.discovery(1, everything))
+            verified = self.aggregate()
+            self.assertEqual(verified[('portable-darwin', 'darwin')], {self.darwin})
+            self.assertEqual(list(self.needs['macos']['outputs']), ['portable_darwin_1_sha256'])
 
     def test_a_missing_or_failed_shard_blocks_aggregation(self):
         for change in ['output', 'envelope']:
@@ -200,6 +225,17 @@ class WorkflowAdapter(unittest.TestCase):
         self.needs['changes']['outputs']['macos'] = 'true'
         self.assertEqual(len(self.aggregate(event='pull_request')), 3)
 
+    def test_the_release_gate_pull_request_must_qualify_with_every_owner(self):
+        # An ordinary PR may leave macOS out; the release gate PR may not,
+        # whatever select jobs said (#1443).
+        self.needs['changes']['outputs']['macos'] = 'false'
+        del self.needs['macos']
+        for shard in (1, 2, 3):
+            shutil.rmtree(self.incoming / ('contract-darwin-portable-darwin-' + str(shard)))
+        self.assertEqual(len(self.aggregate()), 2)
+        with self.assertRaisesRegex(c.Invalid, 'release gate'):
+            self.aggregate(release_gate=True)
+
     def heavy_owners(self, macos):
         """Add every heavy owner, sealed and successful, to the synthetic run.
 
@@ -240,7 +276,7 @@ class WorkflowAdapter(unittest.TestCase):
                 shutil.rmtree(self.incoming / ('contract-darwin-portable-darwin-' + str(shard)))
         return []
 
-    def aggregate_heavy(self, legacy, event='pull_request'):
+    def aggregate_heavy(self, legacy, event='pull_request', release_gate=False):
         legacy_owner = importlib.import_module('oci_legacy_owner')
         ignored = importlib.import_module('ignored_owners')
 
@@ -252,7 +288,7 @@ class WorkflowAdapter(unittest.TestCase):
                 patch.object(legacy_owner, 'qualify', return_value=set()), \
                 patch.object(ignored, 'evidence_problems', problems):
             return self.a.aggregate(self.root, self.manifest_path, self.incoming, self.context, self.needs,
-                                    self.bindings, event=event)
+                                    self.bindings, event=event, release_gate=release_gate)
 
     def test_a_full_ci_train_pull_request_needs_every_heavy_owner_but_not_macos(self):
         legacy = self.heavy_owners(macos='false')
@@ -287,6 +323,16 @@ class WorkflowAdapter(unittest.TestCase):
             with self.subTest(event=event, macos='claimed'), \
                     self.assertRaisesRegex(c.Invalid, 'missing successful owner step output'):
                 self.aggregate_heavy(legacy, event=event)
+
+    def test_the_release_gate_pull_request_passes_with_every_owner(self):
+        legacy = self.heavy_owners(macos='true')
+        self.assertEqual(len(self.aggregate_heavy(legacy, release_gate=True)), len(self.a.w.OWNERS))
+
+    def test_the_release_gate_pull_request_refuses_the_heavy_set_without_macos(self):
+        legacy = self.heavy_owners(macos='false')
+        self.assertEqual(len(self.aggregate_heavy(legacy)), len(self.a.w.OWNERS) - 1)
+        with self.assertRaisesRegex(c.Invalid, 'release gate'):
+            self.aggregate_heavy(legacy, release_gate=True)
 
     def test_push_and_merge_queue_pass_with_every_owner_macos_included(self):
         legacy = self.heavy_owners(macos='true')
@@ -335,9 +381,9 @@ class WorkflowAdapter(unittest.TestCase):
         self.reseal('portable-darwin', 2, attempt='3')
         seen = {}
 
-        def oracle(manifest, gate, context, approved, directory, shard=None):
+        def oracle(manifest, gate, context, approved, directory, shard=None, archive=None):
             seen[(gate, shard)] = context
-            return self.oracle(manifest, gate, context, approved, directory, shard)
+            return self.oracle(manifest, gate, context, approved, directory, shard, archive)
 
         with patch.object(self.a.gates, 'candidate_sources'), patch.object(self.a, 'verify_owner', oracle):
             verified = self.a.aggregate(self.root, self.manifest_path, self.incoming, self.context, self.needs)

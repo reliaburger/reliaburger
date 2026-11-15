@@ -1,0 +1,9 @@
+---
+source: src/relish/commands.rs
+expression: "json(&TaskOutput { run: 42, index: 3, output: \"exit 1\\n\".to_string(), })"
+---
+{
+  "run": 42,
+  "index": 3,
+  "output": "exit 1\n"
+}

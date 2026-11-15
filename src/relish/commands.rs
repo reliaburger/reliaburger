@@ -10,7 +10,7 @@ use crate::config::Config;
 
 use super::RelishError;
 use super::client::BunClient;
-use super::output::{OutputFormat, format_output};
+use super::output::{OutputFormat, format_output, print_output};
 use super::plan::generate_plan;
 
 use crate::bun::agent::CouncilStatus;
@@ -31,8 +31,21 @@ pub async fn apply(
     source: &super::manifest::ManifestSource,
     output: OutputFormat,
     dry_run: bool,
+    break_lease: bool,
 ) -> Result<(), RelishError> {
-    apply_with_client(source, output, dry_run, &BunClient::default_local()).await
+    let client = BunClient::default_local().breaking_leases(break_lease);
+    apply_with_client(source, output, dry_run, &client).await
+}
+
+/// Read a local config file for `lint`, `deploy`, `diff` and `compile`:
+/// Reliaburger TOML, or Kubernetes YAML or JSON imported the way `apply`
+/// imports it, with the migration report on stderr.
+pub(crate) fn load_config_file(path: &Path) -> Result<Config, RelishError> {
+    let loaded = super::manifest::load_file(path)?;
+    if let Some(report) = &loaded.migration_report {
+        eprintln!("{report}");
+    }
+    Ok(loaded.config)
 }
 
 /// Read a manifest for `apply`, printing any migration report to stderr.
@@ -43,15 +56,27 @@ async fn load_manifest(source: &super::manifest::ManifestSource) -> Result<Confi
         eprintln!();
     }
     loaded.config.validate_intrinsic()?;
+    for warning in loaded.config.warnings() {
+        eprintln!("warning: {warning}");
+    }
     Ok(loaded.config)
 }
 
 /// Request another common run; unresolved ownership still requires grant-specific replay.
-pub async fn rerun_jobs(source: &super::manifest::ManifestSource) -> Result<(), RelishError> {
+/// `-o json` prints the node's answer, `created` and `instances`.
+pub async fn rerun_jobs(
+    source: &super::manifest::ManifestSource,
+    output: OutputFormat,
+) -> Result<(), RelishError> {
     let config = load_manifest(source).await?;
     let result = BunClient::default_local()
         .apply_rerunning_jobs(&config)
         .await?;
+    if output != OutputFormat::Human {
+        let answer = serde_json::to_value(&result).map_err(RelishError::SerialiseJson)?;
+        println!("{}", format_output(&answer, output)?);
+        return Ok(());
+    }
     println!(
         "started {} job instance(s): {}",
         result.created,
@@ -66,10 +91,32 @@ pub async fn rerun_jobs(source: &super::manifest::ManifestSource) -> Result<(), 
 fn apply_summary(created: usize, instances: &[String]) -> String {
     if instances.is_empty() {
         format!(
-            "applied {created} app(s); the scheduler places them now (watch with `relish status`)"
+            "applied {created} app(s); the scheduler places them now (watch with `relish apps`)"
         )
     } else {
         format!("deployed {created} instance(s): {}", instances.join(", "))
+    }
+}
+
+/// What the policies say about `config`'s apps, for `relish apply
+/// --dry-run`: the cluster's policies with the config's own replacing any
+/// of the same name, judged as a deployer applying by hand (#1117).
+pub(crate) fn plan_policies(
+    committed: &std::collections::BTreeMap<String, crate::config::PolicySpec>,
+    config: &Config,
+) -> super::plan::PolicyPlan {
+    let effective = crate::policy::effective_policies(committed, config);
+    match crate::policy::PolicySet::compile(&effective) {
+        Ok(set) => super::plan::PolicyPlan::from_evaluation(&crate::policy::evaluate(
+            &set,
+            config,
+            &crate::policy::Caller::token("relish", crate::sesame::types::ApiRole::Deployer),
+            crate::policy::Source::Apply,
+        )),
+        Err(error) => super::plan::PolicyPlan {
+            denials: vec![error.to_string()],
+            ..Default::default()
+        },
     }
 }
 
@@ -85,11 +132,20 @@ async fn apply_with_client(
         // Diff against the live agent's current state when one answers, so
         // updates and unchanged resources render as such instead of every
         // resource claiming to be a create. No agent → the all-create plan.
-        let current = match client.health().await {
-            Ok(()) => Some(client.current_resources().await?),
-            Err(_) => None,
+        let (current, committed_policies) = match client.health().await {
+            Ok(()) => (
+                Some(client.current_resources().await?),
+                // A standalone node has no council and so no policies.
+                client
+                    .policies()
+                    .await
+                    .map(|listing| listing.policies)
+                    .unwrap_or_default(),
+            ),
+            Err(_) => (None, Default::default()),
         };
-        let plan = generate_plan(&config, current.as_deref());
+        let mut plan = generate_plan(&config, current.as_deref());
+        plan.policy = plan_policies(&committed_policies, &config);
         let formatted = format_output(&plan, output)?;
         println!("{formatted}");
         // Human-only trailer: appending it to --output json|yaml would
@@ -107,101 +163,16 @@ async fn apply_with_client(
             println!("{}", apply_summary(result.created, &result.instances));
             Ok(())
         }
-        Err(_) => {
+        Err(error) => {
             // X5: show the plan for reference, but fail — a dead agent
             // must not make a deploy look successful.
             let plan = generate_plan(&config, None);
             let formatted = format_output(&plan, output)?;
             println!("{formatted}");
-            eprintln!("\nerror: bun agent not reachable — nothing was deployed");
-            eprintln!("(use --dry-run to preview a plan without an agent)");
-            Err(RelishError::AgentUnreachable)
+            eprintln!("\nnothing was deployed (use --dry-run to preview a plan without an agent)");
+            Err(error)
         }
     }
-}
-
-/// Show cluster and app status.
-pub async fn status(output: OutputFormat) -> Result<(), RelishError> {
-    status_with_client(output, &BunClient::default_local()).await
-}
-
-async fn status_with_client(output: OutputFormat, client: &BunClient) -> Result<(), RelishError> {
-    let statuses = client.cluster_status().await?;
-
-    match output {
-        OutputFormat::Human => {
-            // One line of council health first: a split or fenced council
-            // must not hide behind a healthy-looking instance list (#424).
-            // A node list that can't be read just drops the header.
-            if let Ok(nodes) = client.nodes().await
-                && !nodes.is_empty()
-            {
-                let observations = crate::relish::council_view::survey_nodes(client, &nodes).await;
-                let summary = crate::relish::council_view::summarise(&observations);
-                print!(
-                    "{}",
-                    crate::relish::council_view::render_status_header(&summary)
-                );
-            }
-            // A Lost image can't be pulled or deployed until someone pushes
-            // it again (#697); say so before the instance list.
-            if let Ok(capabilities) = client.capabilities().await
-                && let Some(placement) = capabilities.placement
-            {
-                print!("{}", render_registry_needs_mtls(&placement.registry));
-                print!("{}", render_lost_images(&placement.registry));
-            }
-            // The council knows why an app isn't placed. That is extra
-            // detail: an agent that can't say still shows its instances.
-            let desired = client.desired_apps().await.unwrap_or_default();
-            print!("{}", render_status(&statuses, &desired));
-        }
-        OutputFormat::Json => {
-            let json =
-                serde_json::to_string_pretty(&statuses).map_err(RelishError::SerialiseJson)?;
-            println!("{json}");
-        }
-        OutputFormat::Yaml => {
-            let yaml = yaml_serde::to_string(&statuses).map_err(RelishError::SerialiseYaml)?;
-            print!("{yaml}");
-        }
-    }
-
-    Ok(())
-}
-
-/// The `relish status` warning for a plaintext cluster's registry (#792):
-/// one line naming the fix, or nothing when the registry can forward.
-pub fn render_registry_needs_mtls(
-    registry: &crate::pickle::capability::RegistryCapabilityEvidence,
-) -> String {
-    if !registry.needs_mtls {
-        return String::new();
-    }
-    "registry: needs mTLS; this plaintext cluster can't push or read cluster images. \
-     Start the cluster with TLS (`relish init`, then `relish join`)\n"
-        .to_string()
-}
-
-/// The `relish status` warning for Lost images (design §7.3): one line
-/// naming them, or nothing when none are lost.
-pub fn render_lost_images(
-    registry: &crate::pickle::capability::RegistryCapabilityEvidence,
-) -> String {
-    if registry.lost_image_count == 0 {
-        return String::new();
-    }
-    let mut names = registry.lost_images.join(", ");
-    let unnamed = registry
-        .lost_image_count
-        .saturating_sub(registry.lost_images.len());
-    if unnamed > 0 {
-        names.push_str(&format!(" and {unnamed} more"));
-    }
-    format!(
-        "registry: {} lost image(s), no live node holds them: {names}; re-push them\n",
-        registry.lost_image_count
-    )
 }
 
 /// The `relish logs` flags, as typed.
@@ -220,9 +191,113 @@ pub struct LogFlags {
 }
 
 /// Stream logs from an app or job.
-pub async fn logs(name: &str, namespace: &str, flags: LogFlags) -> Result<(), RelishError> {
+///
+/// With `-o json`, each line is one JSON object on its own line (`at`,
+/// `node`, `instance`, `stream`, `text`); with `-o yaml`, one list of them.
+pub async fn logs(
+    name: &str,
+    namespace: &str,
+    flags: LogFlags,
+    output: OutputFormat,
+) -> Result<(), RelishError> {
+    if flags.follow && output != OutputFormat::Human {
+        return Err(RelishError::InvalidFlag {
+            flag: "follow".to_string(),
+            reason: "can't be combined with --output json or yaml yet: a followed stream \
+                     doesn't say when, or on which stream, each line was written"
+                .to_string(),
+        });
+    }
     let options = build_log_options(flags, unix_now())?;
-    logs_with_client(name, namespace, &options, &BunClient::default_local()).await
+    logs_with_client(
+        name,
+        namespace,
+        &options,
+        output,
+        &BunClient::default_local(),
+    )
+    .await
+}
+
+/// One log line as `relish logs -o json` prints it. A field the source
+/// didn't record is `null`: the agent's own capture, the fallback when the
+/// log store has nothing, records only the text.
+#[derive(Debug, serde::Serialize)]
+pub struct LogRecord<'a> {
+    /// When the line was stored, RFC 3339 in UTC, to the second.
+    pub at: Option<String>,
+    /// The node that stored the line.
+    pub node: Option<&'a str>,
+    /// The instance that wrote it.
+    pub instance: Option<&'a str>,
+    /// `stdout` or `stderr`.
+    pub stream: Option<&'static str>,
+    /// The line itself, without its newline.
+    pub text: &'a str,
+}
+
+/// The records behind `lines`, oldest first.
+pub fn log_records(lines: &super::client::LogLines) -> Vec<LogRecord<'_>> {
+    match lines {
+        super::client::LogLines::Stored(entries) => entries
+            .iter()
+            .map(|entry| LogRecord {
+                at: rfc3339(entry.timestamp),
+                node: entry.node.as_deref(),
+                instance: entry.instance.as_deref(),
+                stream: Some(entry.stream.as_str()),
+                text: &entry.line,
+            })
+            .collect(),
+        super::client::LogLines::Captured(lines) => lines
+            .iter()
+            .map(|line| LogRecord {
+                at: None,
+                node: None,
+                instance: None,
+                stream: None,
+                text: line,
+            })
+            .collect(),
+    }
+}
+
+/// `seconds` since the Unix epoch as RFC 3339 in UTC, if it's a real time.
+pub(crate) fn rfc3339(seconds: u64) -> Option<String> {
+    let seconds = i64::try_from(seconds).ok()?;
+    time::OffsetDateTime::from_unix_timestamp(seconds)
+        .ok()?
+        .format(&time::format_description::well_known::Rfc3339)
+        .ok()
+}
+
+/// `lines` as `relish logs` prints them in `output`: the plain lines for
+/// people, JSON Lines for `json`, one YAML list for `yaml`. Empty when there
+/// are no lines.
+pub fn render_logs(
+    lines: &super::client::LogLines,
+    output: OutputFormat,
+) -> Result<String, RelishError> {
+    match output {
+        OutputFormat::Human => Ok(lines.render()),
+        OutputFormat::Json => {
+            let mut out = Vec::new();
+            for record in log_records(lines) {
+                out.push(serde_json::to_string(&record).map_err(RelishError::SerialiseJson)?);
+            }
+            Ok(out.join("\n"))
+        }
+        OutputFormat::Yaml => {
+            let records = log_records(lines);
+            if records.is_empty() {
+                return Ok(String::new());
+            }
+            Ok(yaml_serde::to_string(&records)
+                .map_err(RelishError::SerialiseYaml)?
+                .trim_end()
+                .to_string())
+        }
+    }
 }
 
 /// Translate the CLI flags into [`LogOptions`], validating as we go.
@@ -304,7 +379,7 @@ fn parse_since(value: &str, now_epoch: u64) -> Result<u64, RelishError> {
 
 /// Parse a point in time for `--flag`: raw epoch seconds, or a duration like
 /// `30s`, `5m`, `2h`, `1d` before now.
-pub(super) fn parse_time(flag: &str, value: &str, now_epoch: u64) -> Result<u64, RelishError> {
+pub(crate) fn parse_time(flag: &str, value: &str, now_epoch: u64) -> Result<u64, RelishError> {
     if value.chars().all(|c| c.is_ascii_digit()) && !value.is_empty() {
         return value.parse::<u64>().map_err(|e| RelishError::InvalidFlag {
             flag: flag.to_string(),
@@ -354,7 +429,7 @@ fn parse_json_field(value: &str) -> Result<(String, String), RelishError> {
 }
 
 /// Current unix time in seconds.
-fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -365,23 +440,116 @@ async fn logs_with_client(
     name: &str,
     namespace: &str,
     options: &super::client::LogOptions,
+    output: OutputFormat,
     client: &BunClient,
 ) -> Result<(), RelishError> {
-    let log_output = client.logs(name, namespace, options).await?;
+    let log_output = if output == OutputFormat::Human {
+        client.logs(name, namespace, options).await?
+    } else {
+        render_logs(&client.log_lines(name, namespace, options).await?, output)?
+    };
     if !log_output.is_empty() {
         println!("{log_output}");
     }
     Ok(())
 }
 
-/// Export Parquet log files to a destination.
+/// Where `relish logs-export --dest` puts the files.
+#[derive(Debug, PartialEq, Eq)]
+enum ExportLanding {
+    /// A directory on the machine running relish: a bare path or `file://`.
+    ThisMachine { directory: PathBuf },
+    /// An object store, written with the exporter's own credentials.
+    ObjectStore { url: String },
+}
+
+impl ExportLanding {
+    fn parse(destination: &str) -> Result<Self, RelishError> {
+        if !destination.contains("://") {
+            return Ok(Self::ThisMachine {
+                directory: PathBuf::from(destination),
+            });
+        }
+        let invalid = |reason: String| RelishError::InvalidFlag {
+            flag: "dest".into(),
+            reason,
+        };
+        let url = url::Url::parse(destination).map_err(|error| invalid(error.to_string()))?;
+        if url.scheme() != "file" {
+            return Ok(Self::ObjectStore {
+                url: destination.trim_end_matches('/').to_string(),
+            });
+        }
+        let directory = url
+            .to_file_path()
+            .map_err(|()| invalid("a file:// URL must name a path on this machine".into()))?;
+        Ok(Self::ThisMachine { directory })
+    }
+
+    /// Where `node_id`'s files land, in words that can't be taken for the
+    /// wrong machine.
+    fn place_for(&self, node_id: &str) -> String {
+        match self {
+            Self::ThisMachine { directory } => {
+                format!("{} on this machine", directory.join(node_id).display())
+            }
+            Self::ObjectStore { url } => format!("{url}/{node_id}"),
+        }
+    }
+}
+
+/// What `relish logs-export` copied or shipped.
+#[derive(Debug, serde::Serialize)]
+pub struct ExportReport {
+    /// The node whose logs these are.
+    pub node: String,
+    /// Files written this time; ones already there are skipped.
+    pub files: u64,
+    pub bytes: u64,
+    /// Where the files landed: a directory on this machine, or a URL.
+    pub destination: String,
+    #[serde(skip)]
+    summary: String,
+}
+
+impl ExportReport {
+    fn new(landing: &ExportLanding, node_id: &str, files: u64, bytes: u64) -> Self {
+        Self {
+            node: node_id.to_string(),
+            files,
+            bytes,
+            destination: landing.place_for(node_id),
+            summary: render_export_summary(landing, node_id, files, bytes),
+        }
+    }
+}
+
+impl std::fmt::Display for ExportReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "{}", self.summary)
+    }
+}
+
+/// The one line `relish logs-export` prints when it succeeds.
+fn render_export_summary(landing: &ExportLanding, node_id: &str, files: u64, bytes: u64) -> String {
+    let place = landing.place_for(node_id);
+    if files == 0 {
+        format!("no new files to export from {node_id} to {place}")
+    } else {
+        format!("exported {files} file(s) ({bytes} bytes) of {node_id}'s logs to {place}")
+    }
+}
+
+/// Export a node's Parquet log files.
 ///
-/// Asks the running Bun agent to export its LogStore (`POST
-/// /v1/logs/export`): the destination is resolved agent-side (a path on the
-/// agent host, `file://`, `s3://` or `gs://`) and the agent files the export
-/// under its own node name — `--node-id` only affects the local fallback.
-/// When no agent answers the health probe, falls back to reading the local
-/// Parquet store directly, preferring the agent's default
+/// A directory (a bare path or `file://`) is on the machine running relish:
+/// relish copies the files of the node it's talking to over the API. An
+/// `s3://` or `gs://` URL is asked of the agent (`POST /v1/logs/export`),
+/// which writes with its own credentials. Either way the node's name comes
+/// from the agent; `--node-id` only affects a local store.
+///
+/// With `source`, or when no agent answers the health probe, relish reads a
+/// local Parquet store directly, preferring the agent's default
 /// `/var/lib/reliaburger/logs/parquet` and then the per-user data dir (the
 /// same order bun itself uses); a custom `[storage] logs` path is only
 /// reachable through the agent or an explicit `source` directory.
@@ -389,29 +557,43 @@ pub async fn logs_export(
     dest: &Path,
     node_id: &str,
     source: Option<&Path>,
+    output: OutputFormat,
 ) -> Result<(), RelishError> {
     let dest_str = dest.to_str().ok_or_else(|| RelishError::InvalidFlag {
-        flag: "--dest".into(),
+        flag: "dest".into(),
         reason: "destination must be valid UTF-8".into(),
     })?;
+    let landing = ExportLanding::parse(dest_str)?;
     if let Some(source) = source {
-        return logs_export_from(source, dest_str, node_id).await;
+        return logs_export_from(source, dest_str, &landing, node_id, output).await;
     }
     let client = BunClient::default_local();
     if client.health().await.is_ok() {
-        let outcome = client.logs_export(dest_str).await?;
-        if outcome.files_exported == 0 {
-            println!("no new files to export");
-        } else {
-            println!(
-                "agent exported {} file(s) ({} bytes) to {}/{}",
-                outcome.files_exported, outcome.bytes_written, dest_str, outcome.node_id,
-            );
-            if !outcome.checkpoint_saved {
-                eprintln!(
-                    "warning: the agent could not persist its export checkpoint; \
-                     a later export may re-ship these files"
-                );
+        match &landing {
+            ExportLanding::ThisMachine { directory } => {
+                let copied = copy_node_archive(&client, directory).await?;
+                print_output(
+                    &ExportReport::new(&landing, &copied.node_id, copied.files, copied.bytes),
+                    output,
+                )?;
+            }
+            ExportLanding::ObjectStore { .. } => {
+                let outcome = client.logs_export(dest_str).await?;
+                if !outcome.checkpoint_saved {
+                    eprintln!(
+                        "warning: the agent could not persist its export checkpoint; \
+                         a later export may re-ship these files"
+                    );
+                }
+                print_output(
+                    &ExportReport::new(
+                        &landing,
+                        &outcome.node_id,
+                        outcome.files_exported,
+                        outcome.bytes_written,
+                    ),
+                    output,
+                )?;
             }
         }
         return Ok(());
@@ -440,10 +622,159 @@ pub async fn logs_export(
             ),
         });
     };
-    logs_export_from(&source, dest_str, node_id).await
+    logs_export_from(&source, dest_str, &landing, node_id, output).await
 }
 
-async fn logs_export_from(source: &Path, dest_str: &str, node_id: &str) -> Result<(), RelishError> {
+/// What a copy of a node's archive brought over.
+#[derive(Debug, PartialEq, Eq)]
+struct CopiedArchive {
+    node_id: String,
+    files: u64,
+    bytes: u64,
+}
+
+fn archive_error(body: String) -> RelishError {
+    RelishError::ApiError { status: 0, body }
+}
+
+/// Copy the node's flushed log files to `directory/<node>/` on this machine.
+///
+/// Files land under the same `{sha256}-{filename}` names an export gives
+/// them, so one already there is complete and the right bytes: that's all
+/// the memory a repeat run needs. The node's export checkpoint isn't involved,
+/// because a copy on someone's laptop must not let the node prune its logs.
+async fn copy_node_archive(
+    client: &BunClient,
+    directory: &Path,
+) -> Result<CopiedArchive, RelishError> {
+    use crate::ketchup::export::{archive_object_name, is_archive_file_name};
+    use std::path::Component;
+
+    let listing = client.logs_archive().await?;
+    // The agent's answer becomes local paths, so a wrong one must not be able
+    // to write anywhere but under `directory`.
+    let mut components = Path::new(&listing.node_id).components();
+    let one_name = matches!(components.next(), Some(Component::Normal(_)));
+    if !one_name || components.next().is_some() {
+        return Err(archive_error(format!(
+            "the agent gave an unusable node name: {:?}",
+            listing.node_id
+        )));
+    }
+    let target = directory.join(&listing.node_id);
+    tokio::fs::create_dir_all(&target)
+        .await
+        .map_err(|error| archive_error(format!("cannot create {}: {error}", target.display())))?;
+
+    let mut copied = CopiedArchive {
+        node_id: listing.node_id.clone(),
+        files: 0,
+        bytes: 0,
+    };
+    for file in &listing.files {
+        let is_sha256 =
+            file.sha256.len() == 64 && file.sha256.bytes().all(|byte| byte.is_ascii_hexdigit());
+        if !is_archive_file_name(&file.name) || !is_sha256 {
+            return Err(archive_error(format!(
+                "the agent listed an unusable log file: {:?}",
+                file.name
+            )));
+        }
+        let path = target.join(archive_object_name(&file.sha256, &file.name));
+        let exists = tokio::fs::try_exists(&path).await.map_err(|error| {
+            archive_error(format!("cannot inspect {}: {error}", path.display()))
+        })?;
+        if exists {
+            continue;
+        }
+        // Retention may remove a file between the listing and its fetch.
+        let Some(response) = client.logs_archive_file(&file.name).await? else {
+            continue;
+        };
+        receive_archive_file(response, file, &path).await?;
+        copied.files += 1;
+        copied.bytes += file.size;
+    }
+    Ok(copied)
+}
+
+/// Stream one file to `path`. The name appears only once the bytes are
+/// verified and on disk, so a file an interrupted run leaves behind is a
+/// hidden `.partial` that neither a repeat run nor `logs-search` mistakes for
+/// a finished one.
+async fn receive_archive_file(
+    response: reqwest::Response,
+    file: &crate::ketchup::export::ArchiveFile,
+    path: &Path,
+) -> Result<(), RelishError> {
+    let partial = path.with_file_name(format!(".{}.{}.partial", file.name, std::process::id()));
+    let written = write_archive_file(response, file, &partial).await;
+    let renamed = match written {
+        Ok(()) => tokio::fs::rename(&partial, path)
+            .await
+            .map_err(|error| archive_error(format!("cannot write {}: {error}", path.display()))),
+        Err(error) => Err(error),
+    };
+    if renamed.is_err() {
+        let _ = tokio::fs::remove_file(&partial).await;
+    }
+    renamed
+}
+
+async fn write_archive_file(
+    mut response: reqwest::Response,
+    file: &crate::ketchup::export::ArchiveFile,
+    partial: &Path,
+) -> Result<(), RelishError> {
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncWriteExt;
+
+    let write_error = |error: std::io::Error| {
+        archive_error(format!("cannot write {}: {error}", partial.display()))
+    };
+    let changed = || {
+        archive_error(format!(
+            "{} changed on the node during the copy; run the export again",
+            file.name
+        ))
+    };
+    // Logs can hold anything a workload printed, so only their owner reads them.
+    let mut out = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(partial)
+        .await
+        .map_err(write_error)?;
+    let mut hash = Sha256::new();
+    let mut size = 0_u64;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| archive_error(format!("fetching {}: {error}", file.name)))?
+    {
+        size += chunk.len() as u64;
+        if size > file.size {
+            return Err(changed());
+        }
+        hash.update(&chunk);
+        out.write_all(&chunk).await.map_err(write_error)?;
+    }
+    if size != file.size || hex::encode(hash.finalize()) != file.sha256 {
+        return Err(changed());
+    }
+    out.flush().await.map_err(write_error)?;
+    out.sync_all().await.map_err(write_error)
+}
+
+async fn logs_export_from(
+    source: &Path,
+    dest_str: &str,
+    landing: &ExportLanding,
+    node_id: &str,
+    output: OutputFormat,
+) -> Result<(), RelishError> {
     use crate::ketchup::export::{ExportCheckpoint, export_logs};
 
     // The exporter owns cross-process locking, reload and durable persistence.
@@ -459,17 +790,15 @@ async fn logs_export_from(source: &Path, dest_str: &str, node_id: &str) -> Resul
     let mut checkpoint = ExportCheckpoint::default();
 
     match export_logs(source, dest_str, node_id, &mut checkpoint).await {
-        Ok(result) => {
-            if result.files_exported == 0 {
-                println!("no new files to export");
-            } else {
-                println!(
-                    "exported {} file(s) ({} bytes) to {}/{}",
-                    result.files_exported, result.bytes_written, dest_str, node_id,
-                );
-            }
-            Ok(())
-        }
+        Ok(result) => print_output(
+            &ExportReport::new(
+                landing,
+                node_id,
+                result.files_exported as u64,
+                result.bytes_written,
+            ),
+            output,
+        ),
         Err(e) => Err(RelishError::ApiError {
             status: 0,
             body: format!("export failed: {e}"),
@@ -481,23 +810,14 @@ async fn logs_export_from(source: &Path, dest_str: &str, node_id: &str) -> Resul
 ///
 /// Runs a DataFusion SQL query against Parquet files at the given
 /// source path. No running agent needed — reads files directly.
-pub async fn logs_search(source: &str, sql: &str) -> Result<(), RelishError> {
+///
+/// For people each row is one line of JSON; `-o json` prints the rows as one
+/// JSON list.
+pub async fn logs_search(source: &str, sql: &str, output: OutputFormat) -> Result<(), RelishError> {
     use crate::ketchup::remote_query::query_remote_json;
 
     match query_remote_json(source, sql).await {
-        Ok(rows) => {
-            if rows.is_empty() {
-                println!("(no results)");
-            } else {
-                for row in &rows {
-                    println!(
-                        "{}",
-                        serde_json::to_string(row).unwrap_or_else(|_| format!("{row:?}"))
-                    );
-                }
-            }
-            Ok(())
-        }
+        Ok(rows) => print_output(&SearchRows(rows), output),
         Err(e) => Err(RelishError::ApiError {
             status: 0,
             body: format!("search failed: {e}"),
@@ -505,69 +825,216 @@ pub async fn logs_search(source: &str, sql: &str) -> Result<(), RelishError> {
     }
 }
 
+/// The rows `relish logs-search` found.
+#[derive(Debug, serde::Serialize)]
+#[serde(transparent)]
+pub struct SearchRows(pub Vec<serde_json::Value>);
+
+impl std::fmt::Display for SearchRows {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0.is_empty() {
+            return writeln!(f, "(no results)");
+        }
+        for row in &self.0 {
+            writeln!(f, "{row}")?;
+        }
+        Ok(())
+    }
+}
+
 /// Execute a command inside a running container.
-pub async fn exec(app: &str, command: &[String], namespace: &str) -> Result<(), RelishError> {
-    exec_with_client(app, namespace, command, &BunClient::default_local()).await
+///
+/// One-shot: no stdin and no terminal, so an interactive shell exits at
+/// once. Relish exits with the command's own exit code (D34).
+///
+/// `-o json` prints `{app, namespace, command, exit_code, output}`; relish
+/// still exits with the command's exit code.
+pub async fn exec(
+    app: &str,
+    command: &[String],
+    namespace: &str,
+    output: OutputFormat,
+) -> Result<super::CommandOutcome, RelishError> {
+    exec_with_client(app, namespace, command, output, &BunClient::default_local()).await
 }
 
 async fn exec_with_client(
     app: &str,
     namespace: &str,
     command: &[String],
+    output: OutputFormat,
     client: &BunClient,
-) -> Result<(), RelishError> {
+) -> Result<super::CommandOutcome, RelishError> {
     // The entry node only runs its own instances; exec on the node that
     // runs this app (through the entry node's relay on a laptop cluster).
     let target = super::path_cmd::find_source_client(client, app, namespace).await?;
-    let output = target.exec(app, namespace, command).await?;
-    if !output.is_empty() {
-        print!("{output}");
+    let answer = target.exec(app, namespace, command).await?;
+    print_output(
+        &ExecReport {
+            app,
+            namespace,
+            command,
+            exit_code: answer.exit_code,
+            output: &answer.output,
+        },
+        output,
+    )?;
+    Ok(exec_outcome(answer.exit_code))
+}
+
+/// What a `relish exec` ran and what it printed.
+#[derive(Debug, serde::Serialize)]
+struct ExecReport<'a> {
+    app: &'a str,
+    namespace: &'a str,
+    command: &'a [String],
+    exit_code: i32,
+    /// stdout and stderr, as the instance wrote them.
+    output: &'a str,
+}
+
+impl std::fmt::Display for ExecReport<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.output)
     }
-    Ok(())
+}
+
+/// The outcome that makes relish exit with a remote command's exit code.
+/// A code no process could exit with still fails rather than reading as 0.
+fn exec_outcome(exit_code: i32) -> super::CommandOutcome {
+    match u8::try_from(exit_code) {
+        Ok(0) => super::CommandOutcome::Clean,
+        Ok(code) => super::CommandOutcome::Exited(code),
+        Err(_) => super::CommandOutcome::Problems,
+    }
 }
 
 /// Stop all instances of an app.
-pub async fn stop(app: &str, namespace: &str) -> Result<(), RelishError> {
-    stop_with_client(app, namespace, &BunClient::default_local()).await
+pub async fn stop(
+    app: &str,
+    namespace: &str,
+    break_lease: bool,
+    output: OutputFormat,
+) -> Result<(), RelishError> {
+    let client = BunClient::default_local().breaking_leases(break_lease);
+    stop_with_client(app, namespace, output, &client).await
 }
 
 async fn stop_with_client(
     app: &str,
     namespace: &str,
+    output: OutputFormat,
     client: &BunClient,
 ) -> Result<(), RelishError> {
     client.stop(app, namespace).await?;
-    println!(
-        "stop requested for {app}; check `relish status` for completion; `relish apply` starts it again"
-    );
-    Ok(())
+    print_output(
+        &AppChange::new(AppAction::StopRequested, app, namespace),
+        output,
+    )
 }
 
 /// Remove an app from the cluster. A GitOps-managed app needs `force`.
-pub async fn delete(app: &str, namespace: &str, force: bool) -> Result<(), RelishError> {
-    delete_with_client(app, namespace, force, &BunClient::default_local()).await
+pub async fn delete(
+    app: &str,
+    namespace: &str,
+    force: bool,
+    break_lease: bool,
+    output: OutputFormat,
+) -> Result<(), RelishError> {
+    let client = BunClient::default_local().breaking_leases(break_lease);
+    delete_with_client(app, namespace, force, output, &client).await
 }
 
 async fn delete_with_client(
     app: &str,
     namespace: &str,
     force: bool,
+    output: OutputFormat,
     client: &BunClient,
 ) -> Result<(), RelishError> {
     client.delete_with_force(app, namespace, force).await?;
-    println!("delete requested for {app}; check `relish status` for remaining instances");
-    Ok(())
+    let mut change = AppChange::new(AppAction::DeleteRequested, app, namespace);
+    change.forced = force;
+    print_output(&change, output)
+}
+
+/// Hand an app a controller owns back to `relish apply` and GitOps (#1125).
+pub async fn release(
+    app: &str,
+    namespace: &str,
+    break_lease: bool,
+    output: OutputFormat,
+) -> Result<(), RelishError> {
+    BunClient::default_local()
+        .breaking_leases(break_lease)
+        .release(app, namespace)
+        .await?;
+    print_output(&AppChange::new(AppAction::Released, app, namespace), output)
+}
+
+/// What `relish stop`, `delete` or `release` asked of the cluster.
+#[derive(Debug, serde::Serialize)]
+pub struct AppChange<'a> {
+    pub action: AppAction,
+    pub app: &'a str,
+    pub namespace: &'a str,
+    /// `--force` overrode GitOps ownership.
+    pub forced: bool,
+}
+
+/// The change an [`AppChange`] asked for. Stopping and deleting are
+/// requests: the nodes act on them, and `relish apps` shows when they have.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppAction {
+    StopRequested,
+    DeleteRequested,
+    Released,
+}
+
+impl<'a> AppChange<'a> {
+    fn new(action: AppAction, app: &'a str, namespace: &'a str) -> Self {
+        Self {
+            action,
+            app,
+            namespace,
+            forced: false,
+        }
+    }
+}
+
+impl std::fmt::Display for AppChange<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (app, namespace) = (self.app, self.namespace);
+        match self.action {
+            AppAction::StopRequested => writeln!(
+                f,
+                "stop requested for {app}; check `relish apps {app}` for completion; `relish apply` starts it again"
+            ),
+            AppAction::DeleteRequested => writeln!(
+                f,
+                "delete requested for {app}; check `relish apps {app}` for remaining instances"
+            ),
+            AppAction::Released => writeln!(
+                f,
+                "released {app} in {namespace}; relish apply and GitOps manage it again"
+            ),
+        }
+    }
 }
 
 /// Show every instance of an app across the cluster, with its node.
-pub async fn inspect(name: &str) -> Result<(), RelishError> {
-    inspect_with_client(name, &BunClient::default_local()).await
+pub async fn inspect(name: &str, output: OutputFormat) -> Result<(), RelishError> {
+    inspect_with_client(name, output, &BunClient::default_local()).await
 }
 
-async fn inspect_with_client(name: &str, client: &BunClient) -> Result<(), RelishError> {
+async fn inspect_with_client(
+    name: &str,
+    output: OutputFormat,
+    client: &BunClient,
+) -> Result<(), RelishError> {
     let inspection = super::inspect::collect(client, name).await?;
-    print!("{}", super::inspect::render(&inspection));
-    Ok(())
+    print_output(&inspection, output)
 }
 
 /// Security mode written by [`init_with_security`] into the generated node
@@ -628,7 +1095,42 @@ pub fn enable_node_data_path(config: &mut crate::config::node::NodeConfig, host:
 /// Initialise a new cluster with starter config files and PKI, using mTLS for
 /// its internal transports.
 pub fn init(dir: &Path, cluster_name: &str, node_id: &str) -> Result<(), RelishError> {
-    init_with_security(dir, cluster_name, node_id, InitSecurityMode::MutualTls)
+    init_with_security(
+        dir,
+        cluster_name,
+        node_id,
+        InitSecurityMode::MutualTls,
+        OutputFormat::Human,
+    )
+}
+
+/// What `relish init` wrote. The summary for people goes to stderr whatever
+/// the format; no secret is in either, only where the secrets are.
+#[derive(Debug, serde::Serialize)]
+pub struct InitReport {
+    pub cluster: String,
+    pub node: String,
+    /// The node config to start Bun with.
+    pub node_config: PathBuf,
+    /// The sample app.
+    pub app_config: PathBuf,
+    /// The master secret's file (mode 0600). Back it up with the sealed
+    /// root CA key.
+    pub master_key: PathBuf,
+    pub security_bootstrap: PathBuf,
+    pub identity_dir: PathBuf,
+    pub sealed_root_ca: String,
+    /// What a joiner must see from `relish join`.
+    pub root_ca_fingerprint: String,
+    /// The internal transports run in the clear (`--development-plaintext`).
+    pub development_plaintext: bool,
+}
+
+impl std::fmt::Display for InitReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "created {}", self.node_config.display())?;
+        writeln!(f, "created {}", self.app_config.display())
+    }
 }
 
 /// Initialise a new cluster with starter config files, PKI and an explicit
@@ -642,6 +1144,7 @@ pub fn init_with_security(
     cluster_name: &str,
     node_id: &str,
     security_mode: InitSecurityMode,
+    output: OutputFormat,
 ) -> Result<(), RelishError> {
     let cluster_identity = crate::config::node::ClusterSection {
         name: cluster_name.to_string(),
@@ -694,8 +1197,7 @@ pub fn init_with_security(
         crate::sesame::identity_store::root_ca_fingerprint(&node_identity.root_ca_der);
 
     // Output the init summary to stderr (join token is sensitive)
-    let output = crate::sesame::init::format_init_output(&init_result);
-    eprint!("{output}");
+    eprint!("{}", crate::sesame::init::format_init_output(&init_result));
     eprintln!("  Master secret:   {}", secret_path.display());
     eprintln!("  Security state:  {}", bootstrap_path.display());
     eprintln!("  Node identity:   {}", identity_dir.display());
@@ -731,7 +1233,9 @@ pub fn init_with_security(
         "# Reliaburger node configuration.\n\
          # See docs/README.md for full reference.\n\
          {security_header}\n{}",
-        toml::to_string_pretty(&node_config).expect("failed to serialise default node config")
+        toml::to_string_pretty(&node_config).map_err(|error| RelishError::InitFailed(format!(
+            "default node config doesn't serialise: {error}"
+        )))?
     );
 
     let app_toml = r#"# Sample Reliaburger app configuration.
@@ -755,10 +1259,21 @@ path = "/"
         eprintln!("Do not use this configuration on a shared or production network.");
     }
 
-    println!("created {}", node_path.display());
-    println!("created {}", app_path.display());
-
-    Ok(())
+    print_output(
+        &InitReport {
+            cluster: cluster_name.to_string(),
+            node: node_id.to_string(),
+            node_config: node_path,
+            app_config: app_path,
+            master_key: secret_path,
+            security_bootstrap: bootstrap_path,
+            identity_dir,
+            sealed_root_ca: init_result.sealed_root_ca_path.clone(),
+            root_ca_fingerprint: root_fingerprint,
+            development_plaintext: security_mode == InitSecurityMode::DevelopmentPlaintext,
+        },
+        output,
+    )
 }
 
 /// Assemble the first node's on-disk identity from the init result.
@@ -838,49 +1353,6 @@ pub async fn decommission_node(
     Ok(())
 }
 
-/// List cluster nodes and their gossip state.
-pub async fn nodes(output: OutputFormat) -> Result<(), RelishError> {
-    nodes_with_client(output, &BunClient::default_local()).await
-}
-
-async fn nodes_with_client(output: OutputFormat, client: &BunClient) -> Result<(), RelishError> {
-    let nodes = client.nodes().await?;
-
-    if nodes.is_empty() {
-        println!("no cluster nodes (single-node mode)");
-    } else {
-        match output {
-            OutputFormat::Human => {
-                println!(
-                    "{:<20} {:<22} {:<10} {:<8} {:<8}",
-                    "NODE", "ADDRESS", "STATE", "COUNCIL", "LEADER"
-                );
-                for n in &nodes {
-                    println!(
-                        "{:<20} {:<22} {:<10} {:<8} {:<8}",
-                        n.node_id,
-                        n.address,
-                        n.state,
-                        if n.is_council { "yes" } else { "-" },
-                        if n.is_leader { "yes" } else { "-" },
-                    );
-                }
-            }
-            OutputFormat::Json => {
-                let json =
-                    serde_json::to_string_pretty(&nodes).map_err(RelishError::SerialiseJson)?;
-                println!("{json}");
-            }
-            OutputFormat::Yaml => {
-                let yaml = yaml_serde::to_string(&nodes).map_err(RelishError::SerialiseYaml)?;
-                print!("{yaml}");
-            }
-        }
-    }
-
-    Ok(())
-}
-
 /// Join an existing cluster: fetch a certificate from a member and persist it.
 ///
 /// Contacts `addr` (an existing member's API address) with the join token,
@@ -892,6 +1364,7 @@ pub async fn join(
     node_id: &str,
     identity_dir: Option<&Path>,
     ca_fingerprint: Option<&str>,
+    output: OutputFormat,
 ) -> Result<(), RelishError> {
     let base = normalise_member_base(addr);
     let ca_url = format!("{base}/v1/cluster/ca");
@@ -906,7 +1379,7 @@ pub async fn join(
     // a mismatch is refused *here*, before the one-time token is ever sent — so
     // a man-in-the-middle cannot capture and replay a token the real cluster
     // never consumed.
-    let tofu_client = reqwest::Client::builder()
+    let tofu_client = crate::http_client::builder()
         .danger_accept_invalid_certs(true)
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -953,10 +1426,36 @@ pub async fn join(
     crate::sesame::identity_store::save(&dir, &identity)
         .map_err(|e| RelishError::JoinFailed(format!("failed to persist identity: {e}")))?;
 
-    println!("joined as {node_id}: identity written to {}", dir.display());
-    println!("  cluster root CA: {fingerprint}");
-    println!("  restart bun to bring up mTLS with the new identity.");
-    Ok(())
+    print_output(
+        &JoinReport {
+            node: node_id.to_string(),
+            identity_dir: dir,
+            root_ca_fingerprint: fingerprint,
+        },
+        output,
+    )
+}
+
+/// What `relish join` saved. Restart Bun to use it.
+#[derive(Debug, serde::Serialize)]
+pub struct JoinReport {
+    pub node: String,
+    /// Where the node's certificate, key and CA chain now are.
+    pub identity_dir: PathBuf,
+    pub root_ca_fingerprint: String,
+}
+
+impl std::fmt::Display for JoinReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "joined as {}: identity written to {}",
+            self.node,
+            self.identity_dir.display()
+        )?;
+        writeln!(f, "  cluster root CA: {}", self.root_ca_fingerprint)?;
+        writeln!(f, "  restart bun to bring up mTLS with the new identity.")
+    }
 }
 
 /// Read a bounded, owner-only join credential without exposing it in process arguments.
@@ -1078,6 +1577,7 @@ pub async fn council_recover(
     master_key_path: Option<&std::path::Path>,
     api_port: u16,
     force: bool,
+    output: OutputFormat,
 ) -> Result<(), RelishError> {
     use crate::council::recovery::{
         RecoverySource, load_recovery_state, persisted_voters, recover_data_dir,
@@ -1139,26 +1639,73 @@ pub async fn council_recover(
 
     let claim = recover_data_dir(data_dir, state, force)
         .map_err(|e| RelishError::Recovery(e.to_string()))?;
-    let recovery_id = claim
-        .id
-        .map(|id| id.to_string())
-        .unwrap_or_else(|| "-".to_string());
+    print_output(
+        &RecoveryReport {
+            restored_apps: app_count,
+            api_tokens: token_count,
+            previous_epoch: prior_epoch,
+            recovery_epoch: claim.epoch,
+            recovery_id: claim.id.map(|id| id.to_string()),
+            data_dir: data_dir.to_path_buf(),
+        },
+        output,
+    )
+}
 
-    println!("Council recovery complete.");
-    println!("  Restored apps:   {app_count}");
-    println!("  API tokens:      {token_count}");
-    println!("  Recovery epoch:  {prior_epoch} -> {}", claim.epoch);
-    println!("  Recovery id:     {recovery_id}");
-    println!("  Data directory:  {}", data_dir.display());
-    println!();
-    println!("Start this node to re-bootstrap a single-voter council; the reconciler");
-    println!("will regrow it from surviving members. Writes after the last backup are lost.");
-    println!();
-    println!("The voters this council replaces still hold the old one. If they come back where");
-    println!("they can see this node, they fence themselves; if they can see each other but not");
-    println!("this node, nothing can tell them. Re-enrol each one before starting it:");
-    println!("  relish council re-enrol --data-dir <its data directory>");
-    Ok(())
+/// What `relish council recover` restored.
+#[derive(Debug, serde::Serialize)]
+pub struct RecoveryReport {
+    pub restored_apps: usize,
+    pub api_tokens: usize,
+    pub previous_epoch: u64,
+    pub recovery_epoch: u64,
+    pub recovery_id: Option<String>,
+    pub data_dir: PathBuf,
+}
+
+impl std::fmt::Display for RecoveryReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "Council recovery complete.")?;
+        writeln!(f, "  Restored apps:   {}", self.restored_apps)?;
+        writeln!(f, "  API tokens:      {}", self.api_tokens)?;
+        writeln!(
+            f,
+            "  Recovery epoch:  {} -> {}",
+            self.previous_epoch, self.recovery_epoch
+        )?;
+        writeln!(
+            f,
+            "  Recovery id:     {}",
+            self.recovery_id.as_deref().unwrap_or("-")
+        )?;
+        writeln!(f, "  Data directory:  {}", self.data_dir.display())?;
+        writeln!(f)?;
+        writeln!(
+            f,
+            "Start this node to re-bootstrap a single-voter council; the reconciler"
+        )?;
+        writeln!(
+            f,
+            "will regrow it from surviving members. Writes after the last backup are lost."
+        )?;
+        writeln!(f)?;
+        writeln!(
+            f,
+            "The voters this council replaces still hold the old one. If they come back where"
+        )?;
+        writeln!(
+            f,
+            "they can see this node, they fence themselves; if they can see each other but not"
+        )?;
+        writeln!(
+            f,
+            "this node, nothing can tell them. Re-enrol each one before starting it:"
+        )?;
+        writeln!(
+            f,
+            "  relish council re-enrol --data-dir <its data directory>"
+        )
+    }
 }
 
 /// One row of `relish council backups`.
@@ -1235,21 +1782,51 @@ fn print_backups_human(rows: &[BackupListing]) {
 
 /// Re-enrol a voter fenced out by `council recover` (#424): offline, against
 /// a stopped node.
-pub fn council_reenrol(data_dir: &std::path::Path, force: bool) -> Result<(), RelishError> {
+pub fn council_reenrol(
+    data_dir: &std::path::Path,
+    force: bool,
+    output: OutputFormat,
+) -> Result<(), RelishError> {
     let fenced_by = crate::council::recovery::reenrol_data_dir(data_dir, force)
         .map_err(|e| RelishError::Recovery(e.to_string()))?;
-    match fenced_by {
-        Some(epoch) => {
-            println!("Removed the Raft state of a council replaced at recovery epoch {epoch}.")
+    print_output(
+        &ReenrolReport {
+            data_dir: data_dir.to_path_buf(),
+            replaced_at_epoch: fenced_by,
+        },
+        output,
+    )
+}
+
+/// What `relish council re-enrol` removed.
+#[derive(Debug, serde::Serialize)]
+pub struct ReenrolReport {
+    pub data_dir: PathBuf,
+    /// The recovery epoch that fenced this node's old council, when one did.
+    pub replaced_at_epoch: Option<u64>,
+}
+
+impl std::fmt::Display for ReenrolReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.replaced_at_epoch {
+            Some(epoch) => writeln!(
+                f,
+                "Removed the Raft state of a council replaced at recovery epoch {epoch}."
+            )?,
+            None => writeln!(f, "Removed this node's Raft state.")?,
         }
-        None => println!("Removed this node's Raft state."),
+        writeln!(f, "  Data directory:  {}", self.data_dir.display())?;
+        writeln!(f)?;
+        writeln!(
+            f,
+            "Start the node with `cluster.join` pointing at the current council. It joins as"
+        )?;
+        writeln!(
+            f,
+            "a fresh member, adopts the council's recovery epoch, and the reconciler may"
+        )?;
+        writeln!(f, "promote it to voter.")
     }
-    println!("  Data directory:  {}", data_dir.display());
-    println!();
-    println!("Start the node with `cluster.join` pointing at the current council. It joins as");
-    println!("a fresh member, adopts the council's recovery epoch, and the reconciler may");
-    println!("promote it to voter.");
-    Ok(())
 }
 
 fn print_council_human(council: &CouncilStatus) {
@@ -1273,65 +1850,122 @@ fn print_council_human(council: &CouncilStatus) {
 }
 
 /// Resolve a service name to its VIP and backends.
-pub async fn resolve(name: &str) -> Result<(), RelishError> {
-    resolve_with_client(name, &BunClient::default_local()).await
+pub async fn resolve(
+    name: &str,
+    namespace: Option<&str>,
+    output: OutputFormat,
+) -> Result<(), RelishError> {
+    let services = BunClient::default_local().resolve_all().await?;
+    let service = select_service(services, name, namespace)?;
+    println!("{}", format_output(&ResolvedService(service), output)?);
+    Ok(())
 }
 
-async fn resolve_with_client(name: &str, client: &BunClient) -> Result<(), RelishError> {
-    let info = client.resolve(name).await?;
-
-    println!("Service:  {}", info.app_name);
-    println!("VIP:      {}", info.vip);
-    println!("Port:     {}", info.port);
-    println!(
-        "Backends: {}/{} healthy",
-        info.healthy_backends, info.total_backends
-    );
-
-    if !info.backends.is_empty() {
-        println!();
-        println!(
-            "  {:<20} {:<18} {:<8} {:<8}",
-            "INSTANCE", "NODE", "PORT", "HEALTH"
-        );
-        for b in &info.backends {
-            let health = if b.healthy { "healthy" } else { "unhealthy" };
-            println!(
-                "  {:<20} {:<18} {:<8} {:<8}",
-                b.instance_id, b.node_ip, b.host_port, health
-            );
-        }
+/// Pick `name` out of every service the caller may see. Without a
+/// namespace the name must be unique; a name in several namespaces is
+/// refused rather than answered from whichever came first.
+fn select_service(
+    services: Vec<crate::onion::types::ResolveResponse>,
+    name: &str,
+    namespace: Option<&str>,
+) -> Result<crate::onion::types::ResolveResponse, RelishError> {
+    let mut matches: Vec<_> = services
+        .into_iter()
+        .filter(|service| {
+            service.app_name == name && namespace.is_none_or(|wanted| service.namespace == wanted)
+        })
+        .collect();
+    if matches.len() > 1 {
+        let mut namespaces: Vec<_> = matches.iter().map(|s| s.namespace.as_str()).collect();
+        namespaces.sort_unstable();
+        return Err(RelishError::InvalidFlag {
+            flag: "namespace".to_string(),
+            reason: format!(
+                "service {name:?} exists in namespaces {}; pass --namespace",
+                namespaces.join(", ")
+            ),
+        });
     }
+    matches.pop().ok_or_else(|| RelishError::ApiError {
+        status: 404,
+        body: match namespace {
+            Some(namespace) => format!("service {name:?} not found in namespace {namespace:?}"),
+            None => format!("service {name:?} not found"),
+        },
+    })
+}
 
-    Ok(())
+/// A resolved service, rendered for people.
+#[derive(Debug, serde::Serialize)]
+#[serde(transparent)]
+struct ResolvedService(crate::onion::types::ResolveResponse);
+
+impl std::fmt::Display for ResolvedService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let info = &self.0;
+        writeln!(f, "Service:   {}", info.app_name)?;
+        writeln!(f, "Namespace: {}", info.namespace)?;
+        writeln!(f, "VIP:       {}", info.vip)?;
+        writeln!(f, "Port:      {}", info.port)?;
+        write!(
+            f,
+            "Backends:  {}/{} healthy",
+            info.healthy_backends, info.total_backends
+        )?;
+        if !info.backends.is_empty() {
+            write!(
+                f,
+                "\n\n  {:<20} {:<18} {:<8} {:<8}",
+                "INSTANCE", "NODE", "PORT", "HEALTH"
+            )?;
+            for b in &info.backends {
+                let health = if b.healthy { "healthy" } else { "unhealthy" };
+                write!(
+                    f,
+                    "\n  {:<20} {:<18} {:<8} {:<8}",
+                    b.instance_id, b.node_ip, b.host_port, health
+                )?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Show ingress routing table.
-pub async fn routes() -> Result<(), RelishError> {
-    routes_with_client(&BunClient::default_local()).await
+pub async fn routes(output: OutputFormat) -> Result<(), RelishError> {
+    routes_with_client(output, &BunClient::default_local()).await
 }
 
-async fn routes_with_client(client: &BunClient) -> Result<(), RelishError> {
-    let routes = client.routes().await?;
+async fn routes_with_client(output: OutputFormat, client: &BunClient) -> Result<(), RelishError> {
+    print_output(&RouteTable(client.routes().await?), output)
+}
 
-    if routes.is_empty() {
-        println!("no ingress routes configured");
-    } else {
-        println!(
+/// The ingress routing table; as JSON, the list of routes.
+#[derive(Debug, serde::Serialize)]
+#[serde(transparent)]
+struct RouteTable(Vec<crate::wrapper::types::RouteInfo>);
+
+impl std::fmt::Display for RouteTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0.is_empty() {
+            return writeln!(f, "no ingress routes configured");
+        }
+        writeln!(
+            f,
             "{:<30} {:<10} {:<15} {:<12} {:<6}",
             "HOST", "PATH", "APP", "BACKENDS", "WS"
-        );
-        for r in &routes {
+        )?;
+        for r in &self.0 {
             let backends = format!("{}/{}", r.healthy_backends, r.total_backends);
             let ws = if r.websocket { "yes" } else { "no" };
-            println!(
+            writeln!(
+                f,
                 "{:<30} {:<10} {:<15} {:<12} {:<6}",
                 r.host, r.path, r.app_name, backends, ws
-            );
+            )?;
         }
+        Ok(())
     }
-
-    Ok(())
 }
 
 /// Trigger a rolling deploy from a config file.
@@ -1340,11 +1974,16 @@ async fn routes_with_client(client: &BunClient) -> Result<(), RelishError> {
 /// (if the app already exists, the agent performs a rolling update).
 /// With `--dry-run`, prints the plan and exits 0 without deploying;
 /// otherwise an unreachable agent is an error (X5).
-pub async fn deploy(path: &Path, output: OutputFormat, dry_run: bool) -> Result<(), RelishError> {
-    let config = Config::from_file(path)?;
+pub async fn deploy(
+    path: &Path,
+    output: OutputFormat,
+    dry_run: bool,
+    break_lease: bool,
+) -> Result<(), RelishError> {
+    let config = load_config_file(path)?;
     config.validate_intrinsic()?;
 
-    let client = BunClient::default_local();
+    let client = BunClient::default_local().breaking_leases(break_lease);
 
     if dry_run {
         // Same live diff as `apply --dry-run`: a reachable agent supplies
@@ -1384,13 +2023,12 @@ pub async fn deploy(path: &Path, output: OutputFormat, dry_run: bool) -> Result<
             }
             Ok(())
         }
-        Err(_) => {
+        Err(error) => {
             let plan = generate_plan(&config, None);
             let formatted = format_output(&plan, super::OutputFormat::Human)?;
             println!("{formatted}");
-            eprintln!("\nerror: bun agent not reachable — nothing was deployed");
-            eprintln!("(use --dry-run to preview a plan without an agent)");
-            Err(RelishError::AgentUnreachable)
+            eprintln!("\nnothing was deployed (use --dry-run to preview a plan without an agent)");
+            Err(error)
         }
     }
 }
@@ -1515,24 +2153,87 @@ fn render_history_table(
 
 /// Rollback an app to the previous version. A GitOps-managed app needs
 /// `force`.
-pub async fn rollback(app: &str, namespace: &str, force: bool) -> Result<(), RelishError> {
-    let client = BunClient::default_local();
+pub async fn rollback(
+    app: &str,
+    namespace: &str,
+    force: bool,
+    break_lease: bool,
+    output: OutputFormat,
+) -> Result<(), RelishError> {
+    let client = BunClient::default_local().breaking_leases(break_lease);
     client.health().await?;
     // X3: rollback used to only print advice. It now calls the server,
     // which redeploys the previous successful spec.
     client.rollback_with_force(app, namespace, force).await?;
-    println!("rolled {app} back to its previous version");
-    Ok(())
+    print_output(
+        &Rollback {
+            app,
+            namespace,
+            forced: force,
+        },
+        output,
+    )
+}
+
+/// A rollback the cluster accepted: it redeploys the app's previous
+/// successful version.
+#[derive(Debug, serde::Serialize)]
+struct Rollback<'a> {
+    app: &'a str,
+    namespace: &'a str,
+    /// `--force` took the app back from GitOps for this rollback.
+    forced: bool,
+}
+
+impl std::fmt::Display for Rollback<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "rolled {} back to its previous version", self.app)
+    }
 }
 
 /// Validate a config file without deploying.
-pub fn lint(path: &Path) -> Result<(), RelishError> {
-    let config = Config::from_file(path)?;
-    config.validate()?;
+///
+/// Warnings go to stderr whatever the format, and also into the JSON and
+/// YAML report.
+pub fn lint(path: &Path, output: OutputFormat) -> Result<(), RelishError> {
+    let report = lint_report(path)?;
+    for warning in &report.warnings {
+        eprintln!("warning: {warning}");
+    }
+    print_output(&report, output)
+}
 
-    // Count resources
-    let app_count = config.app.len();
-    let job_count = config.job.len();
+/// What `relish lint` found in a config that passed validation.
+#[derive(Debug, serde::Serialize)]
+pub struct LintReport {
+    /// Apps the config declares.
+    pub apps: usize,
+    /// Jobs the config declares.
+    pub jobs: usize,
+    /// Things that are allowed but probably not meant.
+    pub warnings: Vec<String>,
+}
+
+impl std::fmt::Display for LintReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "config valid: {} app(s), {} job(s)",
+            self.apps, self.jobs
+        )
+    }
+}
+
+/// Validate the config at `path` and collect its warnings. An invalid
+/// config is an error, not a report.
+fn lint_report(path: &Path) -> Result<LintReport, RelishError> {
+    let config = load_config_file(path)?;
+    config.validate()?;
+    let mut warnings: Vec<String> = config
+        .warnings()
+        .into_iter()
+        .map(|warning| warning.to_string())
+        .collect();
 
     // Validate run_before references
     for (name, job) in &config.job {
@@ -1542,19 +2243,25 @@ pub fn lint(path: &Path) -> Result<(), RelishError> {
                 .keys()
                 .any(|app_name| format!("app.{app_name}") == *target);
             if !target_exists {
-                eprintln!(
-                    "warning: job {name} has run_before target {target:?} which doesn't exist in this config"
-                );
+                warnings.push(format!(
+                    "job {name} has run_before target {target:?} which doesn't exist in this config"
+                ));
             }
         }
     }
 
-    println!("config valid: {app_count} app(s), {job_count} job(s)");
-    Ok(())
+    Ok(LintReport {
+        apps: config.app.len(),
+        jobs: config.job.len(),
+        warnings,
+    })
 }
 
 /// Compile a config file or directory into a single resolved config.
-pub fn compile(path: &Path) -> Result<(), RelishError> {
+///
+/// For people it prints the merged TOML; `-o json` prints the files it
+/// merged, the warnings and the merged config as data.
+pub fn compile(path: &Path, output: OutputFormat) -> Result<(), RelishError> {
     let result = super::compile::compile(path)?;
 
     if !result.warnings.is_empty() {
@@ -1567,24 +2274,60 @@ pub fn compile(path: &Path) -> Result<(), RelishError> {
     let job_count = result.config.job.len();
     let file_count = result.merged_from.len();
 
-    // Serialise the merged config as TOML
-    let toml = toml::to_string_pretty(&result.config)
-        .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
-    print!("{toml}");
-
-    eprintln!("compiled {file_count} file(s): {app_count} app(s), {job_count} job(s)");
-    Ok(())
+    if output == OutputFormat::Human {
+        // Serialise the merged config as TOML
+        let toml = toml::to_string_pretty(&result.config)
+            .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
+        print!("{toml}");
+        eprintln!("compiled {file_count} file(s): {app_count} app(s), {job_count} job(s)");
+        return Ok(());
+    }
+    print_output(&CompileReport::from(result), output)
 }
 
-/// Show structural diff between two configs.
-pub fn diff(path_a: &Path, path_b: Option<&Path>) -> Result<(), RelishError> {
-    let old = Config::from_file(path_a)?;
+/// `relish compile -o json`: what was merged, and the result.
+#[derive(Debug, serde::Serialize)]
+pub struct CompileReport {
+    pub files: Vec<PathBuf>,
+    pub warnings: Vec<String>,
+    pub config: Config,
+}
+
+impl From<super::compile::CompileResult> for CompileReport {
+    fn from(result: super::compile::CompileResult) -> Self {
+        Self {
+            files: result.merged_from,
+            warnings: result.warnings,
+            config: result.config,
+        }
+    }
+}
+
+impl std::fmt::Display for CompileReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "compiled {} file(s): {} app(s), {} job(s)",
+            self.files.len(),
+            self.config.app.len(),
+            self.config.job.len()
+        )
+    }
+}
+
+/// Show structural diff between two configs. `-o json` prints `added`,
+/// `modified` and `removed`, each empty when nothing changed.
+pub fn diff(path_a: &Path, path_b: Option<&Path>, output: OutputFormat) -> Result<(), RelishError> {
+    let old = load_config_file(path_a)?;
     let new = match path_b {
-        Some(p) => Config::from_file(p)?,
+        Some(p) => load_config_file(p)?,
         None => Config::default(),
     };
     let diff = super::diff::diff_configs(&old, &new);
 
+    if output != OutputFormat::Human {
+        return print_output(&diff, output);
+    }
     if diff.is_empty() {
         println!("no changes");
     } else {
@@ -1593,13 +2336,45 @@ pub fn diff(path_a: &Path, path_b: Option<&Path>) -> Result<(), RelishError> {
     Ok(())
 }
 
+/// What `relish fmt` did to a file.
+#[derive(Debug, serde::Serialize)]
+pub struct FormatReport<'a> {
+    pub path: &'a Path,
+    /// `formatted` rewrote it; `ok` (with `--check`) found it formatted.
+    pub result: FormatResult,
+}
+
+/// The outcome in a [`FormatReport`]. A file `--check` finds unformatted is
+/// an error, not a result.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FormatResult {
+    Formatted,
+    Ok,
+}
+
+impl std::fmt::Display for FormatReport<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.result {
+            FormatResult::Formatted => writeln!(f, "formatted {}", self.path.display()),
+            FormatResult::Ok => writeln!(f, "{}: ok", self.path.display()),
+        }
+    }
+}
+
 /// Format a TOML config file with canonical ordering.
-pub fn fmt(path: &Path, check: bool) -> Result<(), RelishError> {
+pub fn fmt(path: &Path, check: bool, output: OutputFormat) -> Result<(), RelishError> {
     let content = fs::read_to_string(path)?;
 
     if check {
         if super::fmt::is_formatted(&content)? {
-            println!("{}: ok", path.display());
+            print_output(
+                &FormatReport {
+                    path,
+                    result: FormatResult::Ok,
+                },
+                output,
+            )?;
         } else {
             eprintln!("{}: not formatted", path.display());
             return Err(RelishError::FormatFailed(format!(
@@ -1612,29 +2387,19 @@ pub fn fmt(path: &Path, check: bool) -> Result<(), RelishError> {
 
     let formatted = super::fmt::format_toml(&content)?;
 
-    // O10: comment loss is by design (the formatter round-trips through the
-    // `toml` crate's typed representation), but silently eating an
-    // operator's annotations is not. Say so, once, when there was something
-    // to lose.
-    if content
-        .lines()
-        .any(|line| line.trim_start().starts_with('#'))
-    {
-        eprintln!(
-            "warning: {} had comments; the formatter round-trips through TOML's \
-             typed representation, which discards them",
-            path.display()
-        );
-    }
-
     // O10: write atomically. `fs::write` truncates first, so an interrupted
     // or failing write leaves a half-file where a valid config used to be —
     // and this is a config the node reads on startup. A temp file beside the
     // target (same filesystem, so the rename is atomic) means the config is
     // either the old one or the new one, never neither.
     write_atomically(path, formatted.as_bytes())?;
-    println!("formatted {}", path.display());
-    Ok(())
+    print_output(
+        &FormatReport {
+            path,
+            result: FormatResult::Formatted,
+        },
+        output,
+    )
 }
 
 /// Replace a file's contents atomically: write a sibling temp file, then
@@ -1664,44 +2429,114 @@ fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> Result<(), RelishEr
 
 /// Import Kubernetes YAML manifests to Reliaburger TOML.
 #[cfg(feature = "kubernetes")]
-pub fn import_k8s(files: &[std::path::PathBuf], strict: bool) -> Result<(), RelishError> {
+///
+/// For people the TOML goes to stdout and the migration report to stderr;
+/// `-o json` prints both as one object, `config` and `report`.
+pub fn import_k8s(
+    files: &[std::path::PathBuf],
+    strict: bool,
+    output: OutputFormat,
+) -> Result<(), RelishError> {
     let result = super::k8s_import::import_kubernetes(files)?;
 
-    // Print the converted config as TOML
-    let toml = toml::to_string_pretty(&result.config)
-        .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
-    print!("{toml}");
+    if output == OutputFormat::Human {
+        // Print the converted config as TOML
+        let toml = toml::to_string_pretty(&result.config)
+            .map_err(|e| RelishError::FormatFailed(e.to_string()))?;
+        print!("{toml}");
 
-    // Print migration report to stderr
-    if !result.report.converted.is_empty()
-        || !result.report.warnings.is_empty()
-        || !result.report.dropped.is_empty()
-    {
-        eprint!("{}", result.report);
+        // Print migration report to stderr
+        if !result.report.converted.is_empty()
+            || !result.report.warnings.is_empty()
+            || !result.report.dropped.is_empty()
+        {
+            eprint!("{}", result.report);
+        }
+    } else {
+        print_output(
+            &ImportReport {
+                config: &result.config,
+                report: &result.report,
+            },
+            output,
+        )?;
     }
 
-    if strict && !result.report.warnings.is_empty() {
-        return Err(RelishError::FormatFailed(
-            "import produced warnings (--strict mode)".to_string(),
-        ));
+    // #703: a dropped resource is a bigger loss than an approximated one, so
+    // `--strict` (a CI gate) fails on either.
+    let (warnings, dropped) = (result.report.warnings.len(), result.report.dropped.len());
+    if strict && (warnings > 0 || dropped > 0) {
+        return Err(RelishError::FormatFailed(format!(
+            "import produced {warnings} warning(s) and {dropped} dropped resource(s) (--strict mode)"
+        )));
     }
 
     Ok(())
 }
 
+/// `relish import -o json`: the converted config and what the conversion
+/// lost or approximated.
+#[cfg(feature = "kubernetes")]
+#[derive(Debug, serde::Serialize)]
+struct ImportReport<'a> {
+    config: &'a Config,
+    report: &'a super::k8s_import::MigrationReport,
+}
+
+#[cfg(feature = "kubernetes")]
+impl std::fmt::Display for ImportReport<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.report)
+    }
+}
+
+/// `relish export -o json`: the manifests, as the YAML text a cluster
+/// applies, and the report.
+#[cfg(feature = "kubernetes")]
+#[derive(Debug, serde::Serialize)]
+struct KubernetesExport<'a> {
+    manifests: &'a str,
+    report: &'a super::k8s_export::ExportReport,
+}
+
+#[cfg(feature = "kubernetes")]
+impl std::fmt::Display for KubernetesExport<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.manifests)
+    }
+}
+
 /// Export Reliaburger TOML to Kubernetes YAML manifests.
 #[cfg(feature = "kubernetes")]
-pub fn export_k8s(file: &Path) -> Result<(), RelishError> {
+pub fn export_k8s(file: &Path, strict: bool, output: OutputFormat) -> Result<(), RelishError> {
     let config = Config::from_file(file)?;
     let result = super::k8s_export::export_kubernetes(&config)?;
 
-    print!("{}", result.yaml);
+    if output == OutputFormat::Human {
+        print!("{}", result.yaml);
 
-    if !result.report.resources_created.is_empty()
-        || !result.report.unsupported.is_empty()
-        || !result.report.dropped.is_empty()
-    {
-        eprint!("{}", result.report);
+        if !result.report.resources_created.is_empty()
+            || !result.report.unsupported.is_empty()
+            || !result.report.dropped.is_empty()
+        {
+            eprint!("{}", result.report);
+        }
+    } else {
+        print_output(
+            &KubernetesExport {
+                manifests: &result.yaml,
+                report: &result.report,
+            },
+            output,
+        )?;
+    }
+
+    // #1132: the same CI gate as `import --strict`, in the other direction.
+    let (unsupported, dropped) = (result.report.unsupported.len(), result.report.dropped.len());
+    if strict && (unsupported > 0 || dropped > 0) {
+        return Err(RelishError::FormatFailed(format!(
+            "export produced {unsupported} unsupported and {dropped} not-exported field(s) (--strict mode)"
+        )));
     }
 
     Ok(())
@@ -1733,112 +2568,9 @@ pub async fn top(output: OutputFormat) -> Result<(), RelishError> {
     Ok(())
 }
 
-/// The human `relish status` output: every instance with its node, then each
-/// app the scheduler won't place and why (#326). Without that line an
-/// over-quota app is just missing from the table.
-fn render_status(
-    statuses: &[crate::bun::agent::ClusterInstanceStatus],
-    desired: &[crate::bun::diagnostics::DesiredAppEvidence],
-) -> String {
-    use std::fmt::Write as _;
-
-    let mut output = String::new();
-    if statuses.is_empty() {
-        output.push_str("no workloads running\n");
-    } else {
-        let _ = writeln!(
-            output,
-            "{:<24} {:<20} {:<15} {:<12} {:<10} {:<10} {:<6}",
-            "NODE", "INSTANCE", "APP", "NAMESPACE", "STATE", "PID", "RESTARTS"
-        );
-        for row in statuses {
-            let s = &row.instance;
-            let _ = writeln!(
-                output,
-                "{:<24} {:<20} {:<15} {:<12} {:<10} {:<10} {:<6}",
-                row.node,
-                s.id,
-                s.app_name,
-                s.namespace,
-                s.state,
-                pid_cell(s),
-                s.restart_count
-            );
-        }
-    }
-    let blocked: Vec<_> = desired
-        .iter()
-        .filter_map(|app| app.blocked.as_ref().map(|reason| (app, reason)))
-        .collect();
-    let waiting: Vec<_> = desired
-        .iter()
-        .filter_map(|app| app.volume_home_away.as_ref().map(|home| (app, home)))
-        .collect();
-    let failed: Vec<_> = desired
-        .iter()
-        .filter_map(|app| app.rollout_failed.as_ref().map(|failure| (app, failure)))
-        .collect();
-    let short: Vec<_> = desired
-        .iter()
-        .filter_map(|app| app.unschedulable.as_ref().map(|short| (app, short)))
-        .collect();
-    let refused: Vec<_> = statuses
-        .iter()
-        .filter_map(|row| row.instance.reason.as_ref().map(|reason| (row, reason)))
-        .collect();
-    if !blocked.is_empty()
-        || !waiting.is_empty()
-        || !failed.is_empty()
-        || !short.is_empty()
-        || !refused.is_empty()
-    {
-        output.push('\n');
-    }
-    // #881: the runtime refused the launch, so waiting won't start it.
-    for (row, reason) in refused {
-        let _ = writeln!(
-            output,
-            "{} ({}, namespace {}) failed on {}: {reason}",
-            row.instance.id, row.instance.app_name, row.instance.namespace, row.node
-        );
-    }
-    for (app, reason) in blocked {
-        let _ = writeln!(
-            output,
-            "{} (namespace {}) is not placed, blocked: {reason}",
-            app.app, app.namespace
-        );
-    }
-    // #423: the app isn't lost, it waits for the node holding its data.
-    for (app, home) in waiting {
-        let _ = writeln!(
-            output,
-            "{} (namespace {}) waits for {home}, which holds its volume and is out of the cluster",
-            app.app, app.namespace
-        );
-    }
-    // #692: the leader won't try this spec again until a different one is applied.
-    for (app, failure) in failed {
-        let _ = writeln!(
-            output,
-            "{} (namespace {}) RolloutFailed on {}: {}; apply a different spec or roll back",
-            app.app, app.namespace, failure.node, failure.reason
-        );
-    }
-    // #702: the scheduler placed what fits and says why the rest has no node.
-    for (app, short) in short {
-        let _ = writeln!(
-            output,
-            "{} (namespace {}) is unschedulable: {short}",
-            app.app, app.namespace
-        );
-    }
-    output
-}
-
 /// An instance's PID for a table: `-` when it has none, `?` when the node's
 /// runtime didn't answer in time.
-fn pid_cell(status: &crate::bun::agent::InstanceStatus) -> String {
+pub(crate) fn pid_cell(status: &crate::bun::agent::InstanceStatus) -> String {
     match status.pid {
         Some(pid) => pid.to_string(),
         None if status.runtime_unknown => "?".to_string(),
@@ -2001,36 +2733,73 @@ fn read_gitops_section(path: &Path) -> Result<crate::lettuce::types::GitOpsConfi
 }
 
 /// `relish gitops set <file>`: replace the cluster's GitOps configuration.
-pub async fn gitops_set(path: &Path) -> Result<(), RelishError> {
+pub async fn gitops_set(path: &Path, output: OutputFormat) -> Result<(), RelishError> {
     let config = read_gitops_section(path)?;
     BunClient::default_local()
         .gitops_config_set(Some(config))
         .await?;
-    println!(
-        "the cluster's GitOps configuration is now {}; the leader syncs it on its next tick",
-        path.display()
-    );
-    Ok(())
+    print_output(
+        &GitopsChange {
+            enabled: true,
+            config: Some(path),
+        },
+        output,
+    )
 }
 
 /// `relish gitops disable`: turn GitOps off; what it wrote stays.
-pub async fn gitops_disable() -> Result<(), RelishError> {
+pub async fn gitops_disable(output: OutputFormat) -> Result<(), RelishError> {
     BunClient::default_local().gitops_config_set(None).await?;
-    println!("GitOps is off; the apps, namespaces and permissions it wrote stay in place");
-    Ok(())
+    print_output(
+        &GitopsChange {
+            enabled: false,
+            config: None,
+        },
+        output,
+    )
 }
 
-pub async fn secret_rotate(finalize: bool, namespace: Option<&str>) -> Result<(), RelishError> {
+/// What `relish gitops set` or `disable` changed.
+#[derive(Debug, serde::Serialize)]
+pub struct GitopsChange<'a> {
+    /// GitOps now syncs.
+    pub enabled: bool,
+    /// The file the new configuration came from.
+    pub config: Option<&'a Path>,
+}
+
+impl std::fmt::Display for GitopsChange<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.config {
+            Some(path) => writeln!(
+                f,
+                "the cluster's GitOps configuration is now {}; the leader syncs it on its next tick",
+                path.display()
+            ),
+            None => writeln!(
+                f,
+                "GitOps is off; the apps, namespaces and permissions it wrote stay in place"
+            ),
+        }
+    }
+}
+
+/// Rotate or finalise a secret encryption key; the node answers in a
+/// sentence, which `-o json` prints as `{"message": ...}`.
+pub async fn secret_rotate(
+    finalize: bool,
+    namespace: Option<&str>,
+    output: OutputFormat,
+) -> Result<(), RelishError> {
     let client = BunClient::default_local();
-    let result = client.secret_rotate(finalize, namespace).await?;
-    println!("{result}");
-    Ok(())
+    let message = client.secret_rotate(finalize, namespace).await?;
+    print_output(&super::output::Message { message }, output)
 }
 
 /// Sign a Pickle-hosted image with the operator's key and attach the
 /// signature. A tag is resolved to its manifest digest first, and the
 /// digest is what gets signed: a tag can move, a digest can't.
-pub async fn sign(image: &str, key_path: &Path) -> Result<(), RelishError> {
+pub async fn sign(image: &str, key_path: &Path, output: OutputFormat) -> Result<(), RelishError> {
     let key_text = fs::read_to_string(key_path)?;
     let key = crate::pickle::signing::SigningKey::from_pem(&key_text)?;
 
@@ -2044,27 +2813,70 @@ pub async fn sign(image: &str, key_path: &Path) -> Result<(), RelishError> {
     let digest = resolve_image_digest(image, &images)?;
 
     let submission = key.sign(&digest)?;
-    let result = client.sign_image(&submission).await?;
-    println!("{result}");
-    Ok(())
+    let message = client.sign_image(&submission).await?;
+    print_output(
+        &SignReport {
+            image,
+            digest: digest.as_str(),
+            message,
+        },
+        output,
+    )
+}
+
+/// What `relish sign` signed.
+#[derive(Debug, serde::Serialize)]
+pub struct SignReport<'a> {
+    /// The image as given.
+    pub image: &'a str,
+    /// The manifest digest the signature covers.
+    pub digest: &'a str,
+    /// What the cluster said when it attached the signature.
+    pub message: String,
+}
+
+impl std::fmt::Display for SignReport<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "{}", self.message)
+    }
 }
 
 /// Generate an image signing key at `out` (PKCS#8 PEM, owner-only
 /// permissions) and print the public key in the form
-/// `[images.trust_policy] keys` expects.
-pub fn sign_keygen(out: &Path) -> Result<(), RelishError> {
+/// `[images.trust_policy] keys` expects. The private key never leaves the
+/// file, whatever the format.
+pub fn sign_keygen(out: &Path, output: OutputFormat) -> Result<(), RelishError> {
     let key = crate::pickle::signing::SigningKey::generate()?;
     write_private_key(out, key.to_pem().as_bytes())?;
-    let public_key = key.public_key_base64();
-    println!("wrote image signing key to {}", out.display());
-    println!("public key: {public_key}");
-    println!();
-    println!("Trust it by adding this to every node's config:");
-    println!();
-    println!("[images.trust_policy]");
-    println!("require_signatures = true");
-    println!("keys = [\"{public_key}\"]");
-    Ok(())
+    print_output(
+        &SigningKeyReport {
+            path: out,
+            public_key: key.public_key_base64(),
+        },
+        output,
+    )
+}
+
+/// What `relish sign keygen` wrote: where the private key is, and the
+/// public key to trust.
+#[derive(Debug, serde::Serialize)]
+pub struct SigningKeyReport<'a> {
+    pub path: &'a Path,
+    pub public_key: String,
+}
+
+impl std::fmt::Display for SigningKeyReport<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let public_key = &self.public_key;
+        writeln!(f, "wrote image signing key to {}", self.path.display())?;
+        writeln!(f, "public key: {public_key}")?;
+        writeln!(f)?;
+        writeln!(f, "Trust it by adding this to every node's config:")?;
+        writeln!(f)?;
+        writeln!(f, "[images.trust_policy]")?;
+        writeln!(f, "require_signatures = true")?;
+        writeln!(f, "keys = [\"{public_key}\"]")
+    }
 }
 
 /// Write a private key, refusing to overwrite and keeping it owner-only.
@@ -2160,11 +2972,33 @@ pub fn parse_image_tag(reference: &str) -> Result<(&str, &str), RelishError> {
 }
 
 /// `relish images delete <repository:tag>`: untag an image in Pickle.
-pub async fn image_delete(reference: &str) -> Result<(), RelishError> {
-    image_delete_with_client(reference, &BunClient::default_local()).await
+pub async fn image_delete(reference: &str, output: OutputFormat) -> Result<(), RelishError> {
+    image_delete_with_client(reference, output, &BunClient::default_local()).await
 }
 
-async fn image_delete_with_client(reference: &str, client: &BunClient) -> Result<(), RelishError> {
+/// The tag `relish images delete` removed.
+#[derive(Debug, serde::Serialize)]
+pub struct DeletedTag<'a> {
+    pub repository: &'a str,
+    pub tag: &'a str,
+}
+
+impl std::fmt::Display for DeletedTag<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "deleted {}:{}; the image expires once it has been untagged for \
+             gc_retain_days, unless an app or job pins it",
+            self.repository, self.tag
+        )
+    }
+}
+
+async fn image_delete_with_client(
+    reference: &str,
+    output: OutputFormat,
+    client: &BunClient,
+) -> Result<(), RelishError> {
     let (repository, tag) = parse_image_tag(reference)?;
     let registry = client
         .capabilities()
@@ -2173,11 +3007,7 @@ async fn image_delete_with_client(reference: &str, client: &BunClient) -> Result
         .registry
         .ok_or(RelishError::RegistryUnavailable)?;
     client.delete_image_tag(&registry, repository, tag).await?;
-    println!(
-        "deleted {repository}:{tag}; the image expires once it has been untagged for \
-         gc_retain_days, unless an app or job pins it"
-    );
-    Ok(())
+    print_output(&DeletedTag { repository, tag }, output)
 }
 
 pub async fn images(output: OutputFormat) -> Result<(), RelishError> {
@@ -2391,24 +3221,33 @@ fn build_plan_lines(job: &crate::pickle::build::BuildahJob) -> Vec<String> {
 ///
 /// Reads `[build.*]` sections from the config, tars each context,
 /// uploads it to Pickle, and submits a build job.
+///
+/// For people it narrates each step. With `-o json` the narration goes to
+/// stderr and stdout gets one report of every image built.
 pub async fn build(
     path: &std::path::Path,
     registry_port: Option<u16>,
     timeout_secs: u64,
+    output: OutputFormat,
 ) -> Result<(), RelishError> {
+    use super::output::progress;
     use crate::config::Config;
     use crate::pickle::build::{cli_context_upload_url, digest_of, execute_build, tar_context};
 
     let config = Config::from_file(path)?;
+    let mut report = BuildReport { images: Vec::new() };
     if config.build.is_empty() {
         eprintln!("no [build.*] sections found in {}", path.display());
+        if output != OutputFormat::Human {
+            print_output(&report, output)?;
+        }
         return Ok(());
     }
 
     let client = BunClient::default_local();
 
     for (name, spec) in &config.build {
-        println!("Building {name}...");
+        progress(output, format_args!("Building {name}..."));
 
         // Tar the context
         let context_path = if spec.context.is_relative() {
@@ -2423,10 +3262,13 @@ pub async fn build(
             body: format!("failed to tar context: {e}"),
         })?;
         let digest = digest_of(&tar_bytes);
-        println!(
-            "  context: {} ({} bytes, {digest})",
-            context_path.display(),
-            tar_bytes.len()
+        progress(
+            output,
+            format_args!(
+                "  context: {} ({} bytes, {digest})",
+                context_path.display(),
+                tar_bytes.len()
+            ),
         );
 
         // Upload context blob to the Pickle registry (X1: this used to
@@ -2460,7 +3302,7 @@ pub async fn build(
                 body: format!("context upload failed: {body}"),
             });
         }
-        println!("  context uploaded to Pickle");
+        progress(output, "  context uploaded to Pickle");
 
         // Prepare the build job (for display; the agent re-derives it with
         // its own registry port, which a host forward doesn't change).
@@ -2470,7 +3312,7 @@ pub async fn build(
         })?;
 
         for line in build_plan_lines(&job) {
-            println!("{line}");
+            progress(output, line);
         }
 
         // Submit and poll: builds run async on the builder node —
@@ -2478,17 +3320,56 @@ pub async fn build(
         // The wait is bounded (JOB6): a stuck build ends with a
         // non-zero exit and the last known state, not an infinite loop.
         let build_id = client.submit_build(name, &digest, spec).await?;
-        println!("  build {build_id} accepted; waiting (up to {timeout_secs}s)...");
+        progress(
+            output,
+            format_args!("  build {build_id} accepted; waiting (up to {timeout_secs}s)..."),
+        );
         let image = wait_for_build(
             &client,
             build_id,
             std::time::Duration::from_secs(timeout_secs),
         )
         .await?;
-        println!("  built and pushed {image}");
+        progress(output, format_args!("  built and pushed {image}"));
+        report.images.push(BuiltImage {
+            name: name.clone(),
+            context_digest: digest,
+            build_id,
+            image,
+        });
     }
 
+    if output != OutputFormat::Human {
+        print_output(&report, output)?;
+    }
     Ok(())
+}
+
+/// What `relish build -o json` built.
+#[derive(Debug, serde::Serialize)]
+pub struct BuildReport {
+    pub images: Vec<BuiltImage>,
+}
+
+/// One `[build.*]` section that built and pushed.
+#[derive(Debug, serde::Serialize)]
+pub struct BuiltImage {
+    /// The `[build.NAME]` section.
+    pub name: String,
+    /// The uploaded context's digest.
+    pub context_digest: String,
+    pub build_id: u64,
+    /// The image reference it pushed.
+    pub image: String,
+}
+
+impl std::fmt::Display for BuildReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for image in &self.images {
+            writeln!(f, "built and pushed {}", image.image)?;
+        }
+        Ok(())
+    }
 }
 
 /// Longest `Idempotency-Key` the cluster keeps as a request identity.
@@ -2528,13 +3409,18 @@ pub fn submission_key(
 }
 
 /// Submit a batch of jobs for high-throughput scheduling.
+///
+/// `-o json` prints the cluster's answer: `batch_id`, `assigned` and
+/// `unschedulable`.
 pub async fn batch(
     path: &std::path::Path,
     idempotency_key: Option<String>,
+    output: OutputFormat,
 ) -> Result<(), RelishError> {
     batch_with_client(
         path,
         idempotency_key,
+        output,
         &BunClient::default_local(),
         &mut std::io::stderr(),
     )
@@ -2544,6 +3430,7 @@ pub async fn batch(
 async fn batch_with_client(
     path: &std::path::Path,
     idempotency_key: Option<String>,
+    output: OutputFormat,
     client: &BunClient,
     err: &mut dyn std::io::Write,
 ) -> Result<(), RelishError> {
@@ -2551,12 +3438,19 @@ async fn batch_with_client(
 
     let config = Config::from_file(path)?;
     if config.job.is_empty() {
-        eprintln!("no [job.*] sections found in {}", path.display());
-        return Ok(());
+        return Err(RelishError::InvalidFlag {
+            flag: "file".into(),
+            reason: format!("no [job.*] sections found in {}", path.display()),
+        });
     }
 
     let key = submission_key(idempotency_key, err)?;
     let result = client.submit_batch(&config.job, Some(&key)).await?;
+    print_policy_warnings(&result, err);
+    if output != OutputFormat::Human {
+        println!("{}", format_output(&result, output)?);
+        return Ok(());
+    }
     println!(
         "batch {} admitted: {} queued jobs",
         result["batch_id"].as_u64().unwrap_or(0),
@@ -2672,12 +3566,12 @@ pub fn task_array_request(
     {
         return Err(RelishError::InvalidFlag { flag: "runtime".into(), reason: "process requires --exec and refuses --image; runc/shared-runc require --image and refuse --exec".into() });
     }
-    if run.exec.as_ref().is_some_and(|path| !path.is_absolute()) {
+    if let Some(path) = run.exec.as_ref().filter(|path| !path.is_absolute()) {
         return Err(RelishError::InvalidFlag {
             flag: "exec".to_string(),
             reason: format!(
                 "{} isn't an absolute path; nodes allow binaries by absolute path",
-                run.exec.as_ref().expect("checked").display()
+                path.display()
             ),
         });
     }
@@ -2698,6 +3592,7 @@ pub fn task_array_request(
         name: run.name,
         namespace: Some(run.namespace),
         template: crate::config::job::JobSpec {
+            pids: None,
             runtime: run.runtime,
             image: run.image,
             command: Some(run.args),
@@ -2723,6 +3618,7 @@ pub fn task_array_request(
             task_timeout_secs: None,
             overlap: None,
             replay_unknown: false,
+            provenance: None,
         },
         spec: run.spec,
     })
@@ -2782,15 +3678,18 @@ async fn submit_task_manifest_with_client(
         })?;
     if dry_run {
         let tasks: u64 = request.cohort.iter().map(|c| u64::from(c.spec.count)).sum();
-        println!(
-            "valid manifest: {} profiles, {} tasks",
-            request.cohort.len(),
-            tasks
+        return print_output(
+            &ManifestCheck {
+                valid: true,
+                profiles: request.cohort.len(),
+                tasks,
+            },
+            output,
         );
-        return Ok(());
     }
     let key = submission_key(idempotency_key, err)?;
     let response = client.submit_task_manifest(&request, Some(&key)).await?;
+    print_policy_warnings(&response, err);
     if matches!(output, OutputFormat::Human) {
         println!(
             "manifest {} submitted; watch with: relish batch watch {}",
@@ -2802,13 +3701,49 @@ async fn submit_task_manifest_with_client(
     Ok(())
 }
 
+/// What `relish batch submit --dry-run` checked.
+#[derive(Debug, serde::Serialize)]
+pub struct ManifestCheck {
+    pub valid: bool,
+    pub profiles: usize,
+    pub tasks: u64,
+}
+
+impl std::fmt::Display for ManifestCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "valid manifest: {} profiles, {} tasks",
+            self.profiles, self.tasks
+        )
+    }
+}
+
+/// One `relish batch watch` sample: the cluster's summary, one line for
+/// people, one JSON object per line with `-o json`.
+#[derive(Debug, serde::Serialize)]
+#[serde(transparent)]
+pub struct WatchSample(pub serde_json::Value);
+
+impl std::fmt::Display for WatchSample {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&format_batch_watch(&self.0))
+    }
+}
+
 /// Observe bounded summaries once a second; never enumerate the task list.
-pub async fn watch_task_batch(batch_id: u64, timeout_secs: u64) -> Result<(), RelishError> {
+/// With `-o json` each sample is a JSON object on its own line.
+pub async fn watch_task_batch(
+    batch_id: u64,
+    timeout_secs: u64,
+    output: OutputFormat,
+) -> Result<(), RelishError> {
     let client = BunClient::default_local();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     loop {
-        let summary = client.batch_status(batch_id).await?;
-        println!("{}", format_batch_watch(&summary));
+        let summary = WatchSample(client.batch_status(batch_id).await?);
+        super::output::print_record(&summary, output)?;
+        let summary = summary.0;
         if summary["status"] == "Unknown" {
             return Err(RelishError::ApiError {
                 status: 409,
@@ -2958,13 +3893,33 @@ pub fn format_batch_watch(summary: &serde_json::Value) -> String {
     output
 }
 
+/// Print what the `warn` policies said about a submitted job (#1424), one
+/// `warning:` line each, to `err`.
+fn print_policy_warnings(answer: &serde_json::Value, err: &mut dyn std::io::Write) {
+    for warning in answer["policy_warnings"].as_array().into_iter().flatten() {
+        if let Some(warning) = warning.as_str() {
+            let _ = writeln!(err, "warning: {warning}");
+        }
+    }
+}
+
 /// Submit a task array (`relish run --batch`).
-pub async fn run_task_array(run: TaskArrayRun) -> Result<(), RelishError> {
-    run_task_array_with_client(run, &BunClient::default_local(), &mut std::io::stderr()).await
+///
+/// `-o json` prints the cluster's answer (`batch_id`, `count`, `chunks` for
+/// a run; no `batch_id` for a schedule).
+pub async fn run_task_array(run: TaskArrayRun, output: OutputFormat) -> Result<(), RelishError> {
+    run_task_array_with_client(
+        run,
+        output,
+        &BunClient::default_local(),
+        &mut std::io::stderr(),
+    )
+    .await
 }
 
 async fn run_task_array_with_client(
     mut run: TaskArrayRun,
+    output: OutputFormat,
     client: &BunClient,
     err: &mut dyn std::io::Write,
 ) -> Result<(), RelishError> {
@@ -2979,6 +3934,11 @@ async fn run_task_array_with_client(
         submission_key(explicit, err)?
     };
     let answer = client.submit_task_array(&request, Some(&key)).await?;
+    print_policy_warnings(&answer, err);
+    if output != OutputFormat::Human {
+        println!("{}", format_output(&answer, output)?);
+        return Ok(());
+    }
     if let Some(id) = answer["batch_id"].as_u64() {
         println!(
             "job run {id} admitted: {} tasks in {} chunks; at-least-once replay policy",
@@ -3016,19 +3976,73 @@ pub async fn jobs(definitions: bool, output: OutputFormat) -> Result<(), RelishE
     Ok(())
 }
 /// Explicitly accept repeating side effects from exactly the named unknown grants.
-pub async fn replay_job(id: u64, node: &str, digest: &str) -> Result<(), RelishError> {
+pub async fn replay_job(
+    id: u64,
+    node: &str,
+    digest: &str,
+    output: OutputFormat,
+) -> Result<(), RelishError> {
     BunClient::default_local()
         .replay_job(id, node, digest)
         .await?;
-    println!("run {id}: replay acknowledged for {node}; previous side effects may repeat");
-    Ok(())
+    print_output(
+        &RunChange {
+            run: id,
+            change: RunChangeKind::ReplayAcknowledged,
+            node: Some(node),
+        },
+        output,
+    )
 }
 
 /// Stop a task array (`relish batch cancel`).
-pub async fn batch_cancel(batch_id: u64) -> Result<(), RelishError> {
+pub async fn batch_cancel(batch_id: u64, output: OutputFormat) -> Result<(), RelishError> {
     BunClient::default_local().cancel_batch(batch_id).await?;
-    println!("task array {batch_id} cancelled: running tasks are being stopped");
-    Ok(())
+    print_output(
+        &RunChange {
+            run: batch_id,
+            change: RunChangeKind::Cancelled,
+            node: None,
+        },
+        output,
+    )
+}
+
+/// What `relish batch replay` or `batch cancel` changed about a run.
+#[derive(Debug, serde::Serialize)]
+pub struct RunChange<'a> {
+    pub run: u64,
+    pub change: RunChangeKind,
+    /// The node whose unknown grants the replay acknowledged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node: Option<&'a str>,
+}
+
+/// The change in a [`RunChange`].
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunChangeKind {
+    /// Side effects the run had before may repeat.
+    ReplayAcknowledged,
+    /// Running tasks are being stopped.
+    Cancelled,
+}
+
+impl std::fmt::Display for RunChange<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let id = self.run;
+        match self.change {
+            RunChangeKind::ReplayAcknowledged => writeln!(
+                f,
+                "run {id}: replay acknowledged for {}; previous side effects may repeat",
+                self.node.unwrap_or("?")
+            ),
+            RunChangeKind::Cancelled => writeln!(
+                f,
+                "task array {id} cancelled: running tasks are being stopped"
+            ),
+        }
+    }
 }
 
 /// Show a task array's per-task outcomes (`relish batch results`).
@@ -3058,12 +4072,40 @@ pub async fn batch_results(
 }
 
 /// Print a failed task's kept output (`relish batch logs --index`).
-pub async fn batch_task_logs(batch_id: u64, index: u32) -> Result<(), RelishError> {
+///
+/// `-o json` prints `{run, index, output}`; bytes that aren't UTF-8 become
+/// U+FFFD, as they do on a terminal.
+pub async fn batch_task_logs(
+    batch_id: u64,
+    index: u32,
+    output: OutputFormat,
+) -> Result<(), RelishError> {
     let bytes = BunClient::default_local()
         .task_logs(batch_id, index)
         .await?;
-    print!("{}", String::from_utf8_lossy(&bytes));
-    Ok(())
+    print_output(
+        &TaskOutput {
+            run: batch_id,
+            index,
+            output: String::from_utf8_lossy(&bytes).into_owned(),
+        },
+        output,
+    )
+}
+
+/// A task's kept output, from `relish batch logs`.
+#[derive(Debug, serde::Serialize)]
+pub struct TaskOutput {
+    pub run: u64,
+    pub index: u32,
+    /// The first and last 2 KiB the task wrote.
+    pub output: String,
+}
+
+impl std::fmt::Display for TaskOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.output)
+    }
 }
 
 /// Render task results as a table.
@@ -3210,8 +4252,41 @@ pub fn format_array_summary(batch_id: u64, summary: &serde_json::Value) -> Strin
 /// The agent mints the token, stores its SHA-256 digest in Raft, and
 /// returns the plaintext once; this prints it to stdout and never stores
 /// it. Needs a reachable agent and an admin credential.
-pub async fn token_create(request: &super::client::TokenRequest) -> Result<(), RelishError> {
-    token_create_with_client(request, &BunClient::default_local()).await
+pub async fn token_create(
+    request: &super::client::TokenRequest,
+    output: OutputFormat,
+) -> Result<(), RelishError> {
+    token_create_with_client(request, output, &BunClient::default_local()).await
+}
+
+/// A token `relish token create` or `token rotate` just issued. `token` is
+/// the secret itself: the cluster keeps only its hash, so this is the one
+/// time anyone sees it, in JSON as on a terminal.
+#[derive(Debug, serde::Serialize)]
+pub struct IssuedTokenReport<'a> {
+    pub name: &'a str,
+    /// The role, for a new token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub apps: Option<&'a [String]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespaces: Option<&'a [String]>,
+    /// The plaintext secret, shown once.
+    pub token: &'a str,
+    /// Unix seconds; `null` for never.
+    pub expires_at: Option<u64>,
+    /// After a rotation, until when the old secret works, Unix seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_valid_until: Option<u64>,
+}
+
+impl std::fmt::Display for IssuedTokenReport<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The details went to stderr; stdout carries only the secret, so
+        // `TOKEN=$(relish token create ...)` works.
+        writeln!(f, "{}", self.token)
+    }
 }
 
 /// Create a token via the agent so it's persisted in Raft. The token is minted
@@ -3220,6 +4295,7 @@ pub async fn token_create(request: &super::client::TokenRequest) -> Result<(), R
 /// role is validated server-side.
 async fn token_create_with_client(
     request: &super::client::TokenRequest,
+    output: OutputFormat,
     client: &BunClient,
 ) -> Result<(), RelishError> {
     let issued = client.token_create(request).await?;
@@ -3237,22 +4313,36 @@ async fn token_create_with_client(
         None => eprintln!("  Expires: never"),
     }
     eprintln!();
-    println!("{}", issued.token);
-
-    Ok(())
+    print_output(
+        &IssuedTokenReport {
+            name: &request.name,
+            role: Some(&request.role),
+            apps: request.apps.as_deref(),
+            namespaces: request.namespaces.as_deref(),
+            token: &issued.token,
+            expires_at: issued.expires_at,
+            previous_valid_until: None,
+        },
+        output,
+    )
 }
 
 /// Give an API token a new secret through the agent.
 ///
 /// The new secret is printed to stdout once. The old one keeps working
 /// until the time printed on stderr, so clients can move over first.
-pub async fn token_rotate(name: &str, grace_hours: Option<u64>) -> Result<(), RelishError> {
-    token_rotate_with_client(name, grace_hours, &BunClient::default_local()).await
+pub async fn token_rotate(
+    name: &str,
+    grace_hours: Option<u64>,
+    output: OutputFormat,
+) -> Result<(), RelishError> {
+    token_rotate_with_client(name, grace_hours, output, &BunClient::default_local()).await
 }
 
 async fn token_rotate_with_client(
     name: &str,
     grace_hours: Option<u64>,
+    output: OutputFormat,
     client: &BunClient,
 ) -> Result<(), RelishError> {
     let issued = client.token_rotate(name, grace_hours).await?;
@@ -3267,9 +4357,18 @@ async fn token_rotate_with_client(
         None => eprintln!("  Expires: never"),
     }
     eprintln!();
-    println!("{}", issued.token);
-
-    Ok(())
+    print_output(
+        &IssuedTokenReport {
+            name,
+            role: None,
+            apps: None,
+            namespaces: None,
+            token: &issued.token,
+            expires_at: issued.expires_at,
+            previous_valid_until: issued.previous_valid_until,
+        },
+        output,
+    )
 }
 
 /// Print the cluster's age public key, or one namespace's, for encrypting
@@ -3281,13 +4380,36 @@ async fn token_rotate_with_client(
 /// a directory, reads the security bootstrap `relish init` wrote there,
 /// which works offline but only knows the cluster key. With a namespace,
 /// asks for that namespace's own key (F05 I4).
-pub async fn secret_pubkey(dir: Option<&Path>, namespace: Option<&str>) -> Result<(), RelishError> {
+pub async fn secret_pubkey(
+    dir: Option<&Path>,
+    namespace: Option<&str>,
+    output: OutputFormat,
+) -> Result<(), RelishError> {
     let key = match dir {
         Some(dir) => resolve_secret_pubkey(dir)?,
         None => fetch_secret_pubkey(&BunClient::default_local(), namespace).await?,
     };
-    println!("{key}");
-    Ok(())
+    print_output(
+        &PublicKey {
+            namespace,
+            public_key: key,
+        },
+        output,
+    )
+}
+
+/// The age public key `relish secret pubkey` found: the cluster's, or a
+/// namespace's (`namespace` is then set).
+#[derive(Debug, serde::Serialize)]
+pub struct PublicKey<'a> {
+    pub namespace: Option<&'a str>,
+    pub public_key: String,
+}
+
+impl std::fmt::Display for PublicKey<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "{}", self.public_key)
+    }
 }
 
 /// Ask the cluster for its active age public key, or `namespace`'s.
@@ -3338,14 +4460,27 @@ fn resolve_secret_pubkey(dir: &Path) -> Result<String, RelishError> {
 /// Produces an `ENC[AGE:...]` string suitable for embedding in app
 /// config env vars. No cluster access required — encryption is a
 /// local operation using only the public key.
-pub fn secret_encrypt(pubkey: &str, value: &str) -> Result<(), RelishError> {
+///
+/// `-o json` prints `{"encrypted": "ENC[AGE:...]"}`; the plaintext is never
+/// echoed back.
+pub fn secret_encrypt(pubkey: &str, value: &str, output: OutputFormat) -> Result<(), RelishError> {
     use crate::sesame::secret::encrypt_secret;
 
     let encrypted =
         encrypt_secret(value, pubkey).map_err(|e| RelishError::InitFailed(e.to_string()))?;
+    print_output(&Encrypted { encrypted }, output)
+}
 
-    println!("{encrypted}");
-    Ok(())
+/// An `ENC[AGE:...]` value from `relish secret encrypt`.
+#[derive(Debug, serde::Serialize)]
+pub struct Encrypted {
+    pub encrypted: String,
+}
+
+impl std::fmt::Display for Encrypted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "{}", self.encrypted)
+    }
 }
 
 /// List API tokens via the agent, with every node's last use merged in.
@@ -3379,10 +4514,13 @@ pub async fn token_list(output: OutputFormat) -> Result<(), RelishError> {
 
 /// One line per token that has expired, or expires within
 /// [`crate::sesame::token::TOKEN_EXPIRY_WARNING`] of `now`, saying what to do.
+/// The tokens `relish mcp` makes are left out: they live a day and it
+/// renews them itself, and rotating one only gets it rejected under it.
 fn token_expiry_warnings(tokens: &[super::client::TokenSummary], now: u64) -> Vec<String> {
     let horizon = now.saturating_add(crate::sesame::token::TOKEN_EXPIRY_WARNING.as_secs());
     tokens
         .iter()
+        .filter(|token| !super::mcp::credentials::made_by_relish_mcp(&token.name))
         .filter_map(|token| {
             let at = token.expires_at.filter(|at| *at <= horizon)?;
             let name = &token.name;
@@ -3521,15 +4659,19 @@ fn format_duration(seconds: u64) -> String {
 }
 
 /// Revoke an API token by name via the agent.
-pub async fn token_revoke(name: &str) -> Result<(), RelishError> {
+pub async fn token_revoke(name: &str, output: OutputFormat) -> Result<(), RelishError> {
     let client = BunClient::default_local();
-    let result = client.token_revoke(name).await?;
-    println!("{result}");
-    Ok(())
+    let message = client.token_revoke(name).await?;
+    print_output(&super::output::Message { message }, output)
 }
 
 /// Mint a short-lived, single-use node join token through the council.
-pub async fn join_token_create(node_id: &str, ttl_seconds: u64) -> Result<(), RelishError> {
+/// The plaintext is shown once, in JSON as on a terminal.
+pub async fn join_token_create(
+    node_id: &str,
+    ttl_seconds: u64,
+    output: OutputFormat,
+) -> Result<(), RelishError> {
     let client = BunClient::default_local();
     let plaintext = client.join_token_create(node_id, ttl_seconds).await?;
     eprintln!(
@@ -3538,8 +4680,31 @@ pub async fn join_token_create(node_id: &str, ttl_seconds: u64) -> Result<(), Re
     );
     eprintln!("The joining node must enrol with `relish join --node-id {node_id}`.");
     eprintln!("The plaintext is shown once:");
-    println!("{plaintext}");
-    Ok(())
+    print_output(
+        &JoinTokenReport {
+            node_id,
+            ttl_secs: ttl_seconds,
+            token: &plaintext,
+        },
+        output,
+    )
+}
+
+/// A join token `relish join-token create` minted. `token` is the secret:
+/// the council keeps only its hash.
+#[derive(Debug, serde::Serialize)]
+pub struct JoinTokenReport<'a> {
+    /// The only node id the token enrols.
+    pub node_id: &'a str,
+    pub ttl_secs: u64,
+    /// The plaintext, shown once.
+    pub token: &'a str,
+}
+
+impl std::fmt::Display for JoinTokenReport<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "{}", self.token)
+    }
 }
 
 fn format_ttl(seconds: u64) -> String {
@@ -3558,9 +4723,14 @@ pub async fn snapshot_create(
     namespace: &str,
     volume: Option<&str>,
     name: Option<&str>,
+    output: OutputFormat,
 ) -> Result<(), RelishError> {
     let client = BunClient::default_local();
     let metas = client.snapshot_create(app, namespace, volume, name).await?;
+    if output != OutputFormat::Human {
+        println!("{}", format_output(&metas, output)?);
+        return Ok(());
+    }
     if let Some(list) = metas.as_array() {
         for meta in list {
             println!(
@@ -3575,9 +4745,19 @@ pub async fn snapshot_create(
 }
 
 /// List an app's snapshots, newest first.
-pub async fn snapshot_list(app: &str, namespace: &str) -> Result<(), RelishError> {
+///
+/// `-o json` prints the node's list of snapshot records.
+pub async fn snapshot_list(
+    app: &str,
+    namespace: &str,
+    output: OutputFormat,
+) -> Result<(), RelishError> {
     let client = BunClient::default_local();
     let metas = client.snapshot_list(app, namespace).await?;
+    if output != OutputFormat::Human {
+        println!("{}", format_output(&metas, output)?);
+        return Ok(());
+    }
     let Some(list) = metas.as_array() else {
         println!("no snapshots");
         return Ok(());
@@ -3622,13 +4802,55 @@ pub async fn snapshot_restore(
     namespace: &str,
     name: &str,
     volume: Option<&str>,
+    output: OutputFormat,
 ) -> Result<(), RelishError> {
     let client = BunClient::default_local();
     client
         .snapshot_restore(app, namespace, name, volume)
         .await?;
-    println!("restored {namespace}/{app} from snapshot {name}");
-    Ok(())
+    print_output(
+        &SnapshotChange {
+            change: SnapshotChangeKind::Restored,
+            app,
+            namespace,
+            snapshot: name,
+            volume,
+        },
+        output,
+    )
+}
+
+/// What `relish snapshot restore` or `snapshot delete` did.
+#[derive(Debug, serde::Serialize)]
+pub struct SnapshotChange<'a> {
+    pub change: SnapshotChangeKind,
+    pub app: &'a str,
+    pub namespace: &'a str,
+    pub snapshot: &'a str,
+    /// The volume, when `--volume` named one.
+    pub volume: Option<&'a str>,
+}
+
+/// The change in a [`SnapshotChange`].
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotChangeKind {
+    Restored,
+    Deleted,
+}
+
+impl std::fmt::Display for SnapshotChange<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (app, namespace, name) = (self.app, self.namespace, self.snapshot);
+        match self.change {
+            SnapshotChangeKind::Restored => {
+                writeln!(f, "restored {namespace}/{app} from snapshot {name}")
+            }
+            SnapshotChangeKind::Deleted => {
+                writeln!(f, "deleted snapshot {name} of {namespace}/{app}")
+            }
+        }
+    }
 }
 
 /// Delete a snapshot. `volume` picks between volumes that share the
@@ -3638,15 +4860,207 @@ pub async fn snapshot_delete(
     namespace: &str,
     name: &str,
     volume: Option<&str>,
+    output: OutputFormat,
 ) -> Result<(), RelishError> {
     let client = BunClient::default_local();
     client.snapshot_delete(app, namespace, name, volume).await?;
-    println!("deleted snapshot {name} of {namespace}/{app}");
-    Ok(())
+    print_output(
+        &SnapshotChange {
+            change: SnapshotChangeKind::Deleted,
+            app,
+            namespace,
+            snapshot: name,
+            volume,
+        },
+        output,
+    )
 }
 
 #[cfg(test)]
 mod tests {
+    /// #1499: the summary names the node the logs came from and where they
+    /// landed, so nobody looks for an archive on the wrong machine.
+    #[test]
+    fn log_export_summary_names_the_node_and_where_the_files_landed() {
+        use super::{ExportLanding, render_export_summary};
+        let here = ExportLanding::parse("./archive").unwrap();
+        let bucket = ExportLanding::parse("s3://bucket/logs/").unwrap();
+        let lines = [
+            render_export_summary(&here, "node-1", 2, 4096),
+            render_export_summary(&here, "node-1", 0, 0),
+            render_export_summary(&bucket, "node-1", 2, 4096),
+            render_export_summary(&bucket, "node-1", 0, 0),
+        ];
+        insta::assert_snapshot!(lines.join("\n"), @r"
+        exported 2 file(s) (4096 bytes) of node-1's logs to ./archive/node-1 on this machine
+        no new files to export from node-1 to ./archive/node-1 on this machine
+        exported 2 file(s) (4096 bytes) of node-1's logs to s3://bucket/logs/node-1
+        no new files to export from node-1 to s3://bucket/logs/node-1
+        ");
+    }
+
+    /// A bare path and `file://` are this machine's disk; every other scheme
+    /// is an object store the node writes to.
+    #[test]
+    fn export_destination_is_this_machine_unless_it_names_an_object_store() {
+        use super::ExportLanding;
+        let here = |directory: &str| ExportLanding::ThisMachine {
+            directory: directory.into(),
+        };
+        assert_eq!(
+            ExportLanding::parse("./archive").unwrap(),
+            here("./archive")
+        );
+        assert_eq!(
+            ExportLanding::parse("/srv/logs").unwrap(),
+            here("/srv/logs")
+        );
+        assert_eq!(
+            ExportLanding::parse("file:///srv/logs").unwrap(),
+            here("/srv/logs")
+        );
+        assert_eq!(
+            ExportLanding::parse("gs://bucket/logs").unwrap(),
+            ExportLanding::ObjectStore {
+                url: "gs://bucket/logs".into()
+            }
+        );
+        assert!(ExportLanding::parse("file://other-host/srv/logs").is_err());
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    /// An agent that lists `listing` and serves `body` for `logs_1.parquet`,
+    /// or nothing for any other name.
+    async fn canned_archive_agent(
+        listing: serde_json::Value,
+        body: &'static [u8],
+    ) -> (super::BunClient, tokio::task::JoinHandle<()>) {
+        use axum::routing::get;
+        let router = axum::Router::new()
+            .route(
+                "/v1/logs/archive",
+                get(move || {
+                    let listing = listing.clone();
+                    async move { axum::Json(listing) }
+                }),
+            )
+            .route(
+                "/v1/logs/archive/logs_1.parquet",
+                get(move || async move { body }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = super::BunClient::new_with_token(&format!("http://{address}"), None);
+        (client, server)
+    }
+
+    fn listing_of(node_id: &str, name: &str, size: usize, sha256: &str) -> serde_json::Value {
+        serde_json::json!({
+            "node_id": node_id,
+            "files": [{"name": name, "size": size, "sha256": sha256}],
+        })
+    }
+
+    fn names_under(directory: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(directory)
+            .map(|entries| {
+                entries
+                    .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn archive_copy_files_each_log_under_its_hash_and_skips_it_next_time() {
+        let sha256 = sha256_hex(b"parquet");
+        let listing = listing_of("node-1", "logs_1.parquet", 7, &sha256);
+        let (client, server) = canned_archive_agent(listing, b"parquet").await;
+        let dest = tempfile::tempdir().unwrap();
+
+        let first = super::copy_node_archive(&client, dest.path())
+            .await
+            .unwrap();
+        let second = super::copy_node_archive(&client, dest.path())
+            .await
+            .unwrap();
+        server.abort();
+
+        assert_eq!((first.files, first.bytes), (1, 7));
+        assert_eq!((second.files, second.bytes), (0, 0));
+        let path = dest
+            .path()
+            .join("node-1")
+            .join(format!("{sha256}-logs_1.parquet"));
+        assert_eq!(std::fs::read(path).unwrap(), b"parquet");
+        assert_eq!(names_under(&dest.path().join("node-1")).len(), 1);
+    }
+
+    /// A node name or file name from the agent never climbs out of `--dest`.
+    #[tokio::test]
+    async fn archive_copy_refuses_names_that_leave_the_destination() {
+        let sha256 = sha256_hex(b"parquet");
+        let hostile = [
+            listing_of("../outside", "logs_1.parquet", 7, &sha256),
+            listing_of("/tmp/outside", "logs_1.parquet", 7, &sha256),
+            listing_of("..", "logs_1.parquet", 7, &sha256),
+            listing_of("node-1", "../logs_1.parquet", 7, &sha256),
+            listing_of("node-1", "logs_1.parquet", 7, "../../outside"),
+        ];
+        for listing in hostile {
+            let (client, server) = canned_archive_agent(listing.clone(), b"parquet").await;
+            let parent = tempfile::tempdir().unwrap();
+            let dest = parent.path().join("archive");
+            let outcome = super::copy_node_archive(&client, &dest).await;
+            server.abort();
+            assert!(outcome.is_err(), "{listing}");
+            assert!(names_under(&dest.join("node-1")).is_empty(), "{listing}");
+            assert_eq!(names_under(parent.path()).len(), usize::from(dest.exists()));
+        }
+    }
+
+    /// Bytes that don't match the listing never take the archive name, and
+    /// no partial file stays behind.
+    #[tokio::test]
+    async fn archive_copy_refuses_bytes_that_do_not_match_the_listing() {
+        for (size, body) in [
+            (7, b"tampers".as_slice()),
+            (7, b"short".as_slice()),
+            (3, b"too long".as_slice()),
+        ] {
+            let listing = listing_of("node-1", "logs_1.parquet", size, &sha256_hex(b"parquet"));
+            let (client, server) = canned_archive_agent(listing, body).await;
+            let dest = tempfile::tempdir().unwrap();
+            let error = super::copy_node_archive(&client, dest.path())
+                .await
+                .unwrap_err();
+            server.abort();
+            assert!(
+                error.to_string().contains("run the export again"),
+                "{error}"
+            );
+            assert!(names_under(&dest.path().join("node-1")).is_empty());
+        }
+    }
+
+    /// Retention can remove a file after the listing: that's not a failure.
+    #[tokio::test]
+    async fn archive_copy_skips_a_file_retention_removed() {
+        let listing = listing_of("node-1", "logs_2.parquet", 7, &sha256_hex(b"parquet"));
+        let (client, server) = canned_archive_agent(listing, b"parquet").await;
+        let dest = tempfile::tempdir().unwrap();
+        let copied = super::copy_node_archive(&client, dest.path())
+            .await
+            .unwrap();
+        server.abort();
+        assert_eq!((copied.files, copied.bytes), (0, 0));
+    }
+
     #[test]
     fn history_table_names_the_node_of_every_entry() {
         let at = std::time::SystemTime::UNIX_EPOCH;
@@ -3703,7 +5117,7 @@ mod tests {
     fn a_cluster_apply_says_the_apps_are_being_placed() {
         assert_eq!(
             apply_summary(4, &[]),
-            "applied 4 app(s); the scheduler places them now (watch with `relish status`)"
+            "applied 4 app(s); the scheduler places them now (watch with `relish apps`)"
         );
         assert_eq!(
             apply_summary(2, &["default__web-0".into(), "default__web-1".into()]),
@@ -3731,6 +5145,7 @@ mod tests {
                 pid,
                 runtime_unknown: false,
                 status_age_ms: None,
+                age_seconds: None,
                 reason: None,
             },
             cpu_percent: cpu,
@@ -3819,7 +5234,7 @@ mod tests {
     async fn manifest_loading_defers_namespace_existence_to_live_admission() {
         for manifest in [
             "[permission.reader]\nactions = ['logs']\napps = ['web']\nnamespaces = ['existing']\n",
-            "[build.web]\ncontext = '.'\ndestination = 'pickle://web:v1'\nnamespace = 'existing'\n",
+            "[build.web]\ncontext = '.'\ndestination = 'pickle://existing/web:v1'\nnamespace = 'existing'\n",
         ] {
             let file = write_temp_config(manifest);
             let loaded = load_manifest(&source(file.path())).await;
@@ -3833,7 +5248,7 @@ mod tests {
     #[tokio::test]
     async fn manifest_loading_defers_build_namespace_existence_to_live_admission() {
         let file = write_temp_config(
-            "[build.web]\ncontext = '.'\ndestination = 'pickle://web:v1'\nnamespace = 'existing'\n",
+            "[build.web]\ncontext = '.'\ndestination = 'pickle://existing/web:v1'\nnamespace = 'existing'\n",
         );
         let loaded = load_manifest(&source(file.path())).await;
         assert!(
@@ -3847,7 +5262,7 @@ mod tests {
         for manifest in [
             "[permission.reader]\nactions = ['teleport']\napps = ['web']\nnamespaces = ['existing']\n",
             "[permission.reader]\nactions = ['logs']\napps = ['web']\nnamespaces = ['Existing']\n",
-            "[build.web]\ncontext = '.'\ndestination = 'pickle://web:v1'\nnamespace = 'Existing'\n",
+            "[build.web]\ncontext = '.'\ndestination = 'pickle://Existing/web:v1'\nnamespace = 'Existing'\n",
             "[app.web]\nnamespace = 'existing'\n",
         ] {
             let file = write_temp_config(manifest);
@@ -3913,6 +5328,79 @@ mod tests {
     /// are refused immediately without waiting for a timeout.
     fn bogus_client() -> BunClient {
         BunClient::new("http://127.0.0.1:1")
+    }
+
+    #[cfg(feature = "kubernetes")]
+    pub(super) const K8S_DEPLOYMENT: &str = "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  template:\n    spec:\n      containers:\n      - name: web\n        image: nginx:1\n";
+
+    /// `lint`, `diff` and `compile` read Kubernetes YAML the way `apply`
+    /// does, through `manifest::parse`.
+    #[cfg(feature = "kubernetes")]
+    #[test]
+    fn local_config_commands_accept_kubernetes_yaml() {
+        let file = write_temp_config(K8S_DEPLOYMENT);
+        lint(file.path(), OutputFormat::Human).unwrap();
+        diff(file.path(), None, OutputFormat::Human).unwrap();
+        compile(file.path(), OutputFormat::Human).unwrap();
+        let config = load_config_file(file.path()).unwrap();
+        assert!(config.app.contains_key("web"));
+    }
+
+    fn service(namespace: &str) -> crate::onion::types::ResolveResponse {
+        crate::onion::types::ResolveResponse {
+            app_name: "redis".into(),
+            namespace: namespace.into(),
+            vip: "127.128.0.2".into(),
+            port: 6379,
+            healthy_backends: 1,
+            total_backends: 1,
+            backends: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn resolve_picks_the_named_namespace() {
+        let services = vec![service("prod"), service("staging")];
+        let found = select_service(services, "redis", Some("staging")).unwrap();
+        assert_eq!(found.namespace, "staging");
+    }
+
+    #[test]
+    fn resolve_refuses_a_name_in_several_namespaces() {
+        let services = vec![service("prod"), service("staging")];
+        let message = select_service(services, "redis", None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("prod")
+                && message.contains("staging")
+                && message.contains("--namespace"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn resolve_without_a_namespace_takes_the_only_match() {
+        let found = select_service(vec![service("prod")], "redis", None).unwrap();
+        assert_eq!(found.namespace, "prod");
+        assert!(select_service(vec![service("prod")], "redis", Some("dev")).is_err());
+    }
+
+    #[test]
+    fn resolve_prints_the_namespace() {
+        let shown = ResolvedService(service("prod")).to_string();
+        assert!(shown.contains("Namespace: prod"), "{shown}");
+    }
+
+    #[test]
+    fn exec_passes_the_remote_exit_code_through() {
+        use crate::relish::CommandOutcome;
+        assert_eq!(exec_outcome(0), CommandOutcome::Clean);
+        assert_eq!(exec_outcome(3), CommandOutcome::Exited(3));
+        assert_eq!(exec_outcome(255), CommandOutcome::Exited(255));
+        // Outside a process exit code's range: still a failure, never 0.
+        assert_eq!(exec_outcome(256), CommandOutcome::Problems);
+        assert_eq!(exec_outcome(-1), CommandOutcome::Problems);
     }
 
     #[test]
@@ -4084,6 +5572,32 @@ mod tests {
         );
     }
 
+    /// The tokens `relish mcp` makes live a day and renew themselves, so
+    /// they'd always be in the window, and rotating one only gets it
+    /// rejected under `relish mcp` (#1763 review).
+    #[test]
+    fn token_list_doesnt_warn_about_the_tokens_relish_mcp_makes() {
+        use super::super::client::{TokenScopeSummary, TokenSummary};
+        let now = 1_790_337_600;
+        let summary = |name: &str, expires_at: u64| TokenSummary {
+            name: name.to_string(),
+            role: "read-only".to_string(),
+            scope: TokenScopeSummary::default(),
+            created_at: now - 3_600,
+            expires_at: Some(expires_at),
+            last_used: None,
+        };
+        let tokens = [
+            summary("relish-mcp-1790334000-4242", now + 23 * 3_600),
+            summary("relish-mcp-1790000000-17", now - 60),
+            summary("agent", now + 23 * 3_600),
+        ];
+        assert_eq!(
+            token_expiry_warnings(&tokens, now),
+            ["token agent expires in 23h; rotate it with `relish token rotate agent`"]
+        );
+    }
+
     #[tokio::test]
     async fn token_create_errors_when_agent_unreachable() {
         let request = super::super::client::TokenRequest {
@@ -4093,18 +5607,20 @@ mod tests {
             namespaces: None,
             lifetime: super::super::client::TokenLifetime::Default,
             inherit_permissions: false,
+            agent: false,
         };
-        let result = token_create_with_client(&request, &bogus_client()).await;
+        let result = token_create_with_client(&request, OutputFormat::Human, &bogus_client()).await;
         assert!(result.is_err(), "unreachable agent must be an error");
     }
 
     #[tokio::test]
     async fn token_rotate_errors_when_agent_unreachable() {
-        let result = token_rotate_with_client("ci-bot", None, &bogus_client()).await;
+        let result =
+            token_rotate_with_client("ci-bot", None, OutputFormat::Human, &bogus_client()).await;
         assert!(result.is_err(), "unreachable agent must be an error");
     }
 
-    fn write_temp_config(content: &str) -> tempfile::NamedTempFile {
+    pub(super) fn write_temp_config(content: &str) -> tempfile::NamedTempFile {
         let mut f = tempfile::NamedTempFile::new().unwrap();
         f.write_all(content.as_bytes()).unwrap();
         f
@@ -4161,7 +5677,10 @@ spec:
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, RelishError::AgentUnreachable), "got: {err:?}");
+        assert!(
+            matches!(err, RelishError::AgentUnreachable { .. }),
+            "got: {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -4358,174 +5877,41 @@ spec:
         assert!(build_log_options(backwards, 1_750_000_000).is_err());
     }
 
-    fn evidence(app: &str, replicas: u32) -> crate::bun::diagnostics::DesiredAppEvidence {
-        crate::bun::diagnostics::DesiredAppEvidence {
-            app: app.to_string(),
-            namespace: "prod".to_string(),
-            desired_replicas: replicas,
-            scheduled_replicas: 0,
-            placements: Default::default(),
-            service_port: None,
-            blocked: None,
-            volume_home_away: None,
-            unschedulable: None,
-            rollout_failed: None,
-            volume_homes: Vec::new(),
-        }
-    }
-
-    /// #326: an app the namespace quota keeps off every node has no
-    /// instance row, so `relish status` names it and says why.
-    #[test]
-    fn status_names_an_over_quota_app_and_why() {
-        let blocked = crate::bun::diagnostics::DesiredAppEvidence {
-            blocked: Some(crate::meat::quota::QuotaError::CpuExceeded {
-                namespace: "prod".to_string(),
-                current: 0,
-                requested: 1600,
-                limit: 1000,
-            }),
-            ..evidence("greedy", 2)
-        };
-        let output = render_status(&[], &[evidence("fine", 1), blocked]);
-        assert_eq!(
-            output,
-            "no workloads running\n\n\
-             greedy (namespace prod) is not placed, blocked: \
-             namespace \"prod\" would exceed CPU quota: 0+1600 > 1000m\n"
-        );
-    }
-
-    /// #692: an app whose rollout failed shows `RolloutFailed`, where and
-    /// why, and how to clear it.
-    #[test]
-    fn status_names_an_app_whose_rollout_failed() {
-        let failed = crate::bun::diagnostics::DesiredAppEvidence {
-            rollout_failed: Some(crate::meat::deploy_types::RolloutFailure {
-                fingerprint: "abc".to_string(),
-                node: "node-3".to_string(),
-                reason: "web-g2-0 failed its health check".to_string(),
-                at_unix_ms: 1,
-            }),
-            ..evidence("web", 3)
-        };
-        let output = render_status(&[], &[evidence("fine", 1), failed]);
-        assert_eq!(
-            output,
-            "no workloads running\n\n\
-             web (namespace prod) RolloutFailed on node-3: web-g2-0 failed its health check; \
-             apply a different spec or roll back\n"
-        );
-    }
-
-    /// #423: an app waiting for the node that holds its volume isn't just
-    /// missing from the table; status says which node it waits for.
-    #[test]
-    fn status_names_a_volume_app_waiting_for_its_home_node() {
-        let waiting = crate::bun::diagnostics::DesiredAppEvidence {
-            volume_home_away: Some("node-2".to_string()),
-            rollout_failed: None,
-            ..evidence("db", 1)
-        };
-        let output = render_status(&[], &[evidence("fine", 1), waiting]);
-        assert_eq!(
-            output,
-            "no workloads running\n\n\
-             db (namespace prod) waits for node-2, which holds its volume and is out of the \
-             cluster\n"
-        );
-    }
-
-    /// #702: an app placed only in part says how many replicas found a
-    /// node and why the rest didn't.
-    #[test]
-    fn status_says_how_much_of_a_short_app_is_placed_and_why() {
-        let short = crate::bun::diagnostics::DesiredAppEvidence {
-            unschedulable: Some(crate::meat::types::Unschedulable {
-                placed: 2,
-                wanted: 3,
-                reason: crate::meat::types::UnplacedReason::NoRoom,
-            }),
-            ..evidence("web", 3)
-        };
-        let output = render_status(&[], &[evidence("fine", 1), short]);
-        assert_eq!(
-            output,
-            "no workloads running\n\n\
-             web (namespace prod) is unschedulable: placed 2 of 3 replicas: \
-             no node that can run it has room\n"
-        );
-    }
-
-    /// #881: an instance the runtime refused to launch says why under the
-    /// table, so a missing binary isn't just a `failed` cell.
-    #[test]
-    fn status_names_an_instance_that_could_not_launch_and_why() {
-        let row = crate::bun::agent::ClusterInstanceStatus {
-            node: "node-1".to_string(),
-            instance: crate::bun::agent::InstanceStatus {
-                id: "default__ghost-0".to_string(),
-                app_name: "ghost".to_string(),
-                namespace: "default".to_string(),
-                state: "failed".to_string(),
-                restart_count: 0,
-                host_port: None,
-                exit_code: None,
-                pid: None,
-                runtime_unknown: false,
-                status_age_ms: None,
-                reason: Some("binary not found: /opt/ghost/server".to_string()),
-            },
-        };
-        let output = render_status(&[row], &[]);
-        assert!(
-            output.ends_with(
-                "\ndefault__ghost-0 (ghost, namespace default) failed on node-1: \
-                 binary not found: /opt/ghost/server\n"
-            ),
-            "{output}"
-        );
-    }
-
-    #[test]
-    fn status_without_blocked_apps_is_just_the_table() {
-        assert_eq!(
-            render_status(&[], &[evidence("fine", 1)]),
-            "no workloads running\n"
-        );
-    }
-
-    #[tokio::test]
-    async fn status_returns_agent_unreachable() {
-        let err = status_with_client(OutputFormat::Human, &bogus_client())
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RelishError::AgentUnreachable), "got: {err:?}");
-    }
-
     #[tokio::test]
     async fn logs_returns_agent_unreachable() {
         let options = super::super::client::LogOptions::default();
-        let err = logs_with_client("web", "default", &options, &bogus_client())
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RelishError::AgentUnreachable));
+        let err = logs_with_client(
+            "web",
+            "default",
+            &options,
+            OutputFormat::Human,
+            &bogus_client(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, RelishError::AgentUnreachable { .. }));
     }
 
     #[tokio::test]
     async fn exec_returns_agent_unreachable() {
-        let err = exec_with_client("web", "default", &["sh".to_string()], &bogus_client())
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RelishError::AgentUnreachable));
+        let err = exec_with_client(
+            "web",
+            "default",
+            &["sh".to_string()],
+            OutputFormat::Human,
+            &bogus_client(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, RelishError::AgentUnreachable { .. }));
     }
 
     #[tokio::test]
     async fn stop_returns_agent_unreachable() {
-        let err = stop_with_client("web", "default", &bogus_client())
+        let err = stop_with_client("web", "default", OutputFormat::Human, &bogus_client())
             .await
             .unwrap_err();
-        assert!(matches!(err, RelishError::AgentUnreachable));
+        assert!(matches!(err, RelishError::AgentUnreachable { .. }));
     }
 
     #[test]
@@ -4701,6 +6087,7 @@ spec:
             "devcluster",
             "node-01",
             InitSecurityMode::DevelopmentPlaintext,
+            OutputFormat::Human,
         )
         .unwrap();
 
@@ -4713,18 +6100,10 @@ spec:
 
     #[tokio::test]
     async fn inspect_returns_agent_unreachable() {
-        let err = inspect_with_client("web", &bogus_client())
+        let err = inspect_with_client("web", OutputFormat::Human, &bogus_client())
             .await
             .unwrap_err();
-        assert!(matches!(err, RelishError::AgentUnreachable));
-    }
-
-    #[tokio::test]
-    async fn nodes_returns_agent_unreachable() {
-        let err = nodes_with_client(OutputFormat::Human, &bogus_client())
-            .await
-            .unwrap_err();
-        assert!(matches!(err, RelishError::AgentUnreachable), "got: {err:?}");
+        assert!(matches!(err, RelishError::AgentUnreachable { .. }));
     }
 
     #[tokio::test]
@@ -4732,7 +6111,10 @@ spec:
         let err = council_with_client(OutputFormat::Human, &bogus_client())
             .await
             .unwrap_err();
-        assert!(matches!(err, RelishError::AgentUnreachable), "got: {err:?}");
+        assert!(
+            matches!(err, RelishError::AgentUnreachable { .. }),
+            "got: {err:?}"
+        );
     }
 
     #[test]
@@ -4744,7 +6126,7 @@ spec:
             port = 8080
         "#,
         );
-        lint(f.path()).unwrap();
+        lint(f.path(), OutputFormat::Human).unwrap();
     }
 
     #[test]
@@ -4755,19 +6137,168 @@ spec:
             replicas = 3
         "#,
         );
-        let result = lint(f.path());
+        let result = lint(f.path(), OutputFormat::Human);
         assert!(result.is_err());
     }
 
     #[test]
     fn lint_missing_file() {
-        let result = lint(Path::new("/nonexistent/config.toml"));
+        let result = lint(Path::new("/nonexistent/config.toml"), OutputFormat::Human);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn lint_as_json_counts_the_resources_and_carries_the_warnings() {
+        let f = write_temp_config(
+            r#"
+            [app.web]
+            image = "myapp:v1"
+            port = 8080
+
+            [app.worker]
+            exec = "/usr/bin/python3"
+            command = ["worker.py"]
+            [[app.worker.init]]
+            command = ["echo", "hi"]
+
+            [job.migrate]
+            image = "myapp:v1"
+        "#,
+        );
+        let report = lint_report(f.path()).unwrap();
+        insta::assert_snapshot!(format_output(&report, OutputFormat::Json).unwrap());
+        assert_eq!(report.to_string(), "config valid: 2 app(s), 1 job(s)\n");
+    }
+
+    #[test]
+    fn a_rollback_as_json_names_the_app() {
+        let rollback = Rollback {
+            app: "web",
+            namespace: "default",
+            forced: false,
+        };
+        insta::assert_snapshot!(
+            format_output(&rollback, OutputFormat::Json).unwrap(),
+            @r#"
+        {
+          "app": "web",
+          "namespace": "default",
+          "forced": false
+        }
+        "#
+        );
+        assert_eq!(
+            rollback.to_string(),
+            "rolled web back to its previous version\n"
+        );
+    }
+
+    #[test]
+    fn routes_as_json_are_the_list_of_routes() {
+        let routes = RouteTable(vec![crate::wrapper::types::RouteInfo {
+            host: "shop.example.com".to_string(),
+            path: "/".to_string(),
+            app_name: "web".to_string(),
+            namespace: "default".to_string(),
+            healthy_backends: 2,
+            total_backends: 3,
+            websocket: true,
+        }]);
+        insta::assert_snapshot!(format_output(&routes, OutputFormat::Json).unwrap());
+        assert_eq!(
+            RouteTable(Vec::new()).to_string(),
+            "no ingress routes configured\n"
+        );
+    }
+
+    fn stored_line(
+        timestamp: u64,
+        node: &str,
+        instance: &str,
+        stream: crate::ketchup::types::LogStream,
+        line: &str,
+    ) -> crate::ketchup::types::LogEntry {
+        crate::ketchup::types::LogEntry {
+            timestamp,
+            sequence: timestamp * 1_000_000_000,
+            instance: Some(instance.to_string()),
+            node: Some(node.to_string()),
+            stream,
+            line: line.to_string(),
+        }
+    }
+
+    /// #1566: `relish logs -o json` is JSON Lines, one object per log line,
+    /// each saying when, where and on which stream it was written.
+    #[test]
+    fn logs_as_json_are_one_object_per_line() {
+        use crate::ketchup::types::LogStream;
+        let lines = super::super::client::LogLines::Stored(vec![
+            stored_line(
+                1_790_000_000,
+                "node-1",
+                "default__web-0",
+                LogStream::Stdout,
+                "listening on :8080",
+            ),
+            stored_line(
+                1_790_000_001,
+                "node-2",
+                "default__web-1",
+                LogStream::Stderr,
+                r#"{"level":"error","msg":"no \"db\""}"#,
+            ),
+        ]);
+        insta::assert_snapshot!(render_logs(&lines, OutputFormat::Json).unwrap());
+        for line in render_logs(&lines, OutputFormat::Json).unwrap().lines() {
+            let record: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert!(record["text"].is_string(), "{line}");
+        }
+    }
+
+    /// The agent's own capture records only the text, so the other fields
+    /// are `null` rather than guessed.
+    #[test]
+    fn captured_logs_as_json_leave_what_the_capture_lacks_null() {
+        let lines = super::super::client::LogLines::Captured(vec!["hello".to_string()]);
+        assert_eq!(
+            render_logs(&lines, OutputFormat::Json).unwrap(),
+            r#"{"at":null,"node":null,"instance":null,"stream":null,"text":"hello"}"#
+        );
+        let empty = super::super::client::LogLines::Captured(Vec::new());
+        assert_eq!(render_logs(&empty, OutputFormat::Json).unwrap(), "");
+        assert_eq!(render_logs(&empty, OutputFormat::Yaml).unwrap(), "");
+    }
+
+    #[test]
+    fn logs_as_yaml_are_one_list() {
+        use crate::ketchup::types::LogStream;
+        let lines = super::super::client::LogLines::Stored(vec![stored_line(
+            1_790_000_000,
+            "node-1",
+            "default__web-0",
+            LogStream::Stdout,
+            "ready",
+        )]);
+        insta::assert_snapshot!(render_logs(&lines, OutputFormat::Yaml).unwrap());
+    }
+
+    #[tokio::test]
+    async fn following_logs_as_json_is_refused_until_the_stream_says_where_lines_came_from() {
+        let flags = LogFlags {
+            follow: true,
+            ..LogFlags::default()
+        };
+        let error = logs("web", "default", flags, OutputFormat::Json)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--output json or yaml"), "{error}");
     }
 
     // --- relish sign ---
 
-    const MYAPP_V1: &str =
+    pub(super) const MYAPP_V1: &str =
         "sha256:1111111111111111111111111111111111111111111111111111111111111111";
     const MYAPP_V2: &str =
         "sha256:2222222222222222222222222222222222222222222222222222222222222222";
@@ -4905,35 +6436,6 @@ spec:
     }
 
     #[test]
-    fn status_names_lost_images_and_stays_quiet_otherwise() {
-        let mut registry = crate::pickle::capability::RegistryCapabilityEvidence::default();
-        assert_eq!(render_lost_images(&registry), "");
-
-        registry.lost_images = vec!["web:v1".into(), "api@sha256:abc".into()];
-        registry.lost_image_count = 3;
-
-        assert_eq!(
-            render_lost_images(&registry),
-            "registry: 3 lost image(s), no live node holds them: web:v1, api@sha256:abc \
-             and 1 more; re-push them\n"
-        );
-    }
-
-    #[test]
-    fn status_says_once_that_a_plaintext_registry_needs_mtls() {
-        let mut registry = crate::pickle::capability::RegistryCapabilityEvidence::default();
-        assert_eq!(render_registry_needs_mtls(&registry), "");
-
-        registry.needs_mtls = true;
-
-        let line = render_registry_needs_mtls(&registry);
-        assert_eq!(line.lines().count(), 1, "{line}");
-        assert!(line.starts_with("registry: "), "{line}");
-        assert!(line.contains("needs mTLS"), "{line}");
-        assert!(line.contains("relish init"), "{line}");
-    }
-
-    #[test]
     fn image_delete_reads_repository_and_tag() {
         assert_eq!(parse_image_tag("web:v1").unwrap(), ("web", "v1"));
         assert_eq!(
@@ -4983,7 +6485,7 @@ spec:
     fn sign_keygen_writes_an_owner_only_key_and_refuses_to_overwrite() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("image-signing.pem");
-        sign_keygen(&path).unwrap();
+        sign_keygen(&path, OutputFormat::Human).unwrap();
 
         let key = crate::pickle::signing::SigningKey::from_pem(&fs::read_to_string(&path).unwrap());
         assert!(key.is_ok(), "the written key must load back: {key:?}");
@@ -4994,7 +6496,7 @@ spec:
             assert_eq!(mode, 0o600);
         }
         assert!(matches!(
-            sign_keygen(&path),
+            sign_keygen(&path, OutputFormat::Human),
             Err(RelishError::FileExists { .. })
         ));
     }
@@ -5043,7 +6545,7 @@ mod task_array_tests {
     async fn run_batch_sends_and_prints_an_idempotency_key() {
         let (client, seen, server) = key_recording_server().await;
         let mut err = Vec::new();
-        run_task_array_with_client(run(), &client, &mut err)
+        run_task_array_with_client(run(), OutputFormat::Human, &client, &mut err)
             .await
             .unwrap();
         server.abort();
@@ -5059,19 +6561,50 @@ mod task_array_tests {
         );
     }
 
+    /// #1424: a `warn` policy's finding in the answer is printed as a
+    /// warning, so `relish run --batch` says what `relish apply` would.
+    #[tokio::test]
+    async fn run_batch_prints_the_policy_warnings_in_the_answer() {
+        let app = axum::Router::new().route(
+            "/v1/batch/array",
+            axum::routing::post(|| async {
+                axum::Json(serde_json::json!({
+                    "batch_id": 7, "count": 1, "chunks": 1,
+                    "policy_warnings": ["policy pinned warns about job default/render: pin it"],
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client =
+            BunClient::new_with_token(&format!("http://{}", listener.local_addr().unwrap()), None);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut err = Vec::new();
+        run_task_array_with_client(run(), OutputFormat::Human, &client, &mut err)
+            .await
+            .unwrap();
+        server.abort();
+        let printed = String::from_utf8(err).unwrap();
+        assert!(
+            printed.contains("warning: policy pinned warns about job default/render: pin it"),
+            "{printed}"
+        );
+    }
+
     #[tokio::test]
     async fn explicit_idempotency_key_is_sent_unchanged() {
         let (client, seen, server) = key_recording_server().await;
         let mut retry = run();
         retry.idempotency_key = Some("retry-after-timeout-1".into());
         let mut err = Vec::new();
-        run_task_array_with_client(retry, &client, &mut err)
+        run_task_array_with_client(retry, OutputFormat::Human, &client, &mut err)
             .await
             .unwrap();
         let mut bad = run();
         bad.idempotency_key = Some("has a space".into());
         assert!(
-            run_task_array_with_client(bad, &client, &mut Vec::new())
+            run_task_array_with_client(bad, OutputFormat::Human, &client, &mut Vec::new())
                 .await
                 .is_err()
         );
@@ -5102,7 +6635,7 @@ mod task_array_tests {
                 format!("[job.cleanup]\nimage = 'cleanup:v1'\n{policy}\n"),
             )
             .unwrap();
-            assert!(lint(file.path()).is_err(), "{policy}");
+            assert!(lint(file.path(), OutputFormat::Human).is_err(), "{policy}");
         }
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(
@@ -5110,7 +6643,7 @@ mod task_array_tests {
             "[job.cleanup]\nimage = 'cleanup:v1'\nschedule = '@daily'\nmax_attempts = 2\ntask_timeout_secs = 300\noverlap = 'allow'\nreplay_unknown = true\n",
         )
         .unwrap();
-        lint(file.path()).unwrap();
+        lint(file.path(), OutputFormat::Human).unwrap();
     }
 
     fn run() -> TaskArrayRun {
@@ -5302,6 +6835,322 @@ mod task_array_tests {
              \x20        8         1  failed          -     600000\n\
              (more rows exist in this page)\n\
              (couldn't reach node-3; their tasks are missing)\n"
+        );
+    }
+}
+
+/// #1566: the JSON shape of every command, one snapshot each.
+#[cfg(test)]
+mod json_shapes {
+    use super::*;
+
+    fn json<T: serde::Serialize + std::fmt::Display>(value: &T) -> String {
+        format_output(value, OutputFormat::Json).unwrap()
+    }
+
+    #[test]
+    fn app_changes_as_json_name_the_action() {
+        let mut delete = AppChange::new(AppAction::DeleteRequested, "web", "shop");
+        delete.forced = true;
+        insta::assert_snapshot!(
+            "stop",
+            json(&AppChange::new(AppAction::StopRequested, "web", "shop"))
+        );
+        insta::assert_snapshot!("delete", json(&delete));
+        insta::assert_snapshot!(
+            "release",
+            json(&AppChange::new(AppAction::Released, "web", "shop"))
+        );
+        assert_eq!(
+            AppChange::new(AppAction::Released, "web", "shop").to_string(),
+            "released web in shop; relish apply and GitOps manage it again\n"
+        );
+    }
+
+    #[test]
+    fn exec_as_json_carries_the_exit_code_and_output() {
+        let command = ["cat".to_string(), "/ready".to_string()];
+        insta::assert_snapshot!(json(&ExecReport {
+            app: "web",
+            namespace: "default",
+            command: &command,
+            exit_code: 1,
+            output: "cat: /ready: No such file or directory\n",
+        }));
+    }
+
+    #[test]
+    fn logs_export_and_search_as_json() {
+        let here = ExportLanding::parse("/tmp/archive").unwrap();
+        insta::assert_snapshot!("export", json(&ExportReport::new(&here, "node-1", 2, 4096)));
+        insta::assert_snapshot!(
+            "search",
+            json(&SearchRows(vec![serde_json::json!({"count": 3})]))
+        );
+        assert_eq!(SearchRows(Vec::new()).to_string(), "(no results)\n");
+    }
+
+    #[test]
+    fn init_join_and_council_reports_as_json_name_files_not_secrets() {
+        insta::assert_snapshot!(
+            "init",
+            json(&InitReport {
+                cluster: "prod".to_string(),
+                node: "node-01".to_string(),
+                node_config: PathBuf::from("/etc/reliaburger/reliaburger.toml"),
+                app_config: PathBuf::from("/etc/reliaburger/app.toml"),
+                master_key: PathBuf::from("/etc/reliaburger/prod-master.key"),
+                security_bootstrap: PathBuf::from("/etc/reliaburger/prod-security-bootstrap.json"),
+                identity_dir: PathBuf::from("/etc/reliaburger/identity"),
+                sealed_root_ca: "/etc/reliaburger/prod-root-ca.age".to_string(),
+                root_ca_fingerprint: "sha256:ab12".to_string(),
+                development_plaintext: false,
+            })
+        );
+        insta::assert_snapshot!(
+            "join",
+            json(&JoinReport {
+                node: "node-02".to_string(),
+                identity_dir: PathBuf::from("identity"),
+                root_ca_fingerprint: "sha256:ab12".to_string(),
+            })
+        );
+        insta::assert_snapshot!(
+            "recover",
+            json(&RecoveryReport {
+                restored_apps: 4,
+                api_tokens: 2,
+                previous_epoch: 0,
+                recovery_epoch: 1,
+                recovery_id: Some("r-1".to_string()),
+                data_dir: PathBuf::from("/var/lib/reliaburger"),
+            })
+        );
+        insta::assert_snapshot!(
+            "re_enrol",
+            json(&ReenrolReport {
+                data_dir: PathBuf::from("/var/lib/reliaburger"),
+                replaced_at_epoch: Some(1),
+            })
+        );
+    }
+
+    #[test]
+    fn config_commands_as_json() {
+        let old = super::tests::write_temp_config("[app.web]\nimage = \"web:v1\"\nport = 8080\n");
+        let new = super::tests::write_temp_config("[app.web]\nimage = \"web:v2\"\nport = 8080\n");
+        let diff = super::super::diff::diff_configs(
+            &load_config_file(old.path()).unwrap(),
+            &load_config_file(new.path()).unwrap(),
+        );
+        insta::assert_snapshot!("diff", json(&diff));
+        let compiled = CompileReport::from(super::super::compile::compile(new.path()).unwrap());
+        let compiled_json: serde_json::Value = serde_json::from_str(&json(&compiled)).unwrap();
+        assert_eq!(compiled_json["config"]["app"]["web"]["image"], "web:v2");
+        assert_eq!(compiled_json["files"].as_array().unwrap().len(), 1);
+        insta::assert_snapshot!(
+            "fmt",
+            json(&FormatReport {
+                path: Path::new("app.toml"),
+                result: FormatResult::Formatted,
+            })
+        );
+    }
+
+    #[cfg(feature = "kubernetes")]
+    #[test]
+    fn kubernetes_import_and_export_as_json() {
+        let file = super::tests::write_temp_config(super::tests::K8S_DEPLOYMENT);
+        let imported =
+            super::super::k8s_import::import_kubernetes(&[file.path().to_path_buf()]).unwrap();
+        insta::assert_snapshot!(
+            "import",
+            json(&ImportReport {
+                config: &imported.config,
+                report: &imported.report,
+            })
+        );
+        let exported = super::super::k8s_export::export_kubernetes(&imported.config).unwrap();
+        let export: serde_json::Value = serde_json::from_str(&json(&KubernetesExport {
+            manifests: &exported.yaml,
+            report: &exported.report,
+        }))
+        .unwrap();
+        assert!(
+            export["manifests"]
+                .as_str()
+                .unwrap()
+                .contains("kind: Deployment")
+        );
+        assert!(export["report"]["resources_created"].is_array());
+    }
+
+    #[test]
+    fn cluster_settings_as_json() {
+        insta::assert_snapshot!(
+            "gitops_set",
+            json(&GitopsChange {
+                enabled: true,
+                config: Some(Path::new("gitops.toml")),
+            })
+        );
+        insta::assert_snapshot!(
+            "gitops_disable",
+            json(&GitopsChange {
+                enabled: false,
+                config: None,
+            })
+        );
+        insta::assert_snapshot!(
+            "message",
+            json(&super::super::output::Message {
+                message: "token ci revoked".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn image_commands_as_json() {
+        insta::assert_snapshot!(
+            "sign",
+            json(&SignReport {
+                image: "web:v1",
+                digest: super::tests::MYAPP_V1,
+                message: "signature attached".to_string(),
+            })
+        );
+        insta::assert_snapshot!(
+            "sign_keygen",
+            json(&SigningKeyReport {
+                path: Path::new("image.key"),
+                public_key: "MCowBQYDK2VwAyEA".to_string(),
+            })
+        );
+        insta::assert_snapshot!(
+            "images_delete",
+            json(&DeletedTag {
+                repository: "team/web",
+                tag: "v1",
+            })
+        );
+        insta::assert_snapshot!(
+            "build",
+            json(&BuildReport {
+                images: vec![BuiltImage {
+                    name: "web".to_string(),
+                    context_digest: super::tests::MYAPP_V1.to_string(),
+                    build_id: 7,
+                    image: "team/web:v1".to_string(),
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn batch_commands_as_json() {
+        insta::assert_snapshot!(
+            "submit_dry_run",
+            json(&ManifestCheck {
+                valid: true,
+                profiles: 2,
+                tasks: 40,
+            })
+        );
+        insta::assert_snapshot!(
+            "replay",
+            json(&RunChange {
+                run: 42,
+                change: RunChangeKind::ReplayAcknowledged,
+                node: Some("node-2"),
+            })
+        );
+        insta::assert_snapshot!(
+            "cancel",
+            json(&RunChange {
+                run: 42,
+                change: RunChangeKind::Cancelled,
+                node: None,
+            })
+        );
+        insta::assert_snapshot!(
+            "task_logs",
+            json(&TaskOutput {
+                run: 42,
+                index: 3,
+                output: "exit 1\n".to_string(),
+            })
+        );
+        // `batch watch` is JSON Lines: one compact sample per line.
+        let sample = WatchSample(serde_json::json!({"done": false, "total": 10}));
+        assert_eq!(
+            serde_json::to_string(&sample).unwrap(),
+            r#"{"done":false,"total":10}"#
+        );
+    }
+
+    /// #1566: a new token's secret is in the JSON, once, as it is on a
+    /// terminal; nothing else that's secret is.
+    #[test]
+    fn issued_tokens_as_json_carry_the_secret_once() {
+        let apps = vec!["web".to_string()];
+        insta::assert_snapshot!(
+            "token_create",
+            json(&IssuedTokenReport {
+                name: "ci",
+                role: Some("deployer"),
+                apps: Some(&apps),
+                namespaces: None,
+                token: "rbt_secret",
+                expires_at: Some(1_800_000_000),
+                previous_valid_until: None,
+            })
+        );
+        insta::assert_snapshot!(
+            "token_rotate",
+            json(&IssuedTokenReport {
+                name: "ci",
+                role: None,
+                apps: None,
+                namespaces: None,
+                token: "rbt_new_secret",
+                expires_at: None,
+                previous_valid_until: Some(1_790_000_000),
+            })
+        );
+        insta::assert_snapshot!(
+            "join_token_create",
+            json(&JoinTokenReport {
+                node_id: "node-02",
+                ttl_secs: 900,
+                token: "rbj_secret",
+            })
+        );
+    }
+
+    #[test]
+    fn secrets_and_snapshots_as_json() {
+        insta::assert_snapshot!(
+            "pubkey",
+            json(&PublicKey {
+                namespace: Some("shop"),
+                public_key: "age1xyz".to_string(),
+            })
+        );
+        insta::assert_snapshot!(
+            "encrypt",
+            json(&Encrypted {
+                encrypted: "ENC[AGE:abc]".to_string(),
+            })
+        );
+        insta::assert_snapshot!(
+            "snapshot_restore",
+            json(&SnapshotChange {
+                change: SnapshotChangeKind::Restored,
+                app: "db",
+                namespace: "default",
+                snapshot: "nightly",
+                volume: None,
+            })
         );
     }
 }

@@ -2,7 +2,7 @@
 
 **A whitepaper on the design, architecture, and vision for Reliaburger, a radically simplified container orchestration platform written in Rust.**
 
-**Version 0.2.0, October 2026**
+**Version 0.2.8, November 2026**
 
 ---
 
@@ -20,6 +20,7 @@ We believe that:
 8. Configuration should be measured in lines, not pages.
 9. The default experience should be production-ready, not a starting point for further assembly.
 10. Open source means open source. No bait-and-switch. No relicensing.
+11. Trust comes from scrutiny anyone can repeat, not from how many people run the code.
 
 ---
 
@@ -41,15 +42,16 @@ We believe that:
 - [14. GitOps](#14-gitops)
 - [15. Observability](#15-observability)
 - [16. Debugging & Tooling (Relish)](#16-debugging--tooling-relish)
-- [17. Process Workloads (Non-Container)](#17-process-workloads-non-container)
-- [18. Fault Injection (Smoker)](#18-fault-injection-smoker)
-- [19. Testing & Benchmarks](#19-testing--benchmarks)
-- [20. Self-Upgrades](#20-self-upgrades)
-- [21. Multi-Cluster (Franchise)](#21-multi-cluster-franchise)
-- [22. What's Deliberately Not Included](#22-whats-deliberately-not-included)
-- [23. Comparison Matrix](#23-comparison-matrix)
-- [24. Licensing](#24-licensing)
-- [25. Questions & Answers](#25-questions--answers)
+- [17. Built for Humans and Their Agents](#17-built-for-humans-and-their-agents)
+- [18. Process Workloads (Non-Container)](#18-process-workloads-non-container)
+- [19. Fault Injection (Smoker)](#19-fault-injection-smoker)
+- [20. Testing & Benchmarks](#20-testing--benchmarks)
+- [21. Self-Upgrades](#21-self-upgrades)
+- [22. Multi-Cluster (Franchise)](#22-multi-cluster-franchise)
+- [23. What's Deliberately Not Included](#23-whats-deliberately-not-included)
+- [24. Comparison Matrix](#24-comparison-matrix)
+- [25. Licensing](#25-licensing)
+- [26. Questions & Answers](#26-questions--answers)
 
 ---
 
@@ -83,17 +85,45 @@ That's eight separate systems (on top of Kubernetes itself) to install, configur
 
 K3s, k0s, and MicroK8s make Kubernetes smaller. They reduce binary size and resource footprint. But they maintain full API compatibility with upstream Kubernetes, which means they inherit all of its conceptual complexity. You still need to understand Pods, Deployments, ReplicaSets, Services, Endpoints, Ingresses, ConfigMaps, Secrets, PersistentVolumeClaims, StatefulSets, DaemonSets, CRDs, RBAC, NetworkPolicies, and dozens of other resource types. The YAML is the same. The learning curve is the same. The ecosystem sprawl is the same.
 
+### Popularity Stopped Being a Security Model
+
+For a long time we judged how safe infrastructure software was by how many people ran it. "Given enough eyeballs, all bugs are shallow", as [Linus's Law](https://en.wikipedia.org/wiki/Linus%27s_law) puts it, so the popular project was the safe bet. It was never as true as it sounded. [Heartbleed](https://heartbleed.com/) sat in OpenSSL, under much of the internet's TLS, for over two years. [Log4Shell](https://www.cisa.gov/news-events/news/apache-log4j-vulnerability-guidance) was in every Log4j from 2.0-beta9 to 2.14.1. The [xz backdoor](https://www.openwall.com/lists/oss-security/2024/03/29/4) was caught because one engineer wondered why ssh logins were using so much CPU, in a project its maintainer called ["an unpaid hobby project"](https://research.swtch.com/xz-timeline).
+
+In 2026 the heuristic stopped working altogether, because finding bugs became cheap, and the CVE count shows it. 2025 ended at a record 48,185 CVEs by Jerry Gamblin's count ([via Trend Micro](https://www.trendmicro.com/es_mx/research/26/g/making-sense-of-the-vulnpocalypse.html)). 2026 then crossed 1,000 a week for the first time in March ([Gamblin](https://jgamblin.github.io/FirstForecast/)), and by RuntimeWire's count of the NVD API, January to October 2026 brought 92,319 CVEs against 41,213 in the same months of 2025, with 17,481 in October alone against 4,389 a year earlier ([RuntimeWire](https://runtimewire.com/article/nvd-recorded-2-24-times-as-many-cves-from-january-through-october-as-in-the-same)). The Linux kernel's own CNA published 5,683 CVEs in all of 2025 and 8,311 in 2026 by 7 November, peaking at 2,118 in September, by Linux CVE Tracker's count from NVD ([2025](https://linuxcvetracker.com/cve-statistics/2025/), [2026](https://linuxcvetracker.com/cve-statistics/2026/)). Those are third parties' counts of public data, and the causes are mixed: Trend Micro names AI-assisted discovery as one of three drivers, beside changes in reporting and sheer product sprawl, and in May Gamblin put AI-discovered CVEs at under 1% of the total. But the AI-found share is the part that's growing. In November OpenAI reported that one run of an unreleased model built working root exploits for 948 distinct Linux kernel bugs, for about $1.2 million in API credits ([OpenAI](https://openai.com/index/a-thousand-fewer-paths-to-root/), [SecurityWeek](https://www.securityweek.com/ai-agents-got-root-on-linux-via-948-kernel-flaws-in-openai-research/)), and Anthropic's Mythos Preview scanned more than 1,000 open-source projects and estimated 6,202 high- or critical-severity vulnerabilities among them ([Anthropic](https://www.anthropic.com/research/glasswing-initial-update)). Popularity used to mean more people looking. Now machines look at popular code at industrial scale, defenders and attackers alike, and they find bugs faster than most teams can upgrade.
+
+So we don't ask you to trust Reliaburger because many people run it. Few do yet. We ask you to trust it because anyone can check it, any model can read it, and a fix reaches every node in one upgrade. That's a design goal (§2), and it's one of the main reasons the project exists.
+
 ### The Opportunity
 
 There's a large and growing market of teams who need more than Docker Compose (which doesn't do multi-node or rolling deploys) but far less than Kubernetes. These teams typically have 2-200 nodes, run web applications and APIs behind load balancers, and want their containers running reliably without dedicating a full-time platform engineering team to the task.
 
-Reliaburger is built for these teams. It's one node agent (`bun`) and one CLI (`relish`), and the agent includes everything you need to run containers in production: scheduling, networking, ingress with built-in TLS (from the cluster's own CA or your certificate; automatic ACME certificates are planned, [#369](https://github.com/reliaburger/reliaburger/issues/369)), service discovery, a container image registry, log collection, metrics and dashboards, GitOps, and a web UI. No plugins. No ecosystem to assemble. No YAML to wrestle.
+Reliaburger is built for these teams. It's one node agent (`bun`) and one CLI (`relish`), and the agent includes everything you need to run containers: scheduling, networking, ingress with built-in TLS (from the cluster's own CA or your certificate; automatic ACME certificates are planned for 0.4.0, [#1667](https://github.com/reliaburger/reliaburger/issues/1667)), service discovery, a container image registry, log collection, metrics and dashboards, GitOps, and a web UI. No plugins. No ecosystem to assemble. No YAML to wrestle. Until 1.0.0, though, it's good enough for home labs and dev clusters, not production.
 
-The architecture is designed for 10,000 nodes to provide headroom, but the primary audience is teams with 2-200 nodes who benefit from a single, well-tested architecture rather than separate solutions for small and large clusters.
+The architecture is designed for 10,000 nodes to provide headroom, but the primary audience is teams with 2-200 nodes who benefit from a single, well-tested architecture rather than separate solutions for small and large clusters. Those are design targets, not measurements: every release is soaked on three nodes, and the [hollow-node record](qualification/2026-10-28-hollow-nodes.md) found limits at 500 and 1,000 nodes ([#1411](https://github.com/reliaburger/reliaburger/issues/1411), [#1412](https://github.com/reliaburger/reliaburger/issues/1412), [#1413](https://github.com/reliaburger/reliaburger/issues/1413)).
+
+More and more of those teams work with an LLM agent beside them. From 0.2.7 Reliaburger is built for both: every `relish` carries its own source, so an agent can trace a bug to the exact function, prove a fix on a throwaway cluster and draft a report for a human to post, and because releases come in days and upgrades take one command, the fix comes back to the team quickly. Section 17 describes that loop.
+
+The same gap exists for AI work, and it's wider. A team with 8 to 256 GPUs that wants to serve models, fine-tune them and run the product around them has two incumbents. On Kubernetes, serving one model well takes a dozen or more extra projects: a GPU operator, a gang scheduler, an inference gateway, an autoscaler, a model cache. Slurm doesn't run services at all. Reliaburger plans to serve that team from the same single binary: GPUs as first-class devices, model serving, multi-node groups and fair sharing of a cluster between teams. None of it ships yet; the [release order](roadmap.md#releases-after-010) says when each part is due, and the [LLM workloads research](plans/2026-10-11-research-llm-workloads.md) says why.
 
 ---
 
 ## 2. Design Goals
+
+### Trust from Scrutiny, Not Popularity
+
+One goal comes before the numbers. If bugs are now found by machines at the scale §1 describes, an orchestrator is only as safe as three things: how quickly a fix reaches every node, how easily anyone can check the code, and how little code there is to check. Reliaburger is built around all three. Each part below says what exists and what doesn't yet.
+
+**One thing to upgrade.** On Kubernetes a security fix lands in one of many places. The operating system, Kubernetes itself, etcd, containerd, the CNI, the ingress controller, cert-manager, Prometheus, Grafana, the log stack, Argo CD and the registry each ship on their own release cycle and publish their own advisories, so staying patched means tracking a dozen cycles, and one forgotten version is enough. Reliaburger compiles scheduling, ingress, the registry, metrics, logs, PKI, consensus and GitOps into `bun`, so a fix is a new `bun`, and `relish upgrade start` rolls it across the cluster: workers first, then council members one at a time, then the leader, each binary signature-checked, with automatic rollback (§21). `relish agent upgrade-check` says whether the cluster can take it now. The releases come quickly, sixteen in the 45 days from 0.1.0 on 29 September to 0.2.8 on 12 November 2026 ([roadmap](roadmap.md#releases-after-010)). One advisory stream covers the whole platform, our own issues plus RustSec for the crates in `Cargo.lock`, and an advisory nobody has reviewed fails the dependency audit, and with it the release: 0.2.6's first candidate failed on one published against `arrow` that morning, and the second, with the fixed `arrow`, shipped ([release log](release-log.md#026-the-rest-of-the-evaluations-bugs-and-setup-over-ssh)). For contrast, Kubernetes's own [CVE feed](https://kubernetes.io/docs/reference/issues-security/official-cve-feed/) lists 95 CVEs from 2017 to 10 November 2026, 13 of them in 2026, and covers only what Kubernetes's security committee announces; one add-on, ingress-nginx, had a 9.8 [in March 2025](https://www.wiz.io/blog/ingress-nginx-kubernetes-vulnerabilities) that Wiz found in about 43% of cloud environments.
+
+The operating system is the one cycle Reliaburger doesn't own yet. 0.3.0, "Bare metal in an hour", plans to: an appliance image (our own mkosi build of Ubuntu 26.04) with `bun` as its only service, no SSH and no package manager, a read-only, verified `/usr`, netbooted over the LAN from a planned netboot command in `relish`, and signed weekly OS builds that `bun` rolls out to the cluster's pinned version with A/B slots and a fallback boot ([roadmap](roadmap.md#releases-after-010), [research](https://github.com/reliaburger/reliaburger/pull/218)). That's planned, not shipped. Two smaller limits apply today: a person starts every upgrade (the cluster upgrades itself, but it doesn't decide to), and before 1.0 a release that changes a wire or storage format needs a fresh cluster rather than a rolling upgrade.
+
+**Continuously scrutinised, by people and by models.** The code is Apache 2.0 (§25), and every release `relish` carries the exact source it was built from, identified by its SHA-256 (§17.3). `relish agent source` lets any agent search and read that code, and `relish agent patch` builds a fix, runs the tests and boots a throwaway cluster from it. That loop is measured: in 0.2.7's exit test Claude Code, holding a read-only token, found a bug we had planted in the source and patched it in 5 of 5 runs ([record](qualification/2026-11-06-v0.2.7-exit-test.md)). Machines check the code on a schedule: nine fuzz targets run nightly over the decoders that read untrusted bytes, mutation testing runs on every pull request that touches `src/` and weekly, and the RustSec dependency audit runs on every pull request and weekly. LLM agents have reviewed the code too, but only in audits someone starts, such as the one before 0.1.5 that ran three source-review agents in parallel and produced 28 issues ([record](qualification/2026-10-03-codebase-audit/README.md)). Continuous LLM scrutiny, a scheduled review of the whole code base whose findings are published as it runs, is a design goal for 1.0 ([#1840](https://github.com/reliaburger/reliaburger/issues/1840)). It isn't built yet.
+
+**Ten times less code, counted the same way.** We counted Reliaburger and the Kubernetes projects that cover the same features with one tool and one set of rules: code lines of each project's main language, without blanks, comments, tests, vendored or marked-generated code, docs or examples ([record](qualification/2026-11-10-loc-comparison.md)). Reliaburger's `src/` is 202,730 lines of Rust. Kubernetes, etcd, containerd, CoreDNS, ingress-nginx, cert-manager, Prometheus, Alertmanager, Loki, Grafana's backend, Argo CD, distribution and Cilium, at their latest releases, are 2,134,280 lines of Go: 10.5 times as much. Leave out Cilium and Grafana, the two that do the most beyond Reliaburger, and it's 6.7 times. runc isn't in the comparison, because Reliaburger runs containers with it, and nor is Helm, which Reliaburger has no equivalent of. Those thirteen projects declare 698 distinct direct Go module dependencies and 1,194 in all; Reliaburger has 66 direct and 521 crate versions in all (`cargo tree -e normal --target x86_64-unknown-linux-gnu`). Lines aren't bugs, Go is wordier than Rust, and the Kubernetes side does things Reliaburger doesn't (the record lists them). The evidence for why less code in Rust helps is narrower than "fewer lines, fewer bugs": in Android, vulnerabilities concentrate in new and recently changed code, and memory-safety vulnerabilities per line of Rust ran about a thousand times lower than in C and C++ ([Google, 2024](https://security.googleblog.com/2024/09/eliminating-memory-safety-vulnerabilities-Android.html), [Google, 2025](https://security.googleblog.com/2025/11/rust-in-android-move-fast-fix-things.html)).
+
+**What this doesn't cover.** One binary is also one target: a bug in `bun` is on every node at once. Until the 0.3.0 appliance image ships, the host patches separately: a Linux node needs the kernel, glibc and packages such as `runc` and `nftables` (§3.1), and the [runc container escapes of November 2025](https://www.openwall.com/lists/oss-security/2025/11/05/3) would have reached a Reliaburger node through them too. And the crates inside the binary bring their own advisories: on 26 October 2026 RustSec published 13 against one compression crate, which 0.2.3 shipped with under a dated, reviewed exception ([record](qualification/2026-10-26-dependency-exceptions.md)).
+
+### Quantitative Targets
 
 Reliaburger is designed to meet the following quantitative targets. These engineering constraints inform every architectural decision in this document. A target isn't a result: the last column says which ones a release has measured, and links the record in [`qualification/`](qualification/). Everything marked "Target (unmeasured)" is a design goal no release has checked yet.
 
@@ -109,7 +139,9 @@ Reliaburger is designed to meet the following quantitative targets. These engine
 | Cold start (new node joins and accepts work) | < 60 seconds | Target (unmeasured) |
 | Image distribution to N total copies (default 2: the pusher plus one peer) | < 30 seconds per layer (replicated asynchronously by the leader's heal loop) | Target (unmeasured) |
 | Idle node memory | No target | 63 MiB RSS for a single-node cluster, 48 MiB standalone, on macOS before the release candidate ([record](qualification/2026-10-11-idle-node-memory.md), Q15); Linux unmeasured |
-| GPU scheduling | First-class resource, whole-device allocation | Planned ([#359](https://github.com/reliaburger/reliaburger/issues/359)); not in the binary |
+| GPU scheduling | First-class resource: whole devices, allocated by identity and topology | Planned for 0.6.0 ([#359](https://github.com/reliaburger/reliaburger/issues/359)); not in the binary |
+| Faulty GPU detected and its node cordoned | < 2 minutes | Planned for 0.6.0; not in the binary |
+| Multi-node group restarted on a spare node after losing a node | < 5 minutes | Planned for 0.8.0; not in the binary |
 | Minimum kernel version | Linux 5.8+ (for eBPF CO-RE, BTF, BPF_LINK support and the boot-time clock helper) | Requirement |
 | cgroup version | v2 (required for eBPF service discovery and resource isolation) | Requirement |
 
@@ -121,7 +153,11 @@ Reliaburger is designed to meet the following quantitative targets. These engine
 
 **100 million jobs per day** demands a scheduler (Meat) that can make placement decisions at high throughput without becoming a bottleneck. At a sustained rate, this is over a thousand jobs dispatched per second. The design implications (batch scheduling, delegated execution, and asynchronous reporting) are detailed in [design/scheduler-meat.md](design/scheduler-meat.md).
 
-**GPU as a first-class schedulable resource** means that AI/ML workloads aren't a day-two feature. This is a target, not current behaviour: no release allocates a GPU. Today the Bun agent detects NVIDIA GPUs at startup (it probes `/dev/nvidia0` and parses `nvidia-smi`, so no vendor library is linked into the binary) and refuses a workload that asks for more cards than the node has, or any card when GPU support is off. Nothing passes `/dev/nvidia*` into a container yet, and the count doesn't reach the cluster scheduler, so `relish apply` refuses any `gpu` above 0 and the agent refuses one too, rather than start a workload without its device. Propagating GPU capacity (backlog item F01) and passing the `/dev/nvidia*` devices into the container's OCI spec (see [design/agent-bun.md](design/agent-bun.md) §5.4) are both planned ([#359](https://github.com/reliaburger/reliaburger/issues/359)); the [roadmap](roadmap.md#releases-after-010) lists GPU scheduling under "Later", after 0.4.0.
+**GPU as a first-class schedulable resource** means that AI/ML workloads aren't a day-two feature. This is a target, not current behaviour: no release allocates a GPU. Today the Bun agent detects NVIDIA GPUs at startup (it probes `/dev/nvidia0` and parses `nvidia-smi`, so no vendor library is linked into the binary) and refuses a workload that asks for more cards than the node has, or any card when GPU support is off. Nothing passes `/dev/nvidia*` into a container yet, and the count doesn't reach the cluster scheduler, so `relish apply` refuses any `gpu` above 0 and the agent refuses one too, rather than start a workload without its device. Propagating GPU capacity (backlog item F01, [#359](https://github.com/reliaburger/reliaburger/issues/359)), assigning devices by identity and topology, and injecting them into the container through the Container Device Interface (CDI) are planned for 0.6.0, together with GPU health checks and per-container GPU metrics (see [design/agent-bun.md](design/agent-bun.md) §5.4 for the original device design). Model serving, multi-node groups and fair share follow in 0.7.0, 0.8.0 and 0.10.0 ([roadmap](roadmap.md#releases-after-010)).
+
+**A faulty GPU detected and cordoned within two minutes** is the bar GPU clouds are now graded on ([ClusterMAX](https://newsletter.semianalysis.com/p/clustermax-30-the-industry-standard)). Hardware fails constantly at scale: Meta's Llama 3 run on 16,000 GPUs saw 419 unexpected interruptions in 54 days, most of them GPUs and their memory ([paper](https://arxiv.org/html/2407.21783)). The target is planned for 0.6.0 and unmeasured.
+
+**A multi-node group restarted on a spare within five minutes** is what keeps a training run's lost work bounded without a human: diagnose, cordon, resume from the latest checkpoint. It's planned for 0.8.0 and unmeasured.
 
 **Recovery from the loss of any single node, the leader, or the entire council** means that none of these failures interrupts the data plane. Applications continue running when the control plane is unavailable. Losing a node, the leader or a minority of council voters heals without an operator. Losing the whole council is the exception: an operator restores the desired state from a sealed backup (§8.3), because that recovery throws away Raft history and a human should choose which backup wins.
 
@@ -133,7 +169,7 @@ Reliaburger is designed to meet the following quantitative targets. These engine
 
 Reliaburger ships as two binaries: `bun`, the node agent, and `relish`, the CLI. Every component of a node (the scheduler, ingress proxy, image registry, metrics store, log collector, GitOps engine, eBPF service discovery, and web UI) is compiled into `bun`. There's no separate control-plane binary and no plugin to pick, and the two binaries come from one release, so there's no compatibility matrix between components.
 
-The binaries aren't static. Release builds link glibc (`*-linux-gnu`), and a Linux node needs a few host packages: `runc`, `uidmap`, `iptables`, `iproute2`, `nftables` and `btrfs-progs` (the [Linux servers guide](linux-servers.md#1-prerequisites-and-network-requirements) installs them). Static musl builds are planned with the 0.3.0 appliance ([#401](https://github.com/reliaburger/reliaburger/issues/401)).
+The binaries aren't static. Release builds link glibc (`*-linux-gnu`), and a Linux node needs a few host packages: `runc`, `uidmap`, `iptables`, `iproute2`, `nftables` and `btrfs-progs` (the [Linux servers guide](linux-servers.md#1-prerequisites-and-network-requirements) installs them). Static musl builds are planned ([#1774](https://github.com/reliaburger/reliaburger/issues/1774)).
 
 ### 3.2 Apps, Not Pods
 
@@ -141,7 +177,7 @@ The unit of deployment is an **App**, not a Pod/Deployment/Service triple. At it
 
 ### 3.3 Convention Over Configuration
 
-Sensible defaults everywhere, with security-sensitive choices left explicit. An ingress route is plain HTTP unless it selects `tls = "cluster"` (the cluster's Ingress CA) or `tls = "explicit"` (an operator-supplied certificate and key). Automatic public certificate provisioning is a post-v1 feature: `auto` and `acme` are rejected rather than quietly weakening the route. Health checks use sane timeouts. Rolling deploys are the default strategy. Log collection is on by default. Reliaburger collects metrics automatically. Configuration is for overriding defaults, not for bootstrapping basic functionality.
+Sensible defaults everywhere, with security-sensitive choices left explicit. An ingress route is plain HTTP unless it selects `tls = "cluster"` (the cluster's Ingress CA) or `tls = "explicit"` (an operator-supplied certificate and key). Automatic public certificate provisioning is planned for 0.4.0 ([#1667](https://github.com/reliaburger/reliaburger/issues/1667)): until then `auto` and `acme` are rejected rather than quietly weakening the route. Health checks use sane timeouts. Rolling deploys are the default strategy. Log collection is on by default. Reliaburger collects metrics automatically. Configuration is for overriding defaults, not for bootstrapping basic functionality.
 
 ### 3.4 Homogeneous Nodes
 
@@ -187,7 +223,7 @@ Every component in the Reliaburger system is named after a burger part.
 
 ## 5. Core Concepts
 
-Reliaburger defines seven workload resource types, plus `[build.*]` for in-cluster image builds (§5.2). Every production workload can be expressed using a combination of these types.
+Reliaburger defines seven workload resource types today, plus `[build.*]` for in-cluster image builds (§5.2). Two more are planned: Group (§5.8, 0.8.0) for multi-node work and Queue (§5.9, 0.10.0) for sharing a cluster between teams. A Model shorthand (§5.10, 0.7.0) expands to an App rather than adding a type. Every production workload can be expressed using a combination of these types.
 
 ### 5.1 App
 
@@ -209,11 +245,14 @@ host = "myapp.com"
 tls = "cluster"  # certificate from the cluster's Ingress CA; omit for plain HTTP
 ```
 
-**Replica modes:** `replicas = 3` places exactly 3 instances across available nodes. `replicas = "*"` runs one instance on every node (daemon mode). An App with a volume becomes stateful. GPU allocation (`gpu = 1`) is planned ([#359](https://github.com/reliaburger/reliaburger/issues/359)): no release passes a device into the container yet, so `gpu` above 0 is refused (§2). An App with `exec` instead of `image` runs a host binary as a process workload (see Section 17).
+**Replica modes:** `replicas = 3` places exactly 3 instances across available nodes. `replicas = "*"` runs one instance on every node (daemon mode). An App with a volume becomes stateful. GPU allocation (`gpu = 1`) is planned ([#359](https://github.com/reliaburger/reliaburger/issues/359)): no release passes a device into the container yet, so `gpu` above 0 is refused (§2). An App with `exec` instead of `image` runs a host binary as a process workload (see Section 18).
 
 **Autoscaling:** Apps can declare an autoscale block to adjust replicas based on observed metrics:
 
 ```toml
+[app.web]
+image = "nginx:alpine"
+
 [app.web.autoscale]
 min = 2
 max = 10
@@ -223,11 +262,16 @@ target = "70%"
 
 `metric` is `"cpu"` or `"memory"`, and `target` is utilisation of each replica's request, the Kubernetes HPA convention (an app with no CPU request is measured against one core; memory scaling requires a memory request). `min` must be at least 1: there's no scale-to-zero, because an app with no replicas reports no CPU or memory to scale back up on. The leader makes scaling decisions locally based on the per-instance CPU and memory Mayo records. The Lettuce GitOps engine treats autoscaler adjustments as runtime overrides (see Section 14).
 
+CPU is the wrong signal for an inference server, which keeps its GPU busy whenever it's batching, whatever the load. Planned for 0.7.0: the metrics every inference engine already exports (queue depth, KV-cache use, running requests and latency) as autoscaling signals, and `min = 0` for models, with Wrapper holding requests while the first replica starts.
+
 **Init containers:** Apps support init containers via an `[[app.web.init]]` block that runs before the main container starts, meant for database migrations, config generation, or dependency checks. Each init container runs its own `image` (or the app's, when it names none), trust-checked and pinned to a digest like the app's, with the app's environment (secrets decrypted) and the app's volume and config-file mounts.
 
 **Placement constraints:** Nodes carry labels (configured in `node.toml`). Apps can use `required` labels (hard constraints) and `preferred` labels (soft constraints) to control placement.
 
 ```toml
+[app.web]
+image = "nginx:alpine"
+
 [app.web.placement]
 required = ["region=us-east"]
 preferred = ["ssd=true"]
@@ -244,6 +288,9 @@ A Job is a run-to-completion task, either on-demand or scheduled, replacing Kube
 image = "myapp:v1.4.2"
 command = ["npm", "run", "migrate"]
 run_before = ["app.api"]
+
+[app.api]
+image = "myapp:v1.4.2"
 
 [job.cleanup]
 image = "cleanup:latest"
@@ -277,6 +324,20 @@ sending failed and unknown-outcome runs to the alert webhooks. The daily through
 claim still needs sustained qualification, including container launch cost,
 resource demand, storage and service quality. See the [job manual](manual/14_batch-jobs.md).
 
+**Dependencies (planned, 0.9.0):** an `after` key makes one job wait for another: for all of it, element by element (task *i* after task *i*), or for a share of its tasks to succeed. The condition is stored on the job definition and evaluated against compact index sets, not as per-task edges, so a 16-million-task pipeline costs no more Raft state than two arrays. There's no DAG language: full workflows stay in Airflow or Nextflow, which drive Reliaburger through a Python client and their own provider and executor (see §23).
+
+<!-- snippet: planned #1238 -->
+```toml
+[job.embed]
+image = "embed:v1"
+count = 100000
+after = { job = "shard", each = true }
+
+[job.index]
+image = "index:v1"
+after = { job = "embed", min_success = "95%" }
+```
+
 **Image builds:** `relish build` builds container images from `[build.*]` declarations and pushes them to Pickle. A `destination` field (a `pickle://` reference) scopes registry access. This is a manual build path; Lettuce does not dispatch build jobs or inject `${GIT_SHA}` into their tags.
 
 > For batch scheduling and build job details, see [design/scheduler-meat.md](design/scheduler-meat.md) and [design/registry-pickle.md](design/registry-pickle.md).
@@ -286,6 +347,9 @@ resource demand, storage and service quality. See the [job manual](manual/14_bat
 Reliaburger stores secrets encrypted in git using asymmetric encryption (age). The cluster's public key is distributed freely; only the cluster holds the private key. Developers can encrypt secrets offline without cluster access.
 
 ```toml
+[app.api]
+image = "ghcr.io/example/api:1.4.2"
+
 [app.api.env]
 DATABASE_URL = "ENC[AGE:YWdlLWVuY3J5cHRpb24...]"
 NODE_ENV = "production"
@@ -302,6 +366,9 @@ NODE_ENV = "production"
 A free-text file injected into a specific path inside the container. Unlike environment variables, ConfigFiles can contain arbitrary content (NGINX configs, application YAML, TLS certificates). Declared inline with `content`, which each instance gets as its own read-only copy (so two files with the same name can't collide, and a rollout never rewrites the file under a running instance), or with `source` naming a host path on the node, which the node bind-mounts. A `source` is gated like a host-path volume (§5.5): the node must list it under `[storage] allowed_host_paths`, and a token with a `[permission]` block needs `host-exec`.
 
 ```toml
+[app.nginx]
+image = "nginx:alpine"
+
 [[app.nginx.config_file]]
 path = "/etc/nginx/nginx.conf"
 content = """
@@ -358,6 +425,61 @@ max_replicas = 200
 
 ---
 
+### 5.8 Group (planned, 0.8.0)
+
+A Group is several members that start together, fail together and restart together: a training job across nodes, a model too big for one node, or an RL job that mixes trainers, inference servers and sandboxes. Kubernetes needs JobSet, LeaderWorkerSet and a gang scheduler for this; Slurm gets it from allocating nodes to a job. It earns its own type because none of an App's or a Job's rules (independent replicas, independent retries) hold for it.
+
+<!-- snippet: planned #1223 -->
+```toml
+[group.finetune]
+members = 2                       # nodes
+gpu = 8                           # per member
+image = "trl:0.20"
+command = ["torchrun", "--nnodes=${RB_GROUP_SIZE}", "--node-rank=${RB_RANK}",
+           "--rdzv-endpoint=${RB_LEADER}:29500", "train.py"]
+topology = { same = "rack" }
+checkpoint = { dir = "/ckpt", grace = "120s" }
+restart = { attempts = 5, use_spares = true }
+```
+
+The leader places every member in one decision or none, injects each member's rank, the group size and the leader's address, and gives rank 0 a stable name. Roles let one group hold different kinds of member (a Ray head and its workers, trainers and rollout servers). When any member fails, the group's generation changes, every member gets SIGTERM and its grace period, and the group is placed again, on a spare node if one is reserved. Health checks run before a group starts and after it fails. Topology constraints come from node labels, and `network = "rdma"` gives members InfiniBand or RoCE devices with host networking. See the [LLM workloads research](plans/2026-10-11-research-llm-workloads.md#080-groups).
+
+### 5.9 Queue (planned, 0.10.0)
+
+A Queue is a weighted share of the cluster for batch work. Jobs, arrays and groups name a queue; the leader orders their grants by each queue's dominant share of CPU, memory and GPUs (dominant resource fairness), with usage that decays over time, so a team that ran a lot yesterday yields to one that didn't. Backfill lets small work run in front of a large waiting group without delaying it. Priority classes and preemption take capacity back for an under-share queue, with a grace period for checkpoints, and a preempted attempt doesn't spend a retry. Apps always rank above batch. Namespace quotas stay as hard caps on top of queues.
+
+<!-- snippet: planned #1238 -->
+```toml
+[queue.research]
+weight = 2
+
+[queue.product]
+weight = 1
+guaranteed = { gpu = 8 }
+```
+
+See the [batch scheduler research](plans/2026-10-11-research-batch-schedulers.md) for how this compares with Slurm, Kueue and Armada.
+
+### 5.10 Model shorthand (planned, 0.7.0)
+
+`[model.*]` is shorthand for serving an LLM, not a new type. It expands to an ordinary App with an inference engine image (vLLM, SGLang or llama.cpp), a read-only mount of the model's weights from Pickle, readiness checked with a real generation, the engine's metrics endpoint, inference-aware routing in Wrapper and autoscaling on engine metrics. `relish apply --dry-run` shows the expansion.
+
+<!-- snippet: planned #1221 -->
+```toml
+[model.qwen3]
+source = "models/qwen3-32b:2026-09"
+gpu = 2
+replicas = { min = 0, max = 6 }
+scale_on = { queue_depth = 4 }
+
+[model.qwen3.ingress]
+host = "qwen3.models.example.com"
+routing = "prefix-affinity"
+api_keys = true
+```
+
+`relish model run qwen3-32b` writes and applies the same thing in one command and prints an OpenAI-compatible URL. Reliaburger hosts the engines and doesn't replace them (see §23).
+
 ## 6. Node Configuration (Getting Started)
 
 You configure each node's Bun agent via a single TOML file (`node.toml`). A node can join an existing cluster with a two-line configuration:
@@ -402,7 +524,7 @@ short-lived token per node against the current leader:
 ```sh
 $ JOIN_TOKEN="$(relish --endpoint https://10.0.1.5:9117 \
     --ca-cert cluster/identity/root-ca.crt \
-    join-token create --ttl 15m)"
+    join-token create --node-id node-02 --ttl 15m)"
 ```
 
 The council stores only its hash and expiry. Relish prints the plaintext once;
@@ -558,12 +680,17 @@ This eliminates a large proportion of Kubernetes debugging pain: encapsulation o
 Wrapper can run on every node and handles TLS termination, host/path-based routing, health-aware load balancing, connection draining during deploys, and WebSocket support. It is opt-in in `node.toml`. The v1 TLS sources are the cluster's Ingress CA and an operator-supplied certificate/key pair. Automatic ACME/Let's Encrypt provisioning is deferred.
 
 ```toml
+[app.web]
+image = "nginx:alpine"
+
 [app.web.ingress]
 host = "myapp.com"
 tls = "cluster"     # clients must trust the cluster root CA
 ```
 
 There's no IngressClass, no annotations, no separate cert-manager installation. External traffic reaches the cluster via a standard TCP load balancer (or DNS round-robin) pointing to any set of nodes. Service VIPs and published host ports are TCP-only; UDP services aren't supported. Rate limits are per node, per client IP: behind a balancer that spreads one client over N nodes, that client gets up to N times the configured rate. `relish apply` refuses an ingress whose TLS mode or rate limit no node could serve, and if one reaches the cluster anyway, each node skips that route and keeps publishing the rest of the catalogue. Wrapper on each node can route traffic for any app, so you don't need application-aware routing at the load balancer layer.
+
+**Inference routing (planned, 0.7.0).** Model servers need a different router: long-lived streams that may pause before the first token, request bodies too big to buffer, and a choice of replica that depends on the request. Wrapper will route by the OpenAI `model` field and LoRA adapter, prefer the replica that probably holds the prompt's prefix in its cache until that replica's queue fills (the approach that gave 2–3× the throughput of round-robin on prefill-bound traffic in [llm-d's study](https://llm-d.ai/blog/sticky-until-saturated-token-aware-routing)), and answer 429 when every replica is saturated. API keys and token rate limits are per namespace and model. Disaggregated prefill and decode and an external endpoint picker are later work.
 
 > For routing, TLS modes, and connection draining details, see [design/ingress-wrapper.md](design/ingress-wrapper.md).
 
@@ -638,19 +765,22 @@ Isolation needs the eBPF data path. `relish init` enables it on rootful Linux ru
 **Egress is unrestricted by default.** An app with no `egress` block can reach any external destination. Declaring an `egress` block flips that app to deny-by-default: only the listed destinations are permitted, and everything else is blocked. Use it to contain data exfiltration from compromised containers.
 
 ```toml
+[app.api]
+image = "ghcr.io/example/api:1.4.2"
+
 [app.api.egress]
 allow = ["api.stripe.com:443", "hooks.slack.com:443"]
 ```
 
 ### 11.4 Data at Rest
 
-Reliaburger encrypts Raft log entries at rest with AES-256-GCM, under a key derived (HKDF-SHA256, with a fresh salt per entry) from the cluster master key. That key is stored on the node, so the encryption protects a stolen disk or a copied log file, not a node whose root account is compromised. The Raft snapshot (`snapshot.redb`, holding token hashes, wrapped keys and the desired state) isn't encrypted, and neither are Raft's vote and log-position metadata. A cluster with no master key writes its log in plaintext. The CA and age private keys inside the Raft state carry their own HKDF-wrapped encryption under the same master key. Encrypting the snapshot too, with a key sealed to a TPM or derived from node identity, is 0.3.0 appliance work ([#402](https://github.com/reliaburger/reliaburger/issues/402)).
+Reliaburger encrypts Raft log entries at rest with AES-256-GCM, under a key derived (HKDF-SHA256, with a fresh salt per entry) from the cluster master key. That key is stored on the node, so the encryption protects a stolen disk or a copied log file, not a node whose root account is compromised. The Raft snapshot (`snapshot.redb`, holding token hashes, wrapped keys and the desired state) isn't encrypted, and neither are Raft's vote and log-position metadata. A cluster with no master key writes its log in plaintext. The CA and age private keys inside the Raft state carry their own HKDF-wrapped encryption under the same master key. Encrypting the snapshot too, with a key sealed to a TPM or derived from node identity, is planned ([#1775](https://github.com/reliaburger/reliaburger/issues/1775)).
 
 Certificate revocation uses a CRL kept in the council's replicated state; each node refreshes its copy as revocations commit.
 
 ### 11.5 Audit Logging
 
-Every node keeps a durable, bounded audit log of the actions it served: applies, deletes, stops, execs, rollbacks, job, array and build submissions, upgrades, decommissions, elections, snapshots, test leases, fault injection, clearing and expiry, and every change to tokens, secrets and CAs. Each record carries the authenticated principal (never a client-supplied name), the app and namespace, the source address, a timestamp and the action's own facts, and never a secret. The node writes the record as a line of JSON under its data directory and syncs it before answering, so an acknowledged action survives a restart; the log rotates in segments and drops the oldest first, within a configurable bound (64 MiB by default). A write that fails is logged and counted but never fails the operator's action. `GET /v1/audit` and `relish audit` filter by time, action, principal and namespace, and `--cluster` merges every node's log. Only an unscoped Admin may read it, never the internal service principal. Refused requests to the same routes are recorded too (a missing or unknown token, a role, permission or scope refusal), with the principal or `anonymous`, the source address, the route and the reason, rate-limited per source and principal so a flood of bad requests is summarised rather than pushing real records out of the bounded log. The log counts toward the node's disk pressure alongside job data. The in-memory event ring still shows audit records live, but no longer holds the only copy.
+Every node keeps a durable, bounded audit log of the actions it served: applies, deletes, stops, execs, rollbacks, job, array and build submissions, upgrades, decommissions, elections, snapshots, test leases, fault injection, clearing and expiry, every change to tokens, secrets and CAs, and from 0.2.8 every step of an agent's proposal and lease (the `proposal.*` and `lease.*` records, such as `proposal.applied` and `lease.broken`, each saying whether its author was an agent or a person). Each record carries the authenticated principal (never a client-supplied name), the app and namespace, the source address, a timestamp and the action's own facts, and never a secret. The node writes the record as a line of JSON under its data directory and syncs it before answering, so an acknowledged action survives a restart; the log rotates in segments and drops the oldest first, within a configurable bound (64 MiB by default). A write that fails is logged and counted but never fails the operator's action. `GET /v1/audit` and `relish audit` filter by time, action, principal and namespace, and `--cluster` merges every node's log. Only an unscoped Admin may read it, never the internal service principal. Refused requests to the same routes are recorded too (a missing or unknown token, a role, permission or scope refusal), with the principal or `anonymous`, the source address, the route and the reason, rate-limited per source and principal so a flood of bad requests is summarised rather than pushing real records out of the bounded log. The log counts toward the node's disk pressure alongside job data. The in-memory event ring still shows audit records live, but no longer holds the only copy.
 
 **Status:** the log is per node. Central retention (shipping records off the node, so a lost or decommissioned node doesn't take its history with it) is planned, not implemented, as is tamper evidence (hash-chaining records).
 
@@ -669,6 +799,7 @@ Key properties:
 - **Pull-through cache.** External registry images (Docker Hub, GHCR) are cached on first use.
 - **Image signing.** Keyless signing via workload identity, in Reliaburger's own format, and operator-key signing with `relish sign`. For upstream images, the trust policy verifies key-based cosign signatures; keyless cosign is planned ([#619](https://github.com/reliaburger/reliaburger/issues/619)).
 - **Scoped access.** Build jobs can only push to explicitly declared repositories.
+- **Model weights (planned, 0.7.0).** Models stored as OCI artifacts (the CNCF [ModelPack](https://github.com/modelpack/model-spec) spec and [Docker Model Runner's](https://www.docker.com/blog/oci-artifacts-for-ai-model-packaging/) format) and fetched from every peer that holds them at once, in byte ranges that resume after a failure. Nodes report which models and images they hold, so the scheduler places replicas next to their weights and pre-warms the nodes it picks. A 140 GB model then crosses the cluster once instead of once per node. The 30-second-per-layer target in §2 is for images; weights get their own measured target in 0.7.0.
 
 > For GC, signing, replication failure handling, and build job integration, see [design/registry-pickle.md](design/registry-pickle.md).
 
@@ -679,6 +810,9 @@ Key properties:
 When an App's image changes, each node running it performs a rolling deployment of its own instances: start a new instance, wait for its health check, add it to Wrapper routing, drain the old instance, stop it. Old and new versions coexist on the same node without port conflicts.
 
 ```toml
+[app.web]
+image = "nginx:alpine"
+
 [app.web.deploy]
 strategy = "rolling"      # default; or "blue-green"
 max_surge = 1             # extra instances during the rollout (default 1)
@@ -688,11 +822,13 @@ auto_rollback = true      # default true
 
 The leader releases a spec change one node at a time. It commits the new spec to Raft, hands it to the first node (in node-id order) that doesn't run it yet, and keeps every later node on the last spec that rolled out everywhere until that node reports its share running healthy on the new one. Each node rolls its own share with the app's `[deploy]` table, so `max_surge` and `max_unavailable` bound one node's share, not the whole app. The leader reads progress from the nodes' reports, not from state of its own, so a new leader carries on where the old one stopped. A first placement and a scale change aren't gated: neither costs running capacity.
 
-`auto_rollback` (on by default) never ends below the capacity a node started from. A node whose new instance fails its health check stops the rollout; if old instances had already retired, it restarts them on the previous spec before it retires the healthy new ones, and if the previous spec can't come back either it keeps the new ones serving and reports the rollout halted. Either way it tells the leader, which marks the app `RolloutFailed` in Raft. The leader doesn't revert the desired spec (GitOps would only apply it again); it stops handing the failed spec to nodes, and `relish status` and `relish wtf` say where and why it failed. Applying the same spec again doesn't clear the mark, and `relish apply` warns that it isn't retried. Any other spec does, a scale change included, whether it comes from `relish apply`, `relish rollback` or a git commit. The council also keeps the last ten specs that rolled out everywhere for each app, so `relish rollback` still works after every node restarts.
+`auto_rollback` (on by default) never ends below the capacity a node started from. A node whose new instance fails its health check stops the rollout; if old instances had already retired, it restarts them on the previous spec before it retires the healthy new ones, and if the previous spec can't come back either it keeps the new ones serving and reports the rollout halted. Either way it tells the leader, which marks the app `RolloutFailed` in Raft. The leader doesn't revert the desired spec (GitOps would only apply it again); it stops handing the failed spec to nodes, and `relish apps` and `relish wtf` say where and why it failed. Applying the same spec again doesn't clear the mark, and `relish apply` warns that it isn't retried. Any other spec does, a scale change included, whether it comes from `relish apply`, `relish rollback` or a git commit. The council also keeps the last ten specs that rolled out everywhere for each app, so `relish rollback` still works after every node restarts.
 
-There's no superseding: a second deploy that reaches a node while that node's rollout of the app is still running waits for it. Fully leader-coordinated rollouts, with one surge and unavailable budget for the whole cluster held in Raft, are planned.
+There's no superseding: a second deploy that reaches a node while that node's rollout of the app is still running waits for it. Fully leader-coordinated rollouts, with one surge and unavailable budget for the whole cluster held in Raft, are planned ([#1776](https://github.com/reliaburger/reliaburger/issues/1776)).
 
 **Dependency ordering:** Jobs can declare `run_before = ["app.api"]` to ensure migrations complete before app instances start. The target app must be in the same apply and namespace. Cluster apply records ownership before execution and publishes dependent app revisions only after positive zero exit and durable confirmation; uncertainty or leader replacement retains the fence. A hook gets one attempt and a 600-second deadline unless it sets `max_attempts` or `task_timeout_secs`. Recurring schedules work on clusters and standalone nodes alike: once the apps publish, the leader registers each `schedule` as a durable definition and claims each matching UTC minute in Raft. An unknown outcome is never replayed or overtaken automatically: cron skips that job's occurrences until an operator acknowledges the exact grant with `relish batch replay`, and `--rerun-jobs` doesn't clear it.
+
+**Slow starters (planned, 0.7.0).** An inference server can take minutes to load its weights. Health checks get a separate startup gate measured in minutes, readiness that asks for a real generation, and no liveness restarts while loading. Rollouts surge a new replica before draining an old one, so serving capacity never drops.
 
 > For the deploy state machine, connection draining protocol, and autoscaling, see [design/deployments.md](design/deployments.md).
 
@@ -725,7 +861,7 @@ trusted_signing_keys = [                   # GPG or SSH key fingerprints
 
 Or webhook-triggered for instant deploys on push. Lettuce validates webhook payloads using HMAC-SHA256 signatures (configured via `[gitops] webhook_secret`). Only POST requests with a valid signature are processed. The webhook endpoint (`POST /v1/gitops/webhook`) is served on the node's API port, which is HTTPS unless the node runs a development plaintext config. Rate limiting (default: 10 triggers per minute) prevents abuse. When `require_signed_commits` is enabled, Lettuce still verifies the commit referenced by the webhook before applying it.
 
-When `require_signed_commits` is enabled, Lettuce only applies commits that are signed by a key in the `trusted_signing_keys` list. Unsigned or untrusted commits are refused: the sync fails, the previous commit stays applied, and the sync status shows why. No alert fires yet. This is particularly important for configurations that include inline `script` fields (Section 17), since anyone with git write access could otherwise inject arbitrary commands into the cluster.
+When `require_signed_commits` is enabled, Lettuce only applies commits that are signed by a key in the `trusted_signing_keys` list. Unsigned or untrusted commits are refused: the sync fails, the previous commit stays applied, and the sync status shows why. No alert fires yet. This is particularly important for configurations that include inline `script` fields (Section 18), since anyone with git write access could otherwise inject arbitrary commands into the cluster.
 
 **Sync behaviour:**
 
@@ -751,11 +887,13 @@ When `require_signed_commits` is enabled, Lettuce only applies commits that are 
 
 Reliaburger includes a complete observability stack with zero configuration:
 
-**Metrics (Mayo):** Per-node store (Parquet, queried with SQL) that collects node CPU, memory, disk and network, plus per-app CPU and memory. Jobs get their own series: attempt, success, failure and retry counters, duration histograms, and CPU and memory for running tasks read from their cgroups, labelled only by namespace, definition, profile and node. Apps that declare `metrics = {}` have their Prometheus `/metrics` endpoint scraped by the node running each instance. Data is kept at one resolution for `retention_days` (7 by default) and then pruned; tiered downsampling is planned. Council members aggregate one-minute rollups for cluster-wide dashboards. Alerts are fixed threshold rules; PromQL-style custom alerts are planned (see [design/metrics-mayo.md](design/metrics-mayo.md)). Five default alerts ship active out of the box, all on node-level metrics: node CPU above 90 %, node memory above 85 % and above 70 %, node disk above 80 %, and node CPU below 5 % for half an hour.
+**Metrics (Mayo):** Per-node store (Parquet, queried with SQL) that collects node CPU, memory, disk and network, plus per-app CPU and memory. Jobs get their own series: attempt, success, failure and retry counters, duration histograms, and CPU and memory for running tasks read from their cgroups, labelled only by namespace, definition, profile and node. Apps that declare `metrics = {}` have their Prometheus `/metrics` endpoint scraped by the node running each instance. Data is kept at one resolution for `retention_days` (7 by default) and then pruned; tiered downsampling is planned. Council members aggregate one-minute rollups for cluster-wide dashboards. Alerts are fixed threshold rules; you can't define your own yet, and PromQL-style custom alerts are planned (see [design/metrics-mayo.md](design/metrics-mayo.md)). Five default alerts ship active out of the box, all on node-level metrics: node CPU above 90 %, node memory above 85 % and above 70 %, node disk above 80 %, and node CPU below 5 % for half an hour.
 
 **Logs (Ketchup):** Captures stdout/stderr from every container. Structured storage with timestamp-based indexing and zstd compression. `relish logs --json-field key=value` filters JSON lines on the client, after the server has returned the lines you asked for; server-side field queries are planned. Each node exports its log files to a directory, `s3://` or `gs://` on a schedule.
 
 **Dashboards (Brioche):** Built-in web UI compiled into the Bun binary, served on every node. Cluster overview, app detail (metrics, logs, deploy history), node detail, ingress overview, and GitOps status.
+
+**GPU and inference metrics (planned, 0.6.0 and 0.7.0):** per-device GPU utilisation, memory, power, tensor activity and errors, labelled with the app and instance that holds the device, so idle and over-requested GPUs are visible from day one. Models add time to first token, inter-token latency, tokens per second, KV-cache use and queue depth per model and replica.
 
 > For TSDB internals, scraping, aggregation, and alert configuration, see [design/metrics-mayo.md](design/metrics-mayo.md), [design/logs-ketchup.md](design/logs-ketchup.md), and [design/ui-brioche.md](design/ui-brioche.md).
 
@@ -768,10 +906,11 @@ Relish is the CLI and interactive terminal UI for Reliaburger. Running `relish` 
 | Command | Purpose | K8s equivalent |
 |---------|---------|----------------|
 | `relish` (no args) | Interactive terminal UI | k9s |
-| `relish status` | One-line cluster summary | `kubectl cluster-info` + `kubectl get nodes` |
+| `relish status` | One screen: a verdict, then one line per part of the cluster, the same height on three nodes or three hundred | `kubectl cluster-info` + `kubectl get nodes` |
+| `relish apps` / `relish nodes` | The lists `status` used to print, problems first, with `--unhealthy` | `kubectl get pods,nodes` |
 | `relish compile <path>` | Resolve config to final form | (none — Helm template + kustomize build) |
 | `relish lint <path>` | Validate config files | `kubectl --dry-run=client` (barely) |
-| `relish fmt <path>` | Format and sort TOML files | (none) |
+| `relish fmt <path>` | Format and sort a TOML file, keeping its comments | (none) |
 | `relish plan <path>` *(planned)* | Preview changes before apply | `terraform plan` (K8s has nothing equivalent) |
 | `relish diff <a> <b>` | Structural diff between two configs (not live cluster drift) | `kubectl diff` (limited) |
 | `relish apply <path>` | Apply configuration | `kubectl apply` |
@@ -779,7 +918,7 @@ Relish is the CLI and interactive terminal UI for Reliaburger. Running `relish` 
 | `relish batch` | Submit, watch, cancel and read results of task arrays and mixed manifests | (none) |
 | `relish jobs` | Job run summaries and rates, or schedule definitions | `kubectl get jobs,cronjobs` |
 | `relish deploy <path>` | Trigger a rolling deploy from a config file | `kubectl set image` |
-| `relish events` *(planned)* | Streaming event log | `kubectl get events` (1h expiry) |
+| `relish events` | Recent cluster-wide events (the TUI streams them) | `kubectl get events` (1h expiry) |
 | `relish logs <app>` | Stream/search logs | `kubectl logs` + `stern` |
 | `relish path <app> --to <app>` | Connectivity diagnosis | (none — manual iptables/DNS debugging) |
 | `relish inspect <resource>` | Deep resource inspection | `kubectl describe` |
@@ -787,10 +926,11 @@ Relish is the CLI and interactive terminal UI for Reliaburger. Running `relish` 
 | `relish metrics <app>` | An app's own Prometheus metrics, scraped by its nodes | (none — requires Prometheus) |
 | `relish dashboard` | Read-only web dashboard through your authenticated CLI | `kubectl proxy` + a dashboard install |
 | `relish wtf` | Automated health check | (none — requires runbooks + Prometheus alerts) |
-| `relish exec` | Run a command inside a running container | `kubectl exec` |
+| `relish exec` | Run a command once inside a running container and exit with its code (interactive exec is planned) | `kubectl exec` |
 | `relish exec --debug` *(planned)* | Debug container (separate identity) | `kubectl debug` |
 | `relish resolve <name>` | Query eBPF service map | `kubectl get endpoints` + `nslookup` |
 | `relish firewall <app>` *(planned)* | Show effective firewall rules | `kubectl get networkpolicy` + CNI tools |
+| `relish timeline` | What changed in a window: events, the decisions behind them, the audit log and deploys | `kubectl get events` (1h expiry) |
 | `relish history <app>` | Deploy history for an app | `kubectl rollout history` |
 | `relish rollback <app>` | One-command rollback | `kubectl rollout undo` |
 | `relish scale <app> <n>` *(planned)* | Set replica count | `kubectl scale` |
@@ -799,11 +939,14 @@ Relish is the CLI and interactive terminal UI for Reliaburger. Running `relish` 
 | `relish test` | Run integration test suite | (none) |
 | `relish bench` | Run performance benchmarks | (none) |
 | `relish upgrade start` | Rolling cluster upgrade | `kubeadm upgrade` (multi-step) |
+| `relish verify` | Check every node runs the published, signed release, byte for byte | (none) |
 | `relish ca backup` / `ca verify` | Keep and check your own sealed copy of the root CA | (none — manual process) |
 | `relish ca rotate` | Rotate an intermediate CA, signed with your root backup | (none — manual process) |
 | `relish ca status` *(planned)* | Show CA hierarchy and expiry | (none) |
 | `relish ca revoke` *(planned)* | Revoke a compromised certificate | (none — manual process) |
-| `relish token` | Create, list and revoke API tokens | `kubectl create token` + RBAC |
+| `relish token` | Create, list and revoke API tokens; `--agent` for an AI agent's | `kubectl create token` + RBAC |
+| `relish proposal` / `relish undo` | Show, approve or reject an agent's proposed change; undo an applied one | (none) |
+| `relish lease` | List the leases agents hold, or break one | (none) |
 | `relish sign` | Sign a Pickle-hosted image with your own key | `cosign sign` |
 | `relish setup` | Guided setup, or a laptop cluster with `--quickstart` | `kind create cluster` / `minikube start` |
 | `relish local <status\|start\|stop\|destroy>` | Manage the laptop cluster setup made | `kind` / `minikube` commands |
@@ -813,6 +956,10 @@ Relish is the CLI and interactive terminal UI for Reliaburger. Running `relish` 
 | `relish council recover` | Restore a lost council from a sealed backup | `etcdctl snapshot restore` |
 | `relish secret rotate` | Rotate encryption keys | (none — requires Sealed Secrets re-encrypt) |
 | `relish snapshot create\|list\|restore\|delete` | Manage an app's local volume snapshots | (none — requires CSI snapshotter) |
+| `relish gpus` *(planned, 0.6.0)* | GPUs per node: model, health, holder, utilisation | `kubectl describe node` + DCGM exporter + Grafana |
+| `relish model run <name>` *(planned, 0.7.0)* | Serve a model at an OpenAI-compatible URL | (none — KServe or llm-d plus a gateway) |
+| `relish dev start` *(planned, 0.7.1)* | A GPU dev environment over SSH or VS Code | (none) |
+| `relish usage` *(planned, 0.10.0)* | Resource-hours by queue and namespace | (none — Kubecost or similar) |
 | `relish import -f <k8s-yaml>` | Convert K8s manifests to Reliaburger TOML | (none) |
 | `relish export -f <file>` | Generate K8s manifests from a Reliaburger config | (none) |
 
@@ -820,7 +967,105 @@ Relish is the CLI and interactive terminal UI for Reliaburger. Running `relish` 
 
 ---
 
-## 17. Process Workloads (Non-Container)
+## 17. Built for Humans and Their Agents
+
+More and more of the people who run a cluster have an LLM agent at their elbow, and the agent reads the same CLI they do. Every `relish` command was written for a person at a terminal: tables lined up for the eye, a TUI with no arguments, exit codes that mean "warnings". An agent misreads all three. From 0.2.7 Reliaburger treats the agent as a second user of the same interface, without making the first one worse. The principle is that an agent should get facts in a shape it can rely on, should never be able to change the cluster on its own, and should never have to guess whose words it's reading. 0.2.8 keeps that principle and lets the agent ask: it proposes a change, and a person, or a policy a person wrote, approves it (§17.5).
+
+### 17.1 The Improvement Loop
+
+A Kubernetes agent can read the API. It can't read the control plane's code at the version you're running, let alone rebuild it. Every `relish` carries the source it was built from, so an agent can follow a symptom all the way to a fix:
+
+1. **It finds the problem.** `relish agent context` and `diagnose` give it the cluster's findings, with what couldn't be checked marked unknown rather than OK.
+2. **It reads the exact source.** `relish agent source` searches and shows the code this binary was built from, and warns when a node runs a different commit.
+3. **It proves a fix.** `relish agent patch` builds the change, runs the portable test suite and boots a throwaway cluster from the patched binaries, in a home of its own that can't touch the user's real cluster.
+4. **A human posts the report.** `relish agent report` writes a redacted draft with a fingerprint for finding duplicates. It never posts; a human reads it, ticks the review boxes and files it through an issue form built to receive it.
+5. **We release in days,** with build provenance on every file so anyone can check what they download.
+6. **The team upgrades in one command.** `relish agent upgrade-check` says whether the cluster can take the release now, and `relish upgrade start` rolls it (Section 21).
+
+The loop is only as fast as its slowest step, and on most platforms that's the last one. Where an upgrade is a dreaded, quarter-long project, a bug fixed next week reaches production next year, and nobody bothers reporting the next one. Reliaburger's node is one binary, the upgrade is one command, and 0.2.0 to 0.2.6 shipped in three weeks. Frequent, boring upgrades are what make an agent's bug report worth writing.
+
+### 17.2 The Contract
+
+Every `relish agent` command prints exactly one line of JSON in a `relish.agent/v1` envelope, never prompts, never opens a TUI and never reads stdin. The envelope carries the build that answered (version, commit, source digest), the answer, and suggested next commands, each marked `read_only` so an agent can tell "read the logs" from "roll back" without parsing English. A failure carries one error code from a closed list. The exit code says only whether the command answered (0), was misused (2), couldn't reach or authenticate (3), was refused (4) or failed otherwise (5); a cluster with three critical findings is still exit 0. Each command's output is bounded by a byte budget, 24 KiB by default, enforced by trimming the data's arrays from the end rather than cutting the document, and saying what was cut. The JSON Schema of every answer comes from the Rust types, so `relish agent schema` and the MCP tools' output schemas can't drift from the code. The rest of `relish` gained `-o json` on every non-interactive command, connection errors that name the endpoint and the cause, and TUIs that refuse to start without a terminal.
+
+Text a workload controls (log lines, event messages, probe bodies) and text from outside (release notes, GitHub issues) only ever reaches an agent inside an `untrusted` object that names its origin. The wrapper strips terminal escape sequences and bidirectional overrides and runs one shared redaction module over the text (Reliaburger tokens, encrypted values, age identities, private keys, credentials in URLs). It labels the text; it doesn't try to detect attacks, because a filter would miss the clever ones and hide evidence from the honest ones. Ketchup still stores what the app wrote. Redaction happens where text leaves for an agent or a report.
+
+### 17.3 The Source in the Binary
+
+A release `relish` embeds the build, test and read set (the manifest and lockfile, `build.rs`, `src/`, the eBPF programs, the dashboard assets, the tests, and the design docs, book and manual) as one zstd tarball of about 4.7 MB, under 1% of the binary. The tarball is deterministic, so its SHA-256 identifies the source exactly, and a CI job extracts it from a freshly built `relish` and builds it with `cargo build --locked` in an empty directory, so a file missing from the list fails CI rather than a user. Development builds don't embed it (packing on every build turned the half-second rebuild after a book edit into twenty seconds); they read the checkout they were built from. `bun` doesn't carry the bundle: `relish` asks each node which commit it runs and, on a mismatch, says so on every answer and links GitHub's tree at the node's commit.
+
+### 17.4 The Commands
+
+| Command | Purpose |
+|---------|---------|
+| `relish agent guide` | How to use `relish` as an agent: the manual's agent chapter, as sections |
+| `relish agent context` | The first call: `relish status`'s screen and summary, findings, unknowns, active faults, newest events |
+| `relish agent diagnose` / `explain` | Every finding with its evidence; what a finding means, its thresholds and the line of code that decides it; from 0.2.8, why the cluster restarted, placed or refused something |
+| `relish agent timeline` | What changed in a window, newest first, with the rule and evidence of each recorded decision |
+| `relish agent logs` / `manual` | An app's newest log lines in a window, wrapped as untrusted; search and show the compiled-in manual |
+| `relish agent source` | `version`, `tree`, `grep`, `show` and `extract` over the source this binary was built from |
+| `relish agent patch` | Build, test and try a fix on a throwaway cluster; patched binaries are never signed |
+| `relish agent report` | A redacted bug report draft with a dedupe fingerprint; writes files, makes no network call, never posts |
+| `relish agent upgrade-check` | `ready`, `up_to_date`, `needs_fresh_cluster`, `blocked` or `unknown`, with reasons; never `ready` on missing evidence |
+| `relish agent verify` | `verified`, `mismatch` or `unknown`: whether every node and this `relish` are the published, signed release |
+| `relish agent lease` | `take`, `renew` and `release` a short lease on an app or a namespace before changing it |
+| `relish agent propose` | Propose an apply, scale, rollback, stop or delete for a person to approve; `proposals`, `withdraw` and `undo` follow it up |
+| `relish agent setup` | Registers `relish mcp` with six agents (Claude Code, Codex, Cursor, VS Code, Goose, Gemini CLI); shows the diff, writes only with `--yes` |
+| `relish mcp` | The read-only `relish agent` commands as MCP tools over stdio, derived from the CLI's own definitions; from 0.2.8 `--propose` adds the proposal and lease tools |
+
+Two of 0.2.8's additions answer questions an agent couldn't before. *Why did it do that?* The scheduler, a node's restart loop and the apply path record a decision at the moment they make it, with its rule (`placement.scored`, `restart.health_failed`, `deploy.refused.policy` and ten more) and the evidence it compared, because a moment later the scores and failed probes are gone. `relish agent explain --restart`, `--placement` and `--refusal` read one back with the line of code that decides it, and `relish timeline` (for people) and `relish agent timeline` merge events, decisions, the audit log and deploys into one list, newest first. Each source says how much of the window it saw, and a decision the records no longer hold is `not_found`, meaning unknown, not "didn't happen". Restart and placement records live in each node's in-memory events ring, so they don't survive a node restart; a durable decision log is planned (§17.8). *Is this the release?* `relish verify` and `relish agent verify` check every node's `bun`, and the `relish` asking, against the release's published hashes and Ed25519 signatures (§21).
+
+One manual chapter is the source of everything agent-facing: `relish agent guide`, `llms.txt`, the website's `/agents` page, the Claude Code plugin and skill, and a block of the repository's `AGENTS.md` are generated from it, and a test fails when any of them is stale. The chapter ends with a playbook an agent follows to stand up a cluster for its human, on a laptop, over SSH or in a cloud, creating nothing that costs money without an explicit yes.
+
+### 17.5 Asking Before Acting
+
+From 0.2.8 an agent can change the cluster, but never by itself. Four pieces make that safe.
+
+**The token is the boundary.** `relish token create --agent` makes a token for an agent: read-only unless `--role deployer`, never admin, and gone in 8 hours unless `--ttl` says otherwise (168 hours at most). The API treats it as read-only on every route but two: a deployer agent token may propose a change and take a lease. It can't apply, stop, delete or roll back anything, and it can't approve a proposal, its own or anyone else's. The CLI's good manners aren't the control; the cluster's refusal is.
+
+**A proposal is a question for a person.** `relish agent propose` asks for an apply, scale, rollback, stop or delete. The cluster, not the agent, writes everything a person reads about it from its own state: a plain-language summary, the field diff, the blast radius (apps, nodes, instances replaced, started and stopped, routes and service names) and the one command that undoes it. The agent's reason comes last, labelled as its own words. `relish proposal approve` applies it in the same council entry, so a leader change can't leave it approved but not run, or run it twice. If anything the proposal touches has changed since it was made, it fails as `stale` and changes nothing. `relish undo` puts an applied proposal back for 24 hours, and refuses when something else has changed the app since, rather than overwrite that change. A proposal nobody decides expires after an hour.
+
+**Leases stop two agents colliding.** Before it changes an app or a namespace, an agent takes a short lease (two minutes by default, fifteen at most), and someone else's lease refuses it as `lease_held`, naming the holder. Proposing leases each app it touches until the proposal is decided. A lease also stops a person's own `apply`, `deploy`, `stop`, `delete`, `rollback` or `release`, with the holder and the reason; repeating the command with `--break-lease` ends it and records `lease.broken` with the person's name. People win over agents, and the audit log shows when they did. The cluster's own work (scheduling, rollouts, the autoscaler) and GitOps aren't held back by any lease.
+
+**Guardrails are policies.** A policy with `applies_to = "proposals"` judges the proposed change itself, through the same CEL engine as every other policy. It sees the proposal's kind, namespace, apps, nodes, instance counts, replica change, reversibility, changed fields and images, and the author's name, kind and role. It never sees the agent's reason, so the agent can't talk it round, and it has no clock. A `deny` refuses the proposal (the agent sees `guardrail`, exit 4); `action = "approve"` lets routine changes through without a person:
+
+```toml
+[policy.agents-scale-shop]
+applies_to = "proposals"
+action = "approve"
+match = 'author.kind == "agent" && proposal.kind == "scale" && proposal.namespace == "shop" && proposal.replicas_to <= 10'
+```
+
+A policy never approves a change the cluster can't undo exactly, one a `warn` policy flagged, or one whose blast radius it couldn't fully see; those wait for a person. Only an admin writes policies, so only an admin grants approval, and a new cluster has none. `relish policy test --proposal` tries a guardrail on a real proposal before anyone trusts it.
+
+An MCP client gets the same split. Plain `relish mcp` offers only the read-only tools, and from the saved admin context it makes and uses its own read-only token rather than send the admin one. `relish mcp --propose` adds the proposal and lease tools, with no approve tool among them; from the saved admin context it makes a deployer agent token confined to the namespace it's given, and it won't start without one.
+
+### 17.6 Safety Model and Trade-offs
+
+- **No LLM inside `bun`.** The model is on the other end of the pipe, in whichever agent the user already runs. A node that called a model would need API keys, network egress and a budget, and would change behaviour when a vendor's model did.
+- **Read-only, or asking.** No `relish agent` command changes a workload: from 0.2.8 `lease` and `propose` write only council records, which a person or a person's policy then acts on (§17.5). The agent's token, not the CLI, decides what it may read and whether it may propose. `relish mcp` speaks stdio only (no port to find), offers no tool that writes or reaches past the cluster API unless `--propose` adds the proposing ones, and names every excluded command with its reason; a new command is a tool by default, and the snapshot of the tool list puts the question "is this read-only?" in front of a reviewer.
+- **Nothing posts.** Reports, patches and setup changes stop at a step marked `read_only: false` for a human to approve. Patched binaries are unsigned, and every node upgrade checks the release signature, so a patch can't reach a real cluster through `relish upgrade`.
+- **Trust from outside.** Issue forms are the report contract, an AI-assistance policy asks every contributor (us included) to disclose AI help and stand behind every line, and every release file gets a build provenance attestation checkable with `gh attestation verify`. Notarisation of the macOS `relish` and a Homebrew tap are built but *planned* until the maintainer's Apple Developer ID and the tap repository exist.
+
+The trade-off is that an agent gets less than it could. It can't restart the app it diagnosed without someone saying yes, it can't file the issue it drafted, and it reads a 24 KiB answer where a dump of the cluster would be more complete. We think an agent that's useful and can't do damage beats one that's slightly more useful and can.
+
+### 17.7 Measuring It
+
+Claims about agents are only worth what measures them. An agent gym in `scripts/gym/` sets up a cluster, breaks it with Smoker faults or a planted Reliaburger bug, hands a solver the symptom and a read-only token, and scores the answer against ground truth by comparing a closed vocabulary, not by asking another model. A recording shim and the audit log catch any attempt to change the cluster, including one prompted by an injected log line. The scripted baseline ships with it. The gym's first run found a real `bun` bug: a fast crash loop that `relish wtf` couldn't see. 0.2.7's exit test ran Claude Code, with only the Reliaburger plugin and a read-only token, five times through each scenario, and passed: the right diagnosis in 5 of 5 runs of every fault scenario, no planted secret in any report draft, no attempt to change the cluster in 30 runs, and the planted bug found and patched in 5 of 5 ([record](qualification/2026-11-06-v0.2.7-exit-test.md)).
+
+From 0.2.8 the gym also tests proposals, with the solver holding a deployer agent token: a rollback proposed after a bad deploy, a proposal a guardrail refuses, two agents after the same app (the second must meet the first one's lease) and an approval that goes stale because a person changed the app first. Proposing and taking a lease don't make a run unsafe; changing the cluster directly still does, and each scenario checks what the cluster answered, as well as what the agent said.
+
+Every concept an agent must learn is a cost, so a test counts them: on the 0.2.8 train, 8 resource kinds and 189 `relish` commands and subcommands, hidden ones included, read from the CLI's own definitions. The budget lives in `docs/testing/concept-budget.json` with the reason for every number, and the test fails when a count moves either way, so a new concept is a line a reviewer has to agree with. Two measurements aren't made yet, and we quote no numbers for them: the tokens and time the same agent spends on the same faults on Kubernetes ([#1679](https://github.com/reliaburger/reliaburger/issues/1679), for [#1681](https://github.com/reliaburger/reliaburger/issues/1681)), and how small local models do in the gym ([#1687](https://github.com/reliaburger/reliaburger/issues/1687)).
+
+### 17.8 What's Planned
+
+0.2.8 brought forward part of the AI SRE milestone: agent tokens, proposals approved by a person or a policy, and the first half of the incident timeline. The rest stays in 0.4.2, "Let it help" (all *planned*): the timeline's second half, with a `/v1/timeline` endpoint, GitOps and log-pattern sources and a durable decision log (#1084), log patterns (#1087) and webhooks (#1089). Later come OpenTelemetry export (#1091) and a remote MCP endpoint with its own authentication (#1092).
+
+> For the implementation, the tests and the reasoning behind each choice, see the book chapter [Built for Humans and Their Agents](book/19-built-for-agents.md) and the manual chapter [Working with an AI agent](manual/16_working-with-an-ai-agent.md).
+
+---
+
+## 18. Process Workloads (Non-Container)
 
 Reliaburger provides a middle ground between full container workloads and unmanaged system processes: **run a binary from the host's filesystem under the same scheduling, health checks, metrics, and log capture as a container app.** Process Apps use `exec` instead of `image`; process Jobs use `exec` or `script` for inline shell scripts.
 
@@ -843,7 +1088,7 @@ Process applications, ordinary process jobs and every host workload on platforms
 
 ---
 
-## 18. Fault Injection (Smoker)
+## 19. Fault Injection (Smoker)
 
 Smoker is Reliaburger's built-in chaos engineering system. Because Onion's eBPF programs already intercept every `connect()` call, Bun's DNS responder answers every `.internal` name, and Bun already manages cgroups for every container, fault injection is a natural extension of existing infrastructure. No new binaries, processes, or sidecars.
 
@@ -859,6 +1104,9 @@ relish fault scenario chaos/scenario.toml --acknowledge # scripted multi-step sc
 `relish fault delay` has shipped; `relish fault bandwidth` parses but Bun
 refuses it until it's implemented
 ([#366](https://github.com/reliaburger/reliaburger/issues/366)).
+
+Planned for 0.6.0: `relish fault gpu <node>/<device> --xid <code>` injects a synthetic GPU error through the node's GPU event watcher, the way GPU cloud graders test detection, so the health path can be exercised on demand.
+
 Safety rails require an authenticated role, the matching server-owned
 `[testing].allowed_operations` grant and explicit acknowledgement. They also
 enforce duration limits (default 10 min) and blast-radius protection
@@ -872,12 +1120,18 @@ it injects any and exits non-zero if a step is refused. Admin doesn't
 override a disabled operation, and Bun attributes audit events to the
 authenticated credential rather than a client-supplied name.
 
-In 0.2.0 workload faults target apps only: the replica guard refuses a kill or
-pause aimed at a job, and array or shared-executor attempts aren't Smoker
-targets. Jobs are tested under node-level faults instead (Bun killed on a
-worker or the leader, delayed traffic between nodes, a full disk, slow
-fsync), which is how the release's job qualification breaks them. Job-aware
-chaos is planned for 0.2.2.
+Workload faults reach jobs and task arrays as well as apps. `relish fault
+kill render --instance 41` kills the attempt running task 41, wherever it
+runs, and the job handles it as it would a crash, under its own retry and
+`replay_unknown` policy. The replica guard applies
+only to apps, since a job is meant to finish; Bun decides what a target is
+from what runs, so a caller can't relabel an app to dodge the guard, and
+every other rail still applies. An attempt in its own container takes every
+fault. A command in a reusable executor takes kill and pause only, because a
+CPU, memory, I/O or network fault on the executor's shared cgroup would slow
+the tasks that run there next. The release's job qualification also breaks
+whole nodes under jobs (Bun killed on a worker or the leader, delayed traffic
+between nodes, a full disk, slow fsync).
 
 | | Chaos Mesh (K8s) | Litmus (K8s) | Gremlin (SaaS) | **Smoker** |
 |---|---|---|---|---|
@@ -890,7 +1144,7 @@ chaos is planned for 0.2.2.
 
 ---
 
-## 19. Testing & Benchmarks
+## 20. Testing & Benchmarks
 
 Reliaburger compiles its test suite into the binary. `relish test` runs 39
 integration tests across 13 subsystems (scheduling, service discovery,
@@ -923,66 +1177,70 @@ guard, never a daily qualification: the 100-million-a-day claim needs the
 
 ---
 
-## 20. Self-Upgrades
+## 21. Self-Upgrades
 
-Since every component of a node lives in the one `bun` binary, upgrading a node means replacing that binary and restarting the Bun process. The system automates this in a rolling fashion: workers upgrade first (with configurable parallelism), then council members one at a time to maintain quorum, then the leader upgrades last (in place — a council of three or more keeps quorum through the sub-second exec bounce; openraft 0.9 has no graceful leadership transfer). Application workloads are never interrupted, because the container runtime manages containers independently of Bun. During the rolling upgrade window, old and new binaries coexist, but only when both speak the same formats. Every binary carries a cluster protocol generation and a durable state generation (`src/compatibility.rs`), and nodes refuse peers, snapshots, backups and data directories stamped with a different pair. Before 1.0.0 we don't keep backwards compatibility at all: a release that changes a wire or storage format bumps a generation, and upgrading across that bump means starting a fresh cluster, with no migration (see [compatibility before 1.0.0](releasing.md#compatibility-before-100)). So until 1.0, self-upgrade works only between builds of the same format. Every release from 0.1.0 to 0.2.0 bumped one, so no rolling upgrade between two published releases has run yet; shipping a patch release that keeps its predecessor's formats, and qualifying a real published-to-published rolling walk on it, is a goal. A compatibility promise across versions is a post-1.0 goal.
+Since every component of a node lives in the one `bun` binary, upgrading a node means replacing that binary and restarting the Bun process. The system automates this in a rolling fashion: workers upgrade first (with configurable parallelism), then council members one at a time to maintain quorum, then the leader upgrades last (in place — a council of three or more keeps quorum through the sub-second exec bounce; openraft 0.9 has no graceful leadership transfer). Application workloads are never interrupted, because the container runtime manages containers independently of Bun. During the rolling upgrade window, old and new binaries coexist, but only when both speak the same formats. Every binary carries a cluster protocol generation and a durable state generation (`src/compatibility.rs`), and nodes refuse peers, snapshots, backups and data directories stamped with a different pair. Before 1.0.0 we don't keep backwards compatibility at all: a release that changes a wire or storage format bumps a generation, and upgrading across that bump means starting a fresh cluster, with no migration (see [compatibility before 1.0.0](releasing.md#compatibility-before-100)). So until 1.0, self-upgrade works only between builds of the same format. Every release from 0.1.0 to 0.2.2 bumped one. 0.2.3 is the first patch release that kept its predecessor's formats, and a three-node cluster rolled from the published 0.2.2 onto it in place ([record](qualification/2026-10-29-rolling-walk-0.2.2-to-0.2.3.md)). 0.2.4 bumps both again, so a 0.2.3 cluster moves to it as a fresh cluster. A compatibility promise across versions is a post-1.0 goal.
 
 Reliaburger verifies binary integrity via dual signatures: an embedded signing key set compiled into the binary AND an external signing key configured in `node.toml`. Network upgrades require both signatures. Published release metadata carries only the release signature, so `relish upgrade start <version>` countersigns each download with the operator's key (`--external-key`) or takes a countersigned envelope (`--sig`). It picks the build for the platform each node reports rather than the one relish runs on, and a cluster that mixes architectures gets one build per platform. Before staging, each node runs the verified candidate once with `--compatibility` and refuses a binary whose formats differ or that doesn't answer within 60 seconds, a hang guard sized for macOS, which assesses every new executable before its first run. Automatic rollback triggers if a node fails to start on the new version.
+
+From 0.2.8, `relish verify` checks the result: every node reports its `bun`'s SHA-256, `verify` compares it with the hash the release metadata publishes for that version and platform, downloads each build once and checks its Ed25519 signature against the release keys compiled into `relish`, then checks the `relish` running it the same way. The metadata isn't signed and doesn't need to be: a node passes only against bytes the release key signed, so a lying metadata host can make the check fail, never pass. The verdict is `verified`, `mismatch` or `unknown`, and missing evidence is never `verified`. `--metadata`, `--cli-metadata` and `--artefacts` run it offline against downloaded files. It can't catch a node that lies about its own hash, or a replaced `relish`; `gh attestation verify` checks `relish` itself.
 
 > For the upgrade sequence, binary versioning, rollback procedure, and security considerations, see [design/agent-bun.md](design/agent-bun.md).
 
 ---
 
-## 21. Multi-Cluster (Franchise)
+## 22. Multi-Cluster (Franchise)
 
-> **Status: planned — not yet implemented in the current binary.** Nothing in this section runs today. Franchise is a forward-looking design: there is no WAN gossip ring, no `relish franchise` command, no cross-cluster service discovery, and no franchise dashboard. In fact the binary actively refuses the one hook that exists in the config schema — an app that declares `egress.allow_franchise` is refused when a node deploys it, rather than run with the rule silently unenforced (moving that refusal to config validation is [#701](https://github.com/reliaburger/reliaburger/issues/701)). The rest of this section describes the intended design, kept here so the vision is on record.
+> **Status: planned — not yet implemented in the current binary.** Nothing in this section runs today. Franchise is a forward-looking design: there is no WAN gossip ring, no `relish franchise` command, no cross-cluster service discovery, and no franchise dashboard. In fact the binary actively refuses the one hook that exists in the config schema: `relish apply` and `relish lint` refuse an app that declares `egress.allow_franchise`, and a node refuses to deploy one that slips through, rather than run it with the rule silently unenforced. The rest of this section describes the intended design, kept here so the vision is on record.
 
 Reliaburger clusters are independent by design. Each has its own Raft consensus, its own CA hierarchy, and its own lifecycle. Franchise extends this model to give you visibility and connectivity across multiple clusters without coupling them.
 
 Each cluster is a **franchise location**: independently operated, sharing standards and visibility. Peering is a single command:
 
+<!-- snippet: planned #711 -->
 ```bash
 relish franchise join https://prod-west.example.com --token <peer-token>
 ```
 
 This exchanges OIDC trust bundles (Sesame already supports per-cluster SPIFFE trust domains) and joins a WAN gossip ring that is separate from the intra-cluster LAN ring. Both clusters see each other immediately.
 
-### 21.1 WAN Gossip
+### 22.1 WAN Gossip
 
 Leaders exchange lightweight cluster-level metadata over WAN gossip (a Mustard extension): cluster name, leader endpoint, node count, service catalog (app names + health status), and capacity summary. This isn't node-level data or Raft state, just cluster-level summaries, converging in seconds with O(1) per-cluster overhead.
 
-### 21.2 Cross-Cluster Service Discovery
+### 22.2 Cross-Cluster Service Discovery
 
 Onion's eBPF layer resolves a new DNS zone: `name.cluster.franchise` (e.g., `redis.prod-west.franchise`). Cross-cluster traffic routes through the peer cluster's Wrapper ingress, which already terminates mTLS. There are no VPNs, no tunnels, and no direct pod-to-pod networking across clusters. Wrapper is the bridge.
 
 Apps opt in explicitly:
 
+<!-- snippet: planned #711 -->
 ```toml
 [app.web.egress]
 allow_franchise = ["redis.prod-west"]
 ```
 
-### 21.3 Unified Dashboard and Metrics
+### 22.3 Unified Dashboard and Metrics
 
 Brioche provides a franchise overview page: all peered clusters, their health status, app counts, and capacity. Click through to any peer's detail view (Brioche proxies the request). On the CLI, `relish franchise status` shows a summary across all clusters and `relish top --franchise` shows fleet-wide resource usage. Each cluster's Mayo would expose a Prometheus remote-read API (itself planned, [#364](https://github.com/reliaburger/reliaburger/issues/364)), so Brioche could query metrics across the franchise without cross-cluster scraping.
 
-### 21.4 Cross-Cluster Image Pull and GitOps
+### 22.4 Cross-Cluster Image Pull and GitOps
 
 Peered clusters can pull images from one another's Pickle registries on demand (lazy, not eagerly replicated) using the existing OCI Distribution API over the trust relationship. For GitOps, Lettuce supports shared repositories with per-cluster watch directories. A `_defaults.toml` inside the watched tree provides shared values, and child directories can override them. Each cluster independently resolves its watched tree; defaults outside its watch root are not inherited.
 
-### 21.5 Trust Model
+### 22.5 Trust Model
 
 Each cluster keeps its own CA hierarchy; there's no shared root CA. Peering exchanges OIDC trust bundles (see Section 11.2). Cross-cluster traffic uses Wrapper's mTLS with the peer's Ingress CA. A peered cluster going down doesn't affect your local cluster: WAN gossip marks it as unreachable, and local operations continue uninterrupted.
 
-### 21.6 What Franchise Does Not Do
+### 22.6 What Franchise Does Not Do
 
-Franchise deliberately excludes cross-cluster scheduling (each cluster schedules independently), shared Raft (cluster state is sovereign), cross-cluster pod networking (no tunnels or overlay), and automatic failover (redeployment is manual or GitOps-driven). These boundaries keep clusters truly independent. Franchise adds visibility and connectivity without tight coupling.
+Franchise deliberately excludes cross-cluster scheduling (each cluster schedules independently), shared Raft (cluster state is sovereign), cross-cluster pod networking (no tunnels or overlay), and automatic failover (redeployment is manual or GitOps-driven). These boundaries keep clusters truly independent. Franchise adds visibility and connectivity without tight coupling. Batch work is no exception: queues (§5.9) share one cluster between teams, and scheduling jobs across clusters, as Armada and MultiKueue do, isn't planned. If it ever is, it would build on queues and the pull model task arrays already use.
 
 > For WAN gossip protocol details, trust bundle exchange, and cross-cluster routing, see [design/gossip-mustard.md](design/gossip-mustard.md), [design/security-sesame.md](design/security-sesame.md), and [design/ingress-wrapper.md](design/ingress-wrapper.md).
 
 ---
 
-## 22. What's Deliberately Not Included
+## 23. What's Deliberately Not Included
 
 The following features are intentionally excluded from Reliaburger v1. Each is a deliberate design decision, not an oversight.
 
@@ -999,24 +1257,30 @@ The following features are intentionally excluded from Reliaburger v1. Each is a
 | IPv6 | The current networking model (virtual IPs, eBPF hooks) is IPv4-only. IPv6 support is planned for v2. |
 | Pod affinity / anti-affinity | Replaced by simple placement hints via node labels. |
 | Pod Disruption Budgets | Reliaburger's intended drain logic respects the same constraints as rolling deploys: it never drains a node if doing so would reduce any app below `replicas - max_unavailable` healthy instances, checking all affected apps before proceeding. (The `relish drain` command itself is planned — see Section 16.) |
-| Sidecars | Some use cases genuinely require co-located processes sharing a network namespace (authentication proxies, log forwarders, protocol adapters). In v1, init containers cover per-instance startup tasks and separate Apps with service discovery cover most runtime co-location needs, though at the cost of a network hop. A `sidecar` field on the App spec (co-located containers sharing the parent's network namespace and lifecycle) is planned for v2. |
+| Sidecars | Some use cases genuinely require co-located processes sharing a network namespace (authentication proxies, log forwarders, protocol adapters). In v1, init containers cover per-instance startup tasks and separate Apps with service discovery cover most runtime co-location needs, though at the cost of a network hop. A `sidecar` field on the App spec (co-located containers sharing the parent's network namespace and lifecycle) was planned for v2, and arrived early, in 0.2.4 (#1120). |
+| Inference engines and training frameworks | Reliaburger hosts vLLM, SGLang, llama.cpp, Ray and torchrun as ordinary workloads instead of reimplementing them. They move fast and have large communities; the platform's job is placement, devices, weights, routing and recovery. |
+| Workflow / DAG language | Job dependencies (§5.2) cover "this array after that one". Full workflows with data passing, lineage and backfills stay in Airflow, Nextflow and their peers, which drive Reliaburger through a provider and an executor. |
+| GPU sharing by intercepting CUDA | Interception libraries enforce memory limits only while the workload cooperates. Pre-partitioned MIG instances are exposed as devices (0.6.0); time-slicing, MPS and changing MIG layouts are v2. |
+| GPU driver installation | Drivers, Fabric Manager and IMEX belong to the operating system. Reliaburger checks they're present and reports readiness. |
+| Frontier-scale pre-training | Thousands of GPUs bound to one fabric, with site-specific tuning and vendor maintenance windows, is Slurm's ground. Reliaburger targets fine-tuning, RL, evaluation, serving and training up to a few hundred GPUs. |
+| Batch scheduling across clusters | Each cluster schedules independently (§22.6). |
 | Distributed tracing backend | Applications export traces to external collectors (Jaeger, Tempo, Datadog) using standard OpenTelemetry SDKs. Workload identity (Section 11.2) provides authentication to external tracing services. No single tracing backend fits all teams, so including one would violate the "batteries-included means the default works" principle. |
 
 ### Migration Path
 
 Reliaburger provides bidirectional Kubernetes migration tooling. Neither direction is a perfect translation (the systems have different abstractions), but the goal is to preserve as much as possible and clearly report what was lost.
 
-**Importing from Kubernetes** (`relish import`) converts Kubernetes YAML into Reliaburger TOML. The importer correlates related resources automatically: a Deployment + Service + Ingress + HPA that Kubernetes treats as four separate objects becomes a single `[app.*]` block in TOML. Today it groups them by name: a Service with the Deployment's name, an Ingress whose backend names that Service, and an HPA whose scale target names the Deployment. Matching on label selectors, the way Kubernetes itself does, is planned ([#703](https://github.com/reliaburger/reliaburger/issues/703)). Every import produces a migration report with three sections: what was converted directly, what was approximated (review recommended), and what was dropped (no Reliaburger equivalent) with guidance on alternatives.
+**Importing from Kubernetes** (`relish import`) converts Kubernetes YAML into Reliaburger TOML. The importer correlates related resources automatically: a Deployment + Service + Ingress + HPA that Kubernetes treats as four separate objects becomes a single `[app.*]` block in TOML. It matches them the way Kubernetes routes them, within one namespace: a Service attaches to every workload whose pod template labels include its selector, an Ingress follows its backend Service to that workload, and an HPA joins the workload its scale target names. Everything is keyed by namespace and name, so same-named resources in two namespaces never overwrite each other. A ConfigMap a workload reads with `envFrom` is flattened into its env, and a Job's `backoffLimit` and `activeDeadlineSeconds` become its attempt limit and timeout. Every import produces a migration report with three sections: what was converted directly, what was approximated (review recommended), and what was dropped (no Reliaburger equivalent) with guidance on alternatives.
 
 ```bash
 # From files (repeat -f for multiple manifests)
 relish import -f deployment.yaml -f service.yaml
 
-# Fail on any conversion warning (CI gate)
+# Fail if anything was approximated or dropped (CI gate)
 relish import -f deployment.yaml --strict
 ```
 
-**Exporting to Kubernetes** (`relish export`) generates standard Kubernetes manifests from Reliaburger configuration. Each `[app.*]` produces a Deployment + Service, plus Ingress and HPA if the app defines ingress and autoscale blocks. Each `[job.*]` produces a Job or CronJob. Features with no Kubernetes equivalent (auto-rollback, Smoker fault rules, process workloads) are noted in the export report.
+**Exporting to Kubernetes** (`relish export`) generates standard Kubernetes manifests from Reliaburger configuration. Each `[app.*]` produces a Deployment + Service, plus Ingress and HPA if the app defines ingress and autoscale blocks. Each `[job.*]` produces a Job or CronJob. Containers keep their command, arguments, working directory and user. Features with no Kubernetes equivalent (auto-rollback, Smoker fault rules, process workloads) are noted in the export report, and so is every encrypted env value, which exports as a placeholder that needs a Kubernetes Secret.
 
 ```bash
 relish export -f myapp.toml > k8s-manifests.yaml
@@ -1026,13 +1290,13 @@ This is an explicit design goal: Reliaburger should never be a dead end, regardl
 
 ---
 
-## 23. Comparison Matrix
+## 24. Comparison Matrix
 
-The Reliaburger column describes 0.2.0. Rows marked *Target* are design goals from §2 that no release has measured yet, and *Planned* rows aren't in the binary; the [scope and limits](README.md#scope-and-limits) and the [release order](roadmap.md#releases-after-010) say what ships and when the rest is due.
+The Reliaburger column describes 0.2.8. Rows marked *Target* are design goals from §2 that no release has measured yet, and *Planned* rows aren't in the binary; the [scope and limits](README.md#scope-and-limits) and the [release order](roadmap.md#releases-after-010) say what ships and when the rest is due.
 
 | | Kubernetes | k3s / k0s | Nomad | Docker Compose | **Reliaburger** |
 |---|---|---|---|---|---|
-| **Conceptual complexity** | Very high (50+ resource types) | Very high (same API) | Medium (~5 job types) | Low | **Low (7 workload types, plus builds)** |
+| **Conceptual complexity** | Very high (50+ resource types) | Very high (same API) | Medium (~5 job types) | Low | **Low (7 workload types, plus builds; 9 planned)** |
 | **Node types** | Control plane + workers | Server + agent | Server + client | Single host | **Homogeneous** |
 | **Binary count** | Many (apiserver, scheduler, controller-manager, etcd, kubelet, kube-proxy) | 1 | 1 | 1 | **2 (`bun` agent, `relish` CLI)** |
 | **Networking** | Overlay (CNI required) | Overlay (CNI required) | Host or overlay | Host (bridge) | **Per-container namespaces + port mapping (no overlay)** |
@@ -1057,11 +1321,11 @@ The Reliaburger column describes 0.2.0. Rows marked *Target* are design goals fr
 | **Max cluster size** | ~5,000 nodes | ~5,000 nodes | ~10,000 nodes | 1 host | **Target: 10,000 nodes (unmeasured)** |
 | **Volume model** | Local + CSI (network) | Same as K8s | Local + CSI | Docker volumes | **Local only (by design)** |
 | **Multi-node** | Yes | Yes | Yes | No | **Yes** |
-| **Rolling deploys** | Yes | Yes | Yes | No | **Yes, per node (node-local auto-rollback; cluster-coordinated rollouts planned, #692)** |
+| **Rolling deploys** | Yes | Yes | Yes | No | **Yes, one node at a time (a failed rollout stops as `RolloutFailed`; one cluster-wide surge budget is planned)** |
 | **Autoscaling** | HPA (separate config) | Same as K8s | External | No | **Built-in** |
 | **Time to first deploy** | Hours to days | Minutes to 30 min | 30 min to hours | Minutes | **Target: < 5 min (unmeasured)** |
 | **Written in** | Go | Go | Go | Go | **Rust** |
-| **GPU scheduling** | Via device plugin (separate install) | Via device plugin | Yes (device plugins) | No | **Planned (node detects NVIDIA cards; allocation and placement are #359, §2)** |
+| **GPU scheduling** | Via device plugin (separate install) | Via device plugin | Yes (device plugins) | No | **Planned for 0.6.0 (per-device, CDI, health; today the node only detects NVIDIA cards, #359, §2)** |
 | **Secret management** | Built-in (basic) or External (Vault, Sealed Secrets) | Same as K8s | Vault integration | Docker secrets | **Encrypted-in-git (built-in)** |
 | **Workload identity** | Separate (SPIRE, cert-manager) | Same | Consul Connect | None | **Built-in (SPIFFE-compatible, auto-rotated)** |
 | **Non-container jobs** | No | No | Yes (exec driver) | No | **Yes (allowlisted host exec; sandboxing planned)** |
@@ -1070,15 +1334,34 @@ The Reliaburger column describes 0.2.0. Rows marked *Target* are design goals fr
 | **Daemon mode** | DaemonSet (separate resource type) | Same | system scheduler | N/A | **replicas = "*" (same App resource)** |
 | **Job throughput** | Low (per-job API calls) | Low (same) | Medium | N/A | **Target: 100M+ per day (unqualified; task arrays implemented for 0.2.0)** |
 | **Leader recovery** | Automatic within quorum; backup for quorum loss | Same | Automatic within quorum; backup for quorum loss | N/A | **Automatic within quorum; operator restore from a sealed backup for quorum loss (§8.3)** |
-| **Multi-cluster** | Separate (Karmada / Cilium ClusterMesh / many CRDs) | Same | WAN gossip + API forwarding (Consul for service discovery) | N/A | **Planned (Franchise — WAN gossip + Wrapper ingress; not yet implemented, see §21)** |
+| **Multi-cluster** | Separate (Karmada / Cilium ClusterMesh / many CRDs) | Same | WAN gossip + API forwarding (Consul for service discovery) | N/A | **Planned (Franchise — WAN gossip + Wrapper ingress; not yet implemented, see §22)** |
 | **K8s migration** | N/A | N/A | N/A | N/A | **Built-in (relish import/export with migration reports)** |
 | **License** | Apache 2.0 | Apache 2.0 | BSL 1.1 (MPL 2.0 before August 2023) | Apache 2.0 | **Apache 2.0** |
+
+### 24.1 Batch and AI workloads
+
+Batch and GPU work have their own incumbents. Most Reliaburger entries below are planned, with the release in brackets; services, task arrays and the proven scale are in 0.2.0. The [batch scheduler](plans/2026-10-11-research-batch-schedulers.md) and [LLM workloads](plans/2026-10-11-research-llm-workloads.md) research have the evidence for the other columns.
+
+| | Slurm | Kubernetes + Kueue or Volcano | Nomad | **Reliaburger** |
+|---|---|---|---|---|
+| **What you install** | `slurmctld`, `slurmd`, `slurmdbd` with MySQL, MUNGE, usually a shared filesystem | Kubernetes, GPU operator, Kueue or Volcano, JobSet or Trainer, plus a gateway for serving | One binary plus a device plugin | **One agent binary (`bun`), plus the `relish` CLI** |
+| **Services** | No | Yes | Yes | **Yes** |
+| **Queues and fair share** | Fair-share tree, multifactor priority | Cohorts and fair sharing (Kueue), DRF (Volcano) | No; quotas are Enterprise-only | **Planned (0.10.0)** |
+| **Preemption** | Yes | Yes | Yes, off by default for batch | **Planned (0.10.0)** |
+| **Gangs** | Yes (a job's allocation) | Volcano and KAI atomic; Kueue admission with a timeout | No ([#18773](https://github.com/hashicorp/nomad/issues/18773)) | **Planned: groups with roles and spares (0.8.0)** |
+| **Job arrays** | Up to 4,000,001 tasks | Indexed Job, one Pod object per index | None; one child job per dispatch | **Up to 16,777,216 tasks, compact in Raft (0.2.0)** |
+| **Job dependencies** | `afterok` and friends | Via Argo Workflows | No | **Planned (0.9.0)** |
+| **GPU devices** | GRES, MIG | Device plugin or DRA via the GPU operator | Device plugin; MIG since 1.9 | **Planned: CDI, MIG instances (0.6.0)** |
+| **GPU fault handling** | Health-check scripts plus DCGM | NVSentinel (separate) | Device re-fingerprinting | **Planned (0.6.0)** |
+| **LLM serving** | No | KServe or llm-d plus Gateway API Inference Extension | No | **Planned (0.7.0)** |
+| **Model weight distribution** | Shared filesystem | Dragonfly or model caches (separate) | Host volumes | **Planned: P2P in Pickle (0.7.0)** |
+| **Proven scale** | Tens of thousands of nodes | About 5,000 nodes | 10,000 claimed | **Three nodes qualified** |
 
 > **Note on Docker Swarm:** Docker Swarm mode (via `docker stack deploy`) adds multi-node orchestration, rolling deploys, overlay networking, service discovery, and secret management to the Docker engine. It occupies a similar "simple orchestrator" space. However, Swarm has been in maintenance mode since 2019, receives only security patches, and lacks built-in metrics, dashboards, GitOps, a registry, or fault injection. The Docker Compose column above reflects standalone Compose without Swarm mode.
 
 ---
 
-## 24. Licensing
+## 25. Licensing
 
 Reliaburger is licensed under **Apache 2.0**, the same license as Kubernetes, k3s, Docker Engine, and Podman.
 
@@ -1096,7 +1379,7 @@ Reliaburger's manifesto (point #10) states: *"Open source means open source. No 
 
 ---
 
-## 25. Questions & Answers
+## 26. Questions & Answers
 
 This section addresses the hard questions about Reliaburger's architecture: failure modes, scaling limits, and design trade-offs that a critical reader would raise.
 
@@ -1114,7 +1397,7 @@ Not the gossip itself: Mustard carries only lightweight, bounded state (membersh
 
 ### Q4: With encrypted-in-git secrets, how do developers encrypt without cluster access?
 
-Reliaburger uses asymmetric encryption (age). The cluster's public key is committed to the git repository and can be distributed freely. Anyone with the public key can encrypt secrets offline, no cluster access needed. Only the cluster holds the private key for decryption. Reusing ciphertext with a replacement cluster currently requires an operator to provision the existing key material out of band; the previously proposed `relish init --import-key` command isn't implemented. Key rotation supports a graceful transition period where both old and new ciphertexts are accepted.
+Reliaburger uses asymmetric encryption (age). The cluster's public key is committed to the git repository and can be distributed freely. Anyone with the public key can encrypt secrets offline, no cluster access needed. Only the cluster holds the private key for decryption. Reusing ciphertext with a replacement cluster currently requires an operator to provision the existing key material out of band; the previously proposed `--import-key` flag for `relish init` isn't implemented. Key rotation supports a graceful transition period where both old and new ciphertexts are accepted.
 
 ### Q5: When a new leader is elected, can it make wrong scheduling decisions from incomplete state?
 
@@ -1122,13 +1405,13 @@ No. The new leader enters a learning period where it accepts StateReports from n
 
 ### Q6: Aren't exec (non-container) jobs a massive security risk?
 
-They would be, without constraints. The constraint that ships today is a policy gate, not a kernel sandbox. Process workloads require an explicit `admin` or `host-exec` Permission grant, and you must configure an explicit binary allowlist in `node.toml`. An empty or absent allowlist refuses every `exec`/`script` workload, so host execution is disabled on any node the operator hasn't explicitly opened up. Inline scripts additionally require signed commits when applied via GitOps. This deny-by-default posture ensures no host binary can execute without explicit operator approval. On rootful Linux, process batches enforce CPU/memory limits through native executors. Host applications still need cgroup limits; a dedicated unprivileged `burger` user, a seccomp profile and network/PID/mount namespaces remain planned (see Section 17). So treat a process workload as a binary the operator has explicitly whitelisted running on the host, not as a locked-down sandboxed process — for anything hostile, keep it in a container.
+They would be, without constraints. The constraint that ships today is a policy gate, not a kernel sandbox. Process workloads require an explicit `admin` or `host-exec` Permission grant, and you must configure an explicit binary allowlist in `node.toml`. An empty or absent allowlist refuses every `exec`/`script` workload, so host execution is disabled on any node the operator hasn't explicitly opened up. Inline scripts additionally require signed commits when applied via GitOps. This deny-by-default posture ensures no host binary can execute without explicit operator approval. On rootful Linux, process batches enforce CPU/memory limits through native executors. Host applications still need cgroup limits; a dedicated unprivileged `burger` user, a seccomp profile and network/PID/mount namespaces remain planned (see Section 18). So treat a process workload as a binary the operator has explicitly whitelisted running on the host, not as a locked-down sandboxed process — for anything hostile, keep it in a container.
 
 ### Q7: How does Pickle ensure image durability?
 
 Durability is eventual, not guaranteed at push time. A push commits the image locally and returns immediately with an `oci-replication: pending` header, so the client never mistakes acceptance for full redundancy. A leader-only heal loop (running roughly every 60 seconds) then replicates layers towards a redundancy target of 2 total copies by default: the node that received the push plus one peer. There is no synchronous mode and no `push_sync` config key. This keeps push latency low and independent of cluster size, at the cost of a short window after a push where the image exists on only one node. In clusters too small to reach the target, the heal loop records that full redundancy can't be met rather than silently claiming success.
 
-Heal counts only copies on live nodes (alive or suspect in gossip). When a node dies, every image it held drops a copy, and the next heal pass has another live node copy the layers straight from a surviving holder; the leader plans but doesn't relay. Decommissioning a node removes it from every holder list. An image whose last live copy is gone is reported as *lost* by `relish status` and `relish wtf`, and a deploy of it fails telling you to re-push it. Old images don't pile up either: a manifest that has had no tag for `gc_retain_days` expires, unless an app or job pins it, and GC reclaims its layers.
+Heal counts only copies on live nodes (alive or suspect in gossip). When a node dies, every image it held drops a copy, and the next heal pass has another live node copy the layers straight from a surviving holder; the leader plans but doesn't relay. Decommissioning a node removes it from every holder list. An image whose last live copy is gone is reported as *lost* by `relish wtf`, and counted on `relish status`'s `wtf` line, and a deploy of it fails telling you to re-push it. Old images don't pile up either: a manifest that has had no tag for `gc_retain_days` expires, unless an app or job pins it, and GC reclaims its layers.
 
 ### Resource-aware delegated execution
 
@@ -1171,7 +1454,7 @@ new app deployments still require free capacity and rollout headroom.
 
 **Implementation status:** this is the architecture implemented in
 [#266](https://github.com/reliaburger/reliaburger/pull/266), following the
-[resource-aware jobs plan](plans/2026-10-04-plan-delegated-jobs.md). The daily
+[resource-aware jobs plan](plans/archive/2026-10-04-plan-delegated-jobs.md). The daily
 throughput target remains unqualified until real workloads sustain at least
 1,158 unique successful completions per second with headroom, concurrent apps,
 failure recovery and bounded memory and storage. A short simulated burst doesn't
@@ -1197,7 +1480,7 @@ task cgroups; helper resources stay charged while idle. Other platforms retain
 the original owned process backend and refuse unsupported explicit limits.
 Host commands retain host access and Bun's user; they require trusted workloads.
 Neither path removes process creation, durable outcomes or external-effect
-idempotency costs. See the [execution and qualification plan](plans/2026-10-07-plan-reusable-executors-and-throughput.md).
+idempotency costs. See the [execution and qualification plan](plans/archive/2026-10-07-plan-reusable-executors-and-throughput.md).
 
 Fast delegated jobs use bounded grant lookahead derived from verified duration
 summaries, covering receipt acceptance and grant delivery without increasing
@@ -1253,13 +1536,18 @@ group contract and application checkpoint references before supporting those
 runs. Accelerator placement must consider device identity, memory and topology,
 with exclusive whole-device allocation before any supported sharing scheme.
 
-These are design extensions. Current delegated jobs refuse GPU requests, and
-resident model adapters and distributed training groups are not implemented.
-GPU cluster placement and container device assignment remain tracked in F01
-([#359](https://github.com/reliaburger/reliaburger/issues/359)). Their validation
+None of this is implemented yet. Current delegated jobs refuse GPU requests,
+and resident model adapters and distributed training groups don't exist. The
+plan puts them in order: GPU placement, device assignment and GPU health in
+0.6.0 (F01, [#359](https://github.com/reliaburger/reliaburger/issues/359));
+model serving with weights in Pickle, inference routing and autoscaling in
+0.7.0; groups for distributed training, multi-node serving and RL in 0.8.0;
+an OpenAI-compatible batch API over resident model workers in 0.9.0; and
+fair share between teams in 0.10.0 ([roadmap](roadmap.md#releases-after-010),
+[LLM workloads research](plans/2026-10-11-research-llm-workloads.md)). Their validation
 must measure useful records/tokens or training samples per second, queue and
 serving latency, accelerator utilisation and recovery, as well as task counts.
-See the [AI implementation sequence](plans/2026-10-04-plan-delegated-jobs.md#ai-training-and-inference).
+See the [AI implementation sequence](plans/archive/2026-10-04-plan-delegated-jobs.md#ai-training-and-inference).
 
 ### Q8: Can a single leader actually schedule 100M+ jobs per day while doing everything else?
 
@@ -1281,11 +1569,11 @@ Yes, Onion requires Linux kernel 5.8 or later. This covers every actively-mainta
 
 ### Q12: The design goals mention GPU scheduling. Does it support fractional GPUs?
 
-Not yet, and not whole GPUs either: GPU allocation is planned ([#359](https://github.com/reliaburger/reliaburger/issues/359)), and no release passes a device into a container today, so an app asking for `gpu` above 0 is refused (§2). The plan is whole-device allocation first (`gpu = 1`, `gpu = 2`). Fractional GPU sharing (MIG partitions on NVIDIA A100/H100, or time-slicing) requires specific hardware support and driver configuration that varies significantly across GPU generations. Rather than ship a half-baked abstraction, fractional GPU support is deferred to v2, where MIG partitions can be exposed as distinct schedulable devices.
+Not yet, and not whole GPUs either: no release passes a device into a container today, so an app asking for `gpu` above 0 is refused (§2). GPU placement is planned for 0.6.0 ([#359](https://github.com/reliaburger/reliaburger/issues/359)), and it allocates whole devices by identity (`gpu = 1`, `gpu = 2`, or a table naming the model and minimum memory). MIG instances that an operator has already created on an A100 or H100 count as devices too, because the hardware isolates their memory and faults. Time-slicing and MPS don't isolate memory or faults, and changing MIG layouts depends on hardware and drivers that vary across GPU generations, so those stay in v2. Rather than ship a half-baked abstraction, Reliaburger only offers sharing that the hardware enforces.
 
 ### Q13: How does multi-tenancy work? Can one team starve the cluster?
 
-Namespaces provide resource quotas (CPU, memory, GPU, app count, and replica count budgets) that the Meat scheduler enforces when it places workloads. The check happens in the leader's scheduling pass, not at apply time: `relish apply` accepts an over-quota app and commits it to the desired state, and Meat then leaves it unplaced. Running apps are never evicted to make room. The leader records why in the council, so `relish status`, `relish inspect`, the dashboard and `relish wtf` all show the app as blocked with the quota it would break, and the reason clears on the first pass where the app fits. An apply-time rejection isn't on the roadmap yet. Jobs are held to the same budget at the moment the leader grants them work: each attempt's CPU, memory and GPU requests count against the namespace after its apps, and a run with no room waits with a visible quota-blocked reason instead of starting. Job capacity is divided too. One namespace can hold at most 64 active arrays, batches and manual runs and 64 job definitions, and 32 of the cluster's 128 active-run slots are kept for cron fires and deployment hooks, so a tenant flooding the queue can't lock out anyone else's schedules or deploys. A cron fire that still finds no room is recorded as a skipped occurrence with an event, never dropped silently. The default namespace has no quotas unless you configure them, which is appropriate for single-team clusters. Multi-team clusters should configure per-team namespaces with quotas from day one.
+Namespaces provide resource quotas (CPU, memory, GPU, app count, and replica count budgets) that the Meat scheduler enforces when it places workloads. The check happens in the leader's scheduling pass, not at apply time: `relish apply` accepts an over-quota app and commits it to the desired state, and Meat then leaves it unplaced. Running apps are never evicted to make room. The leader records why in the council, so `relish apps`, `relish inspect`, the dashboard and `relish wtf` all show the app as blocked with the quota it would break, and the reason clears on the first pass where the app fits. An apply-time rejection isn't on the roadmap yet. Jobs are held to the same budget at the moment the leader grants them work: each attempt's CPU, memory and GPU requests count against the namespace after its apps, and a run with no room waits with a visible quota-blocked reason instead of starting. Job capacity is divided too. One namespace can hold at most 64 active arrays, batches and manual runs and 64 job definitions, and 32 of the cluster's 128 active-run slots are kept for cron fires and deployment hooks, so a tenant flooding the queue can't lock out anyone else's schedules or deploys. A cron fire that still finds no room is recorded as a skipped occurrence with an event, never dropped silently. The default namespace has no quotas unless you configure them, which is appropriate for single-team clusters. Multi-team clusters should configure per-team namespaces with quotas from day one. Quotas are caps, not fairness: queues with weighted fair share and preemption (§5.9) are planned for 0.10.0.
 
 ### Q14: What's the minimum cluster size?
 
@@ -1299,7 +1587,7 @@ Read those numbers with their limits. They come from macOS on Apple silicon, whe
 
 ### Q16: How does Franchise compare to Kubernetes multi-cluster tools?
 
-Franchise is planned, not yet implemented (see Section 21). This comparison sets out the intended design against the alternatives.
+Franchise is planned, not yet implemented (see Section 22). This comparison sets out the intended design against the alternatives.
 
 | | K8s + Karmada | K8s + Cilium ClusterMesh | Nomad Federation | **Reliaburger Franchise** |
 |---|---|---|---|---|
@@ -1313,6 +1601,14 @@ Franchise is planned, not yet implemented (see Section 21). This comparison sets
 | Extra tools needed | Many | Cilium CNI on all clusters | Consul for service discovery | **None** |
 
 The key difference: Kubernetes multi-cluster requires choosing, installing, and operating additional tools (each with its own learning curve). Franchise is built in and uses infrastructure that already exists in every Reliaburger cluster. Wrapper handles cross-cluster traffic the same way it handles external traffic.
+
+### Q17: Why not Slurm, or Kubernetes with Kueue, for AI work?
+
+They're the right answer at their extremes. A frontier pre-training run on thousands of GPUs belongs on Slurm, and a company that already runs many Kubernetes clusters with a platform team can assemble the GPU operator, a gang scheduler, an inference gateway and a model cache. The gap is the team with 8 to 256 GPUs that wants to serve models, fine-tune them and run the product around them without either. Slurm doesn't run services, so those teams end up running Slurm and Kubernetes side by side and bridging them. Kubernetes needs a dozen or more extra projects before a model serves well. Reliaburger's plan (0.6.0 to 0.10.0) is one binary that does both, for that middle. See the [LLM workloads research](plans/2026-10-11-research-llm-workloads.md).
+
+### Q18: Does Reliaburger replace vLLM, SGLang or Ray?
+
+No. It hosts them. Inference engines and distributed runtimes move quickly and have large communities, and the platforms that try to own those layers are hardware vendors protecting their own stacks. Reliaburger's job is underneath and around them: placing GPUs, injecting devices, moving model weights, routing requests, scaling on the engines' own metrics, and restarting groups when hardware fails. vLLM runs as an App (or a `[model.*]`), torchrun and Ray clusters run as Groups, and RL frameworks such as verl start their Ray cluster as one group, unchanged.
 
 ---
 

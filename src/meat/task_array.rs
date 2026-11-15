@@ -278,6 +278,7 @@ mod tests {
 
     fn exec_template(args: &[&str]) -> JobSpec {
         JobSpec {
+            pids: None,
             runtime: crate::config::job::JobRuntime::Process,
             image: None,
             command: Some(args.iter().map(|a| a.to_string()).collect()),
@@ -295,6 +296,7 @@ mod tests {
             task_timeout_secs: None,
             overlap: None,
             replay_unknown: false,
+            provenance: None,
         }
     }
 

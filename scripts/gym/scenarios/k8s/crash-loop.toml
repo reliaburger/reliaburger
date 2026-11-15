@@ -1,0 +1,37 @@
+# The crash loop after a bad deploy, on Kubernetes: the port of
+# scenarios/crash-loop.toml. The same prompt, truth and checks.
+id = "crash-loop"
+title = "A crash loop after a bad deploy"
+platform = "k8s"
+nodes = 1
+ported = """
+web v1 and v2 are BusyBox containers in a Deployment instead of process
+workloads, and the kubelet's back-off (10 s, then doubling) paces the restarts
+instead of Bun's. Forty seconds still covers three restarts, which is where
+the pod shows CrashLoopBackOff.
+"""
+
+prompt = """
+Someone deployed a new version of the `web` app a minute ago, and since then
+users get connection errors. Find out what is wrong: which app, on which node,
+and what kind of fault.
+"""
+
+[[setup]]
+apply = "k8s/manifests/web-v1.yaml"
+wait_running = "web"
+
+[[setup]]
+apply = "k8s/manifests/web-v2-crashes.yaml"
+
+[[setup]]
+settle = "40s"
+
+[truth]
+app = "web"
+namespace = "default"
+node = "@instance:web"
+fault_kind = "crash_loop"
+
+[score]
+checks = ["app", "node", "fault_kind"]

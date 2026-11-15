@@ -65,9 +65,70 @@ impl RestartPolicy {
     }
 }
 
+/// Why an instance is waiting to restart, kept until the restart records
+/// its decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartCause {
+    /// Its process was found no longer running.
+    ProcessExited,
+    /// The runtime couldn't start it on the last attempt.
+    StartFailed,
+}
+
+/// The decision a restart records: `rule`, the instance, which attempt this
+/// is, the budget and the backoff it waited out. `attempt` is the restart
+/// count after the restart, so the backoff is the one for the count before.
+pub fn restart_decision(
+    rule: &'static str,
+    instance: &str,
+    attempt: u32,
+    policy: &RestartPolicy,
+) -> crate::bun::decisions::Decision {
+    let backoff = policy.compute_backoff(attempt.saturating_sub(1));
+    crate::bun::decisions::Decision::new(rule)
+        .with("instance", instance)
+        .with("attempt", attempt)
+        .with("restart_limit", restart_limit(policy))
+        .with("backoff_seconds", backoff.as_millis() as f64 / 1000.0)
+}
+
+/// The `restart_limit` evidence: the budget, or `unlimited`.
+pub fn restart_limit(policy: &RestartPolicy) -> String {
+    match policy.max_restarts {
+        Some(max) => max.to_string(),
+        None => "unlimited".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_restart_decision_names_the_backoff_it_waited_out() {
+        let policy = RestartPolicy::for_job(5);
+        let details =
+            restart_decision("restart.process_exited", "web-0", 3, &policy).into_details();
+        assert_eq!(details["rule"], "restart.process_exited");
+        assert_eq!(details["instance"], "web-0");
+        assert_eq!(details["attempt"], "3");
+        assert_eq!(details["restart_limit"], "5");
+        // The third restart waited the backoff for two earlier ones: 1s * 2^2.
+        assert_eq!(details["backoff_seconds"], "4");
+    }
+
+    #[test]
+    fn a_long_running_apps_budget_is_unlimited() {
+        let details = restart_decision(
+            "restart.start_failed",
+            "web-0",
+            1,
+            &RestartPolicy::default(),
+        )
+        .into_details();
+        assert_eq!(details["restart_limit"], "unlimited");
+        assert_eq!(details["backoff_seconds"], "1");
+    }
 
     #[test]
     fn default_has_unlimited_restarts() {

@@ -1,0 +1,21 @@
+---
+source: src/bun/api/contract_tests.rs
+expression: view
+---
+{
+  "events": [
+    {
+      "sequence": 41,
+      "timestamp": 1792000000,
+      "kind": "health",
+      "severity": "warning",
+      "app": "db-a",
+      "namespace": "pg",
+      "node": "node-2",
+      "message": "db-a-0 failed its health check"
+    }
+  ],
+  "warnings": [
+    "node-3: did not answer within 2s"
+  ]
+}

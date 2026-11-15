@@ -293,6 +293,38 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .contains_key(&(target.name.clone(), target.namespace.clone()))
             })
     }
+
+    /// The first workload in `config` whose instances here still belong to
+    /// an allocation the council has replaced (#1500).
+    ///
+    /// `relish delete` withdraws a service's VIP, and the council reserves
+    /// it until every consumer confirms. An `apply` before then gets another
+    /// VIP. The discovery journal holds one allocation per service and won't
+    /// let go of the old one until it has retired, and that retirement has
+    /// to be proved against the old allocation. So the new one has to wait
+    /// here until the old one has gone.
+    pub(super) fn superseded_target(
+        &self,
+        config: &crate::config::Config,
+    ) -> Option<crate::bun::deploy_operations::DeployTarget> {
+        let catalog = &self.consumer_owner()?.publications.last()?.catalog;
+        crate::bun::deploy_operations::targets(config)
+            .into_iter()
+            .find(|target| {
+                let id = crate::onion::service_id::ServiceId::new(&target.namespace, &target.name);
+                let replaced = self
+                    .service_map
+                    .resolve(&id)
+                    .zip(catalog.resolve(&id))
+                    .is_some_and(|(local, committed)| {
+                        local.vip != committed.vip || local.port != committed.port
+                    });
+                replaced
+                    && self.supervisor.list_instances().iter().any(|instance| {
+                        instance.app_name == target.name && instance.namespace == target.namespace
+                    })
+            })
+    }
 }
 
 fn stop_incomplete(reason: String) -> BunError {
@@ -306,6 +338,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// off the command loop instead (`request_app_stop`,
     /// `stop_app_unattended`). This inline form lets tests drive a whole stop
     /// without running the loop.
+    ///
+    /// `StillRunning` from the finish means off-loop work, such as removing
+    /// the instance's identity directory, hasn't landed yet. The loop asks
+    /// again on a later turn (`recheck_stop_later`); so does this, for up to
+    /// a minute, so a slow disk doesn't fail a test about something else
+    /// (#1901).
     #[cfg(test)]
     pub(super) async fn stop_app(
         &mut self,
@@ -314,7 +352,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     ) -> Result<(), BunError> {
         let stop = self.begin_app_stop(app_name, namespace).await?;
         self.app_exit_wait(&stop).await?;
-        self.finish_app_stop(app_name, namespace, stop).await
+        let patience = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            match self
+                .finish_app_stop(app_name, namespace, stop.clone())
+                .await
+            {
+                Err(BunError::StillRunning { .. }) if tokio::time::Instant::now() < patience => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                finished => return finished,
+            }
+        }
     }
 
     /// Withdraw an app's routing and move its instances to Stopping.
@@ -368,6 +417,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .iter()
             .filter_map(|id| self.take_back_from_restart(id))
             .collect();
+        // So does a sidecar restart; retirement waits for it to end (#1120).
+        for id in &instances {
+            self.sidecars.cancel_relaunches(id);
+        }
 
         Ok(AppStop {
             instances,
@@ -439,16 +492,29 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         &self,
         stop: &AppStop,
     ) -> impl std::future::Future<Output = Result<(), BunError>> + Send + 'static {
-        let ids = stop.instances.clone();
+        let grace = self.stop_grace;
+        // Each instance stops the way its own launch spec says (#1121), so an
+        // operator stop and a retirement honour the app's stop hooks.
+        let stops: Vec<(InstanceId, InstanceStop)> = stop
+            .instances
+            .iter()
+            .map(|id| (id.clone(), self.instance_stop(id, grace)))
+            .collect();
         let grill = self.supervisor.grill().clone();
         let drains = self.drains.clone();
-        let grace = self.stop_grace;
         let confirmation_timeout = self.stop_confirmation_timeout;
         let taken_restarts = stop.taken_restarts.clone();
         async move {
             restarts::settle_all(&taken_restarts, confirmation_timeout).await?;
-            let waits = ids.iter().map(|id| {
-                drain_and_stop_instance(&drains, &grill, id, grace, confirmation_timeout)
+            let waits = stops.iter().map(|(id, instance_stop)| {
+                drain_and_stop_instance(
+                    &drains,
+                    &grill,
+                    id,
+                    grace,
+                    instance_stop,
+                    confirmation_timeout,
+                )
             });
             // Try every replica, but report the first failure: ownership and
             // enforcement stay until all exits are confirmed, and a later stop
@@ -459,6 +525,22 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .find_map(Result::err)
                 .map_or(Ok(()), Err)
         }
+    }
+
+    /// How `id` is stopped: its launch spec's stop policy (#1121), with
+    /// `default_grace` where the policy names no grace, then its sidecars
+    /// (#1120).
+    pub(super) fn instance_stop(
+        &self,
+        id: &InstanceId,
+        default_grace: std::time::Duration,
+    ) -> InstanceStop {
+        let policy = self
+            .supervisor
+            .get_instance(id)
+            .and_then(|instance| instance.oci_spec.as_ref())
+            .and_then(|spec| spec.stop.as_ref());
+        InstanceStop::for_policy(policy, default_grace).with_sidecars(self.sidecars.of(id))
     }
 
     /// Record a stop whose exits are confirmed and release what it owned.
@@ -533,9 +615,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .as_ref()
                 .filter(|firewall| !firewall.allow_from.is_empty())
                 .map(|firewall| firewall.allow_from.clone());
-            self.register_local_service(&service_id, port, firewall)?;
-            self.publish_backend_ebpf(&service_id).await?;
-            self.sync_firewall_ebpf().await;
+            self.register_and_publish_service(
+                &service_id,
+                port,
+                firewall,
+                "restore_stopped_routing/landed",
+            )
+            .await?;
         }
         if let Some(ingress) = &spec.ingress {
             self.ingress_configs

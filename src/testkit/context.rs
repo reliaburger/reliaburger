@@ -174,6 +174,7 @@ impl TestContext {
                         return client
                             .exec(app, &self.namespace, command)
                             .await
+                            .map(|answer| answer.output)
                             .map_err(|error| {
                                 format!("workload inspection failed on {node}: {error}")
                             });
@@ -603,9 +604,42 @@ impl TestContext {
             if self.deadline.remaining().is_zero() {
                 return Err(format!("timed out after {:?} {waiting}", self.timeout));
             }
+            // The listing shows a cron definition as a `scheduled` row, so no
+            // row at all means the definition is gone or has no `cron`: say
+            // which, and what its deployment and lease say (#1527).
+            let waiting = if last.is_empty() {
+                format!("{waiting}; {}", self.missing_job_note(job).await)
+            } else {
+                waiting
+            };
             self.wait_note.record(waiting).await;
             tokio::time::sleep(Duration::from_millis(500).min(self.deadline.remaining())).await;
         }
+    }
+
+    /// Why `job` may have no row in the jobs listing: what the server says
+    /// of its definition, of the deployment that applied it, and of this
+    /// case's lease. Each read gets two seconds, and one that fails says so.
+    async fn missing_job_note(&self, job: &str) -> String {
+        let budget = Duration::from_secs(2).min(self.deadline.remaining());
+        let definition = match tokio::time::timeout(budget, self.client.job_summaries(true)).await {
+            Ok(Ok(view)) => job_definition_note(&view, job, &self.namespace),
+            Ok(Err(error)) => format!("definitions unreadable: {error}"),
+            Err(_) => "definitions unreadable: timed out".to_string(),
+        };
+        let deployment = match tokio::time::timeout(budget, self.client.deploy_operations()).await {
+            Ok(Ok(snapshot)) => job_deployment_note(&snapshot, job, &self.namespace),
+            Ok(Err(error)) => format!("deployments unreadable: {error}"),
+            Err(_) => "deployments unreadable: timed out".to_string(),
+        };
+        let Some(lease_id) = &self.lease_id else {
+            return format!("{definition}; {deployment}; no lease");
+        };
+        let lease = match tokio::time::timeout(budget, self.client.test_lease(lease_id)).await {
+            Ok(result) => lease_note(lease_id, result, crate::testkit::lease::now_unix_millis()),
+            Err(_) => format!("lease {lease_id} unreadable: timed out"),
+        };
+        format!("{definition}; {deployment}; {lease}")
     }
 
     /// The declared Pickle origin, including its actual scheme and bound port.
@@ -779,7 +813,7 @@ impl TestContext {
                     // durable ownership evidence, but runtime absence still
                     // needs the independent check below.
                 }
-                Ok(Err(crate::relish::RelishError::AgentUnreachable)) => {
+                Ok(Err(crate::relish::RelishError::AgentUnreachable { .. })) => {
                     return CleanupOutcome::Unknown {
                         reason: "could not reach the lease owner to confirm cleanup".to_string(),
                     };
@@ -984,9 +1018,228 @@ impl TestContext {
     }
 }
 
+/// What `GET /v1/jobs/definitions` says about `namespace/job`: absent, or
+/// its revision and `cron`.
+fn job_definition_note(view: &serde_json::Value, job: &str, namespace: &str) -> String {
+    let found = view["definitions"].as_array().and_then(|rows| {
+        rows.iter()
+            .find(|row| row["name"] == job && row["namespace"] == namespace)
+    });
+    match found {
+        Some(row) => format!(
+            "definition {namespace}/{job} exists at revision {} with cron {}",
+            row["revision"], row["cron"]
+        ),
+        None => format!("definition {namespace}/{job} is absent"),
+    }
+}
+
+/// What `GET /v1/deploys/operations` says of the newest deployment that
+/// named `namespace/job`, live or finished.
+fn job_deployment_note(
+    snapshot: &crate::bun::deploy_operations::DeployOperationSnapshot,
+    job: &str,
+    namespace: &str,
+) -> String {
+    let found = snapshot
+        .active_deploys
+        .iter()
+        .chain(&snapshot.history)
+        .filter(|operation| {
+            operation
+                .targets
+                .iter()
+                .any(|target| target.name == job && target.namespace == namespace)
+        })
+        .max_by_key(|operation| operation.started_at);
+    match found {
+        Some(operation) => format!(
+            "deployment {} is {:?} with outcome {:?}",
+            operation.id, operation.phase, operation.outcome
+        ),
+        None => format!("no deployment of {namespace}/{job} is retained"),
+    }
+}
+
+/// What the server says of this case's lease, judged at `now_unix_ms`. A
+/// lease is the only thing that forgets a test job on its own: its
+/// expiry is wall-clock time on the server, so a host that sleeps through
+/// it loses the job while the case's own deadline, which doesn't count
+/// sleep, still has time to run (#1527).
+fn lease_note(
+    lease_id: &str,
+    lease: Result<crate::testkit::lease::TestLease, crate::relish::RelishError>,
+    now_unix_ms: u64,
+) -> String {
+    use crate::testkit::lease::TestLeaseState;
+    let lease = match lease {
+        Ok(lease) => lease,
+        Err(crate::relish::RelishError::ApiError { status: 404, .. }) => {
+            return format!("lease {lease_id} is gone: its cleanup has finished");
+        }
+        Err(error) => return format!("lease {lease_id} unreadable: {error}"),
+    };
+    let expiry = if now_unix_ms < lease.expires_at_unix_ms {
+        format!(
+            "expires in {} s",
+            (lease.expires_at_unix_ms - now_unix_ms) / 1000
+        )
+    } else {
+        format!(
+            "expired {} s ago",
+            (now_unix_ms - lease.expires_at_unix_ms) / 1000
+        )
+    };
+    match lease.state {
+        TestLeaseState::Active => format!("lease {lease_id} is active and {expiry}"),
+        TestLeaseState::Cleaning { attempts, .. } => {
+            format!("lease {lease_id} is being cleaned up (attempt {attempts}) and {expiry}")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_job_definition_note_tells_a_missing_definition_from_a_disabled_one() {
+        let view = serde_json::json!({"definitions": [
+            {"name": "cron", "namespace": "rbtest-node-a", "revision": 3, "cron": null},
+            {"name": "cron", "namespace": "rbtest-node-b", "revision": 1, "cron": "* * * * *"},
+        ]});
+        assert_eq!(
+            job_definition_note(&view, "cron", "rbtest-node-a"),
+            "definition rbtest-node-a/cron exists at revision 3 with cron null"
+        );
+        assert_eq!(
+            job_definition_note(&view, "cron", "rbtest-node-b"),
+            "definition rbtest-node-b/cron exists at revision 1 with cron \"* * * * *\""
+        );
+        assert_eq!(
+            job_definition_note(&view, "cron", "rbtest-node-c"),
+            "definition rbtest-node-c/cron is absent"
+        );
+    }
+
+    fn node_job_lease(
+        state: crate::testkit::lease::TestLeaseState,
+    ) -> crate::testkit::lease::TestLease {
+        let mut lease = crate::testkit::lease::TestLease::new_scoped(
+            format!("node-jobs-{}", "a".repeat(32)),
+            "owner".into(),
+            "admin".into(),
+            format!("rbtest-node-{}", "a".repeat(32)),
+            1_000,
+            200_000,
+            crate::testkit::lease::LeaseScope::NodeJobs,
+        )
+        .unwrap();
+        lease.state = state;
+        lease
+    }
+
+    #[test]
+    fn a_lease_note_says_whether_the_lease_outlived_the_wait() {
+        use crate::testkit::lease::TestLeaseState;
+        let active = node_job_lease(TestLeaseState::Active);
+        assert_eq!(
+            lease_note("l", Ok(active.clone()), 150_000),
+            "lease l is active and expires in 50 s"
+        );
+        assert_eq!(
+            lease_note("l", Ok(active), 260_000),
+            "lease l is active and expired 60 s ago"
+        );
+        let cleaning = node_job_lease(TestLeaseState::Cleaning {
+            attempts: 2,
+            last_error: None,
+        });
+        assert_eq!(
+            lease_note("l", Ok(cleaning), 230_000),
+            "lease l is being cleaned up (attempt 2) and expired 30 s ago"
+        );
+        let gone = Err(crate::relish::RelishError::ApiError {
+            status: 404,
+            body: "lease not found".into(),
+        });
+        assert_eq!(
+            lease_note("l", gone, 0),
+            "lease l is gone: its cleanup has finished"
+        );
+    }
+
+    /// #1527: the case waited for a cron firing, but the host slept past
+    /// its lease's wall-clock expiry, and the lease's cleanup forgot the
+    /// definition. The listing then has no row for the job at all. The
+    /// wait's note must say the definition is absent, the deployment
+    /// finished, and the lease is gone, rather than leave the next reader
+    /// to guess.
+    #[tokio::test]
+    async fn a_job_wait_with_no_row_names_the_definition_deployment_and_lease() {
+        let lease = node_job_lease(crate::testkit::lease::TestLeaseState::Active);
+        let namespace = lease.namespace.clone();
+        let lease_path = format!("/v1/test/leases/{}", lease.lease_id);
+        let operations = serde_json::json!({
+            "active_deploys": [],
+            "history": [{
+                "id": "op-7", "phase": "finished", "outcome": "completed",
+                "started_at": 1, "phase_changed_at": 2, "finished_at": 2,
+                "targets": [{"kind": "job", "name": "cron", "namespace": namespace}],
+                "current_target": null, "message": "done",
+            }],
+        });
+        let router = axum::Router::new()
+            .route(
+                "/v1/jobs",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({"jobs": [], "warnings": []}))
+                }),
+            )
+            .route(
+                "/v1/jobs/definitions",
+                axum::routing::get(|| async { axum::Json(serde_json::json!({"definitions": []})) }),
+            )
+            .route(
+                "/v1/deploys/operations",
+                axum::routing::get(move || async move { axum::Json(operations) }),
+            )
+            .route(
+                &lease_path,
+                axum::routing::get(|| async {
+                    (axum::http::StatusCode::NOT_FOUND, "lease not found")
+                }),
+            );
+        let (base, server) = serve(router).await;
+        let mut ctx = context(&namespace);
+        ctx.client = BunClient::new(&base);
+        ctx.lease_id = Some(lease.lease_id.clone());
+        ctx.deadline = Deadline::after(Duration::from_secs(2)).unwrap();
+        let waited = ctx
+            .wait_for_job_runs("cron", "at least one scheduled run", |rows| {
+                !rows.is_empty()
+            })
+            .await;
+        let note = ctx.wait_note.take().await.unwrap_or_default();
+        server.abort();
+        assert!(waited.is_err());
+        assert!(note.contains("last saw 0 row(s)"), "{note}");
+        assert!(
+            note.contains(&format!("definition {namespace}/cron is absent")),
+            "{note}"
+        );
+        assert!(
+            note.contains("deployment op-7 is Finished with outcome Some(Completed)"),
+            "{note}"
+        );
+        assert!(
+            note.contains(&format!(
+                "lease {} is gone: its cleanup has finished",
+                lease.lease_id
+            )),
+            "{note}"
+        );
+    }
     use crate::config::Config;
 
     /// V02: the report said "within 30 s" long after the release budget
@@ -1059,10 +1312,9 @@ mod tests {
         ])
     }
 
-    /// A loopback port nothing listens on.
-    async fn closed_port() -> std::net::SocketAddr {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        listener.local_addr().unwrap()
+    /// A loopback address that refuses connections (#1844).
+    fn closed_port() -> std::net::SocketAddr {
+        crate::refused_address::refused_address()
     }
 
     /// Serve `router` on a fresh loopback port.
@@ -1108,7 +1360,7 @@ mod tests {
     async fn relayed_peers_go_through_the_entry_node_and_the_entry_node_uses_its_own_connection() {
         // Neither advertised address is reachable, as from a laptop: the
         // guests' own API ports mean nothing on the host.
-        let unreachable = closed_port().await.to_string();
+        let unreachable = closed_port().to_string();
         let (base, server) = serve(entry_router(two_nodes(&unreachable, &unreachable), true)).await;
         let mut context = context("rbtest-relay");
         context.client = BunClient::new(&base);
@@ -1130,7 +1382,7 @@ mod tests {
 
     #[tokio::test]
     async fn direct_route_still_uses_the_entry_connection_for_the_entry_node() {
-        let unreachable = closed_port().await.to_string();
+        let unreachable = closed_port().to_string();
         let (base, server) = serve(entry_router(
             two_nodes(&unreachable, "127.0.0.1:29117"),
             true,
@@ -1148,7 +1400,7 @@ mod tests {
 
     #[tokio::test]
     async fn peer_route_is_relay_when_a_peer_answers_only_through_the_entry_node() {
-        let unreachable = closed_port().await.to_string();
+        let unreachable = closed_port().to_string();
         let (base, server) = serve(entry_router(two_nodes(&unreachable, &unreachable), true)).await;
         let route = PeerRoute::detect(&BunClient::new(&base), "one").await;
         server.abort();
@@ -1163,7 +1415,7 @@ mod tests {
         ))
         .await;
         let peer = peer.trim_start_matches("http://").to_string();
-        let unreachable = closed_port().await.to_string();
+        let unreachable = closed_port().to_string();
         let (base, server) = serve(entry_router(two_nodes(&unreachable, &peer), true)).await;
         let route = PeerRoute::detect(&BunClient::new(&base), "one").await;
         server.abort();
@@ -1173,7 +1425,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_peer_down_both_ways_says_nothing_about_the_route() {
-        let unreachable = closed_port().await.to_string();
+        let unreachable = closed_port().to_string();
         let (base, server) =
             serve(entry_router(two_nodes(&unreachable, &unreachable), false)).await;
         let route = PeerRoute::detect(&BunClient::new(&base), "one").await;
@@ -1561,7 +1813,7 @@ mod tests {
         .with_no_client_auth()
         .with_single_cert(
             vec![certificate.cert.der().clone()],
-            rustls::pki_types::PrivatePkcs8KeyDer::from(certificate.key_pair.serialize_der())
+            rustls::pki_types::PrivatePkcs8KeyDer::from(certificate.signing_key.serialize_der())
                 .into(),
         )
         .unwrap();

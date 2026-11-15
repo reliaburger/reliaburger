@@ -1,0 +1,86 @@
+# The cargo-fuzz crate (#1398): one libFuzzer target per decoder that reads
+# bytes from another machine. The bodies live in `src/fuzz/` of the main
+# crate, behind its `fuzzing` feature, so stable unit tests run them too.
+#
+# It needs nightly Rust and cargo-fuzz: `make fuzz-smoke`, or
+# `cargo +nightly fuzz run <target>` from the repository root.
+[package]
+name = "reliaburger-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+reliaburger = { path = "..", default-features = false, features = ["fuzzing"] }
+
+# Its own workspace, so the root crate's `cargo` commands never build it on
+# stable, and it never builds the root's dev-dependencies.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "gossip_datagram"
+path = "fuzz_targets/gossip_datagram.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "raft_rpc_frame"
+path = "fuzz_targets/raft_rpc_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dns_query"
+path = "fuzz_targets/dns_query.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "council_backup"
+path = "fuzz_targets/council_backup.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "oci_manifest_push"
+path = "fuzz_targets/oci_manifest_push.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "oci_manifest_upstream"
+path = "fuzz_targets/oci_manifest_upstream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "join_csr"
+path = "fuzz_targets/join_csr.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "app_config"
+path = "fuzz_targets/app_config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "node_config"
+path = "fuzz_targets/node_config.rs"
+test = false
+doc = false
+bench = false

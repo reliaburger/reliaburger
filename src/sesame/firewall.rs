@@ -348,6 +348,129 @@ pub fn keys_to_delete<K: Eq + Hash + Copy>(previous: &HashSet<K>, desired: &Hash
     previous.difference(desired).copied().collect()
 }
 
+/// The value of every write to one eBPF hash map that this node saw
+/// succeed, so a reconcile skips the entries the kernel already holds.
+///
+/// A reconcile runs under the eBPF handle's lock, which job tasks take
+/// thousands of times a second, and every map call is a system call. On a
+/// job-heavy node the reconcile runs most ticks, and almost every entry is
+/// the same as last time, so writing only the changed ones keeps the hold
+/// short (#1622). Anything else that writes or deletes one of these keys
+/// forgets it here, and the kernel-truth sweep forgets everything, so a
+/// lost entry comes back by the next sweep at the latest.
+#[derive(Debug)]
+pub struct WrittenValues<K, V> {
+    values: HashMap<K, V>,
+}
+
+impl<K, V> Default for WrittenValues<K, V> {
+    fn default() -> Self {
+        Self {
+            values: HashMap::new(),
+        }
+    }
+}
+
+impl<K: Eq + Hash + Copy, V: PartialEq + Copy> WrittenValues<K, V> {
+    /// Forget `key`, so the next reconcile writes it again.
+    pub fn forget(&mut self, key: &K) {
+        self.values.remove(key);
+    }
+
+    /// Forget every key `departed` picks.
+    pub fn forget_where(&mut self, mut departed: impl FnMut(&K) -> bool) {
+        self.values.retain(|key, _| !departed(key));
+    }
+
+    /// Forget every key, so the next reconcile writes them all.
+    pub fn clear(&mut self) {
+        self.values.clear();
+    }
+}
+
+/// What one reconcile pass writes to every map: the entries whose value
+/// differs from what this node last wrote.
+///
+/// `keys` records each key before its write is attempted: a failed system
+/// call is not permission to forget attempted ownership. A value is
+/// remembered only once its write succeeds, and only when `remember`
+/// says so: a contested destination is written every pass, because the
+/// tasks that claim it write their own value over it.
+pub fn write_changed<K, V, E>(
+    desired: impl IntoIterator<Item = (K, V)>,
+    keys: &mut HashSet<K>,
+    written: &mut WrittenValues<K, V>,
+    remember: fn(&V) -> bool,
+    mut write: impl FnMut(K, V) -> Result<(), E>,
+) -> Result<(), E>
+where
+    K: Eq + Hash + Copy,
+    V: PartialEq + Copy,
+{
+    for (key, value) in desired {
+        keys.insert(key);
+        if written.values.get(&key) == Some(&value) {
+            continue;
+        }
+        written.forget(&key);
+        write(key, value)?;
+        if remember(&value) {
+            written.values.insert(key, value);
+        }
+    }
+    Ok(())
+}
+
+/// Delete the keys `keys` holds that `desired` doesn't, forgetting each
+/// one once its delete succeeds.
+pub fn delete_departed<K, V, E>(
+    desired: &HashSet<K>,
+    keys: &mut HashSet<K>,
+    written: &mut WrittenValues<K, V>,
+    mut delete: impl FnMut(K) -> Result<(), E>,
+) -> Result<(), E>
+where
+    K: Eq + Hash + Copy,
+    V: PartialEq + Copy,
+{
+    for key in keys_to_delete(keys, desired) {
+        written.forget(&key);
+        delete(key)?;
+        keys.remove(&key);
+    }
+    Ok(())
+}
+
+/// Whether a destination's value may be remembered: a contested one may not.
+pub fn uncontested(value: &DestinationValue) -> bool {
+    value.namespace_id != NAMESPACE_CONTESTED
+}
+
+/// Always remember a written value.
+pub fn always<V>(_: &V) -> bool {
+    true
+}
+
+/// What this node last wrote to the three firewall maps it reconciles.
+#[derive(Debug, Default)]
+pub struct FirewallWrites {
+    /// `cgroup_namespace_map`: cgroup id to namespace id.
+    pub namespaces: WrittenValues<u64, u32>,
+    /// `firewall_map` grants.
+    pub firewall: WrittenValues<FirewallKey, FirewallValue>,
+    /// `destination_map` owners.
+    pub destinations: WrittenValues<DestinationKey, DestinationValue>,
+}
+
+impl FirewallWrites {
+    /// Forget every map's values, so the next reconcile writes them all.
+    pub fn clear(&mut self) {
+        self.namespaces.clear();
+        self.firewall.clear();
+        self.destinations.clear();
+    }
+}
+
 /// Errors from writing the eBPF firewall maps.
 #[derive(Debug, thiserror::Error)]
 pub enum FirewallMapError {
@@ -562,37 +685,50 @@ mod maps {
     }
 
     /// Reconcile namespace and firewall entries, retaining keys until removal.
+    /// Only entries whose value changed since this node last wrote them are
+    /// written ([`super::WrittenValues`]).
     pub fn reconcile_firewall_maps(
         bpf: &mut aya::Ebpf,
         namespace_entries: &[super::CgroupNamespaceEntry],
         firewall_entries: &[(FirewallKey, FirewallValue)],
         namespace_keys: &mut std::collections::HashSet<u64>,
         firewall_keys: &mut std::collections::HashSet<FirewallKey>,
+        written: &mut super::FirewallWrites,
     ) -> Result<(), FirewallMapError> {
         let desired_namespaces = namespace_entries
             .iter()
             .map(|entry| entry.cgroup_id)
             .collect();
         let desired_firewall = firewall_entries.iter().map(|(key, _)| *key).collect();
-        for entry in namespace_entries {
-            // A failed syscall is not permission to forget attempted ownership.
-            namespace_keys.insert(entry.cgroup_id);
-            write_cgroup_namespace_entry(bpf, entry.cgroup_id, entry.namespace_id)?;
-        }
-        for (key, value) in firewall_entries {
-            firewall_keys.insert(*key);
-            write_firewall_entry(bpf, *key, *value)?;
-        }
+        super::write_changed(
+            namespace_entries
+                .iter()
+                .map(|entry| (entry.cgroup_id, entry.namespace_id)),
+            namespace_keys,
+            &mut written.namespaces,
+            super::always,
+            |cgroup, namespace| write_cgroup_namespace_entry(bpf, cgroup, namespace),
+        )?;
+        super::write_changed(
+            firewall_entries.iter().copied(),
+            firewall_keys,
+            &mut written.firewall,
+            super::always,
+            |key, value| write_firewall_entry(bpf, key, value),
+        )?;
         // Keep namespace enforcement until obsolete allow rules are removed.
-        for key in super::keys_to_delete(firewall_keys, &desired_firewall) {
-            delete_firewall_entry(bpf, key)?;
-            firewall_keys.remove(&key);
-        }
-        for key in super::keys_to_delete(namespace_keys, &desired_namespaces) {
-            delete_cgroup_namespace_entry(bpf, key)?;
-            namespace_keys.remove(&key);
-        }
-        Ok(())
+        super::delete_departed(
+            &desired_firewall,
+            firewall_keys,
+            &mut written.firewall,
+            |key| delete_firewall_entry(bpf, key),
+        )?;
+        super::delete_departed(
+            &desired_namespaces,
+            namespace_keys,
+            &mut written.namespaces,
+            |key| delete_cgroup_namespace_entry(bpf, key),
+        )
     }
 
     fn destination_map(
@@ -636,22 +772,26 @@ mod maps {
     /// Converge `destination_map` to `desired`. New and changed owners are
     /// written before departed ones are deleted, and `keys` remembers every
     /// key this node attempted, so a failure never forgets one it may own.
+    /// An owner this node already wrote isn't written again
+    /// ([`super::WrittenValues`]).
     pub fn reconcile_destination_map(
         bpf: &mut aya::Ebpf,
         desired: &std::collections::BTreeMap<DestinationKey, DestinationValue>,
         keys: &mut std::collections::HashSet<DestinationKey>,
+        written: &mut super::WrittenValues<DestinationKey, DestinationValue>,
     ) -> Result<(), FirewallMapError> {
         let mut map = destination_map(bpf)?;
-        for (key, value) in desired {
-            keys.insert(*key);
-            map.insert(*key, *value, 0)?;
-        }
+        super::write_changed(
+            desired.iter().map(|(key, value)| (*key, *value)),
+            keys,
+            written,
+            super::uncontested,
+            |key, value| map.insert(key, value, 0),
+        )?;
         let wanted: std::collections::HashSet<DestinationKey> = desired.keys().copied().collect();
-        for key in super::keys_to_delete(keys, &wanted) {
-            deletion_result(map.remove(&key))?;
-            keys.remove(&key);
-        }
-        Ok(())
+        super::delete_departed(&wanted, keys, written, |key| {
+            deletion_result(map.remove(&key))
+        })
     }
 
     fn read_firewall_action(
@@ -1128,6 +1268,137 @@ mod tests {
         );
         assert_ne!(key, job_source_key("other", "report"));
         assert_ne!(key, job_source_key("batch", "other"));
+    }
+
+    fn grant(cgroup: u64) -> (FirewallKey, FirewallValue) {
+        (
+            FirewallKey {
+                src_cgroup_id: cgroup,
+                dst_app_id: 7,
+                _pad: 0,
+            },
+            FirewallValue {
+                action: FIREWALL_ALLOW,
+            },
+        )
+    }
+
+    /// Reconcile `desired` the way the agent does, counting the map calls.
+    fn reconcile_counting(
+        desired: &[(FirewallKey, FirewallValue)],
+        keys: &mut HashSet<FirewallKey>,
+        written: &mut WrittenValues<FirewallKey, FirewallValue>,
+    ) -> (usize, usize) {
+        let (mut writes, mut deletes) = (0, 0);
+        write_changed(desired.iter().copied(), keys, written, always, |_, _| {
+            writes += 1;
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+        let wanted = desired.iter().map(|(key, _)| *key).collect();
+        delete_departed(&wanted, keys, written, |_| {
+            deletes += 1;
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+        (writes, deletes)
+    }
+
+    #[test]
+    fn a_reconcile_writes_only_the_entries_that_changed() {
+        let mut keys = HashSet::new();
+        let mut written = WrittenValues::default();
+        let desired: Vec<_> = (0..200).map(grant).collect();
+        assert_eq!(
+            reconcile_counting(&desired, &mut keys, &mut written),
+            (200, 0)
+        );
+
+        // The same view again: the kernel already holds every entry.
+        assert_eq!(
+            reconcile_counting(&desired, &mut keys, &mut written),
+            (0, 0)
+        );
+
+        // One grant changes, one goes, one arrives.
+        let mut next = desired.clone();
+        next[0].1.action = FIREWALL_DENY;
+        next.pop();
+        next.push(grant(500));
+        assert_eq!(reconcile_counting(&next, &mut keys, &mut written), (2, 1));
+    }
+
+    #[test]
+    fn a_forgotten_entry_is_written_again() {
+        let mut keys = HashSet::new();
+        let mut written = WrittenValues::default();
+        let desired: Vec<_> = (0..3).map(grant).collect();
+        reconcile_counting(&desired, &mut keys, &mut written);
+
+        written.forget_where(|key| key.src_cgroup_id == 1);
+        assert_eq!(
+            reconcile_counting(&desired, &mut keys, &mut written),
+            (1, 0)
+        );
+
+        written.clear();
+        assert_eq!(
+            reconcile_counting(&desired, &mut keys, &mut written),
+            (3, 0)
+        );
+    }
+
+    #[test]
+    fn a_failed_write_keeps_the_key_and_forgets_the_value() {
+        let mut keys = HashSet::new();
+        let mut written = WrittenValues::default();
+        let desired = [grant(1)];
+        reconcile_counting(&desired, &mut keys, &mut written);
+        let mut changed = desired;
+        changed[0].1.action = FIREWALL_DENY;
+
+        let failed = write_changed(changed, &mut keys, &mut written, always, |_, _| Err(()));
+
+        assert!(failed.is_err());
+        assert!(keys.contains(&changed[0].0));
+        // Neither value is known to be in the kernel now, so the old one is
+        // written again rather than skipped.
+        assert_eq!(
+            reconcile_counting(&desired, &mut keys, &mut written),
+            (1, 0)
+        );
+    }
+
+    #[test]
+    fn a_contested_destination_is_written_every_pass() {
+        let mut keys = HashSet::new();
+        let mut written = WrittenValues::default();
+        let address = std::net::Ipv4Addr::new(10, 0, 0, 9);
+        let desired = [
+            (
+                DestinationKey::any_port(address),
+                DestinationValue {
+                    app_id: 0,
+                    namespace_id: NAMESPACE_CONTESTED,
+                },
+            ),
+            (
+                DestinationKey::new(address, 8080),
+                DestinationValue {
+                    app_id: 3,
+                    namespace_id: 4,
+                },
+            ),
+        ];
+        for expected in [2, 1, 1] {
+            let mut writes = 0;
+            write_changed(desired, &mut keys, &mut written, uncontested, |_, _| {
+                writes += 1;
+                Ok::<(), ()>(())
+            })
+            .unwrap();
+            assert_eq!(writes, expected);
+        }
     }
 
     #[test]

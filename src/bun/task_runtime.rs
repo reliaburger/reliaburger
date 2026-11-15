@@ -119,6 +119,8 @@ pub struct OwnedRunner<G: Grill + Clone> {
     /// Fresh-runtime attempts running now, by run: their instance and cgroup,
     /// so the metrics loop can measure them.
     attempts: Mutex<RunningAttempts>,
+    /// Every attempt running here, with its job and task index, for Smoker.
+    live_attempts: std::sync::Arc<super::live_attempts::LiveAttempts>,
     available: Notify,
     secrets: Option<(std::sync::Arc<crate::council::CouncilNode>, [u8; 32])>,
     log_sink: Option<tokio::sync::mpsc::Sender<crate::ketchup::types::LogRecord>>,
@@ -154,6 +156,7 @@ impl<G: Grill + Clone> OwnedRunner<G> {
             cgroup_root: crate::grill::cgroup::CGROUP_ROOT.into(),
             singletons: Mutex::new(BTreeMap::new()),
             attempts: Mutex::new(BTreeMap::new()),
+            live_attempts: super::live_attempts::LiveAttempts::new(),
             available: Notify::new(),
             secrets: None,
             log_sink: None,
@@ -378,6 +381,19 @@ impl<G: Grill + Clone> OwnedRunner<G> {
     ) -> Self {
         self.secrets = Some((council, ikm));
         self
+    }
+    /// List running attempts in `attempts`, which the agent shares, so
+    /// Smoker can find them.
+    pub fn with_live_attempts(
+        mut self,
+        attempts: std::sync::Arc<super::live_attempts::LiveAttempts>,
+    ) -> Self {
+        self.live_attempts = attempts;
+        self
+    }
+    /// The attempts running here.
+    pub fn live_attempts(&self) -> std::sync::Arc<super::live_attempts::LiveAttempts> {
+        self.live_attempts.clone()
     }
     /// Singleton jobs retain the ordinary live log stream and ingest checkpoints.
     pub fn with_log_sink(
@@ -786,6 +802,7 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
                         super::reusable_executor::CommandReporting {
                             sink: self.log_sink.as_ref(),
                             singletons: &self.singletons,
+                            attempts: Some(&self.live_attempts),
                         },
                     )
                     .await;
@@ -860,6 +877,18 @@ impl<G: Grill + Clone + 'static> TaskRunner for OwnedRunner<G> {
         let _listing = task.run.as_ref().map(|run| {
             AttemptListing::new(&self.attempts, run.batch_id, id.clone(), cgroup.clone())
         });
+        // Each attempt here is a fresh runtime generation of its own, so
+        // every fault can be scoped to it (#704).
+        let own_cgroup = (cfg!(target_os = "linux") && self.runtime.honours_cgroup_path())
+            .then(|| cgroup.clone());
+        let _live = super::live_attempts::LiveAttempt::of_task(
+            task,
+            namespace,
+            super::live_attempts::AttemptHandle::Instance(id.clone()),
+            own_cgroup,
+            None,
+        )
+        .map(|attempt| self.live_attempts.register(attempt));
         let mut oci = crate::grill::oci::generate_job_oci_spec(
             "task",
             namespace,
@@ -1338,7 +1367,7 @@ mod tests {
     use super::*;
     fn invocation() -> TaskInvocation {
         TaskInvocation {
-            template: Some(Box::new(
+            template: Some(std::sync::Arc::new(
                 toml::from_str("runtime='process'\nexec='/unused'\nnamespace='tenant-a'").unwrap(),
             )),
             index: 0,
@@ -1354,7 +1383,7 @@ mod tests {
         let runtime = crate::grill::ProcessGrill::new();
         let runner = std::sync::Arc::new(OwnedRunner::new(runtime));
         let mut task = invocation();
-        task.template = Some(Box::new(
+        task.template = Some(std::sync::Arc::new(
             toml::from_str("runtime='process'\nexec='/bin/sh'\nnamespace='tenant-a'").unwrap(),
         ));
         task.args = vec!["-c".into(), "printf live; exec sleep 30".into()];
@@ -1404,7 +1433,7 @@ mod tests {
             1,
         ));
         let mut task = invocation();
-        task.template = Some(Box::new(
+        task.template = Some(std::sync::Arc::new(
             toml::from_str("runtime='process'\nexec='/bin/sh'\nnamespace='tenant-a'").unwrap(),
         ));
         task.args = vec!["-c".into(), "echo original; exec sleep 30".into()];
@@ -1470,7 +1499,7 @@ mod tests {
         );
         for id in [1, 2] {
             let mut task = invocation();
-            task.template = Some(Box::new(
+            task.template = Some(std::sync::Arc::new(
                 toml::from_str("runtime='process'\nexec='/bin/sh'\nnamespace='tenant-a'").unwrap(),
             ));
             task.args = vec!["-c".into(), format!("echo output-{id}")];
@@ -1499,7 +1528,7 @@ mod tests {
         use crate::grill::Grill;
         let runner = std::sync::Arc::new(OwnedRunner::new(crate::grill::ProcessGrill::new()));
         let mut task = invocation();
-        task.template = Some(Box::new(
+        task.template = Some(std::sync::Arc::new(
             toml::from_str("runtime='process'\nexec='/bin/sh'\nnamespace='tenant-a'").unwrap(),
         ));
         task.args = vec!["-c".into(), "printf 'live-output\n'; sleep 30".into()];
@@ -1550,7 +1579,7 @@ mod tests {
         let runtime = crate::grill::ProcessGrill::new();
         let runner = OwnedRunner::new(runtime).with_log_sink(Some(sink), Default::default());
         let mut task = invocation();
-        task.template = Some(Box::new(toml::from_str("runtime='process'\nexec='/bin/sh'\nnamespace='tenant-a'\ncommand=['-c','echo output']").unwrap()));
+        task.template = Some(std::sync::Arc::new(toml::from_str("runtime='process'\nexec='/bin/sh'\nnamespace='tenant-a'\ncommand=['-c','echo output']").unwrap()));
         task.args = vec!["-c".into(), "echo output".into()];
         task.env = vec![
             ("RELIABURGER_TASK_COUNT".into(), "1".into()),

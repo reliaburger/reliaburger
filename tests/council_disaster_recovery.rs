@@ -668,6 +668,7 @@ impl FenceNode {
                 job_capabilities_rx: None,
                 readiness: None,
                 recovery_probe_window: None,
+                council_size_cap: None,
             };
             match start(params, shutdown.clone()).await {
                 Ok((mut handle, runtime)) => {

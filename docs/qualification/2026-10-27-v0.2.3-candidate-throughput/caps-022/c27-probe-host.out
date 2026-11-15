@@ -1,0 +1,61 @@
+jobs-host-processes: 60 seconds, concurrency 27 per node; submission and cold startup are inside the window; positive drain follows it
+0.0s: 0 unique accepted successes, 0 failures, 0 retries; 0.0/s
+5.0s: 2000 unique accepted successes, 0 failures, 0 retries; 396.9/s
+10.1s: 34000 unique accepted successes, 0 failures, 0 retries; 3373.7/s
+15.1s: 66000 unique accepted successes, 0 failures, 0 retries; 4367.8/s
+20.1s: 82000 unique accepted successes, 0 failures, 0 retries; 4070.8/s
+25.2s: 114000 unique accepted successes, 0 failures, 0 retries; 4527.8/s
+30.2s: 146000 unique accepted successes, 0 failures, 0 retries; 4831.0/s
+35.3s: 178000 unique accepted successes, 0 failures, 0 retries; 5047.5/s
+40.3s: 194000 unique accepted successes, 0 failures, 0 retries; 4813.6/s
+45.3s: 226000 unique accepted successes, 0 failures, 0 retries; 4985.7/s
+50.4s: 258000 unique accepted successes, 0 failures, 0 retries; 5122.7/s
+55.4s: 274000 unique accepted successes, 0 failures, 0 retries; 4946.1/s
+{
+  "schema_version": 1,
+  "scenario": "jobs-host-processes",
+  "started_at": "2026-10-26T20:58:42Z",
+  "requested_seconds": 60,
+  "concurrency": 27,
+  "cpu_request_millicores": 25,
+  "cpu_limit_millicores": 1000,
+  "memory_bytes": 33554432,
+  "receipt_chunk_size": 1000,
+  "image": null,
+  "executable": "/opt/bench/busybox",
+  "executable_sha256": null,
+  "measurement_boundary": "configured cluster; concurrency is per node; unique accepted outcomes received before the monotonic cutoff; submission and cold executor/image startup are included; 10m/8Mi helper reservation for shared/host; remote host executable hash is unknown; compare on the same node and byte-identical BusyBox",
+  "unique_accepted_successes": 306000,
+  "verified_successes": 0,
+  "terminal_failures": 0,
+  "accepted_retries": 0,
+  "post_cutoff_drained": 0,
+  "batch_ids": [
+    1
+  ],
+  "active_submissions": [
+    1
+  ],
+  "drain_proofs": [
+    {
+      "batch_id": 1,
+      "done": true,
+      "held": 0,
+      "active_commands": 0
+    }
+  ],
+  "last_accepted_sample_seconds": 59.9264281,
+  "submission_names": [
+    "bench-jobs-06e249d2be9ee8b04ff0a5f17d46de42"
+  ],
+  "measurement_complete": true,
+  "interrupted": false,
+  "cleanup_verified": true,
+  "cleanup_failed_submissions": [],
+  "error": null,
+  "elapsed_including_drain_seconds": 61.259348861,
+  "successes_per_second": 5100.0,
+  "extrapolated_runs_per_day": 440640000.0,
+  "daily_projection": "extrapolation from this window; not an observed daily total",
+  "qualified_100m_per_day": false
+}

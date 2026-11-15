@@ -1,0 +1,8 @@
+---
+source: src/relish/commands.rs
+expression: "json(&GitopsChange { enabled: true, config: Some(Path::new(\"gitops.toml\")), })"
+---
+{
+  "enabled": true,
+  "config": "gitops.toml"
+}

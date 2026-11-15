@@ -1,5 +1,7 @@
 # Reliaburger — Project Guide
 
+@AGENTS.md
+
 ## What This Is
 
 Reliaburger is a batteries-included container orchestrator written in Rust. It is a single binary that replaces Kubernetes + its ecosystem of add-ons with something dramatically simpler.
@@ -37,7 +39,7 @@ For book, manual or website prose, follow [docs/book/STYLE.md](docs/book/STYLE.m
 
 ### 1. Follow the Plan
 
-Every roadmap phase is done; 0.1.0 was released on 29 September 2026, 0.1.1 on 30 September, 0.1.2 on 1 October, 0.1.3 and 0.1.4 on 3 October, 0.1.5 on 6 October, 0.1.6 on 7 October and 0.2.0 ("A million jobs") on 16 October 2026. Status lives in [docs/roadmap.md](docs/roadmap.md) plus the GitHub milestones and issues it links: read its release list and "Known gaps" before starting. Releases after 0.1.0 follow its [release order](docs/roadmap.md#releases-after-010): patch releases 0.2.1 (cluster safety) and 0.2.2 (UX polish) next, then one headline feature per minor release, starting with 0.3.0 ("Bare metal in an hour"). New work goes through a dated plan in `docs/plans/`; the plans that led to 0.1.0 are history in `docs/plans/archive/`. Releases follow [docs/releasing.md](docs/releasing.md).
+Every roadmap phase is done; 0.1.0 was released on 29 September 2026, 0.1.1 on 30 September, 0.1.2 on 1 October, 0.1.3 and 0.1.4 on 3 October, 0.1.5 on 6 October, 0.1.6 on 7 October, 0.2.0 ("A million jobs") on 16 October, 0.2.1 (cluster safety) on 21 October, 0.2.2 (UX polish) on 25 October, 0.2.3 (two billion a day) on 28 October, 0.2.4 (extension points) on 30 October, 0.2.5 (bugs an outside evaluation found) on 3 November, 0.2.6 (setup over SSH) on 6 November, 0.2.7 ("Built for humans and their agents") on 7 November and 0.2.8 ("Agents you can trust, built faster") on 12 November 2026. Status lives in [docs/roadmap.md](docs/roadmap.md) plus the GitHub milestones and issues it links: read its release list and "Known gaps" before starting. Releases after 0.1.0 follow its [release order](docs/roadmap.md#releases-after-010): one headline feature per minor release. 0.3.0 ("Bare metal in an hour") is next. Releases go out as soon as they're ready and verified, with no target dates before 1.0 (maintainer decision, 6 November 2026). New work goes through a dated plan in `docs/plans/`; the plans that led to 0.1.0 are history in `docs/plans/archive/`. Releases follow [docs/releasing.md](docs/releasing.md).
 
 ### 2. Tests First
 
@@ -86,7 +88,14 @@ Fixes and hardening update the existing chapter for that subsystem; they don't g
 | 14 | `14-changing-the-tyres.md` | "Changing the Tyres at Full Speed" |
 | 15 | `15-ready-for-production.md` | "Ready for Production" |
 | 0.2.0 | `17-a-million-jobs.md` | "A Million Jobs" |
+| 0.2.4 | `18-bending-without-forking.md` | "Bending Without Forking" |
+| 0.2.7 | `19-built-for-agents.md` | "Built for Humans and Their Agents" |
+| 0.2.7 | `19-built-for-agents.md` | "Built for Humans and Their Agents" |
 | — | `16-appendix-rust.md` | "Appendix: Rust for C, Python, and Go Programmers" |
+
+### 5. Keep the Line Busy
+
+The work runs as a factory line (maintainer, 6 November 2026). The Mac Studio is there only for this project: keep it at full load with builds, tests, soaks and parallel agents. The laptop session stays busy too, with what its smaller hardware can do. Whenever a piece of work finishes, start the next one that's ready; never sit idle. Independent issues run as parallel agents, each in its own worktree with its own `CARGO_TARGET_DIR`. The one exception is a release gate's soaks, which need a quiet Studio ([docs/releasing.md](docs/releasing.md)); fill that time with reviews, docs, planning and the laptop's work.
 
 ## Quality Standards
 
@@ -136,6 +145,17 @@ See [docs/testing.md](docs/testing.md) and [docs/design/test-harness.md](docs/de
 - Never amend a commit (`git commit --amend`); always make a new one.
 - Update the book chapter in the same change, not at the end.
 - Update `README.md` and `docs/README.md` when features, commands or status change. Never quote test counts.
+
+## Running Agents in Parallel
+
+Lessons from running many agents on one machine (6–7 November 2026, #1724):
+
+- Keep the load average under about twice the core count. Above that, builds and timing-sensitive tests slow down for every agent at once.
+- Give each agent its own `CARGO_TARGET_DIR` (for example `../rb-wt/target-<issue>`), and delete it once its PR merges. Each one grows to about 30 GB. Never share one across worktrees: cargo decides what to rebuild from file mtimes, so a checkout whose files are older than the last build isn't recompiled, and its green run tests another branch's binaries (#1745). If you must share one to save disk, run `git ls-files -z | xargs -0 touch` before each build.
+- Give each agent its own log directory, so parallel runs don't overwrite each other's logs.
+- Check free disk (`df -h`) before a heavy build. A full disk fails builds with odd errors that look like code bugs.
+- When many PRs touch the same shared files (`ci.yml`, the `Makefile`, the evidence manifest), merge them in one integration pass, not one at a time.
+- When the macOS queue is starved, fold the PRs into one integration PR, so the macOS job runs once.
 
 ## Example Naming Convention
 
@@ -240,6 +260,8 @@ let config = NodeConfig::from_file(&path)
 - `tokio::sync::watch` — single producer, multiple consumers, latest-value only. For config or routing table updates.
 - `tokio::sync::oneshot` — single request-response.
 - `tokio::sync::broadcast` — rarely needed. Prefer `watch` unless every subscriber must see every event.
+
+**Never hold two `watch` borrows at once.** A `watch::Ref` holds its channel's read lock, and a reader waits behind a queued writer, so two tasks taking two borrows in opposite orders deadlock their worker threads (#1273, #1433). Copy what you need out of one borrow, in one statement, before taking the next. `cluster::directory::resolve_leader` and `leader_api_address` do this for the Raft metrics and the gossip directory; use them.
 
 **Never block the runtime.** No `std::thread::sleep`, no blocking I/O, no heavy CPU work on async tasks. Use `tokio::task::spawn_blocking` when you must:
 

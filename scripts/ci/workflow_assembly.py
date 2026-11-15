@@ -23,7 +23,7 @@ import gates
 
 OWNERS = {
     'portable-linux': ['make', 'coverage'],
-    'portable-darwin': ['make', 'test'],
+    'portable-darwin': ['make', 'test-macos'],
     'optimized-cron': ['make', 'test-contract-boundaries'],
     'rootless-linux': ['make', 'test-rootless-runc'],
     'linux-root-storage': ['make', 'test-linux'],
@@ -34,10 +34,34 @@ OWNERS = {
     'upgrade-cluster': ['make', 'test-upgrade-cluster'],
     'standard-clients': ['make', 'test-standard-clients'],
 }
-ARCHIVE_COMMAND = ['cargo', 'nextest', 'archive', '--locked', '--archive-file', 'tests.tar.zst']
+# The integration test binaries the archived owners run: every `binary(...)`
+# in their make targets' filters. Archiving all 47 binaries made a 3.0 GB
+# archive whose download often ran past its limit (#977). Cargo still builds
+# bun, relish and testapp for these tests' `CARGO_BIN_EXE_*`, and nextest
+# archives them with the test binaries.
+ARCHIVED_BINARIES = (
+    'cluster_failover', 'cluster_gossip', 'council_self_healing', 'council_disaster_recovery',
+    'placement', 'cluster_task_arrays', 'registry_durability', 'demos',
+    'integration', 'self_upgrade', 'self_upgrade_cluster', 'suite',
+)
+ARCHIVE_COMMAND = (['cargo', 'nextest', 'archive', '--locked', '--archive-file', 'tests.tar.zst']
+                   + [word for name in ARCHIVED_BINARIES for word in ('--test', name)])
+# The owners that run from the build-tests job's nextest archive.
+ARCHIVED_GATES = ('cluster-tests', 'slow-tests', 'upgrade-node', 'upgrade-cluster', 'standard-clients')
+# Each consumer job extracts the archive once into its checkout. Listing only
+# the binaries extracts without running every test binary to list its tests.
+EXTRACTION_ARGUMENTS = [
+    'list', '--archive-file', 'tests.tar.zst', '--extract-to', '.', '--extract-overwrite',
+    '--workspace-remap', '.', '--list-type', 'binaries-only', '--message-format', 'json',
+]
+# What the extraction leaves behind that names the build: the test binaries
+# and their paths, and the workspace's cargo metadata.
+ARCHIVE_METADATA = ('target/nextest/binaries-metadata.json', 'target/nextest/cargo-metadata.json')
+# Every archived owner then reuses that one extracted build, nextest's own
+# build-reuse flags, instead of extracting the archive again (#1050).
 ARCHIVED_SELECTORS = [
-    '--archive-file', 'tests.tar.zst', '--extract-to', '.',
-    '--extract-overwrite', '--workspace-remap', '.', '--profile', 'ci',
+    '--binaries-metadata', ARCHIVE_METADATA[0], '--cargo-metadata', ARCHIVE_METADATA[1],
+    '--target-dir-remap', 'target', '--workspace-remap', '.', '--profile', 'ci',
 ]
 OCI_BUILD_COMMAND = [
     'cargo', 'test', '--features', 'ebpf', '--test', 'owned_runc',
@@ -53,20 +77,23 @@ PORTABLE_GATES = ['portable-linux', 'portable-darwin', 'optimized-cron']
 HEAVY_GATES = [name for name in OWNERS if name not in PORTABLE_GATES]
 # Merge-train pull requests wait for these alone; see selected_workflow.
 LIGHT_GATES = ['portable-linux', 'optimized-cron']
-# Owners split across parallel jobs, by nextest hash partition. Compiling the
-# test binaries takes most of a macOS job, so this mostly overlaps the test
-# runs; the merge in workflow_adapter.py proves every test ran exactly once.
-SHARDS = {'portable-darwin': 3}
+# Owners run by nextest hash partition, and how many jobs share each one.
+# Portable macOS is one job, one partition (hash:1/1) that is the whole suite:
+# three shards each spent 17-40 minutes compiling the same suite to test for
+# about 3, and took three of the five macOS runners the organisation's plan
+# allows (docs/plans/2026-11-06-plan-faster-feedback.md, F1). The merge in
+# workflow_adapter.py still proves the one job ran every listed test.
+SHARDS = {'portable-darwin': 1}
 
 
 def selected_workflow(expected, *, code, heavy, macos):
     """Compute required jobs from trusted changes-job outputs, never artifacts.
 
     `full` runs every owner, `portable` both portable hosts and the optimized
-    boundaries, and `light` (pull requests into a merge train) only portable
-    Linux and the optimized boundaries. `train-full` (a merge-train pull
-    request labelled full-ci) runs every owner except the macOS shards, which
-    the merge queue and the push to the train still run.
+    boundaries, and `light` only portable Linux and the optimized boundaries.
+    `train-full` runs every owner except portable macOS: a code pull
+    request into main, or one into a train labelled full-ci, that doesn't
+    touch macOS code (#1443). Pushes and the nightly still run them.
     """
     c.fields(expected, ('commit', 'run_id', 'attempt'))
     c.require(re.fullmatch('[0-9a-f]{40}', expected['commit']) is not None,
@@ -93,6 +120,11 @@ def selected_workflow(expected, *, code, heavy, macos):
         jobs += ['linux', 'build-tests', 'cluster', 'acceptance']
     return dict(schema_version=1, **expected, mode='full' if full else 'portable',
                 jobs=jobs, gates=PORTABLE_GATES + (HEAVY_GATES if full else []))
+
+
+def extraction_command(nextest):
+    """The one archive extraction of a consumer job, run by the observed nextest."""
+    return [nextest, 'nextest'] + EXTRACTION_ARGUMENTS
 
 
 def partition(gate, shard):
@@ -170,7 +202,7 @@ def make_selection(root, target, *, archived=False, partition=None):
     return selectors, environment
 
 
-def entry_from_make(root, manifest, gate, host, *, archive_origin=None, shard=None):
+def entry_from_make(root, manifest, gate, host, *, archive_origin=None, archive_extraction=None, shard=None):
     """Build ordinary nextest selectors from the current committed owner recipe.
 
     This is a plan, not execution. Original Make must still run once around the
@@ -182,8 +214,9 @@ def entry_from_make(root, manifest, gate, host, *, archive_origin=None, shard=No
     owner = OWNERS[gate]
     c.require(gate in manifest['gates'] and manifest['gates'][gate]['command'] == owner
               and host in manifest['gates'][gate]['hosts'], 'wrong manifest owner or host')
-    archived = gate in ('cluster-tests', 'slow-tests', 'upgrade-node', 'upgrade-cluster', 'standard-clients')
+    archived = gate in ARCHIVED_GATES
     c.require(archived == (archive_origin is not None), 'archived owner needs trusted builder outputs')
+    c.require(archived == (archive_extraction is not None), "archived owner needs its job's archive extraction")
     split = partition(gate, shard) if shard is not None else None
     selectors, environment = make_selection(root, owner[1], archived=archived, partition=split)
     source_files = sorted({source for family in manifest['contracts'] for case in family['cases']
@@ -205,8 +238,13 @@ def entry_from_make(root, manifest, gate, host, *, archive_origin=None, shard=No
     if archived:
         c.require(archive_origin['builder']['command'] == ARCHIVE_COMMAND,
                   'wrong trusted actual archive builder command')
+        c.require(archive_extraction['archive_sha256'] == archive_origin['builder']['archive_sha256'],
+                  "archive extraction is not of the builder's archive")
         entry['archive_origin'] = archive_origin
-        inputs['tests.tar.zst'] = archive_origin['builder']['archive_sha256']
+        entry['archive_extraction'] = archive_extraction
+        # The job hashed the archive once before extracting it. Each owner
+        # checks only the small metadata files its discovery and run read.
+        inputs.update(archive_extraction['metadata'])
     gates.commands(entry)
     return entry
 

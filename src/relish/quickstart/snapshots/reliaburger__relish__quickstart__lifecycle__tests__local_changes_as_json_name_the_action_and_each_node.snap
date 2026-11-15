@@ -1,0 +1,19 @@
+---
+source: src/relish/quickstart/lifecycle.rs
+expression: "crate::relish::output::format_output(&changes, OutputFormat::Json).unwrap()"
+---
+{
+  "cluster": "laptop",
+  "action": "start",
+  "nodes": [
+    {
+      "name": "rb-laptop-1",
+      "result": "started"
+    },
+    {
+      "name": "rb-laptop-2",
+      "result": "started"
+    }
+  ],
+  "quorum_ready": true
+}

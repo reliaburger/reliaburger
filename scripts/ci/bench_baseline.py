@@ -15,10 +15,18 @@ the limit are measured once more, by COMMAND with a Criterion filter naming
 just them appended, and a benchmark fails only when both measurements are over
 the limit. The run's median is not re-measured.
 
+That doesn't help the one disk-bound benchmark, `storage/ledger_and_index_64k`:
+on a runner with a slow disk it stays slow for both measurements, and its ten
+samples in one run can range from 15 ms to 130 ms (#1038). So it is named with
+`--report-only`: it is measured and shown, but never fails the run and isn't
+part of the rest any other benchmark is measured against. Its tmpfs variant,
+the same writes without the disk, is gated like everything else.
+
     bench_baseline.py save    --criterion target/criterion --baseline FILE
     bench_baseline.py compare --criterion target/criterion --baseline FILE \\
                               [--max-ratio 2] [--summary $GITHUB_STEP_SUMMARY] \\
-                              [--remeasure 'cargo bench --bench task_arrays --']
+                              [--remeasure 'cargo bench --bench task_arrays --'] \\
+                              [--report-only NAME ...]
 
 A benchmark is named by its directory under target/criterion
 (`group/function[/parameter]`); its result is `new/estimates.json`.
@@ -78,19 +86,21 @@ class Comparison:
     slower this runner was overall, or None when nothing compares.
     `remeasured` holds, for each benchmark measured a second time, its ratio
     against the rest on the first and on the second measurement.
+    `report_only` names the benchmarks shown but never gated.
     """
     rows: list
     runner: Optional[float]
     regressions: list
     run_too_slow: bool
     remeasured: dict = field(default_factory=dict)
+    report_only: frozenset = frozenset()
 
     @property
     def failed(self):
         return bool(self.regressions) or self.run_too_slow
 
 
-def compare(current, baseline, max_ratio):
+def compare(current, baseline, max_ratio, report_only=()):
     """Measure each benchmark against its baseline, allowing for the runner's speed.
 
     A hosted runner can be uniformly slower than the one that recorded the
@@ -101,21 +111,27 @@ def compare(current, baseline, max_ratio):
     least 1. A slow runner and a regression in most benchmarks look the same
     from inside one run, so the run also fails when its median ratio is above
     `max_ratio`. Benchmarks that are new, or gone, have nothing to compare.
+
+    A `report_only` benchmark gets its ratios like the rest, but is never a
+    regression and is left out of every median, the runner factor included.
     """
+    report_only = frozenset(report_only)
     ratios = {name: mean / baseline[name] for name, mean in current.items()
               if baseline.get(name)}
+    gated = {name: ratio for name, ratio in ratios.items() if name not in report_only}
     rows, regressions = [], []
     for name, mean in sorted(current.items()):
         ratio = ratios.get(name)
         relative = None
         if ratio is not None:
-            rest = [other for key, other in ratios.items() if key != name]
+            rest = [other for key, other in gated.items() if key != name]
             relative = ratio / max(1.0, statistics.median(rest) if rest else 1.0)
-            if relative > max_ratio:
+            if relative > max_ratio and name not in report_only:
                 regressions.append(name)
         rows.append((name, baseline.get(name), mean, ratio, relative))
-    runner = statistics.median(ratios.values()) if ratios else None
-    return Comparison(rows, runner, regressions, runner is not None and runner > max_ratio)
+    runner = statistics.median(gated.values()) if gated else None
+    return Comparison(rows, runner, regressions, runner is not None and runner > max_ratio,
+                      report_only=report_only)
 
 
 def criterion_filter(names):
@@ -140,7 +156,8 @@ def settle(first, second):
         first_relative = next(row[4] for row in first.rows if row[0] == name)
         remeasured[name] = (first_relative, relative.get(name))
     regressions = [name for name in first.regressions if name in second.regressions]
-    return Comparison(first.rows, first.runner, regressions, first.run_too_slow, remeasured)
+    return Comparison(first.rows, first.runner, regressions, first.run_too_slow, remeasured,
+                      first.report_only)
 
 
 def remeasure(command, names):
@@ -151,19 +168,30 @@ def remeasure(command, names):
     return subprocess.run(argv, check=False).returncode
 
 
+def report_only_text(comparison):
+    """The summary's sentence naming the benchmarks that are shown but not gated."""
+    if not comparison.report_only:
+        return ""
+    names = ", ".join(f"`{name}`" for name in sorted(comparison.report_only))
+    verb = "is" if len(comparison.report_only) == 1 else "are"
+    return (f" {names} {verb} report only: shown, but never failing the run or counted "
+            "in the rest.")
+
+
 def table(comparison, max_ratio):
     runner = comparison.runner
     runner_text = f"runner factor {runner:.2f}" if runner is not None else "no runner factor"
     lines = [f"Task-array benchmarks against main's baseline, {runner_text} (the median ratio). "
              f"A benchmark fails above {max_ratio:g}x the rest of the run, and the run fails "
-             f"when its median is above {max_ratio:g}x.", "",
+             f"when its median is above {max_ratio:g}x.{report_only_text(comparison)}", "",
              "| Benchmark | Baseline mean | This run | Ratio | Against the rest |",
              "|---|---:|---:|---:|---:|"]
     for name, before, mean, ratio, relative in comparison.rows:
         before_text = f"{before / 1e6:.3f} ms" if before is not None else "none"
         ratio_text = f"{ratio:.2f}" if ratio is not None else "new"
         relative_text = f"{relative:.2f}" if relative is not None else "new"
-        lines.append(f"| `{name}` | {before_text} | {mean / 1e6:.3f} ms | {ratio_text} "
+        marker = " (report only)" if name in comparison.report_only else ""
+        lines.append(f"| `{name}`{marker} | {before_text} | {mean / 1e6:.3f} ms | {ratio_text} "
                      f"| {relative_text} |")
     if comparison.remeasured:
         lines += ["", f"Over {max_ratio:g}x the rest on the first measurement, so re-measured "
@@ -191,6 +219,8 @@ def main(argv=None):
             command.add_argument("--remeasure", metavar="COMMAND",
                                  help="measure benchmarks over the limit once more with "
                                       "COMMAND, a Criterion filter appended")
+            command.add_argument("--report-only", metavar="NAME", action="append", default=[],
+                                 help="show this benchmark but never fail on it; repeatable")
     arguments = parser.parse_args(argv)
 
     if arguments.command == "save":
@@ -203,13 +233,14 @@ def main(argv=None):
     if baseline is None:
         print(f"no baseline at {arguments.baseline} yet; nothing to compare")
         baseline = {}
-    comparison = compare(current, baseline, arguments.max_ratio)
+    comparison = compare(current, baseline, arguments.max_ratio, arguments.report_only)
     if comparison.regressions and arguments.remeasure:
         status = remeasure(arguments.remeasure, comparison.regressions)
         if status != 0:
             print(f"re-measuring failed with exit status {status}", file=sys.stderr)
             return 1
-        second = compare(read_means(arguments.criterion), baseline, arguments.max_ratio)
+        second = compare(read_means(arguments.criterion), baseline, arguments.max_ratio,
+                         arguments.report_only)
         comparison = settle(comparison, second)
     report = table(comparison, arguments.max_ratio)
     print(report)

@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 272" width="720" height="272" role="img" aria-labelledby="t">
+<title id="t">Accepted jobs a second</title>
+<style>svg{--surface:#fcfcfb;--ink:#0b0b0b;--ink-2:#52514e;--muted:#8a8984;--grid:#e6e5e0;--series-1:#2a78d6;--series-2:#eb6834;--series-3:#1baf7a;--series-other:#8a8984}
+@media (prefers-color-scheme: dark){svg{--surface:#1a1a19;--ink:#f0efec;--ink-2:#c3c2b7;--muted:#8f8e86;--grid:#33332f;--series-1:#3987e5;--series-2:#d95926;--series-3:#199e70;--series-other:#8f8e86}}
+text{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;font-size:11px;fill:var(--ink-2,#52514e)}
+.title{font-size:13px;font-weight:600;fill:var(--ink,#0b0b0b)}
+.surface{fill:var(--surface,#fcfcfb)}
+.grid{stroke:var(--grid,#e6e5e0);stroke-width:1}
+.axis{stroke:var(--muted,#8a8984);stroke-width:1}
+.line{fill:none;stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
+.s1{stroke:var(--series-1,#2a78d6)}.f1{fill:var(--series-1,#2a78d6)}.s2{stroke:var(--series-2,#eb6834)}.f2{fill:var(--series-2,#eb6834)}.s3{stroke:var(--series-3,#1baf7a)}.f3{fill:var(--series-3,#1baf7a)}.s0{stroke:var(--series-other,#8a8984)}.f0{fill:var(--series-other,#8a8984)}
+.target{stroke:var(--ink-2,#52514e);stroke-width:1;stroke-dasharray:4 3}
+.mark{stroke:var(--ink-2,#52514e);fill:none;stroke-width:1.5}
+.mark.failure{stroke:var(--ink,#0b0b0b);stroke-width:2}
+.mark.special,.mark.upgrade{fill:var(--surface,#fcfcfb)}</style>
+<rect class="surface" x="0" y="0" width="720" height="272" rx="6"/>
+<text class="title" x="56" y="20">Accepted jobs a second</text>
+<line class="grid" x1="56" y1="210.0" x2="624" y2="210.0"/><text x="50" y="214.0" text-anchor="end">0</text>
+<line class="grid" x1="56" y1="176.8" x2="624" y2="176.8"/><text x="50" y="180.8" text-anchor="end">1,000</text>
+<line class="grid" x1="56" y1="143.6" x2="624" y2="143.6"/><text x="50" y="147.6" text-anchor="end">2,000</text>
+<line class="grid" x1="56" y1="110.4" x2="624" y2="110.4"/><text x="50" y="114.4" text-anchor="end">3,000</text>
+<line class="grid" x1="56" y1="77.2" x2="624" y2="77.2"/><text x="50" y="81.2" text-anchor="end">4,000</text>
+<line class="grid" x1="56" y1="44.0" x2="624" y2="44.0"/><text x="50" y="48.0" text-anchor="end">5,000</text>
+<text x="56" y="36">accepted a second, 10-minute windows</text>
+<line class="axis" x1="56.0" y1="210" x2="56.0" y2="214"/><text x="56.0" y="226" text-anchor="middle">0 h</text>
+<line class="axis" x1="126.9" y1="210" x2="126.9" y2="214"/><text x="126.9" y="226" text-anchor="middle">1 h</text>
+<line class="axis" x1="197.8" y1="210" x2="197.8" y2="214"/><text x="197.8" y="226" text-anchor="middle">2 h</text>
+<line class="axis" x1="268.7" y1="210" x2="268.7" y2="214"/><text x="268.7" y="226" text-anchor="middle">3 h</text>
+<line class="axis" x1="339.6" y1="210" x2="339.6" y2="214"/><text x="339.6" y="226" text-anchor="middle">4 h</text>
+<line class="axis" x1="410.5" y1="210" x2="410.5" y2="214"/><text x="410.5" y="226" text-anchor="middle">5 h</text>
+<line class="axis" x1="481.4" y1="210" x2="481.4" y2="214"/><text x="481.4" y="226" text-anchor="middle">6 h</text>
+<line class="axis" x1="552.3" y1="210" x2="552.3" y2="214"/><text x="552.3" y="226" text-anchor="middle">7 h</text>
+<line class="axis" x1="623.3" y1="210" x2="623.3" y2="214"/><text x="623.3" y="226" text-anchor="middle">8 h</text>
+<line class="target" x1="56" y1="163.9" x2="624" y2="163.9"/><text x="620" y="159.9" text-anchor="end">target 1,390/s</text>
+<polyline class="line s1" points="67.8,77.9 79.8,72.6 91.8,72.0 103.9,75.5 115.7,74.2 127.7,69.5 140.0,69.3 155.0,75.0 167.0,73.2 178.9,81.4 191.1,79.8 203.5,74.3 215.8,73.5 227.7,77.1 239.6,80.9 251.7,72.9 263.8,99.4 275.8,128.0 287.7,66.7 299.6,72.5 311.9,71.7 323.7,72.1 338.0,87.7 350.0,76.3 362.2,68.5 374.4,69.3 386.3,82.6 398.3,71.1 410.4,79.2 422.4,66.7 440.5,73.9 452.3,65.6 464.3,69.7 476.5,102.5 488.6,69.3 500.9,72.2 512.7,70.7 524.9,77.7 536.7,68.5 549.0,96.6 561.0,127.3 572.8,68.5 584.8,70.9 597.2,72.9 609.1,70.0 623.1,103.9"><title>accepted jobs</title></polyline>
+<line class="mark fault" x1="56.0" y1="236.0" x2="56.0" y2="244.0"><title>fault: bun-kill-follower at 0 min</title></line>
+<line class="mark fault" x1="67.8" y1="236.0" x2="67.8" y2="244.0"><title>fault: bun-kill-leader at 10 min</title></line>
+<line class="mark fault" x1="79.8" y1="236.0" x2="79.8" y2="244.0"><title>fault: deploy-kill at 20 min</title></line>
+<line class="mark fault" x1="91.5" y1="236.0" x2="91.5" y2="244.0"><title>fault: power-off at 30 min</title></line>
+<line class="mark fault" x1="103.3" y1="236.0" x2="103.3" y2="244.0"><title>fault: chaos-kill at 40 min</title></line>
+<line class="mark fault" x1="104.4" y1="236.0" x2="104.4" y2="244.0"><title>fault: chaos-delay at 40 min</title></line>
+<line class="mark fault" x1="115.1" y1="236.0" x2="115.1" y2="244.0"><title>fault: node-delay at 50 min</title></line>
+<line class="mark fault" x1="126.9" y1="236.0" x2="126.9" y2="244.0"><title>fault: bun-kill-follower at 60 min</title></line>
+<line class="mark fault" x1="138.7" y1="236.0" x2="138.7" y2="244.0"><title>fault: bun-kill-leader at 70 min</title></line>
+<path class="mark upgrade" d="M150.6,235.0 L155.6,244.0 L145.6,244.0 Z"><title>upgrade: upgrade walk at 80 min</title></path>
+<line class="mark fault" x1="186.0" y1="236.0" x2="186.0" y2="244.0"><title>fault: node-disk-full at 110 min</title></line>
+<line class="mark fault" x1="197.8" y1="236.0" x2="197.8" y2="244.0"><title>fault: bun-kill-follower at 120 min</title></line>
+<line class="mark fault" x1="209.7" y1="236.0" x2="209.7" y2="244.0"><title>fault: bun-kill-leader at 130 min</title></line>
+<line class="mark fault" x1="221.8" y1="236.0" x2="221.8" y2="244.0"><title>fault: deploy-kill at 140 min</title></line>
+<line class="mark fault" x1="233.3" y1="236.0" x2="233.3" y2="244.0"><title>fault: power-off at 150 min</title></line>
+<line class="mark fault" x1="245.1" y1="236.0" x2="245.1" y2="244.0"><title>fault: chaos-partition at 160 min</title></line>
+<line class="mark fault" x1="247.2" y1="236.0" x2="247.2" y2="244.0"><title>fault: chaos-scenario at 161 min</title></line>
+<line class="mark fault" x1="256.9" y1="236.0" x2="256.9" y2="244.0"><title>fault: node-slow-fsync at 170 min</title></line>
+<path class="mark special" d="M262.0,235.0 L267.0,240.0 L262.0,245.0 L257.0,240.0 Z"><title>special: quorum-loss at 174 min</title></path>
+<line class="mark fault" x1="270.9" y1="236.0" x2="270.9" y2="244.0"><title>fault: bun-kill-follower at 181 min</title></line>
+<line class="mark fault" x1="282.7" y1="236.0" x2="282.7" y2="244.0"><title>fault: bun-kill-leader at 191 min</title></line>
+<path class="mark upgrade" d="M294.5,235.0 L299.5,244.0 L289.5,244.0 Z"><title>upgrade: upgrade walk at 201 min</title></path>
+<line class="mark fault" x1="330.0" y1="236.0" x2="330.0" y2="244.0"><title>fault: node-delay at 231 min</title></line>
+<path class="mark special" d="M337.2,235.0 L342.2,240.0 L337.2,245.0 L332.2,240.0 Z"><title>special: graceful-stop at 237 min</title></path>
+<line class="mark fault" x1="339.7" y1="236.0" x2="339.7" y2="244.0"><title>fault: bun-kill-follower at 240 min</title></line>
+<line class="mark fault" x1="351.6" y1="236.0" x2="351.6" y2="244.0"><title>fault: bun-kill-leader at 250 min</title></line>
+<line class="mark fault" x1="363.8" y1="236.0" x2="363.8" y2="244.0"><title>fault: deploy-kill at 260 min</title></line>
+<line class="mark fault" x1="375.1" y1="236.0" x2="375.1" y2="244.0"><title>fault: power-off at 270 min</title></line>
+<line class="mark fault" x1="386.9" y1="236.0" x2="386.9" y2="244.0"><title>fault: chaos-pause at 280 min</title></line>
+<line class="mark fault" x1="388.6" y1="236.0" x2="388.6" y2="244.0"><title>fault: chaos-drop at 281 min</title></line>
+<line class="mark fault" x1="398.7" y1="236.0" x2="398.7" y2="244.0"><title>fault: node-disk-full at 290 min</title></line>
+<line class="mark fault" x1="410.6" y1="236.0" x2="410.6" y2="244.0"><title>fault: bun-kill-follower at 300 min</title></line>
+<line class="mark fault" x1="422.4" y1="236.0" x2="422.4" y2="244.0"><title>fault: bun-kill-leader at 310 min</title></line>
+<path class="mark upgrade" d="M434.2,235.0 L439.2,244.0 L429.2,244.0 Z"><title>upgrade: upgrade walk at 320 min</title></path>
+<line class="mark fault" x1="469.6" y1="236.0" x2="469.6" y2="244.0"><title>fault: node-slow-fsync at 350 min</title></line>
+<path class="mark special" d="M474.7,235.0 L479.7,240.0 L474.7,245.0 L469.7,240.0 Z"><title>special: all-off at 354 min</title></path>
+<line class="mark fault" x1="481.5" y1="236.0" x2="481.5" y2="244.0"><title>fault: bun-kill-follower at 360 min</title></line>
+<line class="mark fault" x1="493.3" y1="236.0" x2="493.3" y2="244.0"><title>fault: bun-kill-leader at 370 min</title></line>
+<line class="mark fault" x1="505.2" y1="236.0" x2="505.2" y2="244.0"><title>fault: deploy-kill at 380 min</title></line>
+<line class="mark fault" x1="516.9" y1="236.0" x2="516.9" y2="244.0"><title>fault: power-off at 390 min</title></line>
+<line class="mark fault" x1="528.7" y1="236.0" x2="528.7" y2="244.0"><title>fault: chaos-dns at 400 min</title></line>
+<line class="mark fault" x1="530.4" y1="236.0" x2="530.4" y2="244.0"><title>fault: chaos-cpu at 401 min</title></line>
+<line class="mark fault" x1="540.5" y1="236.0" x2="540.5" y2="244.0"><title>fault: node-delay at 410 min</title></line>
+<path class="mark special" d="M546.0,235.0 L551.0,240.0 L546.0,245.0 L541.0,240.0 Z"><title>special: quorum-loss at 414 min</title></path>
+<line class="mark fault" x1="555.6" y1="236.0" x2="555.6" y2="244.0"><title>fault: bun-kill-follower at 422 min</title></line>
+<line class="mark fault" x1="567.5" y1="236.0" x2="567.5" y2="244.0"><title>fault: bun-kill-leader at 432 min</title></line>
+<path class="mark upgrade" d="M579.2,235.0 L584.2,244.0 L574.2,244.0 Z"><title>upgrade: upgrade walk at 442 min</title></path>
+<line class="mark fault" x1="614.7" y1="236.0" x2="614.7" y2="244.0"><title>fault: node-disk-full at 472 min</title></line>
+<path class="mark special" d="M622.4,235.0 L627.4,240.0 L622.4,245.0 L617.4,240.0 Z"><title>special: graceful-stop at 479 min</title></path>
+<path class="mark failure" d="M619.3,236.0 L627.3,244.0 M627.3,236.0 L619.3,244.0"><title>failure: settle-check at 480 min</title></path>
+<line class="mark fault" x1="61.0" y1="255.0" x2="61.0" y2="263.0"/><text x="70.0" y="263">fault</text>
+<path class="mark upgrade" d="M117.5,254.0 L122.5,263.0 L112.5,263.0 Z"/><text x="126.5" y="263">upgrade walk</text>
+<path class="mark special" d="M219.5,254.0 L224.5,259.0 L219.5,264.0 L214.5,259.0 Z"/><text x="228.5" y="263">special</text>
+<path class="mark failure" d="M285.0,255.0 L293.0,263.0 M293.0,255.0 L285.0,263.0"/><text x="298.0" y="263">failure</text>
+</svg>

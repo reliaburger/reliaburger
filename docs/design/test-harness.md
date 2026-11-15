@@ -58,17 +58,21 @@ be visible until we remove its race.
 | `make test-slow` | Required wall-clock health and retry acceptance | Linux; PRs into `main`, `main` and nightly |
 | `make test-linux` | runc, namespaces, eBPF, Btrfs, Buildah and root-only tmpfs | Privileged Linux; PRs into `main`, `main` and nightly |
 | `make test-cluster` | Gossip, placement, failover, healing, recovery and chaos | Linux, serial resource group; PRs into `main`, `main` and nightly |
+| `make test-hollow` | A three-member council process in front of twenty hollow nodes (#1401); the measured sizes run through `scripts/release/qualify-hollow-nodes.sh` | Manual |
 | `make test-upgrade-node` | Real single-node binary replacement | Linux; PRs into `main`, `main` and nightly |
 | `make test-upgrade-cluster` | Real rolling cluster replacement | Linux; PRs into `main`, `main` and nightly |
 | `make test-rootless-runc` | Rootless runc networking and port adoption as a non-root user | Privileged Linux; PRs into `main`, `main` and nightly |
 | `make test-standard-clients` | docker, podman, skopeo and crane against Pickle's TLS listener, verifying the cluster CA | Linux, the runner image's docker, podman and skopeo plus a pinned `crane`, on a host prepared by `scripts/standard-clients-host.sh`; PRs into `main`, `main` and nightly |
 | `make test-apple` | Deferred Apple adapter | Manual Apple-silicon development check, outside 0.1.0 |
-| `make test-gpu`, `make test-s3` | Real NVIDIA hardware; a real S3 bucket | Manual |
+| `make test-gpu` | Real NVIDIA hardware | Manual |
+| `make test-s3` | Log export and a council backup round trip through S3: a throwaway local SeaweedFS, or a real bucket with `RELIABURGER_TEST_S3_URL` | Linux, SeaweedFS as a service container; `main`, nightly, and PRs touching the S3 client, log export or council backups |
 | `make test-ci-scripts`, `make check-ignored` | The CI scripts' fixtures; every `#[ignore]` names its owner | Every pull request ("CI policy") and `make ci` |
 | `make ci` | `fmt-check`, `lint`, `test`, `test-doc`, `test-ci-scripts`, `check-ignored` | Local; CI runs the same pieces as separate jobs |
 | `make ci-bench` | `make ci`, then `make bench` | Local |
 | `make bench` | Criterion transport and 5–250-node measurements | `main`, nightly, and PRs touching gossip |
 | `make bench-large` | Criterion 500- and 1,000-node measurements | `main`, nightly, and PRs touching gossip |
+| `make fuzz-corpus-check` | Every fuzz target body over its seeds and checked-in corpus, on stable (also part of `make test`) | Local; `make test` everywhere |
+| `make fuzz-smoke` | Every cargo-fuzz target for `FUZZ_SECONDS` each (nightly Rust and cargo-fuzz) | `fuzz.yml`: 300 s a target nightly, 30 s on PRs touching a decoder |
 | `make coverage` | The portable suite, run once under line coverage; this is the Linux test gate too | Linux |
 | `make audit` | Current RustSec database, with new vulnerabilities and maintenance warnings denied | Pull requests, release gate and weekly schedule |
 | `tests/examples.rs` (part of `make test`) | Every checked-in workload config parses, validates and plans through Relish without deployment | Linux and hosted macOS |
@@ -84,10 +88,16 @@ cluster, upgrade and privileged Linux) unless labelled `full-ci`; they run once 
 PR targets `main`, and `ci-retarget.yml` reruns CI as soon as GitHub retargets one.
 Pull requests into a release's merge-train branch (`release-*`) run the light set:
 lint, minimum Rust, portable Linux with coverage, the demo app and the optimised
-contract boundaries. Labelled `full-ci`, they run every heavy owner but not the
-macOS shards (the `train-full` selection). The merge queue on the train, the push to it and the gate PR
-into `main` run everything, including the three macOS shards
-([which jobs run](../testing.md#which-jobs-a-pull-request-runs)).
+contract boundaries. Labelled `full-ci`, they run every heavy owner but not
+portable macOS (the `train-full` selection), which is also what a code PR into
+`main` runs. The merge queue on the train, the push to it, pushes to `main`,
+the nightly and the gate PR into `main` labelled `release-gate` run
+everything, portable macOS included; any other PR runs it only
+when it touches macOS-specific code or carries a `macos` label
+([which jobs run](../testing.md#which-jobs-a-pull-request-runs)). Portable
+macOS runs `make test-macos`, relish's tests and the tests only macOS
+compiles, and compile-checks `bun`; every other portable test runs on Linux
+([what runs on macOS](../testing.md#what-runs-on-macos-and-what-runs-on-linux)).
 Documentation-only pull requests skip the Rust jobs entirely, except for the manual
 and the snippets `documentation_first_run` checks. `scripts/ci/test_select_jobs.py`
 holds a fixture for each of these rules.
@@ -101,14 +111,13 @@ applicable exact identity; presence in a union of reports is insufficient. See
 
 ### Tests no CI job runs
 
-These need hardware, credentials or a reboot that hosted runners can't provide. They
+These need hardware or a reboot that hosted runners can't provide. They
 are `#[ignore]`d with a reason naming the target or script that runs them:
 
 | Test | Needs | How to run |
 |---|---|---|
 | `grill::apple::tests::*` | Apple silicon with Apple Container | `make test-apple` |
 | `bun::gpu::tests::nvidia_detector_finds_hardware` | An NVIDIA GPU and `nvidia-smi` | `make test-gpu` |
-| `ketchup::export::tests::export_to_real_s3_manual` | AWS credentials and a bucket | `RELIABURGER_TEST_S3_URL=s3://bucket/prefix make test-s3` |
 | `owned_runc::actual_host_reboot_*`, `oci_crash::actual_bun_kernel_discovery_host_reboot` | A Linux VM that can be rebooted mid-test | `scripts/release/qualify-oci-reboot.sh`, `scripts/release/qualify-discovery-reboot.sh` |
 | `power_cut::actual_power_cut_*` | A disposable Linux VM whose power can be cut while workers write | `scripts/release/qualify-storage-power-cut.sh --vm VM --fixture exporter\|leases\|backups --iterations N` |
 | All of the above, for a release candidate | Lima on the host; it creates and deletes the VM | `scripts/release/qualify-power-cut-reboot.sh --commit SHA --iterations N --record-dir DIR` |
@@ -261,11 +270,22 @@ files on `PATH`. Prefer this
 shape for a new fixture whose caller can take an interpreter; use `install_script` when the
 caller needs a single executable path.
 
-The `[[bin]]` targets (`bun`, `relish`, `testapp`) are not the fixtures' job: `make test`
+The `[[bin]]` targets (`bun`, `relish`, `testapp`) get the same treatment twice. `make test`
 depends on `make warm-executables`, which builds them with `cargo test --no-run`, as the
 suite will, and runs each of them once before the suite
 ([#722](https://github.com/reliaburger/reliaburger/issues/722),
-[#846](https://github.com/reliaburger/reliaburger/issues/846)).
+[#846](https://github.com/reliaburger/reliaburger/issues/846)). That doesn't cover a filtered
+`cargo nextest run` straight after a build, or an assessment the host has to repeat, so a
+test that starts one of them under a deadline also pays its first launch before the clock
+starts ([#1134](https://github.com/reliaburger/reliaburger/issues/1134),
+[#1149](https://github.com/reliaburger/reliaburger/issues/1149)). The shared fixtures do it
+for their callers: `bun_process::first_launch_binaries()` launches all three together, and
+`BunProcess::spawn_runtime`, `wait_for_relish` and `wait_for_relish_output` call it first.
+A test that spawns `bun` or `relish` itself, or hands `bun` to `ProcessControl` as an owner
+(15 s to answer), calls it, or `first_launch` directly, before its own deadline. A
+candidate binary under the upgrade compatibility query is always a fresh private copy, so no
+warm-up applies there; `QUERY_DEADLINE` (60 s) stays a hang guard
+([#1078](https://github.com/reliaburger/reliaburger/issues/1078)).
 
 ## Benchmarks and coverage
 
@@ -308,8 +328,8 @@ inventory, with the original policy visible in the generated matrix.
 
 `workflow_assembly.py` defines eleven literal owners and derives light, portable,
 train-full or full selection from trusted current workflow inputs; only a pull request may
-qualify with less than full. The macOS owner runs as three hash-partition
-shards, and aggregation proves their lists cover every test exactly once. `workflow_adapter.py` preserves
+qualify with less than full, and not a pull request labelled `release-gate`. The macOS owner runs as one job under
+the hash partition `hash:1/1`, and aggregation proves it ran every listed test exactly once. `workflow_adapter.py` preserves
 those commands and their complete selections. Ordinary nextest producers retain
 discovery and JUnit under one selector/environment plan. `completion.py` retains
 libtest discovery, selected-case completion and the actual child exit for owned

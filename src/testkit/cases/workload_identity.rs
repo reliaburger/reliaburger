@@ -167,7 +167,7 @@ async fn namespace_scoped_token_is_rejected_elsewhere(
                     .map_err(|error| format!("scope enforcement unproven: {error}"))?;
             }
             Err(
-                error @ (crate::relish::RelishError::AgentUnreachable
+                error @ (crate::relish::RelishError::AgentUnreachable { .. }
                 | crate::relish::RelishError::RequestTimeout),
             ) => {
                 return unknown(format!(

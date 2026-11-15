@@ -5,6 +5,7 @@ use crossterm::event::KeyEvent;
 use crate::bun::agent::{ClusterInstanceStatus, CouncilStatus, NodeStatus};
 use crate::bun::cluster_view::{ClusterDeployHistory, ClusterEvents, ClusterJobs};
 use crate::bun::events::ClusterEvent;
+use crate::bun::summary::ClusterSummary;
 use crate::mayo::rollup::MetricsQueryResult;
 use crate::wrapper::types::RouteInfo;
 
@@ -31,6 +32,9 @@ pub enum Msg {
 /// Results from HTTP data providers.
 #[derive(Debug)]
 pub enum DataUpdate {
+    /// Boxed: a summary is over a kilobyte, and every other message would
+    /// pay for that space.
+    Summary(Result<Box<ClusterSummary>, ProviderError>),
     Status(Result<Vec<ClusterInstanceStatus>, ProviderError>),
     Nodes(Result<Vec<NodeStatus>, ProviderError>),
     Council(Result<CouncilStatus, ProviderError>),

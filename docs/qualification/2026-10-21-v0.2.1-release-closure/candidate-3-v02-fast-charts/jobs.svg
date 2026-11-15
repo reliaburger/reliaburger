@@ -1,0 +1,119 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 272" width="720" height="272" role="img" aria-labelledby="t">
+<title id="t">Accepted jobs a second</title>
+<style>svg{--surface:#fcfcfb;--ink:#0b0b0b;--ink-2:#52514e;--muted:#8a8984;--grid:#e6e5e0;--series-1:#2a78d6;--series-2:#eb6834;--series-3:#1baf7a;--series-other:#8a8984}
+@media (prefers-color-scheme: dark){svg{--surface:#1a1a19;--ink:#f0efec;--ink-2:#c3c2b7;--muted:#8f8e86;--grid:#33332f;--series-1:#3987e5;--series-2:#d95926;--series-3:#199e70;--series-other:#8f8e86}}
+text{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;font-size:11px;fill:var(--ink-2,#52514e)}
+.title{font-size:13px;font-weight:600;fill:var(--ink,#0b0b0b)}
+.surface{fill:var(--surface,#fcfcfb)}
+.grid{stroke:var(--grid,#e6e5e0);stroke-width:1}
+.axis{stroke:var(--muted,#8a8984);stroke-width:1}
+.line{fill:none;stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
+.s1{stroke:var(--series-1,#2a78d6)}.f1{fill:var(--series-1,#2a78d6)}.s2{stroke:var(--series-2,#eb6834)}.f2{fill:var(--series-2,#eb6834)}.s3{stroke:var(--series-3,#1baf7a)}.f3{fill:var(--series-3,#1baf7a)}.s0{stroke:var(--series-other,#8a8984)}.f0{fill:var(--series-other,#8a8984)}
+.target{stroke:var(--ink-2,#52514e);stroke-width:1;stroke-dasharray:4 3}
+.mark{stroke:var(--ink-2,#52514e);fill:none;stroke-width:1.5}
+.mark.failure{stroke:var(--ink,#0b0b0b);stroke-width:2}
+.mark.special,.mark.upgrade{fill:var(--surface,#fcfcfb)}</style>
+<rect class="surface" x="0" y="0" width="720" height="272" rx="6"/>
+<text class="title" x="56" y="20">Accepted jobs a second</text>
+<line class="grid" x1="56" y1="210.0" x2="624" y2="210.0"/><text x="50" y="214.0" text-anchor="end">0</text>
+<line class="grid" x1="56" y1="168.5" x2="624" y2="168.5"/><text x="50" y="172.5" text-anchor="end">50</text>
+<line class="grid" x1="56" y1="127.0" x2="624" y2="127.0"/><text x="50" y="131.0" text-anchor="end">100</text>
+<line class="grid" x1="56" y1="85.5" x2="624" y2="85.5"/><text x="50" y="89.5" text-anchor="end">150</text>
+<line class="grid" x1="56" y1="44.0" x2="624" y2="44.0"/><text x="50" y="48.0" text-anchor="end">200</text>
+<text x="56" y="36">accepted a second, 10-minute windows</text>
+<line class="axis" x1="56.0" y1="210" x2="56.0" y2="214"/><text x="56.0" y="226" text-anchor="middle">0 min</text>
+<line class="axis" x1="157.7" y1="210" x2="157.7" y2="214"/><text x="157.7" y="226" text-anchor="middle">30 min</text>
+<line class="axis" x1="259.4" y1="210" x2="259.4" y2="214"/><text x="259.4" y="226" text-anchor="middle">60 min</text>
+<line class="axis" x1="361.1" y1="210" x2="361.1" y2="214"/><text x="361.1" y="226" text-anchor="middle">90 min</text>
+<line class="axis" x1="462.8" y1="210" x2="462.8" y2="214"/><text x="462.8" y="226" text-anchor="middle">120 min</text>
+<line class="axis" x1="564.5" y1="210" x2="564.5" y2="214"/><text x="564.5" y="226" text-anchor="middle">150 min</text>
+<polyline class="line s1" points="89.9,75.2 143.7,111.2 215.4,210.0 252.7,150.3 287.0,210.0 322.5,210.0 363.9,210.0 398.6,210.0 432.7,210.0 502.8,210.0 537.6,210.0 571.5,210.0 605.6,210.0"><title>accepted jobs</title></polyline>
+<line class="mark fault" x1="56.0" y1="236.0" x2="56.0" y2="244.0"><title>fault: bun-kill-follower at 0 min</title></line>
+<line class="mark fault" x1="61.7" y1="236.0" x2="61.7" y2="244.0"><title>fault: bun-kill-leader at 1 min</title></line>
+<line class="mark fault" x1="67.9" y1="236.0" x2="67.9" y2="244.0"><title>fault: deploy-kill at 3 min</title></line>
+<line class="mark fault" x1="73.0" y1="236.0" x2="73.0" y2="244.0"><title>fault: power-off at 5 min</title></line>
+<line class="mark fault" x1="78.6" y1="236.0" x2="78.6" y2="244.0"><title>fault: chaos-kill at 6 min</title></line>
+<line class="mark fault" x1="81.0" y1="236.0" x2="81.0" y2="244.0"><title>fault: chaos-delay at 7 min</title></line>
+<line class="mark fault" x1="90.4" y1="236.0" x2="90.4" y2="244.0"><title>fault: bun-kill-follower at 10 min</title></line>
+<line class="mark fault" x1="96.0" y1="236.0" x2="96.0" y2="244.0"><title>fault: bun-kill-leader at 11 min</title></line>
+<path class="mark upgrade" d="M101.7,235.0 L106.7,244.0 L96.7,244.0 Z"><title>upgrade: upgrade walk at 13 min</title></path>
+<line class="mark fault" x1="117.5" y1="236.0" x2="117.5" y2="244.0"><title>fault: chaos-partition at 18 min</title></line>
+<path class="mark failure" d="M118.7,236.0 L126.7,244.0 M126.7,236.0 L118.7,244.0"><title>failure: chaos-scenario at 19 min</title></path>
+<path class="mark special" d="M129.4,235.0 L134.4,240.0 L129.4,245.0 L124.4,240.0 Z"><title>special: graceful-stop at 21 min</title></path>
+<path class="mark failure" d="M139.6,236.0 L147.6,244.0 M147.6,236.0 L139.6,244.0"><title>failure: graceful-start at 25 min</title></path>
+<path class="mark failure" d="M160.9,236.0 L168.9,244.0 M168.9,236.0 L160.9,244.0"><title>failure: heavy-check at 32 min</title></path>
+<path class="mark failure" d="M162.2,236.0 L170.2,244.0 M170.2,236.0 L162.2,244.0"><title>failure: ingress-invalid-pair at 32 min</title></path>
+<path class="mark failure" d="M166.4,236.0 L174.4,244.0 M174.4,236.0 L166.4,244.0"><title>failure: ingress-reload at 33 min</title></path>
+<path class="mark failure" d="M172.8,236.0 L180.8,244.0 M180.8,236.0 L172.8,244.0"><title>failure: ingress-reload at 35 min</title></path>
+<path class="mark failure" d="M199.1,236.0 L207.1,244.0 M207.1,236.0 L199.1,244.0"><title>failure: heavy-check at 43 min</title></path>
+<path class="mark failure" d="M201.0,236.0 L209.0,244.0 M209.0,236.0 L201.0,244.0"><title>failure: ingress-reload at 43 min</title></path>
+<path class="mark failure" d="M211.2,236.0 L219.2,244.0 M219.2,236.0 L211.2,244.0"><title>failure: settle at 46 min</title></path>
+<line class="mark fault" x1="215.4" y1="236.0" x2="215.4" y2="244.0"><title>fault: bun-kill-follower at 47 min</title></line>
+<path class="mark failure" d="M213.1,236.0 L221.1,244.0 M221.1,236.0 L213.1,244.0"><title>failure: heavy-check at 47 min</title></path>
+<path class="mark failure" d="M214.3,236.0 L222.3,244.0 M222.3,236.0 L214.3,244.0"><title>failure: settle-check at 47 min</title></path>
+<path class="mark failure" d="M220.3,236.0 L228.3,244.0 M228.3,236.0 L220.3,244.0"><title>failure: ingress-reload at 49 min</title></path>
+<path class="mark failure" d="M229.2,236.0 L237.2,244.0 M237.2,236.0 L229.2,244.0"><title>failure: settle at 52 min</title></path>
+<line class="mark fault" x1="233.2" y1="236.0" x2="233.2" y2="244.0"><title>fault: bun-kill-leader at 52 min</title></line>
+<path class="mark failure" d="M238.3,236.0 L246.3,244.0 M246.3,236.0 L238.3,244.0"><title>failure: ingress-reload at 54 min</title></path>
+<path class="mark failure" d="M247.3,236.0 L255.3,244.0 M255.3,236.0 L247.3,244.0"><title>failure: settle-check at 57 min</title></path>
+<path class="mark failure" d="M248.5,236.0 L256.5,244.0 M256.5,236.0 L248.5,244.0"><title>failure: settle at 57 min</title></path>
+<line class="mark fault" x1="252.7" y1="236.0" x2="252.7" y2="244.0"><title>fault: deploy-kill at 58 min</title></line>
+<path class="mark failure" d="M260.0,236.0 L268.0,244.0 M268.0,236.0 L260.0,244.0"><title>failure: ingress-invalid-pair at 61 min</title></path>
+<path class="mark failure" d="M261.1,236.0 L269.1,244.0 M269.1,236.0 L261.1,244.0"><title>failure: ingress-reload at 61 min</title></path>
+<path class="mark failure" d="M265.3,236.0 L273.3,244.0 M273.3,236.0 L265.3,244.0"><title>failure: settle-check at 62 min</title></path>
+<path class="mark failure" d="M266.1,236.0 L274.1,244.0 M274.1,236.0 L266.1,244.0"><title>failure: settle at 63 min</title></path>
+<line class="mark fault" x1="270.2" y1="236.0" x2="270.2" y2="244.0"><title>fault: power-off at 63 min</title></line>
+<path class="mark failure" d="M272.1,236.0 L280.1,244.0 M280.1,236.0 L272.1,244.0"><title>failure: settle-check at 64 min</title></path>
+<path class="mark failure" d="M281.3,236.0 L289.3,244.0 M289.3,236.0 L281.3,244.0"><title>failure: ingress-reload at 67 min</title></path>
+<path class="mark failure" d="M299.6,236.0 L307.6,244.0 M307.6,236.0 L299.6,244.0"><title>failure: ingress-reload at 73 min</title></path>
+<path class="mark failure" d="M300.4,236.0 L308.4,244.0 M308.4,236.0 L300.4,244.0"><title>failure: settle at 73 min</title></path>
+<line class="mark fault" x1="304.5" y1="236.0" x2="304.5" y2="244.0"><title>fault: chaos-pause at 73 min</title></line>
+<path class="mark failure" d="M316.8,236.0 L324.8,244.0 M324.8,236.0 L316.8,244.0"><title>failure: settle-check at 78 min</title></path>
+<path class="mark failure" d="M317.8,236.0 L325.8,244.0 M325.8,236.0 L317.8,244.0"><title>failure: ingress-reload at 78 min</title></path>
+<path class="mark failure" d="M322.0,236.0 L330.0,244.0 M330.0,236.0 L322.0,244.0"><title>failure: settle at 79 min</title></path>
+<line class="mark fault" x1="326.0" y1="236.0" x2="326.0" y2="244.0"><title>fault: chaos-drop at 79 min</title></line>
+<path class="mark failure" d="M335.6,236.0 L343.6,244.0 M343.6,236.0 L335.6,244.0"><title>failure: ingress-invalid-pair at 83 min</title></path>
+<path class="mark failure" d="M336.6,236.0 L344.6,244.0 M344.6,236.0 L336.6,244.0"><title>failure: ingress-reload at 83 min</title></path>
+<path class="mark failure" d="M343.6,236.0 L351.6,244.0 M351.6,236.0 L343.6,244.0"><title>failure: settle at 86 min</title></path>
+<path class="mark failure" d="M344.5,236.0 L352.5,244.0 M352.5,236.0 L344.5,244.0"><title>failure: heavy-check at 86 min</title></path>
+<path class="mark special" d="M348.6,235.0 L353.6,240.0 L348.6,245.0 L343.6,240.0 Z"><title>special: quorum-loss at 86 min</title></path>
+<path class="mark failure" d="M359.9,236.0 L367.9,244.0 M367.9,236.0 L359.9,244.0"><title>failure: quorum at 90 min</title></path>
+<path class="mark failure" d="M361.3,236.0 L369.3,244.0 M369.3,236.0 L361.3,244.0"><title>failure: ingress-reload at 91 min</title></path>
+<path class="mark failure" d="M379.5,236.0 L387.5,244.0 M387.5,236.0 L379.5,244.0"><title>failure: ingress-reload at 96 min</title></path>
+<path class="mark failure" d="M394.6,236.0 L402.6,244.0 M402.6,236.0 L394.6,244.0"><title>failure: settle at 101 min</title></path>
+<line class="mark fault" x1="398.6" y1="236.0" x2="398.6" y2="244.0"><title>fault: bun-kill-follower at 101 min</title></line>
+<path class="mark failure" d="M398.6,236.0 L406.6,244.0 M406.6,236.0 L398.6,244.0"><title>failure: ingress-reload at 102 min</title></path>
+<path class="mark failure" d="M412.0,236.0 L420.0,244.0 M420.0,236.0 L412.0,244.0"><title>failure: settle at 106 min</title></path>
+<line class="mark fault" x1="416.0" y1="236.0" x2="416.0" y2="244.0"><title>fault: bun-kill-leader at 106 min</title></line>
+<path class="mark failure" d="M416.7,236.0 L424.7,244.0 M424.7,236.0 L416.7,244.0"><title>failure: ingress-invalid-pair at 107 min</title></path>
+<path class="mark failure" d="M417.7,236.0 L425.7,244.0 M425.7,236.0 L417.7,244.0"><title>failure: ingress-reload at 107 min</title></path>
+<path class="mark failure" d="M419.2,236.0 L427.2,244.0 M427.2,236.0 L419.2,244.0"><title>failure: heavy-check at 108 min</title></path>
+<path class="mark failure" d="M430.0,236.0 L438.0,244.0 M438.0,236.0 L430.0,244.0"><title>failure: settle at 111 min</title></path>
+<path class="mark upgrade" d="M434.2,235.0 L439.2,244.0 L429.2,244.0 Z"><title>upgrade: upgrade walk at 111 min</title></path>
+<path class="mark failure" d="M464.3,236.0 L472.3,244.0 M472.3,236.0 L464.3,244.0"><title>failure: upgrade-upgrade at 121 min</title></path>
+<path class="mark failure" d="M464.6,236.0 L472.6,244.0 M472.6,236.0 L464.6,244.0"><title>failure: upgrade at 121 min</title></path>
+<path class="mark failure" d="M498.8,236.0 L506.8,244.0 M506.8,236.0 L498.8,244.0"><title>failure: upgrade-rollback at 131 min</title></path>
+<path class="mark failure" d="M499.8,236.0 L507.8,244.0 M507.8,236.0 L499.8,244.0"><title>failure: heavy-check at 132 min</title></path>
+<path class="mark failure" d="M500.9,236.0 L508.9,244.0 M508.9,236.0 L500.9,244.0"><title>failure: ingress-reload at 132 min</title></path>
+<path class="mark failure" d="M519.1,236.0 L527.1,244.0 M527.1,236.0 L519.1,244.0"><title>failure: ingress-reload at 137 min</title></path>
+<path class="mark failure" d="M521.5,236.0 L529.5,244.0 M529.5,236.0 L521.5,244.0"><title>failure: settle-check at 138 min</title></path>
+<path class="mark failure" d="M533.5,236.0 L541.5,244.0 M541.5,236.0 L533.5,244.0"><title>failure: settle at 142 min</title></path>
+<line class="mark fault" x1="537.6" y1="236.0" x2="537.6" y2="244.0"><title>fault: chaos-dns at 142 min</title></line>
+<path class="mark failure" d="M537.2,236.0 L545.2,244.0 M545.2,236.0 L537.2,244.0"><title>failure: ingress-reload at 143 min</title></path>
+<path class="mark failure" d="M554.9,236.0 L562.9,244.0 M562.9,236.0 L554.9,244.0"><title>failure: settle at 148 min</title></path>
+<line class="mark fault" x1="558.9" y1="236.0" x2="558.9" y2="244.0"><title>fault: chaos-cpu at 148 min</title></line>
+<path class="mark failure" d="M555.3,236.0 L563.3,244.0 M563.3,236.0 L555.3,244.0"><title>failure: ingress-invalid-pair at 148 min</title></path>
+<path class="mark failure" d="M556.3,236.0 L564.3,244.0 M564.3,236.0 L556.3,244.0"><title>failure: ingress-reload at 148 min</title></path>
+<path class="mark failure" d="M575.2,236.0 L583.2,244.0 M583.2,236.0 L575.2,244.0"><title>failure: ingress-reload at 154 min</title></path>
+<path class="mark failure" d="M576.1,236.0 L584.1,244.0 M584.1,236.0 L576.1,244.0"><title>failure: settle at 154 min</title></path>
+<path class="mark failure" d="M577.0,236.0 L585.0,244.0 M585.0,236.0 L577.0,244.0"><title>failure: heavy-check at 154 min</title></path>
+<path class="mark special" d="M581.2,235.0 L586.2,240.0 L581.2,245.0 L576.2,240.0 Z"><title>special: all-off at 154 min</title></path>
+<path class="mark failure" d="M584.3,236.0 L592.3,244.0 M592.3,236.0 L584.3,244.0"><title>failure: all-off-start at 157 min</title></path>
+<path class="mark failure" d="M593.7,236.0 L601.7,244.0 M601.7,236.0 L593.7,244.0"><title>failure: ingress-reload at 159 min</title></path>
+<path class="mark failure" d="M612.2,236.0 L620.2,244.0 M620.2,236.0 L612.2,244.0"><title>failure: ingress-reload at 165 min</title></path>
+<path class="mark failure" d="M619.3,236.0 L627.3,244.0 M627.3,236.0 L619.3,244.0"><title>failure: settle at 167 min</title></path>
+<line class="mark fault" x1="61.0" y1="255.0" x2="61.0" y2="263.0"/><text x="70.0" y="263">fault</text>
+<path class="mark upgrade" d="M117.5,254.0 L122.5,263.0 L112.5,263.0 Z"/><text x="126.5" y="263">upgrade walk</text>
+<path class="mark special" d="M219.5,254.0 L224.5,259.0 L219.5,264.0 L214.5,259.0 Z"/><text x="228.5" y="263">special</text>
+<path class="mark failure" d="M285.0,255.0 L293.0,263.0 M293.0,255.0 L285.0,263.0"/><text x="298.0" y="263">failure</text>
+</svg>

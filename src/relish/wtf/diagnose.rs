@@ -7,10 +7,12 @@ use super::model::{
     WtfFinding, WtfInputs, WtfOk, WtfReport, WtfSummary, WtfUnknown,
 };
 
-const CRASHLOOP_WINDOW_SECONDS: u64 = 15 * 60;
-const RECENT_DEPLOY_SECONDS: u64 = 30 * 60;
-const STUCK_DEPLOY_SECONDS: u64 = 15 * 60;
-const CERTIFICATE_WARNING_SECONDS: u64 = 14 * 24 * 60 * 60;
+// The thresholds live beside the finding ids they decide, so `relish agent
+// explain` reports the numbers these checks use.
+use super::findings::{
+    CERTIFICATE_WARNING_SECONDS, CRASHLOOP_RESTARTS, CRASHLOOP_WINDOW_SECONDS,
+    DISK_CRITICAL_PERCENT, DISK_WARNING_PERCENT, RECENT_DEPLOY_SECONDS, STUCK_DEPLOY_SECONDS,
+};
 
 /// Diagnose a cluster from an immutable evidence snapshot.
 ///
@@ -42,6 +44,7 @@ pub fn diagnose(inputs: &WtfInputs) -> WtfReport {
         check_tokens(inputs, &mut report);
         check_isolation(inputs, &mut report);
         check_gitops(inputs, &mut report);
+        check_policies(inputs, &mut report);
     }
     record_application_unknowns(&inputs.applications, inputs.app.as_deref(), &mut report);
     check_crashloops(inputs, &mut report);
@@ -87,6 +90,7 @@ fn record_cluster_unknowns(evidence: &ClusterEvidence, report: &mut WtfReport) {
     record_unknown("tokens", &evidence.tokens, "cluster", report);
     record_unknown("isolation", &evidence.isolation, "cluster", report);
     record_unknown("gitops", &evidence.gitops, "cluster", report);
+    record_unknown("policies", &evidence.policies, "cluster", report);
 }
 
 fn record_application_unknowns(
@@ -516,7 +520,7 @@ fn check_crashloops(inputs: &WtfInputs, report: &mut WtfReport) {
 
     let mut found = false;
     for ((app, namespace), mut app_restarts) in grouped {
-        if app_restarts.len() < 3 {
+        if app_restarts.len() < CRASHLOOP_RESTARTS {
             continue;
         }
         found = true;
@@ -537,6 +541,12 @@ fn check_crashloops(inputs: &WtfInputs, report: &mut WtfReport) {
                 message: format!("deploy {} entered {}", deploy.operation_id, deploy.phase),
             });
         }
+        // The app's own log line lands in `correlated_events[].message` and
+        // inside the finding's `details` sentence, where an agent can't tell
+        // it from our words. `relish agent diagnose` moves it into an
+        // `untrusted` object (origin `workload_log`); `wtf`'s own schema
+        // stays as it is.
+        // TODO(#1573): `relish agent logs` wraps every line it returns the same way.
         let log = first_error_log(inputs, app, namespace);
         if let Some(log) = log {
             correlated_events.push(CorrelatedEvent {
@@ -806,9 +816,9 @@ fn check_replicas(inputs: &WtfInputs, report: &mut WtfReport) {
             details,
             suggestion: format!(
                 "the scheduler replaces replicas on a lost node within a minute or two; \
-                 if this persists, check `relish status` and `relish logs {}`, and bring a \
+                 if this persists, check `relish apps {}` and `relish logs {}`, and bring a \
                  stopped node back with `relish local start <node>` on a laptop cluster",
-                app.app
+                app.app, app.app
             ),
             correlated_events: Vec::new(),
             affected_resource: app_resource(&app.app, &app.namespace),
@@ -895,7 +905,7 @@ fn has_crashloop(inputs: &WtfInputs, app: &str, namespace: &str) -> bool {
                         && restart.timestamp >= cutoff
                 })
                 .count()
-                >= 3
+                >= CRASHLOOP_RESTARTS
         })
         .unwrap_or(false)
 }
@@ -1046,7 +1056,10 @@ fn check_disks(inputs: &WtfInputs, report: &mut WtfReport) {
         return;
     };
     let mut found = false;
-    for disk in disks.iter().filter(|disk| disk.used_percent >= 85.0) {
+    for disk in disks
+        .iter()
+        .filter(|disk| disk.used_percent >= DISK_WARNING_PERCENT as f64)
+    {
         found = true;
         let finding = WtfFinding {
             id: "disk-high".to_string(),
@@ -1069,7 +1082,7 @@ fn check_disks(inputs: &WtfInputs, report: &mut WtfReport) {
             correlated_events: Vec::new(),
             affected_resource: format!("node.{}", disk.node_id),
         };
-        if disk.used_percent >= 95.0 {
+        if disk.used_percent >= DISK_CRITICAL_PERCENT as f64 {
             report.critical.push(finding);
         } else {
             report.warnings.push(finding);
@@ -1208,7 +1221,8 @@ fn check_certificates(inputs: &WtfInputs, report: &mut WtfReport) {
 /// Tokens about to stop working, and Admin tokens old enough to rotate.
 ///
 /// Admin tokens are exempt from the default lifetime (F05 decision 6), so
-/// age is the only nudge they get.
+/// age is the only nudge they get. The tokens `relish mcp` makes are left
+/// out: they live a day and it renews them itself.
 fn check_tokens(inputs: &WtfInputs, report: &mut WtfReport) {
     let Some(tokens) = inputs.cluster.tokens.value() else {
         return;
@@ -1217,6 +1231,9 @@ fn check_tokens(inputs: &WtfInputs, report: &mut WtfReport) {
     let horizon = now.saturating_add(crate::sesame::token::TOKEN_EXPIRY_WARNING.as_secs());
     let admin_age = crate::sesame::token::ADMIN_TOKEN_AGE_WARNING.as_secs();
     let mut found = false;
+    let tokens = tokens
+        .iter()
+        .filter(|token| !crate::relish::mcp::credentials::made_by_relish_mcp(&token.name));
     for token in tokens {
         let resource = format!("token.{}", token.name);
         let finding = match token.expires_at {
@@ -1473,6 +1490,87 @@ fn check_gitops(inputs: &WtfInputs, report: &mut WtfReport) {
     }
 }
 
+/// Policy findings (#1119): committed apps and jobs the policies in force
+/// would now refuse or record, the same list `relish policy audit` prints.
+/// A new policy never touches running work, so these keep running; the
+/// row says what the next apply of each would meet. A cluster with no
+/// policies says nothing.
+fn check_policies(inputs: &WtfInputs, report: &mut WtfReport) {
+    let Some(audit) = inputs.cluster.policies.value() else {
+        return;
+    };
+    if audit.policies == 0 {
+        return;
+    }
+    if let Some(broken) = &audit.broken {
+        report.warnings.push(WtfFinding {
+            id: "policy-broken".to_string(),
+            title: "a policy in force can't be evaluated".to_string(),
+            details: vec![broken.clone()],
+            suggestion: "replace the policy with one that compiles, or remove it with \
+                         `relish policy delete`; every app apply is refused until then"
+                .to_string(),
+            correlated_events: Vec::new(),
+            affected_resource: "policies".to_string(),
+        });
+        return;
+    }
+    let refused = audit.verdict.denials.iter().map(|finding| {
+        (
+            "policy-would-deny",
+            format!(
+                "{} {}/{} would now be refused by policy {}",
+                finding.kind.as_str(),
+                finding.workload.namespace,
+                finding.workload.name,
+                finding.policy
+            ),
+            "it keeps running as it is; fix it before its next apply, or change the policy",
+            finding,
+        )
+    });
+    let audited = audit.verdict.audits.iter().map(|finding| {
+        (
+            "policy-audit",
+            format!(
+                "{} {}/{} breaks audit policy {}",
+                finding.kind.as_str(),
+                finding.workload.namespace,
+                finding.workload.name,
+                finding.policy
+            ),
+            "an audit policy only records; make it `action = \"deny\"` once nothing breaks it",
+            finding,
+        )
+    });
+    let mut found = false;
+    for (id, title, suggestion, finding) in refused.chain(audited) {
+        found = true;
+        report.warnings.push(WtfFinding {
+            id: id.to_string(),
+            title,
+            details: vec![finding.message.clone()],
+            suggestion: suggestion.to_string(),
+            correlated_events: Vec::new(),
+            affected_resource: format!(
+                "{}.{}/{}",
+                finding.kind.as_str(),
+                finding.workload.namespace,
+                finding.workload.name
+            ),
+        });
+    }
+    if !found {
+        report.ok.push(WtfOk {
+            id: "policies".to_string(),
+            description: format!(
+                "every committed app and job passes the cluster's {} policy(ies)",
+                audit.policies
+            ),
+        });
+    }
+}
+
 fn app_matches(scope: Option<&str>, app: &str) -> bool {
     scope.is_none_or(|scope| scope == app)
 }
@@ -1493,7 +1591,7 @@ fn with_caveat(description: &str, caveat: Option<&str>) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::relish::wtf::{
         AlertObservation, CertificateObservation, CouncilObservation, CpuThrottleObservation,
@@ -1503,9 +1601,10 @@ mod tests {
         RestartObservation, ServiceObservation, TokenObservation,
     };
 
-    const NOW: u64 = 2_000_000;
+    pub(in crate::relish::wtf) const NOW: u64 = 2_000_000;
 
-    fn healthy_inputs() -> WtfInputs {
+    /// A one-node cluster with one healthy app, `api`, and nothing wrong.
+    pub(in crate::relish::wtf) fn healthy_inputs() -> WtfInputs {
         WtfInputs {
             cluster_name: "test".to_string(),
             collected_at: NOW,
@@ -1571,6 +1670,7 @@ mod tests {
                     }],
                 }),
                 gitops: available(GitOpsObservation::default()),
+                policies: available(crate::policy::audit::PolicyAudit::default()),
             },
             applications: ApplicationEvidence {
                 restarts: available(Vec::new()),
@@ -1652,6 +1752,30 @@ mod tests {
             ]
         );
         assert!(!report.ok.iter().any(|ok| ok.id == "tokens"));
+    }
+
+    /// `relish mcp` makes day-long tokens and renews them itself: not a
+    /// `[token-expiring]` per token (#1763 review).
+    #[test]
+    fn the_tokens_relish_mcp_makes_are_not_expiry_warnings() {
+        let mut inputs = healthy_inputs();
+        inputs.cluster.tokens = available(vec![
+            token(
+                "relish-mcp-1-42",
+                "read-only",
+                NOW - 3_600,
+                Some(NOW + DAY - 3_600),
+            ),
+            token(
+                "relish-mcp-2-43",
+                "read-only",
+                NOW - 2 * DAY,
+                Some(NOW - 60),
+            ),
+            token("agent", "read-only", NOW - 3_600, Some(NOW + DAY - 3_600)),
+        ]);
+        let report = diagnose(&inputs);
+        assert_eq!(warning_ids(&report), [("token-expiring", "token.agent")]);
     }
 
     #[test]
@@ -2162,6 +2286,77 @@ mod tests {
         let report = diagnose(&inputs);
 
         assert!(report.warnings.iter().any(|item| item.id == "deploy-stuck"));
+    }
+
+    /// #1119: the policies row lists what `relish policy audit` lists:
+    /// committed workloads a policy would now refuse, and audit findings.
+    /// Warnings are left to the audit report. No policies, no row.
+    #[test]
+    fn warns_about_committed_workloads_the_policies_would_now_refuse() {
+        use crate::config::PolicyAction;
+        use crate::policy::{Finding, Verdict, WorkloadKind, audit::PolicyAudit};
+        let finding = |policy: &str, action, kind, name: &str| Finding {
+            policy: policy.to_string(),
+            action,
+            kind,
+            workload: crate::meat::types::AppId::new(name, "default"),
+            message: "pin a version".to_string(),
+        };
+        let mut inputs = healthy_inputs();
+        inputs.cluster.policies = available(PolicyAudit {
+            generation: 3,
+            policies: 2,
+            apps: 1,
+            jobs: 1,
+            verdict: Verdict {
+                denials: vec![finding(
+                    "no-latest",
+                    PolicyAction::Deny,
+                    WorkloadKind::App,
+                    "web",
+                )],
+                warnings: vec![finding(
+                    "owner",
+                    PolicyAction::Warn,
+                    WorkloadKind::App,
+                    "web",
+                )],
+                audits: vec![finding(
+                    "limits",
+                    PolicyAction::Audit,
+                    WorkloadKind::Job,
+                    "nightly",
+                )],
+            },
+            broken: None,
+        });
+        let report = diagnose(&inputs);
+        let policies: Vec<_> = warning_ids(&report)
+            .into_iter()
+            .filter(|(id, _)| id.starts_with("policy"))
+            .collect();
+        assert_eq!(
+            policies,
+            vec![
+                ("policy-audit", "job.default/nightly"),
+                ("policy-would-deny", "app.default/web"),
+            ]
+        );
+        assert!(!report.ok.iter().any(|ok| ok.id == "policies"));
+
+        inputs.cluster.policies = available(PolicyAudit {
+            policies: 2,
+            ..PolicyAudit::default()
+        });
+        assert!(diagnose(&inputs).ok.iter().any(|ok| ok.id == "policies"));
+        inputs.cluster.policies = available(PolicyAudit::default());
+        let report = diagnose(&inputs);
+        assert!(!report.ok.iter().any(|ok| ok.id == "policies"));
+        assert!(
+            !warning_ids(&report)
+                .iter()
+                .any(|(id, _)| id.starts_with("policy"))
+        );
     }
 
     #[test]
@@ -3038,5 +3233,64 @@ mod tests {
 
         assert!(report.unknown.iter().any(|u| u.source == "builds"));
         assert!(report.ok.iter().all(|ok| ok.id != "builds"));
+    }
+
+    // `relish agent explain` reports the constants in `findings` as each
+    // check's thresholds. These pin that the checks use exactly them.
+
+    #[test]
+    fn a_crashloop_takes_crashloop_restarts_inside_the_window() {
+        let inside = NOW - CRASHLOOP_WINDOW_SECONDS;
+        let restarts = |count: usize| -> Vec<RestartObservation> {
+            (0..count as u64).map(|at| restart(inside + at)).collect()
+        };
+        let mut inputs = healthy_inputs();
+        inputs.applications.restarts = available(restarts(CRASHLOOP_RESTARTS - 1));
+        assert!(
+            diagnose(&inputs)
+                .critical
+                .iter()
+                .all(|f| f.id != "crashloop")
+        );
+        inputs.applications.restarts = available(restarts(CRASHLOOP_RESTARTS));
+        assert!(
+            diagnose(&inputs)
+                .critical
+                .iter()
+                .any(|f| f.id == "crashloop")
+        );
+        let mut early = restarts(CRASHLOOP_RESTARTS);
+        early[0].timestamp = inside - 1;
+        inputs.applications.restarts = available(early);
+        assert!(
+            diagnose(&inputs)
+                .critical
+                .iter()
+                .all(|f| f.id != "crashloop")
+        );
+    }
+
+    #[test]
+    fn disk_high_warns_and_turns_critical_at_its_two_percentages() {
+        let at = |percent: f64| {
+            let mut inputs = healthy_inputs();
+            inputs.cluster.disks = available(vec![DiskObservation {
+                filesystem_id: None,
+                node_id: "node-1".to_string(),
+                storage_domains: vec!["images".to_string()],
+                used_bytes: 1,
+                total_bytes: 100,
+                used_percent: percent,
+            }]);
+            let report = diagnose(&inputs);
+            (
+                report.warnings.iter().any(|f| f.id == "disk-high"),
+                report.critical.iter().any(|f| f.id == "disk-high"),
+            )
+        };
+        assert_eq!(at(DISK_WARNING_PERCENT as f64 - 0.1), (false, false));
+        assert_eq!(at(DISK_WARNING_PERCENT as f64), (true, false));
+        assert_eq!(at(DISK_CRITICAL_PERCENT as f64 - 0.1), (true, false));
+        assert_eq!(at(DISK_CRITICAL_PERCENT as f64), (false, true));
     }
 }

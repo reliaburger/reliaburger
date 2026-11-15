@@ -1,0 +1,61 @@
+total 39923
+ 68.84% incl   0.00% self  el0t_64_sync_handler
+ 68.84% incl   0.00% self  el0t_64_sync
+ 51.11% incl   1.70% self  el0_svc
+ 48.62% incl   0.06% self  do_el0_svc
+ 48.52% incl   0.04% self  el0_svc_common.constprop.0
+ 48.11% incl   0.34% self  invoke_syscall
+ 41.23% incl   0.00% self  busybox
+ 34.95% incl  11.44% self  [busybox]
+ 27.30% incl   0.92% self  [libc.so.6]
+ 27.28% incl   0.00% self  tokio-rt-worker
+ 17.35% incl   0.09% self  do_mem_abort
+ 17.26% incl   0.40% self  handle_mm_fault
+ 17.15% incl   0.10% self  do_page_fault
+ 16.75% incl   0.10% self  __handle_mm_fault
+ 16.54% incl   0.00% self  <std::sys::thread::unix::Thread>::new::thread_start
+ 16.52% incl   0.00% self  <std::thread::lifecycle::spawn_unchecked<<tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure}, ()>::{closure} as core::ops::function::FnOnce<()>>:
+ 16.52% incl   0.00% self  std::sys::backtrace::__rust_begin_short_backtrace<<tokio::runtime::blocking::pool::Spawner>::spawn_thread::{closure}, ()>
+ 16.44% incl   0.08% self  tokio::runtime::scheduler::multi_thread::worker::run
+ 16.44% incl   0.00% self  tokio::runtime::task::raw::poll<tokio::runtime::blocking::task::BlockingTask<<tokio::runtime::scheduler::multi_thread::worker::Launch>::launch::{closure}>, toki
+ 16.05% incl   0.03% self  <tokio::runtime::scheduler::multi_thread::worker::Context>::run_task
+ 15.90% incl   0.02% self  tokio::runtime::task::raw::poll<reliaburger::relish::bench_jobs::measure_raw::{closure}::{closure}, alloc::sync::Arc<tokio::runtime::scheduler::multi_thread::ha
+ 15.60% incl   0.01% self  __arm64_sys_execve
+ 15.59% incl   0.06% self  reliaburger::relish::bench_jobs::measure_raw::{closure}::{closure}
+ 15.57% incl   0.05% self  do_translation_fault
+ 15.53% incl   0.02% self  do_execveat_common.isra.0
+ 15.49% incl   0.04% self  handle_pte_fault
+ 15.47% incl   0.01% self  execve
+ 15.05% incl   0.00% self  __arm64_sys_exit_group
+ 15.03% incl   0.01% self  do_group_exit
+ 14.99% incl   0.03% self  do_exit
+ 14.75% incl   0.00% self  :
+ 13.76% incl   0.10% self  do_pte_missing
+ 13.19% incl   0.00% self  bprm_execve
+ 13.04% incl   0.04% self  bprm_execve.part.0
+ 12.39% incl   0.00% self  swapper
+ 12.39% incl   0.02% self  cpu_startup_entry
+ 12.36% incl   0.04% self  do_idle
+ 12.24% incl   0.01% self  exit_mm
+ 12.19% incl   0.01% self  mmput
+ 12.17% incl   0.01% self  __mmput
+ 12.11% incl   0.03% self  exit_mmap
+ 11.92% incl  11.74% self  cpuidle_idle_call
+ 11.59% incl   0.01% self  <std::process::Command>::spawn
+ 10.81% incl   0.09% self  do_read_fault
+  9.37% incl   0.00% self  secondary_start_kernel
+  9.37% incl   0.00% self  __secondary_switched
+  9.32% incl   1.00% self  filemap_map_pages
+  9.16% incl   1.45% self  el0_da
+  8.99% incl   0.01% self  exec_binprm
+  8.94% incl   0.01% self  search_binary_handler
+  8.65% incl   0.04% self  load_elf_binary
+  8.41% incl   0.49% self  el0_ia
+  7.10% incl   0.01% self  unmap_vmas
+  7.07% incl   0.04% self  unmap_single_vma.isra.0
+  7.02% incl   0.04% self  unmap_page_range
+  6.64% incl   0.06% self  zap_pmd_range.isra.0
+  6.19% incl   0.01% self  __arm64_sys_clone3
+  6.16% incl   0.01% self  __do_sys_clone3
+  6.08% incl   0.01% self  kernel_clone
+  5.84% incl   0.94% self  set_pte_range

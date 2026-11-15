@@ -37,7 +37,7 @@ pub fn generate_self_signed_cert()
             .map_err(|e| TlsError::CertGenFailed(e.to_string()))?;
 
     let cert_der = CertificateDer::from(cert.cert);
-    let key_der = PrivateKeyDer::try_from(cert.key_pair.serialize_der())
+    let key_der = PrivateKeyDer::try_from(cert.signing_key.serialize_der())
         .map_err(|e| TlsError::CertGenFailed(format!("invalid key: {e}")))?;
 
     Ok((cert_der, key_der))
@@ -630,13 +630,13 @@ mod tests {
     // material crosses stdout or process arguments.
     #[test]
     fn ingress_serial_child() {
-        use rcgen::{CertificateParams, KeyPair};
+        use rcgen::KeyPair;
         let Some(directory) = std::env::var_os("RELIABURGER_SERIAL_TEST_DIRECTORY") else {
             return;
         };
         let directory = std::path::PathBuf::from(directory);
         let certificate = CertificateDer::from(std::fs::read(directory.join("ca.der")).unwrap());
-        let params = CertificateParams::from_ca_cert_der(&certificate).unwrap();
+        let params = crate::sesame::ca::issuer_params_from_der(&certificate).unwrap();
         let key =
             PrivateKeyDer::try_from(std::fs::read(directory.join("ca.key")).unwrap()).unwrap();
         let key = KeyPair::from_der_and_sign_algo(&key, &rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
@@ -677,7 +677,10 @@ mod tests {
         drop(key_file);
         async fn issue(directory: &Path, node: &str) -> Vec<u8> {
             let destination = directory.join(node);
-            let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            // The child's own `test result:` line mustn't reach this test
+            // binary's stdout, where `relish agent patch test` would count
+            // it as this binary's (#1882).
+            let child = tokio::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
                     "wrapper::tls::tests::ingress_serial_child",
@@ -685,14 +688,22 @@ mod tests {
                 ])
                 .env("RELIABURGER_SERIAL_TEST_DIRECTORY", directory)
                 .env("RELIABURGER_SERIAL_TEST_OUTPUT", &destination)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
                 .kill_on_drop(true)
                 .spawn()
                 .unwrap();
-            let status = tokio::time::timeout(std::time::Duration::from_secs(60), child.wait())
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(status.success());
+            let output =
+                tokio::time::timeout(std::time::Duration::from_secs(60), child.wait_with_output())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
             std::fs::read(destination).unwrap()
         }
         let first = issue(directory.path(), "first.der").await;

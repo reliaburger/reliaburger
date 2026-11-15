@@ -1,0 +1,7 @@
+2026-10-30T08:06:09Z bun pid 1846
+2026-10-30T08:07:10Z perfcpu-host jobs-host-processes perf=cpu exit 0
+2026-10-30T08:08:21Z perfoff-host jobs-host-processes perf=off exit 0
+2026-10-30T08:09:32Z perfsched-host jobs-host-processes perf=sched exit 0
+2026-10-30T08:10:43Z probe-host jobs-host-processes perf=probe exit 0
+2026-10-30T08:11:54Z perfcpu-idle idle perf=cpu
+2026-10-30T08:14:01Z DONE

@@ -48,6 +48,21 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             let _ = events.send(ApplyEvent::Error { message }).await;
             return;
         }
+        // Its old incarnation retires first, whatever it was waiting on, and
+        // the reconciler's next attempt deploys under the new allocation.
+        // Nobody needs this stop's answer: that attempt asks again.
+        if let Some(target) = self.superseded_target(&config) {
+            let message = format!(
+                "workload {}/{} has a new service allocation; retry once its previous one has retired",
+                target.namespace, target.name
+            );
+            let (response, _) = oneshot::channel();
+            self.request_app_stop(target.name, target.namespace, StopPurpose::Retire, response)
+                .await;
+            // LOOP-INLINE: one of the first events on the caller's fresh channel; never waits
+            let _ = events.send(ApplyEvent::Error { message }).await;
+            return;
+        }
         if let Some((namespace, app)) = self.restoring_target(&config) {
             let message = format!(
                 "volumes of {namespace}/{app} are being restored from a snapshot; retry once the restore finishes"
@@ -118,6 +133,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             operation: Some(operation),
             stop_confirmation_timeout: self.stop_confirmation_timeout,
             egress: self.egress_resolver(),
+            secrets: self.secret_providers.clone(),
         };
         let worker_task = tokio::spawn(async move {
             worker.run_deploy(config, forward_tx).await;
@@ -404,6 +420,52 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         })
     }
 
+    /// [`Self::oci_spec_with_secrets`] on a blocking thread. Building the
+    /// spec writes each inline config file and creates the identity mount
+    /// directory with `std::fs`, and decrypts secrets, so on a runtime
+    /// worker it would hold that worker, and the loop if it is queued
+    /// there, for as long as the disk takes (#1860).
+    #[allow(clippy::too_many_arguments)]
+    async fn oci_spec_off_runtime(
+        app_name: &str,
+        namespace: &str,
+        spec: &AppSpec,
+        instance_id: &str,
+        host_port: Option<u16>,
+        cgroup_str: &str,
+        volumes_dir: &std::path::Path,
+        netns_path: Option<String>,
+        identities: Vec<age::x25519::Identity>,
+    ) -> Result<crate::grill::oci::OciSpec, BunError> {
+        let (app, namespace, spec, instance_id, cgroup_str, volumes_dir) = (
+            app_name.to_string(),
+            namespace.to_string(),
+            spec.clone(),
+            instance_id.to_string(),
+            cgroup_str.to_string(),
+            volumes_dir.to_path_buf(),
+        );
+        // LOOP-INLINE: the container is built from this spec, so its launch waits for it; the writes run on a blocking thread, not the loop's worker
+        tokio::task::spawn_blocking(move || {
+            Self::oci_spec_with_secrets(
+                &app,
+                &namespace,
+                &spec,
+                &instance_id,
+                host_port,
+                &cgroup_str,
+                Some(&volumes_dir),
+                netns_path.as_deref(),
+                identities,
+            )
+        })
+        .await
+        .map_err(|error| BunError::DeployFailed {
+            app_name: app_name.to_string(),
+            reason: format!("building the container spec stopped: {error}"),
+        })?
+    }
+
     /// Fast pre-create bookkeeping for a fresh instance (the loop side of the
     /// former `drive_instance_startup`): transition to Preparing, prepare
     /// managed volumes and the identity dir, and build the OCI spec. The
@@ -455,23 +517,25 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.prepare_storage(app_name, namespace, spec).await?;
 
         // The per-instance identity dir must exist before create (PKI7).
-        if let Err(e) = self.prepare_instance_identity(instance_id) {
+        if let Err(e) = self.prepare_instance_identity(instance_id).await {
             eprintln!("bun: warning: {e}");
         }
 
         // Mount the host paths the policy approves now, resolved (#797).
-        let spec = self.supervisor.approve_host_paths(app_name, spec)?;
-        let oci_spec = Self::oci_spec_with_secrets(
+        // LOOP-INLINE: the container is built from the approved paths; symlinks resolve on a blocking thread, and an app with none does no I/O
+        let spec = self.supervisor.approve_host_paths(app_name, spec).await?;
+        let oci_spec = Self::oci_spec_off_runtime(
             app_name,
             namespace,
             &spec,
             &instance_id.0,
             host_port,
             &cgroup_str,
-            Some(&self.volumes_dir),
-            netns_path.as_deref(),
+            &self.volumes_dir,
+            netns_path,
             identities,
-        )?;
+        )
+        .await?;
 
         Ok(PreparedInstance {
             oci_spec,
@@ -482,7 +546,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
     /// The runtime refused to launch `instance_id` because its binary can't
     /// run here (#881). Launching it again fails the same way, so the
-    /// instance is `Failed` at once, keeping the reason for `relish status`
+    /// instance is `Failed` at once, keeping the reason for `relish apps`
     /// and `relish wtf`, instead of waiting in `Starting`.
     pub(super) async fn record_launch_failure(&mut self, instance_id: &InstanceId, reason: String) {
         let Some(instance) = self.supervisor.get_instance_mut(instance_id) else {
@@ -506,9 +570,20 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// Post-start bookkeeping for a fresh instance (the loop side of the tail
-    /// of `drive_instance_startup`): record the container IP, transition to
-    /// HealthWait (→Running if no health checks), register its service-map
-    /// backend and finish kernel networking.
+    /// of `drive_instance_startup`): journal its service-map backend, record
+    /// the container IP, transition to HealthWait (→Running if no health
+    /// checks), and finish kernel networking.
+    ///
+    /// The backend's journal write comes first and waits only until the
+    /// turn's deadline (#1263). While it is in flight nothing about the
+    /// start is recorded: the instance stays `Starting`, the op answers
+    /// `StillRunning`, and the deploy worker's next ask finds the backend
+    /// journalled and does the rest without writing it again.
+    ///
+    /// The adoption record's write comes next, the same way (#1853). Only
+    /// once it has landed does the instance get its log forwarder, its state
+    /// and its place in the service map, so an ask after `StillRunning`
+    /// repeats nothing that can't be repeated.
     pub(super) async fn finish_fresh_instance(
         &mut self,
         instance_id: &InstanceId,
@@ -517,49 +592,53 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         evidence: &launch_evidence::LaunchEvidence,
     ) -> Result<(), BunError> {
         self.record_launch_execution(instance_id, &evidence.execution)?;
-        self.spawn_log_forwarder(instance_id, app_name, namespace);
-        self.persist_instance_record(instance_id, evidence).await?;
-        let container_ip = evidence.container_ip;
-
-        if let Some(instance) = self.supervisor.get_instance_mut(instance_id) {
-            instance.container_ip = container_ip;
-        }
-
-        // Starting → HealthWait, then immediately to Running if no health checks
-        {
-            let instance = self
-                .supervisor
-                .get_instance_mut(instance_id)
-                .ok_or_else(|| BunError::InstanceNotFound {
-                    instance_id: instance_id.clone(),
-                })?;
-            instance.state = instance.state.transition_to(ContainerState::HealthWait)?;
-            if instance.health_config.is_none() {
-                instance.state = instance.state.transition_to(ContainerState::Running)?;
+        let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
+        let instance = self.supervisor.get_instance(instance_id).ok_or_else(|| {
+            BunError::InstanceNotFound {
+                instance_id: instance_id.clone(),
             }
+        })?;
+        // Starting → HealthWait, then immediately to Running if no health checks
+        let mut state = instance.state.transition_to(ContainerState::HealthWait)?;
+        if instance.health_config.is_none() {
+            state = state.transition_to(ContainerState::Running)?;
         }
-
-        if let Some(instance) = self.supervisor.get_instance(instance_id)
-            && let Some(host_port) = instance.host_port
-        {
-            let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
+        let mut candidate = self.service_map.clone();
+        if let Some(host_port) = instance.host_port {
             let backend = self.local_backend(
                 instance_id,
                 &service_id,
-                instance.container_ip,
+                evidence.container_ip,
                 host_port,
-                instance.state == ContainerState::Running,
+                state == ContainerState::Running,
             );
-            self.service_map
+            candidate
                 .add_backend(&service_id, backend)
                 .map_err(|error| BunError::BackendPublication {
-                    service: service_id,
+                    service: service_id.clone(),
                     reason: error.to_string(),
                 })?;
         }
+        let landing = self
+            .journal_publication_within_turn(
+                &service_id,
+                &candidate,
+                LoopBranch::DeployOp,
+                "finish_fresh_instance/landed",
+            )
+            .await?;
+        discovery_ownership::still_running_unless_landed(landing, || {
+            format!("journalling {instance_id}'s backend")
+        })?;
 
-        self.finish_instance_networking(app_name, namespace).await?;
-        Ok(())
+        self.persist_instance_record(instance_id, evidence).await?;
+        self.spawn_log_forwarder(instance_id, app_name, namespace);
+        if let Some(instance) = self.supervisor.get_instance_mut(instance_id) {
+            instance.container_ip = evidence.container_ip;
+            instance.state = state;
+        }
+        self.service_map = candidate;
+        self.finish_journalled_networking(&service_id).await
     }
 
     pub(super) async fn reserve_rolling_instance(
@@ -584,14 +663,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         } else {
             None
         };
-        if let Err(error) = self.supervisor.reserve_execution(
-            id.clone(),
-            crate::meat::Resources::new(
-                spec.cpu.map_or(0, |r| r.request),
-                spec.memory.map_or(0, |r| r.request),
-                spec.gpu.unwrap_or(0),
-            ),
-        ) {
+        if let Err(error) = self
+            .supervisor
+            .reserve_execution(id.clone(), crate::meat::admission::app_requests(spec))
+        {
             if let Some(port) = host_port {
                 // LOOP-INLINE: in-memory lock, no I/O
                 self.supervisor.port_allocator.release(port).await?;
@@ -619,6 +694,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 identity: None,
                 identity_mount: None,
                 launch_failure: None,
+                restart_cause: None,
             },
         );
         self.supervisor
@@ -640,6 +716,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         spec: &AppSpec,
         host_port: Option<u16>,
     ) -> Result<crate::grill::oci::OciSpec, BunError> {
+        // A replacement never went through `admit_app`, so the node gate for
+        // runtime knobs (#1122) holds here, before anything is prepared.
+        self.supervisor.admit_runtime_knobs(app_name, spec)?;
         let identities = self.decrypt_identities(namespace).await;
         if identities.is_empty() && spec.env.values().any(|v| v.is_encrypted()) {
             return Err(BunError::DeployFailed {
@@ -651,25 +730,27 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             });
         }
         self.prepare_storage(app_name, namespace, spec).await?;
-        if let Err(e) = self.prepare_instance_identity(instance_id) {
+        if let Err(e) = self.prepare_instance_identity(instance_id).await {
             eprintln!("bun: warning: {e}");
         }
         let cgroup_path =
             crate::grill::cgroup::instance_cgroup_path(namespace, app_name, instance_id)?;
         // A replacement never went through `admit_app`, so this is its host
         // path check as well as the resolution of what to mount (#797).
-        let spec = self.supervisor.approve_host_paths(app_name, spec)?;
-        let oci_spec = Self::oci_spec_with_secrets(
+        // LOOP-INLINE: the container is built from the approved paths; symlinks resolve on a blocking thread, and an app with none does no I/O
+        let spec = self.supervisor.approve_host_paths(app_name, spec).await?;
+        let oci_spec = Self::oci_spec_off_runtime(
             app_name,
             namespace,
             &spec,
             &instance_id.0,
             host_port,
             &cgroup_path.to_string_lossy(),
-            Some(&self.volumes_dir),
+            &self.volumes_dir,
             None,
             identities,
-        )?;
+        )
+        .await?;
         let owner = self
             .supervisor
             .get_instance_mut(instance_id)
@@ -699,7 +780,41 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         new_ips: &std::collections::HashMap<InstanceId, Option<std::net::Ipv4Addr>>,
         mut new_specs: std::collections::HashMap<InstanceId, crate::grill::oci::OciSpec>,
         now: Instant,
+        started_at: SystemTime,
     ) -> Result<(), BunError> {
+        let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
+        // The service as the rollout leaves it is journalled before anything
+        // else changes (#1336), waiting only until the turn's deadline. While
+        // the write is in flight the op answers `StillRunning` with nothing
+        // changed, and the worker's next ask finds it recorded. A refused
+        // registration journals nothing, and fails below, after the old
+        // bookkeeping and keeping the reservation, as it always has.
+        let rolled_out = self.rolled_out_services(&service_id, spec, new_ids, new_ports, new_ips);
+        if let Ok(candidate) = &rolled_out {
+            let landing = self
+                .journal_publication_within_turn(
+                    &service_id,
+                    candidate,
+                    LoopBranch::DeployOp,
+                    "finalise_rolling_deploy/landed",
+                )
+                .await?;
+            discovery_ownership::still_running_unless_landed(landing, || {
+                format!("journalling {service_id}'s replacements")
+            })?;
+        }
+        // From here to `self.service_map = rolled_out?` below, a failed
+        // backend add, retirement or kernel withdrawal returns with the
+        // journal already recording the rolled-out service and memory still
+        // on the old one. That's safe, so `rolled_out` isn't applied early:
+        // the journal is a write-ahead record of what might be exposed, and
+        // being ahead of memory only makes it claim more than is exposed.
+        // A restart withdraws everything the journal names before it
+        // publishes anything, and this service's next publication, built
+        // from memory, journals over it. Only the opposite, something
+        // exposed that the journal doesn't name, would be unsafe (#351).
+        // Applying `rolled_out` before the bookkeeping instead would let
+        // that bookkeeping change the map the journal recorded.
         // DEP5: the worker routed traffic to the fresh instances (published
         // backends) before draining and stopping the old ones, so by the time
         // this op runs the cut-over has already happened. What's left is to
@@ -709,7 +824,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         for old_id in existing {
             self.retain_stopped_instance(old_id);
         }
-        let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
         // M7: publishing backends and retiring old instances now happen
         // incrementally as the rollout steps, so by the time we get here both
         // are usually already done. These loops are idempotent catch-ups for
@@ -770,13 +884,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         {
             self.withdraw_service_ebpf(&service_id).await?;
         }
-        // Re-registration can be refused: a stop that withdrew the council's
-        // allocation mid-rollout leaves nothing to register against. The
-        // retained replacements then retire by proving withdrawal against
-        // this local reservation, so a refusal must put it back.
-        let reserved = self.service_map.clone();
-        let _ = self.service_map.unregister(&service_id);
-
         for new_id in new_ids {
             let host_port = new_ports.get(new_id).copied().flatten();
             let health_config = crate::bun::health::HealthCheckConfig::for_app(spec);
@@ -810,27 +917,23 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     identity,
                     identity_mount,
                     launch_failure: None,
+                    restart_cause: None,
                 },
             );
         }
         let key = (app_name.to_string(), namespace.to_string());
         self.supervisor.app_instances.insert(key, new_ids.to_vec());
 
-        if let Some(port) = spec.port
-            && let Err(error) = self.register_replacement_service(
-                &service_id,
-                port,
-                spec,
-                new_ids,
-                new_ports,
-                new_ips,
-            )
-        {
-            self.service_map = reserved;
-            return Err(error);
-        }
-
-        self.finish_instance_networking(app_name, namespace).await?;
+        // Re-registration can be refused: a stop that withdrew the council's
+        // allocation mid-rollout leaves nothing to register against. The
+        // retained replacements then retire by proving withdrawal against
+        // this local reservation, so a refusal leaves it in place.
+        //
+        // The old bookkeeping above changed only this service's entry, which
+        // the rolled-out map replaces whole, so this is exactly the map the
+        // journal now records.
+        self.service_map = rolled_out?;
+        self.finish_journalled_networking(&service_id).await?;
         // The rolled-out spec owns the route now (#307): a changed host
         // replaces the old one, and a spec without ingress drops it. The
         // stopped-app restore before the rollout only inserts when nothing
@@ -846,24 +949,41 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
         self.rebuild_routing_table().await;
 
-        let entry = crate::meat::deploy_types::DeployHistoryEntry {
-            id: crate::meat::deploy_types::DeployId(
-                SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-            ),
-            app_id: crate::meat::types::AppId::new(app_name, namespace),
-            image: spec.image.clone().unwrap_or_default(),
-            result: crate::meat::deploy_types::DeployResult::Completed,
-            created_at: SystemTime::now(),
-            completed_at: SystemTime::now(),
-            steps_completed: new_ids.len(),
-            steps_total: new_ids.len(),
-            spec: Some(Box::new(spec.clone())),
-        };
+        let entry = crate::meat::deploy_types::DeployHistoryEntry::finished(
+            crate::meat::types::AppId::new(app_name, namespace),
+            spec,
+            crate::meat::deploy_types::DeployResult::Completed,
+            started_at,
+            new_ids.len(),
+            new_ids.len(),
+        );
         super::deploy_ops::record_deploy_history(&mut *self.deploy_history.write().await, entry);
         Ok(())
+    }
+
+    /// The service map a rollout leaves: `service_id` registered afresh,
+    /// with only the replacements' backends, and every other service as it
+    /// is. `service_map` itself doesn't change. A refused registration
+    /// (an allocation a stop withdrew mid-rollout) is the error.
+    fn rolled_out_services(
+        &mut self,
+        service_id: &crate::onion::service_id::ServiceId,
+        spec: &AppSpec,
+        new_ids: &[InstanceId],
+        new_ports: &std::collections::HashMap<InstanceId, Option<u16>>,
+        new_ips: &std::collections::HashMap<InstanceId, Option<std::net::Ipv4Addr>>,
+    ) -> Result<crate::onion::service_map::ServiceMap, BunError> {
+        // Registration works on `service_map` in place, so build the result
+        // there and put the original back.
+        let current = self.service_map.clone();
+        let _ = self.service_map.unregister(service_id);
+        let registered = match spec.port {
+            Some(port) => self
+                .register_replacement_service(service_id, port, spec, new_ids, new_ports, new_ips),
+            None => Ok(()),
+        };
+        let rolled_out = std::mem::replace(&mut self.service_map, current);
+        registered.map(|()| rolled_out)
     }
 
     /// Refuse user/cleanup stops while a deploy can still mutate the target.
@@ -897,4 +1017,57 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
         Ok(())
     }
+}
+
+/// Which instance of which app a launch is for: what a secret provider is
+/// told, and what a refusal names.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct LaunchTarget<'a> {
+    pub(super) instance_id: &'a InstanceId,
+    pub(super) app_name: &'a str,
+    pub(super) namespace: &'a str,
+}
+
+/// Resolve `spec`'s `PROVIDER[...]` env values, then create the instance
+/// from the resolved spec (#1123). Returns the spec it was created from, so
+/// its init containers get the same environment.
+///
+/// This runs on a deploy or restart task, never on the agent loop: a
+/// provider may take up to its timeout. The resolved spec lives only here
+/// and in the runtime. What the supervisor keeps is `spec`, with the
+/// references, so every restart asks the provider again.
+///
+/// A provider that fails refuses the launch with
+/// [`LaunchProblem::SecretUnavailable`](crate::grill::LaunchProblem), the
+/// same way a missing binary does (#881), so the instance fails closed with
+/// the reason in `relish apps` and `relish wtf`.
+pub(super) async fn create_with_secrets<'s, G: Grill>(
+    grill: &G,
+    providers: &crate::sesame::secret_provider::SecretProviders,
+    target: LaunchTarget<'_>,
+    spec: &'s crate::grill::oci::OciSpec,
+) -> Result<std::borrow::Cow<'s, crate::grill::oci::OciSpec>, crate::grill::GrillError> {
+    let launch = if crate::sesame::secret_provider::needs_resolution(&spec.process.provider_env) {
+        let context = crate::sesame::secret_provider::LaunchContext {
+            namespace: target.namespace,
+            app: target.app_name,
+            instance: &target.instance_id.0,
+        };
+        let env = providers
+            .resolve_env(&spec.process.env, &spec.process.provider_env, context)
+            .await
+            .map_err(|error| crate::grill::GrillError::LaunchRefused {
+                instance: target.instance_id.clone(),
+                problem: error.into(),
+            })?;
+        let mut resolved = spec.clone();
+        resolved.process.env = env;
+        // The runtime gets secrets, not references.
+        resolved.process.provider_env.clear();
+        std::borrow::Cow::Owned(resolved)
+    } else {
+        std::borrow::Cow::Borrowed(spec)
+    };
+    grill.create(target.instance_id, &launch).await?;
+    Ok(launch)
 }

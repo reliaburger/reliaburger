@@ -141,6 +141,41 @@ mod tests {
         assert_eq!(prefix.as_ref(), "prod");
     }
 
+    /// `make test-s3` points the client at a local S3 server with these two
+    /// variables, and the server only understands path-style requests
+    /// (`http://host:port/bucket/key`), not `bucket.host` names.
+    #[test]
+    fn s3_store_reaches_a_local_server_by_endpoint_with_path_style_requests() {
+        use object_store::ClientConfigKey;
+        let url = url::Url::parse("s3://council-backups/prod").unwrap();
+        let variables = env(&[
+            ("AWS_ENDPOINT", "http://127.0.0.1:18333"),
+            ("AWS_ALLOW_HTTP", "true"),
+            ("AWS_REGION", "us-east-1"),
+        ]);
+        let builder = s3_builder(&url, variables.clone());
+        let value = |key| builder.get_config_value(&key);
+        assert_eq!(
+            value(AmazonS3ConfigKey::Endpoint).as_deref(),
+            Some("http://127.0.0.1:18333")
+        );
+        assert_eq!(
+            value(AmazonS3ConfigKey::Client(ClientConfigKey::AllowHttp)).as_deref(),
+            Some("true")
+        );
+        assert_eq!(
+            value(AmazonS3ConfigKey::VirtualHostedStyleRequest).as_deref(),
+            Some("false")
+        );
+
+        // The bucket goes in the path after the endpoint, not in the host.
+        let (store, _) = open_with_env(&url, variables).unwrap();
+        assert!(
+            format!("{store:?}").contains("http://127.0.0.1:18333/council-backups"),
+            "{store:?}"
+        );
+    }
+
     #[test]
     fn s3_store_without_a_region_variable_sets_none() {
         let url = url::Url::parse("s3://council-backups/prod").unwrap();

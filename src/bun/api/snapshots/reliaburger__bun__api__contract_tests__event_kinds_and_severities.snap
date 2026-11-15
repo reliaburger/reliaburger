@@ -1,0 +1,30 @@
+---
+source: src/bun/api/contract_tests.rs
+expression: "serde_json::json!({ \"kinds\": kinds, \"severities\": severities, })"
+---
+{
+  "kinds": [
+    "deploy",
+    "restart",
+    "health",
+    "stop",
+    "job-completed",
+    "job-failed",
+    "job-skipped",
+    "job-cancelled",
+    "job-unknown",
+    "alert",
+    "fault",
+    "token",
+    "secret",
+    "identity",
+    "operation",
+    "refusal",
+    "placement"
+  ],
+  "severities": [
+    "info",
+    "warning",
+    "critical"
+  ]
+}

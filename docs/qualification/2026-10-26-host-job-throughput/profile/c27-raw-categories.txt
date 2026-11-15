@@ -1,0 +1,12 @@
+samples 39923
+ 12.39%    idle (no runnable work)
+  0.00%    Bun: Raft core and log
+  0.00%    Bun: task-array leader tick and node sync
+  0.18%    Bun: other (runtime, timers, wakeups, other subsystems)
+  6.47%    helper/child: execve
+ 15.05%    helper/child: exit and address-space teardown
+ 15.71%    helper/child: page faults
+ 18.75%    busybox `true`: user space and other kernel
+ 28.24%    relish (raw scenario spawner and bench client)
+  3.20%    other processes and kernel threads
+other by command: ksoftirqd/ 2.08%, migration/ 0.33%, kworker/1:2-eve 0.15%, kworker/0:3-eve 0.15%, kworker/2:2-eve 0.13%, kworker/3:2-eve 0.13%, perf 0.11%, rcu_preempt 0.05%, lima-guestagent 0.05%, exe 0.02%, containerd 0.00%

@@ -1,15 +1,24 @@
-# The five-minute tour's home-built app: build it on the cluster, then run it
-# next to podinfo. From the directory above this one:
+# The five-minute tour's demo: a burger you can watch. Build it on the
+# cluster, run it, then curl it. From the directory above this one:
 #
 #   relish build burger/burger.toml    # a node builds it with Buildah into Pickle
 #   relish apply burger/burger.toml
-#   curl http://burger.localhost:18080/order
+#   curl http://burger.localhost:18080 # the burger, one coloured line per layer
 #
-# Each order names the podinfo backend replica that "cooked" it, reached by its
-# service name, so apply podinfo first:
-#   relish apply -f https://reliaburger.com/demo/podinfo.yaml
+# One image plays every part. Each layer of the burger is its own app,
+# named after the layer, that serves its slice and the instance that served
+# it. The counter, behind the ingress, asks each layer by its service name and
+# stacks whatever answers; a layer with no healthy instance is a gap. A
+# browser gets the same burger as SVG that redraws every second, and
+# `Accept: application/json` gets JSON. The diner orders a burger twice a
+# second, so there's always traffic for metrics and faults to act on.
 #
-# The Go source, its test and the Dockerfile sit next to this file.
+# The tour then changes one layer at a time with the files next to this one:
+#   relish apply burger/cheese-v2.toml      # a rolling deploy: blue cheese
+#   relish apply burger/patty-v3.toml       # a raw patty, rolled back
+#   relish apply burger/triple-patty.toml   # three patties
+#
+# The Go source, its tests and the Dockerfile sit next to this file.
 
 # Tar this directory, upload it to Pickle, and have a node with Buildah build
 # the Dockerfile (for linux/amd64 and linux/arm64) and push it as burger:v1.
@@ -17,17 +26,141 @@
 context = "."
 destination = "pickle://burger:v1"
 
-[app.burger]
+# The front of the shop, behind the ingress: one on each node.
+[app.counter]
 # A bare name: nodes pull it from the cluster's own registry.
 image = "burger:v1"
 port = 8080
-replicas = 2
+replicas = 3
 cpu = "50m-500m"
 memory = "16Mi-64Mi"
-env = { BACKEND_URL = "http://backend:9898/" }
+metrics = {}
 
-[app.burger.health]
+[app.counter.health]
 path = "/healthz"
+interval = 2
+timeout = 1
 
-[app.burger.ingress]
+[app.counter.ingress]
 host = "burger.localhost"
+
+[app.diner]
+image = "burger:v1"
+args = ["diner"]
+cpu = "10m-100m"
+memory = "8Mi-32Mi"
+
+# The layers, top to bottom. Each is the same image with LAYER and VERSION
+# set. A short health interval makes a dead layer leave the service map in
+# seconds, and a short health and drain timeout keep the tour's rollouts
+# quick.
+[app.top-bun]
+image = "burger:v1"
+port = 8080
+cpu = "10m-200m"
+memory = "8Mi-32Mi"
+env = { LAYER = "top-bun", VERSION = "v1" }
+metrics = {}
+
+[app.top-bun.health]
+path = "/healthz"
+interval = 2
+timeout = 1
+threshold_unhealthy = 2
+
+[app.top-bun.deploy]
+health_timeout = "20s"
+drain_timeout = "5s"
+
+[app.lettuce]
+image = "burger:v1"
+port = 8080
+cpu = "10m-200m"
+memory = "8Mi-32Mi"
+env = { LAYER = "lettuce", VERSION = "v1" }
+metrics = {}
+
+[app.lettuce.health]
+path = "/healthz"
+interval = 2
+timeout = 1
+threshold_unhealthy = 2
+
+[app.lettuce.deploy]
+health_timeout = "20s"
+drain_timeout = "5s"
+
+[app.tomato]
+image = "burger:v1"
+port = 8080
+cpu = "10m-200m"
+memory = "8Mi-32Mi"
+env = { LAYER = "tomato", VERSION = "v1" }
+metrics = {}
+
+[app.tomato.health]
+path = "/healthz"
+interval = 2
+timeout = 1
+threshold_unhealthy = 2
+
+[app.tomato.deploy]
+health_timeout = "20s"
+drain_timeout = "5s"
+
+# Two slices: the rolling deploy swaps them one at a time, so the burger
+# never loses its cheese.
+[app.cheese]
+image = "burger:v1"
+port = 8080
+replicas = 2
+cpu = "10m-200m"
+memory = "8Mi-32Mi"
+env = { LAYER = "cheese", VERSION = "v1" }
+metrics = {}
+
+[app.cheese.health]
+path = "/healthz"
+interval = 2
+timeout = 1
+threshold_unhealthy = 2
+
+[app.cheese.deploy]
+health_timeout = "20s"
+drain_timeout = "5s"
+
+[app.patty]
+image = "burger:v1"
+port = 8080
+cpu = "10m-200m"
+memory = "8Mi-32Mi"
+env = { LAYER = "patty", VERSION = "v1" }
+metrics = {}
+
+[app.patty.health]
+path = "/healthz"
+interval = 2
+timeout = 1
+threshold_unhealthy = 2
+
+[app.patty.deploy]
+health_timeout = "20s"
+drain_timeout = "5s"
+
+[app.bottom-bun]
+image = "burger:v1"
+port = 8080
+cpu = "10m-200m"
+memory = "8Mi-32Mi"
+env = { LAYER = "bottom-bun", VERSION = "v1" }
+metrics = {}
+
+[app.bottom-bun.health]
+path = "/healthz"
+interval = 2
+timeout = 1
+threshold_unhealthy = 2
+
+[app.bottom-bun.deploy]
+health_timeout = "20s"
+drain_timeout = "5s"

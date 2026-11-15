@@ -27,6 +27,56 @@ fn version_reports_the_compiled_binary() {
     assert!(output.stderr.is_empty());
 }
 
+/// Run `relish` the way an agent's shell does: no terminal on stdin or
+/// stdout. Gives up after 20 s, so a reader that hangs fails the test
+/// instead of the run.
+fn run_without_a_terminal(args: &[&str]) -> Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_relish"))
+        .args(args)
+        .env_remove("RELIABURGER_TOKEN")
+        .env_remove("RELIABURGER_CA_CERT")
+        .env_remove("RELIABURGER_ENDPOINT")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() > deadline {
+            child.kill().unwrap();
+            panic!("relish {args:?} hung without a terminal");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    child.wait_with_output().unwrap()
+}
+
+/// #1569: the TUI and the two readers are full-screen. From an agent's shell
+/// they used to error obscurely or hang; now they stop at once and say what
+/// to run instead.
+#[test]
+fn full_screen_commands_fail_fast_without_a_terminal() {
+    for (args, hint) in [
+        (&[][..], "relish agent guide"),
+        (&["tui"], "relish agent guide"),
+        (&["manual"], "relish agent manual"),
+        (&["manual", "tour"], "relish agent manual"),
+        (&["source"], "relish agent source"),
+        (&["source", "ebpf"], "relish agent source"),
+    ] {
+        let output = run_without_a_terminal(args);
+        assert_eq!(output.status.code(), Some(1), "relish {args:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("needs a terminal"),
+            "relish {args:?}: {stderr}"
+        );
+        assert!(stderr.contains(hint), "relish {args:?}: {stderr}");
+        assert!(output.stdout.is_empty(), "relish {args:?}");
+    }
+}
+
 #[test]
 fn invalid_output_format_exits_with_clap_error() {
     let output = run(&["--output", "xml", "status"]);
@@ -89,6 +139,76 @@ fn endpoint_environment_rejects_remote_plaintext_before_dispatch() {
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).contains("must use HTTPS"));
+}
+
+/// #1695: the MCPB bundle passes its optional endpoint setting as
+/// `RELIABURGER_ENDPOINT`, empty when the user left it blank. Blank means
+/// "use the current context", not "an invalid URL".
+#[test]
+fn blank_endpoint_environment_falls_back_to_the_current_context() {
+    let home = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_relish"))
+        .arg("status")
+        .env("RELIABURGER_HOME", home.path())
+        .env("RELIABURGER_ENDPOINT", "  ")
+        .env("RELIABURGER_TOKEN", "")
+        .env_remove("RELIABURGER_CA_CERT")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("invalid endpoint URL"), "{stderr}");
+    assert!(!stderr.contains("endpoint URL must"), "{stderr}");
+}
+
+/// #1695: a blank `RELIABURGER_TOKEN` sends no bearer at all, the same as
+/// an unset one, rather than an empty `Bearer ` header.
+#[tokio::test]
+async fn blank_token_environment_sends_no_bearer() {
+    use axum::{Router, http::HeaderMap};
+    use std::sync::{Arc, Mutex};
+
+    let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
+    let record = seen.clone();
+    let app = Router::new().fallback(move |headers: HeaderMap| {
+        let record = record.clone();
+        async move {
+            record.lock().unwrap().push(
+                headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .map(|value| value.to_str().unwrap_or("<binary>").to_string()),
+            );
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    // Pay `relish`'s first launch before the 60 s bound starts (#1149).
+    crate::bun_process::first_launch_binaries();
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_relish"))
+            .arg("status")
+            .env("RELIABURGER_ENDPOINT", &endpoint)
+            .env("RELIABURGER_TOKEN", " ")
+            .env_remove("RELIABURGER_CA_CERT")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    server.abort();
+    let _ = server.await;
+
+    let seen = seen.lock().unwrap();
+    assert!(
+        !seen.is_empty(),
+        "relish never reached the stub: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(seen.iter().all(Option::is_none), "{seen:?}");
 }
 
 #[test]
@@ -211,6 +331,8 @@ async fn cancel_deploy_waits_for_terminal_evidence_and_refuses_unknown_success()
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        // Pay `relish`'s first launch before the 60 s bound starts (#1149).
+        crate::bun_process::first_launch_binaries();
         let output = tokio::time::timeout(
             std::time::Duration::from_secs(60),
             tokio::process::Command::new(env!("CARGO_BIN_EXE_relish"))
@@ -273,6 +395,8 @@ async fn image_delete_parses_repo_and_tag() {
             .with_state(deleted.clone());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
+    // Pay `relish`'s first launch before the 60 s bound starts (#1149).
+    crate::bun_process::first_launch_binaries();
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(60),
         tokio::process::Command::new(env!("CARGO_BIN_EXE_relish"))
@@ -395,6 +519,8 @@ spec:
     )
     .unwrap();
 
+    // Pay `relish`'s first launch before the 60 s bound starts (#1149).
+    crate::bun_process::first_launch_binaries();
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(60),
         tokio::process::Command::new(env!("CARGO_BIN_EXE_relish"))
@@ -431,6 +557,204 @@ spec:
     assert_eq!(web.args, ["-g", "daemon off;"]);
     assert_eq!(web.port, Some(80));
     assert_eq!(web.replicas, reliaburger::config::Replicas::Fixed(2));
+}
+
+/// #703: `--strict` is sold as a CI gate, so a dropped resource must fail it
+/// as surely as an approximated one.
+#[cfg(feature = "kubernetes")]
+#[test]
+fn import_strict_fails_when_a_resource_is_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = dir.path().join("dropped.yaml");
+    std::fs::write(
+        &manifest,
+        r#"
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-all
+spec:
+  podSelector: {}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data
+spec:
+  accessModes: ["ReadWriteOnce"]
+"#,
+    )
+    .unwrap();
+    let path = manifest.to_str().unwrap();
+
+    let lenient = run(&["import", "-f", path]);
+    assert!(
+        lenient.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lenient.stderr)
+    );
+
+    let strict = run(&["import", "--strict", "-f", path]);
+    assert_eq!(strict.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&strict.stderr);
+    assert!(stderr.contains("NetworkPolicy/deny-all"), "{stderr}");
+    assert!(stderr.contains("2 dropped"), "{stderr}");
+}
+
+#[cfg(feature = "kubernetes")]
+#[test]
+fn import_strict_passes_a_manifest_that_converts_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = dir.path().join("clean.yaml");
+    std::fs::write(
+        &manifest,
+        r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+spec:
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+      - name: web
+        image: web:v1
+        ports:
+        - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  selector:
+    app: web
+  ports:
+  - port: 8080
+"#,
+    )
+    .unwrap();
+    let output = run(&["import", "--strict", "-f", manifest.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("[app.web]"));
+}
+
+/// #1132: `export --strict` is the same CI gate as `import --strict`: a job
+/// whose egress rules Kubernetes can't carry must fail it, and the error says
+/// how many lines of each kind the report has.
+#[cfg(feature = "kubernetes")]
+#[test]
+fn export_strict_fails_when_a_field_is_not_exported() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("job.toml");
+    std::fs::write(
+        &config,
+        r#"
+[job.fetch]
+image = "fetcher:v1"
+
+[job.fetch.egress]
+allow = ["api.example.com:443"]
+"#,
+    )
+    .unwrap();
+    let path = config.to_str().unwrap();
+
+    let lenient = run(&["export", "-f", path]);
+    assert!(
+        lenient.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lenient.stderr)
+    );
+    assert!(String::from_utf8_lossy(&lenient.stderr).contains("[job.fetch.egress]"));
+
+    let strict = run(&["export", "--strict", "-f", path]);
+    assert_eq!(strict.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&strict.stderr);
+    assert!(stderr.contains("[job.fetch.egress]"), "{stderr}");
+    assert!(stderr.contains("1 unsupported"), "{stderr}");
+}
+
+#[cfg(feature = "kubernetes")]
+#[test]
+fn export_strict_passes_a_config_that_exports_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("cron.toml");
+    std::fs::write(
+        &config,
+        "[job.cleanup]\nimage = \"cleanup:v1\"\nschedule = \"0 3 * * *\"\noverlap = \"allow\"\n",
+    )
+    .unwrap();
+    let output = run(&["export", "--strict", "-f", config.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("concurrencyPolicy: Allow"));
+}
+
+/// #703: exporting used to keep `command` only, so Redis came back without
+/// `--maxmemory 64mb --save "" --appendonly no`.
+#[cfg(feature = "kubernetes")]
+#[test]
+fn podinfo_import_then_export_round_trips_args() {
+    let podinfo = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/kubernetes/podinfo.yaml"
+    );
+    let imported = run(&["import", "-f", podinfo]);
+    assert!(
+        imported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&imported.stderr)
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let toml = dir.path().join("podinfo.toml");
+    std::fs::write(&toml, &imported.stdout).unwrap();
+
+    let exported = run(&["export", "-f", toml.to_str().unwrap()]);
+    assert!(
+        exported.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exported.stderr)
+    );
+    let yaml = String::from_utf8_lossy(&exported.stdout);
+    let redis = yaml
+        .split("\n---\n")
+        .filter_map(|document| yaml_serde::from_str::<yaml_serde::Value>(document).ok())
+        .find(|document| {
+            document["kind"].as_str() == Some("Deployment")
+                && document["metadata"]["name"].as_str() == Some("redis")
+        })
+        .unwrap_or_else(|| panic!("no redis Deployment in:\n{yaml}"));
+    let args: Vec<&str> = redis["spec"]["template"]["spec"]["containers"][0]["args"]
+        .as_sequence()
+        .unwrap_or_else(|| panic!("redis lost its args:\n{yaml}"))
+        .iter()
+        .filter_map(|arg| arg.as_str())
+        .collect();
+    assert_eq!(
+        args,
+        [
+            "redis-server",
+            "--maxmemory",
+            "64mb",
+            "--maxmemory-policy",
+            "allkeys-lru",
+            "--save",
+            "",
+            "--appendonly",
+            "no",
+        ]
+    );
 }
 
 #[test]
@@ -504,6 +828,9 @@ async fn relish_batch(endpoint: &str, jobs: &str) -> u64 {
 async fn hung_toml_job_times_out() {
     let harness = crate::batch::Harness::start().await;
     let hang = "runtime = \"process\"\nexec = \"/bin/sleep\"\ncommand = [\"60\"]\ntask_timeout_secs = 1\nmax_attempts = 1\n";
+    // The elapsed-time check below times the jobs, not `relish`'s first
+    // launch, so pay that before the clock starts (#1149).
+    crate::bun_process::first_launch_binaries();
     let started = std::time::Instant::now();
 
     // A job that is safe to repeat counts the timeout as a failed attempt.
@@ -545,4 +872,456 @@ async fn hung_toml_job_times_out() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     assert!(started.elapsed() < std::time::Duration::from_secs(30));
+}
+
+/// Run `relish agent ...` the way an agent's tool runner does: no terminal,
+/// nothing on stdin, no connection settings in the environment.
+fn run_agent(args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_relish"))
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .env_remove("RELIABURGER_TOKEN")
+        .env_remove("RELIABURGER_CA_CERT")
+        .env_remove("RELIABURGER_ENDPOINT")
+        .env_remove("TERM")
+        .output()
+        .unwrap()
+}
+
+/// stdout as the one JSON document an agent command prints.
+fn agent_envelope(output: &Output) -> serde_json::Value {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.matches('\n').count(), 1, "one line: {stdout}");
+    let value: serde_json::Value = serde_json::from_str(&stdout).expect("stdout is JSON");
+    assert_eq!(value["schema"], "relish.agent/v1");
+    value
+}
+
+#[test]
+fn agent_version_answers_without_a_terminal_or_stdin() {
+    let output = run_agent(&["agent", "version"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let value = agent_envelope(&output);
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["command"], "version");
+    assert_eq!(value["data"]["version"], env!("CARGO_PKG_VERSION"));
+}
+
+#[test]
+fn agent_ignores_the_output_flag() {
+    let output = run_agent(&["-o", "yaml", "agent", "version"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(agent_envelope(&output)["ok"], true);
+}
+
+#[test]
+fn agent_usage_errors_are_envelopes_on_stdout_with_exit_2() {
+    for args in [
+        &["agent", "version", "--bogus"][..],
+        &["agent", "nonsense"],
+        &["agent"],
+        &["agent", "version", "--max-bytes", "10"],
+        &["--endpoint", "http://192.0.2.10:9117", "agent", "version"],
+    ] {
+        let output = run_agent(args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stderr.is_empty(), "{args:?}: {output:?}");
+        let value = agent_envelope(&output);
+        assert_eq!(value["ok"], false, "{args:?}");
+        assert_eq!(value["error"]["code"], "usage", "{args:?}");
+    }
+}
+
+#[test]
+fn agent_refuses_a_plaintext_remote_endpoint_from_the_environment_with_an_envelope() {
+    let output = Command::new(env!("CARGO_BIN_EXE_relish"))
+        .args(["agent", "version"])
+        .stdin(std::process::Stdio::null())
+        .env("RELIABURGER_ENDPOINT", "http://192.0.2.10:9117")
+        .env_remove("RELIABURGER_TOKEN")
+        .env_remove("RELIABURGER_CA_CERT")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let value = agent_envelope(&output);
+    assert_eq!(value["error"]["code"], "usage");
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("must use HTTPS"),
+        "{value}"
+    );
+}
+
+#[test]
+fn agent_help_is_ordinary_help() {
+    let output = run_agent(&["agent", "--help"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("--max-bytes"));
+}
+
+/// #1574: the real binary makes a workspace from its own source, and `diff`
+/// sees an edit to it. Building and testing are covered with fake cargos in
+/// the unit tests; this proves the wiring and the real bundle.
+#[test]
+fn agent_patch_init_then_diff_shows_the_edit() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("fix");
+    let dir_text = dir.to_str().unwrap();
+    let output = run_agent(&["agent", "patch", "init", dir_text]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let init = agent_envelope(&output);
+    assert_eq!(init["command"], "patch init");
+    assert_eq!(init["data"]["branch"], "patch");
+    assert!(dir.join("src/relish/agent/patch.rs").is_file());
+
+    let path = dir.join("src/relish/agent/patch.rs");
+    let mut text = std::fs::read_to_string(&path).unwrap();
+    text.push_str("// a fix\n");
+    std::fs::write(&path, text).unwrap();
+    let output = run_agent(&["agent", "patch", "diff", dir_text]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let diff = agent_envelope(&output);
+    assert_eq!(diff["command"], "patch diff");
+    assert_eq!(
+        diff["data"]["files"],
+        serde_json::json!([{
+            "path": "src/relish/agent/patch.rs",
+            "status": "modified",
+            "insertions": 1,
+            "deletions": 0
+        }])
+    );
+    assert!(diff["data"]["diff"].as_str().unwrap().contains("+// a fix"));
+    assert_eq!(diff["data"]["build_changes"], serde_json::json!([]));
+}
+
+/// #1691: an agent with only `relish` hands `patch apply` a diff whose hunk
+/// counts are wrong, inline as one argument starting `---`; it applies,
+/// and `patch diff` prints it with headers git wrote. A hunk that doesn't
+/// match is a usage error that names it.
+#[test]
+fn agent_patch_apply_takes_a_miscounted_diff_and_diff_prints_a_correct_one() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("fix");
+    let dir_text = dir.to_str().unwrap();
+    let output = run_agent(&["agent", "patch", "init", dir_text]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+
+    let source = std::fs::read_to_string(dir.join("src/relish/agent/patch.rs")).unwrap();
+    let first = source.lines().next().unwrap();
+    let miscounted = format!(
+        "--- a/src/relish/agent/patch.rs\n+++ b/src/relish/agent/patch.rs\n@@ -1,5 +1,9 @@\n-{first}\n+//! Patched by an agent.\n"
+    );
+    let output = run_agent(&["agent", "patch", "apply", dir_text, &miscounted]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let applied = agent_envelope(&output);
+    assert_eq!(applied["command"], "patch apply");
+    assert_eq!(applied["data"]["files"][0]["hunks"][0]["recounted"], true);
+
+    let output = run_agent(&["agent", "patch", "diff", dir_text]);
+    let diff = agent_envelope(&output);
+    let text = diff["data"]["diff"].as_str().unwrap();
+    assert!(text.contains("@@ -1,4 +1,4 @@"), "{text}");
+    assert!(text.contains("+//! Patched by an agent."), "{text}");
+
+    let wrong = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-no such line\n+x\n";
+    let output = run_agent(&["agent", "patch", "apply", dir_text, wrong]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let refused = agent_envelope(&output);
+    assert_eq!(refused["error"]["code"], "usage");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("hunk 1 of src/lib.rs"),
+        "{refused}"
+    );
+}
+
+#[test]
+fn agent_patch_on_a_directory_that_is_not_a_workspace_is_not_found() {
+    let root = tempfile::tempdir().unwrap();
+    let output = run_agent(&["agent", "patch", "diff", root.path().to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(5));
+    let value = agent_envelope(&output);
+    assert_eq!(value["error"]["code"], "not_found");
+}
+
+#[test]
+fn agent_schema_stays_within_a_small_budget() {
+    let output = run_agent(&["agent", "schema", "--max-bytes", "1024"]);
+    assert!(output.stdout.len() <= 1024, "{} bytes", output.stdout.len());
+    let value = agent_envelope(&output);
+    // The whole schema is far over 1 KiB and mostly objects, which the
+    // budget never trims, so this either trims the command list or says the
+    // budget is too small. Both are answers inside the budget.
+    if value["ok"] == true {
+        assert_eq!(value["truncated"], true);
+    } else {
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(value["error"]["code"], "usage");
+    }
+}
+
+#[test]
+fn agent_report_writes_a_redacted_draft_and_posts_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let evidence = dir.path().join("diagnose.json");
+    std::fs::write(
+        &evidence,
+        r#"{"node_id": "wolf4", "detail": "wolf4 at 192.0.2.17 sent rbrg_0123abcd"}"#,
+    )
+    .unwrap();
+    let out = dir.path().join("report");
+    let output = run_agent(&[
+        "agent",
+        "report",
+        "--title",
+        "wolf4 is reported dead",
+        "--what-happened",
+        "diagnose said wolf4 was dead",
+        "--expected",
+        "no finding",
+        "--not-tested",
+        "more than two nodes",
+        "--caught-by",
+        "smoker-fault",
+        "--finding",
+        "node-dead",
+        "--evidence",
+        evidence.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let value = agent_envelope(&output);
+    assert_eq!(value["command"], "report");
+    assert_eq!(
+        value["data"]["title"],
+        "agent: [unverified] node-1 is reported dead"
+    );
+    let post = value["next"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(post["read_only"], false);
+    assert!(
+        post["run"]
+            .as_str()
+            .unwrap()
+            .starts_with("gh issue create ")
+    );
+    for name in ["issue.md", "bundle.json", "MANIFEST.json"] {
+        let text = std::fs::read_to_string(out.join(name)).unwrap();
+        for planted in ["wolf4", "192.0.2.17", "rbrg_0123abcd"] {
+            assert!(!text.contains(planted), "{planted} in {name}");
+        }
+    }
+}
+
+/// A stub Bun that answers `/v1/events` with one health-check restart of
+/// `web-0` and the event before it, and refuses `/v1/audit` the way a
+/// token without audit access is refused (#1685).
+async fn stub_bun_with_a_health_restart() -> (String, tokio::task::JoinHandle<()>) {
+    use axum::{Json, Router, routing::get};
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let details = reliaburger::bun::restart::restart_decision(
+        "restart.health_failed",
+        "default__web-0",
+        2,
+        &reliaburger::bun::restart::RestartPolicy::default(),
+    )
+    .with("consecutive_failures", 2)
+    .with("threshold", 2)
+    .into_details();
+    let events = serde_json::json!({
+        "events": [
+            {
+                "sequence": 1, "timestamp": now - 40, "kind": "health",
+                "severity": "warning", "app": "web", "namespace": "default",
+                "node": "node-1", "message": "instance default__web-0 became unhealthy"
+            },
+            {
+                "sequence": 2, "timestamp": now - 30, "kind": "restart",
+                "severity": "warning", "app": "web", "namespace": "default",
+                "node": "node-1", "details": details,
+                "message": "instance default__web-0 restarted (attempt 2)"
+            }
+        ],
+        "warnings": []
+    });
+    let app = Router::new()
+        .route(
+            "/v1/events",
+            get(move || {
+                let events = events.clone();
+                async move { Json(events) }
+            }),
+        )
+        .route(
+            "/v1/audit",
+            get(|| async {
+                (
+                    axum::http::StatusCode::FORBIDDEN,
+                    "insufficient permissions",
+                )
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (endpoint, server)
+}
+
+/// A single node on v0.2.7 whose binary isn't the one the release
+/// publishes, for `relish verify` and `relish agent verify` (#1689).
+async fn drifted_node() -> (String, tokio::task::JoinHandle<()>) {
+    use axum::{Json, Router, http::StatusCode, routing::get};
+    let app = Router::new()
+        .route(
+            "/v1/upgrade/cluster",
+            get(|| async {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({"error": reliaburger::upgrade::NO_COUNCIL})),
+                )
+            }),
+        )
+        .route(
+            "/v1/version",
+            get(|| async {
+                Json(serde_json::json!({
+                    "version": "v0.2.7",
+                    "binary_sha256": "9f3c".repeat(16),
+                    "platform": "linux-x86_64",
+                }))
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (endpoint, server)
+}
+
+/// Release metadata for v0.2.7 naming other bytes than the node runs.
+fn published_metadata(directory: &std::path::Path) -> std::path::PathBuf {
+    let path = directory.join("metadata.json");
+    let document = serde_json::json!({
+        "schema": 1,
+        "latest": "v0.2.7",
+        "releases": [{"version": "v0.2.7", "platforms": {"linux-x86_64": {
+            "url": "https://releases.invalid/bun-linux-x86_64",
+            "sha256": "41aa".repeat(16),
+            "embedded_signature": "c2ln",
+        }}}],
+    });
+    std::fs::write(&path, document.to_string()).unwrap();
+    path
+}
+
+async fn run_against(endpoint: &str, args: &[&str]) -> Output {
+    // Pay `relish`'s first launch before the 60 s bound starts (#1149).
+    crate::bun_process::first_launch_binaries();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_relish"))
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .env("RELIABURGER_ENDPOINT", endpoint)
+            .env_remove("RELIABURGER_TOKEN")
+            .env_remove("RELIABURGER_CA_CERT")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+}
+
+/// #1685: `relish agent explain --restart` answers with the rule, the
+/// evidence and the event before it, and says the audit log was unreadable.
+#[tokio::test]
+async fn agent_explain_says_why_an_instance_restarted() {
+    let (endpoint, server) = stub_bun_with_a_health_restart().await;
+    let output = run_against(&endpoint, &["agent", "explain", "--restart", "web-0"]).await;
+    server.abort();
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let value = agent_envelope(&output);
+    assert_eq!(value["command"], "explain");
+    let decision = &value["data"]["decisions"][0];
+    assert_eq!(decision["rule"], "restart.health_failed");
+    assert_eq!(decision["evidence"]["threshold"], "2");
+    assert_eq!(decision["related"][0]["kind"], "health");
+    assert_eq!(
+        decision["decided_in"]["function"], "restart_published_unhealthy",
+        "{decision}"
+    );
+    assert_eq!(value["data"]["sources"][1]["state"], "unknown");
+}
+
+/// #1685: the timeline merges what the stub has, newest first, as an agent
+/// envelope and as a table.
+#[tokio::test]
+async fn timeline_lists_what_changed_newest_first() {
+    let (endpoint, server) = stub_bun_with_a_health_restart().await;
+    let agent = run_against(&endpoint, &["agent", "timeline", "--since", "10m"]).await;
+    let human = run_against(&endpoint, &["timeline", "--since", "10m"]).await;
+    server.abort();
+    assert_eq!(agent.status.code(), Some(0), "{agent:?}");
+    let value = agent_envelope(&agent);
+    let kinds: Vec<&str> = value["data"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["restart", "health"]);
+    assert_eq!(
+        value["next"][0]["run"],
+        "relish agent explain --restart default__web-0"
+    );
+    assert!(human.status.success(), "{human:?}");
+    let table = String::from_utf8_lossy(&human.stdout);
+    assert!(table.contains("restart.health_failed"), "{table}");
+    assert!(table.contains("audit: unknown"), "{table}");
+}
+
+/// #1689: offline, against a node whose binary drifted, both commands say
+/// `mismatch` and name the node; the human one exits 1, the agent one 0.
+/// Nothing touches the network: `--metadata` turns it off.
+#[tokio::test]
+async fn verify_finds_a_drifted_node_offline() {
+    let directory = tempfile::tempdir().unwrap();
+    let metadata = published_metadata(directory.path());
+    let metadata = metadata.to_str().unwrap();
+    let (endpoint, server) = drifted_node().await;
+
+    let agent = run_against(&endpoint, &["agent", "verify", "--metadata", metadata]).await;
+    assert_eq!(agent.status.code(), Some(0), "an answer exits 0");
+    let envelope: serde_json::Value = serde_json::from_slice(&agent.stdout).unwrap();
+    assert_eq!(envelope["command"], "verify");
+    let data = &envelope["data"];
+    assert_eq!(data["verdict"], "mismatch", "{data}");
+    assert_eq!(data["reasons"][0]["code"], "hash_mismatch");
+    assert_eq!(data["reasons"][0]["node"], "this node");
+    assert_eq!(data["nodes"][0]["hash"], "fail");
+    assert_eq!(data["metadata"][0], metadata);
+
+    let human = run_against(&endpoint, &["verify", "--metadata", metadata]).await;
+    assert_eq!(human.status.code(), Some(1), "a mismatch exits 1");
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(text.starts_with("mismatch: "), "{text}");
+    assert!(text.contains("this node"), "{text}");
+
+    let json = run_against(&endpoint, &["-o", "json", "verify", "--metadata", metadata]).await;
+    assert_eq!(json.status.code(), Some(1));
+    let data: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(data["verdict"], "mismatch");
+
+    server.abort();
+    let _ = server.await;
 }

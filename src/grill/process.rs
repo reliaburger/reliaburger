@@ -55,22 +55,43 @@ pub fn host_environment(workload: &[String]) -> std::collections::BTreeMap<Strin
     host_environment_from(std::env::vars_os(), workload)
 }
 
-fn host_environment_from(
-    inherited: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+/// The variables of Bun's own environment a host command inherits, read
+/// now. A caller that starts many commands reads them once and overlays
+/// each command's entries with [`host_environment_over`].
+pub fn inherited_host_environment() -> std::collections::BTreeMap<String, String> {
+    inherited_from(std::env::vars_os())
+}
+
+/// `inherited` overlaid with the workload's `KEY=value` entries: the same
+/// environment [`host_environment`] builds, from variables read earlier.
+pub fn host_environment_over(
+    mut inherited: std::collections::BTreeMap<String, String>,
     workload: &[String],
 ) -> std::collections::BTreeMap<String, String> {
-    let mut environment: std::collections::BTreeMap<String, String> = inherited
-        .into_iter()
-        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
-        .filter(|(key, _)| inherited_by_host_commands(key))
-        .collect();
-    environment.extend(
+    inherited.extend(
         workload
             .iter()
             .filter_map(|entry| entry.split_once('='))
             .map(|(key, value)| (key.to_owned(), value.to_owned())),
     );
-    environment
+    inherited
+}
+
+fn inherited_from(
+    inherited: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> std::collections::BTreeMap<String, String> {
+    inherited
+        .into_iter()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .filter(|(key, _)| inherited_by_host_commands(key))
+        .collect()
+}
+
+fn host_environment_from(
+    inherited: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    workload: &[String],
+) -> std::collections::BTreeMap<String, String> {
+    host_environment_over(inherited_from(inherited), workload)
 }
 
 #[cfg(test)]
@@ -334,6 +355,9 @@ fn spec_problem(spec: &OciSpec) -> Option<super::LaunchProblem> {
     if !spec.host_process && spec.root.path != super::oci::HOST_ROOT {
         return Some(LaunchProblem::NeedsContainerRuntime(spec.root.path.clone()));
     }
+    if let Some(problem) = spec.runtime_knobs_refusal("process") {
+        return Some(problem);
+    }
     spec.process
         .args
         .is_empty()
@@ -434,6 +458,23 @@ fn owner_error(instance: &InstanceId, error: impl std::fmt::Display) -> GrillErr
     }
 }
 
+/// Create the log directory and open an instance's two append-only log
+/// files. Blocking: call it from a blocking worker.
+fn open_log_files(stem: &Path) -> Result<(std::fs::File, std::fs::File), String> {
+    if let Some(dir) = stem.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("failed to create log dir: {e}"))?;
+    }
+    let open = |suffix: &str| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_file(stem, suffix))
+    };
+    let stdout_file = open("stdout").map_err(|e| format!("failed to open stdout log: {e}"))?;
+    let stderr_file = open("stderr").map_err(|e| format!("failed to open stderr log: {e}"))?;
+    Ok((stdout_file, stderr_file))
+}
+
 fn log_file(stem: &Path, suffix: &str) -> PathBuf {
     let mut name = stem
         .file_name()
@@ -459,6 +500,14 @@ pub struct ProcessGrill {
     capture_gate: Option<Arc<CaptureGate>>,
     #[cfg(test)]
     file_eof_gate: Option<Arc<CaptureGate>>,
+    /// State checks that fail before answering, as an owner too busy to
+    /// reply within its timeout fails.
+    #[cfg(test)]
+    state_failures: Arc<std::sync::atomic::AtomicUsize>,
+    /// How long opening a start's log files stalls, standing in for a slow
+    /// disk (#1857).
+    #[cfg(test)]
+    log_open_stall: Option<std::time::Duration>,
 }
 
 impl ProcessGrill {
@@ -472,6 +521,10 @@ impl ProcessGrill {
             capture_gate: None,
             #[cfg(test)]
             file_eof_gate: None,
+            #[cfg(test)]
+            state_failures: Arc::default(),
+            #[cfg(test)]
+            log_open_stall: None,
         }
     }
 
@@ -486,6 +539,10 @@ impl ProcessGrill {
             capture_gate: None,
             #[cfg(test)]
             file_eof_gate: None,
+            #[cfg(test)]
+            state_failures: Arc::default(),
+            #[cfg(test)]
+            log_open_stall: None,
         }
     }
 
@@ -501,6 +558,10 @@ impl ProcessGrill {
             capture_gate: None,
             #[cfg(test)]
             file_eof_gate: None,
+            #[cfg(test)]
+            state_failures: Arc::default(),
+            #[cfg(test)]
+            log_open_stall: None,
         }
     }
 
@@ -577,14 +638,38 @@ impl ProcessGrill {
                 .await
                 .map_err(|error| owner_error(instance, error))?;
             let path = log_file(&stem, if stdout { "stdout" } else { "stderr" });
-            return tokio::task::spawn_blocking(move || match std::fs::read(path) {
-                Ok(bytes) => Ok(bytes),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-                Err(error) => Err(error),
+            return tokio::task::spawn_blocking(move || {
+                match super::capture::read_retained(&path) {
+                    Ok(bytes) => Ok(bytes),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+                    Err(error) => Err(error),
+                }
             })
             .await
             .map_err(|error| owner_error(instance, error))?
             .map_err(|error| owner_error(instance, error));
+        }
+        let logged = {
+            let mut procs = self.processes.lock().await;
+            let entry = procs
+                .get_mut(instance)
+                .ok_or_else(|| GrillError::NotFound {
+                    instance: instance.clone(),
+                })?;
+            observe_child_exit(entry).map_err(|error| owner_error(instance, error))?;
+            entry
+                .log_stem
+                .as_ref()
+                .map(|stem| log_file(stem, if stdout { "stdout" } else { "stderr" }))
+        };
+        // A file read blocks in the kernel, so it runs on a blocking worker,
+        // after the process table's lock is let go (#1857).
+        if let Some(path) = logged {
+            return Ok(tokio::task::spawn_blocking(move || {
+                super::capture::read_retained(&path).unwrap_or_default()
+            })
+            .await
+            .unwrap_or_default());
         }
         let (buffer, capture) = {
             let mut procs = self.processes.lock().await;
@@ -593,11 +678,6 @@ impl ProcessGrill {
                 .ok_or_else(|| GrillError::NotFound {
                     instance: instance.clone(),
                 })?;
-            observe_child_exit(entry).map_err(|error| owner_error(instance, error))?;
-            if let Some(stem) = &entry.log_stem {
-                let path = log_file(stem, if stdout { "stdout" } else { "stderr" });
-                return Ok(std::fs::read(path).unwrap_or_default());
-            }
             let buffer = if stdout {
                 entry.stdout_buf.clone()
             } else {
@@ -715,6 +795,37 @@ impl super::Grill for ProcessGrill {
                     })?;
             return gate_result(instance, &record);
         }
+        // The log files are opened before the process table is locked: the
+        // calls block in the kernel, so they run on a blocking worker, and a
+        // slow disk must not hold every other instance's calls behind the
+        // lock meanwhile (#1857). The paths depend only on the log directory
+        // and the instance, and a start that then fails leaves at most two
+        // empty files that a later start appends to.
+        let log_stem = self.log_dir.as_ref().map(|dir| dir.join(&instance.0));
+        let log_files = match &log_stem {
+            Some(stem) => {
+                let stem = stem.clone();
+                #[cfg(test)]
+                let stall = self.log_open_stall;
+                let opened = tokio::task::spawn_blocking(move || {
+                    #[cfg(test)]
+                    if let Some(stall) = stall {
+                        std::thread::sleep(stall);
+                    }
+                    open_log_files(&stem)
+                })
+                .await
+                .map_err(|error| GrillError::StartFailed {
+                    instance: instance.clone(),
+                    reason: format!("failed to open the log files: {error}"),
+                })?;
+                Some(opened.map_err(|reason| GrillError::StartFailed {
+                    instance: instance.clone(),
+                    reason,
+                })?)
+            }
+            None => None,
+        };
         let mut procs = self.processes.lock().await;
         let entry = procs
             .get_mut(instance)
@@ -754,28 +865,7 @@ impl super::Grill for ProcessGrill {
 
         // File-backed mode: append to log files that outlive this process
         // (they must survive a self-upgrade exec). In-memory mode: pipes.
-        let log_stem = self.log_dir.as_ref().map(|dir| dir.join(&instance.0));
-        if let Some(stem) = &log_stem {
-            if let Some(dir) = stem.parent() {
-                std::fs::create_dir_all(dir).map_err(|e| GrillError::StartFailed {
-                    instance: instance.clone(),
-                    reason: format!("failed to create log dir: {e}"),
-                })?;
-            }
-            let open = |suffix: &str| {
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(log_file(stem, suffix))
-            };
-            let stdout_file = open("stdout").map_err(|e| GrillError::StartFailed {
-                instance: instance.clone(),
-                reason: format!("failed to open stdout log: {e}"),
-            })?;
-            let stderr_file = open("stderr").map_err(|e| GrillError::StartFailed {
-                instance: instance.clone(),
-                reason: format!("failed to open stderr log: {e}"),
-            })?;
+        if let Some((stdout_file, stderr_file)) = log_files {
             cmd.stdout(std::process::Stdio::from(stdout_file));
             cmd.stderr(std::process::Stdio::from(stderr_file));
         } else {
@@ -917,15 +1007,26 @@ impl super::Grill for ProcessGrill {
         if entry.state == ContainerState::Stopped {
             return Ok(());
         }
+        // The app's own stop signal (#1121), SIGTERM unless it names one.
+        let signal = entry.spec.stop_signal().to_nix();
+        // Each signal is followed by SIGCONT: a workload Smoker paused can't
+        // run its stop handler until it runs again.
+        let resume = nix::sys::signal::Signal::SIGCONT;
         if entry.child.as_ref().and_then(|child| child.id()).is_some() {
-            signal_child_group(entry, nix::sys::signal::Signal::SIGTERM).map_err(error)?;
+            signal_child_group(entry, signal).map_err(error)?;
+            if entry.state != ContainerState::Stopped {
+                signal_child_group(entry, resume).map_err(error)?;
+            }
             if entry.state != ContainerState::Stopped {
                 entry.state = ContainerState::Stopping;
             }
         } else if entry.adopted.is_some() {
-            entry.state = if signal_adopted_process(entry, nix::sys::signal::Signal::SIGTERM)
-                .map_err(error)?
-            {
+            // BLOCKING-OK: procfs, answered from memory
+            entry.state = if signal_adopted_process(entry, signal).map_err(error)? {
+                // Best effort: a process already exiting can't be verified,
+                // and needs no SIGCONT.
+                // BLOCKING-OK: procfs, answered from memory
+                let _ = signal_adopted_process(entry, resume);
                 ContainerState::Stopping
             } else {
                 ContainerState::Stopped
@@ -980,6 +1081,7 @@ impl super::Grill for ProcessGrill {
                 capture.start_drain();
             }
         } else if entry.adopted.is_some() {
+            // BLOCKING-OK: procfs, answered from memory
             entry.state = if signal_adopted_process(entry, nix::sys::signal::Signal::SIGKILL)
                 .map_err(error)?
             {
@@ -994,6 +1096,16 @@ impl super::Grill for ProcessGrill {
     }
 
     async fn state(&self, instance: &InstanceId) -> Result<ContainerState, GrillError> {
+        #[cfg(test)]
+        if self
+            .state_failures
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            self.state_failures
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(owner_error(instance, "process owner request timed out"));
+        }
         if let Some(control) = &self.control {
             let record = control
                 .status_if_present(instance)
@@ -1027,6 +1139,7 @@ impl super::Grill for ProcessGrill {
             // doubles as the zombie reaper — the supervisor polls state
             // regularly, so exited adoptees get waitpid'd here.
             if entry.state != ContainerState::Stopped {
+                // BLOCKING-OK: procfs, answered from memory
                 let (running, exit_code) = poll_adopted_process(adopted.pid, adopted.started_at)
                     .map_err(|error| GrillError::StateUnavailable {
                         instance: instance.clone(),
@@ -1127,10 +1240,12 @@ impl super::Grill for ProcessGrill {
             };
         }
         // A process recorded in an earlier boot is gone, whatever now holds its pid.
+        // BLOCKING-OK: procfs, answered from memory
         if !records::from_this_boot(record) {
             return Ok(false);
         }
         let (running, _) =
+            // BLOCKING-OK: procfs, answered from memory
             poll_adopted_process(record.pid, record.pid_started_at).map_err(|error| {
                 GrillError::StateUnavailable {
                     instance: instance.clone(),
@@ -1240,7 +1355,11 @@ impl super::Grill for ProcessGrill {
         Ok(logs)
     }
 
-    async fn exec(&self, instance: &InstanceId, command: &[String]) -> Result<String, GrillError> {
+    async fn exec(
+        &self,
+        instance: &InstanceId,
+        command: &[String],
+    ) -> Result<super::ExecOutput, GrillError> {
         // Verify the instance exists and is running
         if let Some(control) = &self.control {
             return control
@@ -1271,10 +1390,13 @@ impl super::Grill for ProcessGrill {
         }
 
         // Spawn the command directly (no namespace entry for ProcessGrill)
+        // A caller's timeout drops this future (a pre-stop command's bound,
+        // #1121); the command mustn't outlive it.
         let output = Command::new(&command[0])
             .args(&command[1..])
             .env_clear()
             .envs(environment)
+            .kill_on_drop(true)
             .output()
             .await
             .map_err(|e| GrillError::StartFailed {
@@ -1290,7 +1412,11 @@ impl super::Grill for ProcessGrill {
             }
             result.push_str(&stderr);
         }
-        Ok(result)
+        Ok(super::ExecOutput {
+            output: result,
+            // A signal-killed command has no code; report a plain failure.
+            exit_code: output.status.code().unwrap_or(1),
+        })
     }
 
     async fn follow_logs(
@@ -1347,6 +1473,8 @@ impl super::Grill for ProcessGrill {
         }
 
         let mut drained = false;
+        let mut watch =
+            crate::grill::capture::SourceWatch::new(crate::grill::capture::UNKNOWN_SOURCE_LIMIT);
         #[cfg(test)]
         let mut eof_gated = false;
         loop {
@@ -1392,11 +1520,26 @@ impl super::Grill for ProcessGrill {
                 gate.release.acquire().await.unwrap().forget();
             }
 
-            // Check if the process has exited and no more data is coming
+            if !no_new_data {
+                watch.confirm();
+            }
+
+            // Check if the process has exited and no more data is coming. A
+            // state that can't be read is a busy owner, not an ended process:
+            // leaving now would freeze this instance's logs for good (#1493).
             let exited = match self.state(instance).await {
-                Ok(ContainerState::Stopped) => true,
-                Err(_) => return,
-                _ => false,
+                Ok(state) => {
+                    watch.confirm();
+                    state == ContainerState::Stopped
+                }
+                Err(GrillError::NotFound { .. }) => return,
+                Err(error) => {
+                    if watch.check_failed(tokio::time::Instant::now()) {
+                        eprintln!("ketchup: no longer following {instance}: {error}");
+                        return;
+                    }
+                    false
+                }
             };
             if exited && no_new_data {
                 if !drained {
@@ -1419,7 +1562,7 @@ impl super::Grill for ProcessGrill {
 
             tokio::select! {
                 _ = lines_tx.closed() => return,
-                _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+                _ = tokio::time::sleep(crate::grill::capture::FOLLOW_POLL) => {}
             }
         }
     }
@@ -1439,6 +1582,7 @@ mod tests {
             host_process: true,
             initialiser: false,
             port_mapping: None,
+            stop: None,
             root: OciRoot {
                 path: "/tmp/test".to_string(),
                 readonly: false,
@@ -1447,6 +1591,7 @@ mod tests {
                 rlimits: Vec::new(),
                 args,
                 env: vec!["TEST_VAR=hello".to_string()],
+                provider_env: Vec::new(),
                 cwd: "/".to_string(),
                 user: OciUser { uid: 0, gid: 0 },
                 capabilities: None,
@@ -1460,7 +1605,10 @@ mod tests {
                 cgroups_path: None,
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
+            runtime_knobs: None,
         }
     }
 
@@ -1664,6 +1812,43 @@ mod tests {
         wait_for_state(&grill, &id, ContainerState::Stopped).await;
     }
 
+    /// A paused workload (Smoker's SIGSTOP) runs its stop handler at once:
+    /// the stop signal is followed by SIGCONT.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_lets_a_paused_workload_run_its_handler() {
+        let dir = tempfile::tempdir().unwrap();
+        let ready = dir.path().join("ready");
+        let grill = ProcessGrill::new();
+        let id = InstanceId("paused-0".to_string());
+        let script = format!(
+            "trap 'exit 3' TERM; touch '{}'; while :; do sleep 0.05; done",
+            ready.display()
+        );
+        grill
+            .create(
+                &id,
+                &spec_with_args(vec!["/bin/sh".into(), "-c".into(), script]),
+            )
+            .await
+            .unwrap();
+        grill.start(&id).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !ready.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the workload never got ready");
+        let pid = grill.pid(&id).await.unwrap().unwrap();
+        crate::smoker::process::pause_process(pid as i32).unwrap();
+
+        grill.stop(&id).await.unwrap();
+
+        wait_for_state(&grill, &id, ContainerState::Stopped).await;
+        assert_eq!(grill.exit_code(&id).await.unwrap(), Some(3));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn stop_terminates_shell_descendants() {
@@ -1851,6 +2036,36 @@ mod tests {
     }
 
     // ---- file-backed capture and adoption ----
+
+    /// A start opens its log files on a blocking worker, and must do it
+    /// before it takes the process table's lock: holding the lock across a
+    /// slow open would stall every other call on the runtime (#1857).
+    #[tokio::test]
+    async fn a_slow_log_open_does_not_hold_up_other_instances() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut grill = ProcessGrill::with_log_dir(dir.path().to_path_buf());
+        let stall = std::time::Duration::from_millis(800);
+        grill.log_open_stall = Some(stall);
+        let slow = InstanceId("slow-0".to_string());
+        let other = InstanceId("other-0".to_string());
+        grill.create(&slow, &echo_spec("slow")).await.unwrap();
+        grill.create(&other, &echo_spec("other")).await.unwrap();
+
+        let starting = tokio::spawn({
+            let grill = grill.clone();
+            let slow = slow.clone();
+            async move { grill.start(&slow).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let started = std::time::Instant::now();
+        let state = tokio::time::timeout(stall / 2, grill.state(&other))
+            .await
+            .expect("another instance's state waited for a slow log open");
+        assert!(state.is_ok(), "{state:?}");
+        assert!(started.elapsed() < stall / 2);
+        starting.await.unwrap().unwrap();
+        grill.kill(&slow).await.unwrap();
+    }
 
     #[tokio::test]
     async fn file_backed_mode_writes_logs_to_files() {
@@ -2053,7 +2268,7 @@ mod tests {
         spec.process.env = vec!["JOB=1".into(), format!("PATH={path}")];
         grill.create(&id, &spec).await.unwrap();
         grill.start(&id).await.unwrap();
-        let env = grill.exec(&id, &["env".to_string()]).await.unwrap();
+        let env = grill.exec(&id, &["env".to_string()]).await.unwrap().output;
         let resolved = grill.exec(&id, &["rb-exec-tool".to_string()]).await;
         grill.kill(&id).await.unwrap();
         assert!(env.lines().any(|line| line == "JOB=1"), "{env}");
@@ -2066,7 +2281,7 @@ mod tests {
                 .any(|line| line.starts_with(&format!("{private}="))),
             "{private} leaked: {env}"
         );
-        assert_eq!(resolved.unwrap().trim(), "found");
+        assert_eq!(resolved.unwrap().output.trim(), "found");
     }
 
     #[tokio::test]
@@ -2168,6 +2383,79 @@ mod tests {
         lines
     }
 
+    /// #1493: one owner request timing out on a loaded node ended the
+    /// forwarder for good. The instance kept running, but its lines stopped
+    /// reaching the store, and `relish logs --tail` froze on the last ones
+    /// stored. A failed check says nothing about the workload.
+    #[tokio::test]
+    async fn a_failed_state_check_keeps_a_running_instance_in_the_log_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let grill = ProcessGrill::with_log_dir(dir.path().to_path_buf());
+        let id = InstanceId("client-0".to_string());
+        grill.create(&id, &sleep_spec("60")).await.unwrap();
+        grill.start(&id).await.unwrap();
+        let capture = dir.path().join("client-0.stdout");
+        let mut capture_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&capture)
+            .unwrap();
+        let store_dir = tempfile::tempdir().unwrap();
+        let mut store = crate::ketchup::log_store::LogStore::new(store_dir.path().to_path_buf());
+
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
+        let follower = grill.clone();
+        let follow_id = id.clone();
+        let task = tokio::spawn(async move {
+            follower
+                .follow_logs(&follow_id, sender, &Default::default())
+                .await
+        });
+
+        // Each round is one flush, so the tail has to cross Parquet files.
+        let mut written = 0;
+        for round in 0..4 {
+            if round > 0 {
+                grill
+                    .state_failures
+                    .store(1, std::sync::atomic::Ordering::SeqCst);
+                while grill
+                    .state_failures
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    > 0
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            }
+            for _ in 0..10 {
+                written += 1;
+                std::io::Write::write_all(&mut capture_file, format!("ACK {written}\n").as_bytes())
+                    .unwrap();
+            }
+            for _ in 0..10 {
+                let line = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
+                    .await
+                    .expect("the follower went quiet with lines still unread")
+                    .expect("the follower ended while its instance ran");
+                assert!(store.ingest(&client_record(&id, line)));
+            }
+            store.flush().await.unwrap();
+        }
+
+        let tail: Vec<String> = store
+            .query("client", "default", None, None, None, Some(15))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.line)
+            .collect();
+        let newest: Vec<String> = (26..=40).map(|n| format!("ACK {n}")).collect();
+        assert_eq!(tail, newest);
+
+        task.abort();
+        grill.kill(&id).await.unwrap();
+    }
+
     /// #308: after a Bun restart, a forwarder resumes the capture file at the
     /// store's checkpoint. Only the lines written since are read and
     /// ingested; a truncated capture falls back to byte 0.
@@ -2226,6 +2514,115 @@ mod tests {
             assert!(store.ingest(&client_record(&id, line)));
         }
         grill.kill(&id).await.unwrap();
+    }
+
+    /// #1418: in the 0.2.3 day run the soak's log spammer, about 200 lines a
+    /// second, grew its capture file by 40 MiB an hour for 24 hours, and
+    /// filled most of node 1's disk. Once the store holds the lines durably,
+    /// the capture keeps only its last mebibyte allocated, while the process
+    /// writes on and `stdout` still reads whole lines.
+    #[tokio::test]
+    async fn a_chatty_instance_s_capture_stays_bounded_once_its_lines_are_stored() {
+        use std::os::unix::fs::MetadataExt;
+        const LINE: &str = "spam the quick brown fox jumps over the lazy dog";
+        const BYTES: u64 = 8 * 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let grill = ProcessGrill::with_log_dir(dir.path().to_path_buf());
+        let id = InstanceId("spammer-0".to_string());
+        grill
+            .create(
+                &id,
+                &spec_with_args(vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!("yes '{LINE}' | head -c {BYTES}; sleep 60"),
+                ]),
+            )
+            .await
+            .unwrap();
+        grill.start(&id).await.unwrap();
+        let capture = dir.path().join("spammer-0.stdout");
+        let expected = BYTES / (LINE.len() as u64 + 1);
+
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1024);
+        let follower = grill.clone();
+        let follow_id = id.clone();
+        let task = tokio::spawn(async move {
+            follower
+                .follow_logs(&follow_id, sender, &Default::default())
+                .await
+        });
+        let store_dir = tempfile::tempdir().unwrap();
+        let mut store = crate::ketchup::log_store::LogStore::new(store_dir.path().to_path_buf());
+        let mut read = 0;
+        while read < expected {
+            let line = tokio::time::timeout(std::time::Duration::from_secs(30), receiver.recv())
+                .await
+                .expect("the follower went quiet")
+                .unwrap();
+            assert!(store.ingest(&client_record(&id, line)));
+            read += 1;
+        }
+        task.abort();
+        let allocated = || std::fs::metadata(&capture).unwrap().blocks() * 512;
+        assert!(
+            allocated() >= BYTES,
+            "the whole output is on disk before a flush"
+        );
+
+        // APFS gives an appending file blocks past its end that it hasn't
+        // written yet, and keeps them after the writer closes: on a loaded
+        // host, up to 1 MiB, which `st_blocks` counts (#1537). The reclaim
+        // only ever frees what the store has ingested, so the test makes
+        // that allocation itself, on every filesystem, and measures what
+        // the flush freed rather than what's left.
+        allocate_past_the_end(&capture, 1024 * 1024);
+        let before = allocated();
+
+        store.flush().await.unwrap();
+
+        assert_eq!(std::fs::metadata(&capture).unwrap().len(), BYTES);
+        let retained = super::super::capture::RETAINED_CAPTURE_BYTES + 256 * 1024;
+        let freed = before - allocated();
+        assert!(
+            freed >= BYTES - retained,
+            "the flush freed {freed} of the capture's {before} allocated bytes"
+        );
+        let stdout = grill.stdout(&id).await.unwrap();
+        assert!(!stdout.contains(&0), "reclaimed bytes read back as zeros");
+        let text = String::from_utf8(stdout).unwrap();
+        let mut lines = text.split('\n');
+        assert_eq!(lines.next(), Some(LINE), "the first line read is whole");
+        grill.kill(&id).await.unwrap();
+    }
+
+    /// Allocate `length` bytes past the end of `path` without changing its
+    /// length, as a filesystem's preallocation for an appending file does.
+    fn allocate_past_the_end(path: &std::path::Path, length: i64) {
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            use nix::fcntl::{FallocateFlags, fallocate};
+            let end = i64::try_from(file.metadata().unwrap().len()).unwrap();
+            fallocate(&file, FallocateFlags::FALLOC_FL_KEEP_SIZE, end, length).unwrap();
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::AsRawFd;
+            let mut store = nix::libc::fstore_t {
+                fst_flags: nix::libc::F_ALLOCATEALL,
+                fst_posmode: nix::libc::F_PEOFPOSMODE,
+                fst_offset: 0,
+                fst_length: length,
+                fst_bytesalloc: 0,
+            };
+            // SAFETY: `file` is open for the call, and F_PREALLOCATE reads
+            // and writes one `fstore_t`, which `store` is and outlives the
+            // call. The kernel does not keep the pointer.
+            let result =
+                unsafe { nix::libc::fcntl(file.as_raw_fd(), nix::libc::F_PREALLOCATE, &mut store) };
+            assert_ne!(result, -1, "{}", std::io::Error::last_os_error());
+        }
     }
 
     fn printf_spec(output: &str) -> OciSpec {
@@ -3227,6 +3624,28 @@ mod tests {
         );
     }
 
+    /// #1122: a spec carrying runtime knobs is refused, not run without
+    /// them. Validation keeps knobs off host apps, so this guards a spec
+    /// that reaches the wrong runtime some other way.
+    #[tokio::test]
+    async fn create_refuses_a_spec_with_runtime_knobs_instead_of_ignoring_them() {
+        let grill = ProcessGrill::new();
+        let id = InstanceId("default__lb-0".to_string());
+        let mut spec = echo_spec("hello");
+        spec.runtime_knobs = Some(toml::from_str("capabilities = [\"IPC_OWNER\"]\n").unwrap());
+
+        let problem = refused_launch(grill.create(&id, &spec).await.unwrap_err());
+        assert_eq!(
+            problem.to_string(),
+            "runtime.capabilities CAP_IPC_OWNER can't be applied: runtime knobs need rootful \
+             runc, and this node's runtime is process"
+        );
+        assert!(matches!(
+            grill.start(&id).await,
+            Err(GrillError::NotFound { .. })
+        ));
+    }
+
     /// #914: an image app without a command used to run `sleep 86400` as a
     /// stand-in, and looked healthy while doing nothing.
     #[tokio::test]
@@ -3265,6 +3684,36 @@ mod tests {
             toml::from_str("command = [\"echo\", \"migrating\"]").unwrap();
         let spec = crate::grill::oci::generate_init_oci_spec(&init, &app);
         grill.create(&id, &spec).await.unwrap();
+    }
+
+    /// #1498: a host app's init container runs with the app's environment
+    /// and its own `env` on top, where the one it sets wins.
+    #[tokio::test]
+    async fn a_host_apps_init_container_sees_its_own_env_over_the_apps() {
+        let grill = ProcessGrill::new();
+        let app = app_spec(
+            "loadgen",
+            "exec = \"/bin/sleep\"\ncommand = [\"60\"]\n\
+             env = { MODE = \"app\", SHARED = \"from-app\" }",
+        );
+        let init: crate::config::app::InitContainerSpec = toml::from_str(
+            "command = [\"/usr/bin/env\"]\n\
+             env = { FRONTEND_ADDR = \"frontend:80\", SHARED = \"from-init\" }",
+        )
+        .unwrap();
+        let id = InstanceId("default__loadgen-0__init-0".to_string());
+        let spec = crate::grill::oci::generate_init_oci_spec(&init, &app);
+        grill.create(&id, &spec).await.unwrap();
+        grill.start(&id).await.unwrap();
+        wait_for_state(&grill, &id, ContainerState::Stopped).await;
+        let logs = grill.logs(&id).await.unwrap();
+        for expected in ["FRONTEND_ADDR=frontend:80", "MODE=app", "SHARED=from-init"] {
+            assert!(
+                logs.lines().any(|line| line == expected),
+                "{expected}: {logs}"
+            );
+        }
+        assert!(!logs.contains("SHARED=from-app"), "{logs}");
     }
 
     #[tokio::test]

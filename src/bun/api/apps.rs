@@ -1,4 +1,4 @@
-//! App lifecycle routes: stop, delete and exec.
+//! App lifecycle routes: stop, delete, release and exec.
 
 use super::*;
 
@@ -66,7 +66,16 @@ pub(super) async fn stop_handler(
             .into_response();
     }
     if let Some(council) = state.council.clone() {
-        return cluster_app_change(state, council, app, namespace, AppChange::Stop, &headers).await;
+        return cluster_app_change(
+            state,
+            council,
+            app,
+            namespace,
+            AppChange::Stop,
+            auth.as_deref(),
+            &headers,
+        )
+        .await;
     }
 
     stop_local(&state, app, namespace).await
@@ -143,13 +152,71 @@ pub(super) async fn delete_handler(
     }
     if let Some(council) = state.council.clone() {
         let change = AppChange::Delete { force: query.force };
-        return cluster_app_change(state, council, app, namespace, change, &headers).await;
+        return cluster_app_change(
+            state,
+            council,
+            app,
+            namespace,
+            change,
+            auth.as_deref(),
+            &headers,
+        )
+        .await;
     }
 
     stop_local(&state, app, namespace).await
 }
 
-/// Whether `relish stop` or `relish delete` is changing an app.
+/// `POST /v1/release/{app}/{namespace}`: clear an app's `owner`, handing
+/// it back to `relish apply` and GitOps (#1125). Only the owner's token or
+/// an admin may release an app. Owners live in the council, so a standalone
+/// node has nothing to release.
+pub(super) async fn release_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    Path((app, namespace)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(resp) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Deployer)
+    {
+        return resp;
+    }
+    if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
+        return resp;
+    }
+    if let Err(resp) = enforce_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Deploy,
+        &app,
+        &namespace,
+    )
+    .await
+    {
+        return resp;
+    }
+    let Some(council) = state.council.clone() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "app owners live in a cluster's council" })),
+        )
+            .into_response();
+    };
+    cluster_app_change(
+        state,
+        council,
+        app,
+        namespace,
+        AppChange::Release,
+        auth.as_deref(),
+        &headers,
+    )
+    .await
+}
+
+/// Whether `relish stop`, `relish delete` or `relish release` is changing
+/// an app.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum AppChange {
     /// Scale to zero, keeping the specification, until the next apply.
@@ -157,6 +224,8 @@ pub(super) enum AppChange {
     /// Remove the app from desired state; `force` removes one GitOps
     /// manages.
     Delete { force: bool },
+    /// Clear the app's owner (#1125).
+    Release,
 }
 
 impl AppChange {
@@ -164,6 +233,7 @@ impl AppChange {
         match self {
             AppChange::Stop => "stop",
             AppChange::Delete { .. } => "delete",
+            AppChange::Release => "release",
         }
     }
 }
@@ -211,11 +281,15 @@ pub(super) async fn cluster_app_change(
     app: String,
     namespace: String,
     change: AppChange,
+    auth: Option<&crate::sesame::auth::AuthContext>,
     caller_headers: &HeaderMap,
 ) -> Response {
+    let app_id = crate::meat::AppId::new(&app, &namespace);
     // Followers can't write to Raft (openraft does not forward client
-    // writes), so forward the whole request to the leader's API.
-    if !council.is_leader().await {
+    // writes), so forward the whole request to the leader's API, as the
+    // caller: the leader checks the owner below against its own desired
+    // state, which a follower's replica can lag (#1442).
+    if !crate::bun::leadership::leads(&council).await {
         let leader_url = match leader_api_url(&state, &council, caller_headers).await {
             Ok(url) => url,
             Err(refusal) => return refusal.into_response(),
@@ -226,10 +300,10 @@ pub(super) async fn cluster_app_change(
             ""
         };
         let url = format!("{leader_url}/v1/{}/{app}/{namespace}{force}", change.verb());
-        let mut request = mark_leader_forwarded(state.cluster_http.client().post(url));
-        if let Some(token) = &state.service_token {
-            request = request.bearer_auth(token);
-        }
+        let request = copy_forwarded_auth(
+            mark_leader_forwarded(state.cluster_http.client().post(url)),
+            caller_headers,
+        );
         return match request.send().await {
             Ok(response) => {
                 let status = StatusCode::from_u16(response.status().as_u16())
@@ -247,27 +321,71 @@ pub(super) async fn cluster_app_change(
         };
     }
 
+    // Only the owner's token or an admin changes an owned app (#1125),
+    // checked here on the leader, which proposes the write.
+    if let Some(refusal) =
+        super::apply::owner_command_refusal(&council, auth, &app_id, change.verb()).await
+    {
+        return refusal;
+    }
     if let AppChange::Delete { force } = change
         && let Some(refusal) =
             gitops_managed_refusal(&council, &app, &namespace, "delete", force).await
     {
         return refusal;
     }
-    let app_id = crate::meat::AppId::new(&app, &namespace);
+    // Someone else's lease on the app stops a person's write, by name,
+    // unless they asked to break it (#1686).
+    let break_lease = match crate::bun::lease_fence::break_lease_requested(caller_headers) {
+        Ok(requested) => requested,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": error })),
+            )
+                .into_response();
+        }
+    };
+    let apps = [app_id.clone()];
     let request = match change {
         AppChange::Stop => crate::council::types::RaftRequest::AppStop { app_id },
         AppChange::Delete { .. } => crate::council::types::RaftRequest::AppDelete { app_id },
+        AppChange::Release => crate::council::types::RaftRequest::AppRelease { app_id },
     };
-    match council.write(request).await {
-        Ok(crate::council::CouncilResponse::Refused { reason }) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": reason })),
-        )
-            .into_response(),
+    let mut written = None;
+    for _ in 0..crate::bun::lease_fence::LEASE_ATTEMPTS {
+        let generation =
+            match super::leases::clear_leases_for_write(&state, &council, auth, &apps, break_lease)
+                .await
+            {
+                Ok(generation) => generation,
+                Err(refusal) => return refusal.into_response(),
+            };
+        let fenced = crate::bun::lease_fence::fence(generation, request.clone());
+        match council.write(fenced).await {
+            Ok(crate::council::CouncilResponse::LeaseGenerationMoved { .. }) => continue,
+            other => {
+                written = Some(other);
+                break;
+            }
+        }
+    }
+    let Some(written) = written else {
+        return super::leases::LeaseWriteRefusal::Churn.into_response();
+    };
+    match written {
+        Ok(crate::council::CouncilResponse::Refused { reason }) => {
+            let status = match change {
+                AppChange::Release => StatusCode::CONFLICT,
+                AppChange::Stop | AppChange::Delete { .. } => StatusCode::NOT_FOUND,
+            };
+            (status, Json(serde_json::json!({ "error": reason }))).into_response()
+        }
         Ok(_) => {
             let status = match change {
                 AppChange::Stop => "stopping",
                 AppChange::Delete { .. } => "deleting",
+                AppChange::Release => "released",
             };
             (
                 StatusCode::ACCEPTED,
@@ -351,12 +469,25 @@ pub(super) async fn exec_handler(
     })
     .await
     {
-        Ok(Ok(output)) => Json(serde_json::json!({ "output": output })).into_response(),
-        Ok(Err(e)) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )
-            .into_response(),
+        // A command that ran answers 200 whatever its exit code: the code is
+        // the command's answer, not the API's (D34).
+        Ok(Ok(output)) => Json(output).into_response(),
+        Ok(Err(error)) => {
+            let status = match error {
+                crate::bun::BunError::AppNotFound { .. }
+                | crate::bun::BunError::InstanceNotFound { .. }
+                | crate::bun::BunError::Grill(crate::grill::GrillError::NotFound { .. }) => {
+                    StatusCode::NOT_FOUND
+                }
+                crate::bun::BunError::ExecTimeout { .. } => StatusCode::GATEWAY_TIMEOUT,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (
+                status,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response()
+        }
         Err(response) => response,
     }
 }

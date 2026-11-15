@@ -1,5 +1,6 @@
-# 0.9.145 fixes sibling capture-pipe inheritance on Apple platforms.
-nextest-version = "0.9.145"
+# 0.9.145 fixes sibling capture-pipe inheritance on Apple platforms. 0.9.151
+# is past GHSA-vc25-qg58-w57c, which needs run recording (not enabled here).
+nextest-version = "0.9.151"
 
 [store]
 dir = "target/nextest"
@@ -28,6 +29,27 @@ process-heavy = { max-threads = 2 }
 upgrade-heavy = { max-threads = 1 }
 crash-recovery = { max-threads = 1 }
 
+# A stop hook test may spend its 30 s pre-stop bound and its 30 s stop
+# confirmation on a host flushing hard (#1794), past the default 60 s.
+[[profile.default.overrides]]
+filter = 'binary(suite) & test(/^stop_hooks::/)'
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+# The hollow-node checks share one port range and each starts a council
+# process and a fleet, so they run one at a time. The 100-node summary
+# check starts a hundred nodes and schedules a thousand apps before it
+# measures; the limit only has to catch a hang.
+[[profile.default.overrides]]
+filter = 'binary(hollow_nodes)'
+test-group = "cluster-heavy"
+slow-timeout = { period = "120s", terminate-after = 5 }
+
+# Each scripted demo (scripts/demo/) starts its own cluster and walks
+# several rollouts or GitOps syncs, each waiting on real health checks.
+[[profile.default.overrides]]
+filter = 'binary(demos)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
 # The podinfo demo pulls three real images on a cold cache before it can
 # check anything, so it gets longer than the other host-network tests.
 [[profile.default.overrides]]
@@ -48,6 +70,15 @@ filter = 'binary(ebpf) | binary(owned_network) | binary(owned_runc) | binary(own
 test-group = "host-network"
 slow-timeout = { period = "60s", terminate-after = 2 }
 
+# The 0.2.4 exit tests (#1126) each kill a leader or a node, then wait
+# for an election, a GitOps poll or a controller's failover on top of
+# cluster start-up. The first matching override wins, so this precedes the
+# cluster-heavy one below.
+[[profile.default.overrides]]
+filter = 'binary(cluster_failover) & test(/^(the_platform_policies_hold_through_apply_gitops_and_a_leader_kill|an_admin_removes_a_policy_that_denies_everything_through_any_node|a_controller_fails_a_templated_database_pair_over_when_its_node_dies)$/)'
+test-group = "cluster-heavy"
+slow-timeout = { period = "60s", terminate-after = 5 }
+
 [[profile.default.overrides]]
 filter = 'binary(cluster_failover) | binary(council_self_healing) | binary(council_disaster_recovery) | binary(cluster_gossip) | binary(reporting_tcp) | binary(cluster_task_arrays)'
 test-group = "cluster-heavy"
@@ -59,6 +90,25 @@ slow-timeout = { period = "60s", terminate-after = 2 }
 filter = 'binary(placement) & test(autoscaler_scales_up_from_real_collector_cpu)'
 test-group = "process-heavy"
 slow-timeout = { period = "120s", terminate-after = 3 }
+
+# Each mayo_memory test writes four hours of collection, 240 fsync'd
+# Parquet files, before it measures a heap peak. The verdict is memory, not
+# time; the write scales with the CPU and disk the host has left. Alone on a
+# quiet Mac it takes 3 to 5 s, alone at load 30 about 40 s, and inside a
+# `make ci` at load 40 to 60 it ran out of the default 60 s (#1621). The
+# limit only has to catch a hang.
+[[profile.default.overrides]]
+filter = 'binary(mayo_memory)'
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+# Two portable tests whose work is fsyncs and processes, not waiting: the
+# Mayo streamed-read property (32 cases, each flushing up to eight Parquet
+# files) and sixty-four process owners started and forgotten sixteen at a
+# time. Alone at load 3 they take 4 and 6 s; at load 45 both ran out of the
+# default 60 s (#1641). The limit only has to catch a hang.
+[[profile.default.overrides]]
+filter = 'test(/^mayo::store::tests::streamed_reads_match_the_eager_reader$/) | (binary(process_recovery) & test(=concurrent_forgets_of_retired_generations_all_succeed))'
+slow-timeout = { period = "60s", terminate-after = 3 }
 
 # The jobs catalogue runs a real cron case, which waits for the next UTC
 # minute, then releases each job lease once the leader has settled its
@@ -93,6 +143,12 @@ slow-timeout = { period = "120s", terminate-after = 3 }
 filter = 'binary(node_pressure)'
 threads-required = "num-test-threads"
 
+# Each scripted demo (scripts/demo/) starts its own cluster and walks
+# several rollouts or GitOps syncs, each waiting on real health checks.
+[[profile.ci.overrides]]
+filter = 'binary(demos)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
 # The podinfo demo pulls three real images on a cold cache before it can
 # check anything, so it gets longer than the other host-network tests.
 [[profile.ci.overrides]]
@@ -113,6 +169,15 @@ filter = 'binary(ebpf) | binary(owned_network) | binary(owned_runc) | binary(own
 test-group = "host-network"
 slow-timeout = { period = "60s", terminate-after = 2 }
 
+# The 0.2.4 exit tests (#1126) each kill a leader or a node, then wait
+# for an election, a GitOps poll or a controller's failover on top of
+# cluster start-up. The first matching override wins, so this precedes the
+# cluster-heavy one below.
+[[profile.ci.overrides]]
+filter = 'binary(cluster_failover) & test(/^(the_platform_policies_hold_through_apply_gitops_and_a_leader_kill|an_admin_removes_a_policy_that_denies_everything_through_any_node|a_controller_fails_a_templated_database_pair_over_when_its_node_dies)$/)'
+test-group = "cluster-heavy"
+slow-timeout = { period = "60s", terminate-after = 5 }
+
 [[profile.ci.overrides]]
 filter = 'binary(cluster_failover) | binary(council_self_healing) | binary(council_disaster_recovery) | binary(cluster_gossip) | binary(reporting_tcp) | binary(cluster_task_arrays)'
 test-group = "cluster-heavy"
@@ -122,6 +187,16 @@ slow-timeout = { period = "60s", terminate-after = 2 }
 filter = 'binary(placement) & test(autoscaler_scales_up_from_real_collector_cpu)'
 test-group = "process-heavy"
 slow-timeout = { period = "120s", terminate-after = 3 }
+
+# The mayo_memory override above (#1621).
+[[profile.ci.overrides]]
+filter = 'binary(mayo_memory)'
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+# The streamed-read and concurrent-forget override above (#1641).
+[[profile.ci.overrides]]
+filter = 'test(/^mayo::store::tests::streamed_reads_match_the_eager_reader$/) | (binary(process_recovery) & test(=concurrent_forgets_of_retired_generations_all_succeed))'
+slow-timeout = { period = "60s", terminate-after = 3 }
 
 # The jobs catalogue's override above. CI's coverage run uses this profile,
 # and instrumentation is what makes it slowest.

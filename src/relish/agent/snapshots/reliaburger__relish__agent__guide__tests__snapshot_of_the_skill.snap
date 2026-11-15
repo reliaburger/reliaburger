@@ -1,0 +1,24 @@
+---
+source: src/relish/agent/guide.rs
+expression: "artefact(paths::SKILL)"
+---
+---
+name: reliaburger
+description: "Use when operating, debugging or upgrading a Reliaburger cluster, or when you suspect a bug in Reliaburger itself. Reliaburger is an orchestrator. Its CLI is `relish`."
+license: Apache-2.0
+---
+
+<!-- Generated from docs/manual/16_working-with-an-ai-agent.md by `make agent-docs`: edit the chapter, not this file. -->
+
+# Reliaburger
+
+- **Run `relish agent guide` first.**
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `relish agent guide` | This chapter, as Markdown sections. |
+| `relish agent source grep` | Search it \| quickly. |
+
+`relish agent guide` prints the whole chapter this skill is made from, as the installed `relish` has it, and `relish agent schema` the shape of every answer.

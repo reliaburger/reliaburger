@@ -1,0 +1,9 @@
+---
+source: src/relish/dev.rs
+expression: "json(&SignatureReport\n{\n    signature: std::path::Path::new(\"bun.sig\"), sha256: \"ab12\",\n    external_public_key: Some(\"ed25519:def\"),\n})"
+---
+{
+  "signature": "bun.sig",
+  "sha256": "ab12",
+  "external_public_key": "ed25519:def"
+}

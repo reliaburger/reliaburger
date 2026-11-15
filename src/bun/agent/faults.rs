@@ -37,6 +37,11 @@ pub(super) struct InstalledNetworkFaults {
     /// Proven workload cgroup per caller instance, with the restart count it
     /// was read at, so a restarted container is looked up again.
     pub(super) caller_cgroups: std::collections::HashMap<InstanceId, (u32, u64)>,
+    /// Proven workload cgroup per job attempt in a runtime instance of its
+    /// own, with the attempt it was read for: a runtime slot's instance id
+    /// comes back for the next attempt, under a new cgroup (#1602).
+    pub(super) attempt_cgroups:
+        std::collections::HashMap<InstanceId, (super::fault_coverage::AttemptRun, u64)>,
     /// netem delay bands installed per caller instance id, with the restart
     /// count they were installed at.
     pub(super) delays:
@@ -52,6 +57,38 @@ pub(super) struct InstalledNetworkFaults {
     /// turn's deadline. A fault keyed by caller cgroup doesn't reach them
     /// yet, so an injection waits for them before it answers (#625).
     pub(super) pending_callers: Vec<super::fault_coverage::PendingCaller>,
+    /// Source-scoped faults accepted while every local source was pending
+    /// (#1601). Their injection is answered only once a source is proven,
+    /// and refused if none is.
+    pub(super) unproven_sources: std::collections::HashSet<crate::smoker::types::FaultId>,
+}
+
+impl InstalledNetworkFaults {
+    /// Keep the cgroup a read proved for `caller`, for the run of its
+    /// instance id the read was for.
+    pub(super) fn remember_cgroup(
+        &mut self,
+        caller: &super::fault_coverage::PendingCaller,
+        cgroup: u64,
+    ) {
+        match caller.attempt {
+            Some(run) => {
+                self.attempt_cgroups
+                    .insert(caller.id.clone(), (run, cgroup));
+            }
+            None => {
+                self.caller_cgroups
+                    .insert(caller.id.clone(), (caller.restarts, cgroup));
+            }
+        }
+    }
+}
+
+/// Why a source-scoped fault can't act on this node.
+pub(super) fn no_proven_source(source: &str) -> String {
+    format!(
+        "no running instance of source app {source} on this node has a verified workload cgroup"
+    )
 }
 
 /// Run the cuts a reconcile left in [`InstalledNetworkFaults::late_cuts`].
@@ -166,7 +203,7 @@ pub(super) async fn program_delay_tree(
 }
 
 /// Say what to do when the kernel has no netem, rather than echo tc.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 pub(super) fn delay_error_hint(error: &crate::smoker::network::NetnsCommandError) -> String {
     let text = error.to_string();
     if text.contains("netem") && (text.contains("Unknown") || text.contains("not found")) {
@@ -175,6 +212,88 @@ pub(super) fn delay_error_hint(error: &crate::smoker::network::NetnsCommandError
         )
     } else {
         text
+    }
+}
+
+/// Why a caller's delay wasn't programmed on this pass.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum DelayFailure {
+    /// Programming ran out of turn, or waits on an earlier Bun's sweep; the
+    /// next tick finishes it.
+    Pending(String),
+    /// Programming the interface failed.
+    Failed(String),
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl std::fmt::Display for DelayFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DelayFailure::Pending(reason) => write!(formatter, "{reason}; the next tick retries"),
+            DelayFailure::Failed(reason) => formatter.write_str(reason),
+        }
+    }
+}
+
+/// Decide a delay injection from one reconcile pass: the rule is already in
+/// the registry, so a caller still being programmed is accepted, and only a
+/// real failure for one of `callers` refuses it.
+#[cfg(any(target_os = "linux", test))]
+pub(super) fn delay_injection_outcome(
+    callers: &[String],
+    failures: &[(String, DelayFailure)],
+) -> Result<(), String> {
+    let failed = failures
+        .iter()
+        .find_map(|(instance, failure)| match failure {
+            DelayFailure::Failed(reason) if callers.contains(instance) => Some(reason),
+            _ => None,
+        });
+    match failed {
+        None => Ok(()),
+        Some(reason) => Err(format!("cannot delay traffic: {reason}")),
+    }
+}
+
+/// What a delay caller is once programming it has failed.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CallerNow {
+    /// No longer running here: it took its namespace, and its qdisc, with it.
+    Gone,
+    /// A job or task-array attempt, which starts and finishes in seconds.
+    Attempt,
+    /// An app instance.
+    Instance,
+}
+
+/// Decide what a failed delay program means for one caller.
+///
+/// Thousands of job attempts start and finish an hour, so one can lose its
+/// interface while `tc` runs (#1291). A caller that has gone drops out, and an
+/// attempt without its namespace or `eth0` waits for the next tick; any other
+/// failure, and every failure on an app instance, refuses.
+#[cfg(any(target_os = "linux", test))]
+pub(super) fn delay_program_failure(
+    caller: CallerNow,
+    error: &crate::smoker::network::NetnsCommandError,
+) -> Option<DelayFailure> {
+    use crate::smoker::network::NetnsCommandError;
+    let interface_missing = match error {
+        NetnsCommandError::NoNamespace { .. } => true,
+        NetnsCommandError::Failed { stderr, .. } => stderr.contains("Cannot find device"),
+        _ => false,
+    };
+    match caller {
+        CallerNow::Gone => None,
+        CallerNow::Attempt if interface_missing => Some(DelayFailure::Pending(format!(
+            "job attempt is starting or finishing ({error})"
+        ))),
+        _ if matches!(error, NetnsCommandError::NoNamespace { .. }) => {
+            Some(DelayFailure::Failed(error.to_string()))
+        }
+        _ => Some(DelayFailure::Failed(delay_error_hint(error))),
     }
 }
 
@@ -194,15 +313,24 @@ pub(super) fn delay_callers(
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Populate the gossip + Raft blocklists to partition this node
-    /// from the named peers. Returns how many addresses were blocked.
+    /// from the named peers. Returns the addresses this call inserted,
+    /// which the fault's reversal removes again.
     ///
     /// A peer is identified by gossip node name; its gossip address
     /// comes from membership and its Raft address is derived by the
     /// fixed port offset. Both must be blocked, or SWIM keeps half the
-    /// path alive and the partition doesn't take.
-    pub(super) async fn apply_partition(&self, peers: &[String]) -> usize {
+    /// path alive and the partition doesn't take. Two partitions can't
+    /// overlap: the leader admits one node fault at a time
+    /// (`NodeFaultReservations` in `src/smoker/reservation.rs`). An address
+    /// already blocked when this call runs isn't recorded, so the heal never
+    /// removes a block this call didn't make.
+    pub(super) async fn apply_partition(
+        &self,
+        peers: &[String],
+    ) -> crate::smoker::types::PartitionBlock {
+        let mut block = crate::smoker::types::PartitionBlock::default();
         let Some(handle) = &self.cluster else {
-            return 0;
+            return block;
         };
         let blocklists = &handle.partition_blocklists;
 
@@ -220,12 +348,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .collect()
         };
 
-        let mut blocked = 0;
         if let Some(gossip) = &blocklists.gossip {
             let mut set = gossip.write().await;
             for addr in &targets {
                 if set.insert(*addr) {
-                    blocked += 1;
+                    block.gossip.push(*addr);
                 }
             }
         }
@@ -236,10 +363,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     addr.ip(),
                     (addr.port() as i32 + blocklists.raft_port_offset) as u16,
                 );
-                set.insert(raft_addr);
+                if set.insert(raft_addr) {
+                    block.raft.push(raft_addr);
+                }
             }
         }
-        blocked
+        block
     }
 
     /// Clear both transport blocklists (heal all partitions).
@@ -255,40 +384,26 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
-    /// Unblock a specific set of peers on both transports — the reversal of
-    /// [`apply_partition`]. Only the addresses this fault added are removed, so
-    /// healing one partition fault leaves any others still in force.
-    pub(super) async fn remove_partition(&self, peers: &[String]) {
+    /// Undo [`apply_partition`]: remove exactly the addresses it inserted.
+    ///
+    /// No membership lookup: by heal time the partitioned node has marked
+    /// its peers Dead and stopped listing them (#1820). Other partition
+    /// faults' addresses stay in force.
+    pub(super) async fn remove_partition(&self, block: &crate::smoker::types::PartitionBlock) {
         let Some(handle) = &self.cluster else {
             return;
         };
         let blocklists = &handle.partition_blocklists;
-        let targets: Vec<std::net::SocketAddr> = {
-            let membership = handle.membership_rx.borrow();
-            peers
-                .iter()
-                .filter_map(|name| {
-                    membership
-                        .iter()
-                        .find(|m| &m.node_id.0 == name)
-                        .map(|m| m.address)
-                })
-                .collect()
-        };
         if let Some(gossip) = &blocklists.gossip {
             let mut set = gossip.write().await;
-            for addr in &targets {
+            for addr in &block.gossip {
                 set.remove(addr);
             }
         }
         if let Some(raft) = &blocklists.raft {
             let mut set = raft.write().await;
-            for addr in &targets {
-                let raft_addr = std::net::SocketAddr::new(
-                    addr.ip(),
-                    (addr.port() as i32 + blocklists.raft_port_offset) as u16,
-                );
-                set.remove(&raft_addr);
+            for addr in &block.raft {
+                set.remove(addr);
             }
         }
     }
@@ -388,6 +503,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         };
 
         crate::smoker::types::SafetyContext {
+            workload: request.workload,
             council_size,
             council_nodes_with_active_faults: active_node_faults,
             leader_node_id,
@@ -431,42 +547,22 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
                 Ok(())
             }
-            FaultType::CpuStress { percentage, cores } => {
-                // Cap the TARGET instance's `cpu.max` quota instead of
-                // burning cycles in Bun's own cgroup (CHAOS1). The old code
-                // spun blocking tasks that competed for whatever CPU the Bun
-                // process could get, which starved Bun — not the workload —
-                // and could not be lifted before the deadline. Now the
-                // workload keeps only `100 - percentage` of a core, and clear
-                // /expiry restores its original quota.
-                self.apply_cgroup_fault(
-                    rule,
-                    |cgroup| {
-                        let saved = crate::smoker::resource::read_cpu_max(cgroup)
-                            .map_err(|e| e.to_string())?;
-                        // O17: `cores` used to be parsed and thrown away while
-                        // the quota maths assumed one core, so on a 4-core node
-                        // "80% stress" actually took 95%.
-                        crate::smoker::resource::apply_cpu_stress(cgroup, *percentage, *cores)
-                            .map_err(|e| e.to_string())?;
-                        Ok(saved)
-                    },
-                    |cgroup, saved| {
-                        if let Err(e) = crate::smoker::resource::restore_cpu_max(cgroup, saved) {
-                            eprintln!(
-                                "smoker: rollback cpu.max on {} failed: {e}",
-                                cgroup.display()
-                            );
-                        }
-                    },
-                )
-                .await
-                .map(|saved| {
-                    self.record_reversal(
-                        rule.id,
-                        crate::smoker::types::FaultReversal::CpuMax(saved),
-                    );
-                })
+            FaultType::CpuStress { .. }
+            | FaultType::MemoryPressure { .. }
+            | FaultType::DiskIoThrottle { .. } => {
+                // CPU stress caps the TARGET instance's `cpu.max` quota
+                // instead of burning cycles in Bun's own cgroup (CHAOS1),
+                // memory pressure squeezes its `memory.high` toward its hard
+                // limit so the kernel forces reclaim and allocation stalls,
+                // and a disk throttle sets `io.max` on the device its volumes
+                // live on. Clear and expiry restore each.
+                let device = || self.io_device_major_minor();
+                let Some(fault) = resource_faults::CgroupFault::of(&rule.fault_type, device) else {
+                    return Err(format!("{} is not a cgroup fault", rule.fault_type));
+                };
+                let written = self.apply_cgroup_fault(rule, &fault).await?;
+                self.record_reversal(rule.id, fault.reversal(written));
+                Ok(())
             }
             FaultType::DnsNxdomain => {
                 if rule.namespace.as_deref().is_none_or(str::is_empty) {
@@ -519,85 +615,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 "bandwidth faults are not implemented yet; delay traffic with `relish fault delay` instead"
                     .to_string(),
             ),
-            FaultType::MemoryPressure { percentage } => {
-                // Squeeze the TARGET instance's `memory.high` toward its hard
-                // limit so the kernel forces reclaim/allocation stalls on the
-                // workload (CHAOS1 — this used to be a genuine no-op that
-                // reported success).
-                self.apply_cgroup_fault(
-                    rule,
-                    |cgroup| {
-                        let saved = crate::smoker::resource::read_memory_high(cgroup)
-                            .map_err(|e| e.to_string())?;
-                        crate::smoker::resource::apply_memory_pressure(cgroup, *percentage)
-                            .map_err(|e| e.to_string())?;
-                        Ok(saved)
-                    },
-                    |cgroup, saved| {
-                        if let Err(e) = crate::smoker::resource::restore_memory_high(cgroup, saved)
-                        {
-                            eprintln!(
-                                "smoker: rollback memory.high on {} failed: {e}",
-                                cgroup.display()
-                            );
-                        }
-                    },
-                )
-                .await
-                .map(|saved| {
-                    self.record_reversal(
-                        rule.id,
-                        crate::smoker::types::FaultReversal::MemoryHigh(saved),
-                    );
-                })
-            }
-            FaultType::DiskIoThrottle {
-                bytes_per_sec,
-                write_only,
-            } => {
-                // Throttle the TARGET instance's block-I/O via `io.max`
-                // (CHAOS1). The device major:minor is read from the workload's
-                // volumes dir so the throttle lands on the disk the workload
-                // actually writes to; clear/expiry lifts it.
-                let device = self.io_device_major_minor();
-                let dev_for_reverse = device.clone();
-                let dev_for_rollback = device.clone();
-                self.apply_cgroup_fault(
-                    rule,
-                    |cgroup| {
-                        crate::smoker::resource::apply_disk_io_throttle(
-                            cgroup,
-                            *bytes_per_sec,
-                            *write_only,
-                            &device,
-                        )
-                        .map_err(|e| e.to_string())?;
-                        Ok(cgroup.to_string_lossy().into_owned())
-                    },
-                    |cgroup, _saved| {
-                        if let Err(e) = crate::smoker::resource::remove_disk_io_throttle(
-                            cgroup,
-                            &dev_for_rollback,
-                        ) {
-                            eprintln!(
-                                "smoker: rollback io.max on {} failed: {e}",
-                                cgroup.display()
-                            );
-                        }
-                    },
-                )
-                .await
-                .map(|paths| {
-                    let instances = paths
-                        .into_iter()
-                        .map(|(_, path)| (path, dev_for_reverse.clone()))
-                        .collect();
-                    self.record_reversal(
-                        rule.id,
-                        crate::smoker::types::FaultReversal::DiskIo { instances },
-                    );
-                })
-            }
             FaultType::NodeDrain => {
                 if rule.duration_ns == 0 {
                     return Err("node faults require a non-zero duration".to_string());
@@ -665,14 +682,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
             FaultType::CouncilPartition { peers } => {
                 // Block both the gossip and Raft transports to each named
-                // peer, and record exactly which peers so clear and expiry
-                // unblock these and leave any other partition in force.
-                self.apply_partition(peers).await;
+                // peer, and record exactly which addresses so clear and
+                // expiry unblock these and leave any other partition in force.
+                let block = self.apply_partition(peers).await;
                 self.record_reversal(
                     rule.id,
-                    crate::smoker::types::FaultReversal::Partition {
-                        peers: peers.clone(),
-                    },
+                    crate::smoker::types::FaultReversal::Partition(block),
                 );
                 Ok(())
             }
@@ -686,6 +701,20 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         &self,
         rule: &crate::smoker::types::FaultRule,
     ) -> Vec<(InstanceId, std::path::PathBuf)> {
+        if rule.workload.runs_to_completion() {
+            // A command in a reusable executor was refused before this, so
+            // every attempt with a cgroup has one of its own.
+            return self
+                .attempt_targets(rule)
+                .into_iter()
+                .filter_map(|attempt| match attempt.handle {
+                    crate::bun::live_attempts::AttemptHandle::Instance(id) => {
+                        Some((id, attempt.cgroup?))
+                    }
+                    crate::bun::live_attempts::AttemptHandle::TaskGroup(_) => None,
+                })
+                .collect();
+        }
         self.supervisor
             .list_instances()
             .iter()
@@ -703,65 +732,22 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .collect()
     }
 
-    /// Apply a cgroup-writing fault to every target instance and collect the
-    /// per-instance saved state the `apply` closure returns (for later
-    /// reversal).
+    /// Apply a cgroup-writing fault to every target instance and collect
+    /// what each one needs to undo it.
     ///
     /// Returns an honest error when there are no running instances to target,
-    /// or on any platform without cgroup v2. The `apply` closure runs once per
-    /// target cgroup. If one fails partway through, the instances already
-    /// modified are rolled back with `restore` before the error is surfaced
-    /// (M1) — without that, an earlier replica stayed throttled while the
-    /// caller, seeing the error, dropped the registry entry that would have
-    /// let a later clear undo it.
-    #[cfg(target_os = "linux")]
-    pub(super) async fn apply_cgroup_fault<F, R>(
+    /// or on any platform without cgroup v2. If one write fails partway
+    /// through, the instances already modified are rolled back before the
+    /// error is surfaced (M1). The writes run on a blocking thread
+    /// ([`resource_faults::CgroupFault::write`]).
+    pub(super) async fn apply_cgroup_fault(
         &self,
         rule: &crate::smoker::types::FaultRule,
-        mut apply: F,
-        restore: R,
-    ) -> Result<Vec<(String, String)>, String>
-    where
-        F: FnMut(&std::path::Path) -> Result<String, String>,
-        R: Fn(&std::path::Path, &str),
-    {
-        let targets = self.target_instance_cgroups(rule);
-        if targets.is_empty() {
-            return Err(format!("no running instances of {}", rule.target_service));
-        }
-        let mut saved = Vec::with_capacity(targets.len());
-        let mut applied: Vec<(std::path::PathBuf, String)> = Vec::new();
-        for (id, cgroup) in targets {
-            match apply(&cgroup) {
-                Ok(value) => {
-                    applied.push((cgroup.clone(), value.clone()));
-                    saved.push((id.0, value));
-                }
-                Err(e) => {
-                    // Roll back the instances already modified, newest first,
-                    // so a partial application never leaks a limit.
-                    for (cgroup, value) in applied.iter().rev() {
-                        restore(cgroup, value);
-                    }
-                    return Err(e);
-                }
-            }
-        }
-        Ok(saved)
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    pub(super) async fn apply_cgroup_fault<F, R>(
-        &self,
-        rule: &crate::smoker::types::FaultRule,
-        _apply: F,
-        _restore: R,
-    ) -> Result<Vec<(String, String)>, String>
-    where
-        F: FnMut(&std::path::Path) -> Result<String, String>,
-        R: Fn(&std::path::Path, &str),
-    {
-        Err(format!("{} requires Linux cgroups", rule.fault_type))
+        fault: &resource_faults::CgroupFault,
+    ) -> Result<Vec<resource_faults::Written>, String> {
+        let targets = self.cgroup_fault_targets(rule)?;
+        // LOOP-INLINE: the command path hands cgroup faults to a task (spawn_cgroup_fault); only a direct caller waits here, on a blocking thread
+        fault.write(targets).await
     }
 
     /// Record a fault's reversal state in the registry after it was applied,
@@ -786,6 +772,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::fs::MetadataExt;
+            // BLOCKING-OK: one stat of the volumes directory, whose inode the kernel has cached since startup; only a disk-throttle fault asks (#1887)
             if let Ok(meta) = std::fs::metadata(&self.volumes_dir) {
                 let dev = meta.dev();
                 // Linux encodes major:minor in st_dev; unpack per libc rules.
@@ -909,6 +896,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
             FaultReversal::CpuMax(saved) => {
                 for (_id, cgroup, value) in self.rejoin_cgroups(rule, saved) {
+                    // BLOCKING-OK: cgroupfs, an in-memory kernel interface: no disk behind it
                     if let Err(e) = crate::smoker::resource::restore_cpu_max(&cgroup, &value) {
                         eprintln!(
                             "smoker: restore cpu.max on {} failed: {e}",
@@ -919,6 +907,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
             FaultReversal::MemoryHigh(saved) => {
                 for (_id, cgroup, value) in self.rejoin_cgroups(rule, saved) {
+                    // BLOCKING-OK: cgroupfs, an in-memory kernel interface: no disk behind it
                     if let Err(e) = crate::smoker::resource::restore_memory_high(&cgroup, &value) {
                         eprintln!(
                             "smoker: restore memory.high on {} failed: {e}",
@@ -931,14 +920,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 for (path, device) in instances {
                     let cgroup = std::path::PathBuf::from(path);
                     if let Err(e) =
+                        // BLOCKING-OK: cgroupfs, an in-memory kernel interface: no disk behind it
                         crate::smoker::resource::remove_disk_io_throttle(&cgroup, device)
                     {
                         eprintln!("smoker: lift io.max on {path} failed: {e}");
                     }
                 }
             }
-            FaultReversal::Partition { peers } => {
-                self.remove_partition(peers).await;
+            FaultReversal::Partition(block) => {
+                self.remove_partition(block).await;
             }
             FaultReversal::NodeDrain => {
                 if self.node_drain_gate.finish()
@@ -990,12 +980,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if let Some(cgroup) = self.workload_cgroup_dir(spec)
             && cgroup.is_dir()
         {
+            // BLOCKING-OK: cgroupfs, an in-memory kernel interface: no disk behind it
             if let Err(error) = crate::smoker::resource::restore_recorded_limits(
                 &cgroup,
                 spec.linux.resources.as_ref(),
             ) {
                 eprintln!("smoker: restoring {id}'s recorded limits failed: {error}");
             }
+            // BLOCKING-OK: cgroupfs, an in-memory kernel interface: no disk behind it
             if let Err(error) = crate::smoker::process::resume_cgroup_processes(&cgroup) {
                 eprintln!("smoker: resuming {id}'s processes failed: {error}");
             }
@@ -1020,6 +1012,25 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         rule: &crate::smoker::types::FaultRule,
         saved: &[(String, String)],
     ) -> Vec<(String, std::path::PathBuf, String)> {
+        if rule.workload.runs_to_completion() {
+            // Only an attempt still running under the same runtime instance
+            // gets its value back; a finished one took its cgroup with it.
+            let attempts = self.attempt_targets(rule);
+            return saved
+                .iter()
+                .filter_map(|(id, value)| {
+                    let path = attempts.iter().find_map(|attempt| match &attempt.handle {
+                        crate::bun::live_attempts::AttemptHandle::Instance(instance)
+                            if &instance.0 == id =>
+                        {
+                            attempt.cgroup.clone()
+                        }
+                        _ => None,
+                    })?;
+                    Some((id.clone(), path, value.clone()))
+                })
+                .collect();
+        }
         saved
             .iter()
             .filter_map(|(id, value)| {
@@ -1122,6 +1133,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 severity: crate::bun::events::EventSeverity::Info,
                 action: "fault.expired".to_string(),
                 principal: FAULT_EXPIRY_PRINCIPAL.to_string(),
+                principal_kind: crate::sesame::types::PrincipalKind::System,
                 app: (!rule.target_service.is_empty()).then(|| rule.target_service.clone()),
                 namespace: rule.namespace.clone(),
                 node,
@@ -1204,6 +1216,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                             app: app.clone(),
                             namespace: namespace.clone(),
                             restarts,
+                            attempt: None,
                         });
                         None
                     }
@@ -1217,6 +1230,90 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             });
         }
         self.network_faults.pending_callers = pending;
+        callers.extend(self.attempt_callers(deadline).await);
+        callers
+    }
+
+    /// Job and task-array attempts in a runtime instance of their own, as
+    /// callers. A command in a reusable executor shares the executor's
+    /// cgroup and network with the tasks around it, so it is never one; a
+    /// fault from it is refused at injection.
+    ///
+    /// An attempt's cgroup is cached for that attempt alone, not for its
+    /// instance id: a runtime slot's instance id comes back for the next
+    /// task, under a new cgroup. One the runtime can't name before
+    /// `deadline` is pending, as an app instance is (#1602): an injection
+    /// waits for it, and the next reconcile asks again.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    async fn attempt_callers(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> Vec<crate::smoker::network::LocalCaller> {
+        use super::fault_coverage::{AttemptRun, PendingCaller};
+        use crate::smoker::network::applies_to_caller;
+        let attempts: Vec<_> = self
+            .live_attempts
+            .snapshot()
+            .into_iter()
+            .filter_map(|attempt| match &attempt.handle {
+                crate::bun::live_attempts::AttemptHandle::Instance(id)
+                    if attempt.shared_executor.is_none() =>
+                {
+                    Some((id.clone(), AttemptRun::of(&attempt), attempt))
+                }
+                _ => None,
+            })
+            .collect();
+        self.network_faults.attempt_cgroups.retain(|id, (run, _)| {
+            attempts
+                .iter()
+                .any(|(live_id, live_run, _)| live_id == id && live_run == run)
+        });
+        let mut callers = Vec::new();
+        for (id, run, attempt) in attempts {
+            let named_as_source = self.fault_registry.iter().any(|rule| {
+                rule.fault_type.source_app().is_some()
+                    && applies_to_caller(rule, &attempt.job, &attempt.namespace)
+            });
+            let cgroup_id = match self.network_faults.attempt_cgroups.get(&id) {
+                _ if !named_as_source => None,
+                Some((_, cgroup)) => Some(*cgroup),
+                None => match tokio::time::timeout_at(
+                    deadline,
+                    self.supervisor.grill().workload_cgroup(&id),
+                )
+                .await
+                {
+                    Ok(Ok(Some(cgroup))) => {
+                        self.network_faults
+                            .attempt_cgroups
+                            .insert(id.clone(), (run, cgroup));
+                        Some(cgroup)
+                    }
+                    Ok(Ok(None)) => None,
+                    Ok(Err(error)) => {
+                        eprintln!("smoker: attempt {id} has no provable cgroup: {error}");
+                        None
+                    }
+                    Err(_) => {
+                        self.network_faults.pending_callers.push(PendingCaller {
+                            id: id.clone(),
+                            app: attempt.job.clone(),
+                            namespace: attempt.namespace.clone(),
+                            restarts: 0,
+                            attempt: Some(run),
+                        });
+                        None
+                    }
+                },
+            };
+            callers.push(crate::smoker::network::LocalCaller {
+                instance_id: id.0,
+                app: attempt.job,
+                namespace: attempt.namespace,
+                cgroup_id,
+            });
+        }
         callers
     }
 
@@ -1303,28 +1400,38 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 "no running instance of source app {source} runs on this node"
             ));
         }
-        let failures: Vec<String> = self
-            .reconcile_delays()
-            .await
-            .into_iter()
-            .filter(|(instance, _)| callers.contains(instance))
-            .map(|(_, error)| error)
-            .collect();
-        match failures.first() {
-            None => Ok(()),
-            Some(error) => Err(format!("cannot delay traffic: {error}")),
+        let failures = self.reconcile_delays().await;
+        for (instance, failure) in &failures {
+            if matches!(failure, DelayFailure::Pending(_)) {
+                eprintln!("smoker: delay on {instance}: {failure}");
+            }
         }
+        delay_injection_outcome(&callers, &failures)
     }
 
     /// Instances with their own container address, the only ones a delay
-    /// can shape.
+    /// can shape: app instances with an address, and job attempts in a
+    /// container with its own network namespace.
     #[cfg(target_os = "linux")]
     fn addressed(&self) -> std::collections::HashSet<String> {
+        let attempts = self
+            .live_attempts
+            .snapshot()
+            .into_iter()
+            .filter(|attempt| attempt.shared_executor.is_none())
+            .filter_map(|attempt| match attempt.handle {
+                crate::bun::live_attempts::AttemptHandle::Instance(id) => Some(id),
+                crate::bun::live_attempts::AttemptHandle::TaskGroup(_) => None,
+            })
+            // `/run/netns` is a tmpfs, so this stat never waits on a disk.
+            .filter(|id| crate::grill::netns::namespace_path(id).exists())
+            .map(|id| id.0);
         self.supervisor
             .list_instances()
             .into_iter()
             .filter(|instance| instance.container_ip.is_some())
             .map(|instance| instance.id.0.clone())
+            .chain(attempts)
             .collect()
     }
 
@@ -1377,14 +1484,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// Converge every local caller's netem delays on what the active delay
-    /// faults ask for. Returns `(instance, error)` for each caller whose
-    /// interface couldn't be programmed; those are retried next tick.
+    /// faults ask for. Returns `(instance, failure)` for each caller whose
+    /// interface wasn't programmed; those are retried next tick.
     ///
     /// The callers are programmed at once, under the turn's runtime budget
-    /// (#351, stage 3). One that doesn't finish in time is a failure, and
-    /// its interface is marked unknown so the next pass rebuilds it.
+    /// (#351, stage 3). One that doesn't finish in time is pending, not
+    /// failed, and its interface is marked unknown so the next pass rebuilds
+    /// it.
     #[cfg(target_os = "linux")]
-    pub(super) async fn reconcile_delays(&mut self) -> Vec<(String, String)> {
+    pub(super) async fn reconcile_delays(&mut self) -> Vec<(String, DelayFailure)> {
         use crate::smoker::network::{NetnsCommandError, desired_delays};
 
         let delaying = self.fault_registry.iter().any(|rule| {
@@ -1445,7 +1553,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .map(|instance| {
                     (
                         instance,
-                        "the sweep of delays an earlier Bun left is still running".to_string(),
+                        DelayFailure::Pending(
+                            "the sweep of delays an earlier Bun left is still running".to_string(),
+                        ),
                     )
                 })
                 .collect();
@@ -1465,6 +1575,22 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .unwrap_or_default();
         let mut outcomes = outcomes.into_iter();
         let mut failures = Vec::new();
+        // Asked after programming, so an attempt that finished meanwhile is gone.
+        let attempts: std::collections::HashSet<String> = self
+            .live_attempts
+            .snapshot()
+            .into_iter()
+            .filter_map(|attempt| match attempt.handle {
+                crate::bun::live_attempts::AttemptHandle::Instance(id) => Some(id.0),
+                crate::bun::live_attempts::AttemptHandle::TaskGroup(_) => None,
+            })
+            .collect();
+        let live: std::collections::HashSet<String> = self
+            .supervisor
+            .list_instances()
+            .into_iter()
+            .map(|instance| instance.id.0.clone())
+            .collect();
         for instance in changed {
             let wanted = desired.get(&instance);
             let restart = restarts.get(&instance).copied().unwrap_or_default();
@@ -1476,8 +1602,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .insert(instance.clone(), (u32::MAX, Vec::new()));
                 failures.push((
                     instance,
-                    "programming the delay did not finish within the turn; the next tick retries"
-                        .to_string(),
+                    DelayFailure::Pending(
+                        "programming the delay did not finish within the turn".to_string(),
+                    ),
                 ));
                 continue;
             };
@@ -1492,22 +1619,39 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         self.network_faults.delays.remove(&instance);
                     }
                 },
-                // A caller without its own namespace (host networking)
-                // can't be shaped; remember that so we don't retry every
-                // tick, and report it once.
-                Err(error @ NetnsCommandError::NoNamespace { .. }) => {
-                    if let Some(wanted) = wanted {
-                        self.network_faults
-                            .delays
-                            .insert(instance.clone(), (restart, wanted.clone()));
-                        failures.push((instance, error.to_string()));
-                    } else {
-                        self.network_faults.delays.remove(&instance);
-                    }
-                }
                 Err(error) => {
-                    self.network_faults.delays.remove(&instance);
-                    failures.push((instance, delay_error_hint(&error)));
+                    let now = if live.contains(&instance) {
+                        CallerNow::Instance
+                    } else if attempts.contains(&instance) {
+                        CallerNow::Attempt
+                    } else {
+                        CallerNow::Gone
+                    };
+                    let failure = delay_program_failure(now, &error);
+                    // An app instance without its own namespace (host
+                    // networking) can't be shaped; remember that so we don't
+                    // retry every tick, and report it once.
+                    match (&failure, &error, wanted) {
+                        (
+                            Some(DelayFailure::Failed(_)),
+                            NetnsCommandError::NoNamespace { .. },
+                            Some(wanted),
+                        ) => {
+                            self.network_faults
+                                .delays
+                                .insert(instance.clone(), (restart, wanted.clone()));
+                        }
+                        (_, NetnsCommandError::NoNamespace { .. }, None) => {
+                            self.network_faults.delays.remove(&instance);
+                            continue;
+                        }
+                        _ => {
+                            self.network_faults.delays.remove(&instance);
+                        }
+                    }
+                    if let Some(failure) = failure {
+                        failures.push((instance, failure));
+                    }
                 }
             }
         }
@@ -1530,21 +1674,74 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 rule.target_service
             ));
         }
+        self.check_fault_sources(rule).await
+    }
+
+    /// Check that a source-scoped fault (in the registry already) has a local
+    /// source instance it can act on.
+    ///
+    /// A source the runtime proved a cgroup for passes. So does one still
+    /// pending because the runtime didn't answer before the turn's deadline:
+    /// that is "not yet", not "no" (#1601). The rule is installed for the
+    /// callers proven so far, and [`Self::answer_fault_injection`] reads the
+    /// pending ones from a task and refuses the fault then if none of them
+    /// has a cgroup after all. A source with no running instance, or whose
+    /// runtime answered that it has no provable cgroup, is refused here.
+    #[cfg_attr(not(all(feature = "ebpf", target_os = "linux")), allow(dead_code))]
+    pub(super) async fn check_fault_sources(
+        &mut self,
+        rule: &crate::smoker::types::FaultRule,
+    ) -> Result<(), String> {
+        use crate::smoker::network::applies_to_caller;
         let Some(source) = rule.fault_type.source_app() else {
             return Ok(());
         };
         let callers = self.local_callers().await;
         let proven = callers.iter().any(|caller| {
-            caller.cgroup_id.is_some()
-                && crate::smoker::network::applies_to_caller(rule, &caller.app, &caller.namespace)
+            caller.cgroup_id.is_some() && applies_to_caller(rule, &caller.app, &caller.namespace)
         });
         if proven {
-            Ok(())
-        } else {
-            Err(format!(
-                "no running instance of source app {source} on this node has a verified workload cgroup"
-            ))
+            return Ok(());
         }
+        let pending = self
+            .network_faults
+            .pending_callers
+            .iter()
+            .any(|caller| applies_to_caller(rule, &caller.app, &caller.namespace));
+        if pending {
+            self.network_faults.unproven_sources.insert(rule.id);
+            return Ok(());
+        }
+        Err(no_proven_source(source))
+    }
+
+    /// Whether a local instance `rule` acts on as its source has a cgroup
+    /// the runtime proved, at the instance's current restart count.
+    pub(super) fn source_proven(&self, rule: &crate::smoker::types::FaultRule) -> bool {
+        use crate::smoker::network::applies_to_caller;
+        let instance_proven = self.supervisor.list_instances().iter().any(|instance| {
+            applies_to_caller(rule, &instance.app_name, &instance.namespace)
+                && matches!(
+                    self.network_faults.caller_cgroups.get(&instance.id),
+                    Some((restarts, _)) if *restarts == instance.restart_count
+                )
+        });
+        instance_proven || self.source_attempt_proven(rule)
+    }
+
+    /// Whether a running job attempt `rule` acts on as its source has a
+    /// cgroup the runtime proved for that attempt (#1602).
+    fn source_attempt_proven(&self, rule: &crate::smoker::types::FaultRule) -> bool {
+        self.live_attempts.snapshot().iter().any(|attempt| {
+            let crate::bun::live_attempts::AttemptHandle::Instance(id) = &attempt.handle else {
+                return false;
+            };
+            crate::smoker::network::applies_to_caller(rule, &attempt.job, &attempt.namespace)
+                && matches!(
+                    self.network_faults.attempt_cgroups.get(id),
+                    Some((run, _)) if *run == super::fault_coverage::AttemptRun::of(attempt)
+                )
+        })
     }
 
     /// Converge the eBPF `fault_connect_map` on what the active drop and

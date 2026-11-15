@@ -22,7 +22,7 @@ pub enum ProbeError {
 fn probe_client() -> &'static Result<reqwest::Client, ProbeError> {
     static CLIENT: OnceLock<Result<reqwest::Client, ProbeError>> = OnceLock::new();
     CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
+        crate::http_client::builder()
             .danger_accept_invalid_certs(true)
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()

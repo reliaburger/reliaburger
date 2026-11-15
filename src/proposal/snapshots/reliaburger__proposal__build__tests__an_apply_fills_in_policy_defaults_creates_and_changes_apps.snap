@@ -1,0 +1,8 @@
+---
+source: src/proposal/build_tests.rs
+expression: "proposal.summary.join(\"\\n\")"
+---
+Apply 2 apps: create shop/cache, change shop/web.
+Touches 2 apps on 2 nodes (node-a, node-b); replaces 3 instances, starts 1 instance (the scheduler places them when it applies).
+Serves https://shop.example.com/ and the service web.shop.
+Undo: `relish undo 17` puts every app back as it was and deletes cache, which it created.

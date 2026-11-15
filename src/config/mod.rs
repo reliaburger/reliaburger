@@ -15,10 +15,12 @@ pub mod job;
 pub mod namespace;
 pub mod node;
 pub mod permission;
+pub mod policy;
 pub mod process_workloads;
+pub mod template;
 pub mod types;
 mod validate;
-pub(crate) use validate::valid_workload_label;
+pub(crate) use validate::{valid_workload_label, validate_app_spec};
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -31,12 +33,17 @@ pub use job::JobSpec;
 pub use namespace::NamespaceSpec;
 pub use node::NodeConfig;
 pub use permission::{PermissionAction, PermissionSpec};
+pub use policy::{PolicyAction, PolicySpec, PolicyTarget};
+pub use template::{Provenance, TemplateError, TemplateSpec, UseSpec};
 pub use types::{ConfigFileSpec, EnvValue, Replicas, ResourceRange, VolumeSpec};
 
 /// Top-level workload configuration.
 ///
 /// Parsed from a TOML file containing `[app.*]`, `[job.*]`,
-/// `[namespace.*]`, and `[permission.*]` tables.
+/// `[namespace.*]`, `[permission.*]`, `[policy.*]`, `[template.*]` and
+/// `[use.*]` tables. Templates and uses only live until the config is
+/// expanded ([`Config::expand_templates`]); nothing past the compiler sees
+/// them.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -52,9 +59,19 @@ pub struct Config {
     /// Permission definitions keyed by name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub permission: BTreeMap<String, PermissionSpec>,
+    /// Policy definitions keyed by name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub policy: BTreeMap<String, PolicySpec>,
     /// Build job definitions keyed by name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub build: BTreeMap<String, build::BuildSpec>,
+    /// Template definitions keyed by name (#1124).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub template: BTreeMap<String, TemplateSpec>,
+    /// Template instances keyed by name. `use` is a Rust keyword, so the
+    /// field has another name.
+    #[serde(rename = "use", default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub uses: BTreeMap<String, UseSpec>,
 }
 
 impl Config {
@@ -138,6 +155,22 @@ mod tests {
         assert!(
             error.to_string().contains("permision"),
             "error should name the unknown table, got: {error}"
+        );
+    }
+
+    /// With two mistakes in a file, the error names the one nearer the top,
+    /// the way a compiler reads. toml 0.9 stopped visiting keys in document
+    /// order unless the `preserve_order` feature is on, so without it this
+    /// reported `colour` on line 4, alphabetically first, before `replcias`
+    /// on line 3 (#1026).
+    #[test]
+    fn parse_config_reports_the_first_mistake_in_the_file() {
+        let error = Config::parse("[app.web]\nimage = \"nginx\"\nreplcias = 3\ncolour = \"red\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("replcias") && error.contains("line 3"),
+            "error should name the first mistake, got: {error}"
         );
     }
 

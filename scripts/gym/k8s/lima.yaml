@@ -1,0 +1,26 @@
+# One node of the gym's k3s lab (scripts/gym/k8s/lab.sh). Plain Ubuntu, as
+# scripts/release/ssh-setup-vm.yaml; k3s goes on afterwards from a binary
+# lab.sh downloaded and checked. user-v2 puts the VMs on one network, so
+# they reach each other directly. No mounts: lab.sh copies what a node needs,
+# so nothing on the host is visible inside.
+#
+# Every guest port is ignored here; lab.sh adds the one forward the solver
+# needs (the API server, gymk8s-1's 6443, to 127.0.0.1:16443 on the host)
+# when it creates the server.
+images:
+  - location: "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-arm64.img"
+    arch: "aarch64"
+  - location: "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+    arch: "x86_64"
+cpus: 2
+memory: "3GiB"
+disk: "20GiB"
+mounts: []
+containerd:
+  system: false
+  user: false
+networks:
+  - lima: user-v2
+portForwards:
+  - guestPortRange: [1, 65535]
+    ignore: true

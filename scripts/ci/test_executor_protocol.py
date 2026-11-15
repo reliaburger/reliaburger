@@ -129,6 +129,46 @@ class ExecutorProtocol(unittest.TestCase):
                 'printf finished; printf diagnostic >&2'])
             self.assertEqual((code, output), (0, {1: b'finished', 2: b'diagnostic'}))
 
+    def test_a_command_gets_exactly_the_environment_bun_sent(self):
+        code, output = self.execute(1, ['/usr/bin/env'], ['FIRST=1', 'SECOND=two words'])
+        self.assertEqual((code, output), (0, {1: b'FIRST=1\nSECOND=two words\n', 2: b''}))
+
+    def test_a_bare_command_name_is_looked_up_on_the_tasks_own_path(self):
+        code, output = self.execute(1, ['sh', '-c', 'printf found'], ['PATH=/bin:/usr/bin'])
+        self.assertEqual((code, output), (0, {1: b'found', 2: b''}))
+        code, output = self.execute(2, ['sh', '-c', 'printf found'], ['PATH=/nonexistent'])
+        self.assertEqual((code, output),
+                         (127, {1: b'', 2: b'executor command: No such file or directory\n'}))
+
+    def test_a_command_that_cannot_be_executed_reports_its_errno_then_the_next_one_runs(self):
+        code, output = self.execute(1, ['/nonexistent/command'])
+        self.assertEqual((code, output),
+                         (127, {1: b'', 2: b'executor command: No such file or directory\n'}))
+        self.assertEqual(self.execute(2, ['/bin/sh', '-c', 'printf next']), (0, {1: b'next', 2: b''}))
+
+    def test_a_missing_working_directory_reports_its_errno_and_runs_nothing(self):
+        marker = pathlib.Path(self.fixture.name) / 'must-not-run'
+        code, output = self.execute(1, ['/bin/sh', '-c', f'touch {marker}'], cwd='/nonexistent')
+        self.assertEqual((code, output),
+                         (126, {1: b'', 2: b'executor working directory: No such file or directory\n'}))
+        self.assertFalse(marker.exists())
+
+    @unittest.skipUnless(sys.platform == 'linux', 'vfork-style spawning is Linux-only')
+    def test_spawning_takes_no_copy_on_write_faults_in_the_helper(self):
+        # #1030: a fork-style clone write-protects every page the helper owns,
+        # so the helper faults again on each page it touches after every
+        # spawn. A CLONE_VM | CLONE_VFORK child shares the address space and
+        # the helper takes no such faults. Counting is exact, not a timing.
+        def faults():
+            stat = pathlib.Path(f'/proc/{self.process.pid}/stat').read_text()
+            return int(stat.rsplit(')', 1)[1].split()[7])
+        for sequence in range(1, 9):
+            self.assertEqual(self.execute(sequence, ['/bin/true'])[0], 0)
+        before = faults()
+        for sequence in range(9, 9 + 64):
+            self.assertEqual(self.execute(sequence, ['/bin/true'])[0], 0)
+        self.assertLess(faults() - before, 16, 'the helper pays copy-on-write faults per spawn')
+
     def test_duplicate_sequence_is_refused_without_executing(self):
         self.execute(1, ['/bin/true'])
         marker = pathlib.Path(self.fixture.name) / 'must-not-run'

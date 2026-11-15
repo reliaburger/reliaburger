@@ -174,6 +174,42 @@ class Lifecycle(unittest.TestCase):
             self.assertEqual(len(api.runs),1)
             self.assertEqual(api.cancelled,1)
             self.assertFalse(c.state["errors"])
+    def drain_one_run(self, fault_while_active):
+        """Admit one run, maybe through a fault window, and drain it with a known start lag."""
+        lag=[0]*16; lag[9]=5
+        class API(FakeAPI):
+            def request(self,method,path,body=None,raw=False):
+                if path=="/v1/jobs/runs": return super().request(method,path,body)
+                identity=int(path.split("/")[3])
+                request=next(v for v in self.posts if self.runs[(v["name"],v["request_id"])]==identity)
+                if path.endswith("/cancel"): return {}
+                count=request["definition"]["tasks"]["count"]
+                value=summary(identity,total=count,done=True,not_run=count,name=request["name"],
+                              nodes=[dict(node="rb-a-1",counters=dict(running=0,start_lag_ms_counts=lag))])
+                value.update(runtime=request["definition"]["template"]["runtime"],cpu_request_millicores=25,
+                             memory_request_bytes=32<<20)
+                return value
+        with tempfile.TemporaryDirectory() as directory:
+            c=jobs.Campaign(directory,API(),[],"token")
+            c.prepare("process","short","work",100)
+            self.assertFalse(c.step(100,fault=fault_while_active,stop=True))
+            self.assertTrue(c.step(101,stop=True))
+            self.assertFalse(c.state["errors"])
+            c.state.update(stopped=True,stop_requested_at=101); c.publish(101)
+            return lag,c.state["metrics"],jobs.report(json.loads((Path(directory)/"snapshot.json").read_text()))["m8"]
+    def test_a_run_that_saw_a_fault_window_counts_for_m8_but_not_the_quiet_start_lag(self):
+        # The gated job-start SLO is a quiet-cluster number (#1438).
+        lag,metrics,m8=self.drain_one_run(fault_while_active=True)
+        self.assertEqual(metrics["start_lag_ms_counts"],lag)
+        self.assertEqual(metrics["quiet_start_lag_ms_counts"],[0]*16)
+        self.assertEqual(m8["start_lag_samples"],5)
+        self.assertEqual(m8["quiet_start_lag_samples"],0)
+        self.assertIsNone(m8["quiet_p99_start_lag_ms"])
+    def test_a_run_outside_every_fault_window_counts_for_both(self):
+        lag,metrics,m8=self.drain_one_run(fault_while_active=False)
+        self.assertEqual(metrics["quiet_start_lag_ms_counts"],lag)
+        self.assertEqual(m8["quiet_start_lag_samples"],5)
+        self.assertEqual(m8["quiet_p99_start_lag_ms"],m8["p99_start_lag_ms"])
     def test_timeout_requires_observed_launch_duration_and_timeout_outcome(self):
         value=summary(1,total=1,done=True,failed=1)
         good=dict(index=0,attempts=1,run_ms=3050,started_effect=True)
@@ -571,3 +607,225 @@ class TargetLoad(unittest.TestCase):
         counts=[0]*16; counts[0]=99; counts[10]=1
         self.assertEqual(jobs.percentile(counts,0.99),1)
         self.assertEqual(jobs.percentile(counts,1.0),1024)
+
+
+class DayLoad(unittest.TestCase):
+    """#1032: 2 billion host-job tasks in one day on three nodes."""
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
+        self.path=Path(self.temp.name)/"jobs"; self.api=FakeAPI()
+    def campaign(self, rate=jobs.DAY_DEFAULT_RATE):
+        # A fresh directory each time: one directory is one campaign.
+        self.path=Path(self.temp.name)/("jobs-%d" % len(list(Path(self.temp.name).iterdir())))
+        return jobs.Campaign(self.path,self.api,[],"token",load="day",target_rate=rate)
+    def day_snapshot(self, host=jobs.DAY_DEFAULT_RATE*86400, nodes=None, hours=None):
+        c=self.campaign()
+        c.state["started"]=1_000_000
+        for mode in jobs.MODES: c.state["progress"][mode]["succeeded"]=0
+        c.state["progress"]["process"]["succeeded"]=host
+        third=host//3
+        c.state["per_node"]=nodes if nodes is not None else {
+            name:dict(succeeded=third,slots=27,restarted=False) for name in ("node-1","node-2","node-3")}
+        rate=host//86400
+        c.state["hour_marks"]=[[hour*3600,hour*3600*rate] for hour in range(25)] if hours is None else hours
+        c.state.update(stopped=True,stop_requested_at=1_086_400); c.publish(1_086_400)
+        return json.loads((self.path/"snapshot.json").read_text())
+
+    def test_two_billion_a_day_is_the_default_and_a_billion_the_floor(self):
+        self.assertEqual(jobs.DAY_DEFAULT_RATE,23149)
+        self.assertLess((jobs.DAY_DEFAULT_RATE-1)*86400,2_000_000_000)
+        self.assertGreaterEqual(jobs.DAY_DEFAULT_RATE*86400,2_000_000_000)
+        self.assertGreaterEqual(jobs.DAY_FLOOR*86400,1_000_000_000)
+        self.assertLess((jobs.DAY_FLOOR-1)*86400,1_000_000_000)
+        with self.assertRaises(jobs.InvalidEvidence): self.campaign(rate=jobs.DAY_FLOOR-1)
+        with self.assertRaises(jobs.InvalidEvidence): self.campaign(rate=None)
+        self.campaign(rate=jobs.DAY_FLOOR)
+
+    def test_day_load_runs_host_work_as_the_biggest_arrays_the_api_accepts(self):
+        c=self.campaign()
+        tasks=c.body(c.prepare("process","short","work",100))["definition"]["tasks"]
+        self.assertEqual((tasks["count"],tasks["chunk_size"],tasks["per_node_concurrency"]),(1<<24,1000,27))
+        # Only host jobs carry the day's load; the containers keep the soak mix.
+        self.assertEqual(c.body(c.prepare("shared-runc","short","work",100))["definition"]["tasks"]["count"],262144)
+        self.assertEqual(c.body(c.prepare("runc","short","work",100))["definition"]["tasks"]["count"],262144)
+        self.assertEqual(c.body(c.prepare("process","long","work",100))["definition"]["tasks"]["count"],512)
+
+    def test_each_nodes_host_successes_add_up_across_polls_runs_and_a_restart(self):
+        c=self.campaign()
+        first=dict(id=1,mode="process"); second=dict(id=2,mode="process")
+        view=lambda node,succeeded,slots=27: dict(node=node,slots=slots,counters=dict(succeeded=succeeded))
+        c.count_nodes(first,dict(nodes=[view("node-1",100),view("node-2",50)]))
+        c.count_nodes(first,dict(nodes=[view("node-1",300),view("node-2",50)]))
+        c.count_nodes(second,dict(nodes=[view("node-1",10)]))
+        # node-2 restarted and reopened the run: its counter starts again.
+        c.count_nodes(first,dict(nodes=[view("node-2",20,slots=30)]))
+        nodes=c.state["per_node"]
+        self.assertEqual(nodes["node-1"],dict(succeeded=310,slots=27,restarted=False))
+        self.assertEqual(nodes["node-2"],dict(succeeded=70,slots=30,restarted=True))
+
+    def test_a_clean_day_passes_and_reports_the_day_in_full(self):
+        snapshot=self.day_snapshot()
+        day=jobs.report(snapshot)["day"]
+        self.assertEqual(day["host_successes"],jobs.DAY_DEFAULT_RATE*86400)
+        self.assertEqual(day["host_successes_per_second"],jobs.DAY_DEFAULT_RATE)
+        self.assertTrue(day["target_met"]); self.assertTrue(day["floor_met"])
+        self.assertTrue(day["per_node"]["balanced"])
+        self.assertEqual(len(day["hourly"]),24)
+        self.assertTrue(day["slowdown_ok"])
+        self.assertTrue(jobs.report(snapshot)["target_met"])
+        coverage={m:{item:True for item in jobs.REQUIRED if item!="unknown"} for m in jobs.MODES}
+        snapshot["coverage"]=coverage
+        # No faults, so no lost node to replay and no fault overlap to owe.
+        self.assertEqual(jobs.coverage_failures(snapshot),[])
+
+    def test_a_day_below_the_target_fails_and_says_whether_it_made_the_floor(self):
+        snapshot=self.day_snapshot(host=15000*86400)
+        day=jobs.report(snapshot)["day"]
+        self.assertFalse(day["target_met"]); self.assertTrue(day["floor_met"])
+        self.assertIn("host-job rate 15,000.0/s is below the 23149/s target",";".join(jobs.coverage_failures(snapshot)))
+
+    def test_one_node_over_its_fair_share_fails_the_day(self):
+        nodes={"node-1":dict(succeeded=41,slots=27,restarted=False),"node-2":dict(succeeded=30,slots=27,restarted=False),
+               "node-3":dict(succeeded=29,slots=27,restarted=False)}
+        snapshot=self.day_snapshot(nodes=nodes)
+        self.assertFalse(jobs.report(snapshot)["day"]["per_node"]["balanced"])
+        self.assertIn("node-1 took 41.0% of the host-job successes",";".join(jobs.coverage_failures(snapshot)))
+        # Exactly 40% of three equal nodes' work is at the limit, not over it.
+        nodes["node-1"]["succeeded"]=40; nodes["node-2"]["succeeded"]=31
+        self.assertTrue(jobs.report(self.day_snapshot(nodes=nodes))["day"]["per_node"]["balanced"])
+        self.assertIn("no per-node host-job successes",";".join(jobs.coverage_failures(self.day_snapshot(nodes={}))))
+
+    def test_a_last_hour_much_slower_than_the_first_fails_the_day(self):
+        marks=[[0,0],[3600,3600*20000]]+[[hour*3600,3600*20000+(hour-1)*3600*19000] for hour in range(2,25)]
+        marks[-1][1]=marks[-2][1]+3600*17000
+        snapshot=self.day_snapshot(hours=marks)
+        day=jobs.report(snapshot)["day"]
+        self.assertEqual((day["first_hour"],day["last_hour"]),(20000,17000))
+        self.assertFalse(day["slowdown_ok"])
+        self.assertIn("last hour ran at 17,000.0/s",";".join(jobs.coverage_failures(snapshot)))
+        marks[-1][1]=marks[-2][1]+3600*18000
+        self.assertTrue(jobs.report(self.day_snapshot(hours=marks))["day"]["slowdown_ok"])
+        self.assertIn("fewer than two full hours",";".join(jobs.coverage_failures(self.day_snapshot(hours=marks[:2]))))
+
+    def test_hour_marks_fall_on_the_hour_from_the_start_and_stay_bounded(self):
+        c=self.campaign(); c.state["started"]=1000
+        for now in range(1000,1000+3*3600+1,600):
+            c.state["progress"]["process"]["succeeded"]=now-1000
+            c.mark_hours(now)
+        self.assertEqual(c.state["hour_marks"],[[1000,0],[4600,3600],[8200,7200],[11800,10800]])
+        c.state["hour_marks"]=[[i,i] for i in range(jobs.MAX_HOUR_MARKS)]
+        c.mark_hours(10**9)
+        self.assertEqual(len(c.state["hour_marks"]),jobs.MAX_HOUR_MARKS)
+
+
+
+def outcome(run, status="Succeeded", succeeded=1, failed=0, not_run=0, started=1000):
+    return dict(run=run, started_at_epoch_secs=started, finished_at_epoch_secs=started+10, status=status,
+                succeeded=succeeded, failed=failed, not_run=not_run)
+
+
+def definition(name, history=None, namespace="default"):
+    value = dict(name=name, namespace=namespace, revision=1, count=1, cron=None,
+                 last_observed_minute=None, skipped=None, skipped_count=0)
+    if history is not None: value["history"] = history
+    return value
+
+
+class NamedFixtures(unittest.TestCase):
+    """The named cron, hook and after fixtures, seen through the run summaries and,
+    since the store prunes terminal runs past 20 a namespace, the definitions' own
+    history of their last 10 outcomes (#1935)."""
+
+    def state(self):
+        # The outcomes start at 1000 by default: this campaign's.
+        return {"started": 900, "coverage": {mode: {} for mode in jobs.MODES}, "discovered": {},
+                "progress": {mode: {} for mode in jobs.MODES}}
+
+    def test_an_earlier_campaigns_outcome_neither_credits_nor_fails_a_hook(self):
+        # Definitions keep their history across re-applies, so a cluster
+        # adopted with --home still holds the last campaign's hook runs.
+        state = self.state()
+        state["started"] = 100_000
+        earlier = 100_000 - jobs.HOOK_HISTORY_SKEW - 1
+        jobs.named_fixture_coverage([], [
+            definition("soak-job-hook-process", [outcome(41, started=earlier)]),
+            definition("soak-job-hook-runc", [outcome(42, "Failed", succeeded=0, failed=1, started=earlier)])], state)
+        self.assertNotIn("hook", state["coverage"]["process"])
+        self.assertNotIn("hook", state["coverage"]["runc"])
+        # Within the clock-skew allowance it is this campaign's.
+        jobs.named_fixture_coverage([], [definition("soak-job-hook-process", [outcome(43, started=earlier + 1)])], state)
+        self.assertTrue(state["coverage"]["process"]["hook"])
+        with self.assertRaisesRegex(jobs.InvalidEvidence, "release job fixture failed: soak-job-hook-runc"):
+            jobs.named_fixture_coverage([], [definition("soak-job-hook-runc", [
+                outcome(44, "Failed", succeeded=0, failed=1, started=earlier + 1)])], state)
+
+    def test_a_hook_run_pruned_from_the_summaries_still_counts_from_its_definition(self):
+        # The day tier never redeploys, and more than 20 runs finish in
+        # `default` before the first scan, so the hook's own row is gone.
+        state = self.state()
+        jobs.named_fixture_coverage([], [definition("soak-job-hook-process", [outcome(41)]),
+                                         definition("soak-job-hook-shared-runc", [outcome(42)])], state)
+        self.assertTrue(state["coverage"]["process"]["hook"])
+        self.assertTrue(state["coverage"]["shared-runc"]["hook"])
+        self.assertNotIn("hook", state["coverage"]["runc"])
+
+    def test_a_failed_hook_outcome_fails_the_campaign(self):
+        for status in ("CompletedWithFailures", "Failed"):
+            with self.subTest(status=status), self.assertRaisesRegex(
+                    jobs.InvalidEvidence, "release job fixture failed: soak-job-hook-process"):
+                jobs.named_fixture_coverage([], [definition("soak-job-hook-process", [
+                    outcome(40), outcome(41, status, succeeded=0, failed=1)])], self.state())
+
+    def test_no_row_and_no_finished_hook_means_no_hook_coverage(self):
+        for definitions in ([], [definition("soak-job-hook-process")],
+                            [definition("soak-job-hook-process", [outcome(41, "Cancelled", succeeded=0, not_run=1)])],
+                            [definition("soak-job-hook-process", [outcome(41)], namespace="elsewhere")],
+                            [definition("soak-job-cron-process", [outcome(41)])],
+                            [definition("soak-job-after-process", [outcome(41)])]):
+            with self.subTest(definitions=definitions):
+                state = self.state()
+                jobs.named_fixture_coverage([], definitions, state)
+                self.assertNotIn("hook", state["coverage"]["process"])
+
+    def test_a_malformed_definition_history_is_refused(self):
+        for history in ("Succeeded", [outcome(41, "Finished")], [outcome(41, succeeded=-1)],
+                        [{**outcome(41), "failed": True}], [outcome(0)]):
+            with self.subTest(history=history), self.assertRaises(jobs.InvalidEvidence):
+                jobs.named_fixture_coverage([], [definition("soak-job-hook-process", history)], self.state())
+        with self.assertRaises(jobs.InvalidEvidence):
+            jobs.named_fixture_coverage([], {"soak-job-hook-process": []}, self.state())
+
+    def test_a_finished_fixture_row_still_counts_as_before(self):
+        state = self.state()
+        rows = [summary(7, name="soak-job-hook-runc", total=1, succeeded=1, done=True, active_commands=0),
+                summary(9, name="soak-job-cron-process", total=1, succeeded=1, done=True, active_commands=0),
+                summary(8, name="work", total=1)]
+        named = jobs.named_fixture_coverage(rows, [], state, now=5000)
+        self.assertTrue(state["coverage"]["runc"]["hook"])
+        self.assertTrue(state["coverage"]["process"]["cron"])
+        self.assertEqual(state["progress"]["process"], {"last_cron_id": 9, "last_cron_progress": 5000})
+        self.assertEqual(state["discovered"], {})
+        self.assertEqual([value["batch_id"] for value in named], [7, 9])
+
+    def test_a_failed_fixture_row_still_fails_and_a_fenced_one_is_acknowledged_on_the_second_scan(self):
+        with self.assertRaisesRegex(jobs.InvalidEvidence, "release job fixture failed: soak-job-after-runc"):
+            jobs.named_fixture_coverage([summary(7, name="soak-job-after-runc", total=1, failed=1, done=True,
+                                                 active_commands=0)], [], self.state())
+        state = self.state()
+        jobs.named_fixture_coverage([summary(7, name="soak-job-hook-runc", total=1)], [], state)
+        self.assertEqual(state["discovered"], {})
+        owner = {"node": "node-1", "grant_digest": "a" * 64}
+        fenced = summary(7, name="soak-job-hook-runc", total=1, unknown_owners=[owner])
+        acknowledged = []
+        for _ in range(2):
+            jobs.named_fixture_coverage([copy.deepcopy(fenced)], [], state, now=60,
+                                        acknowledge=lambda *call: acknowledged.append(call))
+        self.assertIn("7", state["discovered"])
+        self.assertEqual(acknowledged, [(7, owner, "named true fixture, two identical fenced observations", 60)])
+        self.assertNotIn("hook", state["coverage"]["runc"])
+
+    def test_the_scan_reads_the_definitions_with_the_summaries(self):
+        import inspect
+        scan = inspect.getsource(jobs.run)
+        self.assertIn('api.request("GET","/v1/jobs/definitions")', scan)
+        self.assertLess(scan.index('"/v1/batch/summaries"'), scan.index("named_fixture_coverage("))

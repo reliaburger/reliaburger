@@ -1,0 +1,35 @@
+{
+  "bun_categories": {
+    "Bun: API server": 12.0,
+    "Bun: Raft core and log": 3.0,
+    "Bun: agent loop and supervisor": 14.0,
+    "Bun: async runtime (scheduler, timers, parking)": 28.0,
+    "Bun: containers (Grill)": 31.0,
+    "Bun: other Reliaburger code": 11.0,
+    "Bun: uncategorised (extend the map)": 6.0
+  },
+  "bun_total": 105.0,
+  "categories": {
+    "Bun: API server": 12.0,
+    "Bun: Raft core and log": 3.0,
+    "Bun: agent loop and supervisor": 14.0,
+    "Bun: async runtime (scheduler, timers, parking)": 28.0,
+    "Bun: containers (Grill)": 31.0,
+    "Bun: other Reliaburger code": 11.0,
+    "Bun: uncategorised (extend the map)": 6.0,
+    "idle (no runnable work)": 39739.0,
+    "other processes and kernel threads": 48.0
+  },
+  "other_by_command": {
+    "containerd": 9.0,
+    "exe": 11.0,
+    "gmain": 1.0,
+    "lima-guestagent": 17.0,
+    "perf": 2.0,
+    "rcu_preempt": 6.0,
+    "vmstat": 2.0
+  },
+  "rate": 0.0,
+  "total": 39892.0,
+  "uncategorised_share": 0.05714285714285714
+}

@@ -1,0 +1,222 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="556" viewBox="0 0 1400 556" font-family="monospace" font-size="11">
+<rect width="100%" height="100%" fill="#fbfbf6"/>
+<text x="700.0" y="20" text-anchor="middle" font-size="15">Host jobs, cap 27: off-CPU time of Bun threads (5 s, sched_switch)</text>
+<text x="10" y="40" font-size="11">total 287,675,229 us; frames under 0.3% hidden; hover for detail</text>
+<g><title>all (287,675,229 us, 100.00%)</title><rect x="10.0" y="530" width="1379.5" height="15" fill="rgb(254,101,73)" rx="1"/>
+<text x="12.0" y="542">all</text>
+</g>
+<g><title>tokio-rt-worker (287,675,229 us, 100.00%)</title><rect x="10.0" y="514" width="1379.5" height="15" fill="rgb(222,138,68)" rx="1"/>
+<text x="12.0" y="526">tokio-rt-worker</text>
+</g>
+<g><title>state=R (4,354,731 us, 1.51%)</title><rect x="12.0" y="498" width="20.4" height="15" fill="rgb(233,184,66)" rx="1"/>
+<text x="14.0" y="510">s..</text>
+</g>
+<g><title>[libc.so.6] (4,354,731 us, 1.51%)</title><rect x="12.0" y="482" width="20.4" height="15" fill="rgb(230,86,47)" rx="1"/>
+<text x="14.0" y="494">[..</text>
+</g>
+<g><title>[libc.so.6] (4,354,731 us, 1.51%)</title><rect x="12.0" y="466" width="20.4" height="15" fill="rgb(230,86,47)" rx="1"/>
+<text x="14.0" y="478">[..</text>
+</g>
+<g><title>&lt;std::sys::thread::unix::Thread&gt;::new::thread_start (4,354,731 us, 1.51%)</title><rect x="12.0" y="450" width="20.4" height="15" fill="rgb(227,110,69)" rx="1"/>
+<text x="14.0" y="462">&lt;..</text>
+</g>
+<g><title>&lt;std::thread::lifecycle::spawn_unchecked&lt;&lt;tokio::runtime::blocking::pool::Spawner&gt;::spawn_thread::{closure}, ()&gt;::{closure} as core::ops::function::FnOnce&lt;()&gt;&gt;::call_once::{shim} (4,354,731 us, 1.51%)</title><rect x="12.0" y="434" width="20.4" height="15" fill="rgb(239,130,75)" rx="1"/>
+<text x="14.0" y="446">&lt;..</text>
+</g>
+<g><title>std::sys::backtrace::__rust_begin_short_backtrace&lt;&lt;tokio::runtime::blocking::pool::Spawner&gt;::spawn_thread::{closure}, ()&gt; (4,354,731 us, 1.51%)</title><rect x="12.0" y="418" width="20.4" height="15" fill="rgb(215,116,49)" rx="1"/>
+<text x="14.0" y="430">s..</text>
+</g>
+<g><title>tokio::runtime::task::raw::poll&lt;tokio::runtime::blocking::task::BlockingTask&lt;&lt;tokio::runtime::scheduler::multi_thread::worker::Launch&gt;::launch::{closure}&gt;, tokio::runtime::blocking::schedule::BlockingSchedule&gt; (4,248,767 us, 1.48%)</title><rect x="12.5" y="402" width="19.9" height="15" fill="rgb(233,148,71)" rx="1"/>
+<text x="14.5" y="414">t..</text>
+</g>
+<g><title>tokio::runtime::scheduler::multi_thread::worker::run (4,248,767 us, 1.48%)</title><rect x="12.5" y="386" width="19.9" height="15" fill="rgb(239,181,53)" rx="1"/>
+<text x="14.5" y="398">t..</text>
+</g>
+<g><title>&lt;tokio::runtime::scheduler::multi_thread::worker::Context&gt;::run_task (4,103,210 us, 1.43%)</title><rect x="13.1" y="370" width="19.2" height="15" fill="rgb(250,151,44)" rx="1"/>
+</g>
+<g><title>tokio::runtime::task::raw::poll&lt;&lt;reliaburger::bun::task_executor::TaskPool&lt;reliaburger::bun::task_array_node::NodeRunner&gt;&gt;::resume_chunk_streaming::{closure}::{closure}, alloc::sync::Arc&lt;tokio::runtime::scheduler::multi_thread::handle::Handle&gt;&gt; (1,922,208 us, 0.67%)</title><rect x="14.4" y="354" width="8.7" height="15" fill="rgb(238,196,52)" rx="1"/>
+</g>
+<g><title>&lt;reliaburger::bun::task_executor::TaskPool&lt;reliaburger::bun::task_array_node::NodeRunner&gt;&gt;::resume_chunk_streaming::{closure}::{closure} (1,893,798 us, 0.66%)</title><rect x="14.4" y="338" width="8.6" height="15" fill="rgb(232,190,66)" rx="1"/>
+</g>
+<g><title>&lt;reliaburger::bun::task_runtime::OwnedRunner&lt;reliaburger::grill::AnyGrill&gt; as reliaburger::bun::task_executor::TaskRunner&gt;::run::{closure} (1,793,075 us, 0.62%)</title><rect x="14.5" y="322" width="8.1" height="15" fill="rgb(229,155,44)" rx="1"/>
+</g>
+<g><title>&lt;reliaburger::bun::reusable_executor::pool::ReusablePool&lt;reliaburger::grill::AnyGrill&gt;&gt;::run&lt;&lt;reliaburger::bun::task_runtime::OwnedRunner&lt;reliaburger::grill::AnyGrill&gt;&gt;::resolve_template::{closure}, &lt;reliaburger::bun::task_runtime::OwnedRunner&lt;reliaburger::grill::AnyGrill&gt; as reliaburger::bun::task_executor::TaskRunner&gt;::run::{closure}::{closure}&gt;::{closure} (1,775,601 us, 0.62%)</title><rect x="14.5" y="306" width="8.0" height="15" fill="rgb(224,188,71)" rx="1"/>
+</g>
+<g><title>tokio::runtime::task::raw::poll&lt;reliaburger::lettuce::runner::spawn_gitops_sync::{closure}, alloc::sync::Arc&lt;tokio::runtime::scheduler::multi_thread::handle::Handle&gt;&gt; (872,939 us, 0.30%)</title><rect x="27.2" y="354" width="3.7" height="15" fill="rgb(247,108,64)" rx="1"/>
+</g>
+<g><title>reliaburger::lettuce::runner::spawn_gitops_sync::{closure} (864,910 us, 0.30%)</title><rect x="27.3" y="338" width="3.6" height="15" fill="rgb(212,166,52)" rx="1"/>
+</g>
+<g><title>state=S (282,908,620 us, 98.34%)</title><rect x="32.9" y="498" width="1356.6" height="15" fill="rgb(207,105,74)" rx="1"/>
+<text x="34.9" y="510">state=S</text>
+</g>
+<g><title>[libc.so.6] (282,908,620 us, 98.34%)</title><rect x="32.9" y="482" width="1356.6" height="15" fill="rgb(230,86,47)" rx="1"/>
+<text x="34.9" y="494">[libc.so.6]</text>
+</g>
+<g><title>[libc.so.6] (282,908,620 us, 98.34%)</title><rect x="32.9" y="466" width="1356.6" height="15" fill="rgb(230,86,47)" rx="1"/>
+<text x="34.9" y="478">[libc.so.6]</text>
+</g>
+<g><title>&lt;std::sys::thread::unix::Thread&gt;::new::thread_start (282,908,620 us, 98.34%)</title><rect x="32.9" y="450" width="1356.6" height="15" fill="rgb(227,110,69)" rx="1"/>
+<text x="34.9" y="462">&lt;std::sys::thread::unix::Thread&gt;::new::thread_start</text>
+</g>
+<g><title>&lt;std::thread::lifecycle::spawn_unchecked&lt;&lt;tokio::runtime::blocking::pool::Spawner&gt;::spawn_thread::{closure}, ()&gt;::{closure} as core::ops::function::FnOnce&lt;()&gt;&gt;::call_once::{shim} (282,908,620 us, 98.34%)</title><rect x="32.9" y="434" width="1356.6" height="15" fill="rgb(239,130,75)" rx="1"/>
+<text x="34.9" y="446">&lt;std::thread::lifecycle::spawn_unchecked&lt;&lt;tokio::runtime::blocking::pool::Spawner&gt;::spawn_thread::{closure}, ()&gt;::{closure} as core::ops::function::FnOnce&lt;()&gt;&gt;::call_once::{shim}</text>
+</g>
+<g><title>std::sys::backtrace::__rust_begin_short_backtrace&lt;&lt;tokio::runtime::blocking::pool::Spawner&gt;::spawn_thread::{closure}, ()&gt; (282,908,620 us, 98.34%)</title><rect x="32.9" y="418" width="1356.6" height="15" fill="rgb(215,116,49)" rx="1"/>
+<text x="34.9" y="430">std::sys::backtrace::__rust_begin_short_backtrace&lt;&lt;tokio::runtime::blocking::pool::Spawner&gt;::spawn_thread::{closure}, ()&gt;</text>
+</g>
+<g><title>&lt;parking_lot::condvar::Condvar&gt;::wait_until_internal (272,030,247 us, 94.56%)</title><rect x="32.9" y="402" width="1304.4" height="15" fill="rgb(225,80,57)" rx="1"/>
+<text x="34.9" y="414">&lt;parking_lot::condvar::Condvar&gt;::wait_until_internal</text>
+</g>
+<g><title>syscall (272,025,007 us, 94.56%)</title><rect x="32.9" y="386" width="1304.4" height="15" fill="rgb(217,175,75)" rx="1"/>
+<text x="34.9" y="398">syscall</text>
+</g>
+<g><title>el0t_64_sync (272,025,007 us, 94.56%)</title><rect x="32.9" y="370" width="1304.4" height="15" fill="rgb(235,98,63)" rx="1"/>
+<text x="34.9" y="382">el0t_64_sync</text>
+</g>
+<g><title>el0t_64_sync_handler (272,025,007 us, 94.56%)</title><rect x="32.9" y="354" width="1304.4" height="15" fill="rgb(220,85,42)" rx="1"/>
+<text x="34.9" y="366">el0t_64_sync_handler</text>
+</g>
+<g><title>el0_svc (272,025,007 us, 94.56%)</title><rect x="32.9" y="338" width="1304.4" height="15" fill="rgb(215,151,76)" rx="1"/>
+<text x="34.9" y="350">el0_svc</text>
+</g>
+<g><title>do_el0_svc (272,025,007 us, 94.56%)</title><rect x="32.9" y="322" width="1304.4" height="15" fill="rgb(218,174,40)" rx="1"/>
+<text x="34.9" y="334">do_el0_svc</text>
+</g>
+<g><title>el0_svc_common.constprop.0 (272,025,007 us, 94.56%)</title><rect x="32.9" y="306" width="1304.4" height="15" fill="rgb(230,117,62)" rx="1"/>
+<text x="34.9" y="318">el0_svc_common.constprop.0</text>
+</g>
+<g><title>invoke_syscall (272,025,007 us, 94.56%)</title><rect x="32.9" y="290" width="1304.4" height="15" fill="rgb(247,138,71)" rx="1"/>
+<text x="34.9" y="302">invoke_syscall</text>
+</g>
+<g><title>__arm64_sys_futex (272,025,007 us, 94.56%)</title><rect x="32.9" y="274" width="1304.4" height="15" fill="rgb(210,125,77)" rx="1"/>
+<text x="34.9" y="286">__arm64_sys_futex</text>
+</g>
+<g><title>do_futex (272,025,007 us, 94.56%)</title><rect x="32.9" y="258" width="1304.4" height="15" fill="rgb(228,138,51)" rx="1"/>
+<text x="34.9" y="270">do_futex</text>
+</g>
+<g><title>futex_wait (272,025,007 us, 94.56%)</title><rect x="32.9" y="242" width="1304.4" height="15" fill="rgb(215,163,77)" rx="1"/>
+<text x="34.9" y="254">futex_wait</text>
+</g>
+<g><title>__futex_wait (272,025,007 us, 94.56%)</title><rect x="32.9" y="226" width="1304.4" height="15" fill="rgb(213,123,55)" rx="1"/>
+<text x="34.9" y="238">__futex_wait</text>
+</g>
+<g><title>futex_wait_queue (272,025,007 us, 94.56%)</title><rect x="32.9" y="210" width="1304.4" height="15" fill="rgb(253,105,54)" rx="1"/>
+<text x="34.9" y="222">futex_wait_queue</text>
+</g>
+<g><title>schedule (272,025,007 us, 94.56%)</title><rect x="32.9" y="194" width="1304.4" height="15" fill="rgb(208,127,57)" rx="1"/>
+<text x="34.9" y="206">schedule</text>
+</g>
+<g><title>__schedule (272,025,007 us, 94.56%)</title><rect x="32.9" y="178" width="1304.4" height="15" fill="rgb(209,168,45)" rx="1"/>
+<text x="34.9" y="190">__schedule</text>
+</g>
+<g><title>__schedule (272,025,007 us, 94.56%)</title><rect x="32.9" y="162" width="1304.4" height="15" fill="rgb(209,168,45)" rx="1"/>
+<text x="34.9" y="174">__schedule</text>
+</g>
+<g><title>tokio::runtime::task::raw::poll&lt;tokio::runtime::blocking::task::BlockingTask&lt;&lt;tokio::runtime::scheduler::multi_thread::worker::Launch&gt;::launch::{closure}&gt;, tokio::runtime::blocking::schedule::BlockingSchedule&gt; (10,045,431 us, 3.49%)</title><rect x="1341.8" y="402" width="47.7" height="15" fill="rgb(233,148,71)" rx="1"/>
+<text x="1343.8" y="414">tokio..</text>
+</g>
+<g><title>tokio::runtime::scheduler::multi_thread::worker::run (10,045,431 us, 3.49%)</title><rect x="1341.8" y="386" width="47.7" height="15" fill="rgb(239,181,53)" rx="1"/>
+<text x="1343.8" y="398">tokio..</text>
+</g>
+<g><title>&lt;tokio::runtime::scheduler::multi_thread::worker::Context&gt;::park_internal (8,570,675 us, 2.98%)</title><rect x="1341.8" y="370" width="40.6" height="15" fill="rgb(220,120,50)" rx="1"/>
+<text x="1343.8" y="382">&lt;tok..</text>
+</g>
+<g><title>&lt;parking_lot::condvar::Condvar&gt;::wait_until_internal (5,887,551 us, 2.05%)</title><rect x="1341.8" y="354" width="27.7" height="15" fill="rgb(225,80,57)" rx="1"/>
+<text x="1343.8" y="366">&lt;p..</text>
+</g>
+<g><title>syscall (5,887,551 us, 2.05%)</title><rect x="1341.8" y="338" width="27.7" height="15" fill="rgb(217,175,75)" rx="1"/>
+<text x="1343.8" y="350">sy..</text>
+</g>
+<g><title>el0t_64_sync (5,887,551 us, 2.05%)</title><rect x="1341.8" y="322" width="27.7" height="15" fill="rgb(235,98,63)" rx="1"/>
+<text x="1343.8" y="334">el..</text>
+</g>
+<g><title>el0t_64_sync_handler (5,887,551 us, 2.05%)</title><rect x="1341.8" y="306" width="27.7" height="15" fill="rgb(220,85,42)" rx="1"/>
+<text x="1343.8" y="318">el..</text>
+</g>
+<g><title>el0_svc (5,887,551 us, 2.05%)</title><rect x="1341.8" y="290" width="27.7" height="15" fill="rgb(215,151,76)" rx="1"/>
+<text x="1343.8" y="302">el..</text>
+</g>
+<g><title>do_el0_svc (5,887,551 us, 2.05%)</title><rect x="1341.8" y="274" width="27.7" height="15" fill="rgb(218,174,40)" rx="1"/>
+<text x="1343.8" y="286">do..</text>
+</g>
+<g><title>el0_svc_common.constprop.0 (5,887,551 us, 2.05%)</title><rect x="1341.8" y="258" width="27.7" height="15" fill="rgb(230,117,62)" rx="1"/>
+<text x="1343.8" y="270">el..</text>
+</g>
+<g><title>invoke_syscall (5,887,551 us, 2.05%)</title><rect x="1341.8" y="242" width="27.7" height="15" fill="rgb(247,138,71)" rx="1"/>
+<text x="1343.8" y="254">in..</text>
+</g>
+<g><title>__arm64_sys_futex (5,887,551 us, 2.05%)</title><rect x="1341.8" y="226" width="27.7" height="15" fill="rgb(210,125,77)" rx="1"/>
+<text x="1343.8" y="238">__..</text>
+</g>
+<g><title>do_futex (5,887,551 us, 2.05%)</title><rect x="1341.8" y="210" width="27.7" height="15" fill="rgb(228,138,51)" rx="1"/>
+<text x="1343.8" y="222">do..</text>
+</g>
+<g><title>futex_wait (5,887,551 us, 2.05%)</title><rect x="1341.8" y="194" width="27.7" height="15" fill="rgb(215,163,77)" rx="1"/>
+<text x="1343.8" y="206">fu..</text>
+</g>
+<g><title>__futex_wait (5,887,551 us, 2.05%)</title><rect x="1341.8" y="178" width="27.7" height="15" fill="rgb(213,123,55)" rx="1"/>
+<text x="1343.8" y="190">__..</text>
+</g>
+<g><title>futex_wait_queue (5,887,551 us, 2.05%)</title><rect x="1341.8" y="162" width="27.7" height="15" fill="rgb(253,105,54)" rx="1"/>
+<text x="1343.8" y="174">fu..</text>
+</g>
+<g><title>schedule (5,887,551 us, 2.05%)</title><rect x="1341.8" y="146" width="27.7" height="15" fill="rgb(208,127,57)" rx="1"/>
+<text x="1343.8" y="158">sc..</text>
+</g>
+<g><title>__schedule (5,887,551 us, 2.05%)</title><rect x="1341.8" y="130" width="27.7" height="15" fill="rgb(209,168,45)" rx="1"/>
+<text x="1343.8" y="142">__..</text>
+</g>
+<g><title>__schedule (5,887,551 us, 2.05%)</title><rect x="1341.8" y="114" width="27.7" height="15" fill="rgb(209,168,45)" rx="1"/>
+<text x="1343.8" y="126">__..</text>
+</g>
+<g><title>&lt;tokio::runtime::time::Driver&gt;::park_internal (2,683,124 us, 0.93%)</title><rect x="1370.0" y="354" width="12.4" height="15" fill="rgb(208,93,70)" rx="1"/>
+</g>
+<g><title>&lt;tokio::runtime::time::Driver&gt;::park_thread_timeout (2,683,124 us, 0.93%)</title><rect x="1370.0" y="338" width="12.4" height="15" fill="rgb(222,102,71)" rx="1"/>
+</g>
+<g><title>&lt;tokio::runtime::io::driver::Driver&gt;::turn (2,683,124 us, 0.93%)</title><rect x="1370.0" y="322" width="12.4" height="15" fill="rgb(216,120,50)" rx="1"/>
+</g>
+<g><title>&lt;mio::poll::Poll&gt;::poll (2,682,573 us, 0.93%)</title><rect x="1370.0" y="306" width="12.4" height="15" fill="rgb(210,93,48)" rx="1"/>
+</g>
+<g><title>epoll_pwait (2,682,573 us, 0.93%)</title><rect x="1370.0" y="290" width="12.4" height="15" fill="rgb(243,128,53)" rx="1"/>
+</g>
+<g><title>el0t_64_sync (2,682,573 us, 0.93%)</title><rect x="1370.0" y="274" width="12.4" height="15" fill="rgb(235,98,63)" rx="1"/>
+</g>
+<g><title>el0t_64_sync_handler (2,682,573 us, 0.93%)</title><rect x="1370.0" y="258" width="12.4" height="15" fill="rgb(220,85,42)" rx="1"/>
+</g>
+<g><title>el0_svc (2,682,573 us, 0.93%)</title><rect x="1370.0" y="242" width="12.4" height="15" fill="rgb(215,151,76)" rx="1"/>
+</g>
+<g><title>do_el0_svc (2,682,573 us, 0.93%)</title><rect x="1370.0" y="226" width="12.4" height="15" fill="rgb(218,174,40)" rx="1"/>
+</g>
+<g><title>el0_svc_common.constprop.0 (2,682,573 us, 0.93%)</title><rect x="1370.0" y="210" width="12.4" height="15" fill="rgb(230,117,62)" rx="1"/>
+</g>
+<g><title>invoke_syscall (2,682,573 us, 0.93%)</title><rect x="1370.0" y="194" width="12.4" height="15" fill="rgb(247,138,71)" rx="1"/>
+</g>
+<g><title>__arm64_sys_epoll_pwait (2,682,573 us, 0.93%)</title><rect x="1370.0" y="178" width="12.4" height="15" fill="rgb(219,132,75)" rx="1"/>
+</g>
+<g><title>do_epoll_pwait.part.0 (2,682,573 us, 0.93%)</title><rect x="1370.0" y="162" width="12.4" height="15" fill="rgb(229,140,76)" rx="1"/>
+</g>
+<g><title>do_epoll_wait (2,682,573 us, 0.93%)</title><rect x="1370.0" y="146" width="12.4" height="15" fill="rgb(233,199,47)" rx="1"/>
+</g>
+<g><title>ep_poll (2,682,573 us, 0.93%)</title><rect x="1370.0" y="130" width="12.4" height="15" fill="rgb(219,115,44)" rx="1"/>
+</g>
+<g><title>schedule_hrtimeout_range (2,682,573 us, 0.93%)</title><rect x="1370.0" y="114" width="12.4" height="15" fill="rgb(209,134,70)" rx="1"/>
+</g>
+<g><title>schedule_hrtimeout_range_clock (2,682,573 us, 0.93%)</title><rect x="1370.0" y="98" width="12.4" height="15" fill="rgb(238,118,42)" rx="1"/>
+</g>
+<g><title>schedule (2,682,573 us, 0.93%)</title><rect x="1370.0" y="82" width="12.4" height="15" fill="rgb(208,127,57)" rx="1"/>
+</g>
+<g><title>__schedule (2,682,573 us, 0.93%)</title><rect x="1370.0" y="66" width="12.4" height="15" fill="rgb(209,168,45)" rx="1"/>
+</g>
+<g><title>__schedule (2,682,573 us, 0.93%)</title><rect x="1370.0" y="50" width="12.4" height="15" fill="rgb(209,168,45)" rx="1"/>
+</g>
+<g><title>&lt;tokio::runtime::scheduler::multi_thread::worker::Context&gt;::run_task (1,474,715 us, 0.51%)</title><rect x="1382.9" y="370" width="6.6" height="15" fill="rgb(250,151,44)" rx="1"/>
+</g>
+<g><title>tokio::runtime::task::raw::poll&lt;&lt;reliaburger::bun::task_executor::TaskPool&lt;reliaburger::bun::task_array_node::NodeRunner&gt;&gt;::resume_chunk_streaming::{closure}::{closure}, alloc::sync::Arc&lt;tokio::runtime::scheduler::multi_thread::handle::Handle&gt;&gt; (1,068,156 us, 0.37%)</title><rect x="1382.9" y="354" width="4.6" height="15" fill="rgb(238,196,52)" rx="1"/>
+</g>
+<g><title>&lt;reliaburger::bun::task_executor::TaskPool&lt;reliaburger::bun::task_array_node::NodeRunner&gt;&gt;::resume_chunk_streaming::{closure}::{closure} (1,068,156 us, 0.37%)</title><rect x="1382.9" y="338" width="4.6" height="15" fill="rgb(232,190,66)" rx="1"/>
+</g>
+<g><title>&lt;reliaburger::bun::task_runtime::OwnedRunner&lt;reliaburger::grill::AnyGrill&gt; as reliaburger::bun::task_executor::TaskRunner&gt;::run::{closure} (928,007 us, 0.32%)</title><rect x="1383.0" y="322" width="4.0" height="15" fill="rgb(229,155,44)" rx="1"/>
+</g>
+<g><title>&lt;reliaburger::bun::reusable_executor::pool::ReusablePool&lt;reliaburger::grill::AnyGrill&gt;&gt;::run&lt;&lt;reliaburger::bun::task_runtime::OwnedRunner&lt;reliaburger::grill::AnyGrill&gt;&gt;::resolve_template::{closure}, &lt;reliaburger::bun::task_runtime::OwnedRunner&lt;reliaburger::grill::AnyGrill&gt; as reliaburger::bun::task_executor::TaskRunner&gt;::run::{closure}::{closure}&gt;::{closure} (926,814 us, 0.32%)</title><rect x="1383.0" y="306" width="3.9" height="15" fill="rgb(224,188,71)" rx="1"/>
+</g>
+</svg>

@@ -1,0 +1,17 @@
+---
+source: src/bun/api/contract_tests.rs
+expression: rows
+---
+[
+  {
+    "node": "node-2",
+    "id": "db-a-0",
+    "app_name": "db-a",
+    "namespace": "pg",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": 31002,
+    "pid": 4242,
+    "status_age_ms": 120
+  }
+]

@@ -489,6 +489,7 @@ async fn raft_rpc_closes_an_open_connection_once_its_peer_is_revoked() {
             RecoveryFence::serving(0),
             reliaburger::smoker::node_fault::NodeTransportGate::new(),
             Some(serving_crl),
+            reliaburger::council::network::RaftBlocklist::default(),
         )
         .await;
     });
@@ -502,6 +503,75 @@ async fn raft_rpc_closes_an_open_connection_once_its_peer_is_revoked() {
     assert!(
         ask_for_vote(&mut stream).await.is_none(),
         "a revoked peer's open connection must not be served"
+    );
+
+    shutdown.cancel();
+}
+
+/// A council partition must hold in both directions (#1810). The partition
+/// fills the target's Raft blocklist, which used to stop only its own RPCs:
+/// the leader's AppendEntries still reached it and it kept applying the log.
+/// The server now names the sender of each RPC from its vote, finds that
+/// node's Raft address in the membership, and closes the connection without
+/// an answer when the blocklist holds it.
+#[tokio::test]
+async fn raft_rpc_refuses_a_peer_its_partition_blocks() {
+    let shutdown = CancellationToken::new();
+    let council = lone_council(1).await;
+    let peer = addr(1);
+    council
+        .initialize(BTreeMap::from([
+            (
+                1,
+                CouncilNodeInfo {
+                    addr: addr(2),
+                    name: "n1".into(),
+                },
+            ),
+            (
+                2,
+                CouncilNodeInfo {
+                    addr: peer,
+                    name: "n2".into(),
+                },
+            ),
+        ]))
+        .await
+        .unwrap();
+    let blocklist = reliaburger::council::network::RaftBlocklist::default();
+    blocklist.write().await.insert(peer);
+
+    let listener = tokio::net::TcpListener::bind(addr(0)).await.unwrap();
+    let bound = listener.local_addr().unwrap();
+    let raft = council.raft().clone();
+    let serving = shutdown.clone();
+    let serving_blocklist = blocklist.clone();
+    tokio::spawn(async move {
+        reliaburger::council::network::serve_raft_rpc_with_node_gate(
+            listener,
+            raft,
+            serving,
+            None,
+            RecoveryFence::serving(0),
+            reliaburger::smoker::node_fault::NodeTransportGate::new(),
+            None,
+            serving_blocklist,
+        )
+        .await;
+    });
+
+    // `vote_frame` is a vote from node 2.
+    let mut stream = tokio::net::TcpStream::connect(bound).await.unwrap();
+    assert!(
+        ask_for_vote(&mut stream).await.is_none(),
+        "a peer the partition blocks must not be served"
+    );
+
+    blocklist.write().await.clear();
+    let mut stream = tokio::net::TcpStream::connect(bound).await.unwrap();
+    assert!(
+        ask_for_vote(&mut stream).await.is_some(),
+        "a healed partition serves the peer again"
     );
 
     shutdown.cancel();

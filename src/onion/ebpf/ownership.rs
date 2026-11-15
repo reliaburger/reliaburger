@@ -322,7 +322,7 @@ pub(super) fn load(
         return Err(io::Error::other("kernel ownership is retiring or retired"));
     }
     let mut loader = aya::EbpfLoader::new();
-    loader.map_pin_path(&ownership.manifest.pin_directory);
+    loader.default_map_pin_directory(&ownership.manifest.pin_directory);
     let mut bpf = match program_directory {
         Some(directory) => loader.load_file(directory.join("onion_connect_owned.bpf.o")),
         None => loader.load(aya::include_bytes_aligned!(concat!(

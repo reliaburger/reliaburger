@@ -1,0 +1,34 @@
+# An unschedulable deploy on Kubernetes: the port of
+# scenarios/unschedulable.toml. The same prompt, truth and checks.
+id = "unschedulable"
+title = "An unschedulable deploy"
+platform = "k8s"
+nodes = 1
+ported = """
+Reliaburger's `placement.required = ["disk=nvme-raid"]` is a nodeSelector on
+the same label. The pod stays Pending with a FailedScheduling event, where
+Reliaburger records the app as unplaceable.
+"""
+
+prompt = """
+The `reports` app was deployed a minute ago and has never started. Find out
+what is wrong: which app and what kind of fault.
+"""
+
+[[setup]]
+apply = "k8s/manifests/web-v1.yaml"
+wait_running = "web"
+
+[[setup]]
+apply = "k8s/manifests/reports-unplaceable.yaml"
+
+[[setup]]
+settle = "15s"
+
+[truth]
+app = "reports"
+namespace = "default"
+fault_kind = "unschedulable"
+
+[score]
+checks = ["app", "fault_kind"]

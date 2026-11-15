@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "scenario": "jobs-host-processes",
+  "started_at": "2026-10-26T22:08:13Z",
+  "requested_seconds": 60,
+  "concurrency": 27,
+  "cpu_request_millicores": 25,
+  "cpu_limit_millicores": 1000,
+  "memory_bytes": 33554432,
+  "receipt_chunk_size": 1000,
+  "image": null,
+  "executable": "/opt/bench/busybox",
+  "executable_sha256": null,
+  "measurement_boundary": "configured cluster; concurrency is per node; unique accepted outcomes received before the monotonic cutoff; submission and cold executor/image startup are included; 10m/8Mi helper reservation for shared/host; remote host executable hash is unknown; compare on the same node and byte-identical BusyBox",
+  "unique_accepted_successes": 1647000,
+  "verified_successes": 0,
+  "terminal_failures": 0,
+  "accepted_retries": 0,
+  "post_cutoff_drained": 0,
+  "batch_ids": [
+    11
+  ],
+  "active_submissions": [
+    11
+  ],
+  "drain_proofs": [
+    {
+      "batch_id": 11,
+      "done": true,
+      "held": 0,
+      "active_commands": 0
+    }
+  ],
+  "last_accepted_sample_seconds": 59.909811288,
+  "submission_names": [
+    "bench-jobs-c29b50f8bf2e84e3b619caa9fee75e30"
+  ],
+  "measurement_complete": true,
+  "interrupted": false,
+  "cleanup_verified": true,
+  "cleanup_failed_submissions": [],
+  "error": null,
+  "elapsed_including_drain_seconds": 61.788455376,
+  "successes_per_second": 27450.0,
+  "extrapolated_runs_per_day": 2371680000.0,
+  "daily_projection": "extrapolation from this window; not an observed daily total",
+  "qualified_100m_per_day": false,
+  "per_node": {
+    "tolerance_percent": 20,
+    "balanced": true,
+    "nodes": [
+      {
+        "node": "reliaburger-scale-1",
+        "slots": 27,
+        "successes": 812349,
+        "successes_per_second": 13539.15,
+        "share_percent": 49.19305367914354,
+        "fair_share_percent": 50.0,
+        "over_fair_share": false,
+        "counters_restarted": false
+      },
+      {
+        "node": "reliaburger-scale-2",
+        "slots": 27,
+        "successes": 839000,
+        "successes_per_second": 13983.333333333334,
+        "share_percent": 50.80694632085646,
+        "fair_share_percent": 50.0,
+        "over_fair_share": false,
+        "counters_restarted": false
+      },
+      {
+        "node": "reliaburger-scale-3",
+        "slots": 0,
+        "successes": 0,
+        "successes_per_second": 0.0,
+        "share_percent": 0.0,
+        "fair_share_percent": 0.0,
+        "over_fair_share": false,
+        "counters_restarted": false
+      }
+    ]
+  }
+}

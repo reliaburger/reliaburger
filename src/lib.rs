@@ -19,16 +19,32 @@ pub mod council;
 pub(crate) mod durable;
 pub mod file_lock;
 pub mod firewall;
+// Fuzz target bodies (#1398): the crate's own tests and the `fuzz/` crate only.
+#[cfg(test)]
+mod blocking_rule;
+#[cfg(any(test, feature = "fuzzing"))]
+pub mod fuzz;
 pub mod grill;
+pub mod http_client;
 pub mod ketchup;
 pub mod lettuce;
+// The source rules' parser for macro arguments (#1860): tests only.
+#[cfg(test)]
+mod macro_args;
 pub mod mayo;
 pub mod meat;
 pub mod mustard;
 pub(crate) mod object_storage;
+#[cfg(test)]
+pub(crate) mod off_runtime;
 pub mod onion;
 pub mod pickle;
+pub mod policy;
+pub mod proposal;
 pub mod reconstruction;
+pub mod redact;
+#[cfg(test)]
+pub(crate) mod refused_address;
 pub mod relish;
 pub mod reporting;
 pub mod sesame;

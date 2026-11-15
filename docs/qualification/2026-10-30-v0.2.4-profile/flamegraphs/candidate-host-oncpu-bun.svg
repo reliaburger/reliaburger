@@ -1,0 +1,1229 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="732" viewBox="0 0 1400 732" font-family="monospace" font-size="11">
+<rect width="100%" height="100%" fill="#fbfbf6"/>
+<text x="700.0" y="20" text-anchor="middle" font-size="15">v0.2.4: host jobs, Bun only, on-CPU</text>
+<text x="10" y="40" font-size="11">total 6,093 samples; frames under 0.2% hidden; hover for detail</text>
+<g><title>all (6,093 samples, 100.00%)</title><rect x="10.0" y="706" width="1379.5" height="15" fill="rgb(254,101,73)" rx="1"/>
+<text x="12.0" y="718">all</text>
+</g>
+<g><title>tokio-rt-worker (6,083 samples, 99.84%)</title><rect x="12.3" y="690" width="1377.2" height="15" fill="rgb(222,138,68)" rx="1"/>
+<text x="14.3" y="702">tokio-rt-worker</text>
+</g>
+<g><title>[libc.so.6] (6,083 samples, 99.84%)</title><rect x="12.3" y="674" width="1377.2" height="15" fill="rgb(230,86,47)" rx="1"/>
+<text x="14.3" y="686">[libc.so.6]</text>
+</g>
+<g><title>[libc.so.6] (6,083 samples, 99.84%)</title><rect x="12.3" y="658" width="1377.2" height="15" fill="rgb(230,86,47)" rx="1"/>
+<text x="14.3" y="670">[libc.so.6]</text>
+</g>
+<g><title>&lt;std::sys::thread::unix::Thread&gt;::new::thread_start (6,083 samples, 99.84%)</title><rect x="12.3" y="642" width="1377.2" height="15" fill="rgb(227,110,69)" rx="1"/>
+<text x="14.3" y="654">&lt;std::sys::thread::unix::Thread&gt;::new::thread_start</text>
+</g>
+<g><title>&lt;std::thread::lifecycle::spawn_unchecked&lt;&lt;tokio::runtime::blocking::pool::Spawner&gt;::spawn_thread::{closure}, ()&gt;::{closure} as core::ops::function::FnOnce&lt;()&gt;&gt;::call_once::{shim} (6,083 samples, 99.84%)</title><rect x="12.3" y="626" width="1377.2" height="15" fill="rgb(239,130,75)" rx="1"/>
+<text x="14.3" y="638">&lt;std::thread::lifecycle::spawn_unchecked&lt;&lt;tokio::runtime::blocking::pool::Spawner&gt;::spawn_thread::{closure}, ()&gt;::{closure} as core::ops::function::FnOnce&lt;()&gt;&gt;::call_once::{shim}</text>
+</g>
+<g><title>std::sys::backtrace::__rust_begin_short_backtrace&lt;&lt;tokio::runtime::blocking::pool::Spawner&gt;::spawn_thread::{closure}, ()&gt; (6,083 samples, 99.84%)</title><rect x="12.3" y="610" width="1377.2" height="15" fill="rgb(215,116,49)" rx="1"/>
+<text x="14.3" y="622">std::sys::backtrace::__rust_begin_short_backtrace&lt;&lt;tokio::runtime::blocking::pool::Spawner&gt;::spawn_thread::{closure}, ()&gt;</text>
+</g>
+<g><title>tokio::runtime::task::raw::poll&lt;tokio::runtime::blocking::task::BlockingTask&lt;reliaburger::bun::task_ledger::commit::{closure}::{closure}&gt;, tokio::runtime::blocking::schedule::BlockingSchedule&gt; (22 samples, 0.36%)</title><rect x="20.9" y="594" width="4.5" height="15" fill="rgb(245,116,69)" rx="1"/>
+</g>
+<g><title>&lt;reliaburger::bun::task_ledger::Ledger&gt;::flush (22 samples, 0.36%)</title><rect x="20.9" y="578" width="4.5" height="15" fill="rgb(233,107,49)" rx="1"/>
+</g>
+<g><title>&lt;reliaburger::bun::task_result_index::TaskResultIndex&gt;::put (15 samples, 0.25%)</title><rect x="20.9" y="562" width="2.9" height="15" fill="rgb(245,153,59)" rx="1"/>
+</g>
+<g><title>tokio::runtime::task::raw::poll&lt;tokio::runtime::blocking::task::BlockingTask&lt;tokio::runtime::scheduler::multi_thread::worker::maybe_move_runtime::{closure}::{closure}&gt;, tokio::runtime::blocking::schedule::BlockingSchedule&gt; (6,023 samples, 98.85%)</title><rect x="25.9" y="594" width="1363.6" height="15" fill="rgb(246,100,46)" rx="1"/>
+<text x="27.9" y="606">tokio::runtime::task::raw::poll&lt;tokio::runtime::blocking::task::BlockingTask&lt;tokio::runtime::scheduler::multi_thread::worker::maybe_move_runtime::{closure}::{closure}&gt;, tokio::runtime::blocking::schedule:..</text>
+</g>
+<g><title>tokio::runtime::scheduler::multi_thread::worker::run (6,023 samples, 98.85%)</title><rect x="25.9" y="578" width="1363.6" height="15" fill="rgb(239,181,53)" rx="1"/>
+<text x="27.9" y="590">tokio::runtime::scheduler::multi_thread::worker::run</text>
+</g>
+<g><title>&lt;std::sys::pal::unix::time::Timespec&gt;::now (24 samples, 0.39%)</title><rect x="25.9" y="562" width="4.9" height="15" fill="rgb(242,186,69)" rx="1"/>
+</g>
+<g><title>clock_gettime (22 samples, 0.36%)</title><rect x="25.9" y="546" width="4.5" height="15" fill="rgb(250,109,71)" rx="1"/>
+</g>
+<g><title>__kernel_clock_gettime (22 samples, 0.36%)</title><rect x="25.9" y="530" width="4.5" height="15" fill="rgb(212,96,46)" rx="1"/>
+</g>
+<g><title>[[vdso]] (22 samples, 0.36%)</title><rect x="25.9" y="514" width="4.5" height="15" fill="rgb(251,141,63)" rx="1"/>
+</g>
+<g><title>&lt;std::time::Instant&gt;::elapsed (13 samples, 0.21%)</title><rect x="31.5" y="562" width="2.4" height="15" fill="rgb(236,106,66)" rx="1"/>
+</g>
+<g><title>&lt;tokio::runtime::scheduler::multi_thread::worker::Context&gt;::park_internal (577 samples, 9.47%)</title><rect x="34.5" y="562" width="130.2" height="15" fill="rgb(220,120,50)" rx="1"/>
+<text x="36.5" y="574">&lt;tokio::runtime::..</text>
+</g>
+<g><title>&lt;parking_lot::condvar::Condvar&gt;::wait_until_internal (85 samples, 1.40%)</title><rect x="37.2" y="546" width="18.8" height="15" fill="rgb(225,80,57)" rx="1"/>
+</g>
+<g><title>syscall (83 samples, 1.36%)</title><rect x="37.6" y="530" width="18.3" height="15" fill="rgb(217,175,75)" rx="1"/>
+</g>
+<g><title>el0t_64_sync (80 samples, 1.31%)</title><rect x="37.6" y="514" width="17.6" height="15" fill="rgb(235,98,63)" rx="1"/>
+</g>
+<g><title>el0t_64_sync_handler (80 samples, 1.31%)</title><rect x="37.6" y="498" width="17.6" height="15" fill="rgb(220,85,42)" rx="1"/>
+</g>
+<g><title>el0_svc (80 samples, 1.31%)</title><rect x="37.6" y="482" width="17.6" height="15" fill="rgb(215,151,76)" rx="1"/>
+</g>
+<g><title>do_el0_svc (62 samples, 1.02%)</title><rect x="37.6" y="466" width="13.5" height="15" fill="rgb(218,174,40)" rx="1"/>
+</g>
+<g><title>el0_svc_common.constprop.0 (62 samples, 1.02%)</title><rect x="37.6" y="450" width="13.5" height="15" fill="rgb(230,117,62)" rx="1"/>
+</g>
+<g><title>invoke_syscall (62 samples, 1.02%)</title><rect x="37.6" y="434" width="13.5" height="15" fill="rgb(247,138,71)" rx="1"/>
+</g>
+<g><title>__arm64_sys_futex (60 samples, 0.98%)</title><rect x="37.6" y="418" width="13.1" height="15" fill="rgb(210,125,77)" rx="1"/>
+</g>
+<g><title>do_futex (60 samples, 0.98%)</title><rect x="37.6" y="402" width="13.1" height="15" fill="rgb(228,138,51)" rx="1"/>
+</g>
+<g><title>futex_wait (58 samples, 0.95%)</title><rect x="37.9" y="386" width="12.6" height="15" fill="rgb(215,163,77)" rx="1"/>
+</g>
+<g><title>__futex_wait (54 samples, 0.89%)</title><rect x="37.9" y="370" width="11.7" height="15" fill="rgb(213,123,55)" rx="1"/>
+</g>
+<g><title>futex_wait_queue (50 samples, 0.82%)</title><rect x="38.1" y="354" width="10.8" height="15" fill="rgb(253,105,54)" rx="1"/>
+</g>
+<g><title>schedule (49 samples, 0.80%)</title><rect x="38.3" y="338" width="10.6" height="15" fill="rgb(208,127,57)" rx="1"/>
+</g>
+<g><title>__schedule (16 samples, 0.26%)</title><rect x="38.3" y="322" width="3.1" height="15" fill="rgb(209,168,45)" rx="1"/>
+</g>
+<g><title>finish_task_switch.isra.0 (15 samples, 0.25%)</title><rect x="38.5" y="306" width="2.9" height="15" fill="rgb(241,109,59)" rx="1"/>
+</g>
+<g><title>finish_task_switch.isra.0 (33 samples, 0.54%)</title><rect x="41.9" y="322" width="7.0" height="15" fill="rgb(241,109,59)" rx="1"/>
+</g>
+<g><title>&lt;tokio::runtime::time::Driver&gt;::park_internal (464 samples, 7.62%)</title><rect x="58.5" y="546" width="104.6" height="15" fill="rgb(208,93,70)" rx="1"/>
+<text x="60.5" y="558">&lt;tokio::runti..</text>
+</g>
+<g><title>&lt;tokio::runtime::time::Driver&gt;::park_thread_timeout (420 samples, 6.89%)</title><rect x="59.4" y="530" width="94.6" height="15" fill="rgb(222,102,71)" rx="1"/>
+<text x="61.4" y="542">&lt;tokio::runt..</text>
+</g>
+<g><title>&lt;tokio::runtime::io::driver::Driver&gt;::turn (418 samples, 6.86%)</title><rect x="59.4" y="514" width="94.2" height="15" fill="rgb(216,120,50)" rx="1"/>
+<text x="61.4" y="526">&lt;tokio::runt..</text>
+</g>
+<g><title>&lt;mio::poll::Poll&gt;::poll (390 samples, 6.40%)</title><rect x="59.4" y="498" width="87.8" height="15" fill="rgb(210,93,48)" rx="1"/>
+<text x="61.4" y="510">&lt;mio::poll:..</text>
+</g>
+<g><title>epoll_pwait (387 samples, 6.35%)</title><rect x="59.8" y="482" width="87.2" height="15" fill="rgb(243,128,53)" rx="1"/>
+<text x="61.8" y="494">epoll_pwait</text>
+</g>
+<g><title>el0t_64_sync (371 samples, 6.09%)</title><rect x="60.7" y="466" width="83.5" height="15" fill="rgb(235,98,63)" rx="1"/>
+<text x="62.7" y="478">el0t_64_sync</text>
+</g>
+<g><title>el0t_64_sync_handler (371 samples, 6.09%)</title><rect x="60.7" y="450" width="83.5" height="15" fill="rgb(220,85,42)" rx="1"/>
+<text x="62.7" y="462">el0t_64_sy..</text>
+</g>
+<g><title>el0_svc (369 samples, 6.06%)</title><rect x="61.2" y="434" width="83.1" height="15" fill="rgb(215,151,76)" rx="1"/>
+<text x="63.2" y="446">el0_svc</text>
+</g>
+<g><title>do_el0_svc (349 samples, 5.73%)</title><rect x="61.2" y="418" width="78.5" height="15" fill="rgb(218,174,40)" rx="1"/>
+<text x="63.2" y="430">do_el0_svc</text>
+</g>
+<g><title>el0_svc_common.constprop.0 (348 samples, 5.71%)</title><rect x="61.2" y="402" width="78.3" height="15" fill="rgb(230,117,62)" rx="1"/>
+<text x="63.2" y="414">el0_svc_c..</text>
+</g>
+<g><title>invoke_syscall (337 samples, 5.53%)</title><rect x="61.9" y="386" width="75.8" height="15" fill="rgb(247,138,71)" rx="1"/>
+<text x="63.9" y="398">invoke_sy..</text>
+</g>
+<g><title>__arm64_sys_epoll_pwait (323 samples, 5.30%)</title><rect x="61.9" y="370" width="72.7" height="15" fill="rgb(219,132,75)" rx="1"/>
+<text x="63.9" y="382">__arm64_s..</text>
+</g>
+<g><title>do_epoll_pwait.part.0 (315 samples, 5.17%)</title><rect x="62.1" y="354" width="70.8" height="15" fill="rgb(229,140,76)" rx="1"/>
+<text x="64.1" y="366">do_epoll..</text>
+</g>
+<g><title>do_epoll_wait (313 samples, 5.14%)</title><rect x="62.1" y="338" width="70.4" height="15" fill="rgb(233,199,47)" rx="1"/>
+<text x="64.1" y="350">do_epoll..</text>
+</g>
+<g><title>ep_poll (300 samples, 4.92%)</title><rect x="63.5" y="322" width="67.4" height="15" fill="rgb(219,115,44)" rx="1"/>
+<text x="65.5" y="334">ep_poll</text>
+</g>
+<g><title>ep_send_events (36 samples, 0.59%)</title><rect x="64.4" y="306" width="7.7" height="15" fill="rgb(219,167,65)" rx="1"/>
+</g>
+<g><title>ep_item_poll.isra.0 (13 samples, 0.21%)</title><rect x="65.3" y="290" width="2.4" height="15" fill="rgb(229,175,75)" rx="1"/>
+</g>
+<g><title>schedule_hrtimeout_range (246 samples, 4.04%)</title><rect x="72.7" y="306" width="55.2" height="15" fill="rgb(209,134,70)" rx="1"/>
+<text x="74.7" y="318">schedu..</text>
+</g>
+<g><title>schedule_hrtimeout_range_clock (244 samples, 4.00%)</title><rect x="73.0" y="290" width="54.8" height="15" fill="rgb(238,118,42)" rx="1"/>
+<text x="75.0" y="302">schedu..</text>
+</g>
+<g><title>schedule (233 samples, 3.82%)</title><rect x="74.5" y="274" width="52.3" height="15" fill="rgb(208,127,57)" rx="1"/>
+<text x="76.5" y="286">sched..</text>
+</g>
+<g><title>__schedule (15 samples, 0.25%)</title><rect x="74.5" y="258" width="2.9" height="15" fill="rgb(209,168,45)" rx="1"/>
+</g>
+<g><title>finish_task_switch.isra.0 (14 samples, 0.23%)</title><rect x="74.5" y="242" width="2.7" height="15" fill="rgb(241,109,59)" rx="1"/>
+</g>
+<g><title>finish_task_switch.isra.0 (218 samples, 3.58%)</title><rect x="77.9" y="258" width="48.9" height="15" fill="rgb(241,109,59)" rx="1"/>
+<text x="79.9" y="270">finis..</text>
+</g>
+<g><title>&lt;tokio::runtime::io::scheduled_io::ScheduledIo&gt;::wake (15 samples, 0.25%)</title><rect x="150.4" y="498" width="2.9" height="15" fill="rgb(248,100,41)" rx="1"/>
+</g>
+<g><title>&lt;tokio::time::clock::Clock&gt;::now (36 samples, 0.59%)</title><rect x="155.4" y="530" width="7.7" height="15" fill="rgb(235,115,54)" rx="1"/>
+</g>
+<g><title>&lt;std::time::Instant&gt;::elapsed (31 samples, 0.51%)</title><rect x="155.9" y="514" width="6.5" height="15" fill="rgb(236,106,66)" rx="1"/>
+</g>
+<g><title>&lt;std::sys::pal::unix::time::Timespec&gt;::now (29 samples, 0.48%)</title><rect x="155.9" y="498" width="6.1" height="15" fill="rgb(242,186,69)" rx="1"/>
+</g>
+<g><title>clock_gettime (26 samples, 0.43%)</title><rect x="156.1" y="482" width="5.4" height="15" fill="rgb(250,109,71)" rx="1"/>
+</g>
+<g><title>__kernel_clock_gettime (26 samples, 0.43%)</title><rect x="156.1" y="466" width="5.4" height="15" fill="rgb(212,96,46)" rx="1"/>
+</g>
+<g><title>[[vdso]] (25 samples, 0.41%)</title><rect x="156.1" y="450" width="5.2" height="15" fill="rgb(251,141,63)" rx="1"/>
+</g>
+<g><title>&lt;tokio::runtime::scheduler::multi_thread::worker::Context&gt;::run_task (5,376 samples, 88.23%)</title><rect x="165.1" y="562" width="1217.1" height="15" fill="rgb(250,151,44)" rx="1"/>
+<text x="167.1" y="574">&lt;tokio::runtime::scheduler::multi_thread::worker::Context&gt;::run_task</text>
+</g>
+<g><title>&lt;parking_lot::condvar::Condvar&gt;::notify_one_slow (57 samples, 0.94%)</title><rect x="165.1" y="546" width="12.4" height="15" fill="rgb(205,97,78)" rx="1"/>
+</g>
+<g><title>syscall (54 samples, 0.89%)</title><rect x="165.8" y="530" width="11.7" height="15" fill="rgb(217,175,75)" rx="1"/>
+</g>
+<g><title>el0t_64_sync (52 samples, 0.85%)</title><rect x="165.8" y="514" width="11.3" height="15" fill="rgb(235,98,63)" rx="1"/>
+</g>
+<g><title>el0t_64_sync_handler (52 samples, 0.85%)</title><rect x="165.8" y="498" width="11.3" height="15" fill="rgb(220,85,42)" rx="1"/>
+</g>
+<g><title>el0_svc (52 samples, 0.85%)</title><rect x="165.8" y="482" width="11.3" height="15" fill="rgb(215,151,76)" rx="1"/>
+</g>
+<g><title>do_el0_svc (37 samples, 0.61%)</title><rect x="165.8" y="466" width="7.9" height="15" fill="rgb(218,174,40)" rx="1"/>
+</g>
+<g><title>el0_svc_common.constprop.0 (37 samples, 0.61%)</title><rect x="165.8" y="450" width="7.9" height="15" fill="rgb(230,117,62)" rx="1"/>
+</g>
+<g><title>invoke_syscall (36 samples, 0.59%)</title><rect x="165.8" y="434" width="7.7" height="15" fill="rgb(247,138,71)" rx="1"/>
+</g>
+<g><title>__arm64_sys_futex (35 samples, 0.57%)</title><rect x="165.8" y="418" width="7.4" height="15" fill="rgb(210,125,77)" rx="1"/>
+</g>
+<g><title>do_futex (35 samples, 0.57%)</title><rect x="165.8" y="402" width="7.4" height="15" fill="rgb(228,138,51)" rx="1"/>
+</g>
+<g><title>futex_wake (32 samples, 0.53%)</title><rect x="165.8" y="386" width="6.7" height="15" fill="rgb(209,132,55)" rx="1"/>
+</g>
+<g><title>wake_up_q (29 samples, 0.48%)</title><rect x="166.1" y="370" width="6.1" height="15" fill="rgb(247,163,52)" rx="1"/>
+</g>
+<g><title>try_to_wake_up (28 samples, 0.46%)</title><rect x="166.3" y="354" width="5.8" height="15" fill="rgb(214,105,74)" rx="1"/>
+</g>
+<g><title>tokio::runtime::task::raw::poll&lt;&lt;reliaburger::bun::task_executor::TaskPool&lt;reliaburger::bun::task_array_node::NodeRunner&gt;&gt;::resume_chunk_streaming::{closure}::{closure}, alloc::sync::Arc&lt;tokio::runtime::scheduler::multi_thread::handle::Handle&gt;&gt; (4,561 samples, 74.86%)</title><rect x="182.8" y="546" width="1032.5" height="15" fill="rgb(238,196,52)" rx="1"/>
+<text x="184.8" y="558">tokio::runtime::task::raw::poll&lt;&lt;reliaburger::bun::task_executor::TaskPool&lt;reliaburger::bun::task_array_node::NodeRunner&gt;&gt;::resume_chunk_streaming::{closu..</text>
+</g>
+<g><title>&lt;reliaburger::bun::task_executor::TaskPool&lt;reliaburger::bun::task_array_node::NodeRunner&gt;&gt;::resume_chunk_streaming::{closure}::{closure} (4,421 samples, 72.56%)</title><rect x="182.8" y="530" width="1000.8" height="15" fill="rgb(232,190,66)" rx="1"/>
+<text x="184.8" y="542">&lt;reliaburger::bun::task_executor::TaskPool&lt;reliaburger::bun::task_array_node::NodeRunner&gt;&gt;::resume_chunk_streaming::{closure}::{closure}</text>
+</g>
+<g><title>&lt;alloc::raw_vec::RawVecInner&lt;_&gt;&gt;::reserve::do_reserve_and_handle&lt;alloc::alloc::Global&gt; (18 samples, 0.30%)</title><rect x="184.8" y="514" width="3.6" height="15" fill="rgb(222,140,71)" rx="1"/>
+</g>
+<g><title>&lt;alloc::raw_vec::RawVecInner&gt;::finish_grow (18 samples, 0.30%)</title><rect x="184.8" y="498" width="3.6" height="15" fill="rgb(217,142,46)" rx="1"/>
+</g>
+<g><title>realloc (15 samples, 0.25%)</title><rect x="184.8" y="482" width="2.9" height="15" fill="rgb(246,113,67)" rx="1"/>
+</g>
+<g><title>[libc.so.6] (13 samples, 0.21%)</title><rect x="184.8" y="466" width="2.4" height="15" fill="rgb(230,86,47)" rx="1"/>
+</g>
+<g><title>&lt;reliaburger::bun::task_executor::TaskPool&lt;reliaburger::bun::task_array_node::NodeRunner&gt;&gt;::resume_chunk_streaming::{closure}::{closure} (22 samples, 0.36%)</title><rect x="188.9" y="514" width="4.5" height="15" fill="rgb(232,190,66)" rx="1"/>
+</g>
+<g><title>&lt;reliaburger::bun::task_runtime::OwnedRunner&lt;reliaburger::grill::AnyGrill&gt; as reliaburger::bun::task_executor::TaskRunner&gt;::run::{closure} (4,230 samples, 69.42%)</title><rect x="193.9" y="514" width="957.6" height="15" fill="rgb(229,155,44)" rx="1"/>
+<text x="195.9" y="526">&lt;reliaburger::bun::task_runtime::OwnedRunner&lt;reliaburger::grill::AnyGrill&gt; as reliaburger::bun::task_executor::TaskRunner&gt;::run::{closure}</text>
+</g>
+<g><title>&lt;reliaburger::bun::reusable_executor::pool::ReusablePool&lt;reliaburger::grill::AnyGrill&gt;&gt;::run&lt;&lt;reliaburger::bun::task_runtime::OwnedRunner&lt;reliaburger::grill::AnyGrill&gt;&gt;::resolve_template::{closure}, &lt;reliaburger::bun::task_runtime::OwnedRunner&lt;reliaburger::grill::AnyGrill&gt; as reliaburger::bun::task_executor::TaskRunner&gt;::run::{closure}::{closure}&gt;::{closure} (4,184 samples, 68.67%)</title><rect x="194.1" y="498" width="947.1" height="15" fill="rgb(224,188,71)" rx="1"/>
+<text x="196.1" y="510">&lt;reliaburger::bun::reusable_executor::pool::ReusablePool&lt;reliaburger::grill::AnyGrill&gt;&gt;::run&lt;&lt;reliaburger::bun::task_runtime::OwnedRunner&lt;rel..</text>
+</g>
+<g><title>&lt;alloc::collections::btree::map::BTreeMap&lt;_, _, _&gt; as core::clone::Clone&gt;::clone::clone_subtree&lt;alloc::string::String, alloc::string::String, alloc::alloc::Global&gt; (31 samples, 0.51%)</title><rect x="194.1" y="482" width="6.5" height="15" fill="rgb(252,139,78)" rx="1"/>
+</g>
+<g><title>&lt;alloc::string::String as core::clone::Clone&gt;::clone (20 samples, 0.33%)</title><rect x="194.6" y="466" width="4.0" height="15" fill="rgb(222,176,41)" rx="1"/>
+</g>
+<g><title>malloc (16 samples, 0.26%)</title><rect x="195.0" y="450" width="3.1" height="15" fill="rgb(212,162,62)" rx="1"/>
+</g>
+<g><title>&lt;alloc::collections::btree::map::BTreeMap&lt;alloc::string::String, reliaburger::config::types::EnvValue&gt;&gt;::insert (26 samples, 0.43%)</title><rect x="201.6" y="482" width="5.4" height="15" fill="rgb(233,144,76)" rx="1"/>
+</g>
+<g><title>malloc (17 samples, 0.28%)</title><rect x="202.7" y="466" width="3.4" height="15" fill="rgb(212,162,62)" rx="1"/>
+</g>
+<g><title>[libc.so.6] (15 samples, 0.25%)</title><rect x="202.7" y="450" width="2.9" height="15" fill="rgb(230,86,47)" rx="1"/>
+</g>
+<g><title>&lt;alloc::string::String as core::clone::Clone&gt;::clone (28 samples, 0.46%)</title><rect x="207.5" y="482" width="5.8" height="15" fill="rgb(222,176,41)" rx="1"/>
+</g>
+<g><title>malloc (19 samples, 0.31%)</title><rect x="208.9" y="466" width="3.8" height="15" fill="rgb(212,162,62)" rx="1"/>
+</g>
+<g><title>&lt;core::iter::adapters::map::Map&lt;alloc::collections::btree::map::IntoIter&lt;alloc::string::String, alloc::string::String&gt;, &lt;reliaburger::bun::reusable_executor::pool::ReusablePool&lt;reliaburger::grill::AnyGrill&gt;&gt;::run&lt;&lt;reliaburger::bun::task_runtime::OwnedRunner&lt;reliaburger::grill::AnyGrill&gt;&gt;::resolve_template::{closure}, &lt;reliaburger::bun::task_runtime::OwnedRunner&lt;reliaburger::grill::AnyGrill&gt; as reliaburger::bun::task_executor::TaskRunner&gt;::run::{closure}::{closure}&gt;::{closure}::{closure}&gt; as core::iter::traits::iterator::Iterator&gt;::collect&lt;alloc::vec::Vec&lt;alloc::string::String&gt;&gt; (136 samples, 2.23%)</title><rect x="214.7" y="482" width="30.3" height="15" fill="rgb(234,174,68)" rx="1"/>
+<text x="216.7" y="494">&lt;c..</text>
+</g>
+<g><title>alloc::fmt::format::format_inner (92 samples, 1.51%)</title><rect x="218.1" y="466" width="20.3" height="15" fill="rgb(243,186,56)" rx="1"/>
+<text x="220.1" y="478">a..</text>
+</g>
+<g><title>core::fmt::write (90 samples, 1.48%)</title><rect x="218.4" y="450" width="19.9" height="15" fill="rgb(210,107,49)" rx="1"/>
+<text x="220.4" y="462">c..</text>
+</g>
+<g><title>&lt;alloc::string::String as core::fmt::Write&gt;::write_str (75 samples, 1.23%)</title><rect x="218.4" y="434" width="16.5" height="15" fill="rgb(253,112,59)" rx="1"/>
+</g>
+<g><title>&lt;alloc::raw_vec::RawVecInner&lt;_&gt;&gt;::reserve::do_reserve_and_handle&lt;alloc::alloc::Global&gt; (59 samples, 0.97%)</title><rect x="218.4" y="418" width="12.9" height="15" fill="rgb(222,140,71)" rx="1"/>
+</g>
+<g><title>&lt;alloc::raw_vec::RawVecInner&gt;::finish_grow (54 samples, 0.89%)</title><rect x="218.8" y="402" width="11.7" height="15" fill="rgb(217,142,46)" rx="1"/>
+</g>
+<g><title>malloc (14 samples, 0.23%)</title><rect x="220.4" y="386" width="2.7" height="15" fill="rgb(212,162,62)" rx="1"/>
+</g>
+<g><title>realloc (27 samples, 0.44%)</title><rect x="223.6" y="386" width="5.6" height="15" fill="rgb(246,113,67)" rx="1"/>
+</g>
+<g><title>[libc.so.6] (22 samples, 0.36%)</title><rect x="223.6" y="370" width="4.5" height="15" fill="rgb(230,86,47)" rx="1"/>
+</g>
+<g><title>[libc.so.6] (17 samples, 0.28%)</title><rect x="223.6" y="354" width="3.4" height="15" fill="rgb(230,86,47)" rx="1"/>
+</g>
+<g><title>cfree (25 samples, 0.41%)</title><rect x="239.0" y="466" width="5.2" height="15" fill="rgb(207,133,68)" rx="1"/>
+</g>
+<g><title>[libc.so.6] (17 samples, 0.28%)</title><rect x="239.0" y="450" width="3.4" height="15" fill="rgb(230,86,47)" rx="1"/>
+</g>
+<g><title>&lt;reliaburger::bun::live_attempts::AttemptListing as core::ops::drop::Drop&gt;::drop (25 samples, 0.41%)</title><rect x="246.7" y="482" width="5.2" height="15" fill="rgb(245,135,75)" rx="1"/>
+</g>
+<g><title>&lt;reliaburger::bun::live_attempts::LiveAttempts&gt;::register (25 samples, 0.41%)</title><rect x="255.1" y="482" width="5.2" height="15" fill="rgb(250,172,50)" rx="1"/>
+</g>
+<g><title>malloc (16 samples, 0.26%)</title><rect x="257.1" y="466" width="3.1" height="15" fill="rgb(212,162,62)" rx="1"/>
+</g>
+<g><title>[libc.so.6] (16 samples, 0.26%)</title><rect x="257.1" y="450" width="3.1" height="15" fill="rgb(230,86,47)" rx="1"/>
+</g>
+<g><title>[libc.so.6] (14 samples, 0.23%)</title><rect x="257.1" y="434" width="2.7" height="15" fill="rgb(230,86,47)" rx="1"/>
+</g>
+<g><title>&lt;reliaburger::bun::reusable_executor::ExecutorKey&gt;::new (94 samples, 1.54%)</title><rect x="261.9" y="482" width="20.8" height="15" fill="rgb(237,182,46)" rx="1"/>
+<text x="263.9" y="494">&lt;..</text>
+</g>
+<g><title>&lt;reliaburger::config::job::JobSpec as serde_core::ser::Serialize&gt;::serialize&lt;&amp;mut serde_json::ser::Serializer&lt;&amp;mut alloc::vec::Vec&lt;u8&gt;&gt;&gt; (51 samples, 0.84%)</title><rect x="264.8" y="466" width="11.1" height="15" fill="rgb(242,136,71)" rx="1"/>
+</g>
+<g><title>&lt;serde_json::ser::Compound&lt;&amp;mut alloc::vec::Vec&lt;u8&gt;, serde_json::ser::CompactFormatter&gt; as serde_core::ser::SerializeStruct&gt;::serialize_field&lt;&lt;reliaburger::config::app::AppSpec as serde_core::ser::Serialize&gt;::serialize::__SerializeWith&gt; (14 samples, 0.23%)</title><rect x="265.9" y="450" width="2.7" height="15" fill="rgb(236,191,71)" rx="1"/>
+</g>
+<g><title>reliaburger::config::types::cpu_range::serialize&lt;&amp;mut serde_json::ser::Serializer&lt;&amp;mut alloc::vec::Vec&lt;u8&gt;&gt;&gt; (14 samples, 0.23%)</title><rect x="265.9" y="434" width="2.7" height="15" fill="rgb(246,192,49)" rx="1"/>
+</g>
+<g><title>reliaburger::config::types::memory_range::serialize&lt;&amp;mut serde_json::ser::Serializer&lt;&amp;mut alloc::vec::Vec&lt;u8&gt;&gt;&gt; (24 samples, 0.39%)</title><rect x="270.5" y="450" width="4.9" height="15" fill="rgb(249,167,45)" rx="1"/>
+</g>
+<g><title>alloc::fmt::format::format_inner (18 samples, 0.30%)</title><rect x="270.5" y="434" width="3.6" height="15" fill="rgb(243,186,56)" rx="1"/>
+</g>
+<g><title>core::fmt::write (17 samples, 0.28%)</title><rect x="270.7" y="418" width="3.4" height="15" fill="rgb(210,107,49)" rx="1"/>
+</g>
+<g><title>&lt;u64 as core::fmt::Display&gt;::fmt (13 samples, 0.21%)</title><rect x="271.4" y="402" width="2.4" height="15" fill="rgb(224,151,41)" rx="1"/>
+</g>
+<g><title>&lt;sha2::Sha256 as digest::digest::Digest&gt;::digest&lt;alloc::vec::Vec&lt;u8&gt;&gt; (13 samples, 0.21%)</title><rect x="276.4" y="466" width="2.4" height="15" fill="rgb(211,106,64)" rx="1"/>
+</g>
+<g><title>&lt;reliaburger::bun::reusable_executor::pool::Checkout&lt;reliaburger::grill::AnyGrill&gt;&gt;::release::{closure} (26 samples, 0.43%)</title><rect x="283.6" y="482" width="5.4" height="15" fill="rgb(234,150,69)" rx="1"/>
+</g>
+<g><title>&lt;reliaburger::bun::reusable_executor::pool::CommandLogs&gt;::new (31 samples, 0.51%)</title><rect x="289.5" y="482" width="6.5" height="15" fill="rgb(228,140,43)" rx="1"/>
+</g>
+<g><title>&lt;reliaburger::bun::reusable_executor::pool::ReusablePool&lt;reliaburger::grill::AnyGrill&gt;&gt;::run&lt;&lt;reliaburger::bun::task_runtime::OwnedRunner&lt;reliaburger::grill::AnyGrill&gt;&gt;::resolve_template::{closure}, &lt;reliaburger::bun::task_runtime::OwnedRunner&lt;reliaburger::grill::AnyGrill&gt; as reliaburger::bun::task_executor::TaskRunner&gt;::run::{closure}::{closure}&gt;::{closure} (62 samples, 1.02%)</title><rect x="297.2" y="482" width="13.5" height="15" fill="rgb(224,188,71)" rx="1"/>
+</g>
+<g><title>&lt;reliaburger::bun::reusable_executor::timings::Timer as core::ops::drop::Drop&gt;::drop (20 samples, 0.33%)</title><rect x="311.2" y="482" width="4.0" height="15" fill="rgb(252,95,70)" rx="1"/>
+</g>
+<g><title>&lt;reliaburger::bun::task_namespace::TaskNamespacePolicy&gt;::check::{closure} (670 samples, 11.00%)</title><rect x="315.8" y="482" width="151.2" height="15" fill="rgb(234,186,44)" rx="1"/>
+<text x="317.8" y="494">&lt;reliaburger::bun::t..</text>
+</g>
+<g><title>&lt;reliaburger::onion::ebpf::loader::ownership::Ownership&gt;::attached (420 samples, 6.89%)</title><rect x="317.1" y="466" width="94.6" height="15" fill="rgb(236,127,75)" rx="1"/>
+<text x="319.1" y="478">&lt;reliaburger..</text>
+</g>
+<g><title>&lt;std::path::Path&gt;::_join (17 samples, 0.28%)</title><rect x="317.8" y="450" width="3.4" height="15" fill="rgb(219,156,44)" rx="1"/>
+</g>
+<g><title>__close (65 samples, 1.07%)</title><rect x="321.6" y="450" width="14.2" height="15" fill="rgb(252,141,58)" rx="1"/>
+</g>
+<g><title>el0t_64_sync (58 samples, 0.95%)</title><rect x="321.9" y="434" width="12.6" height="15" fill="rgb(235,98,63)" rx="1"/>
+</g>
+<g><title>el0t_64_sync_handler (58 samples, 0.95%)</title><rect x="321.9" y="418" width="12.6" height="15" fill="rgb(220,85,42)" rx="1"/>
+</g>
+<g><title>el0_svc (58 samples, 0.95%)</title><rect x="321.9" y="402" width="12.6" height="15" fill="rgb(215,151,76)" rx="1"/>
+</g>
+<g><title>do_el0_svc (48 samples, 0.79%)</title><rect x="321.9" y="386" width="10.4" height="15" fill="rgb(218,174,40)" rx="1"/>
+</g>
+<g><title>el0_svc_common.constprop.0 (48 samples, 0.79%)</title><rect x="321.9" y="370" width="10.4" height="15" fill="rgb(230,117,62)" rx="1"/>
+</g>
+<g><title>invoke_syscall (45 samples, 0.74%)</title><rect x="322.3" y="354" width="9.7" height="15" fill="rgb(247,138,71)" rx="1"/>
+</g>
+<g><title>__arm64_sys_close (43 samples, 0.71%)</title><rect x="322.3" y="338" width="9.2" height="15" fill="rgb(236,146,79)" rx="1"/>
+</g>
+<g><title>__fput_sync (41 samples, 0.67%)</title><rect x="322.3" y="322" width="8.8" height="15" fill="rgb(215,173,78)" rx="1"/>
+</g>
+<g><title>__fput (37 samples, 0.61%)</title><rect x="322.3" y="306" width="7.9" height="15" fill="rgb(207,80,67)" rx="1"/>
+</g>
+<g><title>dput (21 samples, 0.34%)</title><rect x="323.0" y="290" width="4.3" height="15" fill="rgb(231,192,79)" rx="1"/>
+</g>
+<g><title>__dentry_kill (18 samples, 0.30%)</title><rect x="323.0" y="274" width="3.6" height="15" fill="rgb(232,184,74)" rx="1"/>
+</g>
+<g><title>alloc::fmt::format::format_inner (17 samples, 0.28%)</title><rect x="336.8" y="450" width="3.4" height="15" fill="rgb(243,186,56)" rx="1"/>
+</g>
+<g><title>core::fmt::write (17 samples, 0.28%)</title><rect x="336.8" y="434" width="3.4" height="15" fill="rgb(210,107,49)" rx="1"/>
+</g>
+<g><title>&lt;alloc::string::String as core::fmt::Write&gt;::write_str (13 samples, 0.21%)</title><rect x="336.8" y="418" width="2.4" height="15" fill="rgb(253,112,59)" rx="1"/>
+</g>
+<g><title>reliaburger::onion::ebpf::loader::ownership::kernel::link_info (93 samples, 1.53%)</title><rect x="341.4" y="450" width="20.6" height="15" fill="rgb(219,94,70)" rx="1"/>
+<text x="343.4" y="462">r..</text>
+</g>
+<g><title>syscall (91 samples, 1.49%)</title><rect x="341.6" y="434" width="20.1" height="15" fill="rgb(217,175,75)" rx="1"/>
+<text x="343.6" y="446">s..</text>
+</g>
+<g><title>el0t_64_sync (77 samples, 1.26%)</title><rect x="341.6" y="418" width="16.9" height="15" fill="rgb(235,98,63)" rx="1"/>
+</g>
+<g><title>el0t_64_sync_handler (77 samples, 1.26%)</title><rect x="341.6" y="402" width="16.9" height="15" fill="rgb(220,85,42)" rx="1"/>
+</g>
+<g><title>el0_svc (75 samples, 1.23%)</title><rect x="342.0" y="386" width="16.5" height="15" fill="rgb(215,151,76)" rx="1"/>
+</g>
+<g><title>do_el0_svc (46 samples, 0.75%)</title><rect x="342.0" y="370" width="9.9" height="15" fill="rgb(218,174,40)" rx="1"/>
+</g>
+<g><title>el0_svc_common.constprop.0 (46 samples, 0.75%)</title><rect x="342.0" y="354" width="9.9" height="15" fill="rgb(230,117,62)" rx="1"/>
+</g>
+<g><title>invoke_syscall (41 samples, 0.67%)</title><rect x="342.9" y="338" width="8.8" height="15" fill="rgb(247,138,71)" rx="1"/>
+</g>
+<g><title>__arm64_sys_bpf (33 samples, 0.54%)</title><rect x="342.9" y="322" width="7.0" height="15" fill="rgb(235,134,55)" rx="1"/>
+</g>
+<g><title>__sys_bpf (29 samples, 0.48%)</title><rect x="342.9" y="306" width="6.1" height="15" fill="rgb(243,86,42)" rx="1"/>
+</g>
+<g><title>bpf_obj_get_info_by_fd (20 samples, 0.33%)</title><rect x="344.1" y="290" width="4.0" height="15" fill="rgb(236,111,66)" rx="1"/>
+</g>
+<g><title>reliaburger::onion::ebpf::loader::ownership::kernel::open_link (220 samples, 3.61%)</title><rect x="362.4" y="450" width="49.3" height="15" fill="rgb(253,148,61)" rx="1"/>
+<text x="364.4" y="462">relia..</text>
+</g>
+<g><title>syscall (211 samples, 3.46%)</title><rect x="364.2" y="434" width="47.3" height="15" fill="rgb(217,175,75)" rx="1"/>
+<text x="366.2" y="446">syscall</text>
+</g>
+<g><title>el0t_64_sync (204 samples, 3.35%)</title><rect x="364.2" y="418" width="45.7" height="15" fill="rgb(235,98,63)" rx="1"/>
+<text x="366.2" y="430">el0t_..</text>
+</g>
+<g><title>el0t_64_sync_handler (204 samples, 3.35%)</title><rect x="364.2" y="402" width="45.7" height="15" fill="rgb(220,85,42)" rx="1"/>
+<text x="366.2" y="414">el0t_..</text>
+</g>
+<g><title>el0_svc (204 samples, 3.35%)</title><rect x="364.2" y="386" width="45.7" height="15" fill="rgb(215,151,76)" rx="1"/>
+<text x="366.2" y="398">el0_svc</text>
+</g>
+<g><title>do_el0_svc (189 samples, 3.10%)</title><rect x="364.2" y="370" width="42.3" height="15" fill="rgb(218,174,40)" rx="1"/>
+<text x="366.2" y="382">do_e..</text>
+</g>
+<g><title>el0_svc_common.constprop.0 (189 samples, 3.10%)</title><rect x="364.2" y="354" width="42.3" height="15" fill="rgb(230,117,62)" rx="1"/>
+<text x="366.2" y="366">el0_..</text>
+</g>
+<g><title>invoke_syscall (180 samples, 2.95%)</title><rect x="364.2" y="338" width="40.3" height="15" fill="rgb(247,138,71)" rx="1"/>
+<text x="366.2" y="350">invo..</text>
+</g>
+<g><title>__arm64_sys_bpf (175 samples, 2.87%)</title><rect x="364.2" y="322" width="39.1" height="15" fill="rgb(235,134,55)" rx="1"/>
+<text x="366.2" y="334">__ar..</text>
+</g>
+<g><title>__sys_bpf (168 samples, 2.76%)</title><rect x="364.2" y="306" width="37.6" height="15" fill="rgb(243,86,42)" rx="1"/>
+<text x="366.2" y="318">__s..</text>
+</g>
+<g><title>bpf_obj_get_user (163 samples, 2.68%)</title><rect x="364.7" y="290" width="36.4" height="15" fill="rgb(215,170,53)" rx="1"/>
+<text x="366.7" y="302">bpf..</text>
+</g>
+<g><title>bpf_link_new_fd (51 samples, 0.84%)</title><rect x="364.9" y="274" width="11.1" height="15" fill="rgb(236,155,62)" rx="1"/>
+</g>
+<g><title>anon_inode_getfd (50 samples, 0.82%)</title><rect x="365.1" y="258" width="10.8" height="15" fill="rgb(236,123,50)" rx="1"/>
+</g>
+<g><title>__anon_inode_getfile (43 samples, 0.71%)</title><rect x="365.1" y="242" width="9.2" height="15" fill="rgb(247,188,79)" rx="1"/>
+</g>
+<g><title>alloc_file_pseudo (42 samples, 0.69%)</title><rect x="365.1" y="226" width="9.0" height="15" fill="rgb(211,172,73)" rx="1"/>
+</g>
+<g><title>alloc_file (16 samples, 0.26%)</title><rect x="365.1" y="210" width="3.1" height="15" fill="rgb(239,137,48)" rx="1"/>
+</g>
+<g><title>alloc_empty_file (16 samples, 0.26%)</title><rect x="365.1" y="194" width="3.1" height="15" fill="rgb(238,172,68)" rx="1"/>
+</g>
+<g><title>d_alloc_pseudo (21 samples, 0.34%)</title><rect x="368.8" y="210" width="4.3" height="15" fill="rgb(229,89,75)" rx="1"/>
+</g>
+<g><title>__d_alloc (20 samples, 0.33%)</title><rect x="368.8" y="194" width="4.0" height="15" fill="rgb(230,195,42)" rx="1"/>
+</g>
+<g><title>kmem_cache_alloc_lru (19 samples, 0.31%)</title><rect x="368.8" y="178" width="3.8" height="15" fill="rgb(226,86,47)" rx="1"/>
+</g>
+<g><title>user_path_at_empty (106 samples, 1.74%)</title><rect x="377.4" y="274" width="23.5" height="15" fill="rgb(208,88,40)" rx="1"/>
+<text x="379.4" y="286">u..</text>
+</g>
+<g><title>filename_lookup (90 samples, 1.48%)</title><rect x="377.4" y="258" width="19.9" height="15" fill="rgb(243,112,49)" rx="1"/>
+<text x="379.4" y="270">f..</text>
+</g>
+<g><title>path_lookupat (87 samples, 1.43%)</title><rect x="377.6" y="242" width="19.2" height="15" fill="rgb(246,106,44)" rx="1"/>
+</g>
+<g><title>link_path_walk.part.0.constprop.0 (67 samples, 1.10%)</title><rect x="378.7" y="226" width="14.7" height="15" fill="rgb(219,167,57)" rx="1"/>
+</g>
+<g><title>inode_permission (15 samples, 0.25%)</title><rect x="379.0" y="210" width="2.9" height="15" fill="rgb(210,154,54)" rx="1"/>
+</g>
+<g><title>walk_component (31 samples, 0.51%)</title><rect x="384.4" y="210" width="6.5" height="15" fill="rgb(239,189,59)" rx="1"/>
+</g>
+<g><title>step_into (18 samples, 0.30%)</title><rect x="387.1" y="194" width="3.6" height="15" fill="rgb(238,133,60)" rx="1"/>
+</g>
+<g><title>reliaburger::sesame::firewall::maps::read_firewall_state (231 samples, 3.79%)</title><rect x="415.2" y="466" width="51.8" height="15" fill="rgb(218,117,44)" rx="1"/>
+<text x="417.2" y="478">relia..</text>
+</g>
+<g><title>aya::sys::bpf::unit_sys_bpf (92 samples, 1.51%)</title><rect x="417.0" y="450" width="20.3" height="15" fill="rgb(209,166,52)" rx="1"/>
+<text x="419.0" y="462">a..</text>
+</g>
+<g><title>aya::sys::syscall (86 samples, 1.41%)</title><rect x="417.9" y="434" width="19.0" height="15" fill="rgb(219,176,43)" rx="1"/>
+</g>
+<g><title>syscall (85 samples, 1.40%)</title><rect x="418.1" y="418" width="18.8" height="15" fill="rgb(217,175,75)" rx="1"/>
+</g>
+<g><title>el0t_64_sync (79 samples, 1.30%)</title><rect x="418.1" y="402" width="17.4" height="15" fill="rgb(235,98,63)" rx="1"/>
+</g>
+<g><title>el0t_64_sync_handler (79 samples, 1.30%)</title><rect x="418.1" y="386" width="17.4" height="15" fill="rgb(220,85,42)" rx="1"/>
+</g>
+<g><title>el0_svc (79 samples, 1.30%)</title><rect x="418.1" y="370" width="17.4" height="15" fill="rgb(215,151,76)" rx="1"/>
+</g>
+<g><title>do_el0_svc (62 samples, 1.02%)</title><rect x="418.1" y="354" width="13.5" height="15" fill="rgb(218,174,40)" rx="1"/>
+</g>
+<g><title>el0_svc_common.constprop.0 (62 samples, 1.02%)</title><rect x="418.1" y="338" width="13.5" height="15" fill="rgb(230,117,62)" rx="1"/>
+</g>
+<g><title>invoke_syscall (59 samples, 0.97%)</title><rect x="418.4" y="322" width="12.9" height="15" fill="rgb(247,138,71)" rx="1"/>
+</g>
+<g><title>__arm64_sys_bpf (54 samples, 0.89%)</title><rect x="418.4" y="306" width="11.7" height="15" fill="rgb(235,134,55)" rx="1"/>
+</g>
+<g><title>__sys_bpf (48 samples, 0.79%)</title><rect x="418.6" y="290" width="10.4" height="15" fill="rgb(243,86,42)" rx="1"/>
+</g>
+<g><title>map_lookup_elem (33 samples, 0.54%)</title><rect x="421.1" y="274" width="7.0" height="15" fill="rgb(244,153,47)" rx="1"/>
+</g>
+<g><title>reliaburger::sesame::firewall::maps::read_cgroup_source_entry (58 samples, 0.95%)</title><rect x="438.1" y="450" width="12.6" height="15" fill="rgb(235,158,42)" rx="1"/>
+</g>
+<g><title>aya::sys::bpf::unit_sys_bpf (56 samples, 0.92%)</title><rect x="438.3" y="434" width="12.2" height="15" fill="rgb(209,166,52)" rx="1"/>
+</g>
+<g><title>aya::sys::syscall (52 samples, 0.85%)</title><rect x="439.0" y="418" width="11.3" height="15" fill="rgb(219,176,43)" rx="1"/>
+</g>
+<g><title>syscall (50 samples, 0.82%)</title><rect x="439.4" y="402" width="10.8" height="15" fill="rgb(217,175,75)" rx="1"/>
+</g>
+<g><title>el0t_64_sync (50 samples, 0.82%)</title><rect x="439.4" y="386" width="10.8" height="15" fill="rgb(235,98,63)" rx="1"/>
+</g>
+<g><title>el0t_64_sync_handler (50 samples, 0.82%)</title><rect x="439.4" y="370" width="10.8" height="15" fill="rgb(220,85,42)" rx="1"/>
+</g>
+<g><title>el0_svc (50 samples, 0.82%)</title><rect x="439.4" y="354" width="10.8" height="15" fill="rgb(215,151,76)" rx="1"/>
+</g>
+<g><title>do_el0_svc (37 samples, 0.61%)</title><rect x="439.4" y="338" width="7.9" height="15" fill="rgb(218,174,40)" rx="1"/>
+</g>
+<g><title>el0_svc_common.constprop.0 (37 samples, 0.61%)</title><rect x="439.4" y="322" width="7.9" height="15" fill="rgb(230,117,62)" rx="1"/>
+</g>
+<g><title>invoke_syscall (37 samples, 0.61%)</title><rect x="439.4" y="306" width="7.9" height="15" fill="rgb(247,138,71)" rx="1"/>
+</g>
+<g><title>__arm64_sys_bpf (35 samples, 0.57%)</title><rect x="439.4" y="290" width="7.4" height="15" fill="rgb(235,134,55)" rx="1"/>
+</g>
+<g><title>__sys_bpf (29 samples, 0.48%)</title><rect x="439.4" y="274" width="6.1" height="15" fill="rgb(243,86,42)" rx="1"/>
+</g>
+<g><title>map_lookup_elem (23 samples, 0.38%)</title><rect x="440.1" y="258" width="4.7" height="15" fill="rgb(244,153,47)" rx="1"/>
+</g>
+<g><title>reliaburger::sesame::firewall::maps::read_firewall_action (69 samples, 1.13%)</title><rect x="451.2" y="450" width="15.1" height="15" fill="rgb(237,100,63)" rx="1"/>
+</g>
+<g><title>aya::sys::bpf::unit_sys_bpf (62 samples, 1.02%)</title><rect x="451.9" y="434" width="13.5" height="15" fill="rgb(209,166,52)" rx="1"/>
+</g>
+<g><title>aya::sys::syscall (61 samples, 1.00%)</title><rect x="452.1" y="418" width="13.3" height="15" fill="rgb(219,176,43)" rx="1"/>
+</g>
+<g><title>syscall (49 samples, 0.80%)</title><rect x="454.8" y="402" width="10.6" height="15" fill="rgb(217,175,75)" rx="1"/>
+</g>
+<g><title>el0t_64_sync (40 samples, 0.66%)</title><rect x="454.8" y="386" width="8.6" height="15" fill="rgb(235,98,63)" rx="1"/>
+</g>
+<g><title>el0t_64_sync_handler (40 samples, 0.66%)</title><rect x="454.8" y="370" width="8.6" height="15" fill="rgb(220,85,42)" rx="1"/>
+</g>
+<g><title>el0_svc (39 samples, 0.64%)</title><rect x="455.1" y="354" width="8.3" height="15" fill="rgb(215,151,76)" rx="1"/>
+</g>
+<g><title>do_el0_svc (25 samples, 0.41%)</title><rect x="455.1" y="338" width="5.2" height="15" fill="rgb(218,174,40)" rx="1"/>
+</g>
+<g><title>el0_svc_common.constprop.0 (25 samples, 0.41%)</title><rect x="455.1" y="322" width="5.2" height="15" fill="rgb(230,117,62)" rx="1"/>
+</g>
+<g><title>invoke_syscall (23 samples, 0.38%)</title><rect x="455.5" y="306" width="4.7" height="15" fill="rgb(247,138,71)" rx="1"/>
+</g>
+<g><title>__arm64_sys_bpf (19 samples, 0.31%)</title><rect x="455.5" y="290" width="3.8" height="15" fill="rgb(235,134,55)" rx="1"/>
+</g>
+<g><title>__sys_bpf (15 samples, 0.25%)</title><rect x="455.5" y="274" width="2.9" height="15" fill="rgb(243,86,42)" rx="1"/>
+</g>
+<g><title>&lt;std::path::Path&gt;::_join (43 samples, 0.71%)</title><rect x="467.5" y="482" width="9.2" height="15" fill="rgb(219,156,44)" rx="1"/>
+</g>
+<g><title>&lt;alloc::raw_vec::RawVecInner&lt;_&gt;&gt;::reserve::do_reserve_and_handle&lt;alloc::alloc::Global&gt; (35 samples, 0.57%)</title><rect x="467.5" y="466" width="7.4" height="15" fill="rgb(222,140,71)" rx="1"/>
+</g>
+<g><title>&lt;alloc::raw_vec::RawVecInner&gt;::finish_grow (31 samples, 0.51%)</title><rect x="468.0" y="450" width="6.5" height="15" fill="rgb(217,142,46)" rx="1"/>
+</g>
+<g><title>realloc (30 samples, 0.49%)</title><rect x="468.0" y="434" width="6.3" height="15" fill="rgb(246,113,67)" rx="1"/>
+</g>
+<g><title>[libc.so.6] (20 samples, 0.33%)</title><rect x="468.0" y="418" width="4.0" height="15" fill="rgb(230,86,47)" rx="1"/>
+</g>
+<g><title>[libc.so.6] (13 samples, 0.21%)</title><rect x="468.0" y="402" width="2.4" height="15" fill="rgb(230,86,47)" rx="1"/>
+</g>
+<g><title>&lt;std::sys::pal::unix::time::Timespec&gt;::now (42 samples, 0.69%)</title><rect x="477.7" y="482" width="9.0" height="15" fill="rgb(242,186,69)" rx="1"/>
+</g>
+<g><title>clock_gettime (37 samples, 0.61%)</title><rect x="477.9" y="466" width="7.9" height="15" fill="rgb(250,109,71)" rx="1"/>
+</g>
+<g><title>__kernel_clock_gettime (32 samples, 0.53%)</title><rect x="477.9" y="450" width="6.7" height="15" fill="rgb(212,96,46)" rx="1"/>
+</g>
+<g><title>[[vdso]] (32 samples, 0.53%)</title><rect x="477.9" y="434" width="6.7" height="15" fill="rgb(251,141,63)" rx="1"/>
+</g>
+<g><title>&lt;tokio::io::util::write_all::WriteAll&lt;tokio::net::unix::stream::UnixStream&gt; as core::future::future::Future&gt;::poll (265 samples, 4.35%)</title><rect x="487.7" y="482" width="59.5" height="15" fill="rgb(254,100,78)" rx="1"/>
+<text x="489.7" y="494">&lt;tokio:..</text>
+</g>
+<g><title>&lt;tokio::net::unix::stream::UnixStream&gt;::poll_write_priv (258 samples, 4.23%)</title><rect x="489.0" y="466" width="57.9" height="15" fill="rgb(251,199,67)" rx="1"/>
+<text x="491.0" y="478">&lt;tokio..</text>
+</g>
+<g><title>&lt;&amp;mio::net::uds::stream::UnixStream as std::io::Write&gt;::write (256 samples, 4.20%)</title><rect x="489.0" y="450" width="57.5" height="15" fill="rgb(246,135,78)" rx="1"/>
+<text x="491.0" y="462">&lt;&amp;mio:..</text>
+</g>
+<g><title>&lt;&amp;std::os::unix::net::stream::UnixStream as std::io::Write&gt;::write (255 samples, 4.19%)</title><rect x="489.0" y="434" width="57.3" height="15" fill="rgb(224,94,68)" rx="1"/>
+<text x="491.0" y="446">&lt;&amp;std:..</text>
+</g>
+<g><title>__send (255 samples, 4.19%)</title><rect x="489.0" y="418" width="57.3" height="15" fill="rgb(225,100,46)" rx="1"/>
+<text x="491.0" y="430">__send</text>
+</g>
+<g><title>el0t_64_sync (244 samples, 4.00%)</title><rect x="489.3" y="402" width="54.8" height="15" fill="rgb(235,98,63)" rx="1"/>
+<text x="491.3" y="414">el0t_6..</text>
+</g>
+<g><title>el0t_64_sync_handler (244 samples, 4.00%)</title><rect x="489.3" y="386" width="54.8" height="15" fill="rgb(220,85,42)" rx="1"/>
+<text x="491.3" y="398">el0t_6..</text>
+</g>
+<g><title>el0_svc (244 samples, 4.00%)</title><rect x="489.3" y="370" width="54.8" height="15" fill="rgb(215,151,76)" rx="1"/>
+<text x="491.3" y="382">el0_svc</text>
+</g>
+<g><title>do_el0_svc (233 samples, 3.82%)</title><rect x="489.3" y="354" width="52.3" height="15" fill="rgb(218,174,40)" rx="1"/>
+<text x="491.3" y="366">do_el..</text>
+</g>
+<g><title>el0_svc_common.constprop.0 (231 samples, 3.79%)</title><rect x="489.3" y="338" width="51.8" height="15" fill="rgb(230,117,62)" rx="1"/>
+<text x="491.3" y="350">el0_s..</text>
+</g>
+<g><title>invoke_syscall (227 samples, 3.73%)</title><rect x="489.5" y="322" width="50.9" height="15" fill="rgb(247,138,71)" rx="1"/>
+<text x="491.5" y="334">invok..</text>
+</g>
+<g><title>__arm64_sys_sendto (221 samples, 3.63%)</title><rect x="489.5" y="306" width="49.6" height="15" fill="rgb(205,186,46)" rx="1"/>
+<text x="491.5" y="318">__arm..</text>
+</g>
+<g><title>__sys_sendto (220 samples, 3.61%)</title><rect x="489.5" y="290" width="49.3" height="15" fill="rgb(226,198,42)" rx="1"/>
+<text x="491.5" y="302">__sys..</text>
+</g>
+<g><title>__sock_sendmsg (214 samples, 3.51%)</title><rect x="489.5" y="274" width="48.0" height="15" fill="rgb(221,198,79)" rx="1"/>
+<text x="491.5" y="286">__soc..</text>
+</g>
+<g><title>unix_stream_sendmsg (209 samples, 3.43%)</title><rect x="490.4" y="258" width="46.8" height="15" fill="rgb(251,196,49)" rx="1"/>
+<text x="492.4" y="270">unix_..</text>
+</g>
+<g><title>sock_alloc_send_pskb (27 samples, 0.44%)</title><rect x="494.0" y="242" width="5.6" height="15" fill="rgb(225,119,42)" rx="1"/>
+</g>
+<g><title>alloc_skb_with_frags (26 samples, 0.43%)</title><rect x="494.2" y="226" width="5.4" height="15" fill="rgb(234,129,73)" rx="1"/>
+</g>
+<g><title>__alloc_skb (23 samples, 0.38%)</title><rect x="494.2" y="210" width="4.7" height="15" fill="rgb(211,107,56)" rx="1"/>
+</g>
+<g><title>sock_def_readable (162 samples, 2.66%)</title><rect x="500.1" y="242" width="36.2" height="15" fill="rgb(250,111,46)" rx="1"/>
+<text x="502.1" y="254">soc..</text>
+</g>
+<g><title>__wake_up_sync_key (151 samples, 2.48%)</title><rect x="500.1" y="226" width="33.7" height="15" fill="rgb(250,110,69)" rx="1"/>
+<text x="502.1" y="238">__w..</text>
+</g>
+<g><title>&lt;tokio_util::sync::cancellation_token::WaitForCancellationFuture as core::future::future::Future&gt;::poll (21 samples, 0.34%)</title><rect x="554.0" y="482" width="4.3" height="15" fill="rgb(229,124,55)" rx="1"/>
+</g>
+<g><title>[libc.so.6] (22 samples, 0.36%)</title><rect x="558.8" y="482" width="4.5" height="15" fill="rgb(230,86,47)" rx="1"/>
+</g>
+<g><title>cfree (19 samples, 0.31%)</title><rect x="564.0" y="482" width="3.8" height="15" fill="rgb(207,133,68)" rx="1"/>
+</g>
+<g><title>core::ptr::drop_glue&lt;reliaburger::config::job::JobSpec&gt; (55 samples, 0.90%)</title><rect x="573.7" y="482" width="12.0" height="15" fill="rgb(222,95,73)" rx="1"/>
+</g>
+<g><title>cfree (14 samples, 0.23%)</title><rect x="574.0" y="466" width="2.7" height="15" fill="rgb(207,133,68)" rx="1"/>
+</g>
+<g><title>core::ptr::drop_glue&lt;alloc::collections::btree::map::IntoIter&lt;alloc::string::String, reliaburger::config::types::EnvValue&gt;&gt; (40 samples, 0.66%)</title><rect x="577.1" y="466" width="8.6" height="15" fill="rgb(213,104,54)" rx="1"/>
+</g>
+<g><title>cfree (31 samples, 0.51%)</title><rect x="578.3" y="450" width="6.5" height="15" fill="rgb(207,133,68)" rx="1"/>
+</g>
+<g><title>[libc.so.6] (20 samples, 0.33%)</title><rect x="578.3" y="434" width="4.0" height="15" fill="rgb(230,86,47)" rx="1"/>
+</g>
+<g><title>core::ptr::drop_glue&lt;reliaburger::grill::oci::OciProcess&gt; (40 samples, 0.66%)</title><rect x="586.2" y="482" width="8.6" height="15" fill="rgb(246,141,56)" rx="1"/>
+</g>
+<g><title>cfree (35 samples, 0.57%)</title><rect x="586.2" y="466" width="7.4" height="15" fill="rgb(207,133,68)" rx="1"/>
+</g>
+<g><title>[libc.so.6] (23 samples, 0.38%)</title><rect x="586.2" y="450" width="4.7" height="15" fill="rgb(230,86,47)" rx="1"/>
+</g>
+<g><title>getegid (21 samples, 0.34%)</title><rect x="595.2" y="482" width="4.3" height="15" fill="rgb(213,100,58)" rx="1"/>
+</g>
+<g><title>el0t_64_sync (14 samples, 0.23%)</title><rect x="595.5" y="466" width="2.7" height="15" fill="rgb(235,98,63)" rx="1"/>
+</g>
+<g><title>el0t_64_sync_handler (14 samples, 0.23%)</title><rect x="595.5" y="450" width="2.7" height="15" fill="rgb(220,85,42)" rx="1"/>
+</g>
+<g><title>el0_svc (14 samples, 0.23%)</title><rect x="595.5" y="434" width="2.7" height="15" fill="rgb(215,151,76)" rx="1"/>
+</g>
+<g><title>geteuid (40 samples, 0.66%)</title><rect x="600.0" y="482" width="8.6" height="15" fill="rgb(207,101,53)" rx="1"/>
+</g>
+<g><title>el0t_64_sync (31 samples, 0.51%)</title><rect x="600.0" y="466" width="6.5" height="15" fill="rgb(235,98,63)" rx="1"/>
+</g>
+<g><title>el0t_64_sync_handler (31 samples, 0.51%)</title><rect x="600.0" y="450" width="6.5" height="15" fill="rgb(220,85,42)" rx="1"/>
+</g>
+<g><title>el0_svc (30 samples, 0.49%)</title><rect x="600.2" y="434" width="6.3" height="15" fill="rgb(215,151,76)" rx="1"/>
+</g>
+<g><title>reliaburger::bun::reusable_executor::pool::wait_empty_task::{closure} (736 samples, 12.08%)</title><rect x="610.2" y="482" width="166.2" height="15" fill="rgb(214,158,64)" rx="1"/>
+<text x="612.2" y="494">reliaburger::bun::reusa..</text>
+</g>
+<g><title>std::fs::read_to_string::inner (706 samples, 11.59%)</title><rect x="617.0" y="466" width="159.4" height="15" fill="rgb(251,129,58)" rx="1"/>
+<text x="619.0" y="478">std::fs::read_to_strin..</text>
+</g>
+<g><title>&lt;std::sys::fs::unix::File&gt;::open_c (375 samples, 6.15%)</title><rect x="618.1" y="450" width="84.4" height="15" fill="rgb(205,110,64)" rx="1"/>
+<text x="620.1" y="462">&lt;std::sys:..</text>
+</g>
+<g><title>open64 (371 samples, 6.09%)</title><rect x="619.0" y="434" width="83.5" height="15" fill="rgb(231,83,40)" rx="1"/>
+<text x="621.0" y="446">open64</text>
+</g>
+<g><title>el0t_64_sync (363 samples, 5.96%)</title><rect x="619.3" y="418" width="81.7" height="15" fill="rgb(235,98,63)" rx="1"/>
+<text x="621.3" y="430">el0t_64_sync</text>
+</g>
+<g><title>el0t_64_sync_handler (363 samples, 5.96%)</title><rect x="619.3" y="402" width="81.7" height="15" fill="rgb(220,85,42)" rx="1"/>
+<text x="621.3" y="414">el0t_64_sy..</text>
+</g>
+<g><title>el0_svc (363 samples, 5.96%)</title><rect x="619.3" y="386" width="81.7" height="15" fill="rgb(215,151,76)" rx="1"/>
+<text x="621.3" y="398">el0_svc</text>
+</g>
+<g><title>do_el0_svc (350 samples, 5.74%)</title><rect x="619.3" y="370" width="78.8" height="15" fill="rgb(218,174,40)" rx="1"/>
+<text x="621.3" y="382">do_el0_svc</text>
+</g>
+<g><title>el0_svc_common.constprop.0 (349 samples, 5.73%)</title><rect x="619.3" y="354" width="78.5" height="15" fill="rgb(230,117,62)" rx="1"/>
+<text x="621.3" y="366">el0_svc_c..</text>
+</g>
+<g><title>invoke_syscall (348 samples, 5.71%)</title><rect x="619.5" y="338" width="78.3" height="15" fill="rgb(247,138,71)" rx="1"/>
+<text x="621.5" y="350">invoke_sy..</text>
+</g>
+<g><title>__arm64_sys_openat (345 samples, 5.66%)</title><rect x="619.5" y="322" width="77.6" height="15" fill="rgb(208,105,41)" rx="1"/>
+<text x="621.5" y="334">__arm64_s..</text>
+</g>
+<g><title>do_sys_openat2 (342 samples, 5.61%)</title><rect x="619.9" y="306" width="77.0" height="15" fill="rgb(211,169,50)" rx="1"/>
+<text x="621.9" y="318">do_sys_op..</text>
+</g>
+<g><title>do_filp_open (309 samples, 5.07%)</title><rect x="620.4" y="290" width="69.5" height="15" fill="rgb(212,182,66)" rx="1"/>
+<text x="622.4" y="302">do_filp_..</text>
+</g>
+<g><title>path_openat (309 samples, 5.07%)</title><rect x="620.4" y="274" width="69.5" height="15" fill="rgb(235,180,71)" rx="1"/>
+<text x="622.4" y="286">path_ope..</text>
+</g>
+<g><title>alloc_empty_file (54 samples, 0.89%)</title><rect x="620.4" y="258" width="11.7" height="15" fill="rgb(238,172,68)" rx="1"/>
+</g>
+<g><title>kmem_cache_alloc (43 samples, 0.71%)</title><rect x="621.7" y="242" width="9.2" height="15" fill="rgb(228,174,63)" rx="1"/>
+</g>
+<g><title>obj_cgroup_charge (37 samples, 0.61%)</title><rect x="622.9" y="226" width="7.9" height="15" fill="rgb(220,168,78)" rx="1"/>
+</g>
+<g><title>refill_obj_stock (21 samples, 0.34%)</title><rect x="623.3" y="210" width="4.3" height="15" fill="rgb(217,177,43)" rx="1"/>
+</g>
+<g><title>do_open (64 samples, 1.05%)</title><rect x="632.8" y="258" width="14.0" height="15" fill="rgb(254,194,54)" rx="1"/>
+</g>
+<g><title>may_open (18 samples, 0.30%)</title><rect x="633.5" y="242" width="3.6" height="15" fill="rgb(206,167,77)" rx="1"/>
+</g>
+<g><title>inode_permission (18 samples, 0.30%)</title><rect x="633.5" y="226" width="3.6" height="15" fill="rgb(210,154,54)" rx="1"/>
+</g>
+<g><title>kernfs_iop_permission (17 samples, 0.28%)</title><rect x="633.8" y="210" width="3.4" height="15" fill="rgb(216,90,70)" rx="1"/>
+</g>
+<g><title>vfs_open (36 samples, 0.59%)</title><rect x="638.1" y="242" width="7.7" height="15" fill="rgb(227,110,69)" rx="1"/>
+</g>
+<g><title>do_dentry_open (30 samples, 0.49%)</title><rect x="638.1" y="226" width="6.3" height="15" fill="rgb(239,121,77)" rx="1"/>
+</g>
+<g><title>kernfs_fop_open (17 samples, 0.28%)</title><rect x="639.4" y="210" width="3.4" height="15" fill="rgb(212,199,47)" rx="1"/>
+</g>
+<g><title>link_path_walk.part.0.constprop.0 (174 samples, 2.86%)</title><rect x="648.0" y="258" width="38.9" height="15" fill="rgb(219,167,57)" rx="1"/>
+<text x="650.0" y="270">lin..</text>
+</g>
+<g><title>inode_permission (77 samples, 1.26%)</title><rect x="648.0" y="242" width="16.9" height="15" fill="rgb(210,154,54)" rx="1"/>
+</g>
+<g><title>kernfs_iop_permission (44 samples, 0.72%)</title><rect x="649.4" y="226" width="9.5" height="15" fill="rgb(216,90,70)" rx="1"/>
+</g>
+<g><title>kernfs_refresh_inode (14 samples, 0.23%)</title><rect x="659.3" y="226" width="2.7" height="15" fill="rgb(243,99,63)" rx="1"/>
+</g>
+<g><title>walk_component (77 samples, 1.26%)</title><rect x="667.0" y="242" width="16.9" height="15" fill="rgb(239,189,59)" rx="1"/>
+</g>
+<g><title>lookup_fast (24 samples, 0.39%)</title><rect x="667.5" y="226" width="4.9" height="15" fill="rgb(220,191,76)" rx="1"/>
+</g>
+<g><title>step_into (45 samples, 0.74%)</title><rect x="672.9" y="226" width="9.7" height="15" fill="rgb(238,133,60)" rx="1"/>
+</g>
+<g><title>getname (19 samples, 0.31%)</title><rect x="691.5" y="290" width="3.8" height="15" fill="rgb(210,126,52)" rx="1"/>
+</g>
+<g><title>getname_flags.part.0 (18 samples, 0.30%)</title><rect x="691.5" y="274" width="3.6" height="15" fill="rgb(236,120,70)" rx="1"/>
+</g>
+<g><title>__close (72 samples, 1.18%)</title><rect x="703.1" y="450" width="15.8" height="15" fill="rgb(252,141,58)" rx="1"/>
+</g>
+<g><title>el0t_64_sync (66 samples, 1.08%)</title><rect x="703.5" y="434" width="14.4" height="15" fill="rgb(235,98,63)" rx="1"/>
+</g>
+<g><title>el0t_64_sync_handler (66 samples, 1.08%)</title><rect x="703.5" y="418" width="14.4" height="15" fill="rgb(220,85,42)" rx="1"/>
+</g>
+<g><title>el0_svc (64 samples, 1.05%)</title><rect x="704.0" y="402" width="14.0" height="15" fill="rgb(215,151,76)" rx="1"/>
+</g>
+<g><title>do_el0_svc (55 samples, 0.90%)</title><rect x="704.0" y="386" width="12.0" height="15" fill="rgb(218,174,40)" rx="1"/>
+</g>
+<g><title>el0_svc_common.constprop.0 (55 samples, 0.90%)</title><rect x="704.0" y="370" width="12.0" height="15" fill="rgb(230,117,62)" rx="1"/>
+</g>
+<g><title>invoke_syscall (52 samples, 0.85%)</title><rect x="704.2" y="354" width="11.3" height="15" fill="rgb(247,138,71)" rx="1"/>
+</g>
+<g><title>__arm64_sys_close (49 samples, 0.80%)</title><rect x="704.2" y="338" width="10.6" height="15" fill="rgb(236,146,79)" rx="1"/>
+</g>
+<g><title>__fput_sync (43 samples, 0.71%)</title><rect x="704.2" y="322" width="9.2" height="15" fill="rgb(215,173,78)" rx="1"/>
+</g>
+<g><title>__fput (42 samples, 0.69%)</title><rect x="704.2" y="306" width="9.0" height="15" fill="rgb(207,80,67)" rx="1"/>
+</g>
+<g><title>kernfs_fop_release (31 samples, 0.51%)</title><rect x="704.4" y="290" width="6.5" height="15" fill="rgb(236,86,72)" rx="1"/>
+</g>
+<g><title>kernfs_unlink_open_file (13 samples, 0.21%)</title><rect x="704.6" y="274" width="2.4" height="15" fill="rgb(218,131,55)" rx="1"/>
+</g>
+<g><title>seq_release (15 samples, 0.25%)</title><rect x="707.8" y="274" width="2.9" height="15" fill="rgb(246,131,40)" rx="1"/>
+</g>
+<g><title>kvfree (13 samples, 0.21%)</title><rect x="708.0" y="258" width="2.4" height="15" fill="rgb(244,128,45)" rx="1"/>
+</g>
+<g><title>std::io::default_read_to_end&lt;std::fs::File&gt; (149 samples, 2.45%)</title><rect x="722.3" y="450" width="33.2" height="15" fill="rgb(226,138,68)" rx="1"/>
+<text x="724.3" y="462">std..</text>
+</g>
+<g><title>read (31 samples, 0.51%)</title><rect x="724.8" y="434" width="6.5" height="15" fill="rgb(248,166,65)" rx="1"/>
+</g>
+<g><title>el0t_64_sync (27 samples, 0.44%)</title><rect x="724.8" y="418" width="5.6" height="15" fill="rgb(235,98,63)" rx="1"/>
+</g>
+<g><title>el0t_64_sync_handler (27 samples, 0.44%)</title><rect x="724.8" y="402" width="5.6" height="15" fill="rgb(220,85,42)" rx="1"/>
+</g>
+<g><title>el0_svc (26 samples, 0.43%)</title><rect x="725.0" y="386" width="5.4" height="15" fill="rgb(215,151,76)" rx="1"/>
+</g>
+<g><title>do_el0_svc (17 samples, 0.28%)</title><rect x="725.0" y="370" width="3.4" height="15" fill="rgb(218,174,40)" rx="1"/>
+</g>
+<g><title>el0_svc_common.constprop.0 (17 samples, 0.28%)</title><rect x="725.0" y="354" width="3.4" height="15" fill="rgb(230,117,62)" rx="1"/>
+</g>
+<g><title>invoke_syscall (16 samples, 0.26%)</title><rect x="725.0" y="338" width="3.1" height="15" fill="rgb(247,138,71)" rx="1"/>
+</g>
+<g><title>__arm64_sys_read (13 samples, 0.21%)</title><rect x="725.0" y="322" width="2.4" height="15" fill="rgb(240,102,78)" rx="1"/>
+</g>
+<g><title>ksys_read (13 samples, 0.21%)</title><rect x="725.0" y="306" width="2.4" height="15" fill="rgb(249,157,57)" rx="1"/>
+</g>
+<g><title>std::io::default_read_to_end::small_probe_read&lt;std::fs::File&gt; (105 samples, 1.72%)</title><rect x="731.8" y="434" width="23.3" height="15" fill="rgb(224,142,51)" rx="1"/>
+<text x="733.8" y="446">s..</text>
+</g>
+<g><title>read (94 samples, 1.54%)</title><rect x="733.9" y="418" width="20.8" height="15" fill="rgb(248,166,65)" rx="1"/>
+<text x="735.9" y="430">r..</text>
+</g>
+<g><title>el0t_64_sync (88 samples, 1.44%)</title><rect x="733.9" y="402" width="19.4" height="15" fill="rgb(235,98,63)" rx="1"/>
+<text x="735.9" y="414">e..</text>
+</g>
+<g><title>el0t_64_sync_handler (88 samples, 1.44%)</title><rect x="733.9" y="386" width="19.4" height="15" fill="rgb(220,85,42)" rx="1"/>
+<text x="735.9" y="398">e..</text>
+</g>
+<g><title>el0_svc (88 samples, 1.44%)</title><rect x="733.9" y="370" width="19.4" height="15" fill="rgb(215,151,76)" rx="1"/>
+<text x="735.9" y="382">e..</text>
+</g>
+<g><title>do_el0_svc (73 samples, 1.20%)</title><rect x="733.9" y="354" width="16.0" height="15" fill="rgb(218,174,40)" rx="1"/>
+</g>
+<g><title>el0_svc_common.constprop.0 (73 samples, 1.20%)</title><rect x="733.9" y="338" width="16.0" height="15" fill="rgb(230,117,62)" rx="1"/>
+</g>
+<g><title>invoke_syscall (67 samples, 1.10%)</title><rect x="735.2" y="322" width="14.7" height="15" fill="rgb(247,138,71)" rx="1"/>
+</g>
+<g><title>__arm64_sys_read (62 samples, 1.02%)</title><rect x="735.2" y="306" width="13.5" height="15" fill="rgb(240,102,78)" rx="1"/>
+</g>
+<g><title>ksys_read (61 samples, 1.00%)</title><rect x="735.4" y="290" width="13.3" height="15" fill="rgb(249,157,57)" rx="1"/>
+</g>
+<g><title>vfs_read (57 samples, 0.94%)</title><rect x="736.1" y="274" width="12.4" height="15" fill="rgb(240,90,55)" rx="1"/>
+</g>
+<g><title>kernfs_fop_read_iter (54 samples, 0.89%)</title><rect x="736.1" y="258" width="11.7" height="15" fill="rgb(215,165,45)" rx="1"/>
+</g>
+<g><title>seq_read_iter (48 samples, 0.79%)</title><rect x="737.3" y="242" width="10.4" height="15" fill="rgb(213,173,53)" rx="1"/>
+</g>
+<g><title>kernfs_seq_show (18 samples, 0.30%)</title><rect x="738.2" y="226" width="3.6" height="15" fill="rgb(247,175,78)" rx="1"/>
+</g>
+<g><title>cgroup_seqfile_show (18 samples, 0.30%)</title><rect x="738.2" y="210" width="3.6" height="15" fill="rgb(233,95,60)" rx="1"/>
+</g>
+<g><title>cgroup_events_show (15 samples, 0.25%)</title><rect x="738.2" y="194" width="2.9" height="15" fill="rgb(223,95,73)" rx="1"/>
+</g>
+<g><title>seq_printf (13 samples, 0.21%)</title><rect x="738.2" y="178" width="2.4" height="15" fill="rgb(221,112,42)" rx="1"/>
+</g>
+<g><title>kvmalloc_node (24 samples, 0.39%)</title><rect x="742.2" y="226" width="4.9" height="15" fill="rgb(224,94,50)" rx="1"/>
+</g>
+<g><title>__kmalloc_node (20 samples, 0.33%)</title><rect x="742.2" y="210" width="4.0" height="15" fill="rgb(229,94,73)" rx="1"/>
+</g>
+<g><title>std::sys::fs::unix::try_statx (90 samples, 1.48%)</title><rect x="756.1" y="450" width="19.9" height="15" fill="rgb(238,141,76)" rx="1"/>
+<text x="758.1" y="462">s..</text>
+</g>
+<g><title>statx (86 samples, 1.41%)</title><rect x="756.1" y="434" width="19.0" height="15" fill="rgb(229,122,70)" rx="1"/>
+</g>
+<g><title>el0t_64_sync (79 samples, 1.30%)</title><rect x="756.1" y="418" width="17.4" height="15" fill="rgb(235,98,63)" rx="1"/>
+</g>
+<g><title>el0t_64_sync_handler (79 samples, 1.30%)</title><rect x="756.1" y="402" width="17.4" height="15" fill="rgb(220,85,42)" rx="1"/>
+</g>
+<g><title>el0_svc (79 samples, 1.30%)</title><rect x="756.1" y="386" width="17.4" height="15" fill="rgb(215,151,76)" rx="1"/>
+</g>
+<g><title>do_el0_svc (62 samples, 1.02%)</title><rect x="756.1" y="370" width="13.5" height="15" fill="rgb(218,174,40)" rx="1"/>
+</g>
+<g><title>el0_svc_common.constprop.0 (61 samples, 1.00%)</title><rect x="756.1" y="354" width="13.3" height="15" fill="rgb(230,117,62)" rx="1"/>
+</g>
+<g><title>invoke_syscall (59 samples, 0.97%)</title><rect x="756.5" y="338" width="12.9" height="15" fill="rgb(247,138,71)" rx="1"/>
+</g>
+<g><title>__arm64_sys_statx (57 samples, 0.94%)</title><rect x="756.5" y="322" width="12.4" height="15" fill="rgb(238,100,48)" rx="1"/>
+</g>
+<g><title>do_statx (37 samples, 0.61%)</title><rect x="756.7" y="306" width="7.9" height="15" fill="rgb(252,123,70)" rx="1"/>
+</g>
+<g><title>vfs_statx (27 samples, 0.44%)</title><rect x="759.0" y="290" width="5.6" height="15" fill="rgb(229,118,62)" rx="1"/>
+</g>
+<g><title>getname_flags (14 samples, 0.23%)</title><rect x="765.1" y="306" width="2.7" height="15" fill="rgb(219,110,59)" rx="1"/>
+</g>
+<g><title>getname_flags.part.0 (14 samples, 0.23%)</title><rect x="765.1" y="290" width="2.7" height="15" fill="rgb(236,120,70)" rx="1"/>
+</g>
+<g><title>reliaburger::bun::reusable_executor::protocol::cleanup&lt;tokio::net::unix::stream::UnixStream&gt;::{closure} (221 samples, 3.63%)</title><rect x="776.9" y="482" width="49.6" height="15" fill="rgb(248,170,75)" rx="1"/>
+<text x="778.9" y="494">relia..</text>
+</g>
+<g><title>&lt;tokio::net::unix::stream::UnixStream&gt;::poll_write_priv (216 samples, 3.55%)</title><rect x="777.1" y="466" width="48.4" height="15" fill="rgb(251,199,67)" rx="1"/>
+<text x="779.1" y="478">&lt;toki..</text>
+</g>
+<g><title>&lt;&amp;mio::net::uds::stream::UnixStream as std::io::Write&gt;::write (211 samples, 3.46%)</title><rect x="777.1" y="450" width="47.3" height="15" fill="rgb(246,135,78)" rx="1"/>
+<text x="779.1" y="462">&lt;&amp;mio..</text>
+</g>
+<g><title>&lt;&amp;std::os::unix::net::stream::UnixStream as std::io::Write&gt;::write (211 samples, 3.46%)</title><rect x="777.1" y="434" width="47.3" height="15" fill="rgb(224,94,68)" rx="1"/>
+<text x="779.1" y="446">&lt;&amp;std..</text>
+</g>
+<g><title>__send (210 samples, 3.45%)</title><rect x="777.1" y="418" width="47.1" height="15" fill="rgb(225,100,46)" rx="1"/>
+<text x="779.1" y="430">__send</text>
+</g>
+<g><title>el0t_64_sync (192 samples, 3.15%)</title><rect x="777.3" y="402" width="43.0" height="15" fill="rgb(235,98,63)" rx="1"/>
+<text x="779.3" y="414">el0t..</text>
+</g>
+<g><title>el0t_64_sync_handler (192 samples, 3.15%)</title><rect x="777.3" y="386" width="43.0" height="15" fill="rgb(220,85,42)" rx="1"/>
+<text x="779.3" y="398">el0t..</text>
+</g>
+<g><title>el0_svc (191 samples, 3.13%)</title><rect x="777.6" y="370" width="42.8" height="15" fill="rgb(215,151,76)" rx="1"/>
+<text x="779.6" y="382">el0_..</text>
+</g>
+<g><title>do_el0_svc (164 samples, 2.69%)</title><rect x="777.6" y="354" width="36.6" height="15" fill="rgb(218,174,40)" rx="1"/>
+<text x="779.6" y="366">do_..</text>
+</g>
+<g><title>el0_svc_common.constprop.0 (163 samples, 2.68%)</title><rect x="777.6" y="338" width="36.4" height="15" fill="rgb(230,117,62)" rx="1"/>
+<text x="779.6" y="350">el0..</text>
+</g>
+<g><title>invoke_syscall (156 samples, 2.56%)</title><rect x="778.5" y="322" width="34.8" height="15" fill="rgb(247,138,71)" rx="1"/>
+<text x="780.5" y="334">inv..</text>
+</g>
+<g><title>__arm64_sys_sendto (148 samples, 2.43%)</title><rect x="778.5" y="306" width="33.0" height="15" fill="rgb(205,186,46)" rx="1"/>
+<text x="780.5" y="318">__a..</text>
+</g>
+<g><title>__sys_sendto (145 samples, 2.38%)</title><rect x="778.5" y="290" width="32.3" height="15" fill="rgb(226,198,42)" rx="1"/>
+<text x="780.5" y="302">__..</text>
+</g>
+<g><title>__sock_sendmsg (134 samples, 2.20%)</title><rect x="778.7" y="274" width="29.8" height="15" fill="rgb(221,198,79)" rx="1"/>
+<text x="780.7" y="286">__..</text>
+</g>
+<g><title>unix_stream_sendmsg (130 samples, 2.13%)</title><rect x="779.2" y="258" width="28.9" height="15" fill="rgb(251,196,49)" rx="1"/>
+<text x="781.2" y="270">un..</text>
+</g>
+<g><title>sock_alloc_send_pskb (95 samples, 1.56%)</title><rect x="783.7" y="242" width="21.0" height="15" fill="rgb(225,119,42)" rx="1"/>
+<text x="785.7" y="254">s..</text>
+</g>
+<g><title>alloc_skb_with_frags (91 samples, 1.49%)</title><rect x="783.7" y="226" width="20.1" height="15" fill="rgb(234,129,73)" rx="1"/>
+<text x="785.7" y="238">a..</text>
+</g>
+<g><title>__alloc_skb (89 samples, 1.46%)</title><rect x="783.7" y="210" width="19.7" height="15" fill="rgb(211,107,56)" rx="1"/>
+<text x="785.7" y="222">_..</text>
+</g>
+<g><title>kmalloc_reserve (21 samples, 0.34%)</title><rect x="784.1" y="194" width="4.3" height="15" fill="rgb(238,88,55)" rx="1"/>
+</g>
+<g><title>__kmalloc_node_track_caller (16 samples, 0.26%)</title><rect x="784.1" y="178" width="3.1" height="15" fill="rgb(234,197,47)" rx="1"/>
+</g>
+<g><title>kmem_cache_alloc_node (62 samples, 1.02%)</title><rect x="788.9" y="194" width="13.5" height="15" fill="rgb(219,137,71)" rx="1"/>
+</g>
+<g><title>obj_cgroup_charge (52 samples, 0.85%)</title><rect x="790.7" y="178" width="11.3" height="15" fill="rgb(220,168,78)" rx="1"/>
+</g>
+<g><title>refill_obj_stock (24 samples, 0.39%)</title><rect x="791.8" y="162" width="4.9" height="15" fill="rgb(217,177,43)" rx="1"/>
+</g>
+<g><title>obj_cgroup_uncharge_pages (13 samples, 0.21%)</title><rect x="794.1" y="146" width="2.4" height="15" fill="rgb(219,157,69)" rx="1"/>
+</g>
+<g><title>try_charge_memcg (15 samples, 0.25%)</title><rect x="797.3" y="162" width="2.9" height="15" fill="rgb(207,140,68)" rx="1"/>
+</g>
+<g><title>reliaburger::bun::reusable_executor::protocol::command (52 samples, 0.85%)</title><rect x="826.9" y="482" width="11.3" height="15" fill="rgb(212,105,41)" rx="1"/>
+</g>
+<g><title>&lt;alloc::raw_vec::RawVecInner&lt;_&gt;&gt;::reserve::do_reserve_and_handle&lt;alloc::alloc::Global&gt; (14 samples, 0.23%)</title><rect x="826.9" y="466" width="2.7" height="15" fill="rgb(222,140,71)" rx="1"/>
+</g>
+<g><title>&lt;core::slice::iter::Iter&lt;alloc::string::String&gt; as core::iter::traits::iterator::Iterator&gt;::any{closure} (16 samples, 0.26%)</title><rect x="830.8" y="466" width="3.1" height="15" fill="rgb(249,199,67)" rx="1"/>
+</g>
+<g><title>reliaburger::bun::reusable_executor::protocol::receive&lt;tokio::net::unix::stream::UnixStream&gt;::{closure} (1,164 samples, 19.10%)</title><rect x="838.7" y="482" width="263.1" height="15" fill="rgb(221,133,58)" rx="1"/>
+<text x="840.7" y="494">reliaburger::bun::reusable_executor::..</text>
+</g>
+<g><title>&lt;tokio::io::util::read_int::ReadU8&lt;&amp;mut tokio::net::unix::stream::UnixStream&gt; as core::future::future::Future&gt;::poll (282 samples, 4.63%)</title><rect x="838.7" y="466" width="63.4" height="15" fill="rgb(219,174,58)" rx="1"/>
+<text x="840.7" y="478">&lt;tokio:..</text>
+</g>
+<g><title>&lt;tokio::net::unix::stream::UnixStream&gt;::poll_read_priv (276 samples, 4.53%)</title><rect x="840.1" y="450" width="62.0" height="15" fill="rgb(236,105,49)" rx="1"/>
+<text x="842.1" y="462">&lt;tokio:..</text>
+</g>
+<g><title>&lt;&amp;mio::net::uds::stream::UnixStream as std::io::Read&gt;::read (254 samples, 4.17%)</title><rect x="840.1" y="434" width="57.0" height="15" fill="rgb(249,174,58)" rx="1"/>
+<text x="842.1" y="446">&lt;&amp;mio:..</text>
+</g>
+<g><title>&lt;&amp;std::os::unix::net::stream::UnixStream as std::io::Read&gt;::read (254 samples, 4.17%)</title><rect x="840.1" y="418" width="57.0" height="15" fill="rgb(228,97,78)" rx="1"/>
+<text x="842.1" y="430">&lt;&amp;std:..</text>
+</g>
+<g><title>recv (238 samples, 3.91%)</title><rect x="842.8" y="402" width="53.4" height="15" fill="rgb(220,82,42)" rx="1"/>
+<text x="844.8" y="414">recv</text>
+</g>
+<g><title>el0t_64_sync (192 samples, 3.15%)</title><rect x="844.2" y="386" width="43.0" height="15" fill="rgb(235,98,63)" rx="1"/>
+<text x="846.2" y="398">el0t..</text>
+</g>
+<g><title>el0t_64_sync_handler (192 samples, 3.15%)</title><rect x="844.2" y="370" width="43.0" height="15" fill="rgb(220,85,42)" rx="1"/>
+<text x="846.2" y="382">el0t..</text>
+</g>
+<g><title>el0_svc (190 samples, 3.12%)</title><rect x="844.6" y="354" width="42.5" height="15" fill="rgb(215,151,76)" rx="1"/>
+<text x="846.6" y="366">el0_..</text>
+</g>
+<g><title>do_el0_svc (123 samples, 2.02%)</title><rect x="844.6" y="338" width="27.4" height="15" fill="rgb(218,174,40)" rx="1"/>
+<text x="846.6" y="350">do..</text>
+</g>
+<g><title>el0_svc_common.constprop.0 (122 samples, 2.00%)</title><rect x="844.6" y="322" width="27.1" height="15" fill="rgb(230,117,62)" rx="1"/>
+<text x="846.6" y="334">el..</text>
+</g>
+<g><title>invoke_syscall (106 samples, 1.74%)</title><rect x="847.3" y="306" width="23.5" height="15" fill="rgb(247,138,71)" rx="1"/>
+<text x="849.3" y="318">i..</text>
+</g>
+<g><title>__arm64_sys_recvfrom (93 samples, 1.53%)</title><rect x="847.3" y="290" width="20.6" height="15" fill="rgb(229,183,46)" rx="1"/>
+<text x="849.3" y="302">_..</text>
+</g>
+<g><title>__sys_recvfrom (85 samples, 1.40%)</title><rect x="847.3" y="274" width="18.8" height="15" fill="rgb(225,111,56)" rx="1"/>
+</g>
+<g><title>sock_recvmsg (62 samples, 1.02%)</title><rect x="848.2" y="258" width="13.5" height="15" fill="rgb(223,199,77)" rx="1"/>
+</g>
+<g><title>unix_stream_recvmsg (50 samples, 0.82%)</title><rect x="851.0" y="242" width="10.8" height="15" fill="rgb(238,117,49)" rx="1"/>
+</g>
+<g><title>unix_stream_read_generic (36 samples, 0.59%)</title><rect x="853.2" y="226" width="7.7" height="15" fill="rgb(225,108,41)" rx="1"/>
+</g>
+<g><title>unix_stream_read_actor (18 samples, 0.30%)</title><rect x="854.8" y="210" width="3.6" height="15" fill="rgb(215,178,61)" rx="1"/>
+</g>
+<g><title>skb_copy_datagram_iter (17 samples, 0.28%)</title><rect x="855.0" y="194" width="3.4" height="15" fill="rgb(251,117,67)" rx="1"/>
+</g>
+<g><title>__skb_datagram_iter (17 samples, 0.28%)</title><rect x="855.0" y="178" width="3.4" height="15" fill="rgb(208,198,72)" rx="1"/>
+</g>
+<g><title>sockfd_lookup_light (17 samples, 0.28%)</title><rect x="862.3" y="258" width="3.4" height="15" fill="rgb(242,191,46)" rx="1"/>
+</g>
+<g><title>__fdget (16 samples, 0.26%)</title><rect x="862.3" y="242" width="3.1" height="15" fill="rgb(220,101,73)" rx="1"/>
+</g>
+<g><title>__fget_light (16 samples, 0.26%)</title><rect x="862.3" y="226" width="3.1" height="15" fill="rgb(232,112,49)" rx="1"/>
+</g>
+<g><title>&lt;tokio::net::unix::stream::UnixStream&gt;::poll_read_priv (15 samples, 0.25%)</title><rect x="897.6" y="434" width="2.9" height="15" fill="rgb(236,105,49)" rx="1"/>
+</g>
+<g><title>&lt;tokio::net::unix::stream::UnixStream&gt;::poll_read_priv (872 samples, 14.31%)</title><rect x="902.6" y="466" width="197.0" height="15" fill="rgb(236,105,49)" rx="1"/>
+<text x="904.6" y="478">&lt;tokio::net::unix::stream::..</text>
+</g>
+<g><title>&lt;&amp;mio::net::uds::stream::UnixStream as std::io::Read&gt;::read (864 samples, 14.18%)</title><rect x="902.6" y="450" width="195.2" height="15" fill="rgb(249,174,58)" rx="1"/>
+<text x="904.6" y="462">&lt;&amp;mio::net::uds::stream::Un..</text>
+</g>
+<g><title>&lt;&amp;std::os::unix::net::stream::UnixStream as std::io::Read&gt;::read (861 samples, 14.13%)</title><rect x="902.6" y="434" width="194.5" height="15" fill="rgb(228,97,78)" rx="1"/>
+<text x="904.6" y="446">&lt;&amp;std::os::unix::net::strea..</text>
+</g>
+<g><title>recv (858 samples, 14.08%)</title><rect x="903.0" y="418" width="193.8" height="15" fill="rgb(220,82,42)" rx="1"/>
+<text x="905.0" y="430">recv</text>
+</g>
+<g><title>el0t_64_sync (832 samples, 13.66%)</title><rect x="903.5" y="402" width="187.9" height="15" fill="rgb(235,98,63)" rx="1"/>
+<text x="905.5" y="414">el0t_64_sync</text>
+</g>
+<g><title>el0t_64_sync_handler (832 samples, 13.66%)</title><rect x="903.5" y="386" width="187.9" height="15" fill="rgb(220,85,42)" rx="1"/>
+<text x="905.5" y="398">el0t_64_sync_handler</text>
+</g>
+<g><title>el0_svc (832 samples, 13.66%)</title><rect x="903.5" y="370" width="187.9" height="15" fill="rgb(215,151,76)" rx="1"/>
+<text x="905.5" y="382">el0_svc</text>
+</g>
+<g><title>do_el0_svc (788 samples, 12.93%)</title><rect x="903.5" y="354" width="178.0" height="15" fill="rgb(218,174,40)" rx="1"/>
+<text x="905.5" y="366">do_el0_svc</text>
+</g>
+<g><title>el0_svc_common.constprop.0 (779 samples, 12.79%)</title><rect x="903.5" y="338" width="175.9" height="15" fill="rgb(230,117,62)" rx="1"/>
+<text x="905.5" y="350">el0_svc_common.constprop.0</text>
+</g>
+<g><title>invoke_syscall (768 samples, 12.60%)</title><rect x="905.1" y="322" width="173.4" height="15" fill="rgb(247,138,71)" rx="1"/>
+<text x="907.1" y="334">invoke_syscall</text>
+</g>
+<g><title>__arm64_sys_recvfrom (753 samples, 12.36%)</title><rect x="905.1" y="306" width="170.0" height="15" fill="rgb(229,183,46)" rx="1"/>
+<text x="907.1" y="318">__arm64_sys_recvfrom</text>
+</g>
+<g><title>__sys_recvfrom (743 samples, 12.19%)</title><rect x="905.1" y="290" width="167.8" height="15" fill="rgb(225,111,56)" rx="1"/>
+<text x="907.1" y="302">__sys_recvfrom</text>
+</g>
+<g><title>sock_recvmsg (722 samples, 11.85%)</title><rect x="905.5" y="274" width="163.0" height="15" fill="rgb(223,199,77)" rx="1"/>
+<text x="907.5" y="286">sock_recvmsg</text>
+</g>
+<g><title>unix_stream_recvmsg (714 samples, 11.72%)</title><rect x="906.4" y="258" width="161.2" height="15" fill="rgb(238,117,49)" rx="1"/>
+<text x="908.4" y="270">unix_stream_recvmsg</text>
+</g>
+<g><title>unix_stream_read_generic (704 samples, 11.55%)</title><rect x="907.4" y="242" width="158.9" height="15" fill="rgb(225,108,41)" rx="1"/>
+<text x="909.4" y="254">unix_stream_read_generic</text>
+</g>
+<g><title>consume_skb (658 samples, 10.80%)</title><rect x="909.6" y="226" width="148.5" height="15" fill="rgb(212,179,58)" rx="1"/>
+<text x="911.6" y="238">consume_skb</text>
+</g>
+<g><title>kfree_skbmem (37 samples, 0.61%)</title><rect x="909.6" y="210" width="7.9" height="15" fill="rgb(213,121,40)" rx="1"/>
+</g>
+<g><title>kmem_cache_free (31 samples, 0.51%)</title><rect x="909.6" y="194" width="6.5" height="15" fill="rgb(229,146,61)" rx="1"/>
+</g>
+<g><title>__memcg_slab_free_hook (22 samples, 0.36%)</title><rect x="909.6" y="178" width="4.5" height="15" fill="rgb(221,177,56)" rx="1"/>
+</g>
+<g><title>obj_cgroup_uncharge (17 samples, 0.28%)</title><rect x="910.1" y="162" width="3.4" height="15" fill="rgb(216,149,41)" rx="1"/>
+</g>
+<g><title>skb_release_data (87 samples, 1.43%)</title><rect x="918.0" y="210" width="19.2" height="15" fill="rgb(211,143,51)" rx="1"/>
+</g>
+<g><title>skb_free_head (82 samples, 1.35%)</title><rect x="918.2" y="194" width="18.1" height="15" fill="rgb(207,192,62)" rx="1"/>
+</g>
+<g><title>kfree (81 samples, 1.33%)</title><rect x="918.4" y="178" width="17.8" height="15" fill="rgb(254,129,55)" rx="1"/>
+</g>
+<g><title>__memcg_slab_free_hook (66 samples, 1.08%)</title><rect x="918.4" y="162" width="14.4" height="15" fill="rgb(221,177,56)" rx="1"/>
+</g>
+<g><title>obj_cgroup_uncharge (53 samples, 0.87%)</title><rect x="920.7" y="146" width="11.5" height="15" fill="rgb(216,149,41)" rx="1"/>
+</g>
+<g><title>refill_obj_stock (46 samples, 0.75%)</title><rect x="922.3" y="130" width="9.9" height="15" fill="rgb(217,177,43)" rx="1"/>
+</g>
+<g><title>__rcu_read_lock (28 samples, 0.46%)</title><rect x="922.3" y="114" width="5.8" height="15" fill="rgb(206,127,52)" rx="1"/>
+</g>
+<g><title>skb_release_head_state (533 samples, 8.75%)</title><rect x="937.7" y="210" width="120.2" height="15" fill="rgb(236,173,65)" rx="1"/>
+<text x="939.7" y="222">skb_release_head..</text>
+</g>
+<g><title>unix_destruct_scm (530 samples, 8.70%)</title><rect x="937.7" y="194" width="119.5" height="15" fill="rgb(241,199,42)" rx="1"/>
+<text x="939.7" y="206">unix_destruct_scm</text>
+</g>
+<g><title>sock_wfree (528 samples, 8.67%)</title><rect x="937.7" y="178" width="119.1" height="15" fill="rgb(229,143,63)" rx="1"/>
+<text x="939.7" y="190">sock_wfree</text>
+</g>
+<g><title>unix_write_space (517 samples, 8.49%)</title><rect x="938.2" y="162" width="116.6" height="15" fill="rgb(239,123,55)" rx="1"/>
+<text x="940.2" y="174">unix_write_space</text>
+</g>
+<g><title>__wake_up_sync_key (507 samples, 8.32%)</title><rect x="938.2" y="146" width="114.3" height="15" fill="rgb(250,110,69)" rx="1"/>
+<text x="940.2" y="158">__wake_up_sync_..</text>
+</g>
+<g><title>unix_stream_read_actor (21 samples, 0.34%)</title><rect x="1060.9" y="226" width="4.3" height="15" fill="rgb(215,178,61)" rx="1"/>
+</g>
+<g><title>skb_copy_datagram_iter (20 samples, 0.33%)</title><rect x="1061.1" y="210" width="4.0" height="15" fill="rgb(251,117,67)" rx="1"/>
+</g>
+<g><title>__skb_datagram_iter (19 samples, 0.31%)</title><rect x="1061.1" y="194" width="3.8" height="15" fill="rgb(208,198,72)" rx="1"/>
+</g>
+<g><title>simple_copy_to_iter (17 samples, 0.28%)</title><rect x="1061.6" y="178" width="3.4" height="15" fill="rgb(250,110,69)" rx="1"/>
+</g>
+<g><title>sockfd_lookup_light (14 samples, 0.23%)</title><rect x="1069.1" y="274" width="2.7" height="15" fill="rgb(242,191,46)" rx="1"/>
+</g>
+<g><title>__fdget (14 samples, 0.23%)</title><rect x="1069.1" y="258" width="2.7" height="15" fill="rgb(220,101,73)" rx="1"/>
+</g>
+<g><title>__fget_light (14 samples, 0.23%)</title><rect x="1069.1" y="242" width="2.7" height="15" fill="rgb(232,112,49)" rx="1"/>
+</g>
+<g><title>reliaburger::bun::task_executor::wait_deadline::{closure} (19 samples, 0.31%)</title><rect x="1102.4" y="482" width="3.8" height="15" fill="rgb(213,112,57)" rx="1"/>
+</g>
+<g><title>&lt;tokio::time::sleep::Sleep as core::future::future::Future&gt;::poll (16 samples, 0.26%)</title><rect x="1102.4" y="466" width="3.1" height="15" fill="rgb(249,197,79)" rx="1"/>
+</g>
+<g><title>reliaburger::grill::oci::job_process (86 samples, 1.41%)</title><rect x="1106.7" y="482" width="19.0" height="15" fill="rgb(206,88,40)" rx="1"/>
+</g>
+<g><title>alloc::fmt::format::format_inner (62 samples, 1.02%)</title><rect x="1109.8" y="466" width="13.5" height="15" fill="rgb(243,186,56)" rx="1"/>
+</g>
+<g><title>core::fmt::write (60 samples, 0.98%)</title><rect x="1110.1" y="450" width="13.1" height="15" fill="rgb(210,107,49)" rx="1"/>
+</g>
+<g><title>&lt;alloc::string::String as core::fmt::Write&gt;::write_str (49 samples, 0.80%)</title><rect x="1110.5" y="434" width="10.6" height="15" fill="rgb(253,112,59)" rx="1"/>
+</g>
+<g><title>&lt;alloc::raw_vec::RawVecInner&lt;_&gt;&gt;::reserve::do_reserve_and_handle&lt;alloc::alloc::Global&gt; (42 samples, 0.69%)</title><rect x="1110.5" y="418" width="9.0" height="15" fill="rgb(222,140,71)" rx="1"/>
+</g>
+<g><title>&lt;alloc::raw_vec::RawVecInner&gt;::finish_grow (36 samples, 0.59%)</title><rect x="1111.2" y="402" width="7.7" height="15" fill="rgb(217,142,46)" rx="1"/>
+</g>
+<g><title>realloc (20 samples, 0.33%)</title><rect x="1113.7" y="386" width="4.0" height="15" fill="rgb(246,113,67)" rx="1"/>
+</g>
+<g><title>[libc.so.6] (16 samples, 0.26%)</title><rect x="1113.7" y="370" width="3.1" height="15" fill="rgb(230,86,47)" rx="1"/>
+</g>
+<g><title>[libc.so.6] (13 samples, 0.21%)</title><rect x="1113.7" y="354" width="2.4" height="15" fill="rgb(230,86,47)" rx="1"/>
+</g>
+<g><title>reliaburger::grill::process::host_environment_over (68 samples, 1.12%)</title><rect x="1126.1" y="482" width="14.9" height="15" fill="rgb(231,110,51)" rx="1"/>
+</g>
+<g><title>&lt;alloc::collections::btree::map::BTreeMap&lt;alloc::string::String, alloc::string::String&gt;&gt;::insert (26 samples, 0.43%)</title><rect x="1126.1" y="466" width="5.4" height="15" fill="rgb(233,188,71)" rx="1"/>
+</g>
+<g><title>memcmp (15 samples, 0.25%)</title><rect x="1127.7" y="450" width="2.9" height="15" fill="rgb(250,134,43)" rx="1"/>
+</g>
+<g><title>malloc (17 samples, 0.28%)</title><rect x="1135.4" y="466" width="3.4" height="15" fill="rgb(212,162,62)" rx="1"/>
+</g>
+<g><title>&lt;reliaburger::bun::task_runtime::OwnedRunner&lt;reliaburger::grill::AnyGrill&gt;&gt;::resolve_template::{closure} (22 samples, 0.36%)</title><rect x="1144.5" y="498" width="4.5" height="15" fill="rgb(209,89,68)" rx="1"/>
+</g>
+<g><title>&lt;reliaburger::config::job::JobSpec as core::clone::Clone&gt;::clone (13 samples, 0.21%)</title><rect x="1144.9" y="482" width="2.4" height="15" fill="rgb(208,107,51)" rx="1"/>
+</g>
+<g><title>core::ptr::drop_glue&lt;reliaburger::bun::task_executor::TaskInvocation&gt; (43 samples, 0.71%)</title><rect x="1163.1" y="514" width="9.2" height="15" fill="rgb(209,160,40)" rx="1"/>
+</g>
+<g><title>cfree (35 samples, 0.57%)</title><rect x="1163.1" y="498" width="7.4" height="15" fill="rgb(207,133,68)" rx="1"/>
+</g>
+<g><title>[libc.so.6] (20 samples, 0.33%)</title><rect x="1163.1" y="482" width="4.0" height="15" fill="rgb(230,86,47)" rx="1"/>
+</g>
+<g><title>malloc (27 samples, 0.44%)</title><rect x="1172.8" y="514" width="5.6" height="15" fill="rgb(212,162,62)" rx="1"/>
+</g>
+<g><title>[libc.so.6] (19 samples, 0.31%)</title><rect x="1172.8" y="498" width="3.8" height="15" fill="rgb(230,86,47)" rx="1"/>
+</g>
+<g><title>&lt;tokio::runtime::task::core::Core&lt;&lt;reliaburger::bun::task_executor::TaskPool&lt;reliaburger::bun::task_array_node::NodeRunner&gt;&gt;::resume_chunk_streaming::{closure}::{closure}, alloc::sync::Arc&lt;tokio::runtime::scheduler::current_thread::Handle&gt;&gt;&gt;::set_stage (113 samples, 1.85%)</title><rect x="1184.1" y="530" width="25.1" height="15" fill="rgb(245,163,60)" rx="1"/>
+<text x="1186.1" y="542">&lt;..</text>
+</g>
+<g><title>[libc.so.6] (109 samples, 1.79%)</title><rect x="1184.8" y="514" width="24.2" height="15" fill="rgb(230,86,47)" rx="1"/>
+<text x="1186.8" y="526">[..</text>
+</g>
+<g><title>tokio::runtime::task::raw::poll&lt;reliaburger::bun::task_array_node::run_chunk::{closure}, alloc::sync::Arc&lt;tokio::runtime::scheduler::multi_thread::handle::Handle&gt;&gt; (681 samples, 11.18%)</title><rect x="1220.8" y="546" width="153.7" height="15" fill="rgb(221,187,56)" rx="1"/>
+<text x="1222.8" y="558">tokio::runtime::task:..</text>
+</g>
+<g><title>reliaburger::bun::task_array_node::run_chunk::{closure} (670 samples, 11.00%)</title><rect x="1221.3" y="530" width="151.2" height="15" fill="rgb(231,163,45)" rx="1"/>
+<text x="1223.3" y="542">reliaburger::bun::ta..</text>
+</g>
+<g><title>&lt;reliaburger::bun::task_executor::TaskPool&lt;reliaburger::bun::task_array_node::NodeRunner&gt;&gt;::resume_chunk_streaming::{closure} (628 samples, 10.31%)</title><rect x="1221.7" y="514" width="141.7" height="15" fill="rgb(239,122,57)" rx="1"/>
+<text x="1223.7" y="526">&lt;reliaburger::bun::..</text>
+</g>
+<g><title>&lt;reliaburger::bun::task_executor::TaskPool&lt;reliaburger::bun::task_array_node::NodeRunner&gt;&gt;::resume_chunk_streaming::{closure} (18 samples, 0.30%)</title><rect x="1222.2" y="498" width="3.6" height="15" fill="rgb(239,122,57)" rx="1"/>
+</g>
+<g><title>&lt;tokio_util::sync::cancellation_token::WaitForCancellationFuture as core::future::future::Future&gt;::poll (16 samples, 0.26%)</title><rect x="1230.8" y="498" width="3.1" height="15" fill="rgb(229,124,55)" rx="1"/>
+</g>
+<g><title>&lt;tokio::sync::notify::Notified as core::future::future::Future&gt;::poll (14 samples, 0.23%)</title><rect x="1230.8" y="482" width="2.7" height="15" fill="rgb(236,148,64)" rx="1"/>
+</g>
+<g><title>[libc.so.6] (267 samples, 4.38%)</title><rect x="1234.4" y="498" width="60.0" height="15" fill="rgb(230,86,47)" rx="1"/>
+<text x="1236.4" y="510">[libc.s..</text>
+</g>
+<g><title>__rustc::__rdl_alloc (157 samples, 2.58%)</title><rect x="1298.0" y="498" width="35.1" height="15" fill="rgb(250,167,77)" rx="1"/>
+<text x="1300.0" y="510">__r..</text>
+</g>
+<g><title>posix_memalign (154 samples, 2.53%)</title><rect x="1298.3" y="482" width="34.4" height="15" fill="rgb(222,86,72)" rx="1"/>
+<text x="1300.3" y="494">pos..</text>
+</g>
+<g><title>[libc.so.6] (153 samples, 2.51%)</title><rect x="1298.3" y="466" width="34.2" height="15" fill="rgb(230,86,47)" rx="1"/>
+<text x="1300.3" y="478">[li..</text>
+</g>
+<g><title>[libc.so.6] (148 samples, 2.43%)</title><rect x="1298.3" y="450" width="33.0" height="15" fill="rgb(230,86,47)" rx="1"/>
+<text x="1300.3" y="462">[li..</text>
+</g>
+<g><title>[libc.so.6] (147 samples, 2.41%)</title><rect x="1298.3" y="434" width="32.8" height="15" fill="rgb(230,86,47)" rx="1"/>
+<text x="1300.3" y="446">[li..</text>
+</g>
+<g><title>[libc.so.6] (96 samples, 1.58%)</title><rect x="1298.3" y="418" width="21.2" height="15" fill="rgb(230,86,47)" rx="1"/>
+<text x="1300.3" y="430">[..</text>
+</g>
+<g><title>core::slice::sort::stable::driftsort_main&lt;reliaburger::bun::task_executor::TaskRecord, &lt;[reliaburger::bun::task_executor::TaskRecord]&gt;::sort_by_key&lt;u32, &lt;reliaburger::bun::task_executor::TaskPool&lt;reliaburger::bun::task_array_node::NodeRunner&gt;&gt;::resume_chunk_streaming::{closure}::{closure}&gt;::{closure}, alloc::vec::Vec&lt;reliaburger::bun::task_executor::TaskRecord&gt;&gt; (16 samples, 0.26%)</title><rect x="1334.5" y="498" width="3.1" height="15" fill="rgb(213,191,49)" rx="1"/>
+</g>
+<g><title>core::slice::sort::stable::drift::sort&lt;reliaburger::bun::task_executor::TaskRecord, &lt;[reliaburger::bun::task_executor::TaskRecord]&gt;::sort_by_key&lt;u32, &lt;reliaburger::bun::task_executor::TaskPool&lt;reliaburger::bun::task_array_node::NodeRunner&gt;&gt;::resume_chunk_streaming::{closure}::{closure}&gt;::{closure}&gt; (16 samples, 0.26%)</title><rect x="1334.5" y="482" width="3.1" height="15" fill="rgb(250,95,45)" rx="1"/>
+</g>
+<g><title>core::slice::sort::stable::quicksort::quicksort&lt;reliaburger::bun::task_executor::TaskRecord, &lt;[reliaburger::bun::task_executor::TaskRecord]&gt;::sort_by_key&lt;u32, &lt;reliaburger::bun::task_executor::TaskPool&lt;reliaburger::bun::task_array_node::NodeRunner&gt;&gt;::resume_chunk_streaming::{closure}::{closure}&gt;::{closure}&gt; (16 samples, 0.26%)</title><rect x="1334.5" y="466" width="3.1" height="15" fill="rgb(216,86,52)" rx="1"/>
+</g>
+<g><title>core::slice::sort::stable::quicksort::quicksort&lt;reliaburger::bun::task_executor::TaskRecord, &lt;[reliaburger::bun::task_executor::TaskRecord]&gt;::sort_by_key&lt;u32, &lt;reliaburger::bun::task_executor::TaskPool&lt;reliaburger::bun::task_array_node::NodeRunner&gt;&gt;::resume_chunk_streaming::{closure}::{closure}&gt;::{closure}&gt; (16 samples, 0.26%)</title><rect x="1334.5" y="450" width="3.1" height="15" fill="rgb(216,86,52)" rx="1"/>
+</g>
+<g><title>tokio::runtime::task::raw::drop_join_handle_slow&lt;&lt;reliaburger::bun::task_executor::TaskPool&lt;reliaburger::bun::task_array_node::NodeRunner&gt;&gt;::resume_chunk_streaming::{closure}::{closure}, alloc::sync::Arc&lt;tokio::runtime::scheduler::multi_thread::handle::Handle&gt;&gt; (56 samples, 0.92%)</title><rect x="1339.5" y="498" width="12.2" height="15" fill="rgb(205,145,56)" rx="1"/>
+</g>
+<g><title>&lt;tokio::runtime::task::core::Core&lt;&lt;reliaburger::bun::task_executor::TaskPool&lt;reliaburger::bun::task_array_node::NodeRunner&gt;&gt;::resume_chunk_streaming::{closure}::{closure}, alloc::sync::Arc&lt;tokio::runtime::scheduler::current_thread::Handle&gt;&gt;&gt;::set_stage (35 samples, 0.57%)</title><rect x="1339.5" y="482" width="7.4" height="15" fill="rgb(245,163,60)" rx="1"/>
+</g>
+<g><title>[libc.so.6] (35 samples, 0.57%)</title><rect x="1339.5" y="466" width="7.4" height="15" fill="rgb(230,86,47)" rx="1"/>
+</g>
+<g><title>cfree (13 samples, 0.21%)</title><rect x="1348.8" y="482" width="2.4" height="15" fill="rgb(207,133,68)" rx="1"/>
+</g>
+<g><title>[libc.so.6] (13 samples, 0.21%)</title><rect x="1348.8" y="466" width="2.4" height="15" fill="rgb(230,86,47)" rx="1"/>
+</g>
+<g><title>tokio::runtime::task::raw::try_read_output&lt;&lt;reliaburger::bun::task_executor::TaskPool&lt;reliaburger::bun::task_array_node::NodeRunner&gt;&gt;::resume_chunk_streaming::{closure}::{closure}, alloc::sync::Arc&lt;tokio::runtime::scheduler::current_thread::Handle&gt;&gt; (51 samples, 0.84%)</title><rect x="1352.2" y="498" width="11.1" height="15" fill="rgb(246,108,71)" rx="1"/>
+</g>
+<g><title>[libc.so.6] (42 samples, 0.69%)</title><rect x="1352.2" y="482" width="9.0" height="15" fill="rgb(230,86,47)" rx="1"/>
+</g>
+<g><title>reliaburger::bun::task_array_node::run_chunk::{closure} (32 samples, 0.53%)</title><rect x="1365.5" y="514" width="6.7" height="15" fill="rgb(231,163,45)" rx="1"/>
+</g>
+<g><title>tokio::runtime::task::raw::poll&lt;reliaburger::sesame::connection::serve_tls_connection&lt;&lt;std::time::SystemTime&gt;::now&gt;::{closure}, alloc::sync::Arc&lt;tokio::runtime::scheduler::multi_thread::handle::Handle&gt;&gt; (22 samples, 0.36%)</title><rect x="1376.6" y="546" width="4.5" height="15" fill="rgb(251,122,65)" rx="1"/>
+</g>
+<g><title>reliaburger::sesame::connection::serve_tls_connection&lt;&lt;std::time::SystemTime&gt;::now&gt;::{closure} (22 samples, 0.36%)</title><rect x="1376.6" y="530" width="4.5" height="15" fill="rgb(254,192,42)" rx="1"/>
+</g>
+<g><title>reliaburger::sesame::connection::serve_http_connection&lt;reliaburger::sesame::connection::LifetimeLimitedIo&lt;tokio_rustls::server::TlsStream&lt;tokio::net::tcp::stream::TcpStream&gt;&gt;&gt;::{closure} (21 samples, 0.34%)</title><rect x="1376.6" y="514" width="4.3" height="15" fill="rgb(217,117,64)" rx="1"/>
+</g>
+<g><title>&lt;hyper_util::server::conn::auto::UpgradeableConnection&lt;hyper_util::rt::tokio::TokioIo&lt;reliaburger::sesame::connection::StallGuardedIo&lt;reliaburger::sesame::connection::LifetimeLimitedIo&lt;tokio_rustls::server::TlsStream&lt;tokio::net::tcp::stream::TcpStream&gt;&gt;&gt;&gt;, hyper_util::service::glue::TowerToHyperService&lt;axum::routing::Router&gt;, hyper_util::rt::tokio::TokioExecutor&gt; as core::future::future::Future&gt;::poll (21 samples, 0.34%)</title><rect x="1376.6" y="498" width="4.3" height="15" fill="rgb(251,135,53)" rx="1"/>
+</g>
+<g><title>&lt;hyper::proto::h1::dispatch::Dispatcher&lt;hyper::proto::h1::dispatch::Server&lt;hyper_util::service::glue::TowerToHyperService&lt;axum::routing::Router&gt;, hyper::body::incoming::Incoming&gt;, axum_core::body::Body, hyper_util::common::rewind::Rewind&lt;hyper_util::rt::tokio::TokioIo&lt;reliaburger::sesame::connection::StallGuardedIo&lt;reliaburger::sesame::connection::LifetimeLimitedIo&lt;tokio_rustls::server::TlsStream&lt;tokio::net::tcp::stream::TcpStream&gt;&gt;&gt;&gt;&gt;, hyper::proto::h1::role::Server&gt;&gt;::poll_write (17 samples, 0.28%)</title><rect x="1377.3" y="482" width="3.4" height="15" fill="rgb(217,100,41)" rx="1"/>
+</g>
+<g><title>&lt;hyper::proto::h1::dispatch::Server&lt;hyper_util::service::glue::TowerToHyperService&lt;axum::routing::Router&gt;, hyper::body::incoming::Incoming&gt; as hyper::proto::h1::dispatch::Dispatch&gt;::poll_msg (17 samples, 0.28%)</title><rect x="1377.3" y="466" width="3.4" height="15" fill="rgb(214,173,48)" rx="1"/>
+</g>
+<g><title>&lt;hyper_util::service::glue::TowerToHyperServiceFuture&lt;axum::routing::Router, http::request::Request&lt;hyper::body::incoming::Incoming&gt;&gt; as core::future::future::Future&gt;::poll (17 samples, 0.28%)</title><rect x="1377.3" y="450" width="3.4" height="15" fill="rgb(223,179,51)" rx="1"/>
+</g>
+<g><title>&lt;axum::routing::route::RouteFuture&lt;core::convert::Infallible&gt; as core::future::future::Future&gt;::poll (16 samples, 0.26%)</title><rect x="1377.5" y="434" width="3.1" height="15" fill="rgb(224,144,74)" rx="1"/>
+</g>
+<g><title>&lt;axum::util::MapIntoResponseFuture&lt;tower::util::map_err::MapErrFuture&lt;axum::routing::route::RouteFuture&lt;core::convert::Infallible&gt;, &lt;core::convert::Infallible as core::convert::Into&lt;core::convert::Infallible&gt;&gt;::into&gt;&gt; as core::future::future::Future&gt;::poll (16 samples, 0.26%)</title><rect x="1377.5" y="418" width="3.1" height="15" fill="rgb(220,99,48)" rx="1"/>
+</g>
+<g><title>&lt;axum::routing::route::RouteFuture&lt;core::convert::Infallible&gt; as core::future::future::Future&gt;::poll (16 samples, 0.26%)</title><rect x="1377.5" y="402" width="3.1" height="15" fill="rgb(224,144,74)" rx="1"/>
+</g>
+<g><title>&lt;axum::util::MapIntoResponseFuture&lt;tower::util::map_err::MapErrFuture&lt;axum::routing::route::RouteFuture&lt;core::convert::Infallible&gt;, &lt;core::convert::Infallible as core::convert::Into&lt;core::convert::Infallible&gt;&gt;::into&gt;&gt; as core::future::future::Future&gt;::poll (14 samples, 0.23%)</title><rect x="1377.5" y="386" width="2.7" height="15" fill="rgb(220,99,48)" rx="1"/>
+</g>
+<g><title>&lt;axum::routing::route::RouteFuture&lt;core::convert::Infallible&gt; as core::future::future::Future&gt;::poll (14 samples, 0.23%)</title><rect x="1377.5" y="370" width="2.7" height="15" fill="rgb(224,144,74)" rx="1"/>
+</g>
+<g><title>&lt;axum::util::MapIntoResponseFuture&lt;tower::util::map_err::MapErrFuture&lt;axum::routing::route::RouteFuture&lt;core::convert::Infallible&gt;, &lt;core::convert::Infallible as core::convert::Into&lt;core::convert::Infallible&gt;&gt;::into&gt;&gt; as core::future::future::Future&gt;::poll (14 samples, 0.23%)</title><rect x="1377.5" y="354" width="2.7" height="15" fill="rgb(220,99,48)" rx="1"/>
+</g>
+<g><title>&lt;axum::routing::route::RouteFuture&lt;core::convert::Infallible&gt; as core::future::future::Future&gt;::poll (14 samples, 0.23%)</title><rect x="1377.5" y="338" width="2.7" height="15" fill="rgb(224,144,74)" rx="1"/>
+</g>
+<g><title>&lt;axum::util::MapIntoResponseFuture&lt;tower::util::map_err::MapErrFuture&lt;axum::routing::route::RouteFuture&lt;core::convert::Infallible&gt;, &lt;core::convert::Infallible as core::convert::Into&lt;core::convert::Infallible&gt;&gt;::into&gt;&gt; as core::future::future::Future&gt;::poll (14 samples, 0.23%)</title><rect x="1377.5" y="322" width="2.7" height="15" fill="rgb(220,99,48)" rx="1"/>
+</g>
+<g><title>&lt;axum::routing::route::RouteFuture&lt;core::convert::Infallible&gt; as core::future::future::Future&gt;::poll (14 samples, 0.23%)</title><rect x="1377.5" y="306" width="2.7" height="15" fill="rgb(224,144,74)" rx="1"/>
+</g>
+<g><title>&lt;axum::util::MapIntoResponseFuture&lt;tower::util::map_err::MapErrFuture&lt;axum::routing::route::RouteFuture&lt;core::convert::Infallible&gt;, &lt;core::convert::Infallible as core::convert::Into&lt;core::convert::Infallible&gt;&gt;::into&gt;&gt; as core::future::future::Future&gt;::poll (14 samples, 0.23%)</title><rect x="1377.5" y="290" width="2.7" height="15" fill="rgb(220,99,48)" rx="1"/>
+</g>
+<g><title>&lt;axum::routing::route::RouteFuture&lt;core::convert::Infallible&gt; as core::future::future::Future&gt;::poll (14 samples, 0.23%)</title><rect x="1377.5" y="274" width="2.7" height="15" fill="rgb(224,144,74)" rx="1"/>
+</g>
+<g><title>&lt;axum::util::MapIntoResponseFuture&lt;tower::util::map_err::MapErrFuture&lt;axum::routing::route::RouteFuture&lt;core::convert::Infallible&gt;, &lt;core::convert::Infallible as core::convert::Into&lt;core::convert::Infallible&gt;&gt;::into&gt;&gt; as core::future::future::Future&gt;::poll (14 samples, 0.23%)</title><rect x="1377.5" y="258" width="2.7" height="15" fill="rgb(220,99,48)" rx="1"/>
+</g>
+<g><title>&lt;axum::routing::route::RouteFuture&lt;core::convert::Infallible&gt; as core::future::future::Future&gt;::poll (14 samples, 0.23%)</title><rect x="1377.5" y="242" width="2.7" height="15" fill="rgb(224,144,74)" rx="1"/>
+</g>
+<g><title>&lt;axum::util::MapIntoResponseFuture&lt;tower::util::map_err::MapErrFuture&lt;axum::routing::route::RouteFuture&lt;core::convert::Infallible&gt;, &lt;core::convert::Infallible as core::convert::Into&lt;core::convert::Infallible&gt;&gt;::into&gt;&gt; as core::future::future::Future&gt;::poll (14 samples, 0.23%)</title><rect x="1377.5" y="226" width="2.7" height="15" fill="rgb(220,99,48)" rx="1"/>
+</g>
+<g><title>&lt;axum::routing::route::RouteFuture&lt;core::convert::Infallible&gt; as core::future::future::Future&gt;::poll (14 samples, 0.23%)</title><rect x="1377.5" y="210" width="2.7" height="15" fill="rgb(224,144,74)" rx="1"/>
+</g>
+<g><title>&lt;axum::util::MapIntoResponseFuture&lt;tower::util::map_err::MapErrFuture&lt;axum::routing::route::RouteFuture&lt;core::convert::Infallible&gt;, &lt;core::convert::Infallible as core::convert::Into&lt;core::convert::Infallible&gt;&gt;::into&gt;&gt; as core::future::future::Future&gt;::poll (14 samples, 0.23%)</title><rect x="1377.5" y="194" width="2.7" height="15" fill="rgb(220,99,48)" rx="1"/>
+</g>
+<g><title>&lt;axum::routing::route::RouteFuture&lt;core::convert::Infallible&gt; as core::future::future::Future&gt;::poll (14 samples, 0.23%)</title><rect x="1377.5" y="178" width="2.7" height="15" fill="rgb(224,144,74)" rx="1"/>
+</g>
+<g><title>&lt;axum::util::MapIntoResponseFuture&lt;tower::util::map_err::MapErrFuture&lt;axum::routing::route::RouteFuture&lt;core::convert::Infallible&gt;, &lt;core::convert::Infallible as core::convert::Into&lt;core::convert::Infallible&gt;&gt;::into&gt;&gt; as core::future::future::Future&gt;::poll (14 samples, 0.23%)</title><rect x="1377.5" y="162" width="2.7" height="15" fill="rgb(220,99,48)" rx="1"/>
+</g>
+<g><title>&lt;axum::routing::route::RouteFuture&lt;core::convert::Infallible&gt; as core::future::future::Future&gt;::poll (14 samples, 0.23%)</title><rect x="1377.5" y="146" width="2.7" height="15" fill="rgb(224,144,74)" rx="1"/>
+</g>
+<g><title>&lt;axum::util::MapIntoResponseFuture&lt;tower::util::map_err::MapErrFuture&lt;axum::routing::route::RouteFuture&lt;core::convert::Infallible&gt;, &lt;core::convert::Infallible as core::convert::Into&lt;core::convert::Infallible&gt;&gt;::into&gt;&gt; as core::future::future::Future&gt;::poll (14 samples, 0.23%)</title><rect x="1377.5" y="130" width="2.7" height="15" fill="rgb(220,99,48)" rx="1"/>
+</g>
+<g><title>&lt;axum::routing::route::RouteFuture&lt;core::convert::Infallible&gt; as core::future::future::Future&gt;::poll (14 samples, 0.23%)</title><rect x="1377.5" y="114" width="2.7" height="15" fill="rgb(224,144,74)" rx="1"/>
+</g>
+<g><title>&lt;axum::util::MapIntoResponseFuture&lt;tower::util::map_err::MapErrFuture&lt;axum::routing::route::RouteFuture&lt;core::convert::Infallible&gt;, &lt;core::convert::Infallible as core::convert::Into&lt;core::convert::Infallible&gt;&gt;::into&gt;&gt; as core::future::future::Future&gt;::poll (14 samples, 0.23%)</title><rect x="1377.5" y="98" width="2.7" height="15" fill="rgb(220,99,48)" rx="1"/>
+</g>
+<g><title>&lt;axum::routing::route::RouteFuture&lt;core::convert::Infallible&gt; as core::future::future::Future&gt;::poll (14 samples, 0.23%)</title><rect x="1377.5" y="82" width="2.7" height="15" fill="rgb(224,144,74)" rx="1"/>
+</g>
+<g><title>&lt;axum::util::MapIntoResponseFuture&lt;tower::util::map_err::MapErrFuture&lt;axum::routing::route::RouteFuture&lt;core::convert::Infallible&gt;, &lt;core::convert::Infallible as core::convert::Into&lt;core::convert::Infallible&gt;&gt;::into&gt;&gt; as core::future::future::Future&gt;::poll (14 samples, 0.23%)</title><rect x="1377.5" y="66" width="2.7" height="15" fill="rgb(220,99,48)" rx="1"/>
+</g>
+<g><title>&lt;axum::routing::route::RouteFuture&lt;core::convert::Infallible&gt; as core::future::future::Future&gt;::poll (14 samples, 0.23%)</title><rect x="1377.5" y="50" width="2.7" height="15" fill="rgb(224,144,74)" rx="1"/>
+</g>
+<g><title>tokio::runtime::scheduler::multi_thread::worker::run (23 samples, 0.38%)</title><rect x="1384.8" y="562" width="4.7" height="15" fill="rgb(239,181,53)" rx="1"/>
+</g>
+</svg>

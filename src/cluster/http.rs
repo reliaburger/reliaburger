@@ -30,7 +30,7 @@ impl ClusterHttp {
     pub fn plaintext() -> Self {
         Self {
             scheme: "http",
-            client: Client::builder()
+            client: crate::http_client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("valid plaintext cluster HTTP configuration"),

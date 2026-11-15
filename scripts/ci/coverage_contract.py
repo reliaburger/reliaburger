@@ -101,7 +101,7 @@ def tool_context(observed, expected):
     """Bind actual tool observations to their independently expected context.
 
     Public Rust/Cargo1.98.0 and1.98.1 interfaces are audited. The private
-    coverage wrapper remains limited to cargo-llvm-cov0.9.1 and nextest0.9.145.
+    coverage wrapper remains limited to cargo-llvm-cov0.9.1 and nextest0.9.151.
     """
     c.require(
         set(observed) == set(expected) == {'cargo', 'rustc', 'nextest', 'coverage'},
@@ -130,7 +130,7 @@ def tool_context(observed, expected):
         'unaudited cargo-llvm-cov version',
     )
     c.require(
-        re.match('cargo-nextest 0\\.9\\.145(?:\\s|$)', observed['nextest']['version']) is not None,
+        re.match('cargo-nextest 0\\.9\\.151(?:\\s|$)', observed['nextest']['version']) is not None,
         'unaudited nextest version',
     )
     rustc = observed['rustc']

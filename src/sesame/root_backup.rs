@@ -224,9 +224,8 @@ impl RootBackup {
                     .trim()
                     .parse()
                     .map_err(|e: &str| RootBackupError::InvalidRecipient(e.to_string()))?;
-                age::Encryptor::with_recipients(vec![Box::new(recipient)]).ok_or_else(|| {
-                    RootBackupError::SealFailed("no recipient to seal to".to_string())
-                })?
+                age::Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient))
+                    .map_err(|e| RootBackupError::SealFailed(e.to_string()))?
             }
         };
 
@@ -255,19 +254,21 @@ impl RootBackup {
         let decryptor = age::Decryptor::new(age::armor::ArmoredReader::new(sealed))
             .map_err(|e| open_failed(&e))?;
 
-        let mut reader = match (decryptor, with) {
-            (age::Decryptor::Passphrase(d), BackupOpener::Passphrase(passphrase)) => {
-                d.decrypt(passphrase, None).map_err(|e| open_failed(&e))?
+        // Since age 0.11 the decryptor is one type for both seals, and a
+        // passphrase is an identity like any other (`age::scrypt::Identity`).
+        // Checking the seal first keeps the error that says which one to pass.
+        let mut reader = match (decryptor.is_scrypt(), with) {
+            (true, BackupOpener::Passphrase(passphrase)) => {
+                let identity = age::scrypt::Identity::new(passphrase.clone());
+                decryptor
+                    .decrypt(std::iter::once(&identity as &dyn age::Identity))
+                    .map_err(|e| open_failed(&e))?
             }
-            (age::Decryptor::Recipients(d), BackupOpener::Identity(identity)) => d
+            (false, BackupOpener::Identity(identity)) => decryptor
                 .decrypt(std::iter::once(identity as &dyn age::Identity))
                 .map_err(|e| open_failed(&e))?,
-            (age::Decryptor::Passphrase(_), BackupOpener::Identity(_)) => {
-                return Err(RootBackupError::NeedsPassphrase);
-            }
-            (age::Decryptor::Recipients(_), BackupOpener::Passphrase(_)) => {
-                return Err(RootBackupError::NeedsIdentity);
-            }
+            (true, BackupOpener::Identity(_)) => return Err(RootBackupError::NeedsPassphrase),
+            (false, BackupOpener::Passphrase(_)) => return Err(RootBackupError::NeedsIdentity),
         };
 
         let mut plaintext = vec![];
@@ -281,11 +282,12 @@ impl RootBackup {
 /// Read how a sealed backup was sealed, so the CLI knows whether to ask for
 /// a passphrase or an identity.
 pub fn seal_kind(sealed: &[u8]) -> Result<SealKind, RootBackupError> {
-    match age::Decryptor::new(age::armor::ArmoredReader::new(sealed))
-        .map_err(|e| RootBackupError::OpenFailed(e.to_string()))?
-    {
-        age::Decryptor::Passphrase(_) => Ok(SealKind::Passphrase),
-        age::Decryptor::Recipients(_) => Ok(SealKind::Recipient),
+    let decryptor = age::Decryptor::new(age::armor::ArmoredReader::new(sealed))
+        .map_err(|e| RootBackupError::OpenFailed(e.to_string()))?;
+    if decryptor.is_scrypt() {
+        Ok(SealKind::Passphrase)
+    } else {
+        Ok(SealKind::Recipient)
     }
 }
 
@@ -392,7 +394,7 @@ mod tests {
     const PASSPHRASE: &str = "correct horse battery staple";
 
     fn passphrase(text: &str) -> SecretString {
-        SecretString::new(text.to_string())
+        SecretString::from(text.to_string())
     }
 
     fn root_backup(cluster: &str) -> RootBackup {
@@ -404,6 +406,50 @@ mod tests {
             SystemTime::now(),
         )
         .unwrap()
+    }
+
+    // Backups sealed by an age 0.10 build (Reliaburger 0.2.1 and earlier),
+    // checked in as fixtures. The operator holds these files for years, so
+    // every later age release has to keep opening them (#1026).
+    const AGE_0_10_PASSPHRASE_BACKUP: &[u8] =
+        include_bytes!("../../tests/fixtures/age/root-backup-passphrase.age");
+    const AGE_0_10_RECIPIENT_BACKUP: &[u8] =
+        include_bytes!("../../tests/fixtures/age/root-backup-recipient.age");
+    const AGE_0_10_IDENTITY: &str = include_str!("../../tests/fixtures/age/identity.txt");
+    const AGE_0_10_FINGERPRINT: &str = include_str!("../../tests/fixtures/age/fingerprint.txt");
+
+    fn verify_fixture_backup(opened: &RootBackup) {
+        assert_eq!(opened.cluster, "fixture");
+        assert_eq!(opened.fingerprint, AGE_0_10_FINGERPRINT.trim());
+        // The fixture's root expires one day, so check it the day before.
+        let before_expiry = UNIX_EPOCH + Duration::from_secs(opened.not_after as u64 - 86_400);
+        opened.verify(AGE_0_10_FINGERPRINT, before_expiry).unwrap();
+    }
+
+    #[test]
+    fn a_passphrase_backup_sealed_by_age_0_10_still_opens() {
+        assert_eq!(
+            seal_kind(AGE_0_10_PASSPHRASE_BACKUP).unwrap(),
+            SealKind::Passphrase
+        );
+        let opened = RootBackup::open(
+            AGE_0_10_PASSPHRASE_BACKUP,
+            &BackupOpener::Passphrase(passphrase(PASSPHRASE)),
+        )
+        .unwrap();
+        verify_fixture_backup(&opened);
+    }
+
+    #[test]
+    fn a_recipient_backup_sealed_by_age_0_10_still_opens() {
+        assert_eq!(
+            seal_kind(AGE_0_10_RECIPIENT_BACKUP).unwrap(),
+            SealKind::Recipient
+        );
+        let identity: age::x25519::Identity = AGE_0_10_IDENTITY.trim().parse().unwrap();
+        let opened =
+            RootBackup::open(AGE_0_10_RECIPIENT_BACKUP, &BackupOpener::Identity(identity)).unwrap();
+        verify_fixture_backup(&opened);
     }
 
     #[test]

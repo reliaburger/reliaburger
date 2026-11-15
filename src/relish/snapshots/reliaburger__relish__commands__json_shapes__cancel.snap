@@ -1,0 +1,8 @@
+---
+source: src/relish/commands.rs
+expression: "json(&RunChange { run: 42, change: RunChangeKind::Cancelled, node: None, })"
+---
+{
+  "run": 42,
+  "change": "cancelled"
+}

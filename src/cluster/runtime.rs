@@ -82,6 +82,9 @@ pub struct ClusterRuntime {
     /// reaped. For reporting on the cluster only: placement, the council and
     /// the registry read the live-only `ClusterHandle::membership_rx`.
     pub roster_rx: watch::Receiver<Vec<MembershipSnapshot>>,
+    /// This node's gossip counters: updates received and the last
+    /// membership change, read by `GET /v1/cluster/summary`.
+    pub gossip_stats: crate::mustard::stats::GossipStats,
 }
 
 /// Configuration for starting the cluster runtime, derived from node config.
@@ -146,6 +149,11 @@ pub struct ClusterParams {
     /// sooner (`[cluster] recovery_probe_window_secs`, #694). `None` uses
     /// two anti-entropy intervals.
     pub recovery_probe_window: Option<Duration>,
+    /// Most voters the council reconciler seats. `None` uses the default
+    /// of up to seven. Bun always leaves it unset; the hollow-node harness
+    /// holds its council at three while hundreds of hollow nodes join, so
+    /// none of them becomes a voter (#1401).
+    pub council_size_cap: Option<usize>,
 }
 
 /// Open and validate the durable Raft stores under `raft_dir`.
@@ -171,8 +179,11 @@ pub async fn open_raft_storage(
     bool,
     CouncilStateMachine,
 )> {
+    // BLOCKING-OK: opening the Raft stores at startup, before any workload runs
     let _opening_guard = crate::council::recovery_storage::lock(raft_dir)?;
+    // BLOCKING-OK: opening the Raft stores at startup, before any workload runs
     crate::council::recovery_storage::finish_pending(raft_dir)?;
+    // BLOCKING-OK: opening the Raft stores at startup, before any workload runs; the redb open below blocks the same way
     std::fs::create_dir_all(raft_dir)?;
     let log_path = raft_dir.join("log.redb");
     let log_store =
@@ -305,6 +316,7 @@ pub async fn start(
     }
     let (directory_tx, directory_rx) = watch::channel(NodeDirectory::default());
     node.set_directory_watch(directory_tx);
+    let gossip_stats = node.stats();
     // The gossip node is spawned *after* the council is built, so a restarted
     // node can seed gossip from its restored Raft membership (see below).
 
@@ -490,6 +502,10 @@ pub async fn start(
     // The listener re-checks each open connection's peer against the live
     // CRL before every request (#928).
     let rpc_crl = crl_handle.clone();
+    // A council partition refuses the blocked peers' RPCs here as well as
+    // sending none to them, or the leader keeps replicating to a
+    // "partitioned" node over the connections it opens (#1810).
+    let rpc_blocklist = raft_blocklist.clone();
     spawn_supervised("cluster:raft-rpc", supervision.clone(), async move {
         serve_raft_rpc_with_node_gate(
             raft_listener,
@@ -499,6 +515,7 @@ pub async fn start(
             rpc_fence,
             rpc_node_gate,
             Some(rpc_crl),
+            rpc_blocklist,
         )
         .await;
     });
@@ -567,7 +584,7 @@ pub async fn start(
         port_offset,
         raft_id,
         self_info,
-        CouncilReconcilerConfig::default(),
+        CouncilReconcilerConfig::with_size_cap(params.council_size_cap),
         shutdown.clone(),
     );
 
@@ -651,6 +668,7 @@ pub async fn start(
     // idempotency tracker from any Parquet already on disk so a restart doesn't
     // double-count a re-sent window that was already flushed (M17).
     let mut initial_rollup_store =
+        // BLOCKING-OK: startup, before the agent loop or any workload runs
         crate::mayo::rollup_store::RollupStore::new(params.data_dir.join("rollups"));
     if let Err(e) = initial_rollup_store.hydrate_seen_windows().await {
         eprintln!("bun: WARNING: could not seed rollup idempotency from disk: {e}");
@@ -732,6 +750,7 @@ pub async fn start(
             rollup_store,
             directory_rx,
             roster_rx,
+            gossip_stats,
         },
     ))
 }
@@ -930,16 +949,12 @@ fn spawn_leader_target_maintainer(
     let shutdown = supervision.shutdown.clone();
     spawn_supervised("cluster:leader-target", supervision, async move {
         loop {
-            let view = {
-                let metrics = metrics_rx.borrow();
-                let directory = directory_rx.borrow();
-                crate::cluster::directory::resolve_leader(
-                    &metrics,
-                    &directory,
-                    api_offset,
-                    reporting_offset,
-                )
-            };
+            let view = crate::cluster::directory::resolve_leader(
+                &metrics_rx,
+                &directory_rx,
+                api_offset,
+                reporting_offset,
+            );
             if let Some(view) = view {
                 if let Some(reporting) = view.reporting_address {
                     let target = vec![(view.node_id.clone(), reporting)];
@@ -1162,6 +1177,20 @@ impl Default for CouncilReconcilerConfig {
             tick_interval: RECONCILE_INTERVAL,
             op_timeout: RECONCILE_OP_TIMEOUT,
         }
+    }
+}
+
+impl CouncilReconcilerConfig {
+    /// The default reconciler, with the council held at `cap` voters when
+    /// `cap` is set. `None` keeps the default of up to seven. A cap below
+    /// the default minimum of three lowers the minimum with it.
+    pub fn with_size_cap(cap: Option<usize>) -> Self {
+        let mut config = Self::default();
+        if let Some(cap) = cap {
+            config.selection.max_council_size = cap;
+            config.selection.min_council_size = config.selection.min_council_size.min(cap);
+        }
+        config
     }
 }
 
@@ -1606,6 +1635,28 @@ mod tests {
     use super::*;
     use crate::cluster::identity::raft_id_from_name;
     use crate::mustard::state::NodeState;
+
+    #[test]
+    fn reconciler_without_a_size_cap_grows_the_council_to_seven() {
+        let config = CouncilReconcilerConfig::with_size_cap(None);
+        assert_eq!(config.selection.max_council_size, 7);
+        assert_eq!(config.selection.min_council_size, 3);
+        assert_eq!(config.selection.min_node_age, Duration::ZERO);
+    }
+
+    #[test]
+    fn reconciler_with_a_size_cap_of_three_never_seats_a_fourth_voter() {
+        let config = CouncilReconcilerConfig::with_size_cap(Some(3));
+        assert_eq!(config.selection.max_council_size, 3);
+        assert_eq!(config.selection.min_council_size, 3);
+    }
+
+    #[test]
+    fn a_size_cap_below_three_lowers_the_minimum_too() {
+        let config = CouncilReconcilerConfig::with_size_cap(Some(1));
+        assert_eq!(config.selection.max_council_size, 1);
+        assert_eq!(config.selection.min_council_size, 1);
+    }
 
     #[tokio::test]
     async fn bootstrap_propagates_initialisation_failure_and_persists_security() {

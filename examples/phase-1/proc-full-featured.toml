@@ -36,9 +36,10 @@ DATABASE_URL = "postgres://db:5432/myapp"
 LOG_LEVEL = "info"
 
 # Run database migrations before the app starts.
-# With no image of its own it runs on the host, like its app.
+# With no image of its own it runs on the host, like its app, so the node's
+# allowed_binaries must name its binary by path.
 [[app.myapp.init]]
-command = ["echo", "running migrations..."]
+command = ["/bin/echo", "running migrations..."]
 
 # A one-shot migration job that runs independently.
 [job.db-seed]

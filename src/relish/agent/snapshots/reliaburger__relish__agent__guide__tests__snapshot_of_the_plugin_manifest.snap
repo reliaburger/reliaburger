@@ -1,0 +1,22 @@
+---
+source: src/relish/agent/guide.rs
+expression: "artefact(paths::PLUGIN)"
+---
+{
+  "author": {
+    "name": "Miko Pawlikowski"
+  },
+  "description": "Reliaburger is an orchestrator. Its CLI is `relish`.",
+  "homepage": "https://reliaburger.com/agents",
+  "keywords": [
+    "reliaburger",
+    "relish",
+    "orchestrator",
+    "containers",
+    "sre"
+  ],
+  "license": "Apache-2.0",
+  "name": "reliaburger",
+  "repository": "https://github.com/reliaburger/reliaburger",
+  "version": "0.2.7"
+}

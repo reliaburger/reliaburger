@@ -1,6 +1,7 @@
 """A pretty job table must not turn missing or orphaned evidence into a pass."""
 import copy
 import json
+import re
 from pathlib import Path
 import tempfile
 import unittest
@@ -38,9 +39,35 @@ class Gate(unittest.TestCase):
         script=(Path(__file__).parent/"qualify-sustained.sh").read_text()
         self.assertIn("duration_text:=60m",script)
         self.assertIn("duration_text:=8h",script)
-        self.assertIn("end - 120",script)
         self.assertNotIn("sleep 120",script)
         self.assertIn("mark \"$evidence/jobs\"",script)
+
+    def test_the_drain_starts_only_once_the_last_cycle_and_its_special_are_over(self):
+        # A drain timed from the soak's end ran inside the last cycle, which can
+        # finish after it: 0.2.2 candidate 4's hour-8 graceful stop held the
+        # cluster down for the drain's whole allowance (#1338).
+        script=(Path(__file__).parent/"qualify-sustained.sh").read_text()
+        loop_over=script.index('current_slot=final\nwait_until "$end"')
+        sets=[match.start() for match in re.finditer(r"meta job_stop_at ",script)]
+        self.assertTrue(sets)
+        self.assertTrue(all(position>loop_over for position in sets),"job_stop_at is set before the cycles are over")
+        self.assertIn("wait_for_job_drain",script[loop_over:])
+
+    def test_a_controller_that_stops_before_the_harness_asks_for_the_drain_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); snap=root/"snap"; snap.mkdir()
+            (root/"metadata.json").write_text(json.dumps(dict(job_soak=True)))
+            (snap/"jobs.json").write_text(json.dumps(dict(stopped=True,heartbeat=100,errors=[])))
+            self.assertTrue(any("before the final drain" in item["detail"] for item in checker.job_findings(root,snap,100,False)))
+
+    def test_a_final_whose_harness_never_asked_for_the_drain_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); (root/"jobs").mkdir()
+            (root/"metadata.json").write_text(json.dumps(dict(job_soak=True,result="PASS",started_at=100,finished_at=200)))
+            (root/"jobs/snapshot.json").write_text(json.dumps(dict(stopped=True,stop_requested_at=150,heartbeat=200,active=[],errors=[])))
+            checker.save_state(root,{"nodes":["n"]})
+            self.assertEqual(checker.render(root,root/"report.md"),1)
+            self.assertIn("the harness never asked the job campaign to drain",(root/"report.md").read_text())
 
     def test_live_snapshot_without_drain_timestamp_fails_without_crashing_render(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -322,9 +349,10 @@ class JobQualification(unittest.TestCase):
         budget=next(line for line in lines if line[0]=="job-runs")[1:]
         budget=dict(zip(budget[::2],budget[1::2]))
         cycles=len({line[1] for line in lines if line[0]=="cycle"})
-        # The campaign is sized for the whole schedule the plan prints...
+        # The campaign is sized for the whole schedule the plan prints, the
+        # quiet tail after the faults included (#1062)...
         self.assertEqual(cycles*int(header["cycle"]),int(header["duration"]))
-        plan=jobs.run_budget(cycles*int(header["cycle"]))
+        plan=jobs.run_budget(cycles*int(header["cycle"])+int(header["quiet-tail"]))
         self.assertEqual((int(budget["expected"]),int(budget["retained-peak"])),(plan["expected_runs"],plan["peak_retained"]))
         # ...and what it holds at once fits its limit.
         self.assertLessEqual(int(budget["retained-peak"]),int(budget["limit"]))
@@ -337,6 +365,58 @@ class JobQualification(unittest.TestCase):
         self.assertIn("plan: tier fast schedule compressed duration 3600 ",result.stdout)
         specials={line.split()[4] for line in result.stdout.splitlines() if " special " in line}
         self.assertEqual(specials,{"graceful-stop","quorum-loss","all-off"})
+
+    def test_the_day_tier_plans_a_day_of_host_jobs_with_no_faults(self):
+        # #1032: one real 24-hour day on three nodes, then the drain.
+        code,lines,_=self.plan("--tier","day")
+        self.assertEqual(code,0)
+        header=dict(zip(lines[0][::2],lines[0][1::2]))
+        self.assertEqual((header["tier"],header["schedule"],header["duration"],header["quiet-tail"]),("day","none","86400","0"))
+        self.assertEqual((header["job-load"],header["target-rate"],header["node-faults"]),("day",str(jobs.DAY_DEFAULT_RATE),"false"))
+        self.assertFalse([line for line in lines if line[0]=="cycle"])
+        self.assertIn(["day","86400","s","with","no","faults,","walks","or","specials,","then","the","drain"],lines)
+        # The scale-out record measured three 4 vCPU / 6 GiB nodes; quickstart
+        # makes 2 vCPU / 2 GiB ones, so the day resizes them first.
+        self.assertIn(["resize","4","vCPU","6","GiB","each","node,","one","at","a","time,","before","configuring"],lines)
+        # The scale-out record's two billion a day ran Ubuntu's static BusyBox,
+        # which costs half as much per process as the image's.
+        self.assertIn(["host-busybox","busybox-static","1:1.36.1-6ubuntu3.1",
+                       "52151e7f322f926b64049cdaa1410dc3ea6485525e0624b05813791c219ae933"],lines)
+        budget=next(line for line in lines if line[0]=="job-runs")[1:]
+        budget=dict(zip(budget[::2],budget[1::2]))
+        self.assertLessEqual(int(budget["retained-peak"]),int(budget["limit"]))
+
+    def test_the_day_tier_takes_a_lower_rate_down_to_a_billion_a_day_and_no_faults(self):
+        code,lines,_=self.plan("--tier","day","--target-rate","15000")
+        self.assertEqual(code,0)
+        self.assertEqual(dict(zip(lines[0][::2],lines[0][1::2]))["target-rate"],"15000")
+        code,_,error=self.plan("--tier","day","--target-rate",str(jobs.DAY_FLOOR-1))
+        self.assertNotEqual(code,0); self.assertIn(str(jobs.DAY_FLOOR),error)
+        for option in (["--duration","2h"],["--schedule","full"],["--job-load","target"],["--node-faults"]):
+            code,_,error=self.plan("--tier","day",*option)
+            self.assertNotEqual(code,0); self.assertIn("fixed by the job qualification tier",error)
+        # A day has no walks to run a soak build in.
+        code,_,error=self.plan("--tier","day","--soak-bun","/nonexistent/bun-v0.2.3-soak.1")
+        self.assertNotEqual(code,0); self.assertIn("no upgrade walks",error)
+
+    def test_the_day_tier_runs_no_cycles_and_drains_after_the_day(self):
+        # The day spends its whole length in the wait that every tier ends
+        # with, which keeps the light and heavy checks and the TLS rotations
+        # going; the drain starts after it, as in every tier (#1338).
+        script=(self.release/"qualify-sustained.sh").read_text()
+        self.assertIn('while [ "$schedule" != none ]; do',script)
+        self.assertIn('day) : "${schedule:=none}" "${duration_text:=24h}"',script)
+
+    def test_only_the_day_tier_swaps_the_image_busybox_for_a_checked_ubuntu_copy(self):
+        code,lines,_=self.plan("--tier","fast")
+        self.assertEqual(code,0)
+        self.assertFalse([line for line in lines if line[0]=="host-busybox"])
+        script=(self.release/"qualify-sustained.sh").read_text()
+        # Both the package and the binary in it are pinned by SHA-256, and a
+        # mismatch fails setup rather than falling back to the image's copy.
+        self.assertIn("day_busybox_deb_sha256=d96535e0402c011e0ee43449799df2f4504d44b842e4f2b3a6cbc845508eaafc",script)
+        self.assertIn('[ "$(sha256 "$deb")" = "$day_busybox_deb_sha256" ] || setup_fail',script)
+        self.assertIn('[ "$(sha256sum "$root/busybox" | cut -d" " -f1)" = "$busybox_sha256" ]',script)
 
     def test_job_tiers_refuse_a_rate_below_a_hundred_million_a_day_or_a_changed_schedule(self):
         code,_,error=self.plan("--tier","fast","--target-rate","1000")
@@ -516,13 +596,13 @@ class DrainedCampaignApply(unittest.TestCase):
         import os,re,subprocess,time
         source=(self.release/"qualify-sustained.sh").read_text()
         functions="".join(re.search(rf"^{name}\(\) \{{.*?(?:^\}}\n|\}}\n)",source,re.S|re.M).group(0)
-                          for name in ("meta_get","jobs_applied","write_workloads"))
+                          for name in ("meta_get","jobs_applied","soak_workloads","write_workloads"))
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory); evidence=root/"evidence"; (evidence/"jobs").mkdir(parents=True)
             (evidence/"jobs/installed").write_text("")
             if stop_file: (evidence/"jobs/stop").write_text("")
             (evidence/"metadata.json").write_text(json.dumps(metadata))
-            (root/"apps.toml").write_text('[app.soak-identity]\nenv = { SOAK_GENERATION = "0" }\n')
+            (root/"apps.toml").write_text('[policy.soak-team]\nmatch = "true"\n\n[app.soak-identity]\nenv = { SOAK_GENERATION = "0" }\n')
             (root/"scripts/release/sustained").mkdir(parents=True)
             (root/"scripts/release/sustained/soak-jobs.toml").write_text('[job.soak-job-cron-runc]\nschedule = "* * * * *"\n')
             # The clock is the only thing faked: a shell function shadows date(1).
@@ -530,7 +610,23 @@ class DrainedCampaignApply(unittest.TestCase):
             subprocess.run(["bash","-c",clock+functions+"write_workloads"],check=True,
                            env=dict(PATH=os.environ["PATH"],HOME=directory,evidence=str(evidence),generation="7",
                                     workloads_template=str(root/"apps.toml"),repository=str(root)))
-            return (evidence/"workloads.toml").read_text()
+            self.workloads=(evidence/"workloads.toml").read_text()
+            self.policies=(evidence/"policies.toml").read_text()
+            return self.workloads
+
+    def test_the_policies_go_in_their_own_manifest_and_the_jobs_stay_with_the_apps(self):
+        # The API refuses policies in a manifest that has jobs ("policies
+        # apply only to a cluster, in a manifest without jobs"), and a job's
+        # run_before hook must be applied with the app it hooks: 0.2.4's
+        # first V02 fast tiers stopped at each in turn.
+        self.write(dict(job_stop_at=10**10))
+        self.assertIn("[policy.soak-team]",self.policies)
+        self.assertIn('match = "true"',self.policies)
+        self.assertNotIn("[app.",self.policies)
+        self.assertNotIn("[job.",self.policies)
+        self.assertNotIn("[policy.",self.workloads)
+        self.assertIn("[app.soak-identity]",self.workloads)
+        self.assertIn("[job.soak-job-cron-runc]",self.workloads)
 
     def test_the_job_fixtures_are_applied_while_the_campaign_runs(self):
         text=self.write(dict(job_stop_at=10**10))
@@ -626,7 +722,9 @@ class RunBudget(unittest.TestCase):
                               stderr=subprocess.PIPE,text=True,timeout=60,env=dict(os.environ,RELIABURGER_SOAK_CAFFEINATED="1"))
         self.assertEqual(result.returncode,0,result.stderr)
         header=next(line for line in result.stdout.splitlines() if line.startswith("plan: tier ")).split()[1:]
-        duration=int(dict(zip(header[::2],header[1::2]))["duration"])
+        header=dict(zip(header[::2],header[1::2]))
+        # The campaign also runs through the final's quiet tail (#1062).
+        duration=int(header["duration"])+int(header["quiet-tail"])
         line=next(line for line in result.stdout.splitlines() if line.startswith("plan: job-runs "))
         fields=line.split()[2:]
         fields=dict(zip(fields[::2],fields[1::2]))
@@ -907,3 +1005,136 @@ class ControllerFallback(unittest.TestCase):
         self.assertEqual(report["api_fallbacks"],snapshot["api_fallbacks"])
         text="\n".join(checker.job_qualification_lines(report))
         self.assertIn("API fallbacks: n1 missed 1, n2 missed 1; n3 answered 1",text)
+
+
+class CurrentPairExpectations(unittest.TestCase):
+    """#1108: a rotation during the all-off hold moved `current` on while
+    every node was down, and the special pushed it on power-on without
+    `ingress-expect`, so the checker failed every node for serving it."""
+
+    def functions(self):
+        source=(Path(__file__).parent/"qualify-sustained.sh").read_text()
+        bodies={}
+        for header in re.finditer(r"\n([a-z_]+)\(\) \{\n",source):
+            body=source[header.end():]
+            bodies[header.group(1)]=body[:body.index("\n}\n")]
+        return bodies
+
+    def test_every_push_of_the_current_pair_records_what_the_node_must_serve(self):
+        pushes={name:body for name,body in self.functions().items()
+                if 'push_pair "$node" "$tls/current/' in body}
+        self.assertIn("push_current_pair",pushes)
+        for name,body in pushes.items():
+            with self.subTest(function=name):
+                push=body.index('push_pair "$node" "$tls/current/')
+                self.assertIn("check ingress-expect",body[push:])
+
+    def test_power_on_and_the_all_off_special_push_through_the_helper(self):
+        bodies=self.functions()
+        for name in ("power_on","special_all_off"):
+            with self.subTest(function=name):
+                self.assertIn("push_current_pair",bodies[name])
+                self.assertNotIn('push_pair "$node" "$tls/current/',bodies[name])
+
+
+class ControllerExitStatus(unittest.TestCase):
+    """#1035: macOS runs the harness under /bin/bash 3.2. Once the pid space
+    wraps and a later command gets the job controller's old pid, bash 3.2
+    drops the controller from its job table without saving its status, so
+    finish()'s `wait` failed with "not a child of this shell" (127) and the
+    controller's real exit status never reached the verdict. The controller
+    now records its own status in jobs/exit-status and finish() reads that."""
+
+    release=Path(__file__).parent
+    # The shell macOS runs the harness with; elsewhere this is bash 5.
+    bash="/bin/bash" if Path("/bin/bash").exists() else "bash"
+
+    def harness_functions(self, *names):
+        source=(self.release/"qualify-sustained.sh").read_text()
+        functions=""
+        for name in names:
+            start=re.search(rf"^{name}\(\) \{{",source,re.M).start()
+            # One-line helpers end on their own line; the rest at a closing brace in column 0.
+            line=source[start:source.index("\n",start)+1]
+            functions+=line if line.rstrip().endswith("}") else source[start:source.index("\n}\n",start)+3]
+        return functions
+
+    def finish(self, status=None):
+        """Run the harness's finish() for a controller that has already exited
+        and that the shell no longer knows: its pid is one this shell never
+        started, which is what bash 3.2 sees after the pid is reused."""
+        import os,subprocess
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); evidence=root/"evidence"; (evidence/"jobs").mkdir(parents=True)
+            (evidence/"metadata.json").write_text(json.dumps(dict(tier="fast")))
+            if status is not None: (evidence/"jobs/exit-status").write_text(f"{status}\n")
+            script=("set -euo pipefail\n"+self.harness_functions("meta","meta_get","real_home_state","finish")
+                    +"check() { return 0; }\n"
+                    +'keep=true; vm=(); home=; real_before=$(real_home_state)\n'
+                    # A pid that has exited and was never this shell's child.
+                    +"jobs_pid=$(/bin/sh -c 'echo $$')\n"
+                    +"trap finish EXIT\n")
+            result=subprocess.run([self.bash,"-c",script],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,
+                                  env=dict(PATH=os.environ["PATH"],HOME=directory,evidence=str(evidence),record=str(root/"record.md")))
+            return result,json.loads((evidence/"metadata.json").read_text())
+
+    def test_a_controller_that_exited_cleanly_passes_after_the_shell_forgot_it(self):
+        result,metadata=self.finish(status=0)
+        self.assertNotIn("not a child",result.stderr)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertNotIn("result",metadata)
+
+    def test_a_controller_that_failed_fails_the_run_and_names_its_status(self):
+        result,metadata=self.finish(status=1)
+        self.assertNotEqual(result.returncode,0)
+        self.assertEqual(metadata["result"],"FAIL")
+        self.assertIn("Job controller exited with status 1",metadata["notes"])
+
+    def test_a_controller_that_left_no_status_fails_the_run(self):
+        result,metadata=self.finish()
+        self.assertNotEqual(result.returncode,0)
+        self.assertEqual(metadata["result"],"FAIL")
+        self.assertIn("Job controller exited without recording its exit status",metadata["notes"])
+
+    def test_starting_the_controller_clears_a_status_left_by_an_earlier_run(self):
+        import os,subprocess
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); evidence=root/"evidence"; (evidence/"jobs").mkdir(parents=True)
+            (evidence/"jobs/exit-status").write_text("0\n")
+            controller=root/"controller.py"; controller.write_text("import time\ntime.sleep(5)\n")
+            script=(self.harness_functions("start_jobs")+'start_jobs\nkill "$jobs_pid"\n')
+            subprocess.run([self.bash,"-c",script],check=True,
+                           env=dict(PATH=os.environ["PATH"],evidence=str(evidence),job_controller=str(controller),
+                                    job_load="target",target_rate="",api_port="1",ca="ca",limactl="limactl"))
+            self.assertFalse((evidence/"jobs/exit-status").exists())
+
+    def test_the_run_command_records_its_exit_status_for_the_harness(self):
+        import sys
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as directory:
+            evidence=Path(directory); (evidence/"jobs").mkdir()
+            argv=["job_soak.py","run","--evidence",str(evidence),"--api-port","1","--ca","ca","--limactl","limactl"]
+            with mock.patch.object(sys,"argv",argv), mock.patch.object(jobs,"run",return_value=1):
+                self.assertEqual(jobs.main(),1)
+            self.assertEqual((evidence/"jobs/exit-status").read_text().strip(),"1")
+            with mock.patch.object(sys,"argv",argv), mock.patch.object(jobs,"run",side_effect=RuntimeError("boom")):
+                with self.assertRaises(RuntimeError): jobs.main()
+            self.assertEqual((evidence/"jobs/exit-status").read_text().strip(),"1")
+            with mock.patch.object(sys,"argv",argv), mock.patch.object(jobs,"run",return_value=0):
+                self.assertEqual(jobs.main(),0)
+            self.assertEqual((evidence/"jobs/exit-status").read_text().strip(),"0")
+
+
+class NodeFaultOverlap(unittest.TestCase):
+    """A mark records the job modes running on the faulted node in the last
+    15 s. One mark at injection left runc, whose attempts are sparse, a coin
+    toss: the 0.2.2 jobs fast tier missed its only slow-fsync overlap."""
+
+    def test_node_faults_mark_job_overlap_throughout_the_hold(self):
+        source=(Path(__file__).parent/"qualify-sustained.sh").read_text()
+        slot=source[source.index("\nslot_node_fault() {"):]; slot=slot[:slot.index("\n}\n")]
+        injected=slot.index('node_fault_script "$kind" start')
+        removed=slot.index('node_fault_script "$kind" stop')
+        hold=slot[injected:removed]
+        self.assertIn("job_mark_fault",hold)
+        self.assertRegex(hold,r"while \[")

@@ -108,6 +108,7 @@ mod tests {
             host_process: false,
             initialiser: false,
             port_mapping: None,
+            stop: None,
             root: OciRoot {
                 path: "rootfs".to_string(),
                 readonly: false,
@@ -116,6 +117,7 @@ mod tests {
                 rlimits: Vec::new(),
                 args: vec!["sh".to_string()],
                 env: vec![],
+                provider_env: Vec::new(),
                 cwd: "/".to_string(),
                 user: OciUser {
                     uid: 65534,
@@ -160,14 +162,19 @@ mod tests {
                     },
                 ],
                 resources: Some(OciResources {
+                    pids: None,
                     cpu: None,
                     memory: None,
                     unified: std::collections::BTreeMap::new(),
+                    devices: Vec::new(),
                 }),
                 cgroups_path: Some("/sys/fs/cgroup/test".to_string()),
                 uid_mappings: None,
                 gid_mappings: None,
+                sysctl: Default::default(),
+                devices: Vec::new(),
             },
+            runtime_knobs: None,
         }
     }
 

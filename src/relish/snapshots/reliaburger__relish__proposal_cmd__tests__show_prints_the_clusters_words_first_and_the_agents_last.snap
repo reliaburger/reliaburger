@@ -1,0 +1,30 @@
+---
+source: src/relish/proposal_cmd.rs
+expression: shown
+---
+Proposal 17 (scale, pending) by holmes (agent)
+Expires in 3540s.
+
+Scale shop/web from 3 to 5 replicas.
+Touches 1 app on 2 nodes (node-a, node-b); starts 2 instances, forecast on node-c.
+Serves https://shop.example.com/ and the service web.shop.
+Undo: `relish undo 17` puts web back to 3 replicas.
+
+Reversibility: exact. Undo: relish undo 17 (puts web back to 3 replicas).
+
+Policy findings:
+  policy limits warns about app shop/web: no memory limit
+
+Blast radius:
+  apps: shop/web
+  nodes: node-a, node-b
+  instances: 0 replaced, 2 started, 0 stopped
+  forecast: new instances on node-c
+  routes: shop.example.com/
+  services: web.shop
+
+Changes:
+  shop/web replicas: 3 -> 5
+
+The agent's reason (its own words, unverified):
+  p99 over the SLO for 10 minutes

@@ -1,0 +1,31 @@
+# A crash loop after a bad deploy: web v1 runs, then v2 goes out missing a
+# setting it needs, and every start fails five seconds in.
+id = "crash-loop"
+title = "A crash loop after a bad deploy"
+nodes = 1
+
+prompt = """
+Someone deployed a new version of the `web` app a minute ago, and since then
+users get connection errors. Find out what is wrong: which app, on which node,
+and what kind of fault.
+"""
+
+[[setup]]
+apply = "apps/web-v1.toml"
+wait_running = "web"
+
+[[setup]]
+apply = "apps/web-v2-crashes.toml"
+
+# Long enough for three restarts, which is what `relish wtf` calls a loop.
+[[setup]]
+settle = "40s"
+
+[truth]
+app = "web"
+namespace = "default"
+node = "@instance:web"
+fault_kind = "crash_loop"
+
+[score]
+checks = ["app", "node", "fault_kind"]

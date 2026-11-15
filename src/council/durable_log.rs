@@ -24,9 +24,10 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use super::types::TypeConfig;
 use crate::sesame::raft_encryption::{self, EncryptedEntry};
 
-/// Log entries: index → `bincode(Entry)`.
+/// Log entries: index → JSON `Entry`, or the marker byte and a postcard
+/// `EncryptedEntry` when the log is encrypted.
 const ENTRIES: TableDefinition<u64, &[u8]> = TableDefinition::new("raft_log_entries");
-/// Small metadata: vote / committed / last-purged → bincode.
+/// Small metadata: vote / committed / last-purged → postcard.
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("raft_log_meta");
 
 const VOTE_KEY: &str = "vote";
@@ -73,11 +74,26 @@ fn write_err<E: std::error::Error + 'static>(e: E) -> StorageError<u64> {
 
 /// Decode a log entry from stored bytes.
 ///
-/// Reads JSON (the current format); silently accepting the old bincode
-/// format is deliberately not attempted — the entry payloads it could
-/// hold (`AppSpec`) never round-tripped through bincode anyway.
+/// Reads JSON, the only format log entries have been stored in since they
+/// stopped being binary (an `AppSpec` never survived a positional format).
 fn decode_entry(bytes: &[u8]) -> Result<Entry<TypeConfig>, StorageError<u64>> {
     serde_json::from_slice(bytes).map_err(read_err)
+}
+
+/// Decode one postcard value that must fill `bytes` exactly.
+///
+/// Leftover bytes mean the value is damaged or was written in another
+/// format (bincode, before state format 70), so they're refused rather
+/// than ignored: a misread vote is worse than an unreadable one.
+fn decode_exact<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, StorageError<u64>> {
+    let (value, rest) = postcard::take_from_bytes(bytes).map_err(read_err)?;
+    if !rest.is_empty() {
+        return Err(read_err(std::io::Error::other(format!(
+            "{} trailing bytes after a stored raft value",
+            rest.len()
+        ))));
+    }
+    Ok(value)
 }
 
 impl DurableLogStore {
@@ -121,23 +137,23 @@ impl DurableLogStore {
     /// Encode an entry into the bytes stored in redb.
     ///
     /// Plaintext JSON when keyless; when a key is present, the JSON is
-    /// encrypted and the `EncryptedEntry` is bincoded behind a one-byte marker
+    /// encrypted and the `EncryptedEntry` is postcard behind a one-byte marker
     /// so the read path can tell the two formats apart.
     fn encode_value(&self, entry: &Entry<TypeConfig>) -> Result<Vec<u8>, StorageError<u64>> {
-        // JSON, not bincode: log entries carry `RaftRequest`, whose `AppSpec`
+        // JSON, not postcard: log entries carry `RaftRequest`, whose `AppSpec`
         // uses config types (`Replicas`, `ResourceRange`) with `deserialize_any`
-        // for TOML ergonomics. bincode is not self-describing and cannot drive
-        // `deserialize_any`, so it corrupts on read-back. The snapshot already
-        // uses JSON for the same reason. Votes/log-ids stay bincode — they're
-        // plain openraft numeric types.
+        // for TOML ergonomics. A positional binary format isn't self-describing
+        // and can't drive `deserialize_any`, so it corrupts on read-back. The
+        // snapshot uses JSON for the same reason. Votes and log ids are
+        // postcard: they're plain openraft numeric types.
         let json = serde_json::to_vec(entry).map_err(write_err)?;
         match &self.key {
             None => Ok(json),
             Some(ikm) => {
                 let encrypted = raft_encryption::encrypt_entry(&json, ikm).map_err(write_err)?;
-                // bincode is safe here: `EncryptedEntry` is plain byte
+                // postcard is safe here: `EncryptedEntry` is plain byte
                 // vectors/arrays, no `deserialize_any`.
-                let body = bincode::serialize(&encrypted).map_err(write_err)?;
+                let body = postcard::to_stdvec(&encrypted).map_err(write_err)?;
                 let mut out = Vec::with_capacity(body.len() + 1);
                 out.push(ENCRYPTED_MARKER);
                 out.extend_from_slice(&body);
@@ -155,7 +171,7 @@ impl DurableLogStore {
     /// surfaces as a read error rather than silently losing log entries.
     fn decode_value(&self, bytes: &[u8]) -> Result<Entry<TypeConfig>, StorageError<u64>> {
         if bytes.first() == Some(&ENCRYPTED_MARKER) {
-            let encrypted: EncryptedEntry = bincode::deserialize(&bytes[1..]).map_err(read_err)?;
+            let encrypted: EncryptedEntry = decode_exact(&bytes[1..])?;
             let ikm = self.key.as_ref().ok_or_else(|| {
                 read_err(std::io::Error::other(
                     "encrypted raft log entry but no encryption key available",
@@ -218,7 +234,7 @@ impl DurableLogStore {
 
     fn get_vote(&self) -> Result<Option<Vote<u64>>, StorageError<u64>> {
         match self.get_meta(VOTE_KEY)? {
-            Some(bytes) => Ok(Some(bincode::deserialize(&bytes).map_err(read_err)?)),
+            Some(bytes) => Ok(Some(decode_exact(&bytes)?)),
             None => Ok(None),
         }
     }
@@ -278,7 +294,7 @@ impl DurableLogStore {
 
     fn last_purged(&self) -> Result<Option<LogId<u64>>, StorageError<u64>> {
         match self.get_meta(PURGED_KEY)? {
-            Some(bytes) => Ok(Some(bincode::deserialize(&bytes).map_err(read_err)?)),
+            Some(bytes) => Ok(Some(decode_exact(&bytes)?)),
             None => Ok(None),
         }
     }
@@ -355,7 +371,7 @@ impl RaftLogStorage<TypeConfig> for DurableLogStore {
     }
 
     async fn save_vote(&mut self, vote: &Vote<u64>) -> Result<(), StorageError<u64>> {
-        let bytes = bincode::serialize(vote).map_err(write_err)?;
+        let bytes = postcard::to_stdvec(vote).map_err(write_err)?;
         let store = self.clone();
         run_blocking(move || store.put_meta(VOTE_KEY, &bytes)).await
     }
@@ -371,7 +387,7 @@ impl RaftLogStorage<TypeConfig> for DurableLogStore {
         let store = self.clone();
         match committed {
             Some(log_id) => {
-                let bytes = bincode::serialize(&log_id).map_err(write_err)?;
+                let bytes = postcard::to_stdvec(&log_id).map_err(write_err)?;
                 run_blocking(move || store.put_meta(COMMITTED_KEY, &bytes)).await
             }
             None => run_blocking(move || store.del_meta(COMMITTED_KEY)).await,
@@ -380,7 +396,7 @@ impl RaftLogStorage<TypeConfig> for DurableLogStore {
 
     async fn read_committed(&mut self) -> Result<Option<LogId<u64>>, StorageError<u64>> {
         match self.get_meta(COMMITTED_KEY)? {
-            Some(bytes) => Ok(Some(bincode::deserialize(&bytes).map_err(read_err)?)),
+            Some(bytes) => Ok(Some(decode_exact(&bytes)?)),
             None => Ok(None),
         }
     }
@@ -430,7 +446,7 @@ impl RaftLogStorage<TypeConfig> for DurableLogStore {
     }
 
     async fn purge(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
-        let bytes = bincode::serialize(&log_id).map_err(write_err)?;
+        let bytes = postcard::to_stdvec(&log_id).map_err(write_err)?;
         let store = self.clone();
         run_blocking(move || {
             let wtx = store.db.begin_write().map_err(write_err)?;
@@ -523,6 +539,61 @@ mod tests {
         );
     }
 
+    fn raw_meta_bytes(store: &DurableLogStore, key: &str) -> Vec<u8> {
+        store.get_meta(key).unwrap().unwrap()
+    }
+
+    #[tokio::test]
+    async fn vote_and_log_ids_are_stored_as_postcard() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = DurableLogStore::open(dir.path().join("store.redb")).unwrap();
+        let vote = Vote::new(3, 42);
+        store.save_vote(&vote).await.unwrap();
+        store.save_committed(Some(log_id(2, 3))).await.unwrap();
+        store.write_entries(vec![entry(1, 1), entry(1, 2)]).unwrap();
+        store.purge(log_id(1, 2)).await.unwrap();
+
+        assert_eq!(
+            raw_meta_bytes(&store, VOTE_KEY),
+            postcard::to_stdvec(&vote).unwrap()
+        );
+        assert_eq!(
+            raw_meta_bytes(&store, COMMITTED_KEY),
+            postcard::to_stdvec(&log_id(2, 3)).unwrap()
+        );
+        assert_eq!(
+            raw_meta_bytes(&store, PURGED_KEY),
+            postcard::to_stdvec(&log_id(1, 2)).unwrap()
+        );
+    }
+
+    /// The vote as bincode wrote it before postcard: term and node id as
+    /// fixed-width little-endian `u64`s, then the committed flag. Read as
+    /// postcard, it would be term 3, node 0, uncommitted, with 13 bytes left
+    /// over, and those leftover bytes are what refuse it. The state stamp
+    /// refuses the whole directory first; this is the second line.
+    #[test]
+    fn a_bincode_vote_from_the_previous_generation_is_refused_not_misread() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DurableLogStore::open(dir.path().join("store.redb")).unwrap();
+        let mut old = 3u64.to_le_bytes().to_vec();
+        old.extend(42u64.to_le_bytes());
+        old.push(1);
+        store.put_meta(VOTE_KEY, &old).unwrap();
+        assert!(store.get_vote().is_err());
+        assert!(store.is_fresh().is_err());
+    }
+
+    #[test]
+    fn a_log_id_with_trailing_bytes_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DurableLogStore::open(dir.path().join("store.redb")).unwrap();
+        let mut bytes = postcard::to_stdvec(&log_id(1, 2)).unwrap();
+        bytes.push(0);
+        store.put_meta(PURGED_KEY, &bytes).unwrap();
+        assert!(store.last_purged_log_id().is_err());
+    }
+
     #[tokio::test]
     async fn last_purged_log_id_reports_the_purge_boundary() {
         let dir = tempfile::tempdir().unwrap();
@@ -591,6 +662,14 @@ mod tests {
         assert!(
             raft_encryption::is_encrypted(&raw, &plaintext),
             "stored value must not contain the plaintext entry"
+        );
+
+        // Behind the marker, the envelope is exactly one postcard value.
+        let (envelope, rest) = postcard::take_from_bytes::<EncryptedEntry>(&raw[1..]).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(
+            raft_encryption::decrypt_entry(&envelope, &key).unwrap(),
+            plaintext
         );
 
         let mut reader = store.get_log_reader().await;

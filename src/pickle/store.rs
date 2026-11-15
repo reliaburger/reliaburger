@@ -82,9 +82,13 @@ impl BlobStore {
     }
 
     /// Claim exclusive upload ownership and reclaim abandoned temporary files.
-    /// Call before starting any writer. Startup refuses competing owners,
-    /// unrecognised entries and cleanup errors without serving partial recovery.
-    pub async fn claim_upload_directory(&self) -> Result<UploadDirectoryOwner, PickleError> {
+    /// Call before starting any writer. Waits up to `wait` for a busy lock,
+    /// then refuses competing owners, unrecognised entries and cleanup errors
+    /// without serving partial recovery.
+    pub async fn claim_upload_directory(
+        &self,
+        wait: std::time::Duration,
+    ) -> Result<UploadDirectoryOwner, PickleError> {
         let directory = self.base_dir.clone();
         tokio::task::spawn_blocking(move || -> Result<UploadDirectoryOwner, PickleError> {
             std::fs::create_dir_all(&directory)?;
@@ -99,7 +103,7 @@ impl BlobStore {
             // Own the lock before anything below can refuse the claim, so a
             // refusal unlocks it too.
             let owner = UploadDirectoryOwner {
-                _lock: FileLock::try_lock(lock).map_err(|error| {
+                _lock: FileLock::lock_within(lock, wait).map_err(|error| {
                     std::io::Error::other(format!("registry upload directory is busy: {error}"))
                 })?,
             };
@@ -574,6 +578,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = BlobStore::new(dir.path());
         (store, dir)
+    }
+
+    // Blob digests are content addresses on disk and on the wire, so their
+    // bytes are pinned to known answers, not just to each other.
+    #[test]
+    fn compute_sha256_matches_the_fips_known_answer() {
+        assert_eq!(
+            compute_sha256(b"abc").as_str(),
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn a_blob_file_spanning_read_chunks_hashes_to_its_known_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob");
+        std::fs::write(&path, vec![b'a'; 2 * 64 * 1024 + 3]).unwrap();
+
+        assert_eq!(
+            sha256_file(&path).unwrap().as_str(),
+            "sha256:ebd89615d7dd639f1f3770972ad171d88182c2860e67cafece1c3a0da3be7dba"
+        );
     }
 
     async fn repository_upload(
@@ -1368,14 +1394,67 @@ mod tests {
     #[tokio::test]
     async fn upload_directory_owner_excludes_competitors_and_reclaims_on_replacement() {
         let (store, _dir) = test_store();
-        let owner = store.claim_upload_directory().await.unwrap();
+        let owner = store
+            .claim_upload_directory(std::time::Duration::ZERO)
+            .await
+            .unwrap();
         let id = store.initiate_upload().await.unwrap();
         store.write_upload_chunk(&id, b"active").await.unwrap();
-        assert!(store.claim_upload_directory().await.is_err());
+        assert!(
+            store
+                .claim_upload_directory(std::time::Duration::ZERO)
+                .await
+                .is_err()
+        );
         assert_eq!(store.upload_size(&id).await.unwrap(), 6);
         drop(owner);
-        let _replacement = store.claim_upload_directory().await.unwrap();
+        let _replacement = store
+            .claim_upload_directory(std::time::Duration::ZERO)
+            .await
+            .unwrap();
         assert!(!store.upload_path(&id).exists());
+    }
+
+    /// `execv` runs no destructors, so after a self-upgrade the old image's
+    /// lock lives on in any child another thread was forking at that moment,
+    /// until the child's own `exec` closes it. The new image's claim waits
+    /// that out, and still refuses an owner that keeps the lock (#1198).
+    #[tokio::test]
+    async fn a_claim_waits_out_a_briefly_held_lock_and_refuses_a_lasting_one() {
+        let (store, _dir) = test_store();
+        std::fs::create_dir_all(&store.base_dir).unwrap();
+        let lock_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(store.base_dir.join(".upload-owner.lock"))
+            .unwrap();
+        let holder = FileLock::try_lock(lock_file).unwrap();
+        assert!(
+            store
+                .claim_upload_directory(std::time::Duration::ZERO)
+                .await
+                .is_err()
+        );
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(holder);
+        });
+        let owner = store
+            .claim_upload_directory(std::time::Duration::from_secs(10))
+            .await
+            .unwrap();
+        release.join().unwrap();
+        let started = std::time::Instant::now();
+        assert!(
+            store
+                .claim_upload_directory(std::time::Duration::from_millis(200))
+                .await
+                .is_err()
+        );
+        assert!(started.elapsed() >= std::time::Duration::from_millis(200));
+        drop(owner);
     }
 
     /// A child that another thread is forking holds a copy of every open
@@ -1406,13 +1485,21 @@ mod tests {
         let unexpected = store.base_dir.join("uploads").join("operator-file");
         let mut refused = 0;
         for _ in 0..300 {
-            match store.claim_upload_directory().await {
+            match store
+                .claim_upload_directory(std::time::Duration::ZERO)
+                .await
+            {
                 Ok(owner) => drop(owner),
                 Err(_) => refused += 1,
             }
             // A claim refused for an unrecognised entry has taken the lock.
             std::fs::write(&unexpected, b"keep").unwrap();
-            assert!(store.claim_upload_directory().await.is_err());
+            assert!(
+                store
+                    .claim_upload_directory(std::time::Duration::ZERO)
+                    .await
+                    .is_err()
+            );
             std::fs::remove_file(&unexpected).unwrap();
         }
         spawning.store(false, Ordering::Relaxed);
@@ -1430,7 +1517,12 @@ mod tests {
         let sentinel = outside.path().join("a".repeat(32));
         std::fs::write(&sentinel, b"not owned").unwrap();
         std::os::unix::fs::symlink(outside.path(), store.base_dir.join("uploads")).unwrap();
-        assert!(store.claim_upload_directory().await.is_err());
+        assert!(
+            store
+                .claim_upload_directory(std::time::Duration::ZERO)
+                .await
+                .is_err()
+        );
         assert_eq!(std::fs::read(sentinel).unwrap(), b"not owned");
     }
 
@@ -1441,15 +1533,28 @@ mod tests {
         std::fs::create_dir_all(&uploads).unwrap();
         let unexpected = uploads.join("operator-file");
         std::fs::write(&unexpected, b"keep").unwrap();
-        assert!(store.claim_upload_directory().await.is_err());
+        assert!(
+            store
+                .claim_upload_directory(std::time::Duration::ZERO)
+                .await
+                .is_err()
+        );
         assert_eq!(std::fs::read(&unexpected).unwrap(), b"keep");
         std::fs::remove_file(unexpected).unwrap();
         let directory = uploads.join("a".repeat(32));
         std::fs::create_dir(&directory).unwrap();
-        assert!(store.claim_upload_directory().await.is_err());
+        assert!(
+            store
+                .claim_upload_directory(std::time::Duration::ZERO)
+                .await
+                .is_err()
+        );
         assert!(directory.is_dir());
         std::fs::remove_dir(directory).unwrap();
-        let _owner = store.claim_upload_directory().await.unwrap();
+        let _owner = store
+            .claim_upload_directory(std::time::Duration::ZERO)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

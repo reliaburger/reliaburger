@@ -1,0 +1,68 @@
+Oct 28 23:56:31.556479 lima-rb-84540b90e55a-2 systemd[1]: Starting reliaburger.service - Reliaburger node...
+Oct 28 23:56:31.563733 lima-rb-84540b90e55a-2 systemd[1]: Started reliaburger.service - Reliaburger node.
+Oct 28 23:56:31.591874 lima-rb-84540b90e55a-2 bun[1924]: bun: reliaburger node agent v0.2.2 (43baee6)
+Oct 28 23:56:31.612564 lima-rb-84540b90e55a-2 bun[1924]: bun: using runc runtime (root)
+Oct 28 23:56:31.619147 lima-rb-84540b90e55a-2 bun[1924]: bun: workloads use DNS nameserver 192.168.104.3
+Oct 28 23:56:31.805182 lima-rb-84540b90e55a-2 bun[1924]: bun: mTLS enabled on the Raft RPC, reporting and API transports
+Oct 28 23:56:31.805182 lima-rb-84540b90e55a-2 bun[1924]: bun: cluster mode — gossip on 192.168.104.3:9443, 1 seed(s)
+Oct 28 23:56:31.987730 lima-rb-84540b90e55a-2 bun[1924]: bun: GPU support enabled, 0 device(s) detected
+Oct 28 23:56:32.024618 lima-rb-84540b90e55a-2 bun[1924]: bun: eBPF data path loaded (attached=true)
+Oct 28 23:56:32.024959 lima-rb-84540b90e55a-2 bun[1924]: bun: waiting for replicated API credentials before opening 0.0.0.0:9117
+Oct 28 23:56:33.980736 lima-rb-84540b90e55a-2 bun[1924]: report worker: snapshot collection failed or timed out, and no recent observation to re-send
+Oct 28 23:56:38.985006 lima-rb-84540b90e55a-2 bun[1924]: report worker: snapshot collection failed or timed out, and no recent observation to re-send
+Oct 28 23:56:39.619367 lima-rb-84540b90e55a-2 bun[1924]: council: joined a council at recovery epoch 0
+Oct 28 23:56:42.089215 lima-rb-84540b90e55a-2 bun[1924]: bun: dns responder ready on 192.168.104.3:53
+Oct 28 23:56:42.090538 lima-rb-84540b90e55a-2 bun[1924]: bun: ingress listening on http 0.0.0.0:80 / https 0.0.0.0:443
+Oct 28 23:56:42.090786 lima-rb-84540b90e55a-2 bun[1924]: bun: observability enabled (metrics + logs + alerts)
+Oct 28 23:56:42.094350 lima-rb-84540b90e55a-2 bun[1924]: bun: API server listening on 0.0.0.0:9117
+Oct 28 23:56:42.106330 lima-rb-84540b90e55a-2 bun[1924]: bun: gitops sync loop started (it syncs only if the cluster has a [gitops] configuration)
+Oct 28 23:56:42.122574 lima-rb-84540b90e55a-2 bun[1924]: bun: Pickle registry listening on 0.0.0.0:5050 (TLS, authenticated writes and reads)
+Oct 28 23:56:42.122574 lima-rb-84540b90e55a-2 bun[1924]: bun: Pickle registry derived peer-reachable bind 0.0.0.0:5050 from cluster advertise address
+Oct 28 23:57:45.638926 lima-rb-84540b90e55a-2 systemd[1]: reliaburger.service: Sent signal SIGKILL to main process 1924 (bun) on client request.
+Oct 28 23:57:45.639477 lima-rb-84540b90e55a-2 systemd[1]: reliaburger.service: Failed to send signal SIGKILL to auxiliary processes on client request: Invalid argument
+Oct 28 23:57:45.648147 lima-rb-84540b90e55a-2 systemd[1]: reliaburger.service: Main process exited, code=killed, status=9/KILL
+Oct 28 23:57:45.648156 lima-rb-84540b90e55a-2 systemd[1]: reliaburger.service: Failed with result 'signal'.
+Oct 28 23:57:45.648764 lima-rb-84540b90e55a-2 systemd[1]: reliaburger.service: Consumed 1min 22.125s CPU time.
+Oct 28 23:57:47.832215 lima-rb-84540b90e55a-2 systemd[1]: reliaburger.service: Scheduled restart job, restart counter is at 1.
+Oct 28 23:57:47.839070 lima-rb-84540b90e55a-2 systemd[1]: Starting reliaburger.service - Reliaburger node...
+Oct 28 23:57:47.843853 lima-rb-84540b90e55a-2 systemd[1]: Started reliaburger.service - Reliaburger node.
+Oct 28 23:57:47.863197 lima-rb-84540b90e55a-2 bun[1972]: bun: reliaburger node agent v0.2.2 (43baee6)
+Oct 28 23:57:47.879905 lima-rb-84540b90e55a-2 bun[1972]: bun: using runc runtime (root)
+Oct 28 23:57:47.879905 lima-rb-84540b90e55a-2 bun[1972]: bun: workloads use DNS nameserver 192.168.104.3
+Oct 28 23:57:47.892451 lima-rb-84540b90e55a-2 bun[1972]: bun: mTLS enabled on the Raft RPC, reporting and API transports
+Oct 28 23:57:47.892451 lima-rb-84540b90e55a-2 bun[1972]: bun: cluster mode — gossip on 192.168.104.3:9443, 1 seed(s)
+Oct 28 23:57:47.939213 lima-rb-84540b90e55a-2 bun[1972]: bun: GPU support enabled, 0 device(s) detected
+Oct 28 23:57:48.002713 lima-rb-84540b90e55a-2 bun[1972]: bun: eBPF data path loaded (attached=true)
+Oct 28 23:57:48.032607 lima-rb-84540b90e55a-2 bun[1972]: council: no peer advertises a newer recovery epoch than 0; serving raft
+Oct 28 23:57:48.039536 lima-rb-84540b90e55a-2 bun[1972]: bun: dns responder ready on 192.168.104.3:53
+Oct 28 23:57:48.039667 lima-rb-84540b90e55a-2 bun[1972]: bun: ingress listening on http 0.0.0.0:80 / https 0.0.0.0:443
+Oct 28 23:57:48.039667 lima-rb-84540b90e55a-2 bun[1972]: bun: observability enabled (metrics + logs + alerts)
+Oct 28 23:57:48.039712 lima-rb-84540b90e55a-2 bun[1972]: bun: API server listening on 0.0.0.0:9117
+Oct 28 23:57:48.050371 lima-rb-84540b90e55a-2 bun[1972]: bun: gitops sync loop started (it syncs only if the cluster has a [gitops] configuration)
+Oct 28 23:57:48.058860 lima-rb-84540b90e55a-2 bun[1972]: bun: Pickle registry listening on 0.0.0.0:5050 (TLS, authenticated writes and reads)
+Oct 28 23:57:48.058860 lima-rb-84540b90e55a-2 bun[1972]: bun: Pickle registry derived peer-reachable bind 0.0.0.0:5050 from cluster advertise address
+Oct 28 23:57:49.061510 lima-rb-84540b90e55a-2 bun[1972]: pickle: registry cleanup pending: replication failed: error sending request for url (https://192.168.104.1:9117/v1/registry/query)
+Oct 28 23:57:52.110779 lima-rb-84540b90e55a-2 bun[1972]: pickle: registry cleanup resumed
+Oct 29 00:00:43.197504 lima-rb-84540b90e55a-2 bun[1972]: bun: upgrading to v0.2.3 (upgrade up-v0.2.3-1793232033788)
+Oct 29 00:00:43.217574 lima-rb-84540b90e55a-2 bun[1972]: bun: reliaburger node agent v0.2.3 (d387d56)
+Oct 29 00:00:43.223989 lima-rb-84540b90e55a-2 bun[1972]: bun: using runc runtime (root)
+Oct 29 00:00:43.224249 lima-rb-84540b90e55a-2 bun[1972]: bun: workloads use DNS nameserver 192.168.104.3
+Oct 29 00:00:43.237607 lima-rb-84540b90e55a-2 bun[1972]: bun: mTLS enabled on the Raft RPC, reporting and API transports
+Oct 29 00:00:43.237607 lima-rb-84540b90e55a-2 bun[1972]: bun: cluster mode — gossip on 192.168.104.3:9443, 1 seed(s)
+Oct 29 00:00:43.288545 lima-rb-84540b90e55a-2 bun[1972]: bun: GPU support enabled, 0 device(s) detected
+Oct 29 00:00:43.345005 lima-rb-84540b90e55a-2 bun[1972]: bun: eBPF data path loaded (attached=true)
+Oct 29 00:00:43.578954 lima-rb-84540b90e55a-2 bun[1972]: bun: adopted 1 running instance(s) from a previous process
+Oct 29 00:00:43.586218 lima-rb-84540b90e55a-2 bun[1972]: bun: dns responder ready on 192.168.104.3:53
+Oct 29 00:00:43.586838 lima-rb-84540b90e55a-2 bun[1972]: bun: ingress listening on http 0.0.0.0:80 / https 0.0.0.0:443
+Oct 29 00:00:43.586876 lima-rb-84540b90e55a-2 bun[1972]: bun: observability enabled (metrics + logs + alerts)
+Oct 29 00:00:43.588703 lima-rb-84540b90e55a-2 bun[1972]: bun: API server listening on 0.0.0.0:9117
+Oct 29 00:00:43.596773 lima-rb-84540b90e55a-2 bun[1972]: bun: gitops sync loop started (it syncs only if the cluster has a [gitops] configuration)
+Oct 29 00:00:43.615532 lima-rb-84540b90e55a-2 bun[1972]: bun: Pickle registry listening on 0.0.0.0:5050 (TLS, authenticated writes and reads)
+Oct 29 00:00:43.615532 lima-rb-84540b90e55a-2 bun[1972]: bun: Pickle registry derived peer-reachable bind 0.0.0.0:5050 from cluster advertise address
+Oct 29 00:00:44.032253 lima-rb-84540b90e55a-2 bun[1972]: council: no peer advertises a newer recovery epoch than 0; serving raft
+Oct 29 00:00:58.015916 lima-rb-84540b90e55a-2 bun[1972]: orchestrator: retirement of hello/default failed, will retry: cannot retire artifacts for default__hello-1 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 29 00:00:58.318151 lima-rb-84540b90e55a-2 bun[1972]: orchestrator: retirement of hello/default failed, will retry: cannot retire artifacts for default__hello-1 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 29 00:00:58.608666 lima-rb-84540b90e55a-2 bun[1972]: orchestrator: retirement of hello/default failed, will retry: cannot retire artifacts for default__hello-1 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 29 00:00:58.935077 lima-rb-84540b90e55a-2 bun[1972]: orchestrator: retirement of hello/default failed, will retry: cannot retire artifacts for default__hello-1 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 29 00:01:13.611633 lima-rb-84540b90e55a-2 bun[1972]: bun: note: instance default__hello-1 was not adopted after the upgrade — not reverting (cluster reschedules placements)
+Oct 29 00:01:13.611633 lima-rb-84540b90e55a-2 bun[1972]: bun: upgrade to v0.2.3 verified and committed

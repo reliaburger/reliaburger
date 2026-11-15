@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use rand::Rng;
+use rand::RngExt;
 use reliaburger::bun::disk_pressure::check_and_relieve;
 use reliaburger::council::backup::{
     BackupConfig, BackupKey, BackupStore, decode_backup, encode_backup, seal_snapshot,
@@ -303,7 +303,7 @@ async fn run_generator(layout: &ExportLayout) {
         std::fs::rename(&staged, layout.source.join(&name)).unwrap();
         sync_directory(&layout.source);
         ledger.record(&format!("publish {name}"));
-        let pause = rand::thread_rng().gen_range(20..120);
+        let pause = rand::rng().random_range(20..120);
         tokio::time::sleep(Duration::from_millis(pause)).await;
     }
 }
@@ -348,7 +348,7 @@ async fn run_exporter(layout: &ExportLayout, index: usize) {
             Err(error) if error.contains("busy") => {}
             Err(error) => panic!("exporter {index} failed: {error}"),
         }
-        let pause = rand::thread_rng().gen_range(5..60);
+        let pause = rand::rng().random_range(5..60);
         tokio::time::sleep(Duration::from_millis(pause)).await;
     }
 }
@@ -637,7 +637,7 @@ fn apply(model: &mut LeaseModel, operation: &LeaseOperation) {
 }
 
 fn choose_operation(model: &LeaseModel, worker: usize, next: &mut u64) -> LeaseOperation {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let cleaning: Vec<&String> = model
         .iter()
         .filter(|(_, v)| v.cleaning)
@@ -648,19 +648,19 @@ fn choose_operation(model: &LeaseModel, worker: usize, next: &mut u64) -> LeaseO
         .filter(|(_, v)| !v.cleaning)
         .map(|(k, _)| k)
         .collect();
-    if !cleaning.is_empty() && rng.gen_bool(0.5) {
-        let id = cleaning[rng.gen_range(0..cleaning.len())].clone();
+    if !cleaning.is_empty() && rng.random_bool(0.5) {
+        let id = cleaning[rng.random_range(0..cleaning.len())].clone();
         return LeaseOperation::Release { id };
     }
-    if active.len() < 3 || (model.len() < MAX_LIVE_LEASES && rng.gen_bool(0.3)) {
+    if active.len() < 3 || (model.len() < MAX_LIVE_LEASES && rng.random_bool(0.3)) {
         *next += 1;
         return LeaseOperation::Create {
             id: format!("w{worker}-{next}"),
             expires: now_unix_millis() + LEASE_LIFETIME_MS,
         };
     }
-    let id = active[rng.gen_range(0..active.len())].clone();
-    if rng.gen_bool(0.7) {
+    let id = active[rng.random_range(0..active.len())].clone();
+    if rng.random_bool(0.7) {
         *next += 1;
         LeaseOperation::Renew {
             id,
@@ -709,7 +709,7 @@ async fn run_lease_worker(root: &Path, worker: usize) {
         perform(&store, &operation).await;
         ledger.record(&format!("ack {}", operation.encode()));
         apply(&mut model, &operation);
-        let pause = rand::thread_rng().gen_range(2..30);
+        let pause = rand::rng().random_range(2..30);
         tokio::time::sleep(Duration::from_millis(pause)).await;
     }
 }
@@ -933,7 +933,7 @@ async fn run_backup_worker(root: &Path) {
         store.prune(BACKUP_RETAIN).await.unwrap();
         ledger.record(&format!("prune {sequence}"));
         sequence += 1;
-        let pause = rand::thread_rng().gen_range(2..30);
+        let pause = rand::rng().random_range(2..30);
         tokio::time::sleep(Duration::from_millis(pause)).await;
     }
 }

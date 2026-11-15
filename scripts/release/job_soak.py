@@ -59,6 +59,25 @@ DEFAULT_TARGET_RATE = 1390
 # containers can't approach the target, so their runs keep the calibration mix.
 TARGET_CAPS = {"shared-runc": 8, "process": 16}
 MILLION = 1 << 20
+# The day run (#1032): 2 billion accepted host-job tasks in one real day on
+# three nodes is 23,148.1 a second, so 23,149; a billion, the floor, is 11,575.
+DAY_DEFAULT_RATE = 23149
+DAY_FLOOR = 11575
+# Day work runs as the biggest arrays the API accepts (MAX_TASK_COUNT in
+# src/meat/task_array.rs), about 120 a day, so the tail of each array, where
+# fewer than all nodes have work, is a small part of the day.
+DAY_ARRAY_TASKS = 1 << 24
+# relish bench's default host-job concurrency.
+DAY_CONCURRENCY = 27
+# How far a node's share of the host-job successes may exceed its
+# slot-weighted fair share, as a percentage of it: relish bench's
+# NODE_SHARE_TOLERANCE_PERCENT (#1362). 40% of three equal nodes' work passes.
+NODE_SHARE_TOLERANCE_PERCENT = 20
+# How much slower the last full hour may run than the first.
+DAY_SLOWDOWN_PERCENT = 10
+# Hour marks the campaign keeps: more than a week, and a bounded state file.
+MAX_HOUR_MARKS = 200
+LOADS = ("calibration", "target", "day")
 # Why retried attempts failed: the fields of the product's `RetryCauses`
 # (src/meat/task_array_state.rs), the one list validation, progress totals,
 # the regression check and the record all read. test_job_soak.py fails when
@@ -335,9 +354,11 @@ def serve(path, token, address, port):
 class Campaign:
     def __init__(self, directory, api, auditors, token, ledger_reader=None, activity_reader=None,
                  load="calibration", target_rate=None):
-        if load not in ("calibration", "target"): raise InvalidEvidence("unknown job load")
+        if load not in LOADS: raise InvalidEvidence("unknown job load")
         if load == "target" and (target_rate is None or target_rate < TARGET_FLOOR):
             raise InvalidEvidence("the target load needs a rate of at least %d/s" % TARGET_FLOOR)
+        if load == "day" and (target_rate is None or target_rate < DAY_FLOOR):
+            raise InvalidEvidence("the day load needs a rate of at least %d/s (a billion host-job tasks a day)" % DAY_FLOOR)
         self.directory, self.api, self.auditors, self.token = Path(directory), api, auditors, token
         self.ledger_reader = ledger_reader
         self.activity_reader = activity_reader
@@ -358,7 +379,8 @@ class Campaign:
                               progress={m:{"succeeded":0,"retried":0,"last_progress":int(time.time())} for m in MODES},
                               errors=[], totals={}, stopped=False, cron_registered=False, discovered={}, fault_offset=0,
                               load=load, target_rate=target_rate, started=int(time.time()),
-                              metrics=dict(million_wall_seconds=[], start_lag_ms_counts=[0]*16, state_bytes_max=0, raft=None))
+                              metrics=dict(million_wall_seconds=[], start_lag_ms_counts=[0]*16, quiet_start_lag_ms_counts=[0]*16,
+                                           state_bytes_max=0, raft=None))
             self.save()
     def save(self): atomic(self.path, self.state)
     def error(self, message, refused=None):
@@ -392,9 +414,11 @@ class Campaign:
         self.state["finished"] = finished
         return len(self.state["active"]) + len(finished)
     def targeted(self, intent):
-        """Whether this intent is a target-load throughput run."""
-        return (self.state.get("load") == "target" and intent["mode"] in TARGET_CAPS
-                and intent["profile"] == "short" and intent["purpose"] == "work")
+        """Whether this intent is a throughput run: the target load's fast
+        short runs, or the day load's host-job work."""
+        load = self.state.get("load")
+        modes = TARGET_CAPS if load == "target" else ("process",) if load == "day" else ()
+        return intent["mode"] in modes and intent["profile"] == "short" and intent["purpose"] == "work"
     def body(self, intent):
         mode, profile, purpose = (intent[key] for key in ("mode", "profile", "purpose"))
         count = 512 if profile == "long" else 262144
@@ -407,7 +431,10 @@ class Campaign:
             # The bench's no-op command, in million-task arrays: the wall time
             # of each one is an M8 measurement.
             script = "true"
-            tasks.update(count=MILLION, chunk_size=1000, per_node_concurrency=TARGET_CAPS[mode])
+            if self.state.get("load") == "day":
+                tasks.update(count=DAY_ARRAY_TASKS, chunk_size=1000, per_node_concurrency=DAY_CONCURRENCY)
+            else:
+                tasks.update(count=MILLION, chunk_size=1000, per_node_concurrency=TARGET_CAPS[mode])
         if purpose != "work":
             count = 8 if purpose in ("audit", "cancel") else 1
             tasks.update(count=count,chunk_size=1,max_attempts=1,per_node_concurrency=1)
@@ -479,10 +506,15 @@ class Campaign:
                load=self.state.get("load","calibration"),target_rate=self.state.get("target_rate"),
                started=self.state.get("started"),metrics=self.state.get("metrics",{}),
                fresh_activity=self.state.get("fresh_activity",[]),discovered=self.state["discovered"],
+               per_node=self.state.get("per_node",{}),hour_marks=self.state.get("hour_marks",[]),
                api_fallbacks=self.fallbacks(),stop_requested_at=self.state.get("stop_requested_at"),last_fault=self.state.get("last_fault",0),resume_grace_until=self.state.get("resume_grace_until",0)))
     def step(self, now, fault=False, stop=False):
         if fault: self.state["last_fault"]=now
         self.publish(now, fault)
+        if fault:
+            # A run that lived through any part of a fault window doesn't
+            # count towards the quiet-cluster job-start SLO (#1438).
+            for intent in self.state["active"].values(): intent["fault_overlap"]=True
         if not stop:
             try:
                 for mode in MODES:
@@ -571,6 +603,7 @@ class Campaign:
                     if intent["purpose"]=="work" and intent["profile"]=="short" and value["succeeded"]>=2:
                         coverage["reuse"]=True
                 if delta or fault: progress["last_progress"]=now
+                if self.state.get("load")=="day" and intent["mode"]=="process": self.count_nodes(intent,value)
                 intent["previous"]=value
                 intent["observed_at"]=int(time.time())
                 for owner in self.replay_decisions(intent,value):
@@ -579,7 +612,7 @@ class Campaign:
                     self.acknowledge(intent["id"],owner,"known replay-safe long fixture, two identical fenced observations",now)
                     self.state["coverage"][intent["mode"]]["unknown"]=True
                 if not drained(value): continue
-                self.record_metrics(value)
+                self.record_metrics(value,quiet=not intent.get("fault_overlap"))
                 rows=[]
                 if intent["purpose"] in ("failure","timeout","limit") and not stop:
                     page=self.api.request("GET",f'/v1/batch/{intent["id"]}/results?limit=1&index=0')
@@ -615,8 +648,36 @@ class Campaign:
             except (InvalidEvidence,KeyError,TypeError) as error:
                 self.error(f'{intent["mode"]} {intent["profile"]} {intent["purpose"]} ({intent["id"]}): {error}',
                            value if kind=="summary" else None)
+        if self.state.get("load")=="day": self.mark_hours(now)
         self.save(); self.publish(int(time.time()),fault)
         return not self.state["active"]
+    def count_nodes(self, intent, value):
+        """Add each node's new host-job successes in this run (#1032), the
+        way relish bench counts them (#1362): a counter that went backwards
+        means the node restarted and reopened the run, so all of it is new.
+        The last value seen lives on the intent, which goes when the run
+        drains, so the state stays bounded however many runs a day has."""
+        nodes=self.state.setdefault("per_node",{})
+        seen=intent.setdefault("node_succeeded",{})
+        for view in value.get("nodes",[]):
+            name=view.get("node"); succeeded=(view.get("counters") or {}).get("succeeded")
+            if not isinstance(name,str) or type(succeeded) is not int or succeeded<0: continue
+            entry=nodes.setdefault(name,dict(succeeded=0,slots=0,restarted=False))
+            before=seen.get(name,0)
+            if succeeded<before:
+                entry["restarted"]=True; delta=succeeded
+            else:
+                delta=succeeded-before
+            entry["succeeded"]+=delta
+            if type(view.get("slots")) is int: entry["slots"]=max(entry["slots"],view["slots"])
+            seen[name]=succeeded
+    def mark_hours(self, now):
+        """Note the host-job successes on each hour from the campaign's start,
+        for the day run's hourly rates and its slowdown check."""
+        marks=self.state.setdefault("hour_marks",[])
+        started=self.state.get("started") or now
+        if len(marks)<MAX_HOUR_MARKS and now>=started+len(marks)*3600:
+            marks.append([now,self.state["progress"]["process"]["succeeded"]])
     def failure_cause(self, identity):
         """The first failed task's attempts, exit code and first output line,
         as a suffix for the campaign error, or nothing when the candidate
@@ -635,22 +696,28 @@ class Campaign:
             return cause
         first=next((line.strip() for line in output.splitlines() if line.strip()),"")
         return cause+(": "+first[:200] if first else "")
-    def record_metrics(self, value):
-        """Fold one drained run's M8 measurements into the bounded campaign record."""
-        metrics=self.state.setdefault("metrics",dict(million_wall_seconds=[],start_lag_ms_counts=[0]*16,state_bytes_max=0,raft=None))
+    def record_metrics(self, value, quiet=True):
+        """Fold one drained run's M8 measurements into the bounded campaign record.
+
+        Every run's start lag counts for M8; only a `quiet` run's, one no
+        fault window overlapped, counts for the job-start SLO (#1438)."""
+        metrics=self.state.setdefault("metrics",dict(million_wall_seconds=[],start_lag_ms_counts=[0]*16,quiet_start_lag_ms_counts=[0]*16,state_bytes_max=0,raft=None))
         if value["total"]==MILLION and value["succeeded"]==MILLION and type(value.get("elapsed_seconds")) is int:
             metrics["million_wall_seconds"]=(metrics["million_wall_seconds"]+[value["elapsed_seconds"]])[-64:]
         for node in value.get("nodes",[]):
             counts=node.get("counters",{}).get("start_lag_ms_counts")
             if isinstance(counts,list) and len(counts)==16 and all(type(c) is int and c>=0 for c in counts):
                 metrics["start_lag_ms_counts"]=[a+b for a,b in zip(metrics["start_lag_ms_counts"],counts)]
+                if quiet:
+                    quiet_counts=metrics.setdefault("quiet_start_lag_ms_counts",[0]*16)
+                    metrics["quiet_start_lag_ms_counts"]=[a+b for a,b in zip(quiet_counts,counts)]
         if type(value.get("state_bytes")) is int:
             metrics["state_bytes_max"]=max(metrics["state_bytes_max"],value["state_bytes"])
     def sample_raft(self, council, now):
         """Keep the first and latest Raft log index the cluster reported."""
         index=council.get("last_log_index") if isinstance(council,dict) else None
         if type(index) is not int: return
-        metrics=self.state.setdefault("metrics",dict(million_wall_seconds=[],start_lag_ms_counts=[0]*16,state_bytes_max=0,raft=None))
+        metrics=self.state.setdefault("metrics",dict(million_wall_seconds=[],start_lag_ms_counts=[0]*16,quiet_start_lag_ms_counts=[0]*16,state_bytes_max=0,raft=None))
         raft=metrics.get("raft") or dict(first=[now,index],leaders=[])
         raft["last"]=[now,index]
         leader=council.get("leader")
@@ -723,12 +790,15 @@ def report(snapshot):
     if raft.get("first") and raft.get("last") and raft["last"][0]>raft["first"][0]:
         raft_rate=(raft["last"][1]-raft["first"][1])/(raft["last"][0]-raft["first"][0])
     lag=metrics.get("start_lag_ms_counts") or [0]*16
+    quiet_lag=metrics.get("quiet_start_lag_ms_counts") or [0]*16
     rate=sum(accepted.values())/elapsed
     target=snapshot.get("target_rate")
     walls=metrics.get("million_wall_seconds") or []
+    day=day_report(snapshot,elapsed,accepted["process"]) if snapshot.get("load")=="day" else None
+    target_met=None if target is None else day["target_met"] if day else rate>=target
     return dict(schema=1,complete=snapshot.get("stopped") is True,load=snapshot.get("load","calibration"),
-        target_rate=target,elapsed_seconds=elapsed,accepted_successes=accepted,
-        accepted_successes_per_second=rate,target_met=None if target is None else rate>=target,
+        target_rate=target,elapsed_seconds=elapsed,accepted_successes=accepted,day=day,
+        accepted_successes_per_second=rate,target_met=target_met,
         retries=retries,retry_causes=causes,
         audited_attempts=totals.get("audit_attempts",0),
         api_fallbacks=snapshot.get("api_fallbacks") or dict(missed={},answered={}),
@@ -738,6 +808,8 @@ def report(snapshot):
             million_task_array_wall_seconds=dict(runs=len(walls),max=max(walls) if walls else None,
                                                  median=sorted(walls)[len(walls)//2] if walls else None),
             p99_start_lag_ms=percentile(lag,0.99),start_lag_samples=sum(lag),
+            quiet_p99_start_lag_ms=percentile(quiet_lag,0.99) if sum(quiet_lag) else None,
+            quiet_start_lag_samples=sum(quiet_lag),
             raft_entries_per_second=raft_rate,raft_leaders=raft.get("leaders",[]),
             raft_state_bytes_max=metrics.get("state_bytes_max") or None,
             targets=dict(million_task_array_wall_seconds=600,p99_start_lag_ms=1000,
@@ -748,12 +820,74 @@ def report(snapshot):
                          node_ledger_mib_per_million_tasks=64,retained_log_mb=50)))
 
 
+def node_breakdown(per_node):
+    """Each node's part of the host-job successes against its slot-weighted
+    fair share, as relish bench reports it (#1362)."""
+    total=sum(entry.get("succeeded",0) for entry in per_node.values())
+    slots=sum(entry.get("slots",0) for entry in per_node.values())
+    rows=[]
+    for name,entry in sorted(per_node.items()):
+        succeeded,own=entry.get("succeeded",0),entry.get("slots",0)
+        rows.append(dict(node=name,successes=succeeded,slots=own,restarted=entry.get("restarted") is True,
+                         share_percent=100*succeeded/total if total else 0.0,
+                         fair_share_percent=100*own/slots if slots else 0.0,
+                         # In whole numbers, so exactly 40% of three equal nodes' work is at the limit.
+                         over_fair_share=succeeded*slots*100>own*total*(100+NODE_SHARE_TOLERANCE_PERCENT)))
+    return dict(tolerance_percent=NODE_SHARE_TOLERANCE_PERCENT,nodes=rows,
+                balanced=total>0 and not any(row["over_fair_share"] for row in rows))
+
+
+def day_report(snapshot, elapsed, host):
+    """The day run's numbers (#1032): accepted host-job successes against
+    the target and the floor, each node's share, the rate in every full hour
+    from the campaign's start, and the last hour against the first. The first
+    hour includes the campaign's start and its host-job probes."""
+    target=snapshot.get("target_rate") or DAY_DEFAULT_RATE
+    rate=host/elapsed
+    marks=snapshot.get("hour_marks") or []
+    hourly=[(later[1]-earlier[1])/(later[0]-earlier[0]) for earlier,later in zip(marks,marks[1:]) if later[0]>earlier[0]]
+    first=hourly[0] if hourly else None
+    last=hourly[-1] if hourly else None
+    slowdown_ok=(len(hourly)>=2 and last*100>=first*(100-DAY_SLOWDOWN_PERCENT)) if hourly else False
+    return dict(host_successes=host,host_successes_per_second=rate,elapsed_seconds=elapsed,target_rate=target,floor_rate=DAY_FLOOR,
+                day_equivalent=int(rate*86400),target_met=rate>=target,floor_met=rate>=DAY_FLOOR,
+                per_node=node_breakdown(snapshot.get("per_node") or {}),hourly=hourly,first_hour=first,last_hour=last,
+                slowdown_percent=DAY_SLOWDOWN_PERCENT,slowdown_ok=slowdown_ok)
+
+
+def day_failures(day):
+    """What fails a day run, beyond the campaign's own coverage and drain."""
+    problems=[]
+    if not day["target_met"]:
+        problems.append("host-job rate %s/s is below the %s/s target (%s: %s a day)"
+                        % (format(day["host_successes_per_second"],",.1f"),day["target_rate"],
+                           "the billion-a-day floor holds" if day["floor_met"] else "below the billion-a-day floor too",
+                           format(day["day_equivalent"],",")))
+    if not day["per_node"]["nodes"]:
+        problems.append("no per-node host-job successes recorded")
+    for row in day["per_node"]["nodes"]:
+        if row["over_fair_share"]:
+            problems.append("%s took %.1f%% of the host-job successes, over its fair share of %.1f%% plus %d%%"
+                            % (row["node"],row["share_percent"],row["fair_share_percent"],day["per_node"]["tolerance_percent"]))
+    if len(day["hourly"])<2:
+        problems.append("fewer than two full hours of host-job rates, so no slowdown check")
+    elif not day["slowdown_ok"]:
+        problems.append("the last hour ran at %s/s, more than %d%% below the first hour's %s/s"
+                        % (format(day["last_hour"],",.1f"),day["slowdown_percent"],format(day["first_hour"],",.1f")))
+    return problems
+
+
 def coverage_failures(snapshot, nodes=(), kinds=FAULT_KINDS):
     if not isinstance(snapshot,dict): return ["job qualification evidence missing"]
     problems=list(snapshot.get("errors",[]))
+    day=snapshot.get("load")=="day"
+    # A day run injects no faults, so it owes no fault overlap, no node is
+    # lost and nothing becomes an unknown outcome to replay.
+    if day: nodes,kinds=(),()
+    required=[item for item in REQUIRED if not (day and item=="unknown")]
     for mode in MODES:
         coverage=snapshot.get("coverage",{}).get(mode,{})
-        missing=[item for item in REQUIRED if not coverage.get(item)]
+        missing=[item for item in required if not coverage.get(item)]
         for node in nodes:
             if not coverage.get("fault:"+node): missing.append("active fault overlap on "+node)
         for kind in kinds:
@@ -765,6 +899,8 @@ def coverage_failures(snapshot, nodes=(), kinds=FAULT_KINDS):
         result=report(snapshot)
         if not result["target_met"]:
             problems.append("accepted rate %.1f/s is below the %s/s target" % (result["accepted_successes_per_second"],result["target_rate"]))
+    if day:
+        problems+=day_failures(report(snapshot)["day"])
     return problems
 
 
@@ -803,6 +939,81 @@ def consume_faults(campaign):
     campaign.save()
 
 
+NAMED_FIXTURES = {f"soak-job-{kind}-{mode}": (mode, cover) for mode in MODES
+                  for kind, cover in (("cron", "cron"), ("hook", "hook"), ("after", "published-job"))}
+OUTCOME_STATUSES = ("Succeeded", "CompletedWithFailures", "Failed", "Cancelled")
+# Definitions keep their history across re-applies, so on a cluster adopted
+# with --home a hook's history can hold an earlier campaign's runs. Only
+# outcomes that started after this campaign did count, give or take this much
+# clock skew between the host and the cluster.
+HOOK_HISTORY_SKEW = 300
+
+
+def named_fixture_coverage(rows, definitions, state, now=0, acknowledge=None):
+    """Record what one scan shows of the named cron, hook and after fixtures in
+    `state`, and return the fixture rows it saw.
+
+    `rows` are `/v1/batch/summaries` rows and `definitions` the
+    `/v1/jobs/definitions` rows. The store keeps only 20 terminal runs a
+    namespace, so on the day tier, which never redeploys, more than 20 runs
+    finish in `default` before the first scan and a deploy hook's own row is
+    gone. A `run_before` definition stays, with its last 10 outcomes, so a hook
+    counts from either (#1935). A failed fixture, seen either way, fails the
+    campaign. Cron progress still comes from the rows only, and a one-off after
+    job has no definition, so it still needs its row."""
+    named = []
+    for value in rows:
+        label = value.get("name", "")
+        if label not in NAMED_FIXTURES or value.get("kind") == "schedule": continue
+        named.append(value)
+        key = str(value["batch_id"])
+        previous = state["discovered"].get(key)
+        validate_summary(value, previous)
+        if not drained(value):
+            state["discovered"][key] = copy.deepcopy(value)
+            if len(state["discovered"]) > 32: raise InvalidEvidence("unresolved named run budget exhausted")
+        if not value.get("unknown_owners") and drained(value):
+            state["discovered"].pop(key, None)
+        if value["failed"]: raise InvalidEvidence("release job fixture failed: " + label)
+        if value["done"] and value["succeeded"] == value["total"]:
+            mode, cover = NAMED_FIXTURES[label]
+            state["coverage"][mode][cover] = True
+            if cover == "cron":
+                progress = state["progress"][mode]
+                if value["batch_id"] > progress.get("last_cron_id", 0):
+                    progress.update(last_cron_id=value["batch_id"], last_cron_progress=now)
+        elif value.get("unknown_owners"):
+            # These named hook/cron fixtures only execute true. Acknowledgement
+            # is recorded as a test-operator action after observing the fence twice.
+            previous = previous or {}
+            if previous.get("unknown_owners") == value["unknown_owners"]:
+                for owner in value["unknown_owners"]:
+                    if not re.fullmatch(r"[a-f0-9]{64}", owner.get("grant_digest", "")) or not owner.get("node"):
+                        raise InvalidEvidence("named run lacks exact replay fence")
+                    if acknowledge: acknowledge(value["batch_id"], owner, "named true fixture, two identical fenced observations", now)
+        else:
+            state["discovered"].pop(key, None)
+    if not isinstance(definitions, list): raise InvalidEvidence("invalid job definitions")
+    for definition in definitions:
+        if not isinstance(definition, dict): raise InvalidEvidence("invalid job definition")
+        label = definition.get("name")
+        if definition.get("namespace") != "default" or NAMED_FIXTURES.get(label, (None, None))[1] != "hook": continue
+        history = definition.get("history", [])
+        if not isinstance(history, list): raise InvalidEvidence("invalid history for " + label)
+        for outcome in history:
+            if not isinstance(outcome, dict) or outcome.get("status") not in OUTCOME_STATUSES:
+                raise InvalidEvidence("invalid run outcome for " + label)
+            number(outcome, "succeeded"); failed = number(outcome, "failed")
+            if not number(outcome, "run"): raise InvalidEvidence("nonpositive run identity")
+            # An adopted cluster (--home) keeps an earlier campaign's history.
+            if number(outcome, "started_at_epoch_secs") < state["started"] - HOOK_HISTORY_SKEW: continue
+            if failed or outcome["status"] in ("CompletedWithFailures", "Failed"):
+                raise InvalidEvidence("release job fixture failed: " + label)
+            if outcome["status"] == "Succeeded":
+                state["coverage"][NAMED_FIXTURES[label][0]]["hook"] = True
+    return named
+
+
 def run(options):
     evidence=options.evidence
     nodes=json.loads(evidence.joinpath("jobs/nodes.json").read_text())
@@ -832,7 +1043,8 @@ def run(options):
             return json.loads(result.stdout)
         with ThreadPoolExecutor(max_workers=3) as workers: samples=list(workers.map(read,nodes))
         return match_activity([s for s in samples if s],int(time.time()))
-    target_rate=(options.target_rate or DEFAULT_TARGET_RATE) if options.load=="target" else None
+    target_rate={"target":options.target_rate or DEFAULT_TARGET_RATE,
+                 "day":options.target_rate or DAY_DEFAULT_RATE}.get(options.load)
     campaign=Campaign(evidence/"jobs",api,urls,evidence.joinpath("jobs/.token").read_text().strip(),receipts,activity,
                       options.load,target_rate)
     stop_signal=False
@@ -864,42 +1076,12 @@ def run(options):
                 try: campaign.sample_raft(api.request("GET","/v1/cluster/council"),now)
                 except InvalidEvidence: pass
                 rows=api.request("GET","/v1/batch/summaries")["batches"]
-                for value in rows:
-                    label=value.get("name","")
-                    known={f"soak-job-{kind}-{mode}":(mode,cover) for mode in MODES for kind,cover in (("cron","cron"),("hook","hook"),("after","published-job"))}
-                    if label not in known or value.get("kind")=="schedule": continue
-                    key=str(value["batch_id"])
-                    previous=campaign.state["discovered"].get(key)
-                    validate_summary(value,previous)
-                    if not drained(value):
-                        campaign.state["discovered"][key]=copy.deepcopy(value)
-                        if len(campaign.state["discovered"])>32: raise InvalidEvidence("unresolved named run budget exhausted")
-                    if not value.get("unknown_owners") and drained(value):
-                        campaign.state["discovered"].pop(key,None)
-                    if value["failed"]: raise InvalidEvidence("release job fixture failed: "+label)
-                    if value["done"] and value["succeeded"]==value["total"]:
-                        mode,cover=known[label]
-                        campaign.state["coverage"][mode][cover]=True
-                        if cover=="cron":
-                            progress=campaign.state["progress"][mode]
-                            if value["batch_id"]>progress.get("last_cron_id",0):
-                                progress.update(last_cron_id=value["batch_id"],last_cron_progress=now)
-                    elif value.get("unknown_owners"):
-                        # These named hook/cron fixtures only execute true. Acknowledgement
-                        # is recorded as a test-operator action after observing the fence twice.
-                        key=str(value["batch_id"])
-                        previous=previous or {}
-                        if len(campaign.state["discovered"])>32: raise InvalidEvidence("unresolved named run budget exhausted")
-                        if previous.get("unknown_owners")==value["unknown_owners"]:
-                            for owner in value["unknown_owners"]:
-                                if not re.fullmatch(r"[a-f0-9]{64}",owner.get("grant_digest","")) or not owner.get("node"):
-                                    raise InvalidEvidence("named run lacks exact replay fence")
-                                campaign.acknowledge(value["batch_id"],owner,"named true fixture, two identical fenced observations",now)
-                    else:
-                        campaign.state["discovered"].pop(str(value["batch_id"]),None)
-                    if stop_requested and not drained(value): api.request("POST",f'/v1/batch/{value["batch_id"]}/cancel')
+                definitions=api.request("GET","/v1/jobs/definitions")["definitions"]
+                named=named_fixture_coverage(rows,definitions,campaign.state,now,campaign.acknowledge)
                 if stop_requested:
-                    finished=finished and all(drained(v) for v in rows if v.get("name") in known and v.get("kind")!="schedule")
+                    for value in named:
+                        if not drained(value): api.request("POST",f'/v1/batch/{value["batch_id"]}/cancel')
+                    finished=finished and all(drained(v) for v in named)
                 last_scan=now
             if stop_requested and finished:
                 campaign.state["stopped"]=True; campaign.save(); campaign.publish(now,fault)
@@ -920,8 +1102,9 @@ def main():
     controller=commands.add_parser("run")
     controller.add_argument("--evidence",type=Path,required=True); controller.add_argument("--api-port",type=int,required=True)
     controller.add_argument("--ca",type=Path,required=True); controller.add_argument("--limactl",required=True)
-    controller.add_argument("--load",choices=("calibration","target"),default="calibration")
-    controller.add_argument("--target-rate",type=float,help="accepted successes a second for --load target (default %d)" % DEFAULT_TARGET_RATE)
+    controller.add_argument("--load",choices=LOADS,default="calibration")
+    controller.add_argument("--target-rate",type=float,help="accepted successes a second for --load target (default %d) "
+                            "or host-job successes for --load day (default %d)" % (DEFAULT_TARGET_RATE,DAY_DEFAULT_RATE))
     server=commands.add_parser("serve")
     server.add_argument("--database",type=Path,required=True); server.add_argument("--token-file",type=Path,required=True)
     server.add_argument("--address",required=True); server.add_argument("--port",type=int,default=8189)
@@ -937,7 +1120,14 @@ def main():
     marker=commands.add_parser("mark")
     marker.add_argument("directory",type=Path); marker.add_argument("target"); marker.add_argument("kind")
     options=parser.parse_args()
-    if options.command=="run": return run(options)
+    if options.command=="run":
+        # The harness reads this instead of `wait`: macOS bash 3.2 can forget
+        # a reaped background child once its pid is reused (#1035). A crash
+        # records 1; only SIGKILL leaves no file, which the harness fails.
+        status=1
+        try: status=run(options)
+        finally: atomic(options.evidence/"jobs/exit-status",status)
+        return status
     if options.command=="budget":
         plan=run_budget(options.duration,options.runs_per_hour)
         print("job-runs expected %(expected_runs)d retained-peak %(peak_retained)d limit %(limit)d" % plan)

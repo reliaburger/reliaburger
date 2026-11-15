@@ -87,7 +87,7 @@ pub struct FirewallKey {
 
 /// Value for the `firewall_map` BPF hash map.
 #[repr(C)]
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct FirewallValue {
     /// `FIREWALL_DENY` (0) or `FIREWALL_ALLOW` (1).
     pub action: u32,

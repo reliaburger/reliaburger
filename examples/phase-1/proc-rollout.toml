@@ -1,0 +1,50 @@
+# A rolling deploy, a rollback and an automatic rollback (process runtime).
+#
+# This is v1 of a small web app. Change VERSION to "v2" and apply again:
+# Bun starts the new version, waits for its health check, and only then
+# counts the deploy done. `relish rollback web` puts v1 back. Then break it:
+# change the mode to "unhealthy-after" with "--count", "0" (it fails every
+# health check) and VERSION to "v3". The new instance never turns healthy
+# within health_timeout, so Bun restores the previous version, and the
+# cluster marks the spec RolloutFailed and stops handing it out until you
+# change it.
+#
+# scripts/demo/rollout.sh does all of that on a one-node cluster it starts
+# itself, and checks each step. By hand, from the repository root:
+#
+#   cargo build --locked --bins
+#   target/debug/bun --runtime process --config examples/node/process-runtime.toml
+#   target/debug/relish apply examples/phase-1/proc-rollout.toml
+#   curl localhost:8080/env/VERSION          # v1
+#   # edit VERSION to "v2", apply again, curl again
+#   target/debug/relish history web
+#   target/debug/relish rollback web
+#
+# A standalone node rolls a bad version back too, and its `relish apply`
+# fails, naming the health check. RolloutFailed is the council's mark, so it
+# shows only on a cluster: rollout.sh starts one.
+#
+# Process apps share the host's ports: two instances of this one can't both
+# listen on 8080. So it rolls stop-first (max_surge = 0, max_unavailable = 1),
+# with a moment of downtime per step. Containers get their own addresses;
+# container-rollout.toml rolls with no downtime.
+
+[app.web]
+exec = "target/debug/testapp"
+command = ["--mode", "healthy", "--port", "8080"]
+port = 8080
+env = { VERSION = "v1" }
+
+[app.web.health]
+path = "/healthz"
+interval = 1
+timeout = 1
+threshold_unhealthy = 2
+threshold_healthy = 1
+
+[app.web.deploy]
+strategy = "rolling"
+max_surge = 0
+max_unavailable = 1
+health_timeout = "10s"
+auto_rollback = true

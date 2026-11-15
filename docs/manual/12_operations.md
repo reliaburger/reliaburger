@@ -8,13 +8,20 @@ cluster, and getting the council back when everything else has gone wrong.
 `relish upgrade` rolls a new `bun` across the cluster: workers first
 (`--parallel` at a time), then council members one by one, the leader last.
 The new binary adopts running workloads without restarting them, and one that
-crash-loops on boot reverts to the previous version by itself.
+crash-loops on boot reverts to the previous version by itself. Adopted
+replicas stay on their node: while a restarted bun's subsystems are still in
+their first start, the leader keeps that node's placements and places nothing
+new there. (Up to 0.2.3, a bun restart in a multi-node cluster could move its
+replicas to another node, #1449.)
 
 Until 1.0 it works only between builds of the same format. Every build speaks
 one cluster protocol and one state format (`bun --compatibility` prints them),
 and a node takes only a binary with its own pair. Every release from 0.1.0 to
-0.2.0 changed one or the other, so none of them can roll onto the release
+0.2.2 changed one or the other, so none of them can roll onto the release
 before it: moving between them means a fresh cluster, as described below.
+0.2.3 is the only one so far that kept its predecessor's pair, and a 0.2.2
+cluster rolled onto it in place. 0.2.4 changes both again, so a 0.2.3 cluster
+moves to it as a fresh cluster.
 `relish upgrade` is for a later build with the same pair, such as a patch release that doesn't
 change a format, or your own rebuild. `relish upgrade check` tells you which
 case you're in.
@@ -148,7 +155,7 @@ release with another pair as needing a fresh cluster instead of offering the
 command, and `relish upgrade start <version>` refuses it before downloading:
 
 ```text
-v0.2.1 changes the cluster formats (protocol 51 -> 52, state 68 -> 68), so it needs a fresh cluster, not `relish upgrade start`; see …
+v0.2.1 changes the cluster formats (protocol 51 -> 52, state 68 -> 69), so it needs a fresh cluster, not `relish upgrade start`; see …
 ```
 
 A cluster `rollback` never downloads anything: each node goes back to a binary
@@ -195,8 +202,32 @@ And 0.2.0: protocol 51 and state format 68. A 0.1.6 cluster's leader refuses
 it the same way, and moving means recreating the cluster, which loses
 everything the council held
 ([upgrading from 0.1.6](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-016)).
-So no published release has yet rolled in place onto another; the first that
-can will be a release that keeps 0.2.0's pair.
+And 0.2.1: protocol 52 and state format 69. A 0.2.0 cluster's leader refuses
+it the same way
+([upgrading from 0.2.0](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-020)).
+And 0.2.2: protocol 53 and state format 70. A 0.2.1 cluster's leader refuses
+it the same way
+([upgrading from 0.2.1](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-021)).
+0.2.3 keeps 0.2.2's pair, protocol 53 and state format 70, so it's the first
+published release a cluster can roll onto in place. The walk works, but
+each node's app replicas restart, and may move, as that node upgrades
+([#1449](https://github.com/reliaburger/reliaburger/issues/1449), fixed in
+0.2.4; [upgrading from 0.2.2](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-022)).
+And 0.2.4 changes the pair again: protocol 55 and state format 72. A 0.2.3
+cluster's leader refuses it the way a 0.2.1 cluster refused 0.2.2
+([upgrading from 0.2.3](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-023)).
+0.2.5 moves it once more, to protocol 56 and state format 73, and a 0.2.4
+cluster's leader refuses it the same way
+([upgrading from 0.2.4](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-024)).
+0.2.6 moves the protocol to 57 and keeps state format 73, and a 0.2.5
+cluster's leader refuses it too
+([upgrading from 0.2.5](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-025)).
+0.2.7 keeps 0.2.6's pair, protocol 57 and state format 73, so a 0.2.6
+cluster can roll onto it in place
+([upgrading from 0.2.6](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-026)).
+0.2.8 moves the pair to protocol 58 and state format 74, and a 0.2.7
+cluster's leader refuses it
+([upgrading from 0.2.7](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-027)).
 
 A laptop cluster says the same thing when you rerun the quickstart installer
 from a newer release over it. Its saved record names the release that set it
@@ -205,6 +236,130 @@ up, so setup refuses and names both versions:
 ```text
 cluster "laptop" was set up with v0.1.0, and this installer is v0.1.1. Before 1.0, a release that changes the cluster's protocol or state format can't take over an older cluster: run `relish local destroy --yes` and set it up again, then re-apply your apps. …
 ```
+
+### A walk through an upgrade
+
+The same steps in order, for a three-node cluster moving to a release that
+keeps its formats (`v0.2.1` stands for that release). Only one published
+pair rolls, 0.2.2 to 0.2.3, and its
+[record](https://github.com/reliaburger/reliaburger/blob/main/docs/qualification/2026-10-29-rolling-walk-0.2.2-to-0.2.3.md)
+has the commands we ran. There's no script for this walk: run it when your
+cluster and the release share a pair.
+
+1. Check that it can roll. `upgrade check` compares the release's pair with
+   the cluster's; `bun --compatibility` on the downloaded binary says the
+   same thing locally. With `-o json` the answer is a `verdict` field
+   (`up_to_date`, `available`, `needs_fresh_cluster`, `no_artefact_for_node`
+   or `no_artefacts`), with the `command` to run when one is available.
+   `relish agent upgrade-check` asks the same question for an agent, and
+   adds `relish wtf`'s critical findings, the council's quorum and version
+   skew ([Working with an AI agent](16_working-with-an-ai-agent.md#before-an-upgrade)).
+
+   ```sh
+   relish upgrade check
+   relish -o json upgrade check
+   relish agent upgrade-check
+   ```
+
+2. Make your countersigning key, once. Put the `ed25519:…` public key it
+   prints in every node's `[upgrades] external_signing_key` and restart them.
+
+   ```sh
+   relish dev keygen --out keys/
+   ```
+
+3. Read the plan: workers first, then council members, the leader last.
+   `plan` reads the live cluster, and if it can't reach it, it says why and
+   stops rather than guess. `--cluster-size N` plans a cluster of N nodes
+   without asking one.
+
+   ```sh
+   relish upgrade plan v0.2.1
+   relish upgrade plan v0.2.1 --cluster-size 8
+   ```
+
+4. Start it. relish downloads each node's build, countersigns it with your
+   key and pushes it to the cluster's registry; each node fetches it, checks
+   both signatures and swaps itself.
+
+   ```sh
+   relish upgrade start v0.2.1 --external-key keys/release.key
+   relish upgrade status
+   ```
+
+5. Confirm every node runs the new commit, and that each one is the
+   published build, byte for byte. `relish verify` checks every node's
+   binary against the release's SHA-256 and its signature, and exits `0`
+   only when they all match ([is this the
+   release?](#is-this-the-release)).
+
+   ```sh
+   relish nodes
+   relish wtf
+   relish verify
+   ```
+
+6. If a node refused or reverted, the upgrade pauses. Fix the cause and
+   resume, end it if no node moved yet, or walk every node back.
+
+   ```sh
+   relish upgrade resume
+   relish upgrade abort
+   relish upgrade rollback v0.2.0
+   ```
+
+### Is this the release?
+
+`relish verify` checks that the running cluster is exactly the published
+release, byte for byte. It asks every node which `bun` it runs and the SHA-256
+of that binary, and compares it with the hash the release's `metadata.json`
+publishes for that version and platform. The release key signs a binary's
+bytes, not its hash, so `verify` downloads each build the nodes run, once, and
+checks its Ed25519 signature against the release keys compiled into `relish`.
+The metadata isn't signed, and doesn't need to be: a node passes only against
+bytes the release key signed, so a metadata host that lies can make the check
+fail, never pass. It also checks that every node runs the same version, and
+checks the `relish` running it against `cli-metadata.json` the same way. It
+changes nothing.
+
+```sh
+relish verify
+relish -o json verify
+```
+
+It exits `0` when everything matches, `1` for a mismatch and `3` when evidence
+is missing. With `-o json`, or as `relish agent verify`, `verdict` is
+`verified`, `mismatch` or `unknown`, and each entry in `reasons` has a `code`:
+
+| Kind | Codes |
+|------|-------|
+| Mismatch | `hash_mismatch` (a node's binary has drifted), `bad_signature`, `artefact_mismatch` (published bytes that don't match their metadata), `version_skew`, `unpublished_version`, `no_artefact`, `relish_mismatch` (a development build of `relish` is one) |
+| Missing evidence | `metadata_unavailable`, `cluster_unreachable`, `node_unanswered` (a dead node too), `platform_unknown`, `hash_unreported`, `signature_unchecked`, `relish_unchecked` |
+
+A mismatch outranks missing evidence, and missing evidence is never
+`verified`. `nodes` gives every node's `version`, `platform`, `sha256` and
+`published_sha256`, and whether its `hash` and `signature` checks `pass`,
+`fail` or stayed `unchecked`; `relish` is the same for the CLI, and
+`trusted_keys` names the keys the signatures were checked against.
+
+On a cluster without internet, download the release's files on a machine that
+has it and carry them over. `--metadata` turns the network off; `--artefacts`
+holds the `bun-<platform>` binaries for the signature check and
+`--cli-metadata` the metadata for `relish`. Leave one out and that check stays
+`unchecked`, so the verdict is `unknown`, and the reason names the flag.
+`--release-url` points at a mirror of the release downloads instead.
+
+```sh
+gh release download v0.2.8 --repo reliaburger/reliaburger --pattern metadata.json --pattern cli-metadata.json --pattern 'bun-*' --dir release
+relish verify --metadata release/metadata.json --cli-metadata release/cli-metadata.json --artefacts release
+```
+
+What it can't prove: a node reports its own hash, so a node someone has taken
+over can lie, and so can a `relish` someone has replaced. Check `relish`
+itself with `gh attestation verify` first ([checks a stranger can
+run](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#checks-a-stranger-can-run))
+if that matters to you. `relish mcp` doesn't offer `verify` as a tool: it
+reaches past the cluster API to the internet, and its flags read local files.
 
 ### When bun refuses its data directory
 
@@ -272,6 +427,21 @@ as `relish compile`. The configured `path` is the root: its own name adds no
 namespace, and defaults outside it are not inherited. A workload's explicit
 namespace wins. GitOps reconciles deletions too: delete an app from the
 repository and it goes from the cluster.
+
+To see it on your laptop, run the GitOps demo from a checkout. It starts a
+one-node cluster, pushes `examples/gitops/repository` (a repository with
+`_defaults.toml` and two namespace directories) to a `file://` repository,
+applies an app by hand, and turns GitOps on with `examples/node/gitops.toml`.
+Then it deletes an app from the repository and checks that GitOps deleted it
+from the cluster, and that the hand-applied app survived every sync:
+
+```sh
+scripts/demo/gitops.sh
+```
+
+Like the rollout demo, it shows Bun's memory and CPU at every step and ends
+with their average and peak ([measuring a
+demo](01_deploy-an-app.md#rolling-deploys) has the details).
 
 ### What GitOps owns
 
@@ -507,6 +677,41 @@ can't regrow the council alone, because changing membership needs a quorum
 too. Stop it and recover it as above: the dead voters don't answer, so the
 check passes without `--force`.
 
+### A walk through a recovery
+
+The whole council is gone, and one worker survives with backups turned on
+(`[cluster.backup] url = "file:///var/backups/council"` here):
+
+1. See what the backups hold.
+
+   ```sh
+   relish council backups --from file:///var/backups/council
+   ```
+
+2. Stop Bun on the surviving node (`systemctl stop reliaburger`, say), then
+   restore the newest usable backup into its data directory.
+
+   ```sh
+   relish council recover --data-dir /var/lib/reliaburger/data \
+     --from file:///var/backups/council --master-key /etc/reliaburger/master.key
+   ```
+
+3. Start Bun again. It comes up as a one-voter council on a new recovery
+   epoch, and the reconciler regrows the council as nodes join.
+
+   ```sh
+   relish council status
+   relish status
+   ```
+
+4. Before an old voter comes back, stop it and wipe its replaced council
+   state, so it rejoins as a fresh member (next section). It never heard of
+   the recovery, so it isn't fenced yet, hence `--force`.
+
+   ```sh
+   relish council re-enrol --data-dir /var/lib/reliaburger/data --force
+   ```
+
 ### When the old voters come back
 
 The voters you gave up on still hold the old council in their data
@@ -538,8 +743,11 @@ epoch stops that, as long as they can reach the recovered side:
   those.
 
 `relish council status` shows such a node as `fenced` (its epoch column reads
-`0 < 1`, or `1 split` for a split), `relish status` prints a warning line, and
-`relish wtf` reports it as CRITICAL until you re-enrol it.
+`0 < 1`, or `1 split` for a split), and `relish wtf` reports it as CRITICAL
+until you re-enrol it, so `relish status` counts it on its `wtf` line. If
+status sees two leaders at once, its `council` line reads `SPLIT: leader node-1
+AND node-4`; with no leader or no majority it reads `NO LEADER` or `QUORUM
+LOST`, and the verdict is `DOWN`.
 Stop the node, then:
 
 ```sh

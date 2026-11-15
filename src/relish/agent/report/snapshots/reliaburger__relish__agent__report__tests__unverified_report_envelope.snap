@@ -1,0 +1,65 @@
+---
+source: src/relish/agent/report/tests.rs
+expression: envelope
+---
+{
+  "command": "report",
+  "data": {
+    "dir": "<tmp>/report",
+    "duplicate_of": null,
+    "files": [
+      {
+        "bytes": 1720,
+        "path": "issue.md"
+      },
+      {
+        "bytes": 321,
+        "path": "bundle.json"
+      },
+      {
+        "bytes": 1084,
+        "path": "MANIFEST.json"
+      }
+    ],
+    "fingerprint": null,
+    "fix": {
+      "state": "unknown"
+    },
+    "labels": [
+      "bug",
+      "agent-drafted",
+      "unverified"
+    ],
+    "left_out": [],
+    "new_issue_url": "https://github.com/reliaburger/reliaburger/issues/new?template=agent-bug.yml&title=agent%3A+%5Bunverified%5D+relish+logs+--since+prints+the+whole+capture+for+a+quiet+app&fingerprint=None%3A+no+error+code%2C+finding+or+site+was+given+%28seen+on+0.2.7%29.&version=relish+0.2.7%2C+commit+a1b2c3d4e5f60718293a4b5c6d7e8f9012345678%2C+source+as+committed%2C+aarch64-apple-darwin%2C+formats+protocol+57+%2F+state+74&fix_status=Not+known%3A+the+agent+didn%27t+find+a+release+with+the+fix.&summary=relish+logs+payments+--since+5m+printed+lines+from+yesterday%0A%0AExpected%3A+only+lines+from+the+last+five+minutes&reproducer=None.+This+report+is+**unverified**%3A+nobody+has+made+it+happen+on+purpose+yet.&evidence=%7B%0A++%22evidence%22%3A+%5B%5D%2C%0A++%22fingerprint%22%3A+null%2C%0A++%22patch%22%3A+null%2C%0A++%22relish%22%3A+%7B%0A++++%22commit%22%3A+%22a1b2c3d4e5f60718293a4b5c6d7e8f9012345678%22%2C%0A++++%22dirty%22%3A+false%2C%0A++++%22formats%22%3A+%7B%0A++++++%22protocol%22%3A+57%2C%0A++++++%22state%22%3A+74%0A++++%7D%2C%0A++++%22target%22%3A+%22aarch64-apple-darwin%22%2C%0A++++%22version%22%3A+%220.2.7%22%0A++%7D%2C%0A++%22schema%22%3A+%22relish.agent.report%2Fv1%22%0A%7D%0A&source=None.&patch=None.&not_tested=an+app+that+logs+nothing+in+the+window&should_have_caught=A+test.&redaction=Addresses+aliased%3B+log+lines+left+out.+From+%60MANIFEST.json%60%2C+what+went+in+and+what+redaction+took+out%3A%0A%0A%7C+Item+%7C+Bytes+%7C+In+%7C+Redacted+%7C%0A%7C---%7C---%3A%7C---%7C---%7C%0A%7C+field+%60title%60+%7C+60+%7C+yes+%7C+none+%7C%0A%7C+field+%60what_happened%60+%7C+60+%7C+yes+%7C+none+%7C%0A%7C+field+%60expected%60+%7C+37+%7C+yes+%7C+none+%7C%0A%7C+field+%60not_tested%60+%7C+38+%7C+yes+%7C+none+%7C",
+    "post": "gh issue create --repo reliaburger/reliaburger --title 'agent: [unverified] relish logs --since prints the whole capture for a quiet app' --body-file <tmp>/report/issue.md",
+    "redactions": {},
+    "title": "agent: [unverified] relish logs --since prints the whole capture for a quiet app",
+    "verified": false
+  },
+  "next": [
+    {
+      "read_only": true,
+      "run": "cat <tmp>/report/issue.md <tmp>/report/MANIFEST.json",
+      "why": "show the human exactly what would be posted, and what was redacted"
+    },
+    {
+      "read_only": false,
+      "run": "gh issue create --repo reliaburger/reliaburger --title 'agent: [unverified] relish logs --since prints the whole capture for a quiet app' --body-file <tmp>/report/issue.md",
+      "why": "post it, once the human has read it and agrees; never on your own"
+    }
+  ],
+  "ok": true,
+  "relish": {
+    "commit": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+    "dirty": false,
+    "source_digest": null,
+    "version": "0.2.7"
+  },
+  "schema": "relish.agent/v1",
+  "truncated": false,
+  "warnings": [
+    "unverified: no --reproducer, so the title says so; a maintainer reads reproduced reports first",
+    "no fingerprint: pass --error-code, --finding or --site so duplicates can be found"
+  ]
+}

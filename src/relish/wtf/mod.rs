@@ -6,6 +6,7 @@
 
 mod collect;
 mod diagnose;
+pub mod findings;
 mod model;
 
 pub use collect::collect;

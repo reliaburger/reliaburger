@@ -14,6 +14,16 @@ WORKFLOWS = REPO / ".github" / "workflows"
 # Make targets that run nextest and so write a JUnit report under the ci profile.
 NEXTEST_TARGETS = re.compile(r"\bmake (coverage|test(?:-[a-z-]+)?)(?![\w-])")
 NOT_NEXTEST = {"test-doc", "test-images", "test-ci-scripts"}
+# Nextest targets CI runs directly rather than through an evidence owner.
+# `make test-s3` runs only when select-jobs.sh picks it by path (#1534), and
+# every evidence mode is a fixed set of owners, so the final gate checks its
+# job's result instead of binding its two tests. `make test-linux` runs
+# directly only in `linux-next`, the Ubuntu 26.04 parity leg (#1559); the
+# `linux` job still owns its evidence.
+UNBOUND_SUITES = {"test-s3", "test-linux"}
+
+# The no-op job a closed pull request's run starts instead of CI.
+CLOSED_JOB = "closed-pull-request"
 
 
 def jobs(text):
@@ -65,6 +75,34 @@ class LocalGateTests(unittest.TestCase):
         self.assertTrue(any("unittest discover -s scripts/ci" in line for line in ci), ci)
         self.assertTrue(any("ignored_owners.py reasons" in line for line in ci), ci)
 
+    def test_make_ci_runs_the_quick_checks_before_any_build(self):
+        # A format slip or an unowned #[ignore] fails in seconds, not after
+        # Clippy and the suite have compiled (#1724).
+        prerequisites = re.search(r"^ci: ([^#\n]*)", (REPO / "Makefile").read_text(), re.M).group(1).split()
+        self.assertEqual(prerequisites[:3], ["fmt-check", "check-ignored", "test-ci-scripts"])
+        self.assertEqual(set(prerequisites[3:]), {"lint", "test", "test-doc"})
+
+    def test_coverage_writes_one_report_that_also_enforces_the_floor(self):
+        # Each `llvm-cov report` merges every profile and reads every
+        # binary's coverage map again, about two minutes each; one call
+        # writes the lcov file and checks the floor (plan 2026-11-06, F3).
+        status, lines = dry_run("coverage")
+        self.assertEqual(status, 0)
+        reports = [line for line in lines if "llvm-cov report" in line]
+        self.assertEqual(len(reports), 1, reports)
+        self.assertIn("--lcov --output-path target/coverage/lcov.info", reports[0])
+        floor = re.search(r"^COVERAGE_MIN_LINES \?= ([\d.]+)$", (REPO / "Makefile").read_text(), re.M)
+        self.assertIn("--fail-under-lines " + floor.group(1), reports[0])
+        self.assertNotIn("--html", " ".join(lines))
+
+    def test_the_html_coverage_report_has_its_own_target(self):
+        # Nobody opens the HTML on a pull request; CI writes it on main and
+        # the nightly only (D5), and `make coverage coverage-html` locally.
+        status, lines = dry_run("coverage-html")
+        self.assertEqual(status, 0)
+        self.assertEqual([line for line in lines if "llvm-cov" in line],
+                         ["cargo llvm-cov report --failure-mode all --html --output-dir target/coverage/html"])
+
 
 class EvidenceTests(unittest.TestCase):
     def setUp(self):
@@ -98,16 +136,17 @@ class EvidenceTests(unittest.TestCase):
             producer = blocks[index]
             identity = gate.replace('-', '_')
             self.assertIn('id: ' + identity, producer)
-            # A split owner is one matrix job; each shard sets only its own output.
+            # A partitioned owner (portable macOS) runs its one, whole
+            # partition in one job, with no matrix (plan 2026-11-06, F1).
             count = SHARDS.get(gate)
-            suffixes = [''] if count is None else ['_' + str(shard) for shard in range(1, count + 1)]
-            for suffix in suffixes:
-                self.assertIn(identity + suffix + '_sha256: ${{ steps.' + identity
-                              + '.outputs.' + identity + suffix + '_sha256 }}', job)
-            label = gate if count is None else gate + '-${{ matrix.shard }}'
+            self.assertIn(count, (None, 1), gate)
+            self.assertNotIn('matrix', job, gate)
+            suffix = '' if count is None else '_1'
+            self.assertIn(identity + suffix + '_sha256: ${{ steps.' + identity
+                          + '.outputs.' + identity + suffix + '_sha256 }}', job)
+            label = gate if count is None else gate + '-1'
             if count is not None:
-                self.assertIn('        shard: [' + ', '.join(map(str, range(1, count + 1))) + ']\n', job)
-                self.assertIn('--shard "${{ matrix.shard }}/' + str(count) + '"', producer)
+                self.assertIn('--shard "1/1"', producer)
                 self.assertIn('--directory "target/contracts/' + host + '/' + label + '"', producer)
             if gate != 'oci-interruptions':
                 for argument in ('--host ' + host, '--commit "$EXPECTED_CHECKOUT_COMMIT"',
@@ -126,7 +165,7 @@ class EvidenceTests(unittest.TestCase):
         # Original test owners must be intercepted rather than executed again.
         for job in workflow_jobs.values():
             for step in steps(job):
-                self.assertEqual(set(NEXTEST_TARGETS.findall(step)) - NOT_NEXTEST, set())
+                self.assertEqual(set(NEXTEST_TARGETS.findall(step)) - NOT_NEXTEST - UNBOUND_SUITES, set())
 
     def assert_cached_owners_clear_restored_envelopes(self, workflow_jobs):
         """Clear cached generated directories once before any fresh producer."""
@@ -204,7 +243,7 @@ class EvidenceTests(unittest.TestCase):
                      if 'workflow_adapter.py produce' in step
                      and '--gate linux-root-storage ' in step]
         self.assertEqual(len(producers), 1)
-        self.assertIn('sudo -E env PATH=', blocks[producers[0]])
+        self.assertIn('scripts/ci/as-root python3', blocks[producers[0]])
         restores = [index for index, step in enumerate(blocks)
                     if 'name: Restore root-storage evidence ownership' in step]
         self.assertEqual(len(restores), 1)
@@ -401,11 +440,30 @@ class TrainAndQueueTests(unittest.TestCase):
         self.assertRegex(self.triggers, r"\n  merge_group:\n(?:\s+#.*\n)*\s+types: \[checks_requested\]\n")
         self.assertRegex(self.triggers, r"\n  push:\n(?:\s+#.*\n)*\s+branches: \[main, \"release-\*\"\]\n")
 
+    def test_a_merge_group_runs_every_job_and_the_check_the_queue_requires(self):
+        # The train ruleset's queue requires one check, "ignored-test
+        # evidence". A merge group has no pull request and no label, so no
+        # job may hang its condition on the event: each follows select jobs
+        # (which picks everything for merge_group, see test_select_jobs.py)
+        # or the closed-PR guard, and the gate always reports.
+        allowed = {"github.event.action == 'closed'", "github.event.action != 'closed'",
+                   "${{ always() && github.event.action != 'closed' }}"}
+        for name, job in self.jobs.items():
+            condition = re.search(r"^    if: (.+)$", job, re.M)
+            self.assertIsNotNone(condition, name)
+            value = condition.group(1)
+            self.assertTrue(value in allowed or re.fullmatch(r"needs\.changes\.outputs\.[a-z_0-9]+ == 'true'", value),
+                            (name, value))
+        self.assertIn("    name: ignored-test evidence\n", self.jobs["ignored-evidence"])
+
     def test_selection_sees_the_head_branch_and_the_full_ci_label(self):
         changes = self.jobs["changes"]
         self.assertIn("HEAD_REF: ${{ github.event.pull_request.head.ref }}", changes)
         self.assertIn("FULL_CI: ${{ contains(github.event.pull_request.labels.*.name, 'full-ci') }}", changes)
         self.assertIn("macos: ${{ steps.select.outputs.macos }}", changes)
+        self.assertIn("RELEASE_GATE: ${{ contains(github.event.pull_request.labels.*.name, 'release-gate') }}",
+                      changes)
+        self.assertIn("MACOS_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'macos') }}", changes)
 
     def test_evidence_binds_to_the_merge_groups_own_commit(self):
         self.assertIn("  EXPECTED_CHECKOUT_COMMIT: ${{ github.event.merge_group.head_sha || github.sha }}\n",
@@ -421,12 +479,49 @@ class TrainAndQueueTests(unittest.TestCase):
         # Main and merge-queue runs fall back to their own run id.
         self.assertTrue(group.rstrip().endswith("|| github.run_id }}"), group)
 
+    def test_closing_a_pull_request_starts_a_run_that_cancels_its_older_one(self):
+        types = re.search(r"\n  pull_request:\n(?:\s+#.*\n|\s+branches: .*\n)*\s+types: \[(.*)\]\n",
+                          self.triggers).group(1).split(", ")
+        self.assertIn("closed", types)
+        # The closed run joins the pull request's group, so cancel-in-progress
+        # ends the run that was still working on the closed PR.
+        cancel = re.search(r"\n  cancel-in-progress: (.*)", self.ci).group(1)
+        self.assertNotIn("github.event.action", cancel)
+        closed = self.jobs[CLOSED_JOB]
+        self.assertIn("    if: github.event.action == 'closed'\n", closed)
+        self.assertNotIn("needs:", closed)
+        # A no-op: it neither checks out nor builds anything.
+        self.assertEqual([step for step in steps(closed) if "uses:" in step], [])
+        self.assertLessEqual(int(re.search(r"timeout-minutes: (\d+)", closed).group(1)), 5)
+
+    def test_a_closed_pull_requests_run_does_no_other_work(self):
+        guard = "github.event.action != 'closed'"
+        for name, job in self.jobs.items():
+            if name == CLOSED_JOB:
+                continue
+            condition = re.search(r"\n    if: (.*)\n", "\n" + job + "\n")
+            if condition and guard in condition.group(1):
+                continue
+            # Without the guard, a job may only run after select jobs ran,
+            # and only when that succeeded: a status function such as
+            # always() would start it on a closed run too.
+            needs = re.search(r"\n    needs: (.*)\n", "\n" + job + "\n")
+            self.assertIsNotNone(needs, name)
+            self.assertIn("changes", needs.group(1), name)
+            if condition:
+                self.assertNotRegex(condition.group(1), r"always\(\)|failure\(\)|cancelled\(\)", name)
+        for name in ["changes", "ci-policy", "dependency-audit", "ignored-evidence"]:
+            self.assertIn(guard, self.jobs[name], name)
+
     def test_the_final_gate_waits_for_every_other_job_and_always_reports(self):
         gate = self.jobs["ignored-evidence"]
         needs = set(re.search(r"needs: \[([^\]]*)\]", gate).group(1).split(", "))
-        self.assertEqual(needs, set(self.jobs) - {"ignored-evidence"})
+        # The closed-PR job never runs alongside the gate.
+        self.assertEqual(needs, set(self.jobs) - {"ignored-evidence", CLOSED_JOB})
         self.assertIn("    name: ignored-test evidence\n", gate)
-        self.assertIn("    if: ${{ always() }}\n", gate)
+        # It reports whatever the other jobs did, except on a closed PR's
+        # run, where there is nothing to report.
+        self.assertIn("    if: ${{ always() && github.event.action != 'closed' }}\n", gate)
         blocks = steps(gate)
         first = next(index for index, step in enumerate(blocks) if "every_job.py" in step)
         aggregate = next(index for index, step in enumerate(blocks) if "workflow_adapter.py aggregate" in step)
@@ -434,24 +529,133 @@ class TrainAndQueueTests(unittest.TestCase):
         self.assertNotIn("if:", blocks[first])
         self.assertIn('--event "$GITHUB_EVENT_NAME"', blocks[first])
         self.assertIn('--event "$GITHUB_EVENT_NAME"', blocks[aggregate])
+        # The release gate PR qualifies only with every owner, macOS included (#1443).
+        self.assertIn("RELEASE_GATE: ${{ contains(github.event.pull_request.labels.*.name, 'release-gate') }}",
+                      blocks[aggregate])
+        self.assertIn('--release-gate "$RELEASE_GATE"', blocks[aggregate])
         # The owner check still reports when another job failed, so one red
         # job doesn't hide whether the evidence was complete.
         self.assertIn("if: ${{ !cancelled() && needs.changes.outputs.code == 'true' }}", blocks[aggregate])
 
-    def test_macos_runs_when_selected_and_splits_the_once_only_steps(self):
+    def test_macos_is_one_job_that_lints_and_runs_its_selection(self):
+        # One job, not three shards that each compiled the whole suite to
+        # run a third of it (plan 2026-11-06, F1). What it runs, relish and
+        # the macOS-only tests (#1720), is pinned in test_macos_selection.py.
         macos = self.jobs["macos"]
+        portable = [name for name, job in self.jobs.items() if "--gate portable-darwin " in job]
+        self.assertEqual(portable, ["macos"])
         self.assertIn("    if: needs.changes.outputs.macos == 'true'\n", macos)
-        self.assertIn("      fail-fast: false\n", macos)
-        self.assertIn("    name: portable macOS (${{ matrix.shard }}/" + str(SHARDS["portable-darwin"]) + ")\n", macos)
-        for name in ["Lint every target, with all features", "Doctests"]:
+        self.assertIn("    name: portable macOS\n", macos)
+        self.assertNotIn("strategy:", macos)
+        self.assertNotIn("matrix", macos)
+        self.assertEqual(SHARDS["portable-darwin"], 1)
+        self.assertIn('--shard "1/1"', macos)
+        # The ci nextest profile from the workflow env, the all-features
+        # lint, the tests and relish's doctests, each unconditional.
+        self.assertIn("  NEXTEST_PROFILE: ci\n", self.ci)
+        for name, command in [("Lint the library, relish and bun", "run: make lint-macos"),
+                              ("Relish and macOS-only tests", "workflow_adapter.py produce"),
+                              ("Relish's doctests", "cargo test --locked --doc -- relish::")]:
             block = next(step for step in steps(macos) if "name: " + name in step)
-            self.assertRegex(block, r"if: matrix\.shard == \d\n")
+            self.assertIn(command, block)
+            self.assertNotIn("if:", block)
+        cache = next(step for step in steps(macos) if "Swatinem/rust-cache@" in step)
+        self.assertIn("save-if: ${{ github.ref == 'refs/heads/main' }}", cache)
+
+    def test_the_lint_job_checks_formatting_before_restoring_or_building_anything(self):
+        # rustfmt needs no build: run it before the cache restore and the
+        # apt step, so a format slip fails the job within a minute (#1724).
+        blocks = steps(self.jobs["lint"])
+        fmt = next(index for index, step in enumerate(blocks) if "make fmt-check" in step)
+        cache = next(index for index, step in enumerate(blocks) if "Swatinem/rust-cache@" in step)
+        apt = next(index for index, step in enumerate(blocks) if "apt-get" in step)
+        clippy = next(index for index, step in enumerate(blocks) if "make lint" in step and "fmt" not in step)
+        self.assertLess(fmt, cache)
+        self.assertLess(fmt, apt)
+        self.assertLess(fmt, clippy)
 
     def test_the_heavy_jobs_wait_for_their_own_selection(self):
-        for name in ["linux", "build-tests", "cluster", "acceptance"]:
+        for name in ["linux", "linux-next", "build-tests", "cluster", "acceptance"]:
             self.assertIn("if: needs.changes.outputs.heavy == 'true'", self.jobs[name])
-        for name in ["lint", "minimum-rust", "portable", "contract-boundaries", "demo-app"]:
+        for name in ["lint", "minimum-rust", "portable", "doctests", "contract-boundaries", "demo-app", "source-bundle"]:
             self.assertIn("if: needs.changes.outputs.code == 'true'", self.jobs[name])
+
+    def test_the_embedded_source_builds_on_its_own(self):
+        # relish carries its source (#1570); the job proves the bundle alone
+        # builds every binary, from an empty directory, with the locked graph.
+        job = self.jobs["source-bundle"]
+        blocks = steps(job)
+        build = next(index for index, step in enumerate(blocks) if "cargo build --locked --bin relish --features embed-source" in step)
+        extract = next(index for index, step in enumerate(blocks) if "relish agent source extract" in step)
+        rebuild = next(index for index, step in enumerate(blocks) if "cargo build --locked --bins" in step)
+        self.assertLess(build, extract)
+        self.assertLess(extract, rebuild)
+        self.assertIn('"$RUNNER_TEMP/source-bundle"', blocks[extract])
+        # Extraction never asks a cluster: the runner has none (#1571).
+        self.assertIn("--offline", blocks[extract])
+        self.assertIn("working-directory: ${{ runner.temp }}/source-bundle", blocks[rebuild])
+        # The extracted tree packs its own bundle, and nothing of the
+        # checkout's build of the crate stands in for it.
+        self.assertIn("--features embed-source", blocks[rebuild])
+        self.assertIn("cargo clean --package reliaburger", blocks[rebuild])
+        compare = next(index for index, step in enumerate(blocks) if "source-again" in step)
+        self.assertLess(rebuild, compare)
+        # The digest comes from the agent envelope, not from scraping text.
+        self.assertIn("jq -r .data.digest", blocks[compare])
+        self.assertIn("--offline", blocks[compare])
+        self.assertIn('test "$first" = "$second"', blocks[compare])
+        # It restores a cache without competing to save one.
+        self.assertIn("save-if: false", job)
+
+    def test_the_portable_suite_finishes_on_a_slow_runner_with_headroom(self):
+        # About 25 minutes normally and 35 to 41 on a slow runner (#1421).
+        # nextest's per-test timeouts catch a hung test, so the job limit
+        # only has to outlast a slow runner by half again.
+        limit = re.search(r"\n    timeout-minutes: (\d+)\n", self.jobs["portable"])
+        self.assertIsNotNone(limit)
+        self.assertGreaterEqual(int(limit.group(1)), 41 * 3 // 2)
+
+    def test_the_nightly_signing_build_s_own_key_test_runs(self):
+        # The nightly build trusts the nightly key instead of every release
+        # key, and only a build with the feature compiles the test that says
+        # so (#1442).
+        job = self.jobs["doctests"]
+        block = next(step for step in steps(job) if "--features nightly-signing" in step)
+        self.assertIn("cargo test --locked --lib --features nightly-signing upgrade::keys::", block)
+        self.assertNotIn("if:", block)
+        keys = (REPO / "src" / "upgrade" / "keys.rs").read_text()
+        self.assertIn('#[cfg(feature = "nightly-signing")]\n    #[test]', keys)
+
+    def test_doctests_and_the_feature_test_run_beside_the_coverage_run(self):
+        # Both build the crate without instrumentation, so they never shared
+        # the coverage run's build; on portable Linux they added about six
+        # minutes to the critical path (plan 2026-11-06, F2).
+        job = self.jobs["doctests"]
+        self.assertIn("    name: doctests and feature tests\n", job)
+        self.assertIn("    needs: changes\n", job)
+        block = next(step for step in steps(job) if "make test-doc" in step)
+        self.assertNotIn("if:", block)
+        self.assertLess(job.index("make test-doc"), job.index("--features nightly-signing"))
+        # It restores the uninstrumented debug cache and never competes to
+        # save it: build tests saves that key on main.
+        cache = next(step for step in steps(job) if "Swatinem/rust-cache@" in step)
+        self.assertIn("shared-key: linux-debug", cache)
+        self.assertIn("save-if: false", cache)
+        portable = self.jobs["portable"]
+        self.assertNotIn("make test-doc", portable)
+        self.assertNotIn("--features nightly-signing", portable)
+
+    def test_the_html_coverage_report_is_written_on_main_only(self):
+        # D5: the lcov file and the floor on every run, the HTML on pushes
+        # to main and the nightly, after the evidence owner's run.
+        portable = self.jobs["portable"]
+        blocks = steps(portable)
+        produce = next(index for index, step in enumerate(blocks) if "--gate portable-linux" in step)
+        html = next(index for index, step in enumerate(blocks) if "make coverage-html" in step)
+        upload = next(index for index, step in enumerate(blocks) if "name: coverage\n" in step)
+        self.assertLess(produce, html)
+        self.assertLess(html, upload)
+        self.assertIn("if: github.ref == 'refs/heads/main'", blocks[html])
 
 
 class BenchmarkTests(unittest.TestCase):
@@ -476,6 +680,27 @@ class BenchmarkTests(unittest.TestCase):
         compare = next(step for step in steps(job) if "bench_baseline.py compare" in step)
         self.assertIn("--remeasure 'cargo bench --bench task_arrays --'", compare)
 
+    def test_the_on_disk_ledger_benchmark_is_reported_not_gated(self):
+        # Its speed is the runner's disk, which varies several-fold within one
+        # job (#1038); the tmpfs variant beside it is gated instead.
+        job = self.jobs["task-array-benchmarks"]
+        compare = next(step for step in steps(job) if "bench_baseline.py compare" in step)
+        self.assertEqual(re.findall(r"--report-only (\S+)", compare),
+                         ["storage/ledger_and_index_64k"])
+
+    def test_every_report_only_benchmark_has_a_gated_variant_in_the_bench(self):
+        job = self.jobs["task-array-benchmarks"]
+        compare = next(step for step in steps(job) if "bench_baseline.py compare" in step)
+        bench = (REPO / "benches" / "task_arrays.rs").read_text()
+        names = re.findall(r"--report-only (\S+)", compare)
+        self.assertTrue(names)
+        for name in names:
+            with self.subTest(benchmark=name):
+                group, function = name.split("/", 1)
+                self.assertIn(f'benchmark_group("{group}")', bench)
+                self.assertIn(f'"{function}"', bench)
+                self.assertIn(f'"{function}_tmpfs"', bench)
+
     def test_only_main_saves_the_task_array_baseline(self):
         job = self.jobs["task-array-benchmarks"]
         restore = next(step for step in steps(job) if "actions/cache/restore@" in step)
@@ -499,6 +724,371 @@ class BenchmarkTests(unittest.TestCase):
         for target in targets:
             with self.subTest(target=target):
                 self.assertRegex(workflows, rf"(?m)run: make {re.escape(target)}$")
+
+
+class S3Tests(unittest.TestCase):
+    """`make test-s3` runs in CI against the server the script pins (#1534)."""
+
+    def setUp(self):
+        self.jobs = jobs((WORKFLOWS / "ci.yml").read_text())
+        self.job = self.jobs["s3"]
+
+    def test_the_s3_round_trip_runs_when_select_jobs_picks_it(self):
+        # select-jobs.sh sets s3 on pushes and schedules, so it runs nightly.
+        self.assertIn("    if: needs.changes.outputs.s3 == 'true'\n", self.job)
+        self.assertIn("s3: ${{ steps.select.outputs.s3 }}", self.jobs["changes"])
+        self.assertRegex(self.job, r"(?m)^        run: make test-s3$")
+
+    def test_every_seaweedfs_build_the_script_downloads_is_pinned(self):
+        script = (REPO / "scripts" / "test-s3.sh").read_text()
+        self.assertRegex(script, r"(?m)^SEAWEEDFS_VERSION=\S+$")
+        self.assertEqual(len(re.findall(r"digest=[0-9a-f]{64} ;;", script)), 4)
+
+    def test_ci_runs_the_script_s_own_throwaway_server_as_a_laptop_does(self):
+        # One way in: the pinned binary with telemetry off, not a service
+        # container that can't be given flags.
+        self.assertNotIn("services:", self.job)
+        for name in ("RELIABURGER_TEST_S3_URL", "RELIABURGER_TEST_S3_ENDPOINT", "AWS_"):
+            self.assertNotIn(name, self.job)
+
+
+class LinuxNextTests(unittest.TestCase):
+    """The Ubuntu 26.04 privileged job leaves evidence when it runs long
+    (#1943). Its timeouts kept no log: the runner never ran the cancellation,
+    so the test step stayed in progress and no post step ran."""
+
+    def setUp(self):
+        self.job = jobs((WORKFLOWS / "ci.yml").read_text())["linux-next"]
+        self.steps = steps(self.job)
+
+    def step(self, text):
+        found = [index for index, step in enumerate(self.steps) if text in step]
+        self.assertEqual(len(found), 1, text)
+        return found[0]
+
+    def minutes(self, text):
+        return int(re.search(r"(?m)^\s+timeout-minutes: (\d+)$", text).group(1))
+
+    def test_the_test_step_fails_inside_the_job_limit_with_room_for_the_evidence(self):
+        tests = self.step("make test-linux")
+        job = self.minutes(self.job.split("\n    steps:", 1)[0])
+        step = self.minutes(self.steps[tests])
+        # Successful runs took 22 to 31 minutes on 13-14 Nov 2026.
+        self.assertGreaterEqual(step, 40)
+        self.assertGreaterEqual(job - step, 6)
+
+    def test_the_tests_write_junit_and_a_log_that_are_kept_whatever_happens(self):
+        tests = self.steps[self.step("make test-linux")]
+        self.assertIn("NEXTEST_PROFILE=ci", tests)
+        self.assertIn("set -o pipefail", tests)
+        self.assertIn('| tee "$RUNNER_TEMP/linux-next-tests.log"', tests)
+        keep = self.step("name: linux-next-evidence")
+        self.assertGreater(keep, self.step("make test-linux"))
+        self.assertIn("if: always()", self.steps[keep])
+        for path in ("target/nextest/ci/junit.xml", "linux-next-tests.log", "linux-next-resources.log"):
+            self.assertIn(path, self.steps[keep])
+
+    def test_headroom_is_watched_from_before_the_tests_and_reported_after_them(self):
+        watch = self.step('> "$RUNNER_TEMP/linux-next-resources.log"')
+        report = self.step('kill "$(cat "$RUNNER_TEMP/linux-next-resources.pid")"')
+        tests = self.step("make test-linux")
+        self.assertLess(watch, tests)
+        self.assertGreater(report, tests)
+        self.assertIn("if: always()", self.steps[report])
+        # On a failed or timed-out step, the stuck processes' kernel stacks.
+        self.assertIn("/stack", self.steps[report])
+
+    def test_the_runner_is_shielded_from_the_oom_killer_before_anything_is_watched(self):
+        # The job died with its test step "in progress" nine times in two
+        # days while the 24.04 job running the same tests didn't: the runner
+        # itself stopped. An OOM kill of Runner.Worker would do that.
+        shield = self.step('scripts/ci/protect-runner "$RUNNER_TEMP/runner-pids"')
+        self.assertLess(shield, self.step("scripts/ci/watch-runner"))
+        self.assertLess(shield, self.step("make test-linux"))
+        self.assertNotIn("if: always()", self.steps[shield])
+
+    def test_the_tests_run_in_their_own_scope_and_session_back_in_the_oom_killers_reach(self):
+        step = self.steps[self.step("make test-linux")]
+        command = " ".join(re.sub(r"\\\n", " ", step.split("run: |", 1)[1]).split())
+        # Out of the runner's cgroup, so a memory limit or kill there misses
+        # the tests, and out of its session and process group.
+        wrapper = ["scripts/ci/as-root systemd-run --scope --quiet -p Delegate=yes",
+                   "setsid --wait",
+                   # Children inherit the runner's -1000; hand the tests back.
+                   "choom -n 0 --",
+                   "timeout --kill-after=1m",
+                   "make test-linux NEXTEST_PROFILE=ci"]
+        positions = [command.find(part) for part in wrapper]
+        self.assertNotIn(-1, positions, command)
+        self.assertEqual(positions, sorted(positions), command)
+        # The runner can't signal a root tree in its own session, so the
+        # tests stop themselves inside the step's limit.
+        inner = int(re.search(r"timeout --kill-after=1m (\d+)m", command).group(1))
+        self.assertLessEqual(inner + 1, self.minutes(step) - 1)
+
+    def test_the_compile_gets_swap_before_the_tests_run(self):
+        # With the runner shielded, #1943 showed up as a global OOM: on
+        # 15 Nov rustc reached 10.6 GB resident building the lib tests while
+        # rust-lld linked, and the kernel killed it (run 43715574887).
+        swap = self.step("sudo swapon /ci-swapfile")
+        self.assertLess(swap, self.step("make test-linux"))
+        self.assertIn("swapon --show --noheadings", self.steps[swap])
+        self.assertNotIn("if: always()", self.steps[swap])
+
+    def test_the_watcher_logs_kernel_oom_kills_and_whether_the_runner_lives(self):
+        watch = self.steps[self.step("scripts/ci/watch-runner")]
+        self.assertIn('scripts/ci/watch-runner "$RUNNER_TEMP/runner-pids"', watch)
+        report = self.steps[self.step('kill "$(cat "$RUNNER_TEMP/linux-next-resources.pid")"')]
+        # The low-water marks sort only the resource lines, not kernel lines.
+        self.assertIn("grep ' disk_kb='", report)
+        self.assertIn("dmesg -T", report)
+        self.assertIn("'oom|killed process'", report)
+
+    def test_no_sort_takes_an_attached_equals_separator(self):
+        # 26.04's Rust `sort` reads `-t=` as an empty separator and fails
+        # ("separator must be exactly one character long").
+        text = (WORKFLOWS / "ci.yml").read_text()
+        self.assertNotIn("sort -t=", text)
+        self.assertIn("sort -t '=' -k2 -n", self.job)
+        self.assertIn("sort -t '=' -k3 -n", self.job)
+
+
+class ArtifactDownloadTests(unittest.TestCase):
+    """A stalled artefact download fails fast and is retried once (#977).
+
+    `actions/download-artifact` normally takes a minute or two, but one run
+    took 13 minutes and pushed `acceptance` past its 40-minute limit. Each
+    download gets its own short limit and one retry, so a stall costs at most
+    two short limits instead of the job's whole budget. That's enough for the
+    small evidence envelopes; ci.yml's test archive is fetched by
+    `fetch_artifact.py` instead (ArchiveFetchTests).
+    """
+
+    # The longest any one attempt may take; downloads normally take 1 to 2.
+    LIMIT_MINUTES = 5
+    WORKFLOW_FILES = ("ci.yml", "v02-loops.yml")
+
+    def setUp(self):
+        self.workflows = {name: jobs((WORKFLOWS / name).read_text())
+                          for name in self.WORKFLOW_FILES}
+
+    @staticmethod
+    def with_block(step):
+        """The step's `with:` inputs, as text."""
+        found = re.search(r"\n        with:\n((?:          .*\n?)*)", step)
+        return found.group(1).rstrip() if found else ""
+
+    def assert_downloads_retried(self, workflow_jobs):
+        """Every download is a bounded attempt followed by one bounded retry.
+
+        No subTest here: the detection test expects the first failure to raise.
+        """
+        pairs = 0
+        for name, job in workflow_jobs.items():
+            blocks = steps(job)
+            downloads = [index for index, step in enumerate(blocks)
+                         if "uses: actions/download-artifact@" in step]
+            remaining = list(downloads)
+            while remaining:
+                first = remaining.pop(0)
+                attempt = blocks[first]
+                self.assertIn("\n        continue-on-error: true", attempt, f"{name}: the first attempt must not fail the job")
+                step_id = re.search(r"\n        id: ([a-z_]+)\n", attempt)
+                self.assertIsNotNone(step_id, "the first attempt needs an id")
+                self.assertTrue(remaining and remaining[0] == first + 1,
+                                "the first attempt must be followed by its retry")
+                retry = blocks[remaining.pop(0)]
+                self.assertNotIn("continue-on-error", retry)
+                condition = re.search(r"\n        if: (.*)", retry)
+                self.assertIsNotNone(condition, "the retry runs only when the first attempt failed")
+                # !cancelled(): an earlier failed step in the job must not
+                # skip the retry of a download that runs regardless.
+                self.assertIn("!cancelled()", condition.group(1))
+                self.assertIn(f"steps.{step_id.group(1)}.outcome == 'failure'", condition.group(1))
+                self.assertEqual(self.with_block(attempt), self.with_block(retry))
+                self.assertNotEqual(self.with_block(attempt), "")
+                for step in (attempt, retry):
+                    limit = re.search(r"\n        timeout-minutes: (\d+)\n", step + "\n")
+                    self.assertIsNotNone(limit, "each attempt needs its own timeout-minutes")
+                    self.assertLessEqual(int(limit.group(1)), self.LIMIT_MINUTES)
+                pairs += 1
+        return pairs
+
+    def test_a_stalled_artefact_download_fails_fast_and_is_retried_once(self):
+        for name, workflow_jobs in self.workflows.items():
+            with self.subTest(workflow=name):
+                self.assertGreater(self.assert_downloads_retried(workflow_jobs), 0)
+
+    def test_the_jobs_that_download_the_test_archive_keep_their_own_limits(self):
+        ci = self.workflows["ci.yml"]
+        for name, minutes in (("cluster", 30), ("acceptance", 40), ("ignored-evidence", 10)):
+            with self.subTest(job=name):
+                self.assertIn(f"\n    timeout-minutes: {minutes}\n", ci[name])
+
+    def test_an_unbounded_unretried_or_skippable_download_is_detected(self):
+        ci = self.workflows["ci.yml"]
+        self.assert_downloads_retried(ci)
+        original = ci["ignored-evidence"]
+        blocks = steps(original)
+        downloads = [step for step in blocks if "uses: actions/download-artifact@" in step]
+        self.assertEqual(len(downloads), 2)
+        attempt, retry = downloads
+        changes = [
+            original.replace(retry + "\n", ""),
+            original.replace(attempt, re.sub(r"\n        timeout-minutes: \d+", "", attempt)),
+            original.replace(retry, re.sub(r"timeout-minutes: \d+", "timeout-minutes: 15", retry)),
+            original.replace(attempt, attempt.replace("\n        continue-on-error: true", "")),
+            original.replace(retry, retry.replace("!cancelled() && ", "")),
+            original.replace(retry, retry.replace("outcome == 'failure'", "outcome == 'success'")),
+            original.replace(retry, retry.replace("pattern: contract-*", "pattern: something-else")),
+            original.replace(retry, retry + "\n" + retry),
+        ]
+        for changed in changes:
+            with self.subTest(change=changed), self.assertRaises(AssertionError):
+                self.assert_downloads_retried(dict(ci, **{"ignored-evidence": changed}))
+
+
+class ArchiveFetchTests(unittest.TestCase):
+    """The test archive is fetched by a transfer that resumes (#977).
+
+    With `actions/download-artifact`, the 3.0 GB archive took 33 s to almost
+    5 minutes in passing runs, against a 5-minute limit per attempt, and a
+    retry started again from the first byte, so a slow runner failed both
+    attempts. `fetch_artifact.py` resumes where a transfer stopped and stops
+    at its own deadline, inside the step's limit, inside the job's.
+    """
+
+    CONSUMERS = {"cluster": 30, "acceptance": 40}
+    # The fetch, then everything else the job does, must fit the job's limit.
+    LIMIT_MINUTES = 15
+
+    def setUp(self):
+        self.text = (WORKFLOWS / "ci.yml").read_text()
+        self.ci = jobs(self.text)
+
+    def assert_fetches_once(self, job, job_minutes):
+        """No subTest here: the detection test expects the first failure to raise."""
+        fetches = [step for step in steps(job) if "fetch_artifact.py" in step]
+        self.assertEqual(len(fetches), 1, "exactly one fetch of the archive per consumer job")
+        fetch = fetches[0]
+        self.assertIn("--name nextest-archive", fetch)
+        self.assertNotIn("continue-on-error", fetch, "a failed fetch must fail the job")
+        self.assertNotIn("\n        if:", fetch, "a skipped fetch must fail the job")
+        self.assertIn("GH_TOKEN: ${{ github.token }}", fetch)
+        limit = re.search(r"\n        timeout-minutes: (\d+)\n", fetch + "\n")
+        self.assertIsNotNone(limit, "the fetch needs its own timeout-minutes")
+        self.assertLessEqual(int(limit.group(1)), self.LIMIT_MINUTES)
+        self.assertLess(int(limit.group(1)), job_minutes)
+        deadline = re.search(r"--deadline (\d+)", fetch)
+        self.assertIsNotNone(deadline, "the fetch stops itself before the step's limit")
+        self.assertLess(int(deadline.group(1)), int(limit.group(1)) * 60)
+        self.assertRegex(fetch, r"--stall \d+")
+        self.assertNotIn("actions/download-artifact@", job, "the archive has one fetch, not two")
+        self.assertRegex(job, r"\n    permissions:\n      contents: read\n      actions: read\n",
+                         "listing this run's artefacts needs actions: read")
+
+    def test_each_archive_consumer_fetches_the_archive_once_with_a_deadline(self):
+        for name, minutes in self.CONSUMERS.items():
+            with self.subTest(job=name):
+                self.assert_fetches_once(self.ci[name], minutes)
+
+    def test_no_job_downloads_the_archive_with_the_action(self):
+        for name, job in self.ci.items():
+            for step in steps(job):
+                if "actions/download-artifact@" in step:
+                    with self.subTest(job=name):
+                        self.assertNotIn("nextest-archive", step)
+
+    def test_every_caller_of_ci_grants_what_the_fetch_needs(self):
+        callers = 0
+        for path in WORKFLOWS.glob("*.yml"):
+            for name, job in jobs(path.read_text()).items():
+                if "uses: ./.github/workflows/ci.yml" not in job:
+                    continue
+                callers += 1
+                with self.subTest(workflow=path.name, job=name):
+                    self.assertRegex(job, r"\n    permissions:\n      contents: read\n      actions: read\n")
+        self.assertGreater(callers, 0)
+
+    def test_an_unbounded_skippable_or_doubled_fetch_is_detected(self):
+        original = self.ci["acceptance"]
+        fetch = next(step for step in steps(original) if "fetch_artifact.py" in step)
+        changes = [
+            original.replace(fetch + "\n", ""),
+            original.replace(fetch, fetch + "\n" + fetch),
+            original.replace(fetch, re.sub(r"\n        timeout-minutes: \d+", "", fetch)),
+            original.replace(fetch, re.sub(r"timeout-minutes: \d+", "timeout-minutes: 40", fetch)),
+            original.replace(fetch, re.sub(r"--deadline \d+", "--deadline 900", fetch)),
+            original.replace(fetch, re.sub(r" --deadline \d+", "", fetch)),
+            original.replace(fetch, re.sub(r" --stall \d+", "", fetch)),
+            original.replace(fetch, fetch.replace("timeout-minutes:", "continue-on-error: true\n        timeout-minutes:")),
+            original.replace(fetch, fetch.replace("timeout-minutes:", "if: ${{ !cancelled() }}\n        timeout-minutes:")),
+            original.replace(fetch, fetch.replace("--name nextest-archive", "--name something-else")),
+            original.replace(fetch, fetch.replace("\n          GH_TOKEN: ${{ github.token }}", "")),
+            original.replace("      actions: read\n", ""),
+        ]
+        for changed in changes:
+            with self.subTest(change=changed), self.assertRaises(AssertionError):
+                self.assert_fetches_once(changed, 40)
+
+
+class ArchiveExtractionTests(unittest.TestCase):
+    """Each archive consumer extracts the test archive once (#1050).
+
+    `acceptance` has four owners and `cluster` one, and each owner used to
+    extract the 2.9 GB archive twice, for its discovery and for its run. Now
+    one step per job extracts it, and every owner names that step's receipt
+    digest, so its evidence is bound to the archive the step checked.
+    """
+
+    CONSUMERS = ("cluster", "acceptance")
+
+    def setUp(self):
+        self.ci = jobs((WORKFLOWS / "ci.yml").read_text())
+
+    def assert_extracts_once(self, job):
+        """No subTest here: the detection test expects the first failure to raise."""
+        blocks = steps(job)
+        extracts = [index for index, step in enumerate(blocks) if "workflow_adapter.py extract" in step]
+        self.assertEqual(len(extracts), 1, "exactly one extraction per consumer job")
+        extract = blocks[extracts[0]]
+        step_id = re.search(r"\n        id: ([a-z_]+)\n", extract)
+        self.assertIsNotNone(step_id, "the extraction needs an id for its output")
+        self.assertNotIn("\n        if:", extract, "a skipped extraction must fail the owners")
+        fetches = [index for index, step in enumerate(blocks) if "fetch_artifact.py" in step]
+        self.assertTrue(fetches and max(fetches) < extracts[0], "extract after the fetch")
+        producers = [index for index, step in enumerate(blocks) if "workflow_adapter.py produce" in step]
+        self.assertTrue(producers and extracts[0] < min(producers), "extract before every owner")
+        reference = ('--archive-extraction "${{ steps.' + step_id.group(1)
+                     + '.outputs.archive_extraction_sha256 }}"')
+        for index in producers:
+            self.assertIn(reference, blocks[index], "every owner names the job's extraction")
+        for option in ("--archive-file", "--extract-to", "--extract-overwrite"):
+            self.assertNotIn(option, job, "an owner must not open the archive again")
+        return len(producers)
+
+    def test_each_archive_consumer_extracts_once_before_its_owners(self):
+        owners = {name: self.assert_extracts_once(self.ci[name]) for name in self.CONSUMERS}
+        self.assertEqual(owners, {"cluster": 1, "acceptance": 4})
+
+    def test_a_missing_repeated_late_or_unreferenced_extraction_is_detected(self):
+        original = self.ci["acceptance"]
+        blocks = steps(original)
+        extract = next(step for step in blocks if "workflow_adapter.py extract" in step)
+        first = next(step for step in blocks if "workflow_adapter.py produce" in step)
+        last = [step for step in blocks if "workflow_adapter.py produce" in step][-1]
+        changes = [
+            original.replace(extract + "\n", ""),
+            original.replace(extract, extract + "\n" + extract.replace("id: ", "id: again_")),
+            original.replace(extract + "\n", "").replace(first, first + "\n" + extract),
+            original.replace(extract, extract.replace("\n        id: ", "\n        if: ${{ !cancelled() }}\n        id: ")),
+            original.replace(last, last.replace(" --archive-extraction", " --unrelated")),
+            original.replace(last, last.replace("outputs.archive_extraction_sha256", "outputs.something_else")),
+            original + "\n    env:\n      ARCHIVED: cargo nextest run --archive-file tests.tar.zst",
+        ]
+        for changed in changes:
+            with self.subTest(change=changed), self.assertRaises(AssertionError):
+                self.assert_extracts_once(changed)
 
 
 class RetargetTests(unittest.TestCase):

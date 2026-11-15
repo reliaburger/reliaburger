@@ -94,12 +94,23 @@ it, and list your own laptop's network in `[security] operator_cidrs` so
 ## Watch it
 
 ```sh
-relish nodes            # gossip membership and node state
+relish status           # the whole cluster on one screen
+relish nodes            # gossip membership, version, usage and allocation
 relish council status   # every node's view of the council
 ```
 
+`relish status` gives a verdict (`HEALTHY`, `DEGRADED`, or `DOWN` when the
+council has lost its quorum or its leader), then one line each for nodes, the
+council, gossip, versions, capacity, apps, jobs, logs, faults, alerts,
+certificates and agents (leases held, proposals waiting for approval). It's the same size on three nodes or three hundred: a line that
+needs attention ends in the command that shows the detail, such as
+`relish nodes --unhealthy` or `relish apps --unhealthy`.
+
 `relish nodes` shows every member's gossip state: `alive`, `suspect` (missed
-its probes, not yet declared dead) or `dead`. A dead node stays listed for up
+its probes, not yet declared dead) or `dead`, with `cordoned` or `disk` (85%
+full or more) added to an alive node's state. Beside it are the node's Bun
+version, its CPU, memory and disk use, and what the scheduler has allocated
+there. Nodes with a problem come first, and `--unhealthy` keeps only them. A dead node stays listed for up
 to a day after it was last heard from, so you can see what went missing. It
 drops off sooner if it comes back, leaves the cluster on purpose, or you
 retire it with `relish decommission-node`.
@@ -109,8 +120,9 @@ for its own view: its role, recovery epoch, Raft term and log position. Above
 the table it prints the epoch, the leader and quorum (`3/3 voters, quorum
 ok`), and it lists any node that didn't answer. One node's answer can't show a
 split, so it compares them all and calls out fenced nodes, two epochs or two
-leaders. `--output json` gives the same report to scripts. `relish status` opens
-with a one-line summary of it.
+leaders. `--output json` gives the same report to scripts. `relish status`
+sums it up on its `council` line: the leader and its term, the voters, and
+whether quorum holds.
 
 The council heals itself: lose a voter and the reconciler swaps a caught-up
 node in for it, in one membership change, so the voter count stays odd. A voter whose disk is at least 95% full for ten minutes
@@ -123,6 +135,31 @@ restarts it. Once there's space again, it catches up from the leader. If every
 voter is lost, `relish council recover` rebuilds the council from a stopped
 voter's own snapshot and committed log, or from a sealed backup (see
 `operations`). Read its `--help` first: writes after the last backup are lost.
+
+## How fast it should feel
+
+Every release is soaked for hours on a quiet three-node cluster (three small
+VMs on one laptop), and each soak record has a table of these latencies,
+measured while no fault is running. On a cluster like that, 99 in 100 of each
+should come in under:
+
+| What you do | Under |
+|---|---|
+| A job task waits for a pooled executor to start it | 256 ms |
+| `relish status` or `relish nodes` answers | 1 s |
+| `relish apply` returns, its change committed | 2 s |
+| A new instance of an app passes its health check | 5 s |
+| A rolling update reaches every node | 30 s |
+
+`relish status` answers from one summary call to the node you're connected
+to. It also runs `relish wtf`'s checks alongside, with their own 2 s budget;
+past that its `wtf` line says `not checked in time`, and `--quick` skips them.
+
+Only the first one fails a release today. The other four were first measured
+in October 2026 and are recorded, not yet enforced: treat them as targets
+until the soak records show where they really sit. Bigger clusters, real
+networks and slow image pulls add to all of them, and none of them holds
+while a node is down or a leader is being elected.
 
 ## When a node is gone for good
 
@@ -158,8 +195,11 @@ still be sending traffic to addresses the cluster would then hand out again.
 
 `relish dev create` builds `bun` and `relish` from your source tree inside a
 Lima build VM and starts a cluster from them. Like any cluster it runs mTLS:
-it creates the CA on your machine and enrols each VM with `relish join`. It's
-for working on Reliaburger itself; everyone else wants the quickstart.
+it creates the CA on your machine and enrols each VM with `relish join`. Its
+administrator token is named after the cluster, so `relish token list` on the
+`default` dev cluster shows `dev-default-admin` where a quickstart cluster
+shows `laptop-admin`. It's for working on Reliaburger itself; everyone else
+wants the quickstart.
 
 ```sh
 relish dev create --nodes 3

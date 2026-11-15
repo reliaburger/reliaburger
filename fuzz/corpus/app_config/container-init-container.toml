@@ -1,0 +1,43 @@
+# App with an init container (real container).
+#
+# Init containers run one after another before the main app starts. If any
+# fails, the app transitions to Failed. Each runs its own image (or the
+# app's, when it names none), with the app's env and the app's volume and
+# config-file mounts.
+#
+# Here the init runs in alpine, not the app's nginx image: it reads
+# /etc/os-release from its own image and the app's GREETING variable, and
+# writes the page nginx then serves from the shared volume. So
+# `curl localhost:<port>` showing "hello from alpine" proves the init ran
+# in its own image with the app's env and volume.
+#
+# Requires runc on Linux (on macOS, use the managed Linux VM from
+# `relish setup --quickstart`).
+#
+# Deploy with:
+#   cargo run --bin bun -- --runtime runc
+#   cargo run --bin relish -- apply examples/phase-1/container-init-container.toml
+#   cargo run --bin relish -- status
+
+[app.web]
+image = "nginx:latest"
+port = 80
+env = { GREETING = "hello" }
+
+[[app.web.volumes]]
+path = "/usr/share/nginx/html"
+
+[[app.web.init]]
+image = "alpine:latest"
+command = [
+    "/bin/sh",
+    "-c",
+    ". /etc/os-release && echo \"$GREETING from $ID\" > /usr/share/nginx/html/index.html",
+]
+
+[app.web.health]
+path = "/"
+interval = 5
+timeout = 2
+threshold_unhealthy = 3
+threshold_healthy = 1

@@ -1,0 +1,11 @@
+---
+source: src/relish/upgrade.rs
+expression: "json(&UpgradeStatus\n{\n    scope: UpgradeScope::Node, state:\n    serde_json::json!({\"running_version\": \"v0.2.6\", \"in_flight\": null}),\n})"
+---
+{
+  "scope": "node",
+  "state": {
+    "in_flight": null,
+    "running_version": "v0.2.6"
+  }
+}

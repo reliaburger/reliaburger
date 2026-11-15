@@ -130,11 +130,13 @@ fn spawn_fake_agent(mut rx: mpsc::Receiver<CollectSnapshotRequest>, shutdown: Ca
                             uptime: Duration::from_secs(1),
                             cpu_request_millicores: 250,
                             memory_request_mb: 128,
+                            gpu_request: 0,
                             egress_enforcement: Default::default(),
                         }],
                         allocated_ports: vec![8080],
                         capacity_cpu_millicores: 4000,
                         capacity_memory_mb: 8192,
+                        capacity_gpus: 0,
                         job_reservations: Default::default(),
                         capacity_refusals: Vec::new(),
                         rollouts: Vec::new(),
@@ -212,6 +214,7 @@ async fn start_node_with(
             job_capabilities_rx: None,
             readiness: None,
             recovery_probe_window: None,
+            council_size_cap: None,
         },
         shutdown.clone(),
     )
@@ -296,6 +299,7 @@ async fn start_mtls_node(
             job_capabilities_rx: None,
             readiness: None,
             recovery_probe_window: None,
+            council_size_cap: None,
         },
         shutdown.clone(),
     )
@@ -1111,18 +1115,12 @@ async fn node_renewal_retries_directly_after_leader_failure_and_persists_the_new
     let now = time::OffsetDateTime::now_utc();
     params.not_before = now - time::Duration::seconds(300);
     params.not_after = now + time::Duration::seconds(120);
-    let issuer = hierarchy
-        .node
-        .certificate_params
-        .clone()
-        .self_signed(&hierarchy.node.signing_keypair)
-        .unwrap();
+    let issuer = rcgen::Issuer::from_params(
+        &hierarchy.node.certificate_params,
+        &hierarchy.node.signing_keypair,
+    );
     let mut due = (*nodes[worker_index].2.snapshot()).clone();
-    due.certificate_der = params
-        .signed_by(&key, &issuer, &hierarchy.node.signing_keypair)
-        .unwrap()
-        .der()
-        .to_vec();
+    due.certificate_der = params.signed_by(&key, &issuer).unwrap().der().to_vec();
     due.private_key_der = key.serialize_der();
     due.serial = SerialNumber(20);
     let trust = due.trust.clone();
@@ -1220,6 +1218,7 @@ async fn leased_token_cleanup_survives_leader_failure_without_revoking_operator_
         name: "operator".into(),
         token_hash: vec![1; 32],
         role: ApiRole::Admin,
+        kind: reliaburger::sesame::types::TokenKind::Human,
         scope: TokenScope::default(),
         expires_at: None,
         created_at: SystemTime::now(),
@@ -1247,6 +1246,7 @@ async fn leased_token_cleanup_survives_leader_failure_without_revoking_operator_
         name: "rbtest-leader-scope".into(),
         token_hash: vec![3; 32],
         role: ApiRole::Deployer,
+        kind: reliaburger::sesame::types::TokenKind::Human,
         scope: TokenScope {
             apps: None,
             namespaces: Some(vec![lease.namespace.clone()]),

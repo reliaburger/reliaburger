@@ -438,7 +438,9 @@ pub fn check_join_token(
 /// The `wrapping_ikm` is needed to unwrap the Node CA private key from Raft
 /// storage. `lifetime` is the signing member's node leaf lifetime
 /// ([`ca::NODE_LEAF_LIFETIME`] unless that member's node config shortens it),
-/// so the member that signs decides how long the leaf lives.
+/// so the member that signs decides how long the leaf lives. `address` is
+/// where the signing member saw the node, named as an IP SAN when it's
+/// routable ([`ca::sign_node_csr`]).
 pub fn sign_join_csr(
     csr_der: &[u8],
     node_id: &str,
@@ -446,6 +448,7 @@ pub fn sign_join_csr(
     lifetime: Duration,
     state: &SecurityState,
     wrapping_ikm: &[u8],
+    address: Option<std::net::IpAddr>,
 ) -> Result<JoinResult, JoinError> {
     if state.crl.retired_nodes.contains_key(node_id) {
         return Err(JoinError::NodeRetired);
@@ -471,24 +474,21 @@ pub fn sign_join_csr(
         rcgen::KeyPair::from_der_and_sign_algo(&ca_key_der, &rcgen::PKCS_ECDSA_P256_SHA256)
             .map_err(|e| JoinError::CertIssueFailed(format!("invalid CA key: {e}")))?;
 
-    // Derive the issuer params (DN, constraints) from the stored Node CA cert
-    // so the issued leaf's issuer field matches the CA in the trust store.
-    let ca_cert_der = rustls::pki_types::CertificateDer::from(node_ca_der.clone());
-    let mut ca_params = rcgen::CertificateParams::from_ca_cert_der(&ca_cert_der)
+    // Derive the issuer params (name, key id, validity) from the stored Node
+    // CA cert so the issued leaf's issuer field matches the CA in the trust
+    // store and the leaf never outlives the CA's signed validity window.
+    let ca_params = ca::issuer_params_from_der(&node_ca_der)
         .map_err(|e| JoinError::CertIssueFailed(format!("invalid Node CA cert: {e}")))?;
-    // rcgen's reconstructed parameters are for signing, not authority to extend
-    // the stored issuer's lifetime. Read its actual signed validity window.
-    let (_, issuer) = x509_parser::parse_x509_certificate(&node_ca_der)
-        .map_err(|e| JoinError::CertIssueFailed(format!("invalid Node CA cert: {e}")))?;
-    ca_params.not_before =
-        time::OffsetDateTime::from_unix_timestamp(issuer.validity().not_before.timestamp())
-            .map_err(|e| JoinError::CertIssueFailed(format!("invalid Node CA validity: {e}")))?;
-    ca_params.not_after =
-        time::OffsetDateTime::from_unix_timestamp(issuer.validity().not_after.timestamp())
-            .map_err(|e| JoinError::CertIssueFailed(format!("invalid Node CA validity: {e}")))?;
 
-    let (cert_der, serial) =
-        ca::sign_node_csr(csr_der, node_id, serial, lifetime, &ca_keypair, &ca_params)?;
+    let (cert_der, serial) = ca::sign_node_csr(
+        csr_der,
+        node_id,
+        serial,
+        lifetime,
+        &ca_keypair,
+        &ca_params,
+        address,
+    )?;
 
     Ok(JoinResult {
         node_id: node_id.to_string(),
@@ -612,6 +612,7 @@ mod tests {
             ca::NODE_LEAF_LIFETIME,
             state,
             master_secret,
+            None,
         )?;
         Ok((result, key_der))
     }
@@ -628,6 +629,7 @@ mod tests {
             Duration::from_secs(3600),
             &state,
             &master_secret,
+            None,
         )
         .unwrap();
         let (_, leaf) = x509_parser::parse_x509_certificate(&result.certificate_der).unwrap();
@@ -848,6 +850,20 @@ mod tests {
 
         crate::sesame::cert::verify_signature(&result.certificate_der, &result.node_ca_der)
             .unwrap();
+    }
+
+    #[test]
+    fn issued_leaf_names_the_stored_node_ca_by_key_identifier() {
+        // Join and renewal both sign here, with issuer params rebuilt from
+        // the Node CA in replicated state (#1497).
+        let (state, token, master_secret) = setup_with_known_key();
+        let (result, _key) =
+            issue(&state, &token, "node-02", SerialNumber(6), &master_secret).unwrap();
+
+        ca::key_identifier_checks::assert_names_issuer_by_key(
+            &result.certificate_der,
+            &result.node_ca_der,
+        );
     }
 
     #[test]

@@ -98,6 +98,10 @@ The `sysinfo` crate gives us cross-platform system metrics without writing platf
 
 One refresh call cost us a release candidate. `System::refresh_all()` looks like the obvious choice, but in sysinfo 0.33 it refreshes processes *without* removing the ones that have exited, and sysinfo keeps each tracked process's `/proc/<pid>/stat` file open so the next refresh is cheaper. Bun raises its open-file limit to about a million, so nothing capped that cache either. The V02 soak's workloads start a short-lived process every second or so, and after half an hour one node's Bun held 1,532 open files (992 of them `stat` files for processes long gone) and 951 MB of memory. The collector now refreshes memory, CPU and processes separately, asks for dead processes to be removed, and turns sysinfo's file cache off. `exited_processes_are_forgotten_on_refresh` starts twenty `sleep`s, lets one refresh see them, kills them, and checks the next refresh has forgotten every one; with `refresh_all` it still tracks all twenty.
 
+Which units come back is the crate's choice, and it has changed its mind before: sysinfo reported memory in kilobytes until 0.26. In 0.2.2 we moved from 0.33 to 0.39, six breaking releases at once, and none of our calls stopped compiling. A silent change of unit was the real risk. A test like "total memory is positive" passes just as happily with KiB as with bytes, so the collector's tests now compare with a figure read without sysinfo. `node_memory_total_is_the_kernel_figure_in_bytes` checks `node_memory_total_bytes` against `MemTotal` in `/proc/meminfo` on Linux and `hw.memsize` on macOS, exactly. `process_memory_is_resident_bytes_not_kibibytes` checks a process's memory against `ps`, allowing for drift but not for a factor of 1,024. `process_cpu_is_percent_of_one_core_and_node_cpu_is_percent_of_all` spins one thread for a second and checks the process reads well above 1 (a 0–1 fraction couldn't), while node CPU stays between 0 and 100. `disk_capacity_is_bytes_from_the_filesystem`, in the diagnostics module, checks disk capacity against `statvfs`.
+
+The bump did change one number on purpose. On macOS, sysinfo 0.38 counts used memory the way Activity Monitor does (app memory plus wired plus compressed), where 0.33 added up active, wired, compressed and speculative pages. So `node_memory_used_bytes` on a Mac now matches what you see in Activity Monitor. Linux still computes it as `MemTotal` minus `MemAvailable`. sysinfo 0.34 also turned its `multithread` feature off by default; we turn it back on, so the process scan still runs on a thread pool as it did before the bump.
+
 Collection runs every 10 seconds. Each sample is a `(timestamp, metric_name, labels_json, value)` tuple, stored as an Arrow RecordBatch. When the batch fills up, it's flushed to a Parquet file.
 
 ## Prometheus scraping
@@ -362,7 +366,7 @@ matching gates run.
 
 Brioche is a single HTML page. No React, no Vue, no webpack. The server renders the HTML with current data, embeds a 2KB CSS stylesheet, and sends it. The browser refreshes every 5 seconds via a `<meta http-equiv="refresh">` tag.
 
-The dashboard shows three sections: apps (name, status, instance count), nodes (name, state, app count), and alerts. Status dots are green for healthy, amber for pending, red for failed. The dark theme is easy on the eyes during those late-night debugging sessions.
+The dashboard shows three sections: apps (name, status, instance count), nodes (name, state, app count), and alerts. Status dots are green for healthy, amber for pending, red for failed. (From 0.2.8 an app's status is the word `relish apps` uses, `running`, `degraded`, `down` or `stopped`, from one shared rollup; see [Built for Humans and Their Agents](19-built-for-agents.md#brioches-dashboard).) The dark theme is easy on the eyes during those late-night debugging sessions.
 
 Total payload: under 10KB. First paint: instant.
 
@@ -928,6 +932,20 @@ the one line that's left. `a_rotated_capture_file_is_read_again_from_the_start`
 renames the capture file away and writes a longer one in its place, which is
 the case a length check alone gets wrong.
 
+`load` was also the only place that forgot a capture. Every singleton job
+that printed added its capture file's path to the checkpoint, the job's
+instance deleted the file when it retired, and the entry stayed until Bun
+restarted. Each flush cloned the whole map, wrote it into the Parquet footer
+and wrote it again as JSON, so a node running a printing cron job every
+minute carried one more entry a minute, three times over (#1417). Now each
+flush runs the same check on the blocking pool before it writes: a path that
+is gone, or is a different file now, leaves the copy being written, and once
+the flush is durable the store forgets it too, unless the path has meanwhile
+been ingested again as a new file. The test
+`the_checkpoint_forgets_captures_whose_files_are_gone` ingests from two
+hundred job captures, deletes them and checks that one flush leaves only the
+capture still on disk, in memory and in the saved checkpoint.
+
 ### Ask everyone, not just the current home
 
 All of that shipped, and the next soak still caught a stale tail. Right
@@ -1133,6 +1151,292 @@ out of both "running" and "gone" in reports, and be retried. That's a
 design change with its own tests, and we've written it down for after
 0.1.0 rather than slip it in behind this fix.
 
+### Giving the disk back
+
+0.2.3's day run ran three nodes for 24 hours, and near the end node 1's
+disk crossed 80%. The soak's inventory blamed `instances/`, the directory
+that holds instance records and capture files: 949 MiB on node 1, against
+32 MiB and 24 MiB on the other two. We filed it as job instance storage,
+since the run had just started 194,000 fresh `runc` jobs.
+
+The numbers said otherwise. Plotted against time, node 1's `instances/` grew
+in a straight line, 26.4 MiB every 40 minutes, about 39.6 MiB an hour. Job
+load doesn't draw straight lines. The soak's log spammer does: twenty lines
+of about 57 bytes every tenth of a second, close to 11 KB a second, or about
+39 MiB an hour. It lived on node 1 for the whole run. Its capture file held every
+line it had ever printed, and so did the log store, which caps itself and
+prunes. Only the store's copy was bounded.
+
+Why not rotate the capture, the way `logrotate` would? The app writes into
+the file directly, through a descriptor its owner process opened with
+`O_APPEND`, so Bun can't swap the file under it without the app's
+cooperation. Truncating it in place loses whatever the app writes between
+our last read and the truncate. Worse, either one changes what an offset
+means, and the whole of "Resume, don't replay" rests on an offset naming one
+line for good.
+
+So we keep the offsets and drop the bytes. Linux's `fallocate` with
+`FALLOC_FL_PUNCH_HOLE` frees the blocks behind a byte range and leaves a
+*hole*: the range reads back as zeros, takes no disk, and the file keeps its
+length. `FALLOC_FL_KEEP_SIZE` makes that explicit. Writes with `O_APPEND`
+carry on at the end as if nothing happened. macOS has the same thing as an
+`fcntl` called `F_PUNCHHOLE`. `ls -l` still shows the file's full length;
+`du` shows what it takes.
+
+The new function lives in `grill/capture.rs`:
+
+```rust
+pub fn reclaim_ingested(
+    path: &Path,
+    identity: CaptureFileIdentity,
+    ingested_through: u64,
+) -> io::Result<u64> {
+    // ... open for writing, refuse a symlink, check the identity ...
+    let block = metadata.blksize().max(1);
+    let end = ingested_through.min(metadata.len().saturating_sub(RETAINED_CAPTURE_BYTES));
+    let end = end - end % block;
+    let start = data_start(&file, 0)?;
+    let start = start - start % block;
+    if start < end {
+        punch_hole(&file, start, end - start)?;
+    }
+    Ok(end.max(start))
+}
+```
+
+Three rules hide in those lines. It never frees a byte the store hasn't
+ingested (`ingested_through`). It keeps the last mebibyte
+(`RETAINED_CAPTURE_BYTES`), which is exactly the window a tail snapshot
+reads, so `relish logs -f` still starts from real lines. And it only frees
+whole filesystem blocks: a punch that ends mid-block zeroes the partial block
+without freeing it, which would only cost a write.
+
+Who calls it, and when? Not the forwarder: a line it has read may still be
+sitting in the store's memory buffer, and a crash would lose it. The store's
+flush calls it, on the blocking pool, after the Parquet file and the
+checkpoint are both durable. Only files the checkpoint has read more than a
+mebibyte of qualify, so a flush touches a handful of chatty captures, not the
+thousands of small job ones. A failure is printed and the flush stands; it
+costs disk, not data.
+
+The punch is one call per platform, picked at compile time with
+`#[cfg(target_os = "linux")]` and `#[cfg(target_os = "macos")]`. Only the
+matching function exists in the binary, the way an `#ifdef` works in C, and a
+third version for every other platform reports `Unsupported`. Linux goes
+through the `nix` crate's safe wrapper. macOS has none, so it calls `fcntl`
+through `libc` in an `unsafe` block, with the comment the project asks for:
+
+```rust
+// SAFETY: `file` is an open descriptor for the call's duration, and
+// F_PUNCHHOLE reads one `fpunchhole_t`, which `hole` is and outlives the
+// call. The kernel does not keep the pointer.
+let result = unsafe { nix::libc::fcntl(file.as_raw_fd(), nix::libc::F_PUNCHHOLE, &hole) };
+```
+
+`unsafe` doesn't switch the borrow checker off. It lets us do the one thing
+the compiler can't check (call a C function that takes a raw pointer), and
+the comment says why the pointer stays valid.
+
+Holes also change what a reader can meet. A store that loses its checkpoint
+reads the capture from byte 0 again, and byte 0 is now in a hole. Handing the
+store a megabyte of zeros as one line would be worse than useless. So
+`CaptureReader::read_chunk` asks the kernel where the data starts with
+`lseek(SEEK_DATA)`, jumps there, and drops everything up to the next newline,
+because the line the hole ends in may have lost its start. Every line in that
+stretch is already stored, so dropping one costs nothing. `read_retained`
+does the same for the code that reads a whole capture at once.
+
+`data_start` takes its file as `file: &impl std::os::fd::AsFd`. That's
+`impl Trait` in argument position: "any type that can lend out a file
+descriptor", decided at compile time like a C++ template, not a Go interface
+looked up at run time. The reader passes a `tokio::fs::File` and the punch
+passes a `std::fs::File`, and both get their own copy of the function.
+
+The tests use real files. `reclaiming_frees_ingested_bytes_but_keeps_the_length_and_identity`
+writes 8 MiB of numbered lines, reclaims, and checks the length and inode
+stayed while the allocated blocks fell to the last mebibyte;
+`reclaiming_never_frees_bytes_the_store_has_not_ingested` and
+`reclaiming_a_replaced_file_frees_nothing` hold the other two rules.
+`a_reader_from_byte_zero_skips_a_reclaimed_prefix` checks the first line a
+fresh reader returns is whole and numbered where it should be.
+`a_durable_flush_reclaims_the_ingested_capture_prefix` checks nothing is
+freed until the flush, and `a_chatty_instance_s_capture_stays_bounded_once_its_lines_are_stored`
+runs a real process that prints 8 MiB through `yes`, follows it into a store,
+flushes, and measures what the flush freed.
+
+It used to measure what was left, and on a busy Mac it failed now and then
+with 1.4 MB still allocated against a bound of 1.25 (#1537). Under load it
+failed about once in 25 runs, so we could look. The data was exactly where it
+should be: `lseek(SEEK_DATA)` found the first byte at 7 MiB and the last at
+8 MiB, so the punch had freed everything it was meant to. The extra blocks
+were there *before* the flush, past the end of the file. APFS gives a file
+that's being appended to some space ahead of its writer, and under load it
+gave up to a megabyte. `st_blocks` counts that space, the writer exiting
+didn't return it, and no punch inside the file's length can touch it. The
+product was fine; the test was counting something the reclaim doesn't own.
+So now the test makes that allocation itself, on every filesystem
+(`F_PREALLOCATE` on macOS, `fallocate` with `FALLOC_FL_KEEP_SIZE` on Linux),
+and asserts that the flush freed all but the retained tail. The old
+assertion fails every time with the preallocation in place; the new one
+passed 544 runs in a row under the same load.
+
+What we didn't do: route every app's output through Bun, which would let us
+rotate at will but put Bun in the path of every byte every app writes, and
+make an app block when Bun is slow. The issue also asked about the soak's own
+export directory, which grows about 600 MiB a day on each node. That's the
+harness's to bound, and it stays open in #1418.
+
+### The tail that stopped
+
+`relish logs soak-redis-client --tail 20` answered `INCR 1628` on 30 October
+2026, 27 minutes into a day-long run. It gave the same answer for the next
+21 hours, while the app counted past seven thousand and beyond.
+`soak-writer` froze at `ACK 61022` an hour and a half later. No warning, no
+error, twenty tidy lines.
+
+Which part of the path would you blame? We blamed the query. A tail is a
+`SELECT ... ORDER BY sequence DESC LIMIT n` across a Parquet directory, and
+DataFusion's top-k plan shares a filter between partitions and prunes files
+with it. Picking the wrong file after a rotation sounded right, and the freeze
+times differing by app sounded like a size threshold. So we wrote the test: a
+chatty app and a quiet one, forty flushes, row groups splitting every file, a
+tail after each flush. It passed. At the soak's real rates for 150 simulated
+minutes on four partitions, it passed. It passes today, along with
+`tail_crosses_parquet_a_flush_in_flight_and_the_buffer` and
+`tail_survives_the_oldest_files_being_pruned`. The query was never wrong.
+
+The run's evidence directory settled it. Every check lists each node's files,
+and after 18:49 on the first evening no node wrote another log file:
+
+| Node | Runs | Last Parquet file | Written by |
+|---|---|---|---|
+| 1 | `soak-redis-client`, `soak-spammer` | `logs_000120` | 18:49 |
+| 2 | `soak-writer` | `logs_000120` | 18:49 |
+| 3 | `soak-redis` | `logs_000025` | 18:24 |
+
+A flush with an empty buffer writes nothing, so the store wasn't failing to
+write. It had nothing to write. And the same run's other mystery fell out: node 1
+ended with 858 MiB of instance storage against 9 MiB on node 2. That's the
+spammer's capture, which [Giving the disk back](#giving-the-disk-back) can only
+reclaim once a flush has stored it. The lines were reaching the capture files
+and stopping there.
+
+Here's what stopped them, in the Runc follower:
+
+```rust
+terminal = match &context {
+    Some(context) => !matches!(
+        context.role_state(RuntimeRole::Launcher).await,
+        Ok(Some(CommandState::Running { .. }))
+    ),
+    None => true,
+};
+```
+
+"Not `Ok(Running)`" lumps two very different answers together. `Ok(Retired)`
+is the owner saying the workload is gone. `Err(..)` is us failing to find out.
+`role_state` asks the instance's owner process over a Unix socket, the owner
+serves one client at a time, and each request gets two seconds. The follower
+asks five times a second. On a four-vCPU VM running 23,000 host jobs a second,
+it only takes one answer in several hours to miss that deadline. The follower
+reads the error as the end of the workload, finishes, and returns. Nothing
+starts it again until the instance or Bun restarts. That fits the eight-hour soak never
+seeing this: its faults restart Bun all the time, at a sixteenth of the job
+rate. Only a
+quiet cluster with no faults could keep a dead forwarder dead for a day.
+
+The process runtime had the same mistake in a shorter form, `Err(_) => return`,
+which let us reproduce it on any machine.
+`a_failed_state_check_keeps_a_running_instance_in_the_log_store` follows a real
+capture through four flushes and makes one state check fail. It failed on the
+first one, with "the follower ended while its instance ran", and passes now.
+
+The fix is to stop treating "I don't know" as "no". The Runc loop moved into
+`capture::follow_capture`, which the compiler lets every platform build and
+test, and it takes its check as a closure:
+
+```rust
+pub async fn follow_capture<Checked>(
+    mut readers: [CaptureReader; 2],
+    sender: mpsc::Sender<CapturedLine>,
+    limit: Duration,
+    mut running: impl FnMut() -> Checked,
+) where
+    Checked: Future<Output = io::Result<bool>>,
+```
+
+If you're coming from Go, the closure is a `func() (bool, error)`. The generic
+`Checked` exists because every `async` block has its own anonymous type, so a
+function can't spell it out; it can only say "some future that produces an
+`io::Result<bool>`". `Ok(false)` ends the follow, `Ok(true)` carries on, and an
+`Err` is news of nothing.
+
+Could a follower now run forever? It could, for an instance whose records have
+been deleted, because no check will ever answer for it. So a failed check has
+two ways out. If the capture files have gone, the instance was cleaned up and
+the follower stops at once. Otherwise `SourceWatch` starts a ten-minute clock,
+and any answer or any new output stops it. A workload that keeps writing is
+never dropped, however broken its owner is. Only one that's silent *and*
+unaccountable for ten minutes is let go, and that one leaves a line in Bun's
+log, because the old exit said nothing at all and that silence cost us two
+releases. The same patience covers the follower's first step, which could
+fail the same way and leave an instance out of the store from birth.
+
+Why not restart a dead forwarder from a supervisor? That'd need a second loop
+to notice that a task has gone, and still a rule for when not to restart it.
+The rule is the hard part, and the follower already has what it needs to apply
+it.
+
+One thing still looks odd. `--since 3m` returned current lines, which is what
+pointed us at the query. It only looked healthy. The store had
+nothing that recent, so `relish logs` fell back to the agent's plain-text
+endpoint, which reads the capture file directly and ignores `start`. So on
+the node holding the instance, a window of three minutes printed everything
+the capture had kept, and the newest line was indeed new.
+
+We never saw the failed check itself: the journal the run kept starts about
+19 hours later, and the old exit logged nothing anyway. So the chain is strong
+rather than proven. The stores stopped, the captures didn't, and this is the
+one way out of the loop while an instance runs. The next long run's `--tail`
+is the check that closes it.
+
+The fallback itself was the next fix (#1515). Could the capture endpoint learn
+to honour `start`? Not cheaply. A capture file is the raw bytes the workload
+wrote, with no time on any line, so the endpoint would have to start stamping
+lines it currently copies verbatim. It doesn't need to, though. The store's
+query unions its unflushed buffer with the Parquet files, so a line is in the
+store within a moment of being written, and the store is the only place that
+knows when each line arrived. `relish logs` already refused to fall back for
+`--until`, `--stream` and a named instance, for the same reason: an empty
+answer from the store is the answer. `--since` now joins them.
+
+Without a window the fallback stays, and it had a second rough edge. The
+cross-node query fans out to every node, but the capture endpoint only reads
+the node you asked. Ask a node that doesn't run the app, get nothing from the
+store, and the fallback's `404 no local capture for this workload` came back
+as an error. When the store has already answered for the cluster, that 404
+just means "not here", so `relish logs` now prints nothing instead. If the
+store didn't answer, the 404 is still the most honest thing to show, and it
+still surfaces. The match is a single arm with a guard:
+
+```rust
+match self.logs_local(app, namespace, options).await {
+    Err(RelishError::ApiError { status: 404, .. }) if store_answered => Ok(String::new()),
+    other => other,
+}
+```
+
+The `..` in the pattern ignores the variant's other fields (the body here),
+and the `if` after the pattern is a match guard: the arm only matches when
+both the shape and the condition hold. Everything else, success included,
+falls through to `other` and is returned unchanged.
+
+`since_on_a_quiet_app_prints_nothing_from_the_old_capture` serves an empty
+store answer beside a capture holding old lines and asks with a window. It
+printed the old lines before the fix. Its neighbours pin the rest: lines
+inside the window still print, an unwindowed query still reads the capture,
+and a 404 is only forgiven once the store has spoken.
+
 ## When nothing looks like success
 
 Both hardening passes share a pattern, and later reviews kept finding more of it: a failure that comes back dressed as an empty, successful answer. A directory called `blocked.parquet` made the exporter and both retention loops report success. A peer that sent `200 OK` and then went quiet hung a log query. A node that answered `{}` convinced the diagnostic collector there were no alerts. None of these crash. They lie quietly, which is worse.
@@ -1222,6 +1526,44 @@ The `if` after the pattern is a *match guard*: the arm only matches when the pat
 
 `ExportBusy` also turned up where nobody was exporting. `checkpoint_retains_only_live_source_generations_across_restart` exports twice in a row, and in a full `cargo test --test suite` run the second export was refused as busy in four runs out of six (#519). It was the same `flock` quirk that Chapter 9 describes for quickstart operations. The lock belongs to the open file description, and a child process that another thread is halfway through spawning holds a copy of it until its `exec`. Closing our descriptor didn't release the lock, so the export straight after found it held. The lock became an `ExportLock` whose `Drop` calls `unlock()` before the file closes, which releases it for every copy at once. Today it's the shared `file_lock::FileLock` that Chapter 9 describes, which every file lock in the codebase uses. In production that was a spurious skip or a 100 ms wait, since Bun spawns workloads while it exports. In a test it was a failure.
 
+### Whose disk is `./archive`?
+
+The manual had two lines that read like one thought:
+
+```sh
+relish logs-export --dest ./archive
+relish logs-search ./archive "SELECT count(*) FROM logs WHERE line LIKE '%error%'"
+```
+
+Run them on a laptop, against a node somewhere else, and see what happens. The first line prints `agent exported 1 file(s) (2399 bytes) to ./archive/local`, and the files are real. They're just on the node, in `./archive` relative to wherever Bun happened to start. The second line runs on your laptop, where there's no such directory. Our own test caught it in the act: the first failing run left an `archive/` folder in the repository root, because that was the working directory of the agent under test.
+
+Remember the endpoint from earlier in this chapter, `POST /v1/logs/export`? We'd moved the work to the agent so that it could use the store's real path and its credentials. That was right for `s3://`. For a bare path it quietly changed whose disk the path meant, and every word the CLI printed still looked local.
+
+There were two ways out. We could keep the files on the node and make the output say so, or make `--dest` mean what it looks like. A flag that takes `./archive` from a shell on your machine has only one sensible reading, and the second option turned out to cost two small read-only routes, so that's what we did. `GET /v1/logs/archive` lists the node's flushed Parquet files with each one's size and SHA-256, and `GET /v1/logs/archive/{name}` streams one. Relish writes them under `./archive/<node>/`. `s3://` and `gs://` still go to the agent, because it's the one holding the credentials.
+
+Three decisions in there are worth a look.
+
+**A copy isn't an export.** The checkpoint is what licenses pruning, so `relish logs-export` must not touch it: a file on someone's laptop is no reason for a node to delete its only copy. So how does a repeat run skip what it already has, with no checkpoint? We gave the files the names an export gives them, `{sha256}-{filename}`. A name with its hash in it answers the question by itself: if the file exists, those are the bytes. That only holds if a half-written file can never take the name, so Relish writes to a hidden `.partial` file, checks the size and hash, syncs, and only then renames.
+
+**Neither side trusts the other's paths.** The API refuses any name that isn't a single `.parquet` path component, so `_export_checkpoint.json` and `../escape.parquet` get a 400. Relish does the same in the other direction, because the node's name and the file names in the listing are about to become local paths:
+
+```rust
+let mut components = Path::new(&listing.node_id).components();
+let one_name = matches!(components.next(), Some(Component::Normal(_)));
+if !one_name || components.next().is_some() {
+    return Err(archive_error(format!(
+        "the agent gave an unusable node name: {:?}",
+        listing.node_id
+    )));
+}
+```
+
+`Path::components` splits a path the way the operating system would, into an enum with variants like `Normal`, `ParentDir` and `RootDir`, so `..` and `/tmp/x` can't be mistaken for names. `matches!` is a macro that turns a pattern into a `bool`. In Go you'd compare strings against `".."` and hope you'd thought of every spelling; here the type did the thinking.
+
+**The archive's routes refuse a scoped token, even an Admin one.** `/v1/logs/query/{app}/{namespace}` can filter by tenant. A Parquet file can't: it's every tenant's lines in one blob. So these routes call `require_unscoped`, as `/v1/logs/sql` does. We also audit the listing as `logs.exported`, the same action the `POST` records, so moving the work to a `GET` didn't take it off the trail. The audit layer mostly records writes, so this is the one read it records; the files that follow each listing would only add noise. An Admin who already knows a file's name can fetch it without a listing, so this is a record of the normal path, not a wall.
+
+Getting the files to the right machine wasn't the end of it. The end-to-end test copied them, ran the manual's second line, and got back `{"errors":0}`. No error at all. DataFusion's `listing_table_ignore_subdirectory` defaults to `true`, and an export files everything one level down in `<node>/`, so the search looked in `./archive`, found no Parquet directly in it and reported, accurately, zero rows. Chapter 11's example got away with this by pointing at `/tmp/backup/node-1/`; the manual never did. Both query paths now set it to `false`, so a search of an archive's root sees every node in it. A test that stopped at "the files arrived" would have shipped a manual that printed the wrong answer, which is worse than the error we started with.
+
 ### Errors that used to vanish
 
 Retention in the metrics and rollup stores ignored `remove_file` errors and counted the file as deleted anyway; now only successful removals count. The exporter forgives exactly one read failure, `NotFound`, because retention can delete a file between listing the directory and opening it.
@@ -1250,7 +1592,7 @@ The temptation was to build something simpler: a custom iterator over Parquet fi
 
 ### Five default alerts cover 90% of incidents
 
-We thought operators would want to define custom alert rules from day one. In practice, the five defaults (CPU throttle, OOM risk, memory high, disk high, CPU idle) catch nearly every production incident that metrics can detect. Custom rules are a Phase 11 feature, and nobody has complained about the delay.
+We thought operators would want to define custom alert rules from day one. In practice, the five defaults (CPU throttle, OOM risk, memory high, disk high, CPU idle) catch nearly every production incident that metrics can detect. Custom rules still aren't supported, and nobody has complained yet.
 
 The lesson: don't build config for things that have obvious defaults. Ship the defaults, add config later if someone needs it.
 
@@ -1289,6 +1631,10 @@ parquet = { git = "https://github.com/reliaburger/arrow-rs", rev = "34ac1864f214
 
 A fork is a debt: every arrow-rs fix after 59.3.0 passes you by until you redo the patch. So we also asked upstream to backport the fix to the 59 line (apache/arrow-rs#11186), and they released Parquet 59.3.1 with it. In 0.2.1 we deleted the whole `[patch.crates-io]` block, and `Cargo.lock` now takes every arrow-rs crate from crates.io at 59.3.1 (#975). The regression tests didn't change, and they still run on Linux in CI, where the abort happened. The lesson: a test only proves something on the platform where it ran.
 
+Leaving the fork paid off in 0.2.6. On 2 November, RUSTSEC-2026-0442 reported that arrow-data 59.3.1 can read past the end of a RunEndEncoded array's values. The 0.2.6 candidate's release audit refused it. Upstream had already released 59.3.2 on the same line, so the fix was `cargo update` on the fifteen arrow and parquet crates: a `Cargo.lock` change, with no code and no fork. Our own files never build RunEndEncoded arrays, but the advisory is in a crate that reads files from disk, so we took the patch rather than adding an exception to `.cargo/audit.toml`.
+
+zstd hasn't been so easy. On 26 October RustSec published thirteen advisories against zstd 0.13.3 and zstd-safe 7.3.0, and zstd 0.14.3 fixes all of them. But Parquet's zstd codec on the 59 line still asks for `zstd = "^0.13"`, and in Cargo a caret requirement below 1.0 treats the minor version as the breaking one, so `^0.13` will never accept 0.14. Only Arrow 60 moves, and DataFusion 55 needs Arrow 59. 0.2.3 shipped with a dated exception for the thirteen IDs (#1366). Then we shrank it: our own source bundle (#1570) and rust-embed's `include-flate` moved to zstd 0.14, and a test in `tests/suite/dependency_audit.rs` now fails if anything except Arrow, Parquet and DataFusion depends on the old line. The two versions share one copy of the C library, `zstd-sys` 2.1.2 with libzstd 1.5.7, so the bytes we write didn't change. The Rust wrapper got a new major version, but the frames on disk are the same, so no log, metric or bundle needs migrating. The rest of the exception waits for DataFusion 56, which moves to Arrow 60. It's on a release branch but not yet on crates.io, and we won't ship a database engine from a git branch to save one audit entry.
+
 ### Server-rendered HTML with meta refresh beats React
 
 The Brioche dashboard is a single server-rendered HTML page. No JavaScript framework, no API calls, no state management. The browser refreshes every 5 seconds. Total payload: 10KB. Time to first meaningful paint: zero seconds (it's all in the HTML response).
@@ -1304,7 +1650,7 @@ Almost everything in this chapter is a pure data transform: a sample becomes a `
 The three subsystems carry their own tests at the bottom of each source file:
 
 - **Mayo (metrics):** Arrow schema validation, DataFusion SQL over the metrics table, Parquet round-trips, Prometheus text parsing, and the alert state machine. The alert tests read like the transition table itself — `inactive_to_pending_on_breach`, `pending_to_firing_after_duration`, `firing_to_inactive_on_recovery`, `pending_to_inactive_on_recovery`, `missing_metric_does_not_fire`. Each builds an evaluator, feeds it a metric value, and asserts the resulting state. The hardening work added a matching set of failure-path tests, one per edge from the previous section: `query_metric_name_injection_is_neutralised` and `app_metrics_name_injection_cannot_bypass_predicate` (the SQL escape), `resent_window_does_not_double_count` and `restart_resumes_flush_counter_without_clobbering` (idempotent, durable rollups), `stale_telemetry_does_not_resolve_a_firing_alert` (the value-not-boolean state machine), `slack_payload_matches_provider_shape` and `pagerduty_payload_matches_events_v2_shape` (the provider webhook contracts), and `query_proceeds_during_flush` plus `corrupt_parquet_file_does_not_fail_query` (the off-lock flush and corrupt-file skip). Each names the failure it prevents. The streaming work added `every_read_matches_the_eager_golden_answers` and `every_rollup_read_matches_the_eager_golden_answers` (the answers recorded before the change), `streamed_reads_match_the_eager_reader` (the property test), and `a_disjunction_narrows_to_the_hull_of_its_sides` with its neighbours in `scan.rs`, which plan real SQL and check the bounds the scan receives. The memory tests live in their own binary, `tests/mayo_memory.rs`, because they replace the global allocator, and they need a process each (nextest's default) because the counters are process-wide.
-- **Ketchup (logs):** `append_and_query`, grep/tail/time-range filters, and the SQL path (`app` filter, time range, `LIKE` grep, `LIMIT`). The log-path hardening added a matching set of failure tests, one per edge above: `bounded_sql_rejects_non_select`, `bounded_sql_rejects_other_tables` and `bounded_sql_caps_returned_rows` (the seatbelt on `/v1/logs/sql`); `unreachable_node_is_a_partial_failure` and `grep_value_with_ampersand_and_question_mark_transmitted_intact` (honest, correctly-encoded fan-out); `identical_lines_from_two_replicas_both_survive` and `repeated_identical_lines_from_one_node_both_survive` (the `(node, sequence)` dedup identity); `tail_returns_the_newest_lines_in_emission_order`, `lines_within_one_second_keep_emission_order_across_flushes` and `lines_sharing_a_second_come_back_in_sequence_order` (the V02 ordering bugs); `restart_does_not_reingest_lines_already_flushed`, `lines_lost_with_the_buffer_are_ingested_again_after_a_crash` and `refollowing_a_capture_file_replays_the_same_positions_and_the_store_keeps_one_copy` (exactly-once ingestion across restarts); `logs_from_several_instances_name_each_line_s_instance` (labelled tails); `reused_filename_with_new_contents_is_not_skipped` (durable checkpoint ids); and `flush_shared_persists_the_buffer_on_shutdown` (the final flush on stop).
+- **Ketchup (logs):** `append_and_query`, grep/tail/time-range filters, and the SQL path (`app` filter, time range, `LIKE` grep, `LIMIT`). The log-path hardening added a matching set of failure tests, one per edge above: `bounded_sql_rejects_non_select`, `bounded_sql_rejects_other_tables` and `bounded_sql_caps_returned_rows` (the seatbelt on `/v1/logs/sql`); `unreachable_node_is_a_partial_failure` and `grep_value_with_ampersand_and_question_mark_transmitted_intact` (honest, correctly-encoded fan-out); `identical_lines_from_two_replicas_both_survive` and `repeated_identical_lines_from_one_node_both_survive` (the `(node, sequence)` dedup identity); `tail_returns_the_newest_lines_in_emission_order`, `lines_within_one_second_keep_emission_order_across_flushes` and `lines_sharing_a_second_come_back_in_sequence_order` (the V02 ordering bugs); `a_failed_check_does_not_end_the_follow` and `a_failed_state_check_keeps_a_running_instance_in_the_log_store` (a follower that only stops on evidence); `restart_does_not_reingest_lines_already_flushed`, `lines_lost_with_the_buffer_are_ingested_again_after_a_crash` and `refollowing_a_capture_file_replays_the_same_positions_and_the_store_keeps_one_copy` (exactly-once ingestion across restarts); `logs_from_several_instances_name_each_line_s_instance` (labelled tails); `reused_filename_with_new_contents_is_not_skipped` (durable checkpoint ids); and `flush_shared_persists_the_buffer_on_shutdown` (the final flush on stop).
 - **Brioche (dashboard):** HTML rendering, and two security-flavoured tests worth calling out — `render_app_detail_escapes_html` (no stored-XSS through an app name) and `render_app_detail_masks_encrypted_env` (a secret never reaches the page). These are unit tests because the renderer is a pure function from data to a string; you assert on the string.
 
 ### End-to-end: the demo script

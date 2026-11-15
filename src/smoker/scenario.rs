@@ -182,6 +182,8 @@ pub fn step_to_fault_request(
     };
 
     Ok(FaultRequest {
+        workload: Default::default(),
+        task_index: None,
         fault_type,
         target_service: step.target.clone(),
         // Absent means the API's `default`, as for `relish fault`.
@@ -505,7 +507,7 @@ mod tests {
     #[test]
     fn the_shipped_example_scenario_is_valid() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("examples/phase-8/chaos-scenario.toml");
+            .join("examples/phase-8/container-chaos-scenario.toml");
         let scenario = load_scenario(&path).unwrap();
         build_timeline(&scenario, 1.0).unwrap();
     }

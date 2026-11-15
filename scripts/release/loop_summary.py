@@ -28,7 +28,7 @@ import re
 import sys
 import xml.etree.ElementTree as ElementTree
 
-# nextest 0.9.145 ends a stress run with, for example,
+# nextest 0.9.151 ends a stress run with, for example,
 # "Summary [   0.143s] 3/3 stress run iterations: 3 passed"; the first number
 # is the iterations that ran. Its JUnit report holds one testsuite per
 # iteration ("binary@stress-N"), so counting testcases counts every run.

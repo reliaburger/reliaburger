@@ -12,6 +12,8 @@
 
 use std::net::SocketAddr;
 
+use tokio::sync::watch;
+
 use crate::council::types::CouncilNodeInfo;
 use crate::meat::types::NodeId;
 use crate::mustard::directory::NodeDirectory;
@@ -42,26 +44,43 @@ pub struct LeaderView {
     pub reporting_address: Option<SocketAddr>,
 }
 
-/// Resolve the current leader from local Raft metrics and the gossip
-/// directory. Works on voters (metrics) and non-voters (directory hint)
-/// alike; returns `None` only when neither source knows a leader.
-pub fn resolve_leader(
-    metrics: &openraft::RaftMetrics<u64, CouncilNodeInfo>,
-    directory: &NodeDirectory,
-    raft_to_api_offset: i32,
-    raft_to_reporting_offset: i32,
-) -> Option<LeaderView> {
-    let raft_leader = metrics.current_leader.and_then(|leader_id| {
+/// Openraft's metrics channel, as [`crate::council::CouncilNode::metrics`]
+/// hands it out.
+pub type MetricsReceiver = watch::Receiver<openraft::RaftMetrics<u64, CouncilNodeInfo>>;
+
+/// The Raft view of the leader, `(leader_id, raft_address, term)`, and this
+/// node's own term, copied out of the metrics channel.
+type RaftLeader = (Option<(NodeId, SocketAddr, u64)>, u64);
+
+fn raft_leader(metrics: &openraft::RaftMetrics<u64, CouncilNodeInfo>) -> RaftLeader {
+    let leader = metrics.current_leader.and_then(|leader_id| {
         metrics
             .membership_config
             .membership()
             .get_node(&leader_id)
             .map(|info| (NodeId::new(&info.name), info.addr, metrics.current_term))
     });
+    (leader, metrics.current_term)
+}
+
+/// Resolve the current leader from local Raft metrics and the gossip
+/// directory. Works on voters (metrics) and non-voters (directory hint)
+/// alike; returns `None` only when neither source knows a leader.
+///
+/// It never holds both channels' borrows at once (#1273, #1433): see
+/// [`leader_api_address`].
+pub fn resolve_leader(
+    metrics: &MetricsReceiver,
+    directory: &watch::Receiver<NodeDirectory>,
+    raft_to_api_offset: i32,
+    raft_to_reporting_offset: i32,
+) -> Option<LeaderView> {
+    // Copy the metrics out and drop that borrow in this one statement.
+    let (leader, local_term) = raft_leader(&metrics.borrow());
     resolve_leader_view(
-        raft_leader,
-        directory,
-        metrics.current_term,
+        leader,
+        &directory.borrow(),
+        local_term,
         raft_to_api_offset,
         raft_to_reporting_offset,
     )
@@ -128,11 +147,28 @@ pub fn resolve_leader_view(
 /// a node that hasn't learned a Raft term yet, has only the gossip hint. This
 /// is a route, not a proof of leadership: the destination must still pass its
 /// own quorum check before it acts.
+///
+/// Pass `None` for `metrics` on a node without a council handle: it has only
+/// the gossip hint.
+///
+/// A `watch` borrow holds its channel's read lock, and that lock makes a new
+/// reader wait behind a queued writer. Openraft and gossip both publish
+/// often, so a task holding one borrow while it takes the other can wedge
+/// against a task taking them the other way round, parking a worker thread
+/// each. This copies what it needs from the metrics and drops that borrow
+/// before it reads the directory.
 pub fn leader_api_address(
-    metrics: &openraft::RaftMetrics<u64, CouncilNodeInfo>,
-    directory: &NodeDirectory,
+    metrics: Option<&MetricsReceiver>,
+    directory: &watch::Receiver<NodeDirectory>,
 ) -> Option<SocketAddr> {
-    resolve_leader(metrics, directory, 0, 0)
+    // The metrics borrow is a temporary, dropped at the end of this
+    // statement, before the directory borrow below.
+    let raft = metrics.map(|metrics| raft_leader(&metrics.borrow()));
+    let directory = directory.borrow();
+    let Some((leader, local_term)) = raft else {
+        return directory.leader.as_ref().map(|leader| leader.api_address);
+    };
+    resolve_leader_view(leader, &directory, local_term, 0, 0)
         .and_then(|leader| {
             directory
                 .endpoints
@@ -169,6 +205,45 @@ fn offset_address(address: SocketAddr, offset: i32) -> Option<SocketAddr> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Whether a gossip directory write had to wait while `read` was stuck
+/// reading the Raft metrics (#1273, #1433).
+///
+/// The test holds a metrics borrow, as the leader-target maintainer does,
+/// and queues an openraft write behind it. `read` then runs on its own
+/// thread with both channels and blocks on the metrics, because the lock
+/// makes a new reader wait behind a queued writer. If `read` still holds the
+/// directory at that point, gossip's next write waits too: half of the
+/// four-way deadlock. Every wait here is bounded, so a regression fails
+/// instead of hanging.
+#[cfg(test)]
+pub(crate) fn directory_write_waits_for_metrics_read(
+    read: impl FnOnce(MetricsReceiver, watch::Receiver<NodeDirectory>) + Send + 'static,
+) -> bool {
+    use std::time::Duration;
+
+    let (metrics_tx, metrics_rx) = watch::channel(openraft::RaftMetrics::new_initial(1));
+    let (directory_tx, directory_rx) = watch::channel(NodeDirectory::default());
+    let reader_metrics = metrics_rx.clone();
+    let held = metrics_rx.borrow();
+    let metrics_writer = std::thread::spawn(move || {
+        metrics_tx.send_replace(openraft::RaftMetrics::new_initial(1));
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    let reader = std::thread::spawn(move || read(reader_metrics, directory_rx));
+    std::thread::sleep(Duration::from_millis(100));
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let directory_writer = std::thread::spawn(move || {
+        directory_tx.send_replace(NodeDirectory::default());
+        let _ = done_tx.send(());
+    });
+    let waited = done_rx.recv_timeout(Duration::from_millis(500)).is_err();
+    drop(held);
+    metrics_writer.join().unwrap();
+    reader.join().unwrap();
+    directory_writer.join().unwrap();
+    waited
+}
 
 #[cfg(test)]
 mod tests {
@@ -298,5 +373,29 @@ mod tests {
         let view = resolve_leader_view(raft, &NodeDirectory::default(), 1, 2, -1).unwrap();
         assert_eq!(view.api_address, None);
         assert_eq!(view.reporting_address, Some(addr(65534)));
+    }
+
+    // #1433: a reader that held the gossip directory while it waited for the
+    // metrics stalled gossip's next write, half of #1273's deadlock.
+    #[test]
+    fn resolving_the_leader_reads_the_metrics_without_holding_the_directory() {
+        let waited = directory_write_waits_for_metrics_read(|metrics, directory| {
+            resolve_leader(&metrics, &directory, 0, 0);
+        });
+        assert!(
+            !waited,
+            "a gossip directory write waited for the metrics read"
+        );
+    }
+
+    #[test]
+    fn the_leader_api_address_reads_the_metrics_without_holding_the_directory() {
+        let waited = directory_write_waits_for_metrics_read(|metrics, directory| {
+            leader_api_address(Some(&metrics), &directory);
+        });
+        assert!(
+            !waited,
+            "a gossip directory write waited for the metrics read"
+        );
     }
 }

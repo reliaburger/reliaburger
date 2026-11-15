@@ -166,7 +166,7 @@ pub enum AgentCommand {
         app_name: String,
         namespace: String,
         command: Vec<String>,
-        response: oneshot::Sender<Result<String, BunError>>,
+        response: oneshot::Sender<Result<crate::grill::ExecOutput, BunError>>,
     },
     /// Run the fixed Phase 15 connectivity probe from a local workload.
     Trace {
@@ -199,6 +199,9 @@ pub enum AgentCommand {
         /// DER PKCS#10 CSR the joiner generated (PKI4). The joiner keeps its
         /// private key; the issuer only signs this request.
         csr_der: Vec<u8>,
+        /// Where the request came from, which the certificate names as an
+        /// IP SAN when it's routable (#1508).
+        address: Option<std::net::IpAddr>,
         response: oneshot::Sender<Result<crate::sesame::join::JoinBundle, BunError>>,
     },
     /// Snapshot an app's managed volumes (one volume, or all of them).
@@ -583,6 +586,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                             unschedulable: None,
                             rollout_failed: None,
                             volume_homes: Vec::new(),
+                            owner: spec.owner.clone(),
                         },
                     )
                     .collect::<Vec<_>>();
@@ -710,9 +714,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 token,
                 node_id,
                 csr_der,
+                address,
                 response,
             } => {
-                self.spawn_join_issue(token, node_id, csr_der, response);
+                self.spawn_join_issue(token, node_id, csr_der, address, response);
             }
             AgentCommand::SnapshotCreate {
                 namespace,
@@ -910,6 +915,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     return;
                 }
 
+                // An app or a job? This node's own evidence decides, before
+                // the rails see the request (#704).
+                if let Err(reason) = self.scope_local_workload_fault(&mut request) {
+                    let _ = response.send(Err(BunError::FaultRejected { reason }));
+                    return;
+                }
+
                 if request.fault_type.is_node_targeted() {
                     let result = reservation
                         .as_deref()
@@ -953,6 +965,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     self.spawn_signal_fault(&rule, signal, response);
                     return;
                 }
+                // A CPU, memory or disk I/O fault writes its targets' cgroups
+                // from a task: lowering `memory.high` makes the kernel reclaim
+                // before the write returns, which can take seconds.
+                let device = || self.io_device_major_minor();
+                if let Some(fault) = resource_faults::CgroupFault::of(&rule.fault_type, device) {
+                    self.spawn_cgroup_fault(&rule, fault, response);
+                    return;
+                }
                 // A pressure helper takes seconds to start; it starts in a
                 // task, and the caller hears once it runs (#351, stage 3).
                 if let crate::smoker::types::FaultType::NodePressure {
@@ -991,6 +1011,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     }
                     Err(reason) => {
                         self.fault_registry.remove(rule.id);
+                        self.network_faults.unproven_sources.remove(&rule.id);
                         // Take back anything a partial network install wrote.
                         self.reconcile_network_faults().await;
                         let _ = response.send(Err(BunError::FaultRejected { reason }));
@@ -1152,8 +1173,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 generation,
                 response,
             } => {
-                let result = self.confirm_consumer_receipt(generation).await;
-                let _ = response.send(result);
+                // Answered once forgetting the receipt is durable (#1340).
+                self.request_receipt_confirmation(generation, response)
+                    .await;
             }
             AgentCommand::Routes { response } => {
                 let table = self.routing_table.read().await;
@@ -1208,6 +1230,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// pre-upgrade workloads must have been adopted and still be Running.
     /// Commit on success; flag revert and exit on failure (the supervisor
     /// restarts us, and startup recovery swaps the old binary back).
+    ///
+    /// The commit's file work runs off the loop and is waited for only
+    /// until the turn's deadline (#1381); the caller is answered once it
+    /// has landed, in this turn or a follow-up turn.
     pub(super) async fn handle_upgrade_verify(
         &mut self,
         marker: crate::upgrade::marker::UpgradeMarker,
@@ -1246,34 +1272,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             if let Err(reason) = self.verify_upgrade_inventory(&marker).await {
                 eprintln!("bun: note: {reason} — not reverting (cluster reschedules placements)");
             }
-            match manager.commit(&marker) {
-                Ok(()) => {
-                    println!(
-                        "bun: upgrade to {} verified and committed",
-                        marker.target_version
-                    );
-                    let _ = response.send(Ok(true));
-                }
-                Err(e) => {
-                    let _ = response.send(Err(BunError::Upgrade(e)));
-                }
-            }
+            self.commit_verified_upgrade(manager, marker, response)
+                .await;
             return;
         }
 
         match self.verify_upgrade_inventory(&marker).await {
-            Ok(()) => match manager.commit(&marker) {
-                Ok(()) => {
-                    println!(
-                        "bun: upgrade to {} verified and committed",
-                        marker.target_version
-                    );
-                    let _ = response.send(Ok(true));
-                }
-                Err(e) => {
-                    let _ = response.send(Err(BunError::Upgrade(e)));
-                }
-            },
+            Ok(()) => {
+                self.commit_verified_upgrade(manager, marker, response)
+                    .await;
+            }
             Err(reason) => {
                 let _ = manager.mark_revert_pending(&marker, &reason);
                 let _ = response.send(Ok(false));

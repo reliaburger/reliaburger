@@ -247,16 +247,31 @@ pub fn plan_rolling_step(
 /// under its own count and ordinals, so those two fields differ between the
 /// two views of the same version. Everything else (image, command, env,
 /// health check, `[deploy]` table) is the version. A scale change keeps the
-/// fingerprint, so it never waits for a rollout.
+/// fingerprint, so it never waits for a rollout. So does a change of
+/// `owner` (#1125): a controller claiming an app restarts nothing. And so
+/// does `provenance` (#1124), the note of which template made the app.
 pub fn rollout_fingerprint(spec: &crate::config::app::AppSpec) -> String {
     use sha2::Digest;
     let mut version = spec.clone();
     version.replicas = crate::config::Replicas::default();
     version.ordinals = None;
+    version.owner = None;
+    version.provenance = None;
     // Serialising a spec can't fail: every field is plain data. An empty
     // string would still be a stable (if useless) fingerprint.
     let bytes = serde_json::to_vec(&version).unwrap_or_default();
     hex::encode(sha2::Sha256::digest(bytes))
+}
+
+/// [`rollout_fingerprint`] with the restart stamp set aside too (#1682):
+/// two specs that differ only in when they were last restarted are the
+/// same version. The rollback history and `relish rollback` compare
+/// these, so restarts don't push real versions out of the history, and a
+/// rollback never picks "the same spec, restarted earlier".
+pub fn version_fingerprint(spec: &crate::config::app::AppSpec) -> String {
+    let mut version = spec.clone();
+    version.restarted_at = None;
+    rollout_fingerprint(&version)
 }
 
 /// How many distinct fully rolled-out specs the council keeps per app as
@@ -284,10 +299,12 @@ impl AppRollouts {
 
     /// Record `spec` as fully rolled out: it becomes the newest target, and
     /// an older entry of the same version moves up rather than repeating.
+    /// A restart is the same version ([`version_fingerprint`]), so it
+    /// replaces its entry rather than taking a second one.
     pub fn release(&mut self, spec: &crate::config::app::AppSpec) {
-        let fingerprint = rollout_fingerprint(spec);
+        let fingerprint = version_fingerprint(spec);
         self.released
-            .retain(|released| rollout_fingerprint(released) != fingerprint);
+            .retain(|released| version_fingerprint(released) != fingerprint);
         self.released.push(spec.clone());
         let excess = self.released.len().saturating_sub(ROLLBACK_TARGETS_PER_APP);
         self.released.drain(..excess);
@@ -646,6 +663,39 @@ impl DeployHistoryEntry {
             steps_completed: completed,
             steps_total: state.steps.len(),
             spec: None,
+        }
+    }
+
+    /// The entry for a node's deploy of `spec` that began at `started_at`
+    /// and has just ended with `result`.
+    ///
+    /// `completed_at` is now, so `completed_at - created_at` is how long
+    /// the deploy took: what `relish history` and the soak's app start
+    /// read (#1640). The id is the completion time in seconds.
+    pub fn finished(
+        app_id: AppId,
+        spec: &crate::config::app::AppSpec,
+        result: DeployResult,
+        started_at: SystemTime,
+        steps_completed: usize,
+        steps_total: usize,
+    ) -> Self {
+        let completed_at = SystemTime::now();
+        Self {
+            id: DeployId(
+                completed_at
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            ),
+            app_id,
+            image: spec.image.clone().unwrap_or_default(),
+            result,
+            created_at: started_at,
+            completed_at,
+            steps_completed,
+            steps_total,
+            spec: Some(Box::new(spec.clone())),
         }
     }
 }
@@ -1151,5 +1201,56 @@ mod tests {
                 "serving dropped to {min}, below the floor {floor}"
             );
         }
+    }
+
+    /// #1125: who manages an app isn't part of its version, so a
+    /// controller claiming or releasing it starts no rollout.
+    #[test]
+    fn the_owner_is_not_part_of_the_version() {
+        let spec: crate::config::app::AppSpec = toml::from_str("image = 'db:v1'").unwrap();
+        let mut claimed = spec.clone();
+        claimed.owner = Some("pg-failover".into());
+        assert_eq!(rollout_fingerprint(&spec), rollout_fingerprint(&claimed));
+    }
+
+    /// #1124: which template made an app isn't part of its version either,
+    /// so moving an app into a template (or out of one) restarts nothing
+    /// when the expanded spec is the same.
+    #[test]
+    fn the_provenance_is_not_part_of_the_version() {
+        let spec: crate::config::app::AppSpec = toml::from_str("image = 'db:v1'").unwrap();
+        let mut templated = spec.clone();
+        templated.provenance = Some(crate::config::Provenance {
+            template: "postgres".into(),
+            instance: "orders-db".into(),
+        });
+        assert_eq!(rollout_fingerprint(&spec), rollout_fingerprint(&templated));
+    }
+
+    /// #1640: a finished entry starts when the caller says the deploy
+    /// began, ends when it was built, and takes its id from the end.
+    #[test]
+    fn a_finished_entry_spans_from_the_given_start_to_now() {
+        let spec: crate::config::app::AppSpec = toml::from_str("image = 'web:v2'").unwrap();
+        let started_at = SystemTime::now() - Duration::from_secs(90);
+        let entry = DeployHistoryEntry::finished(
+            AppId::new("web", "default"),
+            &spec,
+            DeployResult::Completed,
+            started_at,
+            2,
+            3,
+        );
+        assert_eq!(entry.created_at, started_at);
+        assert!(entry.completed_at >= started_at);
+        let completed_second = entry
+            .completed_at
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert_eq!(entry.id, DeployId(completed_second));
+        assert_eq!(entry.image, "web:v2");
+        assert_eq!((entry.steps_completed, entry.steps_total), (2, 3));
+        assert_eq!(entry.spec.as_deref(), Some(&spec));
     }
 }

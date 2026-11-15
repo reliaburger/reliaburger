@@ -1,0 +1,10 @@
+---
+source: src/relish/manual/mod.rs
+expression: "crate::relish::output::format_output(&ExamplesReport\n{\n    directory: std::path::PathBuf::from(\"./examples\"), written:\n    vec![std::path::PathBuf::from(\"./examples/phase-1/proc-first-run.toml\")],\n}, crate::relish::OutputFormat::Json).unwrap()"
+---
+{
+  "directory": "./examples",
+  "written": [
+    "./examples/phase-1/proc-first-run.toml"
+  ]
+}

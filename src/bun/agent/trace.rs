@@ -192,7 +192,7 @@ impl<G: Grill + Clone + 'static> PreparedTrace<G> {
             result = tokio::time::timeout(timeout, future) => result,
         };
         match result {
-            Ok(Ok(output)) => crate::onion::trace::parse_probe_output(&output, marker)
+            Ok(Ok(output)) => crate::onion::trace::parse_probe_output(&output.output, marker)
                 .ok_or_else(|| "source image lacks a usable POSIX shell or probe tool".to_string()),
             Ok(Err(error)) => Err(format!("workload probe could not start: {error}")),
             Err(_) => Err(format!(

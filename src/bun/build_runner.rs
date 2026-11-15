@@ -420,7 +420,7 @@ async fn sign_on_leader(
     let Some(council) = &state.council else {
         return Err(BuildSignError::Failed("no council available".to_string()));
     };
-    if !council.is_leader().await {
+    if !crate::bun::leadership::leads(council).await {
         return Err(BuildSignError::NotLeader);
     }
     let running = council
@@ -649,8 +649,7 @@ impl ScopedDir {
     /// suffix means two concurrent builds of the *same* context digest
     /// never share a directory (the old digest-derived path did).
     fn new(base: &std::path::Path, build_id: u64) -> std::io::Result<Self> {
-        use rand::Rng as _;
-        let suffix: u64 = rand::thread_rng().r#gen();
+        let suffix: u64 = rand::random();
         let path = base.join(format!("{build_id}-{suffix:016x}"));
         std::fs::create_dir_all(&path)?;
         Ok(Self { path })
@@ -1122,7 +1121,9 @@ async fn run_build_inner(
     // A unique, self-cleaning build directory. `ScopedDir::drop` removes
     // it on every exit path below, so no failure leaves a stray context.
     let base = std::env::temp_dir().join("reliaburger-build");
-    let build_dir = ScopedDir::new(&base, build_id)
+    let build_dir = tokio::task::spawn_blocking(move || ScopedDir::new(&base, build_id))
+        .await
+        .map_err(|e| format!("failed to create build directory: {e}"))?
         .map_err(|e| format!("failed to create build directory: {e}"))?;
     // The tar lands beside the context, not inside it, so `context.tar`
     // never becomes part of the build.
@@ -1496,6 +1497,19 @@ pub async fn build_submit_handler(
         Ok(request) => request,
         Err(resp) => return resp,
     };
+
+    // A build that declares a namespace pushes into that namespace or not
+    // at all (#1066), whoever asks: a bare `pickle://api:v1` would land in a
+    // repository every namespace pulls. `relish` checks this too, but this
+    // is where the decision holds, so a raw API call can't skip it, and it
+    // runs with or without a council.
+    if let Err(e) = crate::config::build::check_destination_namespace(&request.spec) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response();
+    }
 
     // Bind the push to the caller's namespace scope (AUTH1). The *destination's*
     // namespace decides who may push there — never a self-declared build field —
@@ -2046,7 +2060,7 @@ mod tests {
             let authority = security.active_ca(CaRole::Workload).unwrap();
             let (issuer_key, issuer_params) =
                 ca::ca_signing_material(authority, council.wrapping_ikm().unwrap()).unwrap();
-            let issuer = issuer_params.self_signed(&issuer_key).unwrap();
+            let issuer = rcgen::Issuer::new(issuer_params, &issuer_key);
             let leaf_key = rcgen::KeyPair::from_der_and_sign_algo(
                 &rustls::pki_types::PrivateKeyDer::try_from(previous.private_key_der.clone())
                     .unwrap(),
@@ -2061,11 +2075,7 @@ mod tests {
             leaf.not_before = time::OffsetDateTime::now_utc() - time::Duration::hours(2);
             leaf.not_after =
                 time::OffsetDateTime::now_utc() + time::Duration::seconds(seconds_remaining);
-            previous.cert_der = leaf
-                .signed_by(&leaf_key, &issuer, &issuer_key)
-                .unwrap()
-                .der()
-                .to_vec();
+            previous.cert_der = leaf.signed_by(&leaf_key, &issuer).unwrap().der().to_vec();
             let expired_der = previous.cert_der.clone();
             cache.lock().await.insert("default".into(), previous);
             let current = get_or_provision_build_signer(

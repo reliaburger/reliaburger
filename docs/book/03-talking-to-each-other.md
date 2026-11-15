@@ -44,7 +44,7 @@ Not every runtime needs the same approach:
 
 **RuncGrill (rootless mode):** Uses `slirp4netns`, the same tool Podman relies on. It creates a TAP device inside the user namespace with a userspace TCP/IP stack. No root needed. Port forwarding goes through its API socket.
 
-**AppleContainerGrill (macOS):** Apple Container already runs each container in a lightweight VM with its own vmnet interface. The network isolation is free. We just need to discover the container's IP via `container inspect`.
+**AppleContainerGrill (macOS):** Apple Container already runs each container in a lightweight VM with its own vmnet interface, so the network isolation would be free. We say "would" because Bun refuses `--runtime apple` and has since 0.1.0 (#367): on a Mac you run the managed Linux VM that `relish setup --quickstart` builds, and runc inside it. The code below is still in the tree, but no running node takes this path.
 
 **ProcessGrill:** No network isolation. Processes share the host network. This is the cross-platform dev/test fallback.
 
@@ -246,7 +246,7 @@ The helper is a process, not kernel state, so it needs an owner that outlives an
 
 What happens when the helper dies? Every `state()` call supervises it: if the helper's owner reports it gone, Grill starts a new one and reinstalls the forward. The awkward case is the gap in between. The owner polls its child every 10 ms, so for a moment it still says "running" about a helper whose API socket already refuses connections. Our first version treated that moment as fatal. It waited for the API, saw the owner finally report the exit, and returned "helper exited before readiness", quoting the *old* helper's log. A CI flake caught it three times, always under load. The fix is to stop asking "did it die?" and ask "did it die before we could use it?" A helper that dies after we saw it running is simply replaced. A helper this call started gets three attempts, with a short backoff between them. Only if all three die before serving their API does `state()` report an error, now quoting the latest attempt's own stderr. Refusals such as a conflicting forward still fail straight away, because retrying can't fix them.
 
-### Apple Container: the easy case
+### Apple Container: the easy case we switched off
 
 Apple Container runs each container in a lightweight VM with its own vmnet interface. The network isolation comes for free. We just need to discover the IP:
 
@@ -261,6 +261,8 @@ async fn discover_container_ip(instance: &InstanceId) -> Result<Ipv4Addr, GrillE
 ```
 
 After `container start`, we call `container inspect` and fish out the IP from the JSON output. The IP is stored on the `AppleEntry` and exposed via `container_ip()`.
+
+That was the easy part. The hard parts were everything around it: Apple Container has no hook for our DNS resolver injection, no managed-volume retirement to match runc's, and no eBPF connect hook, so an app that worked on a Mac could behave differently on Linux. Rather than ship a runtime with a different contract, we disabled it for 0.1.0. `bun --runtime apple` fails with a message that points at the managed VM, and #367 tracks bringing it back with parity.
 
 ### Testing without root
 
@@ -391,7 +393,7 @@ pub struct BackendInstance {
 
 When Bun deploys an app with a port, it calls `service_map.register(&ServiceId::new("default", "redis"), 6379, None)`. That computes the namespaced VIP and creates an entry with an empty backend list. Every method that mutates or reads a service takes a `&ServiceId`, so the namespace is threaded through the whole path — the compiler won't let a call site forget it. As instances start and reach the Running state, Bun calls `add_backend()` with the real node IP and host port. When health checks fail, `set_backend_health()` flips the flag. When an app is stopped, `unregister()` removes everything and releases the VIP.
 
-There's one deliberate escape hatch. The `relish resolve <name>` CLI and Smoker's fault-injection targeting still take a bare name — a human typing `relish resolve redis` doesn't want to spell out the namespace. Those go through `resolve_by_name()`, which returns the first match in any namespace. Everything on the deploy and routing path uses the namespaced `resolve()`; the bare-name lookup is only for the human-facing edges.
+There's one deliberate escape hatch. Smoker's fault-injection targeting still takes a bare name, and so did `relish resolve <name>` until 0.2.2 — a human typing `relish resolve redis` doesn't want to spell out the namespace. Those go through `resolve_by_name()`, which returns the first match in any namespace (the `relish resolve` section below says why the CLI stopped). Everything on the deploy and routing path uses the namespaced `resolve()`; the bare-name lookup is only for the human-facing edges.
 
 On Linux, every mutation to the `ServiceMap` gets synced to the BPF hash maps in the kernel. On macOS and for ProcessGrill, the map still works — it powers `relish resolve` — but there are no eBPF programs reading it.
 
@@ -436,17 +438,20 @@ You can query the service map from the CLI:
 
 ```
 $ relish resolve redis
-Service:  redis
-VIP:      127.128.0.3
-Port:     6379
-Backends: 2/2 healthy
+Service:   redis
+Namespace: default
+VIP:       127.128.0.3
+Port:      6379
+Backends:  2/2 healthy
 
   INSTANCE             NODE               PORT     HEALTH
   redis-0              10.0.2.2           30891    healthy
   redis-1              10.0.4.2           31022    healthy
 ```
 
-This calls the Bun agent's `/v1/resolve/{name}` endpoint, which reads from the userspace `ServiceMap`. It works on all platforms, even without eBPF — useful for verifying that the service map is correct before debugging the kernel-side programs.
+This calls the Bun agent's `/v1/resolve` endpoint, which lists the services in the userspace `ServiceMap` that the caller's token may see. It works on all platforms, even without eBPF — useful for verifying that the service map is correct before debugging the kernel-side programs.
+
+The bare-name escape hatch above had a catch: with `redis` in both `prod` and `staging`, "the first match in any namespace" meant whichever the map's hash order happened to put first, and the output didn't say which. The 0.2.2 CLI review fixed it in the CLI rather than the agent. Relish fetches the whole list and `select_service` filters it: `--namespace` picks one, a unique name needs nothing, and an ambiguous name is refused with every namespace it exists in, so the human chooses instead of the hash function. The output now names the namespace too.
 
 ### Wiring the service map into the agent
 
@@ -474,7 +479,7 @@ Wiring it in production comes down to three questions, and each has a slightly a
 
 **What if it fails?** A node that can't load eBPF logs the error and keeps running without kernel enforcement. Refusing to start would be worse: the data plane (containers, health checks, the userspace service map) is entirely independent of the connect hook. Losing the hook degrades service resolution to "no VIP rewriting"; it doesn't take the node down.
 
-The verification for all of this lives in `tests/ebpf.rs`, gated twice — behind the `ebpf` feature *and* `RELIABURGER_EBPF_TESTS=1` — and run inside the Lima VM, never in `make ci`. Nine tests load the real program into a real kernel and check the whole chain: attach to the cgroup, write and read the backend map, rewrite a `connect()` to a VIP, deny a VIP with no backends (`EPERM`, remember), pass a non-VIP through untouched, and resolve `.internal` names through the DNS responder. Green there is the only proof that counts — the loader is Linux-kernel code, and no amount of macOS unit testing substitutes for the kernel actually accepting the program.
+The verification for all of this lives in `tests/ebpf.rs`, gated twice — behind the `ebpf` feature *and* `RELIABURGER_EBPF_TESTS=1` — and run inside the Lima VM, never in `make ci`. Its tests load the real program into a real kernel and check the whole chain: attach to the cgroup, write and read the backend map, rewrite a `connect()` to a VIP, deny a VIP with no backends (`EPERM`, remember), pass a non-VIP through untouched, and resolve `.internal` names through the DNS responder. Green there is the only proof that counts — the loader is Linux-kernel code, and no amount of macOS unit testing substitutes for the kernel actually accepting the program.
 
 ### Making the service map cluster-wide: the endpoint catalogue
 
@@ -557,6 +562,30 @@ Everything that should still remove a backend still does. The node's own report 
 That rule had a hole of its own, and an audit found it (#431). "Hasn't reported under this leader" covered two very different nodes: one the leader hasn't heard from *yet*, and one it stopped hearing from long ago. A node whose reports went stale kept publishing its last backends as healthy, because the catalogue build never looked at `stale_nodes`. Worse, once the aggregator evicted the stale payload three windows later, the node looked exactly like one that simply hadn't reported, so the carry-forward rule kept its backends forever. Expired evidence was being renewed into healthy routing indefinitely.
 
 The fix gives silence a deadline. The aggregator now keeps a receive deadline per node that outlives the report payload, and a stale node publishes nothing, either from its old report or from the carried-forward catalogue. That's the `!reports.stale_nodes.contains(&node_id)` line above. A new leader still needs grace, though, or every leader change would withdraw every backend the moment the aggregator compared "never heard from" against the clock. So when the term changes, the aggregator starts a fresh deadline for every member gossip knows about. Each one gets one stale window (30 seconds by default, six report intervals) to reach the new leader. Reports arrive every five seconds, so a healthy node lands well inside it, and only a node that stays silent for a whole window loses its backends.
+
+The 0.2.8 gate found the opposite mistake: a node that did report, but left something out (#1855). Each backend in a report names its *execution*, the generation the runtime launched, read from the runtime's launch inventory. A producer retirement fences a generation, and `blocks` drops a backend whose generation is fenced. It also drops one that names no execution at all, on any node with retirement history, because missing evidence mustn't bring back a retired producer. That's right for a stale report. It's wrong for a report whose inventory read simply ran out of time. Node 3, the leader, was being CPU-throttled, and its inventory read took 501 ms, a millisecond past its turn's deadline. So its report named no execution for any instance, and the leader dropped all three podinfo backends. For one report interval every consumer saw the service empty, and ingress answered 502 while the containers kept serving.
+
+The fix is in the agent. It keeps the execution each instance's report last named, from a complete inventory read or from whatever launched the instance, and a read that misses its deadline reuses it. A complete read is still the truth. The kept execution is only good while the instance runs that launch, though, so the agent forgets it the moment that stops being true: when a restart begins, when a stop or retirement takes the instance back from a restart, and whenever the instance isn't starting, running or unhealthy. Until the replacement's own execution is recorded, a slow read names none, exactly as before:
+
+```rust
+self.reported_executions.retain(|id, _| {
+    instances.get(id).is_some_and(|instance| {
+        matches!(
+            instance.state,
+            ContainerState::Starting
+                | ContainerState::HealthWait
+                | ContainerState::Running
+                | ContainerState::Unhealthy
+        )
+    })
+});
+```
+
+`retain` keeps the map entries the closure says yes to and drops the rest in place. `is_some_and` turns "the instance exists and is in one of these states" into one `bool`, with no `match` on the `Option`.
+
+Our first version also had the leader lend a report with no execution the committed backend's, matched by node, address, port and replica. Review found the hole: a restart keeps all four, so the leader could label a restarted backend with its predecessor's generation. A retirement fences the generation that's actually running, and the leader withdraws a backend, and waits for consumers to drop it, only when it names that generation or none. A backend named for the predecessor stayed in the catalogue, and the release was confirmed while other nodes still routed to the port. An unknown execution is safe because the fence treats it as suspect. A wrong one isn't. So the leader takes every report at its word. `a_fence_of_the_running_generation_withdraws_a_backend_reported_without_one` checks the leader, `a_restart_forgets_the_execution_its_predecessor_reported` and `a_restart_taken_back_reports_no_execution` the agent, and `a_slow_inventory_read_reports_the_last_known_execution` holds the agent's inventory past the deadline.
+
+The one thing we couldn't check was the empty catalogue itself. Wrapper answered 502 for an empty pool without a word in its own journal, and the diagnosis had to work back from node 3's turn timings. Now the first 502 for a route logs a line, and later ones log at most once every ten seconds with a count of the ones in between.
 
 ### Why userspace DNS, not eBPF?
 
@@ -781,6 +810,8 @@ The name `cgroup/connect4` gives it away: this hook only sees IPv4 `connect()` c
 Every health tick checks that both hooks are still attached and the enforcement map is intact. One observation drives two decisions: stopping workloads that need enforcement the kernel no longer provides, and the readiness the node advertises for that tick. Using a single reading for both means the scheduler never hears "enforcing" from a node that has just stopped its workloads for not enforcing.
 
 One wrinkle worth knowing about: a dual-stack socket reaching an IPv4 server goes through *connect6* with a "v4-mapped" address, `::ffff:a.b.c.d`. The connect6 hook has to spot that pattern and judge the connection against the IPv4 policy, or the mapped form becomes yet another bypass. The kernel also insists that `user_ip6` is read in 32-bit chunks — the verifier rejects byte-wise loads from that context field.
+
+The verifier's rules can also tighten under you. The connect hook picks a backend with `idx = (rr + i) % val->count`, then checks `idx < MAX_BACKENDS` before reading `val->backends[idx]`. That satisfied every kernel we'd run, until GitHub's runners moved to Ubuntu 26.04 and Linux 7.0, which refused to load the program: "math between map_value pointer and register with unbounded min value is not allowed". The newer clang there computes the modulo in a 32-bit register, and the 7.0 verifier treats that result's upper half as unknown, so the 32-bit comparison no longer bounds the 64-bit register that does the indexing. Bun couldn't start at all, because a node with Onion enabled won't run without its hook (#1557). The fix masks the index in 64 bits, `slot &= MAX_BACKENDS - 1`, kept honest by a `_Static_assert` that `MAX_BACKENDS` is a power of two. Our first try masked the 32-bit `idx`, and CI on 26.04 refused it again: clang knew `idx` was already below 32 and dropped the mask as redundant. An empty `asm volatile("" : "+r"(slot))` hides the value from the compiler, so the mask stays in the object code. The lessons for eBPF code: a bound the verifier has to infer through a comparison is a bound a newer kernel or compiler may stop inferring, and a bound you add for the verifier's sake is one the optimiser may delete, so check the disassembly. CI then pinned its Linux runners to `ubuntu-24.04` until the rest of 26.04 worked, and the rest was `sudo` itself: 26.04's default is sudo-rs, which ignores `-E`, so every privileged step ran as root without the runner's `CARGO_HOME` or the job's variables. `scripts/ci/as-root` now hands root the environment as arguments to `env`, which both sudos honour, and a `privileged Linux (Ubuntu 26.04)` job runs `make test-linux` on Linux 7.0 beside the 24.04 one, so the next verifier change shows up on a pull request rather than on the day GitHub moves `ubuntu-latest` (#1559).
 
 While we were in there, we fixed how a defective object file fails. The map handles used to be fetched lazily, deep inside the agent, with `.unwrap()` — a `.bpf.o` missing a map would panic Bun at the first write, minutes or hours after startup. Now the loader validates every required map and program against a single list the moment the object loads, and refuses with the full roster of what's missing. One clear error at load time beats nine scattered panics at use time.
 
@@ -1087,7 +1118,7 @@ pub fn generate_self_signed_cert()
     let cert = rcgen::generate_simple_self_signed(
         vec!["localhost".to_string(), "127.0.0.1".to_string()]
     )?;
-    Ok((CertificateDer::from(cert.cert), PrivateKeyDer::try_from(cert.key_pair.serialize_der())?))
+    Ok((CertificateDer::from(cert.cert), PrivateKeyDer::try_from(cert.signing_key.serialize_der())?))
 }
 ```
 
@@ -1144,6 +1175,8 @@ The clean way to tie "resource held" to "work in progress" in Rust is a *permit*
 The `101`-then-splice tests are the ones that pin this down. It's not enough to check that a WebSocket connects. You open a WebSocket, hold it, and assert that a *second* connection is refused while the first is live — proving the permit didn't come back at the 101. Then close the first and assert the second now succeeds. A test that only opens one connection would pass against the buggy code.
 
 TLS handshakes got the same "bound the resource" treatment from the other side. Spawning a task per handshake (the fix from a couple of sections ago) stops one slow handshaker blocking the accept loop, but it doesn't stop *ten thousand* slow handshakers spawning ten thousand tasks. So the accept loop now grabs a handshake permit from a second semaphore before it spends any work, and wraps the handshake itself in a `tokio::time::timeout`. A peer that opens a socket and never sends a ClientHello is dropped on the deadline, and its permit returns to the pool. Bounded concurrency plus a deadline: a flood costs a fixed amount of memory and clears itself.
+
+The first test for this fell into the very trap the WebSocket tests avoid. It opened some silent sockets, waited past the deadline, and checked that it could write five bytes to a fresh connection. That write succeeds whatever the server does, because the kernel accepts the bytes into a socket buffer before the proxy has even looked at the connection. Delete the semaphore or the timeout and it stayed green ([#1057](https://github.com/reliaburger/reliaburger/issues/1057)). `stalled_tls_handshakes_are_bounded_and_reclaimed` now proves each half separately. Two silent sockets fill both slots, and a real `rustls` client is refused while they hold them; to rule out the deadline having already fired, the test checks that both silent sockets are still open at that moment. Then it waits for the server to close each silent socket, and finally the same client completes a full handshake and gets a `404` back from the empty routing table. Take the semaphore away and the first request succeeds. Take the timeout away and the silent sockets never close. Either way the test goes red, which is the only kind of test worth having here.
 
 ### Connections that never say goodbye (V02 soak fix)
 
@@ -1287,7 +1320,7 @@ The rule for a forwarding header is: the proxy owns it. We strip whatever the cl
 
 ## Test count
 
-Phase 3 adds 114 tests, bringing the total to 702. The new tests cover IP calculation (boundary cases, wrapping, max containers per node), service map operations (register, resolve, backend health, unregister), routing table lookups (longest prefix match, round-robin, case insensitivity), firewall rule generation (policy, ordering, SSH exclusion), the DNS responder (`.internal` resolution, upstream passthrough), and eBPF integration (BPF map ops, connect rewrite, backend failover).
+Phase 3's new tests cover IP calculation (boundary cases, wrapping, max containers per node), service map operations (register, resolve, backend health, unregister), routing table lookups (longest prefix match, round-robin, case insensitivity), firewall rule generation (policy, ordering, SSH exclusion), the DNS responder (`.internal` resolution, upstream passthrough), and eBPF integration (BPF map ops, connect rewrite, backend failover).
 
 Most of these run under a plain `cargo test` on any machine. The privileged ones split by gate: `RELIABURGER_NETNS_TESTS=1` (network namespaces, needs root on Linux), `RELIABURGER_RUNC_TESTS=1` (runc containers), and `RELIABURGER_EBPF_TESTS=1` together with `--features ebpf` (the connect-rewrite tests, needs Linux and cgroup v2). On a Mac, `relish dev test` sets all three env vars and the feature flag inside the Lima VM, so one command runs the lot — no need to remember the matrix.
 
@@ -1470,6 +1503,49 @@ The return type says "some iterator yielding `VirtualIP`s" without naming the co
 The producer's side mirrors this. Before a node frees the host port or container address of a stopped instance, it asks the leader to *retire* that exact execution at `/v1/discovery/retire`. The leader records a permanent retirement (the code calls it a *fence*: any late report from that execution is ignored from then on, rather than put back in the catalogue) and answers "confirmed" only once every consumer has sent its receipt. Executions are identified by a runtime generation, an opaque SHA-256 fingerprint of the original launch record. A restart gets a new fingerprint even if it reuses the same name and port, so a delayed receipt for the old execution can't free the new one. The request runs as its own task with a one-second wait, so an unreachable leader makes retirement slow, not the whole agent.
 
 To make a growing backlog visible before the ledger fills, the leader degrades a `discovery:withdrawal-backlog` readiness subsystem at 75% occupancy and exports `discovery_withdrawal_ledger_occupancy_ratio` for alerting.
+
+### Deleted, then applied straight back
+
+An outside evaluation of 0.2.0 ran a simple loop on three nodes: `relish delete` two apps, `relish apply` them again at once. Three cycles converged. The fourth stuck, with every retry refused: "original service withdrawal is unproven". It stayed stuck until someone restarted Bun. Wait for the delete to settle first, and it never happened.
+
+That refusal is the check from [Writing it down before doing it](#writing-it-down-before-doing-it), and it's guarding something real. A retiring instance's address can go back in the pool only once we've shown that the *exact allocation that published it*, that VIP on that port, no longer routes to it. Any other evidence is worthless. An entry under a different VIP tells you nothing about the old one, which may still be sending traffic to an address that's about to be handed to a stranger. Relax the check to get past the wedge, and a client can end up talking to the wrong workload, with no error at all.
+
+So the check was right, and we had to work out how the truth had changed underneath it. Here's the sequence on one node:
+
+1. `relish delete` withdraws the service. Its VIP, say `127.128.3.7`, stays reserved in the ledger until every consumer sends its receipt.
+2. The node stops its replica, but the replica's address has to wait for those receipts, so the retirement answers "not yet". The node's own record of the service stays, along with the journal's.
+3. `relish apply` arrives before the receipts do. The old VIP is still reserved, so the council gives the *same service* a new one.
+4. The node gets a deploy for an app it still holds stopped replicas of, so it treats it as a rollout. It starts a replacement, then registers the service again under the new VIP.
+
+Step 4 breaks a rule the journal enforces. It holds one allocation per service, and it refuses to swap the VIP until the old allocation has retired, because that's the only way a crash leaves a complete list of what might be exposed. On 0.2.0 the node had already changed its in-memory map by the time the journal said no, so every retirement after that compared the journal's VIP with a map that had moved on. Hence "unproven", forever. A restart threw the map away and rebuilt it from the journal, which is why that fixed it. 0.2.4 stopped changing the map before the journal agreed, for reasons of its own (#1336), so main didn't print that message any more. It wedged all the same, this time with "original service allocation has not retired" on every attempt. The bug had changed its clothes, not its behaviour.
+
+We could have taught the journal to hold two allocations per service. That's a change to durable state, plus a second answer to "which VIP does this backend belong to?" everywhere that question gets asked. There's something simpler: never let the two incarnations overlap on a node. The app was deleted, so nothing is lost by finishing that first. Before a deploy starts, the loop compares the node's reservation with the council's committed allocation:
+
+```rust
+let replaced = self
+    .service_map
+    .resolve(&id)
+    .zip(catalog.resolve(&id))
+    .is_some_and(|(local, committed)| {
+        local.vip != committed.vip || local.port != committed.port
+    });
+```
+
+`Option::zip` turns two options into one option of a pair: `Some((a, b))` if both are there, `None` otherwise. `is_some_and` then asks its question only of a value that exists. If the node has no reservation, or the council has no allocation yet, nothing has been replaced.
+
+When something has, the deploy is refused and the old incarnation's retirement is started on the spot:
+
+```rust
+let (response, _) = oneshot::channel();
+self.request_app_stop(target.name, target.namespace, StopPurpose::Retire, response)
+    .await;
+```
+
+Binding the receiver to `_` drops it straight away, because nobody here cares how the stop ends. A send into a dropped receiver returns an error, and `request_app_stop` ignores that, so this is a cheap way of saying "do it, and don't tell me". The reconciler retries the deploy under its usual backoff of 5 s, 10 s, 20 s. Each attempt starts the retirement again if it's still waiting on the other nodes, and once it's finished the next attempt is an ordinary fresh deploy under the new VIP.
+
+The check itself didn't change by a single character. Nobody weakened it. The old incarnation is now judged against the old allocation because the new allocation doesn't exist on this node until the old one has gone. A changed port goes the same way: the journal refuses that too, so an app whose port changes on an enrolled cluster now stops and starts rather than failing its rollout for ever.
+
+One more thing this taught us: the regression test almost couldn't see the bug. The discovery journal only runs on enrolled runc nodes with eBPF, so a process-runtime cluster loops through delete and apply happily and proves nothing about it. The test that does reproduce it, `a_reapplied_app_under_a_new_vip_converges_without_a_restart`, drives one agent with a real journal through exactly the four steps above. `a_new_allocation_waits_here_until_the_old_incarnation_has_retired` checks the safety half: until the other nodes confirm, no new replica starts and the old address stays held. What we don't have is the evaluation's own loop on real runc nodes. We tried: our enrolled OCI fixture runs three nodes on one host, and their replicas collide on the same container routes (`RTNETLINK answers: File exists`), so it can't hold five replicas of two apps. Repeating that loop still needs real machines.
 
 ### When a node goes quiet
 

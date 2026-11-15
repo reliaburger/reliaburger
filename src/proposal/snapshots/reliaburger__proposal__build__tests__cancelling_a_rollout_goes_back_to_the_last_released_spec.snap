@@ -1,0 +1,8 @@
+---
+source: src/proposal/build_tests.rs
+expression: "proposal.summary.join(\"\\n\")"
+---
+Cancel the rollout of shop/web to web:1.5: put it back on web:1.4, the last spec that finished rolling out; nodes already on the new spec roll back.
+Touches 1 app on 2 nodes (node-a, node-b); replaces 3 instances.
+Serves https://shop.example.com/ and the service web.shop.
+Undo: `relish undo 17` puts web back on web:1.5, which starts its rollout again.

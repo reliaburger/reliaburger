@@ -2,7 +2,7 @@
 //!
 //! When a node needs an image it doesn't have locally, it can:
 //! 1. Pull layers from peers that already hold them (recorded in Raft)
-//! 2. Fall back to Docker Hub via `oci-distribution` and cache the
+//! 2. Fall back to Docker Hub via `oci-client` and cache the
 //!    result in Pickle for other nodes to pull from peers next time.
 
 use std::collections::BTreeSet;

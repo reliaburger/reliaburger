@@ -22,10 +22,12 @@ pub struct ProcessWorkloadsConfig {
     /// unaffected — this list gates only ProcessGrill host execution.
     pub allowed_binaries: Vec<PathBuf>,
 
-    /// Enable mount namespace isolation for process workloads (Linux only).
+    /// Request mount namespace isolation for process workloads (Linux only).
     ///
-    /// When enabled, process workloads run in a separate mount namespace
-    /// and cannot see `/var/lib/reliaburger` or other workloads' volumes.
+    /// Not implemented yet (#360). When true, Bun refuses `exec` and
+    /// `script` workloads rather than run them without the isolation, and
+    /// doesn't advertise host workloads to the scheduler. On by default on
+    /// Linux, so a node that runs them sets it to `false`.
     #[serde(skip_serializing_if = "is_default_mount_isolation")]
     pub mount_isolation: bool,
 

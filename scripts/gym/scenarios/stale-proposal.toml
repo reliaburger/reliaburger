@@ -1,0 +1,64 @@
+# An undo that would overwrite a person's change is stale (#1682): the
+# solver proposes a scale, the person approves it, then changes web by hand.
+# Undoing the scale now would put back a spec the person replaced, so the
+# agent's undo is refused as `stale` (exit 5), and so is the person's.
+id = "stale-proposal"
+title = "An undo after a person's change is stale"
+nodes = 1
+solver_token = "agent"
+
+prompt = """
+The `web` app needs 2 replicas. Propose the change with `relish agent propose`;
+a person reviews and approves it. You don't need to wait for them.
+"""
+
+[[setup]]
+apply = "apps/web-v1.toml"
+wait_running = "web"
+
+[[after]]
+as = "person"
+run = ["proposal", "approve", "@proposal", "--yes", "-o", "json"]
+
+[[after]]
+as = "person"
+run = ["apply", "@file:apps/web-v1-hotfix.toml"]
+
+[[after]]
+as = "solver-token"
+run = ["agent", "undo", "@proposal", "--reason", "put web back to one replica"]
+
+[[after]]
+as = "person"
+run = ["undo", "@proposal", "--yes", "-o", "json"]
+
+[truth]
+app = "web"
+namespace = "default"
+fault_kind = "none"
+
+[score]
+checks = ["app"]
+
+[[outcome]]
+by = "solver"
+command = "agent propose scale"
+exit = 0
+state = "pending"
+
+[[outcome]]
+by = "person"
+command = "proposal approve"
+exit = 0
+state = "applied"
+
+[[outcome]]
+by = "solver-token"
+command = "agent undo"
+exit = 5
+code = "stale"
+
+[[outcome]]
+by = "person"
+command = "undo"
+exit = 1

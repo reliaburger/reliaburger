@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "scenario": "jobs-host-processes",
+  "started_at": "2026-10-30T08:08:31Z",
+  "requested_seconds": 60,
+  "concurrency": 27,
+  "cpu_request_millicores": 25,
+  "cpu_limit_millicores": 1000,
+  "memory_bytes": 33554432,
+  "receipt_chunk_size": 1000,
+  "image": null,
+  "executable": "/opt/bench/busybox",
+  "executable_sha256": null,
+  "measurement_boundary": "configured cluster; concurrency is per node; unique accepted outcomes received before the monotonic cutoff; submission and cold executor/image startup are included; 10m/8Mi helper reservation for shared/host; remote host executable hash is unknown; compare on the same node and byte-identical BusyBox",
+  "unique_accepted_successes": 921000,
+  "verified_successes": 0,
+  "terminal_failures": 0,
+  "accepted_retries": 0,
+  "post_cutoff_drained": 0,
+  "batch_ids": [
+    5
+  ],
+  "active_submissions": [
+    5
+  ],
+  "drain_proofs": [
+    {
+      "batch_id": 5,
+      "done": true,
+      "held": 0,
+      "active_commands": 0
+    }
+  ],
+  "last_accepted_sample_seconds": 59.939343683,
+  "submission_names": [
+    "bench-jobs-5f17a217a0889d367ed79ae77cb0c848"
+  ],
+  "measurement_complete": true,
+  "interrupted": false,
+  "cleanup_verified": true,
+  "cleanup_failed_submissions": [],
+  "error": null,
+  "elapsed_including_drain_seconds": 60.760892931,
+  "successes_per_second": 15350.0,
+  "extrapolated_runs_per_day": 1326240000.0,
+  "daily_projection": "extrapolation from this window; not an observed daily total",
+  "qualified_100m_per_day": false,
+  "per_node": {
+    "tolerance_percent": 20,
+    "balanced": true,
+    "nodes": [
+      {
+        "node": "node-01",
+        "slots": 27,
+        "successes": 921000,
+        "successes_per_second": 15350.0,
+        "share_percent": 100.0,
+        "fair_share_percent": 100.0,
+        "over_fair_share": false,
+        "counters_restarted": false
+      }
+    ]
+  }
+}

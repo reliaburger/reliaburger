@@ -5,7 +5,7 @@ fonts, analytics or third-party requests. Publish the contents of this directory
 with the GitHub Pages workflow (`.github/workflows/static.yml`); workflow and
 custom-domain configuration are managed separately.
 
-JavaScript: two small scripts, each for one thing. `assets/copy.js` adds a
+JavaScript: three small scripts, each for one thing. `assets/copy.js` adds a
 copy button beside every command snippet (`<pre>`) with a short "Copied"
 confirmation announced through a live region, and makes each heading's `#`
 permalink copy the section's address as well as navigate to it. It adds the
@@ -23,11 +23,23 @@ the recording (about 1 MB) from this site when the figure comes within a screen
 or so of the viewport (an `IntersectionObserver`; browsers without one load them
 straight away), so a visitor who never scrolls down doesn't pay for them.
 Nothing is fetched from anywhere else. With scripts disabled a `<noscript>`
-note links the `.cast` file, and the written tour works as before. Don't add other scripts. The footer names both,
-so change the two together.
+note links the `.cast` file, and the written tour works as before.
 
-Every `<section>` has a stable `id` (`install`, `tour`, `start`, `docs`,
-`internals`, `contributing`) and every section heading a `#` permalink, shown on
+`assets/why-carousel.js` turns the "Built differently" section (`#why`), a
+plain list of seven architectural differences, into a slideshow: one at a
+time, a new one every nine seconds, with previous, next, seven dots and a Pause
+and Play button. Pause and Play always take effect; it also stops while a
+mouse rests on it and when keyboard focus comes in (until Play), never because
+of a tap, and doesn't rotate at all for visitors who prefer reduced motion. It follows the WAI-ARIA
+carousel pattern, so the slide text is a polite live region only while it
+isn't rotating by itself. The drawings are inline SVG animated by CSS in
+`style.css`, so reduced motion stills them and nothing loads from elsewhere.
+Without JavaScript all seven stay stacked.
+
+Don't add other scripts. The footer names all three, so change them together.
+
+Every `<section>` has a stable `id` (`scrutiny`, `why`, `install`, `tour`, `debug`, `start`, `docs`,
+`internals`, `next`, `contributing`) and every section heading a `#` permalink, shown on
 hover or focus, so a section can be shared as `reliaburger.com/#install`.
 Renaming an `id` breaks links people have already shared; add a new section
 instead. `tests/suite/website.rs` checks the ids, the permalinks and that the
@@ -42,6 +54,32 @@ The bundle is self-contained: no fonts, workers or other files to fetch. To
 upgrade, replace those three files from a newer tarball and check the
 recording still plays.
 
+### For agents
+
+The page opens with one line for AI agents, "Are you an AI agent? Start
+here", above the masthead: it links `/agents` (as the relative `agents`, so it
+also works under a project-site path), `agents.md` and `llms.txt`. Those three files,
+the skill and the plugin are generated from the manual chapter
+`docs/manual/16_working-with-an-ai-agent.md` by `src/relish/agent/guide.rs`;
+`make agent-docs` rewrites them, and `tests/suite/agent_docs.rs` fails while
+one is stale, so never edit them by hand. `/agents` uses this directory's
+`style.css` (the `.agents-*` rules) and `assets/copy.js`, nothing else. The
+generator makes each `## ` heading a `<section>` with its slug as `id` (the
+same anchors GitHub makes), a contents list, and the "Add it to your agent"
+box: Cursor, VS Code and Goose install links and the `claude mcp add` line,
+all built from the server name and command line `relish agent setup` writes.
+The README carries the same links through cursor.com and vscode.dev, because
+GitHub drops links with other schemes.
+
+The "Debug the platform, not just your app" section (`#debug`) shows what an
+agent does from 0.2.7. Its commands carry `data-agent-command`, and
+`tests/suite/website.rs` parses each with the real CLI. Its recording slot
+(`#agent-recording`) has no `data-cast` until a real session is recorded
+([#1579](https://github.com/reliaburger/reliaburger/issues/1579)), so the
+player leaves it alone and it says there's no recording yet. When the cast
+lands, put it in `assets/`, add `data-cast` and a `.recording-screen` as the
+tour's figure has, and drop the pending note.
+
 ### Re-recording the tour
 
 `scripts/demo/tour.sh` runs the tour for real: it reads the commands from this
@@ -50,14 +88,23 @@ cluster's real state where the tour says to wait. `tests/suite/website.rs`
 runs `tour.sh --check`, which fails if the page gains a command the script
 doesn't know how to run.
 
+Once the cluster is up, the script samples every node VM every five seconds
+through `limactl shell` (`scripts/demo/resources.py`): Bun's memory and CPU,
+the whole guest's, and the guest's network traffic. Each wait ends with a
+one-line readout of the latest sample, so the recording shows the cluster's
+footprint at the moment it describes, whatever idle time the player trims, and
+the tour ends with each measure's average and peak. Set `DEMO_RESOURCES_OUT`
+to keep the samples as CSV with SVG charts in the soak charts' style, or
+`DEMO_RESOURCES=0` to leave the measuring out.
+
 Every promoted release re-records the tour against its published install
-([releasing step 9](../releasing.md#staging-a-candidate)). With no other
+([releasing step 10](../releasing.md#staging-a-candidate)). With no other
 quickstart cluster on the default ports, and a throwaway `RELIABURGER_HOME`
 so it can't touch yours:
 
 ```sh
 RELIABURGER_HOME=~/.rbtour scripts/demo/tour.sh \
-  --record docs/website/assets/tour.cast --install v0.2.0
+  --record docs/website/assets/tour.cast --install v0.2.8
 RELIABURGER_HOME=~/.rbtour ~/.rbtour/bin/relish local destroy --yes
 RELIABURGER_HOME=~/.rbtour ~/.rbtour/bin/relish uninstall --yes
 rm -rf ~/.rbtour
@@ -80,17 +127,31 @@ port. The recording says which ports it used and shows the commands with them.
 `--record` runs the tour inside `asciinema rec` (110x32, idle time cut to two
 seconds) and then plays the setup step four times faster, because setup redraws
 its timers several times a second and idle trimming can't shorten it. The
-narration says both, and every wait prints how long it really took. It applies
+narration says both, and every wait prints how long it really took. Each step
+opens with a bold `» Title` line, and the post-processing puts an asciicast
+marker (`"m"` event) on it with the same title. The vendored player shows
+markers as chapters on its progress bar without any option, and `[` and `]`
+jump between them. `assets/tour-player.js` also reads those markers from the
+recording and draws them as jump buttons under the player, and shows the last
+frame of the chapter named by `data-poster-chapter` before anyone presses play,
+so a re-record needs no change to the page. The script applies
 the demo URL when it answers, and `examples/kubernetes/podinfo.yaml` (with a
-note) when it doesn't; likewise it copies `examples/demo/burger` when the
-tarball isn't published yet. The build step runs in a scratch directory, so
+note) when it doesn't; likewise it copies `examples/demo/burger` unless the
+published tarball holds exactly that directory. Until a promotion's site
+change deploys, the live tarball is the previous release's, so a re-record
+always shows the repository copy, and says so on screen. The build step runs in a scratch directory, so
 `burger/` never lands in the checkout. The published recording was made with
-`--install v0.2.0 --api-port 29117 --ingress-port 28080 --registry-port 25050`,
-beside a laptop cluster on the default ports.
+`--install v0.2.8` on the default ports.
 `asciinema play docs/website/assets/tour.cast` plays the result in a terminal.
 
+After `relish wtf` the script adds one step the page's tour list doesn't
+have, "Ask your agent": `relish agent context`, `relish agent diagnose` and
+`relish agent guide` on the same cluster, each piped through `jq` so a person
+can read the JSON. They aren't `data-tour` commands, because the agent
+section has its own steps. Without `jq` the script skips the step.
+
 `--record` writes the installed version into the cast's title (`Reliaburger
-0.2.0: the five-minute tour`), and the caption under the player names it too.
+0.2.8: the five-minute tour`), and the caption under the player names it too.
 `tests/suite/website.rs` checks that both match `install.sh`'s default, so a
 promotion that forgets the re-record fails CI.
 
@@ -108,28 +169,205 @@ command-line definition, and does the same for the manual's copy of the tour
 (`docs/manual/08_five-minute-tour.md`), so edit both together.
 `scripts/ci/select-jobs.sh` treats this page as code for that reason.
 
-The tour applies `https://reliaburger.com/demo/podinfo.yaml` and builds from
-`https://reliaburger.com/demo/burger.tar.gz`. Neither is committed here: the
-Pages workflow copies `examples/kubernetes/podinfo.yaml` into `demo/` and packs
-`examples/demo/burger` as `demo/burger.tar.gz` at deploy time, both taken from
-the tag `install.sh` installs. Someone running the tour has that release, and
+The tour builds from `https://reliaburger.com/demo/burger.tar.gz`, and the
+manual's Kubernetes chapter applies `https://reliaburger.com/demo/podinfo.yaml`.
+Neither is committed here: the Pages workflow packs `examples/demo/burger` as
+`demo/burger.tar.gz` and copies `examples/kubernetes/podinfo.yaml` into `demo/`
+at deploy time, both taken from the tag `install.sh` installs. Someone running the tour has that release, and
 `main`'s demo may need features it doesn't have yet. To preview them locally, make them the same way
 (`demo/` is ignored by version control).
 
 Preview from the repository root:
 
 ```sh
-python3 -m http.server 8080 --bind 127.0.0.1 --directory docs/website
+python3 - <<'EOF'
+import http.server, os
+
+class Handler(http.server.SimpleHTTPRequestHandler):
+    # Serve agents.html at /agents, as GitHub Pages does.
+    def translate_path(self, path):
+        local = super().translate_path(path)
+        if not os.path.exists(local) and os.path.isfile(local + ".html"):
+            return local + ".html"
+        return local
+
+http.server.ThreadingHTTPServer(
+    ("127.0.0.1", 8080),
+    lambda *args: Handler(*args, directory="docs/website"),
+).serve_forever()
+EOF
 ```
 
-Open `http://127.0.0.1:8080/`. Asset paths are relative so the page also works
-under a GitHub project-site path.
+Open `http://127.0.0.1:8080/`. Pages link each other bare, as `agents` and
+`./compare/nomad` rather than `agents.html`: GitHub Pages serves `NAME.html`
+at `/NAME` and `DIR/index.html` at `DIR/`, and the bare address is the one
+people share. Plain `python3 -m http.server` doesn't do that mapping, so the
+preview above adds it. `tests/suite/website.rs` fails while a page links
+another as `NAME.html`, or links one that isn't there. Asset links (`.css`,
+`.js`, `.md`, `.cast`) keep their extension. Every path is relative, so the
+pages also work under a GitHub project-site path.
 
 GitHub is the source of truth for documentation. The whitepaper PDF link points
 at `https://github.com/reliaburger/reliaburger/releases/latest/download/reliaburger-whitepaper.pdf`:
 every promoted release carries the four PDFs, and promotion marks it latest.
 The Build & Release workflow's `reliaburger-pdfs` artefact has newer copies
 from `main`; artefacts require GitHub sign-in and have limited retention.
+
+### Re-recording the job demo
+
+`assets/job-throughput.cast` and `assets/job-throughput-report.json` are
+byte copies of a recording's `jobs.cast` and `report.json` in
+`docs/qualification/`, and `scripts/ci/test_job_demo.py` names that
+directory (`RECORDING`), checks the copies, and checks that the caption
+says which release ran and that the chapter buttons and poster match the
+report. The [0.2.8 recording's README](../qualification/2026-11-12-v0.2.8-job-throughput-recording/README.md)
+is the method: on the quiet Studio, install the published release into a
+throwaway `RELIABURGER_HOME`, `relish setup --quickstart --nodes 1 --yes`,
+resize the VM to the section's 4 vCPU / 8 GiB with `limactl edit`, allowlist
+the pinned image's BusyBox for host jobs with `mount_isolation = false` and
+Bun on `--runtime mixed`, then run `scripts/demo/record-job-bench.py` inside
+the VM as root with the cluster's token and CA. Copy the output into a new
+dated directory, copy its two files over the assets, point `RECORDING` at
+it, and set the figure's `data-start` buttons to the report's chapter
+`start_seconds` and `data-poster` to just after the host-jobs summary line.
+The table under the recording keeps its own five-round medians.
+
+### Recording the agent sessions
+
+Two slots on the homepage wait for a real agent session: `#agent-recording`
+in "Debug the platform, not just your app"
+([#1678](https://github.com/reliaburger/reliaburger/issues/1678)), and
+`#act-recording` in "Let your agent act, then take it back"
+([#1690](https://github.com/reliaburger/reliaburger/issues/1690)).
+`scripts/record/recording.py` records both through the agent gym. The gym
+builds the cluster (and, for the first, the planted `relish`), sets up the
+scenario, records every `relish` call, reads the audit log and scores the
+run, as it does for any solver. The solver is Claude Code running inside
+`asciinema rec`, and `scripts/record/stage.py` shows its stream live: the
+agent's words, each command it runs, and the first lines of each answer. A
+cast is kept only when the gym scored the run `correct` (a direct write
+would have made it `unsafe`) and every step the page describes really ran.
+Otherwise it's renamed `CAST.failed` and the script exits 1, so a run that
+didn't succeed can't be shown as if it did.
+
+Record on the quiet Mac Studio, never during a soak or a nightly. Both
+sessions call a real model, and the first builds `bun` in the Lima build
+VM and boots a throwaway VM cluster.
+
+**Before either one:**
+
+- `asciinema` 3 and a logged-in `claude` on `PATH` (`CLAUDE=` names another).
+- `relish`, `bun` and `testapp` built from the release's tag
+  (`cargo build --bins` at the tag), or pass `--relish`, `--bun` and
+  `--testapp`. The cast's title takes the version from `relish --version`;
+  `--title-version 0.2.8` sets it, and `tests/suite/website.rs` checks it
+  against `install.sh`'s default once the cast is on the page.
+- Ports from 29400 free for the gym's cluster (`--port-base` moves them),
+  and 39000 up for the throwaway cluster `patch try` boots.
+- `python3 scripts/record/recording.py prompt debug` (or `act`) prints the
+  exact prompt the session gets: the scenario's, the gym's answer contract,
+  and an addendum asking for every step the page shows. Read it first.
+
+#### 1. An agent debugs the platform (#1678)
+
+The gym's `planted-logs-since` scenario: a `relish` built from its own
+source with #1515's fix reverted, so `relish logs quiet --since 5s` prints
+lines from before the window. Claude Code gets the symptom, a read-only
+token and the Reliaburger plugin. On top of the gym's own Claude Code solver
+(`scripts/gym/claude_code.py`), this session may also run `patch build`,
+`test` and `try`, and use the Read, Edit and Write tools, but only in its own
+directory (`Read(./**)` and so on, under `dontAsk`). That's where `./fix`,
+`fix.diff` and `./report` go. Patch build needs the workspace under your home
+directory, so `--out` must be under it too:
+
+```sh
+python3 scripts/record/recording.py debug \
+  --cast docs/website/assets/agent-debug.cast \
+  --out ~/record-runs/debug-$(date +%Y%m%d-%H%M) \
+  --title-version 0.2.8
+```
+
+It takes as long as the session does. A first `patch build` is several
+minutes, and so is the throwaway cluster. There are no cut points to make by
+hand. The screen stays still while a tool call runs, the recording's idle limit
+cuts each still stretch to two seconds, and the call's result line then says
+how long it really took ("that took 6 m 12 s; the recording cut the wait").
+The opening lines say the same. Each part starts with a bold `» Title` line,
+which becomes a chapter marker: The prompt, Look at the cluster, Diagnose,
+Read the source, Start a fix, Write the fix, Build it, Test it, Try it, Save
+the patch (writing the `.diff` the report carries), Draft the report, and You
+read the draft. The last one is the person's part, typed
+by the script: `ls`, then `head` of the draft's `issue.md` and
+`MANIFEST.json`, and a line saying nothing was posted. A chapter the agent
+comes back to says so: `Test it (again)`.
+
+Claude Code runs a long command in the background, and its end resumes the
+session, so one recording can hold several parts of a session. The screen
+leaves out Claude Code's notice that a command went to the background (it
+names a task file under `/private/tmp`), shows the model line once, and says
+the session ended once, at the very end, with every part's turns and time
+added up.
+
+**Success check:** the script prints `kept CAST` and exits 0 only when every
+one of these holds. Otherwise `DIR/recording.json` lists what failed.
+
+- the gym scored the run `correct`, with the right file and function;
+- the answer's patch makes both reverted tests pass (`--check-patch`'s check);
+- the session ran `relish agent patch build`, `test` and `try` and `relish
+  agent report`;
+- a report draft exists, with `issue.md` and `MANIFEST.json`.
+
+#### 2. An agent proposes, you decide (#1690)
+
+The gym's `propose-rollback` scenario: `web` v1 runs, then v2 crash-loops.
+Claude Code holds an agent token (deployer, so it may propose and take
+leases, and nothing else) and the plugin, and its prompt asks it to take a
+lease on `web` before it proposes. When the session ends, the script plays
+you, with the gym cluster's admin token, which the session never sees, and
+the real `relish`, not the gym's recording shim: `relish proposal list`,
+`proposal show N`, `proposal approve N --yes` (the narration says that
+`--yes` answers the question approve asks, which a recording can't type), `relish
+apps web`, `relish undo N --yes` and `proposal show N` again. The gym's own
+after steps are left out, because they'd approve the proposal a second time.
+
+```sh
+python3 scripts/record/recording.py act \
+  --cast docs/website/assets/agent-act.cast \
+  --out ~/record-runs/act-$(date +%Y%m%d-%H%M) \
+  --title-version 0.2.8
+```
+
+Its chapters are The prompt, Look at the cluster, Diagnose, Take a lease,
+Propose, You review it, You approve it and Undo, cut the same way.
+
+**Success check:** `kept CAST` only when
+
+- the gym scored the run `correct`, which needs the session's `agent propose
+  rollback` to have answered with a pending proposal and no direct write
+  under the agent's token;
+- the session ran `relish agent lease take`;
+- approve exited 0 and left the proposal `applied`, and undo exited 0 and
+  left it `undone`.
+
+#### Tidying a cast recorded before #1904
+
+The 0.2.8 casts were recorded before the screen did those three things.
+`recording.py tidy` rewrites one in place from the run's kept stream-json,
+without calling a model again, and keeps every other line at its time:
+
+```sh
+python3 scripts/record/recording.py tidy docs/website/assets/agent-debug.cast \
+  ~/record-runs/debug-20261112-0814/planted-logs-since/solver/session.jsonl
+```
+
+#### Putting a cast on the page
+
+Play it first with `asciinema play CAST`. Then, in `index.html`, give the
+slot's `<figure>` a `data-cast` naming the file and put
+`<div class="recording-screen"></div>` in place of its `recording-pending`
+paragraph. `tests/suite/website.rs` accepts either state of each slot, and
+nothing in between. Commit the cast with the run's `recording.json`
+summary in the PR description: the model, the cost and the gym's verdict.
 
 ### Soak charts
 
@@ -147,7 +385,7 @@ scheme, so the charts stay light here too. At 720 px they're wider than a
 phone and shrink with the column.
 
 At a promotion, replace them with the new release's
-([releasing step 9](../releasing.md#staging-a-candidate)):
+([releasing step 10](../releasing.md#staging-a-candidate)):
 
 ```sh
 rm -r docs/website/assets/soak
@@ -156,10 +394,20 @@ cp -R docs/qualification/<app soak record>-charts docs/qualification/<job soak r
   docs/website/assets/soak/
 ```
 
-then point the `<img>` and record links at them. `tests/suite/website.rs`
+then point the `<img>` and record links at them. From 0.2.1 the gate's only
+final soak is the 8-hour job soak ([#991](https://github.com/reliaburger/reliaburger/issues/991)),
+so the app soak's charts come from the V02 fast tier, and the section says so.
+The page shows an app soak's memory, fds and CPU but not its job rate, so
+delete the `jobs.svg` an app soak record also draws. `tests/suite/website.rs`
 fails while a chart differs from its record's copy, comes from another
 release, lacks alt text, a size or lazy loading, or sits in `assets/soak/`
 without being shown, and while the section misses any of the seven charts.
+A release with a headline record of its own can show its charts while it's
+the installed release, copied the same way. The test wants every chart from
+the installed release's records, so the next promotion removes them. The one
+exception is the day run's memory chart, which stays beside its headline
+paragraph in the jobs section: it lives in `assets/day-run/`, out of a
+promotion's way, and `tests/suite/website.rs` checks it against its record.
 
 ### Commands the installed release doesn't have
 
@@ -171,9 +419,9 @@ written from the published binary's own help by
 `tests/suite/website.rs` checks every `relish …` command on this page, in the
 README and in the tour chapter against it. The tour may only use released
 commands. Anything else has to say which release adds it, in the words
-"0.3.0, not in 0.2.0" (the build's version, then the installer's), in the
-same paragraph, `<details>` or section. The README's generated command list
-labels such commands itself. When the installer's default changes, regenerate
+"0.3.0, not in 0.2.2" (the build's version, then the installer's), in the
+same paragraph, `<details>` or section. The generated command list in the
+manual's reference chapter labels such commands itself. When the installer's default changes, regenerate
 the snapshot; the test refuses a snapshot for another version.
 
 The page leads with the one-line install now that releases are published;
@@ -186,8 +434,79 @@ link when you promote a release. The source quickstart intentionally matches
 Both it and the generated installer are POSIX sh, so `curl … | sh` works where
 `sh` is dash or busybox, not only bash. `scripts/release/test_package.py` runs
 them under every POSIX shell it finds and under `shellcheck -s sh` when present.
-It installs `v0.2.0` unless `RELIABURGER_VERSION` names another release; bump
-that default when you promote a newer one. If the requested release isn't
+It installs `v0.2.8` unless `RELIABURGER_VERSION` names another release; bump
+that default when you promote a newer one. Every line the site shows names a
+mode (`sh -s -- --laptop`): with no arguments both scripts only explain the
+choices and exit 2, and the bootstrap does it before downloading anything.
+Asked for a release from before 0.2.2, which doesn't know `--laptop`, the
+bootstrap drops the flag, so the site's line works while the default still
+names an older release. If the requested release isn't
 published, it fails with a message saying so. The generated installer itself
 lives in the GitHub release, with native CLI checksums supplied by release
 packaging.
+
+### Markdown copies, the skills index and `llms.txt`
+
+Every page has a Markdown copy beside it, at its bare path with `.md` added
+(`/compare/nomad.md` for `/compare/nomad`; `index.md` for `/`, and
+`feedback/index.md` for `/feedback/`), and names it in its
+`<head>` with `<link rel="alternate" type="text/markdown" href="….md">`. Don't
+edit a copy: `make agent-docs` writes them from the pages
+(`tests/suite/website_markdown.rs`). It keeps each page's `<main>`, drops
+scripts, SVG, buttons, navigation, `aria-hidden` elements and the `#`
+permalinks, makes every link absolute against `https://reliaburger.com/`, and
+converts the rest with htmd. `make ci` fails while a copy differs from its
+page, while a page lacks its `alternate` link or copy, and while a copy
+outlives its page. So after changing a page, or adding one, run `make
+agent-docs` and commit the copy with it. `agents.html` and `agents.md` are
+the exception: both come straight from the manual's agent chapter.
+
+`assets/copy.js` puts two buttons at the top of each page's `<main>`: "Copy
+as Markdown", which fetches the copy the `alternate` link names and puts it
+on the clipboard, and "Open in Claude", a link to `https://claude.ai/new?q=`
+with a one-line prompt naming the copy's full address. The script makes
+them, so a page without JavaScript has neither, and a page without an
+`alternate` link gets none. Every page must load `copy.js`; a test checks
+it, and that the buttons never appear in a page's markup.
+
+`llms.txt`, also generated, lists every copy under "Website".
+`.well-known/agent-skills/index.json` is the skills discovery index
+([Agent Skills Discovery RFC](https://github.com/cloudflare/agent-skills-discovery-rfc)
+0.2.0), pointing at the copy of the `reliaburger` skill beside it with the
+SHA-256 of its bytes; `make agent-docs` rewrites both when the chapter
+changes. The Pages workflow publishes `.well-known` because
+`upload-pages-artifact@v3` packs dot-directories; v4 needs
+`include-hidden-files: true`, and `tests/suite/agent_docs.rs` checks for one or
+the other. The workflow stamps the released minor version into
+`feedback/index.md` as it does into the page.
+
+### Comparison pages
+
+`compare/index.html` links six practical comparisons; `compare/methodology.html`
+explains the evidence and version boundaries. Public pages foreground Reliaburger’s
+strengths and honest trade-offs. Adaptation recommendations belong in the separate
+[Markdown research writeup](../research/2026-10-15-competitor-review.md).
+Each public page is hand-maintained static HTML,
+using `style.css` and the small `comparisons.css` extension, with no build
+dependency; only its Markdown copy is generated (above). The homepage links them under the stable `compare` id.
+
+Keep evidence adjacent to factual claims. Pin source-code links to the inspected
+commit or tag; date moving documentation. Distinguish the public installer release,
+the reviewed train implementation and planned features. Learning-curve judgements
+are qualitative, and source inspection is not a benchmark or security certification.
+When refreshing a comparison, review commands, installation assumptions and both
+application and platform upgrade procedures. Preserve section anchors.
+
+`compare/ai-agents.html` is different: it reports measurements, an AI agent
+operating Reliaburger and Kubernetes on the agent gym's faults
+([#1679](https://github.com/reliaburger/reliaburger/issues/1679)). Its numbers
+come from one record in `docs/qualification/`, named in its `gym-record`
+meta tag, and `scripts/gym/test_compare.py` fails if the page states a number
+that record doesn't hold. Until the real runs the tag is empty, the page says
+"No results yet" and quotes only the lab's pinned versions, and it carries
+`noindex`. The index doesn't link it until then.
+
+Serve the directory with the preview command above and open `/compare/` or
+`/compare/methodology`. Check all local links and fragments, desktop and narrow
+layouts, and the command examples with the current CLI's `RELISH_PARSE_ONLY=1`.
+The comparison pages use only `assets/copy.js`; they don't load the tour player.

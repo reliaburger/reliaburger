@@ -1,0 +1,8 @@
+---
+source: src/proposal/build_tests.rs
+expression: "proposal.summary.join(\"\\n\")"
+---
+CAN'T BE UNDONE: think before approving.
+Restart shop/web: replace its instances node by node, through its health checks, on the same spec.
+Touches 1 app on 2 nodes (node-a, node-b); replaces 3 instances.
+Serves https://shop.example.com/ and the service web.shop.

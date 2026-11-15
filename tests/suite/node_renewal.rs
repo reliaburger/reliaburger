@@ -147,6 +147,36 @@ async fn post(
         .unwrap()
 }
 
+/// #1508: the renewed leaf names the address the request came from, as an
+/// IP SAN a strict client can check when it connects by address. A request
+/// from loopback names no machine, so its leaf names no address.
+#[tokio::test]
+async fn a_renewed_leaf_names_the_address_the_request_came_from() {
+    let hierarchy = ca::generate_ca_hierarchy("renewal", &IKM).unwrap();
+    let council = council(&hierarchy, true).await;
+    for (source, named) in [
+        (
+            "10.0.0.9:51000",
+            vec!["10.0.0.9".parse::<std::net::IpAddr>().unwrap()],
+        ),
+        ("127.0.0.1:51000", vec![]),
+    ] {
+        let source: std::net::SocketAddr = source.parse().unwrap();
+        let router = router(Arc::clone(&council), Some(peer(&hierarchy, 10)))
+            .layer(axum::Extension(axum::extract::ConnectInfo(source)));
+        let (request, _) = request("node");
+        let response = post(router, &request, Some("internal-token")).await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK, "{source}");
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let bundle: reliaburger::sesame::join::JoinBundle = serde_json::from_slice(&body).unwrap();
+        let leaf = BASE64.decode(&bundle.certificate_b64).unwrap();
+        assert_eq!(ca::ip_sans(&leaf), named, "{source}");
+    }
+    council.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn renewal_allocates_distinct_committed_serials_and_keeps_the_requesters_key() {
     let hierarchy = ca::generate_ca_hierarchy("renewal", &IKM).unwrap();
@@ -155,8 +185,8 @@ async fn renewal_allocates_distinct_committed_serials_and_keeps_the_requesters_k
     let (first, first_key) = request("node");
     let (second, second_key) = request("node");
     let (one, two) = tokio::join!(
-        renewal::issue_renewal(&council, &peer, &first, ca::NODE_LEAF_LIFETIME),
-        renewal::issue_renewal(&council, &peer, &second, ca::NODE_LEAF_LIFETIME)
+        renewal::issue_renewal(&council, &peer, &first, ca::NODE_LEAF_LIFETIME, None),
+        renewal::issue_renewal(&council, &peer, &second, ca::NODE_LEAF_LIFETIME, None)
     );
     let one = one.unwrap();
     let two = two.unwrap();
@@ -179,13 +209,13 @@ async fn renewal_refuses_mismatched_csr_and_foreign_or_revoked_peer_before_alloc
     let valid = peer(&hierarchy, 10);
     let (wrong, _) = request("different-node");
     assert!(matches!(
-        renewal::issue_renewal(&council, &valid, &wrong, ca::NODE_LEAF_LIFETIME).await,
+        renewal::issue_renewal(&council, &valid, &wrong, ca::NODE_LEAF_LIFETIME, None).await,
         Err(RenewalError::Request(_))
     ));
     let (request, _) = request("node");
     let foreign = peer(&ca::generate_ca_hierarchy("foreign", &IKM).unwrap(), 10);
     assert!(matches!(
-        renewal::issue_renewal(&council, &foreign, &request, ca::NODE_LEAF_LIFETIME).await,
+        renewal::issue_renewal(&council, &foreign, &request, ca::NODE_LEAF_LIFETIME, None).await,
         Err(RenewalError::Identity(_))
     ));
     council
@@ -199,7 +229,7 @@ async fn renewal_refuses_mismatched_csr_and_foreign_or_revoked_peer_before_alloc
         .await
         .unwrap();
     assert!(matches!(
-        renewal::issue_renewal(&council, &valid, &request, ca::NODE_LEAF_LIFETIME).await,
+        renewal::issue_renewal(&council, &valid, &request, ca::NODE_LEAF_LIFETIME, None).await,
         Err(RenewalError::Identity(_))
     ));
     assert_eq!(council.security_state().await.next_serial, 100);
@@ -264,6 +294,7 @@ async fn renewal_refuses_a_member_without_current_quorum_authority() {
             &peer(&hierarchy, 10),
             &request,
             ca::NODE_LEAF_LIFETIME,
+            None,
         ),
     )
     .await
@@ -285,20 +316,16 @@ async fn renewal_rejects_an_expired_leaf_even_when_the_connection_used_to_be_val
     params.serial_number = Some(10u64.into());
     params.not_before = time::OffsetDateTime::now_utc() - time::Duration::seconds(90);
     params.not_after = time::OffsetDateTime::now_utc() - time::Duration::seconds(5);
-    let issuer = hierarchy
-        .node
-        .certificate_params
-        .clone()
-        .self_signed(&hierarchy.node.signing_keypair)
-        .unwrap();
-    let leaf = params
-        .signed_by(&key, &issuer, &hierarchy.node.signing_keypair)
-        .unwrap();
+    let issuer = rcgen::Issuer::from_params(
+        &hierarchy.node.certificate_params,
+        &hierarchy.node.signing_keypair,
+    );
+    let leaf = params.signed_by(&key, &issuer).unwrap();
     assert!(cert::check_validity(leaf.der()).is_err());
     let (request, _) = request("node");
     let peer = TlsPeerCertificate(leaf.der().clone());
     assert!(matches!(
-        renewal::issue_renewal(&council, &peer, &request, ca::NODE_LEAF_LIFETIME).await,
+        renewal::issue_renewal(&council, &peer, &request, ca::NODE_LEAF_LIFETIME, None).await,
         Err(RenewalError::Identity(_))
     ));
     assert_eq!(council.security_state().await.next_serial, 100);
@@ -320,7 +347,8 @@ async fn renewal_refuses_malformed_or_incompatible_requests_without_spending_ser
             csr_b64,
         };
         assert!(matches!(
-            renewal::issue_renewal(&council, &valid, &malformed, ca::NODE_LEAF_LIFETIME).await,
+            renewal::issue_renewal(&council, &valid, &malformed, ca::NODE_LEAF_LIFETIME, None)
+                .await,
             Err(RenewalError::Request(_))
         ));
     }
@@ -328,7 +356,14 @@ async fn renewal_refuses_malformed_or_incompatible_requests_without_spending_ser
     let mut old_protocol = request.clone();
     old_protocol.compatibility.protocol = 0;
     assert!(matches!(
-        renewal::issue_renewal(&council, &valid, &old_protocol, ca::NODE_LEAF_LIFETIME).await,
+        renewal::issue_renewal(
+            &council,
+            &valid,
+            &old_protocol,
+            ca::NODE_LEAF_LIFETIME,
+            None
+        )
+        .await,
         Err(RenewalError::Request(_))
     ));
     let mut incompatible = serde_json::to_value(&request).unwrap();
@@ -381,7 +416,8 @@ async fn renewal_refuses_revoked_node_and_root_issuers() {
                 &council,
                 &peer(&hierarchy, 10),
                 &request,
-                ca::NODE_LEAF_LIFETIME
+                ca::NODE_LEAF_LIFETIME,
+                None
             )
             .await,
             Err(RenewalError::Identity(_))
@@ -431,18 +467,12 @@ fn windowed_identity(
         let now = time::OffsetDateTime::now_utc();
         params.not_before = now + time::Duration::seconds(not_before_secs);
         params.not_after = now + time::Duration::seconds(not_after_secs);
-        let issuer = hierarchy
-            .node
-            .certificate_params
-            .clone()
-            .self_signed(&hierarchy.node.signing_keypair)
-            .unwrap();
+        let issuer = rcgen::Issuer::from_params(
+            &hierarchy.node.certificate_params,
+            &hierarchy.node.signing_keypair,
+        );
         (
-            params
-                .signed_by(&key, &issuer, &hierarchy.node.signing_keypair)
-                .unwrap()
-                .der()
-                .to_vec(),
+            params.signed_by(&key, &issuer).unwrap().der().to_vec(),
             key.serialize_der(),
         )
     };
@@ -996,7 +1026,7 @@ async fn decommission_rejects_existing_connections_and_requires_fresh_enrolment(
         StatusCode::FORBIDDEN
     );
     assert!(matches!(
-        renewal::issue_renewal(&council, &peer, &old_request, ca::NODE_LEAF_LIFETIME).await,
+        renewal::issue_renewal(&council, &peer, &old_request, ca::NODE_LEAF_LIFETIME, None).await,
         Err(RenewalError::Identity(_))
     ));
     assert_eq!(council.security_state().await.next_serial, serial);
@@ -1009,7 +1039,8 @@ async fn decommission_rejects_existing_connections_and_requires_fresh_enrolment(
             SerialNumber(serial),
             ca::NODE_LEAF_LIFETIME,
             &state,
-            &IKM
+            &IKM,
+            None
         ),
         Err(reliaburger::sesame::join::JoinError::NodeRetired)
     ));
@@ -1043,6 +1074,7 @@ async fn decommission_rejects_existing_connections_and_requires_fresh_enrolment(
         ca::NODE_LEAF_LIFETIME,
         &state,
         &IKM,
+        None,
     )
     .unwrap();
     let enrolled = reliaburger::sesame::join::JoinBundle::from_result(&fresh)
@@ -1092,11 +1124,8 @@ fn secure_bun_renews_a_due_node_leaf_and_reuses_it_after_restart() {
     .unwrap();
     let ca_key =
         rcgen::KeyPair::from_der_and_sign_algo(&ca_key, &rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-    let issuer_params = rcgen::CertificateParams::from_ca_cert_der(
-        &rustls::pki_types::CertificateDer::from(issuer.certificate_der.clone()),
-    )
-    .unwrap();
-    let issuer = issuer_params.self_signed(&ca_key).unwrap();
+    let issuer_params = ca::issuer_params_from_der(&issuer.certificate_der).unwrap();
+    let issuer = rcgen::Issuer::from_params(&issuer_params, &ca_key);
     let key = rcgen::KeyPair::generate().unwrap();
     let mut params = rcgen::CertificateParams::default();
     params.serial_number = Some(identity.serial.0.into());
@@ -1110,11 +1139,7 @@ fn secure_bun_renews_a_due_node_leaf_and_reuses_it_after_restart() {
     let now = time::OffsetDateTime::now_utc();
     params.not_before = now - time::Duration::seconds(300);
     params.not_after = now + time::Duration::seconds(120);
-    identity.certificate_der = params
-        .signed_by(&key, &issuer, &ca_key)
-        .unwrap()
-        .der()
-        .to_vec();
+    identity.certificate_der = params.signed_by(&key, &issuer).unwrap().der().to_vec();
     identity.private_key_der = key.serialize_der();
     identity_store::save(&identity_dir, &identity).unwrap();
     let (mut bun, address) = spawn_bun_with_port_retry(true, || {

@@ -43,11 +43,16 @@ fn toml_blocks(markdown: &str) -> Vec<String> {
     blocks
 }
 
-/// A manifest that parses and declares an app or a job: fragments and node
-/// configs don't, and are checked elsewhere.
-fn workload_manifest(toml: &str) -> Option<Config> {
-    let config = Config::parse(toml).ok()?;
-    (!config.app.is_empty() || !config.job.is_empty()).then_some(config)
+/// A manifest that parses and declares an app or a job, once its templates
+/// are expanded as `relish apply` expands them (#1124): fragments and node
+/// configs don't, and are checked elsewhere. A template that can't expand
+/// is an error, not a fragment.
+fn workload_manifest(toml: &str) -> Option<Result<Config, String>> {
+    let mut config = Config::parse(toml).ok()?;
+    if let Err(error) = config.expand_templates() {
+        return Some(Err(error.to_string()));
+    }
+    (!config.app.is_empty() || !config.job.is_empty()).then_some(Ok(config))
 }
 
 #[test]
@@ -84,7 +89,12 @@ fn every_published_manifest_passes_apply_validation() {
             continue;
         };
         checked += 1;
-        if let Err(error) = config.validate_intrinsic() {
+        let validated = config.and_then(|config| {
+            config
+                .validate_intrinsic()
+                .map_err(|error| error.to_string())
+        });
+        if let Err(error) = validated {
             refused.push(format!("{name}: {error}"));
         }
     }
@@ -95,6 +105,42 @@ fn every_published_manifest_passes_apply_validation() {
     assert!(
         refused.is_empty(),
         "published manifests the cluster would refuse:\n{}",
+        refused.join("\n")
+    );
+}
+
+/// The agent gym's apps, with the placeholders the runner fills in
+/// (`scripts/gym/cluster.py`), pass the same validation. A scenario whose
+/// setup the cluster refuses tests no agent: `health-restart` did, for a
+/// health timeout longer than its interval.
+#[test]
+fn every_gym_app_passes_apply_validation() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut apps = Vec::new();
+    files_with_extension(&root.join("scripts/gym/apps"), "toml", &mut apps);
+    assert!(apps.len() >= 8, "found only {} gym apps", apps.len());
+    let mut refused = Vec::new();
+    for path in &apps {
+        let toml = std::fs::read_to_string(path)
+            .unwrap()
+            .replace("@TESTAPP@", "/usr/local/bin/testapp")
+            .replace("@APP_PORT@", "29500")
+            .replace("@SECOND_PORT@", "29501");
+        let validated = match workload_manifest(&toml) {
+            Some(config) => config.and_then(|config| {
+                config
+                    .validate_intrinsic()
+                    .map_err(|error| error.to_string())
+            }),
+            None => Err("doesn't parse as an app or job manifest".to_string()),
+        };
+        if let Err(error) = validated {
+            refused.push(format!("{}: {error}", path.display()));
+        }
+    }
+    assert!(
+        refused.is_empty(),
+        "gym apps the cluster would refuse:\n{}",
         refused.join("\n")
     );
 }

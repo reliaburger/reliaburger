@@ -1,7 +1,35 @@
 //! Health on the loop: the probes each tick runs, what their results do to
 //! an instance, and the exits the tick notices.
 
+use super::discovery_ownership::{Landing, WriteOwner};
 use super::*;
+
+/// What [`BunAgent::publish_instance_health`] did with an instance's health.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum HealthPublication {
+    /// The service map already says it, or the instance isn't routable.
+    Current,
+    /// Journalled and installed in this turn.
+    Published,
+    /// Not installed in this turn. Either a discovery journal write was
+    /// already in flight off the loop, so publishing would have waited for
+    /// it (#1100), or this publication's own write outlasted the turn's
+    /// runtime budget and goes on off the loop (#1255). `service_map` is
+    /// unchanged until the write lands, so nothing restarts meanwhile.
+    Deferred,
+}
+
+/// A health publication whose journal write outlasted its turn: what to
+/// install once the write lands (#1255).
+#[derive(Debug, Clone)]
+pub(super) struct HealthWrite {
+    instance_id: InstanceId,
+    /// The registration the probe was for; a replaced instance's next
+    /// probe publishes afresh.
+    created_at: Instant,
+    service: crate::onion::service_id::ServiceId,
+    healthy: bool,
+}
 
 /// Wait for a replacement instance to become healthy, on the deploy worker
 /// (M5): first for the runtime to report `Running`, then — when the app
@@ -195,29 +223,63 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .await;
         }
         // Retry publication even when health state already changed on an earlier
-        // probe. A refused withdrawal must not advance the restart state machine.
-        if let Err(error) = self.publish_instance_health(&instance_id).await {
-            eprintln!("bun: {error}");
-            self.supervisor
-                .health_checker_mut()
-                .schedule_next(instance_id, now);
-            return;
+        // probe. A refused or deferred withdrawal must not advance the restart
+        // state machine.
+        match self.publish_instance_health(&instance_id).await {
+            Ok(HealthPublication::Current | HealthPublication::Published) => {}
+            Ok(HealthPublication::Deferred) => {
+                self.supervisor
+                    .health_checker_mut()
+                    .schedule_next(instance_id, now);
+                return;
+            }
+            Err(error) => {
+                eprintln!("bun: {error}");
+                self.supervisor
+                    .health_checker_mut()
+                    .schedule_next(instance_id, now);
+                return;
+            }
         }
 
         // A later probe can complete publication that the transition probe failed.
+        self.restart_published_unhealthy(&instance_id, now).await;
+
+        self.supervisor
+            .health_checker_mut()
+            .schedule_next(instance_id, now);
+    }
+
+    /// Restart an unhealthy instance whose withdrawal is published.
+    async fn restart_published_unhealthy(&mut self, instance_id: &InstanceId, now: Instant) {
+        // The probe evidence is read before the restart, which resets the
+        // counters.
+        let Some(probe) = self
+            .supervisor
+            .get_instance(instance_id)
+            .filter(|instance| instance.state == ContainerState::Unhealthy)
+            .map(health_evidence)
+        else {
+            return;
+        };
         // LOOP-INLINE: in-memory lock, no I/O
         if self
             .supervisor
-            .get_instance(&instance_id)
-            .is_some_and(|instance| instance.state == ContainerState::Unhealthy)
-            && self
-                .supervisor
-                .maybe_restart(&instance_id, now)
-                .await
-                .unwrap_or(false)
-            && let Some(instance) = self.supervisor.get_instance(&instance_id)
+            .maybe_restart(instance_id, now)
+            .await
+            .unwrap_or(false)
+            && let Some(instance) = self.supervisor.get_instance(instance_id)
         {
-            self.record_event(
+            let mut decision = crate::bun::restart::restart_decision(
+                "restart.health_failed",
+                &instance_id.0,
+                instance.restart_count,
+                &instance.restart_policy,
+            );
+            for (key, value) in probe {
+                decision = decision.with(key, value);
+            }
+            self.record_decision(
                 crate::bun::events::EventKind::Restart,
                 crate::bun::events::EventSeverity::Warning,
                 Some(instance.app_name.clone()),
@@ -226,20 +288,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     "instance {} restarted (attempt {})",
                     instance_id.0, instance.restart_count
                 ),
+                decision,
             )
             .await;
         }
-
-        self.supervisor
-            .health_checker_mut()
-            .schedule_next(instance_id, now);
     }
 
     /// Confirm health publication before routing changes or automatic restart.
     pub(super) async fn publish_instance_health(
         &mut self,
         id: &InstanceId,
-    ) -> Result<(), BunError> {
+    ) -> Result<HealthPublication, BunError> {
         let instance =
             self.supervisor
                 .get_instance(id)
@@ -247,7 +306,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     instance_id: id.clone(),
                 })?;
         if instance.host_port.is_none() {
-            return Ok(());
+            return Ok(HealthPublication::Current);
         }
         let service =
             crate::onion::service_id::ServiceId::new(&instance.namespace, &instance.app_name);
@@ -265,27 +324,110 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             })
             .is_some_and(|backend| backend.healthy == healthy);
         if published {
-            return Ok(());
+            return Ok(HealthPublication::Current);
         }
+        // Journalling waits for a write a consumer step left in flight, which
+        // held a turn for 5 s on a busy disk (#1100). The next probe retries.
+        if self.discovery_write_in_flight() {
+            return Ok(HealthPublication::Deferred);
+        }
+        let write = HealthWrite {
+            instance_id: id.clone(),
+            created_at: instance.created_at,
+            service: service.clone(),
+            healthy,
+        };
+        let candidate = self.health_candidate(&write)?;
+        // Its own write waits only until the turn's runtime budget runs
+        // out, as a consumer step's does: a host disk stall held one probe's
+        // turn for 3.9 s (#1255). A write still going then is installed once
+        // it lands (`finish_health_publication`).
+        let deadline = self.turn_deadline();
+        let landing = self
+            .journal_discovery_publication(
+                &service,
+                &candidate,
+                Some(deadline),
+                WriteOwner::HealthProbe(write),
+            )
+            .await?;
+        if landing == Landing::InFlight {
+            return Ok(HealthPublication::Deferred);
+        }
+        self.install_health_candidate(&service, candidate).await?;
+        Ok(HealthPublication::Published)
+    }
+
+    /// The service map with `write`'s health in it.
+    fn health_candidate(
+        &self,
+        write: &HealthWrite,
+    ) -> Result<crate::onion::service_map::ServiceMap, BunError> {
         let mut candidate = self.service_map.clone();
         candidate
-            .set_backend_health(&service, &id.0, healthy)
+            .set_backend_health(&write.service, &write.instance_id.0, write.healthy)
             .map_err(|error| BunError::BackendPublication {
-                service: service.clone(),
+                service: write.service.clone(),
                 reason: error.to_string(),
             })?;
-        self.publish_backend_snapshot(&service, &candidate).await?;
+        Ok(candidate)
+    }
+
+    /// Publish a journalled health candidate and make it the service map.
+    async fn install_health_candidate(
+        &mut self,
+        service: &crate::onion::service_id::ServiceId,
+        candidate: crate::onion::service_map::ServiceMap,
+    ) -> Result<(), BunError> {
+        self.publish_journalled_backends(service, &candidate)
+            .await?;
         self.service_map = candidate;
         self.rebuild_routing_table().await;
         Ok(())
     }
 
+    /// Install a health publication whose journal write outlasted its turn
+    /// and has now landed, then restart the instance if the publication
+    /// withdrew it, as the probe would have (#1255). An instance that went
+    /// or was replaced meanwhile gets nothing: its next probe publishes
+    /// whatever its health is then.
+    pub(super) async fn finish_health_publication(&mut self, write: HealthWrite) {
+        let now = Instant::now();
+        if self
+            .supervisor
+            .get_instance(&write.instance_id)
+            .is_none_or(|instance| instance.created_at != write.created_at)
+        {
+            return;
+        }
+        let installed = match self.health_candidate(&write) {
+            Ok(candidate) => {
+                self.install_health_candidate(&write.service, candidate)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(error) = installed {
+            eprintln!("bun: {error}");
+            return;
+        }
+        if !write.healthy {
+            self.restart_published_unhealthy(&write.instance_id, now)
+                .await;
+        }
+    }
+
     /// A running app's process has exited, which a health check catches
     /// only if the app has one. Mark it Stopped and route it through the
-    /// restart path.
+    /// restart path. `retry_restart` records the `restart` event when it
+    /// restarts the instance at once; an exit inside the backoff keeps
+    /// `retry_pending`, and the later retry records it instead (#1652).
     pub(super) async fn observe_app_exit(&mut self, id: &InstanceId) {
+        // Its sidecars restart with it, not on their own (#1120).
+        self.sidecars.cancel_relaunches(id);
         if let Some(instance) = self.supervisor.get_instance_mut(id) {
             instance.retry_pending = true;
+            instance.restart_cause = Some(crate::bun::restart::RestartCause::ProcessExited);
             if let Ok(s) = instance.state.transition_to(ContainerState::Stopping) {
                 instance.state = s;
             }
@@ -293,14 +435,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 instance.state = s;
             }
         }
-        // LOOP-INLINE: in-memory lock, no I/O
-        if let Err(BunError::RestartLimitExceeded { .. }) =
-            self.supervisor.maybe_restart(id, Instant::now()).await
-            && let Some(instance) = self.supervisor.get_instance_mut(id)
-            && let Ok(s) = instance.state.transition_to(ContainerState::Failed)
-        {
-            instance.state = s;
-        }
+        self.retry_restart(id).await;
     }
 
     /// Read every running app's state and apply what the reads saw, inline.
@@ -312,4 +447,27 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let sweep = state_sweep::sweep_states(grill, reads).await;
         self.apply_state_sweep(Ok(sweep)).await;
     }
+}
+
+/// The health-check evidence a `restart.health_failed` decision carries:
+/// the failures in a row, the threshold, the probe and its interval.
+pub(super) fn health_evidence(
+    instance: &crate::bun::supervisor::WorkloadInstance,
+) -> Vec<(&'static str, String)> {
+    let mut evidence = vec![(
+        "consecutive_failures",
+        instance.health_counters.consecutive_unhealthy.to_string(),
+    )];
+    if let Some(config) = &instance.health_config {
+        evidence.push(("threshold", config.threshold_unhealthy.to_string()));
+        evidence.push((
+            "probe",
+            format!(
+                "{} port {} path {}",
+                config.protocol, config.port, config.path
+            ),
+        ));
+        evidence.push(("interval_seconds", config.interval.as_secs().to_string()));
+    }
+    evidence
 }

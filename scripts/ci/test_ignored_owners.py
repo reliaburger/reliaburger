@@ -192,6 +192,29 @@ class OwnerTests(unittest.TestCase):
     def test_every_ignored_test_in_this_repository_has_an_owner(self):
         self.assertEqual(ignored_owners.owner_problems(REPO), [])
 
+    def test_every_bound_ci_test_in_this_repository_has_a_manifest_case(self):
+        self.assertEqual(ignored_owners.manifest_problems(REPO), [])
+
+    def test_a_bound_ci_test_no_manifest_case_requires_fails(self):
+        import json
+        with tempfile.TemporaryDirectory() as root:
+            tree = Tree(root)
+            tree.test("tests/cluster_failover.rs", "kept", '#[ignore = "run with make test-cluster"]')
+            tree.test("tests/cluster_extra.rs", "forgotten", '#[ignore = "run with make test-cluster"]')
+            bindings = [dict(source="tests/cluster_failover.rs", function="kept",
+                             binary="reliaburger::cluster_failover", test="kept"),
+                        dict(source="tests/cluster_extra.rs", function="forgotten",
+                             binary="reliaburger::cluster_extra", test="forgotten")]
+            case = dict(id="kept", binary="reliaburger::cluster_failover", test="kept",
+                        requires=["cluster-tests"], sources=["tests/cluster_failover.rs"])
+            tree.write("tests/contracts/ignored-bindings.json", json.dumps(bindings))
+            tree.write("tests/contracts/manifest.json", json.dumps({"contracts": [{"cases": [case]}]}))
+            tree.write("scripts/ci/legacy-oci-aliases.json", "[]")
+            problems = ignored_owners.manifest_problems(tree.root)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("tests/cluster_extra.rs:2 forgotten", problems[0])
+        self.assertIn("make test-cluster", problems[0])
+
 
 class EvidenceTests(unittest.TestCase):
     def setUp(self):

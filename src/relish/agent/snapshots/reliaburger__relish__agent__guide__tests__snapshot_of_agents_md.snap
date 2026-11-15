@@ -1,0 +1,19 @@
+---
+source: src/relish/agent/guide.rs
+expression: "artefact(paths::AGENTS_MD)"
+---
+# Agents working on Reliaburger
+
+Hand-written intro.
+
+<!-- agent-generated:start -->
+<!-- Generated from docs/manual/16_working-with-an-ai-agent.md by `make agent-docs`: edit the chapter, not this file. -->
+
+- **Disclose.**
+
+## Debugging a running cluster
+
+If you're operating or debugging a Reliaburger cluster rather than editing this code, the manual's [Working with an AI agent](docs/manual/16_working-with-an-ai-agent.md) chapter is for you, and `relish agent guide` prints it.
+
+- **Run `relish agent guide` first.**
+<!-- agent-generated:end -->

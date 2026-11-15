@@ -1,0 +1,13 @@
+# cargo-mutants' settings, for CI's mutants.yml and local runs alike (#1584;
+# docs/testing.md, "Mutation testing").
+
+# nextest, as every other test run here: it reads .config/nextest.toml.
+test_tool = "nextest"
+
+# Test support, fuzz-target bodies and the binaries' entry points. The first
+# two only exist for tests, and only process-level suites exercise the third.
+exclude_globs = ["src/testkit/**", "src/fuzz/**", "src/bin/**"]
+
+# A mutant that trips a lint (an unused variable, say) is still a mutant to
+# test, not an unbuildable one.
+cap_lints = true

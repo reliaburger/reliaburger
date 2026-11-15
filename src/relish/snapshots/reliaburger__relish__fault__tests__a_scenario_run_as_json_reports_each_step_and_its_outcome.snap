@@ -1,0 +1,41 @@
+---
+source: src/relish/fault.rs
+expression: "crate::relish::output::format_output(&report, OutputFormat::Json).unwrap()"
+---
+{
+  "name": "refusal",
+  "steps": [
+    {
+      "step": 1,
+      "at_secs": 0.0,
+      "description": "kill a replica",
+      "fault": "kill",
+      "target": "web",
+      "value": "",
+      "outcome": "failed",
+      "error": "API error (status 400): replica minimum"
+    },
+    {
+      "step": 2,
+      "at_secs": 0.0,
+      "description": "slow the rest",
+      "fault": "delay",
+      "target": "web",
+      "value": "200ms",
+      "outcome": "injected",
+      "summary": {
+        "id": 7,
+        "fault_type": "kill",
+        "target_service": "web",
+        "namespace": "default",
+        "target_instance": null,
+        "target_node": "node-1",
+        "remaining_secs": 0,
+        "injected_by": "ops",
+        "node": "node-1"
+      }
+    }
+  ],
+  "elapsed_secs": 0.0,
+  "complete": false
+}

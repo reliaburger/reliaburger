@@ -1,0 +1,2 @@
+prepare_seconds: 17
+packages: qemu-system-x86 ovmf qemu-utils

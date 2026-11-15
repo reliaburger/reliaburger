@@ -1,0 +1,100 @@
+---
+source: src/relish/agent/upgrade_check.rs
+expression: rendered(&evidence(healthy_cluster()))
+---
+{
+  "command": "upgrade-check",
+  "data": {
+    "latest": {
+      "formats": {
+        "protocol": 57,
+        "state": 74
+      },
+      "platforms": [
+        "linux-aarch64",
+        "linux-x86_64"
+      ],
+      "version": "v0.2.7"
+    },
+    "metadata": "https://github.com/reliaburger/reliaburger/releases/latest/download/metadata.json",
+    "nodes": [
+      {
+        "artefact": true,
+        "commit": "50596cfe0000000000000000000000000000beef",
+        "formats": {
+          "protocol": 57,
+          "state": 74
+        },
+        "node": "node-1",
+        "platform": "linux-x86_64",
+        "role": "leader",
+        "state": "alive",
+        "version": "v0.2.6"
+      },
+      {
+        "artefact": true,
+        "commit": "50596cfe0000000000000000000000000000beef",
+        "formats": {
+          "protocol": 57,
+          "state": 74
+        },
+        "node": "node-2",
+        "platform": "linux-x86_64",
+        "role": "council",
+        "state": "alive",
+        "version": "v0.2.6"
+      },
+      {
+        "artefact": true,
+        "commit": "50596cfe0000000000000000000000000000beef",
+        "formats": {
+          "protocol": 57,
+          "state": 74
+        },
+        "node": "node-3",
+        "platform": "linux-x86_64",
+        "role": "council",
+        "state": "alive",
+        "version": "v0.2.6"
+      },
+      {
+        "artefact": true,
+        "commit": "50596cfe0000000000000000000000000000beef",
+        "formats": {
+          "protocol": 57,
+          "state": 74
+        },
+        "node": "node-4",
+        "platform": "linux-x86_64",
+        "role": "worker",
+        "state": "alive",
+        "version": "v0.2.6"
+      }
+    ],
+    "reasons": [],
+    "release_notes": null,
+    "verdict": "ready"
+  },
+  "next": [
+    {
+      "read_only": true,
+      "run": "relish upgrade plan v0.2.7",
+      "why": "the rolling order and how long it should take"
+    },
+    {
+      "read_only": false,
+      "run": "relish upgrade start v0.2.7 --external-key <your key>",
+      "why": "start the rolling upgrade; ask a human first"
+    }
+  ],
+  "ok": true,
+  "relish": {
+    "commit": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+    "dirty": null,
+    "source_digest": null,
+    "version": "0.2.7"
+  },
+  "schema": "relish.agent/v1",
+  "truncated": false,
+  "warnings": []
+}

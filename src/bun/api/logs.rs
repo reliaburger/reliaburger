@@ -1268,3 +1268,107 @@ pub(super) async fn logs_export_handler(
             .into_response(),
     }
 }
+
+/// Who may read a node's whole log store through the archive routes.
+///
+/// The files hold every tenant's logs and go straight back to the caller, so
+/// this is Admin-only, like an export, and a token scoped to some apps or
+/// namespaces is refused: there's no filtering a Parquet file.
+#[allow(clippy::result_large_err)]
+fn authorize_log_archive(auth: Option<&crate::sesame::auth::AuthContext>) -> Result<(), Response> {
+    crate::sesame::auth::authorize(auth, crate::sesame::types::ApiRole::Admin)?;
+    crate::sesame::auth::require_unscoped(auth)
+}
+
+fn log_archive_error(status: StatusCode, message: String) -> Response {
+    (status, Json(serde_json::json!({"error": message}))).into_response()
+}
+
+/// `GET /v1/logs/archive` — this node's flushed log files, with each one's
+/// size and SHA-256, for `relish logs-export` to copy.
+pub(super) async fn logs_archive_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+) -> Response {
+    if let Err(response) = authorize_log_archive(auth.as_deref()) {
+        return response;
+    }
+    if let Err(response) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Admin,
+    )
+    .await
+    {
+        return response;
+    }
+    let Some(log_store) = &state.log_store else {
+        return log_archive_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "log store not enabled".to_string(),
+        );
+    };
+    let data_dir = log_store.read().await.data_dir().to_path_buf();
+    let node_id = state.node_name.as_deref().unwrap_or("local");
+    match crate::ketchup::export::list_archive(&data_dir, node_id).await {
+        Ok(listing) => Json(listing).into_response(),
+        Err(error) => log_archive_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
+}
+
+/// `GET /v1/logs/archive/{name}` — stream one flushed log file.
+///
+/// Only a regular `.parquet` file directly in the store: not the checkpoint,
+/// not a symlink, not a path that climbs out.
+pub(super) async fn logs_archive_file_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    Path(name): Path<String>,
+) -> Response {
+    if let Err(response) = authorize_log_archive(auth.as_deref()) {
+        return response;
+    }
+    if let Err(response) = enforce_cluster_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Admin,
+    )
+    .await
+    {
+        return response;
+    }
+    if !crate::ketchup::export::is_archive_file_name(&name) {
+        return log_archive_error(StatusCode::BAD_REQUEST, format!("not a log file: {name:?}"));
+    }
+    let Some(log_store) = &state.log_store else {
+        return log_archive_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "log store not enabled".to_string(),
+        );
+    };
+    let path = log_store.read().await.data_dir().join(&name);
+    let opened = async {
+        let metadata = tokio::fs::symlink_metadata(&path).await?;
+        if !metadata.is_file() {
+            return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        }
+        Ok((tokio::fs::File::open(&path).await?, metadata.len()))
+    };
+    match opened.await {
+        Ok((file, size)) => (
+            [
+                (
+                    axum::http::header::CONTENT_TYPE,
+                    "application/octet-stream".to_string(),
+                ),
+                (axum::http::header::CONTENT_LENGTH, size.to_string()),
+            ],
+            axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(file)),
+        )
+            .into_response(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            log_archive_error(StatusCode::NOT_FOUND, format!("no log file {name}"))
+        }
+        Err(error) => log_archive_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
+}
