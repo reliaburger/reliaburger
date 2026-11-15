@@ -2795,6 +2795,18 @@ Bun's: a user who gives a job less memory than its runtime needs to start
 should see it fail. The fixture now asks for 32 MiB, which runc can start in
 and `awk` still outgrows.
 
+The bigger helper cost room elsewhere. At target load the soak runs eight
+shared-runc executors a node, and each now reserves 56 MiB, not 40. That's
+128 MiB more a node, on guests with 1,438 MiB to give. The next rehearsal's
+jobs tier powered off two nodes, and when they came back the executors had
+taken nearly every free MiB on all three. `redis` asks for 32 MiB and
+couldn't be placed anywhere for ten minutes. An app's admission refuses
+straight away, while a job waits its turn and gets every MiB that's freed, so
+batch work wins a full node. The soak now runs five shared-runc executors a
+node, under 0.2.8's reservation, and a test fails if a reservation change
+eats that room again. Giving apps first claim on freed memory is a product
+change of its own ([#1967](https://github.com/reliaburger/reliaburger/issues/1967)).
+
 ### Native host executors
 
 Shared containers fixed the container setup. Host jobs still paid for their
