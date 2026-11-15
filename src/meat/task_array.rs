@@ -123,6 +123,9 @@ pub enum TaskArraySpecError {
     UnsupportedTemplate { found: &'static str },
     #[error("a task array template can't have {field}")]
     TemplateField { field: &'static str },
+    /// A fresh runc template's memory limit is too small for runc init (#1959).
+    #[error("a task array template's {reason}")]
+    TemplateMemory { reason: String },
 }
 
 impl TaskArraySpec {
@@ -206,6 +209,9 @@ pub fn validate_template(template: &JobSpec) -> Result<(), TaskArraySpecError> {
     template
         .validate_runtime()
         .map_err(|field| TaskArraySpecError::TemplateField { field })?;
+    if let Some(reason) = template.memory_floor_refusal() {
+        return Err(TaskArraySpecError::TemplateMemory { reason });
+    }
     // At most 64 active profiles are copied into a node sync. Bound each
     // template so argv/environment cannot turn that into an unbounded RPC.
     if serde_json::to_vec(template).map_or(true, |bytes| bytes.len() > 16 * 1024) {
@@ -497,6 +503,24 @@ mod tests {
                 ("RELIABURGER_TASK_ATTEMPT", "2".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn a_fresh_runc_template_below_the_runc_memory_floor_is_refused() {
+        let mut image = exec_template(&[]);
+        image.exec = None;
+        image.runtime = crate::config::job::JobRuntime::Runc;
+        image.image = Some("alpine:3".to_string());
+        image.memory = Some(crate::config::types::ResourceRange {
+            request: 8 << 20,
+            limit: 8 << 20,
+        });
+        let error = validate_template(&image).unwrap_err();
+        assert!(error.to_string().contains("16Mi"), "{error}");
+
+        // A shared-runc task never runs runc init in its own cgroup.
+        image.runtime = crate::config::job::JobRuntime::SharedRunc;
+        assert_eq!(validate_template(&image), Ok(()));
     }
 
     #[test]

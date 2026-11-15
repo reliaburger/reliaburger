@@ -817,6 +817,50 @@ pub fn standard_mounts() -> Vec<OciMount> {
     ]
 }
 
+/// The smallest memory limit a runc container can start under (#1959).
+///
+/// `runc init` runs inside the container's own cgroup before the workload
+/// does. With runc 1.4 it holds a copy of its 10.9 MB binary there, and its
+/// `memory.peak` reached 13.3 MB on a soak node, so `runc create` failed at
+/// 8, 10 and 12 MiB with "container init was OOM-killed". runc 1.5 needs
+/// about 4 MiB, but a node can run either.
+pub const RUNC_MEMORY_LIMIT_FLOOR_BYTES: u64 = 16 << 20;
+
+// The floor must stay above the largest runc init peak we measured.
+const _: () = assert!(RUNC_MEMORY_LIMIT_FLOOR_BYTES >= 13_266_944);
+
+/// Render a memory size as whole mebibytes (`"16Mi"`) when it is one, else
+/// in bytes, so a message reads like the config the user wrote.
+pub fn render_memory(bytes: u64) -> String {
+    if bytes.is_multiple_of(1 << 20) {
+        format!("{}Mi", bytes >> 20)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
+/// Explain a runc start failure caused by `runc init` running out of memory.
+///
+/// Returns `None` unless runc's stderr says its init was OOM-killed. The
+/// reason names the container's memory limit and
+/// [`RUNC_MEMORY_LIMIT_FLOOR_BYTES`], because runc's own words ("memory
+/// limit too low?") don't say how much it needs.
+pub fn explain_runc_init_oom(runc_stderr: &str, memory_limit: Option<u64>) -> Option<String> {
+    if !runc_stderr.contains("OOM-killed") {
+        return None;
+    }
+    let floor = render_memory(RUNC_MEMORY_LIMIT_FLOOR_BYTES);
+    let limit = match memory_limit {
+        Some(bytes) => format!("the memory limit of {}", render_memory(bytes)),
+        None => "the container's memory".to_string(),
+    };
+    Some(format!(
+        "runc init was OOM-killed before the workload started: it runs inside \
+         the container's cgroup and {limit} is too small for it; give the app or \
+         job a memory limit of at least {floor}"
+    ))
+}
+
 fn build_resources(spec: &AppSpec) -> Option<OciResources> {
     build_resources_from_ranges(spec.cpu.as_ref(), spec.memory.as_ref())
 }
@@ -1204,6 +1248,36 @@ impl OciSpec {
 mod tests {
     use super::*;
     use crate::config::types::{ConfigFileSpec, VolumeSpec};
+
+    #[test]
+    fn runc_init_oom_names_the_limit_and_the_floor() {
+        let stderr = "time=\"2026-11-14T10:00:00Z\" level=error msg=\"runc run failed: \
+                      container init was OOM-killed (memory limit too low?)\"\n";
+        let reason = explain_runc_init_oom(stderr, Some(8 << 20)).unwrap();
+        assert!(reason.contains("8Mi"), "{reason}");
+        assert!(reason.contains("16Mi"), "{reason}");
+        assert!(reason.contains("runc init"), "{reason}");
+    }
+
+    #[test]
+    fn runc_init_oom_with_no_limit_still_names_the_floor() {
+        let reason = explain_runc_init_oom("container init was OOM-killed", None).unwrap();
+        assert!(reason.contains("16Mi"), "{reason}");
+    }
+
+    #[test]
+    fn a_start_failure_without_an_init_oom_gets_no_explanation() {
+        assert_eq!(
+            explain_runc_init_oom("exec: \"/app\": no such file or directory", Some(8 << 20)),
+            None
+        );
+    }
+
+    #[test]
+    fn mebibytes_render_whole_or_in_bytes() {
+        assert_eq!(render_memory(16 << 20), "16Mi");
+        assert_eq!(render_memory(1_000_000), "1000000 bytes");
+    }
 
     #[test]
     fn inline_config_file_name_is_the_first_eight_bytes_of_the_path_digest() {

@@ -167,7 +167,10 @@ relish run --batch render --count 10000 --image renderer:v1 --cpu 250m-500m --me
 
 CPU and memory use the same request–limit syntax as apps. Requests govern local
 packing; rootful Linux container and native process jobs enforce limits. Omitted values mean 1 CPU and
-64 MiB, including the limits. A profile that cannot run is shown as refused in
+64 MiB, including the limits. A fresh `runc` job or template needs a memory
+limit of at least 16 MiB, because `runc init` runs inside the container's cgroup
+first; a smaller one is refused at submission. `shared-runc` tasks and
+`process` jobs have no such floor. A profile that cannot run is shown as refused in
 status. Images are bound to a digest at submission and must pass the cluster's Pickle
 and upstream trust policies, including required cosign signatures.
 
