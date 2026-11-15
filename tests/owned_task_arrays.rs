@@ -1618,7 +1618,12 @@ async fn runc_reusable_commands_keep_the_container_but_retire_task_state_and_idl
     assert_eq!(runtime.state(&id).await.unwrap(), ContainerState::Running);
     assert_eq!(
         budget.available(),
-        Resources::new(390, 24 << 20, 0),
+        // The container helper's reservation includes room for runc init (#1957).
+        Resources::new(
+            390,
+            (24 << 20) - reliaburger::bun::reusable_executor::RUNC_INIT_MEMORY_BYTES,
+            0
+        ),
         "idle profile plus helper still owns capacity"
     );
     let next = runner.run(&task, Duration::from_secs(20), &cancel).await;
