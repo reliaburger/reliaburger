@@ -55,7 +55,10 @@ If you're an agent operating or debugging a Reliaburger cluster:
   it, and let them send it.
 - **Asked to set up a cluster?** Follow the playbook "Setting up a cluster for
   your human" at <https://reliaburger.com/agents>, the last section of
-  `relish agent guide`, and spend nothing without an explicit yes.
+  `relish agent guide`, and spend nothing without an explicit yes. On spare
+  machines, Reliaburger installs its own OS over the network and erases
+  their disks: you check and download, and your human runs `relish netboot`
+  and `relish machines claim`.
 <!-- agent-brief:end -->
 
 ## A read-only token
@@ -1299,7 +1302,7 @@ whether to pay for it. You do the rest, and say what you're doing as you go.
 
 ### 1. Ask where
 
-Offer three places and wait for the answer:
+Offer four places and wait for the answer:
 
 - **This computer**: three Linux VMs in Lima. It needs a Mac with Apple
   silicon, or Linux with QEMU and KVM, plus about 8 GiB of free memory and
@@ -1310,6 +1313,9 @@ Offer three places and wait for the answer:
   `sudo`. TCP port 9117 on the first one must be reachable from this computer.
 - **A cloud**: new machines that meet the same bar, made with the provider's
   own CLI.
+- **Spare machines with nothing on them**: old mini PCs or thin clients that
+  become Reliaburger appliances. Their disks are erased, and your human does
+  the hands-on part; step 3 says what that is.
 
 One machine is enough to try it. Three form a council that survives losing one.
 
@@ -1372,7 +1378,37 @@ to finish before setup, or the two fight over `apt`:
 done`; it exits `2` when cloud-init finished with only warnings, often about
 the provider's own part of the config.
 
-### 3. Install and build
+### 3. Spare machines: check, then hand them over
+
+Reliaburger brings its own OS here: an Ubuntu 26.04 appliance with a
+read-only, A/B-updated `/usr` and `bun` as its only service. Read
+`17_appliance.md` (in `llms.txt`) before you advise. Check with your human,
+and say plainly when a machine won't do: each needs UEFI network boot,
+Secure Boot off, 2 GiB of memory, an 8 GB disk, and a wired NIC from that
+chapter's "What you need". Raspberry Pis aren't supported yet. **The
+installer erases each machine's largest disk**, so confirm nothing on them
+is needed.
+
+Install `relish` (step 4's first line). You fetch and check the OS with
+`relish image download --dir os -o json`, and list waiting machines with
+`relish machines -o json`. Your human runs the interactive part:
+
+```sh
+sudo relish netboot os --mac d8:9e:f3:12:34:56 --mac d8:9e:f3:12:34:57
+relish machines claim ~/home-cluster --create --name home \
+  --operator 192.168.1.10 --network 192.168.1.0/24 \
+  d8:9e:f3:12:34:56 d8:9e:f3:12:34:57
+```
+
+`--operator` is this computer's address on that network, and the MACs are
+the machines'.
+
+`claim` asks them to compare each machine's claim key with its screen. That
+check is all that keeps the cluster's keys from anyone else on the network,
+and you can't see the screens, so never suggest `--trust-lan` or `--yes`.
+Then go to step 5. `relish os upgrade` later updates every node: ask first.
+
+### 4. Install and build
 
 Install `relish` on this computer, then build with `-o json`:
 
@@ -1391,7 +1427,7 @@ credential itself), `back_up` for a cluster over SSH, `next`, `teardown` and
 commands will fail until it's dealt with, and it says how, usually a firewall
 rule. If setup stops, run the same command again: it resumes.
 
-### 4. Show them around
+### 5. Show them around
 
 Run `relish status`, then take your human through the five-minute tour, one
 command at a time, saying what each shows before you run the next. Read it as
@@ -1401,7 +1437,7 @@ changes only its own demo app. Its fault commands take `--acknowledge`, so say
 what they'll break first. Its addresses are a laptop cluster's; on machines
 over SSH, use the `app` address from the report.
 
-### 5. Leave a summary and the way out
+### 6. Leave a summary and the way out
 
 Finish with a short summary: where the cluster runs, its nodes, the API and
 the app, where the admin credential lives, what to back up, what it costs per

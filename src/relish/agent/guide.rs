@@ -923,6 +923,24 @@ fn llms_txt(summary: &str, brief: &str, title: &str, inputs: &Inputs<'_>) -> Str
         out,
         "- [Whitepaper]({raw}/docs/whitepaper.md): the architecture in one document"
     );
+    // The appliance is our own Linux distribution, netbooted by `relish
+    // netboot`; the manual says how to use it, these say how it works.
+    let _ = writeln!(
+        out,
+        "- [Becoming the Operating System]({raw}/docs/book/15a-becoming-the-os.md): how \
+         the appliance OS, `relish netboot`, claiming and A/B OS updates were built, \
+         and what real hardware taught us"
+    );
+    let _ = writeln!(
+        out,
+        "- [The appliance's design]({raw}/docs/design/appliance.md): the image, \
+         `relish netboot`, claiming, seeds and `relish os`"
+    );
+    let _ = writeln!(
+        out,
+        "- [The appliance's recipe]({tree}/image): the mkosi configuration, the \
+         netboot installer, iPXE scripts and the lab tools"
+    );
     out
 }
 
@@ -1609,6 +1627,25 @@ Intro paragraph.\n\n## In brief\n\n\
             1,
             "the agent chapter is under Start here only"
         );
+    }
+
+    /// The appliance is a distribution of our own, so an agent asked about
+    /// netbooting needs more than the manual: how it was built, its design,
+    /// and where its recipe lives.
+    #[test]
+    fn llms_txt_points_at_the_appliance_os_and_how_it_was_built() {
+        let llms = artefact(paths::LLMS_TXT);
+        let optional = llms
+            .split("\n## Optional\n")
+            .nth(1)
+            .expect("an Optional section");
+        for link in [
+            "(https://raw.githubusercontent.com/reliaburger/reliaburger/v0.2.7/docs/book/15a-becoming-the-os.md)",
+            "(https://raw.githubusercontent.com/reliaburger/reliaburger/v0.2.7/docs/design/appliance.md)",
+            "(https://github.com/reliaburger/reliaburger/tree/v0.2.7/image)",
+        ] {
+            assert!(optional.contains(link), "no {link} in:\n{optional}");
+        }
     }
 
     #[test]
