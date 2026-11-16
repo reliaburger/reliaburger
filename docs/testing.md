@@ -1220,7 +1220,7 @@ why we copied the idea and not the tooling.
 | Job task start | A job task's start lag on a pooled executor, from the job campaign's buckets, in runs no fault window overlapped | ≤ 256 ms | Gated in the fast and final tiers |
 | API read | `GET /v1/status?cluster=true` and `GET /v1/cluster/nodes` (what `relish status` and `relish nodes` ask) on every node, at every light check, from the host | ≤ 3,000 ms | Gated in the fast and final tiers |
 | API write | `relish apply` of the soak workloads, from the call to the Raft commit | ≤ 3,000 ms | Gated in the fast and final tiers |
-| App start | Each node's deploy of a new `soak-slo` instance, from its start until the instance passes its health check | ≤ 5,000 ms | Record only |
+| App start | Each node's deploy of a new `soak-slo` instance, from its start until the instance passes its health check | ≤ 30,000 ms | Gated in the fast and final tiers |
 | Rolling update | From `relish apply` returning until every node runs the new `soak-slo` | ≤ 100,000 ms | Gated in the fast and final tiers |
 
 **Where the gated number comes from.** The job start lag is the one latency
@@ -1273,11 +1273,32 @@ budget. A day tier and a custom run still record these without gating them:
 the 0.2.4 day run measured a rolling update p99 of 100,000 ms at six times
 the load.
 
-App start stays record only. It's 1 ms in every record, because deploy
-history stamps a deploy's start at the moment it records the deploy's end,
-so `completed_at − created_at` measures nothing
-([#1640](https://github.com/reliaburger/reliaburger/issues/1640)). Its gate
-waits until records time it for real.
+**The app start gate, from 16 November 2026.** App start stayed record only
+at first. It's 1 ms in every record up to 0.2.8, because deploy history
+stamped a deploy's start at the moment it recorded the deploy's end, so
+`completed_at − created_at` measured nothing
+([#1640](https://github.com/reliaburger/reliaburger/issues/1640)). Ignore
+those records' App start column. The 0.3.0 rehearsal's soaks were the first
+to run on builds with the fix, and their 186 starts are real: each matches
+its deploy history entry, a few seconds from start to completion, and the
+three nodes' entries follow one another through the rolling update
+([#1913](https://github.com/reliaburger/reliaburger/issues/1913)):
+
+| Record | Starts | Median | Slowest | p99 bucket |
+|---|---|---|---|---|
+| V02 fast, candidates 2 and 3 | 24, 24 | 4,785, 4,663 ms | 7,346, 7,176 ms | 10,000 ms |
+| V02 fast, seeded, candidates 2 and 3 | 24, 24 | 4,439, 4,736 ms | 6,899, 6,208 ms | 7,000 ms |
+| Jobs fast, candidates 2 and 3 | 12, 18 | 5,640, 5,302 ms | 10,829, 8,789 ms | 15,000, 10,000 ms |
+| Jobs final (8 h), candidate 2 | 60 | 6,563 ms | 11,069 ms | 15,000 ms |
+
+The gate follows the same rule as the other three: two buckets above the
+worst p99, 15,000 ms, which puts it at 30,000 ms. A tier gets only twelve to
+sixty starts, two per cycle per node, so its p99 is close to its slowest
+start, and a margin of one bucket would fail a run on one slow start. The
+job tiers start apps more slowly than the V02 tiers, because the job
+campaign shares the nodes' CPU. Kubernetes's pod start-up SLO is 5 s, but it
+leaves out the image pull and the health check, and it isn't measured on
+three small VMs sharing one laptop.
 
 **How it's measured.** At every light, settle and heavy check outside a fault
 window, the harness times the two API reads on each node that is up
