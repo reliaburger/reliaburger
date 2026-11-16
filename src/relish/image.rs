@@ -11,6 +11,7 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use futures_util::StreamExt;
 use serde::Serialize;
@@ -25,6 +26,13 @@ use crate::upgrade::signing::PublicKey;
 /// Where the newest OS release is named.
 pub const CHANNEL_URL: &str =
     "https://github.com/reliaburger/reliaburger/releases/download/os-channel/os-channel.json";
+
+/// How long a download waits to connect to the release server.
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a download waits for the server's next bytes before it gives
+/// up on a stalled server.
+pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Which files of a release `download` fetches.
 pub fn wanted(entries: &[SumsEntry], version: &str, everything: bool) -> Vec<String> {
@@ -260,10 +268,7 @@ pub async fn download(
     if let Some(warning) = trust.warning() {
         eprintln!("relish image download: {warning}");
     }
-    let client = crate::http_client::builder()
-        .user_agent("relish")
-        .build()
-        .map_err(|e| failed(&e.to_string()))?;
+    let client = download_client(CONNECT_TIMEOUT, IDLE_TIMEOUT)?;
     let channel_bytes = fetch(&client, channel_url).await?;
     let signature = fetch(&client, &format!("{channel_url}.sig")).await?;
     let channel = trust.verify(&channel_bytes, &signature)?;
@@ -380,19 +385,49 @@ async fn download_arch(
     })
 }
 
+/// The client for release downloads: it gives up on a connection after
+/// `connect`, and on a server that sends nothing for `idle`. There's no
+/// limit on the whole download: an image is hundreds of MB, and a slow
+/// link may take an hour over it.
+pub(crate) fn download_client(
+    connect: Duration,
+    idle: Duration,
+) -> Result<reqwest::Client, RelishError> {
+    crate::http_client::builder()
+        .user_agent("relish")
+        .connect_timeout(connect)
+        // Per read, not per request: it restarts with every chunk.
+        .read_timeout(idle)
+        .build()
+        .map_err(|e| failed(&e.to_string()))
+}
+
+/// A failed request or body read, saying what timed out if something did.
+fn request_failed(url: &str, error: &reqwest::Error) -> RelishError {
+    if error.is_timeout() && error.is_connect() {
+        failed(&format!("{url}: timed out connecting to the server"))
+    } else if error.is_timeout() {
+        failed(&format!(
+            "{url}: timed out waiting for the server to send more"
+        ))
+    } else {
+        failed(&format!("{url}: {error}"))
+    }
+}
+
 pub(crate) async fn fetch(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, RelishError> {
     let response = client
         .get(url)
         .send()
         .await
-        .map_err(|e| failed(&format!("{url}: {e}")))?;
+        .map_err(|e| request_failed(url, &e))?;
     if !response.status().is_success() {
         return Err(failed(&format!("{url}: {}", response.status())));
     }
     Ok(response
         .bytes()
         .await
-        .map_err(|e| failed(&format!("{url}: {e}")))?
+        .map_err(|e| request_failed(url, &e))?
         .to_vec())
 }
 
@@ -402,7 +437,7 @@ async fn stream_to(client: &reqwest::Client, url: &str, path: &Path) -> Result<u
         .get(url)
         .send()
         .await
-        .map_err(|e| failed(&format!("{url}: {e}")))?;
+        .map_err(|e| request_failed(url, &e))?;
     if !response.status().is_success() {
         return Err(failed(&format!("{url}: {}", response.status())));
     }
@@ -412,7 +447,7 @@ async fn stream_to(client: &reqwest::Client, url: &str, path: &Path) -> Result<u
     let mut stream = response.bytes_stream();
     let mut total = 0u64;
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| failed(&format!("{url}: {e}")))?;
+        let chunk = chunk.map_err(|e| request_failed(url, &e))?;
         file.write_all(&chunk).await?;
         total += chunk.len() as u64;
     }
@@ -1122,5 +1157,79 @@ mod tests {
             .to_string();
         assert!(error.contains(&format!("{TAG}/boot.ipxe")), "{error}");
         assert!(error.contains("404"), "{error}");
+    }
+
+    /// A server that accepts every connection, reads the request, sends
+    /// `prefix`, then holds the connection open and sends nothing more.
+    /// Returns its URL.
+    async fn stalling_server(prefix: &'static [u8]) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((mut stream, _)) = listener.accept().await {
+                // Answer only once the request is in: hyper drops a
+                // connection that talks before it has asked anything.
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 1024];
+                while !request.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut buffer).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => request.extend_from_slice(&buffer[..read]),
+                    }
+                }
+                let _ = stream.write_all(prefix).await;
+                held.push(stream);
+            }
+        });
+        (format!("http://{address}/os-channel.json"), server)
+    }
+
+    /// Short enough that a stalled test fails fast.
+    const SHORT_IDLE: std::time::Duration = std::time::Duration::from_millis(200);
+
+    #[tokio::test]
+    async fn a_server_that_accepts_and_never_answers_fails_the_fetch_after_the_idle_timeout() {
+        let (url, server) = stalling_server(b"").await;
+        let client = download_client(std::time::Duration::from_secs(1), SHORT_IDLE).unwrap();
+        let started = std::time::Instant::now();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(10), fetch(&client, &url))
+            .await
+            .expect("the fetch hung on a stalled server")
+            .unwrap_err()
+            .to_string();
+        server.abort();
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(error.contains(&url), "{error}");
+        assert!(
+            error.contains("timed out waiting for the server to send more"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_that_stalls_mid_file_fails_the_download_and_leaves_no_file() {
+        let (url, server) = stalling_server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\nthe first few bytes",
+        )
+        .await;
+        let client = download_client(std::time::Duration::from_secs(1), SHORT_IDLE).unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let path = target.path().join("reliaburger-os.raw.zst");
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            stream_to(&client, &url, &path),
+        )
+        .await
+        .expect("the download hung on a stalled server")
+        .unwrap_err()
+        .to_string();
+        server.abort();
+        assert!(
+            error.contains("timed out waiting for the server to send more"),
+            "{error}"
+        );
+        assert!(!path.exists(), "a stalled download left {}", path.display());
     }
 }

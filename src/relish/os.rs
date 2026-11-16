@@ -27,10 +27,8 @@ pub async fn newest(channel_url: &str, trust: &ChannelTrust) -> Result<String, R
     if let Some(warning) = trust.warning() {
         eprintln!("relish os: {warning}");
     }
-    let client = crate::http_client::builder()
-        .user_agent("relish")
-        .build()
-        .map_err(|e| failed(&e.to_string()))?;
+    let client =
+        super::image::download_client(super::image::CONNECT_TIMEOUT, super::image::IDLE_TIMEOUT)?;
     let channel = super::image::fetch(&client, channel_url).await?;
     let signature = super::image::fetch(&client, &format!("{channel_url}.sig")).await?;
     Ok(trust.verify(&channel, &signature)?.version)
