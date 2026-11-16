@@ -532,6 +532,9 @@ pub struct TaskArrayNode {
     root_durable: Arc<std::sync::atomic::AtomicBool>,
     /// One permit, for [`SyncClaim`].
     sync_gate: Arc<Semaphore>,
+    /// Fires when Bun starts stopping: no array starts another attempt
+    /// (#1965).
+    draining: CancellationToken,
     /// Runs at the start of the control-fence check, so a test can make
     /// the disk hang there.
     #[cfg(test)]
@@ -562,6 +565,7 @@ impl TaskArrayNode {
             grant_syncs: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             root_durable: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sync_gate: Arc::new(Semaphore::new(1)),
+            draining: CancellationToken::new(),
             runner: Arc::new(runner),
             arrays: Mutex::new(HashMap::new()),
             #[cfg(test)]
@@ -588,6 +592,15 @@ impl TaskArrayNode {
         telemetry: Arc<crate::mayo::job_metrics::JobTelemetry>,
     ) -> Self {
         self.telemetry = telemetry;
+        self
+    }
+
+    /// Start no new attempt once `draining` fires, which Bun does when it
+    /// starts stopping. Attempts already running carry on; tasks that
+    /// haven't started and retries still to come end as not run, and the
+    /// restarted node runs them (#1965).
+    pub fn with_draining(mut self, draining: CancellationToken) -> Self {
+        self.draining = draining;
         self
     }
 
@@ -1029,7 +1042,8 @@ impl TaskArrayNode {
                     config,
                     Arc::clone(&self.slots),
                 )
-                .with_budget(Arc::clone(&self.budget), assignment.resources),
+                .with_budget(Arc::clone(&self.budget), assignment.resources)
+                .with_draining(self.draining.child_token()),
             ),
             ledger: handle,
             writer,
@@ -1699,6 +1713,14 @@ async fn run_chunk(
         return;
     }
     telemetry.record_durations(&labels, &outcome.result.duration_counts);
+    // A chunk the node's stop cut short isn't finished (#1965). Reported,
+    // the leader would retire it with its unrun tasks counted as not run
+    // for good. Unreported, the chunk stays held, and the restarted node
+    // runs what its ledger lacks: not-run records don't count there. A
+    // stopping array's chunk is different: its unrun tasks are final.
+    if pool.draining() && !cancel.is_cancelled() && outcome.result.not_run > 0 {
+        return;
+    }
     // Keyed by attempt too: a taken-back run finishing late mustn't
     // overwrite the result of the chunk's newer grant on this node.
     finished
@@ -2809,6 +2831,58 @@ mod tests {
         let progress = sync_until_finished(&node, &request(vec![array]), 2).await;
         let not_run: u32 = progress.finished.iter().map(|r| r.not_run).sum();
         assert_eq!(not_run, 20);
+    }
+
+    #[tokio::test]
+    async fn a_stopping_node_retries_nothing_and_its_restart_runs_the_task() {
+        // #1965: the first attempt fails, and Bun starts stopping while it
+        // runs. The task must not use up its attempts in the stop window,
+        // and its chunk must not report the unrun task to the leader as
+        // done: the restarted node runs it.
+        let root = tempfile::tempdir().unwrap();
+        let shutdown = CancellationToken::new();
+        let stop = shutdown.clone();
+        let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counted = Arc::clone(&attempts);
+        let node = fake_node(
+            root.path(),
+            FakeRunner::new(Duration::ZERO, move |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                stop.cancel();
+                AttemptOutcome::Exited { code: 1 }
+            }),
+        )
+        .with_draining(shutdown.child_token());
+        let sync = request(vec![assignment(1, 1, &[(0, 1)])]);
+        node.sync(&sync).await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let row = loop {
+            if let Ok(rows) = node.results(1, false, 10).await
+                && let Some(row) = rows.into_iter().next()
+            {
+                break row;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "no record");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        assert!(row.not_run, "{row:?}");
+        assert_eq!(row.attempts, 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        for _ in 0..5 {
+            let progress = node.sync(&sync).await.unwrap().arrays.remove(0);
+            assert!(
+                progress.finished.is_empty(),
+                "a drained chunk was reported finished: {progress:?}"
+            );
+            assert_eq!(progress.counters.failed, 0);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        drop(node);
+
+        let restarted = fake_node(root.path(), FakeRunner::always_succeeds());
+        let progress = sync_until_finished(&restarted, &sync, 1).await;
+        assert_eq!(progress.finished[0].succeeded, 1);
+        assert_eq!(progress.finished[0].not_run, 0);
     }
 
     #[tokio::test]

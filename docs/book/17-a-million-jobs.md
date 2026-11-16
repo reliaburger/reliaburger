@@ -119,6 +119,29 @@ The `::<RECORD_BYTES>` is a *turbofish*, the syntax for passing a generic parame
 
 A block cut short by a crash at the very end is truncated before new records are appended: nobody was told those records were durable. Damage anywhere earlier is an error, not a skip, because skipping would silently re-run or lose finished tasks. Anything in a held chunk without a terminal record runs again. That's at-least-once execution, and it's a deliberate trade for tasks this short.
 
+#### A stopping node starts no new attempts
+
+The 0.3.0 rehearsal's soak stops the whole cluster gracefully and starts it again. During one of those stops, an ordinary task used all three of its attempts and failed for good: `wget: download timed out` ([#1965](https://github.com/reliaburger/reliaburger/issues/1965)). Its node's Bun took 9 seconds to shut down. Its peers' VMs were already off by then, and the soak's verifier on the same node was stopping too, so every attempt the task started in that window failed. Bun got SIGTERM and then went on retrying.
+
+Nothing told the pool to stop. Bun cancels one `CancellationToken`, `shutdown`, when the signal arrives, and almost every long-lived task watches it. The task arrays didn't. Each array has its own token, but it fires only when the leader stops the array, or when the ledger can't be written, and it does more than stop new work: the runner SIGTERMs every attempt it's running. We didn't want that on a node stop. A running attempt already has its way through a restart: it ends as `Unknown`, or replays when the job allows it.
+
+So the pool takes a second token, `draining`, which it checks but never hands to the runner:
+
+```rust
+let node_permit = tokio::select! {
+    biased;
+    () = self.cancel.cancelled() => None,
+    () = self.draining.cancelled() => None,
+    permit = Arc::clone(&self.node_slots).acquire_owned() => permit.ok(),
+};
+```
+
+The same branch sits in front of the retry backoff, the per-array slot and the resource budget, and an `is_cancelled()` check comes last, just before the launch. Once the token fires, the task ends as not run, and `attempts` counts only the attempts that really started. Bun's `main` hands the node `shutdown.child_token()`. A *child token* is cancelled when its parent is, but cancelling the child leaves the parent alone, so the task-array code can never stop the rest of Bun by mistake.
+
+There's one more step. A chunk with not-run tasks counts as finished, and the leader would retire it, with those tasks counted as not run for good. That's right when the user stopped the array, and wrong here. So a chunk that the drain cut short doesn't report itself. It stays held, its not-run records go to the ledger, and the restarted node runs what the ledger lacks, because a not-run record doesn't count as an outcome there.
+
+`a_draining_pool_retries_nothing_and_leaves_the_task_not_run` in `src/bun/task_executor.rs` fails a task's first attempt and fires the token inside it. The task must end not run after one attempt. Without the token it failed after three. `a_draining_pool_launches_no_task_that_had_not_started` and `draining_lets_a_running_attempt_finish` check the other two edges. `a_stopping_node_retries_nothing_and_its_restart_runs_the_task` in `src/bun/task_array_node.rs` goes through the node: the drained chunk isn't reported, and a node restarted on the same directory runs the task and succeeds. The soak harness got a fix as well: its verifier's systemd unit now starts `Before=reliaburger.service`, and systemd stops units in the reverse order, so the verifier outlives Bun.
+
 ### Putting it together, in one process
 
 The acceptance test in the portable suite wires three simulated nodes (each a real pool with a fake runner and a real ledger on disk) to the real leader state and grant policy. One task in a hundred fails its first attempt and succeeds on retry. A third of the way through, node n3 is lost: its chunks go back to the queue at the next attempt, and its late reports are refused by the fence. At the end every index has exactly one accepted outcome, exactly one retry is counted per failing index, and the three ledgers between them hold a terminal record for all of them. The suite runs 100,000 tasks, which takes about three seconds in a debug build. With the full million it took 30.6 seconds on the laptop, about 32,700 tasks a second, and the leader changed its state in 422 ticks. Real processes will be far slower than a fake; the Criterion suite (`make bench-task-arrays`) measures the machine's fork/exec floor through the real runner, so we'll know by how much before promising anyone a number.

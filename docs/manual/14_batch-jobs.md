@@ -76,6 +76,17 @@ which it is, it retries, because the command never ran. Either way the reason
 is the failed task's output, so `relish batch logs ID --index N` shows it, and Bun
 logs it on stderr with the batch ID, task index and attempt (at most 20 lines a
 minute per run; the next line says how many it left out).
+
+A stopping node starts no new attempts. Once Bun gets SIGTERM, it launches no
+task it hadn't started and no retry still waiting out its backoff. Those tasks
+end as not run, without using up their attempts. Their chunks aren't reported
+to the leader as done, so the restarted node runs them again. An attempt
+already running carries on and isn't stopped. If Bun exits before it finishes,
+the restart treats it like any other interrupted attempt: an `Unknown` outcome,
+or a replay when the job sets `replay_unknown = true`. Before this, a task
+whose first attempt failed during a stop spent its retries while the rest of
+the cluster was shutting down too, and could fail for good (#1965).
+
 A successful launch isn't evidence of successful work. Explicit bulk
 submissions retain at-least-once replay, including a one-element array. This is
 a retry policy on the common engine.
