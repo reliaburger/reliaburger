@@ -9381,6 +9381,75 @@ pull read the same JSON. Two unit tests (one per spelling) failed first, and
 the input that found it now lives in the corpus. After the fix, three minutes
 per target (about two million inputs across the nine) found nothing else.
 
+### Watching less, running more
+
+The first long campaign, a weekend on the Mac Studio in November (156
+worker-hours, 472 million inputs over twelve targets), found nothing new. It
+did find out where the time went. libFuzzer learns from *coverage counters*:
+the compiler gives every branch a byte, the branch bumps it, and after each
+input libFuzzer scans the whole table for bytes that changed. cargo-fuzz puts
+its instrumentation flags in `RUSTFLAGS`, and those reach every crate in the
+build. Ours pulls in tokio, axum, rustls, datafusion and six hundred more, so
+each target carried about 15.3 million counters, nearly all of them for code
+no decoder ever reaches. Most of each execution was spent reading zeros.
+
+The fix is to instrument only what the decoders run through: reliaburger
+itself, and the parsers it hands bytes to (serde_json, postcard, toml,
+hickory-proto, x509-parser and a few more)
+([#1953](https://github.com/reliaburger/reliaburger/issues/1953)). The obvious
+tool didn't work. Nightly Cargo can set `rustflags` per package in a profile,
+and LLVM keeps the last `-sanitizer-coverage-level` it's given, so setting it to
+0 for every dependency looked like a one-line change. Cargo puts a profile's
+flags *before* `RUSTFLAGS`, though, so cargo-fuzz's level 4 came last and won.
+The build ran, and the counter count didn't move.
+
+What did work is a `RUSTC_WRAPPER`, Cargo's hook for running every `rustc`
+call through another program first (it's how sccache works).
+[`fuzz/rustc-coverage.sh`](../../fuzz/rustc-coverage.sh) reads the crate name
+from the arguments and, for anything not on its list, drops
+`-Cpasses=sancov-module`, the flag that turns on the coverage pass.
+AddressSanitizer is a separate flag and stays on everywhere, so a buffer
+overflow in a dependency still stops the run. Generic code helps here: a
+serde derive or serde_json's reader is compiled into the crate that uses it,
+so most of what a decoder runs is reliaburger's own code even when it
+started life in a dependency.
+
+One trap remained. Cargo doesn't fingerprint the wrapper, so the first
+narrowed build reused every dependency it had built before, fully
+instrumented, and again nothing changed. The Makefile now adds a `--cfg`
+named after the wrapper's checksum to `RUSTFLAGS`, which Cargo does
+fingerprint. Nothing reads it; its only job is to make a changed list rebuild.
+
+Each target now carries 4.3 million counters instead of 15.3 million, and
+reliaburger's own share didn't shrink: its compiled objects hold the same
+counters either way, and only crates such as tokio drop to none. On the same
+machine, a minute from the seed corpus ran about 3.6 times as many inputs:
+
+| Target | Inputs a second, before | After | Speed-up |
+|---|---|---|---|
+| `app_config` | 259 | 915 | 3.5× |
+| `dns_query` | 277 | 987 | 3.6× |
+| `oci_manifest_push` | 287 | 1,030 | 3.6× |
+
+Faster only matters if it finds more, so we replayed each minute's corpus
+through the *old*, fully instrumented build, which counts the same way for
+both. The narrowed runs' corpora reached more: 1,704 coverage points against
+1,253 for `dns_query`, 1,410 against 1,165 for `oci_manifest_push`, and 24,171
+against 23,631 for `app_config`. The nightly job gets the same three and a
+half times the inputs in the same five minutes a target, and the job summary
+now shows each target's counter count, so a build that's quietly instrumenting
+everything again shows up as a number in the millions.
+
+Measuring it turned up a second leak, a bigger one. The nightly job had been
+timing out: it spent 25 minutes on each five-minute target. A release build
+packs the source tree into `relish` for `relish source`, and its build script
+tells Cargo to rebuild whenever anything in that tree changes, `fuzz/`
+included. Every fuzz run writes its log and its new corpus files under
+`fuzz/target/`, so each target rebuilt the whole crate, twice: once because
+`cargo fuzz build` was writing its log, and again before the run. A fuzz
+target never reads the bundle, so the build script now skips it when the
+`fuzzing` feature is on, and a target starts in seconds.
+
 The next step is OSS-Fuzz, which runs the same cargo-fuzz targets on
 Google's machines around the clock. That wants targets that have run clean
 nightly for a while first, so it's a follow-up.

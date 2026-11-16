@@ -111,12 +111,15 @@ jobs:
           {
             echo '## Fuzzing'
             echo
-            echo '| Target | Last status line |'
-            echo '| --- | --- |'
+            echo '| Target | Coverage counters | Last status line |'
+            echo '| --- | --- | --- |'
             for log in fuzz/target/logs/*.log; do
               [ -e "$log" ] || continue
+              # Only the decoder crates are instrumented (#1953): a count in
+              # the millions means the whole dependency tree is again.
+              counters=$(grep -oE '[0-9]+ inline 8-bit counters' "$log" | head -n 1 | cut -d' ' -f1)
               line=$(grep -E '^#[0-9]+' "$log" | tail -n 1)
-              echo "| $(basename "$log" .log) | \`${line}\` |"
+              echo "| $(basename "$log" .log) | ${counters} | \`${line}\` |"
             done
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Keep any crashing input
