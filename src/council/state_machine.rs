@@ -388,6 +388,66 @@ impl StateMachineInner {
         self.apply_request_at(request, position)
     }
 
+    /// Why a new bun upgrade (or the resume of a paused one) can't start,
+    /// if it can't. Raft applies one entry at a time, so this is where two
+    /// racing starts are told apart (M13).
+    fn refuse_upgrade_start(
+        &self,
+        start: &crate::upgrade::types::ClusterUpgradeState,
+    ) -> Option<String> {
+        // A bun upgrade and an OS rollout both restart nodes; never start
+        // one while the other holds the fleet.
+        if let Some(rollout) = &self.state.os_rollout {
+            return Some(format!(
+                "OS rollout {} is in progress; resume or abort it first",
+                rollout.rollout_id
+            ));
+        }
+        if let Some(active) = &self.state.active_upgrade {
+            // A resume renames a paused run and replaces it.
+            let paused = matches!(
+                active.phase,
+                crate::upgrade::types::ClusterUpgradePhase::Paused { .. }
+            );
+            if !paused || active.upgrade_id == start.upgrade_id {
+                return Some(format!("upgrade {} is in progress", active.upgrade_id));
+            }
+        }
+        self.state
+            .upgrade_history
+            .iter()
+            .any(|ended| ended.upgrade_id == start.upgrade_id)
+            .then(|| format!("upgrade {} has already run", start.upgrade_id))
+    }
+
+    /// Why a new OS rollout (or the resume of a paused one) can't start,
+    /// if it can't: the same rules as [`Self::refuse_upgrade_start`].
+    fn refuse_os_rollout_start(&self, start: &crate::os::rollout::OsRollout) -> Option<String> {
+        if let Some(upgrade) = &self.state.active_upgrade {
+            return Some(format!(
+                "bun upgrade {} is in progress; finish or abort it first",
+                upgrade.upgrade_id
+            ));
+        }
+        if let Some(active) = &self.state.os_rollout {
+            let paused = matches!(
+                active.phase,
+                crate::os::rollout::OsRolloutPhase::Paused { .. }
+            );
+            if !paused || active.rollout_id == start.rollout_id {
+                return Some(format!(
+                    "OS rollout {} to {} is in progress",
+                    active.rollout_id, active.target
+                ));
+            }
+        }
+        self.state
+            .os_rollout_history
+            .iter()
+            .any(|ended| ended.rollout_id == start.rollout_id)
+            .then(|| format!("OS rollout {} has already run", start.rollout_id))
+    }
+
     fn apply_request_at(
         &mut self,
         request: &RaftRequest,
@@ -1243,35 +1303,30 @@ impl StateMachineInner {
                     .cloned()
                     .collect();
             }
-            RaftRequest::UpgradeUpdate { state } => {
-                // Reject starting a *different* upgrade while one is actively in
-                // progress (M13). The start/rollback handlers check
-                // `active_upgrade` then write, which is racy — two concurrent
-                // starts both passed the is_some() guard and the second
-                // clobbered the first plan mid-flight. Serialised Raft apply is
-                // the right place to enforce it.
-                //
-                // A resume legitimately renames the run to a fresh id and
-                // replaces a *Paused* upgrade, so only a different-id write
-                // against a non-paused active upgrade is the race to block; a
-                // same-id phase update, or a resume of a paused run, still
-                // applies.
-                if let Some(active) = &self.state.active_upgrade
-                    && active.upgrade_id != state.upgrade_id
-                    && !matches!(
-                        active.phase,
-                        crate::upgrade::types::ClusterUpgradePhase::Paused { .. }
-                    )
-                {
-                    return None;
+            RaftRequest::UpgradeStart { state } => {
+                if let Some(reason) = self.refuse_upgrade_start(state) {
+                    return Some(CouncilResponse::Refused { reason });
                 }
-                // A bun upgrade and an OS rollout both restart nodes; never
-                // start one while the other holds the fleet.
-                if self.state.os_rollout.is_some()
-                    && self.state.active_upgrade.as_ref().map(|a| &a.upgrade_id)
-                        != Some(&state.upgrade_id)
-                {
-                    return None;
+                self.state.active_upgrade = Some(*state.clone());
+            }
+            RaftRequest::UpgradeUpdate { state } => {
+                // Progress only: the run must still be the active one. The
+                // orchestrator and the abort handler each read the run,
+                // work, then write; a write computed before an abort or a
+                // completion must not bring the run back once it's ended or
+                // been cleared.
+                let current = self.state.active_upgrade.as_ref().is_some_and(|active| {
+                    active.upgrade_id == state.upgrade_id
+                        && !matches!(
+                            active.phase,
+                            crate::upgrade::types::ClusterUpgradePhase::Completed
+                                | crate::upgrade::types::ClusterUpgradePhase::Aborted { .. }
+                        )
+                });
+                if !current {
+                    return Some(CouncilResponse::Refused {
+                        reason: format!("upgrade {} isn't in progress", state.upgrade_id),
+                    });
                 }
                 self.state.active_upgrade = Some(*state.clone());
             }
@@ -1288,21 +1343,24 @@ impl StateMachineInner {
                     }
                 }
             }
-            RaftRequest::OsRolloutUpdate { rollout } => {
-                // The same guards as a bun upgrade's (M13): no different
-                // rollout over a running one (a resume replaces a paused
-                // one), and none while a bun upgrade holds the fleet.
-                if self.state.active_upgrade.is_some() {
-                    return None;
+            RaftRequest::OsRolloutStart { rollout } => {
+                if let Some(reason) = self.refuse_os_rollout_start(rollout) {
+                    return Some(CouncilResponse::Refused { reason });
                 }
-                if let Some(active) = &self.state.os_rollout
-                    && active.rollout_id != rollout.rollout_id
-                    && !matches!(
-                        active.phase,
-                        crate::os::rollout::OsRolloutPhase::Paused { .. }
-                    )
-                {
-                    return None;
+                self.state.os_rollout = Some(*rollout.clone());
+            }
+            RaftRequest::OsRolloutUpdate { rollout } => {
+                // Progress only, as for a bun upgrade: the leader's loop
+                // reads the rollout, waits on the nodes for up to 30 s, then
+                // writes. `relish os abort` in between ends and clears it,
+                // and the late write must not bring it back.
+                let current = self.state.os_rollout.as_ref().is_some_and(|active| {
+                    active.rollout_id == rollout.rollout_id && !active.phase.is_terminal()
+                });
+                if !current {
+                    return Some(CouncilResponse::Refused {
+                        reason: format!("OS rollout {} isn't in progress", rollout.rollout_id),
+                    });
                 }
                 self.state.os_rollout = Some(*rollout.clone());
             }
@@ -8461,14 +8519,17 @@ mod tests {
     #[test]
     fn upgrade_update_replaces_active_state() {
         let mut inner = StateMachineInner::default();
-        inner.apply_request(&RaftRequest::UpgradeUpdate {
+        inner.apply_request(&RaftRequest::UpgradeStart {
             state: Box::new(upgrade_state("up-1")),
         });
         let mut advanced = upgrade_state("up-1");
         advanced.phase = crate::upgrade::types::ClusterUpgradePhase::UpgradingWorkers;
-        inner.apply_request(&RaftRequest::UpgradeUpdate {
-            state: Box::new(advanced.clone()),
-        });
+        assert_eq!(
+            inner.apply_request(&RaftRequest::UpgradeUpdate {
+                state: Box::new(advanced.clone()),
+            }),
+            None
+        );
 
         assert_eq!(inner.state.active_upgrade, Some(advanced));
         assert!(inner.state.upgrade_history.is_empty());
@@ -8490,22 +8551,30 @@ mod tests {
         )
     }
 
+    fn is_refused(response: Option<CouncilResponse>) -> bool {
+        matches!(response, Some(CouncilResponse::Refused { .. }))
+    }
+
     #[test]
     fn an_os_rollout_and_a_bun_upgrade_never_overlap() {
         let mut inner = StateMachineInner::default();
-        inner.apply_request(&RaftRequest::OsRolloutUpdate {
+        inner.apply_request(&RaftRequest::OsRolloutStart {
             rollout: Box::new(os_rollout("os-1")),
         });
-        inner.apply_request(&RaftRequest::UpgradeUpdate {
-            state: Box::new(upgrade_state("up-1")),
-        });
+        assert!(is_refused(inner.apply_request(
+            &RaftRequest::UpgradeStart {
+                state: Box::new(upgrade_state("up-1")),
+            }
+        )));
         assert!(
             inner.state.active_upgrade.is_none(),
             "no bun upgrade during an OS rollout"
         );
-        inner.apply_request(&RaftRequest::OsRolloutUpdate {
-            rollout: Box::new(os_rollout("os-2")),
-        });
+        assert!(is_refused(inner.apply_request(
+            &RaftRequest::OsRolloutStart {
+                rollout: Box::new(os_rollout("os-2")),
+            }
+        )));
         assert_eq!(inner.state.os_rollout.as_ref().unwrap().rollout_id, "os-1");
 
         inner.apply_request(&RaftRequest::OsRolloutClear {
@@ -8514,12 +8583,14 @@ mod tests {
         assert!(inner.state.os_rollout.is_none());
         assert_eq!(inner.state.os_rollout_history.len(), 1);
 
-        inner.apply_request(&RaftRequest::UpgradeUpdate {
+        inner.apply_request(&RaftRequest::UpgradeStart {
             state: Box::new(upgrade_state("up-1")),
         });
-        inner.apply_request(&RaftRequest::OsRolloutUpdate {
-            rollout: Box::new(os_rollout("os-3")),
-        });
+        assert!(is_refused(inner.apply_request(
+            &RaftRequest::OsRolloutStart {
+                rollout: Box::new(os_rollout("os-3")),
+            }
+        )));
         assert!(
             inner.state.os_rollout.is_none(),
             "no OS rollout during a bun upgrade"
@@ -8529,6 +8600,9 @@ mod tests {
     #[test]
     fn a_paused_os_rollout_can_be_resumed_under_a_new_id() {
         let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::OsRolloutStart {
+            rollout: Box::new(os_rollout("os-1")),
+        });
         let mut paused = os_rollout("os-1");
         paused.phase = crate::os::rollout::OsRolloutPhase::Paused {
             reason: "n1 fell back".into(),
@@ -8536,13 +8610,95 @@ mod tests {
         inner.apply_request(&RaftRequest::OsRolloutUpdate {
             rollout: Box::new(paused.clone()),
         });
-        inner.apply_request(&RaftRequest::OsRolloutUpdate {
-            rollout: Box::new(crate::os::rollout::resume(paused, 10)),
-        });
+        assert_eq!(
+            inner.apply_request(&RaftRequest::OsRolloutStart {
+                rollout: Box::new(crate::os::rollout::resume(paused, 10)),
+            }),
+            None
+        );
         assert_eq!(
             inner.state.os_rollout.as_ref().unwrap().rollout_id,
             "os-1-retry"
         );
+    }
+
+    /// The leader's loop reads the rollout, waits on a node for up to 30 s
+    /// and writes what it learnt. `relish os abort` in that window writes
+    /// `Aborted`, then clears it; the late `Running` write must not bring
+    /// the rollout back.
+    #[test]
+    fn a_stale_os_rollout_update_after_an_abort_leaves_it_cleared() {
+        let mut inner = StateMachineInner::default();
+        let running = os_rollout("os-1");
+        inner.apply_request(&RaftRequest::OsRolloutStart {
+            rollout: Box::new(running.clone()),
+        });
+        let mut aborted = running.clone();
+        aborted.phase = crate::os::rollout::OsRolloutPhase::Aborted {
+            reason: "aborted by the operator".into(),
+        };
+        inner.apply_request(&RaftRequest::OsRolloutUpdate {
+            rollout: Box::new(aborted),
+        });
+        inner.apply_request(&RaftRequest::OsRolloutClear {
+            rollout_id: "os-1".into(),
+        });
+
+        let mut stale = running;
+        stale.nodes[0].phase = crate::os::rollout::OsNodePhase::Draining;
+        assert!(is_refused(inner.apply_request(
+            &RaftRequest::OsRolloutUpdate {
+                rollout: Box::new(stale.clone()),
+            }
+        )));
+        assert!(inner.state.os_rollout.is_none(), "the abort stands");
+        // Nor can the same id start again.
+        assert!(is_refused(inner.apply_request(
+            &RaftRequest::OsRolloutStart {
+                rollout: Box::new(stale),
+            }
+        )));
+        assert!(inner.state.os_rollout.is_none());
+    }
+
+    /// The same stale write landing between the abort's two writes.
+    #[test]
+    fn a_stale_os_rollout_update_between_abort_and_clear_is_refused() {
+        let mut inner = StateMachineInner::default();
+        let running = os_rollout("os-1");
+        inner.apply_request(&RaftRequest::OsRolloutStart {
+            rollout: Box::new(running.clone()),
+        });
+        let mut aborted = running.clone();
+        aborted.phase = crate::os::rollout::OsRolloutPhase::Aborted {
+            reason: "aborted by the operator".into(),
+        };
+        inner.apply_request(&RaftRequest::OsRolloutUpdate {
+            rollout: Box::new(aborted.clone()),
+        });
+
+        assert!(is_refused(inner.apply_request(
+            &RaftRequest::OsRolloutUpdate {
+                rollout: Box::new(running),
+            }
+        )));
+        assert_eq!(inner.state.os_rollout, Some(aborted));
+        inner.apply_request(&RaftRequest::OsRolloutClear {
+            rollout_id: "os-1".into(),
+        });
+        assert!(inner.state.os_rollout.is_none());
+        assert_eq!(inner.state.os_rollout_history.len(), 1);
+    }
+
+    #[test]
+    fn an_os_rollout_update_never_starts_a_rollout() {
+        let mut inner = StateMachineInner::default();
+        assert!(is_refused(inner.apply_request(
+            &RaftRequest::OsRolloutUpdate {
+                rollout: Box::new(os_rollout("os-1")),
+            }
+        )));
+        assert!(inner.state.os_rollout.is_none());
     }
 
     #[test]
@@ -8565,17 +8721,19 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_update_ignores_a_concurrent_different_start() {
+    fn upgrade_start_refuses_a_concurrent_different_start() {
         // M13: a second start with a *different* upgrade id while one is active
         // must not clobber the first plan (the racy check-then-write let two
-        // concurrent starts through). A same-id update still applies.
+        // concurrent starts through).
         let mut inner = StateMachineInner::default();
-        inner.apply_request(&RaftRequest::UpgradeUpdate {
+        inner.apply_request(&RaftRequest::UpgradeStart {
             state: Box::new(upgrade_state("up-1")),
         });
-        inner.apply_request(&RaftRequest::UpgradeUpdate {
-            state: Box::new(upgrade_state("up-2")),
-        });
+        assert!(is_refused(inner.apply_request(
+            &RaftRequest::UpgradeStart {
+                state: Box::new(upgrade_state("up-2")),
+            }
+        )));
         assert_eq!(
             inner.state.active_upgrade.as_ref().unwrap().upgrade_id,
             "up-1",
@@ -8584,12 +8742,15 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_update_allows_a_resume_of_a_paused_run() {
+    fn upgrade_start_allows_a_resume_of_a_paused_run() {
         // M13 regression guard: `upgrade resume` renames the run to a fresh id
         // and replaces the *paused* active upgrade. That must apply — the race
         // guard only blocks a different-id start against a *non-paused* active
         // upgrade, not a resume.
         let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::UpgradeStart {
+            state: Box::new(upgrade_state("up-1")),
+        });
         let mut paused = upgrade_state("up-1");
         paused.phase = crate::upgrade::types::ClusterUpgradePhase::Paused {
             reason: "worker reverted".to_string(),
@@ -8598,9 +8759,12 @@ mod tests {
             state: Box::new(paused),
         });
         // Resume: a fresh id, non-paused phase.
-        inner.apply_request(&RaftRequest::UpgradeUpdate {
-            state: Box::new(upgrade_state("up-1-resume")),
-        });
+        assert_eq!(
+            inner.apply_request(&RaftRequest::UpgradeStart {
+                state: Box::new(upgrade_state("up-1-resume")),
+            }),
+            None
+        );
         assert_eq!(
             inner.state.active_upgrade.as_ref().unwrap().upgrade_id,
             "up-1-resume",
@@ -8608,10 +8772,53 @@ mod tests {
         );
     }
 
+    /// The bun upgrade has the OS rollout's race: the orchestrator reads
+    /// the run, steps it (HTTP to a node), then writes. A run aborted and
+    /// cleared in between must stay cleared, and so must one between the
+    /// abort's two writes.
+    #[test]
+    fn a_stale_upgrade_update_cannot_bring_back_an_aborted_run() {
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::UpgradeStart {
+            state: Box::new(upgrade_state("up-1")),
+        });
+        let mut aborted = upgrade_state("up-1");
+        aborted.phase = crate::upgrade::types::ClusterUpgradePhase::Aborted {
+            reason: "aborted by the operator".into(),
+        };
+        inner.apply_request(&RaftRequest::UpgradeUpdate {
+            state: Box::new(aborted.clone()),
+        });
+        let mut stale = upgrade_state("up-1");
+        stale.phase = crate::upgrade::types::ClusterUpgradePhase::UpgradingWorkers;
+        assert!(is_refused(inner.apply_request(
+            &RaftRequest::UpgradeUpdate {
+                state: Box::new(stale.clone()),
+            }
+        )));
+        assert_eq!(inner.state.active_upgrade, Some(aborted));
+
+        inner.apply_request(&RaftRequest::UpgradeClear {
+            upgrade_id: "up-1".into(),
+        });
+        assert!(is_refused(inner.apply_request(
+            &RaftRequest::UpgradeUpdate {
+                state: Box::new(stale.clone()),
+            }
+        )));
+        assert!(inner.state.active_upgrade.is_none(), "the abort stands");
+        assert!(is_refused(inner.apply_request(
+            &RaftRequest::UpgradeStart {
+                state: Box::new(stale),
+            }
+        )));
+        assert!(inner.state.active_upgrade.is_none());
+    }
+
     #[test]
     fn upgrade_clear_archives_to_history() {
         let mut inner = StateMachineInner::default();
-        inner.apply_request(&RaftRequest::UpgradeUpdate {
+        inner.apply_request(&RaftRequest::UpgradeStart {
             state: Box::new(upgrade_state("up-1")),
         });
 
@@ -8634,7 +8841,7 @@ mod tests {
         let mut inner = StateMachineInner::default();
         for i in 0..25 {
             let id = format!("up-{i}");
-            inner.apply_request(&RaftRequest::UpgradeUpdate {
+            inner.apply_request(&RaftRequest::UpgradeStart {
                 state: Box::new(upgrade_state(&id)),
             });
             inner.apply_request(&RaftRequest::UpgradeClear { upgrade_id: id });
@@ -8646,7 +8853,7 @@ mod tests {
     #[test]
     fn snapshot_with_active_upgrade_roundtrips() {
         let mut inner = StateMachineInner::default();
-        inner.apply_request(&RaftRequest::UpgradeUpdate {
+        inner.apply_request(&RaftRequest::UpgradeStart {
             state: Box::new(upgrade_state("up-1")),
         });
 

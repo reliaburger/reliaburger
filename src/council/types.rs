@@ -227,7 +227,10 @@ pub enum RaftRequest {
     // NOTE: the log and the Raft RPC are JSON, which tags each variant by its
     // name, so renaming a variant changes the format and reordering doesn't.
     // New variants still go at the end, which keeps the history readable.
-    /// Start or advance a cluster-wide rolling binary upgrade (Phase 14).
+    /// Advance the cluster-wide rolling binary upgrade in progress (Phase
+    /// 14). Refused unless the active upgrade has the same id and hasn't
+    /// ended, so a write computed before an abort can't bring it back; a
+    /// new run or a resume is [`RaftRequest::UpgradeStart`].
     UpgradeUpdate {
         state: Box<crate::upgrade::types::ClusterUpgradeState>,
     },
@@ -391,7 +394,10 @@ pub enum RaftRequest {
     QuotaBlocked {
         blocked: Vec<(AppId, crate::meat::quota::QuotaError)>,
     },
-    /// Start or advance an appliance OS rollout (W6).
+    /// Advance the appliance OS rollout in progress (W6). Refused unless
+    /// the active rollout has the same id and hasn't ended, so a write the
+    /// leader computed before `relish os abort` can't bring it back; a new
+    /// rollout or a resume is [`RaftRequest::OsRolloutStart`].
     OsRolloutUpdate {
         rollout: Box<crate::os::rollout::OsRollout>,
     },
@@ -652,6 +658,18 @@ pub enum RaftRequest {
     /// The leader's reaper: drop the specs of proposals that can't be
     /// undone any more, and the oldest records beyond the limit.
     ProposalCompact { now_unix_ms: u64 },
+    /// Start a cluster-wide rolling binary upgrade, or resume a paused one
+    /// under a new id. Refused while another run is active (unless it's
+    /// paused), during an OS rollout, or if the id has run before.
+    UpgradeStart {
+        state: Box<crate::upgrade::types::ClusterUpgradeState>,
+    },
+    /// Start an appliance OS rollout, or resume a paused one under a new
+    /// id. Refused while another rollout is active (unless it's paused),
+    /// during a bun upgrade, or if the id has run before.
+    OsRolloutStart {
+        rollout: Box<crate::os::rollout::OsRollout>,
+    },
 }
 
 // ---------------------------------------------------------------------------
