@@ -49,10 +49,11 @@ image download` and `relish os` read. Today only a manual dispatch with
 `publish` set publishes. The weekly scheduled build (Monday 04:00 UTC,
 `cron: "0 4 * * 1"`) is switched off until v0.3.0 is promoted (maintainer,
 7 October 2026), so the 0.3.0 train reaching main publishes nothing by
-itself. **After v0.3.0 is promoted, restore the `schedule` trigger** in
-`appliance.yml`. Its plan job already treats a scheduled run on main as a
-publishing one, and a build whose packages match the last release publishes
-nothing.
+itself. **After v0.3.0 is promoted, dispatch a publish and restore the
+`schedule` trigger** in `appliance.yml`, as [step 8 of
+staging](#staging-a-candidate) says. Its plan job already treats a scheduled
+run on main as a publishing one, and a build whose packages match the last
+release publishes nothing.
 
 There's no Intel macOS build. 0.2.1 was the last release with
 `relish-macos-x86_64` (maintainer decision, 17 October 2026,
@@ -636,18 +637,6 @@ before it records a run.
 The move is a fresh cluster, as [from 0.2.0](#upgrading-from-020), with the
 same steps and the same losses.
 
-The 0.3.0 appliance train carries everything up to 0.2.7 plus the appliance
-OS rollout and the cluster-wide council size, both new Raft requests and new
-fields in council state, so its builds are at protocol 58 and state format
-74, one past 0.2.7's 57/73. A 0.2.x leader offered a 0.3.0 development build
-refuses it before it records a run, and the move is a fresh cluster.
-On that fresh cluster the root CA is offline (#709): `relish init` writes the
-root's private key only into the backup you name with `--root-backup`, and
-without a terminal it needs `--passphrase-file` or `--recipient` too. The
-setups that run on your machine write it there, sealed to a fresh age
-identity, and print both paths. `relish ca backup` now only re-seals such a
-backup (`--from`).
-
 ### Upgrading from 0.2.6
 
 0.2.7 keeps 0.2.6's formats, protocol 57 and state format 73: `CURRENT` in
@@ -681,6 +670,28 @@ before it records a run.
 The move is a fresh cluster, as [from 0.2.0](#upgrading-from-020), with the
 same steps and the same losses. A script that read `relish status -o json`
 as a list of instances should read `relish apps --instances -o json` instead.
+
+### Upgrading from 0.2.8
+
+0.3.0 can't roll onto a 0.2.8 cluster. The appliance OS rollout and the
+cluster-wide council size are new Raft requests and new fields in council
+state, and OIDC signing-key rotation adds two more requests and a field in
+the security state
+([#709](https://github.com/reliaburger/reliaburger/issues/709)); the full
+list is in `src/compatibility.rs`. So the protocol moved from 58 to 59 and
+the state format from 74 to 75, once for the whole release, and a 0.2.8
+leader refuses `relish upgrade start v0.3.0` before it records a run.
+
+The move is a fresh cluster, as [from 0.2.0](#upgrading-from-020), with the
+same steps and the same losses, and one change to how you start it: the root
+CA is now offline
+([#709](https://github.com/reliaburger/reliaburger/issues/709)). `relish
+init` writes the root's private key only into the backup you name with
+`--root-backup`, and without a terminal it needs `--passphrase-file` or
+`--recipient` too. The setups that run on your machine write it there,
+sealed to a fresh age identity, and print both paths. `relish ca backup` now
+only re-seals such a backup (`--from`). Keep that backup somewhere safe and
+off the cluster: it's the only copy of the root's key.
 
 ## Signing identity
 
@@ -1765,6 +1776,37 @@ the real `curl … | sh` install against it on every host we advertise.
    `docs/qualification/DATE-vX.Y.Z-release-notes.md`, above that list:
    `gh release edit vX.Y.Z --notes-file NOTES` with the draft followed by
    the generated list ([0.2.8's draft](qualification/2026-11-09-v0.2.8-release-notes.md)).
+
+   **Then publish the appliance OS**, from v0.3.0 on. `promote.yml` publishes
+   only `bun` and `relish`; the OS images that `relish image download` and
+   `relish os` read are published by `appliance.yml`, and only from `main`:
+
+   ```sh
+   gh workflow run appliance.yml --ref main -f publish=true
+   ```
+
+   With no `bun_release`, the image takes `bun` and `relish` from the newest
+   published `v*` release, the one you just promoted. The `sign` job runs in
+   the `release` environment, the only place `RELIABURGER_RELEASE_KEY`
+   lives, signs both architectures and the channel, and `publish` releases
+   them as `os-<version>-<arch>` and updates `os-channel.json` on the
+   `os-channel` release. A build whose packages match the last release
+   publishes nothing, so a patch release that changes no package is a no-op.
+
+   After v0.3.0's promotion, and only once, restore the weekly scheduled
+   publish the maintainer paused until then ([why](#what-the-workflow-builds)):
+   add back to `appliance.yml`'s `on:` block
+
+   ```yaml
+     schedule:
+       - cron: "0 4 * * 1"
+   ```
+
+   drop the paragraph saying it's off from the workflow's header and from
+   [What the workflow builds](#what-the-workflow-builds), and turn
+   `test_nothing_publishes_on_a_schedule_until_v0_3_0_is_promoted` in
+   `scripts/ci/test_ci_workflow.py` into a test that the schedule is there.
+   The plan job already treats a scheduled run on `main` as a publishing one.
 
 9. **Publish the performance records**, after the tag
    ([why](#performance-records-after-the-tag)). They don't block the release;

@@ -228,8 +228,10 @@ cluster can roll onto it in place
 0.2.8 moves the pair to protocol 58 and state format 74, and a 0.2.7
 cluster's leader refuses it
 ([upgrading from 0.2.7](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-027)).
-Development builds of 0.3.0, the appliance release, are at protocol 59 and
-state format 75, so a 0.2.x cluster's leader refuses them too.
+0.3.0 moves the pair to protocol 59 and state format 75, and a 0.2.8
+cluster's leader refuses it; its fresh cluster also keeps the root CA
+offline
+([upgrading from 0.2.8](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-028)).
 
 A laptop cluster says the same thing when you rerun the quickstart installer
 from a newer release over it. Its saved record names the release that set it

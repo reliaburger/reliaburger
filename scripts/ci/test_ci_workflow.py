@@ -1298,6 +1298,9 @@ class ApplianceTests(unittest.TestCase):
                     self.assertEqual(job.count("secrets.RELIABURGER_RELEASE_KEY"), 1)
                 else:
                     self.assertNotIn("RELIABURGER_RELEASE_KEY", job)
+        # The key is a secret of the `release` environment only, so a job
+        # without it reads an empty key and the publish fails.
+        self.assertRegex(self.jobs["sign"], r"(?m)^    environment: release$")
         actions = re.findall(r"uses: ([^@\s]+)@", self.jobs["sign"])
         self.assertTrue(actions)
         for action in actions:
@@ -1369,6 +1372,45 @@ class ApplianceTests(unittest.TestCase):
         boot = self.step("Boot test")
         self.assertIn(". image/tests/disk.sh", boot)
         self.assertIn("disk_from_image", boot)
+
+
+class ReleaseKeyEnvironmentTests(unittest.TestCase):
+    """RELIABURGER_RELEASE_KEY is a secret of the `release` environment and
+    nowhere else, so a job that reads it without naming that environment
+    gets an empty key and fails."""
+
+    # A job's environment: `release` itself, or main's `release` against a
+    # train's `nightly` (build.yml signs on main only, with the release key).
+    RELEASE = re.compile(
+        r"(?m)^    environment: (?:release|\$\{\{ github\.ref == 'refs/heads/main' "
+        r"&& 'release' \|\| 'nightly' \}\})$")
+
+    def test_every_job_reading_the_release_key_runs_in_the_release_environment(self):
+        readers = []
+        for path in sorted(WORKFLOWS.glob("*.yml")):
+            for name, job in jobs(path.read_text()).items():
+                if "secrets.RELIABURGER_RELEASE_KEY" not in job:
+                    continue
+                readers.append(f"{path.name}:{name}")
+                with self.subTest(job=f"{path.name}:{name}"):
+                    self.assertRegex(job, self.RELEASE)
+        # appliance.yml's sign job and build.yml's candidate job.
+        self.assertIn("appliance.yml:sign", readers)
+        self.assertGreaterEqual(len(readers), 2, readers)
+
+    def test_a_job_reading_the_key_without_the_environment_is_detected(self):
+        job = "    runs-on: ubuntu-24.04\n    env:\n      K: ${{ secrets.RELIABURGER_RELEASE_KEY }}"
+        self.assertNotRegex(job, self.RELEASE)
+        self.assertNotRegex(job.replace("runs-on", "environment: nightly\n    runs-on"), self.RELEASE)
+
+
+class DeadTriggerTests(unittest.TestCase):
+    """No workflow triggers on a branch pattern no branch uses."""
+
+    def test_no_workflow_triggers_on_feat_appliance_branches(self):
+        for path in sorted(WORKFLOWS.glob("*.yml")):
+            with self.subTest(workflow=path.name):
+                self.assertNotIn("feat/appliance-", path.read_text())
 
 
 if __name__ == "__main__":
