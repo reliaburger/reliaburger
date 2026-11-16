@@ -101,11 +101,13 @@ pub fn asset_url(
 /// What the saved state means once the node is up again on `running`: a
 /// reboot into the target that left us on another version was a fallback.
 ///
-/// `counted` says this boot is still on trial: systemd-boot booted an entry
-/// with tries left, and nothing has blessed it yet. bun starts before the
+/// `counted` says this boot started as a counted one: systemd-boot booted an
+/// entry with tries left. (It sets `LoaderBootCountPath` at boot, and the
+/// variable stays for the whole boot, blessed or not.) bun starts before the
 /// boot check passes, so a counted boot of the target can still fail and
-/// fall back. Until a boot of the target isn't counted any more, the update
-/// stays `Rebooting`, so that a fallback reads as one on the next start.
+/// fall back. It keeps `Rebooting`, so that a fallback reads as one on the
+/// next start, until [`OsSlot`] sees this boot blessed or a later boot of
+/// the target isn't counted.
 pub fn after_boot(saved: OsUpdateState, running: Option<&str>, counted: bool) -> OsUpdateState {
     match saved {
         OsUpdateState::Rebooting { target } if running == Some(target.as_str()) => {
@@ -152,9 +154,13 @@ pub struct SlotPaths {
     pub sysupdate: Vec<String>,
     /// The reboot, as argv.
     pub reboot: Vec<String>,
-    /// systemd-boot's `LoaderBootCountPath` EFI variable: present only on a
-    /// counted boot, one with tries left that nothing has blessed yet.
+    /// systemd-boot's `LoaderBootCountPath` EFI variable: present for the
+    /// whole of a boot that started counted (with tries left), even once
+    /// it's blessed.
     pub boot_count: PathBuf,
+    /// Succeeds once this boot is blessed (`boot-complete.target` reached),
+    /// as argv.
+    pub boot_complete: Vec<String>,
 }
 
 impl Default for SlotPaths {
@@ -171,6 +177,12 @@ impl Default for SlotPaths {
             boot_count: PathBuf::from(
                 "/sys/firmware/efi/efivars/LoaderBootCountPath-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f",
             ),
+            boot_complete: vec![
+                "systemctl".into(),
+                "is-active".into(),
+                "-q".into(),
+                "boot-complete.target".into(),
+            ],
         }
     }
 }
@@ -183,6 +195,9 @@ pub struct OsSlot {
     keys: Vec<PublicKey>,
     running: Option<String>,
     state: tokio::sync::Mutex<OsUpdateState>,
+    /// On a trial boot of the update: a counted boot of the target that
+    /// isn't blessed yet. Cleared, for good, once it is.
+    trial: tokio::sync::Mutex<bool>,
 }
 
 impl OsSlot {
@@ -228,19 +243,45 @@ impl OsSlot {
         let _ = save(&paths.state_file, &saved);
         // On a trial boot of the target, `Rebooting` stays on disk for the
         // next start to judge, but the reboot is done: nothing is under way.
-        let state = match saved {
-            OsUpdateState::Rebooting { target } if running.as_deref() == Some(target.as_str()) => {
-                OsUpdateState::Idle
-            }
-            other => other,
-        };
+        let trial = matches!(
+            &saved,
+            OsUpdateState::Rebooting { target } if running.as_deref() == Some(target.as_str())
+        );
+        let state = if trial { OsUpdateState::Idle } else { saved };
         Arc::new(Self {
             paths,
             arch: arch.to_string(),
             keys,
             running,
             state: tokio::sync::Mutex::new(state),
+            trial: tokio::sync::Mutex::new(trial),
         })
+    }
+
+    /// Whether this node runs a trial boot of an update: the target, on a
+    /// counted boot nobody has blessed yet. Such a boot can still fail its
+    /// boot check and fall back, so the leader doesn't count the node done,
+    /// and the node takes no other update. Once the boot is blessed, the
+    /// saved `Rebooting` becomes `Idle`.
+    pub async fn on_trial(&self) -> bool {
+        let mut trial = self.trial.lock().await;
+        if !*trial {
+            return false;
+        }
+        let blessed = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run(&self.paths.boot_complete, &[]),
+        )
+        .await
+        .is_ok_and(|done| done.is_ok());
+        if !blessed {
+            return true;
+        }
+        *trial = false;
+        if let Err(error) = save_off_runtime(&self.paths.state_file, &OsUpdateState::Idle).await {
+            eprintln!("bun: os update: saving its state: {error}");
+        }
+        false
     }
 
     /// The running image version.
@@ -259,6 +300,14 @@ impl OsSlot {
     pub async fn begin(self: &Arc<Self>, directive: &OsDirective) -> Result<Begun, String> {
         if self.running.as_deref() == Some(directive.version.as_str()) {
             return Ok(Begun::Running);
+        }
+        // Staging now would overwrite the `Rebooting` that tells a fallback
+        // from this boot apart.
+        if self.on_trial().await {
+            return Err(format!(
+                "{} is still on its trial boot; it takes another update once the boot is blessed",
+                self.running.as_deref().unwrap_or("this version")
+            ));
         }
         let mut state = self.state.lock().await;
         match &*state {
@@ -599,6 +648,7 @@ mod tests {
         let paths = SlotPaths {
             state_file: state_file.clone(),
             boot_count: boot_count.clone(),
+            boot_complete: vec!["false".into()],
             ..SlotPaths::default()
         };
 
@@ -609,6 +659,14 @@ mod tests {
             Some("2026.42.0".into()),
         );
         assert_eq!(trial.state().await, OsUpdateState::Idle);
+        assert!(trial.on_trial().await);
+        // Another update would overwrite the marker, so it waits.
+        let next = OsDirective {
+            rollout_id: "r2".into(),
+            version: "2026.43.0".into(),
+            channel_url: "https://example/os-channel/os-channel.json".into(),
+        };
+        assert!(trial.begin(&next).await.is_err());
         let saved: OsUpdateState =
             serde_json::from_slice(&std::fs::read(&state_file).unwrap()).unwrap();
         assert_eq!(saved, rebooting);
@@ -620,6 +678,32 @@ mod tests {
             fallen_back.state().await,
             OsUpdateState::Failed { target, .. } if target == "2026.42.0"
         ));
+    }
+
+    /// Once `boot-complete.target` is reached, the trial is over in this
+    /// very boot: the node is no longer on trial, and the marker becomes
+    /// `Idle`, though `LoaderBootCountPath` stays set until the next boot.
+    #[tokio::test]
+    async fn a_blessed_trial_boot_ends_the_trial_and_clears_the_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_file = dir.path().join("os-update.json");
+        let boot_count = dir.path().join("LoaderBootCountPath");
+        let rebooting = OsUpdateState::Rebooting {
+            target: "2026.42.0".into(),
+        };
+        std::fs::write(&state_file, serde_json::to_vec(&rebooting).unwrap()).unwrap();
+        std::fs::write(&boot_count, b"").unwrap();
+        let paths = SlotPaths {
+            state_file: state_file.clone(),
+            boot_count,
+            boot_complete: vec!["true".into()],
+            ..SlotPaths::default()
+        };
+        let slot = OsSlot::new(paths, "x86_64", Vec::new(), Some("2026.42.0".into()));
+        assert!(!slot.on_trial().await);
+        let saved: OsUpdateState =
+            serde_json::from_slice(&std::fs::read(&state_file).unwrap()).unwrap();
+        assert_eq!(saved, OsUpdateState::Idle);
     }
 
     /// Stage a signed release from a local server, through to sysupdate and
@@ -710,6 +794,7 @@ mod tests {
             sysupdate: record("sysupdate"),
             reboot: record("reboot"),
             boot_count: dir.path().join("LoaderBootCountPath"),
+            boot_complete: vec!["true".into()],
         };
         let slot = OsSlot::new(paths, "x86_64", vec![public], Some("2026.41.0".into()));
         let directive = OsDirective {
@@ -784,6 +869,7 @@ mod tests {
             sysupdate: vec!["false".into()],
             reboot: vec!["false".into()],
             boot_count: dir.path().join("LoaderBootCountPath"),
+            boot_complete: vec!["true".into()],
         };
         let slot = OsSlot::new(paths, "x86_64", vec![other_public], Some("0".into()));
         let directive = OsDirective {

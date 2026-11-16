@@ -172,17 +172,23 @@ pub(super) async fn os_rollout_start_handler(
         nodes,
         now,
     );
-    write_rollout(council, rollout).await
+    write_rollout(council, rollout, None).await
 }
 
-/// Start `rollout`, or resume a paused one under the new id it carries.
+/// Start `rollout`, replacing the paused one `replaces` names (a resume).
 /// The state machine refuses a start that would overlap another rollout or
-/// a bun upgrade, or reuse an id, and says why: that's a 409.
-async fn write_rollout(council: &Arc<crate::council::CouncilNode>, rollout: OsRollout) -> Response {
+/// a bun upgrade, reuse an id, or replace a rollout that has moved on, and
+/// says why: that's a 409.
+async fn write_rollout(
+    council: &Arc<crate::council::CouncilNode>,
+    rollout: OsRollout,
+    replaces: Option<crate::council::types::ReplacesPaused>,
+) -> Response {
     let written = rollout.clone();
     match council
         .write(crate::council::types::RaftRequest::OsRolloutStart {
             rollout: Box::new(rollout),
+            replaces,
         })
         .await
     {
@@ -245,7 +251,11 @@ pub(super) async fn os_rollout_resume_handler(
     }
     match council.desired_state().await.os_rollout {
         Some(rollout) if matches!(rollout.phase, OsRolloutPhase::Paused { .. }) => {
-            write_rollout(council, crate::os::rollout::resume(rollout, unix_now())).await
+            let replaces = crate::council::types::ReplacesPaused::Resume {
+                id: rollout.rollout_id.clone(),
+            };
+            let resumed = crate::os::rollout::resume(rollout, unix_now());
+            write_rollout(council, resumed, Some(replaces)).await
         }
         Some(rollout) => refuse(
             StatusCode::CONFLICT,

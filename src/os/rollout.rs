@@ -151,6 +151,9 @@ pub struct OsProbe {
     pub os_version: Option<String>,
     pub healthy: bool,
     pub update: OsUpdateState,
+    /// The node runs a counted boot that isn't blessed yet: it can still
+    /// fail its boot check and fall back (`os_trial` in `/v1/version`).
+    pub trial: bool,
 }
 
 /// The leader's view of each tick, from outside the rollout record.
@@ -276,7 +279,10 @@ async fn watch<C: OsControl>(
         return timed_out
             .then(|| format!("not back after {} minutes", UPDATE_TIMEOUT.as_secs() / 60));
     };
-    if probe.os_version.as_deref() == Some(target) && probe.healthy {
+    // Done only once the boot is blessed: a trial boot can still fail its
+    // boot check and fall back, and the leader polls only nodes that are
+    // updating.
+    if probe.os_version.as_deref() == Some(target) && probe.healthy && !probe.trial {
         enter(node, OsNodePhase::Done, now);
         return None;
     }
@@ -370,6 +376,7 @@ pub fn probe_from_version(value: &serde_json::Value, healthy: bool) -> OsProbe {
         os_version: value["os_version"].as_str().map(str::to_string),
         healthy,
         update: serde_json::from_value(value["os_update"].clone()).unwrap_or_default(),
+        trial: value["os_trial"].as_bool().unwrap_or(false),
     }
 }
 
@@ -590,6 +597,7 @@ mod tests {
             os_version: Some(version.into()),
             healthy: true,
             update: OsUpdateState::Idle,
+            trial: false,
         })
     }
 
@@ -716,6 +724,34 @@ mod tests {
         assert_eq!(rollout.nodes[0].phase, OsNodePhase::Updating);
     }
 
+    /// On its trial boot the node runs the target and is healthy, but the
+    /// boot check can still fail and fall back. The leader waits for the
+    /// blessing before it moves on, so it sees that fallback.
+    #[tokio::test]
+    async fn a_node_on_its_trial_boot_isnt_done_until_the_boot_is_blessed() {
+        let fleet = Fleet::default();
+        let mut rollout = three_nodes();
+        rollout.nodes[0].phase = OsNodePhase::Updating;
+        let mut trial = on("2026.42.0");
+        if let Some(probe) = &mut trial {
+            probe.trial = true;
+        }
+        fleet.answers("10.0.0.3:9117", trial);
+        rollout = step(rollout, &fleet, &context(100)).await;
+        assert_eq!(rollout.nodes[0].phase, OsNodePhase::Updating);
+
+        fleet.answers("10.0.0.3:9117", on("2026.42.0"));
+        rollout = step(rollout, &fleet, &context(110)).await;
+        assert_eq!(rollout.nodes[0].phase, OsNodePhase::Done);
+    }
+
+    #[test]
+    fn the_probe_reads_the_trial_from_the_version_answer() {
+        let value = serde_json::json!({"os_version": "2026.42.0", "os_trial": true});
+        assert!(probe_from_version(&value, true).trial);
+        assert!(!probe_from_version(&serde_json::json!({}), true).trial);
+    }
+
     #[tokio::test]
     async fn a_fallback_reported_by_the_node_pauses_the_rollout() {
         let fleet = Fleet::default();
@@ -730,6 +766,7 @@ mod tests {
                     target: "2026.42.0".into(),
                     reason: "booted 2026.41.0 instead: 2026.42.0 failed its boot checks".into(),
                 },
+                trial: false,
             }),
         );
         rollout = step(rollout, &fleet, &context(100)).await;

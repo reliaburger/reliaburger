@@ -531,6 +531,7 @@ pub(super) async fn upgrade_start_handler(
     record_upgrade_start(
         council,
         upgrade,
+        None,
         serde_json::json!({ "status": "starting", "upgrade_id": upgrade_id }),
     )
     .await
@@ -559,29 +560,32 @@ pub(super) async fn check_no_os_rollout(
     }
 }
 
-/// Record a new run (or a resume) in Raft and answer 202 with `accepted`,
-/// or 409 with the state machine's reason if it refused: another run, an
-/// OS rollout, or an id that has run before.
+/// Record a new run in Raft, replacing the paused run `replaces` names if
+/// any, and answer 202 with `accepted`. A refusal from the state machine
+/// (another run, an OS rollout, an id that has run before, or a paused run
+/// that has moved on) is a 409 with its reason; a write that didn't commit
+/// is a 503.
 pub(super) async fn record_upgrade_start(
     council: &crate::council::CouncilNode,
     upgrade: crate::upgrade::types::ClusterUpgradeState,
+    replaces: Option<crate::council::types::ReplacesPaused>,
     accepted: serde_json::Value,
 ) -> Response {
-    let error = match council
+    let (status, error) = match council
         .write(crate::council::types::RaftRequest::UpgradeStart {
             state: Box::new(upgrade),
+            replaces,
         })
         .await
     {
-        Ok(crate::council::CouncilResponse::Refused { reason }) => reason,
+        Ok(crate::council::CouncilResponse::Refused { reason }) => (StatusCode::CONFLICT, reason),
         Ok(_) => return (StatusCode::ACCEPTED, Json(accepted)).into_response(),
-        Err(e) => format!("could not record the upgrade: {e}"),
+        Err(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("could not record the upgrade: {e}"),
+        ),
     };
-    (
-        StatusCode::CONFLICT,
-        Json(serde_json::json!({ "error": error })),
-    )
-        .into_response()
+    (status, Json(serde_json::json!({ "error": error }))).into_response()
 }
 
 /// Ask every planned node what it runs and whether it can verify a
@@ -886,8 +890,17 @@ pub(super) async fn upgrade_resume_handler(
             .into_response();
     }
 
+    let replaces = crate::council::types::ReplacesPaused::Resume {
+        id: upgrade.upgrade_id.clone(),
+    };
     let resumed = crate::upgrade::orchestrator::resume(upgrade);
-    record_upgrade_start(council, resumed, serde_json::json!({ "status": "resumed" })).await
+    record_upgrade_start(
+        council,
+        resumed,
+        Some(replaces),
+        serde_json::json!({ "status": "resumed" }),
+    )
+    .await
 }
 
 /// End a paused cluster upgrade in which no node moved (admin, leader
@@ -1080,17 +1093,24 @@ pub(super) async fn upgrade_cluster_rollback_handler(
         nodes: derived_nodes,
     };
 
-    // Archive the paused run only once the rollback plan is valid, so a
-    // malformed request leaves it where it was.
-    if let Some(superseded) = paused
-        && let Err(resp) = archive_aborted_upgrade(council, superseded).await
-    {
-        return resp;
-    }
-
+    // The paused run ends in the same entry that starts the rollback, so
+    // nothing (an OS rollout, say) can start between the two and leave it
+    // archived with nothing rolling back. A malformed request never gets
+    // here, so it leaves the paused run where it was.
+    let replaces = paused.map(|superseded| {
+        let reason = match superseded.phase {
+            crate::upgrade::types::ClusterUpgradePhase::Aborted { reason } => reason,
+            _ => format!("replaced by a rollback to {}", upgrade.target_version),
+        };
+        crate::council::types::ReplacesPaused::Supersede {
+            id: superseded.upgrade_id,
+            reason,
+        }
+    });
     record_upgrade_start(
         council,
         upgrade,
+        replaces,
         serde_json::json!({ "status": "rolling back", "upgrade_id": upgrade_id }),
     )
     .await
