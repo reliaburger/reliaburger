@@ -1994,12 +1994,18 @@ async fn start_spread_web_cluster(
         let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
         let mut last_apply: Option<tokio::time::Instant> = None;
         loop {
-            if live_web_instances(&nodes).await == 3 && nodes_running_web(&nodes).await == 3 {
+            // Wait for a running replica with a pid on every node, not just a
+            // live status: callers read `web_process` straight away, and a
+            // replica can be live (say, `starting`) before it runs (#1961).
+            if live_web_instances(&nodes).await == 3
+                && nodes_running_web(&nodes).await == 3
+                && every_node_runs_a_web_process(&nodes).await
+            {
                 break;
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "web never spread one replica per node"
+                "web never spread one running replica per node"
             );
             if last_apply.is_none_or(|t| t.elapsed() >= Duration::from_secs(8)) {
                 let _ =
@@ -2338,6 +2344,16 @@ async fn web_process(node: &Node) -> Option<(u32, u32)> {
         .into_iter()
         .find(|status| status.app_name == "web" && status.state == "running")
         .and_then(|status| Some((status.pid?, status.restart_count)))
+}
+
+/// Whether every node in `nodes` has a running `web` replica with a pid.
+async fn every_node_runs_a_web_process(nodes: &[&Node]) -> bool {
+    for node in nodes {
+        if web_process(node).await.is_none() {
+            return false;
+        }
+    }
+    true
 }
 
 /// Z2.1: a workload fault sent to one node kills the replica that runs on
