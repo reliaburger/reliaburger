@@ -457,7 +457,7 @@
           <span class="section-number" aria-hidden="true">03 /</span>
           <h2 id="install-title">Install it <a class="permalink" href="#install" aria-label="Link to the install section">#</a></h2>
         </div>
-        <!-- Two ways in, as radio buttons styled as tabs so they work without
+        <!-- Four ways in, as radio buttons styled as tabs so they work without
              a script (#1579). The first panel stays first in the markup:
              tests/suite/website.rs checks the page leads with its install line. -->
         <div class="install-tabs" role="radiogroup" aria-label="How to install">
@@ -467,6 +467,8 @@
         <label class="install-tab" for="install-agent">With your agent</label>
         <input class="install-tab-input" type="radio" name="install-way" id="install-homebrew">
         <label class="install-tab" for="install-homebrew">Homebrew</label>
+        <input class="install-tab-input" type="radio" name="install-way" id="install-hardware">
+        <label class="install-tab" for="install-hardware">Real hardware</label>
         <div class="install-grid install-panel install-panel-tyres">
           <div class="terminal">
             <div class="terminal-heading">INSTALL <span>sh</span></div>
@@ -525,6 +527,29 @@ relish setup --quickstart</code></pre>
               copy for <code>brew uninstall relish</code> to remove.</p>
             <p class="install-links"><a href="https://github.com/reliaburger/homebrew-tap">The tap</a>
               · <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/quickstart.md">One node, CLI only, cleanup</a></p>
+          </div>
+        </div>
+        <div class="install-grid install-panel install-panel-hardware">
+          <div class="terminal">
+            <div class="terminal-heading">NETBOOT <span>sh</span></div>
+            <pre><code data-netboot>relish image download --dir os</code>
+<code data-netboot>sudo relish netboot os</code>
+<code data-netboot>relish machines</code>
+<code data-netboot>relish machines claim ~/lab --create --name lab --operator 192.168.1.10 192.168.1.51 192.168.1.52 192.168.1.53</code></pre>
+          </div>
+          <div class="install-copy">
+            <p>New in 0.3.0, not in 0.2.8. Skip the laptop VMs and use real machines: your
+              laptop serves the OS over the network, each machine installs itself in under a minute, and one
+              command makes them a cluster. Leave <code>relish netboot</code> running, power the
+              machines on, and claim them from a second terminal once each screen shows a claim
+              key. No USB sticks and no distro.</p>
+            <p>You’ll need two or more x86_64 or arm64 machines with UEFI network boot, a
+              supported wired network card, at least 2 GiB of RAM and an 8 GB disk, all on the
+              same LAN, plus a laptop or spare box to serve them. Turn Secure Boot off.
+              <strong>The installer erases the largest built-in disk.</strong> A disk that
+              isn’t blank waits for your yes first.</p>
+            <p class="install-links"><a href="#netboot">Watch it, and what hardware works</a>
+              · <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/manual/17_appliance.md">The appliance chapter of the manual</a></p>
           </div>
         </div>
         </div>
@@ -1073,6 +1098,12 @@ relish setup --quickstart</code></pre>
             the OS, they install themselves in under a minute, and one command makes them a
             cluster. No USB sticks, no distro, nothing to configure on each machine. Your
             router keeps handing out the addresses; relish only answers the boot part.</p>
+          <p class="tour-note">What works: we test on the Dell Wyse 3040, and three of them
+            have to go from power-on to a cluster before 0.3.0 ships. The installer drives
+            Realtek RTL8111, RTL8168 and RTL8125, Intel I219, I225, I226, I210 and I350 and
+            Broadcom tg3 network cards, plus USB Ethernet adapters. Secure Boot must be off.
+            Raspberry Pis aren’t supported yet; they’re
+            <a href="https://github.com/reliaburger/reliaburger/issues/1971">planned</a>.</p>
           <figure id="netboot-recording" class="recording" data-cast="./assets/netboot.cast" data-poster="npt:129">
             <div class="recording-screen"></div>
             <noscript><p class="recording-fallback">The recording plays with JavaScript. Without it,

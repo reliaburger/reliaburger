@@ -250,7 +250,8 @@ h2:hover .permalink, .permalink:focus-visible, .permalink[data-copied] { opacity
 .install-panel { order: 1; flex-basis: 100%; display: none; padding-top: 20px; border-top: 2px solid var(--line); }
 #install-tyres:checked ~ .install-panel-tyres,
 #install-agent:checked ~ .install-panel-agent,
-#install-homebrew:checked ~ .install-panel-homebrew { display: grid; }
+#install-homebrew:checked ~ .install-panel-homebrew,
+#install-hardware:checked ~ .install-panel-hardware { display: grid; }
 /* Copy buttons, added by assets/copy.js. The button sits beside the snippet,
    not over it, so a long command scrolls without sliding under the button. */
 .copyable { display: flex; align-items: flex-start; min-width: 0; }

@@ -2023,6 +2023,72 @@ fn the_install_section_offers_homebrew_after_the_one_line_install() {
     assert!(style.contains("#install-homebrew:checked ~ .install-panel-homebrew"));
 }
 
+/// A fourth tab installs on real machines (#407): the four appliance
+/// commands, each parsed by the netboot test, the warning that the installer
+/// erases a disk, and links down to the netboot section and to the manual's
+/// appliance chapter. It comes after the other three, and says which release
+/// adds it.
+#[test]
+fn the_install_section_offers_real_hardware_last() {
+    let page = read("docs/website/index.html");
+    let section = &page[page.find("<section id=\"install\"").unwrap()..];
+    let section = &section[..section.find("</section>").unwrap()];
+    let homebrew = section.find(">Homebrew</label>").unwrap();
+    let hardware = section
+        .find(">Real hardware</label>")
+        .expect("no Real hardware tab");
+    assert!(homebrew < hardware, "real hardware is the last tab");
+    let panel = &section[section.find("install-panel-hardware").unwrap()..];
+    let commands = marked_commands(panel, "data-netboot");
+    for expected in [
+        "relish image download",
+        "sudo relish netboot",
+        "relish machines",
+        "relish machines claim",
+    ] {
+        assert!(
+            commands.iter().any(|command| command.starts_with(expected)),
+            "the panel lacks `{expected}`: {commands:?}"
+        );
+    }
+    let text = decode(&strip_tags(panel));
+    for needed in [
+        "erases the largest built-in disk",
+        "2 GiB",
+        "8 GB",
+        &unreleased_label(),
+    ] {
+        assert!(text.contains(needed), "the panel doesn't say {needed:?}");
+    }
+    assert!(panel.contains("href=\"#netboot\""));
+    assert!(panel.contains("docs/manual/17_appliance.md"));
+    let style = read("docs/website/style.css");
+    assert!(style.contains("#install-hardware:checked ~ .install-panel-hardware"));
+}
+
+/// The netboot section says what hardware works: the machine it's tested on,
+/// the network cards the installer drives, that Secure Boot must be off, and
+/// that Raspberry Pis aren't supported yet (#1971).
+#[test]
+fn the_netboot_section_says_what_hardware_works() {
+    let page = read("docs/website/index.html");
+    let section = &page[page.find("<section id=\"netboot\"").unwrap()..];
+    let section = &section[..section.find("</section>").unwrap()];
+    let text = decode(&strip_tags(section));
+    for needed in [
+        "Dell Wyse 3040",
+        "RTL8111",
+        "I219",
+        "tg3",
+        "USB Ethernet",
+        "Secure Boot",
+        "Raspberry Pi",
+    ] {
+        assert!(text.contains(needed), "the section doesn't say {needed:?}");
+    }
+    assert!(section.contains("https://github.com/reliaburger/reliaburger/issues/1971"));
+}
+
 // --- Built for humans and their agents (#1578) -----------------------------
 
 /// The text of every `<code ATTRIBUTE>` element on `page`, tags stripped
