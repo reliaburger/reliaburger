@@ -730,6 +730,7 @@ pub(super) async fn version_handler(State(state): State<ApiState>) -> impl IntoR
     if let Some(slot) = crate::os::slot::installed() {
         version["os_version"] = serde_json::json!(slot.running());
         version["os_update"] = serde_json::json!(slot.state().await);
+        version["os_trial"] = serde_json::json!(slot.on_trial().await);
     }
     Json(version)
 }

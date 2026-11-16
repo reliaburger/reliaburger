@@ -658,18 +658,34 @@ pub enum RaftRequest {
     /// The leader's reaper: drop the specs of proposals that can't be
     /// undone any more, and the oldest records beyond the limit.
     ProposalCompact { now_unix_ms: u64 },
-    /// Start a cluster-wide rolling binary upgrade, or resume a paused one
-    /// under a new id. Refused while another run is active (unless it's
-    /// paused), during an OS rollout, or if the id has run before.
+    /// Start a cluster-wide rolling binary upgrade. Refused during an OS
+    /// rollout, if the id has run before, or while another run is active,
+    /// unless `replaces` names that run and it's paused.
     UpgradeStart {
         state: Box<crate::upgrade::types::ClusterUpgradeState>,
+        replaces: Option<ReplacesPaused>,
     },
-    /// Start an appliance OS rollout, or resume a paused one under a new
-    /// id. Refused while another rollout is active (unless it's paused),
-    /// during a bun upgrade, or if the id has run before.
+    /// Start an appliance OS rollout. Refused during a bun upgrade, if the
+    /// id has run before, or while another rollout is active, unless
+    /// `replaces` names that rollout and it's paused.
     OsRolloutStart {
         rollout: Box<crate::os::rollout::OsRollout>,
+        replaces: Option<ReplacesPaused>,
     },
+}
+
+/// What a start does with the paused run it replaces, named by id so a
+/// start can't replace a run it never saw: one that ended, or another
+/// that took its place, is refused instead.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ReplacesPaused {
+    /// Carry the paused run on under the new id (`resume`). It's the same
+    /// run, so it isn't archived.
+    Resume { id: String },
+    /// End the paused run, archiving it as aborted with `reason`, in the
+    /// same entry that starts the new one (a rollback over a paused
+    /// upgrade), so nothing can land between the two.
+    Supersede { id: String, reason: String },
 }
 
 // ---------------------------------------------------------------------------

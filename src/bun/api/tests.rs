@@ -1941,6 +1941,7 @@ async fn an_upgrade_or_rollback_during_an_os_rollout_is_refused() {
     trio[0]
         .write(crate::council::types::RaftRequest::OsRolloutStart {
             rollout: Box::new(rollout),
+            replaces: None,
         })
         .await
         .unwrap();
@@ -1975,6 +1976,7 @@ async fn an_upgrade_or_rollback_during_an_os_rollout_is_refused() {
     let refused = super::upgrade::record_upgrade_start(
         &trio[0],
         upgrade,
+        None,
         serde_json::json!({ "status": "starting" }),
     )
     .await;
