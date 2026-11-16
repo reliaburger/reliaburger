@@ -465,11 +465,22 @@ jobs:
   linux-next:
     # The privileged suite on the newest Ubuntu LTS too (#1559): Linux 7.0's
     # verifier and sudo-rs both broke things 24.04 never showed (#1557). The
-    # `linux` job owns the evidence envelopes; this one only has to pass.
+    # `linux` job owns the evidence envelopes; this one only reports.
     name: privileged Linux (Ubuntu 26.04)
     needs: changes
     if: needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-26.04
+    # Advisory until #1943 closes: the job keeps losing its runner mid-test,
+    # though every run that finished its tests passed them. It still runs
+    # and reports, and its evidence is kept below, but its failure doesn't
+    # fail the run: `ignored-test evidence` only warns (ADVISORY in
+    # scripts/ci/every_job.py), and a candidate build reuses a run it failed
+    # in (scripts/release/ci_reuse.py). Making it required again is part of
+    # closing #1943. `passed` is set only by the last step, because
+    # continue-on-error may hand the gate a failed job as a success.
+    continue-on-error: true
+    outputs:
+      passed: ${{ steps.passed.outputs.passed }}
     # Successful runs take 22 to 31 minutes. Six hit a 40-minute limit on 13
     # and 14 Nov with the test step still "in progress" and no post step run,
     # so GitHub kept no log (#1943). The test step now has its own limit
@@ -588,6 +599,9 @@ jobs:
             ${{ runner.temp }}/linux-next-resources.log
           if-no-files-found: warn
           retention-days: 14
+      - name: Record that the privileged tests passed
+        id: passed
+        run: echo "passed=true" >> "$GITHUB_OUTPUT"
 
   build-tests:
     outputs:

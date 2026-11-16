@@ -6,6 +6,10 @@ can require that one check. A job may be skipped only because select jobs
 left it out: that job must itself have succeeded first. Only a pull request
 may skip the code jobs altogether (a documentation-only change). The
 evidence owners' own checks are in workflow_adapter.py aggregate.
+
+A job in ADVISORY runs and reports on every run, but its failure prints a
+warning instead of failing the gate. Each names the issue whose fix takes it
+back off the list.
 """
 from __future__ import annotations
 
@@ -14,13 +18,40 @@ import json
 from pathlib import Path
 import sys
 
+# {job id: issue}. The Ubuntu 26.04 privileged job keeps losing its runner
+# mid-test (#1943); every run that reached the end of its tests passed them.
+# Taking it off this list is part of closing #1943. The 24.04 `linux` job
+# stays required.
+ADVISORY = {'linux-next': 1943}
+
+
+def warnings(needs):
+    """A warning for each advisory job that ran and didn't pass, or an empty list.
+
+    An advisory job has job-level continue-on-error, which may report a
+    failure as success, so a pass also needs the `passed` output its last
+    step sets.
+    """
+    found = []
+    for name, issue in sorted(ADVISORY.items()):
+        job = needs.get(name)
+        if job is None or job.get('result') == 'skipped':
+            continue
+        result = job.get('result')
+        if result == 'success' and job.get('outputs', {}).get('passed') == 'true':
+            continue
+        how = f'finished as {result!r}' if result != 'success' else 'never reached its last step'
+        found.append(f'{name} {how}. It is advisory until #{issue} closes, so this gate stays green; '
+                     f'its log and JUnit are in the {name}-evidence artefact')
+    return found
+
 
 def problems(needs, event):
     """Why this run must not pass, or an empty list."""
     if 'changes' not in needs:
         return ['select jobs did not run']
     found = [f'{name} finished as {job.get("result")!r}' for name, job in sorted(needs.items())
-             if job.get('result') not in ('success', 'skipped')]
+             if name not in ADVISORY and job.get('result') not in ('success', 'skipped')]
     if needs['changes'].get('result') == 'skipped':
         found.append("changes finished as 'skipped'")
     code = needs['changes'].get('outputs', {}).get('code')
@@ -34,7 +65,10 @@ def main(argv=None):
     parser.add_argument('--needs', required=True, help='the toJSON(needs) of the gate job')
     parser.add_argument('--event', required=True, help='the workflow event name')
     args = parser.parse_args(argv)
-    found = problems(json.loads(Path(args.needs).read_text()), args.event)
+    needs = json.loads(Path(args.needs).read_text())
+    for warning in warnings(needs):
+        print('::warning::CI gate: ' + warning)
+    found = problems(needs, args.event)
     for problem in found:
         print('CI gate: ' + problem, file=sys.stderr)
     return 1 if found else 0
