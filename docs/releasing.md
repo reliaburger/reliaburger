@@ -99,7 +99,12 @@ treats the three kinds of run differently ([which jobs run](testing.md#which-job
   candidate build reuses.
 
 So nothing reaches a train, or `main`, without the full set having passed on
-that exact commit. macOS runs on every push and on the nightly, on the
+that exact commit. The one exception is privileged Linux on Ubuntu 26.04,
+which is advisory until
+[#1943](https://github.com/reliaburger/reliaburger/issues/1943) closes: it
+runs and reports, but its failure only warns, in `ignored-test evidence` and
+in a candidate's `find passing CI`, and making it required again is part of
+closing #1943 ([advisory jobs](testing.md#which-jobs-a-pull-request-runs)). macOS runs on every push and on the nightly, on the
 release gate PR and on the candidate build, but not on ordinary pull
 requests: the organisation's plan runs at most five macOS jobs at once, and
 each full run takes one ([portable macOS in one job](testing.md#portable-macos-in-one-job)).
@@ -1019,7 +1024,9 @@ to `main`, so the build reuses that run instead of running the suite again
 for a `ci.yml` run on exactly this commit, from a push, the merge queue or the
 nightly schedule (a pull request's run tests a merge commit and may skip
 jobs). The run counts only if it succeeded on its first attempt and every
-job in it succeeded, `ignored-test evidence` included. A run that went green
+job in it succeeded, `ignored-test evidence` included, apart from the
+advisory Ubuntu 26.04 job, whose failure only puts a warning in the build log
+until #1943 closes. A run that went green
 only when someone re-ran it doesn't count: a failure that passes on a re-run
 is a flake, retries are 0, and the candidate runs its own suite instead
 ([#1436](https://github.com/reliaburger/reliaburger/issues/1436)); the script's list of required jobs is kept

@@ -141,6 +141,39 @@ class DecideTests(unittest.TestCase):
         del record["run_attempt"]
         self.assertIsNone(self.decide([record])[0])
 
+    def test_a_failed_ubuntu_2604_job_is_reused_with_a_warning(self):
+        # The 26.04 job is advisory until #1943 closes: with continue-on-error
+        # the run still succeeds, and its job's failure only warns.
+        for conclusion in ("failure", "cancelled", "timed_out"):
+            with self.subTest(conclusion=conclusion):
+                run_id, warnings = self.decide([run()], with_job("privileged Linux (Ubuntu 26.04)", conclusion))
+                self.assertEqual(run_id, 1)
+                self.assertEqual(len(warnings), 1)
+                self.assertIn("privileged Linux (Ubuntu 26.04)", warnings[0])
+                self.assertIn("#1943", warnings[0])
+
+    def test_a_missing_ubuntu_2604_job_still_runs_the_suite(self):
+        jobs = [job for job in green_jobs() if job["name"] != "privileged Linux (Ubuntu 26.04)"]
+        self.assertIsNone(self.decide([run()], jobs)[0])
+
+    def test_a_failed_ubuntu_2404_job_still_runs_the_suite(self):
+        run_id, reasons = self.decide([run()], with_job("privileged Linux", "failure"))
+        self.assertIsNone(run_id)
+        self.assertIn("'privileged Linux' finished as failure", reasons[0])
+
+    def test_a_failed_run_runs_the_suite_even_when_only_the_advisory_job_failed(self):
+        # continue-on-error keeps the run green; a red run has another cause.
+        jobs = with_job("privileged Linux (Ubuntu 26.04)", "failure")
+        self.assertIsNone(self.decide([run(conclusion="failure")], jobs)[0])
+
+    def test_only_the_ubuntu_2604_job_is_advisory_and_it_cites_its_issue(self):
+        self.assertEqual(ci_reuse.ADVISORY_JOBS, {"privileged Linux (Ubuntu 26.04)": 1943})
+        self.assertIn("privileged Linux (Ubuntu 26.04)", REQUIRED_JOBS)
+        # The same job the gate treats as advisory, and the one ci.yml lets fail.
+        job = re.search(r"(?ms)^  linux-next:\n(.*?)\n    steps:", CI.read_text()).group(1)
+        self.assertIn("    name: privileged Linux (Ubuntu 26.04)\n", job)
+        self.assertIn("\n    continue-on-error: true", job)
+
     def test_one_green_run_among_failed_ones_is_enough(self):
         runs = [run(1, conclusion="failure"), run(2)]
         self.assertEqual(self.decide(runs)[0], 2)
@@ -320,6 +353,23 @@ class MainTests(unittest.TestCase):
         self.assertEqual(self.main(clock.runs_for, clock=clock),
                          (0, "reuse=true\nci_run=7\nci_run_attempt=1\n"))
         self.assertIn("after waiting 5 minutes", self.summary)
+
+    def test_a_reused_run_whose_advisory_job_failed_warns_in_the_build_log(self):
+        jobs = with_job("privileged Linux (Ubuntu 26.04)", "failure")
+        clock = Clock([[]])
+        log = io.StringIO()
+        with tempfile.NamedTemporaryFile("r", suffix=".out") as output, \
+                tempfile.NamedTemporaryFile("r", suffix=".md") as summary, \
+                contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(log):
+            status = main(["--repository", REPOSITORY, "--commit", COMMIT, "--github-output", output.name,
+                           "--step-summary", summary.name],
+                          runs_for=lambda repository, commit: [run(7)], jobs_for=lambda repository, run_id: jobs,
+                          now=clock.now, sleep=clock.sleep)
+            self.assertEqual((status, output.read()), (0, "reuse=true\nci_run=7\nci_run_attempt=1\n"))
+            text = summary.read()
+        self.assertIn("::warning::", log.getvalue())
+        self.assertIn("#1943", log.getvalue())
+        self.assertIn("#1943", text)
 
     def test_the_summary_says_why_the_suite_runs(self):
         self.main(lambda repository, commit: [run(7, conclusion="failure")])
