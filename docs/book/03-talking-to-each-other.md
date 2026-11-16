@@ -487,7 +487,7 @@ Everything above describes what happens on a single node. But a 10-node cluster 
 
 For a long time that was the actual behaviour, and the honest answer was "cross-node service discovery doesn't work yet." Fixing it is what the **endpoint catalogue** does. The idea is small: the leader already knows what's running where, so let it build one cluster-wide map of every service's backends and replicate it to every node.
 
-Where does the leader's knowledge come from? The reporting tree from Chapter 2. Every node reports its running instances — namespace, app name, host port, health — to its council parent every reporting interval; the council aggregates for the leader. The leader's scheduling loop already reads that aggregate. So building the catalogue is a walk over those reports:
+Where does the leader's knowledge come from? The reporting tree from Chapter 2. Every node reports its running instances — namespace, app name, host port, health — straight to the leader every reporting interval (a flat star today; Chapter 2's two-level tree is planned, [#364](https://github.com/reliaburger/reliaburger/issues/364)), and the leader's aggregator collects them. The leader's scheduling loop already reads that aggregate. So building the catalogue is a walk over those reports:
 
 ```rust
 for (node_id, report) in &reports.reports {

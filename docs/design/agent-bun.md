@@ -232,8 +232,8 @@ cgroup path rather than fabricating a path runc cannot write.
 | **Apple Container** | Runtime (external, macOS) | OCI container lifecycle on macOS. Grill re-adopts a running workload via `container inspect` after a Bun exec. |
 | **Linux kernel 5.8+** | Hard requirement | eBPF socket-level interception (`sock_ops`, `connect4`, `sk_msg`), cgroup v2, BPF CO-RE, the boot-time clock helper. Reusable job executors need `clone3(CLONE_INTO_CGROUP)` (5.7) and the cgroup v2 freezer (5.2), inside the same minimum; they use `cgroup.kill` (5.14) when present and otherwise freeze and kill each task. Bun turns the executor pools off on an older kernel, and the native host pool off without `CONFIG_PROC_CHILDREN` (`src/grill/kernel.rs`) |
 | **Mustard (gossip)** | Internal subsystem | Failure detection, leader discovery, cluster membership, metadata propagation (protocol version, node labels) |
-| **Meat (scheduler)** | Via leader node | Receives scheduling decisions (which workloads to run). On the leader node, Meat runs as a co-located async task. On worker nodes, scheduling decisions arrive via the reporting tree. |
-| **Raft (council)** | Via council members | Committed state (app specs, secrets, config). Worker nodes receive state via the reporting tree, not directly from Raft. |
+| **Meat (scheduler)** | Via leader node | Receives scheduling decisions (which workloads to run). On the leader node, Meat runs as a co-located async task. On other nodes, Bun polls the leader's `GET /v1/placements/{node}` for its assignments. |
+| **Raft (council)** | Via council members | Committed state (app specs, secrets, config). Nodes outside the council read it from the leader over the HTTP API, not directly from Raft. |
 | **Onion (eBPF)** | Internal subsystem | Bun loads and manages the Onion eBPF programs and kernel maps. Onion depends on Bun for map updates when workloads start/stop or health checks change state. |
 | **Pickle (image registry)** | Internal subsystem | Image pull/push, binary distribution during self-upgrade. Bun participates as a Pickle storage node. |
 | **Sesame (PKI)** | Via council members | Node certificate issuance (at join), workload certificate issuance (CSR model), CA trust chain distribution. |
@@ -950,14 +950,16 @@ pub struct UpgradeConfig {
 
 **Bun <-> container runtime:** no daemon and no gRPC. Grill spawns the runtime CLI directly — `runc run`/`runc state`/`runc kill`/`runc delete` against an OCI bundle on Linux, and the Apple `container` CLI on macOS. The `process` backend spawns the host binary itself. State survives Bun restarts because runc's own on-disk state and the Apple VM outlive the agent; Grill re-adopts them on startup.
 
-**Bun <-> reporting tree parent:** postcard-framed messages over an mTLS TCP connection. Messages include:
+**Bun -> leader (reporting):** framed messages over an mTLS TCP connection to the leader's reporting port. Every node reports straight to the leader; a hierarchical tree with council members aggregating is planned (#364). The connection is upstream-only (`ReportingMessage` in `src/reporting/types.rs`):
 
-- `WorkloadStateReport` -- periodic batch of workload states (instance ID, state, health, resource usage)
-- `EventStream` -- real-time events (starts, stops, health changes, OOMs)
-- `SchedulingDirective` -- from parent to Bun: start/stop/update workloads
+- `Report` -- periodic state report (workload states, health, resource usage, events)
+- `MetricsRollup` -- the node's pre-aggregated metrics
+- `CapabilityReport` -- live scheduling capabilities and per-workload security evidence
 - `NodeReadinessReport` -- an independently expiring lease carrying
   the live `Starting`, `Ready`, `Degraded` or `Stopped` state of every critical
   long-lived subsystem, with transition and last-error times
+
+The leader acknowledges with `Ack`. Nothing travels down this connection: placements come from `GET /v1/placements/{node}`, and a node reports a failed rollout step with `POST /v1/rollouts/failed`, both on the HTTP API.
 
 **Bun <-> eBPF kernel maps:** Direct memory-mapped access via `libbpf` file descriptors. Map updates are atomic `bpf_map_update_elem()` calls. No serialisation protocol -- the map keys and values are C-compatible structs (`#[repr(C)]`).
 
@@ -1411,30 +1413,27 @@ $ relish upgrade rollback [version]
 
 ### 5.6 `node.toml` Parsing
 
-Bun parses `/etc/reliaburger/node.toml` at startup. The parsing sequence:
+Bun reads a node config only when you pass `--config PATH`. Without it, every field takes its default (suitable for a first node or a laptop). There's no default path that Bun looks in: `/etc/reliaburger/node.toml` is just where the quickstart and the systemd units we ship put the file, and they pass it with `--config`.
 
-1. Check for the file at `/etc/reliaburger/node.toml`. If absent, use all defaults (suitable for `relish init` on the first node).
-2. Deserialize the TOML using `serde` with `#[serde(default)]` on all fields.
-3. **Validate:**
-   - `cluster.join` addresses must be valid `host:port` pairs.
-   - `storage.*` paths must be absolute.
-   - `resources.reserved_cpu` must be a valid resource string (e.g. "500m").
-   - `resources.reserved_memory` must be a valid resource string (e.g. "512Mi").
-   - `network.port_range` must have `start < end` and both in 1024-65535.
-   - `process_workloads.allowed_binaries` entries must be absolute paths. If any contain glob characters (`*`, `?`, `[`) and `allow_globs` is false, fail with an error.
-   - `upgrades.external_signing_key` must be a valid `ed25519:` prefixed key if present.
-4. **Auto-detect missing values:**
-   - `node.name`: read from `gethostname()`.
-   - `network.advertise_address`: detect from the default route interface.
-   - GPU labels (`gpu = "true"`, `gpu_model = "a100"`): detect via `/dev/nvidia0` + `nvidia-smi` if `resources.gpu_enabled` is true.
-5. **Create storage directories** if they do not exist. Set ownership to the `reliaburger` system user.
-6. **Hot reload:** Bun watches `node.toml` via `inotify`. On change, it re-parses and applies non-disruptive changes (labels, image config, log retention, metrics intervals). Changes to `storage.*` paths, `network.port_range`, or `cluster.join` require a Bun restart and are logged as warnings.
+1. Deserialize the TOML with `serde`. Every section has `#[serde(default, deny_unknown_fields)]`, so a missing key takes its default and a misspelt or unknown key stops Bun at startup.
+2. **Validate** (`NodeConfig::validate`, `src/config/validate.rs`). Among other checks:
+   - `storage.*` paths and `storage.allowed_host_paths` entries must be absolute.
+   - `resources.reserved_cpu` and `resources.reserved_memory` must be valid resource strings (e.g. "500m", "512Mi").
+   - `network.port_range` must have `start < end`.
+   - `upgrades.external_signing_key`, if present, must parse as a key.
+   Bun doesn't check the form of `cluster.join` addresses; a bad one fails when Bun tries to reach it.
+3. **Fill in missing values:**
+   - `node.name`: `node-<gossip_port>`. It isn't read from the hostname.
+   - `network.advertise_address`: `127.0.0.1`. It isn't detected from the default route, so set it on every node another machine must reach.
+   - GPUs: counted at startup when `resources.gpu_enabled` is true.
+4. **Create storage directories** if they don't exist. When the configured data directory can't be created, Bun falls back to a per-user data directory.
+5. **No hot reload.** Bun doesn't watch `node.toml`. Every change takes effect at the next Bun restart.
 
 ---
 
 ## 6. Configuration
 
-All configuration is in `/etc/reliaburger/node.toml`. Every field has a default; the minimal configuration for joining a cluster is:
+Node configuration is the TOML file passed with `bun --config` (conventionally `/etc/reliaburger/node.toml`). Every field has a default; the minimal configuration for joining a cluster is:
 
 ```toml
 [cluster]
@@ -1444,9 +1443,11 @@ join = ["10.0.1.5:9443"]
 
 ### 6.1 Full Reference
 
+The table below covers the common keys, not all of them. The [manual's node config sections](../manual/13_reference.md#node-config-sections) and `src/config/node.rs` are the authority: every section refuses keys it doesn't know, so a key that isn't in the code stops Bun at startup.
+
 | Section | Key | Default | Valid Range / Type | Description |
 |---------|-----|---------|--------------------|-------------|
-| `[node]` | `name` | hostname | string | Human-readable node name. Must be unique in the cluster. |
+| `[node]` | `name` | `node-<gossip_port>` | string | Human-readable node name. Must be unique in the cluster. |
 | `[node.labels]` | (any key) | (none) | string key-value pairs | Arbitrary labels for placement constraints. `zone`, `rack`, `storage`, `role` are common. |
 | `[cluster]` | `name` | `default` | DNS-style name | Stable cluster identity and SPIFFE trust domain. Must match on every node. |
 | `[cluster]` | `join` | `[]` | list of `"host:port"` strings | Addresses of existing cluster members. Empty for first node. |
@@ -1459,25 +1460,19 @@ join = ["10.0.1.5:9443"]
 | `[runtime]` | `allowed_capabilities`, `allowed_sysctls`, `allowed_devices` | `[]` | capability names; namespaced sysctl names or `net.`/`fs.mqueue.` prefixes ending in `.*`; device paths under `/dev` | The runtime knobs an app's `[app.x.runtime]` may use on this node (#1122). Advertised to the scheduler only on rootful runc. See deployments 5.10. |
 | `[resources]` | `reserved_cpu` | `"500m"` | resource string (millicores) | CPU reserved for system + Bun. Not allocatable. |
 | `[resources]` | `reserved_memory` | `"512Mi"` | resource string (bytes) | Memory reserved for system + Bun. Not allocatable. |
-| `[resources]` | `reserved_disk` | `"10Gi"` | resource string (bytes) | Disk reserved for system. |
 | `[resources]` | `gpu_enabled` | `true` | bool | Auto-detect NVIDIA GPUs (probe `/dev/nvidia0`, parse `nvidia-smi`) at startup. When false, GPU workloads are refused on this node. |
-| `[network]` | `advertise_address` | auto-detect | IP address | IP address this node advertises to the cluster. |
-| `[network]` | `port_range` | `{ start = 10000, end = 32767 }` | `"start-end"`, both in 1024-65535 | Ephemeral port range for container port mapping. |
-| `[images]` | `max_storage` | `"50Gi"` | resource string (bytes) | Maximum disk space for Pickle image layers. |
-| `[images]` | `redundancy` | `2` | 1-10 | Number of peers to replicate pushed images to immediately. |
-| `[images]` | `gc_retain_tags` | `10` | 1-1000 | Keep this many most-recent tags per repository. |
-| `[images]` | `gc_retain_days` | `30` | 1-365 | Keep images accessed within this many days. |
-| `[images]` | `pre_pull` | `true` | bool | Pre-pull images referenced by scheduled workloads. |
+| `[network]` | `advertise_address` | `127.0.0.1` | IP address | IP address this node advertises to the cluster. Not auto-detected: set it on any node another machine must reach. |
+| `[network]` | `port_range` | `{ start = 10000, end = 32767 }` | table of `start` and `end` (end exclusive); `start` must be below `end` | Ephemeral port range for container port mapping. |
+| `[images]` | `max_storage` | `"0"` | resource string (bytes), `"0"` is unlimited | Maximum disk space for Pickle image layers. |
+| `[images]` | `redundancy` | `2` | integer | Number of copies of each pushed layer, the pusher's included. |
+| `[images]` | `gc_retain_days` | `7` | days | Keep images accessed within this many days. |
 | `[images]` | `external_registries` | `[]` | list of registry objects | External OCI registries for pulling images not in Pickle. |
 | `[images]` | `mirrors` | `{}` | map of upstream host to mirror `host[:port]` | Registries tried first for digest-pinned images; the upstream is the fallback. |
-| `[logs]` | `retention_days` | `7` | 1-365 | Days to retain uncompressed logs. |
-| `[logs]` | `compressed_retention_days` | `30` | 1-3650 | Days to retain compressed logs. |
-| `[logs]` | `max_storage` | `"20Gi"` | resource string (bytes) | Maximum disk space for logs. |
-| `[metrics]` | `collection_interval` | `"10s"` | duration, 1s-5m | How often to scrape workload metrics endpoints. |
-| `[metrics]` | `retention_full` | `"24h"` | duration, 1h-7d | Retention for full-resolution metrics. |
-| `[metrics]` | `retention_1m` | `"7d"` | duration, 1d-365d | Retention for 1-minute downsampled metrics. |
-| `[metrics]` | `retention_1h` | `"90d"` | duration, 7d-3650d | Retention for 1-hour downsampled metrics. |
-| `[metrics]` | `max_storage` | `"5Gi"` | resource string (bytes) | Maximum disk space for metrics. |
+| `[logs]` | `retention_days` | `7` | days | Days to keep log files. |
+| `[logs]` | `max_storage_mb` | `2048` | megabytes, `0` is unlimited | Maximum disk space for logs. |
+| `[metrics]` | `collection_interval_secs` | `10` | seconds, above 0 | How often Bun collects its node's metrics. |
+| `[metrics]` | `retention_days` | `7` | days | Days to keep metrics files. |
+| `[metrics]` | `max_storage_mb` | `1024` | megabytes, `0` is unlimited | Maximum disk space for metrics. |
 | `[ingress]` | `enabled` | `false` | bool | Whether this node serves external ingress traffic. |
 | `[ingress]` | `http_port` | `80` | 1-65535 | HTTP listen port for Wrapper. |
 | `[ingress]` | `https_port` | `443` | 1-65535 | HTTPS listen port for Wrapper. |
@@ -1488,9 +1483,8 @@ join = ["10.0.1.5:9443"]
 | `[testing]` | `allowed_operations` | `[]` | list of operation names | Server-owned permissions for diagnostics, isolated workloads, faults, node changes, capacity saturation and external probes. |
 | `[testing]` | `allow_protected_mutation` | `false` | bool | Additional server-side gate for mutation on unknown/production clusters. A client flag cannot change it. |
 | `[testing]` | `max_lease_seconds` | `3600` | positive integer seconds | Maximum lifetime of a server-owned test resource lease. |
-| `[process_workloads]` | `allow_globs` | `false` | bool | Allow glob patterns in `allowed_binaries`. |
 | `[upgrades]` | `external_signing_key` | (none) | `"ed25519:..."` | External signing key for dual-signature verification. Required for network upgrades. |
-| `[upgrades]` | `retain_versions` | `3` | 1-10 | Number of previous binary versions to keep on disk. |
+| `[upgrades]` | `retain_versions` | `3` | at least 1 | Number of previous binary versions to keep on disk. |
 | `[testing]` | `external_probe_allowlist` | `[]` | exact `host:port` strings | External destinations `relish path` may probe after its independent Admin, operation and protected-cluster checks; an empty list permits none. Wildcards and CIDRs do not match. |
 
 ---
@@ -1828,7 +1822,7 @@ The default seccomp profile blocks the following syscall families (identical for
 
 **500 apps per node:** At 500 apps, Bun manages 500 cgroups, 500 network namespaces, 500 health check loops, and 500 entries in the Onion service map. The HealthChecker processes ~50 health checks per second (500 apps / 10s interval). Each check is a non-blocking HTTP GET that completes in microseconds to milliseconds. The Tokio runtime handles this without thread-per-check overhead.
 
-**10,000 nodes:** Bun itself is not affected by cluster size. The reporting tree ensures that each Bun instance communicates only with its parent (a council member), not with all other nodes. The Onion service map on each node contains entries for all workloads in the cluster (~5M at max density), which fits comfortably in kernel memory (~80 bytes per entry = ~400 MB, well within typical server memory).
+**10,000 nodes:** Bun's own work doesn't grow with cluster size, but today every Bun reports straight to the leader, and the leader refuses report connections from about 500 nodes up (#1411). The planned reporting tree (#364) would have each Bun talk only to its parent council member. The Onion service map on each node contains entries for all workloads in the cluster (~5M at max density), which fits comfortably in kernel memory (~80 bytes per entry = ~400 MB, well within typical server memory).
 
 **Port allocation at density:** The default port range of 10000..32767 provides about 22,700 ports, all below Linux's ephemeral range (32768-60999). At 500 apps with rolling deploys (briefly 2x ports during transitions), this is 1,000 ports maximum, about 4% utilisation. Port exhaustion is not a concern.
 
@@ -1992,7 +1986,7 @@ Bun Restart
 
 **What we do differently:**
 
-- kubelet communicates with the API server directly; Bun uses a hierarchical reporting tree to avoid all-to-all communication.
+- kubelet communicates with the API server directly. So, today, does Bun: it reports to the leader. A hierarchical reporting tree is planned (#364).
 - kubelet manages Pods (groups of containers with shared namespaces); Bun manages individual workloads (one process per isolation boundary). The Pod abstraction adds complexity that is rarely needed.
 - kubelet has no concept of process workloads. Running host binaries under orchestrator control requires workarounds (hostPath volumes, privileged containers, or DaemonSets with host networking).
 - kubelet does not manage its own upgrades. Cluster upgrades require external tooling (kubeadm, kops, EKS/GKE managed control plane).

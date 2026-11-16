@@ -131,7 +131,7 @@ Reliaburger is designed to meet the following quantitative targets. These engine
 |--------|-------|----------|
 | Maximum nodes per cluster | 10,000 | Target (unmeasured). Only simulated gossip membership has run at this size (`tests/gossip_10k.rs`); every node still reports to the leader directly (§8.1) |
 | Maximum apps per node | 500 | Target (unmeasured) |
-| Job scheduling throughput | 100,000,000 jobs per day (~1,160 per second sustained) | Met on a three-VM laptop cluster: 12 hours with apps and faults at 4,600 accepted a second ([record](qualification/2026-10-17-v0.2.0-job-qualification.md), [#668](https://github.com/reliaburger/reliaburger/issues/668)). Per-job overhead of each runtime on one small VM: [timed job scenarios](qualification/2026-10-09-timed-job-scenarios/README.md) |
+| Job scheduling throughput | 100,000,000 jobs per day (~1,160 per second sustained) | Met on a three-VM laptop cluster: 12 hours with apps and faults at 4,600 accepted a second ([record](qualification/2026-10-17-v0.2.0-job-qualification.md), [#668](https://github.com/reliaburger/reliaburger/issues/668)). The 0.2.8 day run accepted 2,649,391,295 no-op host-job tasks in 24 hours on three VMs ([record](qualification/2026-11-14-v0.2.8-memory-run.md)). Per-job overhead of each runtime on one small VM: [timed job scenarios](qualification/2026-10-09-timed-job-scenarios/README.md) |
 | Leader election time | < 5 seconds | Target (unmeasured) |
 | Time to full operability after leader loss | < 20 seconds (5s election + 15s learning period) | Target (unmeasured) |
 | State reconstruction time (cold start, full cluster) | < 30 seconds | Target (unmeasured) |
@@ -320,9 +320,15 @@ selected result pages replace listing millions of jobs. Each definition keeps
 its last ten outcomes after the runs' detail is pruned, every node exports job
 counters and duration histograms labelled only by namespace, definition,
 profile and node, and the leader records one event per run (never per task),
-sending failed and unknown-outcome runs to the alert webhooks. The daily throughput
-claim still needs sustained qualification, including container launch cost,
-resource demand, storage and service quality. See the [job manual](manual/14_batch-jobs.md).
+sending failed and unknown-outcome runs to the alert webhooks. 0.2.0 met the
+100M-a-day target: 12 hours with apps and faults at 4,600 accepted a second on
+three laptop VMs ([record](qualification/2026-10-17-v0.2.0-job-qualification.md)).
+Later day runs went further with no-op host jobs: 1.81 billion in one real day on
+0.2.3 ([record](qualification/2026-10-28-v0.2.3-day-run.md)) and 2.65 billion on
+0.2.8 ([record](qualification/2026-11-14-v0.2.8-memory-run.md)). Those count jobs
+that do nothing, so container launch cost, resource demand, storage and service
+quality still decide what a particular cluster sustains. See the
+[job manual](manual/14_batch-jobs.md).
 
 **Dependencies (planned, 0.9.0):** an `after` key makes one job wait for another: for all of it, element by element (task *i* after task *i*), or for a share of its tasks to succeed. The condition is stored on the job definition and evaluated against compact index sets, not as per-task edges, so a 16-million-task pipeline costs no more Raft state than two arrays. There's no DAG language: full workflows stay in Airflow or Nextflow, which drive Reliaburger through a Python client and their own provider and executor (see §23).
 
@@ -509,8 +515,9 @@ $ target/debug/relish --ca-cert cluster/identity/root-ca.crt status
 ```
 
 The API is HTTPS on `127.0.0.1:9117`; ports 9443, 9444 and 9445 are gossip,
-Raft and reporting, not the operator API. On Apple Silicon, use `--runtime
-apple` as your ordinary user instead of the `sudo ... --runtime runc` line.
+Raft and reporting, not the operator API. Bun refuses `--runtime apple` (direct
+Apple Container is disabled); on a Mac, run the cluster in the managed Linux VM
+with `relish setup --quickstart` instead.
 This bootstraps a real but non-resilient one-voter cluster. Run as root on
 Linux with `runc` installed, `relish init` turns on `[ebpf]` and `[dns]`, so
 namespace isolation holds from the first deploy; Bun refuses to start a
@@ -608,19 +615,19 @@ Every node runs the same binary: **Bun**. There's no distinction between control
 │  The leader additionally runs:                           │
 │   • Scheduler (Meat)                                     │
 │   • GitOps engine (Lettuce)                              │
+│   • Report and metrics-rollup aggregation                │
 │                                                          │
 │  Council members additionally run:                       │
-│   • API server (reads from local Raft state)             │
-│   • Metrics aggregation                                  │
+│   • A Raft voter's copy of the cluster state             │
 └──────────────────────────────────────────────────────────┘
 ```
 
 ### 7.2 Leader and Council
 
-The leader is an ordinary node that additionally runs the Meat scheduler. Leadership is lightweight: the leader runs application workloads alongside its scheduling duties. Any council member serves API read requests; writes go to the leader via Raft.
+The leader is an ordinary node that additionally runs the Meat scheduler. Leadership is lightweight: the leader runs application workloads alongside its scheduling duties. Every node serves the API. Some reads answer from the receiving node's own replica of the cluster state, which can lag the leader by a moment; reads that must be current go to the confirmed leader. Writes go to the leader via Raft.
 
 ```
-Read:  User → any node → nearest council member → response (from local state)
+Read:  User → any node → local replica, or the confirmed leader → response
 Write: User → any node → leader → Raft commit → response
 UI:    User → any node → Brioche (local) + API calls (routed as above)
 ```
@@ -661,7 +668,7 @@ Recovery from the last two cases is deliberately operator-triggered rather than 
 
 **Backup and restore:** For disaster recovery from total cluster loss, the leader periodically exports an encrypted state-machine snapshot to external object storage (`file://`, `s3://` or `gs://`), sealed with a key derived from the cluster master key. You configure the destination and cadence under `[cluster.backup]`; the export runs automatically on the leader, no command to remember. Credentials and region come from each backend's standard environment variables. Each backup is named after the position of the state inside it (recovery epoch, Raft term, log index), so restores and retention follow the council's history rather than a leader's clock. To recover after losing the whole council, `relish council recover` restores the newest backup that unseals on a stopped survivor, skipping and listing any it can't use, or one you name with `--backup` (see §8.3 above).
 
-**Disk exhaustion:** Council nodes monitor available disk space and proactively step down from the council when storage falls below a configurable threshold (default: 1 GB), preventing Raft from stalling on failed log writes. A pressured leader first hands leadership to a healthy voter, holding its own elections so it can't win the election that follows. The node rejoins the council automatically once disk pressure is resolved.
+**Disk exhaustion:** Council nodes watch the filesystem that holds their Raft directory and step down from the council once it's 95% full, or has no space left, for two checks in a row (about ten minutes; the 95% matches the level `relish wtf` calls critical, and there's no setting for it), preventing Raft from stalling on failed log writes. A pressured leader first hands leadership to a healthy voter, holding its own elections so it can't win the election that follows. The node rejoins the council automatically once disk pressure is resolved.
 
 > For protocol details, state machine diagrams, and split-brain prevention, see [design/gossip-mustard.md](design/gossip-mustard.md).
 
@@ -739,7 +746,7 @@ A compromise of any single intermediate CA doesn't affect the others. The root C
 
 `relish ca rotate --role node|workload|ingress --root-backup FILE` replaces an intermediate: the cluster makes the new key, `relish` signs its request with your root backup on your machine, and both CAs stay trusted while nodes and workloads move over (see the [security manual](manual/10_security.md#rotating-an-intermediate-ca)). `relish ca status` and `relish ca revoke`, with a 90-day expiry warning, are still planned ([#362](https://github.com/reliaburger/reliaburger/issues/362)).
 
-**Node authentication:** Nodes join via short-lived join tokens (default 15 minutes, single-use) that embed a SHA-256 fingerprint of the cluster's root CA certificate, allowing the joining node to verify the cluster's identity before transmitting credentials. On successful join, the node receives a certificate signed by the Node CA. All subsequent communication is mTLS. TPM-based hardware attestation is **planned — not yet implemented** (the binary links no TPM library).
+**Node authentication:** Nodes join via short-lived join tokens (default 15 minutes, single-use). A token is 32 random bytes and carries nothing about the cluster, so it can't prove the cluster's identity on its own. Pass `relish join --ca-fingerprint sha256:...` to pin the root CA: the joiner then checks the root it fetched against the pin before it sends the token, and a man in the middle is caught. Without the pin, that first fetch is trust-on-first-use and the token goes to whichever server answered (§6). On successful join, the node receives a certificate signed by the Node CA. All subsequent communication is mTLS. TPM-based hardware attestation is **planned — not yet implemented** (the binary links no TPM library).
 
 ### 11.2 Workload Identity
 
@@ -842,7 +849,7 @@ Lettuce is Reliaburger's built-in GitOps engine, replacing ArgoCD and Flux with 
 
 CLI compilation and Lettuce share the resolver for inherited `_defaults.toml` values and directory-derived namespaces. Lettuce resolves the configured watch directory from the verified Git commit; defaults outside that directory are not inherited. Malformed input or an unrepresentable namespace collision refuses the whole sync before desired-state changes. GitOps refuses duplicate resource definitions, while CLI compilation reports deterministic overrides within a namespace.
 
-Lettuce reconciles apps, namespaces and permissions. Any job declaration, including a scheduled job or a `run_before` migration, refuses the entire validated commit before desired-state changes. The failed sync leaves the previous applied SHA intact. Execute migration jobs and their dependent apps together through `relish apply`, or submit batch work through `relish batch`. GitOps job execution awaits a durable revision-to-run identity and dispatch path.
+Lettuce reconciles namespaces, permissions, policies and apps. It leaves alone any app a controller owns (see [Writing a controller](manual/15_writing-a-controller.md)). Any job declaration, including a scheduled job or a `run_before` migration, refuses the entire validated commit before desired-state changes. The failed sync leaves the previous applied SHA intact. Execute migration jobs and their dependent apps together through `relish apply`, or submit batch work through `relish batch`. GitOps job execution awaits a durable revision-to-run identity and dispatch path.
 
 **Configuration:**
 
@@ -868,7 +875,7 @@ When `require_signed_commits` is enabled, Lettuce only applies commits that are 
 1. Lettuce watches the configured git repository.
 2. On each poll (or webhook trigger), it pulls the latest commit.
 3. It compares the desired state in the repository against the actual state of the cluster.
-4. It computes a diff and applies only the changes: namespaces first, then permissions, then apps, and removals in the reverse order. A change the cluster refuses doesn't block the others; the sync records a partial result naming each refused change, and the applied commit moves only once everything has applied.
+4. It computes a diff and applies only the changes: namespaces first, then permissions, then policies, then apps, and removals in the reverse order (except that removed policies go before the apps are written, so every app is judged by the policies this commit declares). A change the cluster refuses doesn't block the others; the sync records a partial result naming each refused change, and the applied commit moves only once everything has applied.
 5. The Brioche UI and `relish gitops status` show the sync status, the last applied commit and a history of syncs. There's no preview of pending changes yet.
 
 **Ownership:** Lettuce prunes only what it wrote. Raft holds the set of apps, namespaces and permissions a sync created, changed or adopted, updated in the same entry as the write itself, and the diff removes only resources in that set. GitOps and `relish apply` therefore coexist: turning GitOps on in a working cluster, or committing an empty tree, leaves manually applied resources alone. A manual `relish apply` of a GitOps-managed resource warns that the next sync reverts it, and `relish delete` or `relish rollback` of one is refused without `--force`. A running test's `rbtest-*` namespace never enters the diff, and only the test lease's own cleanup can delete what's in it.
@@ -887,7 +894,7 @@ When `require_signed_commits` is enabled, Lettuce only applies commits that are 
 
 Reliaburger includes a complete observability stack with zero configuration:
 
-**Metrics (Mayo):** Per-node store (Parquet, queried with SQL) that collects node CPU, memory, disk and network, plus per-app CPU and memory. Jobs get their own series: attempt, success, failure and retry counters, duration histograms, and CPU and memory for running tasks read from their cgroups, labelled only by namespace, definition, profile and node. Apps that declare `metrics = {}` have their Prometheus `/metrics` endpoint scraped by the node running each instance. Data is kept at one resolution for `retention_days` (7 by default) and then pruned; tiered downsampling is planned. Council members aggregate one-minute rollups for cluster-wide dashboards. Alerts are fixed threshold rules; you can't define your own yet, and PromQL-style custom alerts are planned (see [design/metrics-mayo.md](design/metrics-mayo.md)). Five default alerts ship active out of the box, all on node-level metrics: node CPU above 90 %, node memory above 85 % and above 70 %, node disk above 80 %, and node CPU below 5 % for half an hour.
+**Metrics (Mayo):** Per-node store (Parquet, queried with SQL) that collects node CPU, memory, disk and network, plus per-app CPU and memory. Jobs get their own series: attempt, success, failure and retry counters, duration histograms, and CPU and memory for running tasks read from their cgroups, labelled only by namespace, definition, profile and node. Apps that declare `metrics = {}` have their Prometheus `/metrics` endpoint scraped by the node running each instance. Data is kept at one resolution for `retention_days` (7 by default) and then pruned; tiered downsampling is planned. Every node sends its one-minute rollups to the leader, which serves them for cluster-wide dashboards. Alerts are fixed threshold rules; you can't define your own yet, and PromQL-style custom alerts are planned (see [design/metrics-mayo.md](design/metrics-mayo.md)). Five default alerts ship active out of the box, all on node-level metrics: node CPU above 90 %, node memory above 85 % and above 70 %, node disk above 80 %, and node CPU below 5 % for half an hour.
 
 **Logs (Ketchup):** Captures stdout/stderr from every container. Structured storage with timestamp-based indexing and zstd compression. `relish logs --json-field key=value` filters JSON lines on the client, after the server has returned the lines you asked for; server-side field queries are planned. Each node exports its log files to a directory, `s3://` or `gs://` on a schedule.
 
@@ -1045,7 +1052,7 @@ An MCP client gets the same split. Plain `relish mcp` offers only the read-only 
 - **No LLM inside `bun`.** The model is on the other end of the pipe, in whichever agent the user already runs. A node that called a model would need API keys, network egress and a budget, and would change behaviour when a vendor's model did.
 - **Read-only, or asking.** No `relish agent` command changes a workload: from 0.2.8 `lease` and `propose` write only council records, which a person or a person's policy then acts on (§17.5). The agent's token, not the CLI, decides what it may read and whether it may propose. `relish mcp` speaks stdio only (no port to find), offers no tool that writes or reaches past the cluster API unless `--propose` adds the proposing ones, and names every excluded command with its reason; a new command is a tool by default, and the snapshot of the tool list puts the question "is this read-only?" in front of a reviewer.
 - **Nothing posts.** Reports, patches and setup changes stop at a step marked `read_only: false` for a human to approve. Patched binaries are unsigned, and every node upgrade checks the release signature, so a patch can't reach a real cluster through `relish upgrade`.
-- **Trust from outside.** Issue forms are the report contract, an AI-assistance policy asks every contributor (us included) to disclose AI help and stand behind every line, and every release file gets a build provenance attestation checkable with `gh attestation verify`. Notarisation of the macOS `relish` and a Homebrew tap are built but *planned* until the maintainer's Apple Developer ID and the tap repository exist.
+- **Trust from outside.** Issue forms are the report contract, an AI-assistance policy asks every contributor (us included) to disclose AI help and stand behind every line, and every release file gets a build provenance attestation checkable with `gh attestation verify`. Notarisation of the macOS `relish` is built but *planned* until the maintainer's Apple Developer ID exists. The Homebrew tap ships, from 0.2.7.
 
 The trade-off is that an agent gets less than it could. It can't restart the app it diagnosed without someone saying yes, it can't file the issue it drafted, and it reads a 24 KiB answer where a dump of the cluster would be more complete. We think an agent that's useful and can't do damage beats one that's slightly more useful and can.
 
@@ -1249,9 +1256,9 @@ The following features are intentionally excluded from Reliaburger v1. Each is a
 | Overlay network / CNI plugins | Per-container network namespaces with port mapping cover the common connectivity needs at a fraction of the complexity. No overlay, no CNI, no virtual network. |
 | Distributed / network-attached volumes | Local volumes only. Distributed storage is a complex domain with its own failure modes. Use managed databases for data that must survive node loss, or applications that replicate internally (CockroachDB, Cassandra). |
 | Custom Resource Definitions (CRDs) | CRDs are Kubernetes's extensibility mechanism and the source of enormous ecosystem complexity. Reliaburger's seven workload resource types cover the 80% use case. |
-| Operators | Operators exist to manage complex stateful workloads on Kubernetes. Without CRDs, there is no operator framework, by design. |
+| Operators | Operators exist to manage complex stateful workloads on Kubernetes. Without CRDs, there's no operator framework or SDK, by design. Since 0.2.4 a controller is an ordinary app holding a scoped API token, which claims the apps it manages with `owner` so `relish apply` and GitOps leave them alone ([Writing a controller](manual/15_writing-a-controller.md)). |
 | Service mesh (full sidecar proxy) | Namespace isolation, per-app eBPF firewall rules, and SPIFFE-based workload identity provide network segmentation and cryptographic authentication without the overhead of a sidecar proxy on every connection. Applications that need mTLS can configure it directly using the workload identity certificates — Reliaburger provides the certs, the app owns its TLS policy. |
-| Helm / package manager | When the configuration is already 15 lines of TOML, a package manager for configuration templates is unnecessary. |
+| Helm / package manager | When the configuration is already 15 lines of TOML, a package manager for configuration templates is unnecessary. For the repetition that's left, 0.2.4 added plain TOML [templates](manual/01_deploy-an-app.md#templates) with parameters, and no chart registry. |
 | External secret manager integration | The encrypted-in-git model covers the majority of use cases. Vault/AWS Secrets Manager integration is planned for v2. |
 | Windows node support | Linux only in v1. |
 | IPv6 | The current networking model (virtual IPs, eBPF hooks) is IPv4-only. IPv6 support is planned for v2. |
@@ -1332,7 +1339,7 @@ The Reliaburger column describes 0.2.8. Rows marked *Target* are design goals fr
 | **Non-container apps** | No | No | Yes (exec/raw_exec drivers) | No | **Yes (allowlisted host exec; sandboxing planned)** |
 | **Scheduling constraints** | nodeSelector, affinity/anti-affinity, taints/tolerations | Same | constraints, affinities | N/A | **Node labels with required/preferred (AND logic)** |
 | **Daemon mode** | DaemonSet (separate resource type) | Same | system scheduler | N/A | **replicas = "*" (same App resource)** |
-| **Job throughput** | Low (per-job API calls) | Low (same) | Medium | N/A | **Target: 100M+ per day (unqualified; task arrays implemented for 0.2.0)** |
+| **Job throughput** | Low (per-job API calls) | Low (same) | Medium | N/A | **100M+ per day: met in 0.2.0; 2.65B no-op host jobs in a day on 0.2.8** |
 | **Leader recovery** | Automatic within quorum; backup for quorum loss | Same | Automatic within quorum; backup for quorum loss | N/A | **Automatic within quorum; operator restore from a sealed backup for quorum loss (§8.3)** |
 | **Multi-cluster** | Separate (Karmada / Cilium ClusterMesh / many CRDs) | Same | WAN gossip + API forwarding (Consul for service discovery) | N/A | **Planned (Franchise — WAN gossip + Wrapper ingress; not yet implemented, see §22)** |
 | **K8s migration** | N/A | N/A | N/A | N/A | **Built-in (relish import/export with migration reports)** |
@@ -1389,7 +1396,7 @@ The default host port range is 10000-32766, about 22,700 ports per node, below L
 
 ### Q2: How do cluster-wide metrics queries work at 10,000 nodes?
 
-Nobody has run 10,000 nodes yet, so this is the design and what exists of it. Each node rolls its own samples up every minute (min, max, sum and count per series) and council members collect those rollups, so cluster-wide dashboard queries hit the council (3-7 nodes), not every node. The rollups are per series today, still carrying labels such as `instance` and `pid`, so they shrink time resolution but not the number of series; rolling them up per app is planned ([#364](https://github.com/reliaburger/reliaburger/issues/364)). Single-app queries fan out only to the nodes running that specific app (typically 3-10 nodes). A Prometheus remote-read endpoint, for federating full-resolution data into your own Thanos or Cortex, is planned too ([#364](https://github.com/reliaburger/reliaburger/issues/364)).
+Nobody has run 10,000 nodes yet, so this is the design and what exists of it. Each node rolls its own samples up every minute (min, max, sum and count per series) and sends those rollups to the leader, so cluster-wide dashboard queries hit one node, not every node. Spreading that collection over the council belongs to the planned reporting tree. The rollups are per series today, still carrying labels such as `instance` and `pid`, so they shrink time resolution but not the number of series; rolling them up per app is planned ([#364](https://github.com/reliaburger/reliaburger/issues/364)). Single-app queries fan out only to the nodes running that specific app (typically 3-10 nodes). A Prometheus remote-read endpoint, for federating full-resolution data into your own Thanos or Cortex, is planned too ([#364](https://github.com/reliaburger/reliaburger/issues/364)).
 
 ### Q3: Isn't gossip carrying too much data at scale?
 
@@ -1455,10 +1462,13 @@ new app deployments still require free capacity and rollout headroom.
 **Implementation status:** this is the architecture implemented in
 [#266](https://github.com/reliaburger/reliaburger/pull/266), following the
 [resource-aware jobs plan](plans/archive/2026-10-04-plan-delegated-jobs.md). The daily
-throughput target remains unqualified until real workloads sustain at least
-1,158 unique successful completions per second with headroom, concurrent apps,
-failure recovery and bounded memory and storage. A short simulated burst doesn't
-establish that result.
+throughput target was qualified for 0.2.0: 12 hours at 4,600 accepted a second,
+alongside apps and faults
+([record](qualification/2026-10-17-v0.2.0-job-qualification.md),
+[#668](https://github.com/reliaburger/reliaburger/issues/668)). Every release gate
+since runs a jobs soak above that rate, and the 0.2.8 day run accepted
+2,649,391,295 no-op host-job tasks in 24 hours on three VMs
+([record](qualification/2026-11-14-v0.2.8-memory-run.md)).
 
 ### Short commands in reusable containers
 
@@ -1551,9 +1561,9 @@ See the [AI implementation sequence](plans/archive/2026-10-04-plan-delegated-job
 
 ### Q8: Can a single leader actually schedule 100M+ jobs per day while doing everything else?
 
-100M jobs a day remains an unqualified design target (§2). The 0.2.0 development implementation keeps arrays compact in Raft and expands them on workers. Singleton jobs, cron and hooks create runs through the same indexed path as arrays. High-volume callers compress repeated work into arrays or mixed-profile manifests.
+Yes, on the evidence so far: 0.2.0 qualified the 100M-a-day target (§2), and the 0.2.8 day run accepted 2.65 billion no-op host jobs in 24 hours on three VMs ([record](qualification/2026-11-14-v0.2.8-memory-run.md)). The 0.2.0 development implementation keeps arrays compact in Raft and expands them on workers. Singleton jobs, cron and hooks create runs through the same indexed path as arrays. High-volume callers compress repeated work into arrays or mixed-profile manifests.
 
-The leader grants chunks: "Node 7, here are your next 1,024 indexes" (the default chunk size, capped at 65,536), and a node with fast-finishing tasks can hold up to sixteen chunks ahead. Workers execute within their shared CPU/memory budget. A leader-driven HTTP sync accepts durable aggregate completions and retransmits grants; per-task ledgers and indexes stay on workers, compacted to about 14 bytes a task once a run finishes. This removes global placement and Raft writes per task. Runtime startup, resource demand, storage, result retention and application service quality still determine whether a particular cluster can sustain the daily target. The [delegated jobs report](qualification/2026-10-04-delegated-jobs/README.md) and the [timed job scenarios](qualification/2026-10-09-timed-job-scenarios/README.md) record the evidence so far; the sustained gate is [#668](https://github.com/reliaburger/reliaburger/issues/668).
+The leader grants chunks: "Node 7, here are your next 1,024 indexes" (the default chunk size, capped at 65,536), and a node with fast-finishing tasks can hold up to sixteen chunks ahead. Workers execute within their shared CPU/memory budget. A leader-driven HTTP sync accepts durable aggregate completions and retransmits grants; per-task ledgers and indexes stay on workers, compacted to about 14 bytes a task once a run finishes. This removes global placement and Raft writes per task. Runtime startup, resource demand, storage, result retention and application service quality still determine whether a particular cluster can sustain the daily target. The [delegated jobs report](qualification/2026-10-04-delegated-jobs/README.md) and the [timed job scenarios](qualification/2026-10-09-timed-job-scenarios/README.md) record the per-job costs, and [#668](https://github.com/reliaburger/reliaburger/issues/668) the sustained gate 0.2.0 passed.
 
 ### Q9: Local-only volumes with no distributed storage. How do teams not lose data?
 

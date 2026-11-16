@@ -1345,21 +1345,22 @@ Warning: No --duration specified. Fault will auto-expire in 10 minutes.
 
 ### 6.2 Maximum Duration
 
-Every fault has a maximum duration, configurable per cluster. The default maximum is **1 hour**.
+Every fault has a maximum duration, set per node in `node.toml`. The default maximum is **1 hour**, and a fault that names no duration lasts **10 minutes**.
 
 ```toml
-# cluster-config.toml
+# node.toml
 [smoker]
-default_duration = "10m"
-max_duration = "1h"
+default_duration_secs = 600
+max_duration_secs = 3600
 ```
 
-Attempts to set a duration longer than `max_duration` are rejected by the leader:
+Both are whole seconds. The node that injects the fault applies them (`smoker::config::effective_duration`, called from Bun's agent loop), so give every node the same values if you change them. A request longer than `max_duration_secs` is rejected:
 
 ```
-Error: Requested duration 2h exceeds maximum allowed duration 1h.
-Use a shorter duration or ask a cluster admin to increase smoker.max_duration.
+fault duration 7200s exceeds the configured maximum of 3600s
 ```
+
+Beneath both, a 24-hour hard ceiling in `FaultRule::new` still applies.
 
 ### 6.3 Safety Overrides
 

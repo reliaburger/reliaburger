@@ -10,7 +10,7 @@
 
 Brioche is Reliaburger's built-in web dashboard, compiled directly into the Bun binary and served from every node in the cluster. It replaces the common Grafana + custom-dashboard pattern by providing purpose-built views for the operations that matter most: cluster health, application status, deployment history, ingress routing, GitOps sync state, and alerting.
 
-Because Brioche is embedded in Bun via Rust's `include_bytes!` / `rust-embed` mechanism, there is nothing to install, no sidecar to deploy, and no separate process to manage. Visiting any node's API port in a browser renders the full dashboard. The shipped UI is **server-rendered HTML with HTMX**, not a client-side single-page application: each page is a full HTML document produced in Rust, and small `hx-get` regions poll `/ui/fragment/*` endpoints for updates. Those requests follow Reliaburger's standard read/write routing (reads go to the nearest council member, writes are forwarded to the leader via Raft).
+Because Brioche is embedded in Bun via Rust's `include_bytes!` / `rust-embed` mechanism, there is nothing to install, no sidecar to deploy, and no separate process to manage. Visiting any node's API port in a browser renders the full dashboard. The shipped UI is **server-rendered HTML with HTMX**, not a client-side single-page application: each page is a full HTML document produced in Rust, and small `hx-get` regions poll `/ui/fragment/*` endpoints for updates. Those requests follow Reliaburger's standard read routing: some reads answer from the receiving node's own copy of council state, which can lag the leader, and others go to the confirmed leader. Dashboard sessions are read-only. The only writes the dashboard makes are proposal decisions (approve, reject, undo), which need a pasted token, and a node that isn't the leader refuses them with 409 and says where the leader is.
 
 **Core dashboard pages:**
 
@@ -131,12 +131,12 @@ Brioche runs on every node, but the data it displays comes from the cluster API.
               ┌───────────────┼────────────────┐
               │               │                │
          Static assets   Read requests    Write requests
-         (local embed)   (→ nearest       (→ leader
-                          council member)   → Raft commit)
+         (local embed)   (local replica   (→ leader
+                          or leader)        → Raft commit)
 ```
 
 - **Static asset requests** (`/`, `/apps`, CSS, JS, fonts): Served directly from the embedded assets on the local node. No network hop.
-- **API read requests** (`GET /v1/*`): The local Bun forwards to the nearest council member if the local node is not a council member. Council members serve from local Raft state.
+- **API read requests** (`GET /v1/*`): There's no nearest-council-member routing. Some reads answer from the receiving node's own replica of council state, which can lag the leader (`/v1/status`, for one); others are forwarded to the confirmed leader (`bun::leadership`).
 - **API write requests** (`POST /v1/*`, `PUT`, `DELETE`): Forwarded to the current leader, which commits via Raft before responding.
 - **Metrics queries** (`GET /v1/metrics/cluster`, `GET /v1/metrics/app/{app}/{namespace}`): fan out across council members or the nodes running the app and merge results. The per-name `GET /v1/metrics` reads the local store. `GET /v1/metrics/app/{app}/{namespace}/chart?name=- **Metrics queries** (`GET /v1/metrics/cluster`, `GET /v1/metrics/app/{app}/{namespace}`): fan out across council members and merge results. The per-name `GET /v1/metrics` reads the local store.kind=gauge|rate|mean` returns one app metric as `{timestamps, series: [{label, values}]}`, one series per instance, counters as per-second rates and histograms as means, which is what the app page draws.
 - **Log streaming** (`GET /v1/logs/{app}/{namespace}?follow=true`, `WS /v1/ws/logs/{app}/{namespace}`): streams from the receiving node's local agent only. Cross-node merge of live follow is not implemented.
@@ -145,7 +145,7 @@ Brioche runs on every node, but the data it displays comes from the cluster API.
 
 Brioche uses a deliberately lightweight frontend stack. The goal is a small asset bundle (<500KB gzipped total), fast page loads (<200ms), and zero build-time complexity that would burden Reliaburger contributors.
 
-**Chosen approach: HTMX + server-rendered HTML (Askama templates) + lightweight JS for charts.**
+**Chosen approach: HTMX + server-rendered HTML + lightweight JS for charts.** This section was written with Askama templates in mind; the shipped pages don't use Askama. They're built with `format!` in `src/brioche/*.rs`, and every value from outside is escaped by hand with `escape_html` (§8.3).
 
 Rationale:
 
@@ -1259,10 +1259,9 @@ redirect flow below is the target design:
 
 **Role enforcement:**
 
-- Read-only tokens can view all dashboard pages but cannot trigger actions (deploy, rollback, scale, retry, sync).
-- Deployer tokens can trigger deploys, rollbacks, and scaling for apps within their scope.
-- Admin tokens have full access including cluster settings, token management, and alert suppression.
-- Action buttons are hidden or disabled based on the authenticated token's role.
+- Every dashboard session is read-only, whatever the role of the token that opened it (`readonly_session_context` in `src/sesame/auth.rs`).
+- There are no deploy, rollback, scale, retry, sync or alert buttons. The only writes are a proposal's approve, reject and undo forms, and each needs the decider to paste a token of the same principal, which the API's own authorisation then checks.
+- A decision posted to a node that isn't the leader is refused with 409 and points at the leader; the session cookie can't be forwarded.
 
 ### 6.3 TLS
 
@@ -1422,14 +1421,17 @@ async fn validate_csrf(
 
 ### 8.3 XSS Prevention
 
-- All dynamic content rendered by Askama templates is auto-escaped by default. Askama escapes `<`, `>`, `&`, `"`, and `'` in all template expressions unless explicitly marked with `|safe` (which is used only for trusted, pre-sanitized content like diff syntax highlighting).
+- There's no template engine and no automatic escaping. Pages are built with `format!`, and every interpolated value from outside (app, instance, node and alert names, labels, proposal text, log lines) goes through `escape_html` (`src/brioche/dashboard.rs`), which escapes `<`, `>`, `&`, `"` and `'`. A new field needs an explicit `escape_html` call; review for it.
 - Log lines are sanitized before rendering: all HTML entities are escaped. Logs are rendered inside `<pre>` blocks with no raw HTML interpretation.
 - User-supplied values (app names, environment variable keys, commit messages) are always escaped.
-- The Content Security Policy (Section 8.4) provides defense in depth against any escaping failures.
+- In the browser, `brioche.js` and uPlot set text with `textContent`, never `innerHTML`.
+- There's no Content Security Policy behind the escaping today (Section 8.4), so the escaping is the only defence.
 
 ### 8.4 Content Security Policy
 
-Brioche serves a strict Content Security Policy header on all responses:
+> **Status: planned, not implemented.** Bun sends only `Content-Security-Policy: frame-ancestors 'none'` and `X-Frame-Options: DENY`, on HTML responses (`forbid_framing` in `src/bun/api/ui.rs`). The strict policy below is the target. The pages have no inline script (`brioche.js` and htmx are external files), so it should work as written.
+
+The planned policy:
 
 ```
 Content-Security-Policy:
@@ -1454,6 +1456,8 @@ Breakdown:
 - `form-action 'self'`: Forms can only submit to the same origin.
 
 ### 8.5 Additional Headers
+
+> **Status: planned, not implemented.** Bun itself sends none of `X-Content-Type-Options`, `Referrer-Policy` or `Permissions-Policy`. The `relish dashboard` proxy adds `Cache-Control: no-store`, `Referrer-Policy: no-referrer`, `X-Content-Type-Options: nosniff` and `X-Frame-Options: DENY` to what it forwards (`src/relish/dashboard.rs`). The sketch below is the target for Bun.
 
 ```rust
 fn security_headers() -> HeaderMap {
@@ -1949,6 +1953,8 @@ All endpoints are prefixed with `/v1`. Authentication is required for all endpoi
 | `/deploys/:id/stream` | Deploy progress updates | Deploy progress indicator |
 
 ### Write Endpoints (POST/PUT/DELETE)
+
+> **Planned, not implemented.** None of the routes in this table exists; there is no `POST /gitops/sync` either. The dashboard's only writes are `POST /ui/proposal/{id}/approve`, `/reject` and `/undo` (§6.2).
 
 | Endpoint | Action | Required Role |
 |----------|--------|---------------|

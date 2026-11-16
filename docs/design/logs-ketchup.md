@@ -84,8 +84,10 @@ Every file carries the schema:
 | `timestamp` | `UInt64` | seconds since Unix epoch |
 | `app` | `Utf8` | app name |
 | `namespace` | `Utf8` | namespace |
-| `stream` | `Utf8` | always `"stdout"` today (see §3.1) |
+| `stream` | `Utf8` | `"stdout"` or `"stderr"` (see §3.1) |
 | `line` | `Utf8` | the captured line |
+| `sequence` | `UInt64` | the store's ordering key; queries sort by it |
+| `instance` | `Utf8` (nullable) | the instance that wrote the line |
 
 **Day-boundary rotation at midnight UTC: planned -- not yet implemented.** Files roll over on flush, not on a calendar boundary; a line lands in whichever flush is current.
 
@@ -165,7 +167,9 @@ pub struct LogQuery {
     pub namespace: String,
     pub start: Option<u64>,             // inclusive, seconds since epoch
     pub end: Option<u64>,               // inclusive, seconds since epoch
-    pub grep: Option<String>,           // SUBSTRING match, not regex
+    pub grep: Option<String>,           // regular expression
+    pub instance: Option<String>,       // only this instance's lines
+    pub stream: Option<LogStream>,      // only stdout or only stderr
     pub json_field: Option<(String, String)>,  // single (key, value)
     pub tail: Option<usize>,            // last N lines
 }
@@ -173,9 +177,9 @@ pub struct LogQuery {
 
 The differences from earlier drafts are load-bearing:
 
-- **`grep` is a plain substring**, applied as SQL `line LIKE '%…%'`. There is no `GrepFilter`, no compiled `regex::Regex`, and no case-insensitive `--grep-i` (the `regex` crate is not a dependency here). **Regex grep: planned -- not yet implemented.**
+- **`grep` is a regular expression**, applied as SQL `regexp_like(line, …)`. `relish` and the store both compile it with the `regex` crate first (`validate_grep`), so a bad pattern is a flag error, not a server fault. There's no separate `--grep-i`; write `(?i)` in the pattern.
 - **`json_field` is a single `(key, value)` pair**, matched **client-side** against the top-level key only. Multiple ANDed filters and dot-path traversal (`request.method`) are **planned -- not yet implemented**.
-- There is **no `instance` filter**, **no `node` filter**, **no `stream` filter**, and **no `until`/`end`-as-follow** field. `--instance` does not exist. **`--until`: planned -- not yet implemented** (the CLI has `--since` only).
+- `instance` and `stream` filter on the columns of the same names (`--instance`, `--stream`), and `end` is the `--until` bound. `--stream` and `--until` don't combine with `--follow`. There is **no `node` filter**.
 - Follow is not a field on `LogQuery`; it is a separate agent command (§3.7).
 
 ### 4.3 Export and Retention Configuration
@@ -206,7 +210,7 @@ The `AsyncFd`/two-tasks-per-stream/`DayLogWriter` mechanics from earlier drafts,
 
 ### 5.3 Querying
 
-Query operations are initiated via `relish logs` (CLI), the Brioche UI, or the HTTP API. The CLI flags that exist are `--tail`, `-f/--follow`, `--grep`, `--since`, and `--json-field` (`src/relish/commands.rs`).
+Query operations are initiated via `relish logs` (CLI), the Brioche UI, or the HTTP API. The CLI flags that exist are `--tail`, `-f/--follow`, `--grep`, `--since`, `--until`, `--instance`, `--stream`, `--json-field` and `--namespace` (`src/bin/relish.rs`).
 
 **One-shot fetch (default mode):**
 ```bash
@@ -225,13 +229,13 @@ relish logs web -f
 relish logs web --since 1h
 relish logs web --since 1739196000        # raw epoch seconds
 ```
-`--since` accepts **raw epoch seconds or a duration** (e.g. `1h`, `30m`); it is parsed by `parse_since` into a start timestamp. **RFC3339 timestamps and `--until` are not supported** -- an `--until` flag does not exist. (RFC3339 parsing and an end bound: planned -- not yet implemented.)
+`--since` and `--until` accept **raw epoch seconds or a duration before now** (e.g. `1h`, `30m`, `2d`); `parse_time` turns each into a timestamp, and both bounds are inclusive. `--until` doesn't combine with `-f`. **RFC3339 timestamps are not supported** (planned -- not yet implemented).
 
 **Text search (grep):**
 ```bash
-relish logs web --grep ERROR
+relish logs web --grep 'error|warn'
 ```
-`--grep` is a **substring** match. Server-side it becomes `line LIKE '%ERROR%'`; the client also re-checks the substring. It is **not** a regex, and there is **no `--grep-i`** case-insensitive variant.
+`--grep` is a **regular expression**. Server-side it becomes `regexp_like(line, 'error|warn')`; `relish` refuses a pattern that won't compile before it sends anything. For a case-insensitive match, start the pattern with `(?i)`.
 
 **Structured JSON field query:**
 ```bash
@@ -239,25 +243,24 @@ relish logs web --json-field level=error
 ```
 A single `key=value` filter, applied **client-side**: each returned line is parsed as JSON and the **top-level** `key` compared as a string. Multiple `--json-field` flags and dot-path traversal (`request.method=POST`) are **planned -- not yet implemented**.
 
-**Instance filter:** **Status: planned -- not yet implemented.** There is no `--instance` flag; logs are not tagged with an instance id.
+**Instance and stream filters:** `--instance default__web-2` keeps one instance's lines, and `--stream stderr` keeps one stream (not with `-f`). Both run server-side against the `instance` and `stream` columns.
 
 ### 5.4 Log Export
 
-Export runs as a periodic background task on each node, configured via:
+Export runs as a periodic background task on each node, configured in the `[logs]` section of `node.toml` (there's no `[logs.export]` table, and no format setting: §4.3):
 
 ```toml
-[logs.export]
-destination = "s3://my-bucket/logs/"
-format = "jsonl.gz"
-interval = "1h"
+[logs]
+export_path = "s3://my-bucket/logs/"
+export_interval_secs = 3600
 ```
 
 **Export pipeline (as implemented):**
 
 Logs are already stored as ZSTD-compressed Parquet (`logs_NNNNNN.parquet`). Export ships those files as-is rather than re-serialising to JSON lines, so an exported archive is queryable with the same DataFusion path as local logs.
 
-1. Every `interval`, the export task lists the local `.parquet` log files.
-2. For each file not yet recorded in the checkpoint, it reads the bytes and `put`s them to `{destination}/{node}/{filename}` through the `object_store` crate — one interface over a bare path, `file://`, `s3://` and `gs://`. Cloud credentials come from each backend's standard environment variables.
+1. Every `export_interval_secs`, the export task lists the local `.parquet` log files.
+2. For each file not yet recorded in the checkpoint, it reads the bytes and `put`s them under `{export_path}/{node}/` through the `object_store` crate — one interface over a bare path, `file://`, `s3://` and `gs://`. Cloud credentials come from each backend's standard environment variables.
 3. On a successful upload, the file's **durable id** is recorded in the checkpoint.
 
 **Export file naming at the destination:**

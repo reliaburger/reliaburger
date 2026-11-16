@@ -172,11 +172,15 @@ rotation process.
 
 **Certificate renewal:**
 
-Automatic renewal and hot reload aren't implemented. The current in-memory
-resolver also doesn't replace a cached cluster leaf at expiry. Production
-acceptance therefore needs renewal before the cluster mode can be called
-hands-off; until then, restart Wrapper before expiry or use externally rotated
-operator material.
+Both kinds renew without a restart. The cluster resolver
+(`IngressCertResolver` in `src/wrapper/tls.rs`) issues a new leaf for a
+hostname on the first handshake after the cached leaf passes the midpoint of
+its validity. If signing fails, it keeps serving the old leaf, but only until
+that leaf expires. Operator files are re-read once a second
+(`FileCertResolver::run`): a changed, valid pair replaces the served one on the
+next handshake, and a pair that won't load is logged once and ignored, so the
+last good pair stays in service until its own expiry. Expiry telemetry is still
+missing (§5.4).
 
 ### 3.5 Connection Draining During Deploys
 
@@ -472,7 +476,9 @@ Every inbound HTTPS request follows this path:
     b. Longest path prefix match → PathRoute
     c. If no match: respond 404 Not Found
 6.  Rate limit check:
-    a. Extract client IP (from X-Forwarded-For if trusted proxy, else peer IP)
+    a. Client IP is always the TCP peer address. There is no trusted-proxy
+       setting and Wrapper never reads X-Forwarded-For, so behind an HTTP load
+       balancer every client shares the balancer's bucket
     b. Check token bucket for (client_ip, route)
     c. If rate limited: respond 429 Too Many Requests with Retry-After header
 7.  Backend selection from BackendPool:
@@ -526,11 +532,12 @@ credential boundaries exist would repeat the same documentation mistake.
 
 ### 5.4 Certificate Renewal (required follow-up)
 
-The v1 cluster resolver caches a generated leaf for the life of the Bun process
-and doesn't inspect its expiry. Operator certificates load at startup and don't
-hot-reload. A production implementation must renew or reload before expiry,
-retain the last valid certificate while rotation runs, expose expiry telemetry,
-and fail acceptance when a required certificate can't be refreshed.
+Renewal and reload ship (§3.4): the cluster resolver renews a leaf at the
+midpoint of its validity, operator files are re-read every second, and both
+keep the last valid certificate, never past its expiry, while a refresh fails.
+What's still missing is expiry telemetry and a check that fails loudly when a
+required certificate can't be refreshed. Today a refused file reload logs one
+line on stderr, and a failed cluster renewal logs nothing.
 
 ### 5.5 Connection Draining
 

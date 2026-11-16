@@ -6,7 +6,7 @@ FEATURE STATUS · 0.2.8
 
 Every feature of Reliaburger 0.2.8, released on 12 November 2026: how far along it is, what it doesn't do yet, and the open issues against it. Search the page for the thing you need.
 
-Before 1.0.0, all of it is for home labs and dev clusters, not production. 1.0.0 is expected in January 2027. Until then, an upgrade can mean starting a fresh cluster.
+Before 1.0.0, all of it is for home labs and dev clusters, not production. 1.0.0 has no date yet. Until then, an upgrade can mean starting a fresh cluster.
 
 ## What the statuses mean
 

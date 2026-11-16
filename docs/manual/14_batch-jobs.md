@@ -135,7 +135,8 @@ relish stop cleanup
 includes dormant schedules and revisions. Stop disables future occurrences and
 cancels retained runs. Deleting a definition doesn't erase uncertain ownership.
 Deployment inventory and cancellation use `/v1/deploys/operations` and
-`/v1/deploys/cancel/OPERATION_ID`. Cancellation is durable; capacity and gates
+`POST /v1/deploys/operations/OPERATION_ID/cancel` (`relish cancel-deploy
+OPERATION_ID`). Cancellation is durable; capacity and gates
 remain held until workers positively retire their launches.
 
 Inspect an `Unknown` summary's owner and grant digest before deciding to repeat

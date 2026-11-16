@@ -60,7 +60,7 @@ Dependency ordering via `run_before` ensures that prerequisite jobs (e.g., datab
 | Component | Role in Deploy System |
 |---|---|
 | **Meat** (scheduler, leader) | Orchestrates the deploy state machine. Makes placement decisions for new instances. Coordinates the rolling sequence across nodes. Enforces namespace quotas at scheduling time. |
-| **Bun** (node agent) | Starts and stops containers on each node. Runs health checks against new instances. Reports instance state back to the leader via the reporting tree. Updates the eBPF service map (Onion) on the local node. |
+| **Bun** (node agent) | Starts and stops containers on each node. Runs health checks against new instances. Reports instance state straight to the leader over the reporting connection. Updates the eBPF service map (Onion) on the local node. |
 | **Wrapper** (ingress proxy) | Maintains the routing pool for external traffic. Adds new instances and removes old instances from the pool during transitions. Implements connection draining (stops sending new requests to draining instances, waits for in-flight requests to complete). |
 | **Onion** (service discovery) | Updates the eBPF service map on every node so that internal service-to-service traffic routes to the correct backends. Map updates are atomic and take microseconds. |
 | **Ketchup** (log collector) | Records structured deploy events (start, step completion, health check pass/fail, drain start/complete, rollback trigger, completion) for audit trail and post-incident analysis. |
@@ -156,20 +156,15 @@ The deploy lifecycle is modeled as an explicit state machine. Each deploy has ex
 
 ### 3.2 Leader-Node Coordination
 
-The deploy orchestration loop runs on the leader node inside Meat. For each rollout step, the leader:
+The leader doesn't send commands to nodes. Each node rolls its own share of an app with the app's `[deploy]` table, and the leader releases a spec change one node at a time (`src/cluster/rollout.rs`, #692):
 
-1. Sends a `StartInstance` command to the target node's Bun agent (via the reporting tree).
-2. Bun starts the new container, allocates a host port, and begins health checking.
-3. Bun reports instance state transitions back to the leader: `Starting` -> `HealthChecking` -> `Healthy` (or `Unhealthy`).
-4. On `Healthy`, the leader sends `UpdateRouting` commands:
-   - To all Wrapper instances: add the new backend, remove the old backend.
-   - To all Bun agents: update the local Onion eBPF service map.
-5. The leader sends a `DrainAndStop` command to the node running the old instance.
-6. Bun on that node signals the old container (SIGTERM), waits for `drain_timeout`, then force-kills if necessary.
-7. Bun reports `Stopped` for the old instance.
-8. The leader advances to the next step.
+1. The leader publishes placements. The first node (by node id) that doesn't run the new spec yet gets it; every node after it keeps the last spec that rolled out everywhere.
+2. Each node's placement reconciler polls the leader's `GET /v1/placements/{node}` and converges on what it finds there: it starts the new instances, health-checks them, and retires the old ones with draining (§3.4).
+3. Each node reports to the leader over the reporting connection which version it last converged on and whether its instances are healthy.
+4. When that node reports its share healthy on the new spec, the leader releases the spec to the next node.
+5. If a node's rollout fails, its reconciler posts a `RolloutFailureReport` to the leader's `POST /v1/rollouts/failed`, and the leader marks the spec `RolloutFailed`.
 
-All communication uses the existing reporting tree and Raft log. Deploy progress isn't persisted in Raft: Raft holds only each app's rollout targets (the last specs that rolled out everywhere) and its `RolloutFailed` mark. A new leader reads each node's converged version and health from its reports and carries on from there (see Section 7: Failure Modes).
+So placements go down over the HTTP API, and state comes up over the reporting connection, which carries reports upward only. Deploy progress isn't persisted in Raft: Raft holds only each app's rollout targets (the last specs that rolled out everywhere) and its `RolloutFailed` mark. A new leader reads each node's converged version and health from its reports and carries on from there (see Section 7: Failure Modes).
 
 ### 3.3 Wrapper Routing Pool Updates During Transition
 
@@ -761,14 +756,6 @@ Rollback re-deploys a previous spec version through the same rolling mechanism, 
 
 ### 5.4 Dependency Ordering (`run_before`)
 
-> **Status: implemented.** Before an app deploys, the agent runs every job whose
-> `run_before` names that app to completion, gating on a clean (exit 0) finish
-> and aborting the deploy if a prerequisite fails or times out. A gating job runs
-> exactly once and is skipped in the regular jobs loop. The multi-stage
-> `DependencyGraph` and topological cycle detection below remain the target for a
-> future iteration; today's gating covers the job→app case (the common migration
-> ordering).
-
 Jobs can declare dependencies on Apps using the `run_before` field:
 
 ```toml
@@ -778,16 +765,14 @@ command = ["npm", "run", "migrate"]
 run_before = ["app.api"]
 ```
 
-When a deploy includes both the migration job and the API app (e.g., both reference the same new image tag, or both are declared in the same TOML file), the deploy system:
+A `run_before` job is a hook, and hooks run on the same lifecycle as every other job: [scheduler-meat.md §5.2](scheduler-meat.md#52-jobs-the-common-lifecycle) is the authority. In short, the leader drives it as one deployment operation:
 
-1. Parses the `DependencyGraph` from all jobs with `run_before` fields referencing the target app.
-2. Transitions the deploy to `RunningPreDeps` phase.
-3. Dispatches all dependency jobs to the Meat scheduler (jobs without inter-dependencies run in parallel).
-4. Waits for all dependency jobs to complete successfully.
-5. On success: transitions to `Rolling` phase and begins the rolling update.
-6. On failure (any dependency job fails after exhausting retries): transitions to `Failed` with a clear error indicating which job failed and why. The app isn't modified.
+1. An apply with hooks writes `DeployBegin` to the council. That persists the deployment intent and admits only the hooks.
+2. The leader grants the hooks to workers like any other job. By default a hook gets one attempt and a 600-second deadline (`src/meat/job.rs`); a job's own `max_attempts` and `task_timeout_secs` override that.
+3. When every hook has an accepted successful outcome, `DeployCommitted` publishes the apps and admits the ordinary jobs and schedules in one entry, and the rolling update begins.
+4. A failed hook fails the deploy before any instance changes. An unknown outcome never opens the gate. `relish cancel-deploy OPERATION_ID` (`POST /v1/deploys/operations/{id}/cancel`) writes `DeployCancel`.
 
-For multi-stage dependencies (e.g., `build-frontend` -> `build-api` -> `app.api`), the dependency graph is resolved topologically. Cycles are detected at deploy time and rejected with an error.
+There's no multi-stage `DependencyGraph` and no topological ordering between hooks: every hook of an apply gates every app in it.
 
 ### 5.5 Connection Draining
 
@@ -1240,7 +1225,7 @@ health_timeout = "60s"
 
 In a cluster either outcome marks the app `RolloutFailed` (Section 5.2), so the leader stops releasing the spec to further nodes.
 
-**Detection:** Bun on the target node performs the health check (HTTP GET to the configured health endpoint). If the endpoint returns a non-2xx status or the connection times out for the entire `health_timeout` duration, the instance is considered unhealthy. Bun reports this to the leader via the reporting tree.
+**Detection:** Bun on the target node performs the health check (HTTP GET to the configured health endpoint). If the endpoint returns a non-2xx status or the connection times out for the entire `health_timeout` duration, the instance is considered unhealthy. Bun reports this to the leader in its next report.
 
 ### 7.2 Node Failure Mid-Deploy
 
