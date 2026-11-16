@@ -382,6 +382,9 @@ pub(super) async fn upgrade_start_handler(
         )
             .into_response();
     }
+    if let Err(resp) = check_no_os_rollout(council).await {
+        return resp;
+    }
     crate::bun::audit::annotate(crate::bun::audit::AuditNote {
         details: std::collections::BTreeMap::from([
             (
@@ -525,25 +528,60 @@ pub(super) async fn upgrade_start_handler(
         return resp;
     }
 
-    match council
-        .write(crate::council::types::RaftRequest::UpgradeUpdate {
+    record_upgrade_start(
+        council,
+        upgrade,
+        serde_json::json!({ "status": "starting", "upgrade_id": upgrade_id }),
+    )
+    .await
+}
+
+/// Refuse a bun upgrade or rollback while an OS rollout holds the fleet:
+/// both restart nodes. The state machine refuses the write too; this says
+/// so before the slow checks.
+// `Response` is large but it IS the HTTP reply to send on failure.
+#[allow(clippy::result_large_err)]
+pub(super) async fn check_no_os_rollout(
+    council: &crate::council::CouncilNode,
+) -> Result<(), Response> {
+    match council.desired_state().await.os_rollout {
+        Some(rollout) => Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "OS rollout {} to {} is in progress; resume or abort it first",
+                    rollout.rollout_id, rollout.target
+                )
+            })),
+        )
+            .into_response()),
+        None => Ok(()),
+    }
+}
+
+/// Record a new run (or a resume) in Raft and answer 202 with `accepted`,
+/// or 409 with the state machine's reason if it refused: another run, an
+/// OS rollout, or an id that has run before.
+pub(super) async fn record_upgrade_start(
+    council: &crate::council::CouncilNode,
+    upgrade: crate::upgrade::types::ClusterUpgradeState,
+    accepted: serde_json::Value,
+) -> Response {
+    let error = match council
+        .write(crate::council::types::RaftRequest::UpgradeStart {
             state: Box::new(upgrade),
         })
         .await
     {
-        Ok(_) => (
-            StatusCode::ACCEPTED,
-            Json(serde_json::json!({ "status": "starting", "upgrade_id": upgrade_id })),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": format!("could not record the upgrade: {e}")
-            })),
-        )
-            .into_response(),
-    }
+        Ok(crate::council::CouncilResponse::Refused { reason }) => reason,
+        Ok(_) => return (StatusCode::ACCEPTED, Json(accepted)).into_response(),
+        Err(e) => format!("could not record the upgrade: {e}"),
+    };
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({ "error": error })),
+    )
+        .into_response()
 }
 
 /// Ask every planned node what it runs and whether it can verify a
@@ -696,15 +734,18 @@ pub(super) async fn archive_aborted_upgrade(
         crate::council::types::RaftRequest::UpgradeClear { upgrade_id },
     ];
     for write in writes {
-        if let Err(e) = council.write(write).await {
-            return Err((
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": format!("could not end the paused upgrade: {e}")
-                })),
-            )
-                .into_response());
-        }
+        let error = match council.write(write).await {
+            Ok(crate::council::CouncilResponse::Refused { reason }) => reason,
+            Ok(_) => continue,
+            Err(e) => e.to_string(),
+        };
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!("could not end the paused upgrade: {error}")
+            })),
+        )
+            .into_response());
     }
     Ok(())
 }
@@ -846,23 +887,7 @@ pub(super) async fn upgrade_resume_handler(
     }
 
     let resumed = crate::upgrade::orchestrator::resume(upgrade);
-    match council
-        .write(crate::council::types::RaftRequest::UpgradeUpdate {
-            state: Box::new(resumed),
-        })
-        .await
-    {
-        Ok(_) => (
-            StatusCode::ACCEPTED,
-            Json(serde_json::json!({ "status": "resumed" })),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )
-            .into_response(),
-    }
+    record_upgrade_start(council, resumed, serde_json::json!({ "status": "resumed" })).await
 }
 
 /// End a paused cluster upgrade in which no node moved (admin, leader
@@ -970,6 +995,9 @@ pub(super) async fn upgrade_cluster_rollback_handler(
                 .into_response();
         }
     };
+    if let Err(resp) = check_no_os_rollout(council).await {
+        return resp;
+    }
     let paused = match council.desired_state().await.active_upgrade {
         None => None,
         Some(active) => match crate::upgrade::orchestrator::supersede(
@@ -1060,21 +1088,10 @@ pub(super) async fn upgrade_cluster_rollback_handler(
         return resp;
     }
 
-    match council
-        .write(crate::council::types::RaftRequest::UpgradeUpdate {
-            state: Box::new(upgrade),
-        })
-        .await
-    {
-        Ok(_) => (
-            StatusCode::ACCEPTED,
-            Json(serde_json::json!({ "status": "rolling back", "upgrade_id": upgrade_id })),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )
-            .into_response(),
-    }
+    record_upgrade_start(
+        council,
+        upgrade,
+        serde_json::json!({ "status": "rolling back", "upgrade_id": upgrade_id }),
+    )
+    .await
 }

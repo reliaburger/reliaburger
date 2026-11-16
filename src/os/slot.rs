@@ -100,10 +100,20 @@ pub fn asset_url(
 
 /// What the saved state means once the node is up again on `running`: a
 /// reboot into the target that left us on another version was a fallback.
-pub fn after_boot(saved: OsUpdateState, running: Option<&str>) -> OsUpdateState {
+///
+/// `counted` says this boot is still on trial: systemd-boot booted an entry
+/// with tries left, and nothing has blessed it yet. bun starts before the
+/// boot check passes, so a counted boot of the target can still fail and
+/// fall back. Until a boot of the target isn't counted any more, the update
+/// stays `Rebooting`, so that a fallback reads as one on the next start.
+pub fn after_boot(saved: OsUpdateState, running: Option<&str>, counted: bool) -> OsUpdateState {
     match saved {
         OsUpdateState::Rebooting { target } if running == Some(target.as_str()) => {
-            OsUpdateState::Idle
+            if counted {
+                OsUpdateState::Rebooting { target }
+            } else {
+                OsUpdateState::Idle
+            }
         }
         OsUpdateState::Rebooting { target } => OsUpdateState::Failed {
             reason: format!(
@@ -142,6 +152,9 @@ pub struct SlotPaths {
     pub sysupdate: Vec<String>,
     /// The reboot, as argv.
     pub reboot: Vec<String>,
+    /// systemd-boot's `LoaderBootCountPath` EFI variable: present only on a
+    /// counted boot, one with tries left that nothing has blessed yet.
+    pub boot_count: PathBuf,
 }
 
 impl Default for SlotPaths {
@@ -155,6 +168,9 @@ impl Default for SlotPaths {
                 "update".into(),
             ],
             reboot: vec!["systemctl".into(), "reboot".into()],
+            boot_count: PathBuf::from(
+                "/sys/firmware/efi/efivars/LoaderBootCountPath-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f",
+            ),
         }
     }
 }
@@ -208,8 +224,16 @@ impl OsSlot {
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_default();
-        let state = after_boot(saved, running.as_deref());
-        let _ = save(&paths.state_file, &state);
+        let saved = after_boot(saved, running.as_deref(), paths.boot_count.exists());
+        let _ = save(&paths.state_file, &saved);
+        // On a trial boot of the target, `Rebooting` stays on disk for the
+        // next start to judge, but the reboot is done: nothing is under way.
+        let state = match saved {
+            OsUpdateState::Rebooting { target } if running.as_deref() == Some(target.as_str()) => {
+                OsUpdateState::Idle
+            }
+            other => other,
+        };
         Arc::new(Self {
             paths,
             arch: arch.to_string(),
@@ -514,21 +538,88 @@ mod tests {
             target: "2026.42.0".into(),
         };
         assert_eq!(
-            after_boot(rebooting.clone(), Some("2026.42.0")),
+            after_boot(rebooting.clone(), Some("2026.42.0"), false),
             OsUpdateState::Idle
         );
         assert!(matches!(
-            after_boot(rebooting, Some("2026.41.0")),
+            after_boot(rebooting, Some("2026.41.0"), false),
             OsUpdateState::Failed { reason, .. } if reason.starts_with("booted 2026.41.0 instead")
         ));
         assert!(matches!(
-            after_boot(OsUpdateState::Staging { target: "x".into() }, Some("y")),
+            after_boot(
+                OsUpdateState::Staging { target: "x".into() },
+                Some("y"),
+                false
+            ),
             OsUpdateState::Failed { .. }
         ));
         assert_eq!(
-            after_boot(OsUpdateState::Idle, Some("y")),
+            after_boot(OsUpdateState::Idle, Some("y"), false),
             OsUpdateState::Idle
         );
+    }
+
+    /// bun starts on the target's first, counted boot, before the boot
+    /// check has passed. If that boot then fails its checks and
+    /// systemd-boot falls back, the next start must still see a fallback.
+    #[test]
+    fn a_fallback_after_bun_started_on_the_trial_boot_is_still_a_failure() {
+        let rebooting = OsUpdateState::Rebooting {
+            target: "2026.42.0".into(),
+        };
+        let on_trial = after_boot(rebooting.clone(), Some("2026.42.0"), true);
+        assert_eq!(on_trial, rebooting, "a counted boot isn't blessed yet");
+        // bun restarts within the trial: still on trial.
+        let on_trial = after_boot(on_trial, Some("2026.42.0"), true);
+        assert!(matches!(
+            after_boot(on_trial.clone(), Some("2026.41.0"), false),
+            OsUpdateState::Failed { target, .. } if target == "2026.42.0"
+        ));
+        // Blessed: the next boot of the target isn't counted.
+        assert_eq!(
+            after_boot(on_trial, Some("2026.42.0"), false),
+            OsUpdateState::Idle
+        );
+    }
+
+    /// The same through [`OsSlot::new`]: on the trial boot the node reports
+    /// nothing under way, so the leader can mark it done and a new update
+    /// can start, but `os-update.json` keeps `Rebooting` until a boot of the
+    /// target is blessed.
+    #[tokio::test]
+    async fn a_slot_on_a_trial_boot_reports_idle_and_remembers_the_trial() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_file = dir.path().join("os-update.json");
+        let boot_count = dir.path().join("LoaderBootCountPath");
+        let rebooting = OsUpdateState::Rebooting {
+            target: "2026.42.0".into(),
+        };
+        std::fs::write(&state_file, serde_json::to_vec(&rebooting).unwrap()).unwrap();
+        std::fs::write(&boot_count, b"").unwrap();
+        let paths = SlotPaths {
+            state_file: state_file.clone(),
+            boot_count: boot_count.clone(),
+            ..SlotPaths::default()
+        };
+
+        let trial = OsSlot::new(
+            paths.clone(),
+            "x86_64",
+            Vec::new(),
+            Some("2026.42.0".into()),
+        );
+        assert_eq!(trial.state().await, OsUpdateState::Idle);
+        let saved: OsUpdateState =
+            serde_json::from_slice(&std::fs::read(&state_file).unwrap()).unwrap();
+        assert_eq!(saved, rebooting);
+
+        // The trial failed and systemd-boot fell back to the old version.
+        std::fs::remove_file(&boot_count).unwrap();
+        let fallen_back = OsSlot::new(paths, "x86_64", Vec::new(), Some("2026.41.0".into()));
+        assert!(matches!(
+            fallen_back.state().await,
+            OsUpdateState::Failed { target, .. } if target == "2026.42.0"
+        ));
     }
 
     /// Stage a signed release from a local server, through to sysupdate and
@@ -618,6 +709,7 @@ mod tests {
             staging: dir.path().join("staging"),
             sysupdate: record("sysupdate"),
             reboot: record("reboot"),
+            boot_count: dir.path().join("LoaderBootCountPath"),
         };
         let slot = OsSlot::new(paths, "x86_64", vec![public], Some("2026.41.0".into()));
         let directive = OsDirective {
@@ -691,6 +783,7 @@ mod tests {
             staging: dir.path().join("staging"),
             sysupdate: vec!["false".into()],
             reboot: vec!["false".into()],
+            boot_count: dir.path().join("LoaderBootCountPath"),
         };
         let slot = OsSlot::new(paths, "x86_64", vec![other_public], Some("0".into()));
         let directive = OsDirective {

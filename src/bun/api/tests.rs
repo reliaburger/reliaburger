@@ -1917,6 +1917,74 @@ async fn an_os_rollout_on_a_two_voter_council_is_refused_at_start() {
     }
 }
 
+/// A bun upgrade and an OS rollout both restart nodes, so the state machine
+/// never lets one start while the other runs. The start and rollback
+/// handlers must say so with a 409, not answer 202 for a run that was
+/// never recorded.
+#[tokio::test]
+async fn an_upgrade_or_rollback_during_an_os_rollout_is_refused() {
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let trio = council_of(3).await;
+    let rollout = crate::os::rollout::plan(
+        "os-1",
+        "2026.42.0",
+        "https://example/os-channel.json",
+        "node-1",
+        vec![(
+            "node-1".into(),
+            "127.0.0.1:7001".into(),
+            true,
+            "2026.41.0".into(),
+        )],
+        0,
+    );
+    trio[0]
+        .write(crate::council::types::RaftRequest::OsRolloutStart {
+            rollout: Box::new(rollout),
+        })
+        .await
+        .unwrap();
+    let node = r#"{"node_id":"node-1","address":"127.0.0.1:7001","role":"Leader"}"#;
+    let start = format!(
+        r#"{{"target_version":"v0.2.0","binaries":[{{"platform":"linux-x86_64","sha256":"{}","embedded_signature":"c2ln"}}],"registry_address":"127.0.0.1:7001","nodes":[{node}]}}"#,
+        "a".repeat(64)
+    );
+    let rollback = format!(r#"{{"target_version":"v0.1.0","nodes":[{node}]}}"#);
+    let app = router_over(trio[0].clone(), admin);
+    for (uri, body) in [
+        ("/v1/upgrade/start", start),
+        ("/v1/upgrade/cluster-rollback", rollback),
+    ] {
+        let (status, reply) = send_bounded(app.clone(), "POST", uri, &admin_key, &body, &[]).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{uri}: {reply}");
+        assert!(reply.contains("OS rollout os-1"), "{uri}: {reply}");
+    }
+    // A rollout that starts after the handler looked: the refused write
+    // is a 409 too.
+    let upgrade = crate::upgrade::types::ClusterUpgradeState {
+        upgrade_id: "up-1".into(),
+        target_version: "v0.2.0".parse().unwrap(),
+        binaries: Vec::new(),
+        parallel: 1,
+        direction: crate::upgrade::types::UpgradeDirection::Upgrade,
+        phase: crate::upgrade::types::ClusterUpgradePhase::Preparing,
+        registry_address: String::new(),
+        allow_downgrade: false,
+        nodes: vec![],
+    };
+    let refused = super::upgrade::record_upgrade_start(
+        &trio[0],
+        upgrade,
+        serde_json::json!({ "status": "starting" }),
+    )
+    .await;
+    assert_eq!(refused.status(), StatusCode::CONFLICT);
+    assert!(trio[0].desired_state().await.active_upgrade.is_none());
+    for node in trio {
+        node.shutdown().await.unwrap();
+    }
+}
+
 /// A three-node council led by node 1, whose API is a fake that records
 /// every request and accepts it. Returns node 2's real router (a
 /// follower) with `token` in its store, what the leader has seen, and

@@ -487,10 +487,12 @@ pub async fn run_rollout(
         if rollout.phase != OsRolloutPhase::Running {
             continue;
         }
-        let (configured, live) = {
-            let membership = membership_rx.borrow();
-            crate::upgrade::orchestrator::count_live_voters(&council, &membership, self_raft_id)
-        };
+        // Copy the membership out before `count_live_voters` borrows the
+        // council's metrics: two watch borrows held at once can deadlock
+        // (#1273, #1433).
+        let membership = membership_rx.borrow().clone();
+        let (configured, live) =
+            crate::upgrade::orchestrator::count_live_voters(&council, &membership, self_raft_id);
         let context = RolloutContext {
             quorum_ok: crate::upgrade::orchestrator::live_quorum_headroom_ok(configured, live),
             undrained: undrained(&desired),
@@ -517,14 +519,22 @@ pub async fn run_rollout(
         }
         let finished = next.phase.is_terminal();
         let rollout_id = next.rollout_id.clone();
-        if let Err(error) = council
+        match council
             .write(RaftRequest::OsRolloutUpdate {
                 rollout: Box::new(next),
             })
             .await
         {
-            eprintln!("bun: OS rollout {rollout_id}: recording progress: {error}");
-            continue;
+            // Aborted (or resumed under a new id) while this step ran.
+            Ok(crate::council::CouncilResponse::Refused { reason }) => {
+                eprintln!("bun: OS rollout {rollout_id}: dropping this step: {reason}");
+                continue;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("bun: OS rollout {rollout_id}: recording progress: {error}");
+                continue;
+            }
         }
         if finished {
             let _ = council
