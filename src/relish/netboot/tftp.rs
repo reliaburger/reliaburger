@@ -30,6 +30,12 @@ pub const MAX_BLOCK_SIZE: u16 = 1468;
 
 /// Seconds to wait for an acknowledgement when the client asks for no timeout.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
+/// The longest timeout a client may ask for. RFC 2349 allows 255 s; no
+/// firmware needs more than a few, and each waiting transfer holds a slot.
+pub const MAX_TIMEOUT: Duration = Duration::from_secs(30);
+/// Transfers at once. A lab boots a handful of machines; past this, a
+/// request gets "busy" and the firmware asks again.
+pub const MAX_TRANSFERS: usize = 64;
 
 /// How many times a block is resent before the transfer is abandoned.
 pub const DEFAULT_RETRIES: u32 = 5;
@@ -273,7 +279,9 @@ pub fn negotiate(requested: &[(String, String)], size: u64, max_block_size: u16)
             }
             "tsize" => agreed.acknowledged.push((name.clone(), size.to_string())),
             "timeout" => {
-                if let Ok(seconds @ 1..=255) = value.parse::<u8>() {
+                if let Ok(seconds @ 1..=255) = value.parse::<u8>()
+                    && Duration::from_secs(u64::from(seconds)) <= MAX_TIMEOUT
+                {
                     agreed.timeout = Duration::from_secs(u64::from(seconds));
                     agreed.acknowledged.push((name.clone(), value.clone()));
                 }
@@ -416,6 +424,8 @@ pub struct TftpSettings {
     pub retries: u32,
     /// The wait for an acknowledgement when the client sets no timeout.
     pub default_timeout: Duration,
+    /// Transfers at once; a request past it is told the server is busy.
+    pub max_transfers: usize,
 }
 
 impl Default for TftpSettings {
@@ -424,6 +434,7 @@ impl Default for TftpSettings {
             max_block_size: MAX_BLOCK_SIZE,
             retries: DEFAULT_RETRIES,
             default_timeout: DEFAULT_TIMEOUT,
+            max_transfers: MAX_TRANSFERS,
         }
     }
 }
@@ -510,6 +521,7 @@ where
     L: Fn(SocketAddr, &str, Outcome) + Clone + Send + 'static,
 {
     let local = socket.local_addr()?.ip();
+    let slots = Arc::new(tokio::sync::Semaphore::new(settings.max_transfers));
     let mut buffer = vec![0u8; 1500];
     loop {
         let (len, peer) = socket.recv_from(&mut buffer).await?;
@@ -519,9 +531,18 @@ where
                 data,
                 negotiated,
             } => {
+                let Ok(slot) = slots.clone().try_acquire_owned() else {
+                    let busy = Packet::Error {
+                        code: ErrorCode::Undefined,
+                        message: "server busy, try again".to_string(),
+                    };
+                    let _ = socket.send_to(&busy.encode(), peer).await;
+                    continue;
+                };
                 let log = log.clone();
                 tokio::spawn(async move {
                     let outcome = send(local, peer, data, &negotiated, settings.retries).await;
+                    drop(slot);
                     log(peer, &filename, outcome);
                 });
             }
@@ -552,13 +573,18 @@ async fn send(
     let (mut transfer, first) = Transfer::start(data, negotiated, retries);
     let mut pending = Some(first);
     let mut buffer = vec![0u8; 1500];
+    // When the last packet sent is due again. Set only when something is
+    // sent: a stale ACK must not start the wait again, or a client
+    // repeating one would keep a lost block from ever being resent.
+    let mut resend_at = tokio::time::Instant::now() + negotiated.timeout;
     loop {
-        if let Some(packet) = pending.take()
-            && socket.send(&packet).await.is_err()
-        {
-            return Outcome::TimedOut;
+        if let Some(packet) = pending.take() {
+            if socket.send(&packet).await.is_err() {
+                return Outcome::TimedOut;
+            }
+            resend_at = tokio::time::Instant::now() + negotiated.timeout;
         }
-        let step = match tokio::time::timeout(negotiated.timeout, socket.recv(&mut buffer)).await {
+        let step = match tokio::time::timeout_at(resend_at, socket.recv(&mut buffer)).await {
             Err(_) => transfer.on_timeout(),
             Ok(Err(_)) => transfer.on_timeout(),
             Ok(Ok(len)) => match Packet::parse(&buffer[..len]) {
@@ -978,6 +1004,114 @@ mod tests {
                 bytes: 100_000,
                 block_size: 1468
             }
+        );
+        task.abort();
+    }
+
+    /// A DATA block that's lost must be sent again one timeout after it
+    /// was sent, however many stale ACKs arrive meanwhile: each used to
+    /// start the wait again, so a client repeating its last ACK kept the
+    /// resend off for ever.
+    #[tokio::test]
+    async fn stale_acks_dont_hold_back_the_resend_of_a_lost_block() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = socket.local_addr().unwrap();
+        let files = Arc::new(TftpFiles::from([("big".to_string(), data(5_000))]));
+        let settings = TftpSettings {
+            default_timeout: Duration::from_millis(300),
+            ..TftpSettings::default()
+        };
+        let task = tokio::spawn(serve(
+            socket,
+            files,
+            settings,
+            |_: SocketAddr, _: &str, _| {},
+        ));
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let request = Packet::ReadRequest {
+            filename: "big".into(),
+            mode: "octet".into(),
+            options: Vec::new(),
+        };
+        client.send_to(&request.encode(), server).await.unwrap();
+        let mut buffer = vec![0u8; 1500];
+        let (_, transfer) = client.recv_from(&mut buffer).await.unwrap();
+        // Block 1 "lost": never acknowledged. Repeat a stale ACK every
+        // 100 ms and expect block 1 again within about one timeout.
+        let started = tokio::time::Instant::now();
+        let resent = loop {
+            client
+                .send_to(&Packet::Ack { block: 0 }.encode(), transfer)
+                .await
+                .unwrap();
+            match tokio::time::timeout(Duration::from_millis(100), client.recv(&mut buffer)).await {
+                Ok(Ok(len)) => break Packet::parse(&buffer[..len]).unwrap(),
+                _ if started.elapsed() > Duration::from_secs(2) => {
+                    panic!("block 1 was never sent again")
+                }
+                _ => {}
+            }
+        };
+        assert!(
+            matches!(resent, Packet::Data { block: 1, .. }),
+            "{resent:?}"
+        );
+        assert!(started.elapsed() < Duration::from_millis(700));
+        task.abort();
+    }
+
+    /// RFC 2349 lets a server accept the client's timeout or leave it out
+    /// of the OACK, never answer another value. Over 30 s, it's left out
+    /// and the default applies, so no client holds a transfer slot for
+    /// minutes between packets.
+    #[test]
+    fn a_requested_timeout_over_thirty_seconds_is_declined() {
+        let agreed = negotiate(&options(&[("timeout", "255")]), 10, MAX_BLOCK_SIZE);
+        assert_eq!(agreed.timeout, DEFAULT_TIMEOUT);
+        assert!(agreed.acknowledged.is_empty());
+        let agreed = negotiate(&options(&[("timeout", "30")]), 10, MAX_BLOCK_SIZE);
+        assert_eq!(agreed.timeout, MAX_TIMEOUT);
+        let agreed = negotiate(&options(&[("timeout", "5")]), 10, MAX_BLOCK_SIZE);
+        assert_eq!(agreed.timeout, Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn a_request_past_the_transfer_limit_is_told_the_server_is_busy() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = socket.local_addr().unwrap();
+        let files = Arc::new(TftpFiles::from([("big".to_string(), data(50_000))]));
+        let settings = TftpSettings {
+            max_transfers: 1,
+            default_timeout: Duration::from_secs(5),
+            ..TftpSettings::default()
+        };
+        let task = tokio::spawn(serve(
+            socket,
+            files,
+            settings,
+            |_: SocketAddr, _: &str, _| {},
+        ));
+        let request = Packet::ReadRequest {
+            filename: "big".into(),
+            mode: "octet".into(),
+            options: Vec::new(),
+        }
+        .encode();
+        // The first client starts a transfer and leaves it waiting.
+        let first = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        first.send_to(&request, server).await.unwrap();
+        let mut buffer = vec![0u8; 1500];
+        first.recv_from(&mut buffer).await.unwrap();
+        // The second is refused while it runs.
+        let second = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        second.send_to(&request, server).await.unwrap();
+        let (len, _) = tokio::time::timeout(Duration::from_secs(2), second.recv_from(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(Packet::parse(&buffer[..len]).unwrap(), Packet::Error { .. }),
+            "the second request should be refused"
         );
         task.abort();
     }

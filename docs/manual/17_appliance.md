@@ -179,8 +179,11 @@ interface gets one when no DHCP server answered it, and the machines you
 boot couldn't reach it. Check the cable and the router, then reconnect the
 interface, or give it a fixed address and pass that with `--address`.
 
-It remembers each machine that downloaded the installer, by MAC address and
-SMBIOS UUID, in `netboot-installed.json` in the directory it serves. Next time that machine
+It remembers each machine whose installer reports a finished install, by MAC
+address and SMBIOS UUID, in `netboot-installed.json` in the directory it
+serves. A machine whose install failed isn't remembered, so it gets the
+installer again on its next network boot. When `--for` is up, relish waits
+up to 20 more minutes for installs still running. Next time that machine
 network-boots, it's told to boot its disk instead. Pass `--reinstall` to
 install over them again. Their disks then hold Reliaburger OS, which counts
 as a used disk: each one waits for your yes, or for its `--wipe`. Each
@@ -763,7 +766,7 @@ openssl pkeyutl -verify -pubin -inkey next/lab-signing-key.pub.pem -rawin \
 ```
 
 `next/` also holds a broken version, two build numbers on (`2026.41.9`),
-whose bun never starts. The channel doesn't name it. It's there to test the
+whose bun starts and never gets healthy. The channel doesn't name it. It's there to test the
 fallback: a node updated to it fails its boot checks three times, then comes
 back on the version it ran before, by itself. CI rolls it out on every x86_64
 build and records how long that took. To try it on one machine, stage it

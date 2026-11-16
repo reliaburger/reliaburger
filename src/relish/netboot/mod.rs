@@ -274,6 +274,9 @@ pub enum NetbootError {
     IpxeMissing { file: PathBuf },
     #[error("invalid duration {0:?} (want a number and s, m, h or d, such as 90m)")]
     InvalidDuration(String),
+    /// One of the four servers stopped while serving, which ends the run.
+    #[error("{reason}")]
+    ServerStopped { reason: String },
     #[error("{context}: {source}")]
     Io {
         context: String,

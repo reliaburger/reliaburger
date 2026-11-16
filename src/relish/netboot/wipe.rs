@@ -24,6 +24,10 @@ use super::installed::BootClient;
 /// hears the "no answer" decline rather than giving up first.
 pub const QUESTION_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// How long after a question appears an answer is taken to be meant for
+/// the one before it, and ignored.
+pub const ANSWER_GRACE: Duration = Duration::from_secs(1);
+
 /// The most a disk report may hold. lsblk's output for a disk with a
 /// hundred partitions is a few kilobytes.
 pub const MAX_REPORT_BYTES: usize = 64 * 1024;
@@ -317,12 +321,15 @@ pub struct Question {
 
 /// Ask the operator each question in turn, reading answers from `lines`
 /// (stdin, one line per answer). Lines typed before a question is shown
-/// are dropped, so a stray Enter can't answer a question nobody saw. A
+/// are dropped, so a stray Enter can't answer a question nobody saw, and so
+/// are lines within `grace` after it ([`ANSWER_GRACE`]): a "y" typed for the
+/// previous machine as this question appeared mustn't wipe this one. A
 /// question whose deadline passes, or that's still queued when it does,
 /// gets [`Answer::NoAnswer`].
 pub async fn ask_operator(
     mut questions: mpsc::UnboundedReceiver<Question>,
     mut lines: mpsc::UnboundedReceiver<String>,
+    grace: Duration,
     print: impl Fn(String),
 ) {
     while let Some(question) = questions.recv().await {
@@ -338,9 +345,16 @@ pub async fn ask_operator(
                 "{}: {} — wipe? [y/N]",
                 question.machine, question.summary
             ));
-            match tokio::time::timeout_at(question.deadline, lines.recv()).await {
-                Ok(Some(line)) => parse_answer(&line),
-                Ok(None) | Err(_) => Answer::NoAnswer,
+            let shown = Instant::now();
+            loop {
+                match tokio::time::timeout_at(question.deadline, lines.recv()).await {
+                    Ok(Some(_)) if shown.elapsed() < grace => print(format!(
+                        "{}: ignored an answer typed too soon after the question; answer again",
+                        question.machine
+                    )),
+                    Ok(Some(line)) => break parse_answer(&line),
+                    Ok(None) | Err(_) => break Answer::NoAnswer,
+                }
             }
         };
         // The machine may have gone; then nobody's waiting for the answer.
@@ -675,15 +689,51 @@ mod tests {
         (question, answer)
     }
 
+    /// A "y" typed for one machine can land just after the next machine's
+    /// question appears. An answer within the grace period is ignored, so
+    /// only an answer typed after reading the question can wipe a disk.
+    #[tokio::test]
+    async fn an_answer_typed_too_soon_after_the_question_is_ignored() {
+        let (ask, questions) = mpsc::unbounded_channel();
+        let (type_line, lines) = mpsc::unbounded_channel();
+        let printed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = printed.clone();
+        tokio::spawn(ask_operator(
+            questions,
+            lines,
+            Duration::from_millis(300),
+            move |line| sink.lock().unwrap().push(line),
+        ));
+        let (q, mut answer) = question(Instant::now() + Duration::from_secs(30));
+        ask.send(q).unwrap();
+        while printed.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        type_line.send("y".to_string()).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(answer.try_recv().is_err(), "a too-early y must not answer");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        type_line.send("n".to_string()).unwrap();
+        assert_eq!(answer.await.unwrap(), Answer::No);
+        let printed = printed.lock().unwrap();
+        assert!(
+            printed.iter().any(|line| line.contains("too soon")),
+            "{printed:?}"
+        );
+    }
+
     #[tokio::test]
     async fn the_operator_is_asked_and_their_answer_goes_back() {
         let (ask, questions) = mpsc::unbounded_channel();
         let (type_line, lines) = mpsc::unbounded_channel();
         let printed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = printed.clone();
-        tokio::spawn(ask_operator(questions, lines, move |line| {
-            sink.lock().unwrap().push(line)
-        }));
+        tokio::spawn(ask_operator(
+            questions,
+            lines,
+            Duration::ZERO,
+            move |line| sink.lock().unwrap().push(line),
+        ));
         let (q, answer) = question(Instant::now() + Duration::from_secs(30));
         ask.send(q).unwrap();
         // Wait until the prompt is out, then answer.
@@ -707,9 +757,12 @@ mod tests {
         type_line.send("y".to_string()).unwrap();
         let printed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let sink = printed.clone();
-        tokio::spawn(ask_operator(questions, lines, move |line| {
-            sink.lock().unwrap().push(line)
-        }));
+        tokio::spawn(ask_operator(
+            questions,
+            lines,
+            Duration::ZERO,
+            move |line| sink.lock().unwrap().push(line),
+        ));
         let (q, answer) = question(Instant::now() + Duration::from_secs(30));
         ask.send(q).unwrap();
         while printed.lock().unwrap().is_empty() {
@@ -723,7 +776,7 @@ mod tests {
     async fn no_answer_before_the_deadline_is_no_answer() {
         let (ask, questions) = mpsc::unbounded_channel();
         let (_type_line, lines) = mpsc::unbounded_channel();
-        tokio::spawn(ask_operator(questions, lines, |_| {}));
+        tokio::spawn(ask_operator(questions, lines, Duration::ZERO, |_| {}));
         let (q, answer) = question(Instant::now() + Duration::from_secs(600));
         ask.send(q).unwrap();
         assert_eq!(answer.await.unwrap(), Answer::NoAnswer);
@@ -737,9 +790,12 @@ mod tests {
         let sink = printed.clone();
         let (q, answer) = question(Instant::now());
         ask.send(q).unwrap();
-        tokio::spawn(ask_operator(questions, lines, move |line| {
-            sink.lock().unwrap().push(line)
-        }));
+        tokio::spawn(ask_operator(
+            questions,
+            lines,
+            Duration::ZERO,
+            move |line| sink.lock().unwrap().push(line),
+        ));
         assert_eq!(answer.await.unwrap(), Answer::NoAnswer);
         let printed = printed.lock().unwrap();
         assert!(

@@ -136,6 +136,14 @@ elapsed=$(( $(date +%s) - start ))
 if [ "$result" = pass ] && ! sudo grep -qi "$mac" "$work/serve/netboot-installed.json" 2>/dev/null; then
     result="installed, but relish netboot didn't remember the machine"
 fi
+# It remembers a machine only when its installer reports success with the
+# install ticket relish gave it, never on the download alone.
+if [ "$result" = pass ] && ! grep -q "reliaburger-install: told relish netboot this machine is installed" "$log"; then
+    result="installed, but the installer didn't report it to relish netboot"
+fi
+if [ "$result" = pass ] && ! grep -q "$mac.* installed; it gets exit from now on" "$work/netboot.log"; then
+    result="installed, but relish netboot's log doesn't show the installer's report"
+fi
 if [ "$result" = pass ] && ! grep -q "$mac.*: disk .*: wiping it and installing (--wipe lists it)" "$work/netboot.log"; then
     result="installed, but relish netboot's log doesn't show the used disk being wiped"
 fi
@@ -180,7 +188,7 @@ if [ "$mode" = router ] && [ "$result" = pass ]; then
         reinstall="never reinstalled"
     elif [ "$reinstall" = pass ] && ! grep -q "$mac.*: disk .*: wiping it and installing (--wipe lists it)" "$work/netboot-reinstall.log"; then
         reinstall="reinstalled, but relish netboot's log doesn't show the disk being wiped"
-    elif [ "$reinstall" = pass ] && ! grep -q "being installed again; it gets exit for the rest of this run" "$work/netboot-reinstall.log"; then
+    elif [ "$reinstall" = pass ] && ! grep -q "installed again; it gets exit for the rest of this run" "$work/netboot-reinstall.log"; then
         reinstall="reinstalled, but relish netboot didn't say it would send the machine on"
     elif [ "$reinstall" = pass ] && [ "$(grep -c "reliaburger-install: installed .* to " "$log2")" != 1 ]; then
         reinstall="installed more than once in one --reinstall run"

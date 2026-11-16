@@ -12,7 +12,7 @@ use tokio::sync::{Mutex, mpsc};
 use super::artefacts::{self, Artefacts};
 use super::dhcp::{self, DhcpContext, ListenPort};
 use super::http::{self, HttpState};
-use super::installed::{InstalledRecord, RECORD_FILE, chain_script};
+use super::installed::{InstallTickets, InstalledRecord, RECORD_FILE, chain_script};
 use super::interface::{self, Interface, udp_socket};
 use super::tftp::{self, Outcome, TftpFiles, TftpSettings};
 use super::wipe::{self, DiskSession, Question};
@@ -81,8 +81,10 @@ pub async fn run(options: NetbootOptions) -> Result<(), NetbootError> {
         operator: operator(),
         question_timeout: wipe::QUESTION_TIMEOUT,
         disks: Mutex::new(DiskSession::default()),
+        installs: Mutex::new(InstallTickets::default()),
         log: log.clone(),
     });
+    let http_state = state.clone();
 
     let (dhcp_context, dhcp_log) = (context.clone(), log.clone());
     let dhcp_task = async move {
@@ -100,19 +102,19 @@ pub async fn run(options: NetbootOptions) -> Result<(), NetbootError> {
         TftpSettings::default(),
         move |peer, name, outcome| log_transfer(&tftp_log, peer, name, outcome),
     );
-    let http_task = axum::serve(listener, http::router(state));
+    let http_task = axum::serve(listener, http::router(http_state));
 
+    // Ctrl-C and --for end the run; a server that stops ends it as a
+    // failure, so the exit status says so.
     let stopped = tokio::select! {
-        _ = tokio::signal::ctrl_c() => "stopped".to_string(),
-        _ = tokio::time::sleep(options.duration) => {
-            format!("stopping after {} (--for)", describe_duration(options.duration))
-        }
-        result = dhcp_task => failed("DHCP", result),
-        result = proxy_task => failed("ProxyDHCP", result),
-        result = tftp_task => failed("TFTP", result),
-        result = http_task => failed("HTTP", result),
+        _ = tokio::signal::ctrl_c() => Ok("stopped".to_string()),
+        stopped = time_is_up(&state, options.duration, &log) => Ok(stopped),
+        result = dhcp_task => Err(failed("DHCP", result)),
+        result = proxy_task => Err(failed("ProxyDHCP", result)),
+        result = tftp_task => Err(failed("TFTP", result)),
+        result = http_task => Err(failed("HTTP", result)),
     };
-    println!("relish netboot: {stopped}");
+    println!("relish netboot: {}", stopped?);
     Ok(())
 }
 
@@ -135,9 +137,12 @@ fn operator() -> Option<mpsc::UnboundedSender<Question>> {
         }
     });
     let (ask, questions) = mpsc::unbounded_channel();
-    tokio::spawn(wipe::ask_operator(questions, lines, |line| {
-        println!("relish netboot: {line}")
-    }));
+    tokio::spawn(wipe::ask_operator(
+        questions,
+        lines,
+        wipe::ANSWER_GRACE,
+        |line| println!("relish netboot: {line}"),
+    ));
     Some(ask)
 }
 
@@ -422,11 +427,48 @@ fn log_transfer(log: &Log, peer: SocketAddr, name: &str, outcome: Outcome) {
     }
 }
 
-fn failed<E: std::fmt::Display>(what: &str, result: Result<(), E>) -> String {
-    match result {
+/// The longest `--for` waits, past its time, for installs still running.
+const FINISH_WAIT: Duration = Duration::from_secs(20 * 60);
+
+/// Wait out `duration`, then for the installs still running, so `--for`
+/// never cuts one off halfway: up to [`FINISH_WAIT`] more.
+async fn time_is_up(state: &HttpState, duration: Duration, log: &Log) -> String {
+    tokio::time::sleep(duration).await;
+    let deadline = tokio::time::Instant::now() + FINISH_WAIT;
+    let mut told = false;
+    loop {
+        let running = state
+            .installs
+            .lock()
+            .await
+            .in_flight(std::time::Instant::now());
+        if running == 0 {
+            return format!("stopping after {} (--for)", describe_duration(duration));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return format!(
+                "stopping after {} (--for) and {} more, with {running} install(s) still unfinished",
+                describe_duration(duration),
+                describe_duration(FINISH_WAIT)
+            );
+        }
+        if !told {
+            log(format!(
+                "relish netboot: --for is up; waiting for {running} install(s) still running (up to {})",
+                describe_duration(FINISH_WAIT)
+            ));
+            told = true;
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+fn failed<E: std::fmt::Display>(what: &str, result: Result<(), E>) -> NetbootError {
+    let reason = match result {
         Ok(()) => format!("the {what} server stopped"),
         Err(error) => format!("the {what} server failed: {error}"),
-    }
+    };
+    NetbootError::ServerStopped { reason }
 }
 
 fn describe_duration(duration: Duration) -> String {
@@ -506,6 +548,17 @@ mod tests {
 
     use crate::relish::netboot::dhcp::DhcpContext;
     use dhcproto::v4::{DhcpOption, Message, MessageType, Opcode};
+
+    /// A server that dies is a failure of the whole run, so `relish
+    /// netboot` exits non-zero and a script or a test notices.
+    #[test]
+    fn a_server_that_stops_or_fails_is_an_error() {
+        let failure = failed("TFTP", Err(std::io::Error::other("socket closed")));
+        assert_eq!(failure.to_string(), "the TFTP server failed: socket closed");
+        assert!(matches!(failure, NetbootError::ServerStopped { .. }));
+        let stopped = failed::<std::io::Error>("HTTP", Ok(()));
+        assert_eq!(stopped.to_string(), "the HTTP server stopped");
+    }
 
     fn arm64_release(files: &[(String, Vec<u8>)]) -> (tempfile::TempDir, Artefacts) {
         let dir = tempfile::tempdir().unwrap();

@@ -17,6 +17,106 @@ use serde::{Deserialize, Serialize};
 
 use super::{Arch, MacAddress, NetbootError};
 
+/// Install tickets outstanding at once. A lab boots a handful of machines;
+/// past this, a machine is sent to its disk until one finishes or expires.
+pub const MAX_INSTALL_TICKETS: usize = 256;
+
+/// How long an install ticket lasts: long enough for a slow install and a
+/// ten-minute wait for the operator's answer about a used disk.
+pub const INSTALL_TICKET_LIFETIME: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// One install script served, waiting for its installer's reports.
+#[derive(Debug, Clone)]
+struct Issued {
+    client: BootClient,
+    issued: std::time::Instant,
+    disk_reported: bool,
+}
+
+/// The install tickets of one `relish netboot` session.
+///
+/// Each install script carries a fresh random ticket on the installer's
+/// command line, and the installer sends it back with its reports: the
+/// disk it found (`POST /disk`) and, once the image is written and checked,
+/// that it installed (`POST /installed`). A report is believed only with a
+/// ticket issued to the machine it names, so nobody else on the LAN can
+/// mark a machine installed or ask questions about its disk, and a machine
+/// counts as installed when its install succeeded, not when it fetched the
+/// installer.
+#[derive(Debug, Default)]
+pub struct InstallTickets {
+    tickets: std::collections::HashMap<String, Issued>,
+}
+
+impl InstallTickets {
+    /// A new ticket for `client`, or `None` while [`MAX_INSTALL_TICKETS`]
+    /// are outstanding.
+    pub fn issue(&mut self, client: &BootClient, now: std::time::Instant) -> Option<String> {
+        self.expire(now);
+        if self.tickets.len() >= MAX_INSTALL_TICKETS {
+            return None;
+        }
+        loop {
+            let ticket = format!("{:032x}", rand::random::<u128>());
+            if !self.tickets.contains_key(&ticket) {
+                self.tickets.insert(
+                    ticket.clone(),
+                    Issued {
+                        client: client.clone(),
+                        issued: now,
+                        disk_reported: false,
+                    },
+                );
+                return Some(ticket);
+            }
+        }
+    }
+
+    /// True the first time `client` reports its disk with `ticket`.
+    pub fn report_disk(
+        &mut self,
+        ticket: &str,
+        client: &BootClient,
+        now: std::time::Instant,
+    ) -> bool {
+        self.expire(now);
+        match self.tickets.get_mut(ticket) {
+            Some(issued) if issued.client.same_machine(client) && !issued.disk_reported => {
+                issued.disk_reported = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// True if `ticket` was issued to `client`; it's then used up.
+    pub fn complete(&mut self, ticket: &str, client: &BootClient, now: std::time::Instant) -> bool {
+        self.expire(now);
+        let valid = self
+            .tickets
+            .get(ticket)
+            .is_some_and(|issued| issued.client.same_machine(client));
+        if valid {
+            self.tickets.remove(ticket);
+        }
+        valid
+    }
+
+    /// Installs that were sent an install script and haven't reported
+    /// success, or expired.
+    pub fn in_flight(&self, now: std::time::Instant) -> usize {
+        self.tickets
+            .values()
+            .filter(|issued| now.duration_since(issued.issued) < INSTALL_TICKET_LIFETIME)
+            .count()
+    }
+
+    fn expire(&mut self, now: std::time::Instant) {
+        self.tickets
+            .retain(|_, issued| now.duration_since(issued.issued) < INSTALL_TICKET_LIFETIME);
+    }
+}
+
 /// The record's file name, in the served directory.
 pub const RECORD_FILE: &str = "netboot-installed.json";
 
@@ -261,9 +361,11 @@ pub fn chain_script(server: Ipv4Addr, http_port: u16) -> String {
 /// `client` so the server can remember the machine.
 ///
 /// `reliaburger.ask` is where the installer reports a disk that isn't
-/// blank and waits for the operator's answer ([`super::wipe`]); it's left
-/// out when the machine sent nothing to key the question on, and then the
-/// installer refuses a used disk as it always did. The script never passes
+/// blank and waits for the operator's answer ([`super::wipe`]), and
+/// `reliaburger.done` where it says it installed. Both carry the install
+/// `ticket` ([`InstallTickets`]). They're left out when the machine sent
+/// nothing to key them on: the installer then refuses a used disk, as it
+/// always did, and the machine is never recorded as installed. The script never passes
 /// `reliaburger.wipe=1`: only the operator's yes or `--wipe` wipes a disk.
 ///
 /// With `reinstall` (`relish netboot --reinstall`) it adds
@@ -280,15 +382,19 @@ pub fn install_script(
     http_port: u16,
     client: &BootClient,
     reinstall: bool,
+    ticket: Option<&str>,
 ) -> String {
     let query = client.query();
-    let (query, mut ask) = if query.is_empty() {
-        (String::new(), String::new())
-    } else {
-        (
+    let (query, mut ask) = match ticket {
+        Some(ticket) if !query.is_empty() => (
             format!("?{query}"),
-            format!(" reliaburger.ask=http://{server}:{http_port}/disk?{query}"),
-        )
+            format!(
+                " reliaburger.ask=http://{server}:{http_port}/disk?{query}&ticket={ticket} \
+                 reliaburger.done=http://{server}:{http_port}/installed?{query}&ticket={ticket}"
+            ),
+        ),
+        _ if !query.is_empty() => (format!("?{query}"), String::new()),
+        _ => (String::new(), String::new()),
     };
     if reinstall {
         ask.push_str(" reliaburger.reinstall=1");
@@ -465,14 +571,21 @@ mod tests {
             8081,
             &client(Some(MAC), None),
             false,
+            Some("00ff"),
         );
         assert!(script.starts_with("#!ipxe\n"));
         assert!(script.contains("set base http://192.168.1.20:8081/${buildarch}\n"));
         assert!(script.contains(
-            "chain --autofree ${base}/installer.efi?mac=52:54:00:12:34:56 reliaburger.url=${base} reliaburger.ask=http://192.168.1.20:8081/disk?mac=52:54:00:12:34:56 console=tty0 console=${console},115200\n"
+            "chain --autofree ${base}/installer.efi?mac=52:54:00:12:34:56 reliaburger.url=${base} reliaburger.ask=http://192.168.1.20:8081/disk?mac=52:54:00:12:34:56&ticket=00ff reliaburger.done=http://192.168.1.20:8081/installed?mac=52:54:00:12:34:56&ticket=00ff console=tty0 console=${console},115200\n"
         ));
         assert!(script.contains("set console ttyAMA0 || set console ttyS0"));
-        let anonymous = install_script(Ipv4Addr::LOCALHOST, 8080, &BootClient::default(), false);
+        let anonymous = install_script(
+            Ipv4Addr::LOCALHOST,
+            8080,
+            &BootClient::default(),
+            false,
+            None,
+        );
         assert!(anonymous.contains("${base}/installer.efi reliaburger.url="));
     }
 
@@ -485,18 +598,26 @@ mod tests {
             8081,
             &client(Some(MAC), Some(UUID)),
             false,
+            Some("00ff"),
         );
         assert!(
             script.contains(
-                " reliaburger.ask=http://192.168.1.20:8081/disk?mac=52:54:00:12:34:56&uuid=4c4c4544-0042-3510-8051-b4c04f4b4e32 "
+                " reliaburger.ask=http://192.168.1.20:8081/disk?mac=52:54:00:12:34:56&uuid=4c4c4544-0042-3510-8051-b4c04f4b4e32&ticket=00ff "
             ),
             "{script}"
         );
         assert!(!script.contains("reliaburger.wipe"), "{script}");
         // With nothing to key the question on, there's no question: the
         // installer refuses a used disk, as it always did.
-        let anonymous = install_script(Ipv4Addr::LOCALHOST, 8080, &BootClient::default(), false);
+        let anonymous = install_script(
+            Ipv4Addr::LOCALHOST,
+            8080,
+            &BootClient::default(),
+            false,
+            None,
+        );
         assert!(!anonymous.contains("reliaburger.ask"), "{anonymous}");
+        assert!(!anonymous.contains("reliaburger.done"), "{anonymous}");
     }
 
     /// `--reinstall` tells the installer not to boot a disk that holds
@@ -505,11 +626,66 @@ mod tests {
     #[test]
     fn a_reinstall_tells_the_installer_to_replace_reliaburger_too() {
         let machine = client(Some(MAC), Some(UUID));
-        let again = install_script(Ipv4Addr::new(192, 168, 1, 20), 8081, &machine, true);
+        let again = install_script(
+            Ipv4Addr::new(192, 168, 1, 20),
+            8081,
+            &machine,
+            true,
+            Some("00ff"),
+        );
         assert!(again.contains(" reliaburger.reinstall=1 "), "{again}");
         assert!(!again.contains("reliaburger.wipe"), "{again}");
-        let first = install_script(Ipv4Addr::new(192, 168, 1, 20), 8081, &machine, false);
+        let first = install_script(
+            Ipv4Addr::new(192, 168, 1, 20),
+            8081,
+            &machine,
+            false,
+            Some("00ff"),
+        );
         assert!(!first.contains("reliaburger.reinstall"), "{first}");
+    }
+
+    /// An install ticket is the machine's proof, on its disk report and its
+    /// "installed" report, that relish sent it the install script: anyone
+    /// else on the LAN can name a MAC, but not guess its ticket.
+    #[test]
+    fn an_install_ticket_vouches_only_for_the_machine_it_was_issued_to() {
+        let now = std::time::Instant::now();
+        let machine = client(Some(MAC), Some(UUID));
+        let other = client(Some("52:54:00:00:00:02"), None);
+        let mut tickets = InstallTickets::default();
+        let ticket = tickets.issue(&machine, now).unwrap();
+        assert!(ticket.len() >= 16 && ticket.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(!tickets.report_disk("0000", &machine, now));
+        assert!(!tickets.report_disk(&ticket, &other, now));
+        assert!(tickets.report_disk(&ticket, &machine, now));
+        assert!(
+            !tickets.report_disk(&ticket, &machine, now),
+            "one disk report a ticket"
+        );
+        assert_eq!(tickets.in_flight(now), 1);
+        assert!(!tickets.complete(&ticket, &other, now));
+        assert!(tickets.complete(&ticket, &machine, now));
+        assert!(
+            !tickets.complete(&ticket, &machine, now),
+            "a ticket is used once"
+        );
+        assert_eq!(tickets.in_flight(now), 0);
+    }
+
+    #[test]
+    fn install_tickets_expire_and_are_capped() {
+        let now = std::time::Instant::now();
+        let machine = client(Some(MAC), None);
+        let mut tickets = InstallTickets::default();
+        let ticket = tickets.issue(&machine, now).unwrap();
+        let later = now + INSTALL_TICKET_LIFETIME + std::time::Duration::from_secs(1);
+        assert!(!tickets.complete(&ticket, &machine, later), "expired");
+        for _ in 0..MAX_INSTALL_TICKETS {
+            assert!(tickets.issue(&machine, later).is_some());
+        }
+        assert!(tickets.issue(&machine, later).is_none(), "full");
+        assert_eq!(tickets.in_flight(later), MAX_INSTALL_TICKETS);
     }
 
     #[test]

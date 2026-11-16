@@ -146,7 +146,7 @@ Stage the next build with `--update`, then roll it node by node, leader last:
 
 Then it reboots the node and waits until the node is back on the new version with `boot-complete.target` reached. That's when `systemd-bless-boot` marks the new UKI good.
 
-For the bad update, build an image whose bun never starts, stage it the same way, and don't wait. A dispatch needs the workflow on `main`; until then, a throwaway draft pull request that adds an empty `image/spike-broken-bun` does the same. The broken run must come at least two runs after the one the nodes run, so its version sorts above that run's next version:
+For the bad update, build an image whose bun never gets healthy, stage it the same way, and don't wait. A dispatch needs the workflow on `main`; until then, a throwaway draft pull request that adds an empty `image/spike-broken-bun` does the same. The broken run must come at least two runs after the one the nodes run, so its version sorts above that run's next version:
 
 ```sh
 gh workflow run appliance.yml --ref main -f broken_bun=true

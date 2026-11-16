@@ -64,6 +64,10 @@ pub struct ArchArtefacts {
     /// The full-driver iPXE build (`ipxe-<arch>.efi`), held the same way,
     /// when the release has it and lists it. Only `--ipxe full` needs it.
     pub ipxe_full: Option<Arc<[u8]>>,
+    /// The installer UKI, held in memory too. It's the trust anchor of an
+    /// install, the code that checks the disk image's signature, so it's
+    /// sent from the bytes that were hashed, never re-read from disk.
+    pub installer: Arc<[u8]>,
 }
 
 impl ArchArtefacts {
@@ -78,11 +82,6 @@ impl ArchArtefacts {
     /// The installer UKI's name in this release.
     pub fn installer_name(&self) -> String {
         format!("reliaburger-os-installer_{}.efi", self.version)
-    }
-
-    /// The installer UKI, which iPXE fetches as `installer.efi`.
-    pub fn installer(&self) -> Option<&ServedFile> {
-        self.files.get(&self.installer_name())
     }
 }
 
@@ -139,6 +138,8 @@ fn load_arch(
     let mut files = BTreeMap::new();
     let mut ipxe: Option<Arc<[u8]>> = None;
     let mut ipxe_full: Option<Arc<[u8]>> = None;
+    let mut installer: Option<Arc<[u8]>> = None;
+    let installer_name = format!("reliaburger-os-installer_{version}.efi");
     for entry in &entries {
         let path = crate::relish::image::local_path(arch_dir, &entry.name);
         if !path.is_file() {
@@ -147,13 +148,15 @@ fn load_arch(
             }
             continue;
         }
-        let digest = if entry.name == snp || entry.name == full {
+        let digest = if entry.name == snp || entry.name == full || entry.name == installer_name {
             let bytes = read(&path)?;
             let digest = sha256_hex(&bytes);
             if entry.name == snp {
                 ipxe = Some(bytes.into());
-            } else {
+            } else if entry.name == full {
                 ipxe_full = Some(bytes.into());
+            } else {
+                installer = Some(bytes.into());
             }
             digest
         } else {
@@ -180,11 +183,15 @@ fn load_arch(
     let ipxe = ipxe.ok_or_else(|| NetbootError::Missing {
         file: arch_dir.join("netboot").join(&snp),
     })?;
+    let installer = installer.ok_or_else(|| NetbootError::Missing {
+        file: arch_dir.join(&installer_name),
+    })?;
     Ok(ArchArtefacts {
         version,
         files,
         ipxe,
         ipxe_full,
+        installer,
     })
 }
 
@@ -304,12 +311,7 @@ mod tests {
         let x86 = &artefacts.architectures[&Arch::X86_64];
         assert_eq!(x86.version.to_string(), VERSION);
         assert_eq!(&x86.ipxe[..], &[7u8; 3000][..]);
-        assert!(
-            x86.installer()
-                .unwrap()
-                .path
-                .ends_with(x86.installer_name())
-        );
+        assert_eq!(&x86.installer[..], b"installer");
         assert!(x86.files["boot.ipxe"].path.ends_with("netboot/boot.ipxe"));
         assert!(
             x86.files

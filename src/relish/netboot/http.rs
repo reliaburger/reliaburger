@@ -10,6 +10,10 @@
 //!
 //! An installer that finds a used disk reports it with `POST /disk` and
 //! polls `GET /disk/<ticket>` for the operator's decision ([`super::wipe`]).
+//! Once the image is written and checked, it says so with `POST
+//! /installed`, and only then is the machine recorded as installed. Both
+//! reports carry the install ticket its install script was given
+//! ([`InstallTickets`]); a report without that machine's ticket is refused.
 
 use std::net::Ipv4Addr;
 use std::sync::Arc;
@@ -21,16 +25,15 @@ use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use futures_util::StreamExt;
 use serde::Deserialize;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::Instant;
 use tokio_util::io::ReaderStream;
 
-use super::artefacts::{Artefacts, ServedFile};
+use super::artefacts::Artefacts;
 use super::installed::{
-    BootClient, BootDecision, DECLINED_SCRIPT, EXIT_SCRIPT, InstalledRecord, NOT_ALLOWED_SCRIPT,
-    decide, install_script,
+    BootClient, BootDecision, DECLINED_SCRIPT, EXIT_SCRIPT, InstallTickets, InstalledRecord,
+    NOT_ALLOWED_SCRIPT, decide, install_script,
 };
 use super::wipe::{
     self, Answer, DiskReport, DiskSession, MAX_REPORT_BYTES, Question, WipeDecision,
@@ -51,7 +54,7 @@ pub struct HttpState {
     pub allowed: Vec<MacAddress>,
     /// Install again even on machines in the record, once each per run.
     pub reinstall: bool,
-    /// Machines that fetched the installer this run under `--reinstall`.
+    /// Machines that installed this run under `--reinstall`.
     pub reinstalled: Mutex<Vec<BootClient>>,
     /// Machines whose used disk may be wiped without asking (`--wipe`).
     pub wipe: Vec<MacAddress>,
@@ -62,6 +65,8 @@ pub struct HttpState {
     pub question_timeout: Duration,
     /// The disk questions asked this session, and their answers.
     pub disks: Mutex<DiskSession>,
+    /// The install tickets issued this session.
+    pub installs: Mutex<InstallTickets>,
     /// Where request lines go.
     pub log: Log,
 }
@@ -75,6 +80,8 @@ pub struct BootQuery {
     pub uuid: Option<String>,
     /// `${buildarch}`.
     pub arch: Option<String>,
+    /// The install ticket, on the installer's reports.
+    pub ticket: Option<String>,
 }
 
 impl BootQuery {
@@ -92,6 +99,7 @@ pub fn router(state: Arc<HttpState>) -> Router {
     Router::new()
         .route("/boot.ipxe", get(boot_script))
         .route("/disk", post(report_disk))
+        .route("/installed", post(report_installed))
         .route("/disk/{ticket}", get(disk_decision))
         .route("/{arch}/{file}", get(artefact))
         .with_state(state)
@@ -117,10 +125,37 @@ async fn boot_script(
         decide(&client, &record, &state.allowed, reinstall, declined)
     };
     let (script, what) = match decision {
-        BootDecision::Install => (
-            install_script(state.server, state.port, &client, reinstall),
-            "install".to_string(),
-        ),
+        BootDecision::Install => {
+            // A machine that says who it is gets an install ticket for its
+            // reports; one that doesn't gets none, and is never recorded.
+            let named = client.mac.is_some() || client.uuid.is_some();
+            let ticket = if named {
+                state
+                    .installs
+                    .lock()
+                    .await
+                    .issue(&client, std::time::Instant::now())
+            } else {
+                None
+            };
+            if named && ticket.is_none() {
+                (
+                    EXIT_SCRIPT.to_string(),
+                    "exit (too many installs waiting; it asks again on its next boot)".to_string(),
+                )
+            } else {
+                (
+                    install_script(
+                        state.server,
+                        state.port,
+                        &client,
+                        reinstall,
+                        ticket.as_deref(),
+                    ),
+                    "install".to_string(),
+                )
+            }
+        }
         BootDecision::AlreadyInstalled => (
             EXIT_SCRIPT.to_string(),
             "exit (installed already; --reinstall to install again)".to_string(),
@@ -173,9 +208,64 @@ async fn report_disk(
             return (StatusCode::BAD_REQUEST, format!("{error}\n")).into_response();
         }
     };
+    // Only the installer relish sent this machine, once: anyone else on
+    // the LAN can name its MAC, but not its install ticket.
+    let first = match query.ticket.as_deref() {
+        Some(ticket) => {
+            state
+                .installs
+                .lock()
+                .await
+                .report_disk(ticket, &client, std::time::Instant::now())
+        }
+        None => false,
+    };
+    if !first {
+        (state.log)(format!(
+            "http: {client}: disk report refused (no install ticket of its own, or reported already)"
+        ));
+        return (
+            StatusCode::FORBIDDEN,
+            "no install ticket for this machine\n",
+        )
+            .into_response();
+    }
     let ticket = state.disks.lock().await.open();
     tokio::spawn(settle_disk(state.clone(), ticket.clone(), client, report));
     (StatusCode::ACCEPTED, format!("{ticket}\n")).into_response()
+}
+
+/// `POST /installed?mac=…&uuid=…&ticket=…`: the installer wrote the image,
+/// checked its hash and made the boot entry. Only now is the machine
+/// recorded, so one whose install failed is offered the installer again
+/// instead of being sent to a blank disk.
+async fn report_installed(
+    State(state): State<Arc<HttpState>>,
+    Query(query): Query<BootQuery>,
+) -> Response {
+    let client = query.client();
+    let valid = match query.ticket.as_deref() {
+        Some(ticket) => {
+            state
+                .installs
+                .lock()
+                .await
+                .complete(ticket, &client, std::time::Instant::now())
+        }
+        None => false,
+    };
+    if !valid {
+        (state.log)(format!(
+            "http: {client}: installed report refused (no install ticket of its own)"
+        ));
+        return (
+            StatusCode::FORBIDDEN,
+            "no install ticket for this machine\n",
+        )
+            .into_response();
+    }
+    remember(state, client).await;
+    (StatusCode::OK, "ok\n").into_response()
 }
 
 /// Decide what happens to a reported disk: at once for a blank disk, a
@@ -230,8 +320,8 @@ async fn settle_disk(
     };
     (state.log)(format!("http: {client}: disk {summary}: {what} ({why})"));
     if decision == WipeDecision::Decline {
-        // It fetched the installer, but installed nothing: forget it, so a
-        // later session asks again instead of sending it to its old disk.
+        // It installed nothing: make sure no record sends it to its old
+        // disk, so a later session asks again.
         if let Err(e) = state.installed.lock().await.forget(&client) {
             (state.log)(format!("http: couldn't forget {client}: {e}"));
         }
@@ -262,9 +352,39 @@ async fn artefact(
     Path((arch, file)): Path<(String, String)>,
     Query(query): Query<BootQuery>,
 ) -> Response {
-    let Some(served) = find(&state.artefacts, &arch, &file) else {
+    let Some(release) =
+        Arch::from_ipxe_name(&arch).and_then(|arch| state.artefacts.architectures.get(&arch))
+    else {
         return (StatusCode::NOT_FOUND, "not served here\n").into_response();
     };
+    let client = query.client();
+    // iPXE names the machine; the installer's own downloads (the image and
+    // its sums) don't, so they're logged by file alone.
+    let log_request = || {
+        (state.log)(match client.mac {
+            Some(_) => format!("http: {client}: {arch}/{file}"),
+            None => format!("http: {arch}/{file}"),
+        })
+    };
+    if file == "installer.efi" {
+        // From memory: the bytes `artefacts::load` hashed.
+        log_request();
+        let bytes = Bytes::from_owner(release.installer.clone());
+        return (
+            [
+                (header::CONTENT_TYPE, content_type(&file).to_string()),
+                (header::CONTENT_LENGTH, bytes.len().to_string()),
+            ],
+            bytes,
+        )
+            .into_response();
+    }
+    let Some(served) = release.files.get(&file) else {
+        return (StatusCode::NOT_FOUND, "not served here\n").into_response();
+    };
+    // The disk image is too big to hold, and the installer checks its
+    // hash against the signed sums before it's ever booted. Still, a file
+    // replaced since the check isn't served.
     if !served.unchanged() {
         (state.log)(format!(
             "http: refusing {}: it changed after relish netboot checked it; restart to check it again",
@@ -279,58 +399,15 @@ async fn artefact(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    let client = query.client();
-    // iPXE names the machine; the installer's own downloads (the image and
-    // its sums) don't, so they're logged by file alone.
-    (state.log)(match client.mac {
-        Some(_) => format!("http: {client}: {arch}/{file}"),
-        None => format!("http: {arch}/{file}"),
-    });
-    let stream = ReaderStream::new(opened);
-    let body = if file == "installer.efi" {
-        // Remember the machine as the installer's last chunk goes out; a
-        // download that stops halfway never gets there. It has to happen
-        // *before* that chunk is yielded: with Content-Length set, hyper
-        // stops polling the body once the last byte is sent, so anything
-        // chained after it would never run.
-        let size = served.size;
-        let mut sent = 0u64;
-        let state = state.clone();
-        Body::from_stream(stream.then(move |chunk| {
-            let last = chunk.as_ref().is_ok_and(|bytes| {
-                sent += bytes.len() as u64;
-                sent >= size
-            });
-            let state = state.clone();
-            let client = client.clone();
-            async move {
-                if last {
-                    remember(state, client).await;
-                }
-                chunk
-            }
-        }))
-    } else {
-        Body::from_stream(stream)
-    };
+    log_request();
     (
         [
             (header::CONTENT_TYPE, content_type(&file).to_string()),
             (header::CONTENT_LENGTH, served.size.to_string()),
         ],
-        body,
+        Body::from_stream(ReaderStream::new(opened)),
     )
         .into_response()
-}
-
-/// The checked file `/<arch>/<file>` names, if any.
-fn find<'a>(artefacts: &'a Artefacts, arch: &str, file: &str) -> Option<&'a ServedFile> {
-    let release = artefacts.architectures.get(&Arch::from_ipxe_name(arch)?)?;
-    if file == "installer.efi" {
-        release.installer()
-    } else {
-        release.files.get(file)
-    }
 }
 
 fn content_type(file: &str) -> &'static str {
@@ -359,10 +436,10 @@ async fn remember(state: Arc<HttpState>, client: BootClient) {
     let result = state.installed.lock().await.remember(&client, now);
     match result {
         Ok(true) => (state.log)(format!(
-            "http: {client} has the installer; it gets exit from now on (--reinstall to install again)"
+            "http: {client} installed; it gets exit from now on (--reinstall to install again)"
         )),
         Ok(false) if state.reinstall => (state.log)(format!(
-            "http: {client} has the installer and is being installed again; it gets exit for the rest of this run"
+            "http: {client} installed again; it gets exit for the rest of this run"
         )),
         Ok(false) => {}
         Err(e) => (state.log)(format!("http: couldn't remember {client}: {e}")),
@@ -426,6 +503,7 @@ mod tests {
             operator,
             question_timeout,
             disks: Mutex::new(DiskSession::default()),
+            installs: Mutex::new(InstallTickets::default()),
             log: Arc::new(move |line| sink.lock().unwrap().push(line)),
         });
         Fixture { dir, state, lines }
@@ -460,6 +538,25 @@ mod tests {
 
     fn boot_uri(mac: &str) -> String {
         format!("/boot.ipxe?mac={mac}&uuid=4c4c4544-0042-3510-8051-b4c04f4b4e32&arch=x86_64")
+    }
+
+    /// Ask for `mac`'s boot script, as iPXE does, and return the install
+    /// ticket on its command line.
+    async fn install_ticket(state: &Arc<HttpState>, mac: &str) -> String {
+        let (_, _, _, script) = get_path(state, &boot_uri(mac)).await;
+        let script = String::from_utf8(script).unwrap();
+        let start = script.find("&ticket=").expect("an install ticket") + "&ticket=".len();
+        script[start..]
+            .chars()
+            .take_while(char::is_ascii_hexdigit)
+            .collect()
+    }
+
+    async fn installed(state: &Arc<HttpState>, query: &str) -> StatusCode {
+        let request = Request::post(format!("/installed?{query}"))
+            .body(Body::empty())
+            .unwrap();
+        send(state, request).await.0
     }
 
     #[tokio::test]
@@ -523,8 +620,12 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
     }
 
+    /// A machine counts as installed when its installer says it installed,
+    /// with its ticket: not when it fetched the installer. One whose
+    /// install failed must get the install script again, not be sent to a
+    /// blank disk.
     #[tokio::test]
-    async fn a_new_machine_gets_the_install_script_then_exit_once_it_has_the_installer() {
+    async fn a_new_machine_gets_the_install_script_then_exit_once_it_reports_it_installed() {
         let f = fixture_with(vec![], false);
         let (status, _, _, script) = get_path(&f.state, &boot_uri(MAC)).await;
         assert_eq!(status, StatusCode::OK);
@@ -533,6 +634,7 @@ mod tests {
         assert!(script.contains(
             "${base}/installer.efi?mac=52:54:00:12:34:56&uuid=4c4c4544-0042-3510-8051-b4c04f4b4e32 "
         ));
+        assert!(script.contains(" reliaburger.done=http://192.168.1.20:8080/installed?mac=52:54:00:12:34:56&uuid=4c4c4544-0042-3510-8051-b4c04f4b4e32&ticket="), "{script}");
 
         let (status, ..) = get_path(
             &f.state,
@@ -540,16 +642,82 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+        // Fetched, not installed: a failed install gets the script again.
+        let (_, _, _, again) = get_path(&f.state, &boot_uri(MAC)).await;
+        assert_ne!(again, EXIT_SCRIPT.as_bytes());
+        assert!(!f.dir.path().join(RECORD_FILE).exists());
+
+        let ticket = install_ticket(&f.state, MAC).await;
+        assert_eq!(
+            installed(&f.state, &format!("mac={MAC}&ticket={ticket}")).await,
+            StatusCode::OK
+        );
         let (_, _, _, script) = get_path(&f.state, &boot_uri(MAC)).await;
         assert_eq!(script, EXIT_SCRIPT.as_bytes());
-
         let record = std::fs::read_to_string(f.dir.path().join(RECORD_FILE)).unwrap();
         assert!(record.contains(MAC), "{record}");
         let lines = f.lines.lock().unwrap();
         assert!(
-            lines.iter().any(|l| l.contains("has the installer")),
+            lines
+                .iter()
+                .any(|l| l.contains("installed; it gets exit from now on")),
             "{lines:?}"
         );
+    }
+
+    /// Anyone on the LAN can name a MAC; only the machine that was sent the
+    /// install script knows its ticket.
+    #[tokio::test]
+    async fn an_installed_report_needs_the_machines_own_ticket() {
+        let f = fixture_with(vec![], false);
+        let ticket = install_ticket(&f.state, MAC).await;
+        let other = install_ticket(&f.state, "52:54:00:00:00:02").await;
+        for query in [
+            format!("mac={MAC}"),
+            format!("mac={MAC}&ticket=0123456789abcdef0123456789abcdef"),
+            format!("mac={MAC}&ticket={other}"),
+            format!("mac=52:54:00:00:00:03&ticket={ticket}"),
+        ] {
+            assert_eq!(
+                installed(&f.state, &query).await,
+                StatusCode::FORBIDDEN,
+                "{query}"
+            );
+        }
+        assert!(!f.dir.path().join(RECORD_FILE).exists());
+        assert_eq!(
+            installed(&f.state, &format!("mac={MAC}&ticket={ticket}")).await,
+            StatusCode::OK
+        );
+        // A ticket is good once.
+        assert_eq!(
+            installed(&f.state, &format!("mac={MAC}&ticket={ticket}")).await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    /// relish hashes the installer, the trust anchor that checks the disk
+    /// image, and then sends exactly those bytes, whatever happens on disk.
+    #[tokio::test]
+    async fn the_installer_is_sent_from_the_bytes_that_were_checked() {
+        let f = fixture_with(vec![], false);
+        let path = f.dir.path().join(format!(
+            "x86_64/reliaburger-os-installer_{}.efi",
+            fixture::VERSION
+        ));
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        // Same size, same modification time, different bytes.
+        std::fs::write(&path, b"INSTALLER").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        let (status, _, length, body) = get_path(&f.state, "/x86_64/installer.efi").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(length.as_deref(), Some("9"));
+        assert_eq!(body, b"installer");
     }
 
     #[tokio::test]
@@ -571,11 +739,10 @@ mod tests {
         );
     }
 
-    /// Over a real connection, as iPXE fetches it: hyper stops polling a
-    /// body with a Content-Length once the last byte is out, which a
-    /// `oneshot` test never shows.
+    /// Over a real connection, as iPXE fetches it: the whole installer
+    /// arrives, and fetching it marks nothing.
     #[tokio::test]
-    async fn a_machine_is_remembered_after_downloading_the_installer_over_tcp() {
+    async fn downloading_the_installer_over_tcp_marks_nothing() {
         let f = fixture_with(vec![], false);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -585,9 +752,8 @@ mod tests {
             .await
             .unwrap();
         assert!(response.status().is_success());
-        response.bytes().await.unwrap();
-        let record = std::fs::read_to_string(f.dir.path().join(RECORD_FILE)).unwrap();
-        assert!(record.contains(MAC), "{record}");
+        assert_eq!(&response.bytes().await.unwrap()[..], b"installer");
+        assert!(!f.dir.path().join(RECORD_FILE).exists());
     }
 
     #[tokio::test]
@@ -626,11 +792,18 @@ mod tests {
             .await
             .remember(&earlier_run, 1)
             .unwrap();
-        get_path(&f.state, &format!("/x86_64/installer.efi?mac={MAC}")).await;
+        let ticket = install_ticket(&f.state, MAC).await;
+        assert_eq!(
+            installed(&f.state, &format!("mac={MAC}&ticket={ticket}")).await,
+            StatusCode::OK
+        );
         let (_, _, _, script) = get_path(&f.state, &boot_uri(MAC)).await;
         assert_eq!(script, EXIT_SCRIPT.as_bytes());
         let lines = f.lines.lock().unwrap().join("\n");
-        assert!(lines.contains("installed again"), "{lines}");
+        assert!(
+            lines.contains("installed again; it gets exit for the rest of this run"),
+            "{lines}"
+        );
     }
 
     #[tokio::test]
@@ -709,6 +882,7 @@ mod tests {
         tokio::spawn(crate::relish::netboot::wipe::ask_operator(
             questions,
             lines,
+            std::time::Duration::ZERO,
             move |line| sink.lock().unwrap().push(line),
         ));
         (ask, type_line, prompts)
@@ -736,8 +910,9 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, app).await });
         let client = reqwest::Client::new();
 
+        let install = install_ticket(&f.state, MAC).await;
         let response = client
-            .post(format!("http://{address}/disk?mac={MAC}"))
+            .post(format!("http://{address}/disk?mac={MAC}&ticket={install}"))
             .body(USED)
             .send()
             .await
@@ -781,21 +956,20 @@ mod tests {
     async fn a_no_leaves_the_disk_and_the_machine_gets_exit_for_the_rest_of_the_session() {
         let (ask, type_line, prompts) = operator();
         let f = fixture_asking(vec![], false, vec![], Some(ask), Duration::from_secs(30));
-        // The machine downloaded the installer, so it's in the record...
+        let install = install_ticket(&f.state, MAC).await;
         get_path(&f.state, &format!("/x86_64/installer.efi?mac={MAC}")).await;
-        let (status, ticket) = report(&f.state, &format!("mac={MAC}"), USED).await;
+        let query = format!("mac={MAC}&ticket={install}");
+        let (status, ticket) = report(&f.state, &query, USED).await;
         assert_eq!(status, StatusCode::ACCEPTED);
         wait_for_prompt(&prompts).await;
         type_line.send("n".to_string()).unwrap();
         assert_eq!(settled(&f.state, &ticket).await, "decline\n");
-        // ...and leaves it, since it installed nothing.
-        let record = std::fs::read_to_string(f.dir.path().join(RECORD_FILE)).unwrap();
-        assert!(!record.contains(MAC), "{record}");
+        assert!(!f.dir.path().join(RECORD_FILE).exists());
         let (_, _, _, script) = get_path(&f.state, &boot_uri(MAC)).await;
         assert_eq!(script, DECLINED_SCRIPT.as_bytes());
-        // Reporting again doesn't ask again.
-        let (_, again) = report(&f.state, &format!("mac={MAC}"), USED).await;
-        assert_eq!(settled(&f.state, &again).await, "decline\n");
+        // Reporting again with the same ticket is refused, and asks nothing.
+        let (status, _) = report(&f.state, &query, USED).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(prompts.lock().unwrap().len(), 1);
     }
 
@@ -803,7 +977,8 @@ mod tests {
     async fn no_answer_in_time_declines() {
         let (ask, _type_line, _prompts) = operator();
         let f = fixture_asking(vec![], false, vec![], Some(ask), Duration::from_millis(50));
-        let (_, ticket) = report(&f.state, &format!("mac={MAC}"), USED).await;
+        let install = install_ticket(&f.state, MAC).await;
+        let (_, ticket) = report(&f.state, &format!("mac={MAC}&ticket={install}"), USED).await;
         assert_eq!(settled(&f.state, &ticket).await, "decline\n");
     }
 
@@ -817,7 +992,8 @@ mod tests {
             Some(ask),
             Duration::from_secs(30),
         );
-        let (_, ticket) = report(&f.state, &format!("mac={MAC}"), USED).await;
+        let install = install_ticket(&f.state, MAC).await;
+        let (_, ticket) = report(&f.state, &format!("mac={MAC}&ticket={install}"), USED).await;
         assert_eq!(settled(&f.state, &ticket).await, "wipe\n");
         assert!(prompts.lock().unwrap().is_empty());
     }
@@ -831,7 +1007,8 @@ mod tests {
             None,
             Duration::from_secs(30),
         );
-        let (_, ticket) = report(&f.state, &format!("mac={MAC}"), USED).await;
+        let install = install_ticket(&f.state, MAC).await;
+        let (_, ticket) = report(&f.state, &format!("mac={MAC}&ticket={install}"), USED).await;
         assert_eq!(settled(&f.state, &ticket).await, "decline\n");
         let lines = f.lines.lock().unwrap();
         assert!(lines.iter().any(|l| l.contains("--wipe")), "{lines:?}");
@@ -840,7 +1017,8 @@ mod tests {
     #[tokio::test]
     async fn a_blank_disk_installs_without_a_question() {
         let f = fixture_with(vec![], false);
-        let (_, ticket) = report(&f.state, &format!("mac={MAC}"), BLANK).await;
+        let install = install_ticket(&f.state, MAC).await;
+        let (_, ticket) = report(&f.state, &format!("mac={MAC}&ticket={install}"), BLANK).await;
         assert_eq!(settled(&f.state, &ticket).await, "install\n");
     }
 
@@ -855,7 +1033,8 @@ mod tests {
             None,
             Duration::from_secs(30),
         );
-        let (status, ticket) = report(&f.state, &format!("mac={MAC}"), USED).await;
+        let install = install_ticket(&f.state, MAC).await;
+        let (status, ticket) = report(&f.state, &format!("mac={MAC}&ticket={install}"), USED).await;
         assert_eq!(status, StatusCode::ACCEPTED);
         for method in ["POST", "PUT", "PATCH", "DELETE"] {
             let request = Request::builder()
@@ -868,8 +1047,11 @@ mod tests {
         }
         assert_eq!(settled(&f.state, &ticket).await, "decline\n");
         // A report that's a decision, not a disk, is refused.
-        let (status, _) = report(&f.state, &format!("mac={MAC}"), "wipe\n").await;
+        let (status, _) = report(&f.state, &format!("mac={MAC}&ticket={install}"), "wipe\n").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+        // So is a disk report without this machine's install ticket.
+        let (status, _) = report(&f.state, &format!("mac={MAC}"), USED).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
         // So is a report nobody can be asked about, or from a machine the
         // --mac list leaves out, or one too big to be lsblk's.
         let (status, _) = report(&f.state, "", USED).await;
