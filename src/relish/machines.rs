@@ -9,7 +9,7 @@
 //! the machine's console (or chose to trust with `--trust-lan`).
 
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -393,6 +393,173 @@ pub fn resolve(
         .collect()
 }
 
+/// Refuse a machine named twice among `targets`, whether by the same name
+/// or by its MAC and its address (`resolved` holds where each target
+/// reaches). Two claims of one machine would give it two seeds, and the
+/// second would overwrite the first.
+pub fn refuse_repeated_targets(
+    targets: &[String],
+    resolved: &[(IpAddr, Option<String>)],
+) -> Result<(), RelishError> {
+    for (index, (address, _)) in resolved.iter().enumerate() {
+        let Some(first) = resolved[..index].iter().position(|(a, _)| a == address) else {
+            continue;
+        };
+        let (earlier, later) = (&targets[first], &targets[index]);
+        return Err(if earlier.eq_ignore_ascii_case(later) {
+            failed(&format!("{later} is named twice: name each machine once"))
+        } else {
+            failed(&format!(
+                "{earlier} and {later} are the same machine ({address}): name each machine once"
+            ))
+        });
+    }
+    Ok(())
+}
+
+/// A seed to send, and where: the node it makes, its file in the cluster
+/// directory, and the claim key the connection is pinned to.
+#[derive(Debug, Clone)]
+struct Delivery {
+    node: bare_metal::FleetNode,
+    seed: PathBuf,
+    fingerprint: String,
+}
+
+/// A machine whose seed didn't arrive, and why.
+#[derive(Debug)]
+struct Undelivered {
+    node: bare_metal::FleetNode,
+    seed: PathBuf,
+    error: RelishError,
+}
+
+/// Send every seed with `post` (`post_seed`, or a test's stand-in), one
+/// machine after another. A machine that can't be reached doesn't stop the
+/// rest: by now `fleet.json` names them all, so a run that stopped halfway
+/// couldn't simply be repeated. Returns the machines that didn't get theirs.
+async fn deliver_seeds<F, Fut>(deliveries: &[Delivery], mut post: F) -> Vec<Undelivered>
+where
+    F: FnMut(SocketAddr, String, Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = Result<(), RelishError>>,
+{
+    let mut undelivered = Vec::new();
+    for delivery in deliveries {
+        let node = &delivery.node;
+        let sent = match tokio::fs::read(&delivery.seed).await {
+            Ok(seed) => {
+                post(
+                    SocketAddr::new(node.address, CLAIM_PORT),
+                    delivery.fingerprint.clone(),
+                    seed,
+                )
+                .await
+            }
+            Err(error) => Err(RelishError::from(error)),
+        };
+        match sent {
+            Ok(()) => println!(
+                "  {} ({} at {}): claimed",
+                node.name, node.mac, node.address
+            ),
+            Err(error) => undelivered.push(Undelivered {
+                node: node.clone(),
+                seed: delivery.seed.clone(),
+                error,
+            }),
+        }
+    }
+    undelivered
+}
+
+/// The error `relish machines claim` ends with when some seeds didn't
+/// arrive: each machine and why, and the command that sends them again.
+fn undelivered_error(directory: &Path, trust_lan: bool, failures: &[Undelivered]) -> RelishError {
+    let mut message = match failures.len() {
+        1 => "1 machine didn't get its seed:\n".to_string(),
+        n => format!("{n} machines didn't get their seed:\n"),
+    };
+    for failure in failures {
+        let node = &failure.node;
+        // Without the "cluster initialisation failed" each of this module's
+        // errors starts with, which would repeat on every line.
+        let reason = match &failure.error {
+            RelishError::InitFailed(reason) => reason.clone(),
+            other => other.to_string(),
+        };
+        message.push_str(&format!(
+            "  {} ({} at {}): {reason}\n",
+            node.name, node.mac, node.address
+        ));
+    }
+    let addresses: Vec<String> = failures
+        .iter()
+        .map(|f| f.node.address.to_string())
+        .collect();
+    let seeds: Vec<String> = failures
+        .iter()
+        .map(|f| f.seed.display().to_string())
+        .collect();
+    message.push_str(&format!(
+        "Their seeds are still in the cluster directory. Once the machines answer, send \
+         them again with:\n  relish machines claim {}{} {}\nor copy {} into seeds/ on an \
+         RBSEED stick and boot the machines with it",
+        directory.display(),
+        if trust_lan { " --trust-lan" } else { "" },
+        addresses.join(" "),
+        seeds.join(", ")
+    ));
+    failed(&message)
+}
+
+/// What [`split_known`] answers: the machines to send their seed again,
+/// and the machines to add.
+type Split = (Vec<(bare_metal::FleetNode, PathBuf)>, Vec<(String, IpAddr)>);
+
+/// The machines `fleet` already has (a claim that didn't arrive, sent
+/// again), each with its seed in `directory`, and the machines it doesn't,
+/// which join. A fleet machine answering at another address is refused:
+/// its seed names the old one.
+fn split_known(
+    directory: &Path,
+    fleet: Option<&bare_metal::Fleet>,
+    machines: &[(String, IpAddr)],
+) -> Result<Split, RelishError> {
+    let mut again = Vec::new();
+    let mut new = Vec::new();
+    for (mac, address) in machines {
+        let known = fleet.and_then(|fleet| fleet.nodes.iter().find(|n| &n.mac == mac));
+        match known {
+            None => new.push((mac.clone(), *address)),
+            Some(node) if node.address != *address => {
+                return Err(failed(&format!(
+                    "{mac} is {} at {} in {}, but answered at {address}; give it back its address",
+                    node.name,
+                    node.address,
+                    directory.join("fleet.json").display()
+                )));
+            }
+            Some(node) => again.push((
+                node.clone(),
+                directory.join("stick").join(bare_metal::stick_file(mac)),
+            )),
+        }
+    }
+    Ok((again, new))
+}
+
+/// The fleet in `directory`, if it has one.
+async fn read_fleet(directory: &Path) -> Result<Option<bare_metal::Fleet>, RelishError> {
+    let path = directory.join("fleet.json");
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|e| failed(&format!("{}: {e}", path.display()))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// `relish machines claim`: check each machine's claim key, make its seed
 /// (a new cluster's, or a join to the cluster in the directory) and post it.
 pub async fn run_claim(options: &ClaimOptions) -> Result<(), RelishError> {
@@ -411,8 +578,10 @@ pub async fn run_claim(options: &ClaimOptions) -> Result<(), RelishError> {
     } else {
         browse(Duration::from_secs(3))?
     };
+    let resolved = resolve(&options.targets, &discovered)?;
+    refuse_repeated_targets(&options.targets, &resolved)?;
     let mut machines = Vec::new();
-    for (address, announced) in resolve(&options.targets, &discovered)? {
+    for (address, announced) in resolved {
         let (info, fingerprint) =
             inspect(SocketAddr::new(address, CLAIM_PORT), announced.as_deref()).await?;
         let mac = info
@@ -427,14 +596,16 @@ pub async fn run_claim(options: &ClaimOptions) -> Result<(), RelishError> {
         );
         machines.push((mac, address, fingerprint));
     }
-    if !options.trust_lan {
-        confirm(&machines)?;
-    }
-
     let pairs: Vec<(String, IpAddr)> = machines
         .iter()
         .map(|(mac, address, _)| (mac.clone(), *address))
         .collect();
+    // One machine at two addresses (its IPv4 and its IPv6 one, say).
+    bare_metal::refuse_repeats(&pairs)?;
+    if !options.trust_lan {
+        confirm(&machines)?;
+    }
+
     let (created, seeds) = match &options.create {
         Some(cluster) => {
             let keys = crate::relish::quickstart::security::root_backup_keys_in(
@@ -471,35 +642,53 @@ pub async fn run_claim(options: &ClaimOptions) -> Result<(), RelishError> {
                 .collect::<Vec<_>>();
             (Some(created), seeds)
         }
-        None => (None, {
-            open_join_windows(&pairs).await?;
-            bare_metal::add(
-                &options.directory,
-                &pairs,
-                options.token_ttl,
-                options.ssh_key.clone(),
-            )
-            .await?
-        }),
+        None => {
+            let fleet = read_fleet(&options.directory).await?;
+            let (mut seeds, new) = split_known(&options.directory, fleet.as_ref(), &pairs)?;
+            if new.is_empty() {
+                // Only seeds sent again, and their join tokens are already
+                // in them. A window still helps a machine added after the
+                // cluster was made, but there may be no cluster to ask yet:
+                // node 1's seed may be among them.
+                if let Err(error) = open_join_windows(&pairs).await {
+                    eprintln!("warning: no join windows opened: {error}");
+                }
+            } else {
+                open_join_windows(&pairs).await?;
+                seeds.extend(
+                    bare_metal::add(
+                        &options.directory,
+                        &new,
+                        options.token_ttl,
+                        options.ssh_key.clone(),
+                    )
+                    .await?,
+                );
+            }
+            (None, seeds)
+        }
     };
-    for ((node, seed), (_, address, fingerprint)) in seeds.iter().zip(&machines) {
-        post_seed(
-            SocketAddr::new(*address, CLAIM_PORT),
-            fingerprint,
-            tokio::fs::read(seed).await?,
-        )
-        .await
-        .map_err(|e| {
-            failed(&format!(
-                "{e}; its seed is still in {}, for a stick",
-                seed.display()
-            ))
-        })?;
-        println!(
-            "  {} ({} at {}): claimed",
-            node.name, node.mac, node.address
-        );
-    }
+    let deliveries: Vec<Delivery> = seeds
+        .into_iter()
+        .map(|(node, seed)| {
+            let (_, _, fingerprint) = machines
+                .iter()
+                .find(|(mac, ..)| *mac == node.mac)
+                .ok_or_else(|| failed(&format!("no claim key for {}", node.mac)))?;
+            Ok(Delivery {
+                fingerprint: fingerprint.clone(),
+                node,
+                seed,
+            })
+        })
+        .collect::<Result<_, RelishError>>()?;
+    let failures = deliver_seeds(&deliveries, |address, fingerprint, seed| async move {
+        post_seed(address, &fingerprint, seed).await
+    })
+    .await;
+    // The cluster is in the directory whether or not node 1 got its seed,
+    // so relish points at it either way: the context is then ready when a
+    // retry reaches node 1.
     if let Some(created) = &created {
         println!(
             "cluster {} created in {}",
@@ -507,9 +696,22 @@ pub async fn run_claim(options: &ClaimOptions) -> Result<(), RelishError> {
             options.directory.display()
         );
         // BLOCKING-OK: relish CLI: a one-shot step before the command does anything long-lived
-        print!("{}", bare_metal::adopt(created, &options.directory)?);
+        match bare_metal::adopt(created, &options.directory) {
+            Ok(context) => print!("{context}"),
+            Err(error) if failures.is_empty() => return Err(error),
+            // The seeds that didn't arrive matter more: say what to run.
+            Err(error) => eprintln!("warning: relish doesn't point at the cluster: {error}"),
+        }
     }
-    Ok(())
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(undelivered_error(
+            &options.directory,
+            options.trust_lan,
+            &failures,
+        ))
+    }
 }
 
 /// How long a claimed machine has to enrol through the cluster's
@@ -807,6 +1009,230 @@ mod tests {
             Some(crate::council::CouncilSize::APPLIANCE),
             "fleet.json records it"
         );
+    }
+
+    #[test]
+    fn a_machine_named_twice_is_refused_naming_both_targets() {
+        let resolved = resolve(
+            &[
+                "10.42.0.11".to_string(),
+                "10.42.0.12".to_string(),
+                "d8:9e:f3:12:34:56".to_string(),
+            ],
+            &[machine("10.42.0.11", "d8:9e:f3:12:34:56")],
+        )
+        .unwrap();
+        let targets = [
+            "10.42.0.11".to_string(),
+            "10.42.0.12".to_string(),
+            "d8:9e:f3:12:34:56".to_string(),
+        ];
+        let error = refuse_repeated_targets(&targets, &resolved)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("10.42.0.11 and d8:9e:f3:12:34:56 are the same machine"),
+            "{error}"
+        );
+        refuse_repeated_targets(&targets[..2], &resolved[..2]).unwrap();
+    }
+
+    #[test]
+    fn two_answers_with_one_mac_are_one_machine_and_refused() {
+        let error = bare_metal::refuse_repeats(&[
+            ("d8:9e:f3:12:34:56".into(), "10.42.0.11".parse().unwrap()),
+            ("d8:9e:f3:12:34:56".into(), "2001:db8::11".parse().unwrap()),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("listed twice"), "{error}");
+    }
+
+    /// A cluster of `machines` made in `dir`, as `--create` makes it.
+    fn created(dir: &std::path::Path, machines: &[(&str, &str)]) -> bare_metal::Created {
+        let cluster = NewCluster {
+            name: "home".into(),
+            operators: vec!["10.42.0.1".into()],
+            network: None,
+            faults: false,
+            external_signing_key: None,
+            council_size: crate::council::CouncilSize::APPLIANCE,
+            yes: true,
+        };
+        bare_metal::create(
+            &cluster.create_options(
+                dir,
+                machines
+                    .iter()
+                    .map(|(mac, address)| (mac.to_string(), address.parse().unwrap()))
+                    .collect(),
+                Duration::from_secs(3600),
+                None,
+                dir.join("operator-keys"),
+            ),
+        )
+        .unwrap()
+    }
+
+    const THREE: [(&str, &str); 3] = [
+        ("52:54:00:42:00:01", "10.42.0.11"),
+        ("52:54:00:42:00:02", "10.42.0.12"),
+        ("52:54:00:42:00:03", "10.42.0.13"),
+    ];
+
+    fn deliveries(created: &bare_metal::Created) -> Vec<Delivery> {
+        created
+            .fleet
+            .nodes
+            .iter()
+            .zip(&created.seeds)
+            .map(|(node, seed)| Delivery {
+                node: node.clone(),
+                seed: seed.clone(),
+                fingerprint: KEY_ONE.into(),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn every_machine_is_sent_its_seed_though_one_refuses_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let created = created(dir.path(), &THREE);
+        let posted = Mutex::new(Vec::new());
+        let failures = deliver_seeds(&deliveries(&created), |address, fingerprint, seed| {
+            posted
+                .lock()
+                .unwrap()
+                .push((address, fingerprint, seed.len()));
+            async move {
+                if address.ip().to_string() == "10.42.0.12" {
+                    Err(failed("10.42.0.12: connection refused"))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+        let posted = posted.into_inner().unwrap();
+        let addresses: Vec<String> = posted.iter().map(|(a, _, _)| a.to_string()).collect();
+        assert_eq!(
+            addresses,
+            [
+                "10.42.0.11:9119".to_string(),
+                "10.42.0.12:9119".to_string(),
+                "10.42.0.13:9119".to_string()
+            ],
+            "the third machine still gets its seed"
+        );
+        assert!(
+            posted
+                .iter()
+                .all(|(_, key, len)| key == KEY_ONE && *len > 0)
+        );
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].node.name, "home-2");
+        assert!(
+            failures[0].error.to_string().contains("connection refused"),
+            "{}",
+            failures[0].error
+        );
+    }
+
+    #[tokio::test]
+    async fn a_seed_that_cannot_be_read_is_a_failure_for_that_machine_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let created = created(dir.path(), &THREE);
+        std::fs::remove_file(&created.seeds[0]).unwrap();
+        let failures = deliver_seeds(&deliveries(&created), |_, _, _| async { Ok(()) }).await;
+        let names: Vec<&str> = failures.iter().map(|f| f.node.name.as_str()).collect();
+        assert_eq!(names, ["home-1"]);
+    }
+
+    #[test]
+    fn the_failure_report_names_each_machine_and_the_command_that_sends_it_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let created = created(dir.path(), &THREE);
+        let failures: Vec<Undelivered> = deliveries(&created)
+            .into_iter()
+            .skip(1)
+            .map(|delivery| Undelivered {
+                error: failed(&format!("{}: timed out", delivery.node.address)),
+                node: delivery.node,
+                seed: delivery.seed,
+            })
+            .collect();
+        for (trust_lan, flag) in [(true, " --trust-lan"), (false, "")] {
+            let report = undelivered_error(dir.path(), trust_lan, &failures).to_string();
+            assert!(
+                report.contains("2 machines didn't get their seed"),
+                "{report}"
+            );
+            assert!(
+                report.contains("home-2 (52:54:00:42:00:02 at 10.42.0.12): 10.42.0.12: timed out"),
+                "{report}"
+            );
+            assert!(report.contains("home-3 (52:54:00:42:00:03"), "{report}");
+            let command = format!(
+                "relish machines claim {}{flag} 10.42.0.12 10.42.0.13",
+                dir.path().display()
+            );
+            assert!(report.contains(&command), "{report}");
+            assert!(
+                report.contains(&created.seeds[1].display().to_string()),
+                "{report}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_machine_already_in_the_fleet_is_sent_its_seed_again_and_a_new_one_is_added() {
+        let dir = tempfile::tempdir().unwrap();
+        let created = created(dir.path(), &THREE[..2]);
+        let new: (String, IpAddr) = ("52:54:00:42:00:09".into(), "10.42.0.19".parse().unwrap());
+        let (again, added) = split_known(
+            dir.path(),
+            Some(&created.fleet),
+            &[
+                ("52:54:00:42:00:02".into(), "10.42.0.12".parse().unwrap()),
+                new.clone(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            again,
+            [(created.fleet.nodes[1].clone(), created.seeds[1].clone())]
+        );
+        assert_eq!(added, [new]);
+    }
+
+    #[test]
+    fn a_fleet_machine_answering_at_another_address_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let created = created(dir.path(), &THREE[..2]);
+        let error = split_known(
+            dir.path(),
+            Some(&created.fleet),
+            &[("52:54:00:42:00:02".into(), "10.42.0.99".parse().unwrap())],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("home-2"), "{error}");
+        assert!(error.contains("10.42.0.12"), "{error}");
+        assert!(error.contains("10.42.0.99"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_directory_without_a_fleet_has_no_known_machines() {
+        let dir = tempfile::tempdir().unwrap();
+        let fleet = read_fleet(dir.path()).await.unwrap();
+        assert!(fleet.is_none());
+        let machines = vec![(
+            "52:54:00:42:00:09".to_string(),
+            "10.42.0.19".parse().unwrap(),
+        )];
+        let (again, added) = split_known(dir.path(), fleet.as_ref(), &machines).unwrap();
+        assert!(again.is_empty());
+        assert_eq!(added, machines);
     }
 
     /// The whole claim over real TLS on loopback: inspect learns the key,

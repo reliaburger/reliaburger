@@ -195,6 +195,7 @@ pub fn create(options: &CreateOptions) -> Result<Created, RelishError> {
     if options.machines.is_empty() {
         return Err(failed("list at least one machine, node 1 first"));
     }
+    refuse_repeats(&options.machines)?;
     crate::config::node::ClusterSection {
         name: options.cluster.clone(),
         ..Default::default()
@@ -320,6 +321,31 @@ pub fn create(options: &CreateOptions) -> Result<Created, RelishError> {
         seeds,
         root_backup,
     })
+}
+
+/// Refuse a machine listed twice, by MAC or by address. Its two seeds would
+/// share one file on the stick, so the second overwrites the first: node
+/// 1's, with the cluster's keys, if node 1 is the one repeated. Names can't
+/// repeat: `create` numbers them.
+pub fn refuse_repeats(machines: &[(String, IpAddr)]) -> Result<(), RelishError> {
+    for (index, (mac, address)) in machines.iter().enumerate() {
+        let earlier = machines[..index].iter().enumerate();
+        for (position, (other_mac, other_address)) in earlier {
+            let same = if other_mac == mac {
+                format!("MAC {mac}")
+            } else if other_address == address {
+                format!("address {address}")
+            } else {
+                continue;
+            };
+            return Err(failed(&format!(
+                "{mac}@{address} is listed twice: it has the same {same} as machine {} \
+                 ({other_mac}@{other_address}). List each machine once",
+                position + 1
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The machines `relish image seed` adds: each named after the cluster
@@ -1098,6 +1124,35 @@ mod tests {
             create(&options(dir.path(), &["d8:9e:f3:00:00:01@192.168.1.51"])).is_err(),
             "an existing cluster"
         );
+    }
+
+    #[test]
+    fn a_machine_listed_twice_is_refused_before_anything_is_written() {
+        for (machines, repeated) in [
+            (
+                [
+                    "d8:9e:f3:00:00:01@192.168.1.51",
+                    "D8-9E-F3-00-00-01@192.168.1.52",
+                ],
+                "MAC d8:9e:f3:00:00:01",
+            ),
+            (
+                [
+                    "d8:9e:f3:00:00:01@192.168.1.51",
+                    "d8:9e:f3:00:00:02@192.168.1.51",
+                ],
+                "address 192.168.1.51",
+            ),
+        ] {
+            let parent = tempfile::tempdir().unwrap();
+            let dir = parent.path().join("home-cluster");
+            // The root backup's keys go inside `dir` here, so an empty
+            // `dir` means they weren't made either.
+            let error = create(&options(&dir, &machines)).unwrap_err().to_string();
+            assert!(error.contains(repeated), "{error}");
+            assert!(error.contains("listed twice"), "{error}");
+            assert!(!dir.exists(), "wrote {:?}", everything_in(&dir));
+        }
     }
 
     #[test]
