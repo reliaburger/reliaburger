@@ -672,6 +672,19 @@ async fn forward_token_write(
     }
 }
 
+/// Label a successful answer the leader gave to a forwarded join-token
+/// request as JSON. The proxy passes the leader's body through but not its
+/// headers, and a client reading the answer expects JSON.
+fn with_json_content_type(mut answer: Response) -> Response {
+    if answer.status() == StatusCode::OK {
+        answer.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+    }
+    answer
+}
+
 /// Take a committed revoke's token out of this node's auth store now, instead
 /// of leaving it working until the next periodic refresh from Raft (every 5
 /// seconds), and return the message for the caller. Other nodes drop it on
@@ -971,9 +984,14 @@ pub(super) async fn token_rotate_handler(
 
 /// List the join tokens the council holds: their node id, expiry and
 /// whether they've been used, never the token.
+///
+/// The leader answers. A follower forwards the request with the caller's
+/// own credential, because its replica can lag and miss a token the leader
+/// just committed.
 pub(super) async fn join_token_list_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
+    headers: HeaderMap,
 ) -> Response {
     if let Err(resp) =
         crate::sesame::auth::authorize_user(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
@@ -999,6 +1017,24 @@ pub(super) async fn join_token_list_handler(
         )
             .into_response();
     };
+    if let Some(council) = crate::bun::leadership::council_to_forward_to(&state).await {
+        let forward = crate::bun::batch::forward_get_to_leader(
+            &state,
+            council,
+            "/v1/join-token/list",
+            &headers,
+        );
+        return match tokio::time::timeout(LEADER_FORWARD_TIMEOUT, forward).await {
+            Ok(answer) => with_json_content_type(answer),
+            Err(_) => (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(serde_json::json!({
+                    "error": "the leader didn't answer in time; listing again is safe"
+                })),
+            )
+                .into_response(),
+        };
+    }
     let security = council.security_state().await;
     Json(serde_json::json!({
         "join_tokens": crate::sesame::join::summarise_join_tokens(&security),
@@ -1008,9 +1044,14 @@ pub(super) async fn join_token_list_handler(
 
 /// Revoke every unused join token for a node id: each is marked consumed
 /// through Raft, so none of them can enrol that node any more.
+///
+/// Only the leader writes, and only its state machine is sure to hold every
+/// token, so a follower forwards the request with the caller's own
+/// credential and the leader repeats every check, as for a create.
 pub(super) async fn join_token_revoke_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
+    headers: HeaderMap,
     body: String,
 ) -> Response {
     if let Err(resp) =
@@ -1051,6 +1092,19 @@ pub(super) async fn join_token_revoke_handler(
         )
             .into_response();
     };
+    if let Some(council) = crate::bun::leadership::council_to_forward_to(&state).await {
+        let answer = forward_token_write(
+            &state,
+            council,
+            "/v1/join-token/revoke",
+            body,
+            &headers,
+            "the leader didn't answer in time, so the revoke may or may not have committed; \
+             revoking again is safe",
+        )
+        .await;
+        return with_json_content_type(answer);
+    }
     let security = council.security_state().await;
     let hashes = crate::sesame::join::join_tokens_to_revoke(&security, &req.node_id);
     for token_hash in &hashes {
@@ -1159,7 +1213,7 @@ pub(super) async fn join_token_create_handler(
     };
 
     if let Some(council) = crate::bun::leadership::council_to_forward_to(&state).await {
-        let mut answer = forward_token_write(
+        let answer = forward_token_write(
             &state,
             council,
             "/v1/join-token/create",
@@ -1169,13 +1223,7 @@ pub(super) async fn join_token_create_handler(
              secret is lost, so nobody can use it and it expires by itself: create another",
         )
         .await;
-        if answer.status() == StatusCode::OK {
-            answer.headers_mut().insert(
-                axum::http::header::CONTENT_TYPE,
-                axum::http::HeaderValue::from_static("application/json"),
-            );
-        }
-        return answer;
+        return with_json_content_type(answer);
     }
 
     let ttl = std::time::Duration::from_secs(req.ttl_seconds);
