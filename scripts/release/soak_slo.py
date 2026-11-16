@@ -59,8 +59,6 @@ GATED_TIERS = ("fast", "final")
 # is their largest; a final's quiet tail gives millions.
 MIN_JOB_START_SAMPLES = 1000
 FAILURES_KEPT = 20
-RECORD_ONLY_NOTE = ("Record only (#1640): deploy history stamps a deploy's start when it finishes, so app start "
-                    "measures nothing yet. The threshold is provisional until it does.")
 
 
 @dataclass(frozen=True)
@@ -78,15 +76,19 @@ class Slo:
 SLOS = (
     # Gated from 6 November 2026 (#1405): two buckets above the worst fast or
     # final record from 0.2.4 to 0.2.6 (read and write 1,500 ms, rolling
-    # update 50,000 ms). docs/testing.md has the table.
+    # update 50,000 ms). App start from 16 November 2026 (#1913), by the same
+    # rule: its first real records, the 0.3.0 rehearsal's fast tiers and 8 h
+    # jobs final, put the worst p99 in the 15,000 ms bucket (186 starts, the
+    # slowest 11,069 ms). Every earlier record read 1 ms (#1640). docs/testing.md
+    # has the table.
     Slo("api-read", "API read p99", "API read", 3000, True, "probe",
         "`GET /v1/status?cluster=true` and `GET /v1/cluster/nodes` on every node, at every light check"),
     Slo("api-write", "API write p99", "API write", 3000, True, "rollout",
         "`relish apply` of the soak workloads, from the call to the commit"),
-    Slo("app-start", "App start p99", "app start", 5000, False, "rollout",
-        "each node's deploy of a new `soak-identity` instance, from its start to the instance running"),
+    Slo("app-start", "App start p99", "app start", 30000, True, "rollout",
+        "each node's deploy of a new `soak-slo` instance, from its start until the instance passes its health check"),
     Slo("deploy-ready", "Rolling update p99", "rolling update", 100000, True, "rollout",
-        "from `relish apply` returning to every node's `soak-identity` running the new spec"),
+        "from `relish apply` returning to every node's `soak-slo` running the new spec"),
     Slo("job-start", "Job task start p99", "job task start", 256, True, "job",
         "a job task's start lag on a pooled executor, from the job campaign's buckets, in runs no fault "
         "window overlapped"),
@@ -348,8 +350,6 @@ def table_lines(slo_rows, data=None):
                      f"{row['verdict']} |")
     lines.append("")
     lines += [f"- {slo.label}: {slo.measures}" for slo in SLOS]
-    if any(row["mode"] == "record only" and not slo.gated for row, slo in zip(slo_rows, SLOS)):
-        lines.append(f"- {RECORD_ONLY_NOTE}")
     for row in slo_rows:
         if row["verdict"] == "FAIL":
             lines.append(f"- **SLO breached: {row['name']}: {row['reason']}**")
