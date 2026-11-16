@@ -123,6 +123,27 @@ class DnsmasqConfig(unittest.TestCase):
         self.assertIn("syntax check OK", done.stdout + done.stderr)
 
 
+class CopyPasteBlocks(unittest.TestCase):
+    """macOS's zsh, without `interactivecomments`, runs a pasted `# note`
+    as arguments: `sudo pfctl -E  # keep the token` failed with "bad
+    pattern: #" in the lab, and the fallback test's reboot line would
+    have too. So the lab's copy-paste blocks carry no comments."""
+
+    PAGES = [MAC / "README.md",
+             MAC.parents[2] / "docs/plans/2026-11-06-wyse-lab-checklist.md"]
+
+    def test_shell_blocks_have_no_comments(self):
+        for page in self.PAGES:
+            in_block = False
+            for number, line in enumerate(page.read_text().splitlines(), 1):
+                if line.strip().startswith("```"):
+                    in_block = line.strip() == "```sh"
+                    continue
+                if in_block:
+                    self.assertIsNone(re.search(r"(^|\s)#", line),
+                                      f"{page.name}:{number}: {line.strip()}")
+
+
 class PfConfig(unittest.TestCase):
     def test_nats_the_lab_out_through_the_wifi_only(self):
         text = PF.read_text()

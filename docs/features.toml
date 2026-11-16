@@ -151,6 +151,16 @@ docs = ["docs/roadmap.md#releases-after-010"]
 evidence = "Roadmap 0.3.0 entry; the release-1-3-0 branch (the 0.3.0 train) carries netboot, claiming, OS updates and the Ubuntu 26.04 guest."
 
 [[group.feature]]
+name = "Raspberry Pi 4 and 5"
+status = "planned"
+milestone = "Later"
+summary = "The appliance on Raspberry Pis: netbooted by `relish netboot`, claimed and updated like any other machine."
+restrictions = "Not built. A Pi boots through its own firmware, not UEFI, and Ubuntu runs it on a kernel of its own (`linux-raspi`), so it needs a second boot platform: a Pi image, the Pi's own network boot in `relish netboot`, and A/B updates through the Pi firmware's `tryboot`. Until then `relish netboot` names a Pi that asks it to boot and leaves it alone."
+issues = [1971]
+docs = ["docs/manual/17_appliance.md#whats-missing", "docs/book/15a-becoming-the-os.md#whats-next"]
+evidence = "#1971 in Later; a dated plan comes first. Ubuntu 26.04's generic arm64 kernel has the Pi 4's NIC and the Pi 5's RP1 drivers but not the Pi SD or PCIe controllers."
+
+[[group.feature]]
 name = "Several clusters as one (Franchise)"
 status = "planned"
 milestone = "Later"

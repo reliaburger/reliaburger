@@ -6,16 +6,19 @@ The commands use these placeholders:
 
 | Placeholder | What | Setup B (isolated) | Setup A (home router) |
 |---|---|---|---|
-| `<iface>` | The Mac's USB-C Ethernet adapter | `en7` | `en7` |
+| `<iface>` | The Mac's USB-C Ethernet adapter (`en9`, an AX88179A, on 15 November) | `en7` | `en7` |
+| `<service>` | That adapter's network service name | `USB 10/100/1G/2.5G LAN` | |
 | `<lab-ip>` | The Mac's address on the lab network | `10.77.0.1` | its reservation, say `192.168.1.10` |
 | `<net>` | The lab network | `10.77.0.0/24` | `192.168.1.0/24` |
-| `<mac-1>` … `<mac-3>` | Each Wyse's MAC, from the label underneath | | |
+| `<mac-1>` … `<mac-3>` | Each Wyse's MAC, from the label underneath, with colons (the label uses dashes) | | |
 | `<ip-1>` … `<ip-3>` | Each Wyse's address | `10.77.0.11` … `.13` | its reservations, say `192.168.1.11` … `.13` |
 | `<run>` | The appliance lab build's run ID | | |
 | `<sha>` | The commit the run says bun and relish were built from | | |
 | `<broken>` | The broken OS version, two builds on from the image | | |
 
-Start with setup B, the Mac as the lab's router. It's the open question: does the 3040's firmware follow DHCP option 60 to UDP 4011? If step 1.4 shows no `ack on 4011`, switch to A and carry on.
+Start with setup B, the Mac as the lab's router. The first Phase 1 run (15 November 2026) showed the 3040's firmware follows DHCP option 60 to UDP 4011. It also found two bugs, both fixed: relish's 4011 reply carried option 43, which the 3040 takes as "boot locally" (#1970), and the installer had no driver for the 3040's network PHY (#1969). The run's notes are in `~/wyse-lab/README.md` on the lab Mac.
+
+The copy-paste blocks carry no `#` comments: macOS's zsh runs a pasted comment as an argument unless `interactivecomments` is set.
 
 ## Phase 0: before the hardware
 
@@ -59,11 +62,13 @@ Once. About 30 minutes, most of it a cargo build.
 - [ ] **Check the Mac.**
 
   ```sh
-  networksetup -listallhardwareports                        # the adapter's Device:, e.g. en7
+  networksetup -listallhardwareports
   /usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate
-  sudo lsof -nP -iUDP:67                                    # must print nothing
-  ls ~/.ssh/id_ed25519.pub
+  sudo lsof -nP -iUDP:67
+  ls ~/.ssh/*.pub
   ```
+
+  The first names the adapter's `Device:` (rows called `Ethernet Adapter (en4)` with no cable are macOS's virtual ones), `lsof` must print nothing, and the last lists your SSH public keys: an RSA one (`id_rsa.pub`) works as well as `id_ed25519.pub`. Install dnsmasq for B with `brew install dnsmasq`, but don't start its Homebrew service.
 
   If the firewall is on, allow relish (and dnsmasq for B, `python3` for the update step):
 
@@ -79,33 +84,36 @@ Once. About 30 minutes, most of it a cargo build.
 The fast loop: aim for under 30 minutes a pass, and use the shortcuts freely.
 
 - [ ] **1.1 Firmware setup on Wyse 1.** F2 at power-on (default password `Fireport`):
-  - BIOS 1.2.5 or newer;
+  - BIOS 1.2.3 or newer (1.2.5 is the last; 1.2.3 netbooted on 15 November, so no reflash is needed, but use the same version on all three);
   - UEFI boot, with legacy (CSM) off; once off, it can't be turned back on;
-  - the network stack and UEFI PXE (IPv4) on;
+  - System Configuration: UEFI Network Stack ticked, and Integrated NIC "Enabled w/PXE";
   - Secure Boot off;
-  - eMMC first, network second.
+  - Power Management: AC Recovery "Power On", so a unit comes back after the cord test (2.4);
+  - Boot Sequence: eMMC (`default`) first, network second. The network entries appear after a save and a reboot into F2; on 1.2.3 the IPv4 one is "IP4 Realtek PCIe GBE Family Controller".
 
-  Note the BIOS version, the PXE entry's exact name, and whether the unit still holds ThinOS.
+  Note the BIOS version, the PXE entry's exact name, and whether the unit still holds ThinOS. The settings page locks after a save; Unlock takes the admin password.
 
-- [ ] **1.2 B only: make the Mac the lab's router.** Cable the adapter to the switch, with nothing else on the switch but the Wyses. Give the adapter a fixed address, NAT out through the Wi-Fi, and run dnsmasq with the reservations in a terminal of its own. The network service name comes from `networksetup -listnetworkserviceorder`.
+- [ ] **1.2 B only: make the Mac the lab's router.** Cable the adapter to the switch, with nothing else on the switch but the Wyses. Give the adapter a fixed address, NAT out through the Wi-Fi, and run dnsmasq with the reservations in a terminal of its own. The network service name (`<service>`) comes from `networksetup -listnetworkserviceorder`; with the cable in, `ifconfig <iface> | grep status` says `active`.
 
   ```sh
-  sudo networksetup -setmanual "USB 10/100/1G/2.5G LAN" 10.77.0.1 255.255.255.0
+  sudo networksetup -setmanual "<service>" 10.77.0.1 255.255.255.0
   sudo sysctl -w net.inet.ip.forwarding=1
   sudo pfctl -a com.apple/reliaburger-lab -f $L/mac/pf-lab.conf
-  sudo pfctl -E          # keep the token it prints for the clean-up
+  sudo pfctl -E
   sudo pfctl -a com.apple/reliaburger-lab -s nat
   ```
 
+  Keep the `Token :` number `pfctl -E` prints, for the clean-up. The last line should print `nat on en0 inet from 10.77.0.0/24 to any -> (en0)`; the ALTQ lines and the warning about `-f` are harmless.
+
   ```sh
-  sudo "$(brew --prefix)/sbin/dnsmasq" --keep-in-foreground --conf-file=$L/mac/dnsmasq.conf \
-    --interface=<iface> \
+  sed 's/^interface=en7$/interface=<iface>/' $L/mac/dnsmasq.conf > ~/wyse-lab/dnsmasq.conf
+  sudo "$(brew --prefix)/sbin/dnsmasq" --no-daemon --conf-file=$HOME/wyse-lab/dnsmasq.conf \
     --dhcp-host=<mac-1>,<ip-1>,wyse-1,infinite \
     --dhcp-host=<mac-2>,<ip-2>,wyse-2,infinite \
     --dhcp-host=<mac-3>,<ip-3>,wyse-3,infinite
   ```
 
-  These flags save editing `dnsmasq.conf`: dnsmasq takes any config line as a long option. Nobody has run these steps on a real Mac yet; the [README](../../image/lab/mac/README.md) marks them unverified.
+  The `--dhcp-host` flags save editing the reservations into `dnsmasq.conf`. The interface can't be set that way: `interface` is a list, so `--interface` adds to the file's `en7` and dnsmasq stops with "unknown interface en7"; hence the copy. `--no-daemon` logs to the terminal and stops on Ctrl-C, where `--keep-in-foreground` logs only to syslog and ignores Ctrl-C. It should print `started, version …, DNS disabled` and the DHCP range. The [README](../../image/lab/mac/README.md) has the rest.
 
   **A only, instead:** plug the switch into the home router. In its admin page, reserve an address for each Wyse and for the Mac's adapter. The router must not answer PXE. Turn the Mac's Wi-Fi off, so the adapter is its only way onto the LAN. Then `ipconfig getifaddr <iface>` should print `<lab-ip>`, and `route -n get default` should name `<iface>`.
 
@@ -121,7 +129,7 @@ The fast loop: aim for under 30 minutes a pass, and use the shortcuts freely.
   - **B:** "this machine's DHCP server … hands out addresses", or "a DHCP server on this machine holds UDP 67";
   - **A:** "&lt;router&gt; hands out addresses on `<iface>`, and no other netboot server answers".
 
-- [ ] **1.4 Power on and watch it install.** A blank eMMC falls through to the network by itself. A unit with ThinOS boots ThinOS, so press F12 and pick the UEFI IPv4 Realtek entry.
+- [ ] **1.4 Power on and watch it install.** A blank eMMC falls through to the network by itself. A unit with ThinOS boots ThinOS, so press F12 and pick the IPv4 entry ("IP4 Realtek PCIe GBE Family Controller" on 1.2.3).
 
   In relish's log, within a minute or so, you should see:
   1. `ack on 4011` twice (B only): once for the firmware and once for iPXE;
@@ -132,7 +140,9 @@ The fast loop: aim for under 30 minutes a pass, and use the shortcuts freely.
 
   The target must be `/dev/mmcblk0`, never a `boot0` or `boot1` partition. The monitor shows the installer's `reliaburger-install:` lines too (#1611); on a build without them, go by relish's log.
 
+  - **If relish logs `ack on 4011` but no `tftp:` line**, and the firmware moves on to IPv6: it didn't accept relish's reply, as the 3040 didn't before #1970. Let dnsmasq name the boot file instead (the README's "If a machine won't boot from relish's reply"), and tell the laptop session.
   - **If B stalls**, dnsmasq hands out the address but relish logs nothing: the firmware ignores option 60. Stop relish and dnsmasq, plug the switch into the home router, and repeat from 1.2 as A.
+  - **If the installer can't fetch**, the monitor shows `systemd-networkd-wait-online` failing and `reliaburger-install: FAILED: can't fetch …` after about 2.5 minutes: the installer has no driver for the NIC. That was #1969; the build's "Installer drivers" step lists what it carries.
   - **If iPXE misbehaves**, hanging or losing the link after TFTP: restart relish with `--ipxe full`.
 
 - [ ] **1.5 Claim it as a one-node cluster.** After the reboot, the monitor shows its address, MAC and claim key. For the dry run, skip the questions with `--trust-lan --yes`, and add your SSH key so the lab image lets you in.
@@ -140,7 +150,7 @@ The fast loop: aim for under 30 minutes a pass, and use the shortcuts freely.
   ```sh
   $R machines --wait 10
   $R machines claim ~/wyse-dry --create --name dry --operator <lab-ip> --network <net> \
-    --ssh-key ~/.ssh/id_ed25519.pub --trust-lan --yes <mac-1>
+    --ssh-key <your-key.pub> --trust-lan --yes <mac-1>
   $R nodes && $R council && $R wtf
   ```
 
@@ -163,16 +173,16 @@ The fast loop: aim for under 30 minutes a pass, and use the shortcuts freely.
   ```sh
   S="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@<ip-1>"
   $S /usr/lib/reliaburger/os-stage http://<lab-ip>:8000/releases/download/os-<broken>-x86_64 <broken>
-  $S 'date -u +%FT%TZ; systemctl reboot'; date -u +%FT%TZ          # T2
+  $S 'date -u +%FT%TZ; systemctl reboot'; date -u +%FT%TZ
   ```
 
   ```sh
-  $S 'journalctl -b 0 -u reliaburger-boot-check -o short-iso --no-pager | grep "bun healthy"'   # T3
+  $S 'journalctl -b 0 -u reliaburger-boot-check -o short-iso --no-pager | grep "bun healthy"'
   ```
 
-  It gets three tries of up to 120 s each, then boots the version it ran before, by itself. T3 − T2 must be 10 minutes or less. Count the reboots you see on the monitor.
+  The reboot line prints T2 (the node's clock, then the Mac's); the `journalctl` line's timestamp is T3. It gets three tries of up to 120 s each, then boots the version it ran before, by itself. T3 − T2 must be 10 minutes or less. Count the reboots you see on the monitor.
 
-- [ ] **1.8 Reset it to go again.** Serve again with `--reinstall` (and the `--wipe` you already have), then make the Wyse boot from the network: F12, then the UEFI IPv4 Realtek entry. It reinstalls once, then boots the new install as a fresh unclaimed machine (#1615). Start a new claim directory each pass.
+- [ ] **1.8 Reset it to go again.** Serve again with `--reinstall` (and the `--wipe` you already have), then make the Wyse boot from the network: F12, then the IPv4 entry. It reinstalls once, then boots the new install as a fresh unclaimed machine (#1615). Start a new claim directory each pass.
 
   ```sh
   rm -rf ~/wyse-dry
@@ -205,11 +215,13 @@ This run counts for the v0.3.0 tag. No shortcuts. About a day, plus 24 hours of 
 - [ ] **2.3 Claim, comparing every key.** No `--trust-lan` or `--yes` this time. Move the monitor from unit to unit and check each claim key matches. At the backup prompt, copy `~/wyse/secrets` off the Mac and type `yes`.
 
   ```sh
-  $R machines --wait 10      # three rows, ARCH x86_64
+  $R machines --wait 10
   $R machines claim ~/wyse --create --name wyse --operator <lab-ip> --network <net> \
-    --ssh-key ~/.ssh/id_ed25519.pub <mac-1> <mac-2> <mac-3>
+    --ssh-key <your-key.pub> <mac-1> <mac-2> <mac-3>
   $R nodes && $R council && $R wtf
   ```
+
+  `machines` should list three rows, ARCH x86_64.
 
   **T1** is the first time `nodes` shows three alive and `wtf` has nothing to fix. **T1 − T0 must be 60 minutes or less.** All three are voters, so note which one leads.
 
