@@ -715,6 +715,9 @@ pub struct TaskPool<R: TaskRunner> {
     budget: Option<Arc<super::execution_budget::ExecutionBudget>>,
     resources: crate::meat::Resources,
     launch_log: Arc<LaunchLog>,
+    /// Fires when the node starts stopping: no new attempt starts after
+    /// it, but running attempts carry on (#1965).
+    draining: CancellationToken,
     /// The turn of the chunk that took one last. A std mutex: it is only
     /// held for a synchronous swap in [`Self::take_turn`], never across
     /// an await.
@@ -743,8 +746,24 @@ impl<R: TaskRunner> TaskPool<R> {
             budget: None,
             resources: crate::meat::Resources::default(),
             launch_log: Arc::default(),
+            draining: CancellationToken::new(),
             last_turn: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Stop starting attempts once `draining` fires. Unlike a chunk's
+    /// cancel token, it doesn't stop the attempts already running: they
+    /// finish, or the node's restart finds them through the ledger. Every
+    /// task that hasn't started, and every retry still to come, ends as
+    /// not run, so a stopping node never uses up a task's attempts.
+    pub fn with_draining(mut self, draining: CancellationToken) -> Self {
+        self.draining = draining;
+        self
+    }
+
+    /// Whether the node has started stopping.
+    pub fn draining(&self) -> bool {
+        self.draining.is_cancelled()
     }
 
     /// Take the next place in the dispatch order. Take it when the chunk
@@ -831,6 +850,7 @@ impl<R: TaskRunner> TaskPool<R> {
             let permit = tokio::select! {
                 biased;
                 () = cancel.cancelled() => None,
+                () = self.draining.cancelled() => None,
                 permit = Arc::clone(&self.slots).acquire_owned() => permit.ok(),
             };
             let Some(permit) = permit else {
@@ -854,6 +874,7 @@ impl<R: TaskRunner> TaskPool<R> {
                 resources: self.resources,
                 work: Arc::clone(&work),
                 cancel: cancel.clone(),
+                draining: self.draining.clone(),
                 launch_log: Arc::clone(&self.launch_log),
             };
             let outcomes = outcomes.clone();
@@ -975,6 +996,9 @@ struct TaskAttempts<R: TaskRunner> {
     resources: crate::meat::Resources,
     work: Arc<ChunkWork>,
     cancel: CancellationToken,
+    /// The pool's draining token: checked before every launch, never
+    /// passed to the runner, so it stops no running attempt.
+    draining: CancellationToken,
     launch_log: Arc<LaunchLog>,
 }
 
@@ -995,6 +1019,7 @@ impl<R: TaskRunner> TaskAttempts<R> {
                 permit = tokio::select! {
                     biased;
                     () = self.cancel.cancelled() => None,
+                    () = self.draining.cancelled() => None,
                     permit = async {
                         tokio::time::sleep(delay).await;
                         Arc::clone(&self.slots).acquire_owned().await.ok()
@@ -1012,6 +1037,7 @@ impl<R: TaskRunner> TaskAttempts<R> {
             let node_permit = tokio::select! {
                 biased;
                 () = self.cancel.cancelled() => None,
+                () = self.draining.cancelled() => None,
                 permit = Arc::clone(&self.node_slots).acquire_owned() => permit.ok(),
             };
             let Some(node_permit) = node_permit else {
@@ -1022,20 +1048,40 @@ impl<R: TaskRunner> TaskAttempts<R> {
                 };
             };
             let invocation = self.invocation(index, attempt);
-            let mut resource_lease = match &self.budget {
+            let lease = match &self.budget {
                 _ if self.runner.owns_admission(&invocation) => None,
-                Some(budget) => match budget.acquire(self.resources, &self.cancel).await {
-                    Some(lease) => Some(lease.quarantine_on_drop()),
-                    None => {
-                        return TaskRecord {
-                            attempts: attempt - 1,
-                            retry_causes: causes,
-                            ..not_run(index)
-                        };
+                Some(budget) => {
+                    let lease = tokio::select! {
+                        biased;
+                        () = self.draining.cancelled() => None,
+                        lease = budget.acquire(self.resources, &self.cancel) => lease,
+                    };
+                    match lease {
+                        Some(lease) => Some(lease),
+                        None => {
+                            return TaskRecord {
+                                attempts: attempt - 1,
+                                retry_causes: causes,
+                                ..not_run(index)
+                            };
+                        }
                     }
-                },
+                }
                 None => None,
             };
+            // The last look before the launch (#1965). A stopping node
+            // starts nothing: this attempt isn't counted, and the task
+            // ends as not run for the restarted node to run. Checked
+            // before the lease is quarantined, so dropping it here gives
+            // its capacity straight back.
+            if self.draining.is_cancelled() {
+                return TaskRecord {
+                    attempts: attempt - 1,
+                    retry_causes: causes,
+                    ..not_run(index)
+                };
+            }
+            let mut resource_lease = lease.map(|lease| lease.quarantine_on_drop());
             if let Some(failed) = previous.take() {
                 count_retry_cause(&mut causes, &failed);
             }
@@ -1809,6 +1855,83 @@ mod tests {
         assert_eq!(order, vec![(1, 10), (0, 0), (2, 0)], "{finished:?}");
         // Chunk 2 still waited for chunk 0 rather than sharing its slot.
         assert!(finished[1].2 <= 11, "{finished:?}");
+    }
+
+    // -- #1965: a stopping node starts no new attempts --------------------
+
+    #[tokio::test]
+    async fn a_draining_pool_retries_nothing_and_leaves_the_task_not_run() {
+        // The first attempt fails, and the node starts stopping while it
+        // runs. Without draining, the task would use all its attempts and
+        // fail for good.
+        let draining = CancellationToken::new();
+        let stop = draining.clone();
+        let runner = Arc::new(FakeRunner::new(Duration::ZERO, move |_| {
+            stop.cancel();
+            AttemptOutcome::Exited { code: 1 }
+        }));
+        let pool = TaskPool::new(Arc::clone(&runner), fast(1)).with_draining(draining);
+        let mut chunk = work(1, 1, 0);
+        chunk.spec.max_attempts = 3;
+        let outcome = pool.run_chunk(&chunk, &CancellationToken::new()).await;
+        assert_eq!(runner.attempts(), 1, "no attempt starts after the stop");
+        let record = &outcome.records[0];
+        assert_eq!(record.outcome, TaskFinal::NotRun);
+        assert_eq!(record.attempts, 1);
+        assert_eq!(record.exit_code, None);
+        assert_eq!(record.output, None);
+        assert_eq!(outcome.result.not_run, 1);
+        assert_eq!(outcome.result.failed_count, 0);
+        assert_eq!(pool.counters().failed.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn a_draining_pool_launches_no_task_that_had_not_started() {
+        let draining = CancellationToken::new();
+        draining.cancel();
+        let runner = Arc::new(FakeRunner::always_succeeds());
+        let pool = TaskPool::new(Arc::clone(&runner), fast(4)).with_draining(draining);
+        let outcome = pool
+            .run_chunk(&work(10, 10, 0), &CancellationToken::new())
+            .await;
+        assert_eq!(runner.attempts(), 0);
+        assert_eq!(outcome.result.not_run, 10);
+        assert!(
+            outcome
+                .records
+                .iter()
+                .all(|r| r.outcome == TaskFinal::NotRun && r.attempts == 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn draining_lets_a_running_attempt_finish() {
+        // Draining isn't cancelling: the attempt already running keeps
+        // its process and its result.
+        let draining = CancellationToken::new();
+        let runner = Arc::new(FakeRunner::new(Duration::from_millis(200), |_| {
+            AttemptOutcome::Exited { code: 0 }
+        }));
+        let pool =
+            Arc::new(TaskPool::new(Arc::clone(&runner), fast(1)).with_draining(draining.clone()));
+        let running = {
+            let pool = Arc::clone(&pool);
+            tokio::spawn(async move {
+                pool.run_chunk(&work(1, 1, 0), &CancellationToken::new())
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while runner.attempts() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        draining.cancel();
+        let outcome = running.await.unwrap();
+        assert_eq!(outcome.records[0].outcome, TaskFinal::Succeeded);
+        assert_eq!(runner.attempts(), 1);
     }
 
     #[tokio::test]

@@ -53,6 +53,16 @@ class Gate(unittest.TestCase):
         self.assertTrue(all(position>loop_over for position in sets),"job_stop_at is set before the cycles are over")
         self.assertIn("wait_for_job_drain",script[loop_over:])
 
+    def test_the_job_verifier_stops_only_after_bun(self):
+        # A stopping Bun whose verifier had already gone failed its job
+        # attempts against it: the rehearsal's graceful stop turned an
+        # ordinary task terminal (#1965). Before= starts the verifier first
+        # and so stops it last.
+        script=(Path(__file__).parent/"qualify-sustained.sh").read_text()
+        start=script.index("cat > /etc/systemd/system/reliaburger-soak-audit.service")
+        unit=script[start:script.index("\nUNIT\n",start)]
+        self.assertIn("\nBefore=reliaburger.service\n",unit)
+
     def test_a_controller_that_stops_before_the_harness_asks_for_the_drain_fails(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory); snap=root/"snap"; snap.mkdir()
