@@ -906,11 +906,14 @@ That fixed the request. The limit has the same problem in a blunter form ([#1959
 So the floor gets a name and a home next to the code that writes `memory.max`, in `src/grill/oci.rs`:
 
 ```rust
-pub const RUNC_MEMORY_LIMIT_FLOOR_BYTES: u64 = 16 << 20;
+pub const RUNC_INIT_MEMORY_BYTES: u64 = 16 << 20;
 
-// The floor must stay above the largest runc init peak we measured.
-const _: () = assert!(RUNC_MEMORY_LIMIT_FLOOR_BYTES >= 13_266_944);
+// The highest memory.peak measured for runc init: lowering the room below it
+// fails the build.
+const _: () = assert!(RUNC_INIT_MEMORY_BYTES >= 13_266_944);
 ```
+
+The name says what the number measures, runc init's footprint, not one of the rules that use it. Chapter 17's shared-runc helper hit the same footprint the same week and first got its own 16 MiB constant ([#1957](https://github.com/reliaburger/reliaburger/issues/1957)). Two constants for one measurement drift apart the day someone updates one, so the helper's cap now adds this one.
 
 `16 << 20` is 16 shifted left by 20 bits, which is 16 × 2²⁰, or 16 MiB. The second line is a compile-time assertion. A `const` item is evaluated by the compiler, and `assert!` inside one runs then, not when the program does. If someone lowers the floor below the measured peak, the crate doesn't build. Naming the constant `_` means we never refer to it; it exists only to be checked. C has `_Static_assert` for this; Go has nothing built in.
 
@@ -926,7 +929,7 @@ The function returns `Option<String>`: `None` means "fine", `Some(reason)` means
 
 ```rust
 let limit = memory?.limit;
-(limit < RUNC_MEMORY_LIMIT_FLOOR_BYTES).then(|| format!(/* ... */))
+(limit < RUNC_INIT_MEMORY_BYTES).then(|| format!(/* ... */))
 ```
 
 The `?` works on `Option` as well as `Result`: if `memory` is `None` (no limit set), the function returns `None` right there. `bool::then` turns a condition into an `Option`, running the closure only when the condition is true. Go would write the same thing as an `if` and two returns; it's a matter of taste, and here the short form reads like the rule it states.

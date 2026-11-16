@@ -1227,7 +1227,7 @@ summary = "`bun` runs on Linux with rootful runc and eBPF; the quickstart guest 
 restrictions = "Clusters need rootful runc with eBPF and bpffs at /sys/fs/bpf. The release gate runs arm64 guests on a Mac."
 issues = []
 docs = ["docs/README.md#runc-linux", "docs/linux-servers.md"]
-evidence = "The gate's nodes are Ubuntu 24.04 aarch64 Lima guests (staged install record, Downloaded bytes). Privileged Linux CI suites run on x86_64. V04 cold installs passed 3 of 3 on clean Linux x86_64 (GitHub-hosted) and arm64 (Lima) hosts, median 85 s and 83 s (docs/qualification/2026-11-12-v04-cold-installs-linux.md)."
+evidence = "The gate's nodes are Ubuntu 26.04 aarch64 Lima guests (the pinned guest image in scripts/release/guest-images.json; staged install record, Downloaded bytes). Privileged Linux CI suites run on x86_64. V04 cold installs passed 3 of 3 on clean Linux x86_64 (GitHub-hosted) and arm64 (Lima) hosts, median 85 s and 83 s (docs/qualification/2026-11-12-v04-cold-installs-linux.md)."
 
 [[group.feature]]
 name = "Rootless runc"
