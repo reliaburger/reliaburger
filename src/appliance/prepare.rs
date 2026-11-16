@@ -525,7 +525,8 @@ fn is_final(error: &crate::sesame::join::JoinClientError) -> bool {
 }
 
 /// Fetch the master key with the identity just enrolled (G1), retrying
-/// until a member answers.
+/// until a member answers. Only the council leader does (a follower answers
+/// 503, as for enrolment and renewal), so each member is asked in turn.
 async fn fetch_master_key(paths: &Paths, config: &SeedConfig) -> Result<(), PrepareError> {
     let join = config
         .join

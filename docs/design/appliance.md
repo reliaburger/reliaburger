@@ -286,7 +286,10 @@ The claim protocol trusts the LAN to deliver packets, not to be honest:
   fingerprint the seed names. It then fetches the master key from `GET
   /v1/cluster/master-key`, which answers only a caller presenting a node
   certificate that chains to the cluster's Node CA, isn't revoked and names a
-  node that isn't retired.
+  node that isn't retired. Like certificate renewal, only a member that
+  confirms it leads answers, checking against the security state it has
+  confirmed with a quorum; a follower answers 503, and the joiner asks each
+  member in turn until the leader does.
 
 ### 3.4 Join windows
 

@@ -60,6 +60,11 @@ pub(super) async fn cluster_ca_handler(State(state): State<ApiState>) -> Respons
 /// certificate that chains to the cluster's Node CA, isn't revoked and
 /// names a node that isn't retired: the same checks as certificate renewal.
 /// Anyone who passes them is a cluster member, which already holds the key.
+///
+/// Like renewal, only a member that proves it leads answers, and it checks
+/// the certificate against the security state it has confirmed with a
+/// quorum. A follower's replica can lag, so a follower refuses with 503 and
+/// the joining node asks the next member.
 pub(super) async fn master_key_handler(
     peer: Option<axum::Extension<crate::sesame::renewal::TlsPeerCertificate>>,
     State(state): State<ApiState>,
@@ -76,7 +81,26 @@ pub(super) async fn master_key_handler(
     let Some(council) = &state.council else {
         return (StatusCode::SERVICE_UNAVAILABLE, "no council available").into_response();
     };
-    let security = council.security_state().await;
+    let confirmed = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        council.security_state_confirmed(crate::council::LEADER_CONFIRMATION),
+    )
+    .await;
+    let security = match confirmed {
+        Ok(Ok(security)) => security,
+        Ok(Err(error)) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": format!("the master key is unavailable from this member: {error}")
+                })),
+            )
+                .into_response();
+        }
+        Err(_) => {
+            return (StatusCode::GATEWAY_TIMEOUT, "master key handout timed out").into_response();
+        }
+    };
     let node_id = match crate::sesame::renewal::validate_peer(&peer, &security) {
         Ok(node_id) => node_id,
         Err(error) => {

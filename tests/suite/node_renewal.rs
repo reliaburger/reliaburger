@@ -273,6 +273,154 @@ async fn a_retired_node_gets_no_master_key_even_with_an_unrevoked_certificate() 
     council.shutdown().await.unwrap();
 }
 
+/// Three voters holding the master key, with `hierarchy` as their CA, once
+/// one of them leads and every member has applied the security state.
+/// Returns the members, the router that carries their Raft traffic and the
+/// leader's index.
+async fn three_members(
+    hierarchy: &ca::CaHierarchy,
+) -> (Vec<Arc<CouncilNode>>, InMemoryRaftRouter, usize) {
+    let network = InMemoryRaftRouter::new();
+    let mut members = Vec::new();
+    let mut infos = BTreeMap::new();
+    for id in 1..=3u64 {
+        let node = Arc::new(
+            CouncilNode::new(
+                id,
+                CouncilConfig {
+                    heartbeat_interval_ms: 50,
+                    election_timeout_min_ms: 150,
+                    election_timeout_max_ms: 300,
+                    ..Default::default()
+                },
+                InMemoryRaftNetworkFactory::new(id, network.clone()),
+                MemLogStore::new(),
+                CouncilStateMachine::new(),
+                Some(IKM),
+            )
+            .await
+            .unwrap(),
+        );
+        network.register(id, &node).await;
+        infos.insert(
+            id,
+            CouncilNodeInfo::new(
+                format!("127.0.0.1:{}", 9000 + id).parse().unwrap(),
+                format!("member-{id}"),
+            ),
+        );
+        members.push(node);
+    }
+    members[0].initialize(infos).await.unwrap();
+    let leader = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            for (index, member) in members.iter().enumerate() {
+                if member.is_leader().await {
+                    return index;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("no member was elected");
+    members[leader]
+        .write(RaftRequest::SecurityStateInit(Box::new(SecurityState {
+            certificate_authorities: vec![hierarchy.root.ca.clone(), hierarchy.node.ca.clone()],
+            next_serial: 100,
+            ..Default::default()
+        })))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for member in &members {
+            while member
+                .security_state()
+                .await
+                .certificate_authorities
+                .is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    })
+    .await
+    .expect("a member never applied the security state");
+    (members, network, leader)
+}
+
+/// The master-key handout checks the caller against the confirmed security
+/// state, as renewal does. A member whose replica hasn't caught up can't
+/// confirm it, so it refuses even a certificate its own replica would still
+/// accept. Only the leader answers, and it applies every revocation it has.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_master_key_is_handed_out_only_against_the_confirmed_security_state() {
+    let hierarchy = ca::generate_ca_hierarchy("master-key-confirmed", &IKM).unwrap();
+    let (members, network, leader) = three_members(&hierarchy).await;
+    let behind = (0..3).find(|index| *index != leader).unwrap();
+    let behind_id = behind as u64 + 1;
+
+    // The normal join path: the leader hands a member's certificate the key.
+    let (status, body) =
+        get_master_key(router(members[leader].clone(), Some(peer(&hierarchy, 10)))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["master_key"], hex::encode(IKM));
+
+    // Cut one member off from replication, then revoke the certificate. The
+    // other two are still a quorum, so the revocation commits without it.
+    for other in (1..=3u64).filter(|other| *other != behind_id) {
+        network.partition(behind_id, other).await;
+    }
+    members[leader]
+        .write(RaftRequest::RevokeCertificate(CrlEntry {
+            serial: SerialNumber(10),
+            issuer: CaRole::Node,
+            revoked_at: SystemTime::now(),
+            reason: "lost stick".into(),
+            expires_at: None,
+        }))
+        .await
+        .unwrap();
+    // So the cut-off member's own replica would still accept the certificate.
+    assert!(
+        members[behind]
+            .security_state()
+            .await
+            .crl
+            .entries
+            .is_empty(),
+        "the cut-off member mustn't have seen the revocation"
+    );
+
+    let (status, body) =
+        get_master_key(router(members[behind].clone(), Some(peer(&hierarchy, 10)))).await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a member that can't confirm the security state refuses: {body}"
+    );
+    assert_ne!(body["master_key"], hex::encode(IKM));
+
+    let (status, body) =
+        get_master_key(router(members[leader].clone(), Some(peer(&hierarchy, 10)))).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the leader applies it: {body}"
+    );
+
+    // Another member's certificate still gets the key from the leader.
+    let (status, body) =
+        get_master_key(router(members[leader].clone(), Some(peer(&hierarchy, 11)))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["master_key"], hex::encode(IKM));
+
+    network.heal().await;
+    for member in members {
+        member.shutdown().await.unwrap();
+    }
+}
+
 /// #1508: the renewed leaf names the address the request came from, as an
 /// IP SAN a strict client can check when it connects by address. A request
 /// from loopback names no machine, so its leaf names no address.
