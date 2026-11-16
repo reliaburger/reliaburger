@@ -2250,51 +2250,33 @@ mod tests {
     }
 
     /// #1871: dropping a build directory in async code mustn't stall the
-    /// worker it runs on while thousands of files are deleted. On a
-    /// current-thread runtime an inline delete would stop the ticker for
-    /// the whole delete.
-    #[tokio::test(flavor = "current_thread")]
-    async fn dropping_a_scoped_dir_in_async_code_never_blocks_the_runtime() {
+    /// worker it runs on while thousands of files are deleted, so the
+    /// delete goes to the blocking pool. The check is structural, not a
+    /// stopwatch (#1978): with the pool's only thread held, a delete sent
+    /// there can't have happened by the end of the first poll, while an
+    /// inline one has, whatever the tree's size or the disk's speed.
+    #[test]
+    fn dropping_a_scoped_dir_in_async_code_never_blocks_the_runtime() {
         let base = std::env::temp_dir().join("reliaburger-build-test");
         let dir = ScopedDir::new(&base, 1871).unwrap();
         let path = dir.path().to_path_buf();
-        let tree = path.clone();
-        tokio::task::spawn_blocking(move || {
-            for d in 0..100 {
-                let sub = tree.join(format!("d{d}"));
-                std::fs::create_dir(&sub).unwrap();
-                for f in 0..100 {
-                    std::fs::write(sub.join(format!("f{f}")), b"x").unwrap();
-                }
-            }
-        })
-        .await
-        .unwrap();
-
-        let ticker = tokio::spawn(async {
-            let mut longest = std::time::Duration::ZERO;
-            let mut last = std::time::Instant::now();
-            for _ in 0..50 {
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                longest = longest.max(last.elapsed());
-                last = std::time::Instant::now();
-            }
-            longest
-        });
-        tokio::task::yield_now().await;
-        drop(dir);
-        let longest = ticker.await.unwrap();
-        assert!(
-            longest < std::time::Duration::from_millis(200),
-            "the runtime stalled for {longest:?} while the directory was deleted"
-        );
-        for _ in 0..300 {
-            if !path.exists() {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let sub = path.join("layer");
+        std::fs::create_dir(&sub).unwrap();
+        for f in 0..10 {
+            std::fs::write(sub.join(format!("f{f}")), b"x").unwrap();
         }
-        panic!("the dropped build directory was never deleted");
+
+        let deleted = crate::off_runtime::assert_runs_on_blocking_pool(async move {
+            drop(dir);
+            for _ in 0..3000 {
+                if !path.exists() {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            false
+        });
+        assert!(deleted, "the dropped build directory was never deleted");
     }
 
     #[test]
