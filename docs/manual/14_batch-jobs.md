@@ -80,7 +80,12 @@ minute per run; the next line says how many it left out).
 A stopping node starts no new attempts. Once Bun gets SIGTERM, it launches no
 task it hadn't started and no retry still waiting out its backoff. Those tasks
 end as not run, without using up their attempts. Their chunks aren't reported
-to the leader as done, so the restarted node runs them again. An attempt
+to the leader as done, so the restarted node runs them again, with no
+`relish batch replay` even under the default `replay_unknown = false`: the
+ledger shows those tasks weren't running. A task keeps the attempts it had
+already used, so `max_attempts` still bounds the total. A node that doesn't
+come back is different: the leader can't read its ledger, so its chunks are
+`Unknown` like any lost worker's. An attempt
 already running carries on and isn't stopped. If Bun exits before it finishes,
 the restart treats it like any other interrupted attempt: an `Unknown` outcome,
 or a replay when the job sets `replay_unknown = true`. Before this, a task
