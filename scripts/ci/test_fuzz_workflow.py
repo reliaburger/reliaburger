@@ -255,6 +255,18 @@ class FuzzInstrumentationTests(unittest.TestCase):
         self.assertRegex(makefile, r"(?m)^FUZZ = RUSTC_WRAPPER=\$\(FUZZ_RUSTC_WRAPPER\) ")
         self.assertTrue(os.access(WRAPPER, os.X_OK), "the wrapper is executable")
 
+    def test_a_fuzz_run_never_rebuilds_the_crate(self):
+        # A release build embeds the source bundle and watches its allowlist,
+        # fuzz/ included, by modification time. Every log and corpus file a
+        # run wrote under fuzz/target/ rebuilt reliaburger, twice a target:
+        # the 16 Nov nightly spent 25 minutes a target and hit its timeout.
+        build = (REPO / "build.rs").read_text()
+        embed = build[build.index("fn embed_source()"):]
+        embed = embed[:embed.index("\n}\n")]
+        skip = embed.find('std::env::var_os("CARGO_FEATURE_FUZZING").is_some()')
+        self.assertNotEqual(skip, -1, "embed_source skips the fuzzing build")
+        self.assertLess(skip, embed.index("rerun-if-changed"))
+
     def test_a_change_to_the_list_rebuilds_every_crate(self):
         # Cargo doesn't fingerprint a RUSTC_WRAPPER: a cached build, or one
         # from before the wrapper, kept its old instrumentation (the first

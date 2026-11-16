@@ -9440,6 +9440,16 @@ half times the inputs in the same five minutes a target, and the job summary
 now shows each target's counter count, so a build that's quietly instrumenting
 everything again shows up as a number in the millions.
 
+Measuring it turned up a second leak, a bigger one. The nightly job had been
+timing out: it spent 25 minutes on each five-minute target. A release build
+packs the source tree into `relish` for `relish source`, and its build script
+tells Cargo to rebuild whenever anything in that tree changes, `fuzz/`
+included. Every fuzz run writes its log and its new corpus files under
+`fuzz/target/`, so each target rebuilt the whole crate, twice: once because
+`cargo fuzz build` was writing its log, and again before the run. A fuzz
+target never reads the bundle, so the build script now skips it when the
+`fuzzing` feature is on, and a target starts in seconds.
+
 The next step is OSS-Fuzz, which runs the same cargo-fuzz targets on
 Google's machines around the clock. That wants targets that have run clean
 nightly for a while first, so it's a follow-up.

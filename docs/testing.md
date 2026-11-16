@@ -780,6 +780,12 @@ target's counter count; one near 15 million means the narrowing
 is off. `scripts/ci/test_fuzz_workflow.py` runs the wrapper over a stand-in
 `rustc` and checks its list against `fuzz/Cargo.lock`.
 
+The fuzz build doesn't embed the source bundle (`build.rs` skips it under the
+`fuzzing` feature). A release build watches the bundle's allowlist, `fuzz/`
+included, so each log and corpus file a run wrote under `fuzz/target/`
+rebuilt reliaburger, twice a target: the nightly spent 25 minutes a target
+and hit its timeout.
+
 [`fuzz.yml`](../.github/workflows/fuzz.yml) runs `make fuzz-smoke` nightly at
 300 seconds a target, and for 30 seconds on a pull request that touches a
 decoder's file or the fuzzing set-up (or by hand, with any budget). A
