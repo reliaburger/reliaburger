@@ -450,6 +450,18 @@ Dependabot's PRs never get macOS otherwise; the nightly covers them. Every
 push to a train or to `main`, the merge queue, the nightly and the candidate
 build still run it, so no commit reaches a train or `main` without it.
 
+**Privileged Linux on Ubuntu 26.04 is advisory** until
+[#1943](https://github.com/reliaburger/reliaburger/issues/1943) closes
+(maintainer decision of 16 November 2026). The job keeps losing its runner
+mid-test, though every run that finished its tests passed them. It runs and
+reports wherever privileged Linux does, and keeps its log and JUnit in the
+`linux-next-evidence` artefact, but its failure only puts a warning on
+`ignored-test evidence` (`ADVISORY` in
+[`every_job.py`](../scripts/ci/every_job.py)) and doesn't stop a candidate
+reusing the run. The 24.04 `privileged Linux` job stays required. Taking
+`linux-next` off that list, and the job's `continue-on-error` with it, is part
+of closing #1943.
+
 The light set exists because macOS was the critical path of almost every run:
 twelve runs before the change took 45–55 minutes of wall time, of which
 runner queueing was mostly under ten, portable macOS 35–49 and acceptance

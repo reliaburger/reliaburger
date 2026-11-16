@@ -6,6 +6,7 @@ import tempfile
 import subprocess
 import unittest
 
+import every_job
 from workflow_assembly import SHARDS
 
 REPO = Path(__file__).resolve().parents[2]
@@ -843,6 +844,42 @@ class LinuxNextTests(unittest.TestCase):
         self.assertIn("grep ' disk_kb='", report)
         self.assertIn("dmesg -T", report)
         self.assertIn("'oom|killed process'", report)
+
+    def header(self):
+        return self.job.split("\n    steps:", 1)[0]
+
+    def test_the_job_is_advisory_until_1943_closes_and_is_the_only_one(self):
+        # It keeps losing its runner mid-test (#1943), which failed the
+        # merge queue's one required check. It still runs and reports, but
+        # neither the gate nor a candidate build waits on its result.
+        self.assertEqual(every_job.ADVISORY, {"linux-next": 1943})
+        self.assertIn("\n    continue-on-error: true", self.header())
+        self.assertIn("# Advisory until #1943 closes", self.header())
+        ci = jobs((WORKFLOWS / "ci.yml").read_text())
+        for name, job in ci.items():
+            header = job.split("\n    steps:", 1)[0]
+            with self.subTest(job=name):
+                self.assertEqual("\n    continue-on-error: true" in header, name in every_job.ADVISORY)
+        # The 24.04 job stays required, and the gate still waits for this one
+        # so it can warn.
+        self.assertNotIn("linux", every_job.ADVISORY)
+        # No evidence owner or exact case belongs to an advisory job, so
+        # the aggregate step never waits on one either.
+        import workflow_adapter
+        self.assertFalse(set(workflow_adapter.JOBS.values()) & set(every_job.ADVISORY))
+        for name in every_job.ADVISORY:
+            self.assertNotIn(f"'{name}'", (REPO / "scripts/ci/workflow_assembly.py").read_text())
+        self.assertIn("linux-next", re.search(r"needs: \[([^\]]*)\]", ci["ignored-evidence"]).group(1))
+
+    def test_only_its_last_step_says_it_passed(self):
+        # continue-on-error may report a failed job as a success to `needs`,
+        # so the gate reads this output to tell them apart.
+        self.assertIn("\n    outputs:\n      passed: ${{ steps.passed.outputs.passed }}", self.header())
+        last = self.steps[-1]
+        self.assertIn("id: passed", last)
+        self.assertIn('echo "passed=true" >> "$GITHUB_OUTPUT"', last)
+        self.assertNotIn("if:", last)
+        self.assertGreater(len(self.steps) - 1, self.step("name: linux-next-evidence"))
 
     def test_no_sort_takes_an_attached_equals_separator(self):
         # 26.04's Rust `sort` reads `-t=` as an empty separator and fails
