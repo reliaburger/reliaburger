@@ -1621,7 +1621,7 @@ async fn runc_reusable_commands_keep_the_container_but_retire_task_state_and_idl
         // The container helper's reservation includes room for runc init (#1957).
         Resources::new(
             390,
-            (24 << 20) - reliaburger::bun::reusable_executor::RUNC_INIT_MEMORY_BYTES,
+            (24 << 20) - reliaburger::grill::oci::RUNC_INIT_MEMORY_BYTES,
             0
         ),
         "idle profile plus helper still owns capacity"

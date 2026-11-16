@@ -2785,6 +2785,9 @@ runc involved, so it keeps the 8 MiB and the host job slots that buys.
 set the limit read it from there: the OCI spec runc writes into the cgroup,
 and `prepare_cgroups`, which writes the cgroup before runc does. The helper's
 `memory.high` is now `max`, so nothing throttles runc init below the limit.
+The 16 MiB is `RUNC_INIT_MEMORY_BYTES` in `src/grill/oci.rs`, the same
+constant that sets the smallest memory limit an app may ask for (Chapter 1),
+so one measurement of runc init feeds both rules.
 
 The task cgroup next to the helper had the #1955 mistake too. It wrote the
 job's memory request to `memory.high`, after Chapter 1 had stopped doing that

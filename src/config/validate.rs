@@ -292,23 +292,23 @@ fn validate_build(
 /// the final spec.
 /// Why a runc container with this memory range can't start, if it can't.
 ///
-/// Refuses a limit below [`RUNC_MEMORY_LIMIT_FLOOR_BYTES`]: `runc init`
+/// Refuses a limit below [`RUNC_INIT_MEMORY_BYTES`]: `runc init`
 /// runs in the container's cgroup first and is OOM-killed under it (#1959).
 /// Only the limit counts; a request is a reservation and sets no cgroup
 /// file (#1955).
 ///
-/// [`RUNC_MEMORY_LIMIT_FLOOR_BYTES`]: crate::grill::oci::RUNC_MEMORY_LIMIT_FLOOR_BYTES
+/// [`RUNC_INIT_MEMORY_BYTES`]: crate::grill::oci::RUNC_INIT_MEMORY_BYTES
 pub(crate) fn runc_memory_floor_refusal(
     memory: Option<&super::types::ResourceRange>,
 ) -> Option<String> {
-    use crate::grill::oci::{RUNC_MEMORY_LIMIT_FLOOR_BYTES, render_memory};
+    use crate::grill::oci::{RUNC_INIT_MEMORY_BYTES, render_memory};
     let limit = memory?.limit;
-    (limit < RUNC_MEMORY_LIMIT_FLOOR_BYTES).then(|| {
+    (limit < RUNC_INIT_MEMORY_BYTES).then(|| {
         format!(
             "memory limit {} is below the {} a container needs to start: runc init \
              runs inside the container's cgroup first and is OOM-killed under it",
             render_memory(limit),
-            render_memory(RUNC_MEMORY_LIMIT_FLOOR_BYTES),
+            render_memory(RUNC_INIT_MEMORY_BYTES),
         )
     })
 }

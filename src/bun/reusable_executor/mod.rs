@@ -30,17 +30,13 @@ pub const HELPER_CPU_REQUEST: u64 = 10;
 /// This is the host helper's whole cap, and the helper's own share of a
 /// container helper's.
 pub const HELPER_MEMORY_BYTES: u64 = 8 << 20;
-/// Room for `runc init`, which runs in a container helper's cgroup before
-/// the helper does. Ubuntu 26.04's runc 1.4.0 keeps a copy of its own 10.9 MB
-/// binary there: memory.peak reached 13,266,944 bytes on a soak guest
-/// (#1957). Rounded up to 16 MiB for a runc a little bigger than that one.
-pub const RUNC_INIT_MEMORY_BYTES: u64 = 16 << 20;
-// The highest memory.peak measured for that runc init: lowering the room
-// below it fails the build.
-const _: () = assert!(RUNC_INIT_MEMORY_BYTES >= 13_266_944);
 /// A shared-runc executor's helper cap and reservation: the helper's own
-/// [`HELPER_MEMORY_BYTES`] plus [`RUNC_INIT_MEMORY_BYTES`].
-pub const CONTAINER_HELPER_MEMORY_BYTES: u64 = HELPER_MEMORY_BYTES + RUNC_INIT_MEMORY_BYTES;
+/// [`HELPER_MEMORY_BYTES`] plus [`RUNC_INIT_MEMORY_BYTES`], since `runc init`
+/// runs in the helper's cgroup before the helper does (#1957).
+///
+/// [`RUNC_INIT_MEMORY_BYTES`]: crate::grill::oci::RUNC_INIT_MEMORY_BYTES
+pub const CONTAINER_HELPER_MEMORY_BYTES: u64 =
+    HELPER_MEMORY_BYTES + crate::grill::oci::RUNC_INIT_MEMORY_BYTES;
 /// A command's `pids.max` when its job doesn't set `pids`.
 pub const DEFAULT_COMMAND_PIDS: u32 = 256;
 /// The helper's own `pids.max`, outside every command's limit.
@@ -550,7 +546,10 @@ mod tests {
         // there: memory.peak reached 13,266,944 bytes on a soak guest, and an
         // 8 MiB memory.max OOM-killed every shared-runc executor (#1957).
         let container = ExecutorProfile::new(&template()).unwrap();
-        assert_eq!(container.helper_memory, (8 << 20) + RUNC_INIT_MEMORY_BYTES);
+        assert_eq!(
+            container.helper_memory,
+            (8 << 20) + crate::grill::oci::RUNC_INIT_MEMORY_BYTES
+        );
         assert_eq!(
             container.reservation.memory_bytes,
             (32 << 20) + CONTAINER_HELPER_MEMORY_BYTES
