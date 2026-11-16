@@ -758,7 +758,27 @@ commands never build it. Three things run the targets:
 |---|---|---|
 | `make test` (in `make ci`) | stable | `fuzz::tests`: every fixture seed is accepted and round-trips, every file in `fuzz/corpus/` runs without a panic, 512 mutated seeds run without a panic, and every target has its binary |
 | `make fuzz-corpus-check` | stable | Only those tests |
-| `make fuzz-smoke` | nightly, cargo-fuzz | Builds every target with sanitizers and runs each for `FUZZ_SECONDS` (default 10). `make fuzz-tools` says how to install what's missing. It builds for the nightly toolchain's host (`FUZZ_TARGET`), because cargo-fuzz otherwise picks the triple it was built for, and CI's prebuilt cargo-fuzz is a musl binary that AddressSanitizer can't use. It builds with `FUZZ_CODEGEN_UNITS` (default 64) codegen units: cargo-fuzz's default of one compiles reliaburger as a single sanitized LLVM module, which took 31 GB in one `rustc` and got the 16 GB hosted runner reclaimed ([#1839](https://github.com/reliaburger/reliaburger/issues/1839)) |
+| `make fuzz-smoke` | nightly, cargo-fuzz | Builds every target with sanitizers and runs each for `FUZZ_SECONDS` (default 10). `make fuzz-tools` says how to install what's missing. It builds for the nightly toolchain's host (`FUZZ_TARGET`), because cargo-fuzz otherwise picks the triple it was built for, and CI's prebuilt cargo-fuzz is a musl binary that AddressSanitizer can't use. It builds with `FUZZ_CODEGEN_UNITS` (default 64) codegen units: cargo-fuzz's default of one compiles reliaburger as a single sanitized LLVM module, which took 31 GB in one `rustc` and got the 16 GB hosted runner reclaimed ([#1839](https://github.com/reliaburger/reliaburger/issues/1839)). Coverage instrumentation is narrowed to the decoder crates (below) |
+
+Every fuzz build and run goes through
+[`fuzz/rustc-coverage.sh`](../fuzz/rustc-coverage.sh), a `RUSTC_WRAPPER` that
+keeps libFuzzer's coverage instrumentation (`-Cpasses=sancov-module`) only on
+reliaburger and the parsers the decoders run through (serde_json, postcard,
+toml, hickory-proto, x509-parser, oci-spec and a few more), and drops it from
+every other dependency
+([#1953](https://github.com/reliaburger/reliaburger/issues/1953)).
+AddressSanitizer stays on everywhere. libFuzzer scans every counter after
+every input: the whole tree was 15.3 million counters a target, the narrowed
+build 4.3 million, and a 60-second run from the seeds went from 259–287 to
+915–1,030 inputs a second (about 3.6×). reliaburger's own counters are the
+same in both builds, and the narrowed runs' corpora reached more coverage when
+replayed through the fully instrumented build. Cargo doesn't fingerprint a
+wrapper, so the Makefile adds a `--cfg` named after the wrapper's checksum to
+`RUSTFLAGS`: a changed list rebuilds every crate. `make fuzz-smoke
+FUZZ_RUSTC_WRAPPER=` instruments everything again. The job summary shows each
+target's counter count; one near 15 million means the narrowing
+is off. `scripts/ci/test_fuzz_workflow.py` runs the wrapper over a stand-in
+`rustc` and checks its list against `fuzz/Cargo.lock`.
 
 [`fuzz.yml`](../.github/workflows/fuzz.yml) runs `make fuzz-smoke` nightly at
 300 seconds a target, and for 30 seconds on a pull request that touches a
@@ -789,7 +809,7 @@ OSS-Fuzz is the follow-up: Google's continuous fuzzing runs Rust projects
 through the same cargo-fuzz targets
 ([guide](https://google.github.io/oss-fuzz/getting-started/new-project-guide/rust-lang/)).
 Applying needs a `projects/reliaburger/` directory in the OSS-Fuzz repository
-(a `project.yaml`, a Dockerfile and a `build.sh` that runs `cargo fuzz build -O`),
+(a `project.yaml`, a Dockerfile and a `build.sh` that runs `cargo fuzz build -O` with `RUSTC_WRAPPER=fuzz/rustc-coverage.sh`),
 once the targets have run clean nightly for a while.
 
 ## Mutation testing
