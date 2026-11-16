@@ -14,7 +14,7 @@
 # <next dir> is the second build's output, with its SHA256SUMS signed and
 # os-channel.json written (os_release.py lab-channel) by the run's throwaway
 # key, whose public half is spike-signing-key.pub.pem. <broken dir> is the
-# third build, whose bun never starts (image/tests/broken-bun), its
+# third build, whose bun never gets healthy (image/tests/broken-bun), its
 # SHA256SUMS signed by the same key. The channel doesn't name it, so only an
 # update that names its version reaches it: the fallback test, or os-stage
 # in the Wyse lab. appliance.yml uploads <tree> as appliance-x86_64-next,

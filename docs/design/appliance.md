@@ -81,7 +81,9 @@ directory and checks it before serving anything. It verifies the Ed25519
 signature on `reliaburger-os_<version>.SHA256SUMS` against the release keys
 compiled into relish, then checks the SHA-256 of every file the sums list
 names. The installer, the `.raw.zst` disk image and the SNP iPXE build are
-required. Serving checks each file again: one that changed on disk since the
+required. iPXE and the installer UKI are held in memory and sent from the
+bytes that were hashed: the installer is what checks the disk image's
+signature. Other files are served from disk, and one that changed since the
 check gets a 409, not stale bytes. `--key` adds a trusted public key, with a
 warning. A CI lab build uses it for its throwaway run key.
 
@@ -97,9 +99,11 @@ warning. A CI lab build uses it for its throwaway run key.
    SMBIOS UUID and architecture.
 4. The HTTP `boot.ipxe` answers with either the install script or `exit 1`
    (§2.4). The install script chains the installer UKI with
-   `reliaburger.url=`, `reliaburger.ask=http://<server>/disk?mac=…&uuid=…`
+   `reliaburger.url=`, `reliaburger.ask=http://<server>/disk?mac=…&uuid=…&ticket=…`
+   and `reliaburger.done=http://<server>/installed?mac=…&uuid=…&ticket=…`
    (only when the machine sent a MAC or UUID), `reliaburger.reinstall=1` for
-   `--reinstall`, and serial and VGA consoles.
+   `--reinstall`, and serial and VGA consoles. The ticket is a random install
+   ticket issued with the script; the installer's reports carry it back.
 
 UEFI only. A BIOS client is ignored and logged. Secure Boot must be off: iPXE
 passes the kernel command line, and with Secure Boot on a UKI ignores it.
@@ -110,8 +114,15 @@ passes the kernel command line, and with Secure Boot on a UKI ignores it.
   to the listed machines.
 - Each machine it installed goes into `netboot-installed.json` in the served
   directory, written atomically, `{machines: [{mac, uuid, arch,
-  installed_at}]}`. A machine is recorded when the last block of the
-  installer has been sent to it.
+  installed_at}]}`. A machine is recorded when its installer reports success
+  (`POST /installed`) with the install ticket issued to it, after the image
+  is written, its hash checked and its boot entry made. Fetching the
+  installer records nothing, so a machine whose install failed gets the
+  install script again. A disk report (`POST /disk`) needs the ticket too,
+  once per ticket. At most 256 tickets are outstanding, each for an hour.
+- `--for` doesn't cut an install off: when it's up, relish waits up to 20
+  more minutes for installs that were sent the install script and haven't
+  reported.
 - A recorded machine gets `exit 1` and boots its disk. With `--reinstall` it
   gets the installer once per run.
 - A machine whose wipe was declined this run gets a script that boots its

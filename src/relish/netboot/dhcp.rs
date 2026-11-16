@@ -281,7 +281,8 @@ fn boot_file(
     http_client: bool,
 ) -> Result<BootFile, Ignored> {
     let arch = match client_arch {
-        Some(6 | 7 | 9 | 16) => Arch::X86_64,
+        // Not 6: 32-bit x86 UEFI can't run our 64-bit iPXE.
+        Some(7 | 9 | 16) => Arch::X86_64,
         Some(11 | 19) => Arch::Arm64,
         _ if ipxe => return Ok(BootFile::Script),
         other => return Err(Ignored::UnsupportedArch(mac, other)),
@@ -623,7 +624,7 @@ mod tests {
     /// either port.
     #[test]
     fn uefi_firmware_never_gets_option_43() {
-        for arch in [6, 7, 9, 11] {
+        for arch in [7, 9, 11] {
             let offer = answer(&pxe_discover(arch), ListenPort::Dhcp, &context())
                 .unwrap()
                 .reply;
@@ -684,8 +685,7 @@ mod tests {
 
     #[test]
     fn each_firmware_architecture_gets_its_own_boot_file() {
-        let cases: [(u16, &[u8]); 6] = [
-            (6, b"ipxe-x86_64.efi"),
+        let cases: [(u16, &[u8]); 5] = [
             (7, b"ipxe-x86_64.efi"),
             (9, b"ipxe-x86_64.efi"),
             (11, b"ipxe-arm64.efi"),
@@ -855,7 +855,8 @@ mod tests {
     #[test]
     fn bios_firmware_and_unknown_architectures_are_refused_with_a_reason() {
         let mac = MacAddress(MAC);
-        for arch in [Some(0), Some(10), None] {
+        // 6 is 32-bit x86 UEFI, which can't run our 64-bit iPXE.
+        for arch in [Some(0), Some(6), Some(10), None] {
             let message = request(MessageType::Discover, b"PXEClient", arch);
             let error = answer(&message, ListenPort::Dhcp, &context()).unwrap_err();
             assert_eq!(error, Ignored::UnsupportedArch(mac, arch));

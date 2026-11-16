@@ -5,6 +5,15 @@
 # installs the image's own bun there only when it's newer than the active
 # one: neither an OS update nor a bun upgrade can move bun backwards.
 #
+# One exception. An OS update whose bun starts but never gets healthy fails
+# its boot check three times, and systemd-boot falls back to the previous
+# OS. That boot isn't counted, so nothing would reboot it again, and its
+# older bun would never come back: the node would keep the bad one. So
+# `image-installed` records which OS version installed the active bun. A
+# boot of an older OS, with that bun still active, is a fallback, and puts
+# this image's bun back. A bun upgraded since doesn't match the record and
+# stays.
+#
 # With /etc/reliaburger/node.toml (written by `bun appliance prepare` from
 # the node's seed) bun runs as a cluster node. A machine with no seed waits
 # in `start prepare` until it's claimed, so bun only gets here without one if
@@ -12,23 +21,43 @@
 # `start console` run bun's appliance steps (reliaburger-seed and
 # reliaburger-console).
 set -eu
-bin=/var/lib/reliaburger/bin
-image=/usr/lib/reliaburger/bin/bun
+# The overrides are for image/tests/test_start.py.
+bin=${RELIABURGER_BIN_DIR:-/var/lib/reliaburger/bin}
+image=${RELIABURGER_IMAGE_BUN:-/usr/lib/reliaburger/bin/bun}
+os_release=${RELIABURGER_OS_RELEASE:-/usr/lib/os-release}
 
 version() { "$1" --version 2>/dev/null | awk '{ print $2 }'; }
+# Whether $1 sorts strictly before $2 as a version.
+older() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n 1)" = "$1" ]; }
 
 install -d -m 0755 "$bin"
+os_version=$(. "$os_release" && echo "${IMAGE_VERSION:-}")
 image_version=$(version "$image")
 active_version=
 [ -x "$bin/bun" ] && active_version=$(version "$bin/bun")
-if [ -z "$active_version" ] \
-    || [ "$(printf '%s\n%s\n' "$active_version" "$image_version" | sort -V | tail -n 1)" != "$active_version" ]; then
-    # First boot, or the image brought a newer bun than the active one.
+# "<OS version> <bun version>": the OS image that installed the active bun.
+recorded_os= recorded_bun=
+[ -f "$bin/image-installed" ] && read -r recorded_os recorded_bun < "$bin/image-installed" || true
+fallback=
+if [ -n "$active_version" ] && [ "$active_version" = "$recorded_bun" ] \
+    && [ -n "$os_version" ] && older "$os_version" "$recorded_os"; then
+    fallback=yes
+fi
+if [ -z "$active_version" ] || older "$active_version" "$image_version" \
+    || { [ -n "$fallback" ] && [ "$active_version" != "$image_version" ]; }; then
+    # First boot, the image brought a newer bun, or a fallback from the OS
+    # whose bun is active.
     install -m 0755 "$image" "$bin/.bun-v$image_version.tmp"
     mv -f "$bin/.bun-v$image_version.tmp" "$bin/bun-v$image_version"
     ln -sfn "bun-v$image_version" "$bin/.bun.tmp"
     mv -Tf "$bin/.bun.tmp" "$bin/bun"
-    echo "reliaburger: bun $image_version from the image is now active (was ${active_version:-none})"
+    printf '%s %s\n' "$os_version" "$image_version" > "$bin/.image-installed.tmp"
+    mv -f "$bin/.image-installed.tmp" "$bin/image-installed"
+    if [ -n "$fallback" ]; then
+        echo "reliaburger: OS $os_version is older than $recorded_os, which brought bun $recorded_bun: a fallback, so this image's bun $image_version is active again"
+    else
+        echo "reliaburger: bun $image_version from the image is now active (was ${active_version:-none})"
+    fi
     # Keep the bun just replaced, for a rollback, and drop older ones: each
     # is about 100 MB, and an 8 GB eMMC can't hold one per OS update. bun's
     # own upgrades prune the same way ([upgrades] retain_versions).

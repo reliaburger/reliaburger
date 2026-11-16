@@ -1,4 +1,5 @@
 """The CI workflow keeps evidence for every suite, and its triggers and gates say what they do."""
+import os
 from pathlib import Path
 import re
 import shlex
@@ -1340,10 +1341,16 @@ class ApplianceTests(unittest.TestCase):
         self.assertIn('"$RUNNER_TEMP/broken" "$BROKEN_VERSION"', lay_out)
 
     def test_both_kinds_of_broken_build_break_bun_the_same_way(self):
+        # A real broken binary, newer than any release, rather than a unit
+        # override: the launcher must install it, as it would a bad release,
+        # so the fallback test proves the older OS gets its own bun back.
         self.assertIn("image/tests/broken-bun/", self.step("Break bun on purpose (spike S4)"))
-        conf = (REPO / "image/tests/broken-bun/usr/lib/systemd/system"
-                / "reliaburger.service.d/50-broken.conf").read_text()
-        self.assertIn("ExecStart=\nExecStart=/bin/false", conf)
+        broken = REPO / "image/tests/broken-bun/usr/lib/reliaburger/bin/bun"
+        self.assertTrue(os.access(broken, os.X_OK), "the broken bun must be executable")
+        version = subprocess.run([broken, "--version"], capture_output=True, text=True)
+        self.assertEqual(version.stdout.split()[:2], ["bun", "999.0.0-broken"])
+        self.assertFalse((REPO / "image/tests/broken-bun/usr/lib/systemd").exists(),
+                         "no unit override: the launcher has to run the broken bun")
 
     def test_the_fallback_test_runs_on_every_x86_64_lab_build(self):
         # Every pull request run, so the release train and its gate run it.

@@ -15,6 +15,9 @@
 #   reliaburger.ask=<URL>        relish netboot passes this: report a disk
 #                                that isn't empty there and wipe it only if
 #                                the operator says so (ask-to-wipe)
+#   reliaburger.done=<URL>       relish netboot passes this: say so there once
+#                                the image is written and checked, so relish
+#                                records the machine as installed only then
 #   reliaburger.reinstall=1      relish netboot --reinstall passes this: treat
 #                                a disk that holds Reliaburger OS like any
 #                                other used disk (ask, or wipe=1), rather
@@ -187,5 +190,16 @@ for link in /sys/class/net/*; do
     [ "$(cat "$link/type" 2>/dev/null)" = 1 ] || continue
     say "this machine: $(basename "$link") $(cat "$link/address") $(ip -4 -br addr show dev "$(basename "$link")" | awk '{ print $3 }')"
 done
+done=$(arg reliaburger.done)
+if [ -n "$done" ]; then
+    # relish netboot sends a recorded machine to its disk from now on. If
+    # this report is lost, the next network boot finds Reliaburger on the
+    # disk and boots it anyway, so it's worth a few tries but not a failure.
+    if curl -fsS --retry 5 --retry-delay 2 --retry-connrefused -X POST -o /dev/null "$done"; then
+        say "told relish netboot this machine is installed"
+    else
+        say "couldn't tell relish netboot this machine is installed; it boots its disk anyway"
+    fi
+fi
 say "rebooting into the installed system"
 systemctl reboot

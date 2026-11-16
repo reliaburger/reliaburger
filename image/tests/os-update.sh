@@ -19,8 +19,10 @@
 # Without --fallback, <target> is the next version, which the channel names:
 # the test passes when the rollout completes and the node is healthy on it.
 #
-# With --fallback, <target> is the broken version, whose bun never starts
-# (image/tests/broken-bun). Each of its three counted boots fails the boot
+# With --fallback, <target> is the broken version, whose bun starts and
+# never gets healthy (image/tests/broken-bun), so bun's launcher installs it
+# as it would a bad release's. After the fallback, <version>'s launcher must
+# put <version>'s own bun back, or the node never gets healthy again. Each of its three counted boots fails the boot
 # check and reboots; then systemd-boot falls back to <version> by itself.
 # The test passes when the node is healthy on <version> again, never was on
 # <target>, and the rollout has paused on the fallback bun reported. It
