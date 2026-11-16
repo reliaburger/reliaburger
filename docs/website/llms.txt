@@ -32,7 +32,10 @@ If you're an agent operating or debugging a Reliaburger cluster:
   it, and let them send it.
 - **Asked to set up a cluster?** Follow the playbook "Setting up a cluster for
   your human" at <https://reliaburger.com/agents>, the last section of
-  `relish agent guide`, and spend nothing without an explicit yes.
+  `relish agent guide`, and spend nothing without an explicit yes. On spare
+  machines, Reliaburger installs its own OS over the network and erases
+  their disks: you check and download, and your human runs `relish netboot`
+  and `relish machines claim`.
 
 ## Start here
 
@@ -81,3 +84,6 @@ Every page on reliaburger.com, as Markdown.
 - [Building Reliaburger](https://github.com/reliaburger/reliaburger/tree/v0.3.0/docs/book): the book, how and why each part was built
 - [Design documents](https://github.com/reliaburger/reliaburger/tree/v0.3.0/docs/design): one per subsystem
 - [Whitepaper](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.0/docs/whitepaper.md): the architecture in one document
+- [Becoming the Operating System](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.0/docs/book/15a-becoming-the-os.md): how the appliance OS, `relish netboot`, claiming and A/B OS updates were built, and what real hardware taught us
+- [The appliance's design](https://raw.githubusercontent.com/reliaburger/reliaburger/v0.3.0/docs/design/appliance.md): the image, `relish netboot`, claiming, seeds and `relish os`
+- [The appliance's recipe](https://github.com/reliaburger/reliaburger/tree/v0.3.0/image): the mkosi configuration, the netboot installer, iPXE scripts and the lab tools

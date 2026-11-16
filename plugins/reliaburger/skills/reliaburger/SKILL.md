@@ -38,7 +38,10 @@ If you're an agent operating or debugging a Reliaburger cluster:
   it, and let them send it.
 - **Asked to set up a cluster?** Follow the playbook "Setting up a cluster for
   your human" at <https://reliaburger.com/agents>, the last section of
-  `relish agent guide`, and spend nothing without an explicit yes.
+  `relish agent guide`, and spend nothing without an explicit yes. On spare
+  machines, Reliaburger installs its own OS over the network and erases
+  their disks: you check and download, and your human runs `relish netboot`
+  and `relish machines claim`.
 
 ## Commands
 
