@@ -1651,6 +1651,124 @@ async fn a_listed_join_token_shows_no_secret_and_a_revoke_stops_it_enrolling() {
     assert_eq!(relish.join_token_revoke("node-7").await.unwrap(), 0);
 }
 
+/// Create a join token for `node_id` on the leader and return its plaintext.
+async fn join_token_on_the_leader(cluster: &TokenCluster, node_id: &str) -> String {
+    let response = cluster
+        .post(
+            &cluster.leader_url,
+            "/v1/join-token/create",
+            serde_json::json!({"node_id": node_id, "ttl_seconds": 900}),
+        )
+        .await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let created: serde_json::Value = response.json().await.unwrap();
+    created["token"].as_str().unwrap().to_string()
+}
+
+/// A join-token revoke sent to a follower reaches the leader, as a create
+/// does: only the leader writes, so the follower forwards rather than
+/// answering from its own replica.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_join_token_revoked_through_a_follower_is_spent_on_the_leader() {
+    let cluster = TokenCluster::start().await;
+    let plaintext = join_token_on_the_leader(&cluster, "node-7").await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while cluster
+            .follower
+            .security_state()
+            .await
+            .join_tokens
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the follower never applied the join token");
+
+    let response = cluster
+        .post(
+            &cluster.follower_url,
+            "/v1/join-token/revoke",
+            serde_json::json!({"node_id": "node-7"}),
+        )
+        .await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.headers()[reqwest::header::CONTENT_TYPE],
+        "application/json"
+    );
+    let answer: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(answer["revoked"], 1, "{answer}");
+    let security = cluster.leader.security_state().await;
+    assert!(matches!(
+        reliaburger::sesame::join::check_join_token(&plaintext, "node-7", &security),
+        Err(reliaburger::sesame::join::JoinError::TokenConsumed)
+    ));
+}
+
+/// A follower whose replica hasn't applied a new join token yet still
+/// revokes it, because the leader decides which tokens to spend. Answering
+/// from the replica would find none and leave the token able to enrol.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_join_token_revoke_through_a_lagging_node_spends_what_the_leader_holds() {
+    let cluster = TokenCluster::start_with_learner().await;
+    cluster.stop_replicating_to_the_follower().await;
+    let plaintext = join_token_on_the_leader(&cluster, "node-7").await;
+    assert!(
+        cluster
+            .follower
+            .security_state()
+            .await
+            .join_tokens
+            .is_empty(),
+        "the cut-off learner can't have the token"
+    );
+
+    let response = cluster
+        .post(
+            &cluster.follower_url,
+            "/v1/join-token/revoke",
+            serde_json::json!({"node_id": "node-7"}),
+        )
+        .await;
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let answer: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(answer["revoked"], 1, "{answer}");
+    let security = cluster.leader.security_state().await;
+    assert!(matches!(
+        reliaburger::sesame::join::check_join_token(&plaintext, "node-7", &security),
+        Err(reliaburger::sesame::join::JoinError::TokenConsumed)
+    ));
+}
+
+/// The list comes from the leader too, so a lagging node shows a token it
+/// hasn't applied yet, with no secret.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_join_token_list_through_a_lagging_node_shows_what_the_leader_holds() {
+    let cluster = TokenCluster::start_with_learner().await;
+    cluster.stop_replicating_to_the_follower().await;
+    let plaintext = join_token_on_the_leader(&cluster, "node-7").await;
+
+    let relish = reliaburger::relish::client::BunClient::new_with_token(
+        &cluster.follower_url,
+        Some(&cluster.admin),
+    );
+    let listed = relish.join_token_list().await.unwrap();
+
+    assert_eq!(
+        listed
+            .iter()
+            .map(|token| (token.node_id.as_str(), token.consumed))
+            .collect::<Vec<_>>(),
+        [("node-7", false)]
+    );
+    let shown = serde_json::to_string(&listed).unwrap();
+    assert!(!shown.contains(plaintext.as_str()), "{shown}");
+}
+
 /// Refusals are the leader's to give, and they come back as it gave them,
 /// with no secret and nothing written.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
