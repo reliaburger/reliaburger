@@ -415,6 +415,20 @@ transition per tick:
 rollout id. `abort` clears the rollout: nodes keep whatever version they're
 on, and one mid-update finishes its reboot.
 
+**Two Raft writes.** `OsRolloutStart` (start and resume) applies only when
+no bun upgrade is active and the id has never run, and only to an empty
+slot, unless its `replaces` names the paused rollout in it: a resume names
+the run it resumes, so it can't replace one it never saw. `OsRolloutUpdate` (the leader's progress, and the
+abort's `Aborted`) applies only to the active rollout with the same id
+before it has ended. Anything else gets `CouncilResponse::Refused` with a
+reason, which the handlers answer with a 409. So a step the leader computed
+before an abort, written after it, is refused rather than restarting the
+rollout. `relish upgrade` and `relish upgrade rollback` answer 409 while an
+OS rollout runs, and a bun upgrade's own start (`UpgradeStart`) and progress
+(`UpgradeUpdate`) follow the same rules. A rollback over a paused bun upgrade
+names it with `ReplacesPaused::Supersede`, which archives it as aborted in the
+same entry that starts the rollback, so nothing can start in between.
+
 ### 4.4 Updating one node
 
 `POST /v1/os/stage {rollout_id, version, channel_url}` (`src/os/slot.rs`)
@@ -444,6 +458,15 @@ failed check on a counted boot reboots. After three tries systemd-boot falls
 back to the previous UKI, whose `usrhash` pins the old `/usr`. Back on the old
 version, bun turns `Rebooting` into `Failed` ("failed its boot checks, so
 systemd-boot fell back"), which pauses the rollout.
+
+bun starts before the boot check passes. On a boot of the target that
+started counted (systemd-boot's `LoaderBootCountPath` EFI variable exists,
+and it stays for the whole boot) bun leaves `Rebooting` in `os-update.json`,
+reports `Idle`, and reports `os_trial: true` in `/v1/version` until
+`boot-complete.target` is reached; then it saves `Idle`. While on trial the
+node refuses another stage directive, which would overwrite the marker, and
+the leader doesn't mark it Done. A fallback after bun started on a trial
+boot is still reported as `Failed`, and the leader is still watching.
 
 **What an update can't change.** Only the UKI and a `/usr` slot are written.
 The data partition (`/etc`, `/var`, bun's state under

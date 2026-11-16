@@ -1231,7 +1231,9 @@ Bun uses cgroup v2 exclusively. The cgroup hierarchy is:
 > the cgroup before the workload ran: with no swap the kernel can't reclaim
 > it, so an 8 MiB request held the start past Bun's 10 s deadline (#1955).
 > `memory.low` isn't used either, because our parent cgroups carry no
-> protection for it to draw on.
+> protection for it to draw on. A reusable executor's `task` cgroup, which
+> Bun writes itself rather than through runc, follows the same rule: its
+> `memory.high` is `max` and its limit is the only ceiling.
 
 **Process accounting (jobs, #741):**
 

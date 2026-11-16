@@ -3034,7 +3034,11 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 reliaburger::bun::task_array_node::NodeRunner::Owned(Box::new(task_runner)),
             )
             .with_budget(execution_budget)
-            .with_telemetry(Arc::clone(&job_telemetry)),
+            .with_telemetry(Arc::clone(&job_telemetry))
+            // A stopping Bun starts no new attempts, so the stop window
+            // can't use up a task's retries (#1965). Running attempts
+            // carry on: the restart's ledger and replay cover them.
+            .with_draining(shutdown.child_token()),
         )))
         .with_job_notifier(WebhookDispatcher::new(
             reliaburger::http_client::builder()

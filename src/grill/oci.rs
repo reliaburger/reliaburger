@@ -817,17 +817,23 @@ pub fn standard_mounts() -> Vec<OciMount> {
     ]
 }
 
-/// The smallest memory limit a runc container can start under (#1959).
+/// The memory `runc init` needs, charged to the cgroup it starts in.
 ///
-/// `runc init` runs inside the container's own cgroup before the workload
-/// does. With runc 1.4 it holds a copy of its 10.9 MB binary there, and its
-/// `memory.peak` reached 13.3 MB on a soak node, so `runc create` failed at
-/// 8, 10 and 12 MiB with "container init was OOM-killed". runc 1.5 needs
-/// about 4 MiB, but a node can run either.
-pub const RUNC_MEMORY_LIMIT_FLOOR_BYTES: u64 = 16 << 20;
+/// `runc init` runs inside the new container's own cgroup before the
+/// workload does. With runc 1.4 (Ubuntu 26.04) it holds a copy of its
+/// 10.9 MB binary there, and its `memory.peak` reached 13,266,944 bytes on a
+/// soak node, so `runc create` failed at 8, 10 and 12 MiB with "container
+/// init was OOM-killed". runc 1.5 needs about 4 MiB, but a node can run
+/// either. Rounded up to 16 MiB for a runc a little bigger than that one.
+///
+/// It's two rules with one cause: the smallest memory limit an app or a
+/// fresh runc job may ask for (#1959), and the room a shared-runc executor's
+/// helper cgroup gets on top of the helper's own (#1957).
+pub const RUNC_INIT_MEMORY_BYTES: u64 = 16 << 20;
 
-// The floor must stay above the largest runc init peak we measured.
-const _: () = assert!(RUNC_MEMORY_LIMIT_FLOOR_BYTES >= 13_266_944);
+// The highest memory.peak measured for runc init: lowering the room below it
+// fails the build.
+const _: () = assert!(RUNC_INIT_MEMORY_BYTES >= 13_266_944);
 
 /// Render a memory size as whole mebibytes (`"16Mi"`) when it is one, else
 /// in bytes, so a message reads like the config the user wrote.
@@ -843,13 +849,13 @@ pub fn render_memory(bytes: u64) -> String {
 ///
 /// Returns `None` unless runc's stderr says its init was OOM-killed. The
 /// reason names the container's memory limit and
-/// [`RUNC_MEMORY_LIMIT_FLOOR_BYTES`], because runc's own words ("memory
+/// [`RUNC_INIT_MEMORY_BYTES`], because runc's own words ("memory
 /// limit too low?") don't say how much it needs.
 pub fn explain_runc_init_oom(runc_stderr: &str, memory_limit: Option<u64>) -> Option<String> {
     if !runc_stderr.contains("OOM-killed") {
         return None;
     }
-    let floor = render_memory(RUNC_MEMORY_LIMIT_FLOOR_BYTES);
+    let floor = render_memory(RUNC_INIT_MEMORY_BYTES);
     let limit = match memory_limit {
         Some(bytes) => format!("the memory limit of {}", render_memory(bytes)),
         None => "the container's memory".to_string(),

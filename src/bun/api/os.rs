@@ -172,29 +172,31 @@ pub(super) async fn os_rollout_start_handler(
         nodes,
         now,
     );
-    write_rollout(council, rollout).await
+    write_rollout(council, rollout, None).await
 }
 
-/// Write `rollout` and read it back: the state machine refuses a write that
-/// would overlap another rollout or a bun upgrade without saying so.
-async fn write_rollout(council: &Arc<crate::council::CouncilNode>, rollout: OsRollout) -> Response {
-    let rollout_id = rollout.rollout_id.clone();
-    if let Err(e) = council
-        .write(crate::council::types::RaftRequest::OsRolloutUpdate {
+/// Start `rollout`, replacing the paused one `replaces` names (a resume).
+/// The state machine refuses a start that would overlap another rollout or
+/// a bun upgrade, reuse an id, or replace a rollout that has moved on, and
+/// says why: that's a 409.
+async fn write_rollout(
+    council: &Arc<crate::council::CouncilNode>,
+    rollout: OsRollout,
+    replaces: Option<crate::council::types::ReplacesPaused>,
+) -> Response {
+    let written = rollout.clone();
+    match council
+        .write(crate::council::types::RaftRequest::OsRolloutStart {
             rollout: Box::new(rollout),
+            replaces,
         })
         .await
     {
-        return refuse(StatusCode::SERVICE_UNAVAILABLE, e.to_string());
-    }
-    match council.desired_state().await.os_rollout {
-        Some(written) if written.rollout_id == rollout_id => {
-            (StatusCode::ACCEPTED, Json(serde_json::json!(written))).into_response()
+        Ok(crate::council::CouncilResponse::Refused { reason }) => {
+            refuse(StatusCode::CONFLICT, reason)
         }
-        _ => refuse(
-            StatusCode::CONFLICT,
-            "another rollout or a bun upgrade started first",
-        ),
+        Ok(_) => (StatusCode::ACCEPTED, Json(serde_json::json!(written))).into_response(),
+        Err(e) => refuse(StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
     }
 }
 
@@ -249,7 +251,11 @@ pub(super) async fn os_rollout_resume_handler(
     }
     match council.desired_state().await.os_rollout {
         Some(rollout) if matches!(rollout.phase, OsRolloutPhase::Paused { .. }) => {
-            write_rollout(council, crate::os::rollout::resume(rollout, unix_now())).await
+            let replaces = crate::council::types::ReplacesPaused::Resume {
+                id: rollout.rollout_id.clone(),
+            };
+            let resumed = crate::os::rollout::resume(rollout, unix_now());
+            write_rollout(council, resumed, Some(replaces)).await
         }
         Some(rollout) => refuse(
             StatusCode::CONFLICT,
@@ -301,8 +307,13 @@ pub(super) async fn os_rollout_abort_handler(
             rollout_id: rollout_id.clone(),
         },
     ] {
-        if let Err(e) = council.write(request).await {
-            return refuse(StatusCode::SERVICE_UNAVAILABLE, e.to_string());
+        match council.write(request).await {
+            // It ended (or was resumed under a new id) since we read it.
+            Ok(crate::council::CouncilResponse::Refused { reason }) => {
+                return refuse(StatusCode::CONFLICT, reason);
+            }
+            Ok(_) => {}
+            Err(e) => return refuse(StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
         }
     }
     Json(serde_json::json!({ "aborted": rollout_id })).into_response()

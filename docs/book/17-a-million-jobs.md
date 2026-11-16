@@ -119,6 +119,33 @@ The `::<RECORD_BYTES>` is a *turbofish*, the syntax for passing a generic parame
 
 A block cut short by a crash at the very end is truncated before new records are appended: nobody was told those records were durable. Damage anywhere earlier is an error, not a skip, because skipping would silently re-run or lose finished tasks. Anything in a held chunk without a terminal record runs again. That's at-least-once execution, and it's a deliberate trade for tasks this short.
 
+#### A stopping node starts no new attempts
+
+The 0.3.0 rehearsal's soak stops the whole cluster gracefully and starts it again. During one of those stops, an ordinary task used all three of its attempts and failed for good: `wget: download timed out` ([#1965](https://github.com/reliaburger/reliaburger/issues/1965)). Its node's Bun took 9 seconds to shut down. Its peers' VMs were already off by then, and the soak's verifier on the same node was stopping too, so every attempt the task started in that window failed. Bun got SIGTERM and then went on retrying.
+
+Nothing told the pool to stop. Bun cancels one `CancellationToken`, `shutdown`, when the signal arrives, and almost every long-lived task watches it. The task arrays didn't. Each array has its own token, but it fires only when the leader stops the array, or when the ledger can't be written, and it does more than stop new work: the runner SIGTERMs every attempt it's running. We didn't want that on a node stop. A running attempt already has its way through a restart: it ends as `Unknown`, or replays when the job allows it.
+
+So the pool takes a second token, `draining`, which it checks but never hands to the runner:
+
+```rust
+let node_permit = tokio::select! {
+    biased;
+    () = self.cancel.cancelled() => None,
+    () = self.draining.cancelled() => None,
+    permit = Arc::clone(&self.node_slots).acquire_owned() => permit.ok(),
+};
+```
+
+The same branch sits in front of the retry backoff, the per-array slot and the resource budget, and an `is_cancelled()` check comes last, just before the launch. Once the token fires, the task ends as not run, and `attempts` counts only the attempts that really started. Bun's `main` hands the node `shutdown.child_token()`. A *child token* is cancelled when its parent is, but cancelling the child leaves the parent alone, so the task-array code can never stop the rest of Bun by mistake.
+
+There's one more step. A chunk with not-run tasks counts as finished, and the leader would retire it, with those tasks counted as not run for good. That's right when the user stopped the array, and wrong here. So a chunk that the drain cut short doesn't report itself. It stays held, its not-run records go to the ledger, and the restarted node runs every task without an outcome there. It doesn't count those tasks' durations either: the restarted node's result counts the chunk's finished tasks from the ledger, so counting them before the stop too would count them twice.
+
+Our first version had two gaps, and a review found both. A job's default is `replay_unknown = false`. For those jobs, a restarted node runs an interrupted chunk only if every task in it has a record at its grant. Anything else might have been running when the node died, so the node refuses the chunk until an operator replays it. That check read the ledger through `group_by_chunk`, which dropped not-run records. So every chunk a stop drained looked unknown, and a graceful stop parked a default job until someone ran `relish batch replay`. A not-run record is safe to count: the node writes one only when the task has nothing running. `group_by_chunk` now keeps the last record per index, with a terminal record always beating a not-run one. Only a task with no record at all is unknown.
+
+The second gap was the attempt count. A drained task that had failed once was recorded as not run with `attempts = 1`, and the restart counted from zero again, so `max_attempts = 3` could mean five attempts in all. `resume_chunk_streaming` now splits the records it's given with `Iterator::partition`, which sorts one collection into two by a predicate. Terminal records skip their task. Not-run records seed its attempt counter, so the restart carries on from attempt 2. The attempt before the restart left no cause behind, so the summary counts it under `unrecorded`, as it does for any attempt count read back from a ledger.
+
+`a_draining_pool_retries_nothing_and_leaves_the_task_not_run` in `src/bun/task_executor.rs` fails a task's first attempt and fires the token inside it. The task must end not run after one attempt. Without the token it failed after three. `a_draining_pool_launches_no_task_that_had_not_started` and `draining_lets_a_running_attempt_finish` check the other two edges. `a_stopping_node_retries_nothing_and_its_restart_runs_the_task` in `src/bun/task_array_node.rs` goes through the node: the drained chunk isn't reported, and a node restarted on the same directory runs the task and succeeds. `a_drained_chunk_of_a_default_job_restarts_without_a_replay` does the same with `replay_unknown = false`. `a_drained_task_keeps_its_attempts_across_the_restart` and `a_resumed_not_run_record_continues_the_tasks_attempt_count` check the attempt count, and `a_drained_chunk_counts_no_durations_until_it_is_reported` checks the durations. The soak harness got a fix as well: its verifier's systemd unit now starts `Before=reliaburger.service`, and systemd stops units in the reverse order, so the verifier outlives Bun.
+
 ### Putting it together, in one process
 
 The acceptance test in the portable suite wires three simulated nodes (each a real pool with a fake runner and a real ledger on disk) to the real leader state and grant policy. One task in a hundred fails its first attempt and succeeds on retry. A third of the way through, node n3 is lost: its chunks go back to the queue at the next attempt, and its late reports are refused by the fence. At the end every index has exactly one accepted outcome, exactly one retry is counted per failing index, and the three ledgers between them hold a terminal record for all of them. The suite runs 100,000 tasks, which takes about three seconds in a debug build. With the full million it took 30.6 seconds on the laptop, about 32,700 tasks a second, and the leader changed its state in 422 ticks. Real processes will be far slower than a fake; the Criterion suite (`make bench-task-arrays`) measures the machine's fork/exec floor through the real runner, so we'll know by how much before promising anyone a number.
@@ -2785,6 +2812,19 @@ runc involved, so it keeps the 8 MiB and the host job slots that buys.
 set the limit read it from there: the OCI spec runc writes into the cgroup,
 and `prepare_cgroups`, which writes the cgroup before runc does. The helper's
 `memory.high` is now `max`, so nothing throttles runc init below the limit.
+The 16 MiB is `RUNC_INIT_MEMORY_BYTES` in `src/grill/oci.rs`, the same
+constant that sets the smallest memory limit an app may ask for (Chapter 1),
+so one measurement of runc init feeds both rules.
+
+The task cgroup next to the helper had the #1955 mistake too. It wrote the
+job's memory request to `memory.high`, after Chapter 1 had stopped doing that
+for every container. runc init never runs there (commands are cloned straight
+into it), so nothing stalled at start, but a command that grew past its
+request was throttled long before its limit. A request is a reservation, so
+the task cgroup's `memory.high` is now `max` as well, and its limit is its
+only ceiling. `ExecutorProfile::task_cgroup_files` lists every file and value
+the task cgroup gets, so a unit test can check them on any machine, where
+`prepare_cgroups` itself needs root and a cgroup filesystem.
 
 With the fix in place, the soak's job campaign failed next, for the same
 reason. Its memory-limit fixture runs an `awk` that grows until the limit

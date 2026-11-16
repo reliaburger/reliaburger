@@ -13,7 +13,7 @@ Sesame is not a separate binary or sidecar. It is compiled into the single `reli
 - **Workload identity.** SPIFFE-compatible X.509 certificates and OIDC JWTs for every workload, issued via a CSR model, rotated automatically.
 - **API authentication.** Scoped tokens with roles, TTLs, and rate limits. Optional OIDC integration with external identity providers.
 - **Secret encryption.** Asymmetric age encryption for secrets checked into git. Namespace-scoped keypairs for multi-tenant isolation.
-- **Data at rest encryption (Raft log entries only).** Raft log entries are encrypted with AES-256-GCM under a key derived (HKDF-SHA256, fresh salt per entry) from the cluster master key, which is stored on the node. `snapshot.redb` and the vote and log-position metadata are plaintext, and a cluster without a master key writes a plaintext log. This protects a stolen disk or copied log, not a node whose root is compromised. Snapshot encryption with a TPM- or identity-derived key is 0.3.0 appliance work (#402); TPM sealing is not implemented.
+- **Data at rest encryption (Raft log entries only).** Raft log entries are encrypted with AES-256-GCM under a key derived (HKDF-SHA256, fresh salt per entry) from the cluster master key, which is stored on the node. `snapshot.redb` and the vote and log-position metadata are plaintext, and a cluster without a master key writes a plaintext log. This protects a stolen disk or copied log, not a node whose root is compromised. Snapshot encryption with a TPM- or identity-derived key is deferred to #1775; TPM sealing is not implemented.
 - **Network security.** nftables perimeter firewall, eBPF inter-app firewall, egress allowlists, namespace isolation -- all managed automatically by Bun.
 - **Certificate revocation.** CRL distribution for long-lived node certificates.
 
@@ -1219,7 +1219,7 @@ An app env value `PROVIDER[name:path]` names a secret kept outside the cluster. 
 > key is stored on the node, so this protects a stolen disk or copied log, not a
 > node whose root is compromised. `snapshot.redb` (token hashes, wrapped keys,
 > desired state) is written in plaintext; encrypting it with a TPM- or
-> identity-derived key is 0.3.0 appliance work (#402).
+> identity-derived key is deferred to #1775.
 > Encrypted entries carry a one-byte marker and a per-entry salt+nonce; a
 > plaintext entry (leading `{`) still decodes, so plaintext and encrypted logs
 > interoperate and a keyless/dev cluster stays plaintext. An encrypted entry

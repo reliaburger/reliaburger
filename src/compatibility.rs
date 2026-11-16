@@ -247,6 +247,11 @@ pub struct Compatibility {
 /// 0.3.0, Bare metal in an hour (59/75): the appliance OS rollout (a new Raft
 /// request and a new field in council state) and the cluster-wide council
 /// size (`RaftRequest::CouncilSize` and `DesiredState::council_size`).
+/// Starts split from progress: `RaftRequest::OsRolloutStart` and
+/// `UpgradeStart`, with `OsRolloutUpdate` and `UpgradeUpdate` applying only
+/// to the active run, and refusals answered as `CouncilResponse::Refused`;
+/// a start's `replaces` (`ReplacesPaused`) names the paused run it resumes
+/// or supersedes, and `/v1/version` carries `os_trial`.
 /// OIDC signing-key rotation (#709): `SecurityState::retiring_oidc_keys`, and
 /// the `RotateOidcSigningKey` and `RetireOidcSigningKeys` Raft requests.
 ///

@@ -227,7 +227,10 @@ pub enum RaftRequest {
     // NOTE: the log and the Raft RPC are JSON, which tags each variant by its
     // name, so renaming a variant changes the format and reordering doesn't.
     // New variants still go at the end, which keeps the history readable.
-    /// Start or advance a cluster-wide rolling binary upgrade (Phase 14).
+    /// Advance the cluster-wide rolling binary upgrade in progress (Phase
+    /// 14). Refused unless the active upgrade has the same id and hasn't
+    /// ended, so a write computed before an abort can't bring it back; a
+    /// new run or a resume is [`RaftRequest::UpgradeStart`].
     UpgradeUpdate {
         state: Box<crate::upgrade::types::ClusterUpgradeState>,
     },
@@ -391,7 +394,10 @@ pub enum RaftRequest {
     QuotaBlocked {
         blocked: Vec<(AppId, crate::meat::quota::QuotaError)>,
     },
-    /// Start or advance an appliance OS rollout (W6).
+    /// Advance the appliance OS rollout in progress (W6). Refused unless
+    /// the active rollout has the same id and hasn't ended, so a write the
+    /// leader computed before `relish os abort` can't bring it back; a new
+    /// rollout or a resume is [`RaftRequest::OsRolloutStart`].
     OsRolloutUpdate {
         rollout: Box<crate::os::rollout::OsRollout>,
     },
@@ -652,6 +658,34 @@ pub enum RaftRequest {
     /// The leader's reaper: drop the specs of proposals that can't be
     /// undone any more, and the oldest records beyond the limit.
     ProposalCompact { now_unix_ms: u64 },
+    /// Start a cluster-wide rolling binary upgrade. Refused during an OS
+    /// rollout, if the id has run before, or while another run is active,
+    /// unless `replaces` names that run and it's paused.
+    UpgradeStart {
+        state: Box<crate::upgrade::types::ClusterUpgradeState>,
+        replaces: Option<ReplacesPaused>,
+    },
+    /// Start an appliance OS rollout. Refused during a bun upgrade, if the
+    /// id has run before, or while another rollout is active, unless
+    /// `replaces` names that rollout and it's paused.
+    OsRolloutStart {
+        rollout: Box<crate::os::rollout::OsRollout>,
+        replaces: Option<ReplacesPaused>,
+    },
+}
+
+/// What a start does with the paused run it replaces, named by id so a
+/// start can't replace a run it never saw: one that ended, or another
+/// that took its place, is refused instead.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ReplacesPaused {
+    /// Carry the paused run on under the new id (`resume`). It's the same
+    /// run, so it isn't archived.
+    Resume { id: String },
+    /// End the paused run, archiving it as aborted with `reason`, in the
+    /// same entry that starts the new one (a rollback over a paused
+    /// upgrade), so nothing can land between the two.
+    Supersede { id: String, reason: String },
 }
 
 // ---------------------------------------------------------------------------

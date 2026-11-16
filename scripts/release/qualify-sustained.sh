@@ -1068,6 +1068,7 @@ cat > /etc/systemd/system/reliaburger-soak-audit.service <<UNIT
 [Unit]
 Description=Independent release job effect verifier
 After=network-online.target
+Before=reliaburger.service
 [Service]
 ExecStart=/usr/bin/python3 /var/lib/reliaburger/soak-jobs/job_soak.py serve --database /var/lib/reliaburger/soak-jobs/effects.sqlite --token-file /var/lib/reliaburger/soak-jobs/.token --address $1
 Restart=on-failure

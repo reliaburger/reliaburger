@@ -30,17 +30,13 @@ pub const HELPER_CPU_REQUEST: u64 = 10;
 /// This is the host helper's whole cap, and the helper's own share of a
 /// container helper's.
 pub const HELPER_MEMORY_BYTES: u64 = 8 << 20;
-/// Room for `runc init`, which runs in a container helper's cgroup before
-/// the helper does. Ubuntu 26.04's runc 1.4.0 keeps a copy of its own 10.9 MB
-/// binary there: memory.peak reached 13,266,944 bytes on a soak guest
-/// (#1957). Rounded up to 16 MiB for a runc a little bigger than that one.
-pub const RUNC_INIT_MEMORY_BYTES: u64 = 16 << 20;
-// The highest memory.peak measured for that runc init: lowering the room
-// below it fails the build.
-const _: () = assert!(RUNC_INIT_MEMORY_BYTES >= 13_266_944);
 /// A shared-runc executor's helper cap and reservation: the helper's own
-/// [`HELPER_MEMORY_BYTES`] plus [`RUNC_INIT_MEMORY_BYTES`].
-pub const CONTAINER_HELPER_MEMORY_BYTES: u64 = HELPER_MEMORY_BYTES + RUNC_INIT_MEMORY_BYTES;
+/// [`HELPER_MEMORY_BYTES`] plus [`RUNC_INIT_MEMORY_BYTES`], since `runc init`
+/// runs in the helper's cgroup before the helper does (#1957).
+///
+/// [`RUNC_INIT_MEMORY_BYTES`]: crate::grill::oci::RUNC_INIT_MEMORY_BYTES
+pub const CONTAINER_HELPER_MEMORY_BYTES: u64 =
+    HELPER_MEMORY_BYTES + crate::grill::oci::RUNC_INIT_MEMORY_BYTES;
 /// A command's `pids.max` when its job doesn't set `pids`.
 pub const DEFAULT_COMMAND_PIDS: u32 = 256;
 /// The helper's own `pids.max`, outside every command's limit.
@@ -234,6 +230,31 @@ impl ExecutorProfile {
             helper_memory,
             reservation,
         })
+    }
+
+    /// The files of the executor's `task` cgroup, where every command it runs
+    /// lands, and the value each gets, in the order they are written.
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn task_cgroup_files(&self) -> [(&'static str, String); 7] {
+        let cpu_max = if self.cpu.limit < 10 {
+            format!("{} 1000000", self.cpu.limit * 1000)
+        } else {
+            crate::grill::cpu_max_from_millicores(self.cpu.limit)
+        };
+        [
+            ("cpu.max", cpu_max),
+            (
+                "cpu.weight",
+                crate::grill::cgroup::cpu_weight_from_millicores(self.cpu.request).to_string(),
+            ),
+            ("memory.max", self.memory.limit.to_string()),
+            ("memory.swap.max", "0".into()),
+            // A memory request is a scheduling reservation, not a throttle:
+            // the limit is the only ceiling, as for a container (#1955).
+            ("memory.high", "max".into()),
+            ("memory.oom.group", "1".into()),
+            ("pids.max", self.pids.to_string()),
+        ]
     }
 }
 
@@ -506,13 +527,29 @@ mod tests {
         );
     }
     #[test]
+    fn a_memory_request_sets_no_soft_limit_on_the_task_cgroup() {
+        // A request is a scheduling reservation, never a throttle (#1955).
+        // The task cgroup's limit is its only memory ceiling, as for an app's
+        // container cgroup (#1956).
+        let profile = ExecutorProfile::new(&template()).unwrap();
+        let files: std::collections::BTreeMap<_, _> =
+            profile.task_cgroup_files().into_iter().collect();
+        assert_eq!(files["memory.high"], "max");
+        assert_eq!(files["memory.max"], (64u64 << 20).to_string());
+        assert_eq!(files["memory.swap.max"], "0");
+        assert_eq!(files["pids.max"], DEFAULT_COMMAND_PIDS.to_string());
+    }
+    #[test]
     fn a_container_helper_has_room_for_runc_init_and_a_host_helper_stays_small() {
         // runc init runs in the helper's cgroup before the helper does.
         // Ubuntu 26.04's runc 1.4.0 holds a copy of its 10.9 MB binary
         // there: memory.peak reached 13,266,944 bytes on a soak guest, and an
         // 8 MiB memory.max OOM-killed every shared-runc executor (#1957).
         let container = ExecutorProfile::new(&template()).unwrap();
-        assert_eq!(container.helper_memory, (8 << 20) + RUNC_INIT_MEMORY_BYTES);
+        assert_eq!(
+            container.helper_memory,
+            (8 << 20) + crate::grill::oci::RUNC_INIT_MEMORY_BYTES
+        );
         assert_eq!(
             container.reservation.memory_bytes,
             (32 << 20) + CONTAINER_HELPER_MEMORY_BYTES
