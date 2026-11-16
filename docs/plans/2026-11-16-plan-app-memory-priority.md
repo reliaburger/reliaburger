@@ -4,7 +4,9 @@
 A node full of job executors couldn't take back a single app replica after
 a fault, and nothing in the product would ever have made it. This plan says
 what we'll change, in what order, and which tests prove it. It's a plan, not
-code: the maintainer asked for it before any implementation starts.
+code: the maintainer asked for it before any implementation starts, and
+settled its three open questions on 16 November 2026 (see
+[Decisions](#decisions)).
 
 ## What happened
 
@@ -195,7 +197,9 @@ A claim does nothing if the leader never sends the replica to a node, and for
    cluster test, where a replica avoids the node jobs have filled, keeps
    passing.
 2. **Yield pass.** Only if the first pass finds no node: filter again counting
-   only app requests, and score by app-free room. A placement made here is a
+   only app requests, and score by app-free room, so the app goes to the node
+   with the most room after apps, not the one whose jobs hold the most memory
+   (decision 2). A placement made here is a
    node whose jobs will yield, and the decision event says so (rule
    `jobs_yield_to_apps`, for the `relish agent explain` work from the
    [ask-the-cluster-why plan](2026-11-08-plan-ask-the-cluster-why.md)).
@@ -267,7 +271,8 @@ Claim { resources: Resources, deadline: Instant }
 
 - Claims only exist for apps that would fit with every job gone, and their
   total never exceeds `capacity - app_used`. So jobs lose only room that apps
-  will actually run in. That's the policy: apps first.
+  will actually run in. That's the policy: apps first, on every cluster, with
+  no setting (decision 3).
 - Each claim lasts at most `CLAIM_PATIENCE`, and a lapsed claim's cooldown
   stops it coming straight back.
 - A claim covered by memory that's already free doesn't make executors yield
@@ -379,7 +384,8 @@ issue says we lack. Both must fail on today's `main` first.
 **Soak.** Restore the jobs fast caps the harness PR lowered for 0.3.0, and
 run `qualify-sustained.sh --tier fast` on the jobs scenario on the Studio, not
 during another gate. The check: after the quorum-loss step, every app reaches
-its replica count inside the settle window. The record goes in
+its replica count inside the settle window, which also tells us whether the
+60 s patience and 5-minute cooldown (decision 1) hold up. The record goes in
 `docs/qualification/`.
 
 ## Book and manual
@@ -440,15 +446,25 @@ app-versus-app priorities among claims, splitting quarantined leases in the
 report, and `relish status` showing claims (a node event and a log line are
 enough for now).
 
-## Open questions for the maintainer
+## Decisions
 
-1. `CLAIM_PATIENCE` of 60 s and a 5-minute cooldown: the soak's settle window
-   is 600 s, so both fit, but they're guesses until the soak runs.
-2. Should the yield pass prefer the node whose jobs hold the most memory, or
-   the one with the most app-free room? The plan says app-free room, which
-   leaves the busiest node alone when it can.
-3. Is "apps always first" right for every cluster, or does someone need a
-   job that an app can't displace? If so, that's the priority work, later.
+The plan asked the maintainer three questions. He took the recommended
+answer to each on 16 November 2026.
+
+1. **Claim patience and cooldown.** Decided (maintainer, 16 November 2026):
+   `CLAIM_PATIENCE` is 60 s and the cooldown after a lapsed claim is
+   5 minutes. Both fit inside the soak's 600 s settle window. The jobs fast
+   soak check (see "Tests first") is where we learn whether they're right;
+   if it says otherwise, changing them is a constant and a test, not a new
+   decision.
+2. **Where the yield pass places an app.** Decided (maintainer, 16 November
+   2026): on the node with the most app-free room, not the one whose jobs hold
+   the most memory. That leaves the busiest node alone when it can, and it's
+   the score the yield pass already uses.
+3. **Apps first everywhere, or a setting.** Decided (maintainer, 16 November
+   2026): apps come first on every cluster, with no setting to turn it off.
+   There are no feature gates before 1.0, and a job that an app can't
+   displace needs priorities, which belong with the priority work, later.
 
 ## Sources
 
