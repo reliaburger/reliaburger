@@ -1719,23 +1719,9 @@ fn prepare_cgroups(base: &Path, profile: ExecutorProfile) -> std::io::Result<()>
         Err(error) => return Err(error),
     }
     std::fs::create_dir(&task)?;
-    std::fs::write(
-        task.join("cpu.max"),
-        if profile.cpu.limit < 10 {
-            format!("{} 1000000", profile.cpu.limit * 1000)
-        } else {
-            crate::grill::cpu_max_from_millicores(profile.cpu.limit)
-        },
-    )?;
-    std::fs::write(
-        task.join("cpu.weight"),
-        crate::grill::cgroup::cpu_weight_from_millicores(profile.cpu.request).to_string(),
-    )?;
-    std::fs::write(task.join("memory.max"), profile.memory.limit.to_string())?;
-    std::fs::write(task.join("memory.swap.max"), "0")?;
-    std::fs::write(task.join("memory.high"), profile.memory.request.to_string())?;
-    std::fs::write(task.join("memory.oom.group"), "1")?;
-    std::fs::write(task.join("pids.max"), profile.pids.to_string())?;
+    for (file, value) in profile.task_cgroup_files() {
+        std::fs::write(task.join(file), value)?;
+    }
     std::fs::write(
         base.join("helper/cpu.max"),
         crate::grill::cpu_max_from_millicores(100),

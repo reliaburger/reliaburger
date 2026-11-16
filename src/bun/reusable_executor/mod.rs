@@ -235,6 +235,31 @@ impl ExecutorProfile {
             reservation,
         })
     }
+
+    /// The files of the executor's `task` cgroup, where every command it runs
+    /// lands, and the value each gets, in the order they are written.
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn task_cgroup_files(&self) -> [(&'static str, String); 7] {
+        let cpu_max = if self.cpu.limit < 10 {
+            format!("{} 1000000", self.cpu.limit * 1000)
+        } else {
+            crate::grill::cpu_max_from_millicores(self.cpu.limit)
+        };
+        [
+            ("cpu.max", cpu_max),
+            (
+                "cpu.weight",
+                crate::grill::cgroup::cpu_weight_from_millicores(self.cpu.request).to_string(),
+            ),
+            ("memory.max", self.memory.limit.to_string()),
+            ("memory.swap.max", "0".into()),
+            // A memory request is a scheduling reservation, not a throttle:
+            // the limit is the only ceiling, as for a container (#1955).
+            ("memory.high", "max".into()),
+            ("memory.oom.group", "1".into()),
+            ("pids.max", self.pids.to_string()),
+        ]
+    }
 }
 
 /// A bounded live tail for one command, never the next occupant of its slot.
@@ -504,6 +529,19 @@ mod tests {
             key,
             "a warm executor's task cgroup keeps the limit it was built with"
         );
+    }
+    #[test]
+    fn a_memory_request_sets_no_soft_limit_on_the_task_cgroup() {
+        // A request is a scheduling reservation, never a throttle (#1955).
+        // The task cgroup's limit is its only memory ceiling, as for an app's
+        // container cgroup (#1956).
+        let profile = ExecutorProfile::new(&template()).unwrap();
+        let files: std::collections::BTreeMap<_, _> =
+            profile.task_cgroup_files().into_iter().collect();
+        assert_eq!(files["memory.high"], "max");
+        assert_eq!(files["memory.max"], (64u64 << 20).to_string());
+        assert_eq!(files["memory.swap.max"], "0");
+        assert_eq!(files["pids.max"], DEFAULT_COMMAND_PIDS.to_string());
     }
     #[test]
     fn a_container_helper_has_room_for_runc_init_and_a_host_helper_stays_small() {

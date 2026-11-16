@@ -2786,6 +2786,16 @@ set the limit read it from there: the OCI spec runc writes into the cgroup,
 and `prepare_cgroups`, which writes the cgroup before runc does. The helper's
 `memory.high` is now `max`, so nothing throttles runc init below the limit.
 
+The task cgroup next to the helper had the #1955 mistake too. It wrote the
+job's memory request to `memory.high`, after Chapter 1 had stopped doing that
+for every container. runc init never runs there (commands are cloned straight
+into it), so nothing stalled at start, but a command that grew past its
+request was throttled long before its limit. A request is a reservation, so
+the task cgroup's `memory.high` is now `max` as well, and its limit is its
+only ceiling. `ExecutorProfile::task_cgroup_files` lists every file and value
+the task cgroup gets, so a unit test can check them on any machine, where
+`prepare_cgroups` itself needs root and a cgroup filesystem.
+
 With the fix in place, the soak's job campaign failed next, for the same
 reason. Its memory-limit fixture runs an `awk` that grows until the limit
 kills it, and expects exit 137. A fresh `runc` job's limit covers runc init
