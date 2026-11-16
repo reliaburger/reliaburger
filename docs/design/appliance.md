@@ -334,6 +334,18 @@ which is why prepare zeroes them: when it's done, the claimed seed and the
 stick's file are overwritten with zeros, flushed and only then removed. The claimed seed is also cleared on a boot that finds `node.toml`
 already in place, in case the power went between the two.
 
+The claimed seed lives in `/var/lib/reliaburger/claim`, on the Btrfs data
+partition. Btrfs is copy-on-write, so an overwrite would go to new blocks and
+leave the seed in the old ones. Before the claim server starts, prepare makes
+the claim directory `NOCOW` (`FS_NOCOW_FL` through `FS_IOC_SETFLAGS`, what
+`chattr +C` does). Files created in it inherit the flag while they're empty,
+so the zeros reach the seed's own blocks. A filesystem without the flag
+(tmpfs, ext4) overwrites in place anyway, and prepare carries on. Two limits
+remain: an SSD or eMMC may keep the old data in cells its wear levelling
+moved away from, and nothing above the device can reach those. The real
+protection is that the seed lives on the disk only from the claim to the end
+of prepare.
+
 ### 3.6 The RBSEED stick
 
 Prepare waits up to 10 seconds for `/dev/disk/by-label/RBSEED`, mounts it

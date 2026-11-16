@@ -71,6 +71,11 @@ relish image download --dir os --arch x86_64
 An architecture the release doesn't have is refused, and so is a name relish
 doesn't know (`x86_64` and `aarch64` are the two it builds).
 
+A slow link is fine: there's no limit on how long a download takes. A server
+that stops answering isn't. The download gives up after 30 seconds without a
+connection, or 60 seconds without a byte, and says which of the two timed
+out. Run it again: files already saved and checked aren't fetched twice.
+
 It saves what an install needs. `--all` also fetches the pieces only OS
 updates use, the kernel image and the `/usr` images, for serving updates
 yourself. `--channel URL` reads another release channel than the published

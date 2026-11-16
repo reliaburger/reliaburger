@@ -312,6 +312,13 @@ fn find_seed(paths: &Paths) -> Result<Option<(Seed, Source)>, PrepareError> {
 /// No seed anywhere: become unclaimed until `relish machines claim` posts one.
 async fn wait_for_claim(paths: &Paths, claim_dir: &Path) -> Result<(), PrepareError> {
     // BLOCKING-OK: appliance prepare: its own process, one step at a time before bun starts, with nothing else on its runtime
+    if make_claim_dir(claim_dir)? == CopyOnWrite::Unsupported {
+        say(&format!(
+            "{} can't turn copy-on-write off; on a copy-on-write filesystem a claimed seed's zeroing won't reach its blocks",
+            claim_dir.display()
+        ));
+    }
+    // BLOCKING-OK: appliance prepare: its own process, one step at a time before bun starts, with nothing else on its runtime
     let key = super::claim::ClaimKey::load_or_create(claim_dir)?;
     let info = super::claim::MachineInfo {
         // BLOCKING-OK: appliance prepare: its own process, one step at a time before bun starts, with nothing else on its runtime
@@ -417,9 +424,99 @@ async fn clear_claimed_seed(paths: &Paths) {
     }
 }
 
+/// Whether a directory's new files are written in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CopyOnWrite {
+    /// Copy-on-write is off: an overwrite reaches the file's own blocks.
+    // Only Linux has the switch.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Off,
+    /// The filesystem has no such switch (tmpfs, ext4, APFS). Ext4 and
+    /// tmpfs overwrite in place anyway; only a copy-on-write filesystem
+    /// without the flag keeps the old blocks.
+    Unsupported,
+}
+
+/// Btrfs's no-copy-on-write inode flag (`FS_NOCOW_FL` in `linux/fs.h`,
+/// what `chattr +C` sets). libc doesn't export it.
+#[cfg(target_os = "linux")]
+const FS_NOCOW_FL: libc::c_int = 0x0080_0000;
+
+/// Make the claim directory, private, with copy-on-write off where the
+/// filesystem has the switch. It must happen before the claim writes a
+/// seed into it: Btrfs only lets a file take the flag while it's empty,
+/// and a new file takes it from its directory. Without it, the zeros
+/// [`zero_and_remove`] writes over a claimed seed land in new blocks, and
+/// the master key stays in the old ones.
+pub(crate) fn make_claim_dir(dir: &Path) -> std::io::Result<CopyOnWrite> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    disable_copy_on_write(dir)
+}
+
+#[cfg(target_os = "linux")]
+fn disable_copy_on_write(dir: &Path) -> std::io::Result<CopyOnWrite> {
+    use std::os::fd::AsRawFd;
+    let handle = std::fs::File::open(dir)?;
+    let read_flags = || {
+        let mut flags: libc::c_int = 0;
+        // SAFETY: `handle` keeps the descriptor open through the call, and
+        // FS_IOC_GETFLAGS writes one int into `flags`, which outlives it.
+        let result = unsafe { libc::ioctl(handle.as_raw_fd(), libc::FS_IOC_GETFLAGS, &mut flags) };
+        if result == 0 {
+            Ok(flags)
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    };
+    let flags = match read_flags() {
+        Ok(flags) => flags,
+        Err(error) => return unsupported_or(error),
+    };
+    if flags & FS_NOCOW_FL != 0 {
+        return Ok(CopyOnWrite::Off);
+    }
+    let wanted = flags | FS_NOCOW_FL;
+    // SAFETY: as above; FS_IOC_SETFLAGS reads one int from `wanted`, which
+    // outlives the call.
+    let result = unsafe { libc::ioctl(handle.as_raw_fd(), libc::FS_IOC_SETFLAGS, &wanted) };
+    if result != 0 {
+        return unsupported_or(std::io::Error::last_os_error());
+    }
+    // An older ext4 accepts flags it doesn't keep, so believe the flag
+    // only once it reads back.
+    match read_flags() {
+        Ok(flags) if flags & FS_NOCOW_FL != 0 => Ok(CopyOnWrite::Off),
+        Ok(_) => Ok(CopyOnWrite::Unsupported),
+        Err(error) => unsupported_or(error),
+    }
+}
+
+/// A filesystem that has no inode flags, or not this one, isn't an error.
+#[cfg(target_os = "linux")]
+fn unsupported_or(error: std::io::Error) -> std::io::Result<CopyOnWrite> {
+    match error.raw_os_error() {
+        Some(libc::ENOTTY | libc::EOPNOTSUPP | libc::ENOSYS | libc::EINVAL) => {
+            Ok(CopyOnWrite::Unsupported)
+        }
+        _ => Err(error),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn disable_copy_on_write(dir: &Path) -> std::io::Result<CopyOnWrite> {
+    std::fs::metadata(dir)?;
+    Ok(CopyOnWrite::Unsupported)
+}
+
 /// Overwrite `path` with zeros, flush them, then remove it: a seed that may
 /// hold the master key shouldn't stay readable in the blocks an unlink
-/// leaves behind.
+/// leaves behind. On Btrfs that holds only for a file made with
+/// copy-on-write off ([`make_claim_dir`]); a stick's FAT overwrites in
+/// place.
 fn zero_and_remove(path: &Path) -> std::io::Result<()> {
     let len = std::fs::metadata(path)?.len();
     let mut handle = std::fs::OpenOptions::new().write(true).open(path)?;
@@ -809,6 +906,48 @@ mod tests {
         zero_and_remove(&path).unwrap();
         assert!(!path.exists());
         assert_zeroed(&link, b"master key bytes".len());
+    }
+
+    /// Whether `dir` carries `FS_NOCOW_FL`, read back with `FS_IOC_GETFLAGS`.
+    #[cfg(target_os = "linux")]
+    fn has_nocow_flag(dir: &Path) -> bool {
+        use std::os::fd::AsRawFd;
+        let handle = std::fs::File::open(dir).unwrap();
+        let mut flags: libc::c_int = 0;
+        // SAFETY: `handle` keeps the descriptor open through the call, and
+        // FS_IOC_GETFLAGS writes one int into `flags`, which outlives it.
+        let result = unsafe { libc::ioctl(handle.as_raw_fd(), libc::FS_IOC_GETFLAGS, &mut flags) };
+        result == 0 && flags & FS_NOCOW_FL != 0
+    }
+
+    #[test]
+    fn the_claim_directory_is_private_with_copy_on_write_off_where_the_filesystem_has_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let claim_dir = dir.path().join("lib/claim");
+        let copy_on_write = make_claim_dir(&claim_dir).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&claim_dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        // Btrfs takes the flag; tmpfs, ext4 and APFS say they can't, and
+        // the claim carries on.
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            copy_on_write == CopyOnWrite::Off,
+            has_nocow_flag(&claim_dir),
+            "{copy_on_write:?}"
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(copy_on_write, CopyOnWrite::Unsupported);
+        // A second boot finds the directory and keeps the flag.
+        assert_eq!(make_claim_dir(&claim_dir).unwrap(), copy_on_write);
+    }
+
+    #[test]
+    fn a_claim_directory_that_cannot_be_made_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not-a-directory");
+        std::fs::write(&file, b"").unwrap();
+        assert!(make_claim_dir(&file.join("claim")).is_err());
     }
 
     fn claimed_create_seed(paths: &Paths) -> (PathBuf, PathBuf, usize) {
