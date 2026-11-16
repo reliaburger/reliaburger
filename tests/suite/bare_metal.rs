@@ -87,3 +87,52 @@ fn claim_create_without_a_terminal_needs_yes_before_contacting_anything() {
     assert!(stderr.contains("--yes"), "{stderr}");
     assert!(!cluster.exists());
 }
+
+#[test]
+fn bare_metal_create_refuses_a_machine_listed_twice_and_writes_nothing() {
+    let home = tempfile::tempdir().unwrap();
+    let cluster = home.path().join("home-cluster");
+    let output = create(
+        home.path(),
+        &cluster,
+        &["--yes", "d8:9e:f3:00:00:01@192.0.2.52"],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("listed twice"), "{stderr}");
+    assert!(
+        !cluster.exists(),
+        "a seed was written for a repeated machine"
+    );
+    assert!(!home.path().join(".reliaburger").exists());
+}
+
+#[test]
+fn claim_create_refuses_a_machine_named_twice_before_contacting_anything() {
+    let home = tempfile::tempdir().unwrap();
+    let cluster = home.path().join("home-cluster");
+    // TEST-NET-1 again: refusing the repeat must not need an answer.
+    let output = relish(
+        home.path(),
+        &[
+            "machines",
+            "claim",
+            cluster.to_str().unwrap(),
+            "--create",
+            "--name",
+            "home",
+            "--operator",
+            "192.0.2.10",
+            "--trust-lan",
+            "--yes",
+            "192.0.2.51",
+            "192.0.2.52",
+            "192.0.2.51",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("192.0.2.51 is named twice"), "{stderr}");
+    assert!(!cluster.exists());
+    assert!(!home.path().join(".reliaburger").exists());
+}

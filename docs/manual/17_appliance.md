@@ -499,6 +499,29 @@ its MAC. To see what your laptop hears, `dns-sd -B _rb-unclaimed._tcp` on
 macOS or `avahi-browse -r _rb-unclaimed._tcp` on Linux lists the machines'
 announcements.
 
+Name each machine once. relish refuses a machine listed twice, by MAC, by
+address, or by its MAC and its address, before it writes anything, and so
+does `relish cluster create --bare-metal`.
+
+If a machine stops answering before its seed arrives, relish still sends the
+others theirs, then lists the ones that missed out and exits with an error:
+
+```
+2 machines didn't get their seed:
+  home-2 (d8:9e:f3:12:34:57 at 192.168.1.52): 192.168.1.52: connection refused
+  home-3 (d8:9e:f3:12:34:58 at 192.168.1.53): 192.168.1.53: connection refused
+Their seeds are still in the cluster directory. Once the machines answer, send them again with:
+  relish machines claim /Users/you/home-cluster 192.168.1.52 192.168.1.53
+or copy … into seeds/ on an RBSEED stick and boot the machines with it
+```
+
+The cluster is made either way, and relish points at node 1. Run the
+command it prints once the machines are back: without `--create`, a machine
+the cluster directory already lists gets the seed it was meant to have,
+rather than a new one. Do it within the hour: a join seed's token lasts as
+long as `--ttl` said (an hour by default), and after that the machine can't
+enrol with it.
+
 `--ssh-key ~/.ssh/id_ed25519.pub` puts a key for root SSH into the seeds.
 Only CI lab builds run sshd; published images ignore it.
 

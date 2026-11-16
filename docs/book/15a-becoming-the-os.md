@@ -935,6 +935,35 @@ One more problem. Each node's perimeter firewall lets cluster ports through only
 
 So `relish machines claim` first asks each node to open a *join window*: `POST /v1/perimeter/admit` with an address and up to 60 minutes. The agent keeps the windows in a map from address to closing time, and the firewall loop, which already rebuilt the ruleset whenever gossip membership changed, now also rebuilds it when the set of open windows changes, adding them to the bootstrap peers. When the window closes, the next tick drops it again. By then the machine has joined, and gossip lets it in for good. The window only lets packets in: enrolment still needs the token, and the cluster ports still need certificates. A stick seed gets no window, because it can sit in a drawer for a week.
 
+### When a claim goes half right
+
+Review of the 0.3.0 train found two ways a claim could leave a cluster directory nobody could use.
+
+The first was a typo. Name the same machine twice, `192.168.1.51 192.168.1.52 192.168.1.51`, and `create` made three nodes and wrote three seeds. But a seed's file on the stick is named after its MAC, so the third seed landed on top of the first. Node 1's seed, the one carrying the cluster's keys, became a join seed for `home-3`. The cluster never started. And running the command again, without the typo, failed with "already holds a cluster", because `fleet.json` was already there. Now `create` checks first, before it writes a byte: `refuse_repeats` refuses any machine whose MAC or address appeared earlier in the list, and names both. Putting it in `create` means `cluster create --bare-metal` gets it too, and no caller can forget it. `machines claim` checks twice more, because a target isn't a machine yet. Before it contacts anything, it refuses two targets that resolve to the same address (`192.168.1.51` and the MAC that announced it, say). After it has asked each machine what it is, it refuses two answers with the same MAC: one machine reached at its IPv4 and its IPv6 address. Names can't repeat, because `create` numbers them.
+
+The second was a machine that didn't answer when the seed went out. The loop that posted seeds used `?` on each post, so the first failure returned at once. The machines after it never got their seeds, and `fleet.json` already listed them all, so again the command couldn't simply be run again. Now `deliver_seeds` posts to every machine whatever happened to the one before, and collects the failures:
+
+```rust
+async fn deliver_seeds<F, Fut>(deliveries: &[Delivery], mut post: F) -> Vec<Undelivered>
+where
+    F: FnMut(SocketAddr, String, Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = Result<(), RelishError>>,
+```
+
+The `where` clause says what the two type parameters must be. `F` is anything callable that takes an address, a fingerprint and the seed's bytes, and returns an `Fut`. It's `FnMut` rather than `FnOnce` because it's called once per machine and may change what it captured. `Fut` is any future that resolves to a `Result`. In Rust, calling an async function returns a future, a value describing work that hasn't run yet, so a function handed some async operation has to name both the callable and the future it returns. Go would take a `func(...) error` and be done. The real command passes `|address, fingerprint, seed| async move { post_seed(address, &fingerprint, seed).await }`. The `async move` block takes ownership of what it uses, so the future doesn't borrow the closure's arguments, which are gone once the closure returns. A test passes a closure that records each address and fails for one of them, then checks the machine after it still got its seed.
+
+Once every post has had its go, the command still adopts the cluster's context, even if node 1 was the one that failed, so relish already points at node 1 when a retry reaches it. Then it exits non-zero, naming each machine and why, and says what to run:
+
+```
+2 machines didn't get their seed:
+  home-2 (d8:9e:f3:12:34:57 at 192.168.1.52): 192.168.1.52: connection refused
+  ...
+Their seeds are still in the cluster directory. Once the machines answer, send them again with:
+  relish machines claim /Users/you/home-cluster 192.168.1.52 192.168.1.53
+```
+
+That command had to start working, too. Without `--create`, `machines claim` adds machines to a running cluster, and `plan_additions` refuses a MAC the fleet already has. So `split_known` now sorts the machines first. One that `fleet.json` already lists is sent the seed already written for it, unchanged, join token and all. Only the rest are added. A fleet machine that answers at a different address is refused, because its seed names the old one. relish still tries to open join windows, but when it's only sending seeds again it carries on without them: node 1 may be among the machines, and then there's no cluster yet to ask.
+
 ## A LAN on a laptop
 
 We had no KVM machine and no spare PCs, only CI and one Apple silicon Mac without root. Everything had to run virtualised until the last step.
