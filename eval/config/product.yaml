@@ -1,0 +1,36 @@
+# Product builds the harness can test. Select one with RBEVAL_PRODUCT=<key>.
+# Every digest below was copied from the release's own SHA256SUMS on
+# 2026-10-18; the harness re-verifies each download against these values and
+# refuses to install a binary that does not match.
+default: v0.2.0
+
+targets:
+  v0.2.0:
+    version: "0.2.0"
+    commit: cc5f64393350f2081f7d88512b95a88316172e5a
+    channel: stable
+    release_tag: v0.2.0
+    published: "2026-10-16T18:06:30Z"
+    base_url: https://github.com/reliaburger/reliaburger/releases/download/v0.2.0
+    # Git ref whose docs define "the documented procedure" for this build.
+    docs_ref: v0.2.0
+    sha256:
+      SHA256SUMS: 343ffd3b3406541b41e537e3d20e744059709be4fc4e673b313917085e374be9
+      bun-linux-x86_64: 6dbda6ff67163e0103999d9bbf7433ff055f71e5d59ef24bdada6a779e5830a4
+      relish-linux-x86_64: 2a37047113068b3735e226fedb14322f3be0e9ecf621d4634837aaefad31d190
+
+  # Signed 0.2.1 staging candidate built from main at 499863ae (2026-10-18),
+  # which includes the redb 4.4.0 upgrade (f0ae8b2e) for power-cut safety of
+  # the Raft store. Used to check whether a v0.2.0 failure is fixed on main.
+  v0.2.1-rc.39098892640:
+    version: "0.2.1"
+    commit: 499863ae5050cc5b8ef0e2ca75d209b21ddbccbf
+    channel: staging-candidate
+    release_tag: staging-v0.2.1-39098892640-1
+    published: "2026-10-18T06:00:33Z"
+    base_url: https://github.com/reliaburger/reliaburger/releases/download/staging-v0.2.1-39098892640-1
+    docs_ref: 499863ae5050cc5b8ef0e2ca75d209b21ddbccbf
+    sha256:
+      SHA256SUMS: d7386289566f7f1e54d5e8cccda2645e38dda54d4f16e31a445ce10f6736357c
+      bun-linux-x86_64: 037910749b8cc87a7a3ddd7904ec3663c35b8eb8ddb668e5f653f097df7c05bb
+      relish-linux-x86_64: 38b28768b7c8f2dfa2940d45dbd95c11b3bab659ef5d056599531086499048bc

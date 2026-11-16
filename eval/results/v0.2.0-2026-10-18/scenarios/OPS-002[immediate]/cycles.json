@@ -1,0 +1,68 @@
+[
+  {
+    "cycle": 1,
+    "settle": false,
+    "delete_returned_s": 0.4,
+    "rows_at_apply": 5,
+    "converged_s": 0.1,
+    "since_delete_s": 0.9,
+    "apply_to_converged_s": 0.4,
+    "instances": [
+      "node-01:default__backend-0:running",
+      "node-01:default__frontend-0:running",
+      "node-02:default__backend-1:running",
+      "node-02:default__frontend-1:running",
+      "node-03:default__frontend-2:running"
+    ]
+  },
+  {
+    "cycle": 2,
+    "settle": false,
+    "delete_returned_s": 0.4,
+    "rows_at_apply": 5,
+    "converged_s": 18.1,
+    "since_delete_s": 18.9,
+    "apply_to_converged_s": 18.4,
+    "instances": [
+      "node-01:default__backend-g1-0:running",
+      "node-01:default__frontend-g2-0:running",
+      "node-02:default__backend-g1-1:running",
+      "node-02:default__frontend-g2-1:running",
+      "node-03:default__frontend-g1-2:running"
+    ]
+  },
+  {
+    "cycle": 3,
+    "settle": false,
+    "delete_returned_s": 0.3,
+    "rows_at_apply": 5,
+    "converged_s": 0.1,
+    "since_delete_s": 0.7,
+    "apply_to_converged_s": 0.3,
+    "instances": [
+      "node-01:default__backend-g1-0:running",
+      "node-01:default__frontend-g2-0:running",
+      "node-02:default__backend-g1-1:running",
+      "node-02:default__frontend-g2-1:running",
+      "node-03:default__frontend-g1-2:running"
+    ]
+  },
+  {
+    "cycle": 4,
+    "settle": false,
+    "delete_returned_s": 0.3,
+    "rows_at_apply": 5,
+    "converged_s": null,
+    "since_delete_s": 301.8,
+    "apply_to_converged_s": null,
+    "instances": [
+      "node-01:default__backend-g3-0:running",
+      "node-01:default__backend-g5-0:stopped",
+      "node-01:default__frontend-g2-0:stopped",
+      "node-02:default__backend-1:running",
+      "node-02:default__frontend-g3-1:stopped",
+      "node-02:default__frontend-g4-1:stopped",
+      "node-03:default__frontend-2:running"
+    ]
+  }
+]

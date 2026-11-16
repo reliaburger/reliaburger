@@ -1,0 +1,3 @@
+
+Dropped (no Reliaburger equivalent):
+  - NetworkPolicy/deny-all — no Reliaburger equivalent

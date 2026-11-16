@@ -1,0 +1,3 @@
+
+Dropped (no Reliaburger equivalent):
+  - CustomResourceDefinition/widgets.example.com — no Reliaburger equivalent

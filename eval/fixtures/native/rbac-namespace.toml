@@ -1,0 +1,3 @@
+# Namespace for OPS-003. Only an unscoped admin may apply [namespace] blocks.
+[namespace.rbeval-rbac]
+max_apps = 4

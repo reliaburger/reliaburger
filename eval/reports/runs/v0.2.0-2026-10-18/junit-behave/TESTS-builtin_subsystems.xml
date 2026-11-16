@@ -1,0 +1,172 @@
+<?xml version='1.0' encoding='utf-8'?>
+<testsuite name="builtin_subsystems.Built-in platform services" tests="8" errors="0" failures="2" skipped="0" time="215.703241" timestamp="2026-10-18T14:00:44.538487" hostname="serval"><testcase classname="builtin_subsystems.Built-in platform services" name="The built-in secrets works with nothing else installed -- @1.1 secrets" status="passed" time="179.669835"><system-out>
+
+@scenario.begin
+
+  @req_VIS-002 @claim_secrets_age_encrypted_in_config
+  Scenario Outline: The built-in secrets works with nothing else installed -- @1.1 secrets
+    Given a healthy disposable Reliaburger cluster ... passed in 137.009s
+    And the native fixture application is running ... passed in 27.467s
+    When I exercise the built-in secrets through its documented interface ... passed in 15.194s
+    Then it should give the documented result within the configured time ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] VIS-002[secrets]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="builtin_subsystems.Built-in platform services" name="The built-in registry works with nothing else installed -- @2.1 registry" status="passed" time="1.038483"><system-out>
+
+@scenario.begin
+
+  @req_VIS-002 @claim_pickle_registry_every_node
+  Scenario Outline: The built-in registry works with nothing else installed -- @2.1 registry
+    Given a healthy disposable Reliaburger cluster ... passed in 0.525s
+    And the native fixture application is running ... passed in 0.168s
+    When I exercise the built-in registry through its documented interface ... passed in 0.346s
+    Then it should give the documented result within the configured time ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] VIS-002[registry]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="builtin_subsystems.Built-in platform services" name="The built-in metrics works with nothing else installed -- @3.1 metrics" status="passed" time="0.861487"><system-out>
+
+@scenario.begin
+
+  @req_VIS-002 @claim_mayo_metrics_builtin
+  Scenario Outline: The built-in metrics works with nothing else installed -- @3.1 metrics
+    Given a healthy disposable Reliaburger cluster ... passed in 0.665s
+    And the native fixture application is running ... passed in 0.139s
+    When I exercise the built-in metrics through its documented interface ... passed in 0.058s
+    Then it should give the documented result within the configured time ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] VIS-002[metrics]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="builtin_subsystems.Built-in platform services" name="The built-in resource top works with nothing else installed -- @3.2 metrics" status="passed" time="0.7627"><system-out>
+
+@scenario.begin
+
+  @req_VIS-002 @claim_mayo_metrics_builtin
+  Scenario Outline: The built-in resource top works with nothing else installed -- @3.2 metrics
+    Given a healthy disposable Reliaburger cluster ... passed in 0.535s
+    And the native fixture application is running ... passed in 0.139s
+    When I exercise the built-in resource top through its documented interface ... passed in 0.089s
+    Then it should give the documented result within the configured time ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] VIS-002[top]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="builtin_subsystems.Built-in platform services" name="The built-in logs works with nothing else installed -- @4.1 logs" status="passed" time="15.777019"><system-out>
+
+@scenario.begin
+
+  @req_VIS-002 @claim_ketchup_logs_builtin
+  Scenario Outline: The built-in logs works with nothing else installed -- @4.1 logs
+    Given a healthy disposable Reliaburger cluster ... passed in 0.571s
+    And the native fixture application is running ... passed in 0.109s
+    When I exercise the built-in logs through its documented interface ... passed in 15.097s
+    Then it should give the documented result within the configured time ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] VIS-002[logs]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="builtin_subsystems.Built-in platform services" name="The built-in task array works with nothing else installed -- @5.1 batch" status="passed" time="16.036141"><system-out>
+
+@scenario.begin
+
+  @req_VIS-002 @claim_batch_jobs_one_lifecycle
+  Scenario Outline: The built-in task array works with nothing else installed -- @5.1 batch
+    Given a healthy disposable Reliaburger cluster ... passed in 0.626s
+    And the native fixture application is running ... passed in 0.109s
+    When I exercise the built-in task array through its documented interface ... passed in 15.301s
+    Then it should give the documented result within the configured time ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] VIS-002[batch]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="builtin_subsystems.Built-in platform services" name="The built-in dashboard works with nothing else installed -- @6.1 dashboard" status="failed" time="0.736326"><failure type="AssertionError" message="GET loopback dashboard: 403">
+
+Failing step: Then it should give the documented result within the configured time ... failed in 0.000s
+Location: features/vision/builtin_subsystems.feature:12
+ASSERT FAILED: GET loopback dashboard: 403
+</failure><system-out>
+
+@scenario.begin
+
+  @req_VIS-002 @claim_brioche_dashboard_and_tui
+  Scenario Outline: The built-in dashboard works with nothing else installed -- @6.1 dashboard
+    Given a healthy disposable Reliaburger cluster ... passed in 0.553s
+    And the native fixture application is running ... passed in 0.168s
+    When I exercise the built-in dashboard through its documented interface ... passed in 0.016s
+    Then it should give the documented result within the configured time ... failed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] VIS-002[dashboard]: FAIL (Then it should give the documented result within the configured time: AssertionError: GET loopback dashboard: 403)
+
+
+</system-err></testcase><testcase classname="builtin_subsystems.Built-in platform services" name="The built-in audit log works with nothing else installed -- @7.1 audit" status="failed" time="0.821249"><failure type="AssertionError" message="0 audit line(s) name the fixture's frontend">
+
+Failing step: Then it should give the documented result within the configured time ... failed in 0.000s
+Location: features/vision/builtin_subsystems.feature:12
+ASSERT FAILED: 0 audit line(s) name the fixture's frontend
+</failure><system-out>
+
+@scenario.begin
+
+  @req_VIS-002 @claim_audit_log_durable_bounded
+  Scenario Outline: The built-in audit log works with nothing else installed -- @7.1 audit
+    Given a healthy disposable Reliaburger cluster ... passed in 0.585s
+    And the native fixture application is running ... passed in 0.147s
+    When I exercise the built-in audit log through its documented interface ... passed in 0.088s
+    Then it should give the documented result within the configured time ... failed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] VIS-002[audit]: FAIL (Then it should give the documented result within the configured time: AssertionError: 0 audit line(s) name the fixture's frontend)
+
+
+</system-err></testcase></testsuite>

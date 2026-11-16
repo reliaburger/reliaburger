@@ -1,0 +1,2 @@
+Warning: No --duration specified. Fault will auto-expire in 10 minutes.
+error: API error (status 400): {"error":"replica minimum: frontend has 3 replicas, only 0 would survive"}

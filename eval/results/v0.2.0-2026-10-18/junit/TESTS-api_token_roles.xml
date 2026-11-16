@@ -1,0 +1,324 @@
+<?xml version='1.0' encoding='utf-8'?>
+<testsuite name="api_token_roles.API token roles and scopes" tests="7" errors="7" failures="0" skipped="0" time="7.230284" timestamp="2026-10-18T14:24:45.801232" hostname="serval"><testcase classname="api_token_roles.API token roles and scopes" name="A read-only token scoped to all tries to read cluster status -- @1.1 " status="error" time="1.405336"><error type="CommandFailed" message="command failed rc=1: relish token create --name rbeval-read-only-52af59fda403 --role read-only  # https://10.77.0.11:9117&#10;stderr: error: API error (status 503): not the leader (the leader is node-02)&#10;&#10;stdout:">
+
+Failing step: And a read-only API token scoped to all ... error in 0.088s
+Location: features/operations/api_token_roles.feature:11
+Traceback (most recent call last):
+  File "/home/decoder/dev/reliaburger-eval/.venv/lib/python3.13/site-packages/behave/model.py", line 1991, in run
+    match.run(runner.context)
+    ~~~~~~~~~^^^^^^^^^^^^^^^^
+  File "/home/decoder/dev/reliaburger-eval/.venv/lib/python3.13/site-packages/behave/matchers.py", line 105, in run
+    self.func(context, *args, **kwargs)
+    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "features/steps/security_steps.py", line 68, in step_scoped_token
+    context.s["token_secret"] = make_token(context, role, None if scope == "all" else scope)
+                                ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "features/steps/security_steps.py", line 29, in make_token
+    r = cl.relish.run(*args, check=True, operator=f"relish token create --role {role}"
+                      + (f" --namespaces {namespaces}" if namespaces else ""))
+  File "/home/decoder/dev/reliaburger-eval/harness/cluster.py", line 156, in run
+    raise CommandFailed(result)
+harness.core.CommandFailed: command failed rc=1: relish token create --name rbeval-read-only-52af59fda403 --role read-only  # https://10.77.0.11:9117
+stderr: error: API error (status 503): not the leader (the leader is node-02)
+
+stdout: 
+
+</error><system-out>
+
+@scenario.begin
+
+  @req_OPS-003 @claim_token_roles_and_scoped_rbac
+  Scenario Outline: A read-only token scoped to all tries to read cluster status -- @1.1 
+    Given a healthy disposable Reliaburger cluster ... passed in 1.056s
+    And the namespace rbeval-rbac exists ... passed in 0.262s
+    And a read-only API token scoped to all ... error in 0.088s
+    When the token is used to read cluster status ... skipped in 0.000s
+    Then the API should allow the request ... skipped in 0.000s
+    And a refused request should appear in the audit log as api.refused ... skipped in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] OPS-003[readonly-status]: BLOCKED (setup: And a read-only API token scoped to all: CommandFailed: command failed rc=1: relish token create --name rbeval-read-only-52af59fda403 --role read-only  #)
+
+
+</system-err></testcase><testcase classname="api_token_roles.API token roles and scopes" name="A read-only token scoped to all tries to apply an app in rbeval-rbac -- @1.2 " status="error" time="0.92586"><error type="CommandFailed" message="command failed rc=1: relish token create --name rbeval-read-only-46cbe2fd3f3f --role read-only  # https://10.77.0.11:9117&#10;stderr: error: API error (status 503): not the leader (the leader is node-02)&#10;&#10;stdout:">
+
+Failing step: And a read-only API token scoped to all ... error in 0.145s
+Location: features/operations/api_token_roles.feature:11
+Traceback (most recent call last):
+  File "/home/decoder/dev/reliaburger-eval/.venv/lib/python3.13/site-packages/behave/model.py", line 1991, in run
+    match.run(runner.context)
+    ~~~~~~~~~^^^^^^^^^^^^^^^^
+  File "/home/decoder/dev/reliaburger-eval/.venv/lib/python3.13/site-packages/behave/matchers.py", line 105, in run
+    self.func(context, *args, **kwargs)
+    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "features/steps/security_steps.py", line 68, in step_scoped_token
+    context.s["token_secret"] = make_token(context, role, None if scope == "all" else scope)
+                                ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "features/steps/security_steps.py", line 29, in make_token
+    r = cl.relish.run(*args, check=True, operator=f"relish token create --role {role}"
+                      + (f" --namespaces {namespaces}" if namespaces else ""))
+  File "/home/decoder/dev/reliaburger-eval/harness/cluster.py", line 156, in run
+    raise CommandFailed(result)
+harness.core.CommandFailed: command failed rc=1: relish token create --name rbeval-read-only-46cbe2fd3f3f --role read-only  # https://10.77.0.11:9117
+stderr: error: API error (status 503): not the leader (the leader is node-02)
+
+stdout: 
+
+</error><system-out>
+
+@scenario.begin
+
+  @req_OPS-003 @claim_token_roles_and_scoped_rbac
+  Scenario Outline: A read-only token scoped to all tries to apply an app in rbeval-rbac -- @1.2 
+    Given a healthy disposable Reliaburger cluster ... passed in 0.535s
+    And the namespace rbeval-rbac exists ... passed in 0.246s
+    And a read-only API token scoped to all ... error in 0.145s
+    When the token is used to apply an app in rbeval-rbac ... skipped in 0.000s
+    Then the API should refuse the request ... skipped in 0.000s
+    And a refused request should appear in the audit log as api.refused ... skipped in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] OPS-003[readonly-apply]: BLOCKED (setup: And a read-only API token scoped to all: CommandFailed: command failed rc=1: relish token create --name rbeval-read-only-46cbe2fd3f3f --role read-only  #)
+
+
+</system-err></testcase><testcase classname="api_token_roles.API token roles and scopes" name="A deployer token scoped to rbeval-rbac tries to apply an app in rbeval-rbac -- @1.3 " status="error" time="0.915742"><error type="CommandFailed" message="command failed rc=1: relish token create --name rbeval-deployer-7d471c7a736a --role deployer --namespaces rbeval-rbac  # https://10.77.0.11:9117&#10;stderr: error: API error (status 503): not the leader (the leader is node-02)&#10;&#10;stdout:">
+
+Failing step: And a deployer API token scoped to rbeval-rbac ... error in 0.153s
+Location: features/operations/api_token_roles.feature:11
+Traceback (most recent call last):
+  File "/home/decoder/dev/reliaburger-eval/.venv/lib/python3.13/site-packages/behave/model.py", line 1991, in run
+    match.run(runner.context)
+    ~~~~~~~~~^^^^^^^^^^^^^^^^
+  File "/home/decoder/dev/reliaburger-eval/.venv/lib/python3.13/site-packages/behave/matchers.py", line 105, in run
+    self.func(context, *args, **kwargs)
+    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "features/steps/security_steps.py", line 68, in step_scoped_token
+    context.s["token_secret"] = make_token(context, role, None if scope == "all" else scope)
+                                ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "features/steps/security_steps.py", line 29, in make_token
+    r = cl.relish.run(*args, check=True, operator=f"relish token create --role {role}"
+                      + (f" --namespaces {namespaces}" if namespaces else ""))
+  File "/home/decoder/dev/reliaburger-eval/harness/cluster.py", line 156, in run
+    raise CommandFailed(result)
+harness.core.CommandFailed: command failed rc=1: relish token create --name rbeval-deployer-7d471c7a736a --role deployer --namespaces rbeval-rbac  # https://10.77.0.11:9117
+stderr: error: API error (status 503): not the leader (the leader is node-02)
+
+stdout: 
+
+</error><system-out>
+
+@scenario.begin
+
+  @req_OPS-003 @claim_token_roles_and_scoped_rbac
+  Scenario Outline: A deployer token scoped to rbeval-rbac tries to apply an app in rbeval-rbac -- @1.3 
+    Given a healthy disposable Reliaburger cluster ... passed in 0.525s
+    And the namespace rbeval-rbac exists ... passed in 0.237s
+    And a deployer API token scoped to rbeval-rbac ... error in 0.153s
+    When the token is used to apply an app in rbeval-rbac ... skipped in 0.000s
+    Then the API should allow the request ... skipped in 0.000s
+    And a refused request should appear in the audit log as api.refused ... skipped in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] OPS-003[deployer-apply-own]: BLOCKED (setup: And a deployer API token scoped to rbeval-rbac: CommandFailed: command failed rc=1: relish token create --name rbeval-deployer-7d471c7a736a --role deploy)
+
+
+</system-err></testcase><testcase classname="api_token_roles.API token roles and scopes" name="A deployer token scoped to rbeval-rbac tries to apply an app in default -- @1.4 " status="error" time="1.007407"><error type="CommandFailed" message="command failed rc=1: relish token create --name rbeval-deployer-506b6b5e3390 --role deployer --namespaces rbeval-rbac  # https://10.77.0.11:9117&#10;stderr: error: API error (status 503): not the leader (the leader is node-02)&#10;&#10;stdout:">
+
+Failing step: And a deployer API token scoped to rbeval-rbac ... error in 0.123s
+Location: features/operations/api_token_roles.feature:11
+Traceback (most recent call last):
+  File "/home/decoder/dev/reliaburger-eval/.venv/lib/python3.13/site-packages/behave/model.py", line 1991, in run
+    match.run(runner.context)
+    ~~~~~~~~~^^^^^^^^^^^^^^^^
+  File "/home/decoder/dev/reliaburger-eval/.venv/lib/python3.13/site-packages/behave/matchers.py", line 105, in run
+    self.func(context, *args, **kwargs)
+    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "features/steps/security_steps.py", line 68, in step_scoped_token
+    context.s["token_secret"] = make_token(context, role, None if scope == "all" else scope)
+                                ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "features/steps/security_steps.py", line 29, in make_token
+    r = cl.relish.run(*args, check=True, operator=f"relish token create --role {role}"
+                      + (f" --namespaces {namespaces}" if namespaces else ""))
+  File "/home/decoder/dev/reliaburger-eval/harness/cluster.py", line 156, in run
+    raise CommandFailed(result)
+harness.core.CommandFailed: command failed rc=1: relish token create --name rbeval-deployer-506b6b5e3390 --role deployer --namespaces rbeval-rbac  # https://10.77.0.11:9117
+stderr: error: API error (status 503): not the leader (the leader is node-02)
+
+stdout: 
+
+</error><system-out>
+
+@scenario.begin
+
+  @req_OPS-003 @claim_token_roles_and_scoped_rbac
+  Scenario Outline: A deployer token scoped to rbeval-rbac tries to apply an app in default -- @1.4 
+    Given a healthy disposable Reliaburger cluster ... passed in 0.661s
+    And the namespace rbeval-rbac exists ... passed in 0.224s
+    And a deployer API token scoped to rbeval-rbac ... error in 0.123s
+    When the token is used to apply an app in default ... skipped in 0.000s
+    Then the API should refuse the request ... skipped in 0.000s
+    And a refused request should appear in the audit log as api.refused ... skipped in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] OPS-003[deployer-apply-other]: BLOCKED (setup: And a deployer API token scoped to rbeval-rbac: CommandFailed: command failed rc=1: relish token create --name rbeval-deployer-506b6b5e3390 --role deploy)
+
+
+</system-err></testcase><testcase classname="api_token_roles.API token roles and scopes" name="A deployer token scoped to rbeval-rbac tries to inspect an app in default -- @1.5 " status="error" time="1.035011"><error type="CommandFailed" message="command failed rc=1: relish token create --name rbeval-deployer-dd90bdee7a0d --role deployer --namespaces rbeval-rbac  # https://10.77.0.11:9117&#10;stderr: error: API error (status 503): not the leader (the leader is node-02)&#10;&#10;stdout:">
+
+Failing step: And a deployer API token scoped to rbeval-rbac ... error in 0.154s
+Location: features/operations/api_token_roles.feature:11
+Traceback (most recent call last):
+  File "/home/decoder/dev/reliaburger-eval/.venv/lib/python3.13/site-packages/behave/model.py", line 1991, in run
+    match.run(runner.context)
+    ~~~~~~~~~^^^^^^^^^^^^^^^^
+  File "/home/decoder/dev/reliaburger-eval/.venv/lib/python3.13/site-packages/behave/matchers.py", line 105, in run
+    self.func(context, *args, **kwargs)
+    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "features/steps/security_steps.py", line 68, in step_scoped_token
+    context.s["token_secret"] = make_token(context, role, None if scope == "all" else scope)
+                                ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "features/steps/security_steps.py", line 29, in make_token
+    r = cl.relish.run(*args, check=True, operator=f"relish token create --role {role}"
+                      + (f" --namespaces {namespaces}" if namespaces else ""))
+  File "/home/decoder/dev/reliaburger-eval/harness/cluster.py", line 156, in run
+    raise CommandFailed(result)
+harness.core.CommandFailed: command failed rc=1: relish token create --name rbeval-deployer-dd90bdee7a0d --role deployer --namespaces rbeval-rbac  # https://10.77.0.11:9117
+stderr: error: API error (status 503): not the leader (the leader is node-02)
+
+stdout: 
+
+</error><system-out>
+
+@scenario.begin
+
+  @req_OPS-003 @claim_token_roles_and_scoped_rbac
+  Scenario Outline: A deployer token scoped to rbeval-rbac tries to inspect an app in default -- @1.5 
+    Given a healthy disposable Reliaburger cluster ... passed in 0.654s
+    And the namespace rbeval-rbac exists ... passed in 0.227s
+    And a deployer API token scoped to rbeval-rbac ... error in 0.154s
+    When the token is used to inspect an app in default ... skipped in 0.000s
+    Then the API should refuse the request ... skipped in 0.000s
+    And a refused request should appear in the audit log as api.refused ... skipped in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] OPS-003[deployer-see-other]: BLOCKED (setup: And a deployer API token scoped to rbeval-rbac: CommandFailed: command failed rc=1: relish token create --name rbeval-deployer-dd90bdee7a0d --role deploy)
+
+
+</system-err></testcase><testcase classname="api_token_roles.API token roles and scopes" name="A deployer token scoped to all tries to create an API token -- @1.6 " status="error" time="0.988632"><error type="CommandFailed" message="command failed rc=1: relish token create --name rbeval-deployer-d88f91afdd67 --role deployer  # https://10.77.0.11:9117&#10;stderr: error: API error (status 503): not the leader (the leader is node-02)&#10;&#10;stdout:">
+
+Failing step: And a deployer API token scoped to all ... error in 0.124s
+Location: features/operations/api_token_roles.feature:11
+Traceback (most recent call last):
+  File "/home/decoder/dev/reliaburger-eval/.venv/lib/python3.13/site-packages/behave/model.py", line 1991, in run
+    match.run(runner.context)
+    ~~~~~~~~~^^^^^^^^^^^^^^^^
+  File "/home/decoder/dev/reliaburger-eval/.venv/lib/python3.13/site-packages/behave/matchers.py", line 105, in run
+    self.func(context, *args, **kwargs)
+    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "features/steps/security_steps.py", line 68, in step_scoped_token
+    context.s["token_secret"] = make_token(context, role, None if scope == "all" else scope)
+                                ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "features/steps/security_steps.py", line 29, in make_token
+    r = cl.relish.run(*args, check=True, operator=f"relish token create --role {role}"
+                      + (f" --namespaces {namespaces}" if namespaces else ""))
+  File "/home/decoder/dev/reliaburger-eval/harness/cluster.py", line 156, in run
+    raise CommandFailed(result)
+harness.core.CommandFailed: command failed rc=1: relish token create --name rbeval-deployer-d88f91afdd67 --role deployer  # https://10.77.0.11:9117
+stderr: error: API error (status 503): not the leader (the leader is node-02)
+
+stdout: 
+
+</error><system-out>
+
+@scenario.begin
+
+  @req_OPS-003 @claim_token_roles_and_scoped_rbac
+  Scenario Outline: A deployer token scoped to all tries to create an API token -- @1.6 
+    Given a healthy disposable Reliaburger cluster ... passed in 0.605s
+    And the namespace rbeval-rbac exists ... passed in 0.259s
+    And a deployer API token scoped to all ... error in 0.124s
+    When the token is used to create an API token ... skipped in 0.000s
+    Then the API should refuse the request ... skipped in 0.000s
+    And a refused request should appear in the audit log as api.refused ... skipped in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] OPS-003[deployer-tokens]: BLOCKED (setup: And a deployer API token scoped to all: CommandFailed: command failed rc=1: relish token create --name rbeval-deployer-d88f91afdd67 --role deployer  # ht)
+
+
+</system-err></testcase><testcase classname="api_token_roles.API token roles and scopes" name="A deployer token scoped to all tries to apply a namespace block -- @1.7 " status="error" time="0.952295"><error type="CommandFailed" message="command failed rc=1: relish token create --name rbeval-deployer-207b5bf27f83 --role deployer  # https://10.77.0.11:9117&#10;stderr: error: API error (status 503): not the leader (the leader is node-02)&#10;&#10;stdout:">
+
+Failing step: And a deployer API token scoped to all ... error in 0.153s
+Location: features/operations/api_token_roles.feature:11
+Traceback (most recent call last):
+  File "/home/decoder/dev/reliaburger-eval/.venv/lib/python3.13/site-packages/behave/model.py", line 1991, in run
+    match.run(runner.context)
+    ~~~~~~~~~^^^^^^^^^^^^^^^^
+  File "/home/decoder/dev/reliaburger-eval/.venv/lib/python3.13/site-packages/behave/matchers.py", line 105, in run
+    self.func(context, *args, **kwargs)
+    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "features/steps/security_steps.py", line 68, in step_scoped_token
+    context.s["token_secret"] = make_token(context, role, None if scope == "all" else scope)
+                                ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "features/steps/security_steps.py", line 29, in make_token
+    r = cl.relish.run(*args, check=True, operator=f"relish token create --role {role}"
+                      + (f" --namespaces {namespaces}" if namespaces else ""))
+  File "/home/decoder/dev/reliaburger-eval/harness/cluster.py", line 156, in run
+    raise CommandFailed(result)
+harness.core.CommandFailed: command failed rc=1: relish token create --name rbeval-deployer-207b5bf27f83 --role deployer  # https://10.77.0.11:9117
+stderr: error: API error (status 503): not the leader (the leader is node-02)
+
+stdout: 
+
+</error><system-out>
+
+@scenario.begin
+
+  @req_OPS-003 @claim_token_roles_and_scoped_rbac
+  Scenario Outline: A deployer token scoped to all tries to apply a namespace block -- @1.7 
+    Given a healthy disposable Reliaburger cluster ... passed in 0.541s
+    And the namespace rbeval-rbac exists ... passed in 0.259s
+    And a deployer API token scoped to all ... error in 0.153s
+    When the token is used to apply a namespace block ... skipped in 0.000s
+    Then the API should refuse the request ... skipped in 0.000s
+    And a refused request should appear in the audit log as api.refused ... skipped in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] OPS-003[deployer-namespace]: BLOCKED (setup: And a deployer API token scoped to all: CommandFailed: command failed rc=1: relish token create --name rbeval-deployer-207b5bf27f83 --role deployer  # ht)
+
+
+</system-err></testcase></testsuite>

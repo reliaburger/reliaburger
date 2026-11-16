@@ -1,0 +1,11 @@
+Created:
+  + Deployment/backend
+  + Service/backend
+  + Deployment/frontend
+  + Service/frontend
+  + Ingress/frontend-ingress
+
+Not exported yet (a K8s equivalent exists):
+  ! [app.backend] health — has a K8s equivalent (livenessProbe/readinessProbe) but is not exported yet
+  ! [app.frontend] health — has a K8s equivalent (livenessProbe/readinessProbe) but is not exported yet
+  ! [app.frontend] metrics — has a K8s equivalent (prometheus.io/* pod annotations) but is not exported yet

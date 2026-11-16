@@ -1,0 +1,2 @@
+HOST                           PATH       APP             BACKENDS     WS    
+fixture.rbeval.test            /          frontend        3/3          no    

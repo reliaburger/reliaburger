@@ -1,0 +1,26 @@
+<?xml version='1.0' encoding='utf-8'?>
+<testsuite name="integrated_platform_bootstrap.Integrated platform bootstrap" tests="1" errors="0" failures="0" skipped="0" time="174.142138" timestamp="2026-10-18T14:03:38.688309" hostname="serval"><testcase classname="integrated_platform_bootstrap.Integrated platform bootstrap" name="Bootstrap and serve a multi-service application" status="passed" time="174.142138"><system-out>
+
+@scenario.begin
+
+  @req_VIS-001 @claim_two_binaries_everything_inside @fresh_lab
+  Scenario: Bootstrap and serve a multi-service application
+    Given a disposable lab with 3 clean supported Linux nodes ... passed in 26.663s
+    And a pinned Reliaburger build and its matching documentation ... passed in 0.204s
+    When I provision a 3-node cluster using the documented procedure ... passed in 119.431s
+    And I deploy the fixture application with 2 communicating services ... passed in 27.466s
+    Then all 3 nodes should report healthy within the configured bootstrap timeout ... passed in 0.267s
+    And the application should pass its external HTTP health probe ... passed in 0.006s
+    And inter-service name resolution should pass its connectivity probe ... passed in 0.104s
+    And the evidence should record external platform dependencies and manual interventions ... passed in 0.001s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] VIS-001: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase></testsuite>

@@ -1,0 +1,67 @@
+Converted:
+  + Namespace/boutique
+  + Deployment/adservice → [app.adservice]
+  + Deployment/shippingservice → [app.shippingservice]
+  + Deployment/checkoutservice → [app.checkoutservice]
+  + Deployment/currencyservice → [app.currencyservice]
+  + Deployment/emailservice → [app.emailservice]
+  + Deployment/productcatalogservice → [app.productcatalogservice]
+  + Deployment/frontend → [app.frontend]
+  + Deployment/recommendationservice → [app.recommendationservice]
+  + Deployment/loadgenerator → [app.loadgenerator]
+  + Deployment/cartservice → [app.cartservice]
+  + Deployment/redis-cart → [app.redis-cart]
+  + Deployment/paymentservice → [app.paymentservice]
+
+Approximated (review recommended):
+  ~ Deployment/adservice — livenessProbe is not imported (only readinessProbe maps to a health check)
+  ~ Deployment/adservice — securityContext.fsGroup 1000 dropped: managed volumes are handed to the container's user on first mount, and host path volumes keep their host ownership
+  ~ Deployment/adservice — readinessProbe is a gRPC check; only httpGet probes import, so this app has no health check. Add a [health] block with an HTTP path
+  ~ Deployment/shippingservice — livenessProbe is not imported (only readinessProbe maps to a health check)
+  ~ Deployment/shippingservice — securityContext.fsGroup 1000 dropped: managed volumes are handed to the container's user on first mount, and host path volumes keep their host ownership
+  ~ Deployment/shippingservice — readinessProbe is a gRPC check; only httpGet probes import, so this app has no health check. Add a [health] block with an HTTP path
+  ~ Deployment/checkoutservice — livenessProbe is not imported (only readinessProbe maps to a health check)
+  ~ Deployment/checkoutservice — securityContext.fsGroup 1000 dropped: managed volumes are handed to the container's user on first mount, and host path volumes keep their host ownership
+  ~ Deployment/checkoutservice — readinessProbe is a gRPC check; only httpGet probes import, so this app has no health check. Add a [health] block with an HTTP path
+  ~ Deployment/currencyservice — livenessProbe is not imported (only readinessProbe maps to a health check)
+  ~ Deployment/currencyservice — securityContext.fsGroup 1000 dropped: managed volumes are handed to the container's user on first mount, and host path volumes keep their host ownership
+  ~ Deployment/currencyservice — readinessProbe is a gRPC check; only httpGet probes import, so this app has no health check. Add a [health] block with an HTTP path
+  ~ Deployment/emailservice — livenessProbe is not imported (only readinessProbe maps to a health check)
+  ~ Deployment/emailservice — securityContext.fsGroup 1000 dropped: managed volumes are handed to the container's user on first mount, and host path volumes keep their host ownership
+  ~ Deployment/emailservice — readinessProbe is a gRPC check; only httpGet probes import, so this app has no health check. Add a [health] block with an HTTP path
+  ~ Service/emailservice — port 5000 forwards to container port 8080; Reliaburger has no port mapping, so clients must connect to emailservice:8080 (ingress is unaffected)
+  ~ Deployment/productcatalogservice — livenessProbe is not imported (only readinessProbe maps to a health check)
+  ~ Deployment/productcatalogservice — securityContext.fsGroup 1000 dropped: managed volumes are handed to the container's user on first mount, and host path volumes keep their host ownership
+  ~ Deployment/productcatalogservice — readinessProbe is a gRPC check; only httpGet probes import, so this app has no health check. Add a [health] block with an HTTP path
+  ~ Deployment/frontend — livenessProbe is not imported (only readinessProbe maps to a health check)
+  ~ Deployment/frontend — securityContext.fsGroup 1000 dropped: managed volumes are handed to the container's user on first mount, and host path volumes keep their host ownership
+  ~ Service/frontend — port 80 forwards to container port 8080; Reliaburger has no port mapping, so clients must connect to frontend:8080 (ingress is unaffected)
+  ~ Deployment/recommendationservice — livenessProbe is not imported (only readinessProbe maps to a health check)
+  ~ Deployment/recommendationservice — securityContext.fsGroup 1000 dropped: managed volumes are handed to the container's user on first mount, and host path volumes keep their host ownership
+  ~ Deployment/recommendationservice — readinessProbe is a gRPC check; only httpGet probes import, so this app has no health check. Add a [health] block with an HTTP path
+  ~ Deployment/loadgenerator — securityContext.fsGroup 1000 dropped: managed volumes are handed to the container's user on first mount, and host path volumes keep their host ownership
+  ~ Deployment/cartservice — livenessProbe is not imported (only readinessProbe maps to a health check)
+  ~ Deployment/cartservice — securityContext.fsGroup 1000 dropped: managed volumes are handed to the container's user on first mount, and host path volumes keep their host ownership
+  ~ Deployment/cartservice — readinessProbe is a gRPC check; only httpGet probes import, so this app has no health check. Add a [health] block with an HTTP path
+  ~ Deployment/redis-cart — pod volumes are not imported; declare Reliaburger volumes manually
+  ~ Deployment/redis-cart — livenessProbe is not imported (only readinessProbe maps to a health check)
+  ~ Deployment/redis-cart — securityContext.fsGroup 1000 dropped: managed volumes are handed to the container's user on first mount, and host path volumes keep their host ownership
+  ~ Deployment/redis-cart — readinessProbe is a tcpSocket check; only httpGet probes import, so this app has no health check. Add a [health] block with an HTTP path
+  ~ Deployment/paymentservice — livenessProbe is not imported (only readinessProbe maps to a health check)
+  ~ Deployment/paymentservice — securityContext.fsGroup 1000 dropped: managed volumes are handed to the container's user on first mount, and host path volumes keep their host ownership
+  ~ Deployment/paymentservice — readinessProbe is a gRPC check; only httpGet probes import, so this app has no health check. Add a [health] block with an HTTP path
+  ~ Service/frontend-external — no imported workload has this name, so nothing answers to it; an app is reachable only by its own name
+
+Dropped (no Reliaburger equivalent):
+  - ServiceAccount/adservice — no Reliaburger equivalent
+  - ServiceAccount/shippingservice — no Reliaburger equivalent
+  - ServiceAccount/checkoutservice — no Reliaburger equivalent
+  - ServiceAccount/currencyservice — no Reliaburger equivalent
+  - ServiceAccount/emailservice — no Reliaburger equivalent
+  - ServiceAccount/productcatalogservice — no Reliaburger equivalent
+  - ServiceAccount/frontend — no Reliaburger equivalent
+  - ServiceAccount/recommendationservice — no Reliaburger equivalent
+  - ServiceAccount/loadgenerator — no Reliaburger equivalent
+  - ServiceAccount/cartservice — no Reliaburger equivalent
+  - ServiceAccount/paymentservice — no Reliaburger equivalent
+

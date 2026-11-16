@@ -1,0 +1,40 @@
+{
+  "claim": {
+    "id": "claim_event_and_log_streaming_apis",
+    "axis": "extensibility",
+    "statement": "Events (deploys, restarts, health, jobs, alerts, faults, token changes) are kept per node in memory (newest 1024) and shown by the TUI, dashboard and relish; live log follow is exposed as server-sent events and a WebSocket; the durable record is the audit log.",
+    "kind": "explicit",
+    "sources": [
+      {
+        "ref": "docs/manual/04_observability.md:238-238",
+        "quote": "Events are kept per node, in"
+      },
+      {
+        "ref": "docs/design/logs-ketchup.md:124-124",
+        "quote": "open `GET /v1/logs/{app}/{namespace}?follow=true` (SSE)"
+      }
+    ],
+    "measurable": "Generate more than 1024 events on one node and verify the oldest are gone while relish audit still has them; curl -N the SSE log follow endpoint; each job run raises exactly one event (job-completed, job-failed, job-cancelled, job-unknown, job-skipped).",
+    "interfaces": [
+      "relish events",
+      "relish audit",
+      "GET /v1/logs/{app}/{namespace}?follow=true",
+      "GET /v1/ws/logs/{app}/{namespace}"
+    ],
+    "gap": "No documented external event subscription or watch API for cluster state (rg -n -i \"watch stream|event stream|/v1/events\" README.md docs/whitepaper.md docs/manual docs/README.md found no user-facing route). The Brioche design lists /events and /events/stream (docs/design/ui-brioche.md lines 1940, 1948) but the user docs do not."
+  },
+  "citation_checks": [
+    {
+      "claim_id": "claim_event_and_log_streaming_apis",
+      "ref": "docs/manual/04_observability.md:238-238",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_event_and_log_streaming_apis",
+      "ref": "docs/design/logs-ketchup.md:124-124",
+      "ok": true,
+      "detail": ""
+    }
+  ]
+}

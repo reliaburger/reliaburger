@@ -1,0 +1,2 @@
+Converted:
+  + DaemonSet/agent → [app.agent] (replicas = "*")

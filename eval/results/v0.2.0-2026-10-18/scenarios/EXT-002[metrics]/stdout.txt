@@ -1,0 +1,331 @@
+[
+  {
+    "name": "go_gc_duration_seconds",
+    "kind": "gauge",
+    "series": 30,
+    "instances": 6,
+    "value": 0.0022381830000000004
+  },
+  {
+    "name": "go_gc_duration_seconds_count",
+    "kind": "counter",
+    "series": 6,
+    "instances": 6,
+    "value": 0.0
+  },
+  {
+    "name": "go_gc_duration_seconds_sum",
+    "kind": "counter",
+    "series": 6,
+    "instances": 6,
+    "value": 0.0
+  },
+  {
+    "name": "go_gc_gogc_percent",
+    "kind": "gauge",
+    "series": 6,
+    "instances": 6,
+    "value": 900.0
+  },
+  {
+    "name": "go_gc_gomemlimit_bytes",
+    "kind": "gauge",
+    "series": 6,
+    "instances": 6,
+    "value": 8.301034833169298e+19
+  },
+  {
+    "name": "go_goroutines",
+    "kind": "gauge",
+    "series": 6,
+    "instances": 6,
+    "value": 138.0
+  },
+  {
+    "name": "go_info",
+    "kind": "gauge",
+    "series": 6,
+    "instances": 6,
+    "value": 9.0
+  },
+  {
+    "name": "go_memstats_alloc_bytes",
+    "kind": "gauge",
+    "series": 6,
+    "instances": 6,
+    "value": 97679256.0
+  },
+  {
+    "name": "go_memstats_alloc_bytes_total",
+    "kind": "counter",
+    "series": 6,
+    "instances": 6,
+    "value": 110900.0
+  },
+  {
+    "name": "go_memstats_buck_hash_sys_bytes",
+    "kind": "gauge",
+    "series": 6,
+    "instances": 6,
+    "value": 13031016.0
+  },
+  {
+    "name": "go_memstats_frees_total",
+    "kind": "counter",
+    "series": 6,
+    "instances": 6,
+    "value": 78.1
+  },
+  {
+    "name": "go_memstats_gc_sys_bytes",
+    "kind": "gauge",
+    "series": 6,
+    "instances": 6,
+    "value": 26508416.0
+  },
+  {
+    "name": "go_memstats_heap_alloc_bytes",
+    "kind": "gauge",
+    "series": 6,
+    "instances": 6,
+    "value": 97679256.0
+  },
+  {
+    "name": "go_memstats_heap_idle_bytes",
+    "kind": "gauge",
+    "series": 6,
+    "instances": 6,
+    "value": 46301184.0
+  },
+  {
+    "name": "go_memstats_heap_inuse_bytes",
+    "kind": "gauge",
+    "series": 6,
+    "instances": 6,
+    "value": 111706112.0
+  },
+  {
+    "name": "go_memstats_heap_objects",
+    "kind": "gauge",
+    "series": 6,
+    "instances": 6,
+    "value": 91727.0
+  },
+  {
+    "name": "go_memstats_heap_released_bytes",
+    "kind": "gauge",
+    "series": 6,
+    "instances": 6,
+    "value": 45842432.0
+  },
+  {
+    "name": "go_memstats_heap_sys_bytes",
+    "kind": "gauge",
+    "series": 6,
+    "instances": 6,
+    "value": 158007296.0
+  },
+  {
+    "name": "go_memstats_last_gc_time_seconds",
+    "kind": "gauge",
+    "series": 6,
+    "instances": 6,
+    "value": 16130926585.05532
+  },
+  {
+    "name": "go_memstats_mallocs_total",
+    "kind": "counter",
+    "series": 6,
+    "instances": 6,
+    "value": 967.8000000000001
+  },
+  {
+    "name": "go_memstats_mcache_inuse_bytes",
+    "kind": "gauge",
+    "series": 6,
+    "instances": 6,
+    "value": 41328.0
+  },
+  {
+    "name": "go_memstats_mcache_sys_bytes",
+    "kind": "gauge",
+    "series": 6,
+    "instances": 6,
+    "value": 144648.0
+  },
+  {
+    "name": "go_memstats_mspan_inuse_bytes",
+    "kind": "gauge",
+    "series": 6,
+    "instances": 6,
+    "value": 561280.0
+  },
+  {
+    "name": "go_memstats_mspan_sys_bytes",
+    "kind": "gauge",
+    "series": 6,
+    "instances": 6,
+    "value": 587520.0
+  },
+  {
+    "name": "go_memstats_next_gc_bytes",
+    "kind": "gauge",
+    "series": 6,
+    "instances": 6,
+    "value": 141368498.0
+  },
+  {
+    "name": "go_memstats_other_sys_bytes",
+    "kind": "gauge",
+    "series": 6,
+    "instances": 6,
+    "value": 5796456.0
+  },
+  {
+    "name": "go_memstats_stack_inuse_bytes",
+    "kind": "gauge",
+    "series": 6,
+    "instances": 6,
+    "value": 5570560.0
+  },
+  {
+    "name": "go_memstats_stack_sys_bytes",
+    "kind": "gauge",
+    "series": 6,
+    "instances": 6,
+    "value": 5570560.0
+  },
+  {
+    "name": "go_memstats_sys_bytes",
+    "kind": "gauge",
+    "series": 6,
+    "instances": 6,
+    "value": 209645912.0
+  },
+  {
+    "name": "go_sched_gomaxprocs_threads",
+    "kind": "gauge",
+    "series": 6,
+    "instances": 6,
+    "value": 18.0
+  },
+  {
+    "name": "go_threads",
+    "kind": "gauge",
+    "series": 6,
+    "instances": 6,
+    "value": 63.0
+  },
+  {
+    "name": "http_request_duration_seconds",
+    "kind": "histogram",
+    "series": 17,
+    "instances": 6,
+    "value": 0.00010965705172413794
+  },
+  {
+    "name": "http_requests_total",
+    "kind": "counter",
+    "series": 6,
+    "instances": 6,
+    "value": 5.8
+  },
+  {
+    "name": "process_cpu_percent",
+    "kind": "gauge",
+    "series": 8,
+    "instances": 6,
+    "value": 0.0
+  },
+  {
+    "name": "process_cpu_seconds_total",
+    "kind": "counter",
+    "series": 6,
+    "instances": 6,
+    "value": 0.003
+  },
+  {
+    "name": "process_max_fds",
+    "kind": "gauge",
+    "series": 6,
+    "instances": 6,
+    "value": 9437184.0
+  },
+  {
+    "name": "process_memory_bytes",
+    "kind": "gauge",
+    "series": 8,
+    "instances": 6,
+    "value": 119648256.0
+  },
+  {
+    "name": "process_network_receive_bytes_total",
+    "kind": "counter",
+    "series": 6,
+    "instances": 6,
+    "value": 1365.9
+  },
+  {
+    "name": "process_network_transmit_bytes_total",
+    "kind": "counter",
+    "series": 6,
+    "instances": 6,
+    "value": 11742.300000000001
+  },
+  {
+    "name": "process_open_fds",
+    "kind": "gauge",
+    "series": 6,
+    "instances": 6,
+    "value": 127.0
+  },
+  {
+    "name": "process_resident_memory_bytes",
+    "kind": "gauge",
+    "series": 6,
+    "instances": 6,
+    "value": 362283008.0
+  },
+  {
+    "name": "process_start_time_seconds",
+    "kind": "gauge",
+    "series": 6,
+    "instances": 6,
+    "value": 16130926583.64
+  },
+  {
+    "name": "process_virtual_memory_bytes",
+    "kind": "gauge",
+    "series": 6,
+    "instances": 6,
+    "value": 11965009920.0
+  },
+  {
+    "name": "process_virtual_memory_max_bytes",
+    "kind": "gauge",
+    "series": 6,
+    "instances": 6,
+    "value": 1.6602069666338596e+20
+  },
+  {
+    "name": "promhttp_metric_handler_requests_in_flight",
+    "kind": "gauge",
+    "series": 6,
+    "instances": 6,
+    "value": 9.0
+  },
+  {
+    "name": "promhttp_metric_handler_requests_total",
+    "kind": "counter",
+    "series": 18,
+    "instances": 6,
+    "value": 0.7000000000000001
+  },
+  {
+    "name": "up",
+    "kind": "gauge",
+    "series": 6,
+    "instances": 6,
+    "value": 9.0
+  }
+]

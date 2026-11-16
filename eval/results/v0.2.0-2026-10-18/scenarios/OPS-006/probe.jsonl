@@ -1,0 +1,129 @@
+{"ts": "2026-10-18T12:26:35.921+00:00", "mono": 21150.295894459, "target": "node-01", "ok": true, "status": 200, "latency_ms": 2.1, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:26:35.923+00:00", "mono": 21150.297944201, "target": "node-02", "ok": true, "status": 200, "latency_ms": 1.9, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:26:35.925+00:00", "mono": 21150.29962928, "target": "node-03", "ok": true, "status": 200, "latency_ms": 1.6, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:26:36.922+00:00", "mono": 21151.29651293, "target": "node-01", "ok": true, "status": 200, "latency_ms": 2.6, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:26:36.924+00:00", "mono": 21151.298928134, "target": "node-02", "ok": true, "status": 200, "latency_ms": 2.3, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:26:36.927+00:00", "mono": 21151.30225628, "target": "node-03", "ok": true, "status": 200, "latency_ms": 3.2, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:26:37.923+00:00", "mono": 21152.297411045, "target": "node-01", "ok": true, "status": 200, "latency_ms": 3.3, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:26:37.925+00:00", "mono": 21152.299920645, "target": "node-02", "ok": true, "status": 200, "latency_ms": 2.4, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:26:37.927+00:00", "mono": 21152.301755268, "target": "node-03", "ok": true, "status": 200, "latency_ms": 1.8, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:26:38.922+00:00", "mono": 21153.296681412, "target": "node-01", "ok": true, "status": 200, "latency_ms": 2.7, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:26:38.924+00:00", "mono": 21153.299384569, "target": "node-02", "ok": true, "status": 200, "latency_ms": 2.6, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:26:38.927+00:00", "mono": 21153.30154306, "target": "node-03", "ok": true, "status": 200, "latency_ms": 2.1, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:26:39.922+00:00", "mono": 21154.296803775, "target": "node-01", "ok": true, "status": 200, "latency_ms": 2.7, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:26:39.924+00:00", "mono": 21154.298694719, "target": "node-02", "ok": true, "status": 200, "latency_ms": 1.8, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:26:39.926+00:00", "mono": 21154.300436536, "target": "node-03", "ok": true, "status": 200, "latency_ms": 1.7, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:26:40.922+00:00", "mono": 21155.296772461, "target": "node-01", "ok": true, "status": 200, "latency_ms": 2.8, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:26:40.923+00:00", "mono": 21155.298290497, "target": "node-02", "ok": true, "status": 200, "latency_ms": 1.4, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:26:40.925+00:00", "mono": 21155.299960253, "target": "node-03", "ok": true, "status": 200, "latency_ms": 1.6, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:26:43.930+00:00", "mono": 21158.30530278, "target": "node-01", "ok": false, "status": null, "latency_ms": 2011.1, "error": "TimeoutError: timed out", "body_head": ""}
+{"ts": "2026-10-18T12:26:45.941+00:00", "mono": 21160.315845979, "target": "node-02", "ok": false, "status": null, "latency_ms": 2010.3, "error": "TimeoutError: timed out", "body_head": ""}
+{"ts": "2026-10-18T12:26:47.952+00:00", "mono": 21162.326976234, "target": "node-03", "ok": false, "status": null, "latency_ms": 2010.9, "error": "TimeoutError: timed out", "body_head": ""}
+{"ts": "2026-10-18T12:26:47.954+00:00", "mono": 21162.329224585, "target": "node-01", "ok": true, "status": 200, "latency_ms": 2.1, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:26:49.962+00:00", "mono": 21164.336887698, "target": "node-02", "ok": false, "status": null, "latency_ms": 2007.5, "error": "TimeoutError: timed out", "body_head": ""}
+{"ts": "2026-10-18T12:26:49.965+00:00", "mono": 21164.339571148, "target": "node-03", "ok": true, "status": 200, "latency_ms": 2.5, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:26:51.974+00:00", "mono": 21166.349388704, "target": "node-01", "ok": false, "status": null, "latency_ms": 2009.6, "error": "TimeoutError: timed out", "body_head": ""}
+{"ts": "2026-10-18T12:26:53.981+00:00", "mono": 21168.356034955, "target": "node-02", "ok": false, "status": null, "latency_ms": 2006.4, "error": "TimeoutError: timed out", "body_head": ""}
+{"ts": "2026-10-18T12:26:53.983+00:00", "mono": 21168.358344135, "target": "node-03", "ok": true, "status": 200, "latency_ms": 2.2, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:26:53.985+00:00", "mono": 21168.360259685, "target": "node-01", "ok": true, "status": 200, "latency_ms": 1.8, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:26:55.989+00:00", "mono": 21170.363944835, "target": "node-02", "ok": false, "status": null, "latency_ms": 2003.6, "error": "TimeoutError: timed out", "body_head": ""}
+{"ts": "2026-10-18T12:26:55.991+00:00", "mono": 21170.366267064, "target": "node-03", "ok": true, "status": 200, "latency_ms": 2.2, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:26:55.995+00:00", "mono": 21170.369853484, "target": "node-01", "ok": true, "status": 200, "latency_ms": 3.5, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:26:58.006+00:00", "mono": 21172.380443658, "target": "node-02", "ok": false, "status": null, "latency_ms": 2010.5, "error": "TimeoutError: timed out", "body_head": ""}
+{"ts": "2026-10-18T12:26:58.007+00:00", "mono": 21172.382235544, "target": "node-03", "ok": true, "status": 200, "latency_ms": 1.6, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:26:58.009+00:00", "mono": 21172.384201469, "target": "node-01", "ok": true, "status": 200, "latency_ms": 1.9, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:00.020+00:00", "mono": 21174.394664205, "target": "node-02", "ok": false, "status": null, "latency_ms": 2010.3, "error": "TimeoutError: timed out", "body_head": ""}
+{"ts": "2026-10-18T12:27:00.022+00:00", "mono": 21174.397159422, "target": "node-03", "ok": true, "status": 200, "latency_ms": 2.4, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:00.024+00:00", "mono": 21174.398996791, "target": "node-01", "ok": true, "status": 200, "latency_ms": 1.7, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:02.035+00:00", "mono": 21176.409464816, "target": "node-02", "ok": false, "status": null, "latency_ms": 2010.3, "error": "TimeoutError: timed out", "body_head": ""}
+{"ts": "2026-10-18T12:27:02.037+00:00", "mono": 21176.411953858, "target": "node-03", "ok": true, "status": 200, "latency_ms": 2.4, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:02.039+00:00", "mono": 21176.413726428, "target": "node-01", "ok": true, "status": 200, "latency_ms": 1.7, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:04.048+00:00", "mono": 21178.42320125, "target": "node-02", "ok": false, "status": null, "latency_ms": 2009.4, "error": "TimeoutError: timed out", "body_head": ""}
+{"ts": "2026-10-18T12:27:04.051+00:00", "mono": 21178.425490258, "target": "node-03", "ok": true, "status": 200, "latency_ms": 2.1, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:04.053+00:00", "mono": 21178.427541082, "target": "node-01", "ok": true, "status": 200, "latency_ms": 1.9, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:06.062+00:00", "mono": 21180.437334513, "target": "node-02", "ok": false, "status": null, "latency_ms": 2009.7, "error": "TimeoutError: timed out", "body_head": ""}
+{"ts": "2026-10-18T12:27:06.064+00:00", "mono": 21180.439299736, "target": "node-03", "ok": true, "status": 200, "latency_ms": 1.8, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:06.067+00:00", "mono": 21180.44148391, "target": "node-01", "ok": true, "status": 200, "latency_ms": 2.1, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:08.076+00:00", "mono": 21182.451200771, "target": "node-02", "ok": false, "status": null, "latency_ms": 2009.6, "error": "TimeoutError: timed out", "body_head": ""}
+{"ts": "2026-10-18T12:27:08.079+00:00", "mono": 21182.453624246, "target": "node-03", "ok": true, "status": 200, "latency_ms": 2.3, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:08.081+00:00", "mono": 21182.455977624, "target": "node-01", "ok": true, "status": 200, "latency_ms": 2.3, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:10.091+00:00", "mono": 21184.466377019, "target": "node-02", "ok": false, "status": null, "latency_ms": 2010.2, "error": "TimeoutError: timed out", "body_head": ""}
+{"ts": "2026-10-18T12:27:10.093+00:00", "mono": 21184.468219952, "target": "node-03", "ok": true, "status": 200, "latency_ms": 1.7, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:10.095+00:00", "mono": 21184.470375724, "target": "node-01", "ok": true, "status": 200, "latency_ms": 2.1, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:12.105+00:00", "mono": 21186.480322714, "target": "node-02", "ok": false, "status": null, "latency_ms": 2009.8, "error": "TimeoutError: timed out", "body_head": ""}
+{"ts": "2026-10-18T12:27:12.108+00:00", "mono": 21186.482924691, "target": "node-03", "ok": true, "status": 200, "latency_ms": 2.5, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:12.110+00:00", "mono": 21186.485032258, "target": "node-01", "ok": true, "status": 200, "latency_ms": 2.0, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.120+00:00", "mono": 21188.495201213, "target": "node-02", "ok": false, "status": null, "latency_ms": 2010.0, "error": "TimeoutError: timed out", "body_head": ""}
+{"ts": "2026-10-18T12:27:14.123+00:00", "mono": 21188.497893201, "target": "node-03", "ok": true, "status": 200, "latency_ms": 2.5, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.125+00:00", "mono": 21188.499967639, "target": "node-01", "ok": true, "status": 200, "latency_ms": 2.0, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.126+00:00", "mono": 21188.500720871, "target": "node-02", "ok": false, "status": null, "latency_ms": 0.7, "error": "ConnectionRefusedError: [Errno 111] Connection refused", "body_head": ""}
+{"ts": "2026-10-18T12:27:14.128+00:00", "mono": 21188.502458494, "target": "node-03", "ok": true, "status": 200, "latency_ms": 1.7, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.130+00:00", "mono": 21188.504657195, "target": "node-01", "ok": true, "status": 200, "latency_ms": 2.1, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.130+00:00", "mono": 21188.504950451, "target": "node-02", "ok": false, "status": null, "latency_ms": 0.2, "error": "ConnectionRefusedError: [Errno 111] Connection refused", "body_head": ""}
+{"ts": "2026-10-18T12:27:14.131+00:00", "mono": 21188.505777543, "target": "node-03", "ok": true, "status": 200, "latency_ms": 0.8, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.132+00:00", "mono": 21188.507281314, "target": "node-01", "ok": true, "status": 200, "latency_ms": 1.5, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.133+00:00", "mono": 21188.507434314, "target": "node-02", "ok": false, "status": null, "latency_ms": 0.1, "error": "ConnectionRefusedError: [Errno 111] Connection refused", "body_head": ""}
+{"ts": "2026-10-18T12:27:14.134+00:00", "mono": 21188.50867437, "target": "node-03", "ok": true, "status": 200, "latency_ms": 1.2, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.136+00:00", "mono": 21188.510405718, "target": "node-01", "ok": true, "status": 200, "latency_ms": 1.7, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.136+00:00", "mono": 21188.510570047, "target": "node-02", "ok": false, "status": null, "latency_ms": 0.1, "error": "ConnectionRefusedError: [Errno 111] Connection refused", "body_head": ""}
+{"ts": "2026-10-18T12:27:14.137+00:00", "mono": 21188.511417455, "target": "node-03", "ok": true, "status": 200, "latency_ms": 0.8, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.138+00:00", "mono": 21188.512689229, "target": "node-01", "ok": true, "status": 200, "latency_ms": 1.2, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.138+00:00", "mono": 21188.51283503, "target": "node-02", "ok": false, "status": null, "latency_ms": 0.1, "error": "ConnectionRefusedError: [Errno 111] Connection refused", "body_head": ""}
+{"ts": "2026-10-18T12:27:14.139+00:00", "mono": 21188.51387048, "target": "node-03", "ok": true, "status": 200, "latency_ms": 1.0, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.140+00:00", "mono": 21188.515373611, "target": "node-01", "ok": true, "status": 200, "latency_ms": 1.4, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.141+00:00", "mono": 21188.515595589, "target": "node-02", "ok": false, "status": null, "latency_ms": 0.2, "error": "ConnectionRefusedError: [Errno 111] Connection refused", "body_head": ""}
+{"ts": "2026-10-18T12:27:14.141+00:00", "mono": 21188.516224669, "target": "node-03", "ok": true, "status": 200, "latency_ms": 0.6, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.142+00:00", "mono": 21188.517216932, "target": "node-01", "ok": true, "status": 200, "latency_ms": 0.9, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.143+00:00", "mono": 21188.517447063, "target": "node-02", "ok": false, "status": null, "latency_ms": 0.2, "error": "ConnectionRefusedError: [Errno 111] Connection refused", "body_head": ""}
+{"ts": "2026-10-18T12:27:14.143+00:00", "mono": 21188.51826599, "target": "node-03", "ok": true, "status": 200, "latency_ms": 0.8, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.144+00:00", "mono": 21188.519320445, "target": "node-01", "ok": true, "status": 200, "latency_ms": 1.0, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.145+00:00", "mono": 21188.519570955, "target": "node-02", "ok": false, "status": null, "latency_ms": 0.2, "error": "ConnectionRefusedError: [Errno 111] Connection refused", "body_head": ""}
+{"ts": "2026-10-18T12:27:14.145+00:00", "mono": 21188.520315917, "target": "node-03", "ok": true, "status": 200, "latency_ms": 0.7, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.147+00:00", "mono": 21188.521839534, "target": "node-01", "ok": true, "status": 200, "latency_ms": 1.5, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.147+00:00", "mono": 21188.522300472, "target": "node-02", "ok": false, "status": null, "latency_ms": 0.4, "error": "ConnectionRefusedError: [Errno 111] Connection refused", "body_head": ""}
+{"ts": "2026-10-18T12:27:14.148+00:00", "mono": 21188.523144685, "target": "node-03", "ok": true, "status": 200, "latency_ms": 0.8, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.150+00:00", "mono": 21188.524622391, "target": "node-01", "ok": true, "status": 200, "latency_ms": 1.4, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.150+00:00", "mono": 21188.524869627, "target": "node-02", "ok": false, "status": null, "latency_ms": 0.2, "error": "ConnectionRefusedError: [Errno 111] Connection refused", "body_head": ""}
+{"ts": "2026-10-18T12:27:14.151+00:00", "mono": 21188.525802541, "target": "node-03", "ok": true, "status": 200, "latency_ms": 0.9, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.152+00:00", "mono": 21188.52711548, "target": "node-01", "ok": true, "status": 200, "latency_ms": 1.3, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.152+00:00", "mono": 21188.52737669, "target": "node-02", "ok": false, "status": null, "latency_ms": 0.2, "error": "ConnectionRefusedError: [Errno 111] Connection refused", "body_head": ""}
+{"ts": "2026-10-18T12:27:14.154+00:00", "mono": 21188.528956985, "target": "node-03", "ok": true, "status": 200, "latency_ms": 1.5, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.155+00:00", "mono": 21188.53008156, "target": "node-01", "ok": true, "status": 200, "latency_ms": 1.1, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.155+00:00", "mono": 21188.530288495, "target": "node-02", "ok": false, "status": null, "latency_ms": 0.2, "error": "ConnectionRefusedError: [Errno 111] Connection refused", "body_head": ""}
+{"ts": "2026-10-18T12:27:14.156+00:00", "mono": 21188.531065266, "target": "node-03", "ok": true, "status": 200, "latency_ms": 0.7, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.157+00:00", "mono": 21188.531988942, "target": "node-01", "ok": true, "status": 200, "latency_ms": 0.9, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.157+00:00", "mono": 21188.532205555, "target": "node-02", "ok": false, "status": null, "latency_ms": 0.2, "error": "ConnectionRefusedError: [Errno 111] Connection refused", "body_head": ""}
+{"ts": "2026-10-18T12:27:14.158+00:00", "mono": 21188.533121022, "target": "node-03", "ok": true, "status": 200, "latency_ms": 0.9, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.161+00:00", "mono": 21188.53637649, "target": "node-01", "ok": true, "status": 200, "latency_ms": 1.1, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.162+00:00", "mono": 21188.536736789, "target": "node-02", "ok": false, "status": null, "latency_ms": 0.3, "error": "ConnectionRefusedError: [Errno 111] Connection refused", "body_head": ""}
+{"ts": "2026-10-18T12:27:14.163+00:00", "mono": 21188.53753318, "target": "node-03", "ok": true, "status": 200, "latency_ms": 0.8, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.164+00:00", "mono": 21188.538711803, "target": "node-01", "ok": true, "status": 200, "latency_ms": 1.1, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.164+00:00", "mono": 21188.539024826, "target": "node-02", "ok": false, "status": null, "latency_ms": 0.2, "error": "ConnectionRefusedError: [Errno 111] Connection refused", "body_head": ""}
+{"ts": "2026-10-18T12:27:14.165+00:00", "mono": 21188.540259432, "target": "node-03", "ok": true, "status": 200, "latency_ms": 1.2, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.167+00:00", "mono": 21188.541394173, "target": "node-01", "ok": true, "status": 200, "latency_ms": 1.1, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.167+00:00", "mono": 21188.541579843, "target": "node-02", "ok": false, "status": null, "latency_ms": 0.1, "error": "ConnectionRefusedError: [Errno 111] Connection refused", "body_head": ""}
+{"ts": "2026-10-18T12:27:14.168+00:00", "mono": 21188.542708076, "target": "node-03", "ok": true, "status": 200, "latency_ms": 1.1, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.169+00:00", "mono": 21188.543726921, "target": "node-01", "ok": true, "status": 200, "latency_ms": 1.0, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.169+00:00", "mono": 21188.543995631, "target": "node-02", "ok": false, "status": null, "latency_ms": 0.2, "error": "ConnectionRefusedError: [Errno 111] Connection refused", "body_head": ""}
+{"ts": "2026-10-18T12:27:14.170+00:00", "mono": 21188.545308424, "target": "node-03", "ok": true, "status": 200, "latency_ms": 1.3, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.172+00:00", "mono": 21188.547017105, "target": "node-01", "ok": true, "status": 200, "latency_ms": 1.6, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.172+00:00", "mono": 21188.547221533, "target": "node-02", "ok": false, "status": null, "latency_ms": 0.2, "error": "ConnectionRefusedError: [Errno 111] Connection refused", "body_head": ""}
+{"ts": "2026-10-18T12:27:14.173+00:00", "mono": 21188.548267631, "target": "node-03", "ok": true, "status": 200, "latency_ms": 1.0, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.174+00:00", "mono": 21188.549266639, "target": "node-01", "ok": true, "status": 200, "latency_ms": 0.9, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.175+00:00", "mono": 21188.549428442, "target": "node-02", "ok": false, "status": null, "latency_ms": 0.1, "error": "ConnectionRefusedError: [Errno 111] Connection refused", "body_head": ""}
+{"ts": "2026-10-18T12:27:14.176+00:00", "mono": 21188.550474255, "target": "node-03", "ok": true, "status": 200, "latency_ms": 1.0, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.177+00:00", "mono": 21188.551431262, "target": "node-01", "ok": true, "status": 200, "latency_ms": 0.9, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.177+00:00", "mono": 21188.55156892, "target": "node-02", "ok": false, "status": null, "latency_ms": 0.1, "error": "ConnectionRefusedError: [Errno 111] Connection refused", "body_head": ""}
+{"ts": "2026-10-18T12:27:14.177+00:00", "mono": 21188.55235315, "target": "node-03", "ok": true, "status": 200, "latency_ms": 0.7, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.921+00:00", "mono": 21189.296137935, "target": "node-01", "ok": true, "status": 200, "latency_ms": 2.2, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:14.922+00:00", "mono": 21189.296901371, "target": "node-02", "ok": false, "status": null, "latency_ms": 0.7, "error": "ConnectionRefusedError: [Errno 111] Connection refused", "body_head": ""}
+{"ts": "2026-10-18T12:27:14.924+00:00", "mono": 21189.299096515, "target": "node-03", "ok": true, "status": 200, "latency_ms": 2.1, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:15.921+00:00", "mono": 21190.295460143, "target": "node-01", "ok": true, "status": 200, "latency_ms": 1.6, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:15.921+00:00", "mono": 21190.295787568, "target": "node-02", "ok": false, "status": null, "latency_ms": 0.3, "error": "ConnectionRefusedError: [Errno 111] Connection refused", "body_head": ""}
+{"ts": "2026-10-18T12:27:15.922+00:00", "mono": 21190.296518616, "target": "node-03", "ok": true, "status": 200, "latency_ms": 0.7, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:16.922+00:00", "mono": 21191.296684093, "target": "node-01", "ok": true, "status": 200, "latency_ms": 2.7, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:16.923+00:00", "mono": 21191.298053335, "target": "node-02", "ok": false, "status": null, "latency_ms": 1.3, "error": "ConnectionRefusedError: [Errno 111] Connection refused", "body_head": ""}
+{"ts": "2026-10-18T12:27:16.925+00:00", "mono": 21191.299847934, "target": "node-03", "ok": true, "status": 200, "latency_ms": 1.7, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:17.921+00:00", "mono": 21192.295881858, "target": "node-01", "ok": true, "status": 200, "latency_ms": 2.0, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:17.924+00:00", "mono": 21192.298555096, "target": "node-02", "ok": true, "status": 200, "latency_ms": 2.5, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}
+{"ts": "2026-10-18T12:27:17.926+00:00", "mono": 21192.300956074, "target": "node-03", "ok": true, "status": 200, "latency_ms": 2.3, "error": null, "body_head": "{\n  \"status\": \"OK\"\n}"}

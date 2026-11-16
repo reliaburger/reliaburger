@@ -1,0 +1,84 @@
+{
+  "id": "EXT-007",
+  "name": "Exported Parquet logs are readable by a standard tool",
+  "feature": "features/extensibility/log_export.feature",
+  "axis": "extensibility",
+  "claim_ids": [
+    "claim_log_and_metric_export_to_object_storage",
+    "claim_batteries_included"
+  ],
+  "source_refs": [
+    "docs/manual/04_observability.md:61-61@v0.2.0",
+    "docs/manual/04_observability.md:114-114@v0.2.0",
+    "docs/manual/12_operations.md:332-332@v0.2.0"
+  ],
+  "product_commit": "cc5f64393350f2081f7d88512b95a88316172e5a",
+  "product_target": "v0.2.0",
+  "environment": "environment.json",
+  "tags": [
+    "claim_log_and_metric_export_to_object_storage",
+    "axis_extensibility",
+    "claim_batteries_included",
+    "req_EXT-007"
+  ],
+  "hypothesis": true,
+  "status": "FAIL",
+  "status_reason": "When I export the logs of the node running it to the workstation with relish logs-export: AssertionError: relish logs-export exit 0, 0 files: ",
+  "start_time": "2026-10-18T12:12:05.943+00:00",
+  "duration_ms": 9377,
+  "observations": [
+    "reused the healthy lab cluster built earlier in this or a previous run"
+  ],
+  "expected": {},
+  "measured": {
+    "cluster_health_at_start": {
+      "ts": "2026-10-18T12:12:06.307+00:00",
+      "nodes": {
+        "node-02": "alive",
+        "node-01": "alive",
+        "node-03": "alive"
+      },
+      "leaders": [
+        "node-02"
+      ],
+      "voters": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "voters_answering": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "unanswered": [],
+      "fenced": [],
+      "ok": true
+    },
+    "marker_node": "node-01",
+    "export_rc": 0,
+    "exported_files": [],
+    "export_s": 0.3
+  },
+  "evidence_paths": [
+    "scenarios/EXT-007/claims/claim_log_and_metric_export_to_object_storage.json",
+    "scenarios/EXT-007/claims/claim_batteries_included.json",
+    "scenarios/EXT-007/cluster_state.json",
+    "scenarios/EXT-007/logs-export.txt",
+    "scenarios/EXT-007/diagnostics/wtf.json",
+    "scenarios/EXT-007/diagnostics/status.json",
+    "scenarios/EXT-007/diagnostics/council.json",
+    "scenarios/EXT-007/diagnostics/nodes.json",
+    "scenarios/EXT-007/diagnostics/journal-node-01.txt",
+    "scenarios/EXT-007/diagnostics/journal-node-02.txt",
+    "scenarios/EXT-007/diagnostics/journal-node-03.txt",
+    "scenarios/EXT-007/commands.jsonl"
+  ],
+  "manual_steps": [],
+  "external_dependencies": [],
+  "limitations": [],
+  "deviations": [],
+  "classification": null,
+  "confidence": "high",
+  "failed_step": "When I export the logs of the node running it to the workstation with relish logs-export"
+}

@@ -1,0 +1,26 @@
+<?xml version='1.0' encoding='utf-8'?>
+<testsuite name="external_telemetry.External operational integration" tests="1" errors="0" failures="0" skipped="0" time="39.686695" timestamp="2026-10-18T14:09:04.186503" hostname="serval"><testcase classname="external_telemetry.External operational integration" name="Export application telemetry to an external collector" status="passed" time="39.686695"><system-out>
+
+@scenario.begin
+
+  @req_EXT-001 @claim_apps_export_traces_to_external_collectors @claim_no_otlp_opentelemetry_export
+  Scenario: Export application telemetry to an external collector
+    Given a healthy disposable Reliaburger cluster ... passed in 0.564s
+    And a reachable external telemetry collector in the test lab ... passed in 2.338s
+    And an instrumented fixture application ... passed in 6.403s
+    When I configure telemetry export using documented supported interfaces ... passed in 23.653s
+    And I generate 100 uniquely identifiable application requests ... passed in 0.124s
+    Then the external collector should receive telemetry attributable to the fixture ... passed in 4.012s
+    And the evidence should classify the integration as native, configured, workaround, source_change, or unsupported ... passed in 0.000s
+    And the evidence should record all required product source modifications ... passed in 2.593s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] EXT-001: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase></testsuite>

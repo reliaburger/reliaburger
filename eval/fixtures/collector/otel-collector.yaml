@@ -1,0 +1,16 @@
+# External telemetry collector for EXT-001. Writes every received span and
+# log record as JSON lines so the harness can attribute them to requests.
+receivers:
+  otlp:
+    protocols:
+      grpc: {endpoint: 0.0.0.0:4317}
+      http: {endpoint: 0.0.0.0:4318}
+exporters:
+  file/traces: {path: /out/traces.jsonl}
+  file/logs: {path: /out/logs.jsonl}
+  file/metrics: {path: /out/metrics.jsonl}
+service:
+  pipelines:
+    traces: {receivers: [otlp], exporters: [file/traces]}
+    logs: {receivers: [otlp], exporters: [file/logs]}
+    metrics: {receivers: [otlp], exporters: [file/metrics]}

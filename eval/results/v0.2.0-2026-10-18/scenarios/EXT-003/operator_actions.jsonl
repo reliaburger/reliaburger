@@ -1,0 +1,12 @@
+{"ts": "2026-10-18T12:05:07.739+00:00", "kind": "command", "description": "edit /etc/reliaburger/node.toml on node-01: add alerts", "scenario": "EXT-003"}
+{"ts": "2026-10-18T12:05:08.951+00:00", "kind": "command", "description": "edit /etc/reliaburger/node.toml on node-02: add alerts", "scenario": "EXT-003"}
+{"ts": "2026-10-18T12:05:10.072+00:00", "kind": "command", "description": "edit /etc/reliaburger/node.toml on node-03: add alerts", "scenario": "EXT-003"}
+{"ts": "2026-10-18T12:05:16.531+00:00", "kind": "command", "description": "restart bun on node-02 (pick up alerts)", "scenario": "EXT-003"}
+{"ts": "2026-10-18T12:05:26.067+00:00", "kind": "command", "description": "restart bun on node-03 (pick up alerts)", "scenario": "EXT-003"}
+{"ts": "2026-10-18T12:05:38.990+00:00", "kind": "command", "description": "restart bun on node-01 (pick up alerts)", "scenario": "EXT-003"}
+{"ts": "2026-10-18T12:06:26.725+00:00", "kind": "command", "description": "edit /etc/reliaburger/node.toml on node-01: remove alerts", "scenario": "EXT-003"}
+{"ts": "2026-10-18T12:06:27.898+00:00", "kind": "command", "description": "edit /etc/reliaburger/node.toml on node-02: remove alerts", "scenario": "EXT-003"}
+{"ts": "2026-10-18T12:06:29.000+00:00", "kind": "command", "description": "edit /etc/reliaburger/node.toml on node-03: remove alerts", "scenario": "EXT-003"}
+{"ts": "2026-10-18T12:06:29.677+00:00", "kind": "command", "description": "restart bun on node-01 (drop alerts)", "scenario": "EXT-003"}
+{"ts": "2026-10-18T12:06:38.671+00:00", "kind": "command", "description": "restart bun on node-02 (drop alerts)", "scenario": "EXT-003"}
+{"ts": "2026-10-18T12:06:47.197+00:00", "kind": "command", "description": "restart bun on node-03 (drop alerts)", "scenario": "EXT-003"}

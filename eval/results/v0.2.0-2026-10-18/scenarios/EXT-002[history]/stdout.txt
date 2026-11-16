@@ -1,0 +1,127 @@
+[
+  {
+    "node": "node-01",
+    "id": 1792325209,
+    "app_id": {
+      "name": "frontend",
+      "namespace": "default"
+    },
+    "image": "ghcr.io/stefanprodan/podinfo@sha256:ec73780a8425f59ea49f5bc8cdff0d598805a224fbaa1f86c67a244f250fa9da",
+    "result": "Completed",
+    "created_at": {
+      "secs_since_epoch": 1792325209,
+      "nanos_since_epoch": 771491507
+    },
+    "completed_at": {
+      "secs_since_epoch": 1792325209,
+      "nanos_since_epoch": 771491577
+    },
+    "steps_completed": 2,
+    "steps_total": 2,
+    "spec": {
+      "image": "ghcr.io/stefanprodan/podinfo@sha256:ec73780a8425f59ea49f5bc8cdff0d598805a224fbaa1f86c67a244f250fa9da",
+      "command": [
+        "./podinfo",
+        "--port=9898",
+        "--port-metrics=9797",
+        "--level=info",
+        "--backend-url=http://backend:9898/echo"
+      ],
+      "replicas": 2,
+      "ordinals": [
+        0,
+        2
+      ],
+      "port": 9898,
+      "health": {
+        "path": "/readyz",
+        "port": null,
+        "protocol": "http",
+        "interval": null,
+        "timeout": null,
+        "threshold_unhealthy": null,
+        "threshold_healthy": null,
+        "initial_delay": null
+      },
+      "memory": "33554432-268435456",
+      "cpu": "100m-1000m",
+      "env": {
+        "PODINFO_UI_MESSAGE": "rbeval-frontend"
+      },
+      "ingress": {
+        "host": "fixture.rbeval.test",
+        "path": "/",
+        "tls": null,
+        "websocket": null,
+        "rate_limit_rps": null,
+        "rate_limit_burst": null
+      },
+      "metrics": {
+        "port": 9797,
+        "path": "/metrics"
+      }
+    }
+  },
+  {
+    "node": "node-02",
+    "id": 1792325221,
+    "app_id": {
+      "name": "frontend",
+      "namespace": "default"
+    },
+    "image": "ghcr.io/stefanprodan/podinfo@sha256:ec73780a8425f59ea49f5bc8cdff0d598805a224fbaa1f86c67a244f250fa9da",
+    "result": "Completed",
+    "created_at": {
+      "secs_since_epoch": 1792325221,
+      "nanos_since_epoch": 588386954
+    },
+    "completed_at": {
+      "secs_since_epoch": 1792325221,
+      "nanos_since_epoch": 588387020
+    },
+    "steps_completed": 1,
+    "steps_total": 1,
+    "spec": {
+      "image": "ghcr.io/stefanprodan/podinfo@sha256:ec73780a8425f59ea49f5bc8cdff0d598805a224fbaa1f86c67a244f250fa9da",
+      "command": [
+        "./podinfo",
+        "--port=9898",
+        "--port-metrics=9797",
+        "--level=info",
+        "--backend-url=http://backend:9898/echo"
+      ],
+      "replicas": 1,
+      "ordinals": [
+        1
+      ],
+      "port": 9898,
+      "health": {
+        "path": "/readyz",
+        "port": null,
+        "protocol": "http",
+        "interval": null,
+        "timeout": null,
+        "threshold_unhealthy": null,
+        "threshold_healthy": null,
+        "initial_delay": null
+      },
+      "memory": "33554432-268435456",
+      "cpu": "100m-1000m",
+      "env": {
+        "PODINFO_UI_MESSAGE": "rbeval-frontend"
+      },
+      "ingress": {
+        "host": "fixture.rbeval.test",
+        "path": "/",
+        "tls": null,
+        "websocket": null,
+        "rate_limit_rps": null,
+        "rate_limit_burst": null
+      },
+      "metrics": {
+        "port": 9797,
+        "path": "/metrics"
+      }
+    }
+  }
+]

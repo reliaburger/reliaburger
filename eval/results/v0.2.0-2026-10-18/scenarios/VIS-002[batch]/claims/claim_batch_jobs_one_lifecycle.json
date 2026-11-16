@@ -1,0 +1,40 @@
+{
+  "claim": {
+    "id": "claim_batch_jobs_one_lifecycle",
+    "axis": "vision",
+    "statement": "One-off jobs, cron schedules, deployment hooks (run_before) and task arrays run on a single durable lifecycle with retries (max_attempts default 4), per-attempt timeouts, quotas and admission shared with apps.",
+    "kind": "explicit",
+    "sources": [
+      {
+        "ref": "README.md:356-356",
+        "quote": "Every kind of job runs on one lifecycle: a one-off job, a cron"
+      },
+      {
+        "ref": "docs/README.md:105-105",
+        "quote": "`max_attempts` (default 4, or 1 for a hook)"
+      }
+    ],
+    "measurable": "relish apply a [job.X] with run_before = [\"app.Y\"]; the app is not published until the hook has an accepted successful outcome. A failing job retries up to max_attempts; overlap = \"forbid\" skips a cron occurrence while a run is active; a cron fire with no capacity is recorded as job-skipped, not dropped silently.",
+    "interfaces": [
+      "[job.NAME] runtime, image, command, schedule, run_before, max_attempts, task_timeout_secs, overlap, replay_unknown",
+      "relish jobs",
+      "relish run --batch",
+      "relish batch submit|watch|cancel|results|logs|replay",
+      "relish apply <file> --rerun-jobs"
+    ]
+  },
+  "citation_checks": [
+    {
+      "claim_id": "claim_batch_jobs_one_lifecycle",
+      "ref": "README.md:356-356",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_batch_jobs_one_lifecycle",
+      "ref": "docs/README.md:105-105",
+      "ok": true,
+      "detail": ""
+    }
+  ]
+}

@@ -1,0 +1,59 @@
+{
+  "claim": {
+    "id": "claim_no_crds_operators_plugins_custom_schedulers",
+    "axis": "extensibility",
+    "statement": "There are no CRDs, operators, plugin system, custom scheduler scorers, Helm or sidecars by design; extension happens through the seven built-in resource types, scripts calling the CLI or API, and the integration points listed in the other extensibility claims.",
+    "kind": "explicit",
+    "limitation": true,
+    "sources": [
+      {
+        "ref": "docs/whitepaper.md:982-982",
+        "quote": "Without CRDs, there is no operator framework, by design."
+      },
+      {
+        "ref": "docs/design/scheduler-meat.md:1447-1447",
+        "quote": "Meat uses a fixed set of scoring dimensions with configurable weights"
+      },
+      {
+        "ref": "docs/design/cli-relish.md:1947-1947",
+        "quote": "**No plugins:** The built-in command set is comprehensive enough."
+      },
+      {
+        "ref": "docs/whitepaper.md:984-984",
+        "quote": "When the configuration is already 15 lines of TOML, a package manager"
+      }
+    ],
+    "measurable": "Applying an unknown kind (a CRD) is rejected or reported as dropped; there is no relish plugin discovery (relish-<name> on PATH is not dispatched); scheduler weights are the only scheduling knob (placement labels, replicas = \"*\"); no admission webhook or controller registration API exists.",
+    "interfaces": [
+      "placement.required labels",
+      "relish apply (unknown kind -> Dropped in report)"
+    ],
+    "gap": "rg -n -i \"plugin|extension|controller|CRD\" docs/manual returned only docs/manual/09_kubernetes.md (CRDs listed as dropped on import)."
+  },
+  "citation_checks": [
+    {
+      "claim_id": "claim_no_crds_operators_plugins_custom_schedulers",
+      "ref": "docs/whitepaper.md:982-982",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_no_crds_operators_plugins_custom_schedulers",
+      "ref": "docs/design/scheduler-meat.md:1447-1447",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_no_crds_operators_plugins_custom_schedulers",
+      "ref": "docs/design/cli-relish.md:1947-1947",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_no_crds_operators_plugins_custom_schedulers",
+      "ref": "docs/whitepaper.md:984-984",
+      "ok": true,
+      "detail": ""
+    }
+  ]
+}

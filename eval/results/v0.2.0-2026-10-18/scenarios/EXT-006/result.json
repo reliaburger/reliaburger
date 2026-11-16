@@ -1,0 +1,96 @@
+{
+  "id": "EXT-006",
+  "name": "An external controller reconciles a custom spec over the API",
+  "feature": "features/extensibility/external_controller.feature",
+  "axis": "extensibility",
+  "claim_ids": [
+    "claim_cli_machine_readable_output",
+    "claim_batteries_included",
+    "claim_event_and_log_streaming_apis"
+  ],
+  "source_refs": [
+    "docs/manual/13_reference.md:13-13@v0.2.0",
+    "docs/design/cli-relish.md:1947-1947@v0.2.0",
+    "docs/manual/04_observability.md:238-238@v0.2.0",
+    "docs/design/logs-ketchup.md:124-124@v0.2.0"
+  ],
+  "product_commit": "cc5f64393350f2081f7d88512b95a88316172e5a",
+  "product_target": "v0.2.0",
+  "environment": "environment.json",
+  "tags": [
+    "claim_cli_machine_readable_output",
+    "req_EXT-006",
+    "axis_extensibility",
+    "claim_batteries_included",
+    "claim_event_and_log_streaming_apis"
+  ],
+  "hypothesis": true,
+  "status": "FAIL",
+  "status_reason": "And the cluster event API should list events for the app: AssertionError: GET /v1/events returned None",
+  "start_time": "2026-10-18T12:07:49.307+00:00",
+  "duration_ms": 34617,
+  "observations": [
+    "reused the healthy lab cluster built earlier in this or a previous run"
+  ],
+  "expected": {
+    "controller_converge_s": "<= 120",
+    "drift_revert_s": "<= 60",
+    "events_naming_app": ">= 1"
+  },
+  "measured": {
+    "cluster_health_at_start": {
+      "ts": "2026-10-18T12:07:49.594+00:00",
+      "nodes": {
+        "node-02": "alive",
+        "node-03": "alive",
+        "node-01": "alive"
+      },
+      "leaders": [
+        "node-01"
+      ],
+      "voters": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "voters_answering": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "unanswered": [],
+      "fenced": [],
+      "ok": true
+    },
+    "controller_converge_s": 12.7,
+    "scale_down_observed": true,
+    "drift_revert_s": 17.6,
+    "events_status": null,
+    "events_naming_app": 0
+  },
+  "evidence_paths": [
+    "scenarios/EXT-006/claims/claim_cli_machine_readable_output.json",
+    "scenarios/EXT-006/claims/claim_batteries_included.json",
+    "scenarios/EXT-006/claims/claim_event_and_log_streaming_apis.json",
+    "scenarios/EXT-006/cluster_state.json",
+    "scenarios/EXT-006/events.json",
+    "scenarios/EXT-006/diagnostics/wtf.json",
+    "scenarios/EXT-006/diagnostics/status.json",
+    "scenarios/EXT-006/diagnostics/council.json",
+    "scenarios/EXT-006/diagnostics/nodes.json",
+    "scenarios/EXT-006/diagnostics/journal-node-01.txt",
+    "scenarios/EXT-006/diagnostics/journal-node-02.txt",
+    "scenarios/EXT-006/diagnostics/journal-node-03.txt",
+    "scenarios/EXT-006/controller-actions.json",
+    "scenarios/EXT-006/commands.jsonl"
+  ],
+  "manual_steps": [],
+  "external_dependencies": [],
+  "limitations": [
+    "the custom spec lives in the controller, not the cluster: there is no CRD store and no watch API, so the controller polls relish status"
+  ],
+  "deviations": [],
+  "classification": "workaround",
+  "confidence": "high",
+  "failed_step": "And the cluster event API should list events for the app"
+}

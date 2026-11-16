@@ -1,0 +1,87 @@
+{
+  "id": "VIS-002[dashboard]",
+  "name": "The built-in dashboard works with nothing else installed -- @6.1 dashboard",
+  "feature": "features/vision/builtin_subsystems.feature",
+  "axis": "vision",
+  "claim_ids": [
+    "claim_integrated_platform",
+    "claim_brioche_dashboard_and_tui"
+  ],
+  "source_refs": [
+    "README.md:13-13@v0.2.0",
+    "docs/manual/04_observability.md:244-244@v0.2.0",
+    "README.md:322-322@v0.2.0"
+  ],
+  "product_commit": "cc5f64393350f2081f7d88512b95a88316172e5a",
+  "product_target": "v0.2.0",
+  "environment": "environment.json",
+  "tags": [
+    "claim_integrated_platform",
+    "req_VIS-002",
+    "axis_vision",
+    "claim_brioche_dashboard_and_tui"
+  ],
+  "hypothesis": false,
+  "status": "FAIL",
+  "status_reason": "Then it should give the documented result within the configured time: AssertionError: GET loopback dashboard: 403",
+  "start_time": "2026-10-18T12:00:35.348+00:00",
+  "duration_ms": 5111,
+  "observations": [
+    "reused the healthy lab cluster built earlier in this or a previous run"
+  ],
+  "expected": {
+    "documented_result": true
+  },
+  "measured": {
+    "cluster_health_at_start": {
+      "ts": "2026-10-18T12:00:35.641+00:00",
+      "nodes": {
+        "node-01": "alive",
+        "node-02": "alive",
+        "node-03": "alive"
+      },
+      "leaders": [
+        "node-01"
+      ],
+      "voters": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "voters_answering": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "unanswered": [],
+      "fenced": [],
+      "ok": true
+    },
+    "dashboard_status": 403,
+    "dashboard_ready_s": 0.0,
+    "dashboard_is_html": false,
+    "result": "GET loopback dashboard: 403",
+    "documented_result": false
+  },
+  "evidence_paths": [
+    "scenarios/VIS-002[dashboard]/claims/claim_integrated_platform.json",
+    "scenarios/VIS-002[dashboard]/claims/claim_brioche_dashboard_and_tui.json",
+    "scenarios/VIS-002[dashboard]/cluster_state.json",
+    "scenarios/VIS-002[dashboard]/dashboard-stdout.txt",
+    "scenarios/VIS-002[dashboard]/diagnostics/wtf.json",
+    "scenarios/VIS-002[dashboard]/diagnostics/status.json",
+    "scenarios/VIS-002[dashboard]/diagnostics/council.json",
+    "scenarios/VIS-002[dashboard]/diagnostics/nodes.json",
+    "scenarios/VIS-002[dashboard]/diagnostics/journal-node-01.txt",
+    "scenarios/VIS-002[dashboard]/diagnostics/journal-node-02.txt",
+    "scenarios/VIS-002[dashboard]/diagnostics/journal-node-03.txt",
+    "scenarios/VIS-002[dashboard]/commands.jsonl"
+  ],
+  "manual_steps": [],
+  "external_dependencies": [],
+  "limitations": [],
+  "deviations": [],
+  "classification": "native",
+  "confidence": "high",
+  "failed_step": "Then it should give the documented result within the configured time"
+}

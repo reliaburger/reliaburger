@@ -1,0 +1,7 @@
+{"ts": "2026-10-18T12:13:00.040+00:00", "kind": "command", "description": "relish apply -f baseline.yaml --dry-run (read the migration report)", "scenario": "INT-001"}
+{"ts": "2026-10-18T12:13:17.526+00:00", "kind": "command", "description": "relish import -f baseline.yaml > app.toml", "scenario": "INT-001"}
+{"ts": "2026-10-18T12:13:17.621+00:00", "kind": "command", "description": "relish secret pubkey", "scenario": "INT-001"}
+{"ts": "2026-10-18T12:13:17.632+00:00", "kind": "command", "description": "relish secret encrypt for FIXTURE_TOKEN", "scenario": "INT-001"}
+{"ts": "2026-10-18T12:13:17.634+00:00", "kind": "manifest_edit", "description": "[app.frontend.env] PODINFO_UI_MESSAGE: copy value from ConfigMap/fixture-config", "scenario": "INT-001"}
+{"ts": "2026-10-18T12:13:17.634+00:00", "kind": "manifest_edit", "description": "[app.frontend.env] FIXTURE_TOKEN: relish secret encrypt the Secret/fixture-secret value", "scenario": "INT-001"}
+{"ts": "2026-10-18T12:13:17.993+00:00", "kind": "command", "description": "relish apply app.toml", "scenario": "INT-001"}

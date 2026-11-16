@@ -1,0 +1,85 @@
+{
+  "id": "EXT-005[custom-kind]",
+  "name": "Extend the platform with a custom resource kind in the app config -- @1.1 ",
+  "feature": "features/extensibility/extension_points.feature",
+  "axis": "extensibility",
+  "claim_ids": [
+    "claim_no_crds_operators_plugins_custom_schedulers",
+    "claim_batteries_included"
+  ],
+  "source_refs": [
+    "docs/whitepaper.md:982-982@v0.2.0",
+    "docs/design/scheduler-meat.md:1447-1447@v0.2.0",
+    "docs/design/cli-relish.md:1947-1947@v0.2.0",
+    "docs/whitepaper.md:984-984@v0.2.0"
+  ],
+  "product_commit": "cc5f64393350f2081f7d88512b95a88316172e5a",
+  "product_target": "v0.2.0",
+  "environment": "environment.json",
+  "tags": [
+    "req_EXT-005",
+    "claim_no_crds_operators_plugins_custom_schedulers",
+    "axis_extensibility",
+    "claim_batteries_included"
+  ],
+  "hypothesis": true,
+  "status": "UNSUPPORTED",
+  "status_reason": "relish apply refuses a table it does not know: error: failed to parse TOML: TOML parse error at line 1, column 2\n  |\n1 | [widget.rbeval]\n  |  ^^^^^^\nunknown field `widget`, expected one of `app`, `job`, `namespace`, `permission`, `build`",
+  "start_time": "2026-10-18T12:07:37.592+00:00",
+  "duration_ms": 4174,
+  "observations": [
+    "reused the healthy lab cluster built earlier in this or a previous run"
+  ],
+  "expected": {},
+  "measured": {
+    "cluster_health_at_start": {
+      "ts": "2026-10-18T12:07:37.944+00:00",
+      "nodes": {
+        "node-02": "alive",
+        "node-03": "alive",
+        "node-01": "alive"
+      },
+      "leaders": [
+        "node-01"
+      ],
+      "voters": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "voters_answering": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "unanswered": [],
+      "fenced": [],
+      "ok": true
+    },
+    "mechanism": "a custom resource kind in the app config",
+    "lint_rc": 1,
+    "apply_rc": 1
+  },
+  "evidence_paths": [
+    "scenarios/EXT-005[custom-kind]/claims/claim_no_crds_operators_plugins_custom_schedulers.json",
+    "scenarios/EXT-005[custom-kind]/claims/claim_batteries_included.json",
+    "scenarios/EXT-005[custom-kind]/cluster_state.json",
+    "scenarios/EXT-005[custom-kind]/lint.txt",
+    "scenarios/EXT-005[custom-kind]/apply.txt",
+    "scenarios/EXT-005[custom-kind]/diagnostics/wtf.json",
+    "scenarios/EXT-005[custom-kind]/diagnostics/status.json",
+    "scenarios/EXT-005[custom-kind]/diagnostics/council.json",
+    "scenarios/EXT-005[custom-kind]/diagnostics/nodes.json",
+    "scenarios/EXT-005[custom-kind]/diagnostics/journal-node-01.txt",
+    "scenarios/EXT-005[custom-kind]/diagnostics/journal-node-02.txt",
+    "scenarios/EXT-005[custom-kind]/diagnostics/journal-node-03.txt",
+    "scenarios/EXT-005[custom-kind]/commands.jsonl"
+  ],
+  "manual_steps": [],
+  "external_dependencies": [],
+  "limitations": [],
+  "deviations": [],
+  "classification": null,
+  "confidence": "high",
+  "failed_step": "When I try to extend the platform with a custom resource kind in the app config"
+}

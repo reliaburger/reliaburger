@@ -1,0 +1,122 @@
+{
+  "id": "EXT-001",
+  "name": "Export application telemetry to an external collector",
+  "feature": "features/extensibility/external_telemetry.feature",
+  "axis": "extensibility",
+  "claim_ids": [
+    "claim_apps_export_traces_to_external_collectors",
+    "claim_no_otlp_opentelemetry_export",
+    "claim_batteries_included"
+  ],
+  "source_refs": [
+    "docs/whitepaper.md:991-991@v0.2.0",
+    "docs/manual/03_networking.md:75-75@v0.2.0",
+    "docs/whitepaper.md:991-991@v0.2.0"
+  ],
+  "product_commit": "cc5f64393350f2081f7d88512b95a88316172e5a",
+  "product_target": "v0.2.0",
+  "environment": "environment.json",
+  "tags": [
+    "claim_apps_export_traces_to_external_collectors",
+    "req_EXT-001",
+    "smoke",
+    "claim_no_otlp_opentelemetry_export",
+    "axis_extensibility",
+    "claim_batteries_included"
+  ],
+  "hypothesis": true,
+  "status": "PASS",
+  "status_reason": "all steps passed with recorded measurements",
+  "start_time": "2026-10-18T12:08:23.926+00:00",
+  "duration_ms": 40258,
+  "observations": [
+    "reused the healthy lab cluster built earlier in this or a previous run",
+    "fixture image exports OTLP spans when run directly in Docker against the same collector",
+    "best available path is 'configured'; platform-native OTLP export is unsupported"
+  ],
+  "expected": {
+    "attributed_ratio": ">= 0.9 within 90 s",
+    "product_source_modifications": "recorded; none for a configured integration"
+  },
+  "measured": {
+    "cluster_health_at_start": {
+      "ts": "2026-10-18T12:08:24.220+00:00",
+      "nodes": {
+        "node-02": "alive",
+        "node-03": "alive",
+        "node-01": "alive"
+      },
+      "leaders": [
+        "node-01"
+      ],
+      "voters": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "voters_answering": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "unanswered": [],
+      "fenced": [],
+      "ok": true
+    },
+    "collector_reachable_from_nodes": {
+      "node-01": true,
+      "node-02": true,
+      "node-03": true
+    },
+    "fixture_selftest_span_s": 5.0,
+    "export_paths": {
+      "platform_native_otlp": {
+        "classification": "unsupported",
+        "evidence": "docs state no OTLP/remote_write (claim_no_otlp_opentelemetry_export); `relish <cmd> --help` across 56 commands mentions: nothing"
+      },
+      "application_sdk_otlp": {
+        "classification": "configured",
+        "config": "two env vars in the app config"
+      }
+    },
+    "requests_sent": 100,
+    "request_statuses": {
+      "200": 100
+    },
+    "attributed_ratio": 1.0,
+    "attributed_count": 100,
+    "first_full_attribution_s": 4.0,
+    "collector_service_names": [
+      "rbeval-otel-fixture",
+      "rbeval-otel-selftest"
+    ],
+    "integration_classification": "configured",
+    "node_bun_sha256": {
+      "node-01": "6dbda6ff67163e0103999d9bbf7433ff055f71e5d59ef24bdada6a779e5830a4",
+      "node-02": "6dbda6ff67163e0103999d9bbf7433ff055f71e5d59ef24bdada6a779e5830a4",
+      "node-03": "6dbda6ff67163e0103999d9bbf7433ff055f71e5d59ef24bdada6a779e5830a4"
+    },
+    "product_source_modifications": []
+  },
+  "evidence_paths": [
+    "scenarios/EXT-001/claims/claim_apps_export_traces_to_external_collectors.json",
+    "scenarios/EXT-001/claims/claim_no_otlp_opentelemetry_export.json",
+    "scenarios/EXT-001/claims/claim_batteries_included.json",
+    "scenarios/EXT-001/cluster_state.json",
+    "scenarios/EXT-001/otel-fixture.toml",
+    "scenarios/EXT-001/trace_ids.txt",
+    "services/collector/traces.jsonl",
+    "scenarios/EXT-001/commands.jsonl"
+  ],
+  "manual_steps": [
+    "set OTEL_EXPORTER_OTLP_ENDPOINT and OTEL_EXPORTER_OTLP_INSECURE in [app.otelfix.env]"
+  ],
+  "external_dependencies": [
+    "OpenTelemetry Collector otel/opentelemetry-collector-contrib:0.137.0 on 10.77.0.1:4317 (outside the cluster)"
+  ],
+  "limitations": [],
+  "deviations": [],
+  "classification": "configured",
+  "confidence": "high",
+  "failed_step": null
+}

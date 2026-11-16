@@ -1,0 +1,12 @@
+App: secretprobe (namespace default)
+  Replicas:  1 desired, 1 running
+  Placed:    node-01 1
+
+Instance: default__secretprobe-0
+  Node:      node-01
+  Namespace: default
+  State:     running
+  Restarts:  0
+  PID:       3388
+  Port:      56582
+

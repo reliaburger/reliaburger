@@ -1,0 +1,69 @@
+Reliaburger CLI
+
+Usage: relish-linux-x86_64 [OPTIONS] [COMMAND]
+
+Commands:
+  tui                Launch the interactive terminal UI
+  dashboard          Open a read-only web dashboard through the current authenticated context
+  apply              Apply a Reliaburger TOML or Kubernetes YAML manifest
+  status             Show cluster and app status
+  logs               Stream logs from an app or job
+  logs-export        Export Parquet log files to a destination directory
+  logs-search        Search exported Parquet log archives with SQL
+  top                Show every workload on every node, with its latest CPU and memory
+  metrics            Show an app's own Prometheus metrics, scraped by the nodes running it
+  exec               Execute a command inside a running container
+  inspect            Show every instance of an app across the cluster, with its node
+  stop               Scale an app to zero, keeping its configuration; `relish apply` starts it again
+  delete             Remove an app from the cluster and stop all its instances
+  init               Initialise a new cluster (generates CAs, age keypair, node identity)
+  nodes              List cluster nodes and their gossip state
+  decommission-node  Permanently retire a stopped or fenced node; return requires fresh enrolment
+  council            Show the council (Raft) on every node, or recover from full loss
+  join               Join an existing cluster
+  resolve            Resolve a service name to its VIP and backends
+  routes             Show ingress routing table
+  fault              Inject faults for chaos testing (Smoker)
+  audit              Show who did what: the durable audit log of applies, deletes, execs, upgrades, faults, tokens and the other changes to the cluster
+  snapshot           Manage volume snapshots (Btrfs-backed volumes only)
+  deploy             Trigger a rolling deploy for an app
+  cancel-deploy      Cancel a node-local deploy and wait for its current work to finish
+  history            Show deploy history for an app, from every node
+  rollback           Rollback an app to the previous version
+  lint               Validate a config file without deploying
+  compile            Compile configs into a single resolved output
+  diff               Show structural diff between two configs
+  fmt                Format a TOML config file with canonical ordering
+  import             Convert Kubernetes YAML manifests to Reliaburger TOML
+  export             Export Reliaburger TOML to Kubernetes YAML manifests
+  images             List images in the local Pickle registry
+  build              Build an OCI image and push to Pickle
+  jobs               List bounded job run summaries and rates, or durable definitions with their last outcomes
+  batch              Submit a batch of jobs, or manage a task array
+  run                Run a resource-aware task array from an image or allowlisted host binary
+  batch-status       Show the progress of a submitted batch
+  secret             Manage secrets (encrypt values for use in app configs)
+  ca                 Back up the cluster's root CA, check the backup, and rotate intermediates
+  token              Manage API tokens
+  join-token         Manage short-lived node-enrolment tokens
+  sign               Sign a Pickle-hosted image with your own key so `require_signatures` admits it
+  dev                Manage a local dev cluster (Lima VMs)
+  upgrade            Roll a new bun binary across the cluster, or back
+  manual             Read the built-in manual (searchable TUI; --web for the browser)
+  source             Browse and fuzzy-search the source this binary was built from
+  uninstall          Remove the CLI, its PATH link, the managed Lima tools and the image cache
+  local              Manage a laptop cluster created by setup --quickstart
+  setup              Guided setup: detect or install bun, then write a starter config
+  test               Run the built-in integration test suite against the cluster
+  bench              Run reproducible performance benchmarks against the real data plane
+  wtf                Diagnose cluster health and correlate likely causes
+  path               Walk the network path from a workload to a destination, hop by hop
+  help               Print this message or the help of the given subcommand(s)
+
+Options:
+      --output <OUTPUT>      Output format: human, json, or yaml [default: human] [possible values: human, json, yaml]
+      --token <TOKEN>        API token for authenticating to the agent. Overrides `RELIABURGER_TOKEN`
+      --ca-cert <CA_CERT>    Path to the cluster CA certificate (PEM). When set, the CLI reaches the agent API over HTTPS. Overrides `RELIABURGER_CA_CERT`
+      --endpoint <ENDPOINT>  Bun API base URL. Overrides `RELIABURGER_ENDPOINT` and the default local address (`http[s]://127.0.0.1:9117`)
+  -h, --help                 Print help
+  -V, --version              Print version

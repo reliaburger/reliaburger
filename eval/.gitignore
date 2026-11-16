@@ -1,0 +1,8 @@
+.venv/
+.lab/
+__pycache__/
+*.pyc
+results/_*/
+reports/junit/*.tmp
+reports/runs/_*/
+results/_*.log

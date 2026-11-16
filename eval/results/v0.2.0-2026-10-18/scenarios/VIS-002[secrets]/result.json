@@ -1,0 +1,82 @@
+{
+  "id": "VIS-002[secrets]",
+  "name": "The built-in secrets works with nothing else installed -- @1.1 secrets",
+  "feature": "features/vision/builtin_subsystems.feature",
+  "axis": "vision",
+  "claim_ids": [
+    "claim_integrated_platform",
+    "claim_secrets_age_encrypted_in_config"
+  ],
+  "source_refs": [
+    "README.md:13-13@v0.2.0",
+    "docs/manual/10_security.md:318-318@v0.2.0",
+    "docs/manual/10_security.md:339-339@v0.2.0",
+    "docs/manual/10_security.md:341-341@v0.2.0"
+  ],
+  "product_commit": "cc5f64393350f2081f7d88512b95a88316172e5a",
+  "product_target": "v0.2.0",
+  "environment": "environment.json",
+  "tags": [
+    "claim_integrated_platform",
+    "req_VIS-002",
+    "axis_vision",
+    "claim_secrets_age_encrypted_in_config"
+  ],
+  "hypothesis": false,
+  "status": "PASS",
+  "status_reason": "all steps passed with recorded measurements",
+  "start_time": "2026-10-18T11:57:00.793+00:00",
+  "duration_ms": 179897,
+  "observations": [
+    "no reusable cluster: building fresh VMs and following docs/linux-servers.md"
+  ],
+  "expected": {
+    "documented_result": true
+  },
+  "measured": {
+    "cluster_health_at_start": {
+      "ts": "2026-10-18T11:59:17.497+00:00",
+      "nodes": {
+        "node-03": "alive",
+        "node-02": "alive",
+        "node-01": "alive"
+      },
+      "leaders": [
+        "node-01"
+      ],
+      "voters": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "voters_answering": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "unanswered": [],
+      "fenced": [],
+      "ok": true
+    },
+    "ciphertext_prefix": "ENC[AGE:LS0t",
+    "decrypted_visible_s": 0.0,
+    "plaintext_in_inspect": false,
+    "ciphertext_in_container_env": false,
+    "result": "container env has the plaintext via 10.77.0.12; inspect does not print it",
+    "documented_result": true
+  },
+  "evidence_paths": [
+    "scenarios/VIS-002[secrets]/claims/claim_integrated_platform.json",
+    "scenarios/VIS-002[secrets]/claims/claim_secrets_age_encrypted_in_config.json",
+    "scenarios/VIS-002[secrets]/cluster_state.json",
+    "scenarios/VIS-002[secrets]/inspect.txt",
+    "scenarios/VIS-002[secrets]/commands.jsonl"
+  ],
+  "manual_steps": [],
+  "external_dependencies": [],
+  "limitations": [],
+  "deviations": [],
+  "classification": "native",
+  "confidence": "high",
+  "failed_step": null
+}

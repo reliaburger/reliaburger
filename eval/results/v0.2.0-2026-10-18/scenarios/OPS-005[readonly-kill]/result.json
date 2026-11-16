@@ -1,0 +1,80 @@
+{
+  "id": "OPS-005[readonly-kill]",
+  "name": "relish fault kill frontend --count 1 --acknowledge as read-only -- @1.5 ",
+  "feature": "features/operations/chaos_safety_rails.feature",
+  "axis": "operations",
+  "claim_ids": [
+    "claim_integrated_platform",
+    "claim_chaos_safety_policy"
+  ],
+  "source_refs": [
+    "README.md:13-13@v0.2.0",
+    "docs/manual/05_chaos.md:81-81@v0.2.0",
+    "docs/manual/05_chaos.md:98-98@v0.2.0",
+    "docs/manual/05_chaos.md:169-169@v0.2.0"
+  ],
+  "product_commit": "cc5f64393350f2081f7d88512b95a88316172e5a",
+  "product_target": "v0.2.0",
+  "environment": "environment.json",
+  "tags": [
+    "req_OPS-005",
+    "claim_integrated_platform",
+    "axis_operations",
+    "claim_chaos_safety_policy"
+  ],
+  "hypothesis": false,
+  "status": "FAIL",
+  "status_reason": "When I request the fault \"kill frontend --count 1 --acknowledge\" with a read-only token: CommandFailed: command failed rc=1: relish token create --name rbeval-read-only-1ab6c349b86d --role read-only  # https://10.77.0.11:9117\nstderr: error: API error (status 503): not the leader (the leader is node-02)\n\nstdout: ",
+  "start_time": "2026-10-18T12:25:20.620+00:00",
+  "duration_ms": 5800,
+  "observations": [
+    "reused the healthy lab cluster built earlier in this or a previous run"
+  ],
+  "expected": {},
+  "measured": {
+    "cluster_health_at_start": {
+      "ts": "2026-10-18T12:25:20.948+00:00",
+      "nodes": {
+        "node-02": "alive",
+        "node-01": "alive",
+        "node-03": "alive"
+      },
+      "leaders": [
+        "node-02"
+      ],
+      "voters": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "voters_answering": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "unanswered": [],
+      "fenced": [],
+      "ok": true
+    }
+  },
+  "evidence_paths": [
+    "scenarios/OPS-005[readonly-kill]/claims/claim_integrated_platform.json",
+    "scenarios/OPS-005[readonly-kill]/claims/claim_chaos_safety_policy.json",
+    "scenarios/OPS-005[readonly-kill]/cluster_state.json",
+    "scenarios/OPS-005[readonly-kill]/diagnostics/wtf.json",
+    "scenarios/OPS-005[readonly-kill]/diagnostics/status.json",
+    "scenarios/OPS-005[readonly-kill]/diagnostics/council.json",
+    "scenarios/OPS-005[readonly-kill]/diagnostics/nodes.json",
+    "scenarios/OPS-005[readonly-kill]/diagnostics/journal-node-01.txt",
+    "scenarios/OPS-005[readonly-kill]/diagnostics/journal-node-02.txt",
+    "scenarios/OPS-005[readonly-kill]/diagnostics/journal-node-03.txt",
+    "scenarios/OPS-005[readonly-kill]/commands.jsonl"
+  ],
+  "manual_steps": [],
+  "external_dependencies": [],
+  "limitations": [],
+  "deviations": [],
+  "classification": null,
+  "confidence": "high",
+  "failed_step": "When I request the fault \"kill frontend --count 1 --acknowledge\" with a read-only token"
+}

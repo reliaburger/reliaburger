@@ -1,0 +1,132 @@
+# Pre-registered pass/fail thresholds.
+#
+# Rule: these values are committed before the scenarios that use them run,
+# and are never changed to make a result pass. Git history is the record.
+# A change for a new product release goes in its own commit with a reason.
+#
+# Each threshold names its basis: a claim id from claims/claims.yaml when the
+# product documents a number, or `hypothesis` when the number is ours.
+
+http:
+  probe_timeout_s: {value: 2, basis: hypothesis, note: per-request timeout for every external HTTP probe}
+
+bootstrap:
+  cluster_formation_s:
+    value: 180
+    basis: hypothesis
+    note: >-
+      linux-servers.md states no duration. Measured from starting bun on the
+      last node to 3 alive nodes, 3 council voters with one leader, and
+      `relish status` exit 0. The quickstart builds three VMs and a demo app
+      inside a 300 s deadline (claim_quickstart_five_minutes), so formation
+      alone should fit well inside 180 s.
+  app_ready_s:
+    value: 300
+    basis: hypothesis
+    note: From `relish apply` to every replica healthy and the ingress probe passing; includes first image pull over the lab NAT.
+
+quickstart:
+  build_deadline_s: {value: 300, basis: claim_quickstart_five_minutes, note: "setup's own deadline from first VM boot to demo app, downloads excluded"}
+
+node_loss:
+  probe_interval_s: {value: 1, basis: seed scenario}
+  detection_s:
+    value: 30
+    basis: hypothesis
+    note: >-
+      SWIM protocol interval 500 ms and probe timeout 200 ms are documented
+      (claim_swim_failure_detection_timings); the suspicion timeout is not.
+      Detection = the lost node is no longer `alive` in `relish nodes` as seen
+      from a survivor.
+  recovery_s:
+    value: 120
+    basis: claim_node_loss_reschedules_in_about_a_minute
+    note: The tour says "about a minute"; the 2026-09-24 qualification measured 52-57 s. Threshold is twice the claim. Measured from power-off to the desired count of running, healthy replicas on survivors.
+  availability_min_ratio:
+    value: 0.95
+    basis: hypothesis
+    note: Share of 1 Hz ingress probes (through a surviving node) that succeed between power-off and recovery + post_recovery_observe_s.
+  post_recovery_observe_s: {value: 30, basis: hypothesis}
+
+leader_loss:
+  election_s: {value: 5, basis: claim_leader_election_and_learning_period_targets, note: documented target for electing a new leader}
+  writes_resume_s: {value: 20, basis: claim_leader_election_and_learning_period_targets, note: documented target for full operability after leader loss}
+
+partition:
+  isolation_s: {value: 60, basis: hypothesis, note: how long one node is cut off from its peers by an nftables table on that node; the operator path stays open}
+  rejoin_s: {value: 120, basis: hypothesis, note: from link restore to the node alive again and the council back to 3 voters}
+  minority_serving_min_ratio: {value: 0.9, basis: claim_partitions_no_split_brain_and_degradation, note: "minority-side nodes keep running apps; 20 requests through the minority ingress"}
+
+power_cut:
+  cycles: {value: 3, basis: hypothesis, note: "hard power cuts of one voter under write load"}
+  load_before_cut_s: {value: 10, basis: hypothesis}
+  rejoin_s: {value: 180, basis: hypothesis, note: "power-on to the node alive and the council back to 3 answering voters"}
+
+power_cycle:
+  recovery_s: {value: 300, basis: hypothesis, note: "all nodes powered on to council healthy and the fixture serving on every ingress"}
+
+rolling_deploy:
+  availability_min_ratio: {value: 0.99, basis: claim_rolling_deploys_health_gated_auto_rollback, note: "docs: max_unavailable 0 and connection draining; 1 Hz ingress probes during a redeploy"}
+  completion_s: {value: 300, basis: hypothesis}
+  rollback_s: {value: 180, basis: claim_rolling_deploys_health_gated_auto_rollback, note: "docs: 60 s health gate, then automatic rollback"}
+
+redeploy:
+  cycles: {value: 5, basis: hypothesis, note: "delete and re-apply cycles per variant; one wedge in five is a reproducible failure"}
+  converge_s: {value: 300, basis: hypothesis, note: "same budget as bootstrap.app_ready_s for a first deploy"}
+  retire_s: {value: 180, basis: hypothesis, note: "time for relish status to stop listing a deleted app before the next apply"}
+
+observability:
+  logs_visible_s: {value: 30, basis: hypothesis, note: from a request with a unique marker to the marker in `relish logs`}
+  metrics_visible_s: {value: 60, basis: claim_app_metrics_scraping_and_extra_targets, note: "docs: scraped every 10 s"}
+  webhook_delivery_s: {value: 90, basis: claim_alert_webhooks_outbound, note: from the triggering event to the first delivery at the external receiver}
+  telemetry_min_attributed_ratio: {value: 0.9, basis: hypothesis, note: share of the 100 uniquely tagged requests the external collector can attribute}
+
+extension:
+  controller_poll_s: {value: 2, basis: hypothesis, note: "the external controller polls relish status; there is no watch API"}
+  controller_converge_s: {value: 120, basis: hypothesis, note: "custom spec created to its app running"}
+  drift_revert_s: {value: 60, basis: hypothesis, note: "manual scale-down to the controller restoring the spec"}
+
+logs_export:
+  query_s: {value: 120, basis: hypothesis, note: "export on one node, then an external Parquet reader finds the marker"}
+
+batch:
+  tasks: {value: 20, basis: hypothesis, note: "a small task array; the 0.2.0 headline is a million"}
+  completion_s: {value: 300, basis: hypothesis}
+
+dashboard:
+  ready_s: {value: 20, basis: hypothesis, note: "relish dashboard prints its loopback link and serves the page"}
+
+registry:
+  min_copies: {value: 2, basis: claim_pickle_registry_every_node, note: "the heal loop brings layer copies to 2"}
+
+gitops:
+  sync_s: {value: 90, basis: claim_lettuce_gitops_builtin, note: "docs: polls every 30 s by default; threshold 3x"}
+  drift_revert_s: {value: 90, basis: claim_lettuce_gitops_builtin, note: "docs: every poll reconciles, so a manual change is reverted on the next 30 s poll; threshold 3x"}
+  delete_s: {value: 90, basis: claim_lettuce_gitops_builtin, note: "docs: deleting an app from the repository removes it from the cluster"}
+
+migration:
+  max_manual_steps:
+    value: 6
+    basis: hypothesis
+    note: >-
+      "Limited rework" made concrete for the five-kind baseline fixture
+      (2 Deployments, 2 Services, Ingress, ConfigMap, Secret): at most six
+      manifest changes or manual steps, each one named by the migration
+      report or docs/manual/09_kubernetes.md.
+
+interop:
+  realworld_ready_s: {value: 600, basis: hypothesis, note: "upstream images are pulled from their own registries on first use"}
+  realworld_max_manual_steps: {value: 3, basis: claim_smooth_k8s_transition, note: "a smooth path needs at most a few edits to unmodified upstream manifests"}
+  export_rollout_s: {value: 300, basis: hypothesis, note: "relish export output applied to the kind baseline until its deployments roll out"}
+
+security:
+  perimeter_probe_timeout_s: {value: 3, basis: hypothesis}
+
+chaos:
+  kill_recovery_s: {value: 120, basis: claim_node_loss_reschedules_in_about_a_minute, note: "a killed instance should come back at least as fast as a lost node's replicas"}
+  audit_visible_s: {value: 30, basis: hypothesis}
+
+timeouts:
+  command_default_s: 300
+  image_pull_s: 600
+  lab_up_s: 1200

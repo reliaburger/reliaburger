@@ -1,0 +1,58 @@
+{
+  "claim": {
+    "id": "claim_k8s_drops_reported_not_silent",
+    "axis": "interoperability",
+    "statement": "Unsupported or approximated Kubernetes features are reported, not silently ignored; dropped items include NetworkPolicy, PVC, CRDs, sidecars (only the first container imports), liveness probes, non-HTTP readiness probes, valueFrom env, and ConfigMap/Secret wiring.",
+    "kind": "explicit",
+    "limitation": true,
+    "sources": [
+      {
+        "ref": "docs/manual/09_kubernetes.md:22-22",
+        "quote": "(NetworkPolicy, PersistentVolumeClaim, CRDs) lands in the report's Dropped list"
+      },
+      {
+        "ref": "docs/manual/09_kubernetes.md:54-54",
+        "quote": "ConfigMaps and Secrets: not wired into workloads"
+      },
+      {
+        "ref": "docs/manual/09_kubernetes.md:45-45",
+        "quote": "sidecars: only the first container is imported;"
+      },
+      {
+        "ref": "docs/whitepaper.md:997-997",
+        "quote": "Matching on label selectors, the way Kubernetes itself does, is planned"
+      }
+    ],
+    "measurable": "Apply a manifest with a NetworkPolicy, PVC, CRD instance, a 2-container pod, livenessProbe, envFrom/valueFrom, a ConfigMap-backed env; each appears in the Dropped or warnings list and is not applied; import --strict exits non-zero on any warning; same-name apps in two namespaces become [app.NAMESPACE-NAME] with a warning; Services are matched to Deployments by name, not by label selector.",
+    "interfaces": [
+      "relish apply -f",
+      "relish import -f --strict"
+    ]
+  },
+  "citation_checks": [
+    {
+      "claim_id": "claim_k8s_drops_reported_not_silent",
+      "ref": "docs/manual/09_kubernetes.md:22-22",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_k8s_drops_reported_not_silent",
+      "ref": "docs/manual/09_kubernetes.md:54-54",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_k8s_drops_reported_not_silent",
+      "ref": "docs/manual/09_kubernetes.md:45-45",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_k8s_drops_reported_not_silent",
+      "ref": "docs/whitepaper.md:997-997",
+      "ok": true,
+      "detail": ""
+    }
+  ]
+}

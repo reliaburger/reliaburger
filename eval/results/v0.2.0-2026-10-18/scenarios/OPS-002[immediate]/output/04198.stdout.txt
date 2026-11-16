@@ -1,0 +1,101 @@
+Oct 18 12:29:56 node-02 bun[737]: report worker: admission at 10.77.0.11:9445 failed; next tick collects fresh state: send failed: TCP connect to 10.77.0.11:9445 timed out
+Oct 18 12:30:01 node-02 bun[737]: report worker: admission at 10.77.0.11:9445 failed; next tick collects fresh state: send failed: TCP connect to 10.77.0.11:9445 timed out
+Oct 18 12:30:02 node-02 bun[737]: pickle: registry cleanup pending: replication failed: registry ownership query timed out
+Oct 18 12:30:06 node-02 bun[737]: report worker: admission at 10.77.0.11:9445 failed; next tick collects fresh state: send failed: TCP connect to 10.77.0.11:9445 timed out
+Oct 18 12:31:31 node-02 bun[737]: report worker: admission at 10.77.0.13:9445 failed; next tick collects fresh state: send failed: TCP connect to 10.77.0.13:9445 timed out
+Oct 18 12:31:35 node-02 bun[737]: pickle: registry cleanup pending: replication failed: registry ownership query timed out
+Oct 18 12:31:36 node-02 bun[737]: report worker: admission at 10.77.0.13:9445 failed; next tick collects fresh state: send failed: TCP connect to 10.77.0.13:9445 timed out
+Oct 18 12:31:41 node-02 bun[737]: report worker: admission at 10.77.0.13:9445 failed; next tick collects fresh state: send failed: TCP connect to 10.77.0.13:9445 timed out
+Oct 18 12:31:45 node-02 bun[737]: pickle: registry cleanup pending: replication failed: registry ownership query timed out
+Oct 18 12:31:46 node-02 bun[737]: report worker: admission at 10.77.0.13:9445 failed; next tick collects fresh state: send failed: TCP connect to 10.77.0.13:9445 timed out
+Oct 18 12:31:51 node-02 bun[737]: report worker: admission at 10.77.0.13:9445 failed; next tick collects fresh state: send failed: TCP connect to 10.77.0.13:9445 timed out
+Oct 18 12:31:55 node-02 bun[737]: pickle: registry cleanup pending: replication failed: registry ownership query timed out
+Oct 18 12:31:56 node-02 bun[737]: report worker: admission at 10.77.0.13:9445 failed; next tick collects fresh state: send failed: TCP connect to 10.77.0.13:9445 timed out
+Oct 18 12:32:01 node-02 bun[737]: report worker: admission at 10.77.0.13:9445 failed; next tick collects fresh state: send failed: TCP connect to 10.77.0.13:9445 timed out
+Oct 18 12:32:05 node-02 bun[737]: pickle: registry cleanup pending: replication failed: registry ownership query timed out
+Oct 18 12:32:06 node-02 bun[737]: report worker: admission at 10.77.0.13:9445 failed; next tick collects fresh state: send failed: TCP connect to 10.77.0.13:9445 timed out
+Oct 18 12:32:11 node-02 bun[737]: report worker: admission at 10.77.0.13:9445 failed; next tick collects fresh state: send failed: TCP connect to 10.77.0.13:9445 timed out
+Oct 18 12:32:15 node-02 bun[737]: pickle: registry cleanup pending: replication failed: registry ownership query timed out
+Oct 18 12:32:16 node-02 bun[737]: report worker: admission at 10.77.0.13:9445 failed; next tick collects fresh state: send failed: TCP connect to 10.77.0.13:9445 timed out
+Oct 18 12:32:21 node-02 bun[737]: mayo: rollup admission failed; requesting the last five minutes next tick (older gaps remain in local metrics only): send failed: TCP connect to 10.77.0.13:9445 timed out
+Oct 18 12:32:21 node-02 bun[737]: report worker: admission at 10.77.0.13:9445 failed; next tick collects fresh state: send failed: TCP connect to 10.77.0.13:9445 timed out
+Oct 18 12:32:25 node-02 bun[737]: bun: the leader hasn't answered for 60s; routing only to this node's own backends until it does
+Oct 18 12:32:25 node-02 bun[737]: pickle: registry cleanup pending: replication failed: registry ownership query timed out
+Oct 18 12:32:26 node-02 bun[737]: pickle: registry cleanup pending: replication failed: registry leader refused proposal: 503 Service Unavailable
+Oct 18 12:32:26 node-02 bun[737]: pickle: registry cleanup pending: replication failed: registry leader refused proposal: 503 Service Unavailable
+-- Boot c19040e968914a78a09631944f248537 --
+Oct 18 12:34:08 node-02 systemd[1]: Starting reliaburger.service - Reliaburger node...
+Oct 18 12:34:08 node-02 systemd[1]: Started reliaburger.service - Reliaburger node.
+Oct 18 12:34:08 node-02 bun[728]: bun: reliaburger node agent v0.2.0 (cc5f643)
+Oct 18 12:34:08 node-02 bun[728]: bun: using runc runtime (root)
+Oct 18 12:34:08 node-02 bun[728]: bun: workloads use DNS nameserver 10.77.0.12
+Oct 18 12:34:08 node-02 bun[728]: bun: mTLS enabled on the Raft RPC, reporting and API transports
+Oct 18 12:34:08 node-02 bun[728]: bun: cluster mode — gossip on 10.77.0.12:9443, 1 seed(s)
+Oct 18 12:34:08 node-02 bun[728]: council: no peer advertises a newer recovery epoch than 0; serving raft
+Oct 18 12:34:08 node-02 bun[728]: bun: GPU support enabled, 0 device(s) detected
+Oct 18 12:34:09 node-02 bun[728]: bun: eBPF data path loaded (attached=true)
+Oct 18 12:34:09 node-02 bun[728]: bun: dns responder ready on 10.77.0.12:53
+Oct 18 12:34:09 node-02 bun[728]: bun: ingress listening on http 0.0.0.0:80 / https 0.0.0.0:443
+Oct 18 12:34:09 node-02 bun[728]: bun: observability enabled (metrics + logs + alerts)
+Oct 18 12:34:09 node-02 bun[728]: bun: API server listening on 0.0.0.0:9117
+Oct 18 12:34:09 node-02 bun[728]: bun: pickle catalog loaded (2 manifests)
+Oct 18 12:34:09 node-02 bun[728]: bun: Pickle registry listening on 0.0.0.0:5050 (TLS, authenticated writes and reads)
+Oct 18 12:34:09 node-02 bun[728]: bun: Pickle registry derived peer-reachable bind 0.0.0.0:5050 from cluster advertise address
+Oct 18 12:35:11 node-02 bun[728]: bun: agent loop turn took 501 ms in stop_wait: journal write 18 ms, runtime inventory 0 ms
+Oct 18 12:35:12 node-02 bun[728]: bun: agent loop turn took 501 ms in stop_wait: journal write 9 ms, runtime inventory 0 ms
+Oct 18 12:35:41 node-02 bun[728]: bun: agent loop turn took 501 ms in stop_wait: journal write 13 ms, runtime inventory 0 ms
+Oct 18 12:35:42 node-02 bun[728]: bun: agent loop turn took 501 ms in stop_wait: journal write 27 ms, runtime inventory 1 ms
+Oct 18 12:35:42 node-02 bun[728]: bun: agent loop turn took 282 ms in stop_wait: journal write 90 ms, runtime inventory 1 ms, kernel lock wait 0 ms, firewall sync 132 ms
+Oct 18 12:36:11 node-02 bun[728]: bun: agent loop turn took 500 ms in stop_wait: journal write 10 ms, runtime inventory 0 ms
+Oct 18 12:36:11 node-02 bun[728]: orchestrator: retirement of frontend/default failed, will retry: cannot retire artifacts for default__frontend-1 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:36:13 node-02 bun[728]: bun: agent loop turn took 501 ms in stop_wait: journal write 19 ms, runtime inventory 0 ms
+Oct 18 12:36:43 node-02 bun[728]: bun: agent loop turn took 501 ms in stop_wait: journal write 10 ms, runtime inventory 0 ms
+Oct 18 12:36:44 node-02 bun[728]: bun: agent loop turn took 500 ms in stop_wait: journal write 34 ms, runtime inventory 0 ms
+Oct 18 12:36:44 node-02 bun[728]: bun: agent loop turn took 252 ms in stop_wait: journal write 55 ms, runtime inventory 2 ms, kernel lock wait 0 ms, firewall sync 140 ms
+Oct 18 12:37:23 node-02 bun[728]: orchestrator: retirement of frontend/default failed, will retry: cannot retire artifacts for default__frontend-1 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:37:23 node-02 bun[728]: orchestrator: retirement of backend/default failed, will retry: cannot retire artifacts for default__backend-1 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:37:30 node-02 bun[728]: bun: agent loop turn took 501 ms in deploy_op (finish_retire): journal write 14 ms, runtime inventory 0 ms
+Oct 18 12:37:36 node-02 bun[728]: bun: agent loop turn took 501 ms in deploy_op (finish_retire): journal write 16 ms, runtime inventory 0 ms
+Oct 18 12:37:43 node-02 bun[728]: orchestrator: retirement of backend/default failed, will retry: cannot retire artifacts for default__backend-g1-1 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:37:43 node-02 bun[728]: orchestrator: retirement of frontend/default failed, will retry: cannot retire artifacts for default__frontend-g2-1 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:37:46 node-02 bun[728]: bun: agent loop turn took 501 ms in stop_wait: journal write 29 ms, runtime inventory 1 ms
+Oct 18 12:37:47 node-02 bun[728]: bun: agent loop turn took 500 ms in stop_wait: journal write 20 ms, runtime inventory 0 ms
+Oct 18 12:37:47 node-02 bun[728]: bun: agent loop turn took 530 ms in stop_wait: journal write 103 ms, runtime inventory 3 ms, kernel lock wait 0 ms, view install 0 ms, firewall sync 347 ms
+Oct 18 12:37:47 node-02 bun[728]: orchestrator: retirement of frontend/default failed, will retry: cluster discovery publication failed: consumer runtime inventory timed out
+Oct 18 12:37:56 node-02 bun[728]: orchestrator: deploy of frontend/default failed (attempt 1), retrying in 5s: rollout finalisation failed: cannot publish backend for default__frontend: original service allocation has not retired; started replacements retained for cleanup
+Oct 18 12:38:00 node-02 bun[728]: bun: cannot publish backend for default__backend: original service allocation has not retired
+Oct 18 12:38:07 node-02 bun[728]: orchestrator: deploy of frontend/default failed (attempt 2), retrying in 10s: cannot publish backend for default__frontend: original service allocation has not retired
+Oct 18 12:38:11 node-02 bun[728]: bun: cannot publish backend for default__backend: original service allocation has not retired
+Oct 18 12:38:21 node-02 bun[728]: bun: cannot publish backend for default__backend: original service allocation has not retired
+Oct 18 12:38:25 node-02 bun[728]: orchestrator: deploy of frontend/default failed (attempt 3), retrying in 20s: old instance artifact retirement failed: cannot retire artifacts for default__frontend-g3-1: original service withdrawal is unproven; started replacements retained for cleanup
+Oct 18 12:38:32 node-02 bun[728]: bun: cannot publish backend for default__backend: original service allocation has not retired
+Oct 18 12:38:43 node-02 bun[728]: bun: cannot publish backend for default__backend: original service allocation has not retired
+Oct 18 12:38:48 node-02 bun[728]: orchestrator: deploy of frontend/default failed (attempt 4), retrying in 40s: old instance artifact retirement failed: cannot retire artifacts for default__frontend-g3-1: original service withdrawal is unproven; started replacements retained for cleanup
+Oct 18 12:38:53 node-02 bun[728]: bun: cannot publish backend for default__backend: original service allocation has not retired
+Oct 18 12:39:03 node-02 bun[728]: bun: cannot publish backend for default__backend: original service allocation has not retired
+Oct 18 12:39:13 node-02 bun[728]: bun: cannot publish backend for default__backend: original service allocation has not retired
+Oct 18 12:39:24 node-02 bun[728]: bun: cannot publish backend for default__backend: original service allocation has not retired
+Oct 18 12:39:29 node-02 bun[728]: sesame: source identity for default__frontend-g3-1 did not arrive within the turn; the next tick retries
+Oct 18 12:39:29 node-02 bun[728]: bun: agent loop turn took 501 ms in follow_up (consumer_sync/journal): journal write 24 ms, kernel lock wait 0 ms, view install 0 ms, firewall sync 476 ms
+Oct 18 12:39:30 node-02 bun[728]: bun: agent loop turn took 401 ms in health_tick: kernel lock wait 0 ms, firewall sync 400 ms
+Oct 18 12:39:30 node-02 bun[728]: orchestrator: deploy of frontend/default failed (attempt 5), retrying in 80s: old instance artifact retirement failed: cannot retire artifacts for default__frontend-g3-1: original service withdrawal is unproven; started replacements retained for cleanup
+Oct 18 12:39:35 node-02 bun[728]: bun: cannot publish backend for default__backend: original service allocation has not retired
+Oct 18 12:39:46 node-02 bun[728]: bun: cannot publish backend for default__backend: original service allocation has not retired
+Oct 18 12:39:57 node-02 bun[728]: bun: cannot publish backend for default__backend: original service allocation has not retired
+Oct 18 12:40:08 node-02 bun[728]: bun: cannot publish backend for default__backend: original service allocation has not retired
+Oct 18 12:40:19 node-02 bun[728]: bun: cannot publish backend for default__backend: original service allocation has not retired
+Oct 18 12:40:29 node-02 bun[728]: bun: cannot publish backend for default__backend: original service allocation has not retired
+Oct 18 12:40:40 node-02 bun[728]: bun: cannot publish backend for default__backend: original service allocation has not retired
+Oct 18 12:40:51 node-02 bun[728]: bun: cannot publish backend for default__backend: original service allocation has not retired
+Oct 18 12:40:51 node-02 bun[728]: bun: agent loop turn took 499 ms in follow_up (consumer_sync/journal): journal write 24 ms, kernel lock wait 0 ms, view install 0 ms, firewall sync 475 ms
+Oct 18 12:40:52 node-02 bun[728]: orchestrator: deploy of frontend/default failed (attempt 6), retrying in 160s: old instance artifact retirement failed: cannot retire artifacts for default__frontend-g3-1: original service withdrawal is unproven; started replacements retained for cleanup
+Oct 18 12:41:02 node-02 bun[728]: bun: cannot publish backend for default__backend: original service allocation has not retired
+Oct 18 12:41:13 node-02 bun[728]: bun: cannot publish backend for default__backend: original service allocation has not retired
+Oct 18 12:41:24 node-02 bun[728]: bun: cannot publish backend for default__backend: original service allocation has not retired
+Oct 18 12:41:35 node-02 bun[728]: bun: cannot publish backend for default__backend: original service allocation has not retired
+Oct 18 12:41:46 node-02 bun[728]: bun: cannot publish backend for default__backend: original service allocation has not retired
+Oct 18 12:41:57 node-02 bun[728]: bun: cannot publish backend for default__backend: original service allocation has not retired
+Oct 18 12:42:07 node-02 bun[728]: bun: cannot publish backend for default__backend: original service allocation has not retired
+Oct 18 12:42:18 node-02 bun[728]: bun: cannot publish backend for default__backend: original service allocation has not retired
+Oct 18 12:42:29 node-02 bun[728]: bun: cannot publish backend for default__backend: original service allocation has not retired
+Oct 18 12:42:39 node-02 bun[728]: bun: cannot publish backend for default__backend: original service allocation has not retired

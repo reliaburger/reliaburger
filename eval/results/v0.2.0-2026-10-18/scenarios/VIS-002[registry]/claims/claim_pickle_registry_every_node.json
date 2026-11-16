@@ -1,0 +1,50 @@
+{
+  "claim": {
+    "id": "claim_pickle_registry_every_node",
+    "axis": "vision",
+    "statement": "Pickle is an OCI registry on every node (port 5050) that caches upstream registries, shares layers peer to peer, and receives images built on the cluster with relish build; images are replicated asynchronously to a default of 2 copies.",
+    "kind": "explicit",
+    "sources": [
+      {
+        "ref": "docs/manual/11_images-and-volumes.md:5-6",
+        "quote": "Every node runs Pickle, the built-in registry"
+      },
+      {
+        "ref": "docs/whitepaper.md:663-663",
+        "quote": "redundancy target (default 2 total copies: the pusher plus one peer)"
+      },
+      {
+        "ref": "docs/whitepaper.md:667-667",
+        "quote": "an image pushed and then immediately lost with its origin node before the heal tick runs is not guaranteed to survive"
+      }
+    ],
+    "measurable": "After pushing/building an image, curl the registry on port 5050 of each node (/v2/); a pull on a second node is served from a peer; the heal loop (roughly every 60 s) brings copies to 2 within the 30 s per layer target (the whitepaper marks that target unmeasured); killing the only origin node before the heal tick can lose the image.",
+    "interfaces": [
+      "relish images",
+      "relish build <path>",
+      "[images] registry_port (5050)",
+      "[[images.external_registries]]",
+      "docker push"
+    ]
+  },
+  "citation_checks": [
+    {
+      "claim_id": "claim_pickle_registry_every_node",
+      "ref": "docs/manual/11_images-and-volumes.md:5-6",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_pickle_registry_every_node",
+      "ref": "docs/whitepaper.md:663-663",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_pickle_registry_every_node",
+      "ref": "docs/whitepaper.md:667-667",
+      "ok": true,
+      "detail": ""
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+{"ts": "2026-10-18T12:09:41.405+00:00", "kind": "command", "description": "edit /etc/reliaburger/node.toml on node-01: add gitops", "scenario": "EXT-008"}
+{"ts": "2026-10-18T12:09:42.173+00:00", "kind": "command", "description": "edit /etc/reliaburger/node.toml on node-02: add gitops", "scenario": "EXT-008"}
+{"ts": "2026-10-18T12:09:43.015+00:00", "kind": "command", "description": "edit /etc/reliaburger/node.toml on node-03: add gitops", "scenario": "EXT-008"}
+{"ts": "2026-10-18T12:09:49.209+00:00", "kind": "command", "description": "restart bun on node-02 (pick up gitops)", "scenario": "EXT-008"}
+{"ts": "2026-10-18T12:09:56.544+00:00", "kind": "command", "description": "restart bun on node-03 (pick up gitops)", "scenario": "EXT-008"}
+{"ts": "2026-10-18T12:10:07.002+00:00", "kind": "command", "description": "restart bun on node-01 (pick up gitops)", "scenario": "EXT-008"}
+{"ts": "2026-10-18T12:11:46.271+00:00", "kind": "command", "description": "edit /etc/reliaburger/node.toml on node-01: remove gitops", "scenario": "EXT-008"}
+{"ts": "2026-10-18T12:11:46.819+00:00", "kind": "command", "description": "edit /etc/reliaburger/node.toml on node-02: remove gitops", "scenario": "EXT-008"}
+{"ts": "2026-10-18T12:11:47.454+00:00", "kind": "command", "description": "edit /etc/reliaburger/node.toml on node-03: remove gitops", "scenario": "EXT-008"}
+{"ts": "2026-10-18T12:11:47.982+00:00", "kind": "command", "description": "restart bun on node-01 (drop gitops)", "scenario": "EXT-008"}
+{"ts": "2026-10-18T12:11:54.665+00:00", "kind": "command", "description": "restart bun on node-02 (drop gitops)", "scenario": "EXT-008"}
+{"ts": "2026-10-18T12:12:03.065+00:00", "kind": "command", "description": "restart bun on node-03 (drop gitops)", "scenario": "EXT-008"}

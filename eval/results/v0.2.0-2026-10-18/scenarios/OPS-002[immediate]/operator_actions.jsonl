@@ -1,0 +1,2 @@
+{"ts": "2026-10-18T12:45:54.368+00:00", "kind": "command", "description": "restart reliaburger.service on node-01 to clear instances that never retire", "scenario": "OPS-002[immediate]"}
+{"ts": "2026-10-18T12:45:57.892+00:00", "kind": "command", "description": "restart reliaburger.service on node-02 to clear instances that never retire", "scenario": "OPS-002[immediate]"}

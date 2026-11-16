@@ -1,0 +1,193 @@
+{
+  "id": "INT-003[online-boutique]",
+  "name": "Import Online Boutique v0.10.7 as published -- @1.2 ",
+  "feature": "features/interoperability/upstream_manifests.feature",
+  "axis": "interoperability",
+  "claim_ids": [
+    "claim_k8s_drops_reported_not_silent",
+    "claim_smooth_k8s_transition",
+    "claim_k8s_apply_converts_eleven_kinds"
+  ],
+  "source_refs": [
+    "docs/manual/09_kubernetes.md:22-22@v0.2.0",
+    "docs/manual/09_kubernetes.md:54-54@v0.2.0",
+    "docs/manual/09_kubernetes.md:45-45@v0.2.0",
+    "docs/whitepaper.md:997-997@v0.2.0",
+    "docs/manual/09_kubernetes.md:3-3@v0.2.0",
+    "docs/manual/09_kubernetes.md:20-20@v0.2.0",
+    "docs/manual/09_kubernetes.md:14-14@v0.2.0",
+    "docs/manual/09_kubernetes.md:15-15@v0.2.0"
+  ],
+  "product_commit": "cc5f64393350f2081f7d88512b95a88316172e5a",
+  "product_target": "v0.2.0",
+  "environment": "environment.json",
+  "tags": [
+    "claim_k8s_drops_reported_not_silent",
+    "claim_smooth_k8s_transition",
+    "req_INT-003",
+    "axis_interoperability",
+    "claim_k8s_apply_converts_eleven_kinds"
+  ],
+  "hypothesis": false,
+  "status": "FAIL",
+  "status_reason": "And every imported workload should be running within the configured time: AssertionError: not running after 600 s: boutique/loadgenerator",
+  "start_time": "2026-10-18T12:13:37.933+00:00",
+  "duration_ms": 621365,
+  "observations": [
+    "reused the healthy lab cluster built earlier in this or a previous run"
+  ],
+  "expected": {
+    "silently_dropped": [],
+    "workloads_running": "12 of 12 within 600 s"
+  },
+  "measured": {
+    "cluster_health_at_start": {
+      "ts": "2026-10-18T12:13:38.364+00:00",
+      "nodes": {
+        "node-02": "alive",
+        "node-01": "alive",
+        "node-03": "alive"
+      },
+      "leaders": [
+        "node-02"
+      ],
+      "voters": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "voters_answering": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "unanswered": [],
+      "fenced": [],
+      "ok": true
+    },
+    "upstream_kinds": [
+      "Deployment",
+      "Service",
+      "ServiceAccount"
+    ],
+    "upstream_documents": 35,
+    "harness_isolation_edits": 1,
+    "zero_touch_apply_rc": 0,
+    "imported_apps": [
+      "boutique/adservice",
+      "boutique/cartservice",
+      "boutique/checkoutservice",
+      "boutique/currencyservice",
+      "boutique/emailservice",
+      "boutique/frontend",
+      "boutique/loadgenerator",
+      "boutique/paymentservice",
+      "boutique/productcatalogservice",
+      "boutique/recommendationservice",
+      "boutique/redis-cart",
+      "boutique/shippingservice"
+    ],
+    "report_counts": {
+      "converted": 13,
+      "merged into the app (no report line)": 9,
+      "dropped": 11,
+      "approximated": 3
+    },
+    "silently_dropped": [],
+    "workloads_running": "11 of 12",
+    "workload_progress": {
+      "boutique/adservice": {
+        "want": 1,
+        "running": 1
+      },
+      "boutique/cartservice": {
+        "want": 1,
+        "running": 1
+      },
+      "boutique/checkoutservice": {
+        "want": 1,
+        "running": 1
+      },
+      "boutique/currencyservice": {
+        "want": 1,
+        "running": 1
+      },
+      "boutique/emailservice": {
+        "want": 1,
+        "running": 1
+      },
+      "boutique/frontend": {
+        "want": 1,
+        "running": 1
+      },
+      "boutique/loadgenerator": {
+        "want": 1,
+        "running": 0
+      },
+      "boutique/paymentservice": {
+        "want": 1,
+        "running": 1
+      },
+      "boutique/productcatalogservice": {
+        "want": 1,
+        "running": 1
+      },
+      "boutique/recommendationservice": {
+        "want": 1,
+        "running": 1
+      },
+      "boutique/redis-cart": {
+        "want": 1,
+        "running": 1
+      },
+      "boutique/shippingservice": {
+        "want": 1,
+        "running": 1
+      }
+    },
+    "all_running_s": null
+  },
+  "evidence_paths": [
+    "scenarios/INT-003[online-boutique]/claims/claim_k8s_drops_reported_not_silent.json",
+    "scenarios/INT-003[online-boutique]/claims/claim_smooth_k8s_transition.json",
+    "scenarios/INT-003[online-boutique]/claims/claim_k8s_apply_converts_eleven_kinds.json",
+    "scenarios/INT-003[online-boutique]/cluster_state.json",
+    "scenarios/INT-003[online-boutique]/upstream.yaml",
+    "scenarios/INT-003[online-boutique]/migration-report.txt",
+    "scenarios/INT-003[online-boutique]/imported.toml",
+    "scenarios/INT-003[online-boutique]/apply.txt",
+    "scenarios/INT-003[online-boutique]/accounting.json",
+    "scenarios/INT-003[online-boutique]/status-not-running.txt",
+    "scenarios/INT-003[online-boutique]/logs/boutique-loadgenerator.txt",
+    "scenarios/INT-003[online-boutique]/diagnostics/wtf.json",
+    "scenarios/INT-003[online-boutique]/diagnostics/status.json",
+    "scenarios/INT-003[online-boutique]/diagnostics/council.json",
+    "scenarios/INT-003[online-boutique]/diagnostics/nodes.json",
+    "scenarios/INT-003[online-boutique]/diagnostics/journal-node-01.txt",
+    "scenarios/INT-003[online-boutique]/diagnostics/journal-node-02.txt",
+    "scenarios/INT-003[online-boutique]/diagnostics/journal-node-03.txt",
+    "scenarios/INT-003[online-boutique]/commands.jsonl"
+  ],
+  "manual_steps": [],
+  "external_dependencies": [
+    "container image: redis:alpine",
+    "container image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/adservice:v0.10.7",
+    "container image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/cartservice:v0.10.7",
+    "container image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/checkoutservice:v0.10.7",
+    "container image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/currencyservice:v0.10.7",
+    "container image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/emailservice:v0.10.7",
+    "container image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/frontend:v0.10.7",
+    "container image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/loadgenerator:v0.10.7",
+    "container image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/paymentservice:v0.10.7",
+    "container image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/productcatalogservice:v0.10.7",
+    "container image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/recommendationservice:v0.10.7",
+    "container image: us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/shippingservice:v0.10.7"
+  ],
+  "limitations": [],
+  "deviations": [
+    "harness put every document in namespace boutique so the set cannot replace the shared fixture's apps of the same name; relish apply has no --namespace flag"
+  ],
+  "classification": null,
+  "confidence": "high",
+  "failed_step": "And every imported workload should be running within the configured time"
+}

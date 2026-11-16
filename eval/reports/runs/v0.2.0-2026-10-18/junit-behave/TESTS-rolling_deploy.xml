@@ -1,0 +1,52 @@
+<?xml version='1.0' encoding='utf-8'?>
+<testsuite name="rolling_deploy.Rolling deploys and automatic rollback" tests="2" errors="0" failures="1" skipped="0" time="97.822756" timestamp="2026-10-18T14:48:16.452342" hostname="serval"><testcase classname="rolling_deploy.Rolling deploys and automatic rollback" name="A healthy change rolls out without downtime" status="failed" time="18.107088"><failure type="AssertionError" message="availability {'count': 39, 'ok': 30, 'ratio': 0.7692, 'longest_failure_streak': 3, 'p50_ms': 1.9, 'p99_ms': 2.9, 'errors': ['503']}">
+
+Failing step: And availability during the rollout should meet the configured threshold ... failed in 0.000s
+Location: features/operations/rolling_deploy.feature:14
+ASSERT FAILED: availability {'count': 39, 'ok': 30, 'ratio': 0.7692, 'longest_failure_streak': 3, 'p50_ms': 1.9, 'p99_ms': 2.9, 'errors': ['503']}
+</failure><system-out>
+
+@scenario.begin
+
+  @req_OPS-010 @claim_rolling_deploys_health_gated_auto_rollback
+  Scenario: A healthy change rolls out without downtime
+    Given a healthy disposable Reliaburger cluster ... passed in 0.576s
+    And the native fixture application is running ... passed in 0.178s
+    And an external probe recording availability once per second ... passed in 5.001s
+    When I apply a changed frontend message ... passed in 0.246s
+    Then every ingress should serve the new message within the configured completion time ... passed in 12.106s
+    And availability during the rollout should meet the configured threshold ... failed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] OPS-010: FAIL (And availability during the rollout should meet the configured threshold: AssertionError: availability {'count': 39, 'ok': 30, 'ratio': 0.7692, 'longest_failure)
+
+
+</system-err></testcase><testcase classname="rolling_deploy.Rolling deploys and automatic rollback" name="A change whose health check never passes is rolled back" status="passed" time="79.715669"><system-out>
+
+@scenario.begin
+
+  @req_OPS-011 @claim_rolling_deploys_health_gated_auto_rollback
+  Scenario: A change whose health check never passes is rolled back
+    Given a healthy disposable Reliaburger cluster ... passed in 0.574s
+    And the native fixture application is running ... passed in 2.518s
+    And an external probe recording availability once per second ... passed in 5.001s
+    When I apply a frontend version whose health check never passes ... passed in 0.284s
+    Then the deploy should be rolled back within the configured rollback time ... passed in 71.242s
+    And the previous version should keep serving on every ingress ... passed in 0.096s
+    And availability during the failed rollout should meet the configured threshold ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] OPS-011: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase></testsuite>

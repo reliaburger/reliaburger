@@ -1,0 +1,144 @@
+[
+  {
+    "node": "node-01",
+    "id": "default__backend-1",
+    "app_name": "backend",
+    "namespace": "default",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": 58516,
+    "pid": 7614,
+    "status_age_ms": 247
+  },
+  {
+    "node": "node-01",
+    "id": "default__frontend-0",
+    "app_name": "frontend",
+    "namespace": "default",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": 42051,
+    "pid": 7736,
+    "status_age_ms": 247
+  },
+  {
+    "node": "node-01",
+    "id": "run-1",
+    "app_name": "rbeval-fail-c21f631bccb2",
+    "namespace": "default",
+    "state": "failed",
+    "restart_count": 0,
+    "host_port": null,
+    "pid": null
+  },
+  {
+    "node": "node-01",
+    "id": "rbeval-shop__backend-0",
+    "app_name": "backend",
+    "namespace": "rbeval-shop",
+    "state": "stopping",
+    "restart_count": 0,
+    "host_port": 28225,
+    "pid": 8121,
+    "status_age_ms": 247
+  },
+  {
+    "node": "node-01",
+    "id": "rbeval-shop__frontend-g1-1",
+    "app_name": "frontend",
+    "namespace": "rbeval-shop",
+    "state": "stopping",
+    "restart_count": 0,
+    "host_port": 25196,
+    "pid": 8250,
+    "status_age_ms": 247
+  },
+  {
+    "node": "node-02",
+    "id": "default__frontend-2",
+    "app_name": "frontend",
+    "namespace": "default",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": 15557,
+    "pid": 7157,
+    "status_age_ms": 180
+  },
+  {
+    "node": "node-02",
+    "id": "rbeval-shop__frontend-g1-2",
+    "app_name": "frontend",
+    "namespace": "rbeval-shop",
+    "state": "stopping",
+    "restart_count": 0,
+    "host_port": 55409,
+    "pid": 7537,
+    "status_age_ms": 180
+  },
+  {
+    "node": "node-03",
+    "id": "apps__gitops-6f367e3a6ac8-0",
+    "app_name": "gitops-6f367e3a6ac8",
+    "namespace": "apps",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": 54320,
+    "pid": 6308,
+    "status_age_ms": 448
+  },
+  {
+    "node": "node-03",
+    "id": "apps__gitops-6f367e3a6ac8-1",
+    "app_name": "gitops-6f367e3a6ac8",
+    "namespace": "apps",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": 29198,
+    "pid": 6505,
+    "status_age_ms": 448
+  },
+  {
+    "node": "node-03",
+    "id": "default__backend-0",
+    "app_name": "backend",
+    "namespace": "default",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": 12283,
+    "pid": 6630,
+    "status_age_ms": 448
+  },
+  {
+    "node": "node-03",
+    "id": "default__frontend-1",
+    "app_name": "frontend",
+    "namespace": "default",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": 41184,
+    "pid": 6760,
+    "status_age_ms": 448
+  },
+  {
+    "node": "node-03",
+    "id": "rbeval-shop__backend-1",
+    "app_name": "backend",
+    "namespace": "rbeval-shop",
+    "state": "stopping",
+    "restart_count": 0,
+    "host_port": 55460,
+    "pid": 7151,
+    "status_age_ms": 448
+  },
+  {
+    "node": "node-03",
+    "id": "rbeval-shop__frontend-g1-0",
+    "app_name": "frontend",
+    "namespace": "rbeval-shop",
+    "state": "stopping",
+    "restart_count": 0,
+    "host_port": 58668,
+    "pid": 7283,
+    "status_age_ms": 448
+  }
+]

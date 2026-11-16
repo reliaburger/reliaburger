@@ -1,0 +1,26 @@
+<?xml version='1.0' encoding='utf-8'?>
+<testsuite name="partition.Network partition" tests="1" errors="0" failures="0" skipped="0" time="67.220151" timestamp="2026-10-18T14:32:29.053521" hostname="serval"><testcase classname="partition.Network partition" name="One non-leader node is partitioned from its peers" status="passed" time="67.220151"><system-out>
+
+@scenario.begin
+
+  @req_OPS-007 @claim_partitions_no_split_brain_and_degradation @destructive
+  Scenario: One non-leader node is partitioned from its peers
+    Given a healthy disposable 3-node Reliaburger cluster with sufficient spare capacity ... passed in 2.874s
+    And the native fixture application is running ... passed in 0.187s
+    When I partition one non-leader node from the other two for the configured isolation time ... passed in 0.758s
+    Then the majority side should commit and run a newly applied app ... passed in 9.865s
+    And the minority node should refuse to commit an apply sent to it ... passed in 0.087s
+    And the minority node should keep serving the fixture through its own ingress ... passed in 10.047s
+    And after the partition heals the node should rejoin within the configured rejoin time ... passed in 43.017s
+    And the cluster should have exactly one leader and no app that only the minority accepted ... passed in 0.386s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] OPS-007: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase></testsuite>

@@ -1,0 +1,16 @@
+[
+  {
+    "t_rel_s": 5.4,
+    "error": "command failed rc=124: relish --output json council  # https://10.77.0.11:9117\nstderr: \n[harness] timed out after 5s\nstd"
+  },
+  {
+    "t_rel_s": 10.9,
+    "error": "command failed rc=124: relish --output json council  # https://10.77.0.11:9117\nstderr: \n[harness] timed out after 5s\nstd"
+  },
+  {
+    "t_rel_s": 11.6,
+    "leaders": [
+      "node-01"
+    ]
+  }
+]

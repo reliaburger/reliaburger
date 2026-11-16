@@ -1,0 +1,177 @@
+{
+  "id": "OPS-009",
+  "name": "Every node loses power at once and is powered on again",
+  "feature": "features/operations/full_power_cycle.feature",
+  "axis": "operations",
+  "claim_ids": [
+    "claim_council_raft_quorum_and_self_healing",
+    "claim_self_healing"
+  ],
+  "source_refs": [
+    "docs/manual/02_cluster-basics.md:6-6@v0.2.0",
+    "docs/manual/02_cluster-basics.md:98-98@v0.2.0",
+    "docs/whitepaper.md:529-529@v0.2.0",
+    "docs/manual/08_five-minute-tour.md:164-164@v0.2.0",
+    "README.md:252-253@v0.2.0"
+  ],
+  "product_commit": "cc5f64393350f2081f7d88512b95a88316172e5a",
+  "product_target": "v0.2.0",
+  "environment": "environment.json",
+  "tags": [
+    "req_OPS-009",
+    "axis_operations",
+    "destructive",
+    "claim_council_raft_quorum_and_self_healing",
+    "claim_self_healing"
+  ],
+  "hypothesis": false,
+  "status": "FAIL",
+  "status_reason": "And the applied apps should still be defined: AssertionError: running after power cycle: {'backend': 1, 'frontend': 1}",
+  "start_time": "2026-10-18T12:25:30.989+00:00",
+  "duration_ms": 52414,
+  "observations": [
+    "reused the healthy lab cluster built earlier in this or a previous run"
+  ],
+  "expected": {
+    "council_healthy_s": "<= 300",
+    "fixture_serving_s": "<= 300",
+    "running_after": {
+      "backend": 2,
+      "frontend": 3
+    }
+  },
+  "measured": {
+    "cluster_health_at_start": {
+      "ts": "2026-10-18T12:25:31.291+00:00",
+      "nodes": {
+        "node-02": "alive",
+        "node-01": "alive",
+        "node-03": "alive"
+      },
+      "leaders": [
+        "node-02"
+      ],
+      "voters": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "voters_answering": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "unanswered": [],
+      "fenced": [],
+      "ok": true
+    },
+    "node_capacity": {
+      "node-01": {
+        "available_mib": 5259,
+        "cpus": 4
+      },
+      "node-02": {
+        "available_mib": 5352,
+        "cpus": 4
+      },
+      "node-03": {
+        "available_mib": 5192,
+        "cpus": 4
+      }
+    },
+    "powered_off": {
+      "node-01": "shut off",
+      "node-02": "shut off",
+      "node-03": "shut off"
+    },
+    "council_healthy_s": 12.7,
+    "health_after": {
+      "ts": "2026-10-18T12:25:58.583+00:00",
+      "nodes": {
+        "node-03": "alive",
+        "node-01": "alive",
+        "node-02": "alive"
+      },
+      "leaders": [
+        "node-02"
+      ],
+      "voters": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "voters_answering": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "unanswered": [],
+      "fenced": [],
+      "ok": true
+    },
+    "fixture_serving_s": 32.7,
+    "fixture_before": {
+      "backend": {
+        "node-01": [
+          "default__backend-1:running"
+        ],
+        "node-03": [
+          "default__backend-0:running"
+        ]
+      },
+      "frontend": {
+        "node-01": [
+          "default__frontend-0:running"
+        ],
+        "node-02": [
+          "default__frontend-2:running"
+        ],
+        "node-03": [
+          "default__frontend-1:running"
+        ]
+      }
+    },
+    "fixture_after": {
+      "backend": {
+        "node-01": [
+          "default__backend-1:running"
+        ],
+        "node-03": [
+          "default__backend-0:preparing"
+        ]
+      },
+      "frontend": {
+        "node-01": [
+          "default__frontend-0:health-wait"
+        ],
+        "node-02": [
+          "default__frontend-2:running"
+        ]
+      }
+    },
+    "running_after": {
+      "backend": 1,
+      "frontend": 1
+    }
+  },
+  "evidence_paths": [
+    "scenarios/OPS-009/claims/claim_council_raft_quorum_and_self_healing.json",
+    "scenarios/OPS-009/claims/claim_self_healing.json",
+    "scenarios/OPS-009/cluster_state.json",
+    "scenarios/OPS-009/diagnostics/wtf.json",
+    "scenarios/OPS-009/diagnostics/status.json",
+    "scenarios/OPS-009/diagnostics/council.json",
+    "scenarios/OPS-009/diagnostics/nodes.json",
+    "scenarios/OPS-009/diagnostics/journal-node-01.txt",
+    "scenarios/OPS-009/diagnostics/journal-node-02.txt",
+    "scenarios/OPS-009/diagnostics/journal-node-03.txt",
+    "scenarios/OPS-009/commands.jsonl"
+  ],
+  "manual_steps": [],
+  "external_dependencies": [],
+  "limitations": [],
+  "deviations": [],
+  "classification": null,
+  "confidence": "high",
+  "failed_step": "And the applied apps should still be defined"
+}

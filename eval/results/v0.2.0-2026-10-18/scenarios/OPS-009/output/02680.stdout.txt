@@ -1,0 +1,67 @@
+Oct 18 12:11:47 node-01 systemd[1]: Stopping reliaburger.service - Reliaburger node...
+Oct 18 12:11:47 node-01 bun[6877]: bun: received shutdown signal
+Oct 18 12:11:47 node-01 bun[6877]: bun: shutdown complete
+Oct 18 12:11:47 node-01 systemd[1]: reliaburger.service: Deactivated successfully.
+Oct 18 12:11:47 node-01 systemd[1]: Stopped reliaburger.service - Reliaburger node.
+Oct 18 12:11:47 node-01 systemd[1]: reliaburger.service: Consumed 3min 24.751s CPU time.
+Oct 18 12:11:47 node-01 systemd[1]: Starting reliaburger.service - Reliaburger node...
+Oct 18 12:11:47 node-01 systemd[1]: Started reliaburger.service - Reliaburger node.
+Oct 18 12:11:47 node-01 bun[7265]: bun: reliaburger node agent v0.2.0 (cc5f643)
+Oct 18 12:11:47 node-01 bun[7265]: bun: using runc runtime (root)
+Oct 18 12:11:47 node-01 bun[7265]: bun: workloads use DNS nameserver 10.77.0.11
+Oct 18 12:11:47 node-01 bun[7265]: bun: mTLS enabled on the Raft RPC, reporting and API transports
+Oct 18 12:11:47 node-01 bun[7265]: bun: cluster mode — gossip on 10.77.0.11:9443, 0 seed(s)
+Oct 18 12:11:48 node-01 bun[7265]: council: no peer advertises a newer recovery epoch than 0; serving raft
+Oct 18 12:11:48 node-01 bun[7265]: bun: GPU support enabled, 0 device(s) detected
+Oct 18 12:11:48 node-01 bun[7265]: bun: eBPF data path loaded (attached=true)
+Oct 18 12:11:48 node-01 bun[7265]: bun: dns responder ready on 10.77.0.11:53
+Oct 18 12:11:48 node-01 bun[7265]: bun: ingress listening on http 0.0.0.0:80 / https 0.0.0.0:443
+Oct 18 12:11:48 node-01 bun[7265]: bun: observability enabled (metrics + logs + alerts)
+Oct 18 12:11:48 node-01 bun[7265]: bun: API server listening on 0.0.0.0:9117
+Oct 18 12:11:48 node-01 bun[7265]: bun: pickle catalog loaded (3 manifests)
+Oct 18 12:11:48 node-01 bun[7265]: bun: Pickle registry listening on 0.0.0.0:5050 (TLS, authenticated writes and reads)
+Oct 18 12:11:48 node-01 bun[7265]: bun: Pickle registry derived peer-reachable bind 0.0.0.0:5050 from cluster advertise address
+Oct 18 12:11:58 node-01 bun[7265]: report worker: admission at 10.77.0.13:9445 failed; next tick collects fresh state: send failed: TCP connect to 10.77.0.13:9445: Connection refused (os error 111)
+Oct 18 12:11:58 node-01 bun[7265]: report worker: admission at 10.77.0.13:9445 failed; next tick collects fresh state: send failed: TCP connect to 10.77.0.13:9445: Connection refused (os error 111)
+Oct 18 12:11:58 node-01 bun[7265]: report worker: admission at 10.77.0.13:9445 failed; next tick collects fresh state: send failed: TCP connect to 10.77.0.13:9445: Connection refused (os error 111)
+Oct 18 12:11:58 node-01 bun[7265]: pickle: registry cleanup pending: replication failed: error sending request for url (https://10.77.0.13:9117/v1/registry/query)
+Oct 18 12:11:59 node-01 bun[7265]: pickle: registry cleanup pending: replication failed: error sending request for url (https://10.77.0.13:9117/v1/registry/query)
+Oct 18 12:12:00 node-01 bun[7265]: pickle: registry cleanup pending: replication failed: error sending request for url (https://10.77.0.13:9117/v1/registry/query)
+Oct 18 12:12:01 node-01 bun[7265]: pickle: registry cleanup pending: replication failed: error sending request for url (https://10.77.0.13:9117/v1/registry/query)
+Oct 18 12:13:29 node-01 bun[7265]: bun: agent loop turn took 501 ms in deploy_op (finish_retire): journal write 13 ms, runtime inventory 0 ms
+Oct 18 12:13:38 node-01 bun[7265]: orchestrator: retirement of frontend/rbeval-shop failed, will retry: cannot retire artifacts for rbeval-shop__frontend-g1-1 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:13:38 node-01 bun[7265]: orchestrator: retirement of backend/rbeval-shop failed, will retry: cannot retire artifacts for rbeval-shop__backend-0 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:13:41 node-01 bun[7265]: bun: agent loop turn took 501 ms in stop_wait: journal write 16 ms, runtime inventory 0 ms
+Oct 18 12:13:41 node-01 bun[7265]: bun: agent loop turn took 500 ms in stop_wait: journal write 43 ms, runtime inventory 0 ms
+Oct 18 12:13:42 node-01 bun[7265]: sesame: source identity for rbeval-shop__backend-0 did not arrive within the turn; the next tick retries
+Oct 18 12:13:42 node-01 bun[7265]: bun: agent loop turn took 554 ms in stop_wait: journal write 168 ms, runtime inventory 2 ms, kernel lock wait 0 ms, view install 0 ms, firewall sync 323 ms
+Oct 18 12:24:47 node-01 bun[7265]: smoker: fault fault-1 expired (kill 1), cleaning up
+Oct 18 12:24:49 node-01 bun[7265]: bun: application restart retains predecessor artifacts for default__frontend-0: cannot retire artifacts for default__frontend-0 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:24:50 node-01 bun[7265]: bun: application restart retains predecessor artifacts for default__frontend-0: cannot retire artifacts for default__frontend-0 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:24:51 node-01 bun[7265]: bun: application restart retains predecessor artifacts for default__frontend-0: cannot retire artifacts for default__frontend-0 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:24:52 node-01 bun[7265]: bun: application restart retains predecessor artifacts for default__frontend-0: releasing default__frontend-0's network reference is still running; try again shortly
+Oct 18 12:24:52 node-01 bun[7265]: bun: agent loop turn took 500 ms in restart_step: journal write 13 ms, runtime inventory 0 ms
+-- Boot 933b1df0d143443bb682027a0a5abb00 --
+Oct 18 12:25:53 node-01 systemd[1]: Starting reliaburger.service - Reliaburger node...
+Oct 18 12:25:53 node-01 systemd[1]: Started reliaburger.service - Reliaburger node.
+Oct 18 12:25:53 node-01 bun[721]: bun: reliaburger node agent v0.2.0 (cc5f643)
+Oct 18 12:25:53 node-01 bun[721]: bun: using runc runtime (root)
+Oct 18 12:25:53 node-01 bun[721]: bun: workloads use DNS nameserver 10.77.0.11
+Oct 18 12:25:54 node-01 bun[721]: bun: mTLS enabled on the Raft RPC, reporting and API transports
+Oct 18 12:25:54 node-01 bun[721]: bun: cluster mode — gossip on 10.77.0.11:9443, 0 seed(s)
+Oct 18 12:25:54 node-01 bun[721]: bun: GPU support enabled, 0 device(s) detected
+Oct 18 12:25:54 node-01 bun[721]: bun: eBPF data path loaded (attached=true)
+Oct 18 12:25:55 node-01 bun[721]: bun: dns responder ready on 10.77.0.11:53
+Oct 18 12:25:55 node-01 bun[721]: bun: ingress listening on http 0.0.0.0:80 / https 0.0.0.0:443
+Oct 18 12:25:55 node-01 bun[721]: bun: observability enabled (metrics + logs + alerts)
+Oct 18 12:25:55 node-01 bun[721]: bun: API server listening on 0.0.0.0:9117
+Oct 18 12:25:55 node-01 bun[721]: bun: pickle catalog loaded (3 manifests)
+Oct 18 12:25:55 node-01 bun[721]: bun: Pickle registry listening on 0.0.0.0:5050 (TLS, authenticated writes and reads)
+Oct 18 12:25:55 node-01 bun[721]: bun: Pickle registry derived peer-reachable bind 0.0.0.0:5050 from cluster advertise address
+Oct 18 12:25:55 node-01 bun[721]: pickle: registry cleanup pending: replication failed: no advertised registry leader endpoint
+Oct 18 12:25:55 node-01 bun[721]: council: no peer advertises a newer recovery epoch than 0; serving raft
+Oct 18 12:25:56 node-01 bun[721]: pickle: registry cleanup pending: replication failed: error sending request for url (https://10.77.0.12:9117/v1/registry/query)
+Oct 18 12:25:59 node-01 bun[721]: orchestrator: deploy of backend/default failed (attempt 1), retrying in 5s: startup cleanup still owns runtime allocations; retry after recovery
+Oct 18 12:25:59 node-01 bun[721]: orchestrator: deploy of frontend/default failed (attempt 1), retrying in 5s: startup cleanup still owns runtime allocations; retry after recovery
+Oct 18 12:26:00 node-01 bun[721]: bun: agent loop turn took 501 ms in health_tick: journal write 11 ms, runtime inventory 1 ms
+Oct 18 12:26:02 node-01 bun[721]: bun: agent loop turn took 501 ms in health_tick: journal write 10 ms, runtime inventory 1 ms

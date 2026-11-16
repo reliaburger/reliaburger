@@ -1,0 +1,89 @@
+{
+  "id": "OPS-004[outsider-api]",
+  "name": "Port the API port 9117 as seen from a non-member -- @1.6 ",
+  "feature": "features/operations/network_perimeter.feature",
+  "axis": "operations",
+  "claim_ids": [
+    "claim_integrated_platform",
+    "claim_network_perimeter_firewall"
+  ],
+  "source_refs": [
+    "README.md:13-13@v0.2.0",
+    "docs/manual/13_reference.md:66-66@v0.2.0",
+    "docs/manual/10_security.md:43-43@v0.2.0"
+  ],
+  "product_commit": "cc5f64393350f2081f7d88512b95a88316172e5a",
+  "product_target": "v0.2.0",
+  "environment": "environment.json",
+  "tags": [
+    "claim_integrated_platform",
+    "claim_network_perimeter_firewall",
+    "axis_operations",
+    "req_OPS-004"
+  ],
+  "hypothesis": false,
+  "status": "PASS",
+  "status_reason": "all steps passed with recorded measurements",
+  "start_time": "2026-10-18T12:27:54.042+00:00",
+  "duration_ms": 9627,
+  "observations": [
+    "reused the healthy lab cluster built earlier in this or a previous run"
+  ],
+  "expected": {
+    "result_on_every_node": "filtered"
+  },
+  "measured": {
+    "cluster_health_at_start": {
+      "ts": "2026-10-18T12:27:54.304+00:00",
+      "nodes": {
+        "node-03": "alive",
+        "node-01": "alive",
+        "node-02": "alive"
+      },
+      "leaders": [
+        "node-01"
+      ],
+      "voters": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "voters_answering": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "unanswered": [],
+      "fenced": [],
+      "ok": true
+    },
+    "source_address": "10.77.0.50",
+    "probe": {
+      "node-01": {
+        "port": 9117,
+        "result": "filtered"
+      },
+      "node-02": {
+        "port": 9117,
+        "result": "filtered"
+      },
+      "node-03": {
+        "port": 9117,
+        "result": "filtered"
+      }
+    }
+  },
+  "evidence_paths": [
+    "scenarios/OPS-004[outsider-api]/claims/claim_integrated_platform.json",
+    "scenarios/OPS-004[outsider-api]/claims/claim_network_perimeter_firewall.json",
+    "scenarios/OPS-004[outsider-api]/cluster_state.json",
+    "scenarios/OPS-004[outsider-api]/commands.jsonl"
+  ],
+  "manual_steps": [],
+  "external_dependencies": [],
+  "limitations": [],
+  "deviations": [],
+  "classification": null,
+  "confidence": "high",
+  "failed_step": null
+}

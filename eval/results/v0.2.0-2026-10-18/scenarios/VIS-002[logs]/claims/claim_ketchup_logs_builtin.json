@@ -1,0 +1,39 @@
+{
+  "claim": {
+    "id": "claim_ketchup_logs_builtin",
+    "axis": "vision",
+    "statement": "Ketchup captures stdout and stderr of every instance on its node, serves cluster-wide queries and live follow through any node, and exports Parquet archives that SQL can query.",
+    "kind": "explicit",
+    "sources": [
+      {
+        "ref": "docs/manual/04_observability.md:8-8",
+        "quote": "You ask any node and"
+      },
+      {
+        "ref": "docs/manual/04_observability.md:78-78",
+        "quote": "Exported Parquet archives answer SQL"
+      }
+    ],
+    "measurable": "relish logs <app> from each node returns the same merged lines; -f shows [node instance] prefixes and picks up replicas scheduled to new nodes; a node that fails to answer yields a warning line on stderr (timeout 10 s) while other nodes' lines still arrive; retention_days default 7, export_interval_secs default 3600.",
+    "interfaces": [
+      "relish logs <app> [--tail --grep --since --until --instance --stream --json-field -f]",
+      "relish logs-export --dest",
+      "relish logs-search <source> <sql>",
+      "[logs] retention_days, export_path, export_interval_secs, max_storage_mb"
+    ]
+  },
+  "citation_checks": [
+    {
+      "claim_id": "claim_ketchup_logs_builtin",
+      "ref": "docs/manual/04_observability.md:8-8",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_ketchup_logs_builtin",
+      "ref": "docs/manual/04_observability.md:78-78",
+      "ok": true,
+      "detail": ""
+    }
+  ]
+}

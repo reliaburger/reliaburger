@@ -1,0 +1,66 @@
+[
+  {
+    "t_rel_s": 0.4,
+    "results": []
+  },
+  {
+    "t_rel_s": 5.4,
+    "results": []
+  },
+  {
+    "t_rel_s": 10.5,
+    "results": []
+  },
+  {
+    "t_rel_s": 15.6,
+    "results": []
+  },
+  {
+    "t_rel_s": 20.7,
+    "results": []
+  },
+  {
+    "t_rel_s": 25.8,
+    "results": []
+  },
+  {
+    "t_rel_s": 30.9,
+    "results": []
+  },
+  {
+    "t_rel_s": 36.0,
+    "results": []
+  },
+  {
+    "t_rel_s": 41.0,
+    "results": []
+  },
+  {
+    "t_rel_s": 46.1,
+    "results": []
+  },
+  {
+    "t_rel_s": 51.2,
+    "results": []
+  },
+  {
+    "t_rel_s": 56.3,
+    "results": []
+  },
+  {
+    "t_rel_s": 61.4,
+    "results": []
+  },
+  {
+    "t_rel_s": 66.4,
+    "results": []
+  },
+  {
+    "t_rel_s": 71.5,
+    "results": [
+      "node-01:RolledBack",
+      "node-02:RolledBack",
+      "node-03:RolledBack"
+    ]
+  }
+]

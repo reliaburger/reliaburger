@@ -1,0 +1,4 @@
+ID     TYPE                   NODE            TARGET                 INSTANCE        REMAINING  INJECTED BY
+1      kill 1                 node-01         frontend               -               0s         admin
+
+1 active fault(s)

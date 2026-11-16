@@ -1,0 +1,77 @@
+{
+  "id": "VIS-002[top]",
+  "name": "The built-in resource top works with nothing else installed -- @3.2 metrics",
+  "feature": "features/vision/builtin_subsystems.feature",
+  "axis": "vision",
+  "claim_ids": [
+    "claim_integrated_platform",
+    "claim_mayo_metrics_builtin"
+  ],
+  "source_refs": [
+    "README.md:13-13@v0.2.0",
+    "docs/manual/04_observability.md:93-93@v0.2.0",
+    "docs/manual/04_observability.md:184-184@v0.2.0"
+  ],
+  "product_commit": "cc5f64393350f2081f7d88512b95a88316172e5a",
+  "product_target": "v0.2.0",
+  "environment": "environment.json",
+  "tags": [
+    "claim_integrated_platform",
+    "req_VIS-002",
+    "axis_vision",
+    "claim_mayo_metrics_builtin"
+  ],
+  "hypothesis": false,
+  "status": "PASS",
+  "status_reason": "all steps passed with recorded measurements",
+  "start_time": "2026-10-18T12:00:02.600+00:00",
+  "duration_ms": 764,
+  "observations": [
+    "reused the healthy lab cluster built earlier in this or a previous run"
+  ],
+  "expected": {
+    "documented_result": true
+  },
+  "measured": {
+    "cluster_health_at_start": {
+      "ts": "2026-10-18T12:00:02.913+00:00",
+      "nodes": {
+        "node-01": "alive",
+        "node-02": "alive",
+        "node-03": "alive"
+      },
+      "leaders": [
+        "node-01"
+      ],
+      "voters": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "voters_answering": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "unanswered": [],
+      "fenced": [],
+      "ok": true
+    },
+    "top_rows_with_samples": 5,
+    "result": "5 running fixture instances with CPU and memory samples",
+    "documented_result": true
+  },
+  "evidence_paths": [
+    "scenarios/VIS-002[top]/claims/claim_integrated_platform.json",
+    "scenarios/VIS-002[top]/claims/claim_mayo_metrics_builtin.json",
+    "scenarios/VIS-002[top]/cluster_state.json",
+    "scenarios/VIS-002[top]/top.txt"
+  ],
+  "manual_steps": [],
+  "external_dependencies": [],
+  "limitations": [],
+  "deviations": [],
+  "classification": "native",
+  "confidence": "high",
+  "failed_step": null
+}

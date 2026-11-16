@@ -1,0 +1,104 @@
+{
+  "id": "INT-003[podinfo-webapp]",
+  "name": "Import podinfo 6.15.0 deploy/webapp as published -- @1.1 ",
+  "feature": "features/interoperability/upstream_manifests.feature",
+  "axis": "interoperability",
+  "claim_ids": [
+    "claim_k8s_drops_reported_not_silent",
+    "claim_smooth_k8s_transition",
+    "claim_k8s_apply_converts_eleven_kinds"
+  ],
+  "source_refs": [
+    "docs/manual/09_kubernetes.md:22-22@v0.2.0",
+    "docs/manual/09_kubernetes.md:54-54@v0.2.0",
+    "docs/manual/09_kubernetes.md:45-45@v0.2.0",
+    "docs/whitepaper.md:997-997@v0.2.0",
+    "docs/manual/09_kubernetes.md:3-3@v0.2.0",
+    "docs/manual/09_kubernetes.md:20-20@v0.2.0",
+    "docs/manual/09_kubernetes.md:14-14@v0.2.0",
+    "docs/manual/09_kubernetes.md:15-15@v0.2.0"
+  ],
+  "product_commit": "cc5f64393350f2081f7d88512b95a88316172e5a",
+  "product_target": "v0.2.0",
+  "environment": "environment.json",
+  "tags": [
+    "claim_k8s_drops_reported_not_silent",
+    "claim_smooth_k8s_transition",
+    "req_INT-003",
+    "axis_interoperability",
+    "claim_k8s_apply_converts_eleven_kinds"
+  ],
+  "hypothesis": false,
+  "status": "FAIL",
+  "status_reason": "When I apply them with relish apply -f in their own namespace: AssertionError: relish apply -f refused the upstream manifests: error: format failed: YAML parse error: duplicate entry with key \"apiVersion\" at line 19 column 1",
+  "start_time": "2026-10-18T12:13:33.502+00:00",
+  "duration_ms": 4429,
+  "observations": [
+    "reused the healthy lab cluster built earlier in this or a previous run"
+  ],
+  "expected": {},
+  "measured": {
+    "cluster_health_at_start": {
+      "ts": "2026-10-18T12:13:33.866+00:00",
+      "nodes": {
+        "node-02": "alive",
+        "node-01": "alive",
+        "node-03": "alive"
+      },
+      "leaders": [
+        "node-02"
+      ],
+      "voters": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "voters_answering": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "unanswered": [],
+      "fenced": [],
+      "ok": true
+    },
+    "upstream_kinds": [
+      "Deployment",
+      "HorizontalPodAutoscaler",
+      "Namespace",
+      "RoleBinding",
+      "Service",
+      "ServiceAccount"
+    ],
+    "upstream_documents": 9,
+    "zero_touch_apply_rc": 1,
+    "imported_apps": []
+  },
+  "evidence_paths": [
+    "scenarios/INT-003[podinfo-webapp]/claims/claim_k8s_drops_reported_not_silent.json",
+    "scenarios/INT-003[podinfo-webapp]/claims/claim_smooth_k8s_transition.json",
+    "scenarios/INT-003[podinfo-webapp]/claims/claim_k8s_apply_converts_eleven_kinds.json",
+    "scenarios/INT-003[podinfo-webapp]/cluster_state.json",
+    "scenarios/INT-003[podinfo-webapp]/upstream.yaml",
+    "scenarios/INT-003[podinfo-webapp]/migration-report.txt",
+    "scenarios/INT-003[podinfo-webapp]/imported.toml",
+    "scenarios/INT-003[podinfo-webapp]/apply.txt",
+    "scenarios/INT-003[podinfo-webapp]/diagnostics/wtf.json",
+    "scenarios/INT-003[podinfo-webapp]/diagnostics/status.json",
+    "scenarios/INT-003[podinfo-webapp]/diagnostics/council.json",
+    "scenarios/INT-003[podinfo-webapp]/diagnostics/nodes.json",
+    "scenarios/INT-003[podinfo-webapp]/diagnostics/journal-node-01.txt",
+    "scenarios/INT-003[podinfo-webapp]/diagnostics/journal-node-02.txt",
+    "scenarios/INT-003[podinfo-webapp]/diagnostics/journal-node-03.txt",
+    "scenarios/INT-003[podinfo-webapp]/commands.jsonl"
+  ],
+  "manual_steps": [],
+  "external_dependencies": [
+    "container image: ghcr.io/stefanprodan/podinfo:6.15.0"
+  ],
+  "limitations": [],
+  "deviations": [],
+  "classification": null,
+  "confidence": "high",
+  "failed_step": "When I apply them with relish apply -f in their own namespace"
+}

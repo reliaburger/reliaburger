@@ -1,0 +1,81 @@
+{
+  "id": "EXT-002[history]",
+  "name": "relish history frontend honours --output json -- @2.5 other read commands under the global --output flag",
+  "feature": "features/extensibility/cli_json_contract.feature",
+  "axis": "extensibility",
+  "claim_ids": [
+    "claim_cli_machine_readable_output",
+    "claim_batteries_included"
+  ],
+  "source_refs": [
+    "docs/manual/13_reference.md:13-13@v0.2.0",
+    "docs/design/cli-relish.md:1947-1947@v0.2.0"
+  ],
+  "product_commit": "cc5f64393350f2081f7d88512b95a88316172e5a",
+  "product_target": "v0.2.0",
+  "environment": "environment.json",
+  "tags": [
+    "claim_cli_machine_readable_output",
+    "axis_extensibility",
+    "claim_batteries_included",
+    "req_EXT-002"
+  ],
+  "hypothesis": true,
+  "status": "PASS",
+  "status_reason": "all steps passed with recorded measurements",
+  "start_time": "2026-10-18T12:07:31.020+00:00",
+  "duration_ms": 702,
+  "observations": [
+    "reused the healthy lab cluster built earlier in this or a previous run",
+    "command: relish --output json history frontend"
+  ],
+  "expected": {
+    "exit_code": 0,
+    "stdout_is_json": true
+  },
+  "measured": {
+    "cluster_health_at_start": {
+      "ts": "2026-10-18T12:07:31.316+00:00",
+      "nodes": {
+        "node-02": "alive",
+        "node-03": "alive",
+        "node-01": "alive"
+      },
+      "leaders": [
+        "node-01"
+      ],
+      "voters": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "voters_answering": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "unanswered": [],
+      "fenced": [],
+      "ok": true
+    },
+    "exit_code": 0,
+    "stdout_bytes": 3206,
+    "stdout_is_json": true,
+    "json_top_level": "list of 2"
+  },
+  "evidence_paths": [
+    "scenarios/EXT-002[history]/claims/claim_cli_machine_readable_output.json",
+    "scenarios/EXT-002[history]/claims/claim_batteries_included.json",
+    "scenarios/EXT-002[history]/cluster_state.json",
+    "scenarios/EXT-002[history]/stdout.txt",
+    "scenarios/EXT-002[history]/stderr.txt",
+    "scenarios/EXT-002[history]/commands.jsonl"
+  ],
+  "manual_steps": [],
+  "external_dependencies": [],
+  "limitations": [],
+  "deviations": [],
+  "classification": null,
+  "confidence": "high",
+  "failed_step": null
+}

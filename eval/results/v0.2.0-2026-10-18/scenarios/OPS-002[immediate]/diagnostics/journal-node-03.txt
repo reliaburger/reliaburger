@@ -1,0 +1,102 @@
+Oct 18 12:29:37 node-03 systemd[1]: Starting reliaburger.service - Reliaburger node...
+Oct 18 12:29:37 node-03 systemd[1]: Started reliaburger.service - Reliaburger node.
+Oct 18 12:29:37 node-03 bun[729]: bun: reliaburger node agent v0.2.0 (cc5f643)
+Oct 18 12:29:37 node-03 bun[729]: bun: using runc runtime (root)
+Oct 18 12:29:37 node-03 bun[729]: bun: workloads use DNS nameserver 10.77.0.13
+Oct 18 12:29:38 node-03 bun[729]: bun: mTLS enabled on the Raft RPC, reporting and API transports
+Oct 18 12:29:38 node-03 bun[729]: bun: cluster mode — gossip on 10.77.0.13:9443, 1 seed(s)
+Oct 18 12:29:38 node-03 bun[729]: bun: GPU support enabled, 0 device(s) detected
+Oct 18 12:29:38 node-03 bun[729]: bun: eBPF data path loaded (attached=true)
+Oct 18 12:29:38 node-03 bun[729]: council: no peer advertises a newer recovery epoch than 0; serving raft
+Oct 18 12:29:40 node-03 bun[729]: bun: dns responder ready on 10.77.0.13:53
+Oct 18 12:29:40 node-03 bun[729]: bun: ingress listening on http 0.0.0.0:80 / https 0.0.0.0:443
+Oct 18 12:29:40 node-03 bun[729]: bun: observability enabled (metrics + logs + alerts)
+Oct 18 12:29:40 node-03 bun[729]: bun: API server listening on 0.0.0.0:9117
+Oct 18 12:29:40 node-03 bun[729]: bun: pickle catalog loaded (14 manifests)
+Oct 18 12:29:40 node-03 bun[729]: bun: Pickle registry listening on 0.0.0.0:5050 (TLS, authenticated writes and reads)
+Oct 18 12:29:40 node-03 bun[729]: bun: Pickle registry derived peer-reachable bind 0.0.0.0:5050 from cluster advertise address
+Oct 18 12:29:42 node-03 bun[729]: bun: agent loop turn took 502 ms in health_tick: journal write 7 ms, runtime inventory 3 ms
+Oct 18 12:29:44 node-03 bun[729]: bun: agent loop turn took 501 ms in health_tick: journal write 9 ms, runtime inventory 3 ms
+Oct 18 12:29:46 node-03 bun[729]: bun: agent loop turn took 500 ms in health_tick: journal write 14 ms, runtime inventory 4 ms
+Oct 18 12:29:48 node-03 bun[729]: bun: agent loop turn took 501 ms in health_tick: journal write 7 ms, runtime inventory 2 ms
+Oct 18 12:29:50 node-03 bun[729]: bun: agent loop turn took 500 ms in health_tick: journal write 13 ms, runtime inventory 2 ms
+Oct 18 12:29:58 node-03 bun[729]: report worker: admission at 10.77.0.11:9445 failed; next tick collects fresh state: send failed: TCP connect to 10.77.0.11:9445 timed out
+Oct 18 12:30:01 node-03 bun[729]: pickle: registry cleanup pending: replication failed: registry ownership query timed out
+Oct 18 12:30:03 node-03 bun[729]: report worker: admission at 10.77.0.11:9445 failed; next tick collects fresh state: send failed: TCP connect to 10.77.0.11:9445 timed out
+Oct 18 12:30:08 node-03 bun[729]: report worker: admission at 10.77.0.11:9445 failed; next tick collects fresh state: send failed: TCP connect to 10.77.0.11:9445 timed out
+Oct 18 12:30:13 node-03 bun[729]: report worker: admission at 10.77.0.11:9445 failed; next tick collects fresh state: send failed: TCP connect to 10.77.0.11:9445 timed out
+Oct 18 12:30:18 node-03 bun[729]: report worker: admission at 10.77.0.11:9445 failed; next tick collects fresh state: send failed: TCP connect to 10.77.0.11:9445 timed out
+Oct 18 12:30:23 node-03 bun[729]: report worker: admission at 10.77.0.11:9445 failed; next tick collects fresh state: send failed: TCP connect to 10.77.0.11:9445 timed out
+Oct 18 12:31:16 node-03 bun[729]: scheduler: endpoint consumer node-01 silent past its view lease; its withdrawal receipts are no longer awaited
+Oct 18 12:31:26 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:31:32 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:32:25 node-03 bun[729]: pickle: registry cleanup pending: replication failed: registry leader refused proposal: 503 Service Unavailable
+Oct 18 12:32:26 node-03 bun[729]: pickle: registry cleanup pending: replication failed: registry leader refused proposal: 503 Service Unavailable
+Oct 18 12:32:34 node-03 bun[729]: orchestrator: retirement of wprobe-3c928725154b/default failed, will retry: cannot retire artifacts for default__wprobe-3c928725154b-0 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:32:34 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:32:36 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:32:36 node-03 bun[729]: bun: agent loop turn took 500 ms in stop_wait: journal write 20 ms, runtime inventory 1 ms
+Oct 18 12:32:36 node-03 bun[729]: bun: agent loop turn took 270 ms in follow_up (consumer_sync/journal): journal write 22 ms, kernel lock wait 0 ms, view install 0 ms, firewall sync 247 ms
+Oct 18 12:32:38 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:32:40 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:32:42 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:32:44 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:32:46 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:32:48 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:32:50 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:32:52 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:32:54 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:33:06 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:33:08 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:33:10 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:33:12 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:33:14 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:33:16 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:33:18 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:33:20 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:33:22 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:33:24 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:33:26 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:33:28 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:33:40 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:33:42 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:33:44 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:33:46 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:33:48 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:33:50 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:33:52 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:33:54 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:33:56 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:33:58 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:34:00 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:34:34 node-03 bun[729]: orchestrator: retirement of frontend/default failed, will retry: cannot retire artifacts for default__frontend-1 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:34:34 node-03 bun[729]: orchestrator: retirement of backend/default failed, will retry: cannot retire artifacts for default__backend-0 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:34:36 node-03 bun[729]: bun: agent loop turn took 501 ms in stop_wait: journal write 12 ms, runtime inventory 1 ms
+Oct 18 12:34:37 node-03 bun[729]: bun: agent loop turn took 500 ms in stop_wait: journal write 34 ms, runtime inventory 1 ms
+Oct 18 12:34:37 node-03 bun[729]: bun: agent loop turn took 389 ms in stop_wait: journal write 89 ms, runtime inventory 5 ms, kernel lock wait 0 ms, firewall sync 223 ms
+Oct 18 12:34:40 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:34:42 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:34:44 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:35:10 node-03 bun[729]: orchestrator: retirement of frontend/default failed, will retry: cannot retire artifacts for default__frontend-2 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:35:12 node-03 bun[729]: bun: agent loop turn took 500 ms in stop_wait: journal write 13 ms, runtime inventory 1 ms
+Oct 18 12:35:16 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:35:40 node-03 bun[729]: orchestrator: retirement of frontend/default failed, will retry: cannot retire artifacts for default__frontend-2 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:35:42 node-03 bun[729]: bun: agent loop turn took 501 ms in stop_wait: journal write 18 ms, runtime inventory 1 ms
+Oct 18 12:35:46 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:36:12 node-03 bun[729]: orchestrator: retirement of frontend/default failed, will retry: cannot retire artifacts for default__frontend-2 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:36:14 node-03 bun[729]: bun: agent loop turn took 501 ms in stop_wait: journal write 19 ms, runtime inventory 2 ms
+Oct 18 12:36:16 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:36:42 node-03 bun[729]: orchestrator: retirement of frontend/default failed, will retry: cannot retire artifacts for default__frontend-2 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:36:44 node-03 bun[729]: bun: agent loop turn took 501 ms in stop_wait: journal write 19 ms, runtime inventory 2 ms
+Oct 18 12:36:50 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:36:52 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:37:22 node-03 bun[729]: orchestrator: retirement of frontend/default failed, will retry: cannot retire artifacts for default__frontend-2 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:37:28 node-03 bun[729]: bun: agent loop turn took 500 ms in deploy_op (finish_retire): journal write 19 ms, runtime inventory 2 ms
+Oct 18 12:37:40 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:37:42 node-03 bun[729]: orchestrator: retirement of frontend/default failed, will retry: cannot retire artifacts for default__frontend-g1-2 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:37:42 node-03 bun[729]: scheduler: endpoint catalogue was not applied: Refused { reason: "endpoint publication generation changed: expected 642, current 643; rebuild from committed state" }
+Oct 18 12:37:42 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:37:43 node-03 bun[729]: orchestrator: retirement of frontend/default failed, will retry: cannot retire artifacts for default__frontend-g1-2 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:37:44 node-03 bun[729]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:37:46 node-03 bun[729]: bun: agent loop turn took 501 ms in stop_wait: journal write 24 ms, runtime inventory 0 ms
+Oct 18 12:37:46 node-03 bun[729]: bun: agent loop turn took 279 ms in follow_up (consumer_sync/journal): journal write 32 ms, kernel lock wait 0 ms, view install 0 ms, firewall sync 246 ms

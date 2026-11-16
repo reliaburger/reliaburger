@@ -1,0 +1,50 @@
+{
+  "claim": {
+    "id": "claim_council_raft_quorum_and_self_healing",
+    "axis": "operations",
+    "statement": "The Raft council starts on the first node, grows to at most seven voters, replaces a lost minority automatically (promoting a caught-up node), and hands over leadership before a voter with a 95 percent full disk is replaced; losing a majority stops writes and scheduling but not running apps.",
+    "kind": "explicit",
+    "sources": [
+      {
+        "ref": "docs/manual/02_cluster-basics.md:6-6",
+        "quote": "and grows as nodes join, up to seven voters."
+      },
+      {
+        "ref": "docs/manual/02_cluster-basics.md:98-98",
+        "quote": "The council heals itself: lose a voter and the reconciler promotes a caught-up"
+      },
+      {
+        "ref": "docs/whitepaper.md:529-529",
+        "quote": "There's no quorum, so nothing can be elected, scheduled or written; apps keep running."
+      }
+    ],
+    "measurable": "On 3 nodes stop one council voter - relish council status shows quorum ok (2/3 or replaced) without operator action and apps keep serving. Stop two - no applies commit (writes fail), existing apps and ingress keep serving. Two-voter councils cannot roll an upgrade. Election target under 5 s and full operability under 20 s are listed as unmeasured targets.",
+    "interfaces": [
+      "relish council status [--output json]",
+      "relish status",
+      "relish wtf",
+      "ports 9444 (Raft)",
+      "GET /v1/cluster/council"
+    ]
+  },
+  "citation_checks": [
+    {
+      "claim_id": "claim_council_raft_quorum_and_self_healing",
+      "ref": "docs/manual/02_cluster-basics.md:6-6",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_council_raft_quorum_and_self_healing",
+      "ref": "docs/manual/02_cluster-basics.md:98-98",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_council_raft_quorum_and_self_healing",
+      "ref": "docs/whitepaper.md:529-529",
+      "ok": true,
+      "detail": ""
+    }
+  ]
+}

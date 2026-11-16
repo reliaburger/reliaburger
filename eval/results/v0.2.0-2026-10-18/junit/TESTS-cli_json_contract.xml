@@ -1,0 +1,337 @@
+<?xml version='1.0' encoding='utf-8'?>
+<testsuite name="cli_json_contract.Machine-readable CLI output" tests="15" errors="0" failures="4" skipped="0" time="33.075466" timestamp="2026-10-18T14:07:37.589716" hostname="serval"><testcase classname="cli_json_contract.Machine-readable CLI output" name="relish status honours --output json -- @1.1 commands the claim names" status="passed" time="19.514047"><system-out>
+
+@scenario.begin
+
+  @req_EXT-002 @claim_cli_machine_readable_output
+  Scenario Outline: relish status honours --output json -- @1.1 commands the claim names
+    Given a healthy disposable Reliaburger cluster ... passed in 0.395s
+    And the native fixture application is running ... passed in 19.065s
+    When I run relish status with --output json from the workstation ... passed in 0.054s
+    Then the command should exit 0 ... passed in 0.000s
+    And its standard output should parse as JSON ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] EXT-002[status]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="cli_json_contract.Machine-readable CLI output" name="relish nodes honours --output json -- @1.2 commands the claim names" status="passed" time="0.883813"><system-out>
+
+@scenario.begin
+
+  @req_EXT-002 @claim_cli_machine_readable_output
+  Scenario Outline: relish nodes honours --output json -- @1.2 commands the claim names
+    Given a healthy disposable Reliaburger cluster ... passed in 0.641s
+    And the native fixture application is running ... passed in 0.160s
+    When I run relish nodes with --output json from the workstation ... passed in 0.082s
+    Then the command should exit 0 ... passed in 0.000s
+    And its standard output should parse as JSON ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] EXT-002[nodes]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="cli_json_contract.Machine-readable CLI output" name="relish council honours --output json -- @1.3 commands the claim names" status="passed" time="0.966793"><system-out>
+
+@scenario.begin
+
+  @req_EXT-002 @claim_cli_machine_readable_output
+  Scenario Outline: relish council honours --output json -- @1.3 commands the claim names
+    Given a healthy disposable Reliaburger cluster ... passed in 0.592s
+    And the native fixture application is running ... passed in 0.176s
+    When I run relish council with --output json from the workstation ... passed in 0.199s
+    Then the command should exit 0 ... passed in 0.000s
+    And its standard output should parse as JSON ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] EXT-002[council]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="cli_json_contract.Machine-readable CLI output" name="relish token list honours --output json -- @1.4 commands the claim names" status="passed" time="0.854561"><system-out>
+
+@scenario.begin
+
+  @req_EXT-002 @claim_cli_machine_readable_output
+  Scenario Outline: relish token list honours --output json -- @1.4 commands the claim names
+    Given a healthy disposable Reliaburger cluster ... passed in 0.623s
+    And the native fixture application is running ... passed in 0.148s
+    When I run relish token list with --output json from the workstation ... passed in 0.084s
+    Then the command should exit 0 ... passed in 0.000s
+    And its standard output should parse as JSON ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] EXT-002[tokens]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="cli_json_contract.Machine-readable CLI output" name="relish audit --since 1h honours --output json -- @1.5 commands the claim names" status="passed" time="0.896613"><system-out>
+
+@scenario.begin
+
+  @req_EXT-002 @claim_cli_machine_readable_output
+  Scenario Outline: relish audit --since 1h honours --output json -- @1.5 commands the claim names
+    Given a healthy disposable Reliaburger cluster ... passed in 0.667s
+    And the native fixture application is running ... passed in 0.173s
+    When I run relish audit --since 1h with --output json from the workstation ... passed in 0.056s
+    Then the command should exit 0 ... passed in 0.000s
+    And its standard output should parse as JSON ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] EXT-002[audit]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="cli_json_contract.Machine-readable CLI output" name="relish inspect frontend honours --output json -- @2.1 other read commands under the global --output flag" status="failed" time="1.043394"><failure type="AssertionError" message="stdout is not JSON (Expecting value: line 1 column 1 (char 0)); it starts 'App: frontend (namespace default)\n  Replicas:  3 desired, 3 running\n  Placed:    node-01 2, node-02 1\n\nInstance: default'">
+
+Failing step: And its standard output should parse as JSON ... failed in 0.000s
+Location: features/extensibility/cli_json_contract.feature:13
+ASSERT FAILED: stdout is not JSON (Expecting value: line 1 column 1 (char 0)); it starts 'App: frontend (namespace default)\n  Replicas:  3 desired, 3 running\n  Placed:    node-01 2, node-02 1\n\nInstance: default'
+</failure><system-out>
+
+@scenario.begin
+
+  @req_EXT-002 @claim_cli_machine_readable_output
+  Scenario Outline: relish inspect frontend honours --output json -- @2.1 other read commands under the global --output flag
+    Given a healthy disposable Reliaburger cluster ... passed in 0.652s
+    And the native fixture application is running ... passed in 0.151s
+    When I run relish inspect frontend with --output json from the workstation ... passed in 0.239s
+    Then the command should exit 0 ... passed in 0.000s
+    And its standard output should parse as JSON ... failed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] EXT-002[inspect]: FAIL (And its standard output should parse as JSON: AssertionError: stdout is not JSON (Expecting value: line 1 column 1 (char 0)); it starts 'App: frontend (namespac)
+
+
+</system-err></testcase><testcase classname="cli_json_contract.Machine-readable CLI output" name="relish routes honours --output json -- @2.2 other read commands under the global --output flag" status="failed" time="0.754162"><failure type="AssertionError" message="stdout is not JSON (Expecting value: line 1 column 1 (char 0)); it starts 'HOST                           PATH       APP             BACKENDS     WS    \nfixture.rbeval.test            /          '">
+
+Failing step: And its standard output should parse as JSON ... failed in 0.000s
+Location: features/extensibility/cli_json_contract.feature:13
+ASSERT FAILED: stdout is not JSON (Expecting value: line 1 column 1 (char 0)); it starts 'HOST                           PATH       APP             BACKENDS     WS    \nfixture.rbeval.test            /          '
+</failure><system-out>
+
+@scenario.begin
+
+  @req_EXT-002 @claim_cli_machine_readable_output
+  Scenario Outline: relish routes honours --output json -- @2.2 other read commands under the global --output flag
+    Given a healthy disposable Reliaburger cluster ... passed in 0.563s
+    And the native fixture application is running ... passed in 0.107s
+    When I run relish routes with --output json from the workstation ... passed in 0.084s
+    Then the command should exit 0 ... passed in 0.000s
+    And its standard output should parse as JSON ... failed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] EXT-002[routes]: FAIL (And its standard output should parse as JSON: AssertionError: stdout is not JSON (Expecting value: line 1 column 1 (char 0)); it starts 'HOST                   )
+
+
+</system-err></testcase><testcase classname="cli_json_contract.Machine-readable CLI output" name="relish resolve backend honours --output json -- @2.3 other read commands under the global --output flag" status="failed" time="0.836784"><failure type="AssertionError" message="stdout is not JSON (Expecting value: line 1 column 1 (char 0)); it starts 'Service:  backend\nVIP:      127.128.131.21\nPort:     9898\nBackends: 2/2 healthy\n\n  INSTANCE             NODE            '">
+
+Failing step: And its standard output should parse as JSON ... failed in 0.000s
+Location: features/extensibility/cli_json_contract.feature:13
+ASSERT FAILED: stdout is not JSON (Expecting value: line 1 column 1 (char 0)); it starts 'Service:  backend\nVIP:      127.128.131.21\nPort:     9898\nBackends: 2/2 healthy\n\n  INSTANCE             NODE            '
+</failure><system-out>
+
+@scenario.begin
+
+  @req_EXT-002 @claim_cli_machine_readable_output
+  Scenario Outline: relish resolve backend honours --output json -- @2.3 other read commands under the global --output flag
+    Given a healthy disposable Reliaburger cluster ... passed in 0.598s
+    And the native fixture application is running ... passed in 0.153s
+    When I run relish resolve backend with --output json from the workstation ... passed in 0.085s
+    Then the command should exit 0 ... passed in 0.000s
+    And its standard output should parse as JSON ... failed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] EXT-002[resolve]: FAIL (And its standard output should parse as JSON: AssertionError: stdout is not JSON (Expecting value: line 1 column 1 (char 0)); it starts 'Service:  backend\nVIP:)
+
+
+</system-err></testcase><testcase classname="cli_json_contract.Machine-readable CLI output" name="relish fault list honours --output json -- @2.4 other read commands under the global --output flag" status="failed" time="0.772291"><failure type="AssertionError" message="stdout is not JSON (Expecting value: line 1 column 1 (char 0)); it starts 'No active faults\n'">
+
+Failing step: And its standard output should parse as JSON ... failed in 0.000s
+Location: features/extensibility/cli_json_contract.feature:13
+ASSERT FAILED: stdout is not JSON (Expecting value: line 1 column 1 (char 0)); it starts 'No active faults\n'
+</failure><system-out>
+
+@scenario.begin
+
+  @req_EXT-002 @claim_cli_machine_readable_output
+  Scenario Outline: relish fault list honours --output json -- @2.4 other read commands under the global --output flag
+    Given a healthy disposable Reliaburger cluster ... passed in 0.598s
+    And the native fixture application is running ... passed in 0.119s
+    When I run relish fault list with --output json from the workstation ... passed in 0.054s
+    Then the command should exit 0 ... passed in 0.000s
+    And its standard output should parse as JSON ... failed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] EXT-002[faults]: FAIL (And its standard output should parse as JSON: AssertionError: stdout is not JSON (Expecting value: line 1 column 1 (char 0)); it starts 'No active faults\n')
+
+
+</system-err></testcase><testcase classname="cli_json_contract.Machine-readable CLI output" name="relish history frontend honours --output json -- @2.5 other read commands under the global --output flag" status="passed" time="0.701409"><system-out>
+
+@scenario.begin
+
+  @req_EXT-002 @claim_cli_machine_readable_output
+  Scenario Outline: relish history frontend honours --output json -- @2.5 other read commands under the global --output flag
+    Given a healthy disposable Reliaburger cluster ... passed in 0.535s
+    And the native fixture application is running ... passed in 0.113s
+    When I run relish history frontend with --output json from the workstation ... passed in 0.054s
+    Then the command should exit 0 ... passed in 0.000s
+    And its standard output should parse as JSON ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] EXT-002[history]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="cli_json_contract.Machine-readable CLI output" name="relish jobs honours --output json -- @2.6 other read commands under the global --output flag" status="passed" time="0.838368"><system-out>
+
+@scenario.begin
+
+  @req_EXT-002 @claim_cli_machine_readable_output
+  Scenario Outline: relish jobs honours --output json -- @2.6 other read commands under the global --output flag
+    Given a healthy disposable Reliaburger cluster ... passed in 0.579s
+    And the native fixture application is running ... passed in 0.178s
+    When I run relish jobs with --output json from the workstation ... passed in 0.081s
+    Then the command should exit 0 ... passed in 0.000s
+    And its standard output should parse as JSON ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] EXT-002[jobs]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="cli_json_contract.Machine-readable CLI output" name="relish images honours --output json -- @2.7 other read commands under the global --output flag" status="passed" time="0.815207"><system-out>
+
+@scenario.begin
+
+  @req_EXT-002 @claim_cli_machine_readable_output
+  Scenario Outline: relish images honours --output json -- @2.7 other read commands under the global --output flag
+    Given a healthy disposable Reliaburger cluster ... passed in 0.561s
+    And the native fixture application is running ... passed in 0.120s
+    When I run relish images with --output json from the workstation ... passed in 0.134s
+    Then the command should exit 0 ... passed in 0.000s
+    And its standard output should parse as JSON ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] EXT-002[images]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="cli_json_contract.Machine-readable CLI output" name="relish top honours --output json -- @2.8 other read commands under the global --output flag" status="passed" time="0.893165"><system-out>
+
+@scenario.begin
+
+  @req_EXT-002 @claim_cli_machine_readable_output
+  Scenario Outline: relish top honours --output json -- @2.8 other read commands under the global --output flag
+    Given a healthy disposable Reliaburger cluster ... passed in 0.628s
+    And the native fixture application is running ... passed in 0.170s
+    When I run relish top with --output json from the workstation ... passed in 0.094s
+    Then the command should exit 0 ... passed in 0.000s
+    And its standard output should parse as JSON ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] EXT-002[top]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="cli_json_contract.Machine-readable CLI output" name="relish metrics frontend honours --output json -- @2.9 other read commands under the global --output flag" status="passed" time="0.784358"><system-out>
+
+@scenario.begin
+
+  @req_EXT-002 @claim_cli_machine_readable_output
+  Scenario Outline: relish metrics frontend honours --output json -- @2.9 other read commands under the global --output flag
+    Given a healthy disposable Reliaburger cluster ... passed in 0.562s
+    And the native fixture application is running ... passed in 0.115s
+    When I run relish metrics frontend with --output json from the workstation ... passed in 0.107s
+    Then the command should exit 0 ... passed in 0.000s
+    And its standard output should parse as JSON ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] EXT-002[metrics]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase><testcase classname="cli_json_contract.Machine-readable CLI output" name="relish wtf honours --output json -- @2.10 other read commands under the global --output flag" status="passed" time="2.520502"><system-out>
+
+@scenario.begin
+
+  @req_EXT-002 @claim_cli_machine_readable_output
+  Scenario Outline: relish wtf honours --output json -- @2.10 other read commands under the global --output flag
+    Given a healthy disposable Reliaburger cluster ... passed in 0.615s
+    And the native fixture application is running ... passed in 0.148s
+    When I run relish wtf with --output json from the workstation ... passed in 1.757s
+    Then the command should exit 0 ... passed in 0.000s
+    And its standard output should parse as JSON ... passed in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] EXT-002[wtf]: PASS (all steps passed with recorded measurements)
+
+
+</system-err></testcase></testsuite>

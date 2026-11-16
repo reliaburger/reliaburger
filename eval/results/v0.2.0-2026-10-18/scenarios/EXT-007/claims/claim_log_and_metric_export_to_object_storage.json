@@ -1,0 +1,51 @@
+{
+  "claim": {
+    "id": "claim_log_and_metric_export_to_object_storage",
+    "axis": "extensibility",
+    "statement": "Logs can be exported on a schedule as Parquet to a local path, file://, s3:// or gs://, metrics can be archived to an S3 bucket prefix, and council state and volume snapshots can be shipped to object storage; these are the documented off-node data interfaces.",
+    "kind": "explicit",
+    "sources": [
+      {
+        "ref": "docs/manual/04_observability.md:61-61",
+        "quote": "export_path = \"s3://bucket/logs/\""
+      },
+      {
+        "ref": "docs/manual/04_observability.md:114-114",
+        "quote": "object_store_url = \"s3://bucket/reliaburger-metrics\""
+      },
+      {
+        "ref": "docs/manual/12_operations.md:332-332",
+        "quote": "url = \"s3://backups/prod-council\"   # or file://, gs://"
+      }
+    ],
+    "measurable": "Configure each key against a MinIO or GCS bucket; Parquet log files appear within export_interval_secs (default 3600); the checkpoint prevents repeat exports; metrics chunks appear under a per-node prefix and the bucket lifecycle (not bun) handles retention; council backup objects appear every interval_secs (300) and retain = 24 are kept. Credentials come from each backend's standard environment variables.",
+    "interfaces": [
+      "[logs] export_path, export_interval_secs",
+      "[metrics] object_store_url",
+      "[cluster.backup] url, interval_secs, retain",
+      "[storage.snapshots]",
+      "relish logs-export",
+      "relish logs-search"
+    ]
+  },
+  "citation_checks": [
+    {
+      "claim_id": "claim_log_and_metric_export_to_object_storage",
+      "ref": "docs/manual/04_observability.md:61-61",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_log_and_metric_export_to_object_storage",
+      "ref": "docs/manual/04_observability.md:114-114",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_log_and_metric_export_to_object_storage",
+      "ref": "docs/manual/12_operations.md:332-332",
+      "ok": true,
+      "detail": ""
+    }
+  ]
+}

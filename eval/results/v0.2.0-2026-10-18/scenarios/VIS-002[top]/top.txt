@@ -1,0 +1,7 @@
+NODE               APP                  NAMESPACE    STATE      PID      RESTARTS      CPU     MEMORY
+node-01            backend              default      running    3134     0            0.0%   12.7 MiB
+node-01            frontend             default      running    3256     0            0.0%   12.7 MiB
+node-01            secretprobe          default      stopping   3388     0            0.0%   12.7 MiB
+node-02            backend              default      running    2584     0            0.0%   12.7 MiB
+node-02            frontend             default      running    2710     0            0.0%   12.8 MiB
+node-03            frontend             default      running    2587     0            0.0%   12.7 MiB

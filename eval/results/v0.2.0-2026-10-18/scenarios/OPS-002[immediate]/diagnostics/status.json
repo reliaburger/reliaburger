@@ -1,0 +1,113 @@
+[
+  {
+    "node": "node-01",
+    "id": "apps__gitops-6f367e3a6ac8-0",
+    "app_name": "gitops-6f367e3a6ac8",
+    "namespace": "apps",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": 16675,
+    "pid": 1393,
+    "status_age_ms": 258
+  },
+  {
+    "node": "node-01",
+    "id": "default__backend-g3-0",
+    "app_name": "backend",
+    "namespace": "default",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": 15983,
+    "pid": 4770,
+    "status_age_ms": 258
+  },
+  {
+    "node": "node-01",
+    "id": "default__backend-g5-0",
+    "app_name": "backend",
+    "namespace": "default",
+    "state": "stopped",
+    "restart_count": 0,
+    "host_port": 21171,
+    "pid": null,
+    "status_age_ms": 258
+  },
+  {
+    "node": "node-01",
+    "id": "default__frontend-g2-0",
+    "app_name": "frontend",
+    "namespace": "default",
+    "state": "stopped",
+    "restart_count": 0,
+    "host_port": 59817,
+    "exit_code": 0,
+    "pid": null,
+    "status_age_ms": 258
+  },
+  {
+    "node": "node-01",
+    "id": "run-1",
+    "app_name": "rbeval-fail-c21f631bccb2",
+    "namespace": "default",
+    "state": "failed",
+    "restart_count": 0,
+    "host_port": null,
+    "pid": null
+  },
+  {
+    "node": "node-02",
+    "id": "default__backend-1",
+    "app_name": "backend",
+    "namespace": "default",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": 41162,
+    "pid": 3366,
+    "status_age_ms": 445
+  },
+  {
+    "node": "node-02",
+    "id": "default__frontend-g3-1",
+    "app_name": "frontend",
+    "namespace": "default",
+    "state": "stopped",
+    "restart_count": 0,
+    "host_port": 29807,
+    "exit_code": 0,
+    "pid": null,
+    "status_age_ms": 445
+  },
+  {
+    "node": "node-02",
+    "id": "default__frontend-g4-1",
+    "app_name": "frontend",
+    "namespace": "default",
+    "state": "stopped",
+    "restart_count": 0,
+    "host_port": 23807,
+    "pid": null,
+    "status_age_ms": 445
+  },
+  {
+    "node": "node-03",
+    "id": "apps__gitops-6f367e3a6ac8-1",
+    "app_name": "gitops-6f367e3a6ac8",
+    "namespace": "apps",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": 24302,
+    "pid": 1712,
+    "status_age_ms": 12
+  },
+  {
+    "node": "node-03",
+    "id": "default__frontend-2",
+    "app_name": "frontend",
+    "namespace": "default",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": 32078,
+    "pid": 3560,
+    "status_age_ms": 12
+  }
+]

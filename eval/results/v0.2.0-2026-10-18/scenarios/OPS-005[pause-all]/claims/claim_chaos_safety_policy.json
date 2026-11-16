@@ -1,0 +1,49 @@
+{
+  "claim": {
+    "id": "claim_chaos_safety_policy",
+    "axis": "operations",
+    "statement": "Fault injection is guarded by --acknowledge, a role (Deployer for workload faults, Admin for node faults), an operator opt-in in [testing].allowed_operations on each node, a safety_class (production and unknown also need allow_protected_mutation), and rails that refuse faults that would take out every replica or put council quorum at risk.",
+    "kind": "explicit",
+    "sources": [
+      {
+        "ref": "docs/manual/05_chaos.md:81-81",
+        "quote": "A server install writes no `[testing]` section, so every fault is refused until"
+      },
+      {
+        "ref": "docs/manual/05_chaos.md:98-98",
+        "quote": "`kill web --count 3` on a three-replica app is refused"
+      },
+      {
+        "ref": "docs/manual/05_chaos.md:169-169",
+        "quote": "`--yes` records consent. It doesn't grant permission and there is no"
+      }
+    ],
+    "measurable": "On a server-installed cluster every relish fault is refused; after setting [testing] allowed_operations = [\"inject_workload_faults\"] and safety_class = \"development\" workload faults work but node-kill does not; kill web --count 3 on a three-replica app is refused; pause without --instance is refused; node-pressure needs a non-zero max_node_pressure_* and memory caps at 90 percent; every injection, clear and expiry is in relish audit --action 'fault.*'; fault.injected with override_safety is recorded as critical.",
+    "interfaces": [
+      "--acknowledge",
+      "[testing] safety_class, allowed_operations, allow_protected_mutation, max_node_pressure_cpu_percent, max_node_pressure_memory_percent",
+      "relish audit --action 'fault.*'",
+      "relish test --chaos --yes"
+    ]
+  },
+  "citation_checks": [
+    {
+      "claim_id": "claim_chaos_safety_policy",
+      "ref": "docs/manual/05_chaos.md:81-81",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_chaos_safety_policy",
+      "ref": "docs/manual/05_chaos.md:98-98",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_chaos_safety_policy",
+      "ref": "docs/manual/05_chaos.md:169-169",
+      "ok": true,
+      "detail": ""
+    }
+  ]
+}

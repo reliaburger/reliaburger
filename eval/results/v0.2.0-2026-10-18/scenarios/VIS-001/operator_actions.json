@@ -1,0 +1,224 @@
+[
+  {
+    "ts": "2026-10-18T12:01:32.766+00:00",
+    "kind": "command",
+    "description": "\u00a71 install required packages on node-01",
+    "scenario": "VIS-001"
+  },
+  {
+    "ts": "2026-10-18T12:01:33.082+00:00",
+    "kind": "command",
+    "description": "\u00a71 mount bpffs on node-01",
+    "scenario": "VIS-001"
+  },
+  {
+    "ts": "2026-10-18T12:01:42.386+00:00",
+    "kind": "command",
+    "description": "\u00a72.1 download, verify and install bun and relish on node-01",
+    "scenario": "VIS-001"
+  },
+  {
+    "ts": "2026-10-18T12:01:42.757+00:00",
+    "kind": "command",
+    "description": "\u00a72.2 create config and state directories on node-01",
+    "scenario": "VIS-001"
+  },
+  {
+    "ts": "2026-10-18T12:02:02.625+00:00",
+    "kind": "command",
+    "description": "\u00a71 install required packages on node-02",
+    "scenario": "VIS-001"
+  },
+  {
+    "ts": "2026-10-18T12:02:02.977+00:00",
+    "kind": "command",
+    "description": "\u00a71 mount bpffs on node-02",
+    "scenario": "VIS-001"
+  },
+  {
+    "ts": "2026-10-18T12:02:11.941+00:00",
+    "kind": "command",
+    "description": "\u00a72.1 download, verify and install bun and relish on node-02",
+    "scenario": "VIS-001"
+  },
+  {
+    "ts": "2026-10-18T12:02:12.293+00:00",
+    "kind": "command",
+    "description": "\u00a72.2 create config and state directories on node-02",
+    "scenario": "VIS-001"
+  },
+  {
+    "ts": "2026-10-18T12:02:30.505+00:00",
+    "kind": "command",
+    "description": "\u00a71 install required packages on node-03",
+    "scenario": "VIS-001"
+  },
+  {
+    "ts": "2026-10-18T12:02:30.846+00:00",
+    "kind": "command",
+    "description": "\u00a71 mount bpffs on node-03",
+    "scenario": "VIS-001"
+  },
+  {
+    "ts": "2026-10-18T12:02:39.448+00:00",
+    "kind": "command",
+    "description": "\u00a72.1 download, verify and install bun and relish on node-03",
+    "scenario": "VIS-001"
+  },
+  {
+    "ts": "2026-10-18T12:02:39.803+00:00",
+    "kind": "command",
+    "description": "\u00a72.2 create config and state directories on node-03",
+    "scenario": "VIS-001"
+  },
+  {
+    "ts": "2026-10-18T12:02:40.668+00:00",
+    "kind": "command",
+    "description": "\u00a73.1 relish init on node-01",
+    "scenario": "VIS-001"
+  },
+  {
+    "ts": "2026-10-18T12:02:40.989+00:00",
+    "kind": "command",
+    "description": "\u00a73.2 write node-01 node.toml",
+    "scenario": "VIS-001"
+  },
+  {
+    "ts": "2026-10-18T12:02:41.322+00:00",
+    "kind": "command",
+    "description": "\u00a73.3 write node-01 systemd unit",
+    "scenario": "VIS-001"
+  },
+  {
+    "ts": "2026-10-18T12:02:42.146+00:00",
+    "kind": "command",
+    "description": "\u00a73.3 enable and start bun on node-01",
+    "scenario": "VIS-001"
+  },
+  {
+    "ts": "2026-10-18T12:02:42.493+00:00",
+    "kind": "command",
+    "description": "\u00a73.4 copy root CA certificate for the CLI",
+    "scenario": "VIS-001"
+  },
+  {
+    "ts": "2026-10-18T12:02:42.956+00:00",
+    "kind": "command",
+    "description": "\u00a73.4 mint the admin token",
+    "scenario": "VIS-001"
+  },
+  {
+    "ts": "2026-10-18T12:02:43.632+00:00",
+    "kind": "command",
+    "description": "\u00a75.2 copy root CA and admin token to the workstation",
+    "scenario": "VIS-001"
+  },
+  {
+    "ts": "2026-10-18T12:02:43.976+00:00",
+    "kind": "command",
+    "description": "\u00a73.5 change --listen to 0.0.0.0:9117",
+    "scenario": "VIS-001"
+  },
+  {
+    "ts": "2026-10-18T12:02:44.613+00:00",
+    "kind": "command",
+    "description": "\u00a73.5 reload and restart bun on node-01",
+    "scenario": "VIS-001"
+  },
+  {
+    "ts": "2026-10-18T12:02:49.523+00:00",
+    "kind": "command",
+    "description": "\u00a74.1 copy master key to node-02",
+    "scenario": "VIS-001"
+  },
+  {
+    "ts": "2026-10-18T12:02:49.978+00:00",
+    "kind": "command",
+    "description": "\u00a74.2 create single-use join token for node-02",
+    "scenario": "VIS-001"
+  },
+  {
+    "ts": "2026-10-18T12:02:50.489+00:00",
+    "kind": "command",
+    "description": "\u00a74.3 relish join on node-02",
+    "scenario": "VIS-001"
+  },
+  {
+    "ts": "2026-10-18T12:02:50.858+00:00",
+    "kind": "command",
+    "description": "\u00a74.3 write node-02 node.toml",
+    "scenario": "VIS-001"
+  },
+  {
+    "ts": "2026-10-18T12:02:51.228+00:00",
+    "kind": "command",
+    "description": "\u00a74.3 write node-02 systemd unit",
+    "scenario": "VIS-001"
+  },
+  {
+    "ts": "2026-10-18T12:02:51.770+00:00",
+    "kind": "command",
+    "description": "\u00a74.1 copy master key to node-03",
+    "scenario": "VIS-001"
+  },
+  {
+    "ts": "2026-10-18T12:02:52.159+00:00",
+    "kind": "command",
+    "description": "\u00a74.2 create single-use join token for node-03",
+    "scenario": "VIS-001"
+  },
+  {
+    "ts": "2026-10-18T12:02:52.613+00:00",
+    "kind": "command",
+    "description": "\u00a74.3 relish join on node-03",
+    "scenario": "VIS-001"
+  },
+  {
+    "ts": "2026-10-18T12:02:52.969+00:00",
+    "kind": "command",
+    "description": "\u00a74.3 write node-03 node.toml",
+    "scenario": "VIS-001"
+  },
+  {
+    "ts": "2026-10-18T12:02:53.341+00:00",
+    "kind": "command",
+    "description": "\u00a74.3 write node-03 systemd unit",
+    "scenario": "VIS-001"
+  },
+  {
+    "ts": "2026-10-18T12:02:54.063+00:00",
+    "kind": "command",
+    "description": "\u00a74.3 enable and start bun on node-02",
+    "scenario": "VIS-001"
+  },
+  {
+    "ts": "2026-10-18T12:02:54.833+00:00",
+    "kind": "command",
+    "description": "\u00a74.3 enable and start bun on node-03",
+    "scenario": "VIS-001"
+  },
+  {
+    "ts": "2026-10-18T12:03:06.349+00:00",
+    "kind": "command",
+    "description": "\u00a76 relish nodes",
+    "scenario": "VIS-001"
+  },
+  {
+    "ts": "2026-10-18T12:03:06.563+00:00",
+    "kind": "command",
+    "description": "\u00a76 relish council",
+    "scenario": "VIS-001"
+  },
+  {
+    "ts": "2026-10-18T12:03:06.894+00:00",
+    "kind": "command",
+    "description": "\u00a76 relish status",
+    "scenario": "VIS-001"
+  },
+  {
+    "ts": "2026-10-18T12:03:11.107+00:00",
+    "kind": "command",
+    "description": "deploy fixture with relish apply",
+    "scenario": "VIS-001"
+  }
+]

@@ -1,0 +1,45 @@
+[
+  {
+    "node": "node-01",
+    "id": "default__logprobe-0",
+    "app_name": "logprobe",
+    "namespace": "default",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": null,
+    "pid": 7372,
+    "status_age_ms": 124
+  },
+  {
+    "node": "node-01",
+    "id": "run-1",
+    "app_name": "rbeval-fail-c21f631bccb2",
+    "namespace": "default",
+    "state": "failed",
+    "restart_count": 0,
+    "host_port": null,
+    "pid": null
+  },
+  {
+    "node": "node-03",
+    "id": "apps__gitops-6f367e3a6ac8-0",
+    "app_name": "gitops-6f367e3a6ac8",
+    "namespace": "apps",
+    "state": "running",
+    "restart_count": 0,
+    "host_port": 54320,
+    "pid": 6308,
+    "status_age_ms": 44
+  },
+  {
+    "node": "node-03",
+    "id": "apps__gitops-6f367e3a6ac8-1",
+    "app_name": "gitops-6f367e3a6ac8",
+    "namespace": "apps",
+    "state": "preparing",
+    "restart_count": 0,
+    "host_port": 29198,
+    "pid": null,
+    "status_age_ms": 44
+  }
+]

@@ -1,0 +1,11 @@
+{
+  "--help": [
+    "lint               Validate a config file without deploying"
+  ],
+  "apply --help": [],
+  "docs/manual/13_reference.md": [],
+  "docs/manual/10_security.md": [],
+  "docs/manual/01_deploy-an-app.md": [
+    "\"acknowledge replay before another admission\"."
+  ]
+}

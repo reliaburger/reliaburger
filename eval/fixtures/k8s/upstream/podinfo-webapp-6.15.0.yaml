@@ -1,0 +1,271 @@
+# Upstream podinfo deploy/webapp, unmodified, concatenated in kubectl apply -R order.
+# Source: github.com/stefanprodan/podinfo tag 6.15.0, commit dd507173b7b75b2312a36cabe0de5f09c1ce69c8
+# (tarball sha256 bf5ac81b6be50ed19e7d400ffac1456c7ba0461a71a5db3fffcb88998f8af727). Apache-2.0.
+---
+# deploy/webapp/common/namespace.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: webapp
+---
+# deploy/webapp/common/service-account.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: webapp
+  namespace: webapp
+---
+# deploy/webapp/common/reconciler-rbac.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: reconciler
+  namespace: webapp
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: reconciler
+  namespace: webapp
+rules:
+  - apiGroups: ['*']
+    resources: ['*']
+    verbs: ['*']
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: reconciler
+  namespace: webapp
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: reconciler
+subjects:
+  - kind: ServiceAccount
+    name: reconciler
+    namespace: webapp
+---
+# deploy/webapp/backend/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: webapp
+spec:
+  minReadySeconds: 3
+  revisionHistoryLimit: 5
+  progressDeadlineSeconds: 60
+  strategy:
+    rollingUpdate:
+      maxUnavailable: 0
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9797"
+      labels:
+        app: backend
+    spec:
+      serviceAccountName: webapp
+      containers:
+      - name: backend
+        image: ghcr.io/stefanprodan/podinfo:6.15.0
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: http
+          containerPort: 9898
+          protocol: TCP
+        - name: http-metrics
+          containerPort: 9797
+          protocol: TCP
+        - name: grpc
+          containerPort: 9999
+          protocol: TCP
+        command:
+        - ./podinfo
+        - --port=9898
+        - --port-metrics=9797
+        - --grpc-port=9999
+        - --grpc-service-name=backend
+        - --level=info
+        env:
+        - name: PODINFO_UI_COLOR
+          value: "#34577c"
+        livenessProbe:
+          exec:
+            command:
+            - podcli
+            - check
+            - http
+            - localhost:9898/healthz
+          initialDelaySeconds: 5
+          timeoutSeconds: 5
+        readinessProbe:
+          exec:
+            command:
+            - podcli
+            - check
+            - http
+            - localhost:9898/readyz
+          initialDelaySeconds: 5
+          timeoutSeconds: 5
+        resources:
+          limits:
+            cpu: 2000m
+            memory: 512Mi
+          requests:
+            cpu: 100m
+            memory: 32Mi
+---
+# deploy/webapp/backend/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: webapp
+spec:
+  type: ClusterIP
+  selector:
+    app: backend
+  ports:
+    - name: http
+      port: 9898
+      protocol: TCP
+      targetPort: http
+    - port: 9999
+      targetPort: grpc
+      protocol: TCP
+      name: grpc
+---
+# deploy/webapp/backend/hpa.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: backend
+  namespace: webapp
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: backend
+  minReplicas: 1
+  maxReplicas: 2
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 99
+---
+# deploy/webapp/frontend/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: webapp
+spec:
+  minReadySeconds: 3
+  revisionHistoryLimit: 5
+  progressDeadlineSeconds: 60
+  strategy:
+    rollingUpdate:
+      maxUnavailable: 0
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9797"
+      labels:
+        app: frontend
+    spec:
+      serviceAccountName: webapp
+      containers:
+      - name: frontend
+        image: ghcr.io/stefanprodan/podinfo:6.15.0
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: http
+          containerPort: 9898
+          protocol: TCP
+        - name: http-metrics
+          containerPort: 9797
+          protocol: TCP
+        command:
+        - ./podinfo
+        - --port=9898
+        - --port-metrics=9797
+        - --level=info
+        - --backend-url=http://backend:9898/echo
+        env:
+        - name: PODINFO_UI_COLOR
+          value: "#34577c"
+        livenessProbe:
+          exec:
+            command:
+            - podcli
+            - check
+            - http
+            - localhost:9898/healthz
+          initialDelaySeconds: 5
+          timeoutSeconds: 5
+        readinessProbe:
+          exec:
+            command:
+            - podcli
+            - check
+            - http
+            - localhost:9898/readyz
+          initialDelaySeconds: 5
+          timeoutSeconds: 5
+        resources:
+          limits:
+            cpu: 1000m
+            memory: 128Mi
+          requests:
+            cpu: 100m
+            memory: 32Mi
+---
+# deploy/webapp/frontend/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: webapp
+spec:
+  type: ClusterIP
+  selector:
+    app: frontend
+  ports:
+    - name: http
+      port: 80
+      protocol: TCP
+      targetPort: http
+---
+# deploy/webapp/frontend/hpa.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: frontend
+  namespace: webapp
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: backend
+  minReplicas: 1
+  maxReplicas: 4
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 99

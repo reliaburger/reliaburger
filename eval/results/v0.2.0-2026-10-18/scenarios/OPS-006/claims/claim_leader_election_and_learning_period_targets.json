@@ -1,0 +1,40 @@
+{
+  "claim": {
+    "id": "claim_leader_election_and_learning_period_targets",
+    "axis": "operations",
+    "statement": "Leader election should take under 5 seconds and full operability after leader loss under 20 seconds (5 s election plus up to a 15 s learning period during which no new work is placed); neither target has been measured.",
+    "kind": "explicit",
+    "limitation": true,
+    "sources": [
+      {
+        "ref": "docs/whitepaper.md:106-106",
+        "quote": "Time to full operability after leader loss"
+      },
+      {
+        "ref": "docs/whitepaper.md:522-522",
+        "quote": "or a 15-second timeout fires"
+      }
+    ],
+    "measurable": "Kill the leader process; time to new leader in relish council status (<5 s) and until a new app apply places replicas (<20 s). The learning period ends when 95 percent of alive nodes have reported or 15 s pass; applies commit but are unplaced meanwhile; the data plane is unaffected.",
+    "interfaces": [
+      "relish council status",
+      "relish fault node-kill <leader> --acknowledge",
+      "relish test --chaos"
+    ],
+    "gap": "Whitepaper section 2 table marks leader election, operability after leader loss, cold-start state reconstruction (<30 s) and node cold start (<60 s) as \"Target (unmeasured)\"."
+  },
+  "citation_checks": [
+    {
+      "claim_id": "claim_leader_election_and_learning_period_targets",
+      "ref": "docs/whitepaper.md:106-106",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_leader_election_and_learning_period_targets",
+      "ref": "docs/whitepaper.md:522-522",
+      "ok": true,
+      "detail": ""
+    }
+  ]
+}

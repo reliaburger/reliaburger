@@ -1,0 +1,196 @@
+{
+  "batch_id": 1,
+  "kind": "array",
+  "name": "rbeval-batch-b9cd0a4b1893",
+  "namespace": "default",
+  "status": "Succeeded",
+  "done": true,
+  "total": 20,
+  "succeeded": 20,
+  "failed": 0,
+  "not_run": 0,
+  "retried": 0,
+  "retry_causes": {
+    "exit_code": 0,
+    "signal": 0,
+    "timeout": 0,
+    "unknown": 0,
+    "launch": 0,
+    "unrecorded": 0
+  },
+  "queued": 0,
+  "held": 0,
+  "active_commands": 0,
+  "other_in_flight_attempts": 0,
+  "activity_semantics": "last_node_sync_verified_start_to_positive_cleanup",
+  "elapsed_seconds": 14,
+  "whole_run_successes_per_second": 1.4285714285714286,
+  "chunks": 1,
+  "chunks_done": 1,
+  "failed_indices": [],
+  "failed_overflow": 0,
+  "submitted_at_epoch_secs": 1792324820,
+  "nodes": [
+    {
+      "node": "node-01",
+      "slots": 66,
+      "counters": {
+        "running": 0,
+        "active_commands": null,
+        "attempts_started": 20,
+        "succeeded": 20,
+        "failed": 0,
+        "retried": 0,
+        "start_lag_ms_counts": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      }
+    },
+    {
+      "node": "node-02",
+      "slots": 66,
+      "counters": {
+        "running": 0,
+        "active_commands": null,
+        "attempts_started": 0,
+        "succeeded": 0,
+        "failed": 0,
+        "retried": 0,
+        "start_lag_ms_counts": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      }
+    },
+    {
+      "node": "node-03",
+      "slots": 68,
+      "counters": {
+        "running": 0,
+        "active_commands": null,
+        "attempts_started": 0,
+        "succeeded": 0,
+        "failed": 0,
+        "retried": 0,
+        "start_lag_ms_counts": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      }
+    }
+  ],
+  "nodes_truncated": false,
+  "duration_final_attempt_ms": {
+    "bounds": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      32,
+      64,
+      128,
+      256,
+      512,
+      1024,
+      2048,
+      4096,
+      8192,
+      16384,
+      null
+    ],
+    "counts": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      4,
+      16,
+      0
+    ]
+  },
+  "cpu_request_millicores": 50,
+  "memory_request_bytes": 16777216,
+  "age_seconds": 15,
+  "details_retention_seconds": 3600,
+  "execution_semantics": "at_least_once",
+  "runtime": "runc",
+  "idle_executor_reservation": null,
+  "idle_executor_reservation_semantics": "profile_per_compatible_executor; process_requires_rootful_linux_native_backend; not_live_node_usage",
+  "quota_blocked": null,
+  "quota_blocked_reason": null,
+  "unrunnable_reason": null,
+  "run": {
+    "name": "rbeval-batch-b9cd0a4b1893",
+    "namespace": "default",
+    "revision": 1,
+    "trigger": {
+      "manual": {
+        "request_id": "6fe8ea0357a4d7f14a982e1679a6022c"
+      }
+    },
+    "definition_digest": "44bd4c16e995262992f8b8779d3ee8685a00e6bc1c5a4009ee9aadfd1948ac21",
+    "replay_unknown": true,
+    "unknown_owners": []
+  },
+  "unknown_owners": [],
+  "state_bytes": 517,
+  "rates": {
+    "successes_per_second": 17.008449720432665,
+    "failures_per_second": 0.0,
+    "interval_seconds": 1.175886123,
+    "sampled_at_epoch_ms": 1792324835337
+  }
+}

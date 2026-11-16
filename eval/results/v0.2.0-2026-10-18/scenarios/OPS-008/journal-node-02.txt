@@ -1,0 +1,17 @@
+Oct 18 12:34:08 node-02 systemd[1]: Starting reliaburger.service - Reliaburger node...
+Oct 18 12:34:08 node-02 systemd[1]: Started reliaburger.service - Reliaburger node.
+Oct 18 12:34:08 node-02 bun[728]: bun: reliaburger node agent v0.2.0 (cc5f643)
+Oct 18 12:34:08 node-02 bun[728]: bun: using runc runtime (root)
+Oct 18 12:34:08 node-02 bun[728]: bun: workloads use DNS nameserver 10.77.0.12
+Oct 18 12:34:08 node-02 bun[728]: bun: mTLS enabled on the Raft RPC, reporting and API transports
+Oct 18 12:34:08 node-02 bun[728]: bun: cluster mode — gossip on 10.77.0.12:9443, 1 seed(s)
+Oct 18 12:34:08 node-02 bun[728]: council: no peer advertises a newer recovery epoch than 0; serving raft
+Oct 18 12:34:08 node-02 bun[728]: bun: GPU support enabled, 0 device(s) detected
+Oct 18 12:34:09 node-02 bun[728]: bun: eBPF data path loaded (attached=true)
+Oct 18 12:34:09 node-02 bun[728]: bun: dns responder ready on 10.77.0.12:53
+Oct 18 12:34:09 node-02 bun[728]: bun: ingress listening on http 0.0.0.0:80 / https 0.0.0.0:443
+Oct 18 12:34:09 node-02 bun[728]: bun: observability enabled (metrics + logs + alerts)
+Oct 18 12:34:09 node-02 bun[728]: bun: API server listening on 0.0.0.0:9117
+Oct 18 12:34:09 node-02 bun[728]: bun: pickle catalog loaded (2 manifests)
+Oct 18 12:34:09 node-02 bun[728]: bun: Pickle registry listening on 0.0.0.0:5050 (TLS, authenticated writes and reads)
+Oct 18 12:34:09 node-02 bun[728]: bun: Pickle registry derived peer-reachable bind 0.0.0.0:5050 from cluster advertise address

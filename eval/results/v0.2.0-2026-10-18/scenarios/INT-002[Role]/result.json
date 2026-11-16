@@ -1,0 +1,75 @@
+{
+  "id": "INT-002[Role]",
+  "name": "Import a Role manifest -- @3.6 Documented as dropped",
+  "feature": "features/interoperability/kubernetes_kinds.feature",
+  "axis": "interoperability",
+  "claim_ids": [
+    "claim_k8s_drops_reported_not_silent",
+    "claim_k8s_apply_converts_eleven_kinds"
+  ],
+  "source_refs": [
+    "docs/manual/09_kubernetes.md:22-22@v0.2.0",
+    "docs/manual/09_kubernetes.md:54-54@v0.2.0",
+    "docs/manual/09_kubernetes.md:45-45@v0.2.0",
+    "docs/whitepaper.md:997-997@v0.2.0",
+    "docs/manual/09_kubernetes.md:20-20@v0.2.0",
+    "docs/manual/09_kubernetes.md:14-14@v0.2.0",
+    "docs/manual/09_kubernetes.md:15-15@v0.2.0"
+  ],
+  "product_commit": "cc5f64393350f2081f7d88512b95a88316172e5a",
+  "product_target": "v0.2.0",
+  "environment": "environment.json",
+  "tags": [
+    "offline",
+    "req_INT-002",
+    "claim_k8s_drops_reported_not_silent",
+    "axis_interoperability",
+    "claim_k8s_apply_converts_eleven_kinds"
+  ],
+  "hypothesis": false,
+  "status": "PASS",
+  "status_reason": "all steps passed with recorded measurements",
+  "start_time": "2026-10-18T12:12:56.076+00:00",
+  "duration_ms": 153,
+  "observations": [],
+  "expected": {
+    "outcome": "dropped"
+  },
+  "measured": {
+    "import_rc": 0,
+    "report": {
+      "converted": [],
+      "approximated": [],
+      "dropped": [
+        {
+          "kind": "Role",
+          "name": "reader",
+          "detail": "no Reliaburger equivalent",
+          "marker": "-",
+          "line": "- Role/reader \u2014 no Reliaburger equivalent"
+        }
+      ],
+      "other": []
+    },
+    "outcome_sections": [
+      "dropped"
+    ],
+    "toml_evidence": "not applicable",
+    "silently_lost": []
+  },
+  "evidence_paths": [
+    "scenarios/INT-002[Role]/claims/claim_k8s_drops_reported_not_silent.json",
+    "scenarios/INT-002[Role]/claims/claim_k8s_apply_converts_eleven_kinds.json",
+    "scenarios/INT-002[Role]/input.yaml",
+    "scenarios/INT-002[Role]/converted.toml",
+    "scenarios/INT-002[Role]/report.txt",
+    "scenarios/INT-002[Role]/commands.jsonl"
+  ],
+  "manual_steps": [],
+  "external_dependencies": [],
+  "limitations": [],
+  "deviations": [],
+  "classification": null,
+  "confidence": "high",
+  "failed_step": null
+}

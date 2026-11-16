@@ -1,0 +1,98 @@
+{
+  "id": "OPS-005[no-ack]",
+  "name": "relish fault kill frontend --count 1 as admin -- @1.3 ",
+  "feature": "features/operations/chaos_safety_rails.feature",
+  "axis": "operations",
+  "claim_ids": [
+    "claim_integrated_platform",
+    "claim_chaos_safety_policy"
+  ],
+  "source_refs": [
+    "README.md:13-13@v0.2.0",
+    "docs/manual/05_chaos.md:81-81@v0.2.0",
+    "docs/manual/05_chaos.md:98-98@v0.2.0",
+    "docs/manual/05_chaos.md:169-169@v0.2.0"
+  ],
+  "product_commit": "cc5f64393350f2081f7d88512b95a88316172e5a",
+  "product_target": "v0.2.0",
+  "environment": "environment.json",
+  "tags": [
+    "req_OPS-005",
+    "claim_integrated_platform",
+    "axis_operations",
+    "claim_chaos_safety_policy"
+  ],
+  "hypothesis": false,
+  "status": "PASS",
+  "status_reason": "all steps passed with recorded measurements",
+  "start_time": "2026-10-18T12:25:11.316+00:00",
+  "duration_ms": 4653,
+  "observations": [
+    "reused the healthy lab cluster built earlier in this or a previous run"
+  ],
+  "expected": {
+    "verdict": "refuse",
+    "frontend_running_again_s": "<= 120"
+  },
+  "measured": {
+    "cluster_health_at_start": {
+      "ts": "2026-10-18T12:25:11.653+00:00",
+      "nodes": {
+        "node-02": "alive",
+        "node-01": "alive",
+        "node-03": "alive"
+      },
+      "leaders": [
+        "node-02"
+      ],
+      "voters": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "voters_answering": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "unanswered": [],
+      "fenced": [],
+      "ok": true
+    },
+    "command": "relish fault kill frontend --count 1",
+    "leader": "node-02",
+    "exit_code": 1,
+    "verdict": "refuse",
+    "refusal_text": "error: API error (status 403): destructive operation requires acknowledgement",
+    "frontend_running_again_s": 0.1,
+    "placement_after": {
+      "node-01": [
+        "default__frontend-0:running"
+      ],
+      "node-02": [
+        "default__frontend-2:running"
+      ],
+      "node-03": [
+        "default__frontend-1:running"
+      ]
+    },
+    "fault_injected_lines": 1
+  },
+  "evidence_paths": [
+    "scenarios/OPS-005[no-ack]/claims/claim_integrated_platform.json",
+    "scenarios/OPS-005[no-ack]/claims/claim_chaos_safety_policy.json",
+    "scenarios/OPS-005[no-ack]/cluster_state.json",
+    "scenarios/OPS-005[no-ack]/stdout.txt",
+    "scenarios/OPS-005[no-ack]/stderr.txt",
+    "scenarios/OPS-005[no-ack]/fault-list-after.txt",
+    "scenarios/OPS-005[no-ack]/audit-fault.txt",
+    "scenarios/OPS-005[no-ack]/commands.jsonl"
+  ],
+  "manual_steps": [],
+  "external_dependencies": [],
+  "limitations": [],
+  "deviations": [],
+  "classification": null,
+  "confidence": "high",
+  "failed_step": null
+}

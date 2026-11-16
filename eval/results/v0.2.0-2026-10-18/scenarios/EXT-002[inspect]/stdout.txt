@@ -1,0 +1,28 @@
+App: frontend (namespace default)
+  Replicas:  3 desired, 3 running
+  Placed:    node-01 2, node-02 1
+
+Instance: default__frontend-1
+  Node:      node-02
+  Namespace: default
+  State:     running
+  Restarts:  0
+  PID:       4486
+  Port:      39556
+
+Instance: default__frontend-0
+  Node:      node-01
+  Namespace: default
+  State:     running
+  Restarts:  0
+  PID:       5094
+  Port:      29736
+
+Instance: default__frontend-2
+  Node:      node-01
+  Namespace: default
+  State:     running
+  Restarts:  0
+  PID:       5221
+  Port:      32619
+

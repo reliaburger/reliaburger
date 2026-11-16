@@ -1,0 +1,206 @@
+[app.adservice]
+image = "us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/adservice:v0.10.7"
+run_as_user = 1000
+run_as_group = 1000
+replicas = 1
+port = 9555
+memory = "188743680-314572800"
+cpu = "200m-300m"
+namespace = "boutique"
+
+[app.adservice.env]
+PORT = "9555"
+
+[app.cartservice]
+image = "us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/cartservice:v0.10.7"
+run_as_user = 1000
+run_as_group = 1000
+replicas = 1
+port = 7070
+memory = "67108864-134217728"
+cpu = "200m-300m"
+namespace = "boutique"
+
+[app.cartservice.env]
+REDIS_ADDR = "redis-cart:6379"
+
+[app.checkoutservice]
+image = "us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/checkoutservice:v0.10.7"
+run_as_user = 1000
+run_as_group = 1000
+replicas = 1
+port = 5050
+memory = "67108864-134217728"
+cpu = "100m-200m"
+namespace = "boutique"
+
+[app.checkoutservice.env]
+CART_SERVICE_ADDR = "cartservice:7070"
+CURRENCY_SERVICE_ADDR = "currencyservice:7000"
+EMAIL_SERVICE_ADDR = "emailservice:5000"
+PAYMENT_SERVICE_ADDR = "paymentservice:50051"
+PORT = "5050"
+PRODUCT_CATALOG_SERVICE_ADDR = "productcatalogservice:3550"
+SHIPPING_SERVICE_ADDR = "shippingservice:50051"
+
+[app.currencyservice]
+image = "us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/currencyservice:v0.10.7"
+run_as_user = 1000
+run_as_group = 1000
+replicas = 1
+port = 7000
+memory = "67108864-134217728"
+cpu = "100m-200m"
+namespace = "boutique"
+
+[app.currencyservice.env]
+DISABLE_PROFILER = "1"
+PORT = "7000"
+
+[app.emailservice]
+image = "us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/emailservice:v0.10.7"
+run_as_user = 1000
+run_as_group = 1000
+replicas = 1
+port = 8080
+memory = "67108864-134217728"
+cpu = "100m-200m"
+namespace = "boutique"
+
+[app.emailservice.env]
+DISABLE_PROFILER = "1"
+PORT = "8080"
+
+[app.frontend]
+image = "us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/frontend:v0.10.7"
+run_as_user = 1000
+run_as_group = 1000
+replicas = 1
+port = 8080
+memory = "67108864-134217728"
+cpu = "100m-200m"
+namespace = "boutique"
+
+[app.frontend.health]
+path = "/_healthz"
+protocol = "http"
+initial_delay = 10
+
+[app.frontend.env]
+AD_SERVICE_ADDR = "adservice:9555"
+CART_SERVICE_ADDR = "cartservice:7070"
+CHECKOUT_SERVICE_ADDR = "checkoutservice:5050"
+CURRENCY_SERVICE_ADDR = "currencyservice:7000"
+ENABLE_PROFILER = "0"
+PORT = "8080"
+PRODUCT_CATALOG_SERVICE_ADDR = "productcatalogservice:3550"
+RECOMMENDATION_SERVICE_ADDR = "recommendationservice:8080"
+SHIPPING_SERVICE_ADDR = "shippingservice:50051"
+SHOPPING_ASSISTANT_SERVICE_ADDR = "shoppingassistantservice:80"
+
+[app.loadgenerator]
+image = "us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/loadgenerator:v0.10.7"
+run_as_user = 1000
+run_as_group = 1000
+replicas = 1
+memory = "268435456-536870912"
+cpu = "300m-500m"
+namespace = "boutique"
+
+[app.loadgenerator.env]
+FRONTEND_ADDR = "frontend:80"
+RATE = "1"
+USERS = "10"
+
+[[app.loadgenerator.init]]
+image = "busybox:1.38.0@sha256:dc2d74b28e4cf8984fa52af1f39bc7c3d9c73760b41a74d629f5d11b1ab28616"
+command = [
+    "/bin/sh",
+    "-exc",
+    """
+MAX_RETRIES=12
+RETRY_INTERVAL=10
+for i in $(seq 1 $MAX_RETRIES); do
+  echo "Attempt $i: Pinging frontend: ${FRONTEND_ADDR}..."
+  STATUSCODE=$(wget --server-response http://${FRONTEND_ADDR} 2>&1 | awk '/^  HTTP/{print $2}')
+  if [ $STATUSCODE -eq 200 ]; then
+      echo "Frontend is reachable."
+      exit 0
+  fi
+  echo "Error: Could not reach frontend - Status code: ${STATUSCODE}"
+  sleep $RETRY_INTERVAL
+done
+echo "Failed to reach frontend after $MAX_RETRIES attempts."
+exit 1
+""",
+]
+
+[app.paymentservice]
+image = "us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/paymentservice:v0.10.7"
+run_as_user = 1000
+run_as_group = 1000
+replicas = 1
+port = 50051
+memory = "67108864-134217728"
+cpu = "100m-200m"
+namespace = "boutique"
+
+[app.paymentservice.env]
+DISABLE_PROFILER = "1"
+PORT = "50051"
+
+[app.productcatalogservice]
+image = "us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/productcatalogservice:v0.10.7"
+run_as_user = 1000
+run_as_group = 1000
+replicas = 1
+port = 3550
+memory = "67108864-134217728"
+cpu = "100m-200m"
+namespace = "boutique"
+
+[app.productcatalogservice.env]
+DISABLE_PROFILER = "1"
+PORT = "3550"
+
+[app.recommendationservice]
+image = "us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/recommendationservice:v0.10.7"
+run_as_user = 1000
+run_as_group = 1000
+replicas = 1
+port = 8080
+memory = "230686720-471859200"
+cpu = "100m-200m"
+namespace = "boutique"
+
+[app.recommendationservice.env]
+DISABLE_PROFILER = "1"
+PORT = "8080"
+PRODUCT_CATALOG_SERVICE_ADDR = "productcatalogservice:3550"
+
+[app.redis-cart]
+image = "redis:alpine"
+run_as_user = 1000
+run_as_group = 1000
+replicas = 1
+port = 6379
+memory = "209715200-268435456"
+cpu = "70m-125m"
+namespace = "boutique"
+
+[app.shippingservice]
+image = "us-central1-docker.pkg.dev/online-boutique-ci/microservices-demo/shippingservice:v0.10.7"
+run_as_user = 1000
+run_as_group = 1000
+replicas = 1
+port = 50051
+memory = "67108864-134217728"
+cpu = "100m-200m"
+namespace = "boutique"
+
+[app.shippingservice.env]
+DISABLE_PROFILER = "1"
+PORT = "50051"
+
+[namespace.boutique]
+secret_key = false

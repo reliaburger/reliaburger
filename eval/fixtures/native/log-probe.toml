@@ -1,0 +1,7 @@
+# VIS-002 logs: prints a unique marker once a second.
+[app.logprobe]
+image = "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028"
+command = ["sh", "-c", "while true; do echo {{TOKEN}}; sleep 1; done"]
+replicas = 1
+cpu = "10m-100m"
+memory = "8Mi-32Mi"

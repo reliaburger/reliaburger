@@ -1,0 +1,18 @@
+{
+  "version": "1",
+  "alert": {
+    "labels": {
+      "job": "rbeval-fail-c21f631bccb2",
+      "namespace": "default",
+      "run": "1"
+    },
+    "name": "job_run_failed",
+    "severity": "critical",
+    "status": "firing",
+    "message": "job default/rbeval-fail-c21f631bccb2 run 1 failed: 0 succeeded, 1 failed, 0 not run; see relish batch results 1 --failed",
+    "value": null,
+    "fired_at": 1792325153
+  },
+  "cluster": "rbeval",
+  "timestamp": 1792325153
+}

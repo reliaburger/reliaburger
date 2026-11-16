@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "cluster_name": "rbeval",
+  "collected_at": 1792327603,
+  "node_count": 3,
+  "critical": [],
+  "warnings": [],
+  "unknown": [],
+  "ok": [
+    {
+      "id": "alerts",
+      "description": "no relevant alerts are firing"
+    },
+    {
+      "id": "builds",
+      "description": "all 3 nodes run bun v0.2.0 (cc5f643), sha256 6dbda6ff6716"
+    },
+    {
+      "id": "certificates",
+      "description": "all observed certificates are currently valid with healthy automatic rotation"
+    },
+    {
+      "id": "council",
+      "description": "council quorum healthy (3/3)"
+    },
+    {
+      "id": "cpu-throttling",
+      "description": "no application accumulated throttled CPU time"
+    },
+    {
+      "id": "crashloops",
+      "description": "no applications have three timestamped restarts in 15 minutes (caveat: restart history is held in node-local, bounded, non-durable event rings)"
+    },
+    {
+      "id": "deploys",
+      "description": "no deploy has been active for more than 15 minutes (caveat: terminal deploy history is bounded and process-local; operation targets do not yet carry image versions)"
+    },
+    {
+      "id": "disks",
+      "description": "all observed storage domains are below 85% usage"
+    },
+    {
+      "id": "faults",
+      "description": "no active Smoker faults"
+    },
+    {
+      "id": "namespace-isolation",
+      "description": "every reporting node enforces namespace isolation"
+    },
+    {
+      "id": "nodes",
+      "description": "all 3 nodes alive and answering"
+    },
+    {
+      "id": "registry",
+      "description": "Pickle is reachable and its known layers meet the redundancy target"
+    },
+    {
+      "id": "replicas",
+      "description": "every app runs its desired replicas"
+    },
+    {
+      "id": "services",
+      "description": "all deployed services have a healthy backend"
+    },
+    {
+      "id": "tokens",
+      "description": "no API token expires within 14 days, and no admin token is past 90 days"
+    }
+  ],
+  "summary": {
+    "critical_count": 0,
+    "warning_count": 0,
+    "unknown_count": 0,
+    "ok_count": 15
+  }
+}

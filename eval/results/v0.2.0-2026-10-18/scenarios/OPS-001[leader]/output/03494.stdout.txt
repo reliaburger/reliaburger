@@ -1,0 +1,53 @@
+Oct 18 12:25:21 node-02 bun[6926]: smoker: fault fault-1 expired (resume), cleaning up
+-- Boot 1c47af902d7347cd879697d612eda005 --
+Oct 18 12:25:55 node-02 systemd[1]: Starting reliaburger.service - Reliaburger node...
+Oct 18 12:25:55 node-02 systemd[1]: Started reliaburger.service - Reliaburger node.
+Oct 18 12:25:55 node-02 bun[733]: bun: reliaburger node agent v0.2.0 (cc5f643)
+Oct 18 12:25:55 node-02 bun[733]: bun: using runc runtime (root)
+Oct 18 12:25:55 node-02 bun[733]: bun: workloads use DNS nameserver 10.77.0.12
+Oct 18 12:25:55 node-02 bun[733]: bun: mTLS enabled on the Raft RPC, reporting and API transports
+Oct 18 12:25:55 node-02 bun[733]: bun: cluster mode — gossip on 10.77.0.12:9443, 1 seed(s)
+Oct 18 12:25:55 node-02 bun[733]: bun: GPU support enabled, 0 device(s) detected
+Oct 18 12:25:55 node-02 bun[733]: bun: eBPF data path loaded (attached=true)
+Oct 18 12:25:56 node-02 bun[733]: council: no peer advertises a newer recovery epoch than 0; serving raft
+Oct 18 12:25:56 node-02 bun[733]: bun: dns responder ready on 10.77.0.12:53
+Oct 18 12:25:56 node-02 bun[733]: bun: ingress listening on http 0.0.0.0:80 / https 0.0.0.0:443
+Oct 18 12:25:56 node-02 bun[733]: bun: observability enabled (metrics + logs + alerts)
+Oct 18 12:25:56 node-02 bun[733]: bun: API server listening on 0.0.0.0:9117
+Oct 18 12:25:56 node-02 bun[733]: bun: pickle catalog loaded (2 manifests)
+Oct 18 12:25:56 node-02 bun[733]: bun: Pickle registry listening on 0.0.0.0:5050 (TLS, authenticated writes and reads)
+Oct 18 12:25:56 node-02 bun[733]: bun: Pickle registry derived peer-reachable bind 0.0.0.0:5050 from cluster advertise address
+Oct 18 12:25:56 node-02 bun[733]: orchestrator: deploy of frontend/default failed (attempt 1), retrying in 5s: startup cleanup still owns runtime allocations; retry after recovery
+Oct 18 12:26:00 node-02 bun[733]: bun: agent loop turn took 501 ms in health_tick: journal write 7 ms, runtime inventory 1 ms
+Oct 18 12:26:01 node-02 bun[733]: scheduler: cannot place apps/gitops-6f367e3a6ac8: no eligible nodes for app AppId { name: "gitops-6f367e3a6ac8", namespace: "apps" }
+Oct 18 12:26:01 node-02 bun[733]: scheduler: cannot place default/backend: no eligible nodes for app AppId { name: "backend", namespace: "default" }
+Oct 18 12:26:01 node-02 bun[733]: scheduler: cannot place default/frontend: no eligible nodes for app AppId { name: "frontend", namespace: "default" }
+Oct 18 12:26:03 node-02 bun[733]: scheduler: cannot place apps/gitops-6f367e3a6ac8: no eligible nodes for app AppId { name: "gitops-6f367e3a6ac8", namespace: "apps" }
+Oct 18 12:26:03 node-02 bun[733]: scheduler: cannot place default/backend: no eligible nodes for app AppId { name: "backend", namespace: "default" }
+Oct 18 12:26:03 node-02 bun[733]: scheduler: cannot place default/frontend: no eligible nodes for app AppId { name: "frontend", namespace: "default" }
+Oct 18 12:26:06 node-02 bun[733]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:26:08 node-02 bun[733]: scheduler: placement pass refused: admission revision changed
+Oct 18 12:26:10 node-02 bun[733]: scheduler: placement pass refused: admission revision changed
+-- Boot 3bb5a3cb0a1440de8d6dfe7a3a7d6ffb --
+Oct 18 12:27:15 node-02 systemd[1]: Starting reliaburger.service - Reliaburger node...
+Oct 18 12:27:15 node-02 systemd[1]: Started reliaburger.service - Reliaburger node.
+Oct 18 12:27:15 node-02 bun[737]: bun: reliaburger node agent v0.2.0 (cc5f643)
+Oct 18 12:27:15 node-02 bun[737]: bun: using runc runtime (root)
+Oct 18 12:27:15 node-02 bun[737]: bun: workloads use DNS nameserver 10.77.0.12
+Oct 18 12:27:15 node-02 bun[737]: bun: mTLS enabled on the Raft RPC, reporting and API transports
+Oct 18 12:27:15 node-02 bun[737]: bun: cluster mode — gossip on 10.77.0.12:9443, 1 seed(s)
+Oct 18 12:27:16 node-02 bun[737]: bun: GPU support enabled, 0 device(s) detected
+Oct 18 12:27:16 node-02 bun[737]: bun: eBPF data path loaded (attached=true)
+Oct 18 12:27:16 node-02 bun[737]: council: no peer advertises a newer recovery epoch than 0; serving raft
+Oct 18 12:27:16 node-02 bun[737]: bun: dns responder ready on 10.77.0.12:53
+Oct 18 12:27:16 node-02 bun[737]: bun: ingress listening on http 0.0.0.0:80 / https 0.0.0.0:443
+Oct 18 12:27:16 node-02 bun[737]: bun: observability enabled (metrics + logs + alerts)
+Oct 18 12:27:16 node-02 bun[737]: bun: API server listening on 0.0.0.0:9117
+Oct 18 12:27:16 node-02 bun[737]: bun: pickle catalog loaded (2 manifests)
+Oct 18 12:27:16 node-02 bun[737]: bun: Pickle registry listening on 0.0.0.0:5050 (TLS, authenticated writes and reads)
+Oct 18 12:27:16 node-02 bun[737]: bun: Pickle registry derived peer-reachable bind 0.0.0.0:5050 from cluster advertise address
+Oct 18 12:27:18 node-02 bun[737]: bun: agent loop turn took 500 ms in health_tick: journal write 13 ms, runtime inventory 1 ms
+Oct 18 12:29:56 node-02 bun[737]: report worker: admission at 10.77.0.11:9445 failed; next tick collects fresh state: send failed: TCP connect to 10.77.0.11:9445 timed out
+Oct 18 12:30:01 node-02 bun[737]: report worker: admission at 10.77.0.11:9445 failed; next tick collects fresh state: send failed: TCP connect to 10.77.0.11:9445 timed out
+Oct 18 12:30:02 node-02 bun[737]: pickle: registry cleanup pending: replication failed: registry ownership query timed out
+Oct 18 12:30:06 node-02 bun[737]: report worker: admission at 10.77.0.11:9445 failed; next tick collects fresh state: send failed: TCP connect to 10.77.0.11:9445 timed out

@@ -1,0 +1,49 @@
+{
+  "claim": {
+    "id": "claim_alert_webhooks_outbound",
+    "axis": "extensibility",
+    "statement": "Alerts and failed or unknown-outcome job runs are delivered to configured webhook destinations (generic HTTP, Slack, PagerDuty), optionally HMAC-SHA256 signed, with 3 retries.",
+    "kind": "explicit",
+    "sources": [
+      {
+        "ref": "docs/manual/04_observability.md:188-188",
+        "quote": "Webhooks deliver them, optionally signed with HMAC-SHA256"
+      },
+      {
+        "ref": "docs/design/metrics-mayo.md:375-375",
+        "quote": "failed deliveries are retried 3 times with backoff (1s, 5s, 25s)"
+      },
+      {
+        "ref": "docs/design/metrics-mayo.md:373-373",
+        "quote": "the digest is sent as `X-Mayo-Signature-256: sha256=<hex>`"
+      }
+    ],
+    "measurable": "Point [[alerts.destinations]] at a local HTTP listener; trigger an alert (cpu fault, node-pressure) and a failing job; verify the body, the X-Mayo-Signature-256 HMAC over it, severity filtering, retries at 1 s, 5 s, 25 s after a 500, and one job_run_failed per run not per task. Evaluate whether a user can add rules (docs - they cannot).",
+    "interfaces": [
+      "[[alerts.destinations]] type = webhook|slack|pagerduty, url, severity, secret",
+      "job_run_failed",
+      "job_run_unknown_outcome"
+    ],
+    "gap": "The user manual only shows type = \"webhook\"; Slack and PagerDuty destination types appear only in docs/design/metrics-mayo.md (lines 17, 43, 225). Custom alert rules are not supported (manual: \"You can't define your own rules yet.\")."
+  },
+  "citation_checks": [
+    {
+      "claim_id": "claim_alert_webhooks_outbound",
+      "ref": "docs/manual/04_observability.md:188-188",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_alert_webhooks_outbound",
+      "ref": "docs/design/metrics-mayo.md:375-375",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_alert_webhooks_outbound",
+      "ref": "docs/design/metrics-mayo.md:373-373",
+      "ok": true,
+      "detail": ""
+    }
+  ]
+}

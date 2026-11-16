@@ -1,0 +1,39 @@
+{
+  "claim": {
+    "id": "claim_app_metrics_scraping_and_extra_targets",
+    "axis": "extensibility",
+    "statement": "Each node scrapes Prometheus text from apps that declare metrics = {} (every 10 s) and from fixed [[metrics.scrape_targets]] URLs (every 30 s); Kubernetes prometheus.io annotations enable it on import.",
+    "kind": "explicit",
+    "sources": [
+      {
+        "ref": "docs/manual/04_observability.md:140-140",
+        "quote": "each node scrapes its own"
+      },
+      {
+        "ref": "docs/manual/04_observability.md:179-179",
+        "quote": "list fixed URLs as `[[metrics.scrape_targets]]` with a `job` and a"
+      }
+    ],
+    "measurable": "Deploy podinfo or any /metrics app; relish metrics <app> shows counters as per-second rates, histograms as mean, and up = 1; killing the target sets up = 0 within one 10 s scrape; a node-exporter listed under scrape_targets appears after about 30 s. Samples carry labels app, namespace, instance, node.",
+    "interfaces": [
+      "metrics = {} / metrics = { port, path }",
+      "[[metrics.scrape_targets]] job, url",
+      "relish metrics <app> [--name --since]",
+      "prometheus.io/scrape, port, path annotations"
+    ]
+  },
+  "citation_checks": [
+    {
+      "claim_id": "claim_app_metrics_scraping_and_extra_targets",
+      "ref": "docs/manual/04_observability.md:140-140",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "claim_id": "claim_app_metrics_scraping_and_extra_targets",
+      "ref": "docs/manual/04_observability.md:179-179",
+      "ok": true,
+      "detail": ""
+    }
+  ]
+}

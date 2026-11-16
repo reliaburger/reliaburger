@@ -1,0 +1,5 @@
+Converted:
+  + StatefulSet/db → [app.db]
+
+Approximated (review recommended):
+  ~ StatefulSet/db — ordering guarantees and stable network IDs lost

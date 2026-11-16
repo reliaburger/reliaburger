@@ -1,0 +1,138 @@
+{
+  "schema_version": 1,
+  "cluster_name": "rbeval",
+  "collected_at": 1792326422,
+  "node_count": 3,
+  "critical": [
+    {
+      "id": "node-dead",
+      "title": "node node-02 is dead",
+      "details": [
+        "Mustard membership does not consider this node alive"
+      ],
+      "suggestion": "node node-02 is dead; if expected, drain it; if not, check the host",
+      "correlated_events": [],
+      "affected_resource": "node.node-02"
+    },
+    {
+      "id": "unreachable-nodes",
+      "title": "node node-02 did not answer its Bun API",
+      "details": [
+        "authenticated per-node evidence collection failed"
+      ],
+      "suggestion": "check the node's bun agent and network: `relish dev shell <node>` / `journalctl -u bun`",
+      "correlated_events": [],
+      "affected_resource": "node.node-02"
+    }
+  ],
+  "warnings": [
+    {
+      "id": "council-member-down",
+      "title": "1 of 3 council members did not answer",
+      "details": [
+        "quorum holds with 2 of 3; 1 more failure(s) would lose it",
+        "not answering: node-02"
+      ],
+      "suggestion": "bring the missing node back, or replace it: `relish nodes`, `relish local start <node>` on a laptop cluster",
+      "correlated_events": [],
+      "affected_resource": "council"
+    },
+    {
+      "id": "under-replicated",
+      "title": "app frontend/default runs 2 of 3 replicas",
+      "details": [
+        "1 replica placed on node-03 is not running"
+      ],
+      "suggestion": "the scheduler replaces replicas on a lost node within a minute or two; if this persists, check `relish status` and `relish logs frontend`, and bring a stopped node back with `relish local start <node>` on a laptop cluster",
+      "correlated_events": [],
+      "affected_resource": "app.frontend/default"
+    }
+  ],
+  "unknown": [
+    {
+      "source": "alerts",
+      "reason": "node node-02: alerts: timed out after 10s",
+      "affected_resource": "cluster"
+    },
+    {
+      "source": "builds",
+      "reason": "the 2 nodes that answered run bun v0.2.0 (cc5f643), sha256 6dbda6ff6716; node node-02: version: timed out after 10s",
+      "affected_resource": "cluster"
+    },
+    {
+      "source": "certificates",
+      "reason": "node node-02: diagnostics: timed out after 10s",
+      "affected_resource": "cluster"
+    },
+    {
+      "source": "cpu_throttling",
+      "reason": "node node-02: diagnostics: timed out after 10s",
+      "affected_resource": "cluster"
+    },
+    {
+      "source": "deploys",
+      "reason": "node node-02: deploy operations: timed out after 10s",
+      "affected_resource": "cluster"
+    },
+    {
+      "source": "disks",
+      "reason": "node node-02: diagnostics: timed out after 10s",
+      "affected_resource": "cluster"
+    },
+    {
+      "source": "faults",
+      "reason": "node node-02: faults: timed out after 10s",
+      "affected_resource": "cluster"
+    },
+    {
+      "source": "recent_logs",
+      "reason": "restart evidence is unavailable, so unhealthy applications are unknown",
+      "affected_resource": "cluster"
+    },
+    {
+      "source": "restarts",
+      "reason": "node node-02: events: timed out after 10s",
+      "affected_resource": "cluster"
+    }
+  ],
+  "ok": [
+    {
+      "id": "certificates",
+      "description": "all observed certificates are currently valid with healthy automatic rotation"
+    },
+    {
+      "id": "cpu-throttling",
+      "description": "no application accumulated throttled CPU time"
+    },
+    {
+      "id": "deploys",
+      "description": "no deploy has been active for more than 15 minutes"
+    },
+    {
+      "id": "disks",
+      "description": "all observed storage domains are below 85% usage"
+    },
+    {
+      "id": "namespace-isolation",
+      "description": "every reporting node enforces namespace isolation"
+    },
+    {
+      "id": "registry",
+      "description": "Pickle is reachable and its known layers meet the redundancy target"
+    },
+    {
+      "id": "services",
+      "description": "all deployed services have a healthy backend"
+    },
+    {
+      "id": "tokens",
+      "description": "no API token expires within 14 days, and no admin token is past 90 days"
+    }
+  ],
+  "summary": {
+    "critical_count": 2,
+    "warning_count": 2,
+    "unknown_count": 9,
+    "ok_count": 8
+  }
+}

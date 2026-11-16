@@ -1,0 +1,9 @@
+# One small app per write probe. The harness renders load-34a6ae6ce030 so every apply
+# is a new app and never a delete-and-re-apply of an old one (see OPS-002).
+[app.load-34a6ae6ce030]
+image = "ghcr.io/stefanprodan/podinfo@sha256:ec73780a8425f59ea49f5bc8cdff0d598805a224fbaa1f86c67a244f250fa9da"
+command = ["./podinfo", "--port=9898", "--level=info"]
+replicas = 1
+port = 9898
+cpu = "20m-200m"
+memory = "16Mi-64Mi"

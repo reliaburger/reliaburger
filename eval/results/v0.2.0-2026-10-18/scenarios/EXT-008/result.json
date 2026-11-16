@@ -1,0 +1,90 @@
+{
+  "id": "EXT-008",
+  "name": "The cluster follows commits, reverts drift and honours deletes",
+  "feature": "features/extensibility/gitops.feature",
+  "axis": "extensibility",
+  "claim_ids": [
+    "claim_lettuce_gitops_builtin",
+    "claim_batteries_included"
+  ],
+  "source_refs": [
+    "docs/manual/12_operations.md:251-251@v0.2.0",
+    "docs/manual/12_operations.md:293-293@v0.2.0",
+    "docs/manual/12_operations.md:281-281@v0.2.0"
+  ],
+  "product_commit": "cc5f64393350f2081f7d88512b95a88316172e5a",
+  "product_target": "v0.2.0",
+  "environment": "environment.json",
+  "tags": [
+    "claim_lettuce_gitops_builtin",
+    "req_EXT-008",
+    "reconfigures",
+    "axis_extensibility",
+    "claim_batteries_included"
+  ],
+  "hypothesis": true,
+  "status": "FAIL",
+  "status_reason": "Then the app should run with 2 replicas within the configured sync time: AssertionError: gitops-6f367e3a6ac8 not running with 2 replicas within 90 s of the commit",
+  "start_time": "2026-10-18T12:09:04.187+00:00",
+  "duration_ms": 181753,
+  "observations": [
+    "reused the healthy lab cluster built earlier in this or a previous run"
+  ],
+  "expected": {
+    "sync_s": "<= 90"
+  },
+  "measured": {
+    "cluster_health_at_start": {
+      "ts": "2026-10-18T12:09:04.543+00:00",
+      "nodes": {
+        "node-02": "alive",
+        "node-03": "alive",
+        "node-01": "alive"
+      },
+      "leaders": [
+        "node-01"
+      ],
+      "voters": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "voters_answering": [
+        "node-01",
+        "node-02",
+        "node-03"
+      ],
+      "unanswered": [],
+      "fenced": [],
+      "ok": true
+    },
+    "node_toml_changed": true,
+    "commit": "712ef7f99bbca69e8dbc8c08f9e1e0c28407583f",
+    "sync_s": null
+  },
+  "evidence_paths": [
+    "scenarios/EXT-008/claims/claim_lettuce_gitops_builtin.json",
+    "scenarios/EXT-008/claims/claim_batteries_included.json",
+    "scenarios/EXT-008/cluster_state.json",
+    "scenarios/EXT-008/audit-after-commit.txt",
+    "scenarios/EXT-008/diagnostics/wtf.json",
+    "scenarios/EXT-008/diagnostics/status.json",
+    "scenarios/EXT-008/diagnostics/council.json",
+    "scenarios/EXT-008/diagnostics/nodes.json",
+    "scenarios/EXT-008/diagnostics/journal-node-01.txt",
+    "scenarios/EXT-008/diagnostics/journal-node-02.txt",
+    "scenarios/EXT-008/diagnostics/journal-node-03.txt",
+    "scenarios/EXT-008/commands.jsonl"
+  ],
+  "manual_steps": [],
+  "external_dependencies": [
+    "git dumb-HTTP server on http://10.77.0.1:18091/infra.git (harness, stands in for a Git host)"
+  ],
+  "limitations": [],
+  "deviations": [
+    "the repository is served over plain HTTP from the lab gateway; the manual shows https and ssh URLs"
+  ],
+  "classification": "configured",
+  "confidence": "high",
+  "failed_step": "Then the app should run with 2 replicas within the configured sync time"
+}

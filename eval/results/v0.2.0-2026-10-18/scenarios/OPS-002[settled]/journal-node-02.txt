@@ -1,0 +1,11 @@
+Oct 18 12:35:11 node-02 bun[728]: bun: agent loop turn took 501 ms in stop_wait: journal write 18 ms, runtime inventory 0 ms
+Oct 18 12:35:12 node-02 bun[728]: bun: agent loop turn took 501 ms in stop_wait: journal write 9 ms, runtime inventory 0 ms
+Oct 18 12:35:41 node-02 bun[728]: bun: agent loop turn took 501 ms in stop_wait: journal write 13 ms, runtime inventory 0 ms
+Oct 18 12:35:42 node-02 bun[728]: bun: agent loop turn took 501 ms in stop_wait: journal write 27 ms, runtime inventory 1 ms
+Oct 18 12:35:42 node-02 bun[728]: bun: agent loop turn took 282 ms in stop_wait: journal write 90 ms, runtime inventory 1 ms, kernel lock wait 0 ms, firewall sync 132 ms
+Oct 18 12:36:11 node-02 bun[728]: bun: agent loop turn took 500 ms in stop_wait: journal write 10 ms, runtime inventory 0 ms
+Oct 18 12:36:11 node-02 bun[728]: orchestrator: retirement of frontend/default failed, will retry: cannot retire artifacts for default__frontend-1 yet: other nodes have not yet confirmed the endpoint's withdrawal
+Oct 18 12:36:13 node-02 bun[728]: bun: agent loop turn took 501 ms in stop_wait: journal write 19 ms, runtime inventory 0 ms
+Oct 18 12:36:43 node-02 bun[728]: bun: agent loop turn took 501 ms in stop_wait: journal write 10 ms, runtime inventory 0 ms
+Oct 18 12:36:44 node-02 bun[728]: bun: agent loop turn took 500 ms in stop_wait: journal write 34 ms, runtime inventory 0 ms
+Oct 18 12:36:44 node-02 bun[728]: bun: agent loop turn took 252 ms in stop_wait: journal write 55 ms, runtime inventory 2 ms, kernel lock wait 0 ms, firewall sync 140 ms

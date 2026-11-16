@@ -1,0 +1,93 @@
+{
+  "id": "INT-004",
+  "name": "A Reliaburger app exported to Kubernetes YAML runs on Kubernetes",
+  "feature": "features/interoperability/upstream_manifests.feature",
+  "axis": "interoperability",
+  "claim_ids": [
+    "claim_smooth_k8s_transition",
+    "claim_k8s_import_export_roundtrip"
+  ],
+  "source_refs": [
+    "docs/manual/09_kubernetes.md:3-3@v0.2.0",
+    "docs/manual/09_kubernetes.md:71-71@v0.2.0",
+    "docs/manual/09_kubernetes.md:73-73@v0.2.0",
+    "docs/whitepaper.md:156-156@v0.2.0"
+  ],
+  "product_commit": "cc5f64393350f2081f7d88512b95a88316172e5a",
+  "product_target": "v0.2.0",
+  "environment": "environment.json",
+  "tags": [
+    "req_INT-004",
+    "claim_smooth_k8s_transition",
+    "claim_k8s_import_export_roundtrip",
+    "axis_interoperability"
+  ],
+  "hypothesis": false,
+  "status": "PASS",
+  "status_reason": "all steps passed with recorded measurements",
+  "start_time": "2026-10-18T12:23:59.301+00:00",
+  "duration_ms": 11746,
+  "observations": [],
+  "expected": {
+    "export_report_names": "health checks and metrics, which the fixture uses"
+  },
+  "measured": {
+    "baseline_kinds": [
+      "ConfigMap",
+      "Deployment",
+      "Ingress",
+      "Namespace",
+      "Secret",
+      "Service"
+    ],
+    "baseline_probes": {
+      "healthz": {
+        "ok": true,
+        "status": 200
+      },
+      "configmap_message": {
+        "ok": true,
+        "got": "rbeval-config-7f3a"
+      },
+      "secret_env": {
+        "ok": true,
+        "present": true
+      },
+      "backend_by_name": {
+        "ok": true,
+        "status": 200
+      }
+    },
+    "exported_kinds": [
+      "Deployment",
+      "Ingress",
+      "Service"
+    ],
+    "export_report_lines": [
+      "! [app.backend] health \u2014 has a K8s equivalent (livenessProbe/readinessProbe) but is not exported yet",
+      "! [app.frontend] health \u2014 has a K8s equivalent (livenessProbe/readinessProbe) but is not exported yet",
+      "! [app.frontend] metrics \u2014 has a K8s equivalent (prometheus.io/* pod annotations) but is not exported yet"
+    ],
+    "server_dry_run_rc": 0,
+    "rollout_s": 1.1,
+    "echo_through_backend": true
+  },
+  "evidence_paths": [
+    "scenarios/INT-004/claims/claim_smooth_k8s_transition.json",
+    "scenarios/INT-004/claims/claim_k8s_import_export_roundtrip.json",
+    "scenarios/INT-004/baseline.yaml",
+    "scenarios/INT-004/export-report.txt",
+    "scenarios/INT-004/exported.yaml",
+    "scenarios/INT-004/kubectl-dry-run.txt",
+    "scenarios/INT-004/commands.jsonl"
+  ],
+  "manual_steps": [],
+  "external_dependencies": [
+    "kind kindest/node:v1.34.0 (baseline only, not used by Reliaburger)"
+  ],
+  "limitations": [],
+  "deviations": [],
+  "classification": "native",
+  "confidence": "high",
+  "failed_step": null
+}

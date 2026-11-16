@@ -1,0 +1,29 @@
+<?xml version='1.0' encoding='utf-8'?>
+<testsuite name="external_controller.External controllers" tests="1" errors="0" failures="1" skipped="0" time="30.819037" timestamp="2026-10-18T14:08:23.925988" hostname="serval"><testcase classname="external_controller.External controllers" name="An external controller reconciles a custom spec over the API" status="failed" time="30.819037"><failure type="AssertionError" message="GET /v1/events returned None">
+
+Failing step: And the cluster event API should list events for the app ... failed in 0.013s
+Location: features/extensibility/external_controller.feature:14
+ASSERT FAILED: GET /v1/events returned None
+</failure><system-out>
+
+@scenario.begin
+
+  @req_EXT-006 @claim_event_and_log_streaming_apis @claim_cli_machine_readable_output
+  Scenario: An external controller reconciles a custom spec over the API
+    Given a healthy disposable Reliaburger cluster ... passed in 0.535s
+    And an external controller that keeps a custom spec outside the cluster ... passed in 0.001s
+    When the controller is given a spec for 2 replicas of a new app ... passed in 0.000s
+    Then the app should run with 2 replicas within the configured convergence time ... passed in 12.678s
+    And after a manual scale-down the controller should restore 2 replicas within the configured drift time ... passed in 17.593s
+    And the cluster event API should list events for the app ... failed in 0.013s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] EXT-006: FAIL (And the cluster event API should list events for the app: AssertionError: GET /v1/events returned None)
+
+
+</system-err></testcase></testsuite>

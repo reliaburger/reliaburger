@@ -1,0 +1,82 @@
+[
+  {
+    "cycle": 1,
+    "settle": true,
+    "delete_returned_s": 0.3,
+    "retired_s": 10.9,
+    "converged_s": 25.0,
+    "since_delete_s": 36.5,
+    "apply_to_converged_s": 25.3,
+    "instances": [
+      "node-01:default__backend-0:running",
+      "node-01:default__frontend-0:running",
+      "node-02:default__backend-1:running",
+      "node-02:default__frontend-1:running",
+      "node-03:default__frontend-2:running"
+    ]
+  },
+  {
+    "cycle": 2,
+    "settle": true,
+    "delete_returned_s": 0.4,
+    "retired_s": 9.2,
+    "converged_s": 20.8,
+    "since_delete_s": 30.7,
+    "apply_to_converged_s": 21.0,
+    "instances": [
+      "node-01:default__backend-0:running",
+      "node-01:default__frontend-0:running",
+      "node-02:default__backend-1:running",
+      "node-02:default__frontend-1:running",
+      "node-03:default__frontend-2:running"
+    ]
+  },
+  {
+    "cycle": 3,
+    "settle": true,
+    "delete_returned_s": 0.3,
+    "retired_s": 8.7,
+    "converged_s": 20.8,
+    "since_delete_s": 30.2,
+    "apply_to_converged_s": 21.1,
+    "instances": [
+      "node-01:default__backend-0:running",
+      "node-01:default__frontend-0:running",
+      "node-02:default__backend-1:running",
+      "node-02:default__frontend-1:running",
+      "node-03:default__frontend-2:running"
+    ]
+  },
+  {
+    "cycle": 4,
+    "settle": true,
+    "delete_returned_s": 0.4,
+    "retired_s": 9.2,
+    "converged_s": 21.1,
+    "since_delete_s": 30.9,
+    "apply_to_converged_s": 21.3,
+    "instances": [
+      "node-01:default__backend-0:running",
+      "node-01:default__frontend-0:running",
+      "node-02:default__backend-1:running",
+      "node-02:default__frontend-1:running",
+      "node-03:default__frontend-2:running"
+    ]
+  },
+  {
+    "cycle": 5,
+    "settle": true,
+    "delete_returned_s": 0.4,
+    "retired_s": 11.5,
+    "converged_s": 22.9,
+    "since_delete_s": 35.1,
+    "apply_to_converged_s": 23.2,
+    "instances": [
+      "node-01:default__backend-0:running",
+      "node-01:default__frontend-0:running",
+      "node-02:default__backend-1:running",
+      "node-02:default__frontend-1:running",
+      "node-03:default__frontend-2:running"
+    ]
+  }
+]

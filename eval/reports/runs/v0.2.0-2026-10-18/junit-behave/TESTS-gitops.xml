@@ -1,0 +1,34 @@
+<?xml version='1.0' encoding='utf-8'?>
+<testsuite name="gitops.GitOps from an external repository" tests="1" errors="0" failures="1" skipped="0" time="157.734652" timestamp="2026-10-18T14:12:05.942411" hostname="serval"><testcase classname="gitops.GitOps from an external repository" name="The cluster follows commits, reverts drift and honours deletes" status="failed" time="157.734652"><failure type="AssertionError" message="gitops-6f367e3a6ac8 not running with 2 replicas within 90 s of the commit">
+
+Failing step: Then the app should run with 2 replicas within the configured sync time ... failed in 90.436s
+Location: features/extensibility/gitops.feature:14
+ASSERT FAILED: gitops-6f367e3a6ac8 not running with 2 replicas within 90 s of the commit
+</failure><system-out>
+
+@scenario.begin
+
+  @req_EXT-008 @claim_lettuce_gitops_builtin
+  Scenario: The cluster follows commits, reverts drift and honours deletes
+    Given a healthy disposable Reliaburger cluster ... passed in 0.650s
+    And the native fixture application is running ... passed in 0.146s
+    And a git repository served over HTTP from the lab gateway ... passed in 35.615s
+    And every node syncs that repository ... passed in 30.654s
+    When I commit an app with 2 replicas to the repository ... passed in 0.234s
+    Then the app should run with 2 replicas within the configured sync time ... failed in 90.436s
+    And apps applied outside GitOps should be left alone ... skipped in 0.000s
+    When I scale the GitOps app to 1 replica by hand ... skipped in 0.000s
+    Then the next sync should restore 2 replicas within the configured drift time ... skipped in 0.000s
+    When I delete the app from the repository ... skipped in 0.000s
+    Then the app should be removed within the configured delete time ... skipped in 0.000s
+
+@scenario.end
+--------------------------------------------------------------------------------
+
+</system-out><system-err>
+
+Captured stderr:
+[rbeval] EXT-008: FAIL (Then the app should run with 2 replicas within the configured sync time: AssertionError: gitops-6f367e3a6ac8 not running with 2 replicas within 90 s of the comm)
+
+
+</system-err></testcase></testsuite>

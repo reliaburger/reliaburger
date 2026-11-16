@@ -1,0 +1,40 @@
+Reliaburger diagnosis: rbeval (3 nodes)
+collected at unix 1792326567
+
+CRITICAL (2)
+  [node-dead] node node-03 is dead (node.node-03)
+    Mustard membership does not consider this node alive
+    next: node node-03 is dead; if expected, drain it; if not, check the host
+  [unreachable-nodes] node node-03 did not answer its Bun API (node.node-03)
+    authenticated per-node evidence collection failed
+    next: check the node's bun agent and network: `relish dev shell <node>` / `journalctl -u bun`
+
+WARNING (1)
+  [council-member-down] 1 of 3 council members did not answer (council)
+    quorum holds with 2 of 3; 1 more failure(s) would lose it
+    not answering: node-03
+    next: bring the missing node back, or replace it: `relish nodes`, `relish local start <node>` on a laptop cluster
+
+UNKNOWN (9)
+  [alerts] cluster: node node-03: alerts: API error (status 502): node node-03 did not answer: error sending request for url (https://10.77.0.13:9117/v1/alerts)
+  [builds] cluster: the 2 nodes that answered run bun v0.2.0 (cc5f643), sha256 6dbda6ff6716; node node-03: version: API error (status 502): node node-03 did not answer: error sending request for url (https://10.77.0.13:9117/v1/version)
+  [certificates] cluster: node node-03: diagnostics: API error (status 502): node node-03 did not answer: error sending request for url (https://10.77.0.13:9117/v1/diagnostics?window_seconds=1)
+  [cpu_throttling] cluster: node node-03: diagnostics: API error (status 502): node node-03 did not answer: error sending request for url (https://10.77.0.13:9117/v1/diagnostics?window_seconds=1)
+  [deploys] cluster: node node-03: deploy operations: API error (status 502): node node-03 did not answer: error sending request for url (https://10.77.0.13:9117/v1/deploys/operations)
+  [disks] cluster: node node-03: diagnostics: API error (status 502): node node-03 did not answer: error sending request for url (https://10.77.0.13:9117/v1/diagnostics?window_seconds=1)
+  [faults] cluster: node node-03: faults: API error (status 502): node node-03 did not answer: error sending request for url (https://10.77.0.13:9117/v1/fault)
+  [recent_logs] cluster: restart evidence is unavailable, so unhealthy applications are unknown
+  [restarts] cluster: node node-03: events: API error (status 502): node node-03 did not answer: error sending request for url (https://10.77.0.13:9117/v1/events?limit=1024&local=true)
+
+OK (9)
+  [certificates] all observed certificates are currently valid with healthy automatic rotation
+  [cpu-throttling] no application accumulated throttled CPU time
+  [deploys] no deploy has been active for more than 15 minutes
+  [disks] all observed storage domains are below 85% usage
+  [namespace-isolation] every reporting node enforces namespace isolation
+  [registry] Pickle is reachable and its known layers meet the redundancy target
+  [replicas] every app runs its desired replicas
+  [services] all deployed services have a healthy backend
+  [tokens] no API token expires within 14 days, and no admin token is past 90 days
+
+Summary: 2 critical, 1 warning, 9 unknown, 9 OK

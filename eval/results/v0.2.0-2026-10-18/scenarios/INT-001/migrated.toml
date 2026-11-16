@@ -1,0 +1,47 @@
+[app.backend]
+image = "ghcr.io/stefanprodan/podinfo@sha256:ec73780a8425f59ea49f5bc8cdff0d598805a224fbaa1f86c67a244f250fa9da"
+command = [
+    "./podinfo",
+    "--port=9898",
+    "--port-metrics=9797",
+    "--level=info",
+]
+replicas = 2
+port = 9898
+memory = "33554432-268435456"
+cpu = "100m-1000m"
+namespace = "rbeval-shop"
+
+[app.backend.health]
+path = "/readyz"
+protocol = "http"
+
+[app.frontend]
+image = "ghcr.io/stefanprodan/podinfo@sha256:ec73780a8425f59ea49f5bc8cdff0d598805a224fbaa1f86c67a244f250fa9da"
+command = [
+    "./podinfo",
+    "--port=9898",
+    "--port-metrics=9797",
+    "--level=info",
+    "--backend-url=http://backend:9898/echo",
+]
+replicas = 3
+port = 9898
+memory = "33554432-268435456"
+cpu = "100m-1000m"
+namespace = "rbeval-shop"
+
+[app.frontend.health]
+path = "/readyz"
+protocol = "http"
+
+[app.frontend.ingress]
+host = "shop.rbeval.test"
+path = "/"
+
+[namespace.rbeval-shop]
+secret_key = false
+
+[app.frontend.env]
+PODINFO_UI_MESSAGE = "rbeval-config-7f3a"
+FIXTURE_TOKEN = "ENC[AGE:LS0tLS1CRUdJTiBBR0UgRU5DUllQVEVEIEZJTEUtLS0tLQpZV2RsTFdWdVkzSjVjSFJwYjI0dWIzSm5MM1l4Q2kwK0lGZ3lOVFV4T1NCNFJFSkdjMDF1UzJkWlZXaDZWWFIxCmFVczBSSGR3TDJWaFozZGpVV0ZXWmpOelRrZFpTRmRtTlZWQkNtZDRTSEExVWk5SEszbDZNbll5YWxOaldUQm0KU1VSMFRUTkhiRVpGUkhGbE0wZFBkRlUyYmpNd09GVUtMVDRnUWljOGVpMW5jbVZoYzJVS1MySkNOWHBMZVd0SwpWVTVDYVZObE1qSk1aRUU0ZHdvdExTMGdZbUpOYTJ4b2FHUkpha054YlVoR1dIQm1WVTloWVRsSk1ITnVOMjVMCmNUUldjRkpvVEdGd01EUjNOQW9xVHFra1dKaU42RUpwa1dTTVRKcDRQdjI3cmpUenhGRmRHQjAyTmI2V1dENkkKM3ZNeURCc3NYNnZBU2M5Ujk3dXEzNXo1MzhPOEdRPT0KLS0tLS1FTkQgQUdFIEVOQ1JZUFRFRCBGSUxFLS0tLS0K]"

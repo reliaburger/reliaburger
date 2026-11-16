@@ -1,0 +1,8 @@
+Service:  backend
+VIP:      127.128.131.21
+Port:     9898
+Backends: 2/2 healthy
+
+  INSTANCE             NODE               PORT     HEALTH  
+  default__backend-0   10.167.36.2        9898     healthy 
+  node-02:10.77.0.12:54405:7091d495225bfe7dcad7c92652b4645a86e19b2b28120b79ef77fd29bc5c0938 10.77.0.12         54405    healthy 
