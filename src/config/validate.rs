@@ -758,6 +758,18 @@ fn validate_app_honoured_fields(name: &str, app: &super::app::AppSpec) -> Result
     if let Some((field, _)) = zero.iter().find(|(_, is_zero)| *is_zero) {
         return Err(refuse(field, format!("{field} must be at least 1")));
     }
+    // A delay near u64::MAX seconds overflows the probe scheduler's clock.
+    let max = crate::bun::health::MAX_HEALTH_DELAY_SECS;
+    let long = [
+        ("health.interval", health.interval),
+        ("health.initial_delay", health.initial_delay),
+    ];
+    if let Some((field, Some(value))) = long.iter().find(|(_, v)| v.is_some_and(|v| v > max)) {
+        return Err(refuse(
+            field,
+            format!("{field} ({value}s) must be at most {max}s (one day)"),
+        ));
+    }
     let interval = health
         .interval
         .unwrap_or(crate::bun::health::DEFAULT_HEALTH_INTERVAL_SECS);
@@ -1196,6 +1208,10 @@ impl NodeConfig {
                 self.metrics.app_scrape_interval_secs,
             ),
             ("logs.export_interval_secs", self.logs.export_interval_secs),
+            (
+                "reporting_tree.report_interval_secs",
+                self.reporting_tree.report_interval_secs,
+            ),
         ] {
             if value == 0 {
                 return Err(ConfigError::Validation {
@@ -1362,6 +1378,20 @@ mod tests {
             matches!(err, ConfigError::Validation { ref field, .. }
                 if field == "metrics.collection_interval_secs"),
             "expected a collection-interval validation error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn node_config_rejects_a_zero_report_interval() {
+        // `tokio::time::interval` panics on a zero period, which would take
+        // the report worker down as soon as it starts.
+        let mut node = crate::config::NodeConfig::default();
+        node.reporting_tree.report_interval_secs = 0;
+        let err = node.validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation { ref field, .. }
+                if field == "reporting_tree.report_interval_secs"),
+            "expected a report-interval validation error, got {err:?}"
         );
     }
 
@@ -2904,6 +2934,17 @@ exec = "/usr/bin/python3""#,
         assert_app_refused(&format!("{health}\ntimeout = 11"), "timeout");
         // Seconds are whole, so a 1 s interval must allow a 1 s timeout.
         validate_app_toml(&format!("{health}\ninterval = 1\ntimeout = 1")).unwrap();
+    }
+
+    #[test]
+    fn health_delays_longer_than_a_day_are_refused() {
+        let health = "image = \"web:v1\"\nport = 8080\n[app.web.health]\npath = \"/healthz\"";
+        for field in ["interval", "initial_delay"] {
+            assert_app_refused(&format!("{health}\n{field} = 9223372036854775807"), field);
+            assert_app_refused(&format!("{health}\n{field} = 86401"), field);
+            validate_app_toml(&format!("{health}\n{field} = 86400"))
+                .unwrap_or_else(|error| panic!("{field} = 86400: {error}"));
+        }
     }
 
     #[test]
