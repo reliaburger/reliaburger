@@ -446,6 +446,11 @@ to the cluster, `4` refused, `5` anything else. A usage error there is a JSON
 envelope on stdout, not text on stderr. See
 [Working with an AI agent](16_working-with-an-ai-agent.md#exit-codes).
 
+With `-o json` or `-o yaml`, `apply` and `deploy` against an agent that
+doesn't answer still print the plan of what they would have done, as data,
+then exit `1` with `nothing was deployed` on stderr. The JSON parses either
+way, so check the exit code before you trust it.
+
 `relish exec` exits with the remote command's own exit code, so
 `relish exec web ls /ready` works in a shell `if`. It exits `1` when it
 can't run the command at all, with an `error:` line on stderr.

@@ -685,8 +685,9 @@ enum Command {
         #[arg(long)]
         quick: bool,
         /// Exit 1 when the cluster is DEGRADED and 2 when it's DOWN, for
-        /// scripts and monitoring. A cluster that doesn't answer exits 3
-        /// with or without it.
+        /// scripts and monitoring. With no answer it exits 3 (couldn't reach
+        /// or authenticate), 4 (refused) or 5 (anything else), with or
+        /// without it.
         #[arg(long)]
         check: bool,
     },

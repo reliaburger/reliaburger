@@ -1487,3 +1487,75 @@ async fn status_exits_three_in_every_format_when_the_cluster_does_not_answer() {
         }
     }
 }
+
+/// A Bun whose summary endpoint and apply both answer `status`.
+async fn stub_bun_answering(status: u16) -> (String, tokio::task::JoinHandle<()>) {
+    use axum::{
+        Router,
+        http::StatusCode,
+        routing::{get, post},
+    };
+    let code = StatusCode::from_u16(status).unwrap();
+    let app = Router::new()
+        .route(
+            "/v1/health",
+            get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }),
+        )
+        .route(
+            "/v1/cluster/summary",
+            get(move || async move { (code, "no") }),
+        )
+        .route("/v1/apply", post(move || async move { (code, "no") }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (endpoint, server)
+}
+
+/// #2013: a summary the cluster refuses to give exits with the agent
+/// envelope's code in every format: 3 for 401 (couldn't authenticate), 4
+/// for 403 (refused), 5 for a 500 (anything else). Never 1 or 2, which
+/// `--check` keeps for DEGRADED and DOWN.
+#[tokio::test]
+async fn status_without_a_summary_exits_with_the_envelope_code() {
+    for (status, exit) in [(401, 3), (403, 4), (500, 5)] {
+        let (endpoint, server) = stub_bun_answering(status).await;
+        for format in ["human", "json", "yaml"] {
+            let args = ["-o", format, "status", "--quick", "--check"];
+            let output = run_against(&endpoint, &args).await;
+            assert_eq!(
+                output.status.code(),
+                Some(exit),
+                "HTTP {status}, relish {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        server.abort();
+        let _ = server.await;
+    }
+}
+
+/// #2012: an apply the node fails prints nothing on stdout under `-o json`
+/// (the error goes to stderr) and exits non-zero, so a script never mistakes
+/// it for an answer.
+#[tokio::test]
+async fn a_failed_apply_under_output_json_exits_non_zero_with_empty_stdout() {
+    let (endpoint, server) = stub_bun_answering(500).await;
+    let directory = tempfile::tempdir().unwrap();
+    let manifest = directory.path().join("app.toml");
+    std::fs::write(&manifest, "[app.web]\nscript = \"exec true\"\n").unwrap();
+    let output = run_against(
+        &endpoint,
+        &["-o", "json", "apply", manifest.to_str().unwrap()],
+    )
+    .await;
+    server.abort();
+    let _ = server.await;
+    assert!(!output.status.success());
+    assert!(
+        output.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("error:"));
+}

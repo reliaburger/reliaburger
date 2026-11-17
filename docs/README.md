@@ -1055,8 +1055,9 @@ size on any cluster: a `HEALTHY`, `DEGRADED` or `DOWN` verdict, then one line
 per part of the cluster from `GET /v1/cluster/summary` plus `relish wtf`'s
 checks (2 s budget, `--quick` skips them), each line that needs attention
 ending in the command to run next. It exits 0 when it got an answer;
-`--check` exits 1 on `DEGRADED` and 2 on `DOWN`; a cluster that doesn't
-answer exits 3 in every output format. `-o json` prints the agent
+`--check` exits 1 on `DEGRADED` and 2 on `DOWN`. With no answer it exits
+3 when it couldn't reach or authenticate to the cluster, 4 when it was
+refused and 5 for anything else, in every output format. `-o json` prints the agent
 envelope. The lists live in `relish apps` (one row per app, problems first;
 `relish apps NAME` or `--instances` for instances) and `relish nodes`
 (version, usage and allocation per node); both filter with `--unhealthy`.

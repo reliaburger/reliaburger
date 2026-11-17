@@ -626,7 +626,7 @@ relish --help                       # Print help and exit
 # Core operations
 relish status                       # The whole cluster on one screen: a verdict, then one line per part
 relish status --quick               # The same without wtf's checks (otherwise run with a 2 s budget)
-relish status --check               # Exit 1 on DEGRADED, 2 on DOWN, 3 if unreachable
+relish status --check               # Exit 1 on DEGRADED, 2 on DOWN; no answer: 3, 4 or 5
 relish apps                         # One row per app (state, ready, restarts, nodes, age), problems first
 relish apps <app>                   # That app's instances (node, state, PID, restarts, age) and why any isn't running
 relish apps --instances             # Every instance of every app
@@ -919,7 +919,12 @@ ends in `; partial (2 of 3 nodes)`, one that couldn't be read says
 `not visible to a scoped token`.
 
 It exits 0 whenever it got an answer. `--check` exits 1 on `DEGRADED` and 2
-on `DOWN`. `-o json` prints the agent envelope (`relish.agent/v1`, command
+on `DOWN`. With no answer, with `--check` or without it and in every output
+format, it exits with the agent envelope's code: 3 when it couldn't reach or
+authenticate to the cluster (refused connection, DNS, TLS, timeout, 401), 4
+when it was refused (403), 5 for anything else (a 500, an answer it couldn't
+parse). Human output says why on stderr; `-o json` and `-o yaml` print a
+failed envelope (#2013). `-o json` prints the agent envelope (`relish.agent/v1`, command
 `status`): `data.verdict`, `data.problems`, `data.lines`, `data.wtf` and
 `data.summary` (the summary endpoint's answer), with `next` steps.
 
