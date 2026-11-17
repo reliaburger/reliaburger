@@ -398,15 +398,19 @@ impl<T: MustardTransport> MustardNode<T> {
         }
     }
 
-    /// Raise the directory's recovery floor to the newest epoch this node's
-    /// fence knows. Returns `true` if the directory changed.
+    /// Copy this node's recovery epochs from its fence into the directory:
+    /// the floor (the newest epoch the fence knows) and the epoch its own
+    /// Raft term belongs to. Returns `true` if the directory changed.
     fn refresh_recovery_floor(&mut self) -> bool {
         // Copied out in one statement, so the fence borrow ends here.
+        let Some(fence) = self.recovery_fence_rx.as_ref().map(|rx| *rx.borrow()) else {
+            return false;
+        };
         let floor = self
-            .recovery_fence_rx
-            .as_ref()
-            .map(|rx| rx.borrow().newest_known_epoch());
-        floor.is_some_and(|floor| self.directory.raise_recovery_floor(floor))
+            .directory
+            .raise_recovery_floor(fence.newest_known_epoch());
+        let local = self.directory.set_local_recovery_epoch(fence.epoch);
+        floor || local
     }
 
     /// Wire the live council roles (voter set + leader by name) the cluster
@@ -2646,6 +2650,13 @@ mod tests {
         let mut node = MustardNode::new(NodeId::new("survivor"), addr(1), fast_config(), t1);
         let fence = crate::council::fence::RecoveryFence::serving(1);
         node.set_recovery_fence_watch(fence.subscribe());
+        assert_eq!(
+            (
+                node.directory().recovery_floor,
+                node.directory().local_recovery_epoch
+            ),
+            (1, 1)
+        );
         let with_hint = |sender: &str, recovery_epoch: u64, term: u64| {
             let mut message = ping_from(sender);
             message.extension = Some(DirectoryExtension {

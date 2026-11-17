@@ -58,6 +58,10 @@ pub struct NodeDirectory {
     /// older epoch names a council that recovery replaced, however high its
     /// term: the directory neither adopts one nor keeps one.
     pub recovery_floor: u64,
+    /// The recovery epoch this node's own Raft term belongs to, from its
+    /// fence. Equal to the floor on a serving member; below it on a node a
+    /// recovery has fenced, whose term is from the replaced council's line.
+    pub local_recovery_epoch: u64,
 }
 
 impl NodeDirectory {
@@ -156,6 +160,14 @@ impl NodeDirectory {
             self.leader = None;
         }
         true
+    }
+
+    /// Record the recovery epoch this node's own Raft term belongs to.
+    /// Returns `true` if it changed.
+    pub fn set_local_recovery_epoch(&mut self, epoch: u64) -> bool {
+        let changed = self.local_recovery_epoch != epoch;
+        self.local_recovery_epoch = epoch;
+        changed
     }
 
     /// Resolve a node's API endpoint, preferring the address it advertised

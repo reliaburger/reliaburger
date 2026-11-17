@@ -1782,12 +1782,14 @@ The fix is to admit that a non-member has no term to judge by. `raft_leader` now
 
 ```rust
 let hint_plausible = |hint: &LeaderHint| {
-    local_term
-        .is_none_or(|local| hint.term <= local.saturating_add(MAX_LEADER_HINT_TERM_LEAD))
+    hint.recovery_epoch != local_epoch
+        || local_term.is_none_or(|local| {
+            hint.term <= local.saturating_add(MAX_LEADER_HINT_TERM_LEAD)
+        })
 };
 ```
 
-`Option::is_none_or(f)` is `true` for `None` and `f(value)` for `Some(value)`: no term, no bound. A member keeps the bound, because its term is real. A non-member takes the newest hint gossip has shown it. Isn't that the forged-term problem again? Not really. Forging a hint takes the cluster's gossip key, since every extension carries an HMAC, and the reporting epoch a hint can move only gates anything on the leader, which is a member and judges hints by its own term.
+`Option::is_none_or(f)` is `true` for `None` and `f(value)` for `Some(value)`: no term, no bound. A member keeps the bound, because its term is real, but only for hints from its own recovery epoch (more on epochs in a moment). A voter that a recovery has fenced still holds the old council's term, and comparing that with the new council's fresh term line would make it refuse the new leader for no reason. A non-member takes the newest hint gossip has shown it. Isn't that the forged-term problem again? Not really. Forging a hint takes the cluster's gossip key, since every extension carries an HMAC, and the reporting epoch a hint can move only gates anything on the leader, which is a member and judges hints by its own term.
 
 The same review found a second way for a hint to lie about its term. `relish council recover` builds a new council at a new *recovery epoch*, and its terms start again from the bottom. For a while, surviving workers still relay the old council's last hint: epoch 0, term 9, say, against the recovered leader's epoch 1, term 3. The directory ordered hints by `(recovery_epoch, term)`, but `resolve_leader_view` compared terms alone, so 9 beat 3 and the recovered leader's reporting epoch jumped to 9. The maintainer only ever let that epoch grow, and the scheduler skips every pass while the epoch differs from the leader's own term. Nothing would ever bring it back down ([#1997](https://github.com/reliaburger/reliaburger/issues/1997)).
 

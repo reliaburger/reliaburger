@@ -28,7 +28,10 @@ use crate::mustard::directory::NodeDirectory;
 /// (e.g. `u64::MAX`) is rejected, so it can't carry a member's reporting
 /// epoch past every later real election.
 ///
-/// The bound applies only to Raft members (#1996). A node outside the Raft
+/// The bound applies only to Raft members (#1996), and only to a hint from
+/// the recovery epoch the member's own term belongs to: a recovery starts a
+/// fresh term line, so a fenced voter's old term says nothing about the new
+/// council's. A node outside the Raft
 /// membership never hears AppendEntries, so its term stays at 0 for good:
 /// bounding hints by it would lose the leader once the cluster had seen more
 /// than ten elections. Such a node follows the newest hint gossip has shown
@@ -123,13 +126,17 @@ pub fn resolve_leader_view(
     raft_to_api_offset: i32,
     raft_to_reporting_offset: i32,
 ) -> Option<LeaderView> {
-    // A Raft member trusts a hint only when its term is plausibly close to
-    // its own (see [`MAX_LEADER_HINT_TERM_LEAD`]). A non-member has no term
-    // of its own to judge by, so it takes the hint.
+    // A Raft member trusts a hint from its own recovery epoch only when the
+    // hint's term is plausibly close to its own (see
+    // [`MAX_LEADER_HINT_TERM_LEAD`]). A non-member has no term of its own to
+    // judge by, and a newer epoch's terms are a different line, so either
+    // takes the hint.
+    let local_epoch = directory.local_recovery_epoch;
     let hint_plausible = |hint: &crate::mustard::message::LeaderHint| {
-        local_term.is_none_or(|local| hint.term <= local.saturating_add(MAX_LEADER_HINT_TERM_LEAD))
+        hint.recovery_epoch != local_epoch
+            || local_term
+                .is_none_or(|local| hint.term <= local.saturating_add(MAX_LEADER_HINT_TERM_LEAD))
     };
-    let local_epoch = directory.recovery_floor;
     if let Some((node_id, raft_address, term)) = raft_leader {
         // A strictly newer gossip hint outranks local Raft metrics: a
         // partitioned ex-leader can keep reporting itself as leader until
@@ -365,6 +372,7 @@ mod tests {
         stale.recovery_epoch = 0;
         directory.observe_hint(&stale);
         directory.raise_recovery_floor(1);
+        directory.set_local_recovery_epoch(1);
 
         let view = resolve_leader_view(raft_leader_at(3), &directory, Some(3), 2, 1).unwrap();
         assert_eq!(view.node_id, NodeId::new("survivor"));
@@ -377,6 +385,32 @@ mod tests {
         directory.observe_hint(&newer);
         let view = resolve_leader_view(raft_leader_at(3), &directory, Some(3), 2, 1).unwrap();
         assert_eq!(view.node_id, NodeId::new("successor"));
+    }
+
+    // A fenced voter of the replaced council keeps its old term (5 here),
+    // but the recovered council's terms start a fresh line, so comparing
+    // them is meaningless: the term bound holds only within the node's own
+    // recovery epoch. A fenced node names no Raft leader, so it resolves
+    // through the hint alone.
+    #[test]
+    fn a_fenced_voter_follows_the_new_council_whatever_its_old_term() {
+        let mut directory = NodeDirectory::default();
+        directory.raise_recovery_floor(1);
+        let mut recovered = hint("survivor", 30, 9217, 9545);
+        recovered.recovery_epoch = 1;
+        directory.observe_hint(&recovered);
+
+        let view = resolve_leader_view(None, &directory, Some(5), 2, 1)
+            .expect("a fenced voter refused the new council's leader");
+        assert_eq!(view.node_id, NodeId::new("survivor"));
+        assert_eq!((view.recovery_epoch, view.term), (1, 30));
+
+        // Within the node's own epoch the bound still holds.
+        let mut absurd = hint("bogus", 5 + MAX_LEADER_HINT_TERM_LEAD + 1, 9217, 9545);
+        absurd.recovery_epoch = 0;
+        let mut same_epoch = NodeDirectory::default();
+        same_epoch.observe_hint(&absurd);
+        assert!(resolve_leader_view(None, &same_epoch, Some(5), 2, 1).is_none());
     }
 
     fn raft_leader_at(term: u64) -> Option<(NodeId, SocketAddr, u64)> {
