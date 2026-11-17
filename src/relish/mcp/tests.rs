@@ -1807,3 +1807,35 @@ async fn a_cut_answer_never_asks_for_more_than_the_ceiling() {
         );
     }
 }
+
+/// `relish mcp` serves the agent commands side by side on one runtime, so
+/// none of them reads the local context there: each starts from
+/// `BunClient::local`, which reads it off the runtime. (`default_local` is
+/// tagged for the blocking rule as a one-shot CLI read, so the rule can't
+/// see this.)
+#[test]
+fn agent_commands_read_the_context_off_the_runtime() {
+    fn visit(directory: &std::path::Path, offenders: &mut Vec<String>) {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(&path, offenders);
+            } else if path.extension().is_some_and(|extension| extension == "rs")
+                && std::fs::read_to_string(&path)
+                    .unwrap()
+                    .contains("BunClient::default_local()")
+            {
+                offenders.push(path.display().to_string());
+            }
+        }
+    }
+    let mut offenders = Vec::new();
+    visit(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/relish/agent"),
+        &mut offenders,
+    );
+    assert!(
+        offenders.is_empty(),
+        "use BunClient::local().await instead: {offenders:?}"
+    );
+}

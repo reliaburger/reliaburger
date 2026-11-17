@@ -859,7 +859,7 @@ async fn token_facts() -> TokenFacts {
     let access = match origin {
         TokenOrigin::Explicit => tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            BunClient::default_local().token_access(),
+            BunClient::local().await.token_access(),
         )
         .await
         .ok()

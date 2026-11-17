@@ -735,12 +735,24 @@ fn advance(context: Context, rest: &str) -> (Context, usize) {
             (context, 1 + escaped)
         }
         Context::Basic if rest.starts_with('"') => (Context::Bare, 0),
-        Context::MultiBasic if rest.starts_with("\"\"\"") => (Context::Bare, 3),
+        // TOML lets a multi-line string end with up to two quotes of its own
+        // before the closing three, so a run of up to five closes it.
+        Context::MultiBasic if rest.starts_with("\"\"\"") => (Context::Bare, quote_run(rest, '"')),
         Context::Literal if rest.starts_with('\'') => (Context::Bare, 0),
-        Context::MultiLiteral if rest.starts_with("'''") => (Context::Bare, 3),
-        Context::Comment if rest.starts_with('\n') => (Context::Bare, 0),
+        Context::MultiLiteral if rest.starts_with("'''") => (Context::Bare, quote_run(rest, '\'')),
+        // A one-line string can't span lines; ending it at the newline keeps
+        // a mistake from changing how the next line is read.
+        Context::Basic | Context::Literal | Context::Comment if rest.starts_with('\n') => {
+            (Context::Bare, 0)
+        }
         _ => (context, 0),
     }
+}
+
+/// How many `quote`s start `rest`, up to the five that can close a
+/// multi-line string.
+fn quote_run(rest: &str, quote: char) -> usize {
+    rest.chars().take(5).take_while(|c| *c == quote).count()
 }
 
 /// Why [`substitute`] couldn't fill a body.

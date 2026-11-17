@@ -490,7 +490,6 @@ pub async fn start_wired_node(options: WiredNodeOptions) -> WiredNode {
             .map(Into::into)
             .collect(),
             mount_isolation: false,
-            ..Default::default()
         },
     );
     agent.set_node_capacity(8000, 16384);

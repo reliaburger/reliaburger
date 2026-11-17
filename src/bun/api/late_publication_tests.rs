@@ -71,7 +71,6 @@ impl StandaloneNode {
                 policy: crate::config::process_workloads::ProcessWorkloadsConfig {
                     mount_isolation: false,
                     allowed_binaries: vec!["/bin/sh".into()],
-                    ..Default::default()
                 },
                 default_concurrency: 8,
                 backoff: (Duration::ZERO, Duration::ZERO),

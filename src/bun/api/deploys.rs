@@ -546,5 +546,7 @@ pub(super) async fn rollback_handler(
             Event::default().data(serde_json::to_string(&e).unwrap_or_default()),
         )
     });
-    Sse::new(stream).into_response()
+    Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
 }

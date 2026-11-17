@@ -47,7 +47,6 @@ impl TestHarness {
             reliaburger::config::process_workloads::ProcessWorkloadsConfig {
                 allowed_binaries: vec!["/bin/sh".into()],
                 mount_isolation: false,
-                ..Default::default()
             },
         );
 

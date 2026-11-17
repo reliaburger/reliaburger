@@ -453,8 +453,8 @@ container. Two gates stand in the way:
   ```
 
   The node's own directories are refused even under a listed prefix: the five
-  `[storage]` directories, the identity directory, the script directory and
-  the directories holding the master key and the security bootstrap. So is a
+  `[storage]` directories, the identity directory and the directories
+  holding the master key and the security bootstrap. So is a
   path that contains one of them, such as `/var/lib`. A refused app fails its
   deploy on that node, and `relish apply` names the path and the reason.
 

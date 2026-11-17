@@ -561,7 +561,9 @@ pub(super) async fn apply_handler(
         Ok::<_, std::convert::Infallible>(Event::default().data(json))
     });
 
-    Sse::new(stream).into_response()
+    Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
 }
 
 /// One progress line per host-path `source` in `config`: the API can't see
@@ -1053,7 +1055,9 @@ pub(super) async fn cluster_apply(
         let json = serde_json::to_string(&apply_event).unwrap_or_default();
         Ok::<_, std::convert::Infallible>(Event::default().data(json))
     });
-    Sse::new(stream).into_response()
+    Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
 }
 
 /// What `relish apply` says after committing an app whose current spec is

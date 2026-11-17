@@ -274,7 +274,9 @@ pub(super) async fn logs_handler(
         };
         let stream = ReceiverStream::new(lines_rx)
             .map(|line| Ok::<_, std::convert::Infallible>(Event::default().data(line)));
-        return Sse::new(stream).into_response();
+        return Sse::new(stream)
+            .keep_alive(axum::response::sse::KeepAlive::default())
+            .into_response();
     }
 
     if selection.instances.is_empty() {

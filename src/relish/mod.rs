@@ -241,6 +241,18 @@ pub enum RelishError {
     #[error("invalid --{flag} value: {reason}")]
     InvalidFlag { flag: String, reason: String },
 
+    /// An app or namespace name the cluster couldn't hold, refused before it
+    /// goes into a request's path.
+    #[error(
+        "invalid {kind} name {name:?}: a name is a lowercase DNS label of 1–63 bytes, with letters or digits at both ends and only letters, digits or hyphens within"
+    )]
+    InvalidName {
+        /// Whether it names an app or a namespace.
+        kind: client::NameKind,
+        /// The name as given.
+        name: String,
+    },
+
     /// `relish upgrade plan` couldn't see the live cluster, so it won't
     /// guess its shape (#1568).
     #[error(

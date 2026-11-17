@@ -234,7 +234,7 @@ pub struct ManualPointer {
 
 /// Run `relish agent diagnose`.
 pub async fn run_diagnose(args: &DiagnoseArgs, max_bytes: usize, rerun: &str) -> Rendered {
-    let client = BunClient::default_local();
+    let client = BunClient::local().await;
     let inputs = match wtf::collect(&client, args.app.as_deref()).await {
         Ok(inputs) => inputs,
         Err(error) => {

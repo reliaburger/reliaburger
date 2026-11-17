@@ -8,6 +8,7 @@ expression: render(answer)
     "decisions": [
       {
         "app": "web",
+        "author_text": null,
         "decided_in": {
           "function": "restart_published_unhealthy",
           "function_line": 1,

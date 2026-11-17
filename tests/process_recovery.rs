@@ -1358,7 +1358,6 @@ fn running_agent(
         reliaburger::config::process_workloads::ProcessWorkloadsConfig {
             allowed_binaries,
             mount_isolation: false,
-            ..Default::default()
         },
     );
     let task = tokio::spawn(async move { agent.run().await });

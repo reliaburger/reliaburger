@@ -1262,7 +1262,7 @@ schedule = "0 3 * * *"
 
 ### The ProcessManager
 
-The `ProcessManager` wraps `ProcessGrill` with two responsibilities: allowlist validation and script temp file lifecycle.
+The `ProcessManager` wraps `ProcessGrill` with one responsibility: allowlist validation.
 
 ```rust
 pub fn prepare_exec(&self, binary: &Path) -> Result<PreparedWorkload, ProcessWorkloadError> {
@@ -1271,11 +1271,11 @@ pub fn prepare_exec(&self, binary: &Path) -> Result<PreparedWorkload, ProcessWor
             path: binary.to_path_buf(),
         });
     }
-    Ok(PreparedWorkload { binary: binary.to_path_buf(), args: Vec::new(), temp_file: None })
+    Ok(PreparedWorkload { binary: binary.to_path_buf(), args: Vec::new() })
 }
 ```
 
-For scripts, it writes the content to a temp file in a secure directory, makes it executable, and returns a workload that runs it via `/bin/sh -c`. The temp file is cleaned up after execution — success or failure.
+A script runs as `/bin/sh -c <script>`, built by `oci::build_args`, so nothing is written to disk and `/bin/sh` goes through the same allowlist. An earlier `prepare_script` wrote each script to a temp file with a predictable name first. Nothing called it, so 0.3.0 deleted it, and the `script_dir` setting that only it read.
 
 The allowlist is configured per node:
 

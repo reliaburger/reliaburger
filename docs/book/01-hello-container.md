@@ -1729,7 +1729,7 @@ pub enum OutputFormat {
 }
 ```
 
-`#[derive(clap::ValueEnum)]` teaches clap how to parse this enum from command-line text. `--output human`, `--output json`, and `--output yaml` all just work. Anything else gets a clear error message. No string matching, no `if output == "json"` scattered through your code.
+`#[derive(clap::ValueEnum)]` teaches clap how to parse this enum from command-line text. `--output human`, `--output json`, and `--output yaml` all just work. Anything else gets a clear error message. No string matching, no `if output == "json"` scattered through your code. Bun's `--runtime` flag was a `String` until 0.3.0, matched against `"auto"`, `"process"`, `"runc"` and `"mixed"` deep in start-up, so `bun --runtime rnuc` loaded its config and set up storage before saying "unknown runtime". It's now a `RuntimeChoice` enum with the same derive, and clap refuses the typo before `main` does anything.
 
 The `#[default]` attribute on `Human` means you don't even need to specify `--output`: it defaults to human-readable text. This is a Rust enum feature that works with the `Default` trait. In Go you'd check for an empty string; in Python you'd pass `default=` to `argparse`. Here the default is part of the type definition itself.
 

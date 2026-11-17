@@ -460,9 +460,9 @@ impl From<&RelishError> for AgentError {
                 agent_error
             }
             RelishError::PolicyDenied { .. } => AgentError::new(ErrorCode::Forbidden, message),
-            RelishError::InvalidFlag { .. } | RelishError::InvalidImageTag { .. } => {
-                AgentError::new(ErrorCode::Usage, message)
-            }
+            RelishError::InvalidFlag { .. }
+            | RelishError::InvalidName { .. }
+            | RelishError::InvalidImageTag { .. } => AgentError::new(ErrorCode::Usage, message),
             RelishError::Manual(_)
             | RelishError::DevClusterNotFound { .. }
             | RelishError::ImageNotInRegistry { .. } => {

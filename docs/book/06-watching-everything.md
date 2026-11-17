@@ -643,6 +643,22 @@ end anywhere, including halfway through a multi-byte UTF-8 character, so the
 decoder buffers bytes and only decodes a block once it has seen the blank line
 that ends it.
 
+A follow has no natural end, which the CLI's HTTP client didn't know until
+0.3.0. `BunClient` gave every request a 300-second deadline with reqwest's
+`ClientBuilder::timeout`, and that deadline covers reading the body, not
+only waiting for the headers. So `relish logs web -f` on a quiet app died
+after five minutes with "request timed out", and so did `relish apply` when
+a rolling deploy's progress stream ran longer. The client now carries two
+reqwest clients. Ordinary requests keep the 300-second total. Streaming ones
+(`logs -f`, the apply and rollback streams) get `read_timeout` instead,
+which resets with every byte that arrives: the command gives up only after
+60 seconds of silence. Silence alone can't mean "dead", since a quiet app
+writes nothing for hours, so every SSE route now sends axum's
+`KeepAlive::default()`, a comment line (`:`) every 15 seconds that SSE
+parsers skip. The test, `a_stream_that_keeps_talking_outlives_the_request_timeout`,
+builds a client with a 300-millisecond deadline and serves it keep-alives
+for most of a second; `a_silent_stream_times_out` checks the other half.
+
 `relish top` had the same blind spot and a subtler trap. The dashboard already
 charted `process_cpu_percent` and `process_memory_bytes`, labelled by app and
 PID. Why not have the CLI query those metrics and match them to instances by

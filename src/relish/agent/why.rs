@@ -200,6 +200,9 @@ pub struct DecisionData {
     /// The evidence the rule compared, one value per key; the rule's
     /// `evidence` in `--rules` says what each key means.
     pub evidence: BTreeMap<String, String>,
+    /// What an agent wrote into the record, a lease's purpose or a
+    /// proposal's reason, kept out of `evidence`. Null when there's none.
+    pub author_text: Option<Untrusted>,
     /// The record's own message, which can quote an app.
     pub message: Untrusted,
     /// Where the rule is decided, when the source bundle could be read.
@@ -462,6 +465,7 @@ fn decision(
         node: entry.node.clone(),
         principal: entry.principal.clone(),
         evidence,
+        author_text: entry.author_text.clone(),
         message: entry.message.clone(),
         reference: entry.reference.clone(),
         related,
@@ -508,7 +512,7 @@ pub async fn run(args: &ExplainArgs, max_bytes: usize, rerun: &str) -> Rendered 
         namespace: Some(namespace),
         limit: usize::MAX,
     };
-    let inputs = timeline::collect(&BunClient::default_local(), &scope).await;
+    let inputs = timeline::collect(&BunClient::local().await, &scope).await;
     let inputs = timeline::Inputs {
         deploys: None,
         ..inputs

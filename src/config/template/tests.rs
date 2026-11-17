@@ -625,3 +625,42 @@ proptest! {
         prop_assert_eq!(&app.command[2], &count.to_string());
     }
 }
+
+/// TOML lets a multi-line string end with up to two quotes of its own
+/// before the closing three, so `''''` and `'''''` (and the `"` forms)
+/// close it. A placeholder after one is in whatever string comes next.
+#[test]
+fn a_multi_line_string_closed_by_four_or_five_quotes_ends_there() {
+    let slot_of = |body: &str| {
+        scan(body)
+            .unwrap()
+            .into_iter()
+            .find_map(|piece| match piece {
+                Piece::Placeholder { slot, .. } => Some(slot),
+                Piece::Text(_) => None,
+            })
+            .unwrap()
+    };
+    for close in ["'''", "''''", "'''''"] {
+        let body = format!("a = '''x{close}\nb = \"${{p}}\"\n");
+        assert_eq!(slot_of(&body), Slot::Basic, "{body}");
+    }
+    for close in ["\"\"\"", "\"\"\"\"", "\"\"\"\"\""] {
+        let body = format!("a = \"\"\"x{close}\nb = '${{p}}'\n");
+        assert_eq!(slot_of(&body), Slot::Literal, "{body}");
+    }
+}
+
+/// A one-line string can't run past its line, so a placeholder on the next
+/// line is never read as inside it, even in a body that isn't valid TOML.
+#[test]
+fn a_one_line_string_ends_at_its_newline() {
+    let pieces = scan("a = 'x\nb = \"${p}\"\n").unwrap();
+    assert!(
+        pieces.contains(&Piece::Placeholder {
+            name: "p",
+            slot: Slot::Basic
+        }),
+        "{pieces:?}"
+    );
+}
