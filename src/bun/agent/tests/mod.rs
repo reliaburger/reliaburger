@@ -9726,6 +9726,7 @@ fn adoption_record(
         host_port: Some(30123),
         app_spec: Some(app_spec),
         oci_spec: crate::grill::oci::OciSpec {
+            managed_volumes: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,

@@ -2045,6 +2045,7 @@ mod tests {
     async fn running(process: &ProcessGrill, name: &str) -> InstanceId {
         let id = InstanceId(name.into());
         let spec = OciSpec {
+            managed_volumes: Vec::new(),
             reusable_executor: false,
             host_process: true,
             initialiser: false,
