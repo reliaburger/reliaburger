@@ -632,8 +632,14 @@ fn answer_internal(
         return build_status_response(query, RCODE_REFUSED);
     }
 
-    let sources = config.source_namespaces.borrow();
-    let Some(service_id) = service_id_for(stripped, sources.namespace(src)) else {
+    // Copied out in one statement, so this borrow ends before the fault and
+    // service-map borrows below: never two watch borrows at once (#2045).
+    let namespace = config
+        .source_namespaces
+        .borrow()
+        .namespace(src)
+        .map(str::to_owned);
+    let Some(service_id) = service_id_for(stripped, namespace.as_deref()) else {
         // A name with more labels than `<app>.<namespace>` can't exist, and
         // saying so lets a resolver walking its search list try the next
         // suffix (`redis.default` → `redis.default.<ns>.internal` first).
