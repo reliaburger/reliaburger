@@ -2112,16 +2112,18 @@ async fn a_follower_forwards_app_changes_to_the_leader_with_the_callers_token() 
     }
 }
 
-/// #1310: a rollback re-applies the previous spec through `cluster_apply`,
-/// so a follower forwards it as an apply. It goes as the caller, bearer and
-/// all, so the leader audits it under the caller's token name and a policy
-/// sees the caller's role, not the follower's service identity.
+/// A follower forwards a rollback to the leader whole, before it reads
+/// anything, and the leader picks the target from its own state. The
+/// follower's replica can lag a deploy that has committed: a target picked
+/// there went back two versions instead of one. It goes as the caller,
+/// bearer and all, so the leader audits it under the caller's token name
+/// and a policy sees the caller's role, not the follower's service
+/// identity (#1310).
 #[tokio::test]
-async fn a_follower_forwards_a_rollback_to_the_leader_with_the_callers_token() {
+async fn a_follower_forwards_a_rollback_to_the_leader_before_choosing_its_target() {
     let (deployer, deployer_key) = a_user_token(crate::sesame::types::ApiRole::Deployer);
-    // No spec in Raft and no gossip peers, so the follower's own records
-    // choose the target: the newest is the current version, the one before
-    // it is what the rollback re-applies.
+    // The follower's own records would choose nginx:1.26. It must not
+    // choose at all.
     let deployed = |id: u64, image: &str| DeployHistoryEntry {
         id: crate::meat::deploy_types::DeployId(id),
         created_at: std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(id),
@@ -2137,35 +2139,31 @@ async fn a_follower_forwards_a_rollback_to_the_leader_with_the_callers_token() {
     let (follower, seen, nodes) =
         follower_with_history_of_a_recording_leader(deployer, Some(history)).await;
 
-    let (status, reply) = send_bounded(
-        follower,
-        "POST",
+    for path in [
         "/v1/rollback/web/default",
-        &deployer_key,
-        "",
-        &[],
-    )
-    .await;
-    assert_eq!(status, StatusCode::ACCEPTED, "{reply}");
-    assert!(reply.contains("recorded by the leader"), "{reply}");
+        "/v1/rollback/web/default?force=true",
+    ] {
+        let (status, reply) =
+            send_bounded(follower.clone(), "POST", path, &deployer_key, "", &[]).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{path}: {reply}");
+        assert!(reply.contains("recorded by the leader"), "{reply}");
+    }
 
     let seen = seen.lock().await.clone();
-    let [(path, bearer, marked, body)] = seen.as_slice() else {
-        panic!("one forward to the leader: {seen:?}");
-    };
-    assert_eq!(path, "/v1/apply");
-    assert_eq!(
-        bearer.as_deref(),
-        Some(format!("Bearer {deployer_key}").as_str()),
-        "the leader must see the caller's token"
-    );
-    assert!(marked, "a forwarded rollback carries the forwarded mark");
-    let config: Config = toml::from_str(body).unwrap();
-    assert_eq!(
-        config.app.get("web").and_then(|spec| spec.image.as_deref()),
-        Some("nginx:1.26"),
-        "the forward re-applies the previous version: {body}"
-    );
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    for (path, bearer, marked, body) in &seen {
+        assert_eq!(
+            path, "/v1/rollback/web/default",
+            "the leader resolves the rollback itself, not an apply of the follower's pick"
+        );
+        assert_eq!(
+            bearer.as_deref(),
+            Some(format!("Bearer {deployer_key}").as_str()),
+            "the leader must see the caller's token"
+        );
+        assert!(marked, "a forwarded rollback carries the forwarded mark");
+        assert!(body.is_empty(), "the follower chose no spec: {body}");
+    }
     for node in nodes {
         node.shutdown().await.unwrap();
     }

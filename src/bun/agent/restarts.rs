@@ -1045,6 +1045,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let rule = match cause {
                     RestartCause::ProcessExited => "restart.process_exited",
                     RestartCause::StartFailed => "restart.start_failed",
+                    // `maybe_restart` marks a never-healthy instance Failed
+                    // instead of restarting it, so none gets here.
+                    RestartCause::NeverHealthy => return,
                 };
                 let decision = crate::bun::restart::restart_decision(
                     rule,

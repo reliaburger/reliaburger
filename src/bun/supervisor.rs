@@ -934,6 +934,13 @@ impl<G: Grill> WorkloadSupervisor<G> {
 
         if let Some(new_state) = transition {
             instance.state = instance.state.transition_to(new_state)?;
+            // Only a startup that never passed a probe goes to Stopping.
+            // The agent's cleanup kills it, and `maybe_restart` then marks
+            // it Failed instead of restarting it.
+            if new_state == ContainerState::Stopping {
+                instance.retry_pending = true;
+                instance.restart_cause = Some(crate::bun::restart::RestartCause::NeverHealthy);
+            }
             Ok(Some(new_state))
         } else {
             Ok(None)
@@ -944,7 +951,8 @@ impl<G: Grill> WorkloadSupervisor<G> {
     /// transition it back to Pending.
     ///
     /// Returns `true` if the restart was initiated, `false` if the
-    /// instance isn't eligible (not in a restartable state).
+    /// instance isn't eligible (not in a restartable state, inside its
+    /// backoff, or never healthy, which marks it `Failed`).
     pub async fn maybe_restart(
         &mut self,
         instance_id: &InstanceId,
@@ -962,6 +970,17 @@ impl<G: Grill> WorkloadSupervisor<G> {
             instance.state,
             ContainerState::Unhealthy | ContainerState::Stopped
         ) {
+            return Ok(false);
+        }
+
+        // A stopped instance that never passed its startup health check is
+        // given up, not restarted.
+        if instance.state == ContainerState::Stopped
+            && instance.restart_cause == Some(crate::bun::restart::RestartCause::NeverHealthy)
+        {
+            instance.state = instance.state.transition_to(ContainerState::Failed)?;
+            instance.retry_pending = false;
+            instance.restart_cause = None;
             return Ok(false);
         }
 
@@ -1631,6 +1650,42 @@ mod tests {
             .process_health_result(&ids[0], HealthStatus::Unhealthy)
             .unwrap();
         assert_eq!(result, None);
+    }
+
+    /// A startup that never passes a probe is stopped, with cleanup owed,
+    /// and once stopped it is marked Failed rather than restarted. Its
+    /// process may still be running, so marking it Failed at once left a
+    /// live process the node counted as stopped.
+    #[tokio::test]
+    async fn a_never_healthy_startup_is_stopped_then_failed_not_restarted() {
+        let mut sup = test_supervisor();
+        let now = Instant::now();
+        let spec = app_spec_with_health(8080);
+        let ids = sup.deploy_app("web", "default", &spec, now).await.unwrap();
+        sup.get_instance_mut(&ids[0]).unwrap().state = ContainerState::HealthWait;
+
+        let mut last = None;
+        while last.is_none() {
+            last = sup
+                .process_health_result(&ids[0], HealthStatus::ConnectionRefused)
+                .unwrap();
+        }
+        assert_eq!(last, Some(ContainerState::Stopping));
+        let instance = sup.get_instance(&ids[0]).unwrap();
+        assert!(instance.retry_pending, "the stop must be owed cleanup");
+        assert_eq!(
+            instance.restart_cause,
+            Some(crate::bun::restart::RestartCause::NeverHealthy)
+        );
+
+        // The agent's cleanup confirmed the process is gone.
+        let instance = sup.get_instance_mut(&ids[0]).unwrap();
+        instance.state = ContainerState::Stopped;
+        assert!(!sup.maybe_restart(&ids[0], Instant::now()).await.unwrap());
+        let instance = sup.get_instance(&ids[0]).unwrap();
+        assert_eq!(instance.state, ContainerState::Failed);
+        assert!(!instance.retry_pending);
+        assert_eq!(instance.restart_count, 0);
     }
 
     #[tokio::test]

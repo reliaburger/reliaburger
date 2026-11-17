@@ -229,6 +229,7 @@ far back the records reach: unknown, not "it didn't happen".
 | `restart.start_failed` | The runtime couldn't start the instance, so the node cleaned up and tried again |
 | `restart.health_failed` | The instance failed `threshold` health probes in a row, so the node restarted it |
 | `restart.budget_exhausted` | The instance used its whole restart budget, so the node gave up and marked it failed |
+| `restart.never_healthy` | The instance never passed its health check in its startup grace, so the node stopped it and marked it failed instead of restarting it |
 | `restart.sidecar_exited` | A sidecar exited and was restarted on its own |
 | `deploy.refused.policy` | An enforcing policy denied the apply |
 | `deploy.refused.owner` | The apply named an owner the caller can't speak for |

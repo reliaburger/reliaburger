@@ -147,9 +147,9 @@ impl HealthStatus {
 }
 
 /// Consecutive failed startup probes after which a HealthWait instance is given
-/// up as Failed (and restarted). At the default 10 s interval this is about ten
-/// minutes (one minute at a 1 s interval): long enough for slow starts, short
-/// enough to not wait forever.
+/// up: stopped, then marked Failed, not restarted. At the default 10 s interval
+/// this is about ten minutes (one minute at a 1 s interval): long enough for
+/// slow starts, short enough to not wait forever.
 const STARTUP_FAILURE_LIMIT: u32 = 60;
 
 /// Evaluate a probe result and determine whether a state transition is needed.
@@ -172,12 +172,16 @@ pub fn evaluate_result(
         }
         // Startup never succeeded: after a generous grace of consecutive failed
         // probes, give up so the instance doesn't sit in HealthWait forever.
-        // Failed then flows into the restart path. The grace is deliberately
+        // Its process may still be running (a probe aimed at the wrong path
+        // answers no matter how long it waits), so it goes to Stopping: the
+        // agent kills it, then marks it Failed without restarting it. A
+        // process that exits during the grace never gets here; the agent's
+        // state sweep sees the exit and restarts it. The grace is deliberately
         // large so a legitimately slow-starting app isn't killed prematurely.
         (ContainerState::HealthWait, false)
             if counters.consecutive_unhealthy >= STARTUP_FAILURE_LIMIT =>
         {
-            Some(ContainerState::Failed)
+            Some(ContainerState::Stopping)
         }
         // Running: enough consecutive failures → Unhealthy
         (ContainerState::Running, false)
@@ -485,7 +489,7 @@ mod tests {
     }
 
     #[test]
-    fn health_wait_fails_after_startup_grace() {
+    fn health_wait_is_stopped_after_startup_grace() {
         let config = default_config();
         // Just under the limit: still waiting.
         let below = HealthCounters {
@@ -501,7 +505,8 @@ mod tests {
             ),
             None
         );
-        // At the limit: give up so it doesn't wait forever.
+        // At the limit: give up so it doesn't wait forever. Its process
+        // may still run, so it is stopped before it is marked Failed.
         let at = HealthCounters {
             consecutive_healthy: 0,
             consecutive_unhealthy: STARTUP_FAILURE_LIMIT,
@@ -513,7 +518,7 @@ mod tests {
                 ContainerState::HealthWait,
                 &config
             ),
-            Some(ContainerState::Failed)
+            Some(ContainerState::Stopping)
         );
     }
 

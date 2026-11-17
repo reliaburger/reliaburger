@@ -181,6 +181,18 @@ pub const RULES: &[DecisionRule] = &[
         ],
     },
     DecisionRule {
+        id: "restart.never_healthy",
+        kind: DecisionKind::Restart,
+        meaning: "the instance never passed its health check during its startup grace, so \
+                  the node stopped it and marked it failed instead of restarting it",
+        evidence: &[
+            ("instance", "the instance given up"),
+            ("consecutive_failures", "the failed probes in a row"),
+            ("probe", "the protocol, port and path probed"),
+            ("interval_seconds", "the time between probes"),
+        ],
+    },
+    DecisionRule {
         id: "restart.sidecar_exited",
         kind: DecisionKind::Restart,
         meaning: "a sidecar's process exited while its instance kept running, so the node \

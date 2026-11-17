@@ -743,7 +743,7 @@ Ten states. Each one means something specific:
 - **Unhealthy**: health checks are failing. Removed from the service map, no new traffic.
 - **Stopping**: graceful shutdown in progress, draining existing connections.
 - **Stopped**: process has exited, resources cleaned up.
-- **Failed**: permanent failure. Exceeded restart limits, or an init container crashed.
+- **Failed**: permanent failure. Exceeded restart limits, an init container crashed, or it never passed its startup health check.
 
 The key insight is that not all transitions are valid. You can't go from `Pending` directly to `Running`: you have to prepare first, start, and pass health checks. You can't go from `Failed` to `Running`: you have to start over from `Pending`. The state machine enforces this:
 
@@ -1477,6 +1477,11 @@ pub fn evaluate_result(
         {
             Some(ContainerState::Running)
         }
+        (ContainerState::HealthWait, false)
+            if counters.consecutive_unhealthy >= STARTUP_FAILURE_LIMIT =>
+        {
+            Some(ContainerState::Stopping)
+        }
         (ContainerState::Running, false)
             if counters.consecutive_unhealthy >= config.threshold_unhealthy =>
         {
@@ -1497,6 +1502,30 @@ It takes all its inputs as parameters, does a `match`, and returns `Option<Conta
 The `match` uses Rust's pattern matching with guards (the `if` clauses). The tuple pattern `(current_state, status.is_healthy())` lets us branch on both values simultaneously. The `_` arm catches everything else: states where health check results don't drive transitions (`Pending`, `Preparing`, `Stopping`, etc.).
 
 Making this a free function rather than a method on `HealthChecker` or `WorkloadInstance` is a deliberate choice. It has no hidden state, no side effects, and it's trivially testable. You can write a dozen test cases for it without setting up a supervisor, a mock runtime, or an instance. Just call the function with different inputs and check the output.
+
+### Dying before the first healthy probe
+
+The second arm is the startup grace. A new instance that fails 60 probes in a row (`STARTUP_FAILURE_LIMIT`, about ten minutes at the default 10-second interval) is given up, so it doesn't sit in `HealthWait` for ever. It used to go straight to `Failed`, and a comment said `Failed` "flows into the restart path". It didn't. `maybe_restart` only restarts from `Unhealthy` or `Stopped`, so a `Failed` instance stayed `Failed`, and nothing recorded why. A review in November 2026 traced two ways that hurt (#1999).
+
+The first was a crash during startup, the classic crash loop. The agent notices an app's process exiting with a *state sweep*: every tick it asks the runtime for the state of each instance and routes an exit through `observe_app_exit`, which stops the instance and restarts it with backoff. But the sweep only asked about `Running` instances. A health-checked app is in `HealthWait` until its first passing probe, so an app that died on startup was never asked about. Its probes were refused for ten minutes, then it went `Failed` with no `restart` event, so `relish wtf` never saw the crash loop. In a cluster the leader eventually noticed the missing replica and redeployed it, ten minutes late and with no record of why.
+
+The second was a process that stays up but never answers its probe, because the `path` or `port` is wrong. It went `Failed` with its process still running. Anything that reads `Failed` as "not running" is then wrong about it: a volume snapshot restore checks for running instances that way, and would swap the volume under a live writer.
+
+The fix has two halves. The sweep now asks about every instance whose exit it watches, through one small function in `src/bun/agent/state_sweep.rs`:
+
+```rust
+pub(super) fn watches_exit(state: ContainerState) -> bool {
+    matches!(state, ContainerState::HealthWait | ContainerState::Running)
+}
+```
+
+`matches!` is a macro from the standard library that returns `true` when its first argument fits the pattern, here either of two variants. The planner uses it to choose which instances to read, and the loop uses it again when the answer comes back, because the instance may have moved on while the read was in flight. Keeping both checks in one function means they can't disagree.
+
+The other half is the grace itself. It now returns `Stopping`, not `Failed`, and `process_health_result` marks the instance `retry_pending` with the cause `RestartCause::NeverHealthy`. That's the same cleanup path a failed restart takes: the agent kills the process off the loop and confirms it's gone, then calls `maybe_restart`. There, a `Stopped` instance whose cause is `NeverHealthy` goes to `Failed` instead of `Pending`. It isn't restarted, because the same probe would fail the same way, and the agent records a `restart.never_healthy` decision with the probe and the failures in a row, so `relish agent explain` can say what happened.
+
+Adding a variant to `RestartCause` had a cost we could see straight away: `retry_restart` matches on the cause to name the rule it records, and Rust's `match` must cover every variant, so the code stopped compiling until we said what a `NeverHealthy` restart means. It means nothing, since `maybe_restart` never restarts one, and the arm says so and returns. In C or Go a new enum value falls through a `switch` silently; here the compiler made us decide.
+
+Two agent tests pin it, in `src/bun/agent/tests/restart_ownership.rs`. `an_exit_before_the_first_healthy_probe_restarts_and_is_recorded` deploys a health-checked app, makes the mock runtime report its process gone while it's still in `HealthWait`, and checks that one sweep restarts it and records `restart.process_exited`. `a_never_healthy_instance_is_stopped_before_it_is_failed` feeds refused probes until the grace runs out, and checks that the instance goes to `Stopping`, the runtime gets a kill, and only then is the instance `Failed`, with no restart and one `restart.never_healthy` decision.
 
 ### A default that depends on another field
 
