@@ -476,7 +476,7 @@ if !self.seen_windows.insert(key) {
 
 `HashSet::insert` returns `false` if the key was already present, which is exactly the "have I seen this?" question we need in one call.
 
-**Temp files that outlived a crash, and a sync nobody checked.** A metrics flush writes a randomly named `.mayo-pending-*` file and renames it into place. A crash between the two left the temp file for good: nothing deleted it and the size cap didn't count it (#2059). `MayoStore::new` now deletes them, which is safe because one Bun owns the directory. The rollup writer had the opposite slip. It renamed its file and then synced the directory, but threw away a failed sync and returned `Ok`, so the caller cleared its buffer while the rename could still vanish in a power cut (#2060). The error now propagates and the rows wait for the next flush. The test takes read permission off the directory (`0o300`: write and search only), so creating and renaming the file still work and only opening the directory to sync it fails.
+**Temp files that outlived a crash, and a sync nobody checked.** A metrics flush writes a randomly named `.mayo-pending-*` file and renames it into place. A crash between the two left the temp file for good: nothing deleted it and the size cap didn't count it (#2059). `MayoStore::new` now deletes them, which is safe because one Bun owns the directory. The rollup writer had the opposite slip. It renamed its file and then synced the directory, but threw away a failed sync and returned `Ok`, so the caller cleared its buffer while the rename could still vanish in a power cut (#2060). The error now propagates and the rows wait for the next flush. That alone left a second bug, which review caught: the renamed file stayed in place while the rows waited, so queries counted them twice until the retry. So the writer removes the file before it reports the failure. A filesystem that can't sync a directory at all answers `EINVAL`, `ENOTSUP` or `ENOSYS`, and that isn't a failed flush: the bytes are synced and there's nothing to retry. The test takes read permission off the directory (`0o300`: write and search only), so creating and renaming the file still work and only opening the directory to sync it fails.
 
 **Rollups that vanished on restart.** The rollup store kept its flushed data in an in-memory `Vec<RecordBatch>` and named every Parquet file with a counter that reset to zero on start. So a restart both lost all history *and* overwrote `rollup_000000.parquet` with new data. We fixed both by making the rollup store read its history back from the Parquet directory (like the metrics store already did) and by seeding the flush counter one past the highest file on disk. Restart now recovers everything and appends rather than clobbering.
 
@@ -1288,21 +1288,20 @@ make an app block when Bun is slow. The issue also asked about the soak's own
 export directory, which grows about 600 MiB a day on each node. That's the
 harness's to bound, and it stays open in #1418.
 
-### Shed, but not forgotten
+### Dropped, and saying so
 
 The buffer in front of all this had a cap from the first hardening pass: a
 million rows, after which the oldest go. It was meant for a disk that keeps
 failing. The 16 November review found it bit a healthy disk too. Flushes ran
 once a minute and nothing flushed sooner, so an app printing more than about
-17,000 lines a second lost lines. Worse, it lost them for good (#2057).
-`ingest` moves the capture offset forward when a line arrives, before it's
-stored, so the next flush checkpointed offsets past the shed lines. A restart
-never read them again, and the reclaim from "Giving the disk back" then
-punched holes over the only copy. And the cap counted rows, not bytes: a
-million 4 KiB lines is 4 GiB.
+17,000 lines a second lost lines (#2057). Nothing said so. `ingest` moves the
+capture offset forward when a line arrives, before it's stored, so the next
+checkpoint skipped the lost lines, and the reclaim from "Giving the disk
+back" then punched holes over the capture's copy. And the cap counted rows,
+not bytes: a million 4 KiB lines is 4 GiB.
 
-Three changes. The store says when it wants flushing, and the task that feeds
-it wakes the flush task:
+The first two changes make dropping rare. The store says when it wants
+flushing, and the task that feeds it wakes the flush task:
 
 ```rust
 let flush_wanted = {
@@ -1323,40 +1322,54 @@ not a queue of them. The flush task waits on `notified()` beside its minute
 tick, as a `tokio::select!` branch written `_ = log_flush_now.notified(), if
 !flush_failing => {}`. The `, if` is the macro's precondition: while the last
 flush failed, that branch is switched off and only the tick retries, so a full
-disk doesn't turn every ingested line into another failing flush. At 100,000 rows or 32 MiB the store asks; the caps are now 1,000,000
-rows *or* 256 MiB, counting a flush still being written.
+disk doesn't turn every ingested line into another failing flush. At 100,000 rows
+or 32 MiB the store asks; the caps are now 1,000,000 rows *or* 256 MiB,
+counting a flush still being written.
 
-The third change is the one that keeps the data. Each buffered line carries
-a `ResumePoint`: its capture file, that file's identity, and the offset the
-line starts at, which is where the previous line from that file ended. When
-the buffer sheds a line, the store remembers the first shed offset per file,
-and `durable_checkpoint` never saves an offset past it:
+The third change decides what a drop means. Our first answer was replay:
+each buffered line remembered where in its capture it started, and no
+checkpoint saved an offset past the first dropped line, so a restart would
+read the lost lines again. Review found two problems with it, both visible
+in our own test. Capture files don't rotate, so the hold lasted for the rest
+of Bun's life: the reclaim never got past it, and a chatty instance's capture
+grew without bound, the disk fill of #1418 back again. And a restart re-read
+everything from the hold onwards, including the lines already in Parquet, so
+the store's promise never to store a line twice was broken.
+
+So a drop is now an honest, counted loss. The checkpoint moves on as usual.
+Each log that lost lines gets one marker line, on stderr, where the gap is:
 
 ```rust
-for (file, (identity, floor)) in &self.shed {
-    if checkpoint.files.get(file) == Some(identity)
-        && let Some(offset) = checkpoint.offsets.get_mut(file)
-    {
-        *offset = (*offset).min(*floor);
-    }
+for entry in self.buffer.drain(0..overflow) {
+    let owner = (entry.app, entry.namespace, entry.instance);
+    let marker = self.drop_markers.entry(owner).or_insert(DropMarker {
+        count: 0,
+        timestamp: entry.timestamp,
+        sequence: entry.sequence,
+    });
+    marker.count += 1;
+    marker.timestamp = entry.timestamp;
+    marker.sequence = entry.sequence;
 }
 ```
 
-`get_mut` hands back a mutable reference into the map, and `*offset = ...`
-writes through it, the way `*p = x` does in C. The capture keeps those bytes,
-because the reclaim only frees what a checkpoint covers, and a restarted Bun
-reads them again. The price is duplicates: lines stored after the first shed
-one are read a second time after a restart. That's the checkpoint's standing
-rule, "at worst twice, never lost". Until a restart the capture isn't
-reclaimed past that point, which costs disk on the one instance that
-overflowed. We didn't make forwarders block instead. A forwarder blocked on
-the store holds its capture file's reader, and the file then grows anyway.
-And a stuck flush would back-pressure every app on the node at once.
+`drain(0..overflow)` removes that range from the vector and hands each
+element over by value, so the loop can move the strings into the map key
+instead of copying them. The marker takes the last dropped line's sequence,
+so a query sorts it into the gap. Markers live beside the buffer, not in it,
+so they're never dropped themselves; the next flush writes them as ordinary
+rows reading "3 log lines dropped: the log store fell behind". The store also
+counts the lines in `dropped_lines`, which Bun's collection loop reports as
+the metric `ketchup_log_lines_dropped_total`, and Bun's log says how many
+went at each flush.
 
-`shed_lines_hold_the_saved_offset_so_a_restart_reads_them_again` caps the
-buffer at two rows, stores two lines, sheds three of the next five, and
-checks that a reopened store resumes from the end of line 2. Before the fix
-it resumed from the end of line 7.
+`shed_lines_are_counted_and_marked_in_the_instance_log` caps the buffer at
+two rows, drops three of seven lines and expects the marker between the
+survivors. `a_restart_after_a_shed_stores_nothing_twice` reopens the store
+and replays the whole capture into it: nothing is stored again.
+`the_capture_is_reclaimed_after_a_shed` follows a 4 MiB capture into a store
+capped at 1,000 rows and checks the flush still frees all but the retained
+tail. With the replay version it freed nothing.
 
 ### The tail that stopped
 

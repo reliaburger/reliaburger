@@ -102,7 +102,13 @@ capture files under the data directory's `instances/`, which the app writes
 into directly. Once the store has saved a stretch of output to disk, Bun hands
 those bytes of the capture back to the filesystem. It keeps the last mebibyte
 of each stream, for `relish logs -f` to start from, and anything not saved
-yet (the store saves once a minute, and sooner when a burst fills its buffer). So a chatty app costs its node the
+yet (the store saves once a minute, and sooner when a burst fills its buffer).
+If an app logs faster than the store can save for long enough (or the disk
+under the store keeps failing), the store drops the oldest lines it hasn't
+saved rather than let Bun run out of memory. You'll know: that app's log gets
+a line on stderr saying "N log lines dropped: the log store fell behind" where
+the gap is, Bun's own log says how many it dropped, and the node metric
+`ketchup_log_lines_dropped_total` counts them. So a chatty app costs its node the
 store's copy plus a mebibyte or so, not everything it ever printed. The capture file's size, as `ls` shows it, still counts everything;
 `du` shows what it really takes. This needs a filesystem that can punch holes
 in a file (ext4, XFS, Btrfs and APFS can); on one that can't, the capture
