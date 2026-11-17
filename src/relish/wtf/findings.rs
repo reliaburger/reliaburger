@@ -27,6 +27,8 @@ pub const CERTIFICATE_WARNING_SECONDS: u64 = 14 * 24 * 60 * 60;
 pub const DISK_WARNING_PERCENT: u64 = 85;
 /// `disk-high`: critical from this percentage full.
 pub const DISK_CRITICAL_PERCENT: u64 = 95;
+/// `backup-failing`: no council backup exported for this many intervals.
+pub const BACKUP_STALE_INTERVALS: u64 = 3;
 
 /// How bad a finding is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
@@ -281,6 +283,29 @@ pub const FINDINGS: &[FindingKind] = &[
         severities: WARNING,
         meaning: "a node can't unseal the cluster's GitOps credentials, so as leader it couldn't sync",
         thresholds: &[],
+    },
+    FindingKind {
+        id: "backup-disabled",
+        severities: CRITICAL,
+        meaning: "a node has [cluster.backup] set but its backup loop can't run: no master key to seal with, or a destination the object store can't open",
+        thresholds: &[],
+    },
+    FindingKind {
+        id: "backup-not-configured",
+        severities: WARNING,
+        meaning: "no council member has [cluster.backup], so losing every voter loses the cluster's desired state; or one voter lacks it and would export nothing as leader",
+        thresholds: &[],
+    },
+    FindingKind {
+        id: "backup-failing",
+        severities: WARNING,
+        meaning: "the leader's last council backup export failed, or no node has exported one for several intervals",
+        thresholds: &[Threshold {
+            constant: "BACKUP_STALE_INTERVALS",
+            value: BACKUP_STALE_INTERVALS,
+            unit: Unit::Count,
+            meaning: "backup intervals without an export before the warning",
+        }],
     },
     FindingKind {
         id: "policy-broken",

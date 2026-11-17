@@ -1136,8 +1136,11 @@ so the secret clients still hold stops at once whatever the grace. The error
 says to check the token's created time in `relish token list` first.
 
 **Revocation (forwarded by #1506):** `POST /v1/token/revoke {name}` commits
-`RaftRequest::RevokeApiToken` on the leader; a follower forwards it with the
-caller's own credential. Authentication reads each node's token store, so the
+`RaftRequest::RevokeApiToken { name, now_unix_ms }` on the leader. The state
+machine refuses to remove the only Admin token, and the last Admin that hasn't
+expired at the entry's `now_unix_ms` (the proposer's clock, as the sweep's), so
+a store is never left with only expired Admins (#2014). A follower forwards
+the revoke with the caller's own credential. Authentication reads each node's token store, so the
 node the client spoke to also drops the token from its store before it answers
 (`drop_revoked_token`), by name, as the state machine does. It first waits up
 to two seconds for its replica to apply the removal, because the five-second

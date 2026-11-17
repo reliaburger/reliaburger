@@ -16,12 +16,12 @@ use crate::relish::client::BunClient;
 use crate::relish::council_view::CouncilNodeObservation;
 
 use super::{
-    AlertObservation, ApplicationEvidence, BuildObservation, CertificateObservation,
-    ClusterEvidence, CouncilObservation, CpuThrottleObservation, DeployObservation,
-    DiskObservation, Evidence, FaultObservation, GitOpsObservation, IsolationObservation,
-    LaunchFailureObservation, LogObservation, NodeGitOpsDifference, NodeGitOpsUnreadable,
-    NodeIsolation, NodeObservation, RegistryObservation, ReplicaObservation, RestartObservation,
-    ServiceObservation, TokenObservation, WtfInputs,
+    AlertObservation, ApplicationEvidence, BackupObservation, BuildObservation,
+    CertificateObservation, ClusterEvidence, CouncilObservation, CpuThrottleObservation,
+    DeployObservation, DiskObservation, Evidence, FaultObservation, GitOpsObservation,
+    IsolationObservation, LaunchFailureObservation, LogObservation, NodeGitOpsDifference,
+    NodeGitOpsUnreadable, NodeIsolation, NodeObservation, RegistryObservation, ReplicaObservation,
+    RestartObservation, ServiceObservation, TokenObservation, WtfInputs,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -252,6 +252,12 @@ pub async fn collect(client: &BunClient, app: Option<&str>) -> Result<WtfInputs,
         Evidence::available(collected_at, Default::default())
     };
     let recent_logs = collect_logs(client, app, &restarts, collected_at).await;
+    let backups = if cluster_enabled {
+        collect_backups(&endpoints, &collected, collected_at)
+    } else {
+        // A standalone node has no council to back up.
+        Evidence::available(collected_at, Vec::new())
+    };
 
     Ok(WtfInputs {
         cluster_name,
@@ -269,6 +275,7 @@ pub async fn collect(client: &BunClient, app: Option<&str>) -> Result<WtfInputs,
             isolation,
             gitops,
             policies,
+            backups,
         },
         applications: ApplicationEvidence {
             restarts,
@@ -916,6 +923,42 @@ fn append_diagnostic_source<T, U, F>(
     }
 }
 
+/// Each node's council backup loop, from its diagnostics (#2016). `endpoints`
+/// and `collected` are parallel: the endpoint says whether the node votes
+/// and leads.
+fn collect_backups(
+    endpoints: &[NodeEndpoint],
+    collected: &[NodeCollection],
+    observed_at: u64,
+) -> Evidence<Vec<BackupObservation>> {
+    let mut builder = EvidenceBuilder::default();
+    for (endpoint, node) in endpoints.iter().zip(collected) {
+        let snapshot = match &node.diagnostics {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                builder.unavailable(format!("node {}: {error}", node.node_id));
+                continue;
+            }
+        };
+        match &snapshot.backup {
+            DiagnosticSource::Available { value, .. }
+            | DiagnosticSource::Degraded { value, .. } => builder.values.push(BackupObservation {
+                node_id: node.node_id.clone(),
+                is_council: endpoint.status.is_council,
+                is_leader: endpoint.status.is_leader,
+                status: value.clone(),
+            }),
+            DiagnosticSource::Unavailable { reason } => {
+                builder.unavailable(format!("node {}: {reason}", node.node_id))
+            }
+            DiagnosticSource::Unsupported { reason } => {
+                builder.unsupported(format!("node {}: {reason}", node.node_id))
+            }
+        }
+    }
+    builder.finish(observed_at)
+}
+
 /// Token lifetimes from `GET /v1/token/list`. Only an unscoped Admin may
 /// read it, so with a lesser credential the evidence is unavailable and
 /// says why.
@@ -1352,6 +1395,9 @@ mod tests {
                 }],
                 reason: "workload inventory unavailable".to_string(),
             },
+            backup: DiagnosticSource::Unsupported {
+                reason: "fixture".to_string(),
+            },
         };
         let collected = vec![NodeCollection {
             node_id: "node-1".to_string(),
@@ -1555,6 +1601,7 @@ mod tests {
                 "disks":{"state":"available","observed_at":10,"value":disks},
                 "cpu_throttling":{"state":"unsupported","reason":"fixture"},
                 "certificates":{"state":"unsupported","reason":"fixture"},
+                "backup":{"state":"unsupported","reason":"fixture"},
             });
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();

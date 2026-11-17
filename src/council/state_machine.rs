@@ -1043,7 +1043,7 @@ impl StateMachineInner {
                 }
                 self.state.security_state.api_tokens.push(token.clone());
             }
-            RaftRequest::RevokeApiToken { name } => {
+            RaftRequest::RevokeApiToken { name, now_unix_ms } => {
                 // Never let a revoke empty the store of Admin tokens. An empty
                 // token store reopens the middleware's bootstrap allow-all
                 // (`sesame::auth`), and the loopback-only bind guard is a
@@ -1052,16 +1052,31 @@ impl StateMachineInner {
                 // sequentially, this check is race-free: two concurrent revokes
                 // of two distinct Admins become two entries, and the second one
                 // (now the last Admin) is refused.
+                //
+                // An expired Admin keeps the store from emptying but lets no
+                // one in, so it doesn't count as a replacement either: the
+                // last *usable* Admin can't go while only expired ones would
+                // be left (#2014). The entry carries the proposer's clock, as
+                // the sweep's does, so every replica decides the same way.
                 use crate::sesame::types::ApiRole;
                 let tokens = &self.state.security_state.api_tokens;
-                let target_is_admin = tokens
+                let usable = |t: &crate::sesame::types::ApiToken| {
+                    t.expires_at
+                        .is_none_or(|at| crate::sesame::token::unix_millis(at) > *now_unix_ms)
+                };
+                let target = tokens
                     .iter()
-                    .any(|t| t.name == *name && t.role == ApiRole::Admin);
-                let admin_count = tokens.iter().filter(|t| t.role == ApiRole::Admin).count();
-                if target_is_admin && admin_count <= 1 {
+                    .find(|t| t.name == *name && t.role == ApiRole::Admin);
+                let admins = tokens.iter().filter(|t| t.role == ApiRole::Admin);
+                let admin_count = admins.clone().count();
+                let usable_admins = admins.filter(|t| usable(t)).count();
+                let last_admin = target.is_some_and(|target| {
+                    admin_count <= 1 || (usable(target) && usable_admins <= 1)
+                });
+                if last_admin {
                     return Some(CouncilResponse::Refused {
                         reason: format!(
-                            "refusing to revoke {name:?}: it is the last Admin token; \
+                            "refusing to revoke {name:?}: it is the last unexpired Admin token; \
                              create a replacement Admin token before revoking this one"
                         ),
                     });
@@ -8228,6 +8243,7 @@ mod tests {
 
         inner.apply_request(&RaftRequest::RevokeApiToken {
             name: "ci".to_string(),
+            now_unix_ms: 0,
         });
         assert!(inner.state.security_state.api_tokens.is_empty());
     }
@@ -8402,6 +8418,7 @@ mod tests {
         // Admin at runtime (which would reopen the bootstrap allow-all).
         let resp = inner.apply_request(&RaftRequest::RevokeApiToken {
             name: "admin-a".to_string(),
+            now_unix_ms: 0,
         });
         assert!(matches!(resp, Some(CouncilResponse::Refused { .. })));
         assert!(
@@ -8417,6 +8434,7 @@ mod tests {
         // A non-Admin token is always revocable, even as the only non-Admin.
         inner.apply_request(&RaftRequest::RevokeApiToken {
             name: "deployer".to_string(),
+            now_unix_ms: 0,
         });
         assert!(
             !inner
@@ -8434,6 +8452,7 @@ mod tests {
         )));
         inner.apply_request(&RaftRequest::RevokeApiToken {
             name: "admin-a".to_string(),
+            now_unix_ms: 0,
         });
         let admins: Vec<_> = inner
             .state
@@ -8444,6 +8463,81 @@ mod tests {
             .map(|t| t.name.clone())
             .collect();
         assert_eq!(admins, vec!["admin-b".to_string()]);
+    }
+
+    #[test]
+    fn revoke_refuses_to_remove_the_last_unexpired_admin_token() {
+        use crate::sesame::types::{ApiRole, ApiToken, TokenScope};
+        use std::time::{Duration, SystemTime};
+        const NOW_MS: u64 = 2_000_000_000_000;
+        let now = SystemTime::UNIX_EPOCH + Duration::from_millis(NOW_MS);
+        let admin = |name: &str, expires_at: Option<SystemTime>| ApiToken {
+            name: name.to_string(),
+            token_hash: vec![1, 2, 3],
+            role: ApiRole::Admin,
+            kind: crate::sesame::types::TokenKind::Human,
+            scope: TokenScope::default(),
+            expires_at,
+            created_at: SystemTime::UNIX_EPOCH,
+            previous_secret: None,
+        };
+        let revoke = |name: &str| RaftRequest::RevokeApiToken {
+            name: name.to_string(),
+            now_unix_ms: NOW_MS,
+        };
+
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::CreateApiToken(admin("live", None)));
+        inner.apply_request(&RaftRequest::CreateApiToken(admin(
+            "expired",
+            Some(now - Duration::from_secs(60)),
+        )));
+
+        // Two Admin tokens, but only one anyone can still use: revoking it
+        // would lock every operator out (#2014).
+        let resp = inner.apply_request(&revoke("live"));
+        assert!(
+            matches!(resp, Some(CouncilResponse::Refused { .. })),
+            "revoking the last unexpired Admin must be refused, got {resp:?}"
+        );
+        assert_eq!(token_names(&inner), ["live", "expired"]);
+
+        // The expired one can go: the usable Admin stays.
+        let resp = inner.apply_request(&revoke("expired"));
+        assert!(!matches!(resp, Some(CouncilResponse::Refused { .. })));
+        assert_eq!(token_names(&inner), ["live"]);
+
+        // A token expiring later than the entry's time still counts as usable.
+        inner.apply_request(&RaftRequest::CreateApiToken(admin(
+            "later",
+            Some(now + Duration::from_secs(60)),
+        )));
+        let resp = inner.apply_request(&revoke("live"));
+        assert!(!matches!(resp, Some(CouncilResponse::Refused { .. })));
+        assert_eq!(token_names(&inner), ["later"]);
+    }
+
+    #[test]
+    fn revoke_refuses_to_remove_the_only_admin_even_when_it_has_expired() {
+        use crate::sesame::types::{ApiRole, ApiToken, TokenScope};
+        use std::time::{Duration, SystemTime};
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::CreateApiToken(ApiToken {
+            name: "old".to_string(),
+            token_hash: vec![1],
+            role: ApiRole::Admin,
+            kind: crate::sesame::types::TokenKind::Human,
+            scope: TokenScope::default(),
+            expires_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1)),
+            created_at: SystemTime::UNIX_EPOCH,
+            previous_secret: None,
+        }));
+        let resp = inner.apply_request(&RaftRequest::RevokeApiToken {
+            name: "old".to_string(),
+            now_unix_ms: 2_000_000_000_000,
+        });
+        assert!(matches!(resp, Some(CouncilResponse::Refused { .. })));
+        assert_eq!(token_names(&inner), ["old"]);
     }
 
     fn rotation_for(name: &str, hash: u8) -> crate::sesame::types::TokenRotation {
@@ -10019,6 +10113,7 @@ mod tests {
         );
         inner.apply_request(&RaftRequest::RevokeApiToken {
             name: leased_token().name,
+            now_unix_ms: 0,
         });
         assert!(inner.state.security_state.api_tokens.is_empty());
         assert!(matches!(

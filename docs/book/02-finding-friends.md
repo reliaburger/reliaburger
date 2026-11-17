@@ -2747,6 +2747,22 @@ retain = 24
 
 Off by default. If you don't set `url`, the loop never starts and you pay nothing.
 
+Here's a trap we built for ourselves, though. "The loop never starts" also happened when you *did* set `url`: with no master key on the node, or a URL the object store couldn't open, Bun printed one line to stderr and carried on. Nothing else noticed. You'd find out on the day you needed a restore and the bucket was empty (#2016). A backup you can't see is a backup you don't have, so each node now keeps its loop's state in a `tokio::sync::watch` channel and serves it from `GET /v1/diagnostics`:
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum BackupStatus {
+    NotConfigured,
+    Disabled { reason: String },
+    Running(BackupProgress),
+}
+```
+
+`#[serde(tag = "state")]` makes the JSON an object with a `"state"` field naming the variant, `{"state": "disabled", "reason": "..."}`, rather than serde's default of wrapping it in an object keyed by the variant name. `BackupProgress` holds the interval, when the loop started, the last successful export and the last failure. `prepare_backup` decides the starting state (and opens the store, so a bad URL is caught before the loop exists), and the loop calls `record_export` after each attempt. Both are plain functions, so the tests feed them a missing key, a bad URL and a failing store without a council in sight.
+
+`relish wtf` reads every node's status. Configured but disabled is critical, since there'll be nothing to restore from. The leader's last export failing, or no export by *any* node for three intervals, is a warning; counting any node means a fresh leader that hasn't ticked yet isn't flagged while its predecessor's backup is still recent. No council member with `[cluster.backup]` at all is a warning too, and so is one voter without it, because whichever voter leads is the one that exports, and `[cluster.backup]` is per-node config.
+
 "Each backend's standard credentials" was, for a while, a promise the code didn't keep. `object_store::parse_url` builds an S3 store with `AmazonS3Builder::new()`, which reads no environment at all, so `AWS_REGION` and friends were ignored and S3 quietly fell back to the instance's metadata credentials in `us-east-1` (#695). Chapter 15 has the fix in `object_storage::open`; the short version is that we now hand each builder its own `AWS_*` or `GOOGLE_*` variables.
 
 The other problem was the name. The first version called each object `council-{millis}.backup`, from the leader's `SystemTime::now()`, and both "restore the newest" and "keep the newest 24" sorted by it. Picture a former leader whose clock ran a day fast. Its backups are the "newest" for a day. Once it has written 24 of them, every correct backup the new leader uploads sorts older and is pruned straight after upload, and a restore picks the stale state. The wall clock is the one thing in a cluster nobody agrees on.

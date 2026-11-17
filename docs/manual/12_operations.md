@@ -603,6 +603,16 @@ The leader confirms it's still the leader before each export, so a deposed
 one skips it. Backups written by 0.2.0 or earlier are named by time alone;
 they're left alone and never restored.
 
+A configured backup can still be off. With no master key on the node (there's
+nothing to seal with, and plaintext state never leaves it), or a `url` the
+object store can't open, the loop never starts. `relish wtf` reports either as
+a critical `backup-disabled` finding naming the node and the reason. It warns
+`backup-failing` when the leader's last export failed, or when nothing has been
+exported for three intervals, and `backup-not-configured` when no council
+member has `[cluster.backup]`, or when one member lacks it while others have
+it: as leader, that member would export nothing. Give every council member the
+same `[cluster.backup]`.
+
 For `s3://` and `gs://`, Bun reads the standard variables of each backend:
 `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`,
 `AWS_REGION` (or `AWS_DEFAULT_REGION`) and `AWS_ENDPOINT` for S3 and

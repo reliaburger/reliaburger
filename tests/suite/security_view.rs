@@ -262,7 +262,10 @@ async fn a_node_without_a_seat_reads_the_leaders_view_and_follows_revocations() 
     );
 
     leader
-        .write(RaftRequest::RevokeApiToken { name: "ci".into() })
+        .write(RaftRequest::RevokeApiToken {
+            name: "ci".into(),
+            now_unix_ms: 0,
+        })
         .await
         .unwrap();
     outsider.adopt_leader_security_view(view().await).await;

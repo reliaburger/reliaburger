@@ -167,6 +167,9 @@ pub struct LocalDiagnosticSnapshot {
     pub cpu_throttling: DiagnosticSource<Vec<CpuThrottleEvidence>>,
     /// Public certificate lifecycle metadata.
     pub certificates: DiagnosticSource<Vec<PublicCertificateMetadata>>,
+    /// This node's council backup loop (#2016); unsupported on a standalone
+    /// node, which has no council.
+    pub backup: DiagnosticSource<crate::council::backup::BackupStatus>,
 }
 
 /// Desired service state used to distinguish an intentionally empty service
@@ -675,6 +678,10 @@ mod tests {
                     automatic_rotation: false,
                 }],
                 reason: "workload inventory is not exposed".to_string(),
+            },
+            backup: DiagnosticSource::Available {
+                observed_at: 10,
+                value: crate::council::backup::BackupStatus::NotConfigured,
             },
         };
 
