@@ -34,8 +34,9 @@ impl GitRepo {
     /// survived a failover) triggers a fresh clone rather than silently
     /// syncing the wrong repo (GIT4). A fresh clone is fetched into a
     /// temporary sibling directory and renamed into place, so a mid-clone
-    /// crash never leaves a half-populated repo at `path`, and a directory
-    /// there without HEAD is removed and cloned again (#2061).
+    /// crash never leaves a half-populated repo at `path`. Whatever was at
+    /// `path` (a drifted clone, or a directory without HEAD) is replaced
+    /// only once the new clone is complete (#2061).
     pub fn clone_or_open(url: &str, path: &Path, branch: &str) -> Result<Self, LettuceError> {
         Self::clone_or_open_with_budget(url, path, branch, CommandBudget::default())
     }
@@ -58,15 +59,14 @@ impl GitRepo {
                         budget,
                     });
                 }
-                // Drift or an unreadable clone: discard and re-clone.
-                Ok(false) | Err(_) => remove_clone(path, "drifted clone")?,
+                // Drift or an unreadable clone: clone afresh. The old clone
+                // stays until the new one is complete.
+                Ok(false) | Err(_) => {}
             }
-        } else if path.exists() {
-            // No HEAD: what an interrupted clone left. `git clone` refuses a
-            // non-empty destination, so it would wedge every later clone.
-            remove_clone(path, "interrupted clone")?;
         }
-
+        // Whatever is at `path` now (a drifted clone, or a HEAD-less
+        // directory an interrupted clone left) is replaced once the new
+        // clone succeeds.
         Self::fresh_clone(url, path, branch, budget)
     }
 
@@ -92,6 +92,9 @@ impl GitRepo {
             // A failed clone may have written part of the staging directory.
             let _ = std::fs::remove_dir_all(&staging);
             return Err(error);
+        }
+        if path.exists() {
+            remove_clone(path, "replaced clone")?;
         }
         std::fs::rename(&staging, path).map_err(|e| {
             let _ = std::fs::remove_dir_all(&staging);
@@ -1117,5 +1120,30 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert!(left.is_empty(), "a failed clone left {left:?}");
+    }
+
+    /// A drifted clone was deleted before the new one was fetched, so a
+    /// fetch that failed left no clone at all. It is now replaced only once
+    /// the new clone is complete.
+    #[test]
+    fn a_failed_reclone_keeps_the_drifted_clone() {
+        let (dir, repo_path) = create_test_repo();
+        let clone_path = dir.path().join("clone");
+        let url = format!("file://{}", repo_path.display());
+        GitRepo::clone_or_open(&url, &clone_path, "main").unwrap();
+        let missing = format!("file://{}", dir.path().join("missing").display());
+
+        assert!(GitRepo::clone_or_open(&missing, &clone_path, "main").is_err());
+
+        assert!(
+            clone_path.join("HEAD").exists(),
+            "the old clone was deleted"
+        );
+        let origin = Command::new("git")
+            .args(["config", "--", "remote.origin.url"])
+            .current_dir(&clone_path)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&origin.stdout).trim(), url);
     }
 }

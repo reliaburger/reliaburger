@@ -103,8 +103,8 @@ actually synced, is no longer called). A reused local clone is verified against 
 remote URL and branch and re-cloned on drift, so a stale clone left by a leadership change
 never syncs the wrong repository. A fresh clone goes into a `.<name>.cloning` sibling first and is
 renamed into place only once `git clone` succeeds, so a clone killed by its deadline leaves
-nothing at the path; a directory there without `HEAD` (an interrupted clone from before this) is
-removed and cloned again rather than wedging every later attempt.
+nothing at the path. Whatever was at the path (a drifted clone, or a directory without `HEAD`
+that an interrupted clone left) is replaced only then, so a failed re-clone keeps the old clone.
 
 **Configuration in Raft (0.2.1, #693).** The `[gitops]` configuration the leader syncs is
 `DesiredState.gitops_config`, a `StoredGitOpsConfig`, not the leader's own `node.toml`. Every
