@@ -3162,6 +3162,50 @@ The return hold shares `ElectionHold` with the handover hold from the next secti
 
 The reproducer changed with the fix. It now checks that the returning node's term doesn't move in the two seconds it spends outside the others' gossip, which is longer than it used to take to campaign. It then checks that leadership and the leader's term stay put once it's added back, and that the leader's replication ended the hold. It passed six runs out of six, and it runs in `make test-cluster` again.
 
+### Who may speak on the Raft port
+
+mTLS answers "who are you?", and on the Raft port the answer was always good enough: a node certificate signed by the Node CA. Every node has one, though, workers included, and the listener stopped there. So a worker could send a Raft RPC that names any leader it liked, and a follower would take it on the strength of the vote inside. It could also stamp a newer recovery epoch on the envelope and fence the voter it reached. A code review found it in November 2026. What the listener was missing was the second question: are you someone this council lets drive Raft?
+
+Start with who sends what. openraft has three RPCs. A leader sends `AppendEntries` and `InstallSnapshot`; a candidate sends `Vote`. Leaders and candidates are always voters, because openraft never lets a learner campaign. Learners only receive. So the check belongs on the *sender*, and it's the same for all three: the node the RPC's vote names (`voted_for`) must be a voter in this node's council, and it must be the node the connection's certificate names. The second half stops one node speaking for another.
+
+The direction matters for learners. A leader dials a learner to replicate to it, so the learner is the receiver and the check runs against the leader. Adding a learner needs nothing new.
+
+"This node's council" needs care too, because openraft keeps two memberships. The effective one is the newest entry in the log, committed or not; the committed one is the newest that has committed. A follower that has appended the entry removing the leader no longer has the leader in its effective membership. But the leader keeps sending until that very entry commits, and refusing it would stall the removal. So the council is the union of both memberships' voters, read from openraft's own state:
+
+```rust
+raft.with_raft_state(|state| {
+    let committed = state.membership_state.committed().membership();
+    let effective = state.membership_state.effective().membership();
+    if committed.nodes().next().is_none() && effective.nodes().next().is_none() {
+        return None;
+    }
+    let mut voters = CouncilVoters::new();
+    add_voters(&mut voters, committed);
+    add_voters(&mut voters, effective);
+    Some(voters)
+})
+.await
+```
+
+`with_raft_state` sends the closure to the Raft core's own task and waits for the answer. The closure gets a reference to the core's state for the length of the call and can't keep it, so its signature asks for an `FnOnce` that is `'static`: it owns everything it captures. That's how openraft lets you look at state it never hands out. It costs a trip through the core, so the server tries the metrics channel's effective membership first and only asks the core when that doesn't settle it.
+
+Two kinds of node had to keep working, and the tests were written for them before the check. A fresh node has no membership at all, and the first leader that replicates to it is how it joins, so a node with no council serves any certificate, as before. It holds nothing worth protecting yet. The other is a member whose view is behind. Take the replaced voter from the last section. If the leader is a node that joined while it was down, its old membership has never heard of that leader, and a strict check would refuse it until leadership happened to move. Its vote counts as much as its log. Say the council swaps voter 3 for node 4 while voter 2 lags, and then the leader dies. Node 4 can't win without node 2's vote, and node 2 has never heard of node 4. The review of the first version of this check found exactly that: the council sat leaderless until the old leader came back. So a member that refuses replication from a stranger, or a vote from one whose log reaches at least as far as its own, asks the voters it *does* know, with a fourth RPC, `CouncilVoters`, dialled over the same node-id-bound mTLS as everything else. If one of them names the stranger, under the certificate's node name, the member admits it for 60 seconds, long enough to catch up and read the membership from its own log. One voucher is enough: a voter in the member's own view can already drive its Raft, so its word adds nothing it couldn't do anyway.
+
+Vouching needs at least one live voter the member knows, and that leaves one gap we chose to keep. Suppose voter 3 is swapped out while node 2 lags, then voter 3 dies, then the leader dies. Node 2 knows only voters 1 and 3, both gone, so nobody can vouch for node 4, and node 4 needs node 2's vote. We tried serving a stranger's vote when nobody answers. Node 4 won the election and then couldn't replicate to node 2, so the council still couldn't commit anything. Making it work would have meant taking a stranger's log entries on trust, which is the very thing the check exists to stop. So the council waits until node 1 or node 3 comes back, and the manual tells an operator who can't wait to run `relish council recover` or re-enrol node 2. `a_lagging_voter_that_lost_every_voter_it_knows_waits_for_one_to_return` pins that behaviour down: no leader while they're gone, and a leader once node 1 returns.
+
+The fence changed shape to match. Before, every RPC went through `fence.admit`, which could move the fence. Now only a member's RPC does. A stranger never moves it, but one on an *older* epoch still gets the `Fenced` reply, because that's how an old voter knocking on a recovered council learns it has been replaced. `refusal_for_outsider` is the read-only half:
+
+```rust
+pub fn refusal_for_outsider(&self, sender: RecoveryClaim) -> Option<RecoveryClaim> {
+    let snapshot = self.snapshot();
+    (sender.epoch < snapshot.newest_known_epoch()).then(|| snapshot.refusal_claim())
+}
+```
+
+`bool::then` turns a condition into an `Option`: `Some` of the closure's result when it's true, `None` when it's false. It reads like Python's `x if cond else None`, and the closure only runs when it's needed.
+
+What doesn't this cover? A fresh node still trusts whoever reaches it first, gossip carries epochs too, and every node still holds the master key, so the check doesn't make a worker harmless. It makes the Raft port mean what the security design always said it meant: changing the log takes the council. The tests in `tests/suite/council_tcp.rs` send each RPC kind from a certificate outside the council and from one speaking for a member, check that a newer epoch from outside leaves the fence alone, and run a council through adding a learner, promoting it and removing its own leader over mTLS. One more gives a member a view that's one voter behind, and checks it admits the leader its voters name and nobody else.
+
 ### Resigning under disk pressure
 
 There's a slower failure worth heading off before it becomes a total loss: a voter whose disk is filling up. Raft can't make progress if a voter can't persist its log, so a voter drowning in disk pressure is a liability sitting in the quorum. Better it resigns and lets a healthy spare take the seat.

@@ -190,6 +190,7 @@ fn raft() -> Vec<Seed> {
             "install-snapshot",
             envelope(RaftRpc::InstallSnapshot(snapshot)),
         ),
+        seed("council-voters", envelope(RaftRpc::CouncilVoters)),
     ]
 }
 

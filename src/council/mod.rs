@@ -1,3 +1,4 @@
+pub mod admission;
 /// Raft consensus for the council (3–7 nodes).
 ///
 /// The council is a small group of nodes that replicate desired state

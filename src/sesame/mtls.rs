@@ -340,7 +340,7 @@ impl PinnedChainServerVerifier {
 }
 
 /// Extract the node id from a leaf certificate's node-id URI SAN, if present.
-fn node_id_from_leaf(der: &CertificateDer<'_>) -> Option<String> {
+pub(crate) fn node_id_from_leaf(der: &CertificateDer<'_>) -> Option<String> {
     use x509_parser::prelude::*;
     let (_, cert) = X509Certificate::from_der(der).ok()?;
     let san = cert.subject_alternative_name().ok().flatten()?;
