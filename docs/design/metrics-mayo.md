@@ -29,7 +29,7 @@ A note on this document: the storage engine is **Parquet + DataFusion SQL**, not
 | Component | Relationship |
 |-----------|-------------|
 | **Bun** (node agent) | Host process. Bun's collection loop samples node and per-process metrics (via the `sysinfo` crate) into the local Mayo store, drives the periodic flush to Parquet, runs the alert evaluation loop, and drives retention/disk-pressure pruning. |
-| **Council** (Raft consensus group) | Each worker node pushes a 1-minute `NodeRollup` to the Raft leader over the reporting transport (the council-parent tree is planned, #364). The leader stores rollups in a separate rollup store, served at `/v1/metrics/rollup` and `/v1/metrics/cluster`. **Cross-council query fan-out and merge is implemented**: `/v1/metrics/cluster` and `/v1/metrics/app` fan out across council voters and sum the results (see §3.3). |
+| **Council** (Raft consensus group) | Each worker node pushes a 1-minute `NodeRollup` to the Raft leader over the reporting transport (the council-parent tree is planned, #364). The leader stores rollups in a separate rollup store, served at `/v1/metrics/rollup` and `/v1/metrics/cluster`. **Cross-council query fan-out and merge is implemented**: `/v1/metrics/cluster` fans out across council voters and sums their rollups, and `/v1/metrics/app` fans out to the nodes running the app (see §5.5). |
 | **Brioche** (web UI) | Queries Mayo over the internal HTTP API (`/v1/metrics*`) for dashboard rendering. |
 | **Relish** (CLI) | `relish` queries the per-app metrics endpoint over HTTP. |
 | **Mustard** (gossip) | Provides cluster membership and node identity, used (with Raft metrics) to find the leader a node reports rollups to. |
@@ -111,10 +111,10 @@ Retention is a single `retention_days` value (default **7**). Two paths prune Pa
 
 **What ships:** each worker node runs a rollup worker (`src/mayo/rollup_worker.rs`) that, every `rollup_interval_secs` (default 60), generates a `NodeRollup` -- 1-minute (min, max, sum, count) aggregates of the local metrics -- and sends it to the Raft leader over the reporting transport (postcard-framed messages, `ReportingMessage::MetricsRollup`, not gRPC). The leader stores received rollups in a separate rollup store, exposed at `/v1/metrics/rollup` (this member's own data) and `/v1/metrics/cluster`.
 
-**What is planned -- not yet implemented:**
+Queries over these rollups, and over an app's samples on every node running it, fan out and merge; §5.5 says how.
 
-- **Cross-council query fan-out and merge.** `src/mayo/query_fanout.rs` contains `fan_out_cluster_query`/`fan_out_app_query` and the merge functions, but nothing calls them. `/v1/metrics/cluster` returns only the handling council member's *local* rollup data; it does not fan out to the other council members or merge their partial sums. So a "cluster-wide" query today reflects one council member's subset, not the whole cluster.
-- **Single-app query fan-out via the Meat placement map.** `/v1/metrics/app/{app}/{namespace}` filters the *local* store by the `namespace/app` label. It does not consult placement or query the other nodes running the app.
+**Also shipped:**
+
 - **`rollup_retention_hours`.** Defaults to 24. Bun's disk-pressure loop calls `RollupStore::prune_expired` each tick to drop rollups older than this window (0 keeps all).
 
 ### 3.4 Prometheus-Compatible Remote-Read API
@@ -324,7 +324,7 @@ The council member stores received rollups in a rollup store and serves them at 
 - `/v1/metrics/app/{app}/{namespace}` resolves the app's nodes from the Meat placement map and fans the query out to each, merging the results (falling back to the local store when there's no placement).
 - `/v1/metrics/cluster` enumerates the Raft voters, maps each to its live membership address, and sums each member's `/v1/metrics/rollup` (falling back to local rollup data on a single node / no council).
 
-Both the single-app path (`/v1/metrics/app`, via the Meat placement map) and the cluster-wide path (`/v1/metrics/cluster`, across council voters) now fan out and merge. The query timeout, top-N merge, and unresponsive-node annotations remain part of the planned design.
+Both the single-app path (`/v1/metrics/app`, via the Meat placement map) and the cluster-wide path (`/v1/metrics/cluster`, across council voters) fan out and merge, with a 10 s timeout on each fan-out (`src/bun/api/metrics.rs`). Top-N merge and annotations naming the nodes that didn't answer remain part of the planned design.
 
 ### 5.6 Alert Evaluation
 

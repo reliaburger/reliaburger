@@ -383,7 +383,7 @@ migration and no feature gate
   turned out to be glibc keeping free memory after log queries, levelling off
   in the 0.2.8 day run
   ([record](qualification/2026-11-14-v0.2.8-memory-run.md)); its full disk
-  ([#1418](https://github.com/reliaburger/reliaburger/issues/1418), 0.3.0)
+  ([#1418](https://github.com/reliaburger/reliaburger/issues/1418), 0.3.1)
   is still open. It ships
   with the `zstd` 0.13 advisories under a reviewed exception
   ([#1367](https://github.com/reliaburger/reliaburger/pull/1367)). 0.2.3 keeps
@@ -419,7 +419,7 @@ migration and no feature gate
   ([#1485](https://github.com/reliaburger/reliaburger/issues/1485)), and pass
   with the fixed checker. It ships with the `zstd` 0.13 advisories under the
   exception 0.2.3 took, which expires on 18 November 2026
-  ([#1366](https://github.com/reliaburger/reliaburger/issues/1366), in 0.3.0).
+  ([#1366](https://github.com/reliaburger/reliaburger/issues/1366), in 0.3.1).
   The profile after the tag found 0.2.4 4.5% faster on host jobs than 0.2.3
   ([record](qualification/2026-10-30-v0.2.4-profile/README.md)). The 24-hour
   memory run failed at hour 21 when the Mac lost its forwards to the VMs; up

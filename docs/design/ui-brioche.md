@@ -138,7 +138,7 @@ Brioche runs on every node, but the data it displays comes from the cluster API.
 - **Static asset requests** (`/`, `/apps`, CSS, JS, fonts): Served directly from the embedded assets on the local node. No network hop.
 - **API read requests** (`GET /v1/*`): There's no nearest-council-member routing. Some reads answer from the receiving node's own replica of council state, which can lag the leader (`/v1/status`, for one); others are forwarded to the confirmed leader (`bun::leadership`).
 - **API write requests** (`POST /v1/*`, `PUT`, `DELETE`): Forwarded to the current leader, which commits via Raft before responding.
-- **Metrics queries** (`GET /v1/metrics/cluster`, `GET /v1/metrics/app/{app}/{namespace}`): fan out across council members or the nodes running the app and merge results. The per-name `GET /v1/metrics` reads the local store. `GET /v1/metrics/app/{app}/{namespace}/chart?name=- **Metrics queries** (`GET /v1/metrics/cluster`, `GET /v1/metrics/app/{app}/{namespace}`): fan out across council members and merge results. The per-name `GET /v1/metrics` reads the local store.kind=gauge|rate|mean` returns one app metric as `{timestamps, series: [{label, values}]}`, one series per instance, counters as per-second rates and histograms as means, which is what the app page draws.
+- **Metrics queries:** `GET /v1/metrics/cluster` fans out across council members (whichever holds rollups, so history from an earlier leader still answers) and merges the results; `GET /v1/metrics/app/{app}/{namespace}` fans out to the nodes running the app. The per-name `GET /v1/metrics` reads the local store. `GET /v1/metrics/app/{app}/{namespace}/chart?name=X&kind=gauge|rate|mean` returns one app metric as `{timestamps, series: [{label, values}]}`, one series per instance, counters as per-second rates and histograms as means, which is what the app page draws.
 - **Log streaming** (`GET /v1/logs/{app}/{namespace}?follow=true`, `WS /v1/ws/logs/{app}/{namespace}`): streams from the receiving node's local agent only. Cross-node merge of live follow is not implemented.
 
 ### 3.4 Frontend Technology
@@ -150,7 +150,7 @@ Brioche uses a deliberately lightweight frontend stack. The goal is a small asse
 Rationale:
 
 - HTMX (~14KB gzipped) provides dynamic page updates without a heavyweight SPA framework. Partial page swaps, WebSocket integration, and server-sent events are supported natively.
-- Askama templates are compiled into Rust at build time (type-checked, zero-allocation rendering). This keeps the rendering logic in Rust and avoids a separate Node.js build pipeline.
+- Pages are rendered in Rust (the plan was Askama templates; the shipped code builds them with `format!`). This keeps the rendering logic in Rust and avoids a separate Node.js build pipeline.
 - Charts are rendered with uPlot (~10KB gzipped) for time-series visualisation. uPlot is the fastest JS charting library for time-series data (handles millions of points) and has no dependencies.
 - Minimal custom JavaScript (<5KB) for interactions not covered by HTMX (keyboard shortcuts, theme switching, chart initialisation).
 
@@ -158,86 +158,24 @@ This means:
 
 - No Node.js required in the build pipeline. `cargo build` produces the complete binary including UI.
 - No `node_modules`. No webpack/vite/rollup.
-- Templates are type-checked at compile time. A missing variable is a compile error.
+- Rendering is ordinary Rust, so a missing field is a compile error. Escaping isn't automatic: every value from outside goes through `escape_html`.
 - The total JS payload is ~30KB gzipped (HTMX + uPlot + custom glue).
 
+What ships is plainer than this section first planned: each page is a Rust function that appends HTML to a `String`, escaping every value from outside by hand (`src/brioche/dashboard.rs`):
+
 ```rust
-use askama::Template;
-
-#[derive(Template)]
-#[template(path = "pages/cluster_overview.html")]
-struct ClusterOverviewPage {
-    cluster: ClusterOverview,
-    alerts: Vec<AlertSummary>,
-    recent_deploys: Vec<DeployEvent>,
-    node_count: u32,
-    app_count: u32,
+pub fn render_dashboard(data: &DashboardData) -> String {
+    let mut html = String::with_capacity(8192);
+    // ... the fixed <head> and <nav> as a raw string, then:
+    if !data.cluster_name.is_empty() {
+        html.push_str(&format!(
+            "<span class=\"cluster\">{}</span>\n",
+            escape_html(&data.cluster_name)
+        ));
+    }
+    // ... sections whose contents HTMX polls from /ui/fragment/*
+    html
 }
-```
-
-```html
-<!-- templates/pages/cluster_overview.html -->
-{% extends "layout.html" %}
-{% block content %}
-<div id="cluster-overview"
-     hx-get="/ui/fragment/nodes"
-     hx-trigger="every 5s"
-     hx-swap="innerHTML">
-
-  <section class="resource-summary">
-    <div class="metric-card">
-      <span class="label">Nodes</span>
-      <span class="value">{{ node_count }}</span>
-    </div>
-    <div class="metric-card">
-      <span class="label">Apps</span>
-      <span class="value">{{ app_count }}</span>
-    </div>
-    <div class="metric-card">
-      <span class="label">CPU</span>
-      <span class="value">{{ cluster.total_cpu_percent }}%</span>
-    </div>
-    <div class="metric-card">
-      <span class="label">Memory</span>
-      <span class="value">{{ cluster.total_memory_percent }}%</span>
-    </div>
-  </section>
-
-  <section class="node-health-map">
-    {% for node in cluster.nodes %}
-    <a href="/nodes/{{ node.name }}"
-       class="node-tile {{ node.status }}">
-      {{ node.name }}
-    </a>
-    {% endfor %}
-  </section>
-
-  <section class="recent-deploys">
-    <h3>Recent Deploys</h3>
-    {% for deploy in recent_deploys %}
-    <div class="deploy-event">
-      <span class="app">{{ deploy.app }}</span>
-      <span class="transition">{{ deploy.from_version }} -> {{ deploy.to_version }}</span>
-      <span class="status {{ deploy.status }}">{{ deploy.status }}</span>
-      <time>{{ deploy.timestamp }}</time>
-    </div>
-    {% endfor %}
-  </section>
-
-  <section class="active-alerts"
-           hx-get="/ui/fragment/alerts"
-           hx-trigger="every 3s"
-           hx-swap="innerHTML">
-    {% for alert in alerts %}
-    <div class="alert {{ alert.severity }}">
-      <span class="name">{{ alert.name }}</span>
-      <span class="target">{{ alert.target }}</span>
-      <span class="message">{{ alert.message }}</span>
-    </div>
-    {% endfor %}
-  </section>
-</div>
-{% endblock %}
 ```
 
 ### 3.5 Real-Time Updates
@@ -287,7 +225,7 @@ async fn log_stream_sse(
 
 ### 4.1 Core API Response Types
 
-These structs define the data that Brioche's API endpoints return. They are shared between the backend (Rust) and the Askama templates.
+These structs define the data that Brioche's API endpoints return. The page renderers in `src/brioche/` read them.
 
 ```rust
 use chrono::{DateTime, Utc};
@@ -1242,7 +1180,7 @@ Brioche uses the same API token authentication as the Relish CLI (Section 11 of 
 
 **Session-cookie details:**
 
-- The cookie carries a random session id that maps, server-side, to the API token held in memory — the token itself is never placed in the cookie, so there is no per-node HKDF encryption to reason about. (Adding the `Secure` attribute, so the cookie is only sent over HTTPS, is a hardening follow-up; it is not set today.)
+- The cookie carries a random session id that maps, server-side, to the API token held in memory — the token itself is never placed in the cookie, so there is no per-node HKDF encryption to reason about. When the API serves TLS, the cookie also carries `Secure`, so a browser never sends it over plain HTTP (`secure_attribute` in `src/bun/api/ui.rs`). A plaintext development API can't set it, or the browser would never send the cookie back.
 - A session lasts at most 12 hours and never longer than the token it was created from (the cookie's `Max-Age` matches). It records the token's principal id (a digest of the token hash), and every request checks that exact token is still in the store and unexpired, so revoking or expiring the token ends its sessions and a new token issued under the same name doesn't revive them.
 - The session is dropped when it expires, when its token is revoked or expires, or on logout, and the user is redirected to the login page.
 - Logout (`POST /ui/logout`) clears the cookie.
@@ -1374,50 +1312,14 @@ Brioche reuses the cluster's API token system. There are no separate credentials
 
 ### 8.2 CSRF Protection
 
-> **Status: planned — not yet implemented.** There is no CSRF-token middleware
-> in the code today (`rg -i csrf src/` finds only certificate-signing-request
-> helpers, unrelated). The current cross-site defence is the `SameSite=Strict`
-> session cookie (§8.1), which stops a third-party origin from riding the
-> browser's session on a state-mutating request. The token-header scheme below
-> is the target design, not current behaviour.
+The dashboard's only writes are the proposal decision forms (approve, reject, undo; §6.2), and each post must pass all of these (`decide` in `src/bun/api/ui_proposals.rs`):
 
-The target design: all state-mutating API endpoints (POST, PUT, DELETE) require a CSRF token in addition to the session cookie.
+- A browser session. A bearer-token request is refused and pointed at `/v1/proposals`.
+- A same-origin, unframed request: refused when `Sec-Fetch-Site` is anything but `same-origin` or `none`, when `Origin` names another host, or when `Sec-Fetch-Dest` isn't `document` (a form posted from a frame is a clickjack).
+- The form's anti-forgery token, a per-session value (`csrf_token_for` in `src/sesame/session.rs`) compared in constant time.
+- The person's own API token, pasted into the form, of the same principal as the session.
 
-**Planned implementation:**
-
-- On login, the server generates a random CSRF token (256-bit, base64-encoded) and returns it in the response body (not in a cookie).
-- The Brioche SPA stores the CSRF token in a JavaScript variable (memory only, not localStorage).
-- HTMX is configured to include the CSRF token as a custom header (`X-CSRF-Token`) on all non-GET requests via `hx-headers`.
-- The server validates that the `X-CSRF-Token` header matches the token associated with the session.
-
-```html
-<body hx-headers='{"X-CSRF-Token": "{{ csrf_token }}"}'>
-```
-
-```rust
-/// CSRF validation middleware
-async fn validate_csrf(
-    req: Request<Body>,
-    next: Next<Body>,
-) -> Result<Response, StatusCode> {
-    if req.method() == Method::GET || req.method() == Method::HEAD {
-        return Ok(next.run(req).await);
-    }
-
-    let session_csrf = extract_session_csrf(&req)?;
-    let header_csrf = req
-        .headers()
-        .get("X-CSRF-Token")
-        .and_then(|v| v.to_str().ok());
-
-    match header_csrf {
-        Some(token) if constant_time_eq(token, &session_csrf) => {
-            Ok(next.run(req).await)
-        }
-        _ => Err(StatusCode::FORBIDDEN),
-    }
-}
-```
+The `SameSite=Strict` session cookie (§8.1) is a further layer. A client that sends no `Sec-Fetch-*` or `Origin` headers (an old browser, a script) still needs the anti-forgery token and the pasted token. There's no `X-CSRF-Token` header scheme: an earlier draft planned one for HTMX writes, but the dashboard has no HTMX writes.
 
 ### 8.3 XSS Prevention
 
@@ -1490,7 +1392,7 @@ As described in the whitepaper (Section 11.3), the Brioche port (shared with the
 Breakdown:
 
 - TLS handshake: ~50ms (first load; reused on subsequent navigations)
-- HTML response (server-rendered by Askama): <10ms server-side
+- HTML response (server-rendered in Rust): <10ms server-side
 - Static asset delivery (CSS, JS): <20ms (embedded, gzipped, served from memory with aggressive caching)
 - DOM rendering: <50ms (minimal JS, no framework hydration)
 - Chart initialisation: async, renders placeholder immediately, data arrives in next 50-100ms
@@ -1526,7 +1428,7 @@ For comparison: a typical Grafana dashboard loads 2-5MB of JavaScript. The Kuber
 
 ### 9.3 Server-Side Performance
 
-- **Template rendering:** Askama compiles templates to Rust code at build time. Rendering a cluster overview page with 100 nodes and 50 apps takes <1ms.
+- **Page rendering:** pages are built with `format!` into a `String`. Rendering a cluster overview page with 100 nodes and 50 apps takes <1ms.
 - **Metrics query fan-out:** Single-app queries complete in <50ms (fan-out to 3-10 nodes). Cluster-wide queries complete in <500ms (fan-out to 5-7 council aggregators). These numbers are set by Mayo's query architecture, not Brioche.
 - **Concurrent dashboard users:** A single Bun instance can serve 100+ concurrent Brioche users without measurable impact. The bottleneck is API query load, not asset serving or template rendering.
 - **Memory overhead:** Embedded assets consume ~2MB of binary size (uncompressed). At runtime, they are served directly from the binary's memory mapping with no additional allocation.
@@ -1544,6 +1446,8 @@ For comparison: a typical Grafana dashboard loads 2-5MB of JavaScript. The Kuber
 ### 10.1 API Endpoint Testing
 
 Every Brioche API endpoint is tested at the Rust level using `axum::test` utilities. Tests run against an in-memory cluster state (no real Raft, no real Mayo) with fixture data.
+
+The sketches below come from the first design. Their write routes (`/v1/apps/web/rollback`) and the `X-CSRF-Token` header don't exist (§8.2 and the appendix); the shipped decision forms' checks are tested in `src/bun/api/ui_proposals.rs`.
 
 ```rust
 #[tokio::test]
@@ -1629,7 +1533,7 @@ async fn test_read_only_token_cannot_trigger_deploy() {
 
 ### 10.2 Template Rendering Tests
 
-Askama templates are type-checked at compile time, which eliminates an entire class of rendering bugs (missing variables, type mismatches). Additional rendering tests verify that:
+Rendering is plain Rust, so the compiler catches a missing field or a type mismatch. It doesn't catch a forgotten `escape_html`, so rendering tests verify that:
 
 - HTML output is well-formed.
 - Dynamic content is properly escaped (inject `<script>alert(1)</script>` into app names and verify it appears as escaped text).
@@ -1794,7 +1698,8 @@ HashiCorp Consul's built-in UI provides service catalog browsing, health check s
 **Crates explicitly not used:**
 
 - `actix-web`: Bun already uses `axum`. Adding a second HTTP framework would be wasteful.
-- `maud`: Macro-based templating is harder to read for HTML-heavy pages. Askama's file-based templates are more maintainable and allow designers to view templates as HTML files.
+- `maud`: Macro-based templating is harder to read for HTML-heavy pages.
+- `askama`: planned at first, but the pages were small enough that `format!` and a hand-called `escape_html` did the job without a template dependency.
 
 ### 12.2 Frontend Libraries
 
@@ -1818,7 +1723,7 @@ There is no frontend build pipeline. The frontend assets are:
 1. **HTMX and uPlot:** Vendored as minified JS files in the `brioche/dist/` directory, checked into the repository. Updated manually when upgrading versions.
 2. **CSS:** Hand-written, stored in `brioche/dist/styles.css`. No preprocessor.
 3. **Custom JS:** Stored in `brioche/dist/brioche.js`. No transpilation, no bundler. Written in plain ES2020+ JavaScript (all target browsers support this).
-4. **HTML templates:** Stored in `brioche/templates/` and compiled by Askama into Rust code at `cargo build` time.
+4. **HTML:** There are no template files. The page renderers in `src/brioche/*.rs` build the HTML in Rust.
 5. **Icons:** SVG sprite file, stored in `brioche/dist/icons.svg`.
 
 This means `cargo build` is the only build command. There is no `npm install`, no `npx webpack`, no `yarn build`. Contributors working on the backend never need Node.js installed.
@@ -1918,6 +1823,16 @@ Brioche's real-time data is exclusively server-to-client (logs, events, deploy p
 ---
 
 ## Appendix: API Endpoint Summary
+
+> **Status: first design, not the shipped API.** Most routes in these tables don't exist, among them `/v1/apps/:name/env`, `/v1/ingress/routes`, `/ui/cluster-overview`, `/ui/alerts-summary` and `POST /auth/validate`. `src/bun/api.rs` is the authority. What the dashboard really uses:
+>
+> - Pages: `/` (cluster overview), `/ui/app/{app}/{namespace}`, `/ui/node/{name}`, `/ui/gitops`, `/ui/proposals` and `/ui/proposal/{id}`.
+> - HTMX fragments: `/ui/fragment/summary`, `/ui/fragment/nodes`, `/ui/fragment/apps`, `/ui/fragment/alerts` and `/ui/fragment/batches`.
+> - An app's environment: `/ui/app/{app}/{namespace}/env`.
+> - Session: `POST /ui/session` (paste a token), `/ui/login` and `/ui/logout`.
+> - Writes: `POST /ui/proposal/{id}/approve`, `/reject` and `/undo` (§6.2).
+>
+> The JSON API the pages read (`/v1/apps`, `/v1/cluster/summary`, `/v1/alerts`, `/v1/events`, `/v1/metrics/*`, `/v1/logs/{app}/{namespace}` and so on) is the same one `relish` uses.
 
 All endpoints are prefixed with `/v1`. Authentication is required for all endpoints.
 

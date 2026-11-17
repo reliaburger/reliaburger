@@ -104,10 +104,10 @@ name = "Council: Raft and gossip in the agent"
 status = "ready"
 since = "0.1.0"
 summary = "Nodes find each other with SWIM gossip, and a Raft council of at most seven voters inside `bun` holds the cluster's state; spare nodes join as learners."
-restrictions = "High availability starts at three nodes. A disk-pressured voter isn't replaced on a full seven-voter council, and one slow disk write can stall a node's agent loop for just over a second."
-issues = [1523, 1524, 1707]
+restrictions = "High availability starts at three nodes."
+issues = []
 docs = ["docs/manual/02_cluster-basics.md", "docs/design/gossip-mustard.md"]
-evidence = "Every gate run kills the leader and followers, cuts power, loses quorum and checks the council history is linearizable (V02 fast tier and jobs final, 0.2.7). 0.2.7 shipped with #1707 (one 1,215 ms turn, release closure). #1523 and #1524 are in 0.3.0. Learners since 0.2.5 (#1494)."
+evidence = "Every gate run kills the leader and followers, cuts power, loses quorum and checks the council history is linearizable (V02 fast tier and jobs final, 0.2.7). 0.2.7 shipped with #1707 (one 1,215 ms turn, release closure), fixed in 0.3.0. 0.3.0 also replaces a disk-pressured voter on a full council (#1523) and holds a returning voter's elections until it hears from a leader (#1524). Learners since 0.2.5 (#1494)."
 
 [[group.feature]]
 name = "Clusters of hundreds of nodes"
@@ -491,7 +491,7 @@ name = "WebSockets and streaming"
 status = "beta"
 since = "0.1.0"
 summary = "WebSocket and streaming responses pass through the ingress."
-restrictions = "A drained WebSocket isn't closed with code 1001 yet, and its proxy headers don't match plain HTTP's."
+restrictions = "None known: since 0.3.0 a drained WebSocket is closed with code 1001, and its proxy headers match plain HTTP's."
 issues = [369]
 docs = ["docs/manual/03_networking.md#ingress"]
 evidence = "F08 #369 in 0.3.0; the fix (b0de7b66) is on the 0.3.0 train."

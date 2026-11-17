@@ -175,7 +175,7 @@ Wrapper maintains a routing pool per ingress route (keyed by `host` + `path`). D
 3. **During drain:** Wrapper stops sending NEW requests to web-1 but allows in-flight requests to complete. Web-1 remains in the pool in `draining` state until all connections close or `drain_timeout` expires.
 4. **After drain:** web-1 is fully removed from the pool and stopped.
 
-Wrapper receives routing pool updates via gossip (Mustard). The propagation delay is bounded by the gossip protocol's convergence time (typically under 2 seconds for health state changes). The leader doesn't advance to the drain phase until it has confirmation (via the reporting tree) that routing updates have propagated.
+Routing updates don't travel over gossip. The leader builds the endpoint catalogue from the nodes' reports and replicates it through Raft, and each node's Wrapper and service map follow their replica. The wait for propagation happens on the node retiring the old instance, not on the leader: before the stop, it asks the leader every 500 ms whether every node has dropped the old backend, while its own Wrapper drains in-flight requests (`retire_old_instance` in `src/bun/agent/deploy_worker.rs`, #1355). The two waits overlap, and the stop follows once both finish or the wait for the other nodes passes its 5 s patience.
 
 ### 3.4 Connection Draining Protocol
 

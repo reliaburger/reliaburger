@@ -46,7 +46,7 @@ Wrapper is disabled by default. Operators enable it on selected nodes with `[ing
 6. Wrapper begins accepting connections
 ```
 
-Wrapper doesn't accept connections until at least one routing table entry exists. If no ingress routes are configured in any app spec, Wrapper binds the ports but returns `503 Service Unavailable` for all requests (with a human-readable body indicating no ingress routes are configured).
+If no ingress routes are configured in any app spec, Wrapper still binds its ports and accepts connections, but every request finds no route and gets `404 Not Found` with an empty body (`src/wrapper/proxy.rs`).
 
 ---
 
@@ -67,7 +67,7 @@ http_port = 80
 https_port = 443
 ```
 
-Each listener spawns a tokio task per accepted connection. Connections are tracked in a `DashMap<ConnectionId, ConnectionState>` for drain coordination.
+Each listener spawns a tokio task per accepted connection. Drain coordination doesn't track connections. It counts requests per backend instance: `SharedDrains` (`src/wrapper/draining.rs`) is a drain tracker behind an `Arc<Mutex<_>>`, and each request captures its backend's count under the routing table's read lock, so a drain started under the write lock can't miss it.
 
 Every accepted connection gets the deadlines in `sesame::connection::ConnectionTimeouts::PRODUCTION`, shared with Bun's API and registry listeners: a 10 s TLS handshake (`tls_handshake_timeout`), 75 s for the first request byte and for each HTTP/1 request head (which also closes idle keep-alive connections), HTTP/2 pings every 30 s with a 20 s ack deadline, a 300 s write-stall limit for responses and WebSockets nobody reads, and TCP keepalive (60 s idle, 15 s probes). A streaming response or a quiet WebSocket is never closed for being idle; only a stalled write ends it. TLS connections still retire after one hour. The stream wrappers that enforce the first-byte, write-stall and lifetime limits forward the socket's vectored writes (`is_write_vectored`, `poll_write_vectored`): without them Hyper copies every response body into a per-connection write buffer that it never shrinks, so each idle keep-alive connection kept the capacity of its largest answer (#892).
 

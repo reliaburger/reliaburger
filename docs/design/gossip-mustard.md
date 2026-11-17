@@ -12,11 +12,11 @@ Design document for the Mustard gossip protocol and the Raft consensus layer in 
 
 Reliaburger coordinates a cluster of up to 10,000 homogeneous nodes without a dedicated control plane. Two protocols operate at different scales to make this work:
 
-- **Mustard** is the gossip protocol. It is based on SWIM (Scalable Weakly-consistent Infection-style Membership) and runs on every node. Mustard handles cluster membership discovery, failure detection, leader identity broadcast, node resource summaries, and catastrophic recovery candidate distribution. It carries only lightweight, fixed-size payloads and achieves O(log N) convergence with O(1) per-node network overhead.
+- **Mustard** is the gossip protocol. It is based on SWIM (Scalable Weakly-consistent Infection-style Membership) and runs on every node. Mustard handles cluster membership discovery, failure detection and leader identity broadcast. Node resource summaries and catastrophic-recovery candidate distribution are planned on top of it, not sent today (§3, §5.5). It carries only lightweight, fixed-size payloads and achieves O(log N) convergence with O(1) per-node network overhead.
 
 - **Raft** runs on a small dynamic council of 3 to 7 nodes selected from the cluster. One council member is the leader; the others are hot standbys. Raft handles leader election among council members, replication of desired state (app specs, secrets, scheduling decisions), and cluster configuration changes. Raft is explicitly not used for runtime state.
 
-- **The hierarchical reporting tree** is the third communication layer. Each worker node reports its runtime state (running containers, health, resource usage, job completions) to its assigned council member over mTLS. Council members aggregate reports for the leader. This keeps variable-size payloads off the gossip mesh, preserving SWIM's scaling properties.
+- **Reporting** is the third communication layer. Each node reports its runtime state (running containers, health, resource usage, job completions) over mTLS. Today every node reports straight to the leader; a hierarchical tree, with council members aggregating for the leader, is planned ([#364](https://github.com/reliaburger/reliaburger/issues/364)). This keeps variable-size payloads off the gossip mesh, preserving SWIM's scaling properties.
 
 **Key design decisions:**
 

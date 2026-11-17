@@ -528,7 +528,7 @@ The default sync mode. A tokio timer fires every `poll_interval_secs` (default 3
 5. Update `SyncState` in Raft with the result.
 6. Release the sync lock.
 
-**Back-off on failure:** If git fetch fails (network error, auth failure), Lettuce applies exponential back-off: 30s, 60s, 120s, 240s, capped at `poll_interval * 8`. The back-off resets on a successful fetch. During back-off, incoming webhooks still trigger immediate sync attempts.
+**Back-off on failure:** Any failed sync backs off, not just a failed fetch: a stored GitOps config that can't be read or decrypted, a clone or fetch that fails (network error, auth failure), a sync task that panics, a commit that fails verification or parsing, and a partial sync in which the cluster refused a change. Each counts as a consecutive failure, is recorded in `SyncState`, and makes the loop sleep `poll_interval` × 2, then × 4, then × 8 at most (`backoff_delay` in `src/lettuce/sync.rs`). A clean sync resets the count. The loop doesn't wake for a webhook while it sleeps; a webhook's sync request is durable, so the next pass after the back-off picks it up.
 
 **Jitter (planned — not yet implemented):** To avoid thundering-herd effects in multi-cluster setups where many clusters point at the same repo, Lettuce could add random jitter of +/- 10% to the poll interval. The current poll timer fires at a fixed interval with no jitter.
 

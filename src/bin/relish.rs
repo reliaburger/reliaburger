@@ -4000,7 +4000,7 @@ async fn main() -> ExitCode {
 /// Map a diagnostic command's outcome to a process exit code.
 ///
 /// A `RelishError` is a tool failure (exit 1). A `CommandOutcome` is the tool
-/// succeeding and *reporting*: clean (0), problems found (1) or warnings (2).
+/// succeeding and *reporting*: clean (0), problems found (1) or warnings (3).
 fn finish_outcome(
     result: Result<reliaburger::relish::CommandOutcome, reliaburger::relish::RelishError>,
 ) -> ExitCode {

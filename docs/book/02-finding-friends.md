@@ -224,9 +224,9 @@ One subtlety: when we receive a gossip update about a node we've never seen, we 
 
 ### Piggyback dissemination
 
-SWIM doesn't use dedicated broadcast messages. Instead, membership updates piggyback on the PING/ACK messages that are already flowing. Each message carries up to `MAX_PIGGYBACK_UPDATES` (8) updates, or fewer when they don't fit in the datagram (we'll get to that budget shortly), and each update is broadcast `ceil(log2(cluster_size))` times before it expires.
+SWIM doesn't use dedicated broadcast messages. Instead, membership updates piggyback on the PING/ACK messages that are already flowing. Each message carries up to `MAX_PIGGYBACK_UPDATES` (8) updates, or fewer when they don't fit in the datagram (we'll get to that budget shortly), and each update is broadcast `3 * ceil(log2(cluster_size))` times, and at least 6, before it expires.
 
-Why `ceil(log2(N))`? Because SWIM's mathematical properties guarantee that an update will reach every node within O(log N) protocol periods with high probability. For a 10,000-node cluster, that's about 14 broadcasts per update. Spread across 500ms protocol intervals, that's 7 seconds for full convergence. Not bad.
+Why `ceil(log2(N))`? Because SWIM's mathematical properties guarantee that an update will reach every node within O(log N) protocol periods with high probability. The 3 is the SWIM paper's λ: every round spends a broadcast on both the PING and the ACK, and not every broadcast lands on a node that hasn't heard yet, so we pay a constant factor for headroom. The floor of 6 keeps an update alive while a young cluster is still tiny. For a 10,000-node cluster, `ceil(log2(N))` is 14, so each update goes out 42 times. Convergence still takes O(log N) rounds of 500 ms, a few seconds.
 
 The dissemination queue prioritises failure-related updates:
 
@@ -2440,7 +2440,7 @@ address) plus the provisioned master-key and identity paths.
 
 1. **Bind ports.** Same as before, different host or different port numbers.
 2. **Create MustardNode with seed.** Node 2 adds the seed address to its membership table and starts the gossip protocol. On its first cycle, it pings `10.0.1.5:9443`.
-3. **Gossip discovery.** Node 1 receives the PING, learns about Node 2, and piggybacks this on its next outgoing messages. Node 2 receives Node 1's ACK with its membership list. Within one or two gossip periods (200ms each by default), both nodes know about each other.
+3. **Gossip discovery.** Node 1 receives the PING, learns about Node 2, and piggybacks this on its next outgoing messages. Node 2 receives Node 1's ACK with its membership list. Within one or two gossip periods (500 ms each by default), both nodes know about each other.
 4. **No council yet.** Node 2 starts as a non-council worker. It doesn't run Raft.
 5. **Start ReportWorker.** Node 2 reports to the leader, which is Node 1. It starts sending `StateReport` messages to Node 1 every 5 seconds.
 6. **Leader notices.** On Node 1, the leader checks whether the council should grow. With `min_council_size = 3`, it wants at least 3 council members. It only has 1 (itself), and Node 2 just appeared. The cluster runtime sets `min_node_age` to zero, so Node 2 is eligible straight away, and the reconciler starts walking it in on its next two-second tick.

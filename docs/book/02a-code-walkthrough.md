@@ -202,7 +202,7 @@ The `write()` method handles the `ForwardToLeader` error case, which openraft re
 The algorithm:
 
 1. Clamp target size to `[min_council_size(3), max_council_size(7)]`.
-2. Filter: must be Alive, not already on council, older than `min_node_age` (600s default), and not be overloaded (CPU < 90%, memory < 85%). A node that hasn't reported resources counts as not overloaded: gossip doesn't carry resource summaries yet, so in a running cluster nobody has, and everyone alive is eligible.
+2. Filter: must be Alive, not already on council, older than `min_node_age` (600 s by default, though the cluster runtime sets it to 0, so age only orders candidates), and not be overloaded (CPU < 90%, memory < 85%). A node that hasn't reported resources counts as not overloaded: gossip doesn't carry resource summaries yet, so in a running cluster nobody has, and everyone alive is eligible.
 3. Sort: nodes in novel zones first (for diversity), then oldest first (stability), then lexicographic by node ID (determinism).
 4. Take however many are needed.
 
@@ -406,9 +406,9 @@ The command-line interface that humans interact with.
 1. Node 1 starts with an empty `join` list. It self-promotes to council leader (quorum of 1 is itself).
 2. Node 2 starts with `join = ["node1:9443"]`. Gossip discovers node 1.
 3. Gossip convergence: O(log N) protocol periods for all nodes to learn about each other.
-4. The leader runs `select_council_candidates()` and promotes eligible nodes after they've been alive for `min_node_age` (600s default).
-5. `ReportWorker` on each non-council node sends a `StateReport` every 5 seconds.
-6. `ReportAggregator` on council members publishes via `watch` channel.
+4. The leader runs `select_council_candidates()` and promotes eligible nodes once they've been alive without a break for `candidate_alive_window` (5 s) and, as learners, have caught up with the log. `min_node_age` (600 s by default) would hold them back longer, but the cluster runtime sets it to 0.
+5. `ReportWorker` on every node sends a `StateReport` to the leader every 5 seconds.
+6. The leader's `ReportAggregator` publishes via `watch` channel.
 
 ### Leader failure recovery
 

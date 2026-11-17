@@ -265,8 +265,10 @@ Logs are already stored as ZSTD-compressed Parquet (`logs_NNNNNN.parquet`). Expo
 
 **Export file naming at the destination:**
 ```
-s3://my-bucket/logs/<node>/logs_NNNNNN.parquet
+s3://my-bucket/logs/<node>/<sha256>-logs_NNNNNN.parquet
 ```
+
+The SHA-256 of the file's contents goes in front of its name (`archive_object_name` in `src/ketchup/export.rs`). A store reuses names once retention empties it, so the hash keeps two generations apart, and a file already in the archive under that name is known to be the right one.
 
 **Export checkpoint persistence:** The checkpoint is a small JSON file (`_export_checkpoint.json`) in the log data directory, holding a set of durable ids. A durable id is `{filename}@{sha256-prefix}` — the filename plus a hash of its contents — *not* the filename alone. Log-file names come from a counter that resumes past the highest file on disk, so retention pruning that empties the directory resets the counter and a later flush reuses `logs_000000.parquet` for different bytes; a filename-keyed checkpoint would skip that reused name forever. Hashing the contents makes the reused name a new object. Bun's export loop and disk-pressure task are the only writers, and `relish logs-export` shares the same checkpoint file when it exports (to object storage, or from `--source`), so there is exactly one authoritative record of what has shipped. The checkpoint survives Bun restarts.
 

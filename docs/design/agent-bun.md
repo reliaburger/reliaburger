@@ -50,7 +50,7 @@ The broader process-isolation design below remains future work.
 
 1. **Single binary, no sidecar model.** Bun is not a separate process from the orchestrator -- it IS the orchestrator on this node. All subsystems (Grill, Onion, Ketchup, Mayo, Pickle, Mustard, Wrapper, Brioche) run as async tasks within the same Tokio runtime. This eliminates IPC overhead and version compatibility concerns between components.
 
-2. **Containers survive Bun restarts.** Containers are managed by containerd/runc, which is independent of Bun. When Bun restarts (including during self-upgrade), it reconnects to running containers by querying the container runtime. Applications are never interrupted by Bun lifecycle events.
+2. **Containers survive Bun restarts.** Containers run under runc (or the Apple VM), which is independent of Bun. When Bun restarts (including during self-upgrade), it reconnects to running containers by querying the container runtime. Applications are never interrupted by Bun lifecycle events.
 
 3. **Process workloads are first-class.** Process workloads (host binaries and inline scripts) receive the same isolation primitives as containers (cgroups, PID namespace, network namespace, mount namespace) minus the filesystem image. From the cluster's perspective, they are indistinguishable from container workloads in terms of scheduling, health checking, service discovery, and metrics.
 
@@ -293,11 +293,11 @@ Bun runs as a single Tokio async runtime with multiple subsystem tasks. Each sub
 
 ```
 Leader (Meat)
-  → Reporting tree (council member parent)
+  → GET /v1/placements/{node} (this node polls the leader)
     → Bun on this node
       → WorkloadSupervisor
         → Grill (container) or ProcessManager (process workload)
-          → containerd/runc or clone()/exec() with namespaces
+          → runc / Apple `container` CLI, or clone()/exec() with namespaces
 ```
 
 **Outbound (state reporting):**
@@ -306,8 +306,8 @@ Leader (Meat)
 Workload event (start, stop, health change, OOM, restart)
   → WorkloadSupervisor
     → Local event log
-    → Reporting tree parent (council member)
-      → Council → Raft state (for cluster-wide queries)
+    → Report to the leader (every node reports straight to it)
+      → Leader's aggregated view (for scheduling and cluster-wide queries)
     → Onion service map update (eBPF kernel map)
     → Ketchup log entry
     → Mayo metric update
@@ -319,7 +319,7 @@ Workload event (start, stop, health change, OOM, restart)
 HealthChecker (periodic per workload)
   → HTTP GET to workload's health endpoint (via container's network namespace)
   → Result → WorkloadSupervisor
-    → If state changed: update Onion service map, emit event, notify reporting tree
+    → If state changed: update Onion service map, emit event, include it in the next report to the leader
     → If unhealthy beyond threshold: trigger restart via Grill/ProcessManager
 ```
 
@@ -573,7 +573,7 @@ pub enum ContainerState {
     /// workload transitions to Failed.
     Initialising,
 
-    /// The main process is starting. For containers: containerd has
+    /// The main process is starting. For containers: runc has
     /// created the container and is executing the entrypoint. For
     /// process workloads: clone() has been called and the process
     /// is executing.
@@ -1056,7 +1056,7 @@ before their Phase 15 cases can use this contract.
 
 **Start a container workload (full sequence):**
 
-1. Receive `AppSpec` from WorkloadSupervisor (originally from the scheduler via the reporting tree).
+1. Receive `AppSpec` from WorkloadSupervisor (originally from the scheduler, through the node's placements poll of the leader).
 2. Transition state to `Pending`.
 3. **Prepare image:** A digest-pinned image this node has already verified and unpacked resolves locally, with no registry or peer request (see §7.11). Otherwise, check Pickle local cache. If missing, fetch from Pickle peers (content-addressed, mTLS). If not in any Pickle node, pull from the external registry configured in `node.toml`. Transition to `Preparing`.
 4. **Allocate port:** Request a host port from PortAllocator. The allocator picks a random available port from the configured range (default 10000..32767), skips any port a TCP bind on the host shows is already taken, and marks it as in-use.
@@ -1067,9 +1067,9 @@ before their Phase 15 cases can use this contract.
 9. **Mount volumes and config files:** Bind-mount declared volumes from the host filesystem (a host-path `source` was checked against `[storage] allowed_host_paths` at admission and again when the OCI spec was built, which mounts the resolved path that check approved). Write `ConfigFileSpec` contents to temp files and bind-mount them read-only at the declared paths.
 10. **Run init containers (Initialising):** For each init container in declaration order, create a container from its own image (the app's when it names none, trust-checked and digest-pinned like the app's) with the app's environment, decrypted secrets, cgroup and volume and config-file mounts, built from the app's finished OCI spec (`generate_init_oci_spec`, #701). It gets its own network namespace and leaves the volumes owned by the app's user. An `exec` or `script` app's init that names no image runs its command on the host instead: its spec carries `host_process` like the app's, so the mixed runtime routes it to the host backend and a switch from `--runtime process` to `mixed` mid-run adopts it there, and admission refuses it unless `[process_workloads] allowed_binaries` names the first word of its command (#935). Wait for exit code 0. If any fails, or none finishes within 300 s, transition to `Failed` and emit event.
 10a. **Start sidecars (#1120):** Register the instance's sidecar identities (`<id>__sidecar-<name>`) with the loop, then create and start each in declaration order from `generate_sidecar_oci_spec`: its own image or the app's, the app's env with its own on top (secret references resolved by `create_with_secrets` like any launch), the app's mounts, its own cgroup beside the app's (`<cgroup>-sidecar-<name>`, with its own limits, since two runc containers can't share one), and the instance's network namespace by path (`/var/run/netns/rb-<id>`) instead of one of its own. Rootful runc sees that path (`OciSpec::joined_network`), reserves no address and sets up no network for it. Apple Container, rootless runc and the process runtime can't share a namespace (`Grill::shares_network_namespaces` is false), so admission refuses an app with sidecars there and the node reports `shared_network: false`, which keeps the scheduler away. A sidecar that fails to start fails the instance, and any already started are killed.
-11. **Create and start the main container (Starting):** Call `containerd::containers::create()` with the OCI spec (rootfs, namespaces, cgroups, mounts, env, seccomp). Call `containerd::tasks::start()`. Attach to stdout/stderr streams and pipe to Ketchup.
+11. **Create and start the main container (Starting):** Write the OCI bundle (rootfs, namespaces, cgroups, mounts, env, seccomp) and start it with the runtime's own CLI: `runc run` on Linux, the `container` CLI on macOS. There's no daemon in between. Capture stdout/stderr and pipe them to Ketchup.
 12. **Health wait (HealthWait):** After `initial_delay`, begin sending HTTP GET to `health` path via the container's network namespace IP and declared port. Continue at `interval` until `threshold_healthy` consecutive successes.
-13. **Running:** Register the instance in the Onion service map (eBPF kernel map). The workload now receives traffic via DNS resolution and connect() rewriting. Emit a `WorkloadRunning` event to the reporting tree.
+13. **Running:** Register the instance in the Onion service map (eBPF kernel map). The workload now receives traffic via DNS resolution and connect() rewriting. Emit a `WorkloadRunning` event, which goes to the leader in the node's next report.
 14. **Ongoing health checking:** HealthChecker continues probing at `interval`. If `threshold_unhealthy` consecutive failures: transition to `Unhealthy`, remove from Onion service map, emit event. If the workload recovers (`threshold_healthy` consecutive passes), transition back to `Running` and re-add to service map.
 15. **Restart on persistent unhealthiness:** If the workload remains `Unhealthy` and the restart policy permits, transition to `Stopping`, send SIGTERM, wait `drain_timeout`, send SIGKILL if still alive, then loop back to step 2 with incremented `restart_count` and exponential backoff.
 
@@ -1088,13 +1088,12 @@ before their Phase 15 cases can use this contract.
 
 **Reconnect after Bun restart:**
 
-1. On startup, Grill queries containerd for all containers with the `reliaburger.managed=true` label.
-2. For each container, reconstruct the `WorkloadId` from container labels.
-3. Re-attach to stdout/stderr streams (Ketchup log capture resumes).
-4. Read the container's current state from containerd.
-5. Resume health checking.
-6. Re-populate the Onion service map from the discovered containers.
-7. Compare the discovered state against the expected state from the reporting tree and reconcile (start missing workloads, stop unexpected ones).
+1. On startup, Bun reads the instance records it wrote for each launch (`adopt_recorded_instances` in `src/bun/agent/records.rs`) and the runtime's durable launch inventory (the runc intent journal, the process records).
+2. For each record, the runtime backend adopts the instance only on positive evidence that it's still the same live launch (`runc state`, the Apple `container inspect`, or the process's pid, start time and boot id). A launch it can't prove is retired, never guessed at.
+3. Re-attach log capture (Ketchup resumes).
+4. Resume health checking.
+5. Re-populate the Onion service map from the adopted instances.
+6. Compare what's running with the placements the leader assigns this node and reconcile (start missing workloads, stop unexpected ones).
 
 ### 5.2 Process Workload Lifecycle
 
@@ -1125,7 +1124,7 @@ before their Phase 15 cases can use this contract.
 
 **Stop a process workload:**
 
-1. Identical to stopping a container, but signals are sent directly to the process PID rather than through containerd.
+1. Identical to stopping a container, but signals are sent directly to the process PID rather than through runc.
 2. Cleanup includes: removing the cgroup, removing the network namespace, deleting the temp script file (if Script), releasing the host port.
 
 ### 5.3 Health Checking
@@ -1501,7 +1500,7 @@ workload at +500 (see "Node-wide OOM order").
 
 **Impact:**
 
-- Running containers are NOT affected. containerd/runc keeps them alive.
+- Running containers are NOT affected. runc's containers (and the Apple VMs) don't depend on Bun's process.
 - eBPF programs persist in the kernel. Onion service discovery and firewall rules continue functioning for existing connections.
 - No new containers can be started or stopped.
 - Health checking pauses. Unhealthy instances are not removed from the service map until Bun restarts and re-evaluates.
@@ -1509,29 +1508,29 @@ workload at +500 (see "Node-wide OOM order").
 - Metrics collection (Mayo) stops.
 - The Onion service map becomes stale (no updates for new workloads or health changes).
 
-**Recovery:** systemd restarts Bun. On startup, Bun reconnects to running containers (see 5.1 reconnect), resumes all operations, and reconciles state with the cluster via the reporting tree.
+**Recovery:** systemd restarts Bun. On startup, Bun reconnects to running containers (see 5.1 reconnect), resumes all operations, and reconciles state with the cluster: it polls the leader for its placements and reports to it.
 
 A restart may also change the runtime flag. When a node moves from `--runtime runc` or `--runtime process` to `mixed` (or to `auto`, which selects `mixed` where runc exists), its running workloads have no `runtime-routes` entry, because only the mixed runtime writes routes. Before startup recovery reads the launch inventory, and after the runtime has its workload DNS resolver (each runc launch records the resolver, and the runc journal refuses a live launch recorded under a different one, #839), Bun routes each launch that exactly one backend's ownership journal lists, and that fits that backend, to it, and logs the instances it routed. Without this step every `runc` to `mixed` restart with running containers failed and systemd restarted Bun in a loop (#823). A launch both backends list stays unrouted and recovery refuses it. An image app that the process runtime ran as a host process couldn't be routed either (#827), but the process runtime now refuses image apps (#914), and 0.2.1 starts from fresh state, so no such launch exists to route.
 
-### 7.2 Container Runtime (containerd) Crash
+### 7.2 Container Runtime Failure
 
-**What happens:** containerd exits unexpectedly.
+**What happens:** A runtime command (`runc run`, `runc state`, `runc kill`, or the Apple `container` CLI) fails or hangs.
 
-**Detection:** Bun's Grill layer detects the broken gRPC connection to the containerd socket.
+**Detection:** Grill runs each command as a child process with a deadline (a `runc` start gets 10 s) and reads its exit status. There's no runtime daemon to lose: no containerd and no gRPC socket.
 
 **Impact:**
 
-- Running containers continue (runc is the actual runtime; containerd is the management layer).
-- Bun cannot start, stop, or inspect containers until containerd restarts.
-- Health checks that probe the workload's network endpoint still work (they use the network namespace directly, not containerd).
+- Running containers continue: each is its own process tree, not a child of a daemon.
+- The one operation fails. A start that fails marks the instance failed, and the supervisor's restart path tries again with back-off.
+- Health checks that probe the workload's network endpoint still work.
 
-**Recovery:** systemd restarts containerd. containerd reconnects to running containers via shim processes. Bun's Grill layer re-establishes the gRPC connection and resumes operations.
+**Recovery:** Nothing to restart. The next command runs a fresh runtime process.
 
 ### 7.3 Node Disk Full
 
 **What happens:** A storage path runs out of space.
 
-**Detection:** Bun monitors disk usage for each configured storage path. Alerts fire at 80% utilisation (warning) and 90% (critical). `relish wtf` reports disk pressure.
+**Detection:** Bun monitors disk usage for each configured storage path. The one built-in disk alert, `disk_high`, fires as a warning when node disk usage stays above 80% for 5 minutes (`src/mayo/alert.rs`). `relish wtf` reports disk pressure.
 
 **Impact:** Depends on which path is full:
 
@@ -1579,7 +1578,7 @@ A restart may also change the runtime flag. When a node moves from `--runtime ru
 
 **Detection:** The new Bun exits within 30 seconds (`boot_grace_secs`), or fails to rejoin gossip within 60 seconds (`gossip_rejoin_secs`). Both clocks start once the new Bun can answer `/v1/version`, that is once its own binary hash is ready, and no later than one rejoin period after its upgrade task starts ([#771](https://github.com/reliaburger/reliaburger/issues/771)). Bun starts that hash at boot on a detached thread, not Tokio's blocking pool, because dropping the runtime waits for blocking-pool tasks: a start-up error exits at once rather than after the hash of a large binary finishes ([#816](https://github.com/reliaburger/reliaburger/issues/816)).
 
-**Impact:** This node is temporarily unable to accept new work. Running containers are unaffected (containerd manages them independently).
+**Impact:** This node is temporarily unable to accept new work. Running containers are unaffected: they don't depend on Bun's process.
 
 **Recovery:** Automatic rollback. Bun reverts the symlink to the previous version, execs the old binary, and reports the failure to the leader. The leader pauses the cluster-wide upgrade. The operator can fix the issue and resume, or roll back the entire cluster.
 
@@ -1587,16 +1586,16 @@ A restart may also change the runtime flag. When a node moves from `--runtime ru
 
 **What happens:** This node loses connectivity to the gossip mesh.
 
-**Detection:** Mustard detects the absence of heartbeats from peers. The reporting tree parent detects the node as unreachable.
+**Detection:** Mustard detects the absence of heartbeats from peers. The leader's aggregator marks the node's reports stale.
 
 **Impact:**
 
 - The node continues running its workloads normally.
-- The cluster stops routing new traffic to this node's workloads (the service map on other nodes is updated by their respective Bun agents based on gossip/reporting tree state, not by this node).
+- The cluster stops routing new traffic to this node's workloads (the service map on other nodes is updated by their own Bun agents from the leader's endpoint catalogue, not by this node).
 - The node cannot receive new scheduling decisions.
 - If the node was a council member, it may fall behind on Raft.
 
-**Recovery:** When connectivity is restored, Mustard's gossip protocol converges within seconds. The reporting tree re-establishes. The node reconciles its state and resumes normal operation.
+**Recovery:** When connectivity is restored, Mustard's gossip protocol converges within seconds. The node's reports to the leader resume. The node reconciles its state and resumes normal operation.
 
 ### 7.8 OOM Kill of a Workload
 
@@ -1716,7 +1715,7 @@ The scenarios count work rather than timing turns against the host's disk (#508,
 | **Self-upgrade replaces the Bun binary** | A compromised upgrade could replace the orchestrator | Dual-signature verification (embedded key set + external key), no auto-update, admin role required, binary verified twice (leader + each node) |
 | **Secret decryption in Bun's memory** | Bun process memory contains plaintext secrets | Secrets are decrypted in memory only, never written to disk. `mlock()` the decryption buffer to prevent swapping. Zero the buffer after injection. |
 | **eBPF programs run in kernel space** | A malicious eBPF program could compromise the kernel | eBPF programs are compiled into the Bun binary (not loaded from external files). The kernel's BPF verifier rejects unsafe programs. |
-| **containerd socket access** | Access to the containerd socket allows arbitrary container operations | The socket is owned by root and the `reliaburger` group. Only Bun has access. It is NOT mounted into any workload's namespace. |
+| **Runtime state access** | Write access to runc's state directory or Bun's OCI bundles allows arbitrary container operations | There is no runtime daemon or socket. runc's state and the bundles live under root-owned directories that only Bun uses, and none is mounted into any workload's namespace. |
 | **Smoker fault injection** | Faults could disrupt production | Workload faults require Deployer plus the server's `inject_workload_faults` grant and acknowledgement; node/council and pressure faults require Admin plus their matching server grants. Duration limits, no persistence across restarts and blast-radius guards still apply. |
 | **`node.toml` contains external signing key** | Compromise of `node.toml` reveals the external key | File permissions 0600, owned by root. The external key is a public-key-like verification key, not a signing private key -- it verifies signatures, it cannot create them. |
 | **Inline script execution** | Arbitrary code execution via git push | Lettuce enforces `require_signed_commits` for any config containing `script` fields. Scripts must be signed by a trusted key. |
@@ -1752,7 +1751,7 @@ The scenarios count work rather than timing turns against the host's disk (#508,
 │    Isolated PID, network, mount, UTS, user namespace│
 │    Seccomp profile applied                           │
 │    Cgroup resource limits enforced                   │
-│    No access to containerd socket, Bun state, or    │
+│    No access to runtime state, Bun state, or        │
 │    other workloads' volumes/tmp                      │
 └─────────────────────────────────────────────────────┘
                          │
@@ -1814,7 +1813,7 @@ The default seccomp profile blocks the following syscall families (identical for
 | eBPF map memory (kernel) | ~0.8 MB per node | Measured at ~5,800 entries |
 | Health check latency (per probe) | < 5ms p99 (same node) | HTTP GET via network namespace; no proxy hop |
 | Port allocation | O(1) | Bitmap-based allocator, random selection |
-| Container start time (image cached) | < 1.2s to first healthy | Measured: containerd create + task start + health pass |
+| Container start time (image cached) | < 1.2s to first healthy | Measured: bundle write + `runc run` + health pass |
 | Self-upgrade per node | ~40s | Drain + stage + exec + reconnect + health verify |
 | Self-upgrade full cluster (12 nodes) | ~8 min | Sequential workers + sequential council + leader |
 
@@ -1831,7 +1830,7 @@ The default seccomp profile blocks the following syscall families (identical for
 ```
 Bun process:
   Tokio runtime + core:                 ~15 MB
-  Grill (containerd client, state):     ~8 MB
+  Grill (runtime state, records):       ~8 MB
   Onion (eBPF management, userspace):   ~5 MB
   Ketchup (log buffers):                ~5 MB
   Mayo (local metrics state):           ~5 MB
@@ -1850,9 +1849,8 @@ Bun process:
     Per-workload:                       ~5 KB
     500 workloads:                      ~2.5 MB
 
-  Majority of the 312 MB at 500 apps is containerd client state,
-  cached container metadata, and Ketchup log buffers for active
-  streams.
+  Majority of the 312 MB at 500 apps is cached container metadata
+  and Ketchup log buffers for active streams.
 ```
 
 ---
@@ -1869,7 +1867,7 @@ Unit tests cover individual components in isolation using mocked dependencies.
 - Port allocation and release (no leaks, no duplicates, correct range enforcement)
 - Cgroup path construction and parameter calculation (millicores to `cpu.max` conversion, memory limit encoding)
 - Container state machine transitions (all valid transitions, rejection of invalid transitions)
-- Reconnect logic (mock containerd returning containers with Reliaburger labels)
+- Reconnect logic (a mock runtime adopting recorded instances, and refusing ones it can't prove live)
 
 **ProcessManager unit tests:**
 
@@ -2022,7 +2020,7 @@ Bun Restart
 **What we do differently:**
 
 - Docker is a general-purpose container runtime; Grill is purpose-built for Reliaburger's specific needs (eBPF integration, Onion service map updates, Ketchup log capture, Mayo metrics).
-- Docker uses its own runtime; Grill uses containerd (which Docker also uses internally, but we skip the Docker daemon layer).
+- Docker runs containers through the dockerd and containerd daemons; Grill calls runc (or the Apple `container` CLI) directly, with no daemon at all.
 - Docker has no concept of cluster scheduling, health-check-aware service discovery, or process workloads.
 
 ### 11.4 containerd
@@ -2033,14 +2031,12 @@ Bun Restart
 
 **What we borrow:**
 
-- containerd is our actual container runtime. Grill is an abstraction layer on top of containerd's gRPC API.
-- containerd's shim model (shim processes that outlive the daemon) is what enables containers to survive Bun restarts.
 - Content-addressed storage for image layers (Pickle extends this pattern to cluster-wide distribution).
+- The idea that containers outlive their manager. containerd gets it from shim processes; we get it from runc's own state, which survives Bun restarts, plus Bun's launch records.
 
 **What we do differently:**
 
-- We use containerd as a library/service, not as a user-facing tool. Operators never interact with containerd directly.
-- We do not use containerd's built-in CRI plugin (which is designed for Kubernetes). We use the lower-level containerd API directly via Grill.
+- We don't use containerd at all. An early draft of this doc did; the shipped Grill drives runc directly (see the decision log in §1). containerd would have kept a second copy of the state Bun already keeps, and added a socket and a daemon to keep alive.
 
 ### 11.5 systemd
 
@@ -2062,7 +2058,7 @@ Bun Restart
 
 | Crate | Purpose | Version | License | Maturity | Notes |
 |-------|---------|---------|---------|----------|-------|
-| `tokio` | Async runtime | 1.x | MIT | Mature, production-grade | The foundation for all async operations. Multi-threaded runtime with work-stealing scheduler. Pin Bun's critical tasks (health checker, reporting tree) to dedicated threads at high density. |
+| `tokio` | Async runtime | 1.x | MIT | Mature, production-grade | The foundation for all async operations. Multi-threaded runtime with work-stealing scheduler. Pin Bun's critical tasks (health checker, report worker) to dedicated threads at high density. |
 | `nix` | Safe Rust bindings for Unix APIs | 0.29+ | MIT | Mature | `clone()`, `unshare()`, `mount()`, `pivot_root()`, `setns()`, `prctl()`, signal handling. Essential for process workload namespace setup. |
 | `toml` + `serde` | TOML parsing and serialisation | latest | MIT/Apache-2.0 | Mature | For `node.toml` parsing and all TOML-based configuration. `serde` provides `#[serde(default)]` for optional fields with defaults. |
 | `age` | age encryption/decryption | 0.10+ | MIT/Apache-2.0 | Stable | For decrypting `ENC[AGE:...]` secrets. The `age` crate is the canonical Rust implementation of the age encryption format. |
@@ -2077,7 +2073,7 @@ Bun Restart
 
 **`nftnl` GPL concern:** The `nftnl` crate has a GPL-2.0 license. If this is incompatible with the project's licensing, the alternative is to invoke the `nft` CLI as a subprocess for nftables management. This is slightly less performant (process spawn per rule change) but avoids the license issue. Atomic rule application is still possible via `nft -f <file>`.
 
-**`containerd-client` vs raw gRPC:** Using the official `containerd-client` crate saves effort and ensures API compatibility. The trade-off is a dependency on the containerd project's release cadence. If the crate lags behind containerd releases, we can fall back to raw `tonic` gRPC with protobuf definitions generated from containerd's `.proto` files.
+**`containerd-client` vs raw gRPC:** Settled by not using containerd (see the §1 decision log). Grill runs the runtime CLIs as child processes.
 
 ---
 
@@ -2089,7 +2085,7 @@ Bun Restart
 
 3. **HealthChecker concurrency model:** At 500 apps with 10-second intervals, the HealthChecker issues ~50 probes/second. This is easily handled by a single async task. But if health check timeouts are long (e.g., 30 seconds for a slow backend), many probes may be in-flight simultaneously. Should health checks have a per-node concurrency limit? Or should we rely on Tokio's task scheduling and the timeout mechanism?
 
-4. **containerd version pinning:** Should Bun pin to a specific containerd version (and potentially bundle it), or should it support a range of containerd versions? Bundling ensures compatibility but increases the binary size and maintenance burden. Supporting a range requires version detection and conditional code paths.
+4. **containerd version pinning:** Moot: Bun doesn't use containerd. The live version of this question is which runc versions Grill supports.
 
 5. **Process workload restart backoff ceiling:** What should the maximum restart backoff be for a persistently failing process workload? Container orchestrators typically cap at 5 minutes. Should process workloads have a different ceiling, given that they are often system-level daemons that the operator expects to keep trying?
 

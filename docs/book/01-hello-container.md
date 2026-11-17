@@ -867,6 +867,8 @@ pub fn cgroup_path(namespace: &str, app_name: &str, instance: u32) -> PathBuf {
 
 `format!()` is Rust's string interpolation macro, similar to Python's f-strings or Go's `fmt.Sprintf`. But unlike `Sprintf`, the compiler checks the format string at compile time. If you reference a variable that doesn't exist, or use the wrong format specifier, you get a compilation error, not a runtime panic.
 
+That's where the chapter started, and `cgroup_path` still exists. A live instance uses `instance_cgroup_path` instead, whose leaf is `g{generation}-{ordinal}` (`/sys/fs/cgroup/reliaburger/default/web/g3-0`, say) rather than a bare ordinal. During a rolling deploy the old `web-0` and its successor exist side by side, and with a bare `0` they'd share one directory: retiring the old container would delete the new one's cgroup. Putting the deployment generation in the name gives each its own. The function also refuses an instance id whose shape doesn't match its namespace and app, so a confused caller can't point it somewhere else.
+
 CPU limits use two parameters. `cpu.max` is a hard limit: "this container can use at most X microseconds of CPU time per Y-microsecond period." `cpu.weight` is proportional sharing: "when the CPU is contended, give this container this share relative to others."
 
 The conversion from millicores (what users write in config) to microseconds (what the kernel expects) is straightforward:
@@ -1124,7 +1126,7 @@ pub struct WorkloadInstance {
 }
 ```
 
-Two fields at the bottom deserve a note. `is_job` distinguishes run-to-completion tasks from long-running apps. We could have modelled this as an enum (`WorkloadKind::App` vs `WorkloadKind::Job`) instead of a boolean, and for a system with more workload types that would be the right call. For now, a boolean is honest about the two cases we actually have.
+Two fields at the bottom deserve a note. `is_job` distinguishes run-to-completion tasks from long-running apps. We could have modelled this as an enum (`WorkloadKind::App` vs `WorkloadKind::Job`) instead of a boolean, and for a system with more workload types that would be the right call. For now, a boolean is honest about the two cases we actually have. (That held until 0.2.0. Jobs then moved to their own task-array lifecycle, the supervisor went back to apps only, and `is_job` is gone; see the note under "Deploying a job".)
 
 `oci_spec` stores the OCI spec that was used to create this instance. Why keep it around? Because when an instance fails and gets restarted, the agent needs to call `grill.create()` again with the same spec. Without storing it, we'd need to regenerate it from the original `AppSpec` or `JobSpec`, which means the agent would need to keep the config around and know which spec belongs to which instance. Storing the OCI spec directly is simpler and self-contained.
 
@@ -1274,6 +1276,8 @@ fn test_supervisor() -> WorkloadSupervisor<MockGrill> {
 The compiler generates a `WorkloadSupervisor<MockGrill>` that calls `MockGrill` methods directly. In production, we'll create a `WorkloadSupervisor<ContainerdGrill>` that calls the real runtime. Same code, different concrete type, zero runtime overhead.
 
 ### Deploying a job
+
+> **Later replaced.** This section and "Monitoring jobs" below describe the job path Phase 1 built, and it no longer exists. `deploy_job`, `is_job` and `check_jobs` were removed in 0.2.0, when every job (a TOML `[job.*]`, a cron fire, a `run_before` hook) became a one-task array on the leader-driven task-array lifecycle. A TOML job now gets four attempts by default, and a hook one attempt with a 600 s deadline (`JobDefinition::from_spec` in `src/meat/job.rs`). Chapter 17, "A Million Jobs", tells that story. We've kept the original here because the reasoning (no port, no health check, a bounded retry budget) still holds; only the machinery changed.
 
 Apps run forever (or until someone stops them). Jobs run to completion. A database migration, a batch data export, a cleanup script. You start it, it does its thing, it exits. If it fails, you retry a few times. If it keeps failing, you give up.
 
@@ -2377,6 +2381,8 @@ _ = health_interval.tick() => {
 
 ### Monitoring jobs
 
+> **Later replaced.** `check_jobs` went with the rest of Phase 1's job path in 0.2.0 (see "Deploying a job" above). Task attempts are now watched by the task-array executors, which report completions to the leader; Chapter 17 covers them. The init-container and restart sections below still describe how apps work.
+
 Apps run forever. Jobs exit. The agent needs to notice when a job process has stopped and decide what to do about it. That's `check_jobs`:
 
 ```rust
@@ -2582,7 +2588,7 @@ The filter logic is specific: only instances that are Pending *and* have been re
 
 This is called the "collect-then-process" pattern. We gather everything we need to act on (releasing the borrow on the supervisor), then iterate and mutate. The alternative would be indexing into the instances map by position, which is both less readable and fragile if the map changes size during iteration.
 
-Everything in this section runs on the event loop, and every `.await` in it holds every other command until it returns. On one container that's fine. On a busy node, a few slow runc calls in a row made the whole node look dead, and Chapter 15 tells that story. Today the tick only *starts* this work: the state reads in `check_jobs` (and its sibling for apps, `check_apps`) run as one parallel sweep in a spawned task, and each restart's kill, create and start run in tasks of their own, reporting back to the loop between steps.
+Everything in this section runs on the event loop, and every `.await` in it holds every other command until it returns. On one container that's fine. On a busy node, a few slow runc calls in a row made the whole node look dead, and Chapter 15 tells that story. Today the tick only *starts* this work: the state reads in `check_apps` run as one parallel sweep in a spawned task, and each restart's kill, create and start run in tasks of their own, reporting back to the loop between steps.
 
 ## A local API
 
@@ -2797,9 +2803,9 @@ Here's what the integration tests cover:
 
 **`relish_status_returns_expected_output`**: deploy via the command channel directly (not HTTP), verify the status API reflects the expected app name.
 
-**`job_runs_to_completion`**: deploy a job with `command = ["echo", "migration complete"]`. Wait a few seconds for the process to exit, then verify the instance reaches Stopped state. This tests the full job pipeline: deploy, `drive_job_startup`, process exit detection in `check_jobs`, and the success path.
+**`job_runs_to_completion`**: deploy a job with `command = ["echo", "migration complete"]`. Wait a few seconds for the process to exit, then verify the instance reaches Stopped state. When we wrote it, this exercised Phase 1's job pipeline: deploy, `drive_job_startup`, process exit detection in `check_jobs`, and the success path. The test still exists in `tests/integration.rs`, and now drives the same TOML job through the task-array path instead.
 
-**`job_failed_retries_then_fails`**: deploy a job with `command = ["false"]`. The `false` command exits immediately with code 1. Wait for all retries to exhaust (3 retries with exponential backoff takes about 12 seconds), then verify the instance reaches Failed state and `restart_count > 0`.
+**`job_failed_retries_then_fails`**: deploy a job with `command = ["false"]`. The `false` command exits immediately with code 1. Wait for all attempts to run out (four by default today, with backoff between them; Phase 1 gave three retries), then verify the instance reaches Failed state and `restart_count > 0`.
 
 **`init_container_success_allows_app_start`**: deploy an app with an init container that runs `echo "init done"`. Verify the deploy succeeds and the app reaches Running. Tests the Preparing → Initialising → Starting path.
 

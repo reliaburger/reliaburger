@@ -603,6 +603,16 @@ The leader confirms it's still the leader before each export, so a deposed
 one skips it. Backups written by 0.2.0 or earlier are named by time alone;
 they're left alone and never restored.
 
+Check that backups are actually landing. Setting `url` doesn't guarantee
+them, and today nothing in `relish status` or `relish wtf` says when they
+stop ([#2016](https://github.com/reliaburger/reliaburger/issues/2016)). A
+node with no master key to seal them with skips backups altogether. A `url`
+Bun can't open (a typo in the scheme, a bucket it can't reach) turns them off
+until Bun restarts. Each case leaves one line in Bun's stderr
+(`backups disabled` or `backup disabled`), and every later export failure is
+a stderr line too (`council: backup export failed`). List the destination
+after the first `interval_secs` and look for new objects.
+
 For `s3://` and `gs://`, Bun reads the standard variables of each backend:
 `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`,
 `AWS_REGION` (or `AWS_DEFAULT_REGION`) and `AWS_ENDPOINT` for S3 and

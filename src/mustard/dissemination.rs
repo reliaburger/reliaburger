@@ -2,8 +2,9 @@
 ///
 /// Membership updates are not sent as dedicated messages. Instead,
 /// they piggyback on every PING/ACK exchange. Each update is broadcast
-/// a limited number of times: `ceil(log2(cluster_size))`, which is
-/// enough for O(log N) convergence across the whole cluster.
+/// a limited number of times: `3 * ceil(log2(cluster_size))`, and at
+/// least 6 (see `broadcast_count`), which is enough for O(log N)
+/// convergence across the whole cluster.
 ///
 /// The queue sends this node's own refutations first, then
 /// failure-related updates (Dead, Suspect), then joins (Alive), so a
