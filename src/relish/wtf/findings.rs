@@ -293,7 +293,7 @@ pub const FINDINGS: &[FindingKind] = &[
     FindingKind {
         id: "backup-not-configured",
         severities: WARNING,
-        meaning: "no council member has [cluster.backup], so losing every voter loses the cluster's desired state; or one voter lacks it and would export nothing as leader",
+        meaning: "some council members have [cluster.backup] but this one doesn't, so as leader it would export nothing (a cluster with none configured gets an OK row that says so)",
         thresholds: &[],
     },
     FindingKind {

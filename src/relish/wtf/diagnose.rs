@@ -1549,8 +1549,10 @@ fn check_gitops(inputs: &WtfInputs, report: &mut WtfReport) {
 }
 
 /// Council backups (#2016): configured but unable to run is critical, since
-/// nothing will be there to restore from; none configured on the council, a
-/// failing export or none for [`BACKUP_STALE_INTERVALS`] intervals warn.
+/// nothing will be there to restore from. A voter without `[cluster.backup]`
+/// while others have it, a failing export, or none for
+/// [`BACKUP_STALE_INTERVALS`] intervals warn. No voter configured at all is
+/// an OK row that says so: a fresh cluster's choice, not a fault.
 ///
 /// Every node reports its own loop, because `[cluster.backup]` is per-node
 /// config and whichever voter leads is the one that exports. Freshness counts
@@ -1594,20 +1596,17 @@ fn check_backups(inputs: &WtfInputs, report: &mut WtfReport) {
         .iter()
         .filter(|node| node.status == BackupStatus::NotConfigured)
         .collect();
+    // A fresh cluster, the appliance included, starts without backups. That's
+    // a choice, not a fault, so the row says so instead of warning.
     if unconfigured.len() == voters.len() {
-        report.warnings.push(WtfFinding {
-            id: "backup-not-configured".to_string(),
-            title: "council backups are not configured".to_string(),
-            details: vec![
-                "if every council member is lost, the cluster's desired state goes with them"
+        if report.critical.len() + report.warnings.len() == problems {
+            report.ok.push(WtfOk {
+                id: "backups".to_string(),
+                description: "council backups aren't configured; see manual 12 \
+                              (operations, \"Backing up the council\")"
                     .to_string(),
-            ],
-            suggestion: "set [cluster.backup] url on every council member (manual: \
-                         operations, \"Backing up the council\")"
-                .to_string(),
-            correlated_events: Vec::new(),
-            affected_resource: "cluster".to_string(),
-        });
+            });
+        }
         return;
     }
     for node in unconfigured {
@@ -1637,7 +1636,10 @@ fn check_backups(inputs: &WtfInputs, report: &mut WtfReport) {
         });
     }
 
-    if report.critical.len() + report.warnings.len() == problems {
+    // With no leader observed, whether anyone exports can't be read: say
+    // nothing rather than claim it.
+    let leader_observed = backups.iter().any(|node| node.is_leader);
+    if leader_observed && report.critical.len() + report.warnings.len() == problems {
         report.ok.push(WtfOk {
             id: "backups".to_string(),
             description: "council backups are configured and the leader is exporting them"
@@ -2075,18 +2077,55 @@ pub(super) mod tests {
         assert!(!report.ok.iter().any(|ok| ok.id == "backups"));
     }
 
+    /// A fresh cluster, the appliance included, has no backups configured:
+    /// an OK row that says so, not a warning (#2016 review).
     #[test]
-    fn a_cluster_without_backups_is_warned() {
+    fn a_cluster_without_backups_is_ok_with_a_caveat() {
+        let mut inputs = healthy_inputs();
+        inputs.cluster.backups = available(vec![
+            backup("node-1", true, true, BackupStatus::NotConfigured),
+            backup("node-2", true, false, BackupStatus::NotConfigured),
+        ]);
+        let report = diagnose(&inputs);
+        assert!(warning_ids(&report).is_empty(), "{report:?}");
+        let row = report
+            .ok
+            .iter()
+            .find(|ok| ok.id == "backups")
+            .expect("a backups row");
+        assert!(row.description.contains("aren't configured"), "{row:?}");
+        assert!(row.description.contains("manual 12"), "{row:?}");
+    }
+
+    /// With no leader observed, nobody knows whether backups are exported:
+    /// no OK row claiming the leader is exporting them.
+    #[test]
+    fn no_observed_leader_gives_no_backups_ok_row() {
         let mut inputs = healthy_inputs();
         inputs.cluster.backups = available(vec![backup(
             "node-1",
             true,
-            true,
-            BackupStatus::NotConfigured,
+            false,
+            backup_running(Some(NOW - 60)),
         )]);
         let report = diagnose(&inputs);
-        assert_eq!(warning_ids(&report), [("backup-not-configured", "cluster")]);
-        assert!(!report.ok.iter().any(|ok| ok.id == "backups"));
+        assert!(!report.ok.iter().any(|ok| ok.id == "backups"), "{report:?}");
+    }
+
+    /// The configured voters lead, but the leader lacks it: as leader it
+    /// exports nothing.
+    #[test]
+    fn a_leader_without_backups_is_warned_when_other_voters_have_them() {
+        let mut inputs = healthy_inputs();
+        inputs.cluster.backups = available(vec![
+            backup("node-1", true, true, BackupStatus::NotConfigured),
+            backup("node-2", true, false, backup_running(Some(NOW - 60))),
+        ]);
+        let report = diagnose(&inputs);
+        assert_eq!(
+            warning_ids(&report),
+            [("backup-not-configured", "node.node-1")]
+        );
     }
 
     /// A voter without `[cluster.backup]` exports nothing once it leads.

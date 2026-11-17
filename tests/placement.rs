@@ -2838,7 +2838,7 @@ async fn wtf_and_path_reach_every_node_through_the_entry_node() {
         inputs.cluster.council
     );
     // Every node reports its council backup loop (#2016); this cluster
-    // configures none, which wtf warns about.
+    // configures none, which wtf's OK row says.
     let backups = inputs
         .cluster
         .backups
@@ -2864,11 +2864,20 @@ async fn wtf_and_path_reach_every_node_through_the_entry_node() {
         app: None,
         ..inputs.clone()
     };
+    let report = reliaburger::relish::wtf::diagnose(&cluster_wide);
     assert!(
-        reliaburger::relish::wtf::diagnose(&cluster_wide)
+        report
+            .ok
+            .iter()
+            .any(|ok| ok.id == "backups" && ok.description.contains("aren't configured")),
+        "{report:?}"
+    );
+    assert!(
+        !report
             .warnings
             .iter()
-            .any(|finding| finding.id == "backup-not-configured")
+            .any(|finding| finding.id.starts_with("backup-")),
+        "{report:?}"
     );
 
     let result = reliaburger::relish::path_cmd::probe_path(

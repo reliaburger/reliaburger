@@ -608,10 +608,11 @@ nothing to seal with, and plaintext state never leaves it), or a `url` the
 object store can't open, the loop never starts. `relish wtf` reports either as
 a critical `backup-disabled` finding naming the node and the reason. It warns
 `backup-failing` when the leader's last export failed, or when nothing has been
-exported for three intervals, and `backup-not-configured` when no council
-member has `[cluster.backup]`, or when one member lacks it while others have
-it: as leader, that member would export nothing. Give every council member the
-same `[cluster.backup]`.
+exported for three intervals, and `backup-not-configured` when one council
+member lacks `[cluster.backup]` while others have it: as leader, that member
+would export nothing. Give every council member the same `[cluster.backup]`.
+With none configured anywhere, `wtf`'s `backups` row is OK and says backups
+aren't configured.
 
 For `s3://` and `gs://`, Bun reads the standard variables of each backend:
 `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`,
