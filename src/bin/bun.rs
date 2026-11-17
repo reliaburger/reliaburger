@@ -2410,11 +2410,22 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
 
     // Drain container log lines from the agent into the LogStore. The store
     // skips lines it already holds, which a forwarder re-reads after a restart.
+    // A busy buffer wakes the flush task early (#2057), so a burst reaches
+    // Parquet long before the buffer's caps shed anything.
+    let log_flush_now = Arc::new(tokio::sync::Notify::new());
     {
         let drain_store = Arc::clone(&log_store);
+        let flush_now = Arc::clone(&log_flush_now);
         feeder_handles.push(tokio::spawn(async move {
             while let Some(rec) = log_rx.recv().await {
-                drain_store.write().await.ingest(&rec);
+                let flush_wanted = {
+                    let mut store = drain_store.write().await;
+                    store.ingest(&rec);
+                    store.flush_wanted()
+                };
+                if flush_wanted {
+                    flush_now.notify_one();
+                }
             }
         }));
     }
@@ -2616,25 +2627,31 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         });
     }
 
-    // Spawn log store flush task (every 60s)
+    // Spawn log store flush task: every 60s, and whenever the buffer asks.
+    // After a failed flush only the tick retries, so a full disk doesn't
+    // turn every ingested line into another failing flush.
     let log_flush_store = Arc::clone(&log_store);
     let log_flush_shutdown = shutdown.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        let mut flush_failing = false;
         loop {
             tokio::select! {
                 _ = log_flush_shutdown.cancelled() => break,
-                _ = tick.tick() => {
-                    // Drain under the lock, write off it (M7): the sync Parquet
-                    // encode + fsync no longer runs while the write lock is held,
-                    // so log appends and queries aren't starved during a flush.
-                    if let Err(e) =
-                        reliaburger::ketchup::log_store::flush_shared(&log_flush_store).await
-                    {
-                        eprintln!("bun: log flush error: {e}");
-                    }
-                }
+                _ = tick.tick() => {}
+                _ = log_flush_now.notified(), if !flush_failing => {}
             }
+            // Drain under the lock, write off it (M7): the sync Parquet
+            // encode + fsync no longer runs while the write lock is held,
+            // so log appends and queries aren't starved during a flush.
+            flush_failing =
+                match reliaburger::ketchup::log_store::flush_shared(&log_flush_store).await {
+                    Ok(_) => false,
+                    Err(e) => {
+                        eprintln!("bun: log flush error: {e}");
+                        true
+                    }
+                };
         }
     });
 
