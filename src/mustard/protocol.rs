@@ -1234,7 +1234,11 @@ impl<T: MustardTransport> MustardNode<T> {
                 NodeState::Left => !self.left,
                 NodeState::Alive => false,
             };
-            if update.node_id == self.node_id && refutable {
+            // A claim below our incarnation has already lost to our own
+            // record (the higher incarnation wins), so refuting it would
+            // only raise the incarnation and spread a refutation for nothing.
+            if update.node_id == self.node_id && refutable && update.incarnation >= self.incarnation
+            {
                 self.refute(update.incarnation);
             }
         }
@@ -3295,6 +3299,48 @@ mod tests {
     /// holding the claim we'd just refuted, so the node disagreed with
     /// everyone else about itself — including the scheduler and council reads
     /// that go through the membership table.
+    /// A claim about us below our incarnation has already lost (the higher
+    /// incarnation wins), so refuting it would only spread a needless bump.
+    #[tokio::test]
+    async fn a_claim_below_our_incarnation_is_not_refuted() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        node.refute(4);
+        assert_eq!(node.incarnation, 5);
+        let claim = |state, incarnation| {
+            GossipMessage::new(
+                NodeId::new("peer"),
+                1,
+                GossipPayload::Ping {
+                    updates: vec![MembershipUpdate {
+                        node_id: NodeId::new("n1"),
+                        address: addr(1),
+                        state,
+                        incarnation,
+                    }],
+                },
+            )
+        };
+        for (state, incarnation) in [
+            (NodeState::Suspect, 3),
+            (NodeState::Dead, 4),
+            (NodeState::Left, 2),
+        ] {
+            node.handle_message(addr(9), claim(state, incarnation))
+                .await;
+            assert_eq!(node.incarnation, 5, "refuted a stale {state:?}");
+            assert_eq!(
+                node.membership.get(&NodeId::new("n1")).unwrap().state,
+                NodeState::Alive
+            );
+        }
+        // A claim at our incarnation is current, and is refuted.
+        node.handle_message(addr(9), claim(NodeState::Suspect, 5))
+            .await;
+        assert_eq!(node.incarnation, 6);
+    }
+
     #[tokio::test]
     async fn refute_marks_this_node_alive_in_its_own_table() {
         let net = InMemoryNetwork::new();

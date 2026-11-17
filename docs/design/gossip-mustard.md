@@ -729,7 +729,7 @@ Leave is **immediate**. There is no `LEAVING` state, no drain-wait, and no `reli
        └──────────────────┘
 ```
 
-**Suspicion subprotocol.** When a node is marked SUSPECT, the suspecting node begins a suspicion timer. During this period, any node can forward evidence that the suspect is alive (an ACK received from the suspect). If the suspect itself learns it is suspected (via piggybacked updates), it increments its incarnation number and broadcasts an ALIVE message, which overrides the SUSPECT state. Only if the suspicion timer expires without refutation does the node transition to DEAD. This prevents false positives from transient network blips.
+**Suspicion subprotocol.** When a node is marked SUSPECT, the suspecting node begins a suspicion timer. During this period, any node can forward evidence that the suspect is alive (an ACK received from the suspect). If the suspect itself learns it is suspected (via piggybacked updates), it increments its incarnation number and broadcasts an ALIVE message, which overrides the SUSPECT state. It refutes only a claim at or above its own incarnation: one below has already lost to its own record, and refuting it would only spread a needless bump. Only if the suspicion timer expires without refutation does the node transition to DEAD. This prevents false positives from transient network blips.
 
 ### 5.2 Leader Election
 

@@ -485,6 +485,8 @@ fn refute(&mut self) {
 
 Bump incarnation, then broadcast "I'm alive at a higher incarnation." Since higher incarnations always win in conflict resolution, this overrides the Suspect update across the entire cluster. Today the refutation goes through `enqueue_refutation`, so it rides the very next outgoing message whatever else is queued. (The listing above is the first version, which used plain `enqueue` and, as we saw in the dissemination section, could queue the refutation behind a backlog of other nodes' failures.)
 
+A node only refutes a claim at or above its own incarnation. A `Suspect` at a lower one has already lost to the node's own record, since the higher incarnation wins, so refuting it would raise the incarnation and spread an `Alive` for nothing; a delayed or repeated rumour used to do exactly that. `a_claim_below_our_incarnation_is_not_refuted` checks `Suspect`, `Dead` and `Left` below the incarnation, and a `Suspect` at it.
+
 ### Three holes in the probe cycle
 
 An audit of the gossip layer in 0.2.1 found three ways a healthy node could still be declared dead, all under exactly the conditions where a cluster is already busy.
