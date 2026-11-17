@@ -92,6 +92,12 @@ BUN_STEADY_AFTER = 600
 API_BUN_RSS_TARGET_MIB = 512
 BUN_RSS_TARGET_MIB = 384
 TASK_ARRAY_STORAGE_TARGET_MIB = 64
+# A node's data/instances in allocated blocks on its own filesystem, as the
+# job inventory counts it (#1418). Since the capture reclaim (0.2.5) every
+# record peaks at 24-29 MiB on every tier, the 24 h day runs included; the
+# 0.2.3 and 0.2.4 day runs grew node 1's to 0.9 GiB. 64 MiB is over twice
+# the highest peak, and far under a day of an unreclaimed capture.
+INSTANCE_STORAGE_LIMIT_MIB = 64
 # A leak-fd window: floors over 10-minute buckets after a 10-minute warm-up,
 # each at least FD_STEP above the last, 25% up overall. Bun images rarely
 # live more than two hours in the soak, so the window has to be short.
@@ -974,6 +980,7 @@ def evaluate(evidence, snapshot):
                     usage["peak_owners"]=max(usage.get("peak_owners",0),len(owned["owners"]))
                     peaks=usage.setdefault("peak_storage_kb",{})
                     for scope,size in owned["storage_kb"].items(): peaks[scope]=max(peaks.get(scope,0),size)
+                    findings+=instance_storage_findings(owned["storage_kb"],node,fault_window)
                     campaign_snapshot=read_json(snapshot,"jobs.json") or {}
                     if campaign_snapshot.get("stopped") and now-campaign_snapshot.get("heartbeat",0)>5 and owned["owners"]:
                         raise job_soak_inventory.InvalidInventory("job-owned resources remain after positive campaign drain")
@@ -1412,6 +1419,18 @@ def bun_rss_samples(metrics, inventory, pid, now):
     process["peak_kb"] = max(process["peak_kb"], rss)
     if now - process["first_seen"] >= BUN_STEADY_AFTER:
         process["steady_kb"].append(rss)
+
+
+def instance_storage_findings(storage_kb, node, fault_window):
+    """A node whose instance storage is over INSTANCE_STORAGE_LIMIT_MIB fails
+    the snapshot (#1418). Inside a fault window it is only reported: storage
+    a fault left behind that retirement doesn't remove is still there, and
+    fails, at the first check after the window."""
+    size=storage_kb.get("instances")
+    if size is None or size<=INSTANCE_STORAGE_LIMIT_MIB*1024:
+        return []
+    return [finding("instance-storage","info" if fault_window else "fail",
+                    f"data/instances holds {size/1024:.1f} MiB, over the {INSTANCE_STORAGE_LIMIT_MIB} MiB limit",node)]
 
 
 def job_host_metrics(state, accepted):
@@ -2136,6 +2155,7 @@ def render(evidence, record):
                   "- Explicit test-operator acknowledgements for known replay-safe fenced fixtures: "+str((job_report or {}).get("totals",{}).get("operator_replay_decisions",0)), ""]
         for node, sample in state.get("job_resources",{}).items():
             lines.append(f"- {node}: latest complete job storage (KiB) {sample.get('storage_kb')}; free {sample.get('available_kb')} KiB; live/peak owners {sample.get('live_owners')}/{sample.get('peak_owners')}; peak storage {sample.get('peak_storage_kb')}")
+        lines += ["", f"Instance storage limit: {INSTANCE_STORAGE_LIMIT_MIB} MiB per node (data/instances, allocated, outside fault windows; #1418)."]
         lines += ["", "Complete disk inventories are recorded. Global retention bounds and the 12-hour job qualification remain #668; this gate cannot certify an unimplemented retention policy.", ""]
         qualification = job_qualification(job_report, state, metadata, elapsed)
         lines += job_qualification_lines(qualification)

@@ -1194,7 +1194,15 @@ within two minutes; a fault that doesn't settle by its deadline; containers,
 namespaces, eBPF pins, file descriptors or memory leaking after settling; an
 upgrade that ends on the wrong version; a Bun panic or a restart no fault
 explains; an agent loop turn over a second; or, with jobs, a run that executes
-twice, goes missing or never drains. The full list is the soak plan's
+twice, goes missing or never drains, or a node's `data/instances` over 64 MiB
+outside a fault window. That last one counts allocated blocks on the data
+filesystem, as the job inventory does: `du -sb` also counts each container's
+mounted root filesystem and the length of capture files whose stored prefix
+Bun has punched out, so it overstates the space used several times over.
+Since 0.2.5 every record peaks at 24 to 29 MiB, the 24-hour day runs
+included; 0.2.3's and 0.2.4's day runs reached 0.9 GiB on node 1 before the
+capture reclaim
+([#1418](https://github.com/reliaburger/reliaburger/issues/1418)). The full list is the soak plan's
 [pass and fail](plans/2026-09-25-v02-sustained.md#4-pass-and-fail). Each
 failure gets a root cause; a product fix means a new candidate and every soak
 again. Before 1.0, a final run whose only failures match a documented harness
