@@ -497,9 +497,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .collect()
     }
 
-    /// Begin cleaning up the runtime a failed restart attempt left behind.
+    /// Begin cleaning up the runtime a failed restart attempt, or a startup
+    /// that never passed its health check, left behind.
     pub(super) async fn begin_restart_cleanup(&mut self, id: InstanceId) {
         self.reported_executions.remove(&id);
+        // A sidecar restart still in flight would start its sidecar after
+        // the Cleanup step killed it; cancelled, it kills what it started
+        // instead, as it does after `observe_app_exit` (#1120, #1999).
+        self.sidecars.cancel_relaunches(&id);
         self.spawn_restart_step(id, RestartStep::Cleanup, None, RestartGate::default());
     }
 

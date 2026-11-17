@@ -1760,8 +1760,8 @@ async fn lease_reads_forward_user_authority_and_refuse_an_isolated_leader() {
     }
 }
 
-/// One request the fake leader received: path, bearer, whether it carried
-/// the leader-forwarded marker, body.
+/// One request the fake leader received: path with its query, bearer,
+/// whether it carried the leader-forwarded marker, body.
 pub(super) type SeenAtLeader = (String, Option<String>, bool, String);
 
 /// Serve a fake leader API on `listener` that accepts every request and
@@ -1774,7 +1774,12 @@ pub(super) fn serve_recording_leader(
     let leader = axum::Router::new().fallback(move |request: axum::extract::Request| {
         let recorder = recorder.clone();
         async move {
-            let path = request.uri().path().to_string();
+            // The query too: a forward that drops `?force=true` changes
+            // what the leader does.
+            let path = request
+                .uri()
+                .path_and_query()
+                .map_or_else(|| request.uri().path().to_string(), |path| path.to_string());
             let bearer = request
                 .headers()
                 .get("authorization")
@@ -2150,12 +2155,18 @@ async fn a_follower_forwards_a_rollback_to_the_leader_before_choosing_its_target
     }
 
     let seen = seen.lock().await.clone();
-    assert_eq!(seen.len(), 2, "{seen:?}");
-    for (path, bearer, marked, body) in &seen {
-        assert_eq!(
-            path, "/v1/rollback/web/default",
-            "the leader resolves the rollback itself, not an apply of the follower's pick"
-        );
+    assert_eq!(
+        seen.iter()
+            .map(|(path, ..)| path.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "/v1/rollback/web/default",
+            "/v1/rollback/web/default?force=true"
+        ],
+        "the leader resolves the rollback itself, not an apply of the follower's \
+         pick, and `force` reaches it"
+    );
+    for (_, bearer, marked, body) in &seen {
         assert_eq!(
             bearer.as_deref(),
             Some(format!("Bearer {deployer_key}").as_str()),
@@ -2543,9 +2554,11 @@ async fn a_follower_without_the_run_forwards_cancel_results_and_logs_to_the_lead
         assert!(reply.contains("recorded by the leader"), "{path}: {reply}");
     }
     let seen = seen.lock().await.clone();
+    // The results forward adds its own paging query; the route is what
+    // this test is about.
     assert_eq!(
         seen.iter()
-            .map(|(path, ..)| path.as_str())
+            .map(|(path, ..)| path.split('?').next().unwrap_or(path))
             .collect::<Vec<_>>(),
         RUN_CALLS.iter().map(|(_, path)| *path).collect::<Vec<_>>()
     );
