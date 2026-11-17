@@ -1095,28 +1095,30 @@ instances with the same files on disk, because this time the scheduling fell
 the other way. The bug arrived with the offsets change a few days earlier,
 and it needs a capture this big on the node being killed.
 
-The fix has two halves. `push` now walks the buffer once, remembering where
-the current line starts, and drains the finished lines in one go at the end:
+The fix has two halves. `push` now searches only the bytes it was just
+given, and copies each of them at most once:
 
 ```rust
-let mut search_from = self.partial.len();
-self.partial.extend_from_slice(bytes);
-let mut line_start = 0;
-while let Some(found) = self.partial[search_from..]
-    .iter()
-    .position(|byte| *byte == b'\n')
-{
-    let newline = search_from + found;
-    // ... hand back `self.partial[line_start..newline]` ...
-    line_start = newline + 1;
-    search_from = line_start;
+let mut rest = bytes;
+loop {
+    // ... skip to the next newline while `discarding` ...
+    let room = MAX_CAPTURED_LINE_BYTES.saturating_sub(self.partial.len());
+    let Some(newline) = rest.iter().position(|byte| *byte == b'\n') else {
+        // ... keep `rest` for the next chunk, up to `room` bytes ...
+        return lines;
+    };
+    let kept = newline.min(room);
+    self.partial.extend_from_slice(&rest[..kept]);
+    lines.push(self.take_line(newline - kept + 1));
+    rest = &rest[newline + 1..];
 }
-self.partial.drain(..line_start);
 ```
 
-`self.partial[search_from..]` is a slice, a borrowed view into the vector
-with no copy, like a Go slice expression. Starting the search at the old
-length is safe because bytes already waiting are, by definition, the part
+`rest[newline + 1..]` is a slice, a borrowed view into the caller's buffer
+with no copy, like a Go slice expression. Moving `rest` forward costs
+nothing; only the bytes of a line get copied, once, into `partial`, which
+`take_line` clears without giving back its memory. Searching only the new
+bytes is safe because bytes already waiting are, by definition, the part
 of a line with no newline yet.
 
 The second half matters more: no forwarder reads a whole file any more.
@@ -1140,6 +1142,16 @@ for 5.5 s in one go, the new one for a few milliseconds at most. The runc versio
 real container print 200,000 lines and follows it from a fresh runtime
 handle, as a restarted Bun would. `a_backlog_of_short_lines_splits_in_linear_time`
 pins `push` itself.
+
+What's `room` for? A line has to end somewhere. Output with no newline, a
+`\r` progress bar or a binary dump, would otherwise sit in `partial` in full
+until the newline finally came. So a line stops growing at `MAX_CAPTURED_LINE_BYTES` (64 KiB).
+The reader hands on that prefix as the line and sets `discarding`, the flag
+it already used to skip the rest of a line whose start was reclaimed, so the
+remainder is counted and dropped up to the next newline. Counting matters:
+the capture offset keeps moving, so the log store can still reclaim the
+file. `a_stream_with_no_newline_stays_within_the_line_cap` pushes 100 MiB
+with no newline in 64 KiB chunks and checks the buffer after every one.
 
 Should one stuck instance be able to stop a node at all? Adoption is
 fail-closed by design: an instance Bun can't prove it owns stops startup,
