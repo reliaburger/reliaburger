@@ -31,7 +31,7 @@ Reading the cluster:
 | `status` | the agent envelope (`relish.agent/v1`): `data.verdict`, `data.problems`, `data.lines`, `data.wtf` and `data.summary` (the `GET /v1/cluster/summary` answer), with `next` steps |
 | `apps` | one row per app: `namespace`, `app`, `state`, `desired`, `running`, `restarts`, `nodes`, `age_seconds`, `reason` |
 | `apps NAME`, `apps --instances` | one record per instance: `node`, `id`, `app_name`, `namespace`, `state`, `pid`, `restart_count`, `age_seconds`, `reason` |
-| `nodes` | one record per node: its gossip state and address, `version`, `cpu_percent`, `memory_percent`, `disk_percent`, `allocated`, `cordoned`, `disk_pressure` and `unanswered` |
+| `nodes` | one record per node: its gossip state and address, `version`, `cpu_percent`, `memory_percent`, `disk_percent`, `allocated`, `cordoned`, `disk_pressure` and `unanswered`; an empty list on a standalone node |
 | `logs` | one object per line (JSON Lines): `at`, `node`, `instance`, `stream`, `text` |
 | `inspect` | `desired` (or `desired_error`), then each node's `answer`: its `instances`, or the `reason` it's missing |
 | `routes` | the list of routes |
@@ -52,7 +52,7 @@ Changing it:
 |---|---|
 | `stop`, `delete`, `release` | `action` (`stop_requested`, `delete_requested`, `released`), `app`, `namespace`, `forced` |
 | `rollback` | the `app`, its `namespace`, and whether it was `forced` |
-| `apply --rerun-jobs`, `batch`, `run` | the node's answer: `created` and `instances`, or `batch_id` and its counts |
+| `apply`, `apply --rerun-jobs`, `batch`, `run` | the node's answer: `created` and `instances`, or `batch_id` and its counts; `apply --dry-run` prints the plan |
 | `batch replay`, `batch cancel` | `run` and the `change` (`replay_acknowledged`, `cancelled`) |
 | `fault <type>` | the fault, with any it created on other nodes under `routed` |
 | `fault list`, `fault clear` | `faults` and `warnings`; the node's `message` |
@@ -65,6 +65,9 @@ Changing it:
 | `policy delete` | the policy `deleted` |
 | `secret rotate`, `token revoke` | the node's `message` |
 | `token create`, `token rotate`, `join-token create` | the new `token`, with its name, role, scope and expiry |
+| `join-token list` | `join_tokens`: each one's `id`, `node_id`, `expires_at` and whether it was `consumed`, never the token |
+| `join-token revoke` | the `node_id` and how many tokens were `revoked` |
+| `identity rotate-signing-key` | the new `key_id`, the `retiring_key_id` and when it stops verifying, `retire_after` |
 | `ca rotate` | the `role`, the `stage` (`begun`, `finalised`) and the council's `message` |
 | `upgrade start` | `scope`, `target_version`, `upgrade_id`, and `already_running` with its `detail` |
 | `upgrade rollback`, `resume`, `abort` | the `change`, and the version or upgrade it was about |
@@ -431,13 +434,22 @@ incomplete evidence. Before
 `relish status` exits `0` whenever it got an answer, whatever the verdict.
 With `--check` it exits `1` on `DEGRADED` and `2` on `DOWN`, for a script or
 a monitor. A usage error exits `2` as well, so try the command once by hand
-before you wire it in.
+before you wire it in. When the cluster doesn't answer, `status` exits with
+the agent codes below, with `--check` or without it and in every output
+format: `3` when it couldn't reach or authenticate to the cluster, `4` when
+it was refused, `5` for anything else. Human output says why on stderr;
+`-o json` and `-o yaml` print a failed envelope.
 
 `relish agent` commands use their own codes, which say only whether the
 command answered: `0` answered, `2` usage, `3` couldn't reach or authenticate
 to the cluster, `4` refused, `5` anything else. A usage error there is a JSON
 envelope on stdout, not text on stderr. See
 [Working with an AI agent](16_working-with-an-ai-agent.md#exit-codes).
+
+With `-o json` or `-o yaml`, `apply` and `deploy` against an agent that
+doesn't answer still print the plan of what they would have done, as data,
+then exit `1` with `nothing was deployed` on stderr. The JSON parses either
+way, so check the exit code before you trust it.
 
 `relish exec` exits with the remote command's own exit code, so
 `relish exec web ls /ready` works in a shell `if`. It exits `1` when it

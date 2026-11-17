@@ -160,8 +160,13 @@ async fn apply_with_client(
         Ok(()) => {
             // Agent is alive — send the config (progress streams to stderr)
             let result = client.apply(&config).await?;
-            println!("{}", apply_summary(result.created, &result.instances));
-            Ok(())
+            if output == OutputFormat::Human {
+                println!("{}", apply_summary(result.created, &result.instances));
+                return Ok(());
+            }
+            // The node's answer, as `--rerun-jobs` prints it (#2012).
+            let answer = serde_json::to_value(&result).map_err(RelishError::SerialiseJson)?;
+            print_output(&answer, output)
         }
         Err(error) => {
             // X5: show the plan for reference, but fail — a dead agent
@@ -2029,7 +2034,8 @@ pub async fn deploy(
         }
         Err(error) => {
             let plan = generate_plan(&config, None);
-            let formatted = format_output(&plan, super::OutputFormat::Human)?;
+            // In the format asked for, as `apply` does (#2012).
+            let formatted = format_output(&plan, output)?;
             println!("{formatted}");
             eprintln!("\nnothing was deployed (use --dry-run to preview a plan without an agent)");
             Err(error)
@@ -4711,21 +4717,32 @@ impl std::fmt::Display for JoinTokenReport<'_> {
     }
 }
 
-/// List the council's join tokens.
-pub async fn join_token_list() -> Result<(), RelishError> {
+/// List the council's join tokens: a table, or `join_tokens` under
+/// `-o json` and `-o yaml` (#2012).
+pub async fn join_token_list(output: OutputFormat) -> Result<(), RelishError> {
     let tokens = BunClient::default_local().join_token_list().await?;
-    print!(
-        "{}",
-        render_join_tokens(&tokens, std::time::SystemTime::now())
-    );
-    Ok(())
+    if output == OutputFormat::Human {
+        print!(
+            "{}",
+            render_join_tokens(&tokens, std::time::SystemTime::now())
+        );
+        return Ok(());
+    }
+    print_output(&serde_json::json!({ "join_tokens": tokens }), output)
 }
 
-/// Revoke a node id's unused join tokens.
-pub async fn join_token_revoke(node_id: &str) -> Result<(), RelishError> {
+/// Revoke a node id's unused join tokens: a sentence, or the `node_id` and
+/// how many were `revoked` under `-o json` and `-o yaml` (#2012).
+pub async fn join_token_revoke(node_id: &str, output: OutputFormat) -> Result<(), RelishError> {
     let revoked = BunClient::default_local()
         .join_token_revoke(node_id)
         .await?;
+    if output != OutputFormat::Human {
+        return print_output(
+            &serde_json::json!({ "node_id": node_id, "revoked": revoked }),
+            output,
+        );
+    }
     match revoked {
         0 => println!("{node_id} had no unused join tokens"),
         1 => println!("revoked 1 join token for {node_id}"),

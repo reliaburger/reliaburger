@@ -1504,6 +1504,29 @@ Scripts that want the verdict as an exit code pass `--check`: 1 for
 kept the plan's numbers. A monitoring script tests its command line once, by
 hand, and from then on a 2 means down.
 
+A cluster that doesn't answer at all is a third case, and for a while it
+borrowed the wrong number. With human output the failure came back as an
+ordinary error, and `relish` exits 1 on an error, so `relish status --check`
+reported an unreachable cluster as `DEGRADED`. With `-o json` the same call
+printed a failed envelope and exited 3, the envelope's code for
+"unreachable". One command, two answers, depending on a formatting flag
+(#2013). Now every format exits with the envelope's code: 3 when it couldn't
+reach or authenticate to the cluster, 4 when it was refused, 5 for anything
+else. The human error still goes to stderr, and `-o yaml` prints the failed
+envelope just as `-o json` does. The code comes from one function, so the
+two paths can't drift apart again:
+
+```rust
+pub fn no_answer_exit_code(error: &RelishError) -> u8 {
+    AgentError::from(error).code.exit_status().code()
+}
+```
+
+`AgentError::from` is a `From` conversion: Rust's standard trait for "build
+this type out of that one". Implementing it once for `&RelishError` gives
+every caller the same mapping from a `relish` error to an agent error code,
+and so the same exit code.
+
 `-o json` prints the agent envelope from earlier in this chapter, with
 `command: "status"`. `data` holds the verdict, the problem count, every line
 with its mark and command, `wtf`'s outcome, and the whole summary. `next`
