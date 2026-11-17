@@ -114,14 +114,15 @@ pub fn fenced_app(write: &RaftRequest) -> Option<&AppId> {
     }
 }
 
-/// The sentence a refused write answers with.
+/// The sentence a refused write answers with. It doesn't quote the
+/// holder's purpose, which is the holder's own words; the body's `lease`
+/// carries it, and `relish lease list` shows it.
 pub fn held_message(lease: &AgentLease, now_unix_ms: u64) -> String {
     format!(
-        "{} is held by {} for {}s more ({}); repeat with --break-lease to take it over",
+        "{} is held by {} for {}s more; repeat with --break-lease to take it over",
         lease.target,
         lease.holder.name,
         lease.expires_at_unix_ms.saturating_sub(now_unix_ms) / 1000,
-        lease.purpose
     )
 }
 
@@ -170,8 +171,8 @@ mod tests {
         assert_eq!(body["lease"]["holder"], "holmes");
         assert_eq!(
             body["error"],
-            "app:shop/web is held by holmes for 60s more (rolling back); repeat with \
-             --break-lease to take it over"
+            "app:shop/web is held by holmes for 60s more; repeat with --break-lease to take \
+             it over"
         );
     }
 

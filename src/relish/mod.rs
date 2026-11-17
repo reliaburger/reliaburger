@@ -260,6 +260,16 @@ pub enum RelishError {
     )]
     UnseenCluster(Box<RelishError>),
 
+    /// `relish apply` or `rollback` followed a deploy's progress for its
+    /// whole deadline without the deploy finishing.
+    #[error(
+        "stopped following the deploy after {seconds} s; it may still be running on the agent (see relish status)"
+    )]
+    DeployStreamDeadline {
+        /// The deadline, in seconds.
+        seconds: u64,
+    },
+
     /// A request to the agent timed out. The operation may still be running.
     #[error("request timed out (the operation may still be running on the agent)")]
     RequestTimeout,

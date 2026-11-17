@@ -397,6 +397,32 @@ mod tests {
         assert_eq!(json["warnings"][0], "node-2 timed out");
     }
 
+    /// A refused lease's audit record, as the route makes it, carries the
+    /// holder's purpose only inside `author_text`.
+    #[test]
+    fn a_held_lease_refusal_keeps_the_purpose_inside_untrusted() {
+        let refused = crate::bun::api::leases::held_refusal_record();
+        let mut refusal = record();
+        refusal.action = refused.action.to_string();
+        refusal.details = refused.details;
+        refusal.message = refused.message;
+        let report = AuditReport(AuditListing {
+            records: vec![refusal],
+            warnings: Vec::new(),
+        });
+        let shown = format_output(&report, OutputFormat::Json).unwrap();
+        let mut json: serde_json::Value = serde_json::from_str(&shown).unwrap();
+        let entry = json["records"][0].as_object_mut().unwrap();
+        let text = entry.remove("author_text").unwrap();
+        assert_eq!(text["untrusted"]["origin"], "lease_purpose", "{shown}");
+        assert!(
+            !serde_json::Value::Object(entry.clone())
+                .to_string()
+                .contains("SYSTEM"),
+            "{shown}"
+        );
+    }
+
     /// The record a two-app apply in one namespace makes: no single app,
     /// the names under `workloads` (#1501).
     fn two_app_apply() -> AuditRecord {

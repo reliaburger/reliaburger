@@ -6,7 +6,6 @@
 /// The `apply` endpoint returns Server-Sent Events, which the client
 /// reads incrementally — printing progress to stderr and collecting
 /// the final result.
-use futures_util::StreamExt;
 use rustls::pki_types::{CertificateDer, pem::PemObject};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
@@ -135,9 +134,11 @@ pub struct AgentVersion {
 pub struct BunClient {
     base_url: String,
     client: Result<reqwest::Client, String>,
-    /// The client for streaming responses: no total deadline, only a limit
-    /// on silence.
+    /// The client for streaming responses. It sets no deadline of its own:
+    /// [`StreamBody`] applies [`ClientTimeouts`] as it reads.
     stream_client: Result<reqwest::Client, String>,
+    /// The deadlines requests through this client get.
+    timeouts: ClientTimeouts,
     websocket_tls: Option<std::sync::Arc<rustls::ClientConfig>>,
     token: Option<String>,
     ca_pem: Option<Vec<u8>>,
@@ -542,14 +543,15 @@ fn snapshots_path(app: &str, namespace: &str) -> Result<String, RelishError> {
     ))
 }
 
-/// Free text (a snapshot's name) as one path segment: every byte outside
+/// Free text (a snapshot's, service's or policy's name) as one path
+/// segment: every byte outside
 /// RFC 3986's unreserved set is percent-encoded, and the dot segments,
 /// which a URL parser resolves even when encoded, are refused.
 fn path_segment(text: &str) -> Result<String, RelishError> {
     if text.is_empty() || text == "." || text == ".." {
         return Err(RelishError::InvalidFlag {
             flag: "name".to_string(),
-            reason: format!("{text:?} can't name a snapshot"),
+            reason: format!("{text:?} can't be one segment of a request path"),
         });
     }
     Ok(text
@@ -571,13 +573,21 @@ const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300)
 /// The agent sends an SSE keep-alive every 15 s, so this is four missed ones.
 const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How long `relish apply` or `rollback` follows a deploy's progress before
+/// it gives up. Keep-alives hold a stream open, so without this a wedged
+/// deploy would hold an unattended script for ever.
+const DEPLOY_STREAM_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
 /// The deadlines a [`BunClient`] applies.
 #[derive(Debug, Clone, Copy)]
 struct ClientTimeouts {
-    /// Total deadline for a request that answers in one go.
+    /// Total deadline for a request that answers in one go, and for the
+    /// wait until a stream's headers arrive.
     request: std::time::Duration,
     /// Longest silence a streaming response may have.
     stream_idle: std::time::Duration,
+    /// Total deadline for following a deploy's progress stream.
+    deploy_stream: std::time::Duration,
 }
 
 impl Default for ClientTimeouts {
@@ -585,6 +595,42 @@ impl Default for ClientTimeouts {
         Self {
             request: REQUEST_TIMEOUT,
             stream_idle: STREAM_IDLE_TIMEOUT,
+            deploy_stream: DEPLOY_STREAM_DEADLINE,
+        }
+    }
+}
+
+/// A streaming response's body, read chunk by chunk under the client's
+/// deadlines: a silence of `idle` ends it, and so does `deadline`.
+struct StreamBody {
+    response: reqwest::Response,
+    idle: std::time::Duration,
+    /// When to stop, and the deadline's length for the error.
+    deadline: Option<(tokio::time::Instant, std::time::Duration)>,
+}
+
+impl StreamBody {
+    /// The next chunk, `None` when the body ends.
+    async fn next(&mut self) -> Option<Result<Vec<u8>, RelishError>> {
+        let mut wait = self.idle;
+        let mut deadline_first = None;
+        if let Some((at, length)) = self.deadline {
+            let left = at.saturating_duration_since(tokio::time::Instant::now());
+            if left <= wait {
+                wait = left;
+                deadline_first = Some(length);
+            }
+        }
+        match tokio::time::timeout(wait, self.response.chunk()).await {
+            Ok(Ok(Some(chunk))) => Some(Ok(chunk.to_vec())),
+            Ok(Ok(None)) => None,
+            Ok(Err(error)) => Some(Err(classify_error(error))),
+            Err(_) => Some(Err(match deadline_first {
+                Some(length) => RelishError::DeployStreamDeadline {
+                    seconds: length.as_secs(),
+                },
+                None => RelishError::RequestTimeout,
+            })),
         }
     }
 }
@@ -916,6 +962,7 @@ impl BunClient {
             base_url: base_url.trim_end_matches('/').to_string(),
             client: Err(reason.clone()),
             stream_client: Err(reason),
+            timeouts: ClientTimeouts::default(),
             websocket_tls: None,
             ca_pem: None,
             service_endpoints: None,
@@ -941,17 +988,15 @@ impl BunClient {
             .clone()
             .and_then(|tls| http_client(token, tls, |builder| builder.timeout(timeouts.request)));
         // A followed log or a deploy's progress stream runs for as long as
-        // the work behind it does. Only silence ends it: the agent sends an
-        // SSE keep-alive comment every 15 s.
-        let stream_client = tls.and_then(|tls| {
-            http_client(token, tls, |builder| {
-                builder.read_timeout(timeouts.stream_idle)
-            })
-        });
+        // the work behind it does, so its client has no deadline; `StreamBody`
+        // ends it on silence (the agent sends an SSE keep-alive every 15 s)
+        // or, for a deploy, at `deploy_stream`.
+        let stream_client = tls.and_then(|tls| http_client(token, tls, |builder| builder));
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             client,
             stream_client,
+            timeouts,
             websocket_tls,
             ca_pem: ca_pem.map(<[u8]>::to_vec),
             service_endpoints: None,
@@ -993,6 +1038,7 @@ impl BunClient {
             base_url: base_url.trim_end_matches('/').to_string(),
             client: self.client.clone(),
             stream_client: self.stream_client.clone(),
+            timeouts: self.timeouts,
             websocket_tls: self.websocket_tls.clone(),
             ca_pem: self.ca_pem.clone(),
             service_endpoints: None,
@@ -1126,8 +1172,9 @@ impl BunClient {
     }
 
     /// The HTTP client for a response that streams for as long as the work
-    /// behind it runs (a followed log, a deploy's progress): it gives up
-    /// only after a silence, never on total time.
+    /// behind it runs (a followed log, a deploy's progress). Send through
+    /// [`Self::start_stream`] and read through [`StreamBody`], which apply
+    /// the deadlines.
     fn streaming_http(&self) -> Result<&reqwest::Client, RelishError> {
         self.stream_client
             .as_ref()
@@ -1135,6 +1182,33 @@ impl BunClient {
                 status: 0,
                 body: reason.clone(),
             })
+    }
+
+    /// Send a request whose answer streams. The work before the first byte
+    /// (binding images, a job's apply) gets the ordinary request deadline.
+    async fn start_stream(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, RelishError> {
+        tokio::time::timeout(self.timeouts.request, request.send())
+            .await
+            .map_err(|_| RelishError::RequestTimeout)?
+            .map_err(classify_error)
+    }
+
+    /// A streamed body that ends on a silence, and for a deploy at the
+    /// deploy deadline.
+    fn stream_body(&self, response: reqwest::Response, deploy: bool) -> StreamBody {
+        StreamBody {
+            response,
+            idle: self.timeouts.stream_idle,
+            deadline: deploy.then(|| {
+                (
+                    tokio::time::Instant::now() + self.timeouts.deploy_stream,
+                    self.timeouts.deploy_stream,
+                )
+            }),
+        }
     }
 
     /// [`default_local`](Self::default_local), read off the runtime: the
@@ -1313,7 +1387,7 @@ impl BunClient {
         if capacity_probe {
             request = request.header("x-reliaburger-capacity-probe", "acknowledged");
         }
-        let response = request.send().await.map_err(classify_error)?;
+        let response = self.start_stream(request).await?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
@@ -1340,12 +1414,12 @@ impl BunClient {
         }
 
         // Read the SSE stream
-        let mut stream = response.bytes_stream();
+        let mut stream = self.stream_body(response, true);
         let mut buffer = Vec::new();
         let mut result = None;
 
         while let Some(chunk) = stream.next().await {
-            let bytes = chunk.map_err(classify_error)?;
+            let bytes = chunk?;
             buffer.extend_from_slice(&bytes);
 
             // Decode only complete frames: a UTF-8 character can span network chunks.
@@ -1445,10 +1519,8 @@ impl BunClient {
             force_query(force)
         );
         let response = self
-            .lease_header(self.streaming_http()?.post(&url))
-            .send()
-            .await
-            .map_err(classify_error)?;
+            .start_stream(self.lease_header(self.streaming_http()?.post(&url)))
+            .await?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
@@ -1456,10 +1528,10 @@ impl BunClient {
             return Err(RelishError::ApiError { status, body });
         }
 
-        let mut stream = response.bytes_stream();
+        let mut stream = self.stream_body(response, true);
         let mut buffer = Vec::new();
         while let Some(chunk) = stream.next().await {
-            let bytes = chunk.map_err(classify_error)?;
+            let bytes = chunk?;
             buffer.extend_from_slice(&bytes);
             while let Some(end) = buffer.windows(2).position(|pair| pair == b"\n\n") {
                 let event_text = String::from_utf8_lossy(&buffer[..end]).into_owned();
@@ -2401,12 +2473,8 @@ impl BunClient {
         params.push(("follow".to_string(), "true".to_string()));
 
         let response = self
-            .streaming_http()?
-            .get(&url)
-            .query(&params)
-            .send()
-            .await
-            .map_err(classify_error)?;
+            .start_stream(self.streaming_http()?.get(&url).query(&params))
+            .await?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
@@ -2415,10 +2483,10 @@ impl BunClient {
         }
 
         let filter = options.line_filter();
-        let mut stream = response.bytes_stream();
+        let mut stream = self.stream_body(response, false);
         let mut decoder = crate::ketchup::sse::SseDecoder::default();
         while let Some(chunk) = stream.next().await {
-            let bytes = chunk.map_err(classify_error)?;
+            let bytes = chunk?;
             for event in decoder.push(&bytes) {
                 print_followed_event(&event, &filter);
             }
@@ -2751,7 +2819,7 @@ impl BunClient {
         &self,
         name: &str,
     ) -> Result<crate::onion::types::ResolveResponse, RelishError> {
-        let url = format!("{}/v1/resolve/{name}", self.base_url);
+        let url = format!("{}/v1/resolve/{}", self.base_url, path_segment(name)?);
         let response = self
             .http()?
             .get(&url)
@@ -3843,10 +3911,12 @@ impl BunClient {
 
     /// Delete a policy (admin only).
     pub async fn delete_policy(&self, name: &str) -> Result<(), RelishError> {
-        let name: String = url::form_urlencoded::byte_serialize(name.as_bytes()).collect();
-        self.post_json(&format!("/v1/policies/{name}/delete"), String::new())
-            .await
-            .map(|_| ())
+        self.post_json(
+            &format!("/v1/policies/{}/delete", path_segment(name)?),
+            String::new(),
+        )
+        .await
+        .map(|_| ())
     }
 
     pub async fn gitops_status(&self) -> Result<crate::lettuce::types::GitOpsStatus, RelishError> {
@@ -3925,6 +3995,7 @@ fn audit_path(filter: &crate::bun::audit::AuditFilter, cluster: bool) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::StreamExt;
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -3952,9 +4023,20 @@ mod tests {
     /// Serve `/v1/rollback/web/default` as an SSE stream of `beats`
     /// keep-alive comments, `interval` apart, then end it.
     async fn trickling_rollback_server(beats: usize, interval: std::time::Duration) -> String {
+        slow_rollback_server(std::time::Duration::ZERO, beats, interval).await
+    }
+
+    /// [`trickling_rollback_server`], answering only after `before_headers`,
+    /// as the agent does while it binds images ahead of the stream.
+    async fn slow_rollback_server(
+        before_headers: std::time::Duration,
+        beats: usize,
+        interval: std::time::Duration,
+    ) -> String {
         let app = axum::Router::new().route(
             "/v1/rollback/web/default",
             axum::routing::post(move || async move {
+                tokio::time::sleep(before_headers).await;
                 let stream = futures_util::stream::unfold(0, move |sent| async move {
                     if sent == beats {
                         return None;
@@ -3980,6 +4062,15 @@ mod tests {
     }
 
     fn client_with_timeouts(url: &str, request_ms: u64, stream_idle_ms: u64) -> BunClient {
+        client_with_deadline(url, request_ms, stream_idle_ms, 60_000)
+    }
+
+    fn client_with_deadline(
+        url: &str,
+        request_ms: u64,
+        stream_idle_ms: u64,
+        deploy_ms: u64,
+    ) -> BunClient {
         BunClient::build_with_timeouts(
             url,
             None,
@@ -3987,8 +4078,42 @@ mod tests {
             ClientTimeouts {
                 request: std::time::Duration::from_millis(request_ms),
                 stream_idle: std::time::Duration::from_millis(stream_idle_ms),
+                deploy_stream: std::time::Duration::from_millis(deploy_ms),
             },
         )
+    }
+
+    /// The work before the stream starts (binding images, a job's apply)
+    /// gets the ordinary request time, not the stream's silence limit.
+    #[tokio::test]
+    async fn the_wait_for_a_stream_to_start_gets_the_request_timeout() {
+        let url = slow_rollback_server(
+            std::time::Duration::from_millis(600),
+            1,
+            std::time::Duration::from_millis(10),
+        )
+        .await;
+        let client = client_with_timeouts(&url, 5_000, 200);
+        client.rollback("web", "default").await.unwrap();
+    }
+
+    /// Keep-alives can't hold a wedged deploy's stream open for ever: the
+    /// command stops at the deploy deadline, and says so.
+    #[tokio::test]
+    async fn a_deploy_stream_stops_at_its_deadline() {
+        let url = trickling_rollback_server(100, std::time::Duration::from_millis(50)).await;
+        let client = client_with_deadline(&url, 5_000, 2_000, 400);
+        let started = std::time::Instant::now();
+        let error = client.rollback("web", "default").await.unwrap_err();
+        assert!(
+            matches!(error, RelishError::DeployStreamDeadline { .. }),
+            "{error:?}"
+        );
+        assert!(
+            error.to_string().contains("may still be running"),
+            "{error}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
     }
 
     /// A deploy's progress stream (and a followed log) runs past the request
@@ -4046,6 +4171,28 @@ mod tests {
             app_path("/v1/stop", "web-2", "team-a").unwrap(),
             "/v1/stop/web-2/team-a"
         );
+    }
+
+    /// A service or policy name goes into its path as one segment too.
+    #[tokio::test]
+    async fn service_and_policy_names_stay_one_path_segment() {
+        let client = BunClient::new_with_token("http://127.0.0.1:1", None);
+        for name in ["..", "."] {
+            assert!(
+                matches!(
+                    client.resolve(name).await,
+                    Err(RelishError::InvalidFlag { .. })
+                ),
+                "{name}"
+            );
+            assert!(
+                matches!(
+                    client.delete_policy(name).await,
+                    Err(RelishError::InvalidFlag { .. })
+                ),
+                "{name}"
+            );
+        }
     }
 
     #[test]

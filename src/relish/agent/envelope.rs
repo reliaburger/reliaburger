@@ -440,7 +440,9 @@ impl From<&RelishError> for AgentError {
                 agent_error
             }
             RelishError::AgentRequired { .. } => AgentError::new(ErrorCode::NoEndpoint, message),
-            RelishError::RequestTimeout => AgentError::new(ErrorCode::Timeout, message),
+            RelishError::RequestTimeout | RelishError::DeployStreamDeadline { .. } => {
+                AgentError::new(ErrorCode::Timeout, message)
+            }
             RelishError::ApiError { status, .. } => {
                 let code = match status {
                     401 => ErrorCode::Unauthenticated,

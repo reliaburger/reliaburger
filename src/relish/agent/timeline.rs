@@ -1248,6 +1248,35 @@ mod tests {
         assert!(refused["author_text"].is_null());
     }
 
+    /// A refused lease's record (as the route makes it) quotes the holder's
+    /// purpose only inside `author_text`: not in `details.reason`, not in
+    /// the message, for the audit record or the event.
+    #[test]
+    fn a_held_lease_refusal_keeps_the_purpose_inside_untrusted() {
+        use crate::bun::api::leases::{HOSTILE_PURPOSE, held_refusal_record};
+        let refused = held_refusal_record();
+        let mut record = audit(1, NOW - 10, refused.action, "web");
+        record.details = refused.details.clone();
+        record.message = refused.message.clone();
+        let mut event = event(2, NOW - 5, "node-1", EventKind::Operation);
+        event.action = Some(refused.action.to_string());
+        event.details = refused.details;
+        event.message = refused.message;
+        let value = render(timeline(
+            inputs(vec![event], vec![record], None),
+            &scope(None, 10),
+        ));
+        let entries = value["data"]["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2, "{value}");
+        for entry in entries {
+            let mut rest = entry.clone();
+            let text = rest.as_object_mut().unwrap().remove("author_text").unwrap();
+            assert_eq!(text["untrusted"]["origin"], "lease_purpose", "{entry}");
+            assert_eq!(text["untrusted"]["lines"][0], HOSTILE_PURPOSE);
+            assert!(!rest.to_string().contains("SYSTEM"), "{rest}");
+        }
+    }
+
     #[test]
     fn a_window_longer_than_a_day_is_refused() {
         let args = TimelineArgs {

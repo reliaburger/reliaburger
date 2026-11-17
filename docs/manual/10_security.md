@@ -394,10 +394,11 @@ per author and one per app.
 An agent may hold a short **lease** on an app or a namespace while it
 works (`relish lease list` shows them). Someone else's lease stops your own
 `relish apply`, `deploy`, `stop`, `delete`, `rollback` or `release` of that
-app, naming the holder, why and for how long:
+app, naming the holder and for how long (`relish lease list` shows why;
+the reason is the holder's own words, so the refusal doesn't quote it):
 
 ```text
-app:shop/web is held by holmes for 87s more (rolling back); repeat with --break-lease to take it over
+app:shop/web is held by holmes for 87s more; repeat with --break-lease to take it over
 ```
 
 Repeat the command with `--break-lease` and the cluster ends the lease,

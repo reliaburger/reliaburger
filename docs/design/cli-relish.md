@@ -170,7 +170,7 @@ The API client is a thin wrapper around `reqwest` configured with:
 - **Fixed local endpoint** by default (`http[s]://127.0.0.1:9117`), overridable with `--endpoint` / `RELIABURGER_ENDPOINT`. There is no automatic multi-node endpoint discovery.
 - **WebSocket upgrade** for streaming endpoints (logs, exec).
 - **Retry with backoff** for transient failures (connection refused, 503). Maximum 3 retries with 1s/2s/4s backoff.
-- **Request timeout:** 300 s for a request that answers in one go. A streaming response (`relish logs -f`, the apply and rollback progress streams) has no total deadline; it ends after 60 s of silence, and the agent sends an SSE keep-alive comment every 15 s.
+- **Request timeout:** 300 s for a request that answers in one go, and for the wait until a streaming response starts. Once it streams (`relish logs -f`, the apply and rollback progress streams), a response ends after 60 s of silence, and the agent sends an SSE keep-alive comment every 15 s. A deploy's progress stream also stops after 30 minutes, with an error saying the deploy may still be running.
 
 ### Output Formatting
 

@@ -696,7 +696,15 @@ which records hold an author's words: a lease's records carry `holder`
 beside `purpose`, and a proposal's own records (`proposal.*`) and the app
 records a proposal made (which carry `author_kind`) hold its `reason`.
 Other records have a `reason` too, such as a refused lease's, but that one
-the cluster wrote, so it stays in `details`. Every caller puts the result in
+the cluster wrote, so it stays in `details`. That only holds if the
+cluster's sentences never quote the purpose, and at first they did: a
+refused lease's `reason`, its message, a `proposal.refused` message and the
+`lease_held` error all said "held by holmes (rolling back)". The review
+caught it, and now no `Display` of a refusal includes the purpose; it
+travels only as the lease's own field. The test that guards it builds a
+`lease.refused` record with the route's own function and checks that the
+purpose shows up in `timeline`, `relish events -o json` and `relish audit
+-o json` inside `author_text` and nowhere else. Every caller puts the result in
 a field named `author_text`. `relish audit` builds its JSON with
 `#[serde(flatten)]` on a cloned record beside that one new field: `flatten`
 writes the inner struct's fields at the outer level, so the answer keeps the
@@ -7142,7 +7150,7 @@ it stops them by name. `relish apply`, `deploy`, `stop`, `delete`,
 and someone else's lease answers `409` with `code: "lease_held"`:
 
 ```text
-app:shop/web is held by holmes for 87s more (rolling back); repeat with --break-lease to take it over
+app:shop/web is held by holmes for 87s more; repeat with --break-lease to take it over
 ```
 
 Repeated with `--break-lease`, the leader breaks each lease in the way,
