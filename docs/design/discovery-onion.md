@@ -361,7 +361,7 @@ Bun rebuilds it from scratch with the namespace and firewall maps (`sync_firewal
 
 An address two owners claim at once (a stale catalogue meeting a reused host port) becomes contested: its namespace is `0xFFFFFFFF`, which no source has, so every namespaced caller is refused until the owners agree. The hooks look up the exact `(ip, port)` first, then `(ip, 0)`. A service's real addresses carry the service's `app_id`, so one `allow_from` grant covers its VIP and its real addresses. A job's identity is `0x8000_0000 | hash(namespace/name)`, which no VIP-derived id can equal.
 
-Traffic that never meets a socket hook (raw sockets, or a container dialling this node's address at a published host port, which the portmap DNAT forwards; the DNAT rule matches only destinations local to the node, so the same port on another node or an outside service is left alone) is checked again on the forward path by the `reliaburger_isolation` nftables table (`src/firewall/isolation.rs`). It holds each local workload address in a per-namespace set and drops a packet from one host veth to another workload's address unless the namespaces match, `allow_from` granted the pair, or the packet answers an allowed connection.
+Traffic that never meets a socket hook (raw sockets, or a container dialling any address at a published host port, which the portmap DNAT forwards) is checked again on the forward path by the `reliaburger_isolation` nftables table (`src/firewall/isolation.rs`). It holds each local workload address in a per-namespace set and drops a packet from one host veth to another workload's address unless the namespaces match, `allow_from` granted the pair, or the packet answers an allowed connection.
 
 ### Virtual IP Allocation: `VirtualIP`
 

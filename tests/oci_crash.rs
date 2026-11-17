@@ -1389,9 +1389,6 @@ async fn normal_clustered_bun_recovers_enrolled_consumer_before_adoption() {
     // host can't all bind the gateway's port 53.
     config.dns = base.dns;
     config.network.advertise_address = Some("127.0.0.1".into());
-    // A clustered runc Bun applies the perimeter, so its ports must sit
-    // outside the host-port range.
-    config.network.port_range = bun_process::host_port_range_clear_of_test_ports();
     // The restart below rebinds these, so they stay leased until the end.
     let cluster_ports = bun_process::reserve_port_block_lease(3);
     config.cluster.gossip_port = cluster_ports.base;
@@ -1635,9 +1632,6 @@ async fn enrolled_upgrade_fixture(
     // host can't all bind the gateway's port 53.
     config.dns = base.dns;
     config.network.advertise_address = Some("127.0.0.1".into());
-    // A clustered runc Bun applies the perimeter, so its ports must sit
-    // outside the host-port range.
-    config.network.port_range = bun_process::host_port_range_clear_of_test_ports();
     // Council discovery requires the same gossip-to-Raft offset on every
     // node. Each upgrade exec rebinds all three, like the API port.
     let cluster_ports = bun_process::reserve_port_block_lease(3);

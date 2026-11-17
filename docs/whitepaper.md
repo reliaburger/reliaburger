@@ -763,7 +763,7 @@ Worker nodes use a CSR model: they generate a keypair locally, send a CSR to the
 
 Three layers of built-in firewall:
 
-1. **Cluster perimeter** (nftables): external traffic enters only through Wrapper. Container host ports answer only cluster members and the node itself, both on the input hook and, for ports published to containers (which the node's own containers can also reach), before the port map rewrites them to a container address. The port map rewrites only connections addressed to the node, so a container's call to the same port number on another node or outside service leaves unchanged
+1. **Cluster perimeter** (nftables): external traffic enters only through Wrapper
 2. **Namespace isolation** (eBPF, backed by nftables): cross-namespace traffic is blocked by default, at service VIPs and at real addresses alike: a backend's container address on any port and a published host port on any node. The socket hooks hold containers, delegated job tasks and host `exec`/`script` workloads (which start inside their own cgroup) to it; a forward-path nftables table catches traffic between local containers that never meets a socket hook, such as raw sockets or a host port reached through DNAT. Processes outside Reliaburger's cgroups (host daemons, Bun itself) stay outside the policy, and a host workload running as root can leave its cgroup, so isolation keeps honest host commands in bounds rather than containing hostile ones.
 3. **Cross-namespace grants** (eBPF `allow_from`): an app or job names the apps and jobs in other namespaces that may connect to it. `allow_from` only opens cross-namespace paths; apps in one namespace always reach each other. Finer control inside a namespace would reuse the same real-address mechanism, and may come later.
 

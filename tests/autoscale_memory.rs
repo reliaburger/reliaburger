@@ -178,9 +178,6 @@ async fn runc_autoscaler_scales_up_on_real_memory_growth() {
     node.dns.enabled = false;
     node.node.name = Some("node-01".into());
     node.network.advertise_address = Some("127.0.0.1".into());
-    // A clustered runc Bun applies the perimeter, so its ports must sit
-    // outside the host-port range.
-    node.network.port_range = bun_process::host_port_range_clear_of_test_ports();
     node.storage.data = root.path().join("data");
     node.storage.images = root.path().join("images");
     node.storage.logs = root.path().join("logs");
