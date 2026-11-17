@@ -890,22 +890,26 @@ fn build_resources_from_ranges(
 ) -> Option<OciResources> {
     let mut unified = BTreeMap::new();
 
-    let cpu_res = cpu.map(|range| {
+    let cpu_res = cpu.and_then(|range| {
         if range.request > 0 {
             let weight = cgroup::cpu_weight_from_millicores(range.request);
             unified.insert("cpu.weight".to_string(), weight.to_string());
         }
-        OciCpuResources {
-            quota: (range.limit * 100_000 / 1000) as i64,
-            period: 100_000,
-        }
+        // A quota too large to compute sets none, like `cpu.max`'s `max`.
+        // Config parsing refuses such a limit; this guards the arithmetic.
+        let quota =
+            cgroup::cpu_quota_us(range.limit).and_then(|quota| i64::try_from(quota).ok())?;
+        Some(OciCpuResources {
+            quota,
+            period: cgroup::CGROUP_PERIOD_US,
+        })
     });
 
     let memory_res = memory.map(|range| OciMemoryResources {
         limit: range.limit as i64,
     });
 
-    if cpu_res.is_some() || memory_res.is_some() {
+    if cpu_res.is_some() || memory_res.is_some() || !unified.is_empty() {
         Some(OciResources {
             pids: None,
             cpu: cpu_res,
@@ -1827,6 +1831,22 @@ mod tests {
         let cpu = resources.cpu.unwrap();
         assert_eq!(cpu.quota, 100_000); // 1000m = full CPU
         assert_eq!(cpu.period, 100_000);
+    }
+
+    /// A CPU limit whose quota can't be computed sets no CFS quota rather
+    /// than a wrapped or negative one (#2042).
+    #[test]
+    fn a_cpu_limit_whose_quota_overflows_sets_no_quota() {
+        let range = ResourceRange {
+            request: 1000,
+            limit: u64::MAX,
+        };
+        let resources = build_resources_from_ranges(Some(&range), None).unwrap();
+        assert!(resources.cpu.is_none());
+        assert_eq!(
+            resources.unified.get("cpu.weight").map(String::as_str),
+            Some("100")
+        );
     }
 
     #[test]
