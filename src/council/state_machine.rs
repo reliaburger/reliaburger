@@ -2672,6 +2672,20 @@ impl StateMachineInner {
                         reason: "node identity is retired".into(),
                     });
                 }
+                // The leaf recorded below would seat this name in
+                // `node_leaves`, so it must not share another node's Raft
+                // id any more than a join may (#2050).
+                if let Some(existing) =
+                    crate::sesame::join::raft_id_taken_by(&self.state.security_state, node_id)
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: crate::sesame::join::JoinError::RaftIdCollision {
+                            node_id: node_id.clone(),
+                            existing: existing.to_string(),
+                        }
+                        .to_string(),
+                    });
+                }
                 let serial = self.state.security_state.next_serial;
                 self.state.security_state.next_serial += 1;
                 crate::sesame::ca_rotation::record_node_leaf(
@@ -3792,6 +3806,9 @@ impl CouncilStateMachine {
     /// The write uses the same enveloped format (version + checksum) as a
     /// normal snapshot, so nothing downstream can tell a recovered snapshot
     /// from an ordinary one except by the bumped `recovery_epoch`.
+    ///
+    /// `snapshot_db` must hold no snapshot yet; a populated store is refused
+    /// with an error rather than left unchanged.
     // `redb::Error` is large but dictated by the crate; boxing it buys nothing.
     #[allow(clippy::result_large_err)]
     pub fn persist_recovered_snapshot(
@@ -3800,6 +3817,23 @@ impl CouncilStateMachine {
     ) -> Result<(), redb::Error> {
         // Serialisation of a plain struct with only owned data is infallible in
         // practice; map any error into a redb error rather than panicking.
+        // Counter 1 is only right in an empty store: `persist_snapshot`
+        // skips a write that isn't newer than what's stored (#2049), so
+        // against a populated store this would silently write nothing.
+        // Recovery always stages a fresh store; refuse anything else.
+        let populated = {
+            let rtx = snapshot_db.begin_read()?;
+            match rtx.open_table(SNAPSHOT) {
+                Ok(table) => table.get(SNAP_INDEX_KEY)?.is_some(),
+                Err(redb::TableError::TableDoesNotExist(_)) => false,
+                Err(error) => return Err(error.into()),
+            }
+        };
+        if populated {
+            return Err(redb::Error::Io(std::io::Error::other(
+                "a recovered snapshot needs an empty snapshot store",
+            )));
+        }
         let data = serde_json::to_vec(&state)
             .map_err(|e| redb::Error::Io(std::io::Error::other(e.to_string())))?;
         persist_snapshot(snapshot_db, &data, 1)
@@ -8388,6 +8422,58 @@ mod tests {
         assert!(reason.contains("worker-c0"), "{reason}");
         assert!(!inner.state.security_state.join_tokens[0].consumed);
         assert_eq!(inner.state.security_state.next_serial, 7);
+    }
+
+    /// A serial for a node leaf (renewal, bootstrap) records the node in
+    /// `node_leaves` too, so it refuses a name whose Raft id another node
+    /// holds, and allocates nothing (#2050). The same name renews as before.
+    #[test]
+    fn allocate_node_serial_refuses_a_node_whose_raft_id_is_taken() {
+        let mut inner = StateMachineInner::default();
+        inner.state.security_state.next_serial = 7;
+        crate::sesame::ca_rotation::record_node_leaf(
+            &mut inner.state.security_state,
+            "worker-c0",
+            3,
+        );
+
+        let resp = inner.apply_request(&RaftRequest::AllocateNodeSerial {
+            node_id: "worker-ar".into(),
+        });
+
+        let Some(CouncilResponse::Refused { reason }) = resp else {
+            panic!("expected a refusal, got {resp:?}");
+        };
+        assert!(reason.contains("worker-c0"), "{reason}");
+        assert_eq!(inner.state.security_state.next_serial, 7);
+        assert!(
+            !inner
+                .state
+                .security_state
+                .node_leaves
+                .contains_key("worker-ar")
+        );
+        let renewal = inner.apply_request(&RaftRequest::AllocateNodeSerial {
+            node_id: "worker-c0".into(),
+        });
+        assert_eq!(
+            renewal,
+            Some(CouncilResponse::SerialAllocated { serial: 7 })
+        );
+    }
+
+    /// The recovered snapshot is written with counter 1, which a store that
+    /// already holds a snapshot would skip. Recovery always stages a fresh
+    /// store, so a populated one is a caller bug and says so.
+    #[test]
+    fn a_recovered_snapshot_refuses_a_store_that_already_holds_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::create(dir.path().join("snapshot.redb")).unwrap();
+        persist_snapshot(&db, b"{}", 4).unwrap();
+
+        let result = CouncilStateMachine::persist_recovered_snapshot(&db, DesiredState::default());
+
+        assert!(result.is_err(), "{result:?}");
     }
 
     #[test]
