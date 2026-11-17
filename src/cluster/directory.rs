@@ -18,17 +18,32 @@ use crate::council::types::CouncilNodeInfo;
 use crate::meat::types::NodeId;
 use crate::mustard::directory::NodeDirectory;
 
-/// How far a gossip leader hint's term may legitimately lead this node's own
-/// Raft term before it is treated as bogus.
+/// How far a gossip leader hint's term may legitimately lead a Raft
+/// member's own term before the member treats it as bogus.
 ///
-/// A real election bumps the term by one, and a follower/learner learns the
+/// A real election bumps the term by one, and a voter or learner learns the
 /// current term from the leader's AppendEntries, so a hint should sit at or
-/// just above the local term — the small lead absorbs gossip out-running Raft
-/// replication to a lagging node. A hint claiming a term far beyond the local
-/// term (e.g. `u64::MAX`) is rejected: because the reporting epoch only ever
-/// grows, adopting one would wedge reporting cluster-wide past every
-/// subsequent real election.
+/// just above its local term — the small lead absorbs gossip out-running Raft
+/// replication to a lagging member. A hint claiming a term far beyond it
+/// (e.g. `u64::MAX`) is rejected, so it can't carry a member's reporting
+/// epoch past every later real election.
+///
+/// The bound applies only to Raft members (#1996). A node outside the Raft
+/// membership never hears AppendEntries, so its term stays at 0 for good:
+/// bounding hints by it would lose the leader once the cluster had seen more
+/// than ten elections. Such a node follows the newest hint gossip has shown
+/// it. Gossip datagrams are HMAC-authenticated with the cluster key, and the
+/// reporting epoch only gates anything on the leader, which is a member.
 pub const MAX_LEADER_HINT_TERM_LEAD: u64 = 10;
+
+/// Where a [`LeaderView`] came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaderSource {
+    /// This node's own Raft metrics, authoritative on a Raft member.
+    Raft,
+    /// The gossip leader hint.
+    Gossip,
+}
 
 /// The resolved route to the current leader.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +53,11 @@ pub struct LeaderView {
     /// The Raft term this view was resolved under. Doubles as the
     /// reporting epoch: a new leader means a new term means a new epoch.
     pub term: u64,
+    /// The recovery epoch `term` belongs to (#1997). Each `council recover`
+    /// starts a fresh term line, so terms only compare within one epoch.
+    pub recovery_epoch: u64,
+    /// Whether Raft metrics or a gossip hint named this leader.
+    pub source: LeaderSource,
     /// The leader's HTTP API endpoint, if resolvable.
     pub api_address: Option<SocketAddr>,
     /// The leader's reporting-tree endpoint, if resolvable.
@@ -49,18 +69,20 @@ pub struct LeaderView {
 pub type MetricsReceiver = watch::Receiver<openraft::RaftMetrics<u64, CouncilNodeInfo>>;
 
 /// The Raft view of the leader, `(leader_id, raft_address, term)`, and this
-/// node's own term, copied out of the metrics channel.
-type RaftLeader = (Option<(NodeId, SocketAddr, u64)>, u64);
+/// node's own term, copied out of the metrics channel. The term is `None`
+/// on a node outside the Raft membership, which never learns one.
+type RaftLeader = (Option<(NodeId, SocketAddr, u64)>, Option<u64>);
 
 fn raft_leader(metrics: &openraft::RaftMetrics<u64, CouncilNodeInfo>) -> RaftLeader {
+    let membership = metrics.membership_config.membership();
     let leader = metrics.current_leader.and_then(|leader_id| {
-        metrics
-            .membership_config
-            .membership()
+        membership
             .get_node(&leader_id)
             .map(|info| (NodeId::new(&info.name), info.addr, metrics.current_term))
     });
-    (leader, metrics.current_term)
+    // Voters and learners both sit in the membership's node map.
+    let member = membership.get_node(&metrics.id).is_some();
+    (leader, member.then_some(metrics.current_term))
 }
 
 /// Resolve the current leader from local Raft metrics and the gossip
@@ -89,27 +111,33 @@ pub fn resolve_leader(
 /// The pure core of [`resolve_leader`], taking the Raft view already
 /// extracted as `(leader_id, raft_address, term)` so it can be unit-tested
 /// without fabricating `openraft` metrics.
+///
+/// `local_term` is this node's own Raft term, or `None` when it isn't a Raft
+/// member (#1996). The directory's leader hint is already from this node's
+/// recovery epoch or a newer one (#1997): see
+/// [`NodeDirectory::raise_recovery_floor`].
 pub fn resolve_leader_view(
     raft_leader: Option<(NodeId, SocketAddr, u64)>,
     directory: &NodeDirectory,
-    local_term: u64,
+    local_term: Option<u64>,
     raft_to_api_offset: i32,
     raft_to_reporting_offset: i32,
 ) -> Option<LeaderView> {
-    // A gossip leader hint is only trusted when its term is plausibly close to
-    // this node's own Raft term (see [`MAX_LEADER_HINT_TERM_LEAD`]). An
-    // implausibly high term is bogus and, because the reporting epoch only
-    // grows, would otherwise wedge reporting forever.
+    // A Raft member trusts a hint only when its term is plausibly close to
+    // its own (see [`MAX_LEADER_HINT_TERM_LEAD`]). A non-member has no term
+    // of its own to judge by, so it takes the hint.
     let hint_plausible = |hint: &crate::mustard::message::LeaderHint| {
-        hint.term <= local_term.saturating_add(MAX_LEADER_HINT_TERM_LEAD)
+        local_term.is_none_or(|local| hint.term <= local.saturating_add(MAX_LEADER_HINT_TERM_LEAD))
     };
+    let local_epoch = directory.recovery_floor;
     if let Some((node_id, raft_address, term)) = raft_leader {
         // A strictly newer gossip hint outranks local Raft metrics: a
         // partitioned ex-leader can keep reporting itself as leader until
-        // it steps down, while the rest of the cluster has moved on. But a
+        // it steps down, while the rest of the cluster has moved on. Newer
+        // means a newer recovery epoch, or a higher term in this one; a
         // hint far beyond the local term can never outrank real metrics.
         if let Some(hint) = &directory.leader
-            && hint.term > term
+            && (hint.recovery_epoch, hint.term) > (local_epoch, term)
             && hint_plausible(hint)
         {
             return Some(hint_view(hint));
@@ -128,6 +156,8 @@ pub fn resolve_leader_view(
         return Some(LeaderView {
             node_id,
             term,
+            recovery_epoch: local_epoch,
+            source: LeaderSource::Raft,
             api_address,
             reporting_address,
         });
@@ -185,10 +215,30 @@ pub fn leader_api_address(
         .or_else(|| directory.leader.as_ref().map(|leader| leader.api_address))
 }
 
+/// Whether the leader-target maintainer should publish `view.term` as this
+/// node's reporting epoch, given the `(recovery_epoch, term)` it published
+/// last (#1997). Returns the pair to remember when it should.
+///
+/// The leader's own Raft metrics are authoritative, so a Raft view always
+/// sets the epoch, even downwards: that is what lets a recovered leader, or
+/// one whose epoch an old council's hint once raised, schedule again. A
+/// gossip view only moves the epoch forward, ordered by recovery epoch and
+/// then term, so a lagging hint can't roll it back.
+pub fn next_reporting_epoch(last: Option<(u64, u64)>, view: &LeaderView) -> Option<(u64, u64)> {
+    let key = (view.recovery_epoch, view.term);
+    let publish = match view.source {
+        LeaderSource::Raft => last != Some(key),
+        LeaderSource::Gossip => last.is_none_or(|last| key > last),
+    };
+    publish.then_some(key)
+}
+
 fn hint_view(hint: &crate::mustard::message::LeaderHint) -> LeaderView {
     LeaderView {
         node_id: hint.node_id.clone(),
         term: hint.term,
+        recovery_epoch: hint.recovery_epoch,
+        source: LeaderSource::Gossip,
         api_address: Some(hint.api_address),
         reporting_address: Some(hint.reporting_address),
     }
@@ -272,16 +322,128 @@ mod tests {
             leader: Some(hint("leader", 5, 9117, 9445)),
             ..Default::default()
         };
-        let view = resolve_leader_view(None, &directory, 5, 2, 1).unwrap();
+        let view = resolve_leader_view(None, &directory, None, 2, 1).unwrap();
         assert_eq!(view.node_id, NodeId::new("leader"));
         assert_eq!(view.term, 5);
+        assert_eq!(view.source, LeaderSource::Gossip);
         assert_eq!(view.api_address, Some(addr(9117)));
         assert_eq!(view.reporting_address, Some(addr(9445)));
     }
 
     #[test]
     fn no_leader_anywhere_resolves_to_none() {
-        assert!(resolve_leader_view(None, &NodeDirectory::default(), 0, 2, 1).is_none());
+        assert!(resolve_leader_view(None, &NodeDirectory::default(), None, 2, 1).is_none());
+        assert!(resolve_leader_view(None, &NodeDirectory::default(), Some(0), 2, 1).is_none());
+    }
+
+    // #1996: beyond the council cap a node never joins Raft. Its metrics
+    // stay at term 0 with no membership, however many elections the
+    // cluster has had, so bounding the hint by that term lost the leader
+    // after the tenth. This drives the real metrics path.
+    #[test]
+    fn a_node_outside_raft_follows_the_leader_after_many_elections() {
+        let (_metrics_tx, metrics) = watch::channel(openraft::RaftMetrics::new_initial(9));
+        let (_directory_tx, directory) = watch::channel(NodeDirectory {
+            leader: Some(hint("leader", 50, 9117, 9445)),
+            ..Default::default()
+        });
+        let view = resolve_leader(&metrics, &directory, 2, 1)
+            .expect("a node outside Raft lost the leader at term 50");
+        assert_eq!(view.node_id, NodeId::new("leader"));
+        assert_eq!(view.term, 50);
+        assert_eq!(view.api_address, Some(addr(9117)));
+    }
+
+    // #1997: after `council recover` the recovered leader starts a fresh
+    // term line at a new recovery epoch. The replaced council's hint, still
+    // relayed by survivors, has a higher term from the old line: it must not
+    // outrank the recovered leader's own metrics.
+    #[test]
+    fn an_old_councils_hint_cannot_outrank_a_recovered_leader() {
+        let mut directory = NodeDirectory::default();
+        let mut stale = hint("old-leader", 9, 9217, 9545);
+        stale.recovery_epoch = 0;
+        directory.observe_hint(&stale);
+        directory.raise_recovery_floor(1);
+
+        let view = resolve_leader_view(raft_leader_at(3), &directory, Some(3), 2, 1).unwrap();
+        assert_eq!(view.node_id, NodeId::new("survivor"));
+        assert_eq!((view.recovery_epoch, view.term), (1, 3));
+        assert_eq!(view.source, LeaderSource::Raft);
+
+        // A hint from the new council, at a higher term, still outranks.
+        let mut newer = hint("successor", 4, 9217, 9545);
+        newer.recovery_epoch = 1;
+        directory.observe_hint(&newer);
+        let view = resolve_leader_view(raft_leader_at(3), &directory, Some(3), 2, 1).unwrap();
+        assert_eq!(view.node_id, NodeId::new("successor"));
+    }
+
+    fn raft_leader_at(term: u64) -> Option<(NodeId, SocketAddr, u64)> {
+        Some((NodeId::new("survivor"), addr(9444), term))
+    }
+
+    fn view(source: LeaderSource, recovery_epoch: u64, term: u64) -> LeaderView {
+        LeaderView {
+            node_id: NodeId::new("leader"),
+            term,
+            recovery_epoch,
+            source,
+            api_address: None,
+            reporting_address: None,
+        }
+    }
+
+    // #1997: an old council's term once raised the reporting epoch, and the
+    // epoch only grew, so the recovered leader's lower term never matched
+    // it and every orchestration pass was skipped.
+    #[test]
+    fn the_leaders_own_term_sets_the_reporting_epoch_even_downwards() {
+        let raised = Some((0, 9));
+        assert_eq!(
+            next_reporting_epoch(raised, &view(LeaderSource::Raft, 1, 3)),
+            Some((1, 3))
+        );
+        assert_eq!(
+            next_reporting_epoch(raised, &view(LeaderSource::Raft, 0, 7)),
+            Some((0, 7)),
+            "Raft metrics are authoritative, even below a hint's term"
+        );
+        assert_eq!(
+            next_reporting_epoch(Some((1, 3)), &view(LeaderSource::Raft, 1, 3)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_gossip_hint_only_moves_the_reporting_epoch_forward() {
+        let last = Some((1, 5));
+        // A lagging hint can't roll the epoch back.
+        assert_eq!(
+            next_reporting_epoch(last, &view(LeaderSource::Gossip, 1, 4)),
+            None
+        );
+        assert_eq!(
+            next_reporting_epoch(last, &view(LeaderSource::Gossip, 0, 9)),
+            None
+        );
+        assert_eq!(
+            next_reporting_epoch(last, &view(LeaderSource::Gossip, 1, 5)),
+            None
+        );
+        // A newer term, or a newer recovery epoch with a lower term, moves it.
+        assert_eq!(
+            next_reporting_epoch(last, &view(LeaderSource::Gossip, 1, 6)),
+            Some((1, 6))
+        );
+        assert_eq!(
+            next_reporting_epoch(last, &view(LeaderSource::Gossip, 2, 1)),
+            Some((2, 1))
+        );
+        assert_eq!(
+            next_reporting_epoch(None, &view(LeaderSource::Gossip, 0, 1)),
+            Some((0, 1))
+        );
     }
 
     #[test]
@@ -297,7 +459,7 @@ mod tests {
         // Raft knows the leader at raft port 9444; the directory's
         // advertised addresses win over 9444+offset.
         let raft = Some((NodeId::new("leader"), addr(9444), 7));
-        let view = resolve_leader_view(raft, &directory, 7, 2, 1).unwrap();
+        let view = resolve_leader_view(raft, &directory, Some(7), 2, 1).unwrap();
         assert_eq!(view.term, 7);
         assert_eq!(view.api_address, Some(addr(19117)));
         assert_eq!(view.reporting_address, Some(addr(19445)));
@@ -306,7 +468,7 @@ mod tests {
     #[test]
     fn voter_falls_back_to_offset_derivation_without_a_directory_entry() {
         let raft = Some((NodeId::new("leader"), addr(9444), 7));
-        let view = resolve_leader_view(raft, &NodeDirectory::default(), 7, 2, 1).unwrap();
+        let view = resolve_leader_view(raft, &NodeDirectory::default(), Some(7), 2, 1).unwrap();
         assert_eq!(view.api_address, Some(addr(9446)));
         assert_eq!(view.reporting_address, Some(addr(9445)));
     }
@@ -320,7 +482,7 @@ mod tests {
             ..Default::default()
         };
         let raft = Some((NodeId::new("old-leader"), addr(9444), 6));
-        let view = resolve_leader_view(raft, &directory, 6, 2, 1).unwrap();
+        let view = resolve_leader_view(raft, &directory, Some(6), 2, 1).unwrap();
         assert_eq!(view.node_id, NodeId::new("new-leader"));
         assert_eq!(view.term, 7);
     }
@@ -332,7 +494,7 @@ mod tests {
             ..Default::default()
         };
         let raft = Some((NodeId::new("raft-leader"), addr(9444), 7));
-        let view = resolve_leader_view(raft, &directory, 7, 2, 1).unwrap();
+        let view = resolve_leader_view(raft, &directory, Some(7), 2, 1).unwrap();
         assert_eq!(view.node_id, NodeId::new("raft-leader"));
     }
 
@@ -347,7 +509,7 @@ mod tests {
 
         // Voter path: the absurd hint cannot outrank the node's own metrics.
         let raft = Some((NodeId::new("real-leader"), addr(9444), 7));
-        let view = resolve_leader_view(raft, &directory, 7, 2, 1).unwrap();
+        let view = resolve_leader_view(raft, &directory, Some(7), 2, 1).unwrap();
         assert_eq!(
             view.node_id,
             NodeId::new("real-leader"),
@@ -355,22 +517,22 @@ mod tests {
         );
         assert_eq!(view.term, 7);
 
-        // Non-voter path: with no Raft leader, the absurd hint is rejected
-        // outright rather than adopted (which would fix the epoch at MAX).
-        assert!(resolve_leader_view(None, &directory, 7, 2, 1).is_none());
+        // A member between leaders rejects the absurd hint outright rather
+        // than adopting it (which would fix its epoch at MAX).
+        assert!(resolve_leader_view(None, &directory, Some(7), 2, 1).is_none());
 
         // A hint just within the window is still honoured.
         let near = NodeDirectory {
             leader: Some(hint("near", 7 + MAX_LEADER_HINT_TERM_LEAD, 9217, 9545)),
             ..Default::default()
         };
-        assert!(resolve_leader_view(None, &near, 7, 2, 1).is_some());
+        assert!(resolve_leader_view(None, &near, Some(7), 2, 1).is_some());
     }
 
     #[test]
     fn offset_derivation_rejects_out_of_range_ports() {
         let raft = Some((NodeId::new("leader"), addr(65535), 1));
-        let view = resolve_leader_view(raft, &NodeDirectory::default(), 1, 2, -1).unwrap();
+        let view = resolve_leader_view(raft, &NodeDirectory::default(), Some(1), 2, -1).unwrap();
         assert_eq!(view.api_address, None);
         assert_eq!(view.reporting_address, Some(addr(65534)));
     }

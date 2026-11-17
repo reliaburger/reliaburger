@@ -875,12 +875,15 @@ fn spawn_leader_hint_publisher(
     let self_id = identity::raft_id_from_name(&node_id.0);
     spawn_supervised("cluster:leader-hint", supervision, async move {
         loop {
+            // Read the fence before the metrics borrow, so the two watch
+            // borrows are never held together (#1273, #1433).
+            let recovery_epoch = fence.snapshot().epoch;
             let hint = {
                 let m = metrics_rx.borrow();
                 (m.current_leader == Some(self_id)).then(|| LeaderHint {
                     node_id: node_id.clone(),
                     term: m.current_term,
-                    recovery_epoch: fence.snapshot().epoch,
+                    recovery_epoch,
                     api_address,
                     reporting_address,
                 })
@@ -970,6 +973,8 @@ fn spawn_leader_target_maintainer(
 ) {
     let shutdown = supervision.shutdown.clone();
     spawn_supervised("cluster:leader-target", supervision, async move {
+        // The `(recovery_epoch, term)` last published as the epoch.
+        let mut published = None;
         loop {
             let view = crate::cluster::directory::resolve_leader(
                 &metrics_rx,
@@ -989,16 +994,21 @@ fn spawn_leader_target_maintainer(
                         }
                     });
                 }
-                // Terms only grow; ignoring lower values keeps a lagging
-                // gossip hint from briefly rolling the epoch back.
-                epoch_tx.send_if_modified(|epoch| {
-                    if view.term > *epoch {
-                        *epoch = view.term;
-                        true
-                    } else {
-                        false
-                    }
-                });
+                // This node's own Raft term always sets the epoch; a gossip
+                // hint only moves it forward, by recovery epoch then term
+                // (#1997).
+                if let Some(key) = crate::cluster::directory::next_reporting_epoch(published, &view)
+                {
+                    published = Some(key);
+                    epoch_tx.send_if_modified(|epoch| {
+                        if *epoch != view.term {
+                            *epoch = view.term;
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                }
             }
             tokio::select! {
                 _ = shutdown.cancelled() => break,
