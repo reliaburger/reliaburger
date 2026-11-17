@@ -1321,13 +1321,25 @@ where
     false
 }
 
+/// How the lagging-voter scenario plays out after the swap.
+#[derive(Clone, Copy, PartialEq)]
+enum AfterTheSwap {
+    /// Node 3, evicted, keeps running and can vouch for node 4.
+    EvictedVoterRuns,
+    /// As `EvictedVoterRuns`, with node 2 restarted while it lags.
+    LaggingVoterRestarts,
+    /// Node 3 dies too, so node 2 can reach none of the voters it knows.
+    EvictedVoterDies,
+}
+
 /// The council `{1, 2, 3}` swaps voter 3 for node 4 while voter 2 lags: the
 /// joint and the final configs commit without it, so its membership still
 /// says `{1, 2, 3}`. Then leader 1 crashes. Node 4 can only win with node
 /// 2's vote, and node 2 has never heard of node 4, so it must ask voter 3
-/// (evicted, but still running) before it votes. With `restart`, node 2 is
-/// restarted while it lags, so the check holds after a restart too.
-async fn lagging_voter_still_elects_a_new_voter(restart: bool) {
+/// (evicted, but still running) before it votes. `after` picks the
+/// variant: node 2 restarted while it lags, or voter 3 dead too, which is
+/// the documented case with no leader until node 1 returns.
+async fn lagging_voter_after_a_swap(after: AfterTheSwap) {
     let tls = TlsSetup::new();
     let identities: Vec<NodeIdentity> = (1..=4)
         .map(|id| tls.identity(&format!("n{id}"), 10 + id))
@@ -1387,25 +1399,53 @@ async fn lagging_voter_still_elects_a_new_voter(restart: bool) {
         "node 2 was meant to miss the change"
     );
 
-    if restart {
-        let address = nodes[1].address;
-        crash(&nodes[1]).await;
-        let (log, state) = stores[1].clone();
-        nodes[1] = start_vouching_node(2, &identities[1], log, state, address).await;
-        // openraft publishes the restored membership shortly after start.
-        assert!(
-            eventually(50, || async { applied_voters(&nodes[1].council) == three }).await,
-            "the restarted node didn't come back with its old membership"
-        );
+    match after {
+        AfterTheSwap::EvictedVoterRuns => {}
+        AfterTheSwap::LaggingVoterRestarts => {
+            let address = nodes[1].address;
+            crash(&nodes[1]).await;
+            let (log, state) = stores[1].clone();
+            nodes[1] = start_vouching_node(2, &identities[1], log, state, address).await;
+            // openraft publishes the restored membership shortly after start.
+            assert!(
+                eventually(50, || async { applied_voters(&nodes[1].council) == three }).await,
+                "the restarted node didn't come back with its old membership"
+            );
+        }
+        AfterTheSwap::EvictedVoterDies => crash(&nodes[2]).await,
     }
 
     crash(&nodes[0]).await;
     let new_leader = Arc::clone(&nodes[3].council);
-    assert!(
-        eventually(300, || new_leader.is_leader()).await,
-        "node 4 never won an election with the lagging voter's vote"
-    );
     let final_voters = BTreeSet::from([1, 2, 4]);
+    if after == AfterTheSwap::EvictedVoterDies {
+        // Every voter node 2 knows is gone, so nobody can vouch for node 4,
+        // and node 4 can't win without node 2's vote: no leader. This is the
+        // documented limit; the way out is to bring node 1 (or 3) back, or
+        // recover the council.
+        assert!(
+            !eventually(100, || async {
+                new_leader.is_leader().await || nodes[1].council.is_leader().await
+            })
+            .await,
+            "nobody can vouch for node 4, so the council must stay without a leader"
+        );
+        let address = nodes[0].address;
+        let (log, state) = stores[0].clone();
+        nodes[0] = start_vouching_node(1, &identities[0], log, state, address).await;
+        assert!(
+            eventually(300, || async {
+                nodes[0].council.is_leader().await || new_leader.is_leader().await
+            })
+            .await,
+            "the council never elected a leader once node 1 came back"
+        );
+    } else {
+        assert!(
+            eventually(300, || new_leader.is_leader()).await,
+            "node 4 never won an election with the lagging voter's vote"
+        );
+    }
     assert!(
         eventually(100, || async {
             applied_voters(&nodes[1].council) == final_voters
@@ -1414,7 +1454,7 @@ async fn lagging_voter_still_elects_a_new_voter(restart: bool) {
         "the lagging voter never caught up with the new leader"
     );
 
-    for node in &nodes[1..] {
+    for node in &nodes {
         crash(node).await;
     }
     stores.clear();
@@ -1422,10 +1462,19 @@ async fn lagging_voter_still_elects_a_new_voter(restart: bool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lagging_voter_votes_for_a_voter_added_while_it_was_behind() {
-    lagging_voter_still_elects_a_new_voter(false).await;
+    lagging_voter_after_a_swap(AfterTheSwap::EvictedVoterRuns).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lagging_voter_restarted_while_behind_still_votes_for_the_new_voter() {
-    lagging_voter_still_elects_a_new_voter(true).await;
+    lagging_voter_after_a_swap(AfterTheSwap::LaggingVoterRestarts).await;
+}
+
+/// The documented limit of the membership check: once leader 1 and the
+/// swapped-out voter 3 are both gone, node 2 can reach none of the voters
+/// it knows, nobody can vouch for node 4, and the council has no leader.
+/// It recovers when node 1 comes back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lagging_voter_that_lost_every_voter_it_knows_waits_for_one_to_return() {
+    lagging_voter_after_a_swap(AfterTheSwap::EvictedVoterDies).await;
 }
