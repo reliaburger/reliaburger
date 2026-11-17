@@ -160,7 +160,14 @@ impl CaptureTasks {
     }
 
     fn abort(&self) {
-        for reader in self.readers.lock().unwrap().iter().flatten() {
+        // A poisoned lock still holds valid abort handles: aborting is all we do.
+        for reader in self
+            .readers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .flatten()
+        {
             reader.abort();
         }
     }
@@ -903,10 +910,13 @@ impl super::Grill for ProcessGrill {
         // Spawn tasks to capture stdout/stderr (in-memory mode only —
         // file-backed mode has no pipes to read).
         let stdout_buf = entry.stdout_buf.clone();
-        if let Some(stdout) = child.stdout.take() {
+        // The pipes exist only in in-memory mode, which is when `capture` is set.
+        if let Some(stdout) = child.stdout.take()
+            && let Some(capture) = capture.as_ref()
+        {
             #[cfg(test)]
             let gate = self.capture_gate.clone();
-            let capture = capture.as_ref().unwrap().clone();
+            let capture = capture.clone();
             let completion = CaptureCompletion {
                 capture: capture.clone(),
                 index: 0,
@@ -936,14 +946,20 @@ impl super::Grill for ProcessGrill {
                     }
                 }
             });
-            capture.readers.lock().unwrap()[0] = Some(reader_task.abort_handle());
+            capture
+                .readers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)[0] =
+                Some(reader_task.abort_handle());
         }
 
         let stderr_buf = entry.stderr_buf.clone();
-        if let Some(stderr) = child.stderr.take() {
+        if let Some(stderr) = child.stderr.take()
+            && let Some(capture) = capture.as_ref()
+        {
             #[cfg(test)]
             let gate = self.capture_gate.clone();
-            let capture = capture.as_ref().unwrap().clone();
+            let capture = capture.clone();
             let completion = CaptureCompletion {
                 capture: capture.clone(),
                 index: 1,
@@ -973,7 +989,11 @@ impl super::Grill for ProcessGrill {
                     }
                 }
             });
-            capture.readers.lock().unwrap()[1] = Some(reader_task.abort_handle());
+            capture
+                .readers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)[1] =
+                Some(reader_task.abort_handle());
         }
 
         entry.capture = capture;

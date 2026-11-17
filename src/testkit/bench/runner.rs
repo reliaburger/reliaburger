@@ -143,6 +143,8 @@ pub async fn run(
             }
         };
         let chaos = ChaosGuard::default();
+        // `Deadline::after` refuses only a zero or overflowing budget. This
+        // one and the two cleanup budgets below are constants in minutes.
         let deadline = Deadline::after(timeout).expect("suite timeout is non-zero");
         let context = SuiteContext {
             client: client.clone(),

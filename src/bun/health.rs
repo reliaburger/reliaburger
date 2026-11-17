@@ -273,11 +273,11 @@ impl HealthChecker {
     /// Skips entries for unregistered instances (lazy deletion).
     /// Returns the instance ID and a clone of its config.
     pub fn pop_due(&mut self, now: Instant) -> Option<(InstanceId, HealthCheckConfig)> {
-        while let Some(Reverse(entry)) = self.heap.peek() {
-            if entry.deadline > now {
+        while let Some(top) = self.heap.peek_mut() {
+            if top.0.deadline > now {
                 return None;
             }
-            let Reverse(entry) = self.heap.pop().unwrap();
+            let Reverse(entry) = std::collections::binary_heap::PeekMut::pop(top);
             // Skip stale entries from unregistered instances
             if let Some(config) = self.configs.get(&entry.instance_id) {
                 return Some((entry.instance_id, config.clone()));

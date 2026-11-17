@@ -259,6 +259,9 @@ impl LogOptions {
     pub(crate) fn line_filter(&self) -> LineFilter {
         let grep = self.grep.as_deref().map(|pattern| {
             regex::Regex::new(pattern).unwrap_or_else(|_| {
+                // An escaped pattern is a plain literal. It compiles unless it
+                // is past regex's size limit, megabytes longer than any
+                // command line.
                 regex::Regex::new(&regex::escape(pattern)).expect("an escaped pattern compiles")
             })
         });
