@@ -3280,6 +3280,33 @@
       ]
     },
     {
+      "id": "issue-555-legacy-oci-owned_network-published_ports_answer_members_only_and_rewrite_only_local_destinations",
+      "issue": 555,
+      "promise": "Complete the exact retained legacy OCI case through its finite owned driver.",
+      "supported_paths": [
+        "Exact original ignored test identity and declared Make owner."
+      ],
+      "refused_paths": [
+        "No generic aliases or success from another test or owner."
+      ],
+      "boundaries": [
+        "Source binding only; real isolated Linux OCI execution and current receipt are required."
+      ],
+      "cases": [
+        {
+          "id": "legacy-oci-owned_network-published_ports_answer_members_only_and_rewrite_only_local_destinations",
+          "binary": "reliaburger::owned_network",
+          "test": "published_ports_answer_members_only_and_rewrite_only_local_destinations",
+          "requires": [
+            "oci-interruptions"
+          ],
+          "sources": [
+            "tests/owned_network.rs"
+          ]
+        }
+      ]
+    },
+    {
       "id": "issue-555-legacy-oci-owned_runc-runc_owned_preparation_recovers_original_intent_and_retires_without_adoption",
       "issue": 555,
       "promise": "Complete the exact retained legacy OCI case through its finite owned driver.",

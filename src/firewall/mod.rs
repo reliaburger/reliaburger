@@ -8,7 +8,10 @@ pub mod isolation;
 /// reporting) and the management API. Cluster nodes bypass every block;
 /// listed bootstrap peers reach the management and cluster ports; operator
 /// CIDRs (`[security] operator_cidrs`) reach the management API port only.
-/// Everything else (SSH, operator services) is untouched.
+/// Everything else (SSH, operator services) is untouched. Published container
+/// ports are held to the same policy on the prerouting hook, before the port
+/// map rewrites them to a container address and sends them down the forward
+/// path, where the input chain never sees them.
 ///
 /// Uses its own `reliaburger_fw` nftables table, separate from the
 /// `reliaburger` table `grill::netns` uses for port mapping. Rules are
