@@ -1200,12 +1200,6 @@
     "test": "operator_cidr_reaches_the_api_port_but_not_cluster_ports"
   },
   {
-    "source": "tests/owned_network.rs",
-    "function": "published_ports_answer_members_only_and_rewrite_only_local_destinations",
-    "binary": "reliaburger::owned_network",
-    "test": "published_ports_answer_members_only_and_rewrite_only_local_destinations"
-  },
-  {
     "source": "tests/owned_rootless.rs",
     "function": "rootless_cluster_refuses_before_ownership_recovery_for_every_selection",
     "binary": "reliaburger::owned_rootless",

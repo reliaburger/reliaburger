@@ -142,7 +142,7 @@ nft add chain ip reliaburger prerouting { type nat hook prerouting priority -100
 nft add rule ip reliaburger prerouting tcp dport {host_port} dnat to {container_ip}:{service_port}
 ```
 
-This is kernel-level forwarding. Zero copies, zero userspace overhead. The perimeter firewall, later in this chapter, gets a table of its own, `reliaburger_fw`, so that rebuilding it never touches these NAT chains.
+This is kernel-level forwarding. Zero copies, zero userspace overhead. We reuse this same nftables table later for the perimeter firewall.
 
 **Rootless mode uses a Rust TCP proxy.** We can't touch nftables without root, so we spawn a tokio task that binds the host port and forwards connections to the container:
 
@@ -906,7 +906,7 @@ Onion handles traffic inside the cluster. But when a browser hits `myapp.com`, t
 
 ### Why not just expose the containers directly?
 
-Each container gets a dynamically allocated host port (from `[network] port_range`, 10000-32767 by default). You could map DNS to `node-ip:30891` and call it a day. Three problems:
+Each container gets a dynamically allocated host port (30000-31000). You could map DNS to `node-ip:30891` and call it a day. Three problems:
 
 1. The port changes every time the container restarts or moves to a different node.
 2. You'd need one DNS record per container per app. With 10 replicas across 5 nodes, that's 50 records to manage.
@@ -1066,7 +1066,7 @@ The config side is a new `[ingress]` section in node.toml, disabled by default �
 
 ### What we're protecting
 
-A Reliaburger node exposes a lot of ports: container host ports (10000-32767 by default), gossip (9443), Raft (9444), reporting (9445), the management API (9117), plus whatever the operator runs (SSH, monitoring, etc.). Not all of these should be reachable from the outside.
+A Reliaburger node exposes a lot of ports: container host ports (30000-31000), gossip (9443), Raft (9444), reporting (9445), the management API (9117), plus whatever the operator runs (SSH, monitoring, etc.). Not all of these should be reachable from the outside.
 
 The obvious approach would be a default-deny firewall: block everything, then poke holes for what's needed. We tried that. Turns out, blocking *everything* also blocks SSH, and the first time you apply a default-deny ruleset on a remote server without an out-of-band console, you learn that lesson the hard way.
 
@@ -1074,9 +1074,9 @@ So we took a different approach. We only block *our* ports. SSH, the operator's 
 
 ### What gets blocked
 
-The nftables input chain in the `reliaburger_fw` table has `policy accept` (everything passes by default) and explicit `drop` rules for three port ranges:
+The nftables input chain in the `reliaburger` table has `policy accept` (everything passes by default) and explicit `drop` rules for three port ranges:
 
-1. **Container host ports (`[network] port_range`, 10000-32767 by default)**: Dynamically allocated by the port allocator. External clients should reach containers through Wrapper (ports 80/443), not by hitting these ports directly.
+1. **Container host ports (30000-31000)**: Dynamically allocated by the port allocator. External clients should reach containers through Wrapper (ports 80/443), not by hitting these ports directly.
 
 2. **Cluster ports (9443, 9444, 9445)**: Gossip, Raft consensus, and reporting tree communication. Only cluster node IPs should reach these.
 
@@ -1085,29 +1085,6 @@ The nftables input chain in the `reliaburger_fw` table has `policy accept` (ever
 Cluster nodes get a blanket `accept` rule that comes *before* all the `drop` rules. So inter-node traffic is never blocked — gossip, scheduling, state replication all work normally. Operator CIDRs (`[security] operator_cidrs`, wired up in Chapter 4) get access to the management port specifically.
 
 The order matters in nftables: first match wins. Cluster node accept → operator CIDR accept → drop rules → everything else passes.
-
-### The packets that never reach input
-
-Here's a question worth pausing on. A client outside the cluster connects to `node-ip:21000`, and 21000 is a port Bun published for a container. Which chain sees that packet?
-
-Not the input chain. The `reliaburger` table's prerouting rule rewrites the destination to the container's address before the kernel decides where the packet goes. After the rewrite it isn't addressed to the node any more, so the kernel routes it down the *forward* path, past the input chain and its `tcp dport 10000-32767 drop`, and into the container. The input chain only ever saw the host ports nothing had rewritten.
-
-So the `reliaburger_fw` table has a second chain, a filter chain on the prerouting hook at priority -150. nftables runs hooks in priority order, lowest first, and the port map's NAT chain sits at -100, so this one sees every packet before the rewrite:
-
-```
-chain prerouting {
-    type filter hook prerouting priority -150; policy accept;
-    iif "lo" accept
-    iifname "veth-*" accept
-    ct direction reply ct state established,related accept
-    ip saddr { 10.0.1.1, 10.0.1.2 } accept
-    fib daddr type local tcp dport 10000-32767 drop
-}
-```
-
-It holds published ports to the input chain's policy: loopback, this node's own containers (every host-side veth is `veth-…`), replies to connections the node opened, and cluster members get through. Everyone else's connection to a host port on this node is dropped. Operator CIDRs and bootstrap peers aren't on the list, just as they aren't for host ports in the input chain. `fib daddr type local` asks the routing table whether the destination is one of this node's own addresses, so traffic passing through to somewhere else on the same port number (a container talking to MongoDB on 27017, say) is none of this chain's business.
-
-Legitimate traffic still flows. Wrapper on another node reaches a backend at `node-ip:host-port` from that node's address, a cluster member. A container calling a remote backend through Onion leaves its node masqueraded behind the node's address too. Local backends never need the host port at all: Onion and Wrapper send them to the container's own address.
 
 ### Two address families, two tables
 
@@ -1135,7 +1112,7 @@ fn cluster_nodes_bypass_all_blocks() {
     let rules = generate_ruleset(&config, &nodes);
     // Accept comes before drop
     let accept_pos = rules.find("10.0.1.1 } accept").unwrap();
-    let drop_pos = rules.find("10000-32767 drop").unwrap();
+    let drop_pos = rules.find("30000-31000 drop").unwrap();
     assert!(accept_pos < drop_pos);
 }
 ```

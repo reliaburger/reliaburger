@@ -11,7 +11,7 @@
     "gate": "oci-interruptions",
     "group": "owned_network",
     "runtime": "linux-network-namespaces",
-    "source_sha256": "f3ed341aa7ffa78906624ef185b94f1d0969050954b752a7f2caabc7462d9da4",
+    "source_sha256": "0b34fc3a001e8a114cf80f5760d7578e2a859a63540ed7e892c524c04bfa829d",
     "case_id": "legacy-oci-owned_network-owned_network_setup_and_forwarding_retire_through_the_generation"
   },
   {
@@ -26,7 +26,7 @@
     "gate": "oci-interruptions",
     "group": "owned_network",
     "runtime": "linux-network-namespaces",
-    "source_sha256": "f3ed341aa7ffa78906624ef185b94f1d0969050954b752a7f2caabc7462d9da4",
+    "source_sha256": "0b34fc3a001e8a114cf80f5760d7578e2a859a63540ed7e892c524c04bfa829d",
     "case_id": "legacy-oci-owned_network-killed_network_caller_cannot_publish_a_veth_after_recovered_retirement"
   },
   {
@@ -41,7 +41,7 @@
     "gate": "oci-interruptions",
     "group": "owned_network",
     "runtime": "linux-network-namespaces",
-    "source_sha256": "f3ed341aa7ffa78906624ef185b94f1d0969050954b752a7f2caabc7462d9da4",
+    "source_sha256": "0b34fc3a001e8a114cf80f5760d7578e2a859a63540ed7e892c524c04bfa829d",
     "case_id": "legacy-oci-owned_network-same_node_containers_have_independent_host_and_peer_routes"
   },
   {
@@ -56,23 +56,8 @@
     "gate": "oci-interruptions",
     "group": "owned_network",
     "runtime": "linux-network-namespaces",
-    "source_sha256": "f3ed341aa7ffa78906624ef185b94f1d0969050954b752a7f2caabc7462d9da4",
+    "source_sha256": "0b34fc3a001e8a114cf80f5760d7578e2a859a63540ed7e892c524c04bfa829d",
     "case_id": "legacy-oci-owned_network-operator_cidr_reaches_the_api_port_but_not_cluster_ports"
-  },
-  {
-    "source": "tests/owned_network.rs",
-    "function": "published_ports_answer_members_only_and_rewrite_only_local_destinations",
-    "binary": "reliaburger::owned_network",
-    "test": "published_ports_answer_members_only_and_rewrite_only_local_destinations",
-    "declared_owner": [
-      "make",
-      "test-linux"
-    ],
-    "gate": "oci-interruptions",
-    "group": "owned_network",
-    "runtime": "linux-network-namespaces",
-    "source_sha256": "f3ed341aa7ffa78906624ef185b94f1d0969050954b752a7f2caabc7462d9da4",
-    "case_id": "legacy-oci-owned_network-published_ports_answer_members_only_and_rewrite_only_local_destinations"
   },
   {
     "source": "tests/owned_runc.rs",

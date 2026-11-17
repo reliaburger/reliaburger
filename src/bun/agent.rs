@@ -1547,12 +1547,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.cgroup_mount = mount;
     }
 
-    /// Whether this agent applies the nftables perimeter (rootful Linux in
-    /// cluster mode).
-    pub fn perimeter_enabled(&self) -> bool {
-        self.perimeter_config.enabled
-    }
-
     /// Configure the actual protected listener ports, explicit enrolment peers
     /// and operator networks allowed to the management port. This grants
     /// network reachability only; protocol authentication still applies.

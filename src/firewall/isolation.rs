@@ -2,7 +2,7 @@
 //!
 //! The eBPF socket hooks hold every `connect()` and `sendmsg()` to namespace
 //! isolation, but some traffic never meets a socket hook: raw sockets, and a
-//! container dialling this node's address at a published host port, which the
+//! container dialling any address at a published host port, which the
 //! `reliaburger` table's DNAT then forwards to another container on this
 //! node. This table checks what the hooks can't see, after DNAT, on the
 //! forward path between host veths (`veth-…`): a packet from one local
