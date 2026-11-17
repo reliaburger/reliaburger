@@ -135,6 +135,7 @@ async fn push_pull_with_10k_members_is_bounded_and_sweeps_the_table() {
                     1,
                     GossipPayload::Sync {
                         entries: vec![],
+                        floors: vec![],
                         wants_reply: true,
                     },
                 ),
