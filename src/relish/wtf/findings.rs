@@ -196,6 +196,12 @@ pub const FINDINGS: &[FindingKind] = &[
         ],
     },
     FindingKind {
+        id: "export-failing",
+        severities: WARNING,
+        meaning: "a node can't export its logs or metrics; it prunes only what it has exported, so the store's size cap and retention are on hold until an export works",
+        thresholds: &[],
+    },
+    FindingKind {
         id: "cert-expired",
         severities: CRITICAL,
         meaning: "a node or workload certificate is past its not-after time",

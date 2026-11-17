@@ -87,6 +87,72 @@ pub struct DiagnosticStaticEvidence {
     pub storage_paths: Vec<DiagnosticStoragePath>,
     /// Public node leaf metadata, when cluster mTLS is configured.
     pub node_certificate: Option<PublicCertificateMetadata>,
+    /// The stores whose export is failing, as Bun's disk-pressure task
+    /// last found them.
+    pub export_holds: ExportHolds,
+}
+
+/// A store whose export is failing (#2062). With an export destination set,
+/// Bun prunes only what it has exported, so while the export fails it
+/// prunes nothing: the store's size cap and retention are both on hold.
+///
+/// No error text: an object store's error can name a host path, and this
+/// payload never carries one. Bun's log has the reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExportHoldEvidence {
+    /// `logs` or `metrics`.
+    pub storage_domain: String,
+    /// Unix seconds of the first failed export since the last one that
+    /// worked.
+    pub failing_since: u64,
+}
+
+/// Which stores' exports are failing, shared between the disk-pressure task
+/// that finds out and the diagnostics endpoint that reports it.
+///
+/// A std mutex: it's held only to update or copy a small map, in
+/// synchronous code, never across an `.await`.
+#[derive(Debug, Clone, Default)]
+pub struct ExportHolds(std::sync::Arc<std::sync::Mutex<BTreeMap<String, u64>>>);
+
+// Two handles are equal when they share one record. Needed because
+// `StaticCapabilities` compares equal by value; nothing compares holds.
+impl PartialEq for ExportHolds {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ExportHolds {}
+
+impl ExportHolds {
+    /// Record the outcome of one export attempt for `storage_domain`: a
+    /// failure starts (or continues) a hold, anything else ends it.
+    pub fn record(&self, storage_domain: &str, failed: bool, now: u64) {
+        let mut holds = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if failed {
+            holds.entry(storage_domain.to_string()).or_insert(now);
+        } else {
+            holds.remove(storage_domain);
+        }
+    }
+
+    /// The holds in force, sorted by storage domain.
+    pub fn current(&self) -> Vec<ExportHoldEvidence> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|(storage_domain, failing_since)| ExportHoldEvidence {
+                storage_domain: storage_domain.clone(),
+                failing_since: *failing_since,
+            })
+            .collect()
+    }
 }
 
 /// Capacity evidence for one configured storage domain.
@@ -167,6 +233,9 @@ pub struct LocalDiagnosticSnapshot {
     pub cpu_throttling: DiagnosticSource<Vec<CpuThrottleEvidence>>,
     /// Public certificate lifecycle metadata.
     pub certificates: DiagnosticSource<Vec<PublicCertificateMetadata>>,
+    /// Stores whose export is failing, so their retention is on hold.
+    #[serde(default)]
+    pub export_holds: Vec<ExportHoldEvidence>,
 }
 
 /// Desired service state used to distinguish an intentionally empty service
@@ -644,6 +713,23 @@ mod tests {
     }
 
     #[test]
+    fn an_export_hold_lasts_from_the_first_failure_until_an_export_works() {
+        let holds = ExportHolds::default();
+        holds.record("logs", true, 100);
+        holds.record("logs", true, 400);
+        holds.record("metrics", false, 400);
+        assert_eq!(
+            holds.current(),
+            [ExportHoldEvidence {
+                storage_domain: "logs".to_string(),
+                failing_since: 100,
+            }]
+        );
+        holds.clone().record("logs", false, 700);
+        assert!(holds.current().is_empty(), "a clone shares the record");
+    }
+
+    #[test]
     fn public_snapshot_never_serialises_paths_or_certificate_material() {
         let snapshot = LocalDiagnosticSnapshot {
             schema_version: LOCAL_DIAGNOSTIC_SCHEMA_VERSION,
@@ -676,6 +762,7 @@ mod tests {
                 }],
                 reason: "workload inventory is not exposed".to_string(),
             },
+            export_holds: Vec::new(),
         };
 
         let json = serde_json::to_string(&snapshot).unwrap();

@@ -2765,7 +2765,11 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
 
     // Spawn disk pressure check task (every 5 minutes)
     // Exports un-exported files before pruning, so data is never lost.
+    // A failing export holds that store's retention; `relish wtf` reports
+    // it from these holds (#2062).
+    let export_holds = reliaburger::bun::diagnostics::ExportHolds::default();
     {
+        let dp_export_holds = export_holds.clone();
         let dp_log_store = Arc::clone(&log_store);
         let dp_mayo_store = Arc::clone(&mayo_store);
         let dp_shutdown = shutdown.clone();
@@ -2824,8 +2828,16 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                             log_retention_days,
                         )
                         .await;
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        dp_export_holds.record("logs", log_result.export_error.is_some(), now);
                         if let Some(error) = &log_result.export_error {
-                            eprintln!("bun: log export failed during disk pressure: {error}");
+                            eprintln!(
+                                "bun: log export failed during disk pressure: {error}; \
+                                 no log files are pruned until an export works"
+                            );
                         }
                         if log_result.files_pruned > 0 {
                             println!(
@@ -2844,8 +2856,16 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                             metrics_retention_days,
                         )
                         .await;
+                        dp_export_holds.record(
+                            "metrics",
+                            metrics_result.export_error.is_some(),
+                            now,
+                        );
                         if let Some(error) = &metrics_result.export_error {
-                            eprintln!("bun: metrics export failed during disk pressure: {error}");
+                            eprintln!(
+                                "bun: metrics export failed during disk pressure: {error}; \
+                                 no metrics files are pruned until an export works"
+                            );
                         }
                         if metrics_result.files_pruned > 0 {
                             println!(
@@ -3177,6 +3197,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         diagnostics: reliaburger::bun::diagnostics::DiagnosticStaticEvidence {
             storage_paths: diagnostic_storage_paths,
             node_certificate: None,
+            export_holds: export_holds.clone(),
         },
         test_policy: config.testing.clone(),
         token_lifetime: config.security.token_lifetime(),

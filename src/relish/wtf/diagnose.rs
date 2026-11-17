@@ -40,6 +40,7 @@ pub fn diagnose(inputs: &WtfInputs) -> WtfReport {
         check_council(inputs, &mut report);
         check_faults(inputs, &mut report);
         check_disks(inputs, &mut report);
+        check_export_holds(inputs, &mut report);
         check_certificates(inputs, &mut report);
         check_registry(inputs, &mut report);
         check_tokens(inputs, &mut report);
@@ -86,6 +87,7 @@ fn record_cluster_unknowns(evidence: &ClusterEvidence, report: &mut WtfReport) {
     record_unknown("council", &evidence.council, "cluster", report);
     record_unknown("faults", &evidence.faults, "cluster", report);
     record_unknown("disks", &evidence.disks, "cluster", report);
+    record_unknown("export_holds", &evidence.export_holds, "cluster", report);
     record_unknown("certificates", &evidence.certificates, "cluster", report);
     record_unknown("registry", &evidence.registry, "cluster", report);
     record_unknown("tokens", &evidence.tokens, "cluster", report);
@@ -1151,6 +1153,40 @@ fn check_disks(inputs: &WtfInputs, report: &mut WtfReport) {
     }
 }
 
+/// A store whose export keeps failing prunes nothing (#2062): with an export
+/// destination set, Bun deletes only what it has shipped, so its size cap
+/// and retention wait until an export works and the disk fills meanwhile.
+fn check_export_holds(inputs: &WtfInputs, report: &mut WtfReport) {
+    let Some(holds) = inputs.cluster.export_holds.value() else {
+        return;
+    };
+    for hold in holds {
+        let failing_for = inputs.collected_at.saturating_sub(hold.failing_since);
+        report.warnings.push(WtfFinding {
+            id: "export-failing".to_string(),
+            title: format!(
+                "node {} can't export its {}, so their retention is on hold",
+                hold.node_id, hold.storage_domain
+            ),
+            details: vec![
+                format!("exports have failed for {failing_for} s"),
+                format!(
+                    "until one works, the node prunes no {} files: neither max_storage_mb \
+                     nor retention_days applies",
+                    hold.storage_domain
+                ),
+            ],
+            suggestion: format!(
+                "fix the [{}] export_path destination (credentials, bucket, path); node {}'s \
+                 Bun log says why each export failed",
+                hold.storage_domain, hold.node_id
+            ),
+            correlated_events: Vec::new(),
+            affected_resource: format!("node.{}", hold.node_id),
+        });
+    }
+}
+
 fn check_cpu_throttling(inputs: &WtfInputs, report: &mut WtfReport) {
     let Some(observations) = inputs.applications.cpu_throttling.value() else {
         return;
@@ -1650,10 +1686,10 @@ pub(super) mod tests {
     use super::*;
     use crate::relish::wtf::{
         AlertObservation, CertificateObservation, CouncilObservation, CpuThrottleObservation,
-        DeployObservation, DiskObservation, FaultObservation, GitOpsObservation,
-        IsolationObservation, LaunchFailureObservation, LogObservation, NodeGitOpsDifference,
-        NodeIsolation, NodeObservation, RegistryObservation, ReplicaObservation,
-        RestartObservation, ServiceObservation, TokenObservation,
+        DeployObservation, DiskObservation, ExportHoldObservation, FaultObservation,
+        GitOpsObservation, IsolationObservation, LaunchFailureObservation, LogObservation,
+        NodeGitOpsDifference, NodeIsolation, NodeObservation, RegistryObservation,
+        ReplicaObservation, RestartObservation, ServiceObservation, TokenObservation,
     };
 
     pub(in crate::relish::wtf) const NOW: u64 = 2_000_000;
@@ -1693,6 +1729,7 @@ pub(super) mod tests {
                     total_bytes: 100,
                     used_percent: 20.0,
                 }]),
+                export_holds: available(Vec::new()),
                 certificates: available(vec![CertificateObservation {
                     certificate_kind: "node".to_string(),
                     identity: "node-1".to_string(),
@@ -1932,6 +1969,38 @@ pub(super) mod tests {
         assert_eq!(report.node_count, 1);
         assert_eq!(report.summary.ok_count, report.ok.len());
         assert!(report.ok.iter().any(|ok| ok.id == "nodes"));
+    }
+
+    /// A failing export holds the store's retention, which only Bun's log
+    /// said, every five minutes, while the disk filled (#2062).
+    #[test]
+    fn a_failing_export_is_a_warning_that_retention_is_on_hold() {
+        let mut inputs = healthy_inputs();
+        inputs.cluster.export_holds = available(vec![ExportHoldObservation {
+            node_id: "node-1".to_string(),
+            storage_domain: "logs".to_string(),
+            failing_since: NOW - 600,
+        }]);
+
+        let report = diagnose(&inputs);
+
+        let finding = report
+            .warnings
+            .iter()
+            .find(|finding| finding.id == "export-failing")
+            .expect("an export-failing warning");
+        assert_eq!(finding.affected_resource, "node.node-1");
+        assert!(
+            finding.title.contains("retention is on hold"),
+            "{}",
+            finding.title
+        );
+        assert!(
+            finding.details[0].contains("600 s"),
+            "{:?}",
+            finding.details
+        );
+        assert!(finding.suggestion.contains("[logs] export_path"));
     }
 
     #[test]

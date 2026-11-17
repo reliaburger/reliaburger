@@ -324,6 +324,7 @@ pub(super) async fn diagnostics_handler(
         disks,
         cpu_throttling,
         certificates,
+        export_holds: state.static_capabilities.diagnostics.export_holds.current(),
     })
 }
 
