@@ -74,6 +74,11 @@ pub fn portmap_definition() -> Vec<String> {
 }
 
 /// Argv for the single prerouting rule that consults the map.
+///
+/// The rule matches only packets addressed to this node (`fib daddr type
+/// local`). Host ports are allocated per node, so the same number on another
+/// node, or on a service outside the cluster, belongs to someone else, and a
+/// container's connection to that address leaves the node unchanged.
 pub fn map_rule() -> Vec<String> {
     [
         "add",
@@ -81,6 +86,10 @@ pub fn map_rule() -> Vec<String> {
         "ip",
         TABLE,
         "prerouting",
+        "fib",
+        "daddr",
+        "type",
+        "local",
         "dnat",
         "ip",
         "addr",
@@ -95,6 +104,28 @@ pub fn map_rule() -> Vec<String> {
     .into_iter()
     .map(String::from)
     .collect()
+}
+
+/// Argv emptying the prerouting chain. The chain holds nothing but the map
+/// rule, and the elements live in the map, so flushing it loses no mapping.
+pub fn flush_prerouting() -> Vec<String> {
+    ["flush", "chain", "ip", TABLE, "prerouting"]
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
+/// Whether a `nft list chain` listing of the prerouting chain holds the map
+/// rule as [`map_rule`] writes it, and no other version of it. A node can
+/// keep an older rule in the kernel across an upgrade; `false` tells the
+/// caller to replace it.
+pub fn prerouting_is_current(listing: &str) -> bool {
+    let map_reference = format!("@{MAP}");
+    let mut rules = listing.lines().filter(|line| line.contains(&map_reference));
+    let Some(first) = rules.next() else {
+        return false;
+    };
+    first.contains("fib daddr type local") && rules.next().is_none()
 }
 
 /// Argv adding one element to the map.
@@ -371,7 +402,22 @@ pub(crate) mod tests {
     fn map_rule_syntax() {
         assert_eq!(
             map_rule().join(" "),
-            "add rule ip reliaburger prerouting dnat ip addr . port to tcp dport map @portmap"
+            "add rule ip reliaburger prerouting fib daddr type local dnat ip addr . port to tcp dport map @portmap"
+        );
+    }
+
+    #[test]
+    fn only_the_local_destination_rule_counts_as_current() {
+        let current = "table ip reliaburger {\n\tchain prerouting {\n\t\ttype nat hook prerouting priority dstnat; policy accept;\n\t\tfib daddr type local dnat ip addr . port to tcp dport map @portmap # handle 5\n\t}\n}\n";
+        let unscoped = "table ip reliaburger {\n\tchain prerouting {\n\t\tdnat ip addr . port to tcp dport map @portmap # handle 4\n\t}\n}\n";
+        let both = "\t\tdnat ip addr . port to tcp dport map @portmap # handle 4\n\t\tfib daddr type local dnat ip addr . port to tcp dport map @portmap # handle 5\n";
+        assert!(prerouting_is_current(current));
+        assert!(!prerouting_is_current(unscoped));
+        assert!(!prerouting_is_current(both));
+        assert!(!prerouting_is_current("table ip reliaburger {\n}\n"));
+        assert_eq!(
+            flush_prerouting().join(" "),
+            "flush chain ip reliaburger prerouting"
         );
     }
 

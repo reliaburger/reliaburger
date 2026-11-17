@@ -45,6 +45,11 @@ The Bun API also has to listen on a routable address (`bun --listen
   (`192.168.0.17/24`; the error names `192.168.0.0/24`).
 - It's read at startup; there's no live reload.
 
+Container host ports (`[network] port_range`, 10000-32767 by default) answer
+only cluster members and the node itself. That holds for ports published to
+containers too, which the node's own containers can also reach. Clients
+outside the cluster reach apps through Wrapper's ingress ports instead.
+
 Rootless Bun and macOS don't run the perimeter, so the setting has no effect
 there. The laptop quickstart doesn't need it either: it reaches each node's API
 through a port forward that arrives on the node's loopback.

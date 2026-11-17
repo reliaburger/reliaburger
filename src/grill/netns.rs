@@ -776,7 +776,9 @@ pub async fn teardown_container_network_with_commands(
 /// Anything a container sends is accepted: to another container on this
 /// node, or out through the masquerade. Traffic towards a container is
 /// accepted only as a reply, or when a published port's DNAT sent it there,
-/// so the rest of the network can't route into container addresses.
+/// so the rest of the network can't route into container addresses. Who may
+/// reach a published port at all is the perimeter's call, made in its
+/// prerouting chain before the DNAT (`firewall::rules`).
 const FORWARD_ACCEPT_RULES: [&[&str]; 2] = [
     &["-i", "veth-+", "-j", "ACCEPT"],
     &[
@@ -901,9 +903,12 @@ async fn ensure_nft_table(executor: &impl RuntimeCommandExecutor) -> Result<(), 
     // The named port map (`add map` is idempotent, like table/chain).
     run_nft(executor, &portmap::portmap_definition()).await?;
 
-    // The single lookup rule that consults the map, guarded the same way.
+    // The single lookup rule that consults the map. `add rule` appends, so
+    // probe first. A chain holding an older version of the rule (the kernel
+    // keeps it across a Bun upgrade) is emptied and rewritten.
     let prerouting = list_chain(executor, "prerouting").await?;
-    if !prerouting.contains("@portmap") {
+    if !portmap::prerouting_is_current(&prerouting) {
+        run_nft(executor, &portmap::flush_prerouting()).await?;
         run_nft(executor, &portmap::map_rule()).await?;
     }
 
@@ -1216,6 +1221,65 @@ mod tests {
         assert_ne!(host_veth_name(&first), host_veth_name(&second));
     }
 
+    /// Answers every command with success, listing `prerouting` as the given
+    /// text, and records the nft argv it saw.
+    struct ScriptedNft {
+        prerouting: &'static str,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RuntimeCommandExecutor for ScriptedNft {
+        async fn output(
+            &self,
+            _program: &str,
+            arguments: &[&str],
+        ) -> std::io::Result<crate::grill::command::CommandOutput> {
+            // A short, non-async critical section: the lock is never held
+            // across an await.
+            self.calls.lock().unwrap().push(arguments.join(" "));
+            let stdout = if arguments.ends_with(&["prerouting"]) && arguments[0] == "-a" {
+                self.prerouting.as_bytes().to_vec()
+            } else {
+                b"masquerade".to_vec()
+            };
+            Ok(crate::grill::command::CommandOutput {
+                exit_code: Some(0),
+                stdout,
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn an_older_port_map_rule_is_replaced_and_a_current_one_kept() {
+        let older = ScriptedNft {
+            prerouting: "dnat ip addr . port to tcp dport map @portmap # handle 4",
+            calls: Default::default(),
+        };
+        ensure_nft_table(&older).await.unwrap();
+        let calls = older.calls.lock().unwrap().clone();
+        let flush = calls
+            .iter()
+            .position(|call| call == "flush chain ip reliaburger prerouting")
+            .expect("older rule must be flushed");
+        assert_eq!(
+            calls[flush + 1],
+            "add rule ip reliaburger prerouting fib daddr type local dnat ip addr . port to tcp dport map @portmap"
+        );
+
+        let current = ScriptedNft {
+            prerouting: "fib daddr type local dnat ip addr . port to tcp dport map @portmap # handle 5",
+            calls: Default::default(),
+        };
+        ensure_nft_table(&current).await.unwrap();
+        let calls = current.calls.lock().unwrap().clone();
+        assert!(
+            !calls.iter().any(|call| call.starts_with("flush")
+                || call.contains("add rule ip reliaburger prerouting")),
+            "{calls:?}"
+        );
+    }
+
     // Argv generation for map elements is unit-tested in
     // `grill::portmap` (cross-platform); only the live nftables
     // behaviour is tested here, behind the netns gate.
@@ -1443,6 +1507,12 @@ mod tests {
         ensure_nft_table(&DirectCommandExecutor)
             .await
             .expect("failed to ensure table");
+        // The kernel's own listing of the rule we wrote must read as
+        // current, or every setup would flush and rewrite the chain.
+        let listing = list_chain(&DirectCommandExecutor, "prerouting")
+            .await
+            .unwrap();
+        assert!(portmap::prerouting_is_current(&listing), "{listing}");
         let executor = NftCommandExecutor;
         let container_ip = Ipv4Addr::new(10, 0, 2, 2);
 
