@@ -96,6 +96,9 @@ job_controller=$repository/scripts/release/job_soak.py
 job_inventory=$repository/scripts/release/job_soak_inventory.py
 export_retention=$repository/scripts/release/soak_export_retention.py
 guest_memory=$repository/scripts/release/sustained/guest-memory.sh
+# power_off, power_on and settle, shared with qualify-power-cut-endurance.sh.
+# shellcheck source=sustained/power.sh
+. "$repository/scripts/release/sustained/power.sh"
 bun_memory_awk=$repository/scripts/release/sustained/bun-memory.awk
 history_client=$repository/scripts/release/council_history.py
 linearizability=$repository/scripts/release/linearizability.py
@@ -313,6 +316,7 @@ evidence=$(cd "$evidence" && pwd)
 [ -n "$record" ] || record=$evidence/record.md
 [ ! -e "$record" ] || fail "$record already exists"
 mkdir -p "$evidence/snapshots" "$evidence/failures" "$evidence/tls" "$evidence/config"
+power_log_dir=$evidence/snapshots
 chmod 700 "$evidence"
 [ "$plan" = true ] || say "evidence: $evidence"
 
@@ -1458,37 +1462,33 @@ next_rotation=$(( $(date +%s) + rotation ))
 open_window() { window_label=$1; check window "$evidence" open "$1" --down "${2:-0}" ${3:+--node "$3"}; }
 close_window() { check window "$evidence" "${1:-close}"; window_label=; }
 
-# Wait for two consecutive clean settle checks after a fault.
-settle() {
-    local label=$1 deadline=$2 started streak=0 elapsed
-    started=$(date +%s)
-    while :; do
-        elapsed=$(( $(date +%s) - started ))
-        if [ "$elapsed" -ge "$deadline" ]; then
-            close_window close
-            event --phase "$label" --verdict fail --settle-seconds "$elapsed" --detail "not settled within $deadline s"
-            record_failure settle "$label did not settle within $deadline s" "${last_snapshot:-}"
-            return 1
-        fi
-        # Heavy checks and rotations keep their cadence through long settles.
-        local kind=settle
-        if [ "$(date +%s)" -ge "$next_heavy" ]; then
-            kind=heavy
-            next_heavy=$(( $(date +%s) + heavy_every ))
-        fi
-        if observe "$kind"; then streak=$(( streak + 1 )); else streak=0; fi
-        if [ "$(date +%s)" -ge "$next_rotation" ]; then
-            run_slot rotate_ingress
-            next_rotation=$(( $(date +%s) + rotation ))
-        fi
-        if [ "$streak" -ge 2 ]; then
-            close_window settled
-            event --phase "$label" --verdict settled --settle-seconds "$(( $(date +%s) - started ))"
-            say "$label settled in $(( $(date +%s) - started )) s"
-            return 0
-        fi
-        sleep 10
-    done
+# settle (sustained/power.sh) waits for two consecutive clean checks after a
+# fault. Heavy checks and rotations keep their cadence through long settles.
+settle_probe() {
+    local kind=settle
+    if [ "$(date +%s)" -ge "$next_heavy" ]; then
+        kind=heavy
+        next_heavy=$(( $(date +%s) + heavy_every ))
+    fi
+    observe "$kind"
+}
+settle_between() {
+    if [ "$(date +%s)" -ge "$next_rotation" ]; then
+        run_slot rotate_ingress
+        next_rotation=$(( $(date +%s) + rotation ))
+    fi
+}
+settle_timed_out() {
+    local label=$1 deadline=$2 elapsed=$3
+    close_window close
+    event --phase "$label" --verdict fail --settle-seconds "$elapsed" --detail "not settled within $deadline s"
+    record_failure settle "$label did not settle within $deadline s" "${last_snapshot:-}"
+}
+settle_succeeded() {
+    local label=$1 seconds=$2
+    close_window settled
+    event --phase "$label" --verdict settled --settle-seconds "$seconds"
+    say "$label settled in $seconds s"
 }
 
 # Every choice comes from the run's seed and is logged as a `choice` event
@@ -1543,21 +1543,18 @@ slot_deploy_kill() {
     avoid=0
 }
 
+# power_off and power_on (sustained/power.sh) cut a node's VM and bring it
+# back; these hooks are the soak's bookkeeping around them.
 power_offs=0
-power_off() {
+power_before_off() {
     local node=$1
     job_mark_fault "$node" "${current_slot:-power-off}"
     keep_host_logs power-off "$node"
-    down[node]=1
     check power-cut "$evidence"
-    "$limactl" stop --force "${vm[node]}" > "$evidence/snapshots/power-off-$node-$(date +%s).log" 2>&1 || true
 }
-power_on() {
-    local node=$1 result=0
-    "$relish" local start "$node" > "$evidence/snapshots/power-on-$node-$(date +%s).log" 2>&1 || result=$?
-    down[node]=0
+power_after_on() {
+    local node=$1
     push_current_pair "$node"
-    return "$result"
 }
 
 slot_power_off() {

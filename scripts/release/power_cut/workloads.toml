@@ -1,0 +1,80 @@
+# Workloads for the power-cut endurance run
+# (scripts/release/qualify-power-cut-endurance.sh). The data-bearing apps of
+# the sustained soak (scripts/release/sustained/soak-workloads.toml), the same
+# commands and pinned images, without the soak's placement labels: step 1
+# runs on one node, so every volume stays where it was made.
+#
+# The harness reads `ACK n` from the writer's log and `INCR n` from the Redis
+# client's log just before each cut, and after power returns checks that
+# /data/seq holds 1..N, that the counter never went backwards, and, the part
+# that can actually see a loss, where each one resumed. By the time the
+# cluster has settled the writer has appended hundreds of lines and the
+# client has counted on, so a file or counter that lost acknowledged values
+# looks whole again. So each start records its resume point durably before
+# doing anything else: the writer appends the last whole line it found to
+# /data/resumes, the client pushes the counter it found onto soak:starts.
+# These two commands differ from the soak's only in that.
+
+# Appends 1, 2, 3, ... to /data/seq about ten times a second, syncs, then logs
+# `ACK n`. On start it drops a torn last line (a power cut mid-append) and
+# carries on from the last whole one.
+[app.soak-writer]
+image = "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028"
+command = ["/bin/sh", "-c", '''
+trap 'exit 0' TERM
+f=/data/seq
+touch "$f"
+lines=$(wc -l < "$f")
+head -n "$lines" "$f" > "$f.tmp" && mv "$f.tmp" "$f" && sync
+n=$(tail -n 1 "$f")
+echo "RESUME ${n:-0} after $lines lines"
+n=${n:-0}
+echo "$n" >> /data/resumes
+sync
+while true; do
+  n=$((n + 1))
+  echo "$n" >> "$f"
+  sync
+  echo "ACK $n"
+  sleep 0.1
+done
+''']
+
+[[app.soak-writer.volumes]]
+path = "/data"
+size = "256Mi"
+
+# Redis with an append-only file synced on every write.
+[app.soak-redis]
+image = "public.ecr.aws/docker/library/redis@sha256:234c902a2db49461a129e2d4aeff85b28cf20187ed274a67f6e50995fa713c7b"
+command = ["redis-server", "--dir", "/data", "--appendonly", "yes", "--appendfsync", "always"]
+port = 6379
+
+[[app.soak-redis.volumes]]
+path = "/data"
+size = "256Mi"
+
+# On start, push the counter it finds onto soak:starts; then INCR once a
+# second, logging `INCR n`. The counter must never go backwards.
+[app.soak-redis-client]
+image = "public.ecr.aws/docker/library/redis@sha256:234c902a2db49461a129e2d4aeff85b28cf20187ed274a67f6e50995fa713c7b"
+command = ["/bin/sh", "-c", '''
+trap 'exit 0' TERM
+# Before the first INCR: record the counter as this start found it.
+until start=$(redis-cli -h soak-redis -p 6379 GET soak:counter 2>&1) \
+  && case $start in ''|*[!0-9]*) [ -z "$start" ] ;; *) true ;; esac \
+  && pushed=$(redis-cli -h soak-redis -p 6379 RPUSH soak:starts "${start:-0}" 2>&1) \
+  && case $pushed in ''|*[!0-9]*) false ;; *) true ;; esac; do
+  echo "ERR start $start $pushed"
+  sleep 1
+done
+echo "START ${start:-0}"
+while true; do
+  v=$(redis-cli -h soak-redis -p 6379 INCR soak:counter 2>&1)
+  case $v in
+    ''|*[!0-9]*) echo "ERR $v" ;;
+    *) echo "INCR $v" ;;
+  esac
+  sleep 1
+done
+''']
