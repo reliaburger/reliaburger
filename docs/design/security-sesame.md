@@ -1050,14 +1050,23 @@ The dashboard follows the same scope, cookie or bearer. `GET /`,
 `/ui/fragment/apps` and `/ui/fragment/nodes` list and count only in-scope
 apps, and `/ui/node/{name}` lists only in-scope instances, trimming the peer's
 answer (fetched under the service token) as `/v1/status?cluster=true` does.
-These routes name no app, so the `{app}` source check can't see them;
-`namespace_scoped_token_sees_only_its_namespace_on_the_dashboard` covers them.
+The alert panel (`GET /` and `/ui/fragment/alerts`) and `GET /v1/alerts`
+keep only alerts whose series names an in-scope app (`app` is
+`<namespace>/<app>`, or a bare `app` beside a `namespace` label); an alert on
+a series that names no app, such as a node's, is unscoped-only
+(`ui::alert_visible`). These routes name no app, so the `{app}` source check
+can't see them; `namespace_scoped_token_sees_only_its_namespace_on_the_dashboard`
+and `namespace_scoped_token_sees_only_its_namespaces_alerts` cover them.
 
 **Ingress hosts.** Wrapper routes a host's requests by longest path prefix
 across every app on that host, so an app on a host can take requests meant for
-another. On the leader's apply path (`cluster_apply`), a scoped token may put
+another. Wherever app specs are written for a caller, a scoped token may put
 an app on an ingress host only if every app already serving that host is in
-its scope (`authorize_ingress_hosts`). An app that already serves the host
+its scope (`authorize_ingress_hosts`, `authorize_ingress_apps`): the leader's
+apply path (`cluster_apply`), a manifest with jobs (`job_apply::apply`), and a
+proposal when it's created (as the author), approved (as the approver) and
+undone (the `before` specs, as the undoer). GitOps syncs only a repository an
+unscoped admin configured, so it carries that authority and isn't checked. An app that already serves the host
 keeps it through later applies, so an unscoped token can share a host across
 namespaces on purpose. Unscoped tokens aren't checked: they may change any of
 those apps anyway.

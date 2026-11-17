@@ -215,7 +215,7 @@ pub(super) async fn gather_dashboard_data(
     let (summary, apps, alerts, nodes) = tokio::join!(
         super::summary::gather_cluster_summary(state, auth, sources),
         gather_dashboard_apps(state, sources.directory, auth),
-        firing_dashboard_alerts(state),
+        firing_dashboard_alerts(state, auth),
         gather_dashboard_nodes(state, auth),
     );
     let (apps, apps_error) = match apps {
@@ -640,13 +640,15 @@ pub(super) async fn fragment_alerts_handler(
     {
         return resp;
     }
-    let alerts = firing_dashboard_alerts(&state).await;
+    let alerts = firing_dashboard_alerts(&state, auth.as_deref()).await;
     html_response(fragments::render_alerts_table_fragment(&alerts))
 }
 
-/// The firing alerts, shaped for the dashboard's alert table.
+/// The firing alerts `auth` may see ([`alert_visible`]), shaped for the
+/// dashboard's alert table.
 pub(super) async fn firing_dashboard_alerts(
     state: &ApiState,
+    auth: Option<&crate::sesame::auth::AuthContext>,
 ) -> Vec<crate::brioche::dashboard::DashboardAlert> {
     let Some(evaluator) = &state.alerts else {
         return Vec::new();
@@ -656,6 +658,7 @@ pub(super) async fn firing_dashboard_alerts(
         .await
         .firing_alerts()
         .iter()
+        .filter(|alert| alert_visible(auth, &alert.labels))
         .map(|a| crate::brioche::dashboard::DashboardAlert {
             labels: a.labels.clone(),
             name: a.rule_name.clone(),
@@ -663,6 +666,31 @@ pub(super) async fn firing_dashboard_alerts(
             description: a.description.clone(),
         })
         .collect()
+}
+
+/// Whether `auth` may see an alert on the series `labels` names. Per-app
+/// series carry `app = "<namespace>/<app>"` (a `namespace` label beside a
+/// bare `app` names it too), and a scoped caller sees an alert only on an
+/// app its scope covers. An alert on a series that names no app, such as a
+/// node's CPU, belongs to no tenant, so only an unscoped caller sees it.
+pub(super) fn alert_visible(
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    labels: &std::collections::BTreeMap<String, String>,
+) -> bool {
+    if crate::sesame::auth::require_unscoped(auth).is_ok() {
+        return true;
+    }
+    let Some(app) = labels.get("app") else {
+        return false;
+    };
+    let (namespace, name) = match app.split_once('/') {
+        Some((namespace, name)) => (namespace, name),
+        None => match labels.get("namespace") {
+            Some(namespace) => (namespace.as_str(), app.as_str()),
+            None => return false,
+        },
+    };
+    crate::sesame::auth::authorize_scoped(auth, name, namespace).is_ok()
 }
 
 /// `GET /ui/fragment/app/{app}/{namespace}/instances` — instance table fragment.

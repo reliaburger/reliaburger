@@ -2015,3 +2015,120 @@ async fn sec_a_refused_browser_decision_is_audited_as_the_token() {
     assert_eq!(record.details["token_name"], "bob");
     assert_eq!(record.details["reason"], "forbidden");
 }
+
+/// Commit `name` in `namespace` serving `host` at `/`, as an admin's
+/// `relish apply` would.
+async fn serve_host(cluster: &Cluster, name: &str, namespace: &str, host: &str) {
+    let spec: crate::config::app::AppSpec = toml::from_str(&format!(
+        "image = \"web:1.4\"\nport = 8080\nnamespace = \"{namespace}\"\n\
+         [ingress]\nhost = \"{host}\"\npath = \"/\"\n"
+    ))
+    .unwrap();
+    cluster
+        .council
+        .write(crate::council::types::RaftRequest::AppSpec {
+            app_id: crate::meat::AppId::new(name, namespace),
+            spec: Box::new(spec),
+        })
+        .await
+        .unwrap();
+}
+
+/// An `apply` proposal for `billing/{name}` on `host` at `path`.
+fn ingress_proposal(name: &str, host: &str, path: &str) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "apply", "namespace": "billing", "reason": "move the route",
+        "config": format!(
+            "[app.{name}]\nimage = \"web:1.4\"\nport = 8080\nnamespace = \"billing\"\n\
+             [app.{name}.ingress]\nhost = \"{host}\"\npath = \"{path}\"\n"
+        ),
+    })
+}
+
+/// A proposal writes app specs as `relish apply` does, so the ingress-host
+/// rule holds on each of its paths. A scoped author can't propose an app on
+/// a host another namespace serves; a scoped approver can't approve one
+/// whose host another namespace took since; and a scoped undo can't put an
+/// app back on a host another namespace took since. Each is judged against
+/// the cluster as it is when the step runs.
+#[tokio::test]
+async fn a_proposal_cant_route_a_host_another_namespace_serves() {
+    let cluster = cluster("proposal-ingress-host").await;
+    serve_host(&cluster, "web", "shop", "shop.example.com").await;
+
+    // Creating: refused as the author.
+    let (status, body) = cluster
+        .propose(
+            &cluster.billing_bot,
+            ingress_proposal("pay", "shop.example.com", "/login"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // Approving: the host was free when proposed, then shop took it.
+    let (status, body) = cluster
+        .propose(
+            &cluster.billing_bot,
+            ingress_proposal("pay", "pay.example.com", "/"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let id = body["id"].as_u64().unwrap();
+    serve_host(&cluster, "checkout", "shop", "pay.example.com").await;
+    let (status, body) = cluster
+        .post(
+            &format!("/v1/proposals/{id}/approve"),
+            &cluster.carol,
+            String::new(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(
+        !cluster
+            .council
+            .desired_state()
+            .await
+            .apps
+            .contains_key(&crate::meat::AppId::new("pay", "billing"))
+    );
+
+    // Undoing: ledger moves off its host, shop takes it, and the undo
+    // would put ledger back beside shop's app.
+    serve_host(&cluster, "ledger", "billing", "ledger.example.com").await;
+    let (status, body) = cluster
+        .propose(
+            &cluster.billing_bot,
+            ingress_proposal("ledger", "books.example.com", "/"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let id = body["id"].as_u64().unwrap();
+    let (status, body) = cluster
+        .post(
+            &format!("/v1/proposals/{id}/approve"),
+            &cluster.carol,
+            String::new(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "an in-scope approval: {body}");
+    assert_eq!(body["state"], "applied", "{body}");
+    serve_host(&cluster, "grab", "shop", "ledger.example.com").await;
+    let (status, body) = cluster
+        .post(
+            &format!("/v1/proposals/{id}/undo"),
+            &cluster.carol,
+            String::new(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // A cluster-wide person still undoes it.
+    let (status, body) = cluster
+        .post(
+            &format!("/v1/proposals/{id}/undo"),
+            &cluster.alice,
+            String::new(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}

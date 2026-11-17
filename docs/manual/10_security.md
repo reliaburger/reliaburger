@@ -248,7 +248,9 @@ A browser session keeps its token's permissions and scope, and it's
 read-only: a cookie can read the dashboard but never change anything. A
 session made from a scoped token sees only its apps and namespaces on every
 dashboard page, the overview, the apps table and each node's page included,
-as `/v1/status` shows it. The Proposals page
+as `/v1/status` shows it. The alert panel, like `/v1/alerts`, shows it only
+alerts on its own apps; an alert on a node's own metrics names no namespace,
+so only an unscoped token sees it. The Proposals page
 lets a person approve, reject or undo an agent's proposal, but the cookie
 can't do that on its own. These are the browser path's defences:
 

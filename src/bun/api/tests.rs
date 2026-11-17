@@ -5740,6 +5740,56 @@ async fn scoped_deployer_cannot_route_a_host_another_namespace_serves() {
     council.shutdown().await.unwrap();
 }
 
+/// A manifest with a job takes the job lifecycle instead of the app path,
+/// and its apps take ingress hosts too, so the host rule holds there: an
+/// app beside a job can't route a host another namespace serves.
+#[tokio::test]
+async fn scoped_deployer_cannot_route_another_namespaces_host_beside_a_job() {
+    let (app, council, _commands) = workload_admission_fixture("ingress-host-job").await;
+    let shop: crate::config::app::AppSpec = toml::from_str(
+        "image = \"test:v1\"\nport = 8080\n[ingress]\nhost = \"shop.example.com\"\npath = \"/\"\n",
+    )
+    .unwrap();
+    council
+        .write(crate::council::RaftRequest::AppSpec {
+            app_id: crate::meat::types::AppId::new("web", "shop"),
+            spec: Box::new(shop),
+        })
+        .await
+        .unwrap();
+    let mut dev = deployer_context();
+    dev.scoped_namespaces = Some(vec!["dev".to_string()]);
+    let job = "[job.work]\nimage = \"test:v1\"\nnamespace = \"dev\"\n";
+
+    let taking = format!(
+        "{}{job}",
+        ingress_manifest("aaa", "dev", "shop.example.com", "/login")
+    );
+    assert_eq!(
+        apply_as_context(&app, dev.clone(), &taking).await,
+        StatusCode::FORBIDDEN,
+        "an app beside a job took another namespace's host"
+    );
+    assert!(
+        !council
+            .desired_state()
+            .await
+            .apps
+            .contains_key(&crate::meat::types::AppId::new("aaa", "dev"))
+    );
+
+    let own = format!(
+        "{}{job}",
+        ingress_manifest("aaa", "dev", "dev.example.com", "/")
+    );
+    assert_ne!(
+        apply_as_context(&app, dev, &own).await,
+        StatusCode::FORBIDDEN,
+        "an app beside a job was refused its own host"
+    );
+    council.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn administrative_manifests_require_unscoped_user_admin_before_any_write() {
     let (app, council, mut commands) = workload_admission_fixture("manifest-admin").await;
@@ -8107,6 +8157,100 @@ async fn unscoped_token_sees_every_namespace_on_the_dashboard() {
 
     peer_server.abort();
     worker.abort();
+}
+
+/// A router whose alert evaluator has one rule firing on three series: an
+/// app in `team-a`, an app in `team-b` and a node, which belongs to no
+/// tenant. Its store holds `tokens`.
+async fn setup_alerts_in_two_tenants(tokens: Vec<crate::sesame::types::ApiToken>) -> Router {
+    use crate::mayo::alert::{AlertEvaluator, AlertOperator, AlertRule, AlertSeverity};
+    use crate::mayo::types::MetricKey;
+    let series = |labels: &[(&str, &str)]| {
+        MetricKey::with_labels(
+            "process_cpu_percent",
+            labels
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+        )
+    };
+    let observed = std::collections::HashMap::from([
+        (series(&[("app", "team-a/alpha-web")]), 95.0),
+        (series(&[("app", "team-b/bravo-db")]), 95.0),
+        (series(&[("node", "node-7")]), 95.0),
+    ]);
+    let mut evaluator = AlertEvaluator::new(vec![AlertRule {
+        name: "cpu-high".to_string(),
+        metric_name: "process_cpu_percent".to_string(),
+        threshold: 80.0,
+        operator: AlertOperator::GreaterThan,
+        for_duration: std::time::Duration::ZERO,
+        severity: AlertSeverity::Warning,
+        description: "CPU over 80%".to_string(),
+    }]);
+    // Pending on the first evaluation, firing on the second.
+    evaluator.evaluate(&observed);
+    evaluator.evaluate(&observed);
+    assert_eq!(evaluator.firing_alerts().len(), 3);
+    let store = crate::sesame::auth::new_token_store();
+    store.write().await.extend(tokens);
+    let (cmd_tx, _cmd_rx) = mpsc::channel(4);
+    router(
+        cmd_tx,
+        None,
+        None,
+        None,
+        None,
+        Some(Arc::new(RwLock::new(evaluator))),
+        None,
+        Some(store),
+        None,
+        None,
+        None,
+        None,
+        9117,
+        None,
+    )
+}
+
+/// The dashboard's alert panel and `/v1/alerts` show a scoped caller only
+/// the alerts on its own apps: not another namespace's, and not a node's,
+/// which names no namespace. A cluster-wide token still sees all three.
+#[tokio::test]
+async fn namespace_scoped_token_sees_only_its_namespaces_alerts() {
+    let scoped = crate::sesame::token::create_token(
+        "tenant-a-alerts",
+        crate::sesame::types::ApiRole::ReadOnly,
+        crate::sesame::types::TokenScope {
+            apps: None,
+            namespaces: Some(vec!["team-a".to_string()]),
+        },
+        None,
+    )
+    .unwrap();
+    let (admin, admin_plaintext) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let app = setup_alerts_in_two_tenants(vec![scoped.token, admin]).await;
+
+    for uri in ["/ui/fragment/alerts", "/v1/alerts"] {
+        let (code, body) = get_authenticated(app.clone(), uri, &scoped.plaintext).await;
+        assert_eq!(code, StatusCode::OK, "{uri}");
+        let body = String::from_utf8(body).unwrap();
+        assert!(
+            body.contains("alpha-web"),
+            "{uri} hid the token's own alert"
+        );
+        assert!(
+            !body.contains("bravo-db") && !body.contains("node-7"),
+            "{uri} showed an alert outside the token's scope: {body}"
+        );
+
+        let (code, body) = get_authenticated(app.clone(), uri, &admin_plaintext).await;
+        assert_eq!(code, StatusCode::OK, "{uri}");
+        let body = String::from_utf8(body).unwrap();
+        for name in ["alpha-web", "bravo-db", "node-7"] {
+            assert!(body.contains(name), "{uri} is missing {name} for an admin");
+        }
+    }
 }
 
 /// The registry holds a scoped token to `<namespace>/<app>` repositories

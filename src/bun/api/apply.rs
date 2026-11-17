@@ -609,16 +609,33 @@ pub(crate) fn runtime_knob_notes(config: &Config) -> Vec<String> {
 /// routes all lie inside its scope. An unscoped token passes, as it may
 /// change any of those apps anyway.
 #[allow(clippy::result_large_err)]
-fn authorize_ingress_hosts(
+pub(crate) fn authorize_ingress_hosts(
     auth: Option<&crate::sesame::auth::AuthContext>,
     config: &Config,
     desired: &crate::council::types::DesiredState,
 ) -> Result<(), Response> {
-    for (name, spec) in &config.app {
+    authorize_ingress_apps(
+        auth,
+        config.app.iter().map(|(name, spec)| {
+            let namespace = spec.namespace.as_deref().unwrap_or("default");
+            (crate::meat::types::AppId::new(name, namespace), spec)
+        }),
+        desired,
+    )
+}
+
+/// [`authorize_ingress_hosts`] for apps given as their identity and the
+/// spec they would have, as a proposal carries them.
+#[allow(clippy::result_large_err)]
+pub(crate) fn authorize_ingress_apps<'a>(
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    apps: impl IntoIterator<Item = (crate::meat::types::AppId, &'a crate::config::app::AppSpec)>,
+    desired: &crate::council::types::DesiredState,
+) -> Result<(), Response> {
+    for (id, spec) in apps {
         let Some(ingress) = &spec.ingress else {
             continue;
         };
-        let namespace = spec.namespace.as_deref().unwrap_or("default");
         // Hosts are compared as the routing table keys them.
         let host = ingress.host.to_lowercase();
         let serves = |candidate: &crate::config::app::AppSpec| {
@@ -630,7 +647,6 @@ fn authorize_ingress_hosts(
         // An app keeps the host it already serves: an unscoped token may
         // have shared that host on purpose, and re-applying the app mustn't
         // start failing because of it.
-        let id = crate::meat::types::AppId::new(name, namespace);
         if desired.apps.get(&id).is_some_and(serves) {
             continue;
         }
@@ -641,8 +657,9 @@ fn authorize_ingress_hosts(
         });
         if outside_scope {
             return Err(crate::sesame::auth::scope_refusal(format!(
-                "app.{name}: ingress host {host:?} is already served by an app outside this \
-                 token's scope; a host's routes belong to the namespace that serves it"
+                "app.{}: ingress host {host:?} is already served by an app outside this \
+                 token's scope; a host's routes belong to the namespace that serves it",
+                id.name
             )));
         }
     }
