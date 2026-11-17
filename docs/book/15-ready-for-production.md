@@ -9004,6 +9004,38 @@ has the numbers. What it changes is the wording of every power-cut record we
 publish from here on: a hypervisor cut tests "lose the page cache", and the
 write-cache cut built on `dm-log-writes` is what earns the stronger claim.
 
+### A check that can't fail isn't a check
+
+The first piece of the endurance run is deliberately small: one node, one
+kind of cut, five invariants. `qualify-power-cut-endurance.sh` installs a
+published release, starts the soak's two data-bearing workloads, and cuts the
+power every few minutes. The writer appends 1, 2, 3, ... to `/data/seq`,
+`sync`s, and only then prints `ACK n`. Just before each cut the harness reads
+the highest `ACK` from the writer's log. After the cut it waits for the
+cluster to settle and checks that the file runs 1..N with nothing missing and
+N at least that `ACK`.
+
+Our first smoke run passed five cuts out of five. Then we read the evidence.
+At the first cut the host had seen `ACK 428`; the file held 464 lines. Fine?
+Look at what the writer does when it starts: it drops a torn last line and
+carries on from the last whole one. Suppose the cut had lost lines 401 to
+428. The writer would come back, find 400, and append 401, 402, ... at ten a
+second. The cluster took 118 s to settle, and long before then the file
+would run unbroken past 428. The check would pass. It could
+*never* fail for a loss smaller than the settle time's worth of writes, and
+the Redis counter had the same blind spot.
+
+The fix is to look at the moment that matters, the restart, rather than at
+the state long after it. Each start of the writer now appends the number it
+resumed from to `/data/resumes` and syncs it before writing anything else;
+each start of the Redis client reads the counter and pushes that value onto
+a list before its first `INCR`. I1 passes only if there's a new start since
+the last cut and it resumed at or past the `ACK`. The unit test for it is the
+exact scenario above: a file that's whole to 500 and a resume point of 90
+against an `ACK` of 100 must fail. The lesson isn't new, but it's worth
+repeating every time you write an invariant: make it fail on purpose at least
+once, or you don't know what it checks.
+
 ## A thousand nodes that aren't there
 
 How big a cluster have we actually run? Three VMs. The whitepaper's 10,000-node

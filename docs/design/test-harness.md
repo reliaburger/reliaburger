@@ -131,6 +131,12 @@ the log parser and replay) are tested against fixtures in
 `scripts/release/test_power_cut_calibrate.py`, part of `make test-ci-scripts`.
 The [calibration record](../qualification/2026-11-18-power-cut-calibration.md)
 says which fault model each cut gives.
+`scripts/release/qualify-power-cut-endurance.sh` cuts a one-node quickstart
+cluster's power again and again and checks invariants I1, I2, I4, I6 and I7
+after each cut ([testing guide](../testing.md#power-cut-endurance)); its
+decisions live in `scripts/release/power_cut/endurance.py`, tested by
+`scripts/release/test_power_cut_endurance.py`. It shares `power_off`,
+`power_on` and `settle` with the soak through `scripts/release/sustained/power.sh`.
 
 `.github/workflows/v02-loops.yml` is the other long-running lane. It runs only when
 someone pushes the `v02-loops` branch or dispatches it by hand, and loops the upgrade,
