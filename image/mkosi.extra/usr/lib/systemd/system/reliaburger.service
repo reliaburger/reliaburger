@@ -1,4 +1,4 @@
-# bun on the appliance. The same restart and kill policy as the quickstart's
+# bun on the appliance. The same restart, kill and OOM policy as the quickstart's
 # unit (src/relish/quickstart/provision.rs): owners outlive bun restarts.
 # It starts once reliaburger-seed.service has turned the machine's seed or
 # claim into a cluster config.
@@ -13,6 +13,7 @@ ExecStartPre=/bin/sh -ec 'mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/
 ExecStart=/usr/lib/reliaburger/start
 Restart=always
 RestartSec=2
+OOMScoreAdjust=-900
 LimitNOFILE=1048576
 KillMode=process
 TimeoutStopSec=30
