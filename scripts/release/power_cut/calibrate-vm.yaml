@@ -1,0 +1,22 @@
+# The disposable Lima VM for the power-cut calibration (step 0 of
+# docs/plans/2026-11-18-plan-power-cut-endurance.md). calibrate.sh creates
+# one per cut kind from this file and deletes them afterwards. Never create
+# the development VM from it.
+#
+# The guest is the Ubuntu 26.04 cloud image the 0.3.0 quickstart guest image
+# is built from, at a quickstart node's size (2 vCPU, 2 GiB). Nothing from
+# the host is mounted, so every write the writer makes lands on the guest's
+# own virtual disk, and provisioning is a no-op: Lima runs provision scripts
+# on every boot, and every cut boots the VM again.
+images:
+- location: "https://cloud-images.ubuntu.com/releases/resolute/release-20260927/ubuntu-26.04-server-cloudimg-arm64.img"
+  arch: "aarch64"
+  digest: "sha256:63a93bd5a8d76e33b15ceb5daa3657bd79be804748051ab178e643b0f5da22e7"
+vmType: "vz"
+cpus: 2
+memory: "2GiB"
+disk: "10GiB"
+mounts: []
+containerd:
+  system: false
+  user: false
