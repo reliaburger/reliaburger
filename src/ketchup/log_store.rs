@@ -676,18 +676,6 @@ struct BufferedLogEntry {
     instance: Option<String>,
     stream: LogStream,
     line: String,
-    /// The capture file this line came from and the offset to read it from
-    /// again, should the buffer shed it. `None` for a line with no known
-    /// capture position.
-    resume: Option<ResumePoint>,
-}
-
-/// Where to re-read a buffered line from: its capture file, that file's
-/// identity, and the offset the line starts at.
-struct ResumePoint {
-    file: PathBuf,
-    identity: FileIdentity,
-    offset: u64,
 }
 
 impl BufferedLogEntry {
@@ -698,10 +686,30 @@ impl BufferedLogEntry {
             + self.namespace.len()
             + self.instance.as_ref().map_or(0, String::len)
             + self.line.len()
-            + self
-                .resume
-                .as_ref()
-                .map_or(0, |resume| resume.file.as_os_str().len())
+    }
+}
+
+/// Whose log a dropped line belonged to: app, namespace and instance.
+type LogOwner = (String, String, Option<String>);
+
+/// Lines one log lost to a full buffer, stored as one marker line where
+/// they were (#2057).
+#[derive(Debug, Clone, Copy)]
+struct DropMarker {
+    /// How many lines were dropped.
+    count: u64,
+    /// The last dropped line's timestamp and sequence: the marker sorts
+    /// where the gap is.
+    timestamp: u64,
+    sequence: u64,
+}
+
+impl DropMarker {
+    fn line(&self) -> String {
+        match self.count {
+            1 => "1 log line dropped: the log store fell behind".to_string(),
+            count => format!("{count} log lines dropped: the log store fell behind"),
+        }
     }
 }
 
@@ -722,13 +730,13 @@ pub struct LogStore {
     /// Bytes the rows in `buffer` hold, by [`BufferedLogEntry::size`].
     buffer_bytes: usize,
     limits: BufferLimits,
-    /// Per capture file, where the first row the buffer shed began (#2057).
-    /// No checkpoint saves an offset past it, so the capture keeps those
-    /// bytes and a restart reads them again. Kept until the capture is gone
-    /// or replaced; a restart starts afresh.
-    shed: std::collections::BTreeMap<PathBuf, (FileIdentity, u64)>,
-    /// Rows shed since the last flush reported them.
-    shed_unreported: u64,
+    /// Per log, the lines a full buffer dropped since the last flush. Each
+    /// becomes a marker line in the next flush; markers are never shed.
+    drop_markers: std::collections::BTreeMap<LogOwner, DropMarker>,
+    /// Lines dropped since the store opened, for the node's metrics.
+    dropped_lines: u64,
+    /// Lines dropped since the last flush reported them in Bun's log.
+    dropped_unreported: u64,
 }
 
 impl LogStore {
@@ -748,9 +756,16 @@ impl LogStore {
             ingested,
             buffer_bytes: 0,
             limits: BufferLimits::DEFAULT,
-            shed: std::collections::BTreeMap::new(),
-            shed_unreported: 0,
+            drop_markers: std::collections::BTreeMap::new(),
+            dropped_lines: 0,
+            dropped_unreported: 0,
         }
+    }
+
+    /// How many log lines this store has dropped since it opened, because
+    /// its buffer was full.
+    pub fn dropped_lines(&self) -> u64 {
+        self.dropped_lines
     }
 
     /// Whether the buffer has grown enough to flush now instead of waiting
@@ -795,7 +810,6 @@ impl LogStore {
             None,
             stream,
             line,
-            None,
         );
     }
 
@@ -809,7 +823,7 @@ impl LogStore {
         line: &str,
     ) {
         let nanos = timestamp.saturating_mul(NANOS_PER_SECOND);
-        self.push(timestamp, nanos, app, namespace, None, stream, line, None);
+        self.push(timestamp, nanos, app, namespace, None, stream, line);
     }
 
     /// Ingest a workload line from a log forwarder, stamped with the current
@@ -831,7 +845,6 @@ impl LogStore {
     }
 
     fn ingest_at_nanos(&mut self, nanos: u64, record: &super::types::LogRecord) -> bool {
-        let mut resume = None;
         if let Some(position) = &record.position
             && let Some(identity) = position.identity
         {
@@ -840,13 +853,6 @@ impl LogStore {
             if same_file && seen.is_some_and(|offset| position.end_offset <= offset) {
                 return false;
             }
-            // A forwarder reads a capture in order from where the store
-            // left off, so this line starts where the last one ended.
-            resume = Some(ResumePoint {
-                file: position.file.clone(),
-                identity,
-                offset: if same_file { seen.unwrap_or(0) } else { 0 },
-            });
             self.ingested.files.insert(position.file.clone(), identity);
             self.ingested
                 .offsets
@@ -862,7 +868,6 @@ impl LogStore {
             Some(record.instance.clone()),
             record.stream,
             &record.line,
-            resume,
         );
         true
     }
@@ -878,7 +883,6 @@ impl LogStore {
         instance: Option<String>,
         stream: LogStream,
         line: &str,
-        resume: Option<ResumePoint>,
     ) {
         self.clear_completed_flush();
         // Wall-clock nanoseconds order lines across nodes; the bump keeps the
@@ -894,7 +898,6 @@ impl LogStore {
             instance,
             stream,
             line: line.to_string(),
-            resume,
         };
         self.buffer_bytes += entry.size();
         self.buffer.push(entry);
@@ -905,9 +908,10 @@ impl LogStore {
     /// rather than let a stuck flush grow the buffer until the node OOMs.
     /// A flush still being written counts against both caps.
     ///
-    /// A shed line isn't lost (#2057): its capture offset becomes a ceiling
-    /// on what any checkpoint saves for that capture, so the capture keeps
-    /// it and a restart reads it again.
+    /// A shed line is a counted loss (#2057). Early flushes and the byte cap
+    /// make shedding rare, so we don't replay it: the checkpoint moves on as
+    /// usual, the line's log gets a marker saying how many lines went, and
+    /// the store counts them.
     fn shed_overflow(&mut self) {
         let (pending_rows, pending_bytes) = self
             .pending
@@ -919,41 +923,29 @@ impl LogStore {
         let mut bytes = self.buffer_bytes;
         let mut overflow = 0;
         while overflow < self.buffer.len() && (rows > row_limit || bytes > byte_limit) {
-            let entry = &self.buffer[overflow];
             rows -= 1;
-            bytes -= entry.size();
-            if let Some(resume) = &entry.resume {
-                // The buffer holds a capture's lines in order, so the first
-                // shed line of a file is its lowest offset.
-                let floor = self
-                    .shed
-                    .entry(resume.file.clone())
-                    .or_insert((resume.identity, resume.offset));
-                if floor.0 != resume.identity {
-                    *floor = (resume.identity, resume.offset);
-                }
-            }
+            bytes -= self.buffer[overflow].size();
             overflow += 1;
         }
-        if overflow > 0 {
-            self.buffer.drain(0..overflow);
-            self.buffer_bytes = bytes;
-            self.shed_unreported += overflow as u64;
+        if overflow == 0 {
+            return;
         }
-    }
-
-    /// The checkpoint a flush may save: what has been ingested, held back to
-    /// the first shed line of each capture.
-    fn durable_checkpoint(&self) -> IngestCheckpoint {
-        let mut checkpoint = self.ingested.clone();
-        for (file, (identity, floor)) in &self.shed {
-            if checkpoint.files.get(file) == Some(identity)
-                && let Some(offset) = checkpoint.offsets.get_mut(file)
-            {
-                *offset = (*offset).min(*floor);
-            }
+        for entry in self.buffer.drain(0..overflow) {
+            let owner = (entry.app, entry.namespace, entry.instance);
+            // Lines arrive in sequence order, so the last one shed is where
+            // the gap ends.
+            let marker = self.drop_markers.entry(owner).or_insert(DropMarker {
+                count: 0,
+                timestamp: entry.timestamp,
+                sequence: entry.sequence,
+            });
+            marker.count += 1;
+            marker.timestamp = entry.timestamp;
+            marker.sequence = entry.sequence;
         }
-        checkpoint
+        self.buffer_bytes = bytes;
+        self.dropped_lines += overflow as u64;
+        self.dropped_unreported += overflow as u64;
     }
 
     /// Number of unflushed entries.
@@ -978,26 +970,61 @@ impl LogStore {
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
             );
             self.ingested.forget(gone);
-            let files = &self.ingested.files;
-            self.shed
-                .retain(|file, (identity, _)| files.get(file) == Some(identity));
         }
     }
 
     /// Convert the buffer to an Arrow RecordBatch.
     fn buffer_to_batch(&self) -> Result<Option<RecordBatch>, KetchupError> {
-        if self.buffer.is_empty() {
+        if self.buffer.is_empty() && self.drop_markers.is_empty() {
             return Ok(None);
         }
 
-        let timestamps: Vec<u64> = self.buffer.iter().map(|e| e.timestamp).collect();
-        let apps: Vec<&str> = self.buffer.iter().map(|e| e.app.as_str()).collect();
-        let namespaces: Vec<&str> = self.buffer.iter().map(|e| e.namespace.as_str()).collect();
-        let streams: Vec<&str> = self.buffer.iter().map(|e| e.stream.as_str()).collect();
-        let lines: Vec<&str> = self.buffer.iter().map(|e| e.line.as_str()).collect();
-        let sequences: Vec<u64> = self.buffer.iter().map(|e| e.sequence).collect();
-        let instances: Vec<Option<&str>> =
-            self.buffer.iter().map(|e| e.instance.as_deref()).collect();
+        // The buffered lines, then one marker per log that lost lines.
+        let marker_lines: Vec<String> = self.drop_markers.values().map(DropMarker::line).collect();
+        let owners = self.drop_markers.keys();
+        let markers = self.drop_markers.values();
+        let timestamps: Vec<u64> = self
+            .buffer
+            .iter()
+            .map(|e| e.timestamp)
+            .chain(markers.clone().map(|marker| marker.timestamp))
+            .collect();
+        let apps: Vec<&str> = self
+            .buffer
+            .iter()
+            .map(|e| e.app.as_str())
+            .chain(owners.clone().map(|(app, _, _)| app.as_str()))
+            .collect();
+        let namespaces: Vec<&str> = self
+            .buffer
+            .iter()
+            .map(|e| e.namespace.as_str())
+            .chain(owners.clone().map(|(_, namespace, _)| namespace.as_str()))
+            .collect();
+        let streams: Vec<&str> = self
+            .buffer
+            .iter()
+            .map(|e| e.stream.as_str())
+            .chain(markers.clone().map(|_| LogStream::Stderr.as_str()))
+            .collect();
+        let lines: Vec<&str> = self
+            .buffer
+            .iter()
+            .map(|e| e.line.as_str())
+            .chain(marker_lines.iter().map(String::as_str))
+            .collect();
+        let sequences: Vec<u64> = self
+            .buffer
+            .iter()
+            .map(|e| e.sequence)
+            .chain(markers.map(|marker| marker.sequence))
+            .collect();
+        let instances: Vec<Option<&str>> = self
+            .buffer
+            .iter()
+            .map(|e| e.instance.as_deref())
+            .chain(owners.map(|(_, _, instance)| instance.as_deref()))
+            .collect();
 
         let batch = RecordBatch::try_new(
             Arc::new(log_schema()),
@@ -1030,22 +1057,23 @@ impl LogStore {
         };
         let filename = format!("logs_{:06}.parquet", self.flush_counter);
         let path = self.data_dir.join(filename);
-        if self.shed_unreported > 0 {
+        if self.dropped_unreported > 0 {
             eprintln!(
-                "ketchup: the log buffer was full and shed {} line(s); their capture files keep them, and a restart reads them again",
-                self.shed_unreported
+                "ketchup: the log buffer was full and dropped {} line(s); each log that lost lines has a marker line where they were",
+                self.dropped_unreported
             );
-            self.shed_unreported = 0;
+            self.dropped_unreported = 0;
         }
         let bytes = std::mem::take(&mut self.buffer_bytes);
         self.buffer.clear();
+        self.drop_markers.clear();
         self.flush_counter += 1;
         let pending = LogPendingFlush {
             data_dir: self.data_dir.clone(),
             path,
             batch,
             bytes,
-            checkpoint: self.durable_checkpoint(),
+            checkpoint: self.ingested.clone(),
             writing: Arc::new(tokio::sync::Mutex::new(())),
             completed: Arc::new(AtomicBool::new(false)),
             gone: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -1788,16 +1816,15 @@ mod tests {
         assert!(store.buffer.last().unwrap().line.starts_with("99 "));
     }
 
-    /// Shedding the oldest buffered lines used to leave their capture
-    /// offsets in the next checkpoint, so a restart skipped them and the
-    /// capture reclaim then punched them out of the only remaining copy. The
-    /// saved offset now stays at the first shed line.
+    /// A burst that outruns flushing sheds the oldest buffered lines. They
+    /// are a counted loss, not a silent one (#2057): the instance's own log
+    /// says how many lines went missing where they went missing, and the
+    /// store counts them.
     #[tokio::test]
-    async fn shed_lines_hold_the_saved_offset_so_a_restart_reads_them_again() {
+    async fn shed_lines_are_counted_and_marked_in_the_instance_log() {
         let dir = tempfile::tempdir().unwrap();
-        let logs = dir.path().join("logs");
         let capture = capture_file(&dir, "chatty.stdout");
-        let mut store = LogStore::new(logs.clone());
+        let mut store = LogStore::new(dir.path().join("logs"));
         store.limits = tiny_limits();
         assert!(store.ingest(&writer_line(&capture, 1)));
         assert!(store.ingest(&writer_line(&capture, 2)));
@@ -1807,15 +1834,98 @@ mod tests {
             assert!(store.ingest(&writer_line(&capture, n)));
         }
         store.flush().await.unwrap();
+
         assert_eq!(
             writer_lines(&store).await,
-            ["ACK 0001", "ACK 0002", "ACK 0006", "ACK 0007"]
+            [
+                "ACK 0001",
+                "ACK 0002",
+                "3 log lines dropped: the log store fell behind",
+                "ACK 0006",
+                "ACK 0007",
+            ]
         );
+        assert_eq!(store.dropped_lines(), 3);
+    }
 
-        let reopened = LogStore::new(logs);
+    /// The first fix held a capture's checkpoint at the first shed line for
+    /// the rest of Bun's life. A restart then stored every later line a
+    /// second time, and the capture was never reclaimed past that point. A
+    /// shed line is now a counted loss, and the checkpoint moves on.
+    #[tokio::test]
+    async fn a_restart_after_a_shed_stores_nothing_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        let capture = capture_file(&dir, "chatty.stdout");
+        let mut store = LogStore::new(logs.clone());
+        store.limits = tiny_limits();
+        for n in 1..=7 {
+            assert!(store.ingest(&writer_line(&capture, n)));
+        }
+        store.flush().await.unwrap();
+        let before = writer_lines(&store).await;
+        drop(store);
+
+        let mut reopened = LogStore::new(logs);
         assert_eq!(
             reopened.capture_offsets().0.get(&capture),
-            Some(&(2 * LINE_BYTES))
+            Some(&(7 * LINE_BYTES))
+        );
+        // A forwarder that re-reads the capture stores nothing again.
+        for n in 1..=7 {
+            assert!(!reopened.ingest(&writer_line(&capture, n)), "line {n}");
+        }
+        reopened.flush().await.unwrap();
+        assert_eq!(writer_lines(&reopened).await, before);
+    }
+
+    /// A shed must not stop the capture reclaim: the first fix pinned the
+    /// checkpoint at the first shed line, so the capture grew for good.
+    #[tokio::test]
+    async fn the_capture_is_reclaimed_after_a_shed() {
+        use std::os::unix::fs::MetadataExt;
+        let directory = tempfile::tempdir().unwrap();
+        let captures = tempfile::tempdir().unwrap();
+        let file = captures.path().join("spammer.stdout");
+        let line = "spam the quick brown fox jumps over the lazy dog\n";
+        let contents = line.repeat(4 * 1024 * 1024 / line.len());
+        std::fs::write(&file, &contents).unwrap();
+        let allocated = || std::fs::metadata(&file).unwrap().blocks() * 512;
+        let mut store = LogStore::new(directory.path().to_path_buf());
+        // Far fewer rows than the capture holds, so most of it is shed.
+        store.limits = BufferLimits {
+            max_rows: 1000,
+            ..BufferLimits::DEFAULT
+        };
+        let mut reader =
+            crate::grill::capture::CaptureReader::new(LogStream::Stdout, Some(file.clone()));
+        loop {
+            let bytes = reader.read_chunk().await.unwrap();
+            if bytes.is_empty() {
+                break;
+            }
+            for line in reader.push(&bytes) {
+                store.ingest_at(
+                    100,
+                    &crate::ketchup::types::LogRecord {
+                        app: "spammer".into(),
+                        namespace: "default".into(),
+                        instance: "spammer-0".into(),
+                        stream: line.stream,
+                        line: line.line,
+                        position: line.position,
+                    },
+                );
+            }
+        }
+        assert!(store.dropped_lines() > 0, "the test must shed");
+
+        store.flush().await.unwrap();
+
+        assert!(
+            allocated() <= crate::grill::capture::RETAINED_CAPTURE_BYTES + 256 * 1024,
+            "{} bytes of the capture are still allocated",
+            allocated()
         );
     }
 

@@ -2445,6 +2445,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // measures) and `relish top` (which reads the latest usage).
     let job_telemetry = Arc::new(reliaburger::mayo::job_metrics::JobTelemetry::default());
     let collection_jobs = Arc::clone(&job_telemetry);
+    let collection_logs = Arc::clone(&log_store);
     feeder_handles.push(tokio::spawn(async move {
         // Off the runtime: the first refresh reads every process on the host.
         let Ok(mut collector) = tokio::task::spawn_blocking(SystemCollector::new).await else {
@@ -2512,6 +2513,15 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                             value: value as f64,
                         });
                     }
+
+                    // Log lines the log store dropped because its buffer
+                    // was full (#2057): zero unless it fell behind.
+                    samples.push(reliaburger::mayo::collector::CollectedMetric {
+                        key: reliaburger::mayo::types::MetricKey::simple(
+                            "ketchup_log_lines_dropped_total",
+                        ),
+                        value: collection_logs.read().await.dropped_lines() as f64,
+                    });
 
                     // How long the agent loop's turns take, by branch. A long
                     // turn holds every caller, so this is the loop's health.
