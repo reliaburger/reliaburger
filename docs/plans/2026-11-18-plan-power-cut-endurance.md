@@ -11,9 +11,10 @@ build it in and which decisions it rests on. It comes from a design draft of
 17 November 2026 (prior art, fault models and invariants); the parts of that
 draft this plan needs are summarised in [Background](#background). The
 maintainer took the draft's recommendations for D-3 to D-11 provisionally on
-17 November; D-1 (a dedicated Linux box) and D-2 (smart plugs) are open, so
-everything below runs on the Studio under the quiet lock until they're
-settled, and the hardware tier is a later step.
+17 November, and decided D-1 and D-2 the same day: for the next couple of
+months the continuous run uses spare capacity on the Mac Studio, pausing
+whenever something more important runs, and after that a hardware tier cuts
+real power to three Wyse 3040s on smart plugs.
 
 It's new test infrastructure, not a 0.3.0 fix: its PRs go into `main` and say
 "Part of #2067".
@@ -134,12 +135,14 @@ almost never hits (timed cuts and the enumeration lane cover those), model 3
 Memory fits (~22 GiB for all three beside the agents' ~75 GB), but nine VMs
 booting every few minutes would fake slow turns in a soak, as background builds
 did in the A/B run ([#1587](https://github.com/reliaburger/reliaburger/issues/1587)).
-So, until D-1 is settled, the run lives on the Studio under **option A**: a
-host-wide quiet lock (`$HOME/.reliaburger/quiet.lock`) that the gate,
+The run lives on the Studio's spare capacity (D-1), so the pause is the main
+path, not a fallback: a host-wide quiet lock (`$HOME/.reliaburger/quiet.lock`) that the gate,
 `nightly-qualify.sh` and the soak scripts take. The endurance harness checks
 it before every cut; when it's held, the harness finishes the cycle, verifies,
 powers every VM off (itself a cut) and waits. On release it powers on and
-verifies that long-outage cut.
+verifies that long-outage cut like any other: a pause is a cut lasting hours,
+with clocks jumping and leases and certificates ageing, and it's counted and
+checked as one.
 
 Step 1 checks the lock and the gate's `chain.log` before starting and before
 each cut, and stops cleanly if either says a gate is running; the full pause
@@ -221,9 +224,10 @@ run; 4–7 make it strong.
 | **2. Three and five nodes; full invariants; driver** | Multi-topology (fix quickstart if it can't run three clusters side by side); the operation driver and change ledger; I3, I5, I8–I13; the read-only checker token; staggered returns and brownouts; charts | A unit test per new checker subcommand on good and bad fixtures | A day run on 1, 3 and 5 nodes passes (needs the maintainer's yes on memory) |
 | **3. Timed cuts** | `guest-watcher.sh` firing `sysrq b` 0–500 ms into a named operation (Raft snapshot, backup, image unpack, volume snapshot, rollout, job ledger write, self-upgrade) | Watcher logic on a fake file system tree; the checker counts each operation's minimum | Every operation reached its minimum in a day run |
 | **4. Write-cache cut** | Extra Lima disks, an LVM thin pool, `dm-log-writes` under Bun's data, a boot unit that replays to the last flush (or a prefix after it) over the epoch's snapshot | A gated test that writes, marks, flushes, writes more, replays and finds exactly the flushed data | 100 write-cache cuts pass on 1 node, or a bug is found and fixed with its own failing test |
-| **5. Quiet lock and continuous mode** | The lock taken by the gate, `nightly-qualify.sh` and the soak scripts; the pause protocol; `--tier continuous` with rolling records | Lock protocol tests in each script's Python tests; the pause path in the fake-limactl tests | The run pauses under a nightly, resumes, and verifies the long-outage cut |
+| **5. Quiet lock and continuous mode (the main path, D-1)** | The lock taken by the gate, `nightly-qualify.sh` and the soak scripts; the pause protocol; `--tier continuous` with rolling records | Lock protocol tests in each script's Python tests; the pause path in the fake-limactl tests | The run pauses under a nightly, resumes, and verifies the long-outage cut |
 | **6. Crash-state enumeration lane** | `qualify-crash-states.sh`: one operation per store recorded under `dm-log-writes`, every flush point and sampled prefixes replayed, each opened and checked | Unit tests for the replay-point generator | Every store passes; joins step 5 of the gate as a sixth lane (D-10) |
-| **7. Appliance lane and hardware tier** | On the 0.3.x train: cuts during `systemd-sysupdate`, bless and counted boots (KVM); a smart-plug driver if D-2 says yes | Fake-plug and fake-QEMU tests | A Linux/KVM appliance run and, if D-2 is yes, a Wyse run, each with a record |
+| **7a. Hardware tier (D-2)** | Three of the lab's ten or so Wyse 3040s, each on a smart plug. First find plugs with a local HTTP API and no cloud dependency (Shelly Gen2+ and Tasmota-flashed plugs are the candidates to check). A plug driver (`--hardware fleet.json`); the netboot and claim flow resetting the three units to a clean install between runs; the same loop at one cut every 10–20 minutes, the same invariants, and the same `cuts.jsonl` and summary format, with the ACK ledgers kept on the Mac, not the devices | Fake-plug tests for the driver; the reset flow against a fake netboot server | A week on the three Wyses with a record; the only evidence for flash that lies (model 3) |
+| **7b. Appliance lane** | On the 0.3.x train: cuts during `systemd-sysupdate`, bless and counted boots. It needs KVM, and there's no Linux box (D-1): it runs on the Wyse tier's real hardware, a GitHub-hosted runner with `/dev/kvm` (6 h job cap), or waits | Fake-QEMU tests | An appliance run with a record, on whichever host it gets |
 | **8. Docs and publication** | Manual chapter, agent guide section, testing.md, `features.toml`, website, book | `doc_snippets.rs`; `test_features_page.py` | The first week-long record on a published release is linked from the website and `relish agent guide` |
 
 Each bug the run finds gets its own issue, a failing test at the lowest level
@@ -233,8 +237,8 @@ that reproduces it, and a fix, as `tests/power_cut.rs` did for the exporter.
 
 | | Decision | Status |
 |---|---|---|
-| **D-1** | Where the continuous run lives: a dedicated Linux/KVM mini PC (~£300), which also hosts the appliance lane, or the Studio pausing under the quiet lock | **Open.** Until it's settled the run is on the Studio under the quiet lock |
-| **D-2** | A hardware tier: smart plugs on the Wyse 3040 lab, ~£60 for three | **Open.** A later step (7) either way |
+| **D-1** | Where the continuous run lives | **Decided (maintainer, 17 November 2026):** for the next couple of months, spare capacity on the Mac Studio, pausing whenever something more important runs (release gates, nightlies, soaks). The quiet lock and the pause/resume design (pause = power its VMs off; resume = check the long outage as a cut) is the main path. No dedicated Linux box for now, so the appliance lane needs another answer for KVM, or waits for D-2 |
+| **D-2** | A hardware tier with real power cuts | **Decided (maintainer, 17 November 2026):** after the Studio period, smart plugs and 3 of the lab's ~10 Wyse 3040s dedicated to it. Planned as step 7a: plug control (plugs with a local API and no cloud), the netboot and claim flow to reset the lab between runs, the same invariants and evidence format |
 | **D-3** | Recovery bounds: Bun healthy ≤ 120 s after boot; quorum ≤ 120 s after a majority is back; `relish wtf` clean ≤ 300 s after the last node. Measure for a week, then fix them at the worst seen plus a margin | Provisional (maintainer, 17 Nov) |
 | **D-4** | VM shape: quickstart's 2 vCPU / 2 GiB with an 8 GiB disk; a 1 GiB variant later if we claim to fit there | Provisional (maintainer, 17 Nov) |
 | **D-5** | The public claim: "≥ 1,000 cuts per topology, ≥ 300 with unflushed writes dropped, 0 violations" per release, with per-topology and pooled bounds, refreshed continuously | Provisional (maintainer, 17 Nov) |
