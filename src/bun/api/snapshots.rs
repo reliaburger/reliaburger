@@ -93,6 +93,8 @@ fn snapshot_refusal(status: StatusCode, message: String) -> Response {
 struct ForwardedSnapshot<'a> {
     namespace: &'a str,
     app: &'a str,
+    /// The path segments after `/v1/snapshots/{namespace}/{app}`, decoded.
+    suffix: &'a [&'a str],
     method: axum::http::Method,
     uri: &'a axum::http::Uri,
     headers: &'a HeaderMap,
@@ -103,16 +105,25 @@ struct ForwardedSnapshot<'a> {
 /// Send a snapshot request to the node that holds the volume, marked as
 /// forwarded and carrying the caller's own credential, so that node repeats
 /// every check, and pass its answer back.
+///
+/// The path is rebuilt from the decoded segments, one at a time, so a
+/// segment can't change which route the holding node answers.
 async fn forward_snapshot(
     state: &ApiState,
     node: &str,
     request: ForwardedSnapshot<'_>,
 ) -> Response {
-    let path = request
-        .uri
-        .path_and_query()
-        .map_or(request.uri.path(), |path| path.as_str());
-    let Ok(url) = target_node_api_url(state, node, path).await else {
+    let mut segments = vec!["v1", "snapshots", request.namespace, request.app];
+    segments.extend_from_slice(request.suffix);
+    let mut path = match crate::cluster::http::peer_path(&segments) {
+        Ok(path) => path,
+        Err(error) => return peer_path_refusal(&error),
+    };
+    if let Some(query) = request.uri.query() {
+        path.push('?');
+        path.push_str(query);
+    }
+    let Ok(url) = target_node_api_url(state, node, &path).await else {
         return snapshot_refusal(
             StatusCode::SERVICE_UNAVAILABLE,
             format!(
@@ -265,6 +276,7 @@ pub(super) async fn snapshot_create_handler(
     let request = ForwardedSnapshot {
         namespace: &namespace,
         app: &app,
+        suffix: &[],
         method,
         uri: &uri,
         headers: &headers,
@@ -303,6 +315,7 @@ pub(super) async fn snapshot_list_handler(
     let request = ForwardedSnapshot {
         namespace: &namespace,
         app: &app,
+        suffix: &[],
         method,
         uri: &uri,
         headers: &headers,
@@ -358,6 +371,7 @@ pub(super) async fn snapshot_restore_handler(
     let request = ForwardedSnapshot {
         namespace: &namespace,
         app: &app,
+        suffix: &["restore"],
         method,
         uri: &uri,
         headers: &headers,
@@ -415,6 +429,7 @@ pub(super) async fn snapshot_delete_handler(
     let request = ForwardedSnapshot {
         namespace: &namespace,
         app: &app,
+        suffix: &[name.as_str()],
         method,
         uri: &uri,
         headers: &headers,

@@ -14,12 +14,18 @@ app inside 15 minutes; Bun records one for every restart, so `relish events`
 shows the same history `wtf` read. A high lifetime restart count in
 `relish apps` on its own isn't one.
 
-You only need to reach one node. `wtf`, `inspect` and `path` send every
-per-node request through the node you're connected to (`/v1/nodes/<node>/relay/...`), carrying
-your own credential, so they work from a laptop whose VMs sit behind Lima's
-private network. The relay forwards only the handful of read-only diagnostic
-calls these commands make, plus the path probe itself, and each target
-repeats every authentication and authorisation check.
+You only need to reach one node. `wtf`, `inspect`, `path`, `test` and `exec`
+send every per-node request through the node you're connected to
+(`/v1/nodes/<node>/relay/...`), carrying your own credential, so they work
+from a laptop whose VMs sit behind Lima's private network. The relay forwards
+only the handful of read-only diagnostic calls these commands make, plus two
+`POST`s: the path probe (`POST /v1/path`) and `relish exec` into an instance
+on another node (`POST /v1/exec/<app>/<namespace>`). Each target repeats every
+authentication and authorisation check, so an exec through the relay needs
+the same Deployer role and `exec` permission as one sent straight to the
+node. The relay builds the target's path one segment at a time and refuses a
+path that would need any percent-encoding, and a node-only route on the
+target refuses a relayed request.
 
 ```sh
 relish wtf                       # diagnose the whole cluster

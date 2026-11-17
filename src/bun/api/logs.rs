@@ -603,10 +603,17 @@ pub(super) async fn follow_cluster_logs(
                 let Some(member) = members.iter().find(|member| member.node_id == node) else {
                     continue;
                 };
-                let url = state.cluster_http.url(
-                    &member.address.to_string(),
-                    &format!("/v1/logs/{app}/{namespace}"),
-                );
+                // A placed app's name always encodes; one that can't has no
+                // logs on a peer to follow.
+                let Ok(path) = crate::cluster::http::peer_path(&[
+                    "v1",
+                    "logs",
+                    app.as_str(),
+                    namespace.as_str(),
+                ]) else {
+                    continue;
+                };
+                let url = state.cluster_http.url(&member.address.to_string(), &path);
                 Some(spawn_peer_log_source(
                     &state,
                     node.0.clone(),

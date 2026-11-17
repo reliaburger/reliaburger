@@ -175,15 +175,25 @@ pub(super) const MAX_RELAY_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 /// A path probe runs for up to 25 seconds on the target; allow for the hop.
 pub(super) const RELAY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// The per-node reads `relish wtf`, `relish inspect`, `relish path` and
-/// `relish test` make, and nothing else. The relay is a reachability aid, not a general proxy.
-pub(super) fn relay_allows(method: &axum::http::Method, path: &str) -> bool {
-    // The relay builds a URL from `path`, and a URL normalises `.` and `..`
-    // segments away: `v1/exec/../apply` would leave as `POST /v1/apply`. So
-    // a path with a dot segment, even a percent-encoded one, is refused
-    // before any allowlist match.
-    if path.split('/').any(is_dot_segment) {
-        return false;
+/// The per-node requests `relish wtf`, `relish inspect`, `relish path`,
+/// `relish test` and `relish exec` make, and nothing else. The relay is a
+/// reachability aid, not a general proxy.
+///
+/// `path` is the request's path after the relay prefix, percent-decoded.
+/// Returns the path the target node will receive, built segment by segment
+/// with [`crate::cluster::http::peer_path`], when the relay forwards it.
+///
+/// The allowlist is checked against that built path, not against `path`,
+/// and only a path that needed no encoding passes. A URL resolves `.` and
+/// `..`, drops tabs and newlines and, for `http`, reads `\` as `/`, so a
+/// segment holding any of those, or `%`, `?`, `#` or a control character,
+/// could reach a route the allowlist never named. Such a path is refused.
+pub(super) fn relay_peer_path(method: &axum::http::Method, path: &str) -> Option<String> {
+    let segments: Vec<&str> = path.split('/').collect();
+    let peer_path = crate::cluster::http::peer_path(&segments).ok()?;
+    let sent = peer_path.strip_prefix('/')?;
+    if sent != path {
+        return None;
     }
     const READS: &[&str] = &[
         "v1/health",
@@ -203,21 +213,15 @@ pub(super) fn relay_allows(method: &axum::http::Method, path: &str) -> bool {
         // `relish nodes` shows each node's version and usage.
         "v1/cluster/summary/node",
     ];
-    match *method {
+    let allowed = match *method {
         // `relish test` compares each node's own deploy history.
-        axum::http::Method::GET => READS.contains(&path) || is_deploy_history_path(path),
+        axum::http::Method::GET => READS.contains(&sent) || is_deploy_history_path(sent),
         // `relish exec` reaches an instance on another node this way too;
         // the target repeats the exec authorisation with the caller's token.
-        axum::http::Method::POST => path == "v1/path" || is_exec_path(path),
+        axum::http::Method::POST => sent == "v1/path" || is_exec_path(sent),
         _ => false,
-    }
-}
-
-/// Whether a path segment is one a URL resolves away: `.` or `..`, written
-/// plainly or percent-encoded (`%2e`, `%2E`).
-fn is_dot_segment(segment: &str) -> bool {
-    let decoded = segment.to_ascii_lowercase().replace("%2e", ".");
-    decoded == "." || decoded == ".."
+    };
+    allowed.then_some(peer_path)
 }
 
 /// `v1/deploys/history/{app}` and nothing longer (the namespace is a query).
@@ -245,7 +249,8 @@ pub(super) fn is_exec_path(path: &str) -> bool {
 /// addresses, so `relish wtf` and `relish path` reach every other node
 /// through this. The caller's own credential travels with the request and the
 /// target repeats every authentication and authorisation check; the relay
-/// never adds the node's service identity.
+/// never adds the node's service identity, and marks the request as
+/// forwarded for a person, so a node-only route on the target refuses it.
 pub(super) async fn node_relay_handler(
     State(state): State<ApiState>,
     known: Option<axum::Extension<KnownMembers>>,
@@ -255,18 +260,20 @@ pub(super) async fn node_relay_handler(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    if !relay_allows(&method, &path) {
+    let Some(peer_path) = relay_peer_path(&method, &path) else {
         return (
             StatusCode::NOT_FOUND,
-            format!("the node relay does not forward {method} /{path}"),
+            format!(
+                "the node relay does not forward {method} /{}",
+                path.escape_debug()
+            ),
         )
             .into_response();
-    }
-    let mut url =
-        match known_node_api_url(&state, known.as_deref(), &node, &format!("/{path}")).await {
-            Ok(url) => url,
-            Err(response) => return response,
-        };
+    };
+    let mut url = match known_node_api_url(&state, known.as_deref(), &node, &peer_path).await {
+        Ok(url) => url,
+        Err(response) => return response,
+    };
     if let Some(query) = uri.query() {
         url.push('?');
         url.push_str(query);
@@ -354,8 +361,14 @@ mod tests {
     fn relay_refuses_dot_segments() {
         let post = axum::http::Method::POST;
         let get = axum::http::Method::GET;
-        assert!(relay_allows(&post, "v1/exec/web/default"));
-        assert!(relay_allows(&get, "v1/deploys/history/web"));
+        assert_eq!(
+            relay_peer_path(&post, "v1/exec/web/default").as_deref(),
+            Some("/v1/exec/web/default")
+        );
+        assert_eq!(
+            relay_peer_path(&get, "v1/deploys/history/web").as_deref(),
+            Some("/v1/deploys/history/web")
+        );
         for path in [
             "v1/exec/../apply",
             "v1/exec/web/..",
@@ -363,10 +376,61 @@ mod tests {
             "v1/exec/%2e%2e/apply",
             "v1/exec/%2E./apply",
         ] {
-            assert!(!relay_allows(&post, path), "relayed POST /{path}");
+            assert_eq!(relay_peer_path(&post, path), None, "relayed POST /{path}");
         }
         for path in ["v1/deploys/history/..", "v1/deploys/history/%2e%2e"] {
-            assert!(!relay_allows(&get, path), "relayed GET /{path}");
+            assert_eq!(relay_peer_path(&get, path), None, "relayed GET /{path}");
+        }
+    }
+
+    /// `..%5C..%5Ctoken%5Clist` decodes to one segment the old
+    /// allowlist read as an app name, but a URL reads `\` as `/` and then
+    /// resolves the `..`s, so it would have left as `GET /v1/token/list`.
+    #[test]
+    fn relay_refuses_backslashes_in_a_segment() {
+        let get = axum::http::Method::GET;
+        let post = axum::http::Method::POST;
+        for path in [
+            "v1/deploys/history/..\\..\\token\\list",
+            "v1/deploys/history/web\\x",
+        ] {
+            assert_eq!(relay_peer_path(&get, path), None, "relayed GET /{path}");
+        }
+        assert_eq!(
+            relay_peer_path(&post, "v1/exec/..\\..\\apply/default"),
+            None
+        );
+    }
+
+    /// A URL parser drops tabs and newlines, so `.\t.` would arrive as `..`.
+    #[test]
+    fn relay_refuses_tab_newline_and_control_character_segments() {
+        let get = axum::http::Method::GET;
+        let post = axum::http::Method::POST;
+        for path in [
+            "v1/deploys/history/.\t.",
+            "v1/deploys/history/.\n.",
+            "v1/deploys/history/web\r",
+            "v1/deploys/history/web\u{0}",
+            "v1/status\t",
+        ] {
+            assert_eq!(relay_peer_path(&get, path), None, "relayed GET {path:?}");
+        }
+        assert_eq!(relay_peer_path(&post, "v1/exec/.\t./apply"), None);
+    }
+
+    /// The relay forwards only a path that reaches the peer exactly as
+    /// written: one needing `%`-encoding is refused, not rewritten.
+    #[test]
+    fn relay_refuses_segments_a_url_would_encode() {
+        let get = axum::http::Method::GET;
+        for path in [
+            "v1/deploys/history/web%2fx",
+            "v1/deploys/history/web?x",
+            "v1/deploys/history/web#x",
+            "v1/deploys/history/web x",
+        ] {
+            assert_eq!(relay_peer_path(&get, path), None, "relayed GET /{path}");
         }
     }
 }

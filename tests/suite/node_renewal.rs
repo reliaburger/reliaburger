@@ -199,6 +199,54 @@ async fn a_member_certificate_and_only_that_gets_the_master_key() {
     assert_eq!(status, StatusCode::FORBIDDEN, "a revoked certificate");
 }
 
+/// A node that forwards or relays a person's request presents its own
+/// certificate, so the node-only routes must tell such a request from the
+/// node's own: they refuse anything marked as forwarded for a person, even
+/// with a valid member certificate and, for renewal, the service token.
+#[tokio::test]
+async fn a_request_forwarded_for_a_person_is_refused_by_node_only_routes() {
+    const FORWARDED_FOR_USER: &str = "x-reliaburger-forwarded-for-user";
+    let hierarchy = ca::generate_ca_hierarchy("master-key-forwarded", &IKM).unwrap();
+    let council = council(&hierarchy, true).await;
+
+    let response = router(council.clone(), Some(peer(&hierarchy, 10)))
+        .oneshot(
+            Request::get("/v1/cluster/master-key")
+                .header(FORWARDED_FOR_USER, "1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&body);
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(!body.contains(&hex::encode(IKM)), "{body}");
+
+    let (renewal, _) = request("node");
+    let response = router(council.clone(), Some(peer(&hierarchy, 10)))
+        .oneshot(
+            Request::post("/v1/cluster/renew")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer internal-token")
+                .header(FORWARDED_FOR_USER, "1")
+                .body(Body::from(serde_json::to_vec(&renewal).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN, "renewal");
+
+    // The node's own request, unmarked, still gets the key.
+    let (status, body) = get_master_key(router(council.clone(), Some(peer(&hierarchy, 10)))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["master_key"], hex::encode(IKM));
+    council.shutdown().await.unwrap();
+}
+
 /// G1: a retired node's certificate gets no master key, even one that was
 /// never revoked. Retirement is by node id, so this is what stops a node
 /// that was decommissioned, but kept a valid leaf, fetching the key again.

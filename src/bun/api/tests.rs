@@ -2112,6 +2112,81 @@ async fn a_follower_forwards_app_changes_to_the_leader_with_the_callers_token() 
     }
 }
 
+/// A follower forwards a lease read with the lease id as one encoded path
+/// segment. An id holding `\` and `..` reaches the leader as a lease read,
+/// never as another route, and one holding a tab or newline, which a URL
+/// parser would drop, is refused before anything is sent.
+#[tokio::test]
+async fn a_follower_forwards_a_lease_id_as_one_path_segment() {
+    let (deployer, deployer_key) = a_user_token(crate::sesame::types::ApiRole::Deployer);
+    let (follower, seen, nodes) = follower_of_a_recording_leader(deployer).await;
+
+    let (status, body) = get_authenticated(
+        follower.clone(),
+        "/v1/test/leases/..%5C..%5Ctoken%5Clist",
+        &deployer_key,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let paths: Vec<String> = seen
+        .lock()
+        .await
+        .iter()
+        .map(|(path, ..)| path.clone())
+        .collect();
+    assert_eq!(paths, ["/v1/test/leases/..%5C..%5Ctoken%5Clist"]);
+
+    for path in [
+        "/v1/test/leases/.%09.",
+        "/v1/test/leases/.%0A.",
+        "/v1/test/leases/lease%0D",
+    ] {
+        let (status, body) = get_authenticated(follower.clone(), path, &deployer_key).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{path}: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+    assert_eq!(seen.lock().await.len(), 1, "a refused id reaches no leader");
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// Every request a node forwards or relays for a person carries the
+/// person's credential and the forwarded-for-user mark, which node-only
+/// routes refuse.
+#[test]
+fn a_forwarded_request_carries_the_callers_credential_and_the_mark() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        axum::http::HeaderValue::from_static("Bearer rbrg_person"),
+    );
+    let client = crate::cluster::ClusterHttp::plaintext();
+    let request = copy_forwarded_auth(
+        client.client().get("http://127.0.0.1:1/v1/status"),
+        &headers,
+    )
+    .build()
+    .unwrap();
+    assert_eq!(
+        request.headers().get(FORWARDED_FOR_USER_HEADER).unwrap(),
+        "1"
+    );
+    assert_eq!(
+        request.headers().get("authorization").unwrap(),
+        "Bearer rbrg_person"
+    );
+}
+
 /// #1310: a rollback re-applies the previous spec through `cluster_apply`,
 /// so a follower forwards it as an apply. It goes as the caller, bearer and
 /// all, so the leader audits it under the caller's token name and a policy
