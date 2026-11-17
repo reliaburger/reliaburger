@@ -231,10 +231,27 @@ the opaque `.wh..wh..opq`) are applied by `grill::whiteout`, under two rules:
 - **No symlink is followed.** The whiteout's parent directory is opened from
   the rootfs one component at a time with `O_NOFOLLOW | O_DIRECTORY`, and
   everything below it goes through `fstatat`, `openat` and `unlinkat` relative
-  to a directory descriptor. A whiteout whose parent is a symlink, a file or
-  missing removes nothing. A symlink inside a removed tree is unlinked, never
-  followed. A whiteout path with `..` is skipped, and a leading `/` is read
-  relative to the rootfs, as `tar` reads ordinary entries.
+  to a directory descriptor. On Linux the walk uses `O_PATH`, which needs
+  only search (`x`) permission on each directory, as a path lookup does; a
+  directory is opened for reading only to list it. A whiteout whose parent is
+  a symlink, a file or missing removes nothing. A symlink inside a removed
+  tree is unlinked, never followed. A whiteout path with `..` is skipped, and
+  a leading `/` is read relative to the rootfs, as `tar` reads ordinary
+  entries.
+- **A parent reached through an in-image symlink is a no-op.** containerd
+  resolves symlinks that stay inside the root, so for an image with
+  `lib -> usr/lib`, `lib/.wh.foo` removes `usr/lib/foo` there and nothing
+  here. That errs on the safe side: builders write whiteouts at the real
+  path (`usr/lib/.wh.foo`), because that is where the overlay snapshot saw
+  the deletion.
+- **Permission errors keep the entry.** Root removes anything. A rootless
+  Bun unpacks as an ordinary user, and an image can make a lower directory
+  read-only (`0555`) or unreadable. When removing or listing an entry fails
+  with `EACCES` or `EPERM`, the entry stays in the rootfs, Bun logs a
+  warning, and the pull carries on, as it did before whiteouts went through
+  descriptors. The leftover is inside the rootfs, and failing would refuse an
+  image other runtimes run. Any other error (a full disk, an I/O error)
+  fails the unpack.
 - **Only lower layers are hidden** ([OCI image spec, whiteouts](https://github.com/opencontainers/image-spec/blob/main/layer.md#whiteouts)).
   The unpacker records the paths the current layer has written, and a
   whiteout leaves those, and any directory holding one of them, in place.

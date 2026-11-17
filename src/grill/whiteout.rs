@@ -25,13 +25,14 @@
 use std::collections::BTreeSet;
 use std::ffi::{CString, OsStr};
 use std::ops::Bound;
+use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 
 use nix::dir::Dir;
 use nix::errno::Errno;
-use nix::fcntl::{AtFlags, OFlag};
+use nix::fcntl::{AtFlags, OFlag, open, openat};
 use nix::sys::stat::{Mode, SFlag, fstatat};
 use nix::unistd::{UnlinkatFlags, unlinkat};
 
@@ -138,42 +139,58 @@ impl LayerEntries {
 
 /// Apply one whiteout to the rootfs at `rootfs`, sparing `layer`'s own
 /// entries.
+///
+/// An entry the unpacker isn't allowed to remove (`EACCES` or `EPERM`) is
+/// kept with a warning; any other error fails the whiteout.
 pub fn apply(rootfs: &Path, whiteout: &Whiteout, layer: &LayerEntries) -> std::io::Result<()> {
     let directory = match whiteout {
         Whiteout::Remove { directory, .. } | Whiteout::Opaque { directory } => directory,
     };
-    let Some(parent) = open_beneath(rootfs, directory)? else {
-        return Ok(());
+    let parent = match open_beneath(rootfs, directory) {
+        Ok(Some(parent)) => parent,
+        Ok(None) => return Ok(()),
+        Err(errno) => return kept(directory, errno),
     };
     let pending = match whiteout {
         Whiteout::Remove { name, .. } => {
             vec![Pending::new(&Rc::new(parent), name.clone(), directory)]
         }
-        Whiteout::Opaque { .. } => children(parent, directory)?,
+        Whiteout::Opaque { .. } => match children(parent, directory) {
+            Ok(pending) => pending,
+            Err(errno) => return kept(directory, errno),
+        },
     };
     remove_lower(pending, layer)
 }
 
-/// The flags for opening a directory without following a symlink in its
-/// last component. Paths are opened one component at a time, so no
+/// The flags for walking to a directory without following a symlink in
+/// its last component. Paths are opened one component at a time, so no
 /// component anywhere is followed.
-fn directory_flags() -> OFlag {
-    OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC
+///
+/// On Linux `O_PATH` opens a directory for `*at` calls only, which needs
+/// the same search (`x`) permission a path lookup does, not read. macOS has
+/// no `O_PATH`, so it opens the directory for reading.
+fn walk_flags() -> OFlag {
+    #[cfg(target_os = "linux")]
+    let access = OFlag::O_PATH;
+    #[cfg(not(target_os = "linux"))]
+    let access = OFlag::O_RDONLY;
+    access | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC
 }
 
 /// Open `relative` under `rootfs`, one component at a time, never following
 /// a symlink. `None` when a component is missing or isn't a real directory:
 /// then the image has nothing there to remove.
-fn open_beneath(rootfs: &Path, relative: &Path) -> std::io::Result<Option<Dir>> {
-    let mut directory = Dir::open(rootfs, directory_flags(), Mode::empty())?;
+fn open_beneath(rootfs: &Path, relative: &Path) -> Result<Option<OwnedFd>, Errno> {
+    let mut directory = open(rootfs, walk_flags(), Mode::empty())?;
     for component in relative.components() {
         let Component::Normal(name) = component else {
             continue;
         };
-        directory = match Dir::openat(&directory, name, directory_flags(), Mode::empty()) {
+        directory = match openat(&directory, name, walk_flags(), Mode::empty()) {
             Ok(next) => next,
             Err(Errno::ENOENT | Errno::ENOTDIR | Errno::ELOOP) => return Ok(None),
-            Err(errno) => return Err(errno.into()),
+            Err(errno) => return Err(errno),
         };
     }
     Ok(Some(directory))
@@ -183,7 +200,7 @@ fn open_beneath(rootfs: &Path, relative: &Path) -> std::io::Result<Option<Dir>> 
 struct Pending {
     /// The directory holding `name`. `Rc` (a reference-counted pointer)
     /// lets siblings share it; it closes when the last one is done.
-    parent: Rc<Dir>,
+    parent: Rc<OwnedFd>,
     name: CString,
     /// `name`'s path relative to the rootfs, for [`LayerEntries`] lookups.
     path: PathBuf,
@@ -193,7 +210,7 @@ struct Pending {
 }
 
 impl Pending {
-    fn new(parent: &Rc<Dir>, name: CString, directory: &Path) -> Self {
+    fn new(parent: &Rc<OwnedFd>, name: CString, directory: &Path) -> Self {
         let path = directory.join(OsStr::from_bytes(name.as_bytes()));
         Pending {
             parent: Rc::clone(parent),
@@ -205,10 +222,12 @@ impl Pending {
 }
 
 /// Queue every entry of the open `directory`, which sits at `path` relative
-/// to the rootfs.
-fn children(mut directory: Dir, path: &Path) -> std::io::Result<Vec<Pending>> {
+/// to the rootfs. Listing needs read permission on the directory itself.
+fn children(directory: OwnedFd, path: &Path) -> Result<Vec<Pending>, Errno> {
     let mut names = Vec::new();
-    for entry in directory.iter() {
+    let read = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
+    let mut listing = Dir::openat(&directory, c".", read, Mode::empty())?;
+    for entry in listing.iter() {
         let name = entry?.file_name().to_owned();
         if name.as_bytes() != b"." && name.as_bytes() != b".." {
             names.push(name);
@@ -253,17 +272,22 @@ fn remove_lower(mut pending: Vec<Pending>, layer: &LayerEntries) -> std::io::Res
             }
             continue;
         }
-        let directory = match Dir::openat(
+        let queued = openat(
             &*item.parent,
             item.name.as_c_str(),
-            directory_flags(),
+            walk_flags(),
             Mode::empty(),
-        ) {
-            Ok(directory) => directory,
+        )
+        .and_then(|directory| children(directory, &item.path));
+        let queued = match queued {
+            Ok(queued) => queued,
             Err(Errno::ENOENT) => continue,
-            Err(errno) => return Err(errno.into()),
+            // Unreadable: the directory and what's in it stay.
+            Err(errno) => {
+                kept(&item.path, errno)?;
+                continue;
+            }
         };
-        let queued = children(directory, &item.path)?;
         item.emptied = true;
         pending.push(item);
         pending.extend(queued);
@@ -274,7 +298,30 @@ fn remove_lower(mut pending: Vec<Pending>, layer: &LayerEntries) -> std::io::Res
 fn unlink(item: &Pending, flags: UnlinkatFlags) -> std::io::Result<()> {
     match unlinkat(&*item.parent, item.name.as_c_str(), flags) {
         Ok(()) | Err(Errno::ENOENT) => Ok(()),
-        Err(errno) => Err(errno.into()),
+        // A child was kept (and warned about), so its directory stays too.
+        Err(Errno::ENOTEMPTY) if matches!(flags, UnlinkatFlags::RemoveDir) => Ok(()),
+        Err(errno) => kept(&item.path, errno),
+    }
+}
+
+/// Decide what an error removing `path` means.
+///
+/// Root removes anything, but a rootless Bun unpacks as an ordinary user,
+/// and an image may make a lower directory read-only (`0555`) or
+/// unreadable. Then the entry stays in the rootfs, as it would with a
+/// failed `rm`, and the pull carries on: the leftover is still inside the
+/// rootfs, and failing would refuse an image other runtimes run. Any other
+/// error (a full disk, an I/O error) fails the unpack.
+fn kept(path: &Path, errno: Errno) -> std::io::Result<()> {
+    match errno {
+        Errno::EACCES | Errno::EPERM => {
+            eprintln!(
+                "image: whiteout kept {} in the rootfs: {errno}",
+                path.display()
+            );
+            Ok(())
+        }
+        errno => Err(errno.into()),
     }
 }
 

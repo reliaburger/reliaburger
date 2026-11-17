@@ -1639,6 +1639,78 @@ mod tests {
         assert_eq!(std::fs::read(rootfs.join("e/both.txt")).unwrap(), b"upper");
     }
 
+    /// Reaching a whiteout's parent needs only search (`x`) permission on
+    /// the directories above it, as a path lookup does. A rootless Bun
+    /// unpacking an image whose lower directory is `0311` (no read bit)
+    /// still applies the whiteout. Root bypasses the check, so this only
+    /// proves something when run as a normal user.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn whiteout_beneath_a_directory_without_read_permission_is_applied() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let lower = tmp.path().join("lower.tar.gz");
+        create_layer_with_modes(
+            &lower,
+            &[
+                TestEntry::File("a/b/gone.txt", b"lower"),
+                TestEntry::File("a/b/kept.txt", b"lower"),
+                TestEntry::Directory("a/"),
+            ],
+            0o311,
+        );
+        let upper = tmp.path().join("upper.tar.gz");
+        create_layer(&upper, &[TestEntry::File("a/b/.wh.gone.txt", b"")]);
+
+        let rootfs = tmp.path().join("rootfs");
+        let result = unpack_layers(&[lower, upper], &rootfs);
+        let gone = rootfs.join("a/b/gone.txt").exists();
+        let kept = rootfs.join("a/b/kept.txt").exists();
+        // Let the temporary directory clean itself up.
+        let _ = std::fs::set_permissions(rootfs.join("a"), PermissionsExt::from_mode(0o755));
+
+        result.unwrap();
+        assert!(!gone, "the whiteout was not applied");
+        assert!(kept);
+    }
+
+    /// An image can make a lower directory read-only (`0555`). Root removes
+    /// entries from it regardless; a rootless Bun can't, and keeps the
+    /// entry with a warning rather than failing the whole pull.
+    #[test]
+    fn whiteout_in_a_read_only_lower_directory_does_not_fail_the_unpack() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let lower = tmp.path().join("lower.tar.gz");
+        create_layer_with_modes(
+            &lower,
+            &[
+                TestEntry::File("ro/file.txt", b"lower"),
+                TestEntry::File("ro/sub/deep.txt", b"lower"),
+                TestEntry::Directory("ro/"),
+            ],
+            0o555,
+        );
+        let upper = tmp.path().join("upper.tar.gz");
+        create_layer(
+            &upper,
+            &[
+                TestEntry::File("ro/.wh.file.txt", b""),
+                TestEntry::File("ro/.wh.sub", b""),
+            ],
+        );
+
+        let rootfs = tmp.path().join("rootfs");
+        let result = unpack_layers(&[lower, upper], &rootfs);
+        let _ = std::fs::set_permissions(rootfs.join("ro"), PermissionsExt::from_mode(0o755));
+
+        result.unwrap();
+        if nix::unistd::geteuid().is_root() {
+            assert!(!rootfs.join("ro/file.txt").exists());
+            assert!(!rootfs.join("ro/sub").exists());
+        }
+    }
+
     #[test]
     fn whiteout_removes_a_lower_directory_tree() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1694,6 +1766,11 @@ mod tests {
     }
 
     fn create_layer(path: &Path, entries: &[TestEntry<'_>]) {
+        create_layer_with_modes(path, entries, 0o755);
+    }
+
+    /// [`create_layer`], giving every `Directory` entry `directory_mode`.
+    fn create_layer_with_modes(path: &Path, entries: &[TestEntry<'_>], directory_mode: u32) {
         let file = std::fs::File::create(path).unwrap();
         let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
         let mut tar = tar::Builder::new(encoder);
@@ -1708,7 +1785,7 @@ mod tests {
                     tar.append_data(&mut header, name, &content[..]).unwrap();
                 }
                 TestEntry::Directory(name) => {
-                    header.set_mode(0o755);
+                    header.set_mode(directory_mode);
                     header.set_entry_type(tar::EntryType::Directory);
                     tar.append_data(&mut header, name, &[][..]).unwrap();
                 }
