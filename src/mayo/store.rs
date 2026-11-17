@@ -142,14 +142,39 @@ pub(crate) fn write_batch_parquet(
     file.sync_all().map_err(MayoError::Io)?;
     std::fs::rename(&tmp, path).map_err(MayoError::Io)?;
     if let Some(dir) = path.parent() {
-        // A dir fsync makes the rename itself durable. A failure is the
-        // caller's to retry: Ok means the batch survives a power cut, and the
-        // caller drops its rows on Ok (#2060).
-        std::fs::File::open(dir)
-            .and_then(|dir_file| dir_file.sync_all())
-            .map_err(MayoError::Io)?;
+        // A dir fsync makes the rename itself durable. Ok means the batch
+        // survives a power cut, and the caller drops its rows on Ok (#2060).
+        // A filesystem that can't sync directories at all has nothing to
+        // retry. Any other failure is the caller's to retry, and it keeps its
+        // rows, so the file comes out first: left in place, queries would
+        // count those rows twice until the retry.
+        match std::fs::File::open(dir).and_then(|dir_file| dir_file.sync_all()) {
+            Ok(()) => {}
+            Err(error) if directory_sync_unsupported(&error) => {}
+            Err(error) => {
+                if let Err(removal) = std::fs::remove_file(path) {
+                    eprintln!(
+                        "mayo: cannot remove unconfirmed {}: {removal}",
+                        path.display()
+                    );
+                }
+                return Err(MayoError::Io(error));
+            }
+        }
     }
     Ok(())
+}
+
+/// Whether a failed directory sync means the filesystem can't sync
+/// directories at all, rather than that this sync failed.
+fn directory_sync_unsupported(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::Unsupported
+        || matches!(
+            error.raw_os_error(),
+            Some(
+                nix::libc::EINVAL | nix::libc::ENOTSUP | nix::libc::EOPNOTSUPP | nix::libc::ENOSYS
+            )
+        )
 }
 
 /// Prefix of the temporary file a local Mayo flush writes before renaming
@@ -1652,12 +1677,34 @@ mod tests {
         // Write and search, but no read: the file and the rename succeed and
         // only opening the directory to sync it fails.
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o300)).unwrap();
-        let result = write_batch_parquet(&dir.path().join("rollup_000000.parquet"), &batch);
+        let path = dir.path().join("rollup_000000.parquet");
+        let result = write_batch_parquet(&path, &batch);
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(
             result.is_err(),
             "a failed directory sync was reported as Ok"
         );
+        // The caller keeps the rows for its next flush, so a file left in
+        // place would count them twice until then.
+        assert!(!path.exists(), "the unconfirmed file was left in place");
+    }
+
+    /// Some filesystems can't sync a directory at all. That isn't a failed
+    /// flush: the file bytes are synced, and there's nothing to retry.
+    #[test]
+    fn a_directory_sync_the_filesystem_does_not_support_is_not_a_failure() {
+        for errno in [nix::libc::EINVAL, nix::libc::ENOTSUP, nix::libc::ENOSYS] {
+            assert!(
+                directory_sync_unsupported(&std::io::Error::from_raw_os_error(errno)),
+                "errno {errno}"
+            );
+        }
+        for errno in [nix::libc::EIO, nix::libc::EACCES, nix::libc::ENOSPC] {
+            assert!(
+                !directory_sync_unsupported(&std::io::Error::from_raw_os_error(errno)),
+                "errno {errno}"
+            );
+        }
     }
 
     #[tokio::test]
