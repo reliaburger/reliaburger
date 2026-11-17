@@ -31,11 +31,15 @@ demo_git() {
 }
 
 # The example's files, pointed at this build's testapp and the demo's ports.
+#
+# Each port is rewritten only where it stands as a whole number, so a rule
+# never matches inside a port an earlier one wrote: with port base 28078,
+# 8081 becomes 28082, which a bare `s|8082|...|` turned into 228083 (#2068).
 point_at_demo() {
-    sed -e "s|\"target/debug/testapp\"|\"${TESTAPP}\"|" \
-        -e "s|8080|${DEMO_THIRD_APP_PORT}|g" \
-        -e "s|8081|${DEMO_APP_PORT}|g" \
-        -e "s|8082|${DEMO_SECOND_APP_PORT}|g" \
+    sed -E -e "s|\"target/debug/testapp\"|\"${TESTAPP}\"|" \
+        -e "s/(^|[^0-9])8080([^0-9]|$)/\1${DEMO_THIRD_APP_PORT}\2/g" \
+        -e "s/(^|[^0-9])8081([^0-9]|$)/\1${DEMO_APP_PORT}\2/g" \
+        -e "s/(^|[^0-9])8082([^0-9]|$)/\1${DEMO_SECOND_APP_PORT}\2/g" \
         "$1" >"$2"
 }
 
