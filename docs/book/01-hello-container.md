@@ -2940,6 +2940,33 @@ OCI images use a convention called *whiteout files* to handle deletions between 
 
 The unpacker watches for these markers and removes the corresponding files before continuing with the rest of the layer.
 
+That sounds like two calls to `std::fs::remove_dir_all`, and it used to be. Two details make it harder.
+
+The first is symlinks. Ordinary tar entries go through the `tar` crate's `unpack_in`, which checks that each entry's parent directory really sits inside the rootfs. Whiteouts never reach that code: we resolve them ourselves. A lower layer can make `x` a symlink to `/etc`, and a path call on `rootfs/x/.wh.passwd` follows that symlink like any other. Checking the *name* (no `..`, no leading `/`) doesn't help, because the name is fine; the filesystem is what points elsewhere. Bun unpacks images as root, so the removal has to be unable to leave the rootfs.
+
+The fix lives in `src/grill/whiteout.rs`. It opens the rootfs as a directory descriptor and walks to the whiteout's parent one component at a time with `openat` and `O_NOFOLLOW | O_DIRECTORY`. If any component is a symlink, the kernel refuses to open it (`ELOOP` or `ENOTDIR`), and the whiteout has nothing to remove. Below that point every call is relative to a descriptor: `fstatat` with `AT_SYMLINK_NOFOLLOW` to see what an entry is, `openat` to descend, `unlinkat` to remove. A symlink inside a removed directory is unlinked as a link, so its target is never touched. This is the same pattern `chown_tree` in `src/grill/volume.rs` uses for volumes (chapter 5), and it comes from the `nix` crate we already depend on, so no new crate was needed. Linux's `openat2` with `RESOLVE_BENEATH` would do the walk in one call, but it isn't on macOS, where these unit tests also run.
+
+The first version opened every directory on the way with `O_RDONLY`, and review caught a regression in it. Opening a directory for reading needs its read bit, but walking through it on a path only needs the search (`x`) bit. Root doesn't care, but a rootless Bun unpacks as an ordinary user, and an image whose lower directory was `0311` would have failed to pull. On Linux the walk now uses `O_PATH`, a descriptor that's good for `*at` calls and nothing else, which asks only for the search bit. A directory is opened for reading only when we have to list it. The same rootless Bun can't remove anything from a `0555` directory either. There we chose to keep the entry, log a warning and carry on: the leftover is still inside the rootfs, and failing would refuse an image every other runtime runs. Any other error, such as a full disk, still fails the pull.
+
+Refusing every symlink has one visible effect. containerd follows symlinks that stay inside the root, so if an image has `lib -> usr/lib`, a whiteout written as `lib/.wh.foo` removes `usr/lib/foo` there and nothing here. We accept that. Builders take whiteouts from the overlay snapshot's upper directory, where the kernel has already resolved the link, so they write `usr/lib/.wh.foo`, the real path.
+
+The second is order. The OCI image spec says a whiteout hides only *lower* layers. Builders put whiteouts before their siblings, but nothing forces them to, and a layer listing `d/new.txt` and then `d/.wh..wh..opq` would lose its own `new.txt` if we applied the marker blindly. So the unpacker records each path the current layer has written in a `LayerEntries` set, and a whiteout skips those (and keeps any directory with something from this layer inside it). containerd's applier makes the same choice. The alternative, reading each layer twice so whiteouts can run first, would decompress every layer twice.
+
+`LayerEntries` wraps a `BTreeSet<PathBuf>`, and the "anything beneath this path?" question uses the set's ordering. `PathBuf` compares component by component, so everything under `a/b` sorts directly after `a/b` itself (and `a/b/c` sorts before `a/bc`). One range query answers it:
+
+```rust
+self.paths
+    .range::<Path, _>((Bound::Included(path), Bound::Unbounded))
+    .next()
+    .is_some_and(|first| first.starts_with(path))
+```
+
+`range::<Path, _>` is a *turbofish*: it names the generic type parameter by hand, here "look this up by `&Path`, not `PathBuf`". A `BTreeSet<PathBuf>` can be searched by `&Path` because `PathBuf` implements `Borrow<Path>`, the same trick that lets a `HashMap<String, _>` take a `&str` key. The tuple of `Bound`s is used instead of the shorter `path..` because the standard library's `RangeFrom<&T>` only works for sized `T`, and `Path` is unsized.
+
+Removing a directory tree uses an explicit stack, not recursion, so a deeply nested image fails with an error instead of overflowing the thread's stack. Each pending name holds an `Rc<Dir>` of its parent: `Rc` is a reference-counted pointer, so siblings share one open descriptor, which closes when the last of them is done.
+
+The tests `whiteouts_under_a_symlinked_parent_stay_inside_the_rootfs` and `whiteout_after_its_siblings_keeps_the_same_layer_entries` pin both rules. Each failed against the old path-based code.
+
 ### Content-addressed caching
 
 Every blob is stored by its SHA-256 digest under `{store_root}/blobs/sha256/{hash}`. If the file already exists, we skip the download entirely. Tags always re-fetch the manifest (since `latest` might point to a new digest tomorrow), but if all the layers are already cached, the second pull only costs one HTTP request for the manifest.

@@ -538,6 +538,8 @@ The fix content-addresses the rootfs: each set of layers unpacks into `…/{tag}
 
 That marker turned out to be a promise we hadn't kept. The V02 soak powered a node off a few seconds after it unpacked Redis. When the node came back, `gen-…/.complete` was there and `usr/local/bin/redis-server` was 0 bytes: ext4 had written the tiny marker and was still holding the unpacked data in the page cache when the power went. Every redeploy then failed with `exec format error`, the node never got its pinned workload back, and the agent retried every two seconds. The marker now waits for `syncfs` on the unpacked tree, which flushes the whole filesystem in one call rather than fsyncing thousands of files, and is itself written with the same synced temp-file-and-rename as everything else. Cached blobs got the same treatment: they used to be renamed into place without a sync.
 
+What goes *into* a generation got the same scrutiny. Unpacking applies each layer's whiteouts, and those are resolved by our code rather than by the `tar` crate, so they need their own rules: never follow a symlink the image put in the rootfs, and never remove an entry of the whiteout's own layer. Chapter 1's "Layer unpacking and whiteouts" walks through both; the short version is that every removal goes through a directory descriptor opened with `O_NOFOLLOW`, the pattern `chown_tree` uses for volumes earlier in this chapter.
+
 ### One writable rootfs per workload
 
 That fixed image publication, but not workload isolation. Two replicas still
