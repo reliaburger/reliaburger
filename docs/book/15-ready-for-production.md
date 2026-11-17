@@ -2432,7 +2432,9 @@ expects.
 
 `relish logs -o json` is JSON Lines, one object per log line with `at`,
 `node`, `instance`, `stream` and `text`, so an agent can filter on fields
-instead of on the `[instance]` labels people see. The client used to turn the
+instead of on the `[instance]` labels people see. `text` is an `untrusted`
+object, because the app wrote the line ([Chapter
+19](19-built-for-agents.md#their-words-not-ours)). The client used to turn the
 store's entries into text before anyone could ask for anything else; it now
 returns a `LogLines` enum, `Stored` entries with their metadata or `Captured`
 plain lines from the agent's own fallback, and rendering happens last. A

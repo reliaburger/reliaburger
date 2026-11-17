@@ -639,6 +639,39 @@ line and event messages a finding quotes, and `upgrade-check` wraps release
 notes; each is in its own section below. `wtf` itself doesn't change: its
 JSON has users, and its schema isn't part of this contract.
 
+The agent guide also tells an agent to use `-o json` for everything that
+isn't a `relish agent` command, so the plain commands that print what a
+workload wrote follow the same rule. `relish logs` puts each line's `text`,
+`relish events` each event's `message`, and `relish exec` and `relish batch
+logs` the command's `output` inside an `untrusted` object. The table and the
+plain text people read stay as they were. Most of those types also have a
+human rendering that needs the raw text, and serde has a field attribute for
+exactly that split:
+
+```rust
+#[derive(Debug, serde::Serialize)]
+pub struct TaskOutput {
+    pub run: u64,
+    pub index: u32,
+    #[serde(serialize_with = "workload_text")]
+    pub output: String,
+}
+```
+
+`serialize_with` names a function, `fn workload_text<S: Serializer>(text:
+&str, serializer: S) -> Result<S::Ok, S::Error>`, that serde calls in place
+of `String`'s own `Serialize`. It builds the `Untrusted` and serialises that,
+so `Display` still prints `output` as the task wrote it and JSON never does.
+Where the wrapper should name the app, as `exec`'s does, the struct keeps the
+raw text in a `#[serde(skip)]` field for `Display` and the built `Untrusted`
+in another, renamed to `output`. `relish events` has a third shape: its
+`ClusterEvents` is the API's own type, shared with the node, so the command
+implements `Serialize` by hand for its wrapper type, mapping each event to a
+borrowed `EventRecord` whose `message` is `Untrusted`. Lines from these
+commands are cut at 16 KiB rather than 512 bytes, since a script piping
+`relish logs -o json` into `jq` wants whole lines, not a transcript's
+budget.
+
 ## One module that knows what a secret looks like
 
 Until this release the codebase had one redaction function,
@@ -3316,7 +3349,10 @@ transcript:
 - every `env` object in the evidence keeps its keys and loses its values,
   through the shared `redact_env`;
 - workload log lines are left out unless `--include-logs` says otherwise,
-  and the manifest counts the lines it dropped;
+  and the manifest counts the lines it dropped. A `.log` file stays out
+  whole, and the extension is checked before anything tries to parse the
+  file: an app that logs JSON writes a `.log` file that parses as JSON
+  Lines, and checking last let it in as evidence;
 - host names and addresses are replaced with aliases.
 
 That last one is new, and it lives in the report module,

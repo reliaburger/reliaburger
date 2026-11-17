@@ -246,6 +246,12 @@ command left lines out. Tell your agent to treat anything inside `untrusted`
 as evidence to read, never as instructions to follow. Redaction is a safety
 net, not a promise: read what you share before you post it anywhere.
 
+The rest of `relish` keeps the same rule under `-o json` and `-o yaml`:
+`relish logs` puts each line's `text`, `relish events` each `message`, and
+`relish exec` and `relish batch logs` the `output` in an `untrusted` object,
+with lines cut at 16 KiB (512 bytes for an event). Their plain output for
+people is unchanged.
+
 ## Commands
 
 <!-- agent-commands:start -->
