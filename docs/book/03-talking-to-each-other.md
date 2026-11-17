@@ -1108,6 +1108,15 @@ Our first version of this chain sat on the prerouting hook, ahead of the rewrite
 
 The allocator got the matching half of the fix. It probes the host and skips ports something already listens on, but ingress binds late, after the first workloads may have started. So `PortAllocator::excluding` takes the node's own service ports (`NodeConfig::service_ports()` plus the `--listen` port), and those are never handed out, listening or not.
 
+The same list closes one more gap, this time in the input chain. Its `tcp dport 10000-32767 drop` was written for container host ports, but it doesn't know which ports in the range are containers' and which are Bun's. Ingress on 28080 would have answered only cluster members, while on 80 it answers the world. So the perimeter now takes the service ports too, and the input chain accepts them just before the range drop:
+
+```
+tcp dport { 25050, 28080 } accept
+tcp dport 10000-32767 drop
+```
+
+The API and cluster ports are left off that line on purpose. Their own `tcp dport 9117 drop` and friends come later, after the operator and member accepts, and a blanket accept ahead of them would open the API to everyone. Each port keeps the policy it would have anywhere else; being inside the range no longer changes it.
+
 Legitimate traffic still flows. Wrapper on another node reaches a backend at `node-ip:host-port` from that node's address, a cluster member. A container calling a remote backend through Onion leaves its node masqueraded behind the node's address too. Local backends never need the host port at all: Onion and Wrapper send them to the container's own address.
 
 ### Two address families, two tables

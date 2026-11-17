@@ -755,6 +755,8 @@ fn published_ports_answer_members_only_and_rewrite_only_local_destinations() {
     let config = PerimeterConfig {
         management_port: 29117,
         operator_cidrs: vec![format!("{outsider}/32")],
+        // Ingress, also inside the range, answers everyone.
+        service_ports: vec![29117, 28080],
         ..PerimeterConfig::default()
     };
     let ruleset = generate_ruleset(&config, &nodes).unwrap();
@@ -776,13 +778,30 @@ fn published_ports_answer_members_only_and_rewrite_only_local_destinations() {
     greeter(&network_ns, member, 21000, b'R');
     // Bun's own API, on the node, on a port inside the range.
     greeter(&node_ns, node, 29117, b'A');
+    greeter(&node_ns, node, 28080, b'I');
+    // A third address on the network: neither member nor operator.
+    ip(&[
+        "-n",
+        &network_ns,
+        "addr",
+        "add",
+        "198.18.78.4/24",
+        "dev",
+        &peer,
+    ]);
+    let stranger = Ipv4Addr::new(198, 18, 78, 4);
 
-    let (member_reached, outsider_reached, operator_reached_api) =
+    let (member_reached, outsider_reached, operator_reached_api, stranger_reached) =
         in_namespace(&network_ns, move || {
             (
                 greeting_from(member, node, 21000),
                 greeting_from(outsider, node, 21000),
                 greeting_from(outsider, node, 29117),
+                (
+                    greeting_from(stranger, node, 28080),
+                    greeting_from(stranger, node, 29117),
+                    greeting_from(stranger, node, 21000),
+                ),
             )
         });
     let container_reached = in_namespace(&container_ns, move || {
@@ -793,10 +812,18 @@ fn published_ports_answer_members_only_and_rewrite_only_local_destinations() {
             member_reached,
             outsider_reached,
             container_reached,
-            operator_reached_api
+            operator_reached_api,
+            stranger_reached,
         ),
-        (Some(b'L'), None, Some(b'R'), Some(b'A')),
+        (
+            Some(b'L'),
+            None,
+            Some(b'R'),
+            Some(b'A'),
+            (Some(b'I'), None, None)
+        ),
         "(member→published port, outsider→published port, container→member's port, \
-         operator→API port inside the range)"
+         operator→API port inside the range, \
+         stranger→(ingress inside the range, API, published port))"
     );
 }

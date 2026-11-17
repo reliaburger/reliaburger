@@ -47,6 +47,12 @@ pub struct PerimeterConfig {
     /// before gossip discovers them. Does not open container host ports.
     #[serde(default)]
     pub bootstrap_peers: Vec<String>,
+    /// Ports Bun itself serves on (`NodeConfig::service_ports` and the API
+    /// port). One inside `host_port_range` keeps the policy it would have
+    /// outside it: ingress, the registry and DNS answer everyone, while the
+    /// API and cluster ports keep their own operator and member rules.
+    #[serde(default)]
+    pub service_ports: Vec<u16>,
 }
 
 impl Default for PerimeterConfig {
@@ -58,6 +64,7 @@ impl Default for PerimeterConfig {
             operator_cidrs: Vec::new(),
             management_port: 9117,
             bootstrap_peers: Vec::new(),
+            service_ports: Vec::new(),
         }
     }
 }
@@ -315,6 +322,26 @@ fn render_family_table(
         rules.push('\n');
     }
 
+    // Bun's own public listeners (ingress, registry, DNS) inside the range
+    // answer as they would outside it. The API and cluster ports are left
+    // out: their own drops below keep them to operators and members.
+    let open_service_ports: BTreeSet<u16> = config
+        .service_ports
+        .iter()
+        .copied()
+        .filter(|port| *port != config.management_port && !config.cluster_ports.contains(port))
+        .collect();
+    if !open_service_ports.is_empty() {
+        let ports = open_service_ports
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        rules.push_str("    # Bun's own listeners keep their usual policy inside the range\n");
+        rules.push_str(&format!("    tcp dport {{ {ports} }} accept\n"));
+        rules.push('\n');
+    }
+
     // Block external access to container host port range
     let (port_start, port_end) = config.host_port_range;
     rules.push_str("    # Block external access to container host ports\n");
@@ -548,6 +575,34 @@ mod tests {
             assert!(!chain.contains("dport"), "{chain}");
             assert_eq!(chain.matches("drop").count(), 1, "{chain}");
         }
+    }
+
+    /// Ingress or the registry on a port inside the host-port range answers
+    /// as it would outside it. The API and cluster ports keep their own
+    /// operator and member rules even when listed.
+    #[test]
+    fn service_ports_inside_the_range_keep_their_usual_policy() {
+        let config = PerimeterConfig {
+            service_ports: vec![28080, 25050, 9117, 9443, 28080],
+            ..PerimeterConfig::default()
+        };
+        let rules = generate_ruleset(&config, &ClusterNodes::new()).unwrap();
+        for table in rules.split("chain input").skip(1) {
+            let accept = table
+                .find("    tcp dport { 25050, 28080 } accept\n")
+                .unwrap_or_else(|| panic!("no service-port accept in:\n{table}"));
+            let drop = table.find("tcp dport 10000-32767 drop").unwrap();
+            assert!(accept < drop, "the accept must precede the range drop");
+            // The API and cluster ports still answer only operators and
+            // members.
+            assert!(table.contains("tcp dport 9117 drop"));
+            assert!(table.contains("tcp dport 9443 drop"));
+        }
+        // No service ports, no accept line.
+        let rules = generate_ruleset(&PerimeterConfig::default(), &ClusterNodes::new()).unwrap();
+        let input = rules.split("chain input").nth(1).unwrap();
+        let input = &input[..input.find("chain forward").unwrap()];
+        assert!(!input.contains("tcp dport {"), "{input}");
     }
 
     #[test]
