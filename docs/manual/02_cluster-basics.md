@@ -159,18 +159,19 @@ should come in under:
 | A job task waits for a pooled executor to start it | 256 ms |
 | `relish status` or `relish nodes` answers | 1 s |
 | `relish apply` returns, its change committed | 2 s |
-| A new instance of an app passes its health check | 5 s |
+| A new instance of an app passes its health check | 10 s |
 | A rolling update reaches every node | 30 s |
 
 `relish status` answers from one summary call to the node you're connected
 to. It also runs `relish wtf`'s checks alongside, with their own 2 s budget;
 past that its `wtf` line says `not checked in time`, and `--quick` skips them.
 
-Only the first one fails a release today. The other four were first measured
-in October 2026 and are recorded, not yet enforced: treat them as targets
-until the soak records show where they really sit. Bigger clusters, real
-networks and slow image pulls add to all of them, and none of them holds
-while a node is down or a leader is being elected.
+A release fails its soak when any of them goes well past what earlier
+soaks measured. The other four were first measured in October 2026, and
+their gates sit about twice as high as the slowest soak so far, so a release
+can't quietly get much slower. Bigger clusters, real networks and slow image
+pulls add to all of them, and none of them holds while a node is down or a
+leader is being elected.
 
 ## When a node is gone for good
 

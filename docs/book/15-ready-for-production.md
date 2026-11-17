@@ -472,8 +472,20 @@ at a glance. App start was 1 ms in every record, on machines that take seconds t
 container. "A start and a completion on that node's own clock" turned out to be one clock
 reading taken twice: every deploy-history writer filled both fields with `SystemTime::now()`
 as it wrote the entry ([#1640](https://github.com/reliaburger/reliaburger/issues/1640)). A
-number that never moves deserves suspicion. App start stays record only until its
-timestamps mean something.
+number that never moves deserves suspicion. App start stayed record only until its
+timestamps meant something.
+
+They did from the 0.3.0 rehearsal, the first soaks on builds with the fix
+([#1913](https://github.com/reliaburger/reliaburger/issues/1913)). Its seven records hold 186
+starts, from 2.6 s to 11.1 s, with medians of about 5 s. Before trusting them we checked a
+few against the raw deploy history the harness keeps in its evidence: each start was a few
+seconds from `created_at` to `completed_at`, and the three nodes' entries followed one
+another through the rollout, as a rolling update should. The job tiers are a second or two
+slower than the V02 tiers, because the job campaign is busy on the same CPUs. The worst p99
+was the 15 s bucket, in the jobs tiers, so by the same two-bucket rule App start is gated
+at 30 s. That's six times Kubernetes's 5 s, but it isn't the same measurement: theirs
+leaves out the image pull and stops at "running", while ours waits for the health check,
+on three small VMs sharing one laptop. Now all five latencies can fail a release.
 
 
 Here's a bug that a passing test hid for a while. Bun can run a workload as a plain host
