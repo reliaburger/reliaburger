@@ -47,11 +47,25 @@
 # (RUSTSEC-2026-0387, timing variability), so age went back to 0.11.5.
 # Both were reviewed again and kept on 12 November 2026: no newer basic-toml,
 # proc-macro-error2, age or i18n-config release changes that.
+# RUSTSEC-2026-0542 (humantime 2.4.0), RUSTSEC-2026-0543 (chrono 0.4.45) and
+# RUSTSEC-2026-0555 (chrono-tz 0.10.4) were added 17 November 2026 (see
+# docs/qualification/2026-11-17-dependency-exceptions.md): unmaintained, no
+# patched release, and none is Reliaburger's own dependency. Arrow, Parquet,
+# DataFusion 55, object_store, openraft, oci-client, rmcp, schemars and
+# prometheus-parse lock chrono; DataFusion turns on arrow's chrono-tz feature
+# itself; object_store requires humantime. Arrow 60 and DataFusion 55.3.0 still
+# use chrono, so #1366 doesn't remove them; #2036 tracks their removal.
+# tests/suite/dependency_audit.rs fails if Reliaburger depends on any of the
+# three directly, or if one is excused after it leaves Cargo.lock.
 # Next review: 10 December 2026.
 [advisories]
 ignore = [
     "RUSTSEC-2026-0374",
     "RUSTSEC-2026-0173",
+    # humantime, chrono and chrono-tz: unmaintained, through dependencies only.
+    "RUSTSEC-2026-0542",
+    "RUSTSEC-2026-0543",
+    "RUSTSEC-2026-0555",
 ]
 
 [output]
