@@ -872,6 +872,9 @@ impl super::Grill for ProcessGrill {
 
         // File-backed mode: append to log files that outlive this process
         // (they must survive a self-upgrade exec). In-memory mode: pipes.
+        // Pipes and their capture are decided together: a pipe nobody reads
+        // would block the child once it fills.
+        let capture = log_files.is_none().then(|| CaptureTasks::new(instance));
         if let Some((stdout_file, stderr_file)) = log_files {
             cmd.stdout(std::process::Stdio::from(stdout_file));
             cmd.stderr(std::process::Stdio::from(stderr_file));
@@ -902,15 +905,10 @@ impl super::Grill for ProcessGrill {
             }
         })?;
 
-        let capture = if self.log_dir.is_none() {
-            Some(CaptureTasks::new(instance))
-        } else {
-            None
-        };
         // Spawn tasks to capture stdout/stderr (in-memory mode only —
         // file-backed mode has no pipes to read).
         let stdout_buf = entry.stdout_buf.clone();
-        // The pipes exist only in in-memory mode, which is when `capture` is set.
+        // `capture` is set exactly when the pipes are (see above).
         if let Some(stdout) = child.stdout.take()
             && let Some(capture) = capture.as_ref()
         {

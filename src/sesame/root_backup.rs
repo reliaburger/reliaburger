@@ -390,6 +390,20 @@ fn check_opens(
 }
 
 fn write_new_private(path: &Path, bytes: &[u8]) -> Result<(), RootBackupError> {
+    create_private_with(path, |file| {
+        file.write_all(bytes)?;
+        file.sync_all()
+    })
+}
+
+/// Create `path` owner-only (it must not exist yet) and fill it with `write`.
+///
+/// A file that fails part-way is removed: left behind, it would make the
+/// retry fail on `create_new`.
+fn create_private_with(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> Result<(), RootBackupError> {
     let failed = |e: std::io::Error| RootBackupError::WriteFailed {
         path: path.display().to_string(),
         reason: e.to_string(),
@@ -402,8 +416,11 @@ fn write_new_private(path: &Path, bytes: &[u8]) -> Result<(), RootBackupError> {
         options.mode(0o600);
     }
     let mut file = options.open(path).map_err(failed)?;
-    file.write_all(bytes).map_err(failed)?;
-    file.sync_all().map_err(failed)
+    write(&mut file).map_err(|error| {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        failed(error)
+    })
 }
 
 fn read_back(path: &Path) -> Result<Vec<u8>, RootBackupError> {
@@ -775,6 +792,18 @@ mod tests {
         );
         let other = age::x25519::Identity::generate();
         assert!(RootBackup::open(&sealed, &BackupOpener::Identity(other)).is_err());
+    }
+
+    #[test]
+    fn a_write_that_fails_after_the_file_is_created_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("root.age");
+        let err =
+            create_private_with(&path, |_| Err(std::io::Error::other("disk full"))).unwrap_err();
+        assert!(matches!(err, RootBackupError::WriteFailed { .. }), "{err}");
+        assert!(!path.exists(), "a partial file blocks the retry");
+        write_new_private(&path, b"second try").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second try");
     }
 
     #[test]
