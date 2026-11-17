@@ -222,6 +222,25 @@ is a live owner, never replaced alongside. Rootless cgroup limits remain an admi
 doesn't create a delegated user scope, so the OCI rewrite removes the rootful
 cgroup path rather than fabricating a path runc cannot write.
 
+### 1.3 Layer whiteouts
+
+`unpack_layers` extracts ordinary entries with the `tar` crate's `unpack_in`,
+which keeps each entry's parent inside the rootfs. Whiteouts (`.wh.<name>` and
+the opaque `.wh..wh..opq`) are applied by `grill::whiteout`, under two rules:
+
+- **No symlink is followed.** The whiteout's parent directory is opened from
+  the rootfs one component at a time with `O_NOFOLLOW | O_DIRECTORY`, and
+  everything below it goes through `fstatat`, `openat` and `unlinkat` relative
+  to a directory descriptor. A whiteout whose parent is a symlink, a file or
+  missing removes nothing. A symlink inside a removed tree is unlinked, never
+  followed. A whiteout path with `..` is skipped, and a leading `/` is read
+  relative to the rootfs, as `tar` reads ordinary entries.
+- **Only lower layers are hidden** ([OCI image spec, whiteouts](https://github.com/opencontainers/image-spec/blob/main/layer.md#whiteouts)).
+  The unpacker records the paths the current layer has written, and a
+  whiteout leaves those, and any directory holding one of them, in place.
+  The result is the same whether the whiteout comes before or after its
+  siblings in the tar.
+
 ---
 
 ## 2. Dependencies

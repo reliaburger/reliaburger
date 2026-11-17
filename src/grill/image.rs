@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use oci_client::manifest::OciDescriptor;
 
 use super::oci_pull::retry_registry_read;
+use super::whiteout::{self, LayerEntries, LayerEntry};
 
 /// A parsed OCI image reference.
 ///
@@ -927,32 +928,16 @@ fn sha256_hex(data: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Join `rel` onto `base`, rejecting any path that would escape `base`.
-///
-/// Only plain path components are allowed; absolute prefixes, root, and
-/// parent-dir (`..`) components are refused. Regular tar entries are sanitised
-/// by the tar crate's `unpack_in`, but whiteout targets are resolved by hand,
-/// so without this a layer entry such as `../../etc/.wh.passwd` would delete
-/// host files outside the rootfs.
-fn safe_join(base: &Path, rel: &Path) -> Option<PathBuf> {
-    use std::path::Component;
-    let mut out = base.to_path_buf();
-    for component in rel.components() {
-        match component {
-            Component::Normal(part) => out.push(part),
-            Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
-        }
-    }
-    out.starts_with(base).then_some(out)
-}
-
 /// Unpack OCI image layers (gzipped tarballs) into a rootfs directory.
 ///
 /// Layers are applied base-first (index 0 is the bottom layer).
-/// Handles OCI whiteout files:
+/// Handles OCI whiteout files (see the `whiteout` module):
 /// - `.wh.<name>` — delete `<name>` from a lower layer
-/// - `.wh..wh..opq` — clear the entire directory (opaque whiteout)
+/// - `.wh..wh..opq` — clear the directory of lower-layer entries (opaque
+///   whiteout)
+///
+/// A whiteout never follows a symlink, and never removes an entry of its
+/// own layer, wherever it sits in the layer's tar.
 pub fn unpack_layers(layer_paths: &[PathBuf], rootfs: &Path) -> Result<(), ImageError> {
     unpack_layers_with_owner(layer_paths, rootfs, None)
 }
@@ -994,6 +979,8 @@ pub fn unpack_layers_with_owner(
         archive.set_unpack_xattrs(true);
         archive.set_overwrite(true);
 
+        // What this layer has unpacked so far: its own whiteouts spare these.
+        let mut written = LayerEntries::default();
         for entry_result in archive.entries().map_err(|e| ImageError::UnpackFailed {
             digest: digest.clone(),
             reason: format!("failed to read tar entries: {e}"),
@@ -1009,65 +996,24 @@ pub fn unpack_layers_with_owner(
             })?;
             let path = path.to_path_buf();
 
-            let file_name = path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-
-            // Handle opaque whiteout: clear the entire parent directory
-            if file_name == ".wh..wh..opq" {
-                if let Some(parent) = path.parent() {
-                    let Some(target) = safe_join(rootfs, parent) else {
-                        eprintln!(
-                            "image: skipping opaque whiteout with unsafe path {}",
-                            path.display()
-                        );
-                        continue;
-                    };
-                    if target.exists() {
-                        // Remove all existing contents but keep the directory
-                        for child in
-                            std::fs::read_dir(&target).map_err(|e| ImageError::UnpackFailed {
-                                digest: digest.clone(),
-                                reason: format!("failed to read dir for opaque whiteout: {e}"),
-                            })?
-                        {
-                            let child = child.map_err(|e| ImageError::UnpackFailed {
-                                digest: digest.clone(),
-                                reason: format!("failed to read dir entry: {e}"),
-                            })?;
-                            let child_path = child.path();
-                            if child_path.is_dir() {
-                                let _ = std::fs::remove_dir_all(&child_path);
-                            } else {
-                                let _ = std::fs::remove_file(&child_path);
-                            }
+            match LayerEntry::classify(&path) {
+                LayerEntry::Ordinary => {}
+                LayerEntry::Whiteout(marker) => {
+                    whiteout::apply(rootfs, &marker, &written).map_err(|e| {
+                        ImageError::UnpackFailed {
+                            digest: digest.clone(),
+                            reason: format!("failed to apply whiteout {}: {e}", path.display()),
                         }
-                    }
+                    })?;
+                    continue;
                 }
-                continue;
-            }
-
-            // Handle whiteout: delete the named file from a lower layer
-            if let Some(deleted_name) = file_name.strip_prefix(".wh.") {
-                if let Some(parent) = path.parent() {
-                    // Route the whole relative path through safe_join so neither
-                    // the parent nor a crafted `deleted_name` can escape rootfs.
-                    let Some(target) = safe_join(rootfs, &parent.join(deleted_name)) else {
-                        eprintln!(
-                            "image: skipping whiteout with unsafe path {}",
-                            path.display()
-                        );
-                        continue;
-                    };
-                    if target.is_dir() {
-                        let _ = std::fs::remove_dir_all(&target);
-                    } else {
-                        let _ = std::fs::remove_file(&target);
-                    }
+                LayerEntry::Unsafe => {
+                    eprintln!(
+                        "image: skipping whiteout with unsafe path {}",
+                        path.display()
+                    );
+                    continue;
                 }
-                continue;
             }
 
             // Skip device nodes (can't create without root)
@@ -1083,6 +1029,9 @@ pub fn unpack_layers_with_owner(
                     digest: digest.clone(),
                     reason: format!("failed to unpack {}: {e}", path.display()),
                 })?;
+            if unpacked && let Some(relative) = whiteout::relative_path(&path) {
+                written.insert(relative);
+            }
             if let Some(base) = owner_shift
                 && unpacked
             {
@@ -1151,7 +1100,7 @@ fn shift_owner<R: std::io::Read>(
     };
     let uid = shifted(header.uid().map_err(|e| e.to_string())?)?;
     let gid = shifted(header.gid().map_err(|e| e.to_string())?)?;
-    let target = safe_join(rootfs, path).ok_or("unsafe path")?;
+    let target = rootfs.join(whiteout::relative_path(path).ok_or("unsafe path")?);
     std::os::unix::fs::lchown(&target, Some(uid), Some(gid)).map_err(|e| e.to_string())?;
     if header.entry_type() != tar::EntryType::Symlink {
         let mode = header.mode().map_err(|e| e.to_string())?;
@@ -1597,6 +1546,121 @@ mod tests {
         assert!(sentinel.exists(), "traversal whiteout escaped the rootfs");
     }
 
+    /// A lower layer's symlink must not carry a later whiteout out of the
+    /// rootfs: `x -> /outside` followed by `x/.wh..wh..opq` used to empty
+    /// `/outside`, and `y/.wh.keep.txt` to delete a file there.
+    #[test]
+    fn whiteouts_under_a_symlinked_parent_stay_inside_the_rootfs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(outside.join("nested")).unwrap();
+        std::fs::write(outside.join("keep.txt"), b"host file").unwrap();
+        std::fs::write(outside.join("nested/deep.txt"), b"host file").unwrap();
+        let outside = outside.to_str().unwrap();
+
+        let lower = tmp.path().join("lower.tar.gz");
+        create_layer(
+            &lower,
+            &[
+                TestEntry::Symlink("x", outside),
+                TestEntry::Symlink("y", outside),
+                TestEntry::Directory("d/"),
+                TestEntry::Symlink("d/z", outside),
+            ],
+        );
+        let upper = tmp.path().join("upper.tar.gz");
+        create_layer(
+            &upper,
+            &[
+                TestEntry::File("x/.wh..wh..opq", b""),
+                TestEntry::File("y/.wh.keep.txt", b""),
+                TestEntry::File("d/z/.wh.nested", b""),
+                TestEntry::File(".wh.d", b""),
+            ],
+        );
+
+        let rootfs = tmp.path().join("rootfs");
+        unpack_layers(&[lower, upper], &rootfs).unwrap();
+
+        let outside = Path::new(outside);
+        assert!(
+            outside.join("keep.txt").exists(),
+            "whiteout left the rootfs"
+        );
+        assert!(
+            outside.join("nested/deep.txt").exists(),
+            "whiteout left the rootfs"
+        );
+        // The whiteout of `d` removes the symlink inside it, not its target.
+        assert!(!rootfs.join("d").exists());
+        // The symlinks themselves belong to the image and stay.
+        assert!(rootfs.join("x").is_symlink());
+        assert!(rootfs.join("y").is_symlink());
+    }
+
+    /// A whiteout hides only lower layers. A layer that lists its own
+    /// entries before an opaque whiteout of their directory keeps them.
+    #[test]
+    fn whiteout_after_its_siblings_keeps_the_same_layer_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lower = tmp.path().join("lower.tar.gz");
+        create_layer(
+            &lower,
+            &[
+                TestEntry::File("d/old.txt", b"lower"),
+                TestEntry::File("d/sub/old.txt", b"lower"),
+                TestEntry::File("e/old.txt", b"lower"),
+                TestEntry::File("e/both.txt", b"lower"),
+            ],
+        );
+        let upper = tmp.path().join("upper.tar.gz");
+        create_layer(
+            &upper,
+            &[
+                TestEntry::File("d/new.txt", b"upper"),
+                TestEntry::File("d/sub/new.txt", b"upper"),
+                TestEntry::File("d/.wh..wh..opq", b""),
+                TestEntry::File("e/both.txt", b"upper"),
+                TestEntry::File("e/.wh..wh..opq", b""),
+            ],
+        );
+
+        let rootfs = tmp.path().join("rootfs");
+        unpack_layers(&[lower, upper], &rootfs).unwrap();
+
+        assert!(!rootfs.join("d/old.txt").exists());
+        assert!(!rootfs.join("d/sub/old.txt").exists());
+        assert!(!rootfs.join("e/old.txt").exists());
+        assert_eq!(std::fs::read(rootfs.join("d/new.txt")).unwrap(), b"upper");
+        assert_eq!(
+            std::fs::read(rootfs.join("d/sub/new.txt")).unwrap(),
+            b"upper"
+        );
+        assert_eq!(std::fs::read(rootfs.join("e/both.txt")).unwrap(), b"upper");
+    }
+
+    #[test]
+    fn whiteout_removes_a_lower_directory_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lower = tmp.path().join("lower.tar.gz");
+        create_layer(
+            &lower,
+            &[
+                TestEntry::File("tree/a/b/c.txt", b"lower"),
+                TestEntry::File("tree/top.txt", b"lower"),
+                TestEntry::File("other.txt", b"lower"),
+            ],
+        );
+        let upper = tmp.path().join("upper.tar.gz");
+        create_layer(&upper, &[TestEntry::File(".wh.tree", b"")]);
+
+        let rootfs = tmp.path().join("rootfs");
+        unpack_layers(&[lower, upper], &rootfs).unwrap();
+
+        assert!(!rootfs.join("tree").exists());
+        assert!(rootfs.join("other.txt").exists());
+    }
+
     #[test]
     fn unpack_preserves_symlinks() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1620,6 +1684,42 @@ mod tests {
 
     fn create_test_layer(path: &Path, files: &[(&str, &[u8])]) {
         create_test_layer_with_dirs(path, &[], files);
+    }
+
+    /// One entry of a layer built by [`create_layer`], written in order.
+    enum TestEntry<'a> {
+        File(&'a str, &'a [u8]),
+        Directory(&'a str),
+        Symlink(&'a str, &'a str),
+    }
+
+    fn create_layer(path: &Path, entries: &[TestEntry<'_>]) {
+        let file = std::fs::File::create(path).unwrap();
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+        let mut tar = tar::Builder::new(encoder);
+        for entry in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            match entry {
+                TestEntry::File(name, content) => {
+                    header.set_size(content.len() as u64);
+                    header.set_mode(0o644);
+                    header.set_entry_type(tar::EntryType::Regular);
+                    tar.append_data(&mut header, name, &content[..]).unwrap();
+                }
+                TestEntry::Directory(name) => {
+                    header.set_mode(0o755);
+                    header.set_entry_type(tar::EntryType::Directory);
+                    tar.append_data(&mut header, name, &[][..]).unwrap();
+                }
+                TestEntry::Symlink(name, target) => {
+                    header.set_mode(0o777);
+                    header.set_entry_type(tar::EntryType::Symlink);
+                    tar.append_link(&mut header, name, target).unwrap();
+                }
+            }
+        }
+        tar.into_inner().unwrap().finish().unwrap();
     }
 
     /// Build a one-entry layer whose name is written verbatim into the tar
