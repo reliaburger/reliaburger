@@ -51,8 +51,10 @@
 //! A member that was down or slow while the council changed can hold a
 //! membership that predates the current leader: the leader joined while it
 //! was away. Its own view says the leader is a stranger, and refusing it
-//! forever would lock a legitimate member out. So when a stranger sends it
-//! replication, it asks the voters it *does* know which nodes are voters in
+//! forever would lock a legitimate member out. Its vote matters too: with
+//! the old leader gone, a voter added while it lagged may need its vote to
+//! win. So when a stranger sends it replication, or asks for its vote with
+//! a log at least as long as its own, it asks the voters it *does* know which nodes are voters in
 //! their councils ([`super::network::RaftRpc::CouncilVoters`]), over the same
 //! node-id-bound mTLS the transport always dials with. If one of them names
 //! the stranger, with the same node name the certificate carries, it admits
@@ -354,7 +356,7 @@ impl RaftAdmission {
         });
         let Some((voucher, name)) = voucher else {
             eprintln!(
-                "raft: refused replication from node {sender} ({peer:?}): it isn't a voter in \
+                "raft: refused a Raft RPC from node {sender} ({peer:?}): it isn't a voter in \
                  this node's council, and none of the voters asked ({asked:?}) names it"
             );
             return;
@@ -388,12 +390,20 @@ impl RaftRpc {
         vote.leader_id().voted_for()
     }
 
-    /// Whether this RPC replicates the log (only a leader sends these).
-    pub fn replicates(&self) -> bool {
-        matches!(
-            self,
-            RaftRpc::AppendEntries(_) | RaftRpc::InstallSnapshot(_)
-        )
+    /// Whether a stranger sending this RPC is worth asking the council's
+    /// voters about, given the index of this node's last log entry.
+    ///
+    /// Replication always is: this node may be the one that is behind. So
+    /// is a vote whose log reaches at least as far as this node's: a voter
+    /// that missed a membership change may be the vote a new voter needs to
+    /// win, with the old leader gone. A vote with a shorter log isn't, since
+    /// Raft would refuse it anyway.
+    pub fn worth_vouching_for(&self, our_last_index: Option<u64>) -> bool {
+        match self {
+            RaftRpc::AppendEntries(_) | RaftRpc::InstallSnapshot(_) => true,
+            RaftRpc::Vote(request) => request.last_log_id.map(|id| id.index) >= our_last_index,
+            RaftRpc::CouncilVoters => false,
+        }
     }
 }
 
@@ -503,11 +513,47 @@ mod tests {
             leader_commit: None,
         });
         assert_eq!(append.sender(), Some(7));
-        assert!(append.replicates());
         let vote = RaftRpc::Vote(VoteRequest::new(openraft::Vote::new(3, 5), None));
         assert_eq!(vote.sender(), Some(5));
-        assert!(!vote.replicates());
         assert_eq!(RaftRpc::CouncilVoters.sender(), None);
-        assert!(!RaftRpc::CouncilVoters.replicates());
+    }
+
+    fn vote_with_last_index(index: Option<u64>) -> RaftRpc {
+        use openraft::raft::VoteRequest;
+        RaftRpc::Vote(VoteRequest::new(
+            openraft::Vote::new(3, 5),
+            index.map(|index| openraft::LogId::new(openraft::CommittedLeaderId::new(2, 5), index)),
+        ))
+    }
+
+    /// Replication from a stranger is always worth asking about: this node
+    /// may be the one that is behind. A stranger's vote is worth asking
+    /// about only when its log reaches at least as far as this node's,
+    /// because Raft would refuse a shorter log's candidate anyway.
+    #[test]
+    fn a_strangers_replication_or_long_enough_vote_is_worth_asking_about() {
+        use openraft::raft::{AppendEntriesRequest, InstallSnapshotRequest};
+        let append = RaftRpc::AppendEntries(AppendEntriesRequest {
+            vote: openraft::Vote::new_committed(3, 7),
+            prev_log_id: None,
+            entries: Vec::new(),
+            leader_commit: None,
+        });
+        assert!(append.worth_vouching_for(Some(10)));
+        let snapshot = RaftRpc::InstallSnapshot(InstallSnapshotRequest {
+            vote: openraft::Vote::new_committed(3, 7),
+            meta: Default::default(),
+            offset: 0,
+            data: Vec::new(),
+            done: false,
+        });
+        assert!(snapshot.worth_vouching_for(Some(10)));
+
+        assert!(vote_with_last_index(Some(12)).worth_vouching_for(Some(10)));
+        assert!(vote_with_last_index(Some(10)).worth_vouching_for(Some(10)));
+        assert!(!vote_with_last_index(Some(9)).worth_vouching_for(Some(10)));
+        assert!(!vote_with_last_index(None).worth_vouching_for(Some(0)));
+        assert!(vote_with_last_index(None).worth_vouching_for(None));
+        assert!(!RaftRpc::CouncilVoters.worth_vouching_for(None));
     }
 }

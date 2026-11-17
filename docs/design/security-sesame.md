@@ -866,9 +866,11 @@ epoch is still told the newer one. Two cases keep legitimate members in:
 
 - A fresh node with no membership serves whoever replicates to it, because
   that is how a learner joins. It holds no Raft state yet.
-- A member whose membership is behind (the leader joined while it was away)
-  asks the voters it knows, over node-id-bound mTLS, whether the sender is a
-  voter in their councils. If one names it, under the same node name, the
+- A member whose membership is behind (the leader or a candidate joined
+  while it was away) asks the voters it knows, over node-id-bound mTLS,
+  whether the sender is a voter in their councils. It asks about replication
+  and about a vote whose log is at least as long as its own, since a council
+  that lost its leader may need that vote. If one names it, under the same node name, the
   member admits it for 60 seconds while it catches up from the log.
 
 A fresh node's first contact is therefore trusted on first use, and a node

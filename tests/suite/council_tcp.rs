@@ -1145,3 +1145,287 @@ async fn a_member_whose_view_is_behind_admits_a_leader_its_voters_name() {
 
     shutdown.cancel();
 }
+
+/// A vote request from candidate `id` whose log reaches `index` at term 9.
+fn vote_reaching(id: u64, index: u64) -> reliaburger::council::network::RaftRpc {
+    reliaburger::council::network::RaftRpc::Vote(openraft::raft::VoteRequest::new(
+        openraft::Vote::new(9, id),
+        Some(openraft::LogId::new(
+            openraft::CommittedLeaderId::new(9, id),
+            index,
+        )),
+    ))
+}
+
+/// A stranger's vote is held to the same rule as its replication: refused
+/// until a voter this node knows names it, then served. A candidate no
+/// voter names stays refused however long its log claims to be.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_strangers_vote_is_served_only_once_a_voter_names_it() {
+    let shutdown = CancellationToken::new();
+    let tls = TlsSetup::new();
+
+    let voucher = lone_council(1).await;
+    let voucher_address =
+        serve_with_vouching(&voucher, 1, &tls.identity("n1", 10), &shutdown).await;
+    voucher
+        .initialize(BTreeMap::from([
+            (1, info_at(1, voucher_address)),
+            (2, info_at(2, addr(1))),
+            (3, info_at(3, addr(1))),
+        ]))
+        .await
+        .unwrap();
+
+    let behind = lone_council(2).await;
+    let behind_address = serve_with_vouching(&behind, 2, &tls.identity("n2", 11), &shutdown).await;
+    behind
+        .initialize(BTreeMap::from([
+            (1, info_at(1, voucher_address)),
+            (2, info_at(2, behind_address)),
+        ]))
+        .await
+        .unwrap();
+
+    let outsider = tls.identity("n9", 19);
+    assert!(
+        !answered_within(
+            &outsider,
+            behind_address,
+            &rpc_frame(0, vote_reaching(9, 100)),
+            20
+        )
+        .await,
+        "a candidate no voter names must stay refused"
+    );
+
+    let candidate = tls.identity("n3", 12);
+    let mut stream = connect_as(&candidate, behind_address).await;
+    assert!(
+        ask(&mut stream, &rpc_frame(0, vote_reaching(3, 100)))
+            .await
+            .is_none(),
+        "a candidate this node has never heard of isn't served before a voter names it"
+    );
+    assert!(
+        answered_within(
+            &candidate,
+            behind_address,
+            &rpc_frame(0, vote_reaching(3, 100)),
+            50
+        )
+        .await,
+        "the candidate voter 1 names must be served"
+    );
+
+    shutdown.cancel();
+}
+
+/// One node of a vouching council: its council, its Raft address, the
+/// blocklist its own Raft client honours, and the token that stops its
+/// listener. The council's factory and the vouching share one connector.
+struct VouchingNode {
+    council: Arc<CouncilNode>,
+    address: SocketAddr,
+    blocklist: reliaburger::council::network::RaftBlocklist,
+    listener: CancellationToken,
+}
+
+/// Start node `id` over mTLS on `log` and `state` (pass clones of a
+/// previous run's stores to restart it), listening on `at` (`addr(0)` for
+/// any port).
+async fn start_vouching_node(
+    id: u64,
+    identity: &NodeIdentity,
+    log: MemLogStore,
+    state: CouncilStateMachine,
+    at: SocketAddr,
+) -> VouchingNode {
+    let connector = tokio_rustls::TlsConnector::from(
+        reliaburger::sesame::mtls::build_mtls_client_config(identity, CrlHandle::default())
+            .unwrap(),
+    );
+    let acceptor = tokio_rustls::TlsAcceptor::from(
+        reliaburger::sesame::mtls::build_mtls_server_config(identity, CrlHandle::default())
+            .unwrap(),
+    );
+    let factory = TcpRaftNetworkFactory::new_tls(id, connector);
+    let blocklist = factory.blocklist();
+    let admission = reliaburger::council::admission::RaftAdmission::new(factory.clone());
+    let council = Arc::new(
+        CouncilNode::new(id, CouncilConfig::default(), factory, log, state, None)
+            .await
+            .unwrap(),
+    );
+    // A restarted node takes its old port back; the old listener may take
+    // a moment to let go of it.
+    let mut bound = None;
+    for _ in 0..50 {
+        match tokio::net::TcpListener::bind(at).await {
+            Ok(listener) => {
+                bound = Some(listener);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+    let listener = bound.expect("the Raft port never came free");
+    let address = listener.local_addr().unwrap();
+    let token = CancellationToken::new();
+    let raft = council.raft().clone();
+    let contact = council.leader_contact();
+    let serving = token.clone();
+    let server_blocklist = blocklist.clone();
+    tokio::spawn(async move {
+        reliaburger::council::network::serve_raft_rpc_with_admission(
+            listener,
+            raft,
+            contact,
+            serving,
+            Some(acceptor),
+            RecoveryFence::serving(0),
+            reliaburger::smoker::node_fault::NodeTransportGate::new(),
+            None,
+            server_blocklist,
+            admission,
+        )
+        .await;
+    });
+    VouchingNode {
+        council,
+        address,
+        blocklist,
+        listener: token,
+    }
+}
+
+/// Stop a node as a crash would, as far as its peers can tell: its
+/// listener closes and its Raft stops.
+async fn crash(node: &VouchingNode) {
+    node.listener.cancel();
+    node.council.shutdown().await.ok();
+}
+
+/// Wait up to `attempts` × 100 ms for `check` to hold.
+async fn eventually<F, Fut>(attempts: u32, mut check: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    for _ in 0..attempts {
+        if check().await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
+/// The council `{1, 2, 3}` swaps voter 3 for node 4 while voter 2 lags: the
+/// joint and the final configs commit without it, so its membership still
+/// says `{1, 2, 3}`. Then leader 1 crashes. Node 4 can only win with node
+/// 2's vote, and node 2 has never heard of node 4, so it must ask voter 3
+/// (evicted, but still running) before it votes. With `restart`, node 2 is
+/// restarted while it lags, so the check holds after a restart too.
+async fn lagging_voter_still_elects_a_new_voter(restart: bool) {
+    let tls = TlsSetup::new();
+    let identities: Vec<NodeIdentity> = (1..=4)
+        .map(|id| tls.identity(&format!("n{id}"), 10 + id))
+        .collect();
+    let mut stores: Vec<(MemLogStore, CouncilStateMachine)> = (0..4)
+        .map(|_| (MemLogStore::new(), CouncilStateMachine::new()))
+        .collect();
+    let mut nodes = Vec::new();
+    for (index, identity) in identities.iter().enumerate() {
+        let (log, state) = stores[index].clone();
+        nodes.push(start_vouching_node(index as u64 + 1, identity, log, state, addr(0)).await);
+    }
+    let info = |nodes: &[VouchingNode], id: u64| info_at(id, nodes[id as usize - 1].address);
+
+    let leader = Arc::clone(&nodes[0].council);
+    leader
+        .initialize(BTreeMap::from([(1, info(&nodes, 1))]))
+        .await
+        .unwrap();
+    assert!(
+        eventually(50, || leader.is_leader()).await,
+        "node 1 never led"
+    );
+    let ten_s = Duration::from_secs(10);
+    for id in [2, 3] {
+        tokio::time::timeout(ten_s, leader.add_learner(id, info(&nodes, id)))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    tokio::time::timeout(ten_s, leader.change_membership(BTreeSet::from([1, 2, 3])))
+        .await
+        .unwrap()
+        .unwrap();
+    let three = BTreeSet::from([1, 2, 3]);
+    assert!(
+        eventually(100, || async { applied_voters(&nodes[1].council) == three }).await,
+        "node 2 never applied {{1,2,3}}"
+    );
+
+    // Node 2 falls behind: the leader stops reaching it.
+    nodes[0].blocklist.write().await.insert(nodes[1].address);
+    tokio::time::timeout(ten_s, leader.add_learner(4, info(&nodes, 4)))
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(
+        ten_s,
+        leader.change_membership_evicting(BTreeSet::from([1, 2, 4])),
+    )
+    .await
+    .expect("swapping voter 3 for node 4 timed out")
+    .expect("swapping voter 3 for node 4 failed");
+    assert_eq!(
+        applied_voters(&nodes[1].council),
+        three,
+        "node 2 was meant to miss the change"
+    );
+
+    if restart {
+        let address = nodes[1].address;
+        crash(&nodes[1]).await;
+        let (log, state) = stores[1].clone();
+        nodes[1] = start_vouching_node(2, &identities[1], log, state, address).await;
+        // openraft publishes the restored membership shortly after start.
+        assert!(
+            eventually(50, || async { applied_voters(&nodes[1].council) == three }).await,
+            "the restarted node didn't come back with its old membership"
+        );
+    }
+
+    crash(&nodes[0]).await;
+    let new_leader = Arc::clone(&nodes[3].council);
+    assert!(
+        eventually(300, || new_leader.is_leader()).await,
+        "node 4 never won an election with the lagging voter's vote"
+    );
+    let final_voters = BTreeSet::from([1, 2, 4]);
+    assert!(
+        eventually(100, || async {
+            applied_voters(&nodes[1].council) == final_voters
+        })
+        .await,
+        "the lagging voter never caught up with the new leader"
+    );
+
+    for node in &nodes[1..] {
+        crash(node).await;
+    }
+    stores.clear();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lagging_voter_votes_for_a_voter_added_while_it_was_behind() {
+    lagging_voter_still_elects_a_new_voter(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lagging_voter_restarted_while_behind_still_votes_for_the_new_voter() {
+    lagging_voter_still_elects_a_new_voter(true).await;
+}

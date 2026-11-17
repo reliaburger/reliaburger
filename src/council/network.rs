@@ -783,10 +783,12 @@ async fn handle_raft_frame<S: AsyncWrite + Unpin>(
             },
         },
         Standing::Stranger => {
-            // A leader this node has never heard of may be one that joined
-            // while this node was away: ask the voters it knows.
-            if rpc.replicates()
-                && let Some(sender) = sender
+            // A leader or candidate this node has never heard of may be a
+            // voter that joined while this node was away: ask the voters it
+            // knows. Copy the index out of the metrics in one statement.
+            let our_last_index = raft.metrics().borrow().last_log_index;
+            if let Some(sender) = sender
+                && rpc.worth_vouching_for(our_last_index)
             {
                 admission.ask_for_vouch(raft, sender, identity);
             }
