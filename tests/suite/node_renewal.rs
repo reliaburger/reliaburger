@@ -1095,11 +1095,11 @@ async fn worker_renews_a_short_override_leaf_at_its_midpoint() {
     let mut fixture =
         WorkerFixture::with_leader_lifetime(&hierarchy, false, Some(override_lifetime)).await;
     // Exactly the window a 600 s override signs (600 s plus the 300 s
-    // backdate), issued long enough ago that its midpoint is 3 s away.
+    // backdate), issued long enough ago that its midpoint is 8 s away.
     fixture
         .live
         .replace(
-            windowed_identity(&hierarchy, 20, -447, 453),
+            windowed_identity(&hierarchy, 20, -442, 458),
             &reliaburger::sesame::trust::TrustSet::from_state(
                 &fixture.council.security_state().await,
             )
@@ -1108,14 +1108,37 @@ async fn worker_renews_a_short_override_leaf_at_its_midpoint() {
         .await
         .unwrap();
     let monitor = fixture.start_with_ceiling(Some(override_lifetime));
+    // The midpoint the worker computes, from the leaf as signed: X.509
+    // keeps whole seconds, so it isn't exactly 8 s after the call above.
+    let installed = fixture.live.snapshot();
+    let midpoint = installed.not_before
+        + installed
+            .not_after
+            .duration_since(installed.not_before)
+            .unwrap()
+            / 2;
     wait_for_condition(|| monitor.state() == RenewalState::Valid).await;
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    assert_eq!(
-        fixture.calls.load(Ordering::SeqCst),
-        0,
-        "renewed before the midpoint"
+    // Watch the worker up to the midpoint. The worker reads its clock
+    // before it counts a call, so a call counted before our clock read
+    // was decided before the midpoint too. Only those samples are checked:
+    // a loaded host that spends the margin on setup shortens the watch
+    // instead of passing for an early renewal (#2008).
+    let mut checked = 0;
+    loop {
+        let calls = fixture.calls.load(Ordering::SeqCst);
+        let serial = fixture.live.snapshot().serial;
+        if std::time::SystemTime::now() >= midpoint {
+            break;
+        }
+        assert_eq!(calls, 0, "renewed before the midpoint");
+        assert_eq!(serial, SerialNumber(20));
+        checked += 1;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        checked > 0,
+        "setup ran past the leaf's midpoint before the worker could be watched"
     );
-    assert_eq!(fixture.live.snapshot().serial, SerialNumber(20));
     wait_for_condition(|| {
         fixture.live.snapshot().serial.0 >= 100 && monitor.state() == RenewalState::Valid
     })
