@@ -107,7 +107,7 @@ you asked and on the leader, and on the others within about five seconds. If
 the node you asked is more than two seconds behind the leader, the message says
 so, and that node may accept the token until it catches up.
 
-If the leader doesn't answer within 10 seconds you get a `504`, and the write
+If the leader doesn't answer within 20 seconds you get a `504`, and the write
 may have happened anyway. Repeating a `revoke` is safe, and a lost join token
 expires by itself. Check `relish token list` before repeating a `create` or a
 `rotate`, because a secret may be lost (see Rotation below).

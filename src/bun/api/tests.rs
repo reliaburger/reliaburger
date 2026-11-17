@@ -3385,6 +3385,46 @@ async fn a_forwarded_job_apply_streams_past_the_forward_timeout() {
     }
 }
 
+/// Before its event stream starts, the leader binds each of a job apply's
+/// images against its upstream registry, up to 20 s apiece, and then writes
+/// to the council. With three slow registries that runs past the plain
+/// forward timeout, so the follower waits for the headers in proportion to
+/// the images instead of answering 504 while the leader goes on to commit.
+#[tokio::test(start_paused = true)]
+async fn a_forwarded_job_apply_waits_for_the_leader_to_bind_each_image() {
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let leader_port = listener.local_addr().unwrap().port();
+    // Three upstream binds that each run to their limit, then the write.
+    let binding =
+        3 * crate::pickle::binding::UPSTREAM_BIND_TIMEOUT + crate::council::node::WRITE_TIMEOUT;
+    let leader = axum::Router::new().fallback(move || async move {
+        tokio::time::sleep(binding).await;
+        (
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            "data: accepted\n\n",
+        )
+    });
+    tokio::spawn(async move { axum::serve(listener, leader).await.unwrap() });
+    let (follower, nodes) = follower_of_the_leader_api_on(admin, None, leader_port).await;
+    assert!(binding > crate::bun::batch::LEADER_FORWARD_TIMEOUT);
+
+    let request = axum::http::Request::post("/v1/apply")
+        .header("authorization", format!("Bearer {admin_key}"))
+        .body(Body::from(
+            "[job.a]\nimage = \"a:1\"\ncommand = [\"true\"]\n\
+             [job.b]\nimage = \"b:1\"\ncommand = [\"true\"]\n\
+             [job.c]\nimage = \"c:1\"\ncommand = [\"true\"]\n",
+        ))
+        .unwrap();
+    let (status, reply) = send_within(follower, request, binding * 4).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert_eq!(reply, "data: accepted\n\n");
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn lease_created_through_a_lagging_follower_is_in_its_replica_when_returned() {
     use crate::council::CouncilNode;
@@ -9656,6 +9696,77 @@ async fn a_node_that_isnt_an_appliance_refuses_to_stage_an_os() {
     shutdown.cancel();
 }
 
+/// Serve `council`'s router on a local port and return a client for it,
+/// the token that stops the server, and the server task.
+async fn served_client_for_council(
+    council: Arc<crate::council::CouncilNode>,
+) -> (
+    crate::relish::client::BunClient,
+    CancellationToken,
+    tokio::task::JoinHandle<()>,
+) {
+    let (app, shutdown, token) = router_for_council(council).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = crate::relish::client::BunClient::new_with_token(
+        &format!("http://{}", listener.local_addr().unwrap()),
+        Some(&token),
+    );
+    let serving = shutdown.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move { serving.cancelled().await })
+            .await
+            .unwrap();
+    });
+    (client, shutdown, server)
+}
+
+/// `relish apply` is a person waiting on a slow disk, not a loop that can
+/// try again next tick: a commit slower than the background write timeout
+/// still completes the apply instead of aborting it halfway.
+#[tokio::test(start_paused = true)]
+async fn a_commit_slower_than_the_write_timeout_still_completes_an_apply() {
+    let council = seeded_council("slow-apply").await;
+    let (client, shutdown, server) = served_client_for_council(council.clone()).await;
+    council.slow_writes(crate::council::node::WRITE_TIMEOUT + std::time::Duration::from_secs(5));
+    let permission = crate::config::Config::parse(
+        "[permission.reader]\nactions = ['logs']\napps = ['web']\nnamespaces = ['default']\n",
+    )
+    .unwrap();
+    let result = client.apply(&permission).await;
+    assert!(
+        result.is_ok(),
+        "a slow commit aborted the apply: {result:?}"
+    );
+    assert!(
+        council
+            .desired_state()
+            .await
+            .permissions
+            .contains_key("reader")
+    );
+    shutdown.cancel();
+    server.await.unwrap();
+}
+
+/// A write that never commits ends the apply with an answer that says what
+/// the caller can do: the outcome is unknown, and applying again is safe.
+#[tokio::test(start_paused = true)]
+async fn an_apply_whose_write_never_commits_says_it_is_safe_to_repeat() {
+    let council = seeded_council("hung-apply").await;
+    let (client, shutdown, server) = served_client_for_council(council.clone()).await;
+    council.hang_writes();
+    let permission = crate::config::Config::parse(
+        "[permission.reader]\nactions = ['logs']\napps = ['web']\nnamespaces = ['default']\n",
+    )
+    .unwrap();
+    let error = client.apply(&permission).await.unwrap_err().to_string();
+    assert!(error.contains("outcome unknown"), "{error}");
+    assert!(error.contains("safe to repeat"), "{error}");
+    shutdown.cancel();
+    server.await.unwrap();
+}
+
 #[tokio::test]
 async fn apply_uses_committed_namespace_context_before_any_resource_write() {
     use crate::council::RaftRequest;
@@ -11448,4 +11559,47 @@ async fn a_hold_request_holds_this_nodes_elections() {
     assert_eq!(response.status(), StatusCode::OK);
     assert!(nodes[0].elections_held());
     nodes[0].shutdown().await.unwrap();
+}
+
+/// Ending a paused upgrade is two council writes. One that doesn't commit
+/// in time hasn't been refused: the answer is a 503 that says the outcome
+/// is unknown, not a 409 that says the run can't be ended.
+#[tokio::test(start_paused = true)]
+async fn ending_an_upgrade_whose_write_times_out_answers_503_outcome_unknown() {
+    let council = seeded_council("hung-archive").await;
+    council.hang_writes();
+    let aborted = crate::upgrade::types::ClusterUpgradeState {
+        upgrade_id: "up-1".to_string(),
+        target_version: "v0.2.0".parse().unwrap(),
+        binaries: Vec::new(),
+        parallel: 1,
+        direction: crate::upgrade::types::UpgradeDirection::Upgrade,
+        phase: crate::upgrade::types::ClusterUpgradePhase::Aborted {
+            reason: "aborted by the operator".to_string(),
+        },
+        registry_address: String::new(),
+        allow_downgrade: false,
+        nodes: vec![],
+    };
+    let response = super::upgrade::archive_aborted_upgrade(&council, aborted)
+        .await
+        .unwrap_err();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.contains("outcome unknown"), "{body}");
+}
+
+/// A follower's backstop for a forwarded token write must outlast what the
+/// leader may spend on it: proving it leads, the council write, and the
+/// wait for its own replica. Otherwise a slow but healthy leader commits a
+/// token whose only copy of the secret the follower has already given up on.
+#[test]
+fn the_token_forward_backstop_outlasts_the_leaders_own_deadlines() {
+    assert!(
+        super::identity::LEADER_FORWARD_TIMEOUT
+            > crate::council::node::LEADER_CONFIRMATION
+                + crate::council::node::WRITE_TIMEOUT
+                + super::identity::TOKEN_REPLICATION_WAIT
+    );
 }

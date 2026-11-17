@@ -117,6 +117,10 @@ pub struct CouncilNode {
     /// Test hook: every write that hung, with the moment it arrived.
     #[cfg(test)]
     hung_writes: std::sync::Mutex<Vec<(tokio::time::Instant, RaftRequest)>>,
+    /// Test hook: how long each later write waits before it reaches Raft,
+    /// in microseconds, as a slow commit would.
+    #[cfg(test)]
+    write_delay_micros: std::sync::atomic::AtomicU64,
     /// Test hook: how many times [`Self::desired_state`] cloned the whole
     /// desired state, so a loop can be shown not to (#1030).
     #[cfg(test)]
@@ -229,6 +233,8 @@ impl CouncilNode {
             #[cfg(test)]
             hung_writes: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
+            write_delay_micros: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
             full_desired_reads: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             leadership_proofs: std::sync::atomic::AtomicU64::new(0),
@@ -302,8 +308,22 @@ impl CouncilNode {
             .clone()
     }
 
+    /// Test hook: make every later write take `delay` longer to commit.
+    #[cfg(test)]
+    pub(crate) fn slow_writes(&self, delay: Duration) {
+        let micros = u64::try_from(delay.as_micros()).unwrap_or(u64::MAX);
+        self.write_delay_micros
+            .store(micros, std::sync::atomic::Ordering::SeqCst);
+    }
+
     #[cfg(test)]
     async fn hang_write_if_asked(&self, request: &RaftRequest) {
+        let delay = self
+            .write_delay_micros
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_micros(delay)).await;
+        }
         if self.writes_hang.load(std::sync::atomic::Ordering::SeqCst) {
             // A plain mutex in a test hook: the guard is a temporary,
             // dropped before the await below.
