@@ -754,6 +754,11 @@ pub enum AttestationMode {
 }
 ```
 
+A token names one node id. The council refuses to create or consume a token
+whose node id has the same Raft id (`raft_id_from_name`, a djb2 hash of the
+name) as a different node in `SecurityState::node_leaves` or the CRL's retired
+nodes, so two nodes never share a seat in the council directory (#2050).
+
 ### 4.10 Raft Log Encryption
 
 ```rust

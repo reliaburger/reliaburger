@@ -104,6 +104,9 @@ struct StateMachineInner {
     /// state doesn't hold.
     snapshot_last_log_id: Option<LogId<u64>>,
     snapshot_membership: StoredMembership<u64, CouncilNodeInfo>,
+    /// The name `snapshot_data` goes by, made once with it by
+    /// [`snapshot_id_for`].
+    snapshot_id: String,
     /// When set, snapshots are persisted here so applied state survives a
     /// restart (the durable log replays only the post-snapshot tail).
     db: Option<Arc<Database>>,
@@ -128,6 +131,12 @@ impl std::fmt::Debug for StateMachineInner {
 /// Write the latest snapshot (data + index + version + checksum) to redb,
 /// fsyncing on commit. The version and checksum keys land in the same write
 /// transaction as the payload they describe.
+///
+/// A write whose `index` isn't newer than the stored one is skipped (#2049).
+/// openraft builds a snapshot in a spawned task while it installs one inline,
+/// so their commits can land in either order. The counter was taken under
+/// the state lock, so it orders the states, and an older snapshot committing
+/// late must not replace a newer one whose log openraft has already purged.
 // `redb::Error` is large but dictated by the crate; boxing it here buys nothing.
 #[allow(clippy::result_large_err)]
 fn persist_snapshot(db: &Database, data: &[u8], index: u64) -> Result<(), redb::Error> {
@@ -135,6 +144,15 @@ fn persist_snapshot(db: &Database, data: &[u8], index: u64) -> Result<(), redb::
     let wtx = db.begin_write()?;
     {
         let mut t = wtx.open_table(SNAPSHOT)?;
+        let stored = t
+            .get(SNAP_INDEX_KEY)?
+            .and_then(|stored| <[u8; 8]>::try_from(stored.value()).ok())
+            .map(u64::from_le_bytes);
+        if stored.is_some_and(|stored| stored >= index) {
+            drop(t);
+            wtx.abort()?;
+            return Ok(());
+        }
         t.insert(SNAP_DATA_KEY, data)?;
         t.insert(SNAP_INDEX_KEY, index.to_le_bytes().as_slice())?;
         t.insert(
@@ -162,6 +180,25 @@ async fn persist_snapshot_blocking(
         Ok(Err(e)) => Err(StorageError::from(StorageIOError::write_state_machine(&e))),
         Err(e) => Err(StorageError::from(StorageIOError::write_state_machine(&e))),
     }
+}
+
+/// Name a snapshot after the log position it covers, a random value and this
+/// node's snapshot counter (#2051). openraft keeps receiving into one stream
+/// while the id stays the same, and every node counts its own snapshots, so a
+/// counter alone let a new leader's chunks land on top of an old leader's
+/// snapshot of the same number. The random part keeps two snapshots of the
+/// same log position apart too: their JSON needn't match byte for byte.
+fn snapshot_id_for(last_log_id: Option<LogId<u64>>, counter: u64) -> String {
+    let position = last_log_id.map_or_else(
+        || "none".to_string(),
+        |log_id| {
+            format!(
+                "{}-{}-{}",
+                log_id.leader_id.term, log_id.leader_id.node_id, log_id.index
+            )
+        },
+    );
+    format!("{position}-{:016x}-{counter}", rand::random::<u64>())
 }
 
 /// SHA-256 of the snapshot payload bytes.
@@ -958,6 +995,19 @@ impl StateMachineInner {
                         reason: "node identity is retired".into(),
                     });
                 }
+                // Refused at creation so the operator learns before handing
+                // the token out; the consume below checks again (#2050).
+                if let Some(existing) =
+                    crate::sesame::join::raft_id_taken_by(&self.state.security_state, &jt.node_id)
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: crate::sesame::join::JoinError::RaftIdCollision {
+                            node_id: jt.node_id.clone(),
+                            existing: existing.to_string(),
+                        }
+                        .to_string(),
+                    });
+                }
                 // Prune consumed tokens and cap the list so it can't grow
                 // without bound over a long-lived cluster (O5). Pruning keys on
                 // `consumed` (replicated state) and a fixed cap, not wall-clock
@@ -1017,8 +1067,32 @@ impl StateMachineInner {
                         reason: "join token already consumed".to_string(),
                     });
                 }
-                token.consumed = true;
                 let node_id = token.node_id.clone();
+                // Checked again here, not only before the write: two joins
+                // whose names collide can each pass the pre-check (#2050).
+                if let Some(existing) =
+                    crate::sesame::join::raft_id_taken_by(&self.state.security_state, &node_id)
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: crate::sesame::join::JoinError::RaftIdCollision {
+                            node_id,
+                            existing: existing.to_string(),
+                        }
+                        .to_string(),
+                    });
+                }
+                let Some(token) = self
+                    .state
+                    .security_state
+                    .join_tokens
+                    .iter_mut()
+                    .find(|jt| jt.token_hash == *token_hash)
+                else {
+                    return Some(CouncilResponse::Refused {
+                        reason: "join token not found".to_string(),
+                    });
+                };
+                token.consumed = true;
                 let serial = self.state.security_state.next_serial;
                 self.state.security_state.next_serial += 1;
                 crate::sesame::ca_rotation::record_node_leaf(
@@ -3680,6 +3754,7 @@ impl CouncilStateMachine {
             {
                 inner.snapshot_index = u64::from_le_bytes(le);
             }
+            inner.snapshot_id = snapshot_id_for(inner.snapshot_last_log_id, inner.snapshot_index);
         }
         inner.db = Some(db);
         Ok(Self::around(inner))
@@ -3867,6 +3942,7 @@ impl RaftStateMachine<TypeConfig> for CouncilStateMachine {
             guard.snapshot_data = Some(data.clone());
             guard.snapshot_last_log_id = meta.last_log_id;
             guard.snapshot_membership = meta.last_membership.clone();
+            guard.snapshot_id = snapshot_id_for(meta.last_log_id, guard.snapshot_index);
             (guard.db.clone(), guard.snapshot_index)
         };
 
@@ -3887,7 +3963,7 @@ impl RaftStateMachine<TypeConfig> for CouncilStateMachine {
                 let meta = SnapshotMeta {
                     last_log_id: guard.snapshot_last_log_id,
                     last_membership: guard.snapshot_membership.clone(),
-                    snapshot_id: format!("mem-{}", guard.snapshot_index),
+                    snapshot_id: guard.snapshot_id.clone(),
                 };
                 Ok(Some(Snapshot {
                     meta,
@@ -3911,7 +3987,7 @@ pub struct MemSnapshotBuilder {
 
 impl RaftSnapshotBuilder<TypeConfig> for MemSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<u64>> {
-        let (data, index, db, last_log_id, last_membership) = {
+        let (data, snapshot_id, index, db, last_log_id, last_membership) = {
             let mut guard = self.inner.write().await;
             let data = serde_json::to_vec(&guard.state)
                 .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?;
@@ -3919,8 +3995,10 @@ impl RaftSnapshotBuilder<TypeConfig> for MemSnapshotBuilder {
             guard.snapshot_data = Some(data.clone());
             guard.snapshot_last_log_id = guard.state.last_applied_log;
             guard.snapshot_membership = guard.state.last_membership.clone();
+            guard.snapshot_id = snapshot_id_for(guard.snapshot_last_log_id, guard.snapshot_index);
             (
                 data,
+                guard.snapshot_id.clone(),
                 guard.snapshot_index,
                 guard.db.clone(),
                 guard.state.last_applied_log,
@@ -3937,7 +4015,7 @@ impl RaftSnapshotBuilder<TypeConfig> for MemSnapshotBuilder {
         let meta = SnapshotMeta {
             last_log_id,
             last_membership,
-            snapshot_id: format!("mem-{index}"),
+            snapshot_id,
         };
 
         Ok(Snapshot {
@@ -4707,6 +4785,67 @@ mod tests {
             t.insert(key, bytes.as_slice()).unwrap();
         }
         wtx.commit().unwrap();
+    }
+
+    /// openraft builds a snapshot in a spawned task while it installs one
+    /// inline, so their two commits can land in either order. The install
+    /// (newer, counter 2) committing before the build (older, counter 1)
+    /// must leave the install on disk, or a restart finds the log purged
+    /// past the stored snapshot and refuses to start.
+    #[tokio::test]
+    async fn an_older_snapshot_committing_late_does_not_overwrite_a_newer_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("order.redb");
+        let db = Database::create(&path).unwrap();
+        let state_at = |index| {
+            let state = DesiredState {
+                last_applied_log: Some(log_id(1, index)),
+                ..DesiredState::default()
+            };
+            serde_json::to_vec(&state).unwrap()
+        };
+
+        persist_snapshot(&db, &state_at(20), 2).unwrap();
+        persist_snapshot(&db, &state_at(10), 1).unwrap();
+        drop(db);
+
+        let mut sm =
+            CouncilStateMachine::with_store(std::sync::Arc::new(Database::create(&path).unwrap()))
+                .unwrap();
+        let (last_applied, _) = sm.applied_state().await.unwrap();
+        assert_eq!(last_applied.map(|l| l.index), Some(20));
+    }
+
+    /// openraft keeps receiving into one stream while the snapshot id stays
+    /// the same. Two nodes that built the same number of snapshots must
+    /// still name theirs differently, or a leader change mid-transfer
+    /// splices the new leader's chunks into the old one's bytes.
+    #[tokio::test]
+    async fn two_nodes_with_the_same_snapshot_count_name_their_snapshots_apart() {
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let mut sm = CouncilStateMachine::new();
+            sm.apply_fixture(vec![normal_entry(
+                1,
+                1,
+                RaftRequest::AppSpec {
+                    app_id: AppId::new("web", "prod"),
+                    spec: Box::new(default_spec()),
+                },
+            )])
+            .await
+            .unwrap();
+            let built = sm
+                .get_snapshot_builder()
+                .await
+                .build_snapshot()
+                .await
+                .unwrap();
+            let current = sm.get_current_snapshot().await.unwrap().unwrap();
+            assert_eq!(built.meta.snapshot_id, current.meta.snapshot_id);
+            ids.push(built.meta.snapshot_id);
+        }
+        assert_ne!(ids[0], ids[1]);
     }
 
     #[tokio::test]
@@ -8181,6 +8320,74 @@ mod tests {
         });
         assert!(matches!(second, Some(CouncilResponse::Refused { .. })));
         assert_eq!(inner.state.security_state.next_serial, 8);
+    }
+
+    fn join_token_for(node_id: &str, hash: u8) -> crate::sesame::types::JoinToken {
+        crate::sesame::types::JoinToken {
+            token_hash: [hash; 32],
+            expires_at: std::time::SystemTime::now(),
+            consumed: false,
+            attestation_mode: crate::sesame::types::AttestationMode::None,
+            node_id: node_id.to_string(),
+        }
+    }
+
+    /// `worker-c0` and `worker-ar` hash to the same Raft id. A second node
+    /// under that id would hide the first: a dead voter would look alive
+    /// through the other node's gossip. A token for the second name is
+    /// refused when it's created.
+    #[test]
+    fn create_join_token_refuses_a_node_whose_raft_id_is_taken() {
+        let mut inner = StateMachineInner::default();
+        crate::sesame::ca_rotation::record_node_leaf(
+            &mut inner.state.security_state,
+            "worker-c0",
+            3,
+        );
+
+        let resp = inner.apply_request(&RaftRequest::CreateJoinToken(join_token_for(
+            "worker-ar",
+            0xCE,
+        )));
+
+        let Some(CouncilResponse::Refused { reason }) = resp else {
+            panic!("expected a refusal, got {resp:?}");
+        };
+        assert!(reason.contains("worker-c0"), "{reason}");
+        assert!(inner.state.security_state.join_tokens.is_empty());
+        let again = inner.apply_request(&RaftRequest::CreateJoinToken(join_token_for(
+            "worker-c0",
+            0xCF,
+        )));
+        assert_eq!(again, None, "the same name may enrol again");
+    }
+
+    /// Two tokens minted before either node joined: whichever consumes
+    /// second is refused, and spends neither its token nor a serial.
+    #[test]
+    fn consume_join_token_for_issue_refuses_a_node_whose_raft_id_is_taken() {
+        let mut inner = StateMachineInner::default();
+        inner.state.security_state.next_serial = 7;
+        inner.apply_request(&RaftRequest::CreateJoinToken(join_token_for(
+            "worker-ar",
+            0xCE,
+        )));
+        crate::sesame::ca_rotation::record_node_leaf(
+            &mut inner.state.security_state,
+            "worker-c0",
+            3,
+        );
+
+        let resp = inner.apply_request(&RaftRequest::ConsumeJoinTokenForIssue {
+            token_hash: [0xCE; 32],
+        });
+
+        let Some(CouncilResponse::Refused { reason }) = resp else {
+            panic!("expected a refusal, got {resp:?}");
+        };
+        assert!(reason.contains("worker-c0"), "{reason}");
+        assert!(!inner.state.security_state.join_tokens[0].consumed);
+        assert_eq!(inner.state.security_state.next_serial, 7);
     }
 
     #[test]
