@@ -229,9 +229,32 @@ pub enum GossipPayload {
     Sync {
         /// Membership entries from the sender's table, in any state.
         entries: Vec<MembershipUpdate>,
+        /// The sequence floors the sender keeps for departed members. A
+        /// datagram carries entries or floors, never both, and at most
+        /// [`MAX_PIGGYBACK_UPDATES`] of either.
+        floors: Vec<SequenceFloor>,
         /// Whether the receiver should answer with its own table.
         wants_reply: bool,
     },
+}
+
+/// The highest sequence a node accepted from a member that has since been
+/// reaped, shared in anti-entropy so a node that never heard the member
+/// (one that joined later, or restarted) learns it too.
+///
+/// A receiver drops any later datagram from `node_id` at or below
+/// `sequence` until the floor expires. A genuinely restarted member's
+/// counter starts above it, so the floor only stops old datagrams.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SequenceFloor {
+    /// The departed member.
+    pub node_id: NodeId,
+    /// The highest sequence accepted from it.
+    pub sequence: u64,
+    /// Seconds left before the floor expires. A floor travels with its
+    /// remaining time, not a fresh one, so passing it around never makes
+    /// it outlive the node that first recorded it.
+    pub expires_in_secs: u32,
 }
 
 impl GossipPayload {
@@ -662,6 +685,7 @@ mod tests {
             3,
             GossipPayload::Sync {
                 entries,
+                floors: vec![],
                 wants_reply,
             },
         )
@@ -716,6 +740,42 @@ mod tests {
             "full sync datagram too large: {} bytes",
             datagram.len()
         );
+    }
+
+    #[test]
+    fn a_full_floor_datagram_fits_the_udp_budget() {
+        // Floors go in their own sync datagrams, at most
+        // MAX_PIGGYBACK_UPDATES each, with the longest names and the
+        // largest values every varint can carry.
+        let long_name = |i: u64| NodeId::new(format!("{}{i}", "n".repeat(62)));
+        let floors = (0..MAX_PIGGYBACK_UPDATES as u64)
+            .map(|i| SequenceFloor {
+                node_id: long_name(i),
+                sequence: u64::MAX,
+                expires_in_secs: u32::MAX,
+            })
+            .collect();
+        let mut msg = GossipMessage::new(
+            long_name(9),
+            u64::MAX,
+            GossipPayload::Sync {
+                entries: vec![],
+                floors,
+                wants_reply: false,
+            },
+        );
+        msg.sequence = u64::MAX;
+        let datagram = encode_datagram(&msg).unwrap();
+        assert!(
+            datagram.len() < MAX_DATAGRAM_BYTES,
+            "full floor datagram too large: {} bytes",
+            datagram.len()
+        );
+        let decoded = decode_datagram(&datagram).unwrap();
+        let GossipPayload::Sync { floors, .. } = decoded.payload else {
+            panic!("a sync datagram decoded as something else");
+        };
+        assert_eq!(floors.len(), MAX_PIGGYBACK_UPDATES);
     }
 
     // -- datagram byte budget (#696) -----------------------------------------

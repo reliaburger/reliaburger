@@ -44,7 +44,7 @@ use super::dissemination::DisseminationQueue;
 use super::membership::{MembershipSnapshot, MembershipTable};
 use super::message::{
     DirectoryExtension, GossipMessage, GossipPayload, LeaderHint, MAX_PIGGYBACK_UPDATES,
-    MAX_SYNC_ENTRIES, MembershipUpdate,
+    MAX_SYNC_ENTRIES, MembershipUpdate, SequenceFloor,
 };
 use super::state::NodeState;
 use super::transport::MustardTransport;
@@ -55,6 +55,30 @@ const MAX_PENDING_RELAYS: usize = 64;
 
 /// Shortest gap between two log lines about failed gossip sends.
 const SEND_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How long a node keeps a reaped member's sequence floor. Until it expires,
+/// an old datagram from the departed member stays old.
+const SEQUENCE_FLOOR_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Most sequence floors a node keeps. Past this, the floor closest to
+/// expiring goes first, so a burst of departures can't grow memory.
+const MAX_SEQUENCE_FLOORS: usize = 1024;
+
+/// Most floors one side sends in a single anti-entropy exchange; a larger
+/// set goes out as a rotating window, like the membership table.
+const MAX_SYNC_FLOORS: usize = MAX_PIGGYBACK_UPDATES * 2;
+
+/// A reaped member's sequence floor, as this node keeps it.
+#[derive(Debug, Clone)]
+struct RetainedFloor {
+    /// The highest sequence accepted from the member.
+    sequence: u64,
+    /// When the floor stops applying.
+    expires: Instant,
+    /// Whether we've already logged a datagram dropped below this floor,
+    /// so a stream of them is one log line.
+    logged: bool,
+}
 
 /// An indirect probe this node is running for a peer: when `target`
 /// acknowledges our PING before `expires`, we forward the ACK to
@@ -235,9 +259,15 @@ pub struct MustardNode<T: MustardTransport> {
     /// tables larger than one exchange carries (`MAX_SYNC_ENTRIES`).
     sync_cursor: usize,
     /// The highest message sequence accepted from each sender. A message
-    /// at or below it is a replay or a duplicate and is dropped. Pruned
-    /// when the sender is reaped from membership.
+    /// at or below it is a replay or a duplicate and is dropped. Moved to
+    /// `sequence_floors` when the sender is reaped from membership.
     sequences: HashMap<NodeId, u64>,
+    /// Sequence floors for reaped members, ours and those learned in
+    /// anti-entropy. A reap forgets the member, not what it last sent, so an
+    /// old datagram from it is still old after the reap.
+    sequence_floors: HashMap<NodeId, RetainedFloor>,
+    /// Where the next outgoing window of `sequence_floors` starts.
+    floor_cursor: usize,
     /// Indirect probes this node is relaying, waiting for the target's ACK.
     pending_relays: VecDeque<PendingRelay>,
     /// Failed sends, reported at a bounded rate.
@@ -304,6 +334,8 @@ impl<T: MustardTransport> MustardNode<T> {
             next_push_pull: Instant::now(),
             sync_cursor: 0,
             sequences: HashMap::new(),
+            sequence_floors: HashMap::new(),
+            floor_cursor: 0,
             pending_relays: VecDeque::new(),
             send_failures: SendFailureLog::default(),
             oversize_extension_logged: false,
@@ -545,8 +577,28 @@ impl<T: MustardTransport> MustardNode<T> {
 
     /// Whether `message` is the newest we've seen from its sender. Records
     /// its sequence if so. A replayed or duplicated datagram carries a
-    /// sequence at or below the last one we accepted from that sender.
-    fn admit_sequence(&mut self, message: &GossipMessage) -> bool {
+    /// sequence at or below the last one we accepted from that sender, or
+    /// at or below its floor if the sender has been reaped since.
+    fn admit_sequence(&mut self, message: &GossipMessage, now: Instant) -> bool {
+        if let Some(floor) = self.sequence_floors.get_mut(&message.sender)
+            && floor.expires > now
+        {
+            if message.sequence <= floor.sequence {
+                if !floor.logged {
+                    floor.logged = true;
+                    eprintln!(
+                        "mustard: dropping gossip from departed node {}: its sequence is at or \
+                         below the last one heard before it was reaped (if it restarted, its \
+                         clock went backwards; it is heard again when the floor expires)",
+                        message.sender
+                    );
+                }
+                return false;
+            }
+            // A newer sequence: the member really is back. Track it as a
+            // live sender from here on.
+            self.sequence_floors.remove(&message.sender);
+        }
         match self.sequences.get_mut(&message.sender) {
             Some(last) if message.sequence <= *last => false,
             Some(last) => {
@@ -771,20 +823,7 @@ impl<T: MustardTransport> MustardNode<T> {
         });
         self.promote_expired_suspects();
         let now = Instant::now();
-        let reaped = self
-            .membership
-            .reap_expired_dead(self.config.cleanup_timeout, now);
-        if !reaped.is_empty() {
-            // Forget a reaped member's sequence, so the same node coming
-            // back (a restart whose clock stepped backwards included) is
-            // heard again rather than dropped as a replay forever.
-            for node in &reaped {
-                self.sequences.remove(node);
-            }
-            if self.directory.prune(&reaped) {
-                self.publish_directory();
-            }
-        }
+        self.reap_departed(now);
         self.ping_rejoin_contact().await;
 
         // An isolated node stays due, so it syncs with the first peer it
@@ -858,24 +897,169 @@ impl<T: MustardTransport> MustardNode<T> {
         }
     }
 
+    /// Reap members that have been Dead or Left past `cleanup_timeout`, and
+    /// expire old sequence floors.
+    ///
+    /// A reaped member's last accepted sequence becomes its floor, kept for
+    /// [`SEQUENCE_FLOOR_RETENTION`]. Forgetting it with the member would make
+    /// the member's old datagrams count as fresh again. The same node really coming back is still heard: its
+    /// counter carries on from where it was, or restarts from the wall
+    /// clock, above the floor either way.
+    fn reap_departed(&mut self, now: Instant) {
+        self.sequence_floors.retain(|_, floor| floor.expires > now);
+        let reaped = self
+            .membership
+            .reap_expired_dead(self.config.cleanup_timeout, now);
+        if reaped.is_empty() {
+            return;
+        }
+        for node in &reaped {
+            if let Some(sequence) = self.sequences.remove(node) {
+                self.retain_floor(node.clone(), sequence, now + SEQUENCE_FLOOR_RETENTION);
+            }
+        }
+        if self.directory.prune(&reaped) {
+            self.publish_directory();
+        }
+    }
+
+    /// Keep a sequence floor for `node`, raising an existing one. When the
+    /// table is full, the floor closest to expiring makes room.
+    fn retain_floor(&mut self, node: NodeId, sequence: u64, expires: Instant) {
+        if let Some(floor) = self.sequence_floors.get_mut(&node) {
+            floor.sequence = floor.sequence.max(sequence);
+            floor.expires = floor.expires.max(expires);
+            return;
+        }
+        if self.sequence_floors.len() >= MAX_SEQUENCE_FLOORS {
+            let soonest = self
+                .sequence_floors
+                .iter()
+                .min_by_key(|(_, floor)| floor.expires)
+                .map(|(node, _)| node.clone());
+            if let Some(soonest) = soonest {
+                self.sequence_floors.remove(&soonest);
+            }
+        }
+        self.sequence_floors.insert(
+            node,
+            RetainedFloor {
+                sequence,
+                expires,
+                logged: false,
+            },
+        );
+    }
+
+    /// Fold floors a peer sent in anti-entropy into ours.
+    ///
+    /// For a member that's down but not yet reaped, a peer's floor raises
+    /// our sequence for it, so by the reap every node agrees on the highest
+    /// sequence any of them accepted: a datagram the member sent to someone
+    /// else is no newer than our floor. A floor for a sender we hear
+    /// directly and consider up is ignored (our own record is what counts),
+    /// and so is a floor about this node.
+    fn merge_floors(&mut self, floors: &[SequenceFloor], now: Instant) {
+        for floor in floors {
+            if floor.node_id == self.node_id {
+                continue;
+            }
+            if let Some(last) = self.sequences.get_mut(&floor.node_id) {
+                let departing = self
+                    .membership
+                    .get(&floor.node_id)
+                    .is_some_and(|member| member.state.is_down());
+                if departing {
+                    *last = (*last).max(floor.sequence);
+                }
+                continue;
+            }
+            let remaining =
+                Duration::from_secs(u64::from(floor.expires_in_secs)).min(SEQUENCE_FLOOR_RETENTION);
+            if remaining.is_zero() {
+                continue;
+            }
+            self.retain_floor(floor.node_id.clone(), floor.sequence, now + remaining);
+        }
+    }
+
+    /// The floors for one exchange, each with its remaining time: all of
+    /// them when they fit in [`MAX_SYNC_FLOORS`], otherwise the next window,
+    /// rotating through them (sorted by node id) one exchange at a time.
+    ///
+    /// Members that are down but not yet reaped go too, at the full
+    /// retention: they'll be floors once reaped, and sharing them now lets
+    /// the cluster agree on each one first.
+    fn floor_window(&mut self, now: Instant) -> Vec<SequenceFloor> {
+        let retention_secs = u32::try_from(SEQUENCE_FLOOR_RETENTION.as_secs()).unwrap_or(u32::MAX);
+        let departing: Vec<SequenceFloor> = self
+            .membership
+            .iter()
+            .filter(|member| member.state.is_down())
+            .filter_map(|member| {
+                self.sequences
+                    .get(&member.node_id)
+                    .map(|&sequence| SequenceFloor {
+                        node_id: member.node_id.clone(),
+                        sequence,
+                        expires_in_secs: retention_secs,
+                    })
+            })
+            .collect();
+        let mut floors: Vec<SequenceFloor> = self
+            .sequence_floors
+            .iter()
+            .filter(|(_, floor)| floor.expires > now)
+            .map(|(node, floor)| SequenceFloor {
+                node_id: node.clone(),
+                sequence: floor.sequence,
+                expires_in_secs: u32::try_from(floor.expires.duration_since(now).as_secs())
+                    .unwrap_or(u32::MAX),
+            })
+            .chain(departing)
+            .collect();
+        floors.sort_unstable_by(|a, b| a.node_id.cmp(&b.node_id));
+        if floors.len() <= MAX_SYNC_FLOORS {
+            return floors;
+        }
+        let start = self.floor_cursor % floors.len();
+        self.floor_cursor = start + MAX_SYNC_FLOORS;
+        floors
+            .iter()
+            .cycle()
+            .skip(start)
+            .take(MAX_SYNC_FLOORS)
+            .cloned()
+            .collect()
+    }
+
     /// Handle an incoming gossip message. Returns `false` if it was dropped
-    /// unread: a different protocol generation, or a sequence number at or
-    /// below the last one accepted from its sender (a replay or duplicate).
+    /// unread: a different protocol generation, a datagram naming this node
+    /// as its sender, or a sequence number at or below the last one
+    /// accepted from its sender, or its floor (a replay or duplicate).
     pub async fn handle_message(&mut self, from: SocketAddr, message: GossipMessage) -> bool {
         if message.version != GossipMessage::VERSION
             || message.state_format != crate::compatibility::CURRENT.state
         {
             return false;
         }
+        // A datagram in our own name tells us nothing we don't know: it's
+        // our own PING to a seed list that names us, or an old one of ours
+        // come back. There's no sequence to check it against (we don't track
+        // our own), and applying it could only move our own address or roll
+        // our directory entry back.
+        if message.sender == self.node_id {
+            return false;
+        }
+        let now = Instant::now();
         // Replay protection comes before anything is applied. The HMAC proves
         // the sender wrote these bytes once, not that it wrote them just now:
         // a captured datagram replayed from another socket would otherwise
         // move the sender's address there, and an old extension would roll
         // its directory fields (recovery epoch included) back.
-        if message.sender != self.node_id && !self.admit_sequence(&message) {
+        if !self.admit_sequence(&message, now) {
             return false;
         }
-        let now = Instant::now();
 
         // Fold the directory extension in first — endpoint knowledge and the
         // leader hint are useful even if the membership payload is stale.
@@ -892,7 +1076,7 @@ impl<T: MustardTransport> MustardNode<T> {
         // Register the sender at the socket it came from. A relayed ACK's
         // sender is the relay itself, so this records the relay at its own
         // socket, never the probed node at the relay's (M13).
-        if message.sender != self.node_id && from != self.address {
+        if from != self.address {
             self.rejoin_contacts
                 .retain(|(node, _)| node != &message.sender);
             self.rejoin_contacts
@@ -993,12 +1177,15 @@ impl<T: MustardTransport> MustardNode<T> {
                     self.expect_relay_ack(target.clone(), requester.clone());
                 }
             }
-            GossipPayload::Sync { wants_reply, .. } => {
-                if message.sender != self.node_id
-                    && let Some(sender) = &self.synced_watch
-                {
+            GossipPayload::Sync {
+                floors,
+                wants_reply,
+                ..
+            } => {
+                if let Some(sender) = &self.synced_watch {
                     sender.send_if_modified(|synced| !std::mem::replace(synced, true));
                 }
+                self.merge_floors(floors, now);
                 // The entries were merged above like any piggybacked update.
                 // Answer a request with our own table; never answer a reply,
                 // or two nodes would bounce their tables back and forth.
@@ -1008,7 +1195,6 @@ impl<T: MustardTransport> MustardNode<T> {
             }
             GossipPayload::Ack { relayed_for, .. } => {
                 if relayed_for.is_none()
-                    && message.sender != self.node_id
                     && let Some(sender) = &self.rejoin_watch
                 {
                     sender.send_replace(true);
@@ -1129,8 +1315,9 @@ impl<T: MustardTransport> MustardNode<T> {
         true
     }
 
-    /// Send our membership table to `target` as a burst of `Sync` datagrams.
-    /// Only the first datagram carries `wants_reply`, so the peer answers once.
+    /// Send our membership table to `target` as a burst of `Sync` datagrams,
+    /// then our sequence floors in datagrams of their own. Only the first
+    /// datagram carries `wants_reply`, so the peer answers once.
     ///
     /// Sync datagrams go out unstamped: the directory extension can take
     /// ~1,100 bytes with a full label set, and every probe already carries it,
@@ -1143,7 +1330,21 @@ impl<T: MustardTransport> MustardNode<T> {
                 self.incarnation,
                 GossipPayload::Sync {
                     entries: entries.to_vec(),
+                    floors: vec![],
                     wants_reply: wants_reply && index == 0,
+                },
+            );
+            self.send(target, &sync).await;
+        }
+        let floors = self.floor_window(Instant::now());
+        for floors in floors.chunks(MAX_PIGGYBACK_UPDATES) {
+            let sync = GossipMessage::new(
+                self.node_id.clone(),
+                self.incarnation,
+                GossipPayload::Sync {
+                    entries: vec![],
+                    floors: floors.to_vec(),
+                    wants_reply: false,
                 },
             );
             self.send(target, &sync).await;
@@ -2263,6 +2464,7 @@ mod tests {
             1,
             GossipPayload::Sync {
                 entries,
+                floors: vec![],
                 wants_reply,
             },
         )
@@ -2405,6 +2607,7 @@ mod tests {
             let GossipPayload::Sync {
                 entries,
                 wants_reply,
+                ..
             } = reply.payload
             else {
                 panic!("expected only sync datagrams, got {:?}", reply.payload);
@@ -3244,6 +3447,303 @@ mod tests {
                 .disk_pressured
                 .contains(&NodeId::new("victim"))
         );
+    }
+
+    // -- freshness across a reap, and datagrams in our own name ---------------
+
+    /// An instant past `fast_config`'s cleanup timeout for anything that
+    /// went down now.
+    fn after_the_reap() -> Instant {
+        Instant::now() + fast_config().cleanup_timeout + Duration::from_millis(1)
+    }
+
+    /// `node` hears `datagrams` from "peer", then declares it dead and reaps
+    /// it, as it would 60 s after a real failure.
+    async fn hear_then_reap(
+        node: &mut MustardNode<InMemoryTransport>,
+        datagrams: &[GossipMessage],
+    ) {
+        for datagram in datagrams {
+            assert!(node.handle_message(addr(2), datagram.clone()).await);
+        }
+        node.membership.declare_dead(&NodeId::new("peer"));
+        node.reap_departed(after_the_reap());
+        assert!(node.membership.get(&NodeId::new("peer")).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_departed_members_recorded_datagrams_do_not_bring_it_back_after_the_reap() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        let recorded: Vec<_> = (0..3).map(|_| ping_from("peer")).collect();
+        hear_then_reap(&mut node, &recorded).await;
+
+        // Someone who recorded them replays them, in order, from elsewhere.
+        for datagram in recorded {
+            assert!(
+                !node.handle_message(addr(66), datagram).await,
+                "a datagram recorded before the reap was accepted after it"
+            );
+        }
+        assert!(
+            node.membership.get(&NodeId::new("peer")).is_none(),
+            "a replay brought a departed member back"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reaped_member_that_really_comes_back_is_heard() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        hear_then_reap(&mut node, &[ping_from("peer")]).await;
+
+        // A restarted process's counter starts above everything it sent
+        // before, and it may come back at a new incarnation.
+        let restarted = GossipMessage::new(
+            NodeId::new("peer"),
+            2,
+            GossipPayload::Ping { updates: vec![] },
+        );
+        assert!(node.handle_message(addr(7), restarted).await);
+        let member = node.membership.get(&NodeId::new("peer")).unwrap();
+        assert_eq!(member.state, NodeState::Alive);
+        assert_eq!(member.address, addr(7));
+        assert_eq!(member.incarnation, 2);
+        // From here on it's an ordinary live sender.
+        assert!(node.handle_message(addr(7), ping_from("peer")).await);
+    }
+
+    #[tokio::test]
+    async fn a_node_that_never_heard_the_departed_member_learns_its_floor_in_push_pull() {
+        let net = InMemoryNetwork::new();
+        let ta = net.register(addr(1)).await;
+        let tj = net.register(addr(3)).await;
+        let mut old_hand = MustardNode::new(NodeId::new("a"), addr(1), fast_config(), ta);
+        let mut joiner = MustardNode::new(NodeId::new("j"), addr(3), fast_config(), tj);
+        let recorded = ping_from("peer");
+        hear_then_reap(&mut old_hand, std::slice::from_ref(&recorded)).await;
+
+        // The joiner's first anti-entropy exchange with a member.
+        old_hand.send_membership(addr(3), false).await;
+        let mut floors_seen = 0;
+        while let Some((from, message)) = joiner.transport.try_recv() {
+            if let GossipPayload::Sync {
+                floors, entries, ..
+            } = &message.payload
+            {
+                assert!(floors.is_empty() || entries.is_empty());
+                floors_seen += floors.len();
+            }
+            joiner.handle_message(from, message).await;
+        }
+        assert_eq!(floors_seen, 1, "the exchange must carry the floor");
+
+        assert!(
+            !joiner.handle_message(addr(66), recorded).await,
+            "a node that joined after the reap accepted the recorded datagram"
+        );
+        assert!(joiner.membership.get(&NodeId::new("peer")).is_none());
+        // The real member coming back is still heard by the joiner.
+        assert!(joiner.handle_message(addr(7), ping_from("peer")).await);
+    }
+
+    #[tokio::test]
+    async fn peers_agree_on_a_departing_members_floor_before_the_reap() {
+        let net = InMemoryNetwork::new();
+        let ta = net.register(addr(1)).await;
+        let tb = net.register(addr(3)).await;
+        let mut a = MustardNode::new(NodeId::new("a"), addr(1), fast_config(), ta);
+        let mut b = MustardNode::new(NodeId::new("b"), addr(3), fast_config(), tb);
+        // The member's last datagram to `a`, then a later one to `b`.
+        let to_a = ping_from("peer");
+        let to_b = ping_from("peer");
+        assert!(a.handle_message(addr(2), to_a).await);
+        assert!(b.handle_message(addr(2), to_b.clone()).await);
+        a.membership.declare_dead(&NodeId::new("peer"));
+        b.membership.declare_dead(&NodeId::new("peer"));
+
+        // An exchange while the member is down but not yet reaped.
+        b.send_membership(addr(1), false).await;
+        while let Some((from, message)) = a.transport.try_recv() {
+            a.handle_message(from, message).await;
+        }
+        a.reap_departed(after_the_reap());
+
+        assert!(
+            !a.handle_message(addr(66), to_b).await,
+            "a datagram the departed member sent to another node was accepted after the reap"
+        );
+        assert!(a.membership.get(&NodeId::new("peer")).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_shared_floor_keeps_its_original_expiry() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        let now = Instant::now();
+        node.retain_floor(NodeId::new("gone"), 5, now + Duration::from_secs(100));
+
+        let window = node.floor_window(now + Duration::from_secs(40));
+        assert_eq!(window.len(), 1);
+        assert_eq!(window[0].sequence, 5);
+        assert_eq!(
+            window[0].expires_in_secs, 60,
+            "a floor must travel with its remaining time, not a fresh one"
+        );
+        // Expired floors are neither sent nor kept.
+        assert!(node.floor_window(now + Duration::from_secs(101)).is_empty());
+        node.reap_departed(now + Duration::from_secs(101));
+        assert!(node.sequence_floors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn floors_from_a_peer_never_cover_this_node_or_a_live_sender() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        assert!(node.handle_message(addr(2), ping_from("live")).await);
+        let floor = |name: &str| SequenceFloor {
+            node_id: NodeId::new(name),
+            sequence: u64::MAX,
+            expires_in_secs: u32::MAX,
+        };
+        node.merge_floors(&[floor("n1"), floor("live"), floor("gone")], Instant::now());
+
+        assert_eq!(
+            node.sequence_floors.keys().cloned().collect::<Vec<_>>(),
+            vec![NodeId::new("gone")]
+        );
+        // However long the sender says, a floor lasts at most the retention.
+        assert!(
+            node.sequence_floors[&NodeId::new("gone")].expires
+                <= Instant::now() + SEQUENCE_FLOOR_RETENTION
+        );
+        assert!(node.handle_message(addr(2), ping_from("live")).await);
+    }
+
+    #[tokio::test]
+    async fn the_floor_table_is_bounded_and_drops_the_soonest_to_expire() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        let now = Instant::now();
+        for i in 0..=MAX_SEQUENCE_FLOORS as u64 {
+            node.retain_floor(
+                NodeId::new(format!("gone-{i}")),
+                i,
+                now + Duration::from_secs(i + 1),
+            );
+        }
+        assert_eq!(node.sequence_floors.len(), MAX_SEQUENCE_FLOORS);
+        assert!(!node.sequence_floors.contains_key(&NodeId::new("gone-0")));
+        assert!(node.floor_window(now).len() <= MAX_SYNC_FLOORS);
+    }
+
+    #[tokio::test]
+    async fn a_datagram_in_this_nodes_own_name_is_dropped() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let reflector = net.register(addr(66)).await;
+        let mut node = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        let mut own = ping_from("n1");
+        own.extension = Some(DirectoryExtension {
+            node_id: NodeId::new("n1"),
+            api_address: addr(9117),
+            reporting_address: addr(9445),
+            leader: None,
+            labels: BTreeMap::from([("zone".to_string(), "recorded".to_string())]),
+            disk_pressured: true,
+            recovery_epoch: Some(1),
+            recovery_id: None,
+            jobs: None,
+            hmac: [0u8; 32],
+        });
+
+        for _ in 0..2 {
+            assert!(
+                !node.handle_message(addr(66), own.clone()).await,
+                "a datagram in our own name was applied"
+            );
+        }
+        let me = node.membership.get(&NodeId::new("n1")).unwrap();
+        assert_eq!(me.address, addr(1), "our own address moved");
+        assert!(me.labels.is_empty(), "our own labels were rolled back");
+        assert!(!node.directory().disk_pressured.contains(&NodeId::new("n1")));
+        assert!(reflector.try_recv().is_none(), "we answered our own ping");
+    }
+
+    /// Poll `done` every 10 ms for up to five seconds.
+    async fn wait_until(what: &str, done: impl Fn() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Normal operation across a failure: a node dies, its peer reaps it and
+    /// keeps its floor, and the same node restarted (incarnation 1 again,
+    /// with a fresh counter) rejoins through its seed.
+    #[tokio::test]
+    async fn a_restarted_node_rejoins_after_its_reap() {
+        let net = InMemoryNetwork::new();
+        let mut a = MustardNode::new(
+            NodeId::new("a"),
+            addr(1),
+            fast_config(),
+            net.register(addr(1)).await,
+        );
+        let (roster_tx, roster_rx) = watch::channel(Vec::new());
+        let (members_tx, members_rx) = watch::channel(Vec::new());
+        a.set_roster_watch(roster_tx);
+        a.set_membership_watch(members_tx);
+        let start_b = |transport| {
+            let mut b = MustardNode::new(NodeId::new("b"), addr(2), fast_config(), transport);
+            b.add_seed(NodeId::new("a"), addr(1));
+            let shutdown = CancellationToken::new();
+            let task_shutdown = shutdown.clone();
+            let task = tokio::spawn(async move { b.run(task_shutdown).await });
+            (shutdown, task)
+        };
+        let a_shutdown = CancellationToken::new();
+        let a_task = {
+            let shutdown = a_shutdown.clone();
+            tokio::spawn(async move {
+                a.run(shutdown).await;
+                a
+            })
+        };
+        let b_alive = |rx: &watch::Receiver<Vec<MembershipSnapshot>>| {
+            rx.borrow()
+                .iter()
+                .any(|m| m.node_id == NodeId::new("b") && m.state == NodeState::Alive)
+        };
+
+        let (b_shutdown, b_task) = start_b(net.register(addr(2)).await);
+        wait_until("b joins", || b_alive(&members_rx)).await;
+
+        // b crashes: it stops without announcing anything.
+        b_task.abort();
+        let _ = b_task.await;
+        drop(b_shutdown);
+        wait_until("a reaps b", || {
+            !roster_rx
+                .borrow()
+                .iter()
+                .any(|m| m.node_id == NodeId::new("b"))
+        })
+        .await;
+
+        let (b_shutdown, b_task) = start_b(net.register(addr(2)).await);
+        wait_until("b rejoins", || b_alive(&members_rx)).await;
+
+        b_shutdown.cancel();
+        a_shutdown.cancel();
+        b_task.await.unwrap();
+        a_task.await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]

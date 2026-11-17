@@ -124,16 +124,20 @@ Node A                                   Node B (random live peer)
   │── Sync { entries[0..8], wants_reply } ──>│  merge each entry
   │── Sync { entries[8..16] } ──────────────>│  (≤ MAX_SYNC_DATAGRAMS)
   │                                          │
+  │── Sync { floors[0..8] } ────────────────>│  (≤ 2 datagrams)
+  │                                          │
   │<── Sync { entries[0..8] } ───────────────│  B's table, never
   │<── Sync { entries[8..16] } ──────────────│  wants_reply
-  merge each entry
+  │<── Sync { floors[0..8] } ────────────────│
+  merge each entry and floor
 ```
 
 - **When.** Every `push_pull_interval` (10 s, twenty probe periods) a node picks one random live peer. The schedule starts due, so a joining node syncs on its first cycle with a live peer (the join sync) instead of waiting for rumours; an isolated node stays due until it finds one.
 - **What.** Every membership entry in any state: node id, address, state, incarnation. A peer that missed a `Dead` or `Left` needs it as much as one that missed a join. The directory extension is not included: it describes only the stamping node, every probe carries it, and probing reaches every member once membership has converged.
 - **Merge.** Each entry goes through the same `apply_update`/`resolve_conflict` path as a piggybacked update (incarnation first, then `Dead`/`Left` > `Suspect` > `Alive`), so a stale table can never resurrect a dead node or undo a refutation, and an entry about ourselves in `Suspect`/`Dead`/`Left` triggers the usual refutation. An unknown member is only added when `Alive`. Entries that change the table are re-queued for piggybacking.
+- **Floors.** After its entries, each side sends the sequence floors it keeps for reaped members (§8.1), in datagrams of their own: at most `MAX_PIGGYBACK_UPDATES` per datagram and `MAX_SYNC_FLOORS` (16) per exchange, rotating through a larger set like the table.
 - **Bounds.** Sync rides the existing authenticated UDP transport (the message HMAC covers the entries). A datagram carries at most `MAX_PIGGYBACK_UPDATES` (8) entries and no directory extension, which stays under 1,400 bytes even with 63-byte names and IPv6 addresses. One side of an exchange is at most `MAX_SYNC_DATAGRAMS` (8) datagrams, so `MAX_SYNC_ENTRIES` (64) entries. A table that fits goes whole every time. A larger one goes as a rotating window over the table sorted by node id, so a 10,000-member table is covered in 157 exchanges, and `tests/gossip_10k.rs` pins both the per-exchange cap and the sweep.
-- **Why UDP, not TCP.** memberlist sends the whole table over TCP and scales its interval with log N because the exchange grows with the cluster. Mustard has no gossip stream transport, and adding one means a listener, framing and authentication for a single message type. A capped exchange keeps the per-node cost flat (about 16 datagrams per 10 s, sent and answered), so the interval needn't scale. The price is that a 10,000-member cluster sweeps its table over many exchanges, so there anti-entropy is a slow backstop and piggybacking does the real work; in a small cluster every exchange is a full resync.
+- **Why UDP, not TCP.** memberlist sends the whole table over TCP and scales its interval with log N because the exchange grows with the cluster. Mustard has no gossip stream transport, and adding one means a listener, framing and authentication for a single message type. A capped exchange keeps the per-node cost flat (about 16 datagrams per 10 s, sent and answered, plus up to four of sequence floors, §8.1), so the interval needn't scale. The price is that a 10,000-member cluster sweeps its table over many exchanges, so there anti-entropy is a slow backstop and piggybacking does the real work; in a small cluster every exchange is a full resync.
 - **Loss.** Only the first datagram asks for a reply, and a reply never asks for one, so an exchange is one push and one pull. A lost datagram costs that part of one exchange; the next interval tries again.
 
 **Gossip message categories carried by Mustard:**
@@ -299,7 +303,8 @@ struct GossipMessage {
     incarnation: u64,
     /// The sender's message counter (§8.1): seeded from wall-clock
     /// microseconds at process start, +1 per message. Receivers drop a
-    /// message at or below the highest sequence seen from its sender.
+    /// message at or below the highest sequence seen from its sender, or
+    /// below its floor once it has been reaped.
     sequence: u64,
     /// HMAC-SHA256 over the message with this field zeroed, keyed by the
     /// gossip key derived from the cluster master key.
@@ -338,10 +343,20 @@ enum GossipPayload {
     /// Anti-entropy push-pull: up to MAX_PIGGYBACK_UPDATES entries of the
     /// sender's full membership table. Only the first datagram of a request
     /// sets wants_reply; replies never do.
+    /// A datagram carries entries or sequence floors (§8.1), never both.
     Sync {
         entries: Vec<MembershipUpdate>,
+        floors: Vec<SequenceFloor>,
         wants_reply: bool,
     },
+}
+
+/// A reaped member's last accepted sequence, with the seconds left before
+/// it expires (a floor travels with its remaining time, never a fresh one).
+struct SequenceFloor {
+    node_id: NodeId,
+    sequence: u64,
+    expires_in_secs: u32,
 }
 
 /// Largest datagram any node sends.
@@ -1217,7 +1232,11 @@ A node started without a master key (single-node and pre-security configurations
 
 **Replay protection.** An HMAC proves the sender wrote a datagram once, not that it wrote it just now. Before #696 a captured, validly signed PING replayed from another host moved the sender's recorded address to the attacker's socket (so probes went there and the real node was declared dead), and an old directory extension rolled the sender's recovery epoch back. Every message now carries a `sequence` inside the HMAC: a process-wide counter seeded from wall-clock microseconds at start and incremented per message, so it rises across restarts. A receiver keeps the highest sequence it has accepted from each sender and drops any message at or below it before applying anything, so an address change or directory update can only come from a newer message. A receiver also ignores a directory extension that names anyone but the sender, so directory fields are bound to that sequence too. A relay forwards an indirect-probe ACK in its own name (`relayed_for`), so every message has exactly one stamping node.
 
-The sequence is a counter, not a timestamp check, so receivers need no clock agreement and no acceptance window: a timestamp would have to tolerate skew between hosts, and anything inside that tolerance could be replayed. The cost is that strict ordering drops a datagram that UDP delivers out of order behind a newer one from the same sender; gossip already tolerates loss, so that's a lost datagram, not an error. A node whose clock stepped backwards across a restart is not heard until its old record is reaped (suspicion plus `cleanup_timeout`), because reaping a member forgets its sequence.
+**Sequence floors.** Reaping a member (60 s after it goes Dead or Left) removes it from the table, but not what it last sent. Its highest accepted sequence becomes a *floor*, kept for 24 hours (`SEQUENCE_FLOOR_RETENTION`), and any datagram from that sender at or below the floor is dropped. So the freshness check doesn't reset with the reap: an old datagram from a departed node stays old, and only the node itself can bring it back. The same node really coming back is unaffected, since its counter carries on, or restarts from the wall clock, above the floor; its first newer datagram turns the floor back into an ordinary per-sender sequence. A node that never heard the departed member (one that joined, or restarted, after the reap) learns the floor in anti-entropy (§3.2): each side of a push-pull sends its floors after its entries, each with its remaining time, so passing a floor on never extends it. Members that are down but not yet reaped go too, and a node raises its own sequence for such a member to the highest it hears, so by the reap the whole cluster agrees on the highest sequence any node accepted, including datagrams the member sent to someone else. A node keeps at most 1,024 floors (`MAX_SEQUENCE_FLOORS`), dropping the one closest to expiry first, ignores a floor about itself or about a sender it hears directly, and caps a received floor's lifetime at the retention.
+
+**Datagrams in our own name.** A node drops any datagram whose `sender` is itself, before anything is applied. It keeps no sequence for itself to check such a datagram against, and nothing in one can be news: applying it could only move the node's own address or roll its own directory entry back. The only legitimate case is a seed list that names the node's own address, and a reply from itself tells it nothing.
+
+The sequence is a counter, not a timestamp check, so receivers need no clock agreement and no acceptance window: a timestamp would have to tolerate skew between hosts, and anything inside that tolerance could be replayed. The cost is that strict ordering drops a datagram that UDP delivers out of order behind a newer one from the same sender; gossip already tolerates loss, so that's a lost datagram, not an error. A node whose clock stepped backwards across a restart (by more than its downtime) is not heard until its floor expires, up to 24 hours after its peers reaped it; each peer logs the first datagram it drops for that reason, naming the node.
 
 **TODO (not yet implemented):** gossip key rotation. The key is fixed for the life of the master key; there's no rotation command and no dual-key acceptance window.
 

@@ -13,7 +13,8 @@ use std::path::Path;
 use crate::council::network::{RaftRpc, RaftRpcEnvelope};
 use crate::meat::NodeId;
 use crate::mustard::message::{
-    DirectoryExtension, GossipMessage, GossipPayload, LeaderHint, MembershipUpdate, encode_datagram,
+    DirectoryExtension, GossipMessage, GossipPayload, LeaderHint, MembershipUpdate, SequenceFloor,
+    encode_datagram,
 };
 use crate::mustard::state::NodeState;
 
@@ -86,6 +87,11 @@ fn gossip() -> Vec<Seed> {
     });
     let sync = message(GossipPayload::Sync {
         entries: vec![update("a", NodeState::Alive), update("b", NodeState::Left)],
+        floors: vec![SequenceFloor {
+            node_id: NodeId::new("departed"),
+            sequence: 41,
+            expires_in_secs: 3600,
+        }],
         wants_reply: true,
     });
     let mut with_directory = message(GossipPayload::Ping { updates: vec![] });
