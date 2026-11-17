@@ -235,6 +235,18 @@ fn read_sidecar(host_path: &Path) -> Result<Option<VolumeSidecar>, VolumeError> 
 
 Last, the image is created with `OpenOptions::new().create_new(true)`, Rust's spelling of `O_CREAT | O_EXCL`: it fails with `AlreadyExists` instead of opening a file that's already there. An image with no record is either the leftover of a crash between formatting and recording, or a populated volume whose record was lost. Bun can't tell which, so it refuses and leaves the call to the operator. Just before `mkfs.ext4 -F` runs, a second check reads the image's first megabyte and refuses if any byte isn't zero, so `-F` only ever formats a blank file. Both helpers carry `#[cfg_attr(not(target_os = "linux"), allow(dead_code))]`: only the Linux build calls them outside tests, and the attribute applies `allow(dead_code)` on every other target, so macOS builds don't warn about them. The gated regression provisions a 16 MiB loop volume, writes to it, unmounts it, deletes its record and provisions again: the second call fails, and the data is still in the image.
 
+Refusing an existing image has a cost the first version missed, and review caught it. If `mkfs` or `mount` fails on a volume's very first start, the image this call just claimed stays behind with no record, maybe still mounted, and every retry refuses it for good. So the claim now comes with an undo. `setup_loop_mount` claims the image, then runs everything else in a helper, and on any error it unmounts the image if it got that far and deletes it:
+
+```rust
+claim_loop_image(&img_path)?;
+if let Err(error) = self.format_and_mount(path, &img_path, size_bytes) {
+    self.abandon_loop(path);
+    return Err(error);
+}
+```
+
+That's safe because nothing has used the image yet: the record that would let a container mount it is written last, and a failure there runs the same undo. Splitting the steps into a helper keeps the cleanup in one place. Inside `format_and_mount`, `?` returns at the first failure, and the single `if let Err` above sees it, whichever step failed. A crash can still land between the claim and `mkfs`, where no cleanup runs. That leaves an image that is still all zeros, so `claim_loop_image` takes back a blank image instead of refusing it. Blank means no filesystem, so there's no data to lose. The test needs failures that a real system won't produce on demand, so `VolumeManager` grows a test-only hook, `loop_fault: Option<fn(LoopStep) -> bool>`, behind `#[cfg(test)]`. It doesn't exist in a release build at all. The gated test fails the first start before formatting, after mounting and before recording, and checks each time that nothing is left mounted, the image is gone, and the next start provisions the volume.
+
 On macOS, there's no loop mount. Reliaburger creates a plain directory and logs a warning. Size limits are soft-only on macOS. This is a development convenience, not a production limitation — production clusters run Linux.
 
 ## Whose volume is it?

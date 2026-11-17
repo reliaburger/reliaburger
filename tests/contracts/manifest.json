@@ -237,7 +237,8 @@
       "issue": 2000,
       "promise": "A loop volume whose provisioning record is lost or unreadable keeps its data: provisioning refuses rather than formatting its image.",
       "supported_paths": [
-        "A provisioned loop volume with an intact record mounts again with its data."
+        "A provisioned loop volume with an intact record mounts again with its data.",
+        "A first provisioning that fails part-way removes its own image, so the next start provisions the volume."
       ],
       "refused_paths": [
         "A loop image with no readable record is never claimed or formatted again."
@@ -250,6 +251,17 @@
           "id": "issue-2000-a_loop_image_without_its_record_is_never_formatted",
           "binary": "reliaburger",
           "test": "grill::volume::tests::a_loop_image_without_its_record_is_never_formatted",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/grill/volume.rs"
+          ]
+        },
+        {
+          "id": "issue-2000-a_failed_first_loop_provisioning_can_be_retried",
+          "binary": "reliaburger",
+          "test": "grill::volume::tests::a_failed_first_loop_provisioning_can_be_retried",
           "requires": [
             "linux-root-storage"
           ],

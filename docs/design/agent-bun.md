@@ -143,7 +143,10 @@ maps it into the node range and prepares every read-write volume:
   can't sit inside an older one or over one. The `*.volume.json` sidecar beside
   the volume is written durably (file and directory synced), and one that
   exists but can't be read stops the start rather than reading as "new
-  volume". A loop image that already exists is never formatted. The sidecar
+  volume". A loop image that already holds data is never formatted; a first
+  provisioning that fails part-way unmounts and removes the image it made, so
+  the next start can try again. The volumes directory and its ancestors are
+  trusted as configured; only the path below it is checked. The sidecar
   records who the volume was last handed to, and the plan follows from it:
 
   | Recorded owner | Volume root owner | Action |

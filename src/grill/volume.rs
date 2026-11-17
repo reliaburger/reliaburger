@@ -113,12 +113,33 @@ pub enum VolumeError {
 #[cfg(test)]
 type ProvisionFault = fn(&Path, &Path) -> Result<(), VolumeError>;
 
+/// A point in a loop volume's first provisioning where a test can make it
+/// fail.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Only Linux makes loop volumes, so other targets never reach two of these.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+enum LoopStep {
+    /// Just before `mkfs.ext4`.
+    Format,
+    /// Just after the image is mounted.
+    Mounted,
+    /// Just before the provisioning record is written.
+    Record,
+}
+
+/// Returns true to fail at that step.
+#[cfg(test)]
+type LoopFault = fn(LoopStep) -> bool;
+
 /// Manages volume creation and size enforcement.
 pub struct VolumeManager {
     /// Base directory for managed volumes.
     volumes_dir: PathBuf,
     #[cfg(test)]
     before_test_provision: Option<ProvisionFault>,
+    #[cfg(test)]
+    loop_fault: Option<LoopFault>,
 }
 
 impl VolumeManager {
@@ -128,6 +149,8 @@ impl VolumeManager {
             volumes_dir: volumes_dir.into(),
             #[cfg(test)]
             before_test_provision: None,
+            #[cfg(test)]
+            loop_fault: None,
         }
     }
 
@@ -235,8 +258,26 @@ impl VolumeManager {
         // Only a Btrfs qgroup lives on the subvolume itself; a restore swaps
         // in a new subvolume and must set the same limit again.
         let quota = size_bytes.filter(|_| backend == super::btrfs::VolumeBackend::BtrfsSubvolume);
-        self.write_backend(&host_path, backend, quota, size_bytes)?;
+        let recorded = self.record_new_volume(&host_path, backend, quota, size_bytes);
+        if recorded.is_err() && backend == super::btrfs::VolumeBackend::LoopMount {
+            // A mounted image with no record would refuse every retry.
+            self.abandon_loop(&host_path);
+        }
+        recorded?;
         Ok(host_path)
+    }
+
+    /// Write a new volume's provisioning record.
+    fn record_new_volume(
+        &self,
+        host_path: &Path,
+        backend: super::btrfs::VolumeBackend,
+        quota_bytes: Option<u64>,
+        size_bytes: Option<u64>,
+    ) -> Result<(), VolumeError> {
+        #[cfg(test)]
+        self.inject_loop_fault(LoopStep::Record)?;
+        self.write_backend(host_path, backend, quota_bytes, size_bytes)
     }
 
     /// Container mount paths of every provisioned managed volume for
@@ -379,19 +420,35 @@ impl VolumeManager {
     ///
     /// Creates a new image file, formats it with ext4, and loop-mounts it.
     /// Writes beyond the quota fail with ENOSPC. An image that already
-    /// exists is never formatted: with no readable provisioning record it
-    /// may still hold an app's data.
+    /// exists is never formatted unless it's still blank: with no readable
+    /// provisioning record it may hold an app's data.
     #[cfg(target_os = "linux")]
     fn setup_loop_mount(&self, path: &Path, size_bytes: u64) -> Result<(), VolumeError> {
-        use std::process::Command;
-
         let img_path = loop_image_path(path);
         claim_loop_image(&img_path)?;
+        // This call made the image, so a failure from here on is this call's
+        // to undo. Left behind, an image with no record refuses every retry.
+        if let Err(error) = self.format_and_mount(path, &img_path, size_bytes) {
+            self.abandon_loop(path);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Format a freshly claimed image and mount it at `path`.
+    #[cfg(target_os = "linux")]
+    fn format_and_mount(
+        &self,
+        path: &Path,
+        img_path: &Path,
+        size_bytes: u64,
+    ) -> Result<(), VolumeError> {
+        use std::process::Command;
 
         // Reserve the blocks, so a full disk fails now rather than later.
         let status = Command::new("fallocate")
             .args(["-l", &size_bytes.to_string()])
-            .arg(&img_path)
+            .arg(img_path)
             .status()
             .map_err(|e| VolumeError::CreateFailed {
                 path: path.display().to_string(),
@@ -406,10 +463,12 @@ impl VolumeManager {
 
         // `-F` formats without asking, so only ever over an image this call
         // created and that is still blank.
-        refuse_formatted_image(&img_path)?;
+        refuse_formatted_image(img_path)?;
+        #[cfg(test)]
+        self.inject_loop_fault(LoopStep::Format)?;
         let status = Command::new("mkfs.ext4")
             .args(["-F", "-q"])
-            .arg(&img_path)
+            .arg(img_path)
             .status()
             .map_err(|e| VolumeError::CreateFailed {
                 path: path.display().to_string(),
@@ -425,7 +484,7 @@ impl VolumeManager {
         // Loop mount
         let status = Command::new("mount")
             .args(["-o", "loop"])
-            .arg(&img_path)
+            .arg(img_path)
             .arg(path)
             .status()
             .map_err(|e| VolumeError::CreateFailed {
@@ -438,6 +497,8 @@ impl VolumeManager {
                 reason: "loop mount failed (requires root)".to_string(),
             });
         }
+        #[cfg(test)]
+        self.inject_loop_fault(LoopStep::Mounted)?;
 
         // A fresh ext4 filesystem has `lost+found`, so the app would not see
         // an empty volume. Redis's entrypoint then refuses to take its data
@@ -446,6 +507,54 @@ impl VolumeManager {
         std::fs::remove_dir(path.join("lost+found"))?;
 
         Ok(())
+    }
+
+    /// Undo a loop volume's first provisioning: unmount it if it got that
+    /// far and remove the image. Only for an image this provisioning made
+    /// and never recorded, so no app has written to it.
+    #[cfg(target_os = "linux")]
+    fn abandon_loop(&self, path: &Path) {
+        if super::rootfs::is_mountpoint(path) {
+            let unmounted = std::process::Command::new("umount")
+                .arg(path)
+                .status()
+                .is_ok_and(|status| status.success());
+            if !unmounted {
+                // Removing the image under a live mount would let a retry
+                // mount a second image over it. Keep it, and say so.
+                eprintln!(
+                    "warning: couldn't unmount {} after its first provisioning failed; \
+                     unmount it and remove {} before the next start",
+                    path.display(),
+                    loop_image_path(path).display()
+                );
+                return;
+            }
+        }
+        match std::fs::remove_file(loop_image_path(path)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => eprintln!(
+                "warning: couldn't remove {} after its first provisioning failed: {error}",
+                loop_image_path(path).display()
+            ),
+        }
+    }
+
+    /// No-op on non-Linux platforms, which never make loop volumes.
+    #[cfg(not(target_os = "linux"))]
+    fn abandon_loop(&self, _path: &Path) {}
+
+    /// Fail at `step` when a test asked for it.
+    #[cfg(test)]
+    fn inject_loop_fault(&self, step: LoopStep) -> Result<(), VolumeError> {
+        match self.loop_fault {
+            Some(fault) if fault(step) => Err(VolumeError::CreateFailed {
+                path: "loop volume".to_string(),
+                reason: format!("injected failure at {step:?}"),
+            }),
+            _ => Ok(()),
+        }
     }
 
     /// No-op on non-Linux platforms.
@@ -659,6 +768,10 @@ enum PathWalk {
 ///
 /// Every directory this accepts is one only Bun writes, so the path still
 /// means the same thing when the caller uses it a moment later.
+///
+/// `volumes_dir` itself and its ancestors are trusted as the operator
+/// configured them: a symlink there (the directory on another disk, say)
+/// is followed. Only the components below it are checked.
 fn resolve_volume_path(
     volumes_dir: &Path,
     relative: &Path,
@@ -760,11 +873,13 @@ fn holds_a_volume(directory: &Path) -> bool {
     !found.is_empty()
 }
 
-/// Create a loop volume's image file, refusing one that already exists.
+/// Create a loop volume's image file, refusing one that holds data.
 ///
 /// An existing image with no readable record is what a crash between
 /// formatting and recording leaves, or what a lost record leaves behind a
-/// volume full of data. Either way it isn't Bun's to format again.
+/// volume full of data. Either way it isn't Bun's to format again. A
+/// blank one is the exception: it has no filesystem, so no data, and is
+/// what a crash before formatting leaves. It's emptied and claimed again.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn claim_loop_image(image: &Path) -> Result<(), VolumeError> {
     match std::fs::OpenOptions::new()
@@ -773,6 +888,16 @@ fn claim_loop_image(image: &Path) -> Result<(), VolumeError> {
         .open(image)
     {
         Ok(file) => {
+            file.sync_all()?;
+            Ok(())
+        }
+        Err(error)
+            if error.kind() == std::io::ErrorKind::AlreadyExists
+                && std::fs::symlink_metadata(image).is_ok_and(|metadata| metadata.is_file())
+                && refuse_formatted_image(image).is_ok() =>
+        {
+            let file = std::fs::OpenOptions::new().write(true).open(image)?;
+            file.set_len(0)?;
             file.sync_all()?;
             Ok(())
         }
@@ -1535,6 +1660,85 @@ mod tests {
         let fresh = dir.path().join("fresh.img");
         claim_loop_image(&fresh).unwrap();
         assert_eq!(std::fs::metadata(&fresh).unwrap().len(), 0);
+    }
+
+    /// A blank image with no record (what a crash between claiming and
+    /// formatting leaves) holds no filesystem, so claiming it again is
+    /// safe, and refusing it would leave the volume stuck for good.
+    #[test]
+    fn a_blank_image_with_no_record_is_claimed_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("data.img");
+        std::fs::File::create(&image)
+            .unwrap()
+            .set_len(2 * 1024 * 1024)
+            .unwrap();
+
+        claim_loop_image(&image).unwrap();
+
+        assert_eq!(std::fs::metadata(&image).unwrap().len(), 0);
+    }
+
+    /// The volumes directory itself is the operator's choice, and a
+    /// symlink there (say `/var/lib/reliaburger` on another disk) is
+    /// trusted. Only the path below it is resolved without symlinks.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_volumes_root_is_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("disk");
+        std::fs::create_dir(&real).unwrap();
+        let root = dir.path().join("volumes");
+        std::os::unix::fs::symlink(&real, &root).unwrap();
+        let vm = VolumeManager::new(&root);
+
+        let data = vm
+            .create_managed_volume("default", "db", Path::new("/data"), None)
+            .unwrap();
+        std::fs::set_permissions(&data, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        let plan = hand_to_container_user(&root, &data, me(&data)).unwrap();
+
+        assert_eq!(plan, OwnershipPlan::HandOver);
+        assert!(real.join("default/db/data").is_dir());
+        assert_eq!(mode_of(&data), 0o755);
+    }
+
+    /// A first provisioning that fails part-way removes the image it made
+    /// (unmounting it first if it got that far), so the next start can
+    /// provision the volume, rather than finding an image with no record
+    /// and refusing it for good.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires Linux root with mkfs.ext4 and loop devices; run with make test-linux"]
+    fn a_failed_first_loop_provisioning_can_be_retried() {
+        assert!(nix::unistd::geteuid().is_root());
+        for step in [LoopStep::Format, LoopStep::Mounted, LoopStep::Record] {
+            let scratch = tempfile::tempdir().unwrap();
+            let mut vm = VolumeManager::new(scratch.path());
+            vm.loop_fault = Some(match step {
+                LoopStep::Format => |step| step == LoopStep::Format,
+                LoopStep::Mounted => |step| step == LoopStep::Mounted,
+                LoopStep::Record => |step| step == LoopStep::Record,
+            });
+            let path = scratch.path().join("default/db/data");
+
+            let failed =
+                vm.create_managed_volume("default", "db", Path::new("/data"), Some("16Mi"));
+
+            assert!(failed.is_err(), "{step:?}: {failed:?}");
+            assert!(
+                !crate::grill::rootfs::is_mountpoint(&path),
+                "{step:?}: left mounted"
+            );
+            assert!(!loop_image_path(&path).exists(), "{step:?}: image left");
+            vm.loop_fault = None;
+            let again = vm.create_managed_volume("default", "db", Path::new("/data"), Some("16Mi"));
+            let mounted = crate::grill::rootfs::is_mountpoint(&path);
+            let _ = std::process::Command::new("umount").arg(&path).status();
+            assert_eq!(again.unwrap(), path, "{step:?}");
+            assert!(mounted, "{step:?}: retry didn't mount");
+        }
     }
 
     #[test]

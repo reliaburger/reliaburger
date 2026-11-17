@@ -175,6 +175,12 @@
   },
   {
     "source": "src/grill/volume.rs",
+    "function": "a_failed_first_loop_provisioning_can_be_retried",
+    "binary": "reliaburger",
+    "test": "grill::volume::tests::a_failed_first_loop_provisioning_can_be_retried"
+  },
+  {
+    "source": "src/grill/volume.rs",
     "function": "btrfs_quota_blocks_writes_beyond_limit",
     "binary": "reliaburger",
     "test": "grill::volume::tests::btrfs_quota_blocks_writes_beyond_limit"
