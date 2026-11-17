@@ -39,6 +39,10 @@ pub const MAX_CAPTURED_LINE_BYTES: usize = 64 * 1024;
 /// tell it from a line the workload ended there.
 pub const CUT_LINE_MARKER: &str = " [line cut at 64 KiB]";
 
+/// How many skipped bytes of a cut line a [`CaptureReader`] lets pass before
+/// it reports them with a line of their own.
+pub const SKIPPED_REPORT_BYTES: u64 = 1024 * 1024;
+
 /// How often a follower looks for new output.
 pub const FOLLOW_POLL: Duration = Duration::from_millis(200);
 
@@ -430,6 +434,8 @@ pub struct CaptureReader {
     /// Dropping bytes up to the next newline: the read skipped a reclaimed
     /// prefix, so the line in progress lost its start.
     discarding: bool,
+    /// Bytes skipped while `discarding` that no line's position covers yet.
+    skipped_unreported: u64,
     identity: Option<CaptureFileIdentity>,
     #[cfg(test)]
     read_test_gate: Option<std::sync::Arc<CaptureReadGate>>,
@@ -449,6 +455,7 @@ impl CaptureReader {
             consumed: 0,
             partial: Vec::new(),
             discarding: false,
+            skipped_unreported: 0,
             identity: None,
             #[cfg(test)]
             read_test_gate: None,
@@ -490,6 +497,7 @@ impl CaptureReader {
             consumed,
             partial: Vec::new(),
             discarding: false,
+            skipped_unreported: 0,
             identity,
             #[cfg(test)]
             read_test_gate: None,
@@ -542,11 +550,13 @@ impl CaptureReader {
             self.consumed = 0;
             self.partial.clear();
             self.discarding = false;
+            self.skipped_unreported = 0;
         }
         if start > offset {
             self.consumed = start;
             self.partial.clear();
             self.discarding = true;
+            self.skipped_unreported = 0;
         }
         self.identity = Some(identity);
         Ok(chunk)
@@ -569,7 +579,9 @@ impl CaptureReader {
     ///
     /// A line longer than [`MAX_CAPTURED_LINE_BYTES`] comes out cut to that
     /// length, and the bytes past the cut are counted as consumed but never
-    /// held, so the reader buffers at most that much between calls. A reader
+    /// held, so the reader buffers at most that much between calls. Every
+    /// [`SKIPPED_REPORT_BYTES`] of them it hands on a `[skipped N more bytes
+    /// of a cut line]` line, so the capture offset follows them. A reader
     /// resumed from an offset inside a skipped line hands its rest on as one
     /// more line, also cut to the cap.
     ///
@@ -583,9 +595,16 @@ impl CaptureReader {
             if self.discarding {
                 let Some(newline) = rest.iter().position(|byte| *byte == b'\n') else {
                     self.consumed += rest.len() as u64;
+                    self.skipped_unreported += rest.len() as u64;
+                    if self.skipped_unreported >= SKIPPED_REPORT_BYTES {
+                        lines.push(self.skipped_line());
+                    }
                     return lines;
                 };
                 self.consumed += newline as u64 + 1;
+                // The next line's position covers these bytes; until it
+                // comes, at most SKIPPED_REPORT_BYTES wait unreported.
+                self.skipped_unreported = 0;
                 self.discarding = false;
                 rest = &rest[newline + 1..];
             }
@@ -628,6 +647,17 @@ impl CaptureReader {
         line.line.push_str(CUT_LINE_MARKER);
         self.partial.clear();
         line
+    }
+
+    /// Report the bytes skipped since the last line, as a line of their own.
+    ///
+    /// The log store only moves a capture's ingested offset, and so only
+    /// reclaims its bytes, on a line with a position. Skipped bytes have no
+    /// line, so without this a stream that never ends its line would keep
+    /// its whole capture on disk.
+    fn skipped_line(&mut self) -> CapturedLine {
+        let skipped = std::mem::take(&mut self.skipped_unreported);
+        self.line(format!("[skipped {skipped} more bytes of a cut line]").as_bytes())
     }
 
     /// Take a trailing line that never got its newline, once the stream has
@@ -950,19 +980,75 @@ mod tests {
                 reader.partial.len()
             );
         }
-        assert_eq!(lines.len(), 1, "one truncated line, then nothing");
         assert_eq!(
             lines[0].line,
             format!("{}{CUT_LINE_MARKER}", "x".repeat(MAX_CAPTURED_LINE_BYTES))
         );
         // Every byte is accounted for, so the capture offset keeps moving.
         assert_eq!(reader.read_offset(), STREAM as u64);
+        // The skipped bytes are reported as they go, so the log store's
+        // offset follows them instead of stopping at the cut.
+        for skipped in &lines[1..] {
+            assert!(skipped.line.starts_with("[skipped "), "{}", skipped.line);
+        }
+        let reported = ends(&lines[lines.len() - 1..])[0];
+        assert!(
+            reported + SKIPPED_REPORT_BYTES >= STREAM as u64,
+            "skipped bytes reported only up to {reported}"
+        );
 
         // The next newline ends the skipped line; the one after it is whole.
         let lines = reader.push(b"tail\nnext\n");
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].line, "next");
         assert_eq!(ends(&lines), vec![STREAM as u64 + 10]);
+    }
+
+    /// A capture that never ends a line must still be reclaimed: the store
+    /// only frees bytes up to the offset it has ingested, and skipped bytes
+    /// produce no line of their own.
+    #[tokio::test]
+    async fn a_capture_with_no_newline_is_reclaimed_once_flushed() {
+        use std::os::unix::fs::MetadataExt;
+        let logs = tempfile::tempdir().unwrap();
+        let captures = tempfile::tempdir().unwrap();
+        let file = captures.path().join("progress.stdout");
+        let length: u64 = 8 * 1024 * 1024;
+        std::fs::write(&file, vec![b'#'; length as usize]).unwrap();
+        let allocated = || std::fs::metadata(&file).unwrap().blocks() * 512;
+        let mut store = crate::ketchup::log_store::LogStore::new(logs.path().to_path_buf());
+        let mut reader = CaptureReader::new(LogStream::Stdout, Some(file.clone()));
+        loop {
+            let bytes = reader.read_chunk().await.unwrap();
+            if bytes.is_empty() {
+                break;
+            }
+            for line in reader.push(&bytes) {
+                store.ingest_at(
+                    100,
+                    &crate::ketchup::types::LogRecord {
+                        app: "progress".into(),
+                        namespace: "default".into(),
+                        instance: "progress-0".into(),
+                        stream: line.stream,
+                        line: line.line,
+                        position: line.position,
+                    },
+                );
+            }
+        }
+        store.flush().await.unwrap();
+
+        let ingested = store.capture_offsets().0[&file];
+        assert!(
+            ingested + SKIPPED_REPORT_BYTES >= length,
+            "the store ingested only {ingested} of {length} bytes"
+        );
+        assert!(
+            allocated() <= RETAINED_CAPTURE_BYTES + SKIPPED_REPORT_BYTES + 256 * 1024,
+            "{} bytes of the capture are still allocated",
+            allocated()
+        );
     }
 
     #[test]

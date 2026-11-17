@@ -1148,9 +1148,24 @@ What's `room` for? A line has to end somewhere. Output with no newline, a
 until the newline finally came. So a line stops growing at `MAX_CAPTURED_LINE_BYTES` (64 KiB).
 The reader hands on that prefix as the line and sets `discarding`, the flag
 it already used to skip the rest of a line whose start was reclaimed, so the
-remainder is counted and dropped up to the next newline. Counting matters:
-the capture offset keeps moving, so the log store can still reclaim the
-file. `a_stream_with_no_newline_stays_within_the_line_cap` pushes 100 MiB
+remainder is counted and dropped up to the next newline.
+
+Counting isn't enough on its own, though. The log store learns how far a
+capture has been read only from the positions on the lines it ingests, and
+it only reclaims a capture's disk up to that offset. Skipped bytes have no
+line, so a progress bar that never printed a newline kept its whole capture
+file on disk, growing forever, while memory stayed flat. So every
+`SKIPPED_REPORT_BYTES` (1 MiB) of skipping, the reader hands on a small line
+of its own, `[skipped 1048576 more bytes of a cut line]`, carrying the
+position it has reached. The store needs no new idea: it ingests a line,
+moves the offset and reclaims behind it, exactly as before. Why not a
+record with a position and no line? We considered it. The store saves its
+offsets only when it flushes rows, so an offset with no row would wait
+for some other line to come along, and on a quiet node that might never
+happen. The marker costs one short row per megabyte, and it also tells you
+the line went on. `a_capture_with_no_newline_is_reclaimed_once_flushed`
+follows an 8 MiB capture with no newline into a real `LogStore`, flushes it
+and checks that the file's disk allocation drops to the retained tail. `a_stream_with_no_newline_stays_within_the_line_cap` pushes 100 MiB
 with no newline in 64 KiB chunks and checks the buffer after every one.
 
 A cut line has to say so, or a reader takes 64 KiB for the whole line. So
