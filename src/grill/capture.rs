@@ -35,6 +35,10 @@ pub const CAPTURE_CHUNK_BYTES: usize = 64 * 1024;
 /// next newline.
 pub const MAX_CAPTURED_LINE_BYTES: usize = 64 * 1024;
 
+/// Appended to a line cut at [`MAX_CAPTURED_LINE_BYTES`], so a reader can
+/// tell it from a line the workload ended there.
+pub const CUT_LINE_MARKER: &str = " [line cut at 64 KiB]";
+
 /// How often a follower looks for new output.
 pub const FOLLOW_POLL: Duration = Duration::from_millis(200);
 
@@ -594,22 +598,34 @@ impl CaptureReader {
                 // Over the cap with no newline in sight: hand on the prefix
                 // and skip the rest of the line, here and in later chunks.
                 self.partial.extend_from_slice(&rest[..room]);
-                lines.push(self.take_line(rest.len() - room));
+                lines.push(self.take_line(rest.len() - room, Some(rest[room])));
                 self.discarding = true;
                 return lines;
             };
             let kept = newline.min(room);
             self.partial.extend_from_slice(&rest[..kept]);
-            lines.push(self.take_line(newline - kept + 1));
+            let cut = (kept < newline).then(|| rest[kept]);
+            lines.push(self.take_line(newline - kept + 1, cut));
             rest = &rest[newline + 1..];
         }
     }
 
     /// Hand on the buffered line, counting `skipped` more bytes of it (the
     /// part past the cap, and its newline) as consumed.
-    fn take_line(&mut self, skipped: usize) -> CapturedLine {
+    ///
+    /// `cut_before` is the first byte left out when the line was cut at the
+    /// cap, `None` when the line is whole. A cut line ends at the last whole
+    /// UTF-8 character before the cap and carries [`CUT_LINE_MARKER`].
+    fn take_line(&mut self, skipped: usize, cut_before: Option<u8>) -> CapturedLine {
         self.consumed += (self.partial.len() + skipped) as u64;
-        let line = self.line(&self.partial);
+        let Some(next) = cut_before else {
+            let line = self.line(&self.partial);
+            self.partial.clear();
+            return line;
+        };
+        let end = character_boundary(&self.partial, next);
+        let mut line = self.line(&self.partial[..end]);
+        line.line.push_str(CUT_LINE_MARKER);
         self.partial.clear();
         line
     }
@@ -635,6 +651,27 @@ impl CaptureReader {
                 identity: self.identity,
             }),
         }
+    }
+}
+
+/// Where to cut `kept` so the cut doesn't split a UTF-8 character, given
+/// `next`, the first byte left out. A continuation byte (`0b10xxxxxx`) there
+/// means the character started inside `kept`, so the cut moves back to that
+/// character's first byte. A character is at most four bytes, so this looks
+/// back at most three. Bytes that aren't UTF-8 at all are cut where they
+/// fall.
+fn character_boundary(kept: &[u8], next: u8) -> usize {
+    let is_continuation = |byte: u8| byte & 0b1100_0000 == 0b1000_0000;
+    let mut end = kept.len();
+    let mut following = next;
+    while is_continuation(following) && end > 0 && kept.len() - end < 3 {
+        end -= 1;
+        following = kept[end];
+    }
+    if is_continuation(following) {
+        kept.len()
+    } else {
+        end
     }
 }
 
@@ -914,7 +951,10 @@ mod tests {
             );
         }
         assert_eq!(lines.len(), 1, "one truncated line, then nothing");
-        assert_eq!(lines[0].line.len(), MAX_CAPTURED_LINE_BYTES);
+        assert_eq!(
+            lines[0].line,
+            format!("{}{CUT_LINE_MARKER}", "x".repeat(MAX_CAPTURED_LINE_BYTES))
+        );
         // Every byte is accounted for, so the capture offset keeps moving.
         assert_eq!(reader.read_offset(), STREAM as u64);
 
@@ -938,9 +978,29 @@ mod tests {
         long.extend_from_slice(b"\nok\n");
         let lines = reader.push(&long);
         assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0].line.len(), MAX_CAPTURED_LINE_BYTES);
+        assert_eq!(
+            lines[0].line,
+            format!("{}{CUT_LINE_MARKER}", "b".repeat(MAX_CAPTURED_LINE_BYTES))
+        );
         assert_eq!(lines[1].line, "ok");
         assert_eq!(reader.read_offset(), (exact.len() + long.len()) as u64);
+    }
+
+    /// A cut never splits a multi-byte character: the line would end in a
+    /// replacement character instead of the text the workload wrote.
+    #[test]
+    fn a_line_is_cut_at_a_character_boundary() {
+        // One ASCII byte, then two-byte characters, so byte
+        // MAX_CAPTURED_LINE_BYTES falls in the middle of an "é".
+        let text = format!("x{}", "é".repeat(MAX_CAPTURED_LINE_BYTES));
+        let mut reader = file_reader();
+        let mut lines = reader.push(text.as_bytes());
+        lines.extend(reader.push(b"\n"));
+        assert_eq!(lines.len(), 1);
+        let kept = lines[0].line.strip_suffix(CUT_LINE_MARKER).unwrap();
+        assert_eq!(kept.len(), MAX_CAPTURED_LINE_BYTES - 1);
+        assert!(text.starts_with(kept));
+        assert!(!kept.contains('\u{fffd}'));
     }
 
     #[tokio::test]

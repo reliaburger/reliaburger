@@ -1153,6 +1153,19 @@ the capture offset keeps moving, so the log store can still reclaim the
 file. `a_stream_with_no_newline_stays_within_the_line_cap` pushes 100 MiB
 with no newline in 64 KiB chunks and checks the buffer after every one.
 
+A cut line has to say so, or a reader takes 64 KiB for the whole line. So
+it ends with ` [line cut at 64 KiB]`. And the cut must not land inside a
+character. Rust's `String` is always valid UTF-8, so `from_utf8_lossy`
+turns half an "é" into U+FFFD, the replacement character, and the line
+would end in garbage the workload never wrote. UTF-8 makes the fix cheap:
+every byte after the first one of a multi-byte character starts with the
+bits `10`. If the first byte left out is one of those, the character
+began inside the kept part, so `character_boundary` steps back to the
+byte that starts it, at most three bytes. In Go you'd reach for
+`utf8.RuneStart`; in Rust it's one mask, `byte & 0b1100_0000 ==
+0b1000_0000`. `a_line_is_cut_at_a_character_boundary` puts the cap in the
+middle of an "é" and checks that the kept text is a clean prefix.
+
 Should one stuck instance be able to stop a node at all? Adoption is
 fail-closed by design: an instance Bun can't prove it owns stops startup,
 because the alternative is a reconciler that doesn't see it and starts a
