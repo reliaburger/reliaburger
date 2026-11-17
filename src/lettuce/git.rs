@@ -49,20 +49,17 @@ impl GitRepo {
         branch: &str,
         budget: CommandBudget,
     ) -> Result<Self, LettuceError> {
-        if path.join("HEAD").exists() {
-            match reused_clone_matches(path, url, branch, &budget) {
-                Ok(true) => {
-                    return Ok(Self {
-                        path: path.to_path_buf(),
-                        url: url.to_string(),
-                        branch: branch.to_string(),
-                        budget,
-                    });
-                }
-                // Drift or an unreadable clone: clone afresh. The old clone
-                // stays until the new one is complete.
-                Ok(false) | Err(_) => {}
-            }
+        // A drifted or unreadable clone falls through to a fresh clone; the
+        // old one stays until the new one is complete.
+        if path.join("HEAD").exists()
+            && matches!(reused_clone_matches(path, url, branch, &budget), Ok(true))
+        {
+            return Ok(Self {
+                path: path.to_path_buf(),
+                url: url.to_string(),
+                branch: branch.to_string(),
+                budget,
+            });
         }
         // Whatever is at `path` now (a drifted clone, or a HEAD-less
         // directory an interrupted clone left) is replaced once the new
