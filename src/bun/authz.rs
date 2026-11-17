@@ -451,7 +451,8 @@ pub const CERTIFICATE_ONLY_ROUTES: &[(Method, &str)] = &[(Get, "/v1/cluster/mast
 /// arrives with the forwarding node's certificate.
 pub fn is_node_only(method: &axum::http::Method, path: &str) -> bool {
     let method = match *method {
-        axum::http::Method::GET => Get,
+        // axum answers HEAD with the GET handler, so it is the same route.
+        axum::http::Method::GET | axum::http::Method::HEAD => Get,
         axum::http::Method::POST => Post,
         axum::http::Method::DELETE => Delete,
         _ => return false,
@@ -541,6 +542,20 @@ mod tests {
         assert!(!is_node_only(&get, "/v1/status"));
         assert!(!is_node_only(&post, "/v1/exec/{app}/{namespace}"));
         assert!(!is_node_only(&get, "/v1/cluster/ca"));
+    }
+
+    /// axum serves HEAD with a route's GET handler, so HEAD on a node-only
+    /// GET route is node-only too.
+    #[test]
+    fn head_on_a_node_only_get_route_is_node_only() {
+        let head = axum::http::Method::HEAD;
+        assert!(is_node_only(&head, "/v1/cluster/master-key"));
+        assert!(is_node_only(&head, "/v1/placements/{node_id}"));
+        assert!(!is_node_only(&head, "/v1/status"));
+        assert!(!is_node_only(
+            &axum::http::Method::PUT,
+            "/v1/cluster/master-key"
+        ));
     }
 
     /// A handler that reads the caller's TLS certificate trusts it to name

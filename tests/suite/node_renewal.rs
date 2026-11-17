@@ -238,7 +238,18 @@ async fn a_request_forwarded_for_a_person_is_refused_by_node_only_routes() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::FORBIDDEN, "renewal");
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&body);
+    assert_eq!(status, StatusCode::FORBIDDEN, "renewal: {body}");
+    // Renewal has other 403s (no certificate, a bad identity); this one must
+    // be the node-only refusal.
+    assert!(
+        body.contains("this route answers nodes only"),
+        "renewal: {body}"
+    );
 
     // The node's own request, unmarked, still gets the key.
     let (status, body) = get_master_key(router(council.clone(), Some(peer(&hierarchy, 10)))).await;
