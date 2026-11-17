@@ -548,6 +548,68 @@ fn split_known(
     Ok((again, new))
 }
 
+/// Give each join seed sent `again` a fresh join token through `refresh`
+/// (`bare_metal::refresh_join_token_with`, or a test's stand-in): the one
+/// it was written with lasts only `--ttl` from when it was made, and a
+/// machine that was down that long would be turned away. Without a cluster
+/// to mint one (node 1 isn't up yet), a seed is sent as written while its
+/// token in the initial state is still valid at `now`, and otherwise kept
+/// back as undelivered. Returns the seeds to send and the ones kept back.
+async fn refresh_resent<F, Fut>(
+    directory: &Path,
+    again: Vec<(bare_metal::FleetNode, PathBuf)>,
+    now: std::time::SystemTime,
+    mut refresh: F,
+) -> (Vec<(bare_metal::FleetNode, PathBuf)>, Vec<Undelivered>)
+where
+    F: FnMut(bare_metal::FleetNode, PathBuf) -> Fut,
+    Fut: std::future::Future<Output = Result<bool, RelishError>>,
+{
+    let mut send = Vec::new();
+    let mut kept = Vec::new();
+    for (node, seed) in again {
+        let error = match refresh(node.clone(), seed.clone()).await {
+            Ok(refreshed) => {
+                if refreshed {
+                    println!("  {}: a new join token", node.name);
+                }
+                send.push((node, seed));
+                continue;
+            }
+            Err(error) => error,
+        };
+        let reason = match &error {
+            RelishError::InitFailed(reason) => reason.clone(),
+            other => other.to_string(),
+        };
+        // BLOCKING-OK: relish CLI: a one-shot read before the command does anything long-lived
+        match bare_metal::bootstrap_join_token_expiry(directory, &node.name) {
+            Ok(Some(expiry)) if expiry <= now => kept.push(Undelivered {
+                error: failed(&format!(
+                    "its join token expired at {}, and the cluster minted no new one ({reason}); \
+                     once node 1 is running, run the command again",
+                    crate::relish::commands::rfc3339(
+                        expiry
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| d.as_secs())
+                    )
+                    .unwrap_or_else(|| "an unknown time".into())
+                )),
+                node,
+                seed,
+            }),
+            _ => {
+                eprintln!(
+                    "warning: no new join token for {} ({reason}); sending its seed as written",
+                    node.name
+                );
+                send.push((node, seed));
+            }
+        }
+    }
+    (send, kept)
+}
+
 /// The fleet in `directory`, if it has one.
 async fn read_fleet(directory: &Path) -> Result<Option<bare_metal::Fleet>, RelishError> {
     let path = directory.join("fleet.json");
@@ -606,7 +668,7 @@ pub async fn run_claim(options: &ClaimOptions) -> Result<(), RelishError> {
         confirm(&machines)?;
     }
 
-    let (created, seeds) = match &options.create {
+    let (created, seeds, kept) = match &options.create {
         Some(cluster) => {
             let keys = crate::relish::quickstart::security::root_backup_keys_in(
                 &crate::relish::local_context::root_directory()?,
@@ -640,16 +702,29 @@ pub async fn run_claim(options: &ClaimOptions) -> Result<(), RelishError> {
                 .cloned()
                 .zip(created.seeds.iter().cloned())
                 .collect::<Vec<_>>();
-            (Some(created), seeds)
+            (Some(created), seeds, Vec::new())
         }
         None => {
             let fleet = read_fleet(&options.directory).await?;
-            let (mut seeds, new) = split_known(&options.directory, fleet.as_ref(), &pairs)?;
+            let (again, new) = split_known(&options.directory, fleet.as_ref(), &pairs)?;
+            let client = super::client::BunClient::default_local();
+            let ttl = options.token_ttl;
+            let (mut seeds, kept) = refresh_resent(
+                &options.directory,
+                again,
+                std::time::SystemTime::now(),
+                |node, seed| {
+                    let client = &client;
+                    async move {
+                        bare_metal::refresh_join_token_with(client, &node.name, &seed, ttl).await
+                    }
+                },
+            )
+            .await;
             if new.is_empty() {
-                // Only seeds sent again, and their join tokens are already
-                // in them. A window still helps a machine added after the
-                // cluster was made, but there may be no cluster to ask yet:
-                // node 1's seed may be among them.
+                // Only seeds sent again. A window still helps a machine
+                // added after the cluster was made, but there may be no
+                // cluster to ask yet: node 1's seed may be among them.
                 if let Err(error) = open_join_windows(&pairs).await {
                     eprintln!("warning: no join windows opened: {error}");
                 }
@@ -665,7 +740,7 @@ pub async fn run_claim(options: &ClaimOptions) -> Result<(), RelishError> {
                     .await?,
                 );
             }
-            (None, seeds)
+            (None, seeds, kept)
         }
     };
     let deliveries: Vec<Delivery> = seeds
@@ -682,10 +757,13 @@ pub async fn run_claim(options: &ClaimOptions) -> Result<(), RelishError> {
             })
         })
         .collect::<Result<_, RelishError>>()?;
-    let failures = deliver_seeds(&deliveries, |address, fingerprint, seed| async move {
-        post_seed(address, &fingerprint, seed).await
-    })
-    .await;
+    let mut failures = kept;
+    failures.extend(
+        deliver_seeds(&deliveries, |address, fingerprint, seed| async move {
+            post_seed(address, &fingerprint, seed).await
+        })
+        .await,
+    );
     // The cluster is in the directory whether or not node 1 got its seed,
     // so relish points at it either way: the context is then ready when a
     // retry reaches node 1.
@@ -1219,6 +1297,74 @@ mod tests {
         assert!(error.contains("home-2"), "{error}");
         assert!(error.contains("10.42.0.12"), "{error}");
         assert!(error.contains("10.42.0.99"), "{error}");
+    }
+
+    fn resent(created: &bare_metal::Created) -> Vec<(bare_metal::FleetNode, PathBuf)> {
+        created
+            .fleet
+            .nodes
+            .iter()
+            .cloned()
+            .zip(created.seeds.iter().cloned())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_seed_sent_again_is_given_a_new_token_by_the_cluster() {
+        let dir = tempfile::tempdir().unwrap();
+        let created = created(dir.path(), &THREE[..2]);
+        let mut asked = Vec::new();
+        let (send, kept) = refresh_resent(
+            dir.path(),
+            resent(&created)[1..].to_vec(),
+            std::time::SystemTime::now(),
+            |node, _| {
+                asked.push(node.name.clone());
+                async { Ok(true) }
+            },
+        )
+        .await;
+        assert_eq!(asked, ["home-2"]);
+        assert_eq!(send, resent(&created)[1..]);
+        assert!(kept.is_empty());
+    }
+
+    #[tokio::test]
+    async fn without_a_cluster_a_seed_whose_token_is_still_valid_is_sent_as_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let created = created(dir.path(), &THREE);
+        let (send, kept) = refresh_resent(
+            dir.path(),
+            resent(&created),
+            std::time::SystemTime::now(),
+            |_, _| async { Err(failed("connection refused")) },
+        )
+        .await;
+        assert_eq!(send, resent(&created), "node 1 and both joiners go");
+        assert!(kept.is_empty());
+    }
+
+    #[tokio::test]
+    async fn without_a_cluster_a_seed_whose_token_expired_is_kept_back_saying_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let created = created(dir.path(), &THREE);
+        // Two hours on: the seeds' one-hour tokens have expired.
+        let later = std::time::SystemTime::now() + Duration::from_secs(2 * 3600);
+        let (send, kept) = refresh_resent(dir.path(), resent(&created), later, |_, _| async {
+            Err(failed("connection refused"))
+        })
+        .await;
+        assert_eq!(
+            send,
+            resent(&created)[..1],
+            "node 1's create seed needs no token, so it still goes"
+        );
+        let names: Vec<&str> = kept.iter().map(|k| k.node.name.as_str()).collect();
+        assert_eq!(names, ["home-2", "home-3"]);
+        let error = undelivered_error(dir.path(), false, &kept).to_string();
+        assert!(error.contains("its join token expired at 20"), "{error}");
+        assert!(error.contains("connection refused"), "{error}");
+        assert!(error.contains("once node 1 is running"), "{error}");
     }
 
     #[tokio::test]

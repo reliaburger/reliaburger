@@ -464,6 +464,75 @@ pub async fn add_with(
     Ok(added.into_iter().zip(written).collect())
 }
 
+/// The join seed `seed` with `token` in place of the join token it was
+/// written with, every other setting and file kept. Refuses node 1's create
+/// seed, which has no join token.
+pub fn with_join_token(seed: &[u8], token: String) -> Result<Vec<u8>, RelishError> {
+    let crate::appliance::seed::Seed::V1 { mut config, files } =
+        crate::appliance::seed::Seed::from_tar_gz(seed).map_err(|e| failed(&e.to_string()))?
+    else {
+        return Err(failed("not a seed relish writes"));
+    };
+    let Some(join) = config.join.as_mut() else {
+        return Err(failed(&format!(
+            "{} creates the cluster: its seed has no join token",
+            config.node
+        )));
+    };
+    join.token = token;
+    seed_tarball(&config, &files)
+}
+
+/// Give the join seed at `seed` a join token that `client`'s cluster mints
+/// now, bound to `node`, so a seed sent again long after it was written
+/// isn't turned away for an expired token. Answers false, and asks the
+/// cluster nothing, for node 1's create seed.
+pub async fn refresh_join_token_with(
+    client: &super::client::BunClient,
+    node: &str,
+    seed: &Path,
+    token_ttl: Duration,
+) -> Result<bool, RelishError> {
+    let bytes = tokio::fs::read(seed).await?;
+    let crate::appliance::seed::Seed::V1 { config, .. } =
+        crate::appliance::seed::Seed::from_tar_gz(&bytes).map_err(|e| failed(&e.to_string()))?
+    else {
+        return Err(failed("not a seed relish writes"));
+    };
+    if config.join.is_none() {
+        return Ok(false);
+    }
+    let token = client
+        .join_token_create_for_seed(node, token_ttl.as_secs())
+        .await?;
+    // BLOCKING-OK: relish CLI: a one-shot write before the command does anything long-lived
+    write_private(seed, &with_join_token(&bytes, token)?)?;
+    Ok(true)
+}
+
+/// When the join token `create` put in the cluster's initial security state
+/// for `node` expires, if it put one there. A machine added later has its
+/// token in the running cluster instead.
+pub fn bootstrap_join_token_expiry(
+    directory: &Path,
+    node: &str,
+) -> Result<Option<std::time::SystemTime>, RelishError> {
+    let path = directory.join("secrets").join("security-bootstrap.json");
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let state: crate::sesame::types::SecurityState =
+        serde_json::from_slice(&bytes).map_err(|e| failed(&format!("{}: {e}", path.display())))?;
+    Ok(state
+        .join_tokens
+        .iter()
+        .filter(|token| token.node_id == node && !token.consumed)
+        .map(|token| token.expires_at)
+        .max())
+}
+
 /// What to tell the user about a machine outside the network the cluster
 /// admits (`cluster create --network`): its firewalls drop it until it
 /// joins. Claiming it opens a join window on every node, so only a stick
@@ -1032,6 +1101,79 @@ mod tests {
         assert_eq!(
             stick_file("d8:9e:f3:12:34:56"),
             "seeds/d8-9e-f3-12-34-56.seed"
+        );
+    }
+
+    #[test]
+    fn a_join_seed_given_a_new_token_keeps_every_other_setting_and_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut create_options = options(
+            dir.path(),
+            &[
+                "d8:9e:f3:00:00:01@192.168.1.51",
+                "d8:9e:f3:00:00:02@192.168.1.52",
+            ],
+        );
+        create_options.ssh_key = Some(b"ssh-ed25519 AAAA operator".to_vec());
+        let created = create(&create_options).unwrap();
+        let written = std::fs::read(&created.seeds[1]).unwrap();
+
+        let rewritten = with_join_token(&written, "a-new-token".into()).unwrap();
+
+        let Seed::V1 {
+            config: before,
+            files: files_before,
+        } = Seed::from_tar_gz(&written).unwrap()
+        else {
+            panic!("v1")
+        };
+        let Seed::V1 { config, files } = Seed::from_tar_gz(&rewritten).unwrap() else {
+            panic!("v1")
+        };
+        assert_eq!(config.join.as_ref().unwrap().token, "a-new-token");
+        let mut expected = before.clone();
+        expected.join.as_mut().unwrap().token = "a-new-token".into();
+        assert_eq!(*config, *expected);
+        assert_eq!(files, files_before);
+    }
+
+    #[test]
+    fn a_create_seed_is_never_given_a_join_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let created = create(&options(dir.path(), &["d8:9e:f3:00:00:01@192.168.1.51"])).unwrap();
+        let error = with_join_token(&std::fs::read(&created.seeds[0]).unwrap(), "t".into())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("home-1 creates the cluster"), "{error}");
+    }
+
+    #[test]
+    fn the_initial_state_says_when_each_join_token_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut create_options = options(
+            dir.path(),
+            &[
+                "d8:9e:f3:00:00:01@192.168.1.51",
+                "d8:9e:f3:00:00:02@192.168.1.52",
+            ],
+        );
+        create_options.token_ttl = Duration::from_secs(3600);
+        let before = std::time::SystemTime::now();
+        create(&create_options).unwrap();
+
+        let expiry = bootstrap_join_token_expiry(dir.path(), "home-2")
+            .unwrap()
+            .expect("home-2 has a token in the initial state");
+        assert!(expiry >= before + Duration::from_secs(3600));
+        assert!(expiry <= std::time::SystemTime::now() + Duration::from_secs(3600));
+        assert_eq!(
+            bootstrap_join_token_expiry(dir.path(), "home-1").unwrap(),
+            None
+        );
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(
+            bootstrap_join_token_expiry(empty.path(), "home-2").unwrap(),
+            None
         );
     }
 
