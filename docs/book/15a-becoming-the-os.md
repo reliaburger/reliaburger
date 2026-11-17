@@ -623,6 +623,23 @@ exit 1
 
 Only a counted boot reboots itself. A node running a blessed version whose bun is merely slow just reports the failure and stays up, because rebooting it would gain nothing.
 
+The 120 s used to be measured with `date +%s`. A review before the Wyse lab, whose plan warns that second-hand Wyses may have flat RTC batteries, showed why that was wrong. A machine with a flat RTC battery boots with its clock behind, sometimes by days, and `systemd-timesyncd` corrects it with one step forward at its first sync. If that step landed while the check was waiting, the deadline was already in the past: a good update on a counted boot would report bun unhealthy, reboot, and after three tries fall back. The check now counts seconds since boot from `/proc/uptime`, which only goes forward. The test's stub `date` jumps a day on every call, and the new test fails against the old script.
+
+The same flat battery matters to bun, whose gossip expects a node's clock to move forward across restarts. So bun now waits briefly for the first sync, in a unit of its own:
+
+```ini
+[Unit]
+After=network-online.target systemd-timesyncd.service
+Before=reliaburger.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=-/usr/bin/timeout 30 /usr/lib/systemd/systemd-time-wait-sync
+```
+
+The obvious version would be `After=time-sync.target` on bun's unit, and we nearly wrote it. But systemd's own `systemd-time-wait-sync.service` has `TimeoutStartSec=infinity`: on a LAN with no NTP server, the target is never reached and bun never starts. So we bound the wait ourselves. The `-` in front of the command tells systemd that a non-zero exit, here `timeout`'s 124, isn't a failure. `RemainAfterExit=yes` makes the unit count as active once it has run, so bun's own restarts don't wait again. Thirty seconds plus the slowest healthy bun we've measured (23 s) leaves half of a counted boot's 120 s spare, and a unit test checks that sum.
+
 The good update rolled across all five lab nodes, followers first and the leader last. Each came back blessed about 20 s after its reboot, the cluster never dropped below five nodes alive, and Raft carried on (term 12, log index 964 to 1008).
 
 Then the bad one. CI can build an image whose bun never starts (a `workflow_dispatch` input drops in a unit override with `ExecStart=/bin/false`), and we staged it on node-05. Three counted boots each ended with `bun not healthy after 300 s` and a reboot. The UKI ran out of tries at `+0-3`, systemd-boot picked the previous version by itself, and node-05 was healthy 7.6 s into that boot and back in the cluster. From the first try to the fallback took about 15 min 40 s, with no hands. Nearly all of that is the 300 s timeout, three times over, which told us where to tune: a counted boot now gets 120 s, since a healthy lab node answers in 8 to 23 s, and an ordinary boot keeps 300 s because nothing falls back from it. The Wyse will tell us whether 120 s is right for slow hardware. A unit test pins both limits down. The kernel publishes EFI variables as files under `/sys/firmware/efi/efivars`, and the check reads that directory from `BOOT_CHECK_EFIVARS` when it's set. So `image/tests/test_boot_check.py` can make a boot counted by creating one empty file, then check for 120 s and a reboot, or for 300 s and none.

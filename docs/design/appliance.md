@@ -479,11 +479,27 @@ Staging, Rebooting, Failed) and in `/v1/version` as `os_version` and
 **Boot counting.** `reliaburger-boot-check.service` is required by
 `boot-complete.target`, so `systemd-bless-boot` marks the new UKI good only
 once bun answers as healthy. It allows 120 seconds on a counted boot and 300
-seconds otherwise, and the clock doesn't start until prepare is done. A
+seconds otherwise, and the clock doesn't start until prepare is done. The
+clock is seconds since boot (`/proc/uptime`), not the wall clock, which jumps
+when it first syncs: a machine with a flat RTC battery boots behind, and the
+jump would otherwise use the budget up at once. A
 failed check on a counted boot reboots. After three tries systemd-boot falls
 back to the previous UKI, whose `usrhash` pins the old `/usr`. Back on the old
 version, bun turns `Rebooting` into `Failed` ("failed its boot checks, so
 systemd-boot fell back"), which pauses the rollout.
+
+**Time before bun.** bun and its peers expect a node's wall clock to move
+forward across restarts, so `reliaburger.service` starts after
+`reliaburger-time-wait.service`, which runs
+`systemd-time-wait-sync` under `timeout 30` once per boot, after the network
+and `systemd-timesyncd` are up. It waits only until the first sync, so a
+node that can reach NTP waits a second or two. Giving up isn't a failure
+(`ExecStart=-`), so a LAN with no NTP server delays bun by 30 s, still well
+inside a counted boot's 120 s. bun isn't ordered after `time-sync.target`:
+systemd's own `systemd-time-wait-sync.service` never gives up
+(`TimeoutStartSec=infinity`), and if anything enabled it, a node with no NTP
+would never start bun. `image/tests/test_time_wait.py` holds the units to
+this.
 
 bun starts before the boot check passes. On a boot of the target that
 started counted (systemd-boot's `LoaderBootCountPath` EFI variable exists,

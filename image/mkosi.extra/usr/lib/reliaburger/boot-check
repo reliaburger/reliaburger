@@ -15,6 +15,15 @@ set -u
 # BOOT_CHECK_EFIVARS is for image/tests/test_boot_check.py; the unit unsets
 # it (UnsetEnvironment=), so the manager's environment can't supply it.
 efivars=${BOOT_CHECK_EFIVARS:-/sys/firmware/efi/efivars}
+# Seconds since boot, which only move forward. `date +%s` jumps when the
+# clock first syncs, and a machine with a flat RTC battery boots hours or
+# days behind: the whole budget would pass at that jump, and a counted boot
+# of a good update would reboot and fall back. BOOT_CHECK_UPTIME is for the
+# tests, and the unit unsets it too.
+uptime_seconds() {
+    read -r up _ < "${BOOT_CHECK_UPTIME:-/proc/uptime}"
+    echo "${up%.*}"
+}
 counted() {
     # systemd-boot sets this only when the entry has tries left (+N).
     [ -e "$efivars/LoaderBootCountPath-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f" ]
@@ -55,8 +64,8 @@ done
 # nodes answer in 8 to 23 s; S5 measures the Wyse. Other boots get five,
 # since nothing falls back from them.
 if counted; then limit=120; else limit=300; fi
-deadline=$(( $(date +%s) + limit ))
-while [ "$(date +%s)" -lt "$deadline" ]; do
+deadline=$(( $(uptime_seconds) + limit ))
+while [ "$(uptime_seconds)" -lt "$deadline" ]; do
     if curl -fsS --max-time 2 http://127.0.0.1:9117/v1/health >/dev/null 2>&1 \
         || curl -fsSk --max-time 2 https://127.0.0.1:9117/v1/health >/dev/null 2>&1; then
         report "bun healthy ($(/var/lib/reliaburger/bin/bun --version 2>/dev/null))"
