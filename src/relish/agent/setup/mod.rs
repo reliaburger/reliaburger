@@ -625,13 +625,35 @@ fn write(path: &Path, before: Option<&str>, after: Option<&str>) -> io::Result<(
     let mut temporary = path.as_os_str().to_owned();
     temporary.push(".relish-setup.tmp");
     let temporary = PathBuf::from(temporary);
-    fs::write(&temporary, after)?;
-    if let Ok(meta) = fs::metadata(path) {
-        fs::set_permissions(&temporary, meta.permissions())?;
-    }
-    fs::rename(&temporary, path).inspect_err(|_| {
+    replace_through(&temporary, path, after).inspect_err(|_| {
         let _ = fs::remove_file(&temporary);
     })
+}
+
+/// Write `contents` to `temporary`, give it `path`'s permissions and rename
+/// it over `path`. An agent's config can hold other servers' tokens, so the
+/// copy is created owner-only before a byte goes in; a leftover from a
+/// killed run is removed first rather than reused with its old mode.
+fn replace_through(temporary: &Path, path: &Path, contents: &str) -> io::Result<()> {
+    use std::io::Write as _;
+    match fs::remove_file(temporary) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+        _ => {}
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(temporary)?;
+    file.write_all(contents.as_bytes())?;
+    drop(file);
+    if let Ok(meta) = fs::metadata(path) {
+        fs::set_permissions(temporary, meta.permissions())?;
+    }
+    fs::rename(temporary, path)
 }
 
 /// What setup knows about the token the agents' `relish mcp` will send,

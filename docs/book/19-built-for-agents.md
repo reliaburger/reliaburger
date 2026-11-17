@@ -5039,8 +5039,13 @@ Three details in `write`, each from a way it could go wrong:
 - **Rename, don't overwrite.** The new text goes to `<file>.relish-setup.tmp`
   beside the original, then `fs::rename` moves it over. On one filesystem a
   rename is atomic, so a crash leaves the old file or the new one, never half
-  of each. The original's permissions are copied first: `~/.claude.json` is
-  often `0600`, and it should stay that way.
+  of each. The temporary file is created owner-only (`0600`) before a byte
+  goes in, with `OpenOptions` and `create_new`: `~/.claude.json` holds other
+  MCP servers' tokens, and `fs::write` would have created the copy with the
+  umask's mode, usually `0644`, readable by every local user until the
+  rename. A leftover from a killed run is removed first, and any failure
+  removes the copy. Then the original's permissions are copied over: a
+  `0600` file stays `0600`, and a new file stays owner-only.
 - **Check before writing.** Claude Code rewrites `~/.claude.json` while it
   runs. Setup keeps the text it planned against and reads the file again just
   before the rename; if it changed, setup writes nothing and says `not
