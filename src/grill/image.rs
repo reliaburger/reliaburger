@@ -1767,7 +1767,7 @@ mod tests {
 
     // -- Hermetic OCI distribution fixture ------------------------------------
 
-    #[derive(Clone, Copy)]
+    #[derive(Debug, Clone, Copy)]
     enum RegistryFaultTarget {
         Manifest,
         Configuration,
@@ -2671,12 +2671,25 @@ mod tests {
             let reference = fixture.reference.clone();
             let pull = tokio::spawn(async move { store.pull_and_unpack(&reference).await });
             expire_stalled_attempt(&received, if layer { LAYER_READ } else { METADATA_READ }).await;
-            let rootfs = tokio::time::timeout(std::time::Duration::from_secs(10), pull)
-                .await
-                .expect("the retry never completed")
-                .unwrap()
-                .unwrap()
-                .rootfs;
+            // The retry backs off for 1 to 1.25 s, reconnects, reads again
+            // and unpacks with fsyncs. Beside F_FULLFSYNC writers and CPU
+            // spinners that took 3 to 6 s, and once on a loaded host past
+            // 10 s (#2031). The window only guards a hang.
+            let started = std::time::Instant::now();
+            let rootfs = match tokio::time::timeout(std::time::Duration::from_secs(30), pull).await
+            {
+                Ok(pulled) => pulled.unwrap().unwrap().rootfs,
+                // Say how far the retry got (#2031): a second request for
+                // the stalled path means it reconnected and the time went
+                // after that, in reading or unpacking.
+                Err(_) => panic!(
+                    "the {target:?} retry never completed in {:?}: {} manifest and {} layer \
+                     requests",
+                    started.elapsed(),
+                    fixture.manifest_requests.load(Ordering::SeqCst),
+                    fixture.layer_requests.load(Ordering::SeqCst),
+                ),
+            };
             assert_eq!(
                 std::fs::read(rootfs.join("bin/sh")).unwrap(),
                 b"fixture shell"
