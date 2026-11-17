@@ -1303,6 +1303,18 @@
   },
   {
     "source": "tests/owned_runc.rs",
+    "function": "runc_container_paused_by_smoker_takes_its_stop_signal_at_once",
+    "binary": "reliaburger::owned_runc",
+    "test": "runc_container_paused_by_smoker_takes_its_stop_signal_at_once"
+  },
+  {
+    "source": "tests/owned_runc.rs",
+    "function": "runc_container_with_a_paused_init_takes_its_stop_signal_at_once",
+    "binary": "reliaburger::owned_runc",
+    "test": "runc_container_with_a_paused_init_takes_its_stop_signal_at_once"
+  },
+  {
+    "source": "tests/owned_runc.rs",
     "function": "recovered_source_identity_belongs_to_the_container_not_its_launcher",
     "binary": "reliaburger::owned_runc",
     "test": "recovered_source_identity_belongs_to_the_container_not_its_launcher"

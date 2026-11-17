@@ -651,9 +651,34 @@ impl RuncGrill {
                     String::from_utf8_lossy(&output.stderr)
                 )));
             }
+            runtime.owned_resume(&id, &context).await;
             Ok(())
         })
         .await
+    }
+
+    /// Follow a stop signal with SIGCONT, as ProcessGrill does (#2041).
+    ///
+    /// A paused process holds its stop signal pending: a workload that traps
+    /// it would sit out its grace and die by SIGKILL. Smoker's pause freezes
+    /// the pid the runtime reports, which is the `runc run` launcher, and a
+    /// frozen launcher can't see its container exit; a pause can also freeze
+    /// the container's own init. So both get SIGCONT. A running process
+    /// ignores it, and a failure only leaves the stop to its grace and force
+    /// kill, so neither result is an error.
+    async fn owned_resume(&self, id: &InstanceId, context: &ClaimedCommandExecutor) {
+        if let Ok(Some(CommandState::Running { pid })) =
+            context.role_state(RuntimeRole::Launcher).await
+            && let Ok(pid) = i32::try_from(pid)
+        {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGCONT,
+            );
+        }
+        let _ = self
+            .owned_runc_command(context, &["kill", &id.0, "SIGCONT"])
+            .await;
     }
 
     /// Report positive owner evidence and complete any observed retirement.
