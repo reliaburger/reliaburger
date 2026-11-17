@@ -128,6 +128,7 @@ impl OwnedCommands {
             .map_err(|_| io::Error::other("cannot generate runtime command identity"))?;
         let id = CommandId(InstanceId(format!("command-{}", hex::encode(nonce))));
         let spec = OciSpec {
+            managed_volumes: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,

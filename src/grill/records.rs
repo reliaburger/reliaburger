@@ -349,6 +349,7 @@ mod tests {
 
     fn oci_spec() -> OciSpec {
         OciSpec {
+            managed_volumes: Vec::new(),
             reusable_executor: false,
             host_process: false,
             initialiser: false,

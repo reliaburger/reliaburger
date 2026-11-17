@@ -1578,6 +1578,7 @@ mod tests {
     /// A host workload's spec: the only kind the process runtime runs.
     fn spec_with_args(args: Vec<String>) -> OciSpec {
         OciSpec {
+            managed_volumes: Vec::new(),
             reusable_executor: false,
             host_process: true,
             initialiser: false,

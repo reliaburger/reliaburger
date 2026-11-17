@@ -233,6 +233,33 @@
       ]
     },
     {
+      "id": "issue-2000",
+      "issue": 2000,
+      "promise": "A loop volume whose provisioning record is lost or unreadable keeps its data: provisioning refuses rather than formatting its image.",
+      "supported_paths": [
+        "A provisioned loop volume with an intact record mounts again with its data."
+      ],
+      "refused_paths": [
+        "A loop image with no readable record is never claimed or formatted again."
+      ],
+      "boundaries": [
+        "Actual loop-backed ext4 formatting requires the provisioned Linux root gate; the portable record and image checks cannot substitute for it."
+      ],
+      "cases": [
+        {
+          "id": "issue-2000-a_loop_image_without_its_record_is_never_formatted",
+          "binary": "reliaburger",
+          "test": "grill::volume::tests::a_loop_image_without_its_record_is_never_formatted",
+          "requires": [
+            "linux-root-storage"
+          ],
+          "sources": [
+            "src/grill/volume.rs"
+          ]
+        }
+      ]
+    },
+    {
       "id": "issue-529",
       "issue": 529,
       "promise": "Artifact signing credentials remain useful beyond the ordinary short-lived TLS leaf window.",

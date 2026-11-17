@@ -20,6 +20,7 @@ const CONFIRMATION: Duration = Duration::from_secs(5);
 /// A host workload running `script` under `/bin/sh`, stopped as `stop` says.
 fn workload(script: &str, stop: StopPolicy) -> OciSpec {
     OciSpec {
+        managed_volumes: Vec::new(),
         reusable_executor: false,
         host_process: true,
         initialiser: false,

@@ -133,10 +133,18 @@ process can only write what its mapped ids own. Before creating the container,
 Bun resolves the process user (image `USER`, or `run_as_user`/`run_as_group`),
 maps it into the node range and prepares every read-write volume:
 
-- **Managed volumes** (those with a `*.volume.json` provisioning sidecar,
-  whatever the backend: plain directory, loop-mounted ext4 or Btrfs subvolume)
-  are handed to that user. The sidecar records who the volume was last handed
-  to, and the plan follows from it:
+- **Managed volumes** (the ones the spec builder records in
+  `OciSpec::managed_volumes`, whatever the backend: plain directory,
+  loop-mounted ext4 or Btrfs subvolume) are handed to that user. A file found
+  beside a bind source never makes it managed. Before the hand-over, Bun walks
+  the path from the volumes directory one component at a time and refuses a
+  symlink, a non-directory, or a component that is itself a volume (or a
+  restore copy of one); provisioning applies the same walk, so a new volume
+  can't sit inside an older one or over one. The `*.volume.json` sidecar beside
+  the volume is written durably (file and directory synced), and one that
+  exists but can't be read stops the start rather than reading as "new
+  volume". A loop image that already exists is never formatted. The sidecar
+  records who the volume was last handed to, and the plan follows from it:
 
   | Recorded owner | Volume root owner | Action |
   |---|---|---|
