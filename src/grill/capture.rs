@@ -175,6 +175,25 @@ async fn capture_gone(readers: &[CaptureReader]) -> bool {
     true
 }
 
+/// Whether the byte before `offset` in `path` is a newline, so `offset`
+/// starts a line. A reclaimed prefix reads as zeros, which are not. A file
+/// that can't be read answers yes: the reader then reads on as it always
+/// did, rather than drop a line it can't prove is partial.
+async fn follows_a_newline(path: &Path, offset: u64) -> bool {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let previous = async {
+        let mut file = tokio::fs::File::open(path).await?;
+        file.seek(io::SeekFrom::Start(offset - 1)).await?;
+        let mut byte = [0u8; 1];
+        file.read_exact(&mut byte).await?;
+        Ok::<u8, io::Error>(byte[0])
+    };
+    match previous.await {
+        Ok(byte) => byte == b'\n',
+        Err(_) => true,
+    }
+}
+
 /// Read at most [`CAPTURE_CHUNK_BYTES`] of `path`, starting at `offset`.
 ///
 /// A missing file, or an offset at or past its end, reads as empty. A chunk
@@ -480,6 +499,11 @@ impl CaptureReader {
     /// (or replaced), so the offset no longer names a line in it. Resume also
     /// checks the offset's identity, and read_chunk checks the opened descriptor
     /// again so replacement after checkpoint loading cannot inherit that offset.
+    ///
+    /// An offset that doesn't follow a newline is inside a line: a
+    /// `[skipped …]` line checkpoints one partway through a cut line. The
+    /// reader then skips to the next newline, as it would have without the
+    /// restart, rather than hand the rest on as if a line began there.
     pub async fn resume(stream: LogStream, file: PathBuf, offsets: &CaptureOffsets) -> Self {
         let metadata = tokio::fs::metadata(&file).await.ok();
         let identity = metadata.as_ref().map(CaptureFileIdentity::of);
@@ -491,12 +515,13 @@ impl CaptureReader {
                     && offsets.identity(&file) == identity
             })
             .unwrap_or(0);
+        let discarding = consumed > 0 && !follows_a_newline(&file, consumed).await;
         Self {
             stream,
             file: Some(file),
             consumed,
             partial: Vec::new(),
-            discarding: false,
+            discarding,
             skipped_unreported: 0,
             identity,
             #[cfg(test)]
@@ -581,9 +606,9 @@ impl CaptureReader {
     /// length, and the bytes past the cut are counted as consumed but never
     /// held, so the reader buffers at most that much between calls. Every
     /// [`SKIPPED_REPORT_BYTES`] of them it hands on a `[skipped N more bytes
-    /// of a cut line]` line, so the capture offset follows them. A reader
-    /// resumed from an offset inside a skipped line hands its rest on as one
-    /// more line, also cut to the cap.
+    /// of a cut line]` line, so the capture offset follows them. A cut line
+    /// is at most [`MAX_CAPTURED_LINE_BYTES`] of the line plus
+    /// [`CUT_LINE_MARKER`].
     ///
     /// The cost is linear in the bytes fed in: bytes already waiting hold no
     /// newline, so only the new ones are searched, and each new byte is
@@ -1159,6 +1184,76 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].line, "three");
         assert_eq!(ends(&lines), vec![14]);
+    }
+
+    /// A `[skipped …]` line checkpoints an offset in the middle of a cut
+    /// line. A Bun restart that resumes there must go on skipping that line,
+    /// not hand its rest on as if a new line began.
+    #[tokio::test]
+    async fn resume_inside_a_skipped_line_keeps_skipping_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("web.stdout");
+        let mut contents = b"one\n".to_vec();
+        contents.extend(std::iter::repeat_n(b'x', 1000));
+        contents.extend_from_slice(b"\nnext\n");
+        std::fs::write(&path, &contents).unwrap();
+        let offsets = |offset: u64| {
+            CaptureOffsets(
+                [(path.clone(), offset)].into_iter().collect(),
+                [(
+                    path.clone(),
+                    CaptureFileIdentity::of(&std::fs::metadata(&path).unwrap()),
+                )]
+                .into_iter()
+                .collect(),
+            )
+        };
+
+        // Mid-line: the byte before the offset is an 'x'.
+        let mut reader =
+            CaptureReader::resume(LogStream::Stdout, path.clone(), &offsets(500)).await;
+        let chunk = read_capture_chunk(&path, reader.read_offset())
+            .await
+            .unwrap();
+        let lines = reader.push(&chunk);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0].line, "next");
+
+        // At a line start the reader reads normally.
+        let mut reader = CaptureReader::resume(LogStream::Stdout, path.clone(), &offsets(4)).await;
+        let chunk = read_capture_chunk(&path, reader.read_offset())
+            .await
+            .unwrap();
+        let lines = reader.push(&chunk);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].line, "x".repeat(1000));
+    }
+
+    /// A reclaimed prefix reads as zeros, and a zero is no newline: an offset
+    /// just past one is mid-line too.
+    #[tokio::test]
+    async fn resume_after_a_zeroed_byte_keeps_skipping() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("web.stdout");
+        let mut contents = vec![0u8; 100];
+        contents.extend_from_slice(b"rest\nnext\n");
+        std::fs::write(&path, &contents).unwrap();
+        let offsets = CaptureOffsets(
+            [(path.clone(), 100)].into_iter().collect(),
+            [(
+                path.clone(),
+                CaptureFileIdentity::of(&std::fs::metadata(&path).unwrap()),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let mut reader = CaptureReader::resume(LogStream::Stdout, path.clone(), &offsets).await;
+        let chunk = read_capture_chunk(&path, reader.read_offset())
+            .await
+            .unwrap();
+        let lines = reader.push(&chunk);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0].line, "next");
     }
 
     #[tokio::test]

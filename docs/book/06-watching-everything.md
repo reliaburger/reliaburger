@@ -1165,8 +1165,18 @@ for some other line to come along, and on a quiet node that might never
 happen. The marker costs one short row per megabyte, and it also tells you
 the line went on. `a_capture_with_no_newline_is_reclaimed_once_flushed`
 follows an 8 MiB capture with no newline into a real `LogStore`, flushes it
-and checks that the file's disk allocation drops to the retained tail. `a_stream_with_no_newline_stays_within_the_line_cap` pushes 100 MiB
-with no newline in 64 KiB chunks and checks the buffer after every one.
+and checks that the file's disk allocation drops to the retained tail.
+`a_stream_with_no_newline_stays_within_the_line_cap` pushes 100 MiB with no
+newline in 64 KiB chunks and checks the buffer after every one.
+
+Those markers have a side effect a reviewer caught. They checkpoint an offset
+in the middle of a line, and a reader resumed after a Bun restart always
+assumed its offset started a line. So the rest of a never-ending line came
+out looking like a fresh one. `resume` now looks at the byte before the
+offset. If it isn't a newline (a reclaimed hole reads as zeros, which count
+as mid-line too), the reader starts out skipping, just as it would have
+without the restart. `resume_inside_a_skipped_line_keeps_skipping_it` and
+`resume_after_a_zeroed_byte_keeps_skipping` pin both cases.
 
 A cut line has to say so, or a reader takes 64 KiB for the whole line. So
 it ends with ` [line cut at 64 KiB]`. And the cut must not land inside a
