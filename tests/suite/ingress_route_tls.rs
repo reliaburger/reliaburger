@@ -26,6 +26,7 @@ use crate::task_harness;
 
 const CLUSTER_HOST: &str = "cluster.example";
 const EXPLICIT_HOST: &str = "explicit.example";
+const PLAIN_HOST: &str = "plain.example";
 
 /// A routing table with one route per `(host, tls)` pair.
 fn routes(entries: &[(&str, &str)]) -> Arc<RwLock<RoutingTable>> {
@@ -174,13 +175,23 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyServer {
 
 /// The leaf the listener at `address` presents for SNI `host`.
 async fn leaf_for(address: SocketAddr, host: &str) -> Vec<u8> {
+    handshake(address, host, true).await
+}
+
+/// The leaf the listener presents to a client that sends no SNI at all.
+async fn leaf_without_sni(address: SocketAddr) -> Vec<u8> {
+    handshake(address, "localhost", false).await
+}
+
+async fn handshake(address: SocketAddr, host: &str, send_sni: bool) -> Vec<u8> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let config = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
         .with_safe_default_protocol_versions()
         .unwrap()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(AcceptAnyServer(provider)))
         .with_no_client_auth();
+    config.enable_sni = send_sni;
     let name = ServerName::try_from(host.to_string()).unwrap();
     let stream = tokio::time::timeout(Duration::from_secs(3), async {
         tokio_rustls::TlsConnector::from(Arc::new(config))
@@ -232,6 +243,34 @@ async fn cluster_and_explicit_routes_on_one_listener_get_their_own_certificates(
     assert!(
         signed_by(&cluster, &ingress_ca),
         "a cluster route gets a leaf from the Ingress CA"
+    );
+
+    assert_eq!(
+        leaf_without_sni(address).await,
+        operator_leaf,
+        "a handshake with no SNI names no route, so it gets the operator's pair"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cluster_only_node_mints_no_leaf_for_plain_routes_or_no_sni() {
+    let table = routes(&[(CLUSTER_HOST, "cluster"), (PLAIN_HOST, "none")]);
+    let (cluster, ingress_ca) = cluster_resolver(Arc::clone(&table));
+    let (address, _tasks) = start(WrapperConfig::default(), table, Some(cluster)).await;
+
+    assert!(signed_by(
+        &leaf_for(address, CLUSTER_HOST).await,
+        &ingress_ca
+    ));
+    // Before #2011 the Ingress CA minted a leaf for any routed host, plain
+    // ones included. Only `tls = "cluster"` hosts get one now.
+    assert!(
+        !signed_by(&leaf_for(address, PLAIN_HOST).await, &ingress_ca),
+        "a plain route's host gets the self-signed certificate"
+    );
+    assert!(
+        !signed_by(&leaf_without_sni(address).await, &ingress_ca),
+        "a handshake with no SNI gets the self-signed certificate"
     );
 }
 

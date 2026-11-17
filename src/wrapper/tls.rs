@@ -635,14 +635,15 @@ impl RouteCertResolver {
     /// The source for a handshake's SNI (`None` = no SNI). Split out from
     /// `resolve` so the choice is testable without a `ClientHello`.
     fn source_for(&self, server_name: Option<&str>) -> CertificateSource {
-        // A routing table locked for a rebuild reads as "no route": that one
-        // handshake gets the default, as it does in `IngressCertResolver`.
-        let mode = server_name.and_then(|name| {
-            self.routes
-                .try_read()
-                .ok()
-                .and_then(|table| table.certificate_mode(name))
-        });
+        let mode = match server_name {
+            None => None,
+            Some(name) => match self.routes.try_read() {
+                Ok(table) => table.certificate_mode(name),
+                // A rebuild holds the table, so this host's mode is unknown.
+                // The operator pair might be the other mode's certificate.
+                Err(_) => return CertificateSource::SelfSigned,
+            },
+        };
         match (mode, server_name) {
             (Some(TlsMode::Explicit), _) if self.operator.is_some() => CertificateSource::Operator,
             (Some(TlsMode::Cluster), _) if self.cluster.is_some() => CertificateSource::Cluster,
@@ -1167,6 +1168,23 @@ mod tests {
             SelfSigned
         );
         assert_eq!(operator_only.source_for(Some("explicit.example")), Operator);
+
+        // A cluster-only node no longer mints a cluster leaf for a plain
+        // route's host: only `tls = "cluster"` hosts get one.
+        assert_eq!(cluster_only.source_for(Some("plain.example")), SelfSigned);
+
+        // While a rebuild holds the table, the host's mode is unknown. It
+        // must get self-signed, not the operator pair: the host might be a
+        // `cluster` one. A handshake with no SNI never reads the table.
+        let rebuilding = routes.try_write().unwrap();
+        assert_eq!(both.source_for(Some("cluster.example")), SelfSigned);
+        assert_eq!(
+            operator_only.source_for(Some("unknown.example")),
+            SelfSigned
+        );
+        assert_eq!(both.source_for(None), Operator);
+        drop(rebuilding);
+        assert_eq!(both.source_for(Some("cluster.example")), Cluster);
     }
 
     /// A configured ingress host still gets a real cluster-CA cert, cached.

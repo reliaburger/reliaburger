@@ -141,12 +141,15 @@ certificate per handshake from the SNI host's routes:
 | `cluster` route | Ingress CA resolver | an Ingress CA leaf for that host |
 | `explicit` or `cluster` route | no | the self-signed development certificate, with one warning per host on stderr; never the other mode's certificate |
 | plain-HTTP route, unknown host, or no SNI | — | the operator pair if the node has one, else the self-signed certificate |
+| any SNI while a rebuild holds the routing table | — | the self-signed certificate for that handshake, since the host's mode is unknown |
 
 SNI names a host, not a path, so routes on one host share a certificate. When
 they disagree, `explicit` wins over `cluster`, and either wins over plain HTTP
 (`RoutingTable::certificate_mode`). Before 0.3.0 the listener made one choice
 for every route (disk pair if present, else the Ingress CA), so the mode only
-decided the plain-HTTP redirect.
+decided the plain-HTTP redirect. A cluster-mode node with no disk pair also
+minted an Ingress CA leaf for plain routes' hosts; now only `cluster` hosts get
+one, and plain hosts get the self-signed certificate.
 
 **Cluster CA flow (current):**
 

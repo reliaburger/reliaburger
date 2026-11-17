@@ -146,7 +146,9 @@ by the hostname the client asks for. Routes on one host share a certificate,
 and `explicit` wins if they disagree. A node missing what a route's mode needs
 (no pair for `explicit`, no cluster CA for `cluster`) serves that host the
 self-signed fallback and logs a warning, rather than the other mode's
-certificate. There's no ACME: `relish apply` and `relish lint` refuse `auto` and
+certificate. A host whose routes are all plain HTTP, reached over HTTPS, gets
+the node's `tls_cert` pair if it has one and the self-signed fallback if not;
+it never gets a cluster certificate. There's no ACME: `relish apply` and `relish lint` refuse `auto` and
 `acme`, as they do any other unknown mode. The listener's self-signed fallback
 is for development, not a substitute for either mode.
 
