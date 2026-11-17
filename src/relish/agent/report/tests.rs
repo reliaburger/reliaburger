@@ -531,6 +531,32 @@ fn log_lines_are_left_out_unless_asked_for() {
     );
 }
 
+/// A `.log` file stays out whatever it holds: an app that logs JSON, or
+/// `relish logs -o json > web.log`, still makes a log file.
+#[test]
+fn a_log_file_of_json_lines_stays_out_unless_asked_for() {
+    let root = tempfile::tempdir().unwrap();
+    let json_lines = root.path().join("web.log");
+    std::fs::write(
+        &json_lines,
+        "{\"level\":\"error\",\"msg\":\"login failed for bob\"}\n{\"level\":\"info\"}\n",
+    )
+    .unwrap();
+    let one_document = root.path().join("number.log");
+    std::fs::write(&one_document, "42\n").unwrap();
+    for path in [&json_lines, &one_document] {
+        let left_out = matches!(
+            Evidence::read(path, false).unwrap(),
+            Evidence::LeftOut { ref why, .. } if why.contains("--include-logs")
+        );
+        assert!(left_out, "{} went into the report", path.display());
+    }
+    assert!(matches!(
+        Evidence::read(&json_lines, true).unwrap(),
+        Evidence::JsonLines { .. }
+    ));
+}
+
 #[test]
 fn with_include_logs_log_lines_go_in_redacted() {
     let root = tempfile::tempdir().unwrap();

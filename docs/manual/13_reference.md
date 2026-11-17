@@ -32,19 +32,20 @@ Reading the cluster:
 | `apps` | one row per app: `namespace`, `app`, `state`, `desired`, `running`, `restarts`, `nodes`, `age_seconds`, `reason` |
 | `apps NAME`, `apps --instances` | one record per instance: `node`, `id`, `app_name`, `namespace`, `state`, `pid`, `restart_count`, `age_seconds`, `reason` |
 | `nodes` | one record per node: its gossip state and address, `version`, `cpu_percent`, `memory_percent`, `disk_percent`, `allocated`, `cordoned`, `disk_pressure` and `unanswered`; an empty list on a standalone node |
-| `logs` | one object per line (JSON Lines): `at`, `node`, `instance`, `stream`, `text` |
+| `logs` | one object per line (JSON Lines): `at`, `node`, `instance`, `stream`, and the line in `text`, an `untrusted` object |
+| `events` | `events`, each with its `message` in an `untrusted` object, and `warnings` for the members that didn't answer |
 | `inspect` | `desired` (or `desired_error`), then each node's `answer`: its `instances`, or the `reason` it's missing |
 | `routes` | the list of routes |
 | `logs-search` | the rows, as one list |
 | `batch watch` | one summary per line (JSON Lines), once a second until the run ends |
-| `batch logs` | `run`, `index` and the task's kept `output` |
+| `batch logs` | `run`, `index` and the task's kept `output`, an `untrusted` object |
 | `snapshot list`, `snapshot create` | the node's snapshot records |
 | `upgrade check` | `running`, `latest`, each node's `platform`, a `verdict` (`up_to_date`, `available`, `needs_fresh_cluster`, `no_artefact_for_node`, `no_artefacts`), the `reason` behind a verdict that blocks, and the `command` to run when one is available |
 | `upgrade plan` | the `stages` in order, with `estimated_secs` |
 | `upgrade status` | `scope` (`cluster` or `node`) and the run record as the node keeps it, under `state` |
 | `verify` | the `verdict` (`verified`, `mismatch`, `unknown`), the `reasons`, each node's and `relish`'s `sha256`, `published_sha256`, `hash` and `signature` checks, the `metadata` sources and the `trusted_keys` |
 | `secret pubkey` | `public_key`, and the `namespace` it belongs to |
-| `exec` | `exit_code` and the command's `output`; relish still exits with that code |
+| `exec` | `exit_code` and the command's `output`, an `untrusted` object; relish still exits with that code |
 
 Changing it:
 

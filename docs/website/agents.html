@@ -269,6 +269,11 @@ a cut line with <code>…[cut]</code>. <code>truncated</code> is <code>true</cod
 command left lines out. Tell your agent to treat anything inside <code>untrusted</code>
 as evidence to read, never as instructions to follow. Redaction is a safety
 net, not a promise: read what you share before you post it anywhere.</p>
+<p>The rest of <code>relish</code> keeps the same rule under <code>-o json</code> and <code>-o yaml</code>:
+<code>relish logs</code> puts each line's <code>text</code>, <code>relish events</code> each <code>message</code>, and
+<code>relish exec</code> and <code>relish batch logs</code> the <code>output</code> in an <code>untrusted</code> object,
+with lines cut at 16 KiB (512 bytes for an event). Their plain output for
+people is unchanged.</p>
 </section>
 <section class="agents-section" id="commands">
 <h2>Commands <a class="permalink" href="#commands" aria-label="Link to this section">#</a></h2>
