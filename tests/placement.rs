@@ -1010,9 +1010,13 @@ async fn restarting_bun_on_a_volume_apps_node_never_moves_the_app() {
     assert_eq!(home.len(), 1, "db runs once: {home:?}");
     let home_index = ports.iter().position(|(n, _)| *n == home[0]).unwrap();
     let (home_name, home_port) = ports[home_index];
-    let marker = volume_root(home_name, home_port, "db")
-        .join("data")
-        .join("marker");
+    let volume = volume_root(home_name, home_port, "db").join("data");
+    // `apply_until_live` counts a pending instance, which is listed before
+    // the off-loop provisioning has created its volume; on a loaded host
+    // that can take more than a turn (#2024).
+    let provisioned = wait_until(Duration::from_secs(45), || volume.is_dir()).await;
+    assert!(provisioned, "{home_name} never provisioned db's volume");
+    let marker = volume.join("marker");
     std::fs::write(&marker, b"written before the restart").unwrap();
     let observer_index = if home_index == 0 { 1 } else { 0 };
 
