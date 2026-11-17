@@ -984,6 +984,19 @@ Their seeds are still in the cluster directory. Once the machines answer, send t
 
 That command had to start working, too. Without `--create`, `machines claim` adds machines to a running cluster, and `plan_additions` refuses a MAC the fleet already has. So `split_known` now sorts the machines first. One that `fleet.json` already lists is sent the seed already written for it, unchanged, join token and all. Only the rest are added. A fleet machine that answers at a different address is refused, because its seed names the old one. relish still tries to open join windows, but when it's only sending seeds again it carries on without them: node 1 may be among the machines, and then there's no cluster yet to ask.
 
+"Unchanged, join token and all" turned out to be one fix too few. A join token lasts `--ttl`, an hour by default, counted from `create`. A machine that was down for a morning came back to a seed whose token the cluster had stopped accepting, and the retry the error message recommended failed again, this time at enrolment, where the operator sees it last. So before a seed is sent again, `refresh_resent` asks the running cluster for a new token bound to the same node and rewrites the seed with it. `with_join_token` parses the tarball, swaps the one field and writes everything else back as it was. Node 1's create seed has no token, so it goes as it is and the cluster isn't asked. When there's no cluster to ask, because node 1 is among the machines that missed out, relish looks up the old token's expiry in `secrets/security-bootstrap.json`, the initial state `create` wrote. If the token is still good, the seed goes as written. If it has expired, relish doesn't send a seed that's bound to fail: it reports that machine as undelivered, gives the time the token expired, and tells the operator to run the command again once node 1 is up.
+
+The real command hands `refresh_resent` a closure that borrows one client for every machine:
+
+```rust
+|node, seed| {
+    let client = &client;
+    async move { bare_metal::refresh_join_token_with(client, &node.name, &seed, ttl).await }
+}
+```
+
+`async move` moves what it uses into the future, and we want the node and seed path moved but the client only borrowed. Writing `let client = &client;` first makes the thing that gets moved a reference, which is cheap to copy. Without it, `move` would try to move the client itself into the first future, and the second call of the closure would find it gone. The tests pass closures that either succeed or fail with "connection refused". The time is a parameter too, so a test can ask what happens two hours later without waiting two hours.
+
 ## A LAN on a laptop
 
 We had no KVM machine and no spare PCs, only CI and one Apple silicon Mac without root. Everything had to run virtualised until the last step.

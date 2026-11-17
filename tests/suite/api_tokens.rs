@@ -1586,6 +1586,78 @@ async fn image_seed_writes_a_join_seed_whose_token_the_council_accepts_for_that_
     );
 }
 
+/// A join seed sent again by `relish machines claim` gets a token the
+/// running council mints then, bound to its node, in place of the one it
+/// was written with (which expires `--ttl` after `create`). Node 1's create
+/// seed is left alone and mints nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_join_seed_sent_again_carries_a_token_the_council_minted_for_that_node() {
+    use reliaburger::appliance::seed::Seed;
+    use reliaburger::relish::bare_metal;
+
+    let cluster = TokenCluster::start().await;
+    let parent = tempfile::tempdir().unwrap();
+    let directory = parent.path().join("home-cluster");
+    let machine = |text: &str| bare_metal::parse_machine(text).unwrap();
+    let created = bare_metal::create(&bare_metal::CreateOptions {
+        directory: directory.clone(),
+        cluster: "home".into(),
+        machines: vec![
+            machine("d8:9e:f3:00:00:01@192.168.1.51"),
+            machine("d8:9e:f3:00:00:02@192.168.1.52"),
+        ],
+        operators: vec!["192.168.1.10".into()],
+        network: Some("192.168.1.0/24".into()),
+        faults: false,
+        ssh_key: None,
+        token_ttl: Duration::from_secs(3600),
+        external_signing_key: None,
+        council_size: reliaburger::council::CouncilSize::APPLIANCE,
+        root_backup_keys: parent.path().join("operator-keys"),
+    })
+    .unwrap();
+    let relish = reliaburger::relish::client::BunClient::new_with_token(
+        &cluster.leader_url,
+        Some(&cluster.admin),
+    );
+    let node_1 = std::fs::read(&created.seeds[0]).unwrap();
+    let token = |path: &std::path::Path| {
+        let Seed::V1 { config, .. } = Seed::from_tar_gz(&std::fs::read(path).unwrap()).unwrap()
+        else {
+            panic!("not a v1 seed");
+        };
+        config.join.expect("a join seed has [join]").token
+    };
+    let old = token(&created.seeds[1]);
+
+    let create_refreshed = bare_metal::refresh_join_token_with(
+        &relish,
+        "home-1",
+        &created.seeds[0],
+        Duration::from_secs(3600),
+    )
+    .await
+    .unwrap();
+    let join_refreshed = bare_metal::refresh_join_token_with(
+        &relish,
+        "home-2",
+        &created.seeds[1],
+        Duration::from_secs(3600),
+    )
+    .await
+    .unwrap();
+
+    assert!(!create_refreshed);
+    assert_eq!(std::fs::read(&created.seeds[0]).unwrap(), node_1);
+    assert!(join_refreshed);
+    let new = token(&created.seeds[1]);
+    assert_ne!(new, old);
+    let security = cluster.leader.security_state().await;
+    assert_eq!(security.join_tokens.len(), 1, "only home-2's seed minted");
+    reliaburger::sesame::join::check_join_token(&new, "home-2", &security)
+        .expect("the council accepts the new token for home-2");
+}
+
 /// #1893: `relish join-token list` and `revoke` through relish's own client
 /// against a running council. The list shows a token without its secret; a
 /// revoke spends every unused token for that node through Raft, so the

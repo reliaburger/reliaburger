@@ -536,9 +536,12 @@ or copy … into seeds/ on an RBSEED stick and boot the machines with it
 The cluster is made either way, and relish points at node 1. Run the
 command it prints once the machines are back: without `--create`, a machine
 the cluster directory already lists gets the seed it was meant to have,
-rather than a new one. Do it within the hour: a join seed's token lasts as
-long as `--ttl` said (an hour by default), and after that the machine can't
-enrol with it.
+rather than a new one. Each join seed sent again gets a new join token from
+the cluster, good for `--ttl` from then (an hour by default), so it doesn't
+matter how long the machine was away. Only node 1 can mint one: if node 1
+isn't running yet, a seed goes as written while its first token lasts, and
+after that relish keeps it back, says the token expired, and asks you to run
+the command again once node 1 is up.
 
 `--ssh-key ~/.ssh/id_ed25519.pub` puts a key for root SSH into the seeds.
 Only CI lab builds run sshd; published images ignore it.
