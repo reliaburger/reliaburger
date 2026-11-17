@@ -200,9 +200,10 @@ pub struct BoundProxy {
 
 /// Bind the Wrapper HTTP and HTTPS listeners.
 ///
-/// TLS uses the certificate and key from `config.tls_cert_path` /
-/// `config.tls_key_path` when both are set, and a self-signed
-/// certificate generated at startup otherwise.
+/// TLS serves the certificate and key from `config.tls_cert_path` /
+/// `config.tls_key_path` when both are set, and a self-signed certificate
+/// generated at startup otherwise. With no Ingress CA, a `tls = "cluster"`
+/// host gets the self-signed certificate; see [`bind_proxy_with_tls`].
 pub async fn bind_proxy(
     config: WrapperConfig,
     routing_table: Arc<RwLock<RoutingTable>>,
@@ -225,13 +226,15 @@ pub async fn bind_proxy_with_drains(
     bind_proxy_with_tls(config, routing_table, drains, None, None, shutdown).await
 }
 
-/// Bind the listeners, optionally resolving TLS certificates per SNI from the
-/// cluster Ingress CA (M8).
+/// Bind the listeners, choosing each TLS host's certificate by its route's
+/// `tls` mode (M8, #2011).
 ///
-/// When `cert_resolver` is `Some`, `tls = "cluster"` routes are served a
-/// certificate issued from the Ingress CA for the requested host, so a client
-/// trusting the cluster root trusts the ingress. When `None`, TLS falls back to
-/// the operator disk cert or a self-signed `localhost` cert, exactly as before.
+/// `cert_resolver` is the cluster Ingress CA resolver: with it, `tls =
+/// "cluster"` hosts are served a leaf issued for the requested host, so a
+/// client trusting the cluster root trusts the ingress. `tls = "explicit"`
+/// hosts are served the operator pair from `config.tls_cert_path` /
+/// `config.tls_key_path`. A host whose mode names a certificate this node
+/// lacks gets the self-signed `localhost` cert, never the other mode's.
 pub async fn bind_proxy_with_tls(
     config: WrapperConfig,
     routing_table: Arc<RwLock<RoutingTable>>,
@@ -271,39 +274,28 @@ pub async fn bind_proxy_with_tls(
     let http_listener = bind(config.http_port).await?;
     let http_addr = local_addr(&http_listener)?;
 
-    // An operator disk cert always wins. Otherwise, if the cluster Ingress CA
-    // resolver is wired, serve per-SNI cluster-signed certs; failing both, a
-    // self-signed `localhost` cert (dev / no-cluster).
-    let mut file_cert_resolver = None;
-    let tls_config = match (&config.tls_cert_path, &config.tls_key_path) {
-        (Some(cert), Some(key)) => {
-            let resolver = Arc::new(
-                super::tls::FileCertResolver::load(cert, key)
-                    .await
-                    .map_err(|e| {
-                        WrapperError::ProxyFailed(format!("failed to load TLS files: {e}"))
-                    })?,
-            );
-            file_cert_resolver = Some(Arc::clone(&resolver));
-            super::tls::build_tls_config_with_resolver(resolver).map_err(|e| {
-                WrapperError::ProxyFailed(format!("failed to build TLS config: {e}"))
-            })?
-        }
-        _ => match cert_resolver {
-            Some(resolver) => {
-                super::tls::build_tls_config_with_resolver(resolver).map_err(|e| {
-                    WrapperError::ProxyFailed(format!("failed to build ingress TLS resolver: {e}"))
-                })?
-            }
-            None => {
-                let (cert, key) = super::tls::generate_self_signed_cert()
-                    .map_err(|e| WrapperError::ProxyFailed(format!("failed to self-sign: {e}")))?;
-                super::tls::build_tls_config(vec![cert], key).map_err(|e| {
-                    WrapperError::ProxyFailed(format!("failed to build TLS config: {e}"))
-                })?
-            }
-        },
+    // The route's `tls` mode picks the certificate per SNI host (#2011): the
+    // operator pair for `explicit`, an Ingress CA leaf for `cluster`.
+    let file_cert_resolver = match (&config.tls_cert_path, &config.tls_key_path) {
+        (Some(cert), Some(key)) => Some(Arc::new(
+            super::tls::FileCertResolver::load(cert, key)
+                .await
+                .map_err(|e| WrapperError::ProxyFailed(format!("failed to load TLS files: {e}")))?,
+        )),
+        _ => None,
     };
+    let (self_signed_cert, self_signed_key) = super::tls::generate_self_signed_cert()
+        .map_err(|e| WrapperError::ProxyFailed(format!("failed to self-sign: {e}")))?;
+    let resolver = super::tls::RouteCertResolver::new(
+        Arc::clone(&state.routing_table),
+        file_cert_resolver.clone(),
+        cert_resolver,
+        vec![self_signed_cert],
+        self_signed_key,
+    )
+    .map_err(|e| WrapperError::ProxyFailed(format!("failed to build TLS resolver: {e}")))?;
+    let tls_config = super::tls::build_tls_config_with_resolver(Arc::new(resolver))
+        .map_err(|e| WrapperError::ProxyFailed(format!("failed to build TLS config: {e}")))?;
     let tls_acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
 
     let https_listener = bind(config.https_port).await?;

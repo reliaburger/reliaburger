@@ -1141,6 +1141,37 @@ Operators can also provide their own cert and key via config (`tls_cert_path`, `
 
 Sesame later added cluster-CA certificates, and operators can load a certificate and key from disk. Automatic ACME/Let's Encrypt provisioning didn't make the v1 cut. `auto` and `acme` therefore fail route validation instead of falling back to either plaintext or a self-signed certificate.
 
+### One listener, a certificate per route
+
+Each route picks its certificate with `tls`: `cluster` for a leaf from the cluster's Ingress CA, `explicit` for the operator's pair. But a node has one HTTPS listener for every route, and until 0.3.0 that listener made one choice for all of them: the disk pair if the node had one, the Ingress CA if it didn't. So a `cluster` route on a node with a disk pair got the operator's certificate, and an `explicit` route on a node without one quietly got a cluster leaf (#2011). The route's mode only decided whether plain HTTP redirected.
+
+The fix uses the one thing a TLS client tells us before we must answer: the hostname in its SNI (Server Name Indication, the name the client puts in its first handshake message). rustls asks a `ResolvesServerCert` for the certificate on every handshake, and `RouteCertResolver` answers by looking the host up in the routing table:
+
+```rust
+match (mode, server_name) {
+    (Some(TlsMode::Explicit), _) if self.operator.is_some() => CertificateSource::Operator,
+    (Some(TlsMode::Cluster), _) if self.cluster.is_some() => CertificateSource::Cluster,
+    (Some(TlsMode::Explicit), Some(host)) => {
+        self.warn_once(host, "explicit", "no tls_cert/tls_key pair in [ingress]");
+        CertificateSource::SelfSigned
+    }
+    (Some(TlsMode::Cluster), Some(host)) => {
+        self.warn_once(host, "cluster", "no Ingress CA (council state is missing)");
+        CertificateSource::SelfSigned
+    }
+    _ if self.operator.is_some() => CertificateSource::Operator,
+    _ => CertificateSource::SelfSigned,
+}
+```
+
+A `match` arm can carry a guard (`if ...`) that must also hold for the arm to win, so the first two arms say "this mode, and the node has what it needs". When it doesn't, the host gets the self-signed certificate and one warning, never the other mode's certificate. A client that checks names rejects the self-signed one, which is the honest answer from a misconfigured node. Everything else (a plain-HTTP route reached over HTTPS, an unknown host, a handshake with no SNI) gets the operator pair when there is one, as before.
+
+The resolver holds the two sources as `Option<Arc<FileCertResolver>>` and `Option<Arc<dyn ResolvesServerCert>>`. The second is a trait object: Bun wraps the Ingress CA resolver in a `ReloadableCertResolver` so a CA rotation can swap it, and the listener doesn't need to know which concrete type it got. `resolve` is a synchronous callback on the handshake path, so it reads the routing table with `try_read()` rather than `.await`; a table locked mid-rebuild reads as "no route" for that one handshake.
+
+SNI names a host, not a path, so two routes on one host share a certificate. When they disagree, `explicit` wins over `cluster`, since the operator chose that certificate for that name on purpose. `RoutingTable::certificate_mode` makes that call, and its test pins it.
+
+The tests that caught the old behaviour run real handshakes against one listener with both kinds of route and check which leaf comes back: the operator's for `explicit`, one the Ingress CA signed for `cluster` (`tests/suite/ingress_route_tls.rs`). Two older tests had passed a plain certificate as the "cluster" resolver to get a known leaf on every host. That leaned on the listener-wide behaviour, so they now load an operator pair instead.
+
 ## What we learned
 
 ### `wrapping_add` is not optional

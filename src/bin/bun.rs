@@ -2321,7 +2321,8 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         // Wire the cluster Ingress CA into TLS so `tls = "cluster"` routes are
         // served a cluster-signed cert per SNI (M8), not a self-signed
         // `localhost` cert. Available only in cluster mode (a council + the
-        // wrapping IKM to unwrap the Ingress CA key). A disk cert still wins.
+        // wrapping IKM to unwrap the Ingress CA key). `tls = "explicit"`
+        // routes get the `[ingress]` disk pair instead (#2011).
         let ingress_resolver: Option<std::sync::Arc<dyn rustls::server::ResolvesServerCert>> =
             match &api_council {
                 Some(council) => {

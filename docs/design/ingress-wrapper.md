@@ -41,7 +41,7 @@ Wrapper is disabled by default. Operators enable it on selected nodes with `[ing
 1. Bun joins cluster (mTLS handshake via Sesame node certificate)
 2. Bun populates the service map from reporting tree state
 3. Bun starts Wrapper listener tasks
-4. Wrapper loads an operator certificate or builds its in-memory Ingress CA resolver
+4. Wrapper loads the operator certificate, if configured, and builds its in-memory Ingress CA resolver, if it can; each serves its own routes
 5. Wrapper binds ports 80 and 443
 6. Wrapper begins accepting connections
 ```
@@ -131,6 +131,23 @@ Wrapper manages TLS certificates per ingress route. Each route specifies a TLS m
 `relish apply` and `relish lint`. A route that reaches a node anyway is
 skipped rather than guessed at or served in plaintext.
 
+**Choosing per SNI (#2011):** one HTTPS listener serves every route on a node,
+so the listener's resolver (`wrapper::tls::RouteCertResolver`) picks the
+certificate per handshake from the SNI host's routes:
+
+| SNI host | Node has the source | Certificate served |
+|---|---|---|
+| `explicit` route | operator pair | the `[ingress]` `tls_cert`/`tls_key` pair |
+| `cluster` route | Ingress CA resolver | an Ingress CA leaf for that host |
+| `explicit` or `cluster` route | no | the self-signed development certificate, with one warning per host on stderr; never the other mode's certificate |
+| plain-HTTP route, unknown host, or no SNI | — | the operator pair if the node has one, else the self-signed certificate |
+
+SNI names a host, not a path, so routes on one host share a certificate. When
+they disagree, `explicit` wins over `cluster`, and either wins over plain HTTP
+(`RoutingTable::certificate_mode`). Before 0.3.0 the listener made one choice
+for every route (disk pair if present, else the Ingress CA), so the mode only
+decided the plain-HTTP redirect.
+
 **Cluster CA flow (current):**
 
 ```
@@ -151,8 +168,8 @@ unconfigured host can never obtain a trusted cluster certificate. The cache is
 additionally capped as defence in depth.
 
 This currently requires the ingress node to have council state and the
-wrapping key material. If it doesn't, the listener uses its self-signed
-development certificate. Operators must not treat that fallback as a
+wrapping key material. If it doesn't, `cluster` hosts get the listener's
+self-signed development certificate, never the operator pair. Operators must not treat that fallback as a
 cluster-issued production certificate.
 
 **Explicit flow (current):**
@@ -160,7 +177,8 @@ cluster-issued production certificate.
 ```
 1. The operator sets both `tls_cert` and `tls_key` in `[ingress]`
 2. Wrapper reads the PEM files during startup
-3. Routes marked `tls = "explicit"` use that listener certificate
+3. Hosts with a `tls = "explicit"` route are served that pair; a node
+   without one serves those hosts the self-signed certificate and warns
 ```
 
 **Certificate storage:**
@@ -500,8 +518,9 @@ locally. There is no network CSR round-trip in the current implementation.
 **Mode: `explicit`**
 
 Used with `tls_cert` and `tls_key` in the node's `[ingress]` configuration.
-This is the public-certificate path in v1. The same listener certificate serves
-all explicit routes on that node, so its SANs must cover every advertised host.
+This is the public-certificate path in v1. The same pair serves all explicit
+routes on that node, so its SANs must cover every advertised host. `cluster`
+hosts on the same listener keep their Ingress CA leaves.
 
 **Mode: omitted / `none` / `off` / `disabled`**
 

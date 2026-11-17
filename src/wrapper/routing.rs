@@ -310,6 +310,25 @@ impl RoutingTable {
         self.routes.contains_key(&normalise_host(host))
     }
 
+    /// The TLS mode that chooses the certificate for `host`, or `None` when
+    /// `host` has no route.
+    ///
+    /// A TLS client names a host, not a path, so every route on one host
+    /// shares one certificate. When the routes on a host disagree,
+    /// `explicit` beats `cluster` (the operator chose that certificate for
+    /// this name on purpose), and either beats a plain-HTTP route.
+    pub fn certificate_mode(&self, host: &str) -> Option<TlsMode> {
+        let routes = self.routes.get(&normalise_host(host))?;
+        let modes = || routes.iter().map(|route| route.tls_mode);
+        Some(if modes().any(|mode| mode == TlsMode::Explicit) {
+            TlsMode::Explicit
+        } else if modes().any(|mode| mode == TlsMode::Cluster) {
+            TlsMode::Cluster
+        } else {
+            TlsMode::Disabled
+        })
+    }
+
     /// Total number of routes across all hosts.
     pub fn route_count(&self) -> usize {
         self.routes.values().map(|r| r.len()).sum()
@@ -1308,6 +1327,43 @@ mod tests {
         let route = table.lookup("myapp.com", "/").unwrap();
         assert_eq!(route.tls_mode, TlsMode::Cluster);
         assert!(route.tls_mode.requires_tls());
+    }
+
+    /// #2011: SNI names a host, so one host's routes share a certificate.
+    /// An `explicit` route on the host wins over `cluster`, and either wins
+    /// over a plain-HTTP route.
+    #[test]
+    fn certificate_mode_is_chosen_per_host() {
+        let mut map = ServiceMap::new();
+        let mut configs = HashMap::new();
+        for (app, host, path, tls) in [
+            ("plain", "plain.com", "/", None),
+            ("cluster-root", "mixed.com", "/", Some("cluster")),
+            ("explicit-api", "mixed.com", "/api", Some("explicit")),
+            ("cluster-only", "cluster.com", "/", Some("cluster")),
+            ("cluster-api", "partly.com", "/api", Some("cluster")),
+            ("plain-root", "partly.com", "/", None),
+        ] {
+            map.register_app(app, "default", 8080, None).unwrap();
+            configs.insert(
+                ns_key("default", app),
+                IngressSpec {
+                    tls: tls.map(str::to_string),
+                    ..spec_with_path(host, path)
+                },
+            );
+        }
+        let mut table = RoutingTable::new();
+        table.rebuild(&map, &configs).unwrap();
+
+        assert_eq!(table.certificate_mode("plain.com"), Some(TlsMode::Disabled));
+        assert_eq!(table.certificate_mode("mixed.com"), Some(TlsMode::Explicit));
+        assert_eq!(
+            table.certificate_mode("Cluster.COM:443"),
+            Some(TlsMode::Cluster)
+        );
+        assert_eq!(table.certificate_mode("partly.com"), Some(TlsMode::Cluster));
+        assert_eq!(table.certificate_mode("unknown.com"), None);
     }
 
     #[test]

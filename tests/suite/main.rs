@@ -62,6 +62,7 @@ mod ingress;
 mod ingress_certificates;
 mod ingress_connection_lifetime;
 mod ingress_file_reload;
+mod ingress_route_tls;
 mod ingress_sessions;
 mod issue_forms;
 mod live_node_identity;
