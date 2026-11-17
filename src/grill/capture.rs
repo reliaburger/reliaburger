@@ -565,7 +565,9 @@ impl CaptureReader {
     ///
     /// A line longer than [`MAX_CAPTURED_LINE_BYTES`] comes out cut to that
     /// length, and the bytes past the cut are counted as consumed but never
-    /// held, so the reader buffers at most that much between calls.
+    /// held, so the reader buffers at most that much between calls. A reader
+    /// resumed from an offset inside a skipped line hands its rest on as one
+    /// more line, also cut to the cap.
     ///
     /// The cost is linear in the bytes fed in: bytes already waiting hold no
     /// newline, so only the new ones are searched, and each new byte is

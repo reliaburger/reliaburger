@@ -1222,7 +1222,31 @@ impl NodeConfig {
             }
         }
 
-        Ok(())
+        self.validate_stale_report_timeout()
+    }
+
+    /// A stale timeout at or below the report interval marks every node
+    /// stale between two of its own reports, and the report worker
+    /// multiplies the timeout into a `Duration`, which overflows near
+    /// u64::MAX seconds.
+    fn validate_stale_report_timeout(&self) -> Result<(), ConfigError> {
+        let tree = &self.reporting_tree;
+        let max = super::node::MAX_STALE_REPORT_TIMEOUT_SECS;
+        let reason = if tree.stale_report_timeout_secs <= tree.report_interval_secs {
+            format!(
+                "must be greater than reporting_tree.report_interval_secs ({}s)",
+                tree.report_interval_secs
+            )
+        } else if tree.stale_report_timeout_secs > max {
+            format!("must be at most {max}s (one day)")
+        } else {
+            return Ok(());
+        };
+        Err(ConfigError::Validation {
+            field: "reporting_tree.stale_report_timeout_secs".to_string(),
+            context: "node config".to_string(),
+            reason,
+        })
     }
 }
 
@@ -1393,6 +1417,48 @@ mod tests {
                 if field == "reporting_tree.report_interval_secs"),
             "expected a report-interval validation error, got {err:?}"
         );
+    }
+
+    fn stale_report_timeout_error(stale: u64, interval: u64) -> Option<ConfigError> {
+        let mut node = crate::config::NodeConfig::default();
+        node.reporting_tree.report_interval_secs = interval;
+        node.reporting_tree.stale_report_timeout_secs = stale;
+        node.validate().err()
+    }
+
+    fn is_stale_timeout_error(error: Option<ConfigError>) -> bool {
+        matches!(error, Some(ConfigError::Validation { ref field, .. })
+            if field == "reporting_tree.stale_report_timeout_secs")
+    }
+
+    #[test]
+    fn node_config_rejects_a_zero_stale_report_timeout() {
+        assert!(is_stale_timeout_error(stale_report_timeout_error(0, 5)));
+    }
+
+    #[test]
+    fn stale_report_timeout_must_be_longer_than_the_report_interval() {
+        // A timeout at or below the interval marks every node stale between
+        // two of its own reports.
+        assert!(is_stale_timeout_error(stale_report_timeout_error(5, 5)));
+        assert!(is_stale_timeout_error(stale_report_timeout_error(4, 5)));
+        assert!(stale_report_timeout_error(6, 5).is_none());
+    }
+
+    #[test]
+    fn stale_report_timeout_is_capped() {
+        // The report worker multiplies the timeout into a `Duration`, which
+        // panics on overflow near u64::MAX seconds.
+        let max = crate::config::node::MAX_STALE_REPORT_TIMEOUT_SECS;
+        assert!(is_stale_timeout_error(stale_report_timeout_error(
+            u64::MAX,
+            5
+        )));
+        assert!(is_stale_timeout_error(stale_report_timeout_error(
+            max + 1,
+            5
+        )));
+        assert!(stale_report_timeout_error(max, 5).is_none());
     }
 
     #[test]

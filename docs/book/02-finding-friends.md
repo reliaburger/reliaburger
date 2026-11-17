@@ -1736,6 +1736,8 @@ stale_report_timeout_secs = 30
 
 The defaults are sensible for most clusters. Smaller clusters might lower the interval; very large clusters might raise it to reduce load on council members.
 
+The two numbers also have to agree with each other, and Bun checks that at startup. A zero interval would panic the worker on its first tick, because `tokio::time::interval` refuses a zero period. A stale timeout at or below the interval marks every node stale between two of its own reports. And a stale timeout near `u64::MAX` seconds overflowed when the worker multiplied it by `BUSY_LOOP_STALE_WINDOWS`: `Duration * u32` panics on overflow, just as `Instant + Duration` does. So validation refuses all three, and caps the timeout at a day. The worker also uses `Duration::saturating_mul`, the version that stops at `Duration::MAX` instead of panicking.
+
 ## The node directory: growing past the council
 
 Here's an embarrassing question the Phase 12b review asked: what happens to the *eighth* node in a cluster whose council caps at seven?
