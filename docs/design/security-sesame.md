@@ -158,6 +158,7 @@ Worker Node (Bun)                     Council Node (nearest parent)
      |       key.pem                             |
      |       ca.pem                              |
      |       token (OIDC JWT)                    |
+     |       api-token (OIDC JWT, API audience)  |
      |       bundle.pem                          |
      |                                          |
      |  8. Schedule next rotation                |
@@ -691,7 +692,8 @@ pub struct WorkloadJwtClaims {
     /// Subject: the workload's SPIFFE URI.
     pub sub: String,
 
-    /// Audience. Today this is exactly `["spiffe://CLUSTER"]`; per-app
+    /// Audience. `token` carries exactly `["spiffe://CLUSTER"]`, and
+    /// `api-token` exactly `["reliaburger-api:CLUSTER"]` (§5.3); per-app
     /// audiences are planned but not yet appended (§6.6).
     pub aud: Vec<String>,
 
@@ -916,7 +918,7 @@ Bun on each worker node maintains a rotation schedule for every running workload
 1. **Initial issuance.** When Bun starts a workload, it immediately generates a keypair and sends a CSR to its nearest council parent.
 2. **Validation.** The council member checks that the requesting node (identified by its mTLS node certificate CN) is scheduled to run the workload (verified against Meat's scheduling state).
 3. **Signing.** The council member signs the certificate with the Workload CA, sets a 1-hour lifetime, and returns it.
-4. **Writing.** Bun writes `cert.pem`, `key.pem`, `ca.pem`, `bundle.pem`, and `token` (OIDC JWT) to the workload's tmpfs mount at `/var/run/reliaburger/identity/`.
+4. **Writing.** Bun writes `cert.pem`, `key.pem`, `ca.pem`, `bundle.pem`, `token` (OIDC JWT) and `api-token` (the same JWT with the API's audience, §5.3) to the workload's tmpfs mount at `/var/run/reliaburger/identity/`.
 5. **Rotation timer.** Bun schedules the next rotation for 30 minutes later (half the certificate lifetime).
 6. **Pre-fetch.** At the 30-minute mark, Bun generates a new keypair, sends a new CSR, receives the new certificate, and atomically writes the new files to the tmpfs mount.
 7. **Grace period.** If the CSR fails because the council is unreachable, Bun keeps the current certificate and extends its local validity window by up to 4 additional hours (configurable). The extension is logged as a security event, `relish wtf` warns about it, and an alert fires.
@@ -929,8 +931,11 @@ Bun on each worker node maintains a rotation schedule for every running workload
 
 **OIDC JWT minting** happens at the same time as certificate issuance. The council member constructs the JWT with the workload's SPIFFE URI as the `sub` claim, the cluster's OIDC issuer as `iss`, and a single audience `spiffe://CLUSTER`. The JWT is signed with the Ed25519 OIDC signing key and returned alongside the signed X.509 certificate.
 
+**Token audience.** It mints a second JWT with the same claims and the audience `reliaburger-api:CLUSTER` (`sesame::oidc::api_audience`). Bun writes the first as `token`, the one a workload hands to its peers and to cloud federation, and the second as `api-token`. The API's `WorkloadJwtVerifier` accepts only the second audience (`JwtConstraints::for_api`), so a party that receives `token` can't present it as an API login, and `api-token` isn't valid where `spiffe://CLUSTER` is expected. Both are owner-only files with the same one-hour lifetime and rotation.
+
 > **Two claim details differ from the aspirational model.** (1) The `aud` claim
-> is exactly `["spiffe://<cluster>"]` today — **per-app audiences from
+> is exactly `["spiffe://<cluster>"]` today (`["reliaburger-api:<cluster>"]` on
+> `api-token`) — **per-app audiences from
 > `[app.NAME.identity]` are not appended** (that is planned, §6.6). (2) The
 > `reliaburger.dev/node` claim is currently the **literal string `"local"`**,
 > not the issuing node's id — the CSR-signing path passes `"local"` as the node
@@ -1035,8 +1040,27 @@ carries the route's namespace), `GET /v1/fault` only workload faults on
 in-scope apps (`FaultSummary` carries the fault's namespace), and
 `GET /v1/build/{id}` answers only for a build whose destination repository
 (`BuildRecord::repository`) is in scope. `GET /v1/fault?cluster=true` refuses a
-scoped caller, since node faults belong to no tenant. A workload's JWT is a
+scoped caller, since node faults belong to no tenant, and so does
+`DELETE /v1/fault` without `service` (clear every workload fault) or with
+`service` and no `namespace`: a scoped token clears faults one in-scope
+service and namespace at a time. A workload's `api-token` JWT is a
 scoped read-only token, so these are the rules a compromised container meets.
+
+The dashboard follows the same scope, cookie or bearer. `GET /`,
+`/ui/fragment/apps` and `/ui/fragment/nodes` list and count only in-scope
+apps, and `/ui/node/{name}` lists only in-scope instances, trimming the peer's
+answer (fetched under the service token) as `/v1/status?cluster=true` does.
+These routes name no app, so the `{app}` source check can't see them;
+`namespace_scoped_token_sees_only_its_namespace_on_the_dashboard` covers them.
+
+**Ingress hosts.** Wrapper routes a host's requests by longest path prefix
+across every app on that host, so an app on a host can take requests meant for
+another. On the leader's apply path (`cluster_apply`), a scoped token may put
+an app on an ingress host only if every app already serving that host is in
+its scope (`authorize_ingress_hosts`). An app that already serves the host
+keeps it through later applies, so an unscoped token can share a host across
+namespaces on purpose. Unscoped tokens aren't checked: they may change any of
+those apps anyway.
 
 **Permission specs (shipped):** A `[permission.<token-name>]` block
 (`config::PermissionSpec`, replicated as `DesiredState.permissions`) is an

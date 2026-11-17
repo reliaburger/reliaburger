@@ -5655,6 +5655,91 @@ async fn assert_authorised_job_dispatch_and_settlement(
     );
 }
 
+/// A manifest of one app named `name` in `namespace` with an ingress
+/// route on `host` at `path`.
+fn ingress_manifest(name: &str, namespace: &str, host: &str, path: &str) -> String {
+    format!(
+        "[app.{name}]\nimage = \"test:v1\"\nport = 8080\nnamespace = \"{namespace}\"\n\
+         [app.{name}.ingress]\nhost = \"{host}\"\npath = \"{path}\"\n"
+    )
+}
+
+/// Every node routes a host's requests by longest path prefix, then path,
+/// then app name, across every app on that host. Nothing checked who
+/// already served a host, so a Deployer scoped to `dev` could put an app
+/// on `shop`'s host at a longer prefix (or at `/` with a name that sorts
+/// first) and take `shop`'s requests. A scoped token may now only put a
+/// route on a host whose existing routes all lie inside its scope.
+#[tokio::test]
+async fn scoped_deployer_cannot_route_a_host_another_namespace_serves() {
+    let (app, council, _commands) = workload_admission_fixture("ingress-host-scope").await;
+    let shop: crate::config::app::AppSpec = toml::from_str(
+        "image = \"test:v1\"\nport = 8080\n[ingress]\nhost = \"shop.example.com\"\npath = \"/\"\n",
+    )
+    .unwrap();
+    council
+        .write(crate::council::RaftRequest::AppSpec {
+            app_id: crate::meat::types::AppId::new("web", "shop"),
+            spec: Box::new(shop),
+        })
+        .await
+        .unwrap();
+    let scoped_to = |namespace: &str| {
+        let mut auth = deployer_context();
+        auth.scoped_namespaces = Some(vec![namespace.to_string()]);
+        auth
+    };
+
+    for manifest in [
+        ingress_manifest("aaa", "dev", "shop.example.com", "/login"),
+        ingress_manifest("aaa", "dev", "shop.example.com", "/"),
+        ingress_manifest("aaa", "dev", "SHOP.Example.com", "/"),
+    ] {
+        assert_eq!(
+            apply_as_context(&app, scoped_to("dev"), &manifest).await,
+            StatusCode::FORBIDDEN,
+            "a token scoped to dev took shop's host: {manifest}"
+        );
+    }
+    let desired = council.desired_state().await;
+    assert!(
+        !desired
+            .apps
+            .contains_key(&crate::meat::types::AppId::new("aaa", "dev")),
+        "the refused app reached the desired state"
+    );
+
+    // Its own host, a second route on its own namespace's host, a
+    // cluster-wide token sharing the host on purpose, and the original app
+    // re-applied on the now-shared host all still apply.
+    for (auth, manifest) in [
+        (
+            scoped_to("dev"),
+            ingress_manifest("aaa", "dev", "dev.example.com", "/"),
+        ),
+        (
+            scoped_to("shop"),
+            ingress_manifest("api", "shop", "shop.example.com", "/api"),
+        ),
+        (
+            deployer_context(),
+            ingress_manifest("help", "support", "shop.example.com", "/help"),
+        ),
+        // Once shared, each app keeps its route through later applies.
+        (
+            scoped_to("shop"),
+            ingress_manifest("web", "shop", "shop.example.com", "/"),
+        ),
+    ] {
+        assert_ne!(
+            apply_as_context(&app, auth, &manifest).await,
+            StatusCode::FORBIDDEN,
+            "an apply inside the token's scope was refused: {manifest}"
+        );
+    }
+    council.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn administrative_manifests_require_unscoped_user_admin_before_any_write() {
     let (app, council, mut commands) = workload_admission_fixture("manifest-admin").await;
@@ -6831,6 +6916,67 @@ async fn scoped_token_is_refused_faulting_another_namespace() {
     shutdown.cancel();
 }
 
+/// `DELETE /v1/fault` with no `service` clears every workload fault in
+/// every namespace. It refused a scoped token only on the narrower "this
+/// service in every namespace" form, so a Deployer scoped to `team-a` could
+/// end `team-b`'s fault experiments. It's cluster-wide, so a scoped token
+/// is refused; the same token still clears its own namespace's faults, and
+/// a cluster-wide admin still clears them all.
+#[tokio::test]
+async fn scoped_token_is_refused_clearing_every_namespaces_faults() {
+    let scoped = crate::sesame::token::create_token(
+        "tenant-a-chaos",
+        crate::sesame::types::ApiRole::Deployer,
+        crate::sesame::types::TokenScope {
+            apps: None,
+            namespaces: Some(vec!["team-a".to_string()]),
+        },
+        None,
+    )
+    .unwrap();
+    let (admin, admin_plaintext) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let capabilities = crate::bun::capabilities::StaticCapabilities {
+        test_policy: crate::testkit::safety::ClusterTestPolicy {
+            safety_class: crate::testkit::safety::ClusterSafetyClass::Development,
+            allowed_operations: std::collections::BTreeSet::from([
+                crate::testkit::safety::OperationPermission::InjectWorkloadFaults,
+            ]),
+            ..crate::testkit::safety::ClusterTestPolicy::default()
+        },
+        ..crate::bun::capabilities::StaticCapabilities::default()
+    };
+    let (app, shutdown) = setup_with_auth_readiness_and_leases(
+        vec![scoped.token, admin],
+        None,
+        crate::bun::readiness::ReadinessTracker::new(),
+        capabilities,
+        None,
+    )
+    .await;
+
+    assert_eq!(
+        delete_authenticated(app.clone(), "/v1/fault", &scoped.plaintext).await,
+        StatusCode::FORBIDDEN,
+        "a scoped token cleared every namespace's faults"
+    );
+    assert_eq!(
+        delete_authenticated(
+            app.clone(),
+            "/v1/fault?service=web&namespace=team-a",
+            &scoped.plaintext
+        )
+        .await,
+        StatusCode::OK,
+        "a scoped token could not clear its own namespace's faults"
+    );
+    assert_eq!(
+        delete_authenticated(app, "/v1/fault", &admin_plaintext).await,
+        StatusCode::OK,
+        "a cluster-wide admin could not clear every fault"
+    );
+    shutdown.cancel();
+}
+
 /// The cluster-wide metrics endpoints read across every app and namespace,
 /// so — like `/v1/logs/sql` — a scoped token is refused (C3) rather than
 /// served every tenant's data. `/v1/events` used to be on this list; it now
@@ -7801,6 +7947,163 @@ async fn namespace_scoped_token_sees_only_its_namespace_in_status() {
     let mut cluster_ids: Vec<_> = cluster.iter().map(|s| s.instance.id.as_str()).collect();
     cluster_ids.sort_unstable();
     assert_eq!(cluster_ids, ["local-a", "peer-a"]);
+
+    peer_server.abort();
+    worker.abort();
+}
+
+/// A router whose node runs `alpha-web` in `team-a` and `bravo-db` in
+/// `team-b`, with a peer running one more instance of each, and whose
+/// store holds the given tokens. The dashboard pages read all of it.
+async fn setup_two_tenant_dashboard(
+    tokens: Vec<crate::sesame::types::ApiToken>,
+) -> (
+    Router,
+    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let status = |id: &str, app: &str, namespace: &str| -> InstanceStatus {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "app_name": app, "namespace": namespace, "state": "running",
+            "restart_count": 0, "host_port": null, "pid": null
+        }))
+        .unwrap()
+    };
+    let peer_statuses = vec![
+        status("peer-alpha-0", "alpha-web", "team-a"),
+        status("peer-bravo-0", "bravo-db", "team-b"),
+    ];
+    let peer = Router::new().route(
+        "/v1/status",
+        axum::routing::get(move || {
+            let statuses = peer_statuses.clone();
+            async move { Json(statuses) }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer_address = listener.local_addr().unwrap();
+    let peer_server = tokio::spawn(async move {
+        axum::serve(listener, peer).await.unwrap();
+    });
+
+    let desired = |app: &str, namespace: &str| -> crate::bun::diagnostics::DesiredAppEvidence {
+        serde_json::from_value(serde_json::json!({
+            "app": app, "namespace": namespace, "desired_replicas": 2,
+            "scheduled_replicas": 2, "service_port": null
+        }))
+        .unwrap()
+    };
+    let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
+    let local_statuses = vec![
+        status("local-alpha-1", "alpha-web", "team-a"),
+        status("local-bravo-1", "bravo-db", "team-b"),
+    ];
+    let desired_apps = vec![
+        desired("alpha-web", "team-a"),
+        desired("bravo-db", "team-b"),
+    ];
+    let worker = tokio::spawn(async move {
+        while let Some(command) = cmd_rx.recv().await {
+            match command {
+                AgentCommand::Status { response } => {
+                    let _ = response.send(local_statuses.clone());
+                }
+                AgentCommand::DesiredApps { response } => {
+                    let _ = response.send(desired_apps.clone());
+                }
+                _ => {}
+            }
+        }
+    });
+    let store = crate::sesame::auth::new_token_store();
+    store.write().await.extend(tokens);
+    let members = Arc::new(RwLock::new(vec![NodeMembershipInfo {
+        node_id: crate::meat::NodeId::new("peer"),
+        address: peer_address,
+        api_advertised: true,
+        jobs: None,
+    }]));
+    let app = router(
+        cmd_tx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(store),
+        None,
+        None,
+        Some(members),
+        None,
+        9117,
+        None,
+    );
+    (app, peer_server, worker)
+}
+
+/// The dashboard pages that list apps or instances (`/`, the apps
+/// fragment, and a node's page, this node's or a peer's) trim their rows
+/// to the caller's scope, as `/v1/status` does. Their routes name no app,
+/// so the per-app scope check never ran on them: a token scoped to
+/// `team-a`, or the dashboard session made from it, listed every
+/// namespace's apps and instances.
+#[tokio::test]
+async fn namespace_scoped_token_sees_only_its_namespace_on_the_dashboard() {
+    let scoped = crate::sesame::token::create_token(
+        "tenant-a-viewer",
+        crate::sesame::types::ApiRole::ReadOnly,
+        crate::sesame::types::TokenScope {
+            apps: None,
+            namespaces: Some(vec!["team-a".to_string()]),
+        },
+        None,
+    )
+    .unwrap();
+    let (app, peer_server, worker) = setup_two_tenant_dashboard(vec![scoped.token]).await;
+
+    for (uri, expected) in [
+        ("/", "alpha-web"),
+        ("/ui/fragment/apps", "alpha-web"),
+        ("/ui/node/local", "local-alpha-1"),
+        ("/ui/node/peer", "peer-alpha-0"),
+    ] {
+        let (code, body) = get_authenticated(app.clone(), uri, &scoped.plaintext).await;
+        assert_eq!(code, StatusCode::OK, "{uri}");
+        let body = String::from_utf8(body).unwrap();
+        assert!(
+            body.contains(expected),
+            "{uri} hid the token's own namespace"
+        );
+        assert!(
+            !body.contains("bravo-db") && !body.contains("team-b"),
+            "{uri} showed another namespace's workloads"
+        );
+    }
+
+    peer_server.abort();
+    worker.abort();
+}
+
+/// …while a cluster-wide token still sees every namespace there.
+#[tokio::test]
+async fn unscoped_token_sees_every_namespace_on_the_dashboard() {
+    let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let (app, peer_server, worker) = setup_two_tenant_dashboard(vec![token]).await;
+
+    for (uri, expected) in [
+        ("/", ["alpha-web", "bravo-db"]),
+        ("/ui/fragment/apps", ["alpha-web", "bravo-db"]),
+        ("/ui/node/local", ["local-alpha-1", "local-bravo-1"]),
+        ("/ui/node/peer", ["peer-alpha-0", "peer-bravo-0"]),
+    ] {
+        let (code, body) = get_authenticated(app.clone(), uri, &plaintext).await;
+        assert_eq!(code, StatusCode::OK, "{uri}");
+        let body = String::from_utf8(body).unwrap();
+        for name in expected {
+            assert!(body.contains(name), "{uri} is missing {name}");
+        }
+    }
 
     peer_server.abort();
     worker.abort();
@@ -10976,7 +11279,7 @@ async fn a_signing_key_rotation_reaches_every_node() {
         let claims = crate::sesame::types::WorkloadJwtClaims {
             iss: issuer.to_string(),
             sub: "spiffe://test/ns/default/app/api".to_string(),
-            aud: vec!["spiffe://test".to_string()],
+            aud: vec![crate::sesame::oidc::api_audience("test")],
             exp: now + 600,
             iat: now,
             namespace: "default".to_string(),

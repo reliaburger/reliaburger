@@ -5322,6 +5322,7 @@ async fn a_signed_identity_is_stored_off_the_loop() {
             root_ca_cert_der: vec![2],
             ca_bundle_der: vec![vec![1], vec![2]],
             jwt_token: Some("jwt".into()),
+            api_jwt_token: Some("api-jwt".into()),
         }),
     );
     let task = agent

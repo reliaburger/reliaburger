@@ -601,6 +601,54 @@ pub(crate) fn runtime_knob_notes(config: &Config) -> Vec<String> {
         .collect()
 }
 
+/// Refuse an app whose ingress host is already served by an app the
+/// caller's token may not change. Every node routes a host's requests by
+/// longest path prefix across all the apps on it, so an app on a shared
+/// host can take requests meant for another: a token scoped to some
+/// namespaces (or apps) may only put a route on a host whose existing
+/// routes all lie inside its scope. An unscoped token passes, as it may
+/// change any of those apps anyway.
+#[allow(clippy::result_large_err)]
+fn authorize_ingress_hosts(
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    config: &Config,
+    desired: &crate::council::types::DesiredState,
+) -> Result<(), Response> {
+    for (name, spec) in &config.app {
+        let Some(ingress) = &spec.ingress else {
+            continue;
+        };
+        let namespace = spec.namespace.as_deref().unwrap_or("default");
+        // Hosts are compared as the routing table keys them.
+        let host = ingress.host.to_lowercase();
+        let serves = |candidate: &crate::config::app::AppSpec| {
+            candidate
+                .ingress
+                .as_ref()
+                .is_some_and(|other| other.host.to_lowercase() == host)
+        };
+        // An app keeps the host it already serves: an unscoped token may
+        // have shared that host on purpose, and re-applying the app mustn't
+        // start failing because of it.
+        let id = crate::meat::types::AppId::new(name, namespace);
+        if desired.apps.get(&id).is_some_and(serves) {
+            continue;
+        }
+        let outside_scope = desired.apps.iter().any(|(existing, existing_spec)| {
+            serves(existing_spec)
+                && crate::sesame::auth::authorize_scoped(auth, &existing.name, &existing.namespace)
+                    .is_err()
+        });
+        if outside_scope {
+            return Err(crate::sesame::auth::scope_refusal(format!(
+                "app.{name}: ingress host {host:?} is already served by an app outside this \
+                 token's scope; a host's routes belong to the namespace that serves it"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Apply a config in cluster mode: propose each app spec to Raft.
 ///
 /// On a follower, the whole request is forwarded to the leader's API
@@ -716,6 +764,13 @@ pub(super) async fn cluster_apply(
                 return owner_refusal(&error);
             }
         };
+
+    if config.app.values().any(|spec| spec.ingress.is_some())
+        && let Err(response) =
+            authorize_ingress_hosts(auth.as_ref(), &config, &council.desired_state().await)
+    {
+        return response;
+    }
 
     if caller_headers.contains_key(CAPACITY_PROBE_HEADER) {
         use crate::cluster::capacity::{CapacityAdmissionError, SchedulingRefusal};

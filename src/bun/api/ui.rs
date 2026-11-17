@@ -178,15 +178,28 @@ pub(super) fn statuses_to_dashboard_apps(
     rows
 }
 
+/// The dashboard's app rows, as `auth` may see them: a token scoped to
+/// some apps or namespaces gets only those rows, as `/v1/status` does.
+/// The statuses and desired apps come back unfiltered (peers answer this
+/// node's service token), so the caller's scope is applied here.
 pub(super) async fn gather_dashboard_apps(
     state: &ApiState,
     directory: Option<&LeaderDirectory>,
+    auth: Option<&crate::sesame::auth::AuthContext>,
 ) -> Result<Vec<DashboardApp>, String> {
-    let (statuses, desired) = tokio::try_join!(
+    let (statuses, mut desired) = tokio::try_join!(
         cluster_statuses(state),
         gather_desired_apps(state, DesiredAppsSource::Caller(directory))
     )?;
-    let statuses: Vec<_> = statuses.into_iter().map(|row| row.instance).collect();
+    let visible = |app: &str, namespace: &str| {
+        crate::sesame::auth::authorize_scoped(auth, app, namespace).is_ok()
+    };
+    desired.retain(|app| visible(&app.app, &app.namespace));
+    let statuses: Vec<_> = statuses
+        .into_iter()
+        .map(|row| row.instance)
+        .filter(|instance| visible(&instance.app_name, &instance.namespace))
+        .collect();
     Ok(statuses_to_dashboard_apps(&statuses, &desired))
 }
 
@@ -201,9 +214,9 @@ pub(super) async fn gather_dashboard_data(
 ) -> DashboardData {
     let (summary, apps, alerts, nodes) = tokio::join!(
         super::summary::gather_cluster_summary(state, auth, sources),
-        gather_dashboard_apps(state, sources.directory),
+        gather_dashboard_apps(state, sources.directory, auth),
         firing_dashboard_alerts(state),
-        gather_dashboard_nodes(state),
+        gather_dashboard_nodes(state, auth),
     );
     let (apps, apps_error) = match apps {
         Ok(apps) => (apps, None),
@@ -224,10 +237,12 @@ pub(super) async fn gather_dashboard_data(
 /// The membership table only holds nodes gossip currently considers alive, so
 /// every row here is a live member. When the council is up we also count each
 /// node's assigned apps from the desired state, giving the same per-node app
-/// totals the placements endpoint serves. No membership table (standalone)
-/// yields an empty list, and the caller falls back to a single-node view.
+/// totals the placements endpoint serves, counting only the apps `auth`'s
+/// scope covers. No membership table (standalone) yields an empty list, and
+/// the caller falls back to a single-node view.
 pub(super) async fn gather_dashboard_nodes(
     state: &ApiState,
+    auth: Option<&crate::sesame::auth::AuthContext>,
 ) -> Vec<crate::brioche::dashboard::DashboardNode> {
     let Some(membership) = &state.membership else {
         return vec![];
@@ -239,7 +254,10 @@ pub(super) async fn gather_dashboard_nodes(
         std::collections::HashMap::new();
     if let Some(council) = &state.council {
         let desired = council.desired_state().await;
-        for placements in desired.scheduling.values() {
+        let visible = desired.scheduling.iter().filter(|(app, _)| {
+            crate::sesame::auth::authorize_scoped(auth, &app.name, &app.namespace).is_ok()
+        });
+        for (_, placements) in visible {
             for placement in placements {
                 *app_counts.entry(placement.node_id.clone()).or_insert(0) += 1;
             }
@@ -464,7 +482,10 @@ pub(super) async fn app_detail_handler(
 /// Any node's page lists that node's workloads: this node answers from its
 /// own status, another member is asked for its status directly, and a
 /// member that doesn't answer is named on the page rather than shown empty.
+/// A scoped caller sees only the workloads its scope covers: the peer
+/// answers this node's service token, so the trimming happens here.
 pub(super) async fn node_detail_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Path(name): Path<String>,
 ) -> Response {
@@ -501,6 +522,17 @@ pub(super) async fn node_detail_handler(
         }
         (false, None) => (Vec::new(), None),
     };
+    let statuses: Vec<InstanceStatus> = statuses
+        .into_iter()
+        .filter(|status| {
+            crate::sesame::auth::authorize_scoped(
+                auth.as_deref(),
+                &status.app_name,
+                &status.namespace,
+            )
+            .is_ok()
+        })
+        .collect();
     // The charts read this node's metrics store, so drawing them on another
     // node's page would label this node's CPU and memory as that node's.
     let charts = if is_self { node_charts() } else { Vec::new() };
@@ -553,10 +585,11 @@ pub(super) async fn gitops_handler(State(state): State<ApiState>) -> Response {
 
 /// `GET /ui/fragment/apps` — apps table HTML fragment for HTMX swap.
 pub(super) async fn fragment_apps_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     directory: Option<axum::Extension<LeaderDirectory>>,
     State(state): State<ApiState>,
 ) -> Response {
-    match gather_dashboard_apps(&state, directory.as_deref()).await {
+    match gather_dashboard_apps(&state, directory.as_deref(), auth.as_deref()).await {
         Ok(apps) => html_response(fragments::render_apps_table_fragment(&apps)),
         Err(error) => unavailable_response(error),
     }
@@ -584,9 +617,12 @@ pub(super) async fn fragment_summary_handler(
 }
 
 /// `GET /ui/fragment/nodes` — nodes table HTML fragment for HTMX swap.
-pub(super) async fn fragment_nodes_handler(State(state): State<ApiState>) -> Response {
+pub(super) async fn fragment_nodes_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+) -> Response {
     // AUTH7: reflect the real gossip membership, not a hardcoded empty list.
-    let nodes = gather_dashboard_nodes(&state).await;
+    let nodes = gather_dashboard_nodes(&state, auth.as_deref()).await;
     html_response(fragments::render_nodes_table_fragment(&nodes))
 }
 

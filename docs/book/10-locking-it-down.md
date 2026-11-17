@@ -218,6 +218,7 @@ The workload sees its identity at `/run/reliaburger/identity/`:
     ca.pem        — Workload CA + Root CA chain
     bundle.pem    — cert + CA chain concatenated
     token         — OIDC JWT (owner-only)
+    api-token     — the same JWT for the Reliaburger API alone (owner-only)
     meta.json     — rotation metadata (no secrets)
 ```
 
@@ -1013,6 +1014,59 @@ The matrix rows changed to match (`App(DEPLOY)` on the snapshot routes, `Body(FA
 Reads had a version of the same problem. Every container gets a JWT, and the manual calls it confined to the workload's own app and namespace. But `/v1/resolve`, `/v1/routes`, `/v1/fault` and `/v1/build/{id}` took no auth context at all, so one compromised container could list every service VIP, every ingress route and every fault in the cluster. They now filter like `/v1/status` does, with `authorize_scoped(...).is_ok()` in a `filter`. That needed a namespace on two wire types that only carried an app name (`RouteInfo` and `FaultSummary`), and a destination repository on each build record. `GET /v1/fault?cluster=true` refuses a scoped caller outright, as the events listing does, because node faults belong to no tenant. The legacy batch status branch got the scope check its task-array neighbour already had.
 
 Three smaller holes went in the same change. The node relay forwards only an allowlist of paths, but it built a URL from the path, and a URL resolves `..` away: `v1/exec/../apply` matched the exec rule and left as `POST /v1/apply`. The target re-authorised, so it wasn't an escalation, but an allowlist you can walk around isn't one. The relay now refuses any `.` or `..` segment, percent-encoded or not. The session cookie gets `Secure` when the API serves TLS, which the handler learns from the `TlsTransport` extension the TLS listener puts on every request. And the registry, which used to fall back to plaintext when its TLS configuration failed to build, now fails to start, as the API always did.
+
+### Scope on the routes that name no app
+
+The source check above is good at one thing: a route whose pattern names an app. The `/v1/status` story showed what it can't see, and a review of the 0.3.0 train found four more places where a namespace-scoped token reached past its namespace. None of them names an app in its path, which is exactly why they got through.
+
+**The dashboard.** A token scoped to `shop` that logs in to the dashboard keeps its scope on the session cookie; we made sure of that back when sessions arrived. But the overview at `GET /`, the apps table at `/ui/fragment/apps` and the node page at `/ui/node/{name}` never asked the session anything. The overview passed the caller's `AuthContext` to the summary at the top and nowhere else, so the counts were right and the table under them listed every namespace's apps. The node page asked a peer for its instances with the service token and rendered whatever came back.
+
+The fix is the closure from `/v1/status`, once more. `gather_dashboard_apps` and the node handler take the caller's `auth` and keep only what `authorize_scoped` allows:
+
+```rust
+let visible = |app: &str, namespace: &str| {
+    crate::sesame::auth::authorize_scoped(auth, app, namespace).is_ok()
+};
+desired.retain(|app| visible(&app.app, &app.namespace));
+```
+
+The node table's per-node app counts go through the same filter, so a count can't tell you what the table won't. `namespace_scoped_token_sees_only_its_namespace_on_the_dashboard` runs the four pages against an agent and a peer that each run an app in `team-a` and one in `team-b`, and its mirror image checks that an unscoped token still sees both.
+
+**Clearing every fault.** `DELETE /v1/fault?service=web` with no namespace clears `web`'s faults in every namespace, and it already refused a scoped token. `DELETE /v1/fault` with no `service` at all clears every workload fault in every namespace, which is wider, and it didn't. The `match` on the query had a `None => None` arm with no check in it. It now calls `require_unscoped`, as its narrower neighbour does, and the manual's line about only an unscoped admin clearing every fault is finally true. A scoped Deployer clears its own faults by naming a service and a namespace it may touch.
+
+**Ingress hosts.** Wrapper keeps one list of routes per host and picks the longest matching path prefix, then the path, then the app name. That's what lets `shop/web` serve `/` and `shop/api` serve `/api` on the same host. It also meant nothing asked who owned a host. A Deployer scoped to `dev` could apply `dev/aaa` on `shop.example.com` at `/login`, and every node would send `shop`'s login requests to it. A longer prefix wins outright.
+
+Checking the exact host and path wouldn't help, because a longer prefix is a different path. So the rule is about the host: on the leader's apply path, a scoped token may put an app on a host only if every app already serving it is inside the token's scope. An app that already serves the host keeps it through later applies. Without that, an admin who shared a host between two namespaces would leave both tenants unable to redeploy their own apps. Unscoped tokens skip the check, since they could change any of those apps directly. `authorize_ingress_hosts` is a plain function over the manifest and the desired state, which makes it easy to read:
+
+```rust
+let id = crate::meat::types::AppId::new(name, namespace);
+if desired.apps.get(&id).is_some_and(serves) {
+    continue;
+}
+let outside_scope = desired.apps.iter().any(|(existing, existing_spec)| {
+    serves(existing_spec)
+        && crate::sesame::auth::authorize_scoped(auth, &existing.name, &existing.namespace)
+            .is_err()
+});
+```
+
+`Option::is_some_and` takes a closure and returns `true` only when the option holds a value the closure accepts, so "the app exists *and* already serves this host" is one expression with no `match`. `serves` is itself a closure that borrows `host`. A closure that captures only shared references is `Copy`, so we can hand it to `is_some_and` and still call it on the next line. Hosts are compared lowercased, as the routing table keys them, so `SHOP.Example.com` is the same host.
+
+**The token audience.** Every workload gets a JWT with the audience `spiffe://CLUSTER`. That's the token it hands to its peers and to a cloud provider's workload identity federation. The API accepted the same token as a read-only login confined to the workload's app. So any party a workload gave its token to could present it to the API for the rest of its hour. The access was narrow (read-only, one app), but a credential meant for others shouldn't log in to our API at all.
+
+The JWT checks (see "Constraining the JWT", later in this chapter) already compare `aud` against an expected value; the API was simply expecting the same one as everyone else. Now the council mints two tokens at once, with the same claims and different audiences:
+
+```rust
+let token = mint(&claims)?;
+let api_token = mint(&crate::sesame::types::WorkloadJwtClaims {
+    aud: vec![crate::sesame::oidc::api_audience(cluster_name)],
+    ..claims
+})?;
+```
+
+`..claims` is the struct update syntax from chapter 1, here taking every field but `aud` from an existing value rather than from `Default`. It moves `claims`, which is fine: it's the last use. Bun writes the second token as `api-token`, beside `token`, and `WorkloadJwtVerifier` builds its constraints with `JwtConstraints::for_api`, which expects `reliaburger-api:CLUSTER`. Neither token passes for the other. We considered requiring the workload's mTLS certificate alongside the JWT instead. That would need the API listener to trust the Workload CA for client certificates, a much bigger change than a second string in `aud`.
+
+One Rust detail in the minting: the two tokens exist only when the cluster has an OIDC key, so the code builds an `Option<(String, String)>` and splits it with `Option::unzip` into the `Option<String>` pair the result struct wants. Without OIDC both are `None`, and both files are written empty, as `token` always was.
 
 ### Don't hash under a lock
 

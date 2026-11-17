@@ -45,8 +45,12 @@ pub struct CsrSignResult {
     /// Every trusted Workload CA and root, for the workload's `ca.pem`
     /// (F04 R2).
     pub ca_bundle_der: Vec<Vec<u8>>,
-    /// OIDC JWT token (if OIDC config is present).
+    /// OIDC JWT token (if OIDC config is present), with the
+    /// `spiffe://<cluster>` audience: the one a workload hands to others.
     pub jwt_token: Option<String>,
+    /// The same workload's JWT for the cluster API alone, with
+    /// [`crate::sesame::oidc::api_audience`] (if OIDC config is present).
+    pub api_jwt_token: Option<String>,
     /// Allocated serial number.
     pub serial: SerialNumber,
 }
@@ -1032,8 +1036,10 @@ impl CouncilNode {
         )
         .map_err(|e| CouncilError::SecurityError(format!("CSR signing failed: {e}")))?;
 
-        // Mint OIDC JWT if config is present
-        let jwt_token = if let Some(ref oidc_config) = state_after.oidc_signing_config {
+        // Mint the OIDC JWTs if config is present: one for everyone else,
+        // and one whose audience only the cluster API accepts, so a party
+        // the first is handed to can't replay it as an API login.
+        let jwt_tokens = if let Some(ref oidc_config) = state_after.oidc_signing_config {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -1050,12 +1056,20 @@ impl CouncilNode {
                 node: node_id.to_string(),
                 instance: instance_id.to_string(),
             };
-            let token = crate::sesame::oidc::mint_jwt(&claims, oidc_config, ikm)
-                .map_err(|e| CouncilError::SecurityError(format!("JWT minting failed: {e}")))?;
-            Some(token)
+            let mint = |claims: &crate::sesame::types::WorkloadJwtClaims| {
+                crate::sesame::oidc::mint_jwt(claims, oidc_config, ikm)
+                    .map_err(|e| CouncilError::SecurityError(format!("JWT minting failed: {e}")))
+            };
+            let token = mint(&claims)?;
+            let api_token = mint(&crate::sesame::types::WorkloadJwtClaims {
+                aud: vec![crate::sesame::oidc::api_audience(cluster_name)],
+                ..claims
+            })?;
+            Some((token, api_token))
         } else {
             None
         };
+        let (jwt_token, api_jwt_token) = jwt_tokens.unzip();
 
         Ok(CsrSignResult {
             cert_der,
@@ -1063,6 +1077,7 @@ impl CouncilNode {
             root_ca_cert_der,
             ca_bundle_der,
             jwt_token,
+            api_jwt_token,
             serial,
         })
     }
@@ -2533,6 +2548,21 @@ mod tests {
         let claims =
             crate::sesame::oidc::verify_jwt(result.jwt_token.as_ref().unwrap(), oidc).unwrap();
         assert_eq!(claims.sub, "spiffe://test-cluster/ns/default/app/api");
+        // Two tokens: the one the workload hands out, with the trust
+        // domain's audience, and the one only the cluster API accepts.
+        // Neither passes for the other.
+        let token = result.jwt_token.as_deref().unwrap();
+        let api_token = result.api_jwt_token.as_deref().unwrap();
+        let federation = crate::sesame::oidc::JwtConstraints::for_config(oidc, "test-cluster");
+        let api = crate::sesame::oidc::JwtConstraints::for_api(oidc, "test-cluster");
+        let verify = |token: &str, constraints: &crate::sesame::oidc::JwtConstraints| {
+            crate::sesame::oidc::verify_jwt_with_constraints(token, oidc, constraints)
+        };
+        assert!(verify(token, &federation).is_ok());
+        assert!(verify(token, &api).is_err());
+        let api_claims = verify(api_token, &api).unwrap();
+        assert_eq!(api_claims.sub, claims.sub);
+        assert!(verify(api_token, &federation).is_err());
     }
 
     // -----------------------------------------------------------------------

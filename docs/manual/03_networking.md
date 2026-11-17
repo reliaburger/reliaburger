@@ -145,6 +145,14 @@ pair. There's no ACME: `relish apply` and `relish lint` refuse `auto` and
 `acme`, as they do any other unknown mode. The listener's self-signed fallback
 is for development, not a substitute for either mode.
 
+Several apps can share a host on different paths; the longest matching path
+wins. A host belongs to whoever serves it, though: a token scoped with
+`--namespaces` or `--apps` can't put a route on a host that an app outside its
+scope already serves, at any path, and `relish apply` answers 403. An unscoped
+token can share a host across namespaces on purpose. Each app on it keeps its
+route through later applies, but adding another app to a shared host takes an
+unscoped token.
+
 Each node keeps its own rate limiter. Behind an L4 load balancer spreading a
 client over N nodes, that client gets up to N times `rate_limit_rps`. A zero
 rate or burst is refused at apply, and so is a rate too large to double into

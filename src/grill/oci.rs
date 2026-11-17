@@ -726,8 +726,8 @@ fn build_mounts(
     }
 
     // Workload identity mount — populated by Bun after CSR signing.
-    // Starts empty; cert.pem, key.pem, ca.pem, bundle.pem, token, and
-    // meta.json appear once the council signs the workload's CSR. The
+    // Starts empty; cert.pem, key.pem, ca.pem, bundle.pem, token,
+    // api-token and meta.json appear once the council signs the workload's CSR. The
     // source is per-INSTANCE (PKI7): replicas of the same app must not
     // share (or overwrite) each other's private key. Bun prepares the
     // directory (tmpfs-backed on Linux root) before create; the

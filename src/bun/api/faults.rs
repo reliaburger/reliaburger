@@ -1573,7 +1573,15 @@ pub(super) async fn fault_clear_all_handler(
                 Some((service.clone(), None))
             }
         },
-        None => None,
+        // Clearing every workload fault reaches every namespace, so it is a
+        // cluster-wide action too: a scoped token names a service and a
+        // namespace it may touch instead.
+        None => {
+            if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+                return response;
+            }
+            None
+        }
     };
     // Every clear but one confined to a named service in a named namespace
     // reaches across tenants, so a `[permission]` block must grant `fault`

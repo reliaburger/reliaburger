@@ -228,8 +228,14 @@ pub struct WorkloadIdentity {
     pub private_key_der: Vec<u8>,
     /// PEM-encoded CA trust chain (Workload CA cert + Root CA cert).
     pub ca_chain_pem: String,
-    /// OIDC JWT token, signed by the cluster's Ed25519 OIDC signing key.
+    /// OIDC JWT token, signed by the cluster's Ed25519 OIDC signing key,
+    /// with the `spiffe://<cluster>` audience: the token a workload hands
+    /// to cloud federation and its peers. Written as `token`.
     pub jwt_token: String,
+    /// The same workload's JWT with the audience only the cluster API
+    /// accepts ([`crate::sesame::oidc::api_audience`]). Written as
+    /// `api-token`.
+    pub api_jwt_token: String,
     /// When this identity was issued.
     pub issued_at: SystemTime,
     /// When the certificate expires (default: 1 hour from issuance).

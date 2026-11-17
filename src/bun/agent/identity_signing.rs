@@ -210,6 +210,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             signed.private_key_der,
             &signed_workload.ca_bundle_der,
             signed_workload.jwt_token.unwrap_or_default(),
+            signed_workload.api_jwt_token.unwrap_or_default(),
         );
         // Write to the instance's own identity mount (PKI7). The directory was
         // prepared before the container was created; a rotation for an adopted
@@ -297,6 +298,7 @@ impl SigningRequest {
                     root_ca_cert_der: signed.root_ca_cert_der,
                     ca_bundle_der: signed.ca_bundle_der,
                     jwt_token: signed.jwt_token,
+                    api_jwt_token: signed.api_jwt_token,
                 })
                 .map_err(|error| error.to_string());
         }
