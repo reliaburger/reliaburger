@@ -2946,18 +2946,24 @@ write will land on. `rollback` checks where it's asked and re-applies
 through the apply path, whose forward now carries the caller too, so the
 leader's owner rules judge it again.
 
-That last sentence went untested until #1310 asked for proof. The rollback
-handler builds a config and hands it to `cluster_apply`, so whether the
-caller survives the trip depends on one argument at one call site, and
-nothing failed when we swapped it for an empty `HeaderMap`.
-`a_follower_forwards_a_rollback_to_the_leader_with_the_callers_token` now
+That last sentence went untested until #1310 asked for proof, and when a
+later review read the same handler it found the lag problem again, one step
+earlier. The follower picked the rollback's *target* from its own replica
+and only then forwarded the chosen spec as an apply. Deploy v3, ask a
+follower that hasn't applied it yet to roll back, and it sees v2 as current
+and v1 as the one before: the leader applies v1, two versions back. The
+owner and GitOps refusals read the same stale replica (#2001). So `rollback` now
+works like `stop` and `delete`: a follower forwards `POST
+/v1/rollback/{app}/{namespace}` (with `?force=true` if it was given) to the
+leader as the caller before it reads anything, and the leader picks the
+target, checks the owner and builds the apply from its own state.
+`a_follower_forwards_a_rollback_to_the_leader_before_choosing_its_target`
 posts a rollback to a follower whose fake leader records what it receives.
-It seeds the follower with two completed deploy records, so the rollback has
-a target without any Raft writes, and checks that exactly one `/v1/apply`
-reaches the leader carrying the caller's bearer, the forwarded mark and the
-older image. With the bearer there, the leader audits the rollback under the
-caller's token name and a policy's `caller.role` is the caller's, because the
-leader authenticates a forwarded apply like any other.
+It seeds the follower with two completed deploy records, so the follower
+*could* pick a target, and checks that what reaches the leader is the
+rollback itself, with an empty body, the caller's bearer and the forwarded
+mark. With the bearer there, the leader audits the rollback under the
+caller's token name and a policy's `caller.role` is the caller's.
 
 **The JSON is pinned.** `src/bun/api/contract_tests.rs` builds one example of
 every shape a controller reads or writes, and checks its JSON against a

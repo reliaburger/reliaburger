@@ -65,14 +65,18 @@ impl RestartPolicy {
     }
 }
 
-/// Why an instance is waiting to restart, kept until the restart records
-/// its decision.
+/// Why an instance stopped and awaits cleanup, kept until the restart (or
+/// the decision not to restart) is recorded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RestartCause {
     /// Its process was found no longer running.
     ProcessExited,
     /// The runtime couldn't start it on the last attempt.
     StartFailed,
+    /// It never passed its health check during its startup grace. It is
+    /// stopped and then marked failed, not restarted: a probe aimed at the
+    /// wrong path or port fails the same way every time.
+    NeverHealthy,
 }
 
 /// The decision a restart records: `rule`, the instance, which attempt this
