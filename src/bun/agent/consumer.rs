@@ -1023,7 +1023,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.publish_backends_kernel(&ids, &map).await?;
         let mut current = self.routing_table.write().await;
         table.inherit_local_health(&current);
-        *current = table;
+        current.replace(table);
         drop(current);
         self.service_map_tx.send_replace(map);
         Ok(())
@@ -1295,7 +1295,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     async fn clear_consumer_userspace(&mut self) {
-        *self.routing_table.write().await = crate::wrapper::routing::RoutingTable::new();
+        self.routing_table
+            .write()
+            .await
+            .replace(crate::wrapper::routing::RoutingTable::new());
         self.service_map_tx.send_replace(ServiceMap::new());
         self.cluster_catalog = EndpointCatalog::default();
         self.cluster_catalog_generation = None;

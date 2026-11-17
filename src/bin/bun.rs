@@ -735,7 +735,7 @@ async fn build_ingress_cert_resolver(
         params,
         rustls::pki_types::CertificateDer::from(ingress_ca.certificate_der.clone()),
         lifetime,
-        routing_table,
+        routing_table.read().await.certificate_modes(),
         vec![default_cert],
         default_key,
     ) {
