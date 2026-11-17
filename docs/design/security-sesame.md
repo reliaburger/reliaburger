@@ -1994,7 +1994,7 @@ The nftables ruleset is kept minimal by design:
 | Rule Category | Typical Count |
 |---------------|--------------|
 | Perimeter rules (input chain) | 5-10 static rules |
-| Perimeter rules (prerouting filter chain, ahead of the port map's DNAT) | 5 static rules |
+| Perimeter rules (forward filter chain, for connections the port map rewrote) | 4 static rules |
 | Cluster nodes set | 1 set, N entries (N = cluster size) |
 | Admin CIDRs set | 1 set, typically < 10 entries |
 | Per-app egress sets | 1 set per app with egress config |

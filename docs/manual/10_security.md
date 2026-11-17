@@ -50,6 +50,10 @@ only cluster members and the node itself. That holds for ports published to
 containers too, which the node's own containers can also reach. Clients
 outside the cluster reach apps through Wrapper's ingress ports instead.
 
+Bun never publishes a workload on one of its own ports. If you put the API
+port inside the range (`--listen 0.0.0.0:29117`, say), `operator_cidrs` still
+reach it.
+
 Rootless Bun and macOS don't run the perimeter, so the setting has no effect
 there. The laptop quickstart doesn't need it either: it reaches each node's API
 through a port forward that arrives on the node's loopback.

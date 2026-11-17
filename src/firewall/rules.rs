@@ -28,10 +28,10 @@ pub struct PerimeterConfig {
     /// configured `[network] port_range` (the same range the port allocator
     /// draws from), so the ports dropped for outsiders exactly match the host
     /// ports Bun hands out. The default mirrors that config default. External
-    /// access to these ports is blocked, both on the input hook and, for the
-    /// ports published to containers, ahead of the port map's rewrite on the
-    /// prerouting hook — traffic reaches containers via Wrapper on the ingress
-    /// ports instead.
+    /// access to these ports is blocked on the input hook. Ports published to
+    /// containers are held to the same policy on the forward hook, after the
+    /// port map's rewrite. Traffic reaches containers via Wrapper on the
+    /// ingress ports instead.
     pub host_port_range: (u16, u16),
     /// Cluster communication ports (gossip, Raft, reporting).
     /// Only accessible from cluster node IPs.
@@ -338,7 +338,7 @@ fn render_family_table(
     // Everything else passes through (policy accept)
     rules.push_str("    # Everything else: accept (SSH, operator services, etc.)\n");
     rules.push_str("  }\n");
-    rules.push_str(&render_prerouting_chain(saddr_keyword, config, node_ips));
+    rules.push_str(&render_forward_chain(saddr_keyword, node_ips));
     rules.push_str("}\n");
 
     rules
@@ -347,26 +347,23 @@ fn render_family_table(
 /// Render the chain that holds published host ports to the input chain's
 /// source policy.
 ///
-/// The `reliaburger` table's nat prerouting rule (priority -100) rewrites a
-/// published port's destination to the container's address, so that traffic
-/// takes the forward path and never meets the input chain. This filter chain
-/// runs first, at -150, and drops what the input chain would: a connection to
-/// a host port on this node from anything but loopback, this node's own
-/// containers (`veth-…`) or a cluster member. Replies to the node's own
-/// outbound connections pass, and so does traffic only passing through to
-/// another address.
-fn render_prerouting_chain(
-    saddr_keyword: &str,
-    config: &PerimeterConfig,
-    node_ips: &[IpAddr],
-) -> String {
+/// The `reliaburger` table's nat prerouting rule rewrites a published port's
+/// destination to the container's address, so that traffic takes the forward
+/// path and never meets the input chain. This filter chain on the forward
+/// hook drops what the input chain would: a connection the port map rewrote
+/// (`ct status dnat`) towards one of this node's containers (`veth-…`) from
+/// anything but this node's own containers or a cluster member. Replies pass.
+///
+/// It matches the rewrite, not a port number. Only ports in `@portmap` are
+/// rewritten, so a port Bun itself serves on (the API, ingress, the
+/// registry) is never touched here, even inside the host-port range.
+fn render_forward_chain(saddr_keyword: &str, node_ips: &[IpAddr]) -> String {
     let mut chain = String::new();
-    chain.push_str("  chain prerouting {\n");
-    chain.push_str("    type filter hook prerouting priority -150; policy accept;\n");
-    chain.push_str("    # Published host ports, before the port map rewrites them\n");
-    chain.push_str("    iif \"lo\" accept\n");
-    chain.push_str("    iifname \"veth-*\" accept\n");
+    chain.push_str("  chain forward {\n");
+    chain.push_str("    type filter hook forward priority -10; policy accept;\n");
+    chain.push_str("    # Published host ports, after the port map rewrote them\n");
     chain.push_str("    ct direction reply ct state established,related accept\n");
+    chain.push_str("    iifname \"veth-*\" accept\n");
     if !node_ips.is_empty() {
         let ip_set = node_ips
             .iter()
@@ -377,10 +374,7 @@ fn render_prerouting_chain(
             "    {saddr_keyword} saddr {{ {ip_set} }} accept\n"
         ));
     }
-    let (port_start, port_end) = config.host_port_range;
-    chain.push_str(&format!(
-        "    fib daddr type local tcp dport {port_start}-{port_end} drop\n"
-    ));
+    chain.push_str("    ct status dnat oifname \"veth-*\" drop\n");
     chain.push_str("  }\n");
     chain
 }
@@ -503,11 +497,11 @@ pub async fn apply_ruleset(_ruleset: &str) -> Result<(), FirewallError> {
 
 #[cfg(test)]
 mod tests {
-    /// The prerouting chain of each family's table, from its header to the
-    /// end of the chain.
-    fn prerouting_chains(rules: &str) -> Vec<&str> {
+    /// The forward chain of each family's table, from its header to the end
+    /// of the chain.
+    fn forward_chains(rules: &str) -> Vec<&str> {
         rules
-            .split("  chain prerouting {\n")
+            .split("  chain forward {\n")
             .skip(1)
             .map(|rest| &rest[..rest.find("\n  }\n").unwrap()])
             .collect()
@@ -515,9 +509,11 @@ mod tests {
 
     /// A published port is rewritten to a container address before the input
     /// hook, so its traffic never meets the input chain's drop. The same
-    /// source policy has to hold ahead of that rewrite.
+    /// source policy holds on the forward path, for exactly the connections
+    /// the port map rewrote: by matching the rewrite rather than a port
+    /// range, a port Bun itself serves inside the range is never touched.
     #[test]
-    fn published_ports_obey_the_source_policy_before_the_port_map_rewrite() {
+    fn published_ports_obey_the_source_policy_after_the_port_map_rewrite() {
         let config = PerimeterConfig {
             operator_cidrs: vec!["192.168.0.0/24".to_string()],
             bootstrap_peers: vec!["192.168.9.9".to_string()],
@@ -525,22 +521,20 @@ mod tests {
         };
         let rules =
             generate_ruleset(&config, &cluster_with_nodes(&["10.0.1.1", "fd00::1"])).unwrap();
-        let chains = prerouting_chains(&rules);
+        assert!(!rules.contains("chain prerouting"), "{rules}");
+        let chains = forward_chains(&rules);
         assert_eq!(chains.len(), 2, "one per family:\n{rules}");
         for (chain, members) in chains
             .iter()
             .zip(["ip saddr { 10.0.1.1 }", "ip6 saddr { fd00::1 }"])
         {
-            // A filter chain that runs before the port map's nat rule
-            // (priority -100 in the `reliaburger` table).
-            assert!(chain.contains("type filter hook prerouting priority -150; policy accept;"));
+            assert!(chain.contains("type filter hook forward priority -10; policy accept;"));
             let drop = chain
-                .find("fib daddr type local tcp dport 10000-32767 drop")
+                .find("ct status dnat oifname \"veth-*\" drop")
                 .unwrap_or_else(|| panic!("no drop in:\n{chain}"));
             for allowed in [
-                "iif \"lo\" accept",
-                "iifname \"veth-*\" accept",
                 "ct direction reply ct state established,related accept",
+                "iifname \"veth-*\" accept",
                 &format!("{members} accept"),
             ] {
                 let at = chain
@@ -550,7 +544,8 @@ mod tests {
             }
             // Operators and bootstrap peers never reach container host ports.
             assert!(!chain.contains("192.168."), "{chain}");
-            // Traffic passing through the node to somewhere else is not ours.
+            // Only rewritten connections: no port, so no service port.
+            assert!(!chain.contains("dport"), "{chain}");
             assert_eq!(chain.matches("drop").count(), 1, "{chain}");
         }
     }
