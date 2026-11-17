@@ -263,3 +263,37 @@ fn lock_file_has_only_patched_zstd_and_audit_needs_no_exception_for_it() {
         );
     }
 }
+
+/// RUSTSEC-2026-0542, -0543 and -0555: humantime, chrono and chrono-tz are
+/// unmaintained, with no release to move to. `.cargo/audit.toml` excuses them
+/// because only other crates (Arrow, Parquet, DataFusion, object_store,
+/// openraft and more) depend on them. Reliaburger's own code must not start
+/// depending on them, and once none is locked any more the exceptions must go.
+#[test]
+fn only_dependencies_lock_the_unmaintained_time_crates_and_audit_excuses_only_those_locked() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let lock = std::fs::read_to_string(root.join("Cargo.lock")).unwrap();
+    let audit = std::fs::read_to_string(root.join(".cargo/audit.toml")).unwrap();
+    let ours = lock
+        .split("[[package]]")
+        .find(|package| package.contains("\nname = \"reliaburger\"\n"))
+        .unwrap();
+    let excused = [
+        ("humantime", "RUSTSEC-2026-0542"),
+        ("chrono", "RUSTSEC-2026-0543"),
+        ("chrono-tz", "RUSTSEC-2026-0555"),
+    ];
+    for (name, advisory) in excused {
+        assert!(
+            !ours.contains(&format!("\n \"{name}\",\n"))
+                && !ours.contains(&format!("\n \"{name} ")),
+            "reliaburger depends on {name} directly"
+        );
+        let locked = lock.contains(&format!("\nname = \"{name}\"\n"));
+        let ignored = audit.contains(&format!("\"{advisory}\""));
+        assert!(
+            locked || !ignored,
+            ".cargo/audit.toml ignores {advisory} but Cargo.lock no longer locks {name}"
+        );
+    }
+}
