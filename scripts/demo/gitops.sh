@@ -32,15 +32,23 @@ demo_git() {
 
 # The example's files, pointed at this build's testapp and the demo's ports.
 #
-# Each port is rewritten only where it stands as a whole number, so a rule
-# never matches inside a port an earlier one wrote: with port base 28078,
-# 8081 becomes 28082, which a bare `s|8082|...|` turned into 228083 (#2068).
+# Each port is rewritten only where it stands as a whole number, and first
+# into a placeholder with no digits in it, so no rule ever matches a port
+# another one wrote: with port base 28078, 8081 becomes 28082, which a bare
+# `s|8082|...|` turned into 228083 (#2068). A match uses up the character
+# after the port, so a port right after another (`8080,8080`) is left for
+# the second pass.
 point_at_demo() {
-    sed -E -e "s|\"target/debug/testapp\"|\"${TESTAPP}\"|" \
-        -e "s/(^|[^0-9])8080([^0-9]|$)/\1${DEMO_THIRD_APP_PORT}\2/g" \
-        -e "s/(^|[^0-9])8081([^0-9]|$)/\1${DEMO_APP_PORT}\2/g" \
-        -e "s/(^|[^0-9])8082([^0-9]|$)/\1${DEMO_SECOND_APP_PORT}\2/g" \
-        "$1" >"$2"
+    local whole port placeholder rules=()
+    for port in 8080:THIRD 8081:APP 8082:SECOND; do
+        whole="s/(^|[^0-9])${port%%:*}([^0-9]|$)/\1@${port#*:}_PORT@\2/g"
+        rules+=(-e "${whole}" -e "${whole}")
+    done
+    for placeholder in "THIRD:${DEMO_THIRD_APP_PORT}" "APP:${DEMO_APP_PORT}" \
+        "SECOND:${DEMO_SECOND_APP_PORT}"; do
+        rules+=(-e "s/@${placeholder%%:*}_PORT@/${placeholder#*:}/g")
+    done
+    sed -E -e "s|\"target/debug/testapp\"|\"${TESTAPP}\"|" "${rules[@]}" "$1" >"$2"
 }
 
 # The STATE column of every instance `relish apps --instances` lists for app $1 in
