@@ -74,6 +74,25 @@ impl JwtConstraints {
             max_age_secs: MAX_TOKEN_AGE_SECS,
         }
     }
+
+    /// The constraints the cluster API puts on a workload JWT presented as
+    /// a bearer: as [`for_config`](Self::for_config), but the audience is
+    /// [`api_audience`]. The token a workload hands to other parties (cloud
+    /// federation, its peers) carries only `spiffe://<cluster>`, so none of
+    /// them can replay it as an API login.
+    pub fn for_api(config: &OidcSigningConfig, cluster_name: &str) -> Self {
+        Self {
+            expected_audience: api_audience(cluster_name),
+            ..Self::for_config(config, cluster_name)
+        }
+    }
+}
+
+/// The audience of the workload JWT meant for the cluster's own API, which
+/// a workload finds in its identity directory's `api-token`. Distinct from
+/// the `spiffe://<cluster>` audience of `token`, the one for everyone else.
+pub fn api_audience(cluster_name: &str) -> String {
+    format!("reliaburger-api:{cluster_name}")
 }
 
 /// Largest tolerated clock skew for a JWT's future `iat`, in seconds.

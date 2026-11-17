@@ -89,6 +89,18 @@ pub(crate) async fn apply(
                 return super::api::apply::owner_refusal(&error);
             }
         };
+        // An app in a job manifest takes an ingress host under the same
+        // rule as on the app path: a scoped token can't route a host that
+        // an app outside its scope serves.
+        if config.app.values().any(|spec| spec.ingress.is_some())
+            && let Err(response) = super::api::apply::authorize_ingress_hosts(
+                auth,
+                &config,
+                &council.desired_state().await,
+            )
+        {
+            return response;
+        }
         // The apps and jobs in a job manifest are judged by the policies in
         // force, as `relish apply` judges any app (#1117, #1119). The state
         // machine commits them later, once their jobs have run, so their

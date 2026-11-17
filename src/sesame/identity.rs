@@ -225,6 +225,7 @@ pub fn build_identity_bundle(
     private_key_der: Vec<u8>,
     ca_bundle: &[Vec<u8>],
     jwt_token: String,
+    api_jwt_token: String,
 ) -> WorkloadIdentity {
     let ca_chain_pem: String = ca_bundle
         .iter()
@@ -238,6 +239,7 @@ pub fn build_identity_bundle(
         private_key_der,
         ca_chain_pem,
         jwt_token,
+        api_jwt_token,
         issued_at: now,
         expires_at: now + WORKLOAD_CERT_LIFETIME,
         next_rotation: now + ROTATION_INTERVAL,
@@ -251,6 +253,10 @@ pub fn build_identity_bundle(
 
 /// Metadata sidecar file name inside an instance identity directory.
 const IDENTITY_META_FILE: &str = "meta.json";
+
+/// The workload's JWT for the cluster API alone, beside `token` (the one it
+/// hands to everyone else).
+const API_TOKEN_FILE: &str = "api-token";
 
 /// Size cap for the tmpfs backing an instance identity directory. The
 /// bundle is a few kilobytes; 1 MiB leaves generous headroom.
@@ -404,12 +410,13 @@ fn is_mount_point(dir: &Path) -> bool {
 
 /// Write a workload identity's files into its per-instance directory.
 ///
-/// Writes six files atomically (write to `.tmp` then rename):
+/// Writes seven files atomically (write to `.tmp` then rename):
 /// - `cert.pem` — the workload certificate
 /// - `key.pem` — the private key (owner-only)
 /// - `ca.pem` — the CA trust chain
 /// - `bundle.pem` — cert + CA chain concatenated
 /// - `token` — the OIDC JWT string (owner-only)
+/// - `api-token` — the OIDC JWT for the cluster API alone (owner-only)
 /// - `meta.json` — rotation metadata for adoption after a Bun restart
 ///
 /// When `owner` is set (Linux root mode), every file and the directory
@@ -452,6 +459,11 @@ pub fn write_identity_files(
         identity.jwt_token.as_bytes(),
         Some(0o600),
     )?;
+    atomic_write_mode(
+        &dir.join(API_TOKEN_FILE),
+        identity.api_jwt_token.as_bytes(),
+        Some(0o600),
+    )?;
     atomic_write(&dir.join(IDENTITY_META_FILE), meta_json.as_bytes())?;
 
     if let Some((uid, gid)) = owner {
@@ -484,6 +496,14 @@ pub fn load_identity(dir: &Path) -> Result<Option<WorkloadIdentity>, IdentityErr
     let private_key_der = read_pem_der(dir, "key.pem")?;
     let ca_chain_pem = std::fs::read_to_string(dir.join("ca.pem"))?;
     let jwt_token = std::fs::read_to_string(dir.join("token"))?;
+    // A cluster without OIDC writes an empty `api-token`, as it does an
+    // empty `token`; a directory with none loads the same way, and the
+    // next rotation writes it.
+    let api_jwt_token = match std::fs::read_to_string(dir.join(API_TOKEN_FILE)) {
+        Ok(token) => token,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.into()),
+    };
 
     Ok(Some(WorkloadIdentity {
         spiffe_uri: meta.spiffe_uri,
@@ -491,6 +511,7 @@ pub fn load_identity(dir: &Path) -> Result<Option<WorkloadIdentity>, IdentityErr
         private_key_der,
         ca_chain_pem,
         jwt_token,
+        api_jwt_token,
         issued_at: meta.issued_at,
         expires_at: meta.expires_at,
         next_rotation: meta.next_rotation,
@@ -1059,6 +1080,7 @@ mod tests {
             private_key_der,
             &[workload_ca_cert_der.clone(), root_ca_cert_der.clone()],
             "test-jwt-token".to_string(),
+            "test-api-jwt-token".to_string(),
         );
 
         assert_eq!(identity.spiffe_uri, uri);
@@ -1066,6 +1088,7 @@ mod tests {
         assert!(!identity.private_key_der.is_empty());
         assert!(identity.ca_chain_pem.contains("BEGIN CERTIFICATE"));
         assert_eq!(identity.jwt_token, "test-jwt-token");
+        assert_eq!(identity.api_jwt_token, "test-api-jwt-token");
         assert!(!identity.grace_extended);
         assert!(identity.expires_at > identity.issued_at);
         assert!(identity.next_rotation > identity.issued_at);
@@ -1093,6 +1116,7 @@ mod tests {
             private_key_der,
             &[workload_ca_cert_der, root_ca_cert_der],
             jwt.to_string(),
+            format!("api-{jwt}"),
         )
     }
 
@@ -1156,6 +1180,9 @@ mod tests {
 
         let token = std::fs::read_to_string(dir.join("token")).unwrap();
         assert_eq!(token, "my-jwt-token");
+        // The API's token sits beside the one the workload hands out.
+        let api_token = std::fs::read_to_string(dir.join("api-token")).unwrap();
+        assert_eq!(api_token, "api-my-jwt-token");
 
         let bundle = std::fs::read_to_string(dir.join("bundle.pem")).unwrap();
         // Bundle should contain the cert + CA chain (at least 3 PEM blocks)
@@ -1200,6 +1227,7 @@ mod tests {
         assert_eq!(loaded.private_key_der, identity.private_key_der);
         assert_eq!(loaded.ca_chain_pem, identity.ca_chain_pem);
         assert_eq!(loaded.jwt_token, identity.jwt_token);
+        assert_eq!(loaded.api_jwt_token, identity.api_jwt_token);
         assert_eq!(loaded.next_rotation, identity.next_rotation);
         assert_eq!(loaded.expires_at, identity.expires_at);
         assert!(!loaded.grace_extended);
@@ -1291,6 +1319,7 @@ mod tests {
             private_key_der: vec![],
             ca_chain_pem: String::new(),
             jwt_token: String::new(),
+            api_jwt_token: String::new(),
             issued_at: SystemTime::now(),
             expires_at: SystemTime::now() + Duration::from_secs(3600),
             next_rotation: SystemTime::now() + Duration::from_secs(1800),
@@ -1311,6 +1340,7 @@ mod tests {
             private_key_der: vec![],
             ca_chain_pem: String::new(),
             jwt_token: String::new(),
+            api_jwt_token: String::new(),
             issued_at: now - Duration::from_secs(2000),
             expires_at: now + Duration::from_secs(1600),
             next_rotation: now - Duration::from_secs(200), // past rotation time
@@ -1328,6 +1358,7 @@ mod tests {
             private_key_der: vec![],
             ca_chain_pem: String::new(),
             jwt_token: String::new(),
+            api_jwt_token: String::new(),
             issued_at: now - Duration::from_secs(4000),
             expires_at: now + Duration::from_secs(14400), // extended
             next_rotation: now - Duration::from_secs(2200),
@@ -1345,6 +1376,7 @@ mod tests {
             private_key_der: vec![],
             ca_chain_pem: String::new(),
             jwt_token: String::new(),
+            api_jwt_token: String::new(),
             issued_at: now - Duration::from_secs(7200),
             expires_at: now - Duration::from_secs(100), // expired
             next_rotation: now - Duration::from_secs(5400),
@@ -1362,6 +1394,7 @@ mod tests {
             private_key_der: vec![],
             ca_chain_pem: String::new(),
             jwt_token: String::new(),
+            api_jwt_token: String::new(),
             issued_at: now,
             expires_at: now + Duration::from_secs(3600),
             next_rotation: now + Duration::from_secs(1800),
@@ -1385,6 +1418,7 @@ mod tests {
             private_key_der: vec![],
             ca_chain_pem: String::new(),
             jwt_token: String::new(),
+            api_jwt_token: String::new(),
             issued_at: now,
             expires_at: max_expiry, // already at max
             next_rotation: now + Duration::from_secs(1800),

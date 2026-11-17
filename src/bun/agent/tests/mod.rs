@@ -10852,6 +10852,7 @@ fn write_test_identity(
             hierarchy.root.ca.certificate_der.clone(),
         ],
         "adopted-jwt".to_string(),
+        "adopted-api-jwt".to_string(),
     );
     let dir = crate::sesame::identity::instance_identity_dir(volumes, instance);
     crate::sesame::identity::write_identity_files(&identity, &dir, None).unwrap();
@@ -14157,6 +14158,7 @@ async fn signed_identity_is_stored_only_for_a_live_instance() {
                 root_ca_cert_der: vec![2],
                 ca_bundle_der: vec![vec![1], vec![2]],
                 jwt_token: Some("jwt".into()),
+                api_jwt_token: Some("api-jwt".into()),
             }),
         )
     };
@@ -14178,6 +14180,7 @@ async fn signed_identity_is_stored_only_for_a_live_instance() {
 
     let instance = agent.supervisor.get_instance(&live).unwrap();
     assert_eq!(instance.identity.as_ref().unwrap().jwt_token, "jwt");
+    assert_eq!(instance.identity.as_ref().unwrap().api_jwt_token, "api-jwt");
     assert!(agent.instance_identity_dir(&live).exists());
     assert!(
         !agent.instance_identity_dir(&retired).exists(),

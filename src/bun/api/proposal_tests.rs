@@ -23,6 +23,9 @@ struct Cluster {
     watcher: String,
     /// A deployer agent token scoped to `billing`.
     billing_bot: String,
+    /// The stored token behind `billing_bot`, for a test that commits it to
+    /// the council, where the reaper looks an author's scope up.
+    billing_bot_token: crate::sesame::types::ApiToken,
     /// A human admin.
     alice: String,
     /// A human deployer.
@@ -98,6 +101,7 @@ async fn cluster(tag: &str) -> Cluster {
     let mut store = EventStore::new();
     store.set_audit_log(log.clone());
     let events = Arc::new(RwLock::new(store));
+    let billing_bot_token = billing_bot.token.clone();
     let (app, shutdown) = setup_with_auth_leases_events_and_council(
         vec![
             holmes.token,
@@ -123,6 +127,7 @@ async fn cluster(tag: &str) -> Cluster {
         holmes: holmes.plaintext,
         watcher: watcher.plaintext,
         billing_bot: billing_bot.plaintext,
+        billing_bot_token,
         alice,
         bob,
         carol: carol.plaintext,
@@ -2014,4 +2019,195 @@ async fn sec_a_refused_browser_decision_is_audited_as_the_token() {
     );
     assert_eq!(record.details["token_name"], "bob");
     assert_eq!(record.details["reason"], "forbidden");
+}
+
+/// Commit `name` in `namespace` serving `host` at `/`, as an admin's
+/// `relish apply` would.
+async fn serve_host(cluster: &Cluster, name: &str, namespace: &str, host: &str) {
+    let spec: crate::config::app::AppSpec = toml::from_str(&format!(
+        "image = \"web:1.4\"\nport = 8080\nnamespace = \"{namespace}\"\n\
+         [ingress]\nhost = \"{host}\"\npath = \"/\"\n"
+    ))
+    .unwrap();
+    cluster
+        .council
+        .write(crate::council::types::RaftRequest::AppSpec {
+            app_id: crate::meat::AppId::new(name, namespace),
+            spec: Box::new(spec),
+        })
+        .await
+        .unwrap();
+}
+
+/// An `apply` proposal for `billing/{name}` on `host` at `path`.
+fn ingress_proposal(name: &str, host: &str, path: &str) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "apply", "namespace": "billing", "reason": "move the route",
+        "config": format!(
+            "[app.{name}]\nimage = \"web:1.4\"\nport = 8080\nnamespace = \"billing\"\n\
+             [app.{name}.ingress]\nhost = \"{host}\"\npath = \"{path}\"\n"
+        ),
+    })
+}
+
+/// A proposal writes app specs as `relish apply` does, so the ingress-host
+/// rule holds on each of its paths. A scoped author can't propose an app on
+/// a host another namespace serves; a scoped approver can't approve one
+/// whose host another namespace took since; and a scoped undo can't put an
+/// app back on a host another namespace took since. Each is judged against
+/// the cluster as it is when the step runs.
+#[tokio::test]
+async fn a_proposal_cant_route_a_host_another_namespace_serves() {
+    let cluster = cluster("proposal-ingress-host").await;
+    serve_host(&cluster, "web", "shop", "shop.example.com").await;
+
+    // Creating: refused as the author.
+    let (status, body) = cluster
+        .propose(
+            &cluster.billing_bot,
+            ingress_proposal("pay", "shop.example.com", "/login"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // Approving: the host was free when proposed, then shop took it.
+    let (status, body) = cluster
+        .propose(
+            &cluster.billing_bot,
+            ingress_proposal("pay", "pay.example.com", "/"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let id = body["id"].as_u64().unwrap();
+    serve_host(&cluster, "checkout", "shop", "pay.example.com").await;
+    let (status, body) = cluster
+        .post(
+            &format!("/v1/proposals/{id}/approve"),
+            &cluster.carol,
+            String::new(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(
+        !cluster
+            .council
+            .desired_state()
+            .await
+            .apps
+            .contains_key(&crate::meat::AppId::new("pay", "billing"))
+    );
+
+    // Undoing: ledger moves off its host, shop takes it, and the undo
+    // would put ledger back beside shop's app.
+    serve_host(&cluster, "ledger", "billing", "ledger.example.com").await;
+    let (status, body) = cluster
+        .propose(
+            &cluster.billing_bot,
+            ingress_proposal("ledger", "books.example.com", "/"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let id = body["id"].as_u64().unwrap();
+    let (status, body) = cluster
+        .post(
+            &format!("/v1/proposals/{id}/approve"),
+            &cluster.carol,
+            String::new(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "an in-scope approval: {body}");
+    assert_eq!(body["state"], "applied", "{body}");
+    serve_host(&cluster, "grab", "shop", "ledger.example.com").await;
+    let (status, body) = cluster
+        .post(
+            &format!("/v1/proposals/{id}/undo"),
+            &cluster.carol,
+            String::new(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // A cluster-wide person still undoes it.
+    let (status, body) = cluster
+        .post(
+            &format!("/v1/proposals/{id}/undo"),
+            &cluster.alice,
+            String::new(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// Approve an agent's apply in `billing` without a person.
+const AGENTS_APPLY_IN_BILLING: &str = "[policy.agents-apply-billing]\n\
+     applies_to = \"proposals\"\n\
+     action = \"approve\"\n\
+     match = 'author.kind == \"agent\" && proposal.kind == \"apply\" && proposal.namespace == \"billing\"'\n";
+
+/// The reaper approves a pending proposal when a later policy allows it,
+/// with no person behind the approval. It applies the ingress-host rule as
+/// the author, against the cluster as it is then: a host another namespace
+/// took after the proposal was made fails the proposal with the reason,
+/// and nothing is written. A proposal on a free host still applies.
+#[tokio::test]
+async fn the_reaper_checks_ingress_hosts_as_the_author() {
+    let cluster = cluster("proposal-reaper-ingress").await;
+    // The reaper reads the author's scope from the council's tokens.
+    cluster
+        .council
+        .write(crate::council::types::RaftRequest::CreateApiToken(
+            cluster.billing_bot_token.clone(),
+        ))
+        .await
+        .unwrap();
+    let (status, body) = cluster
+        .propose(
+            &cluster.billing_bot,
+            ingress_proposal("pay", "pay.example.com", "/"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["state"], "pending", "{body}");
+    let taken = body["id"].as_u64().unwrap();
+    let (status, body) = cluster
+        .propose(
+            &cluster.billing_bot,
+            ingress_proposal("till", "till.example.com", "/"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let free = body["id"].as_u64().unwrap();
+
+    serve_host(&cluster, "checkout", "shop", "pay.example.com").await;
+    cluster.write_policies(AGENTS_APPLY_IN_BILLING).await;
+    crate::bun::proposals::reap_once(
+        &cluster.council,
+        Some(&cluster.events),
+        "node-1",
+        crate::testkit::lease::now_unix_millis(),
+    )
+    .await
+    .unwrap();
+
+    let (_, body) = cluster
+        .get(&format!("/v1/proposals/{taken}"), &cluster.alice)
+        .await;
+    assert_eq!(body["state"], "failed", "{body}");
+    assert!(body.to_string().contains("ingress host"), "{body}");
+    let desired = cluster.council.desired_state().await;
+    assert!(
+        !desired
+            .apps
+            .contains_key(&crate::meat::AppId::new("pay", "billing"))
+    );
+
+    let (_, body) = cluster
+        .get(&format!("/v1/proposals/{free}"), &cluster.alice)
+        .await;
+    assert_eq!(body["state"], "applied", "{body}");
+    assert!(
+        desired
+            .apps
+            .contains_key(&crate::meat::AppId::new("till", "billing"))
+    );
 }

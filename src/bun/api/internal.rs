@@ -283,6 +283,7 @@ pub(super) async fn workload_csr_handler(
             root_ca_cert_der: signed.root_ca_cert_der,
             ca_bundle_der: signed.ca_bundle_der,
             jwt_token: signed.jwt_token,
+            api_jwt_token: signed.api_jwt_token,
         }))
         .into_response(),
         Ok(Err(error)) => error.into_response(),
