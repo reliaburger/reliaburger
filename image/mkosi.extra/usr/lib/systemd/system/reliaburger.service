@@ -1,11 +1,14 @@
 # bun on the appliance. The same restart and kill policy as the quickstart's
 # unit (src/relish/quickstart/provision.rs): owners outlive bun restarts.
 # It starts once reliaburger-seed.service has turned the machine's seed or
-# claim into a cluster config.
+# claim into a cluster config, and after reliaburger-time-wait.service has
+# given the clock up to 30 s to sync. Not After=time-sync.target: if
+# anything enabled systemd-time-wait-sync.service, which never gives up, a
+# node with no NTP would never start bun.
 [Unit]
 Description=Reliaburger node
-After=network-online.target reliaburger-seed.service
-Wants=network-online.target
+After=network-online.target reliaburger-seed.service reliaburger-time-wait.service
+Wants=network-online.target reliaburger-time-wait.service
 
 [Service]
 Type=simple
