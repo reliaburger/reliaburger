@@ -257,8 +257,8 @@ per run, never one per task, labelled with `job`, `namespace` and `run`. The
 [batch jobs chapter](14_batch-jobs.md#job-history-metrics-and-events) lists
 the job metrics.
 
-Council members hold cluster-wide rollups, so one node can answer for the
-fleet.
+Every node sends its rollups to the council leader, so one node can answer for
+the fleet.
 
 ## Events and dashboards
 

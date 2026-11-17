@@ -18,7 +18,8 @@ with it.
 
 Patch releases (0.1.x) fix and harden without a headline. Each minor release
 after that ships one headline feature, with a single exit test that proves it.
-1.0.0 is expected in January 2027. Until then every release is a development release: an incompatible format
+There are no target dates before 1.0.0: each release goes out when it's ready
+and verified. Until 1.0.0 every release is a development release: an incompatible format
 change bumps the compatibility generation and needs a fresh cluster, with no
 migration and no feature gate
 ([compatibility before 1.0.0](releasing.md#compatibility-before-100)).
@@ -382,7 +383,7 @@ migration and no feature gate
   turned out to be glibc keeping free memory after log queries, levelling off
   in the 0.2.8 day run
   ([record](qualification/2026-11-14-v0.2.8-memory-run.md)); its full disk
-  ([#1418](https://github.com/reliaburger/reliaburger/issues/1418), 0.3.0)
+  ([#1418](https://github.com/reliaburger/reliaburger/issues/1418), 0.3.1)
   is still open. It ships
   with the `zstd` 0.13 advisories under a reviewed exception
   ([#1367](https://github.com/reliaburger/reliaburger/pull/1367)). 0.2.3 keeps
@@ -418,7 +419,7 @@ migration and no feature gate
   ([#1485](https://github.com/reliaburger/reliaburger/issues/1485)), and pass
   with the fixed checker. It ships with the `zstd` 0.13 advisories under the
   exception 0.2.3 took, which expires on 18 November 2026
-  ([#1366](https://github.com/reliaburger/reliaburger/issues/1366), in 0.3.0).
+  ([#1366](https://github.com/reliaburger/reliaburger/issues/1366), in 0.3.1).
   The profile after the tag found 0.2.4 4.5% faster on host jobs than 0.2.3
   ([record](qualification/2026-10-30-v0.2.4-profile/README.md)). The 24-hour
   memory run failed at hour 21 when the Mac lost its forwards to the VMs; up
@@ -542,9 +543,19 @@ migration and no feature gate
 - [ ] **0.4.2: "Let the AI SRE help"**
   ([milestone](https://github.com/reliaburger/reliaburger/milestone/18),
   [research](plans/2026-10-18-research-ai-sre.md)). The read-only half moved
-  to 0.2.7. What stays: human-approved mutations through proposals, agent
-  tokens labelled in audit, a merged incident timeline, log patterns in
-  Ketchup, agent-ready webhooks and a larger eval. No LLM inside `bun`.
+  to 0.2.7, and 0.2.8 shipped agent tokens, proposals approved by a person or
+  a policy, and the first half of the incident timeline. What stays: the
+  timeline's second half
+  ([#1084](https://github.com/reliaburger/reliaburger/issues/1084)), log
+  patterns in Ketchup
+  ([#1087](https://github.com/reliaburger/reliaburger/issues/1087)) and
+  agent-ready webhooks
+  ([#1089](https://github.com/reliaburger/reliaburger/issues/1089)), a
+  per-token read rate limit and a session id in audit
+  ([#1082](https://github.com/reliaburger/reliaburger/issues/1082)), and a
+  larger local-model eval
+  ([#1837](https://github.com/reliaburger/reliaburger/issues/1837)). No LLM
+  inside `bun`.
 - [ ] **0.4.3, 0.4.4 and 0.4.5: "Stronger walls"**
   ([0.4.3](https://github.com/reliaburger/reliaburger/milestone/20),
   [0.4.4](https://github.com/reliaburger/reliaburger/milestone/21),

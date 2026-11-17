@@ -13,7 +13,7 @@ Mayo is Reliaburger's embedded, per-node metrics store. It provides a metrics pi
 
 - **Auto-collects** node infrastructure metrics (CPU, memory, disk, network) and per-process metrics (CPU, memory) for every running instance.
 - **Stores data locally** as flat Parquet files (`metrics_NNNNNN.parquet`), queried with **DataFusion SQL**, and prunes them by a single `retention_days` window.
-- **Pushes 1-minute rollups** to its council parent over the reporting transport, so a council member can serve a partial cluster view.
+- **Pushes 1-minute rollups** to the Raft leader over the reporting transport, so the leader can serve a coarse cluster view. (A tree of council parents, each holding part of the cluster, is planned (#364); today every node reports straight to the leader.)
 - **Evaluates built-in threshold alert rules** (metric, operator, threshold, duration), with webhook, Slack, and PagerDuty notification.
 
 The result is a batteries-included metrics store embedded in the single Bun binary, with no external database and no configuration for the common case.
@@ -29,10 +29,10 @@ A note on this document: the storage engine is **Parquet + DataFusion SQL**, not
 | Component | Relationship |
 |-----------|-------------|
 | **Bun** (node agent) | Host process. Bun's collection loop samples node and per-process metrics (via the `sysinfo` crate) into the local Mayo store, drives the periodic flush to Parquet, runs the alert evaluation loop, and drives retention/disk-pressure pruning. |
-| **Council** (Raft consensus group) | Each worker node pushes a 1-minute `NodeRollup` to its assigned council parent over the reporting transport. The council member stores rollups in a separate rollup store, served at `/v1/metrics/rollup` and `/v1/metrics/cluster`. **Cross-council query fan-out and merge is implemented**: `/v1/metrics/cluster` and `/v1/metrics/app` fan out across council voters and sum the results (see §3.3). |
+| **Council** (Raft consensus group) | Each worker node pushes a 1-minute `NodeRollup` to the Raft leader over the reporting transport (the council-parent tree is planned, #364). The leader stores rollups in a separate rollup store, served at `/v1/metrics/rollup` and `/v1/metrics/cluster`. **Cross-council query fan-out and merge is implemented**: `/v1/metrics/cluster` fans out across council voters and sums their rollups, and `/v1/metrics/app` fans out to the nodes running the app (see §5.5). |
 | **Brioche** (web UI) | Queries Mayo over the internal HTTP API (`/v1/metrics*`) for dashboard rendering. |
 | **Relish** (CLI) | `relish` queries the per-app metrics endpoint over HTTP. |
-| **Mustard** (gossip) | Provides cluster membership and node identity, used to determine which council parent a node reports rollups to. |
+| **Mustard** (gossip) | Provides cluster membership and node identity, used (with Raft metrics) to find the leader a node reports rollups to. |
 | **Meat** (scheduler) | Provides the app-to-node placement map. The `/v1/metrics/app` endpoint uses it to fan single-app queries out to the nodes running the app and sum the results. |
 | **Wrapper** (ingress proxy) | **Implemented.** The proxy maintains a process-global `IngressMetrics` counter (total, per-status-class, in-flight); Bun's collection loop folds `global_ingress_metrics().snapshot()` into the time series as `ingress_requests_total`, `ingress_responses_Nxx`, and `ingress_requests_in_flight`. Per-route duration histograms remain future work. |
 
@@ -55,7 +55,7 @@ Each node stores its own metrics locally. There is no central metrics database. 
 
 - Metrics storage scales linearly with cluster size.
 - There is no single bottleneck or point of failure for metrics.
-- A node failure loses only that node's local historical data (the 1-minute rollups its council parent holds provide a coarse cluster-level view).
+- A node failure loses only that node's local historical data (the 1-minute rollups the leader holds provide a coarse cluster-level view).
 - No inter-node replication of raw metric data is required.
 
 ```
@@ -109,12 +109,12 @@ Retention is a single `retention_days` value (default **7**). Two paths prune Pa
 
 ### 3.3 Rollup Push to Council Members
 
-**What ships:** each worker node runs a rollup worker (`src/mayo/rollup_worker.rs`) that, every `rollup_interval_secs` (default 60), generates a `NodeRollup` -- 1-minute (min, max, sum, count) aggregates of the local metrics -- and sends it to its assigned council parent over the reporting transport (postcard-framed messages, `ReportingMessage::MetricsRollup`, not gRPC). The council member stores received rollups in a separate rollup store, exposed at `/v1/metrics/rollup` (this member's own data) and `/v1/metrics/cluster`.
+**What ships:** each worker node runs a rollup worker (`src/mayo/rollup_worker.rs`) that, every `rollup_interval_secs` (default 60), generates a `NodeRollup` -- 1-minute (min, max, sum, count) aggregates of the local metrics -- and sends it to the Raft leader over the reporting transport (postcard-framed messages, `ReportingMessage::MetricsRollup`, not gRPC). The leader stores received rollups in a separate rollup store, exposed at `/v1/metrics/rollup` (this member's own data) and `/v1/metrics/cluster`.
 
-**What is planned -- not yet implemented:**
+Queries over these rollups, and over an app's samples on every node running it, fan out and merge; §5.5 says how.
 
-- **Cross-council query fan-out and merge.** `src/mayo/query_fanout.rs` contains `fan_out_cluster_query`/`fan_out_app_query` and the merge functions, but nothing calls them. `/v1/metrics/cluster` returns only the handling council member's *local* rollup data; it does not fan out to the other council members or merge their partial sums. So a "cluster-wide" query today reflects one council member's subset, not the whole cluster.
-- **Single-app query fan-out via the Meat placement map.** `/v1/metrics/app/{app}/{namespace}` filters the *local* store by the `namespace/app` label. It does not consult placement or query the other nodes running the app.
+**Also shipped:**
+
 - **`rollup_retention_hours`.** Defaults to 24. Bun's disk-pressure loop calls `RollupStore::prune_expired` each tick to drop rollups older than this window (0 keeps all).
 
 ### 3.4 Prometheus-Compatible Remote-Read API
@@ -311,7 +311,7 @@ An executor's cgroup holds its helper as well as its task groups, so the sample 
 
 ### 5.4 Rollup Push to the Council
 
-Every `rollup_interval_secs` (default 60) the rollup worker (`src/mayo/rollup_worker.rs`) reads the local Mayo store, generates a `NodeRollup` of 1-minute (min, max, sum, count) aggregates, and sends it to its council parent as a `ReportingMessage::MetricsRollup` over the reporting transport (postcard-framed, **not** gRPC or a bespoke TCP call). Parents are assigned by an FNV-1a hash of the node ID over the sorted council list (`src/reporting/assignment.rs`), so every node computes the same tree without coordination.
+Every `rollup_interval_secs` (default 60) the rollup worker (`src/mayo/rollup_worker.rs`) reads the local Mayo store, generates a `NodeRollup` of 1-minute (min, max, sum, count) aggregates, and sends it to the Raft leader as a `ReportingMessage::MetricsRollup` over the reporting transport (postcard-framed, **not** gRPC or a bespoke TCP call). The worker still picks its parent with an FNV-1a hash of the node ID over a council list (`src/reporting/assignment.rs`), but the cluster runtime hands it a one-entry list holding only the current leader (`spawn_leader_target_maintainer` in `src/cluster/runtime.rs`), so every node reports to the leader. Spreading nodes over several council parents is planned (#364).
 
 **Reassignment backfill: implemented.** When the council changes and a node's parent moves, the worker's next push is a backfill: the last five minutes as per-minute rollups (`RollupGenerator::generate_backfill`), each stamped with its own minute so the new parent's `(node, timestamp)` dedup makes re-sends idempotent. A failed send keeps the backfill request set and retries on the next tick; minutes older than the five-minute window stay only in the node's local store.
 
@@ -324,7 +324,7 @@ The council member stores received rollups in a rollup store and serves them at 
 - `/v1/metrics/app/{app}/{namespace}` resolves the app's nodes from the Meat placement map and fans the query out to each, merging the results (falling back to the local store when there's no placement).
 - `/v1/metrics/cluster` enumerates the Raft voters, maps each to its live membership address, and sums each member's `/v1/metrics/rollup` (falling back to local rollup data on a single node / no council).
 
-Both the single-app path (`/v1/metrics/app`, via the Meat placement map) and the cluster-wide path (`/v1/metrics/cluster`, across council voters) now fan out and merge. The query timeout, top-N merge, and unresponsive-node annotations remain part of the planned design.
+Both the single-app path (`/v1/metrics/app`, via the Meat placement map) and the cluster-wide path (`/v1/metrics/cluster`, across council voters) fan out and merge, with a 10 s timeout on each fan-out (`src/bun/api/metrics.rs`). Top-N merge and annotations naming the nodes that didn't answer remain part of the planned design.
 
 ### 5.6 Alert Evaluation
 
@@ -372,7 +372,7 @@ Note the real shape: `severity`/`status` are lowercase strings; `value` is the n
 
 **Signing:** when a destination has a `secret`, the body is signed HMAC-SHA256 and the digest is sent as `X-Mayo-Signature-256: sha256=<hex>`. For PagerDuty the `secret` doubles as the routing key.
 
-**Retry policy:** failed deliveries are retried 3 times with backoff (1s, 5s, 25s); after that the delivery is dropped with a log. There is no `mayo_alert_notification_failed_total` counter. Failure logs redact the URL to scheme+host so a Slack webhook path (which carries the secret) is never written to disk.
+**Retry policy:** a delivery gets 3 attempts in all, with a 1 s wait after the first failure and a 5 s wait after the second (about 6 s of waiting, not counting request time); after the third failure the delivery is dropped with a log. There is no `mayo_alert_notification_failed_total` counter. Failure logs redact the URL to scheme+host so a Slack webhook path (which carries the secret) is never written to disk.
 
 **Job runs (#684).** The leader also sends a built-in notification through the same dispatcher for every job run that ends with a failed task (`job_run_failed`) or whose outcome becomes unknown after its owner went quiet (`job_run_unknown_outcome`). It's a critical, firing-only alert with labels `job`, `namespace` and `run`, so each run is its own PagerDuty incident; nothing resolves it. The leader derives these from the replicated job state, not from task results (`src/bun/job_events.rs`), so a million-task run sends one. A new leader takes a silent first snapshot, so a leader change never re-announces retained runs; a run that finishes in the second before the change can go unannounced, and its outcome stays in the definition's history.
 
@@ -479,7 +479,7 @@ The push interval is `metrics.rollup_interval_secs` (§6.1). The consistent-hash
 
 ### 7.2 Aggregator Council Member Failure
 
-The rollup worker keeps pushing to the last known parent and follows parent reassignment as membership changes. On a reassignment it backfills the last five minutes to the new parent as per-minute rollups, retrying until they're admitted (§5.4), so the new parent's history has no gap as long as the handoff took less than five minutes. **Still planned -- not yet implemented:** consistent-hash assignment (today's modulo hash can move many nodes when the council changes size) and per-query annotations for gaps older than the backfill window.
+Today the parent is always the current leader, so a reassignment is a leader change. The rollup worker keeps pushing to the last known parent and follows the new one. On a reassignment it backfills the last five minutes to the new parent as per-minute rollups, retrying until they're admitted (§5.4), so the new parent's history has no gap as long as the handoff took less than five minutes. **Still planned -- not yet implemented:** consistent-hash assignment (today's modulo hash can move many nodes when the council changes size) and per-query annotations for gaps older than the backfill window.
 
 ### 7.3 Stale Rollups
 
@@ -496,7 +496,7 @@ The rollup worker keeps pushing to the last known parent and follows parent reas
 **Behaviour:**
 
 - All that node's local metric history is lost. This is an accepted trade-off of per-node storage.
-- Its council parent retains the last rollups it received (a coarse 1-minute view); the cluster-wide query fan-out (§5.5) now sums each council member's rollups, so that history is reachable through any voter, not only the parent that happens to hold it.
+- The leader retains the last rollups it received (a coarse 1-minute view); the cluster-wide query fan-out (§5.5) sums each council member's rollups, so that history is reachable through any voter.
 
 **Mitigation for teams requiring durability:** set `export_path` so Parquet files are shipped to object storage before pruning. Remote-read federation into external Prometheus/Thanos is **planned -- not yet implemented**.
 

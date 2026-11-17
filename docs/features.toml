@@ -104,10 +104,10 @@ name = "Council: Raft and gossip in the agent"
 status = "ready"
 since = "0.1.0"
 summary = "Nodes find each other with SWIM gossip, and a Raft council of at most seven voters inside `bun` holds the cluster's state; spare nodes join as learners."
-restrictions = "High availability starts at three nodes. A disk-pressured voter isn't replaced on a full seven-voter council, and one slow disk write can stall a node's agent loop for just over a second."
-issues = [1523, 1524, 1707]
+restrictions = "High availability starts at three nodes."
+issues = []
 docs = ["docs/manual/02_cluster-basics.md", "docs/design/gossip-mustard.md"]
-evidence = "Every gate run kills the leader and followers, cuts power, loses quorum and checks the council history is linearizable (V02 fast tier and jobs final, 0.2.7). 0.2.7 shipped with #1707 (one 1,215 ms turn, release closure). #1523 and #1524 are in 0.3.0. Learners since 0.2.5 (#1494)."
+evidence = "Every gate run kills the leader and followers, cuts power, loses quorum and checks the council history is linearizable (V02 fast tier and jobs final, 0.2.7). 0.2.7 shipped with #1707 (one 1,215 ms turn, release closure), fixed in 0.3.0. 0.3.0 also replaces a disk-pressured voter on a full council (#1523) and holds a returning voter's elections until it hears from a leader (#1524). Learners since 0.2.5 (#1494)."
 
 [[group.feature]]
 name = "Clusters of hundreds of nodes"
@@ -180,7 +180,7 @@ title = "Running apps"
 name = "Apps, replicas and health checks"
 status = "ready"
 since = "0.1.0"
-summary = "An `[app.*]` block gives an image, replicas, resources, environment, config files and HTTP, TCP or exec health checks."
+summary = "An `[app.*]` block gives an image, replicas, resources, environment, config files and HTTP or HTTPS health checks."
 restrictions = "GPU requests above zero are refused until GPU support lands."
 issues = []
 docs = ["docs/manual/01_deploy-an-app.md", "docs/manual/01_deploy-an-app.md#health-checks"]
@@ -491,7 +491,7 @@ name = "WebSockets and streaming"
 status = "beta"
 since = "0.1.0"
 summary = "WebSocket and streaming responses pass through the ingress."
-restrictions = "A drained WebSocket isn't closed with code 1001 yet, and its proxy headers don't match plain HTTP's."
+restrictions = "None known: since 0.3.0 a drained WebSocket is closed with code 1001, and its proxy headers match plain HTTP's."
 issues = [369]
 docs = ["docs/manual/03_networking.md#ingress"]
 evidence = "F08 #369 in 0.3.0; the fix (b0de7b66) is on the 0.3.0 train."
@@ -596,13 +596,13 @@ evidence = "Upstream trust and cosign since 0.1.6 (F03a). The gate builds and si
 
 [[group.feature]]
 name = "Agent tokens labelled in audit"
-status = "planned"
-milestone = "0.4.2"
+status = "alpha"
+since = "0.2.8"
 summary = "Tokens for AI agents that are read-only by default, short-lived and labelled as agents in the audit log."
-restrictions = "Today you make a read-only token yourself with `relish token create --role read-only`."
+restrictions = "`relish token create --agent` makes one: never admin, a deployer one only proposes and takes leases, and it lives 8 h unless `--ttl` (up to 168 h). Every audit record carries the principal's kind. A per-token read rate limit and a session id in audit are still to come (#1082, 0.4.2)."
 issues = [1082]
 docs = ["docs/manual/16_working-with-an-ai-agent.md#a-read-only-token"]
-evidence = "#1082 in 0.4.2."
+evidence = "Shipped in 0.2.8 with proposals (#1682), which also put `principal_kind` on every audit record. #1082 keeps the rest in 0.4.2."
 
 # --- Secrets -----------------------------------------------------------------
 
@@ -995,7 +995,7 @@ name = "`relish agent`"
 status = "beta"
 since = "0.2.7"
 summary = "Commands that answer an AI agent in one line of JSON within a byte budget: the cluster's findings, its logs, the manual and the exact source the binary was built from."
-restrictions = "Read-only, with a read-only token. No LLM runs inside `bun`."
+restrictions = "No command changes a workload. Reading needs only a read-only token; `lease`, `propose`, `withdraw` and `undo` write council records and need a deployer agent token, and `setup --yes` writes agent configs. No LLM runs inside `bun`."
 issues = []
 docs = ["docs/manual/16_working-with-an-ai-agent.md#commands", "docs/manual/16_working-with-an-ai-agent.md#the-contract"]
 evidence = "Exit test passed on 6 November 2026: Claude Code with a read-only token diagnosed three Smoker scenarios and found a planted bug (qualification/2026-11-06-v0.2.7-exit-test.md). New in 0.2.7, so its shapes may still change."
@@ -1005,7 +1005,7 @@ name = "`relish mcp`"
 status = "beta"
 since = "0.2.7"
 summary = "Serves the `relish agent` commands as read-only MCP tools over stdio."
-restrictions = "The tools are read-only, but they run with the context's token, which is usually the admin one."
+restrictions = "From an admin context it makes and sends a read-only agent token of its own, never the admin one; a token you pass explicitly is sent as given. `--propose` adds tools that propose changes and take leases, with a deployer agent token."
 issues = []
 docs = ["docs/manual/16_working-with-an-ai-agent.md#through-mcp"]
 evidence = "New in 0.2.7; #1730 (0.2.8) gives MCP clients a read-only token of their own."
@@ -1015,7 +1015,7 @@ name = "Bug reports an agent drafts"
 status = "beta"
 since = "0.2.7"
 summary = "`relish agent report` drafts a redacted bug report with the reproducer, the patch and what wasn't tested, for you to read and post."
-restrictions = "Read the draft before you post it: redaction isn't idempotent, and a second pass can expose credentials in a URL."
+restrictions = "Redaction is pattern-based, so read the draft before you post it."
 issues = []
 docs = ["docs/manual/16_working-with-an-ai-agent.md#drafting-a-bug-report"]
 evidence = "#1717 (0.2.8). Nothing is posted on its own (manual 16)."

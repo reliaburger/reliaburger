@@ -29,7 +29,7 @@ Relish is a pure client-side binary. It doesn't run any server processes, doesn'
 
 Every Relish command that interacts with the cluster communicates through the Reliaburger cluster API, exposed on port 9117 (mTLS) on every node. The API follows the request routing described in the whitepaper:
 
-- **Read-only requests** (status, apps, nodes, inspect, logs, top, resolve, routes, history, wtf) are served by any council member from its local Raft state replica. The receiving node forwards to the nearest council member if it isn't one itself.
+- **Read-only requests** (status, apps, nodes, inspect, logs, top, resolve, routes, history, wtf) have no nearest-council-member routing. Some answer from the receiving node's own replica of council state, which can lag the leader; others are forwarded to the confirmed leader.
 - **Write requests** (apply, deploy, rollback, secret encrypt, snapshot create, fault inject) are forwarded to the leader, which commits via Raft before responding.
 
 Relish can target any node in the cluster. It doesn't need to know which node is the leader.
@@ -167,10 +167,10 @@ The API client is a thin wrapper around `reqwest` configured with:
 
 - **HTTP or HTTPS** to the Bun agent. With `--ca-cert` (or `RELIABURGER_CA_CERT`) the client trusts the cluster root CA and uses HTTPS; otherwise it talks plaintext HTTP to the local agent. There is no client-certificate file on disk.
 - **Token authentication** via a `Bearer <token>` header from `--token` or `RELIABURGER_TOKEN`.
-- **Fixed local endpoint** by default (`http[s]://127.0.0.1:9117`), overridable with `--endpoint` / `RELIABURGER_ENDPOINT`. There is no automatic multi-node endpoint discovery.
-- **WebSocket upgrade** for streaming endpoints (logs, exec).
-- **Retry with backoff** for transient failures (connection refused, 503). Maximum 3 retries with 1s/2s/4s backoff.
-- **Request timeout:** 30s default, configurable per-command. Streaming connections have no timeout.
+- **Endpoint:** `--endpoint` / `RELIABURGER_ENDPOINT` first, then the laptop cluster's saved context, then `http://127.0.0.1:9117` (manual 13). There is no automatic multi-node endpoint discovery.
+- **Plain HTTP for streams:** `relish logs -f` reads a streamed HTTP response, and `exec` is a plain `POST /v1/exec/{app}/{namespace}`.
+- **No automatic retries** on ordinary requests. A few calls retry a specific answer themselves (a fault clear retries a 504 within a budget, for example), and write calls that take an `Idempotency-Key` are safe for the caller to repeat.
+- **Timeouts:** a connect timeout, and a 300-second total timeout on every request from the shared client. Today that total covers streamed bodies too, so a `relish logs -f` or a long `apply` stream ends after five minutes.
 
 ### Output Formatting
 

