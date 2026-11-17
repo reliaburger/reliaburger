@@ -1222,7 +1222,50 @@ impl NodeConfig {
             }
         }
 
-        self.validate_stale_report_timeout()
+        self.validate_stale_report_timeout()?;
+        if self.reporting_tree.stale_node_grace_secs == 0 {
+            return Err(ConfigError::Validation {
+                field: "reporting_tree.stale_node_grace_secs".to_string(),
+                context: "node config".to_string(),
+                reason: "must be greater than zero".to_string(),
+            });
+        }
+        self.validate_smoker_durations()
+    }
+
+    /// Fault durations must satisfy `0 < default <= max <= 1 day`. A default
+    /// above the maximum refuses every fault injected without `--duration`,
+    /// a zero refuses every timed fault, and `FaultRule::new` would silently
+    /// cut anything over a day to 24 h.
+    fn validate_smoker_durations(&self) -> Result<(), ConfigError> {
+        let smoker = &self.smoker;
+        let max_secs = crate::smoker::types::MAX_FAULT_DURATION_NS / 1_000_000_000;
+        let (field, reason) = if smoker.default_duration_secs == 0 {
+            (
+                "default_duration_secs",
+                "must be greater than zero".to_string(),
+            )
+        } else if smoker.default_duration_secs > smoker.max_duration_secs {
+            (
+                "default_duration_secs",
+                format!(
+                    "must be at most smoker.max_duration_secs ({}s)",
+                    smoker.max_duration_secs
+                ),
+            )
+        } else if smoker.max_duration_secs > max_secs {
+            (
+                "max_duration_secs",
+                format!("must be at most {max_secs}s (one day)"),
+            )
+        } else {
+            return Ok(());
+        };
+        Err(ConfigError::Validation {
+            field: format!("smoker.{field}"),
+            context: "node config".to_string(),
+            reason,
+        })
     }
 
     /// A stale timeout at or below the report interval marks every node
@@ -1459,6 +1502,47 @@ mod tests {
             5
         )));
         assert!(stale_report_timeout_error(max, 5).is_none());
+    }
+
+    fn refused_field(node: &crate::config::NodeConfig) -> Option<String> {
+        match node.validate() {
+            Err(ConfigError::Validation { field, .. }) => Some(field),
+            Err(other) => panic!("unexpected error {other:?}"),
+            Ok(()) => None,
+        }
+    }
+
+    #[test]
+    fn node_config_rejects_a_zero_stale_node_grace() {
+        // Zero would move a live node's replicas the moment its reports go
+        // stale.
+        let mut node = crate::config::NodeConfig::default();
+        node.reporting_tree.stale_node_grace_secs = 0;
+        assert_eq!(
+            refused_field(&node).as_deref(),
+            Some("reporting_tree.stale_node_grace_secs")
+        );
+    }
+
+    #[test]
+    fn smoker_durations_must_satisfy_zero_below_default_below_max_below_a_day() {
+        let smoker = |default, max| {
+            let mut node = crate::config::NodeConfig::default();
+            node.smoker.default_duration_secs = default;
+            node.smoker.max_duration_secs = max;
+            refused_field(&node)
+        };
+        let default_field = Some("smoker.default_duration_secs".to_string());
+        let max_field = Some("smoker.max_duration_secs".to_string());
+        // A default above the maximum refuses every fault given no duration.
+        assert_eq!(smoker(600, 300), default_field);
+        assert_eq!(smoker(0, 3600), default_field);
+        // Zero refuses every timed fault.
+        assert_eq!(smoker(0, 0), default_field);
+        // Over a day, FaultRule::new would silently cut it to 24 h.
+        assert_eq!(smoker(600, 86_401), max_field);
+        assert_eq!(smoker(300, 300), None);
+        assert_eq!(smoker(1, 86_400), None);
     }
 
     #[test]
