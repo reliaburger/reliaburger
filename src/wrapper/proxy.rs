@@ -513,23 +513,32 @@ pub(super) fn generate_request_id() -> String {
 
 /// The host a request is for, as the routing table matches it.
 ///
-/// HTTP/1.1 names the host in the `Host` header. HTTP/2 names it in the
-/// `:authority` pseudo-header, which hyper puts in the request URI, and a
-/// client usually sends no `Host` header at all. Browsers and curl negotiate
-/// HTTP/2 on the HTTPS listener, so the URI's authority is the fallback.
-/// An empty string matches no route.
-fn request_host(req: &Request<Body>) -> String {
-    if let Some(host) = req
+/// HTTP/1.1 names the host in the `Host` header, with the URI's authority
+/// as the fallback. HTTP/2 names it in the `:authority` pseudo-header, which
+/// hyper puts in the request URI, and a client usually sends no `Host`
+/// header at all. RFC 9113 §8.3.1 makes `:authority` win there, and calls a
+/// request whose `Host` disagrees with it malformed: that one is refused
+/// with 400 rather than routed by either. An empty string matches no route.
+fn request_host(req: &Request<Body>) -> Result<String, StatusCode> {
+    let header = req
         .headers()
         .get(axum::http::header::HOST)
-        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.to_str().ok());
+    let authority = req.uri().authority();
+    if req.version() == axum::http::Version::HTTP_2
+        && let Some(authority) = authority
     {
-        return host.to_string();
+        if header.is_some_and(|host| !host.eq_ignore_ascii_case(authority.as_str())) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        return Ok(authority.host().to_string());
     }
-    req.uri()
-        .authority()
+    if let Some(host) = header {
+        return Ok(host.to_string());
+    }
+    Ok(authority
         .map(|authority| authority.host().to_string())
-        .unwrap_or_default()
+        .unwrap_or_default())
 }
 
 /// Route and proxy a single request.
@@ -543,7 +552,10 @@ async fn do_proxy(
     // Check for WebSocket upgrade before anything else
     let is_ws = super::websocket::is_websocket_upgrade(&req);
 
-    let host = request_host(&req);
+    let host = match request_host(&req) {
+        Ok(host) => host,
+        Err(status) => return status.into_response(),
+    };
 
     let path = req.uri().path().to_string();
 

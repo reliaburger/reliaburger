@@ -466,9 +466,10 @@ Every inbound HTTPS request follows this path:
       an unknown SNI (or none) is served the self-signed default, which a
       hostname-validating client rejects
 3.  HTTP/1.1 or HTTP/2 request parsed (via hyper's auto builder). Wrapper's rustls config advertises ALPN `h2, http/1.1`, so browsers and curl negotiate HTTP/2 over TLS. (hyper's auto builder also speaks h2 on cleartext prior-knowledge.)
-4.  Host taken from the `Host` header; when there is none (HTTP/2 sends the
-    host as the `:authority` pseudo-header, which hyper puts in the request
-    URI), from the URI's authority. The SNI hostname is not used.
+4.  Host extracted. HTTP/2 uses the `:authority` pseudo-header, which hyper
+    puts in the request URI (RFC 9113 §8.3.1); a request whose `Host` header
+    disagrees with it is malformed and gets 400. HTTP/1.1 uses the `Host`
+    header, falling back to the URI's authority. The SNI hostname is not used.
 5.  Routing table lookup:
     a. Exact match on Host → Vec<PathRoute>
     b. Longest path prefix match → PathRoute
