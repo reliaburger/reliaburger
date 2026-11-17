@@ -753,10 +753,10 @@ fn every_section_can_be_linked_to() {
     );
 }
 
-/// The page sets expectations before anyone installs, and the date it gives
-/// for 1.0.0 is the one the roadmap gives.
+/// The page sets expectations before anyone installs, and, like the roadmap,
+/// gives 1.0.0 no date.
 #[test]
-fn the_status_box_says_who_it_is_for_and_when_1_0_0_is_due() {
+fn the_status_box_says_who_it_is_for_and_that_1_0_0_has_no_date() {
     let page = read("docs/website/index.html");
     let start = page
         .find("<aside class=\"status status-note\"")
@@ -768,8 +768,11 @@ fn the_status_box_says_who_it_is_for_and_when_1_0_0_is_due() {
     for phrase in ["home labs", "dev clusters", "production until 1.0.0"] {
         assert!(text.contains(phrase), "the status box lacks {phrase:?}");
     }
-    assert!(text.contains("January 2027"));
-    assert!(read("docs/roadmap.md").contains("January 2027"));
+    // Releases go out when they're ready, with no target dates before 1.0
+    // (maintainer decision, 6 November 2026).
+    assert!(text.contains("1.0.0, which has no date yet"));
+    assert!(read("docs/roadmap.md").contains("no target dates before 1.0.0"));
+    assert!(!page.contains("January 2027"));
 }
 
 /// The day run is the page's headline claim, so its memory chart stays beside
