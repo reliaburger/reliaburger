@@ -284,6 +284,25 @@ fn token_context(stored: &ApiToken, principal_id: String) -> AuthContext {
     }
 }
 
+/// The context the stored token behind `principal_id` authenticates as,
+/// its current secret or one still in its rotation grace, with its role and
+/// scope as they stand in `tokens`. `None` when no stored token has that
+/// principal id any more. The proposal reaper judges a policy approval as
+/// its author through this, since no request carries the author's token.
+pub(crate) fn context_for_principal(
+    principal_id: &str,
+    tokens: &[ApiToken],
+) -> Option<AuthContext> {
+    tokens.iter().find_map(|stored| {
+        let current = token_principal_id(stored) == principal_id;
+        let previous = stored
+            .previous_secret
+            .as_ref()
+            .is_some_and(|previous| principal_for_hash(&previous.token_hash) == principal_id);
+        (current || previous).then(|| token_context(stored, principal_id.to_string()))
+    })
+}
+
 /// The context of the token a browser session was made from, with that
 /// token's own role and scope, read from the store now, so a token revoked,
 /// expired, rotated past its grace period or changed since login counts as

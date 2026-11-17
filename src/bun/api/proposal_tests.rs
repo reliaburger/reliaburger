@@ -23,6 +23,9 @@ struct Cluster {
     watcher: String,
     /// A deployer agent token scoped to `billing`.
     billing_bot: String,
+    /// The stored token behind `billing_bot`, for a test that commits it to
+    /// the council, where the reaper looks an author's scope up.
+    billing_bot_token: crate::sesame::types::ApiToken,
     /// A human admin.
     alice: String,
     /// A human deployer.
@@ -98,6 +101,7 @@ async fn cluster(tag: &str) -> Cluster {
     let mut store = EventStore::new();
     store.set_audit_log(log.clone());
     let events = Arc::new(RwLock::new(store));
+    let billing_bot_token = billing_bot.token.clone();
     let (app, shutdown) = setup_with_auth_leases_events_and_council(
         vec![
             holmes.token,
@@ -123,6 +127,7 @@ async fn cluster(tag: &str) -> Cluster {
         holmes: holmes.plaintext,
         watcher: watcher.plaintext,
         billing_bot: billing_bot.plaintext,
+        billing_bot_token,
         alice,
         bob,
         carol: carol.plaintext,
@@ -2131,4 +2136,78 @@ async fn a_proposal_cant_route_a_host_another_namespace_serves() {
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// Approve an agent's apply in `billing` without a person.
+const AGENTS_APPLY_IN_BILLING: &str = "[policy.agents-apply-billing]\n\
+     applies_to = \"proposals\"\n\
+     action = \"approve\"\n\
+     match = 'author.kind == \"agent\" && proposal.kind == \"apply\" && proposal.namespace == \"billing\"'\n";
+
+/// The reaper approves a pending proposal when a later policy allows it,
+/// with no person behind the approval. It applies the ingress-host rule as
+/// the author, against the cluster as it is then: a host another namespace
+/// took after the proposal was made fails the proposal with the reason,
+/// and nothing is written. A proposal on a free host still applies.
+#[tokio::test]
+async fn the_reaper_checks_ingress_hosts_as_the_author() {
+    let cluster = cluster("proposal-reaper-ingress").await;
+    // The reaper reads the author's scope from the council's tokens.
+    cluster
+        .council
+        .write(crate::council::types::RaftRequest::CreateApiToken(
+            cluster.billing_bot_token.clone(),
+        ))
+        .await
+        .unwrap();
+    let (status, body) = cluster
+        .propose(
+            &cluster.billing_bot,
+            ingress_proposal("pay", "pay.example.com", "/"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["state"], "pending", "{body}");
+    let taken = body["id"].as_u64().unwrap();
+    let (status, body) = cluster
+        .propose(
+            &cluster.billing_bot,
+            ingress_proposal("till", "till.example.com", "/"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let free = body["id"].as_u64().unwrap();
+
+    serve_host(&cluster, "checkout", "shop", "pay.example.com").await;
+    cluster.write_policies(AGENTS_APPLY_IN_BILLING).await;
+    crate::bun::proposals::reap_once(
+        &cluster.council,
+        Some(&cluster.events),
+        "node-1",
+        crate::testkit::lease::now_unix_millis(),
+    )
+    .await
+    .unwrap();
+
+    let (_, body) = cluster
+        .get(&format!("/v1/proposals/{taken}"), &cluster.alice)
+        .await;
+    assert_eq!(body["state"], "failed", "{body}");
+    assert!(body.to_string().contains("ingress host"), "{body}");
+    let desired = cluster.council.desired_state().await;
+    assert!(
+        !desired
+            .apps
+            .contains_key(&crate::meat::AppId::new("pay", "billing"))
+    );
+
+    let (_, body) = cluster
+        .get(&format!("/v1/proposals/{free}"), &cluster.alice)
+        .await;
+    assert_eq!(body["state"], "applied", "{body}");
+    assert!(
+        desired
+            .apps
+            .contains_key(&crate::meat::AppId::new("till", "billing"))
+    );
 }

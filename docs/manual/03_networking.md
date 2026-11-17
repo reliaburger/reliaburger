@@ -150,7 +150,9 @@ wins. A host belongs to whoever serves it, though: a token scoped with
 `--namespaces` or `--apps` can't put a route on a host that an app outside its
 scope already serves, at any path, and `relish apply` answers 403. The rule
 holds for an app in a manifest with jobs, and for a proposal when it's made,
-approved or undone. An unscoped
+approved or undone. A proposal a policy approves later is checked again as
+its author at that moment, and fails with the reason if the host has been
+taken since. An unscoped
 token can share a host across namespaces on purpose. Each app on it keeps its
 route through later applies, but adding another app to a shared host takes an
 unscoped token.

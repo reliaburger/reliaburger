@@ -1065,7 +1065,11 @@ an app on an ingress host only if every app already serving that host is in
 its scope (`authorize_ingress_hosts`, `authorize_ingress_apps`): the leader's
 apply path (`cluster_apply`), a manifest with jobs (`job_apply::apply`), and a
 proposal when it's created (as the author), approved (as the approver) and
-undone (the `before` specs, as the undoer). GitOps syncs only a repository an
+undone (the `before` specs, as the undoer). When the reaper approves a pending
+proposal under a policy, it checks again as the author, whose scope it reads
+from the stored token (`sesame::auth::context_for_principal`), against the
+cluster at that moment. A conflict, or an author whose token is gone, fails
+the proposal with the reason (`FailedReason::Refused`) and writes nothing. GitOps syncs only a repository an
 unscoped admin configured, so it carries that authority and isn't checked. An app that already serves the host
 keeps it through later applies, so an unscoped token can share a host across
 namespaces on purpose. Unscoped tokens aren't checked: they may change any of

@@ -632,6 +632,21 @@ pub(crate) fn authorize_ingress_apps<'a>(
     apps: impl IntoIterator<Item = (crate::meat::types::AppId, &'a crate::config::app::AppSpec)>,
     desired: &crate::council::types::DesiredState,
 ) -> Result<(), Response> {
+    match ingress_host_conflict(auth, apps, desired) {
+        Some(reason) => Err(crate::sesame::auth::scope_refusal(reason)),
+        None => Ok(()),
+    }
+}
+
+/// Why one of `apps` may not take its ingress host under `auth`'s scope,
+/// or `None` when every one may. The rule [`authorize_ingress_hosts`]
+/// describes, as a sentence, for a caller that records the reason rather
+/// than answering with it (the proposal reaper).
+pub(crate) fn ingress_host_conflict<'a>(
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    apps: impl IntoIterator<Item = (crate::meat::types::AppId, &'a crate::config::app::AppSpec)>,
+    desired: &crate::council::types::DesiredState,
+) -> Option<String> {
     for (id, spec) in apps {
         let Some(ingress) = &spec.ingress else {
             continue;
@@ -656,14 +671,14 @@ pub(crate) fn authorize_ingress_apps<'a>(
                     .is_err()
         });
         if outside_scope {
-            return Err(crate::sesame::auth::scope_refusal(format!(
+            return Some(format!(
                 "app.{}: ingress host {host:?} is already served by an app outside this \
                  token's scope; a host's routes belong to the namespace that serves it",
                 id.name
-            )));
+            ));
         }
     }
-    Ok(())
+    None
 }
 
 /// Apply a config in cluster mode: propose each app spec to Raft.
