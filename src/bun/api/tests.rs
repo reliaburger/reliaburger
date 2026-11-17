@@ -255,6 +255,19 @@ async fn seeded_council_with_log(
     Arc<crate::council::CouncilNode>,
     crate::council::log_store::MemLogStore,
 ) {
+    let (node, log, _) = seeded_council_with_init(tag).await;
+    (node, log)
+}
+
+/// [`seeded_council_with_log`], with the cluster's init result too: its
+/// `node_certificate` is a valid TLS identity for `node-1`.
+async fn seeded_council_with_init(
+    tag: &str,
+) -> (
+    Arc<crate::council::CouncilNode>,
+    crate::council::log_store::MemLogStore,
+    crate::sesame::init::InitResult,
+) {
     use std::collections::BTreeMap;
 
     use crate::council::log_store::MemLogStore;
@@ -305,7 +318,7 @@ async fn seeded_council_with_log(
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    (Arc::new(node), log)
+    (Arc::new(node), log, init)
 }
 
 /// Send a GET to `uri` against `app` and return (status, body bytes).
@@ -3670,6 +3683,55 @@ async fn placements_expose_only_the_consumers_original_withdrawal_generations() 
     assert_eq!(
         instructions[1]["services"]["default__web"]["retire_vip"],
         true
+    );
+    shutdown.cancel();
+    council.shutdown().await.unwrap();
+}
+
+/// A node reports only its own failed rollouts: with a TLS identity, the
+/// report must name the node that identity belongs to.
+#[tokio::test]
+async fn a_rollout_failure_must_name_the_reporting_node() {
+    let (council, _log, init) = seeded_council_with_init("rollout-failed-peer").await;
+    let (app, shutdown) = setup_with_auth_leases_events_and_council(
+        vec![],
+        Some("internal".into()),
+        crate::bun::readiness::ReadinessTracker::new(),
+        lease_static_capabilities(),
+        None,
+        None,
+        Some(council.clone()),
+    )
+    .await;
+    let as_node_1 = app.layer(axum::Extension(crate::sesame::renewal::TlsPeerCertificate(
+        init.node_certificate.certificate_der.clone().into(),
+    )));
+    let report = |node: &str| {
+        format!(
+            r#"{{"app_name":"web","namespace":"default","node":"{node}","fingerprint":"0","reason":"test"}}"#
+        )
+    };
+    assert_eq!(
+        post_status(
+            as_node_1.clone(),
+            "/v1/rollouts/failed",
+            "internal",
+            &report("node-2")
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    // Its own report gets past the identity check; the state machine then
+    // refuses it because no app `web` exists.
+    assert_eq!(
+        post_status(
+            as_node_1,
+            "/v1/rollouts/failed",
+            "internal",
+            &report("node-1")
+        )
+        .await,
+        StatusCode::CONFLICT
     );
     shutdown.cancel();
     council.shutdown().await.unwrap();

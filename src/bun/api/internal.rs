@@ -446,6 +446,7 @@ pub(super) async fn credential_free_development_cluster(
 /// node the app is placed on (#1067).
 pub(super) async fn rollout_failed_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    peer: Option<axum::Extension<crate::sesame::renewal::TlsPeerCertificate>>,
     State(state): State<ApiState>,
     Json(report): Json<crate::cluster::rollout::RolloutFailureReport>,
 ) -> Response {
@@ -467,6 +468,21 @@ pub(super) async fn rollout_failed_handler(
             "rollout failures go to the current leader",
         )
             .into_response();
+    }
+    // A node speaks only for itself: over mTLS the report must name the
+    // node the certificate belongs to, as placements and CSRs do.
+    if let Some(peer) = peer {
+        let security = council.desired_state().await.security_state;
+        match crate::sesame::renewal::validate_peer(&peer, &security) {
+            Ok(identity) if identity == report.node => {}
+            _ => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    "a rollout failure must name the node that reports it",
+                )
+                    .into_response();
+            }
+        }
     }
     let app_id = crate::meat::AppId::new(&report.app_name, &report.namespace);
     // Nobody vouches for an unauthenticated report, so it can speak only for
