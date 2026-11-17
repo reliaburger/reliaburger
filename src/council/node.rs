@@ -30,6 +30,14 @@ use crate::sesame::types::{CaRole, SerialNumber, SpiffeUri};
 /// settled leader's followers can answer it late (#1009, #1393, #1937).
 pub const LEADER_CONFIRMATION: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// How long [`CouncilNode::write`] waits for a write to commit. A leader
+/// that lost its quorum after it last proved it leads keeps a write
+/// pending until a new term reaches it, which can be the whole partition;
+/// past this the caller gets [`CouncilError::WriteTimedOut`] instead.
+/// A healthy commit takes milliseconds; the margin is for fsync stalls
+/// on a loaded host (#1902), matching the task-array write timeout.
+pub const WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// How often [`CouncilNode::applied_api_token`] looks at the replica again.
 const API_TOKEN_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
@@ -329,10 +337,32 @@ impl CouncilNode {
         Ok(())
     }
 
-    /// Write a request to the Raft log.
+    /// Write a request to the Raft log, waiting at most [`WRITE_TIMEOUT`]
+    /// for it to commit.
     ///
-    /// Returns `ForwardToLeader` if this node is not the leader.
+    /// Returns `ForwardToLeader` if this node is not the leader, and
+    /// `WriteTimedOut` if the write didn't commit in time. A timed-out
+    /// write may still commit later.
     pub async fn write(&self, request: RaftRequest) -> Result<CouncilResponse, CouncilError> {
+        self.write_within(WRITE_TIMEOUT, request).await
+    }
+
+    /// [`Self::write`] with a deadline of the caller's choosing, for a loop
+    /// that must get back to its other work sooner.
+    pub async fn write_within(
+        &self,
+        deadline: Duration,
+        request: RaftRequest,
+    ) -> Result<CouncilResponse, CouncilError> {
+        // Dropping openraft's pending `client_write` only stops waiting for
+        // its answer: the entry, if proposed, still commits or is lost by
+        // Raft's own rules, so the outcome is unknown rather than undone.
+        tokio::time::timeout(deadline, self.write_unbounded(request))
+            .await
+            .unwrap_or(Err(CouncilError::WriteTimedOut { waited: deadline }))
+    }
+
+    async fn write_unbounded(&self, request: RaftRequest) -> Result<CouncilResponse, CouncilError> {
         #[cfg(test)]
         self.hang_write_if_asked(&request).await;
         if let Some(error) = self.fenced_error() {
@@ -2250,6 +2280,39 @@ mod tests {
         assert_eq!(
             result.unwrap_err().to_string(),
             format!("not the leader (the leader is node-{leader_id})")
+        );
+    }
+
+    /// A leader that lost its quorum after confirming it leads used to wait
+    /// in `client_write` until a new term reached it, so a handler or loop
+    /// behind it hung for the whole partition. The write now gives up at
+    /// [`WRITE_TIMEOUT`] and says its outcome is unknown.
+    #[tokio::test(start_paused = true)]
+    async fn a_write_without_quorum_gives_up_at_the_write_timeout() {
+        let (nodes, router) = create_cluster(3).await;
+        init_cluster(&nodes).await;
+        let leader_id = wait_for_leader(&nodes, Duration::from_secs(5))
+            .await
+            .unwrap();
+        for node in &nodes {
+            node.hold_elections_until(std::time::Instant::now() + Duration::from_secs(60));
+        }
+        let leader = &nodes[(leader_id - 1) as usize];
+        for follower in (1..=3).filter(|id| *id != leader_id) {
+            router.partition(leader_id, follower).await;
+        }
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(WRITE_TIMEOUT * 3, leader.write(RaftRequest::Noop))
+            .await
+            .expect("a write without quorum never returned");
+        assert!(
+            matches!(result, Err(CouncilError::WriteTimedOut { .. })),
+            "expected WriteTimedOut, got {result:?}"
+        );
+        assert!(started.elapsed() >= WRITE_TIMEOUT);
+        assert!(
+            result.unwrap_err().to_string().contains("outcome unknown"),
+            "the caller must know the write may still commit"
         );
     }
 

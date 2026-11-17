@@ -83,6 +83,10 @@ pub enum CouncilError {
     InitError(String),
     #[error("raft write failed: {0}")]
     WriteFailed(String),
+    /// A write didn't commit within its deadline. It may still commit:
+    /// the caller has to check, or repeat an idempotent write.
+    #[error("raft write outcome unknown: not committed within {waited:?}")]
+    WriteTimedOut { waited: std::time::Duration },
     #[error("linearizable read failed: {0}")]
     ReadFailed(String),
     #[error("network error: {0}")]

@@ -1138,6 +1138,7 @@ The last piece is the bootstrap guard's freshness check. `is_fresh` used to retu
 
 The test that ties the theme together does the full loop through the real startup path: bootstrap a node on durable storage, write state, trigger a snapshot, let openraft purge the log, then flip one byte in the stored payload and restart. The restart must return an error (the checksum mismatch) and never a plausible-looking empty cluster. A sibling test deletes the snapshot outright and expects the purge-boundary error instead. Corruption you can detect at startup is an incident; corruption you detect three weeks later is an archaeology dig.
 
+
 ### The file that outgrew its header
 
 All that care about our own bytes didn't help when the store underneath us broke. The 0.2.1 soak cut the power to a node, and on the way back up Bun panicked inside redb before it had read a single key:
@@ -1256,6 +1257,24 @@ pub async fn write(&self, request: RaftRequest)
 ```
 
 We match on the specific error variant we care about (`ForwardToLeader`) and flatten everything else into a generic string. This is deliberate: the caller needs to know whether to retry on a different node, but doesn't need to distinguish between the dozen other failure modes openraft defines.
+
+That listing is the first version. A later review ([#2055](https://github.com/reliaburger/reliaburger/issues/2055)) found the hole in it: `client_write` has no deadline. Picture a leader that proved it leads, then lost both followers to a partition. It proposes the entry, and the entry can't commit, because no quorum will ever acknowledge it. openraft keeps the write pending until a newer term reaches the leader, and that only happens when the partition heals. Every handler waiting on that write waits with it, and so does the lease reaper, so leases stop expiring for as long as the partition lasts. Today `write` gives up after `WRITE_TIMEOUT`, 10 seconds:
+
+```rust
+pub async fn write_within(
+    &self,
+    deadline: Duration,
+    request: RaftRequest,
+) -> Result<CouncilResponse, CouncilError> {
+    tokio::time::timeout(deadline, self.write_unbounded(request))
+        .await
+        .unwrap_or(Err(CouncilError::WriteTimedOut { waited: deadline }))
+}
+```
+
+`tokio::time::timeout` returns `Result<T, Elapsed>`, and here `T` is itself a `Result`. `unwrap_or` peels off the outer layer: an answer in time comes through as it is, and a late one becomes our own `WriteTimedOut`. Note that this `unwrap_or` can't panic, unlike `unwrap`. It takes the value to use instead. When the timeout fires, Rust drops the `write_unbounded` future, and with it openraft's pending `client_write`. That stops us waiting, but it doesn't take the entry back. If the leader already proposed it, it may still commit once the partition heals. So the error's message says "outcome unknown", not "failed", and the HTTP handlers answer 503 with that message. `write` is `write_within(WRITE_TIMEOUT, request)`. The scheduler's loop passes 5 seconds, so a stuck write can't hold up the next tick's placements.
+
+`a_write_without_quorum_gives_up_at_the_write_timeout`, in `src/council/node.rs`, builds this case with the in-memory router: three voters, elections held so the followers don't depose anyone, and the leader cut off from both. Before the change the write never returned. The test runs on a paused clock (`#[tokio::test(start_paused = true)]`): when every task is waiting, Tokio moves the clock straight to the next timer, so a 10-second timeout costs no real time.
 
 ### Bootstrap: the loneliest node
 
