@@ -77,6 +77,17 @@ that can't unseal the cluster's GitOps credentials (no master key) gets a
 of these, the `gitops` OK row says so. See
 [GitOps](12_operations.md#gitops).
 
+`wtf` asks every node what its council backup loop is doing. A node with
+`[cluster.backup]` set whose loop can't run (no master key, or a destination
+the object store can't open) is a critical `backup-disabled` finding with the
+reason. The leader's last export failing, or no node having exported for three
+intervals, is a `backup-failing` warning. One council member without
+`[cluster.backup]` while others have it is a `backup-not-configured` warning.
+With no member configured, the `backups` OK row says backups aren't
+configured; otherwise it says the leader is exporting. With no leader
+observed, there's no `backups` row. See
+[Backing up the council](12_operations.md#backing-up-the-council).
+
 `wtf` also asks every node for its own view of the council, because a split
 brain looks healthy from either half. It reports CRITICAL when a node is
 fenced out of a council `relish council recover` replaced, when nodes serve
@@ -162,6 +173,9 @@ means, the numbers that decide it and the line of code that does (see
 | `gitops-plaintext-secret` | warning | A secret is plaintext in the GitOps repository |
 | `gitops-local-config` | warning | A node's own `[gitops]` is ignored |
 | `gitops-config-unreadable` | warning | A node can't unseal the GitOps credentials |
+| `backup-disabled` | critical | A node has `[cluster.backup]` but its backup loop can't run |
+| `backup-not-configured` | warning | One council member lacks `[cluster.backup]` while others have it |
+| `backup-failing` | warning | The leader's last backup failed, or none for 3 intervals |
 | `policy-broken` | warning | A policy in force can't be evaluated |
 | `policy-would-deny` | warning | A committed app or job breaks a deny policy |
 | `policy-audit` | warning | A committed app or job breaks an audit policy |

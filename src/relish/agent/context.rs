@@ -641,6 +641,7 @@ mod tests {
                 }),
                 gitops: available(GitOpsObservation::default()),
                 policies: available(crate::policy::audit::PolicyAudit::default()),
+                backups: available(Vec::new()),
             },
             applications: ApplicationEvidence {
                 restarts: available(vec![

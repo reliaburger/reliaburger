@@ -202,7 +202,11 @@ pub enum RaftRequest {
     /// Add a new API token.
     CreateApiToken(crate::sesame::types::ApiToken),
     /// Revoke (remove) an API token by name.
-    RevokeApiToken { name: String },
+    ///
+    /// `now_unix_ms` is the proposer's clock, so every replica judges which
+    /// Admin tokens have expired the same way when it applies the guard
+    /// against revoking the last usable Admin (#2014).
+    RevokeApiToken { name: String, now_unix_ms: u64 },
     /// Allocate the next certificate serial number.
     AllocateSerial,
     /// Start a secret key rotation: add a new age keypair, mark the
@@ -1222,6 +1226,7 @@ mod tests {
             }),
             RaftRequest::RevokeApiToken {
                 name: "ci-deploy".to_string(),
+                now_unix_ms: 0,
             },
             RaftRequest::RotateApiToken(crate::sesame::types::TokenRotation {
                 name: "ci-deploy".to_string(),

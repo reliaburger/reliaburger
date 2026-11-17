@@ -392,6 +392,22 @@ pub struct ClusterEvidence {
     /// What the policies in force would now say about every committed app
     /// and job (#1119), the report `relish policy audit` prints.
     pub policies: Evidence<crate::policy::audit::PolicyAudit>,
+    /// Each node's council backup loop (#2016). Empty on a standalone node,
+    /// which has no council to back up.
+    pub backups: Evidence<Vec<BackupObservation>>,
+}
+
+/// One node's council backup loop, from its `GET /v1/diagnostics` (#2016).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupObservation {
+    /// Node identifier.
+    pub node_id: String,
+    /// Whether the node is a council voter, and so may lead and export.
+    pub is_council: bool,
+    /// Whether the node led the council when wtf asked.
+    pub is_leader: bool,
+    /// What its backup loop is doing.
+    pub status: crate::council::backup::BackupStatus,
 }
 
 /// What `relish wtf` checks about GitOps (#693).

@@ -98,8 +98,10 @@ every fault, or apply `[namespace]` and `[permission]` declarations. A
 
 `create` prints the plaintext token once, on stdout, and the cluster keeps
 only a hash, so `TOKEN="$(relish token create ...)"` captures it. Its expiry
-goes to stderr. `revoke` refuses to remove the last admin token; create its
-replacement first. Revoking a token, or letting it expire, also ends every
+goes to stderr. `revoke` refuses to remove the only admin token, and the
+last admin token that is unexpired and unscoped; create its replacement first.
+An expired admin token can't let anyone in, and a scoped one can't create or
+revoke tokens, so neither counts as a replacement. Revoking a token, or letting it expire, also ends every
 dashboard session that was logged in with it.
 
 `create`, `rotate`, `revoke` and `join-token create` work against any node: a

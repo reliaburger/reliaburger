@@ -1394,7 +1394,10 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(60));
 
         nodes[0]
-            .write(RaftRequest::RevokeApiToken { name: "ci".into() })
+            .write(RaftRequest::RevokeApiToken {
+                name: "ci".into(),
+                now_unix_ms: 0,
+            })
             .await
             .unwrap();
         assert!(

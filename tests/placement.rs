@@ -2837,6 +2837,48 @@ async fn wtf_and_path_reach_every_node_through_the_entry_node() {
         "the leader's council view came through the relay: {:?}",
         inputs.cluster.council
     );
+    // Every node reports its council backup loop (#2016); this cluster
+    // configures none, which wtf's OK row says.
+    let backups = inputs
+        .cluster
+        .backups
+        .value()
+        .expect("backup evidence is available")
+        .clone();
+    let mut reported: Vec<_> = backups
+        .iter()
+        .map(|node| (node.node_id.clone(), node.status.clone()))
+        .collect();
+    reported.sort_by(|a, b| a.0.cmp(&b.0));
+    let expected: Vec<_> = names
+        .iter()
+        .map(|name| {
+            (
+                name.clone(),
+                reliaburger::council::backup::BackupStatus::NotConfigured,
+            )
+        })
+        .collect();
+    assert_eq!(reported, expected);
+    let cluster_wide = reliaburger::relish::wtf::WtfInputs {
+        app: None,
+        ..inputs.clone()
+    };
+    let report = reliaburger::relish::wtf::diagnose(&cluster_wide);
+    assert!(
+        report
+            .ok
+            .iter()
+            .any(|ok| ok.id == "backups" && ok.description.contains("aren't configured")),
+        "{report:?}"
+    );
+    assert!(
+        !report
+            .warnings
+            .iter()
+            .any(|finding| finding.id.starts_with("backup-")),
+        "{report:?}"
+    );
 
     let result = reliaburger::relish::path_cmd::probe_path(
         &reliaburger::onion::trace::TraceRequest {

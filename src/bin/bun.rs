@@ -1386,6 +1386,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     let mut api_known_members: Option<api::KnownMembers> = None;
     // Gossip's own counters, for `GET /v1/cluster/summary`.
     let mut api_gossip_stats: Option<reliaburger::mustard::stats::GossipStats> = None;
+    let mut api_backup_monitor: Option<reliaburger::council::backup::BackupMonitor> = None;
     // Handles the orchestration tasks need, captured before the
     // ClusterHandle moves into the agent (spawned further down, once
     // the service token exists).
@@ -1466,6 +1467,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         replication_membership = Some(handle.membership_rx.clone());
         registry_directory = Some(cluster_runtime.directory_rx.clone());
         api_gossip_stats = Some(cluster_runtime.gossip_stats.clone());
+        api_backup_monitor = Some(reliaburger::council::backup::BackupMonitor(
+            cluster_runtime.backup_rx.clone(),
+        ));
         orchestration = Some((
             handle.membership_rx.clone(),
             handle.raft_metrics_rx.clone(),
@@ -3318,6 +3322,10 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     };
     let app = match api_gossip_stats {
         Some(stats) => app.layer(axum::Extension(stats)),
+        None => app,
+    };
+    let app = match api_backup_monitor {
+        Some(monitor) => app.layer(axum::Extension(monitor)),
         None => app,
     };
     let app = match leader_directory {

@@ -85,6 +85,9 @@ pub struct ClusterRuntime {
     /// This node's gossip counters: updates received and the last
     /// membership change, read by `GET /v1/cluster/summary`.
     pub gossip_stats: crate::mustard::stats::GossipStats,
+    /// This node's council backup loop state (#2016), served by
+    /// `GET /v1/diagnostics` for `relish wtf`.
+    pub backup_rx: watch::Receiver<crate::council::backup::BackupStatus>,
 }
 
 /// Configuration for starting the cluster runtime, derived from node config.
@@ -611,23 +614,31 @@ pub async fn start(
     );
 
     // Encrypted external council backup (12b.2 D21/CP12): a leader-only export
-    // loop, only when a destination is configured and a master key is present
-    // to seal with. Without the master key there is nothing to derive the seal
-    // key from, so we skip it loudly rather than shipping plaintext state.
-    if params.backup.enabled() {
-        match params.wrapping_ikm {
-            Some(master_key) => {
-                tokio::spawn(crate::council::backup::run_backup_loop(
-                    Arc::clone(&council),
-                    master_key,
-                    params.backup.clone(),
-                    shutdown.clone(),
-                ));
-            }
-            None => eprintln!(
-                "cluster: council backup configured but no master key available; backups disabled"
-            ),
-        }
+    // loop, only when a destination is configured, the store opens, and a
+    // master key is present to seal with. Without the master key there is
+    // nothing to derive the seal key from, so we skip it rather than ship
+    // plaintext state. Either way the status reaches `relish wtf` (#2016).
+    let started_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let (backup_status, backup_store) = crate::council::backup::prepare_backup(
+        &params.backup,
+        params.wrapping_ikm.is_some(),
+        started_at,
+    );
+    if let crate::council::backup::BackupStatus::Disabled { reason } = &backup_status {
+        eprintln!("cluster: council backup configured but disabled: {reason}");
+    }
+    let (backup_tx, backup_rx) = watch::channel(backup_status);
+    if let (Some(store), Some(master_key)) = (backup_store, params.wrapping_ikm) {
+        tokio::spawn(crate::council::backup::run_backup_loop(
+            Arc::clone(&council),
+            master_key,
+            params.backup.clone(),
+            store,
+            backup_tx,
+            shutdown.clone(),
+        ));
     }
 
     // --- Reporting tree (flat star: every node reports to the leader) ---
@@ -773,6 +784,7 @@ pub async fn start(
             directory_rx,
             roster_rx,
             gossip_stats,
+            backup_rx,
         },
     ))
 }
