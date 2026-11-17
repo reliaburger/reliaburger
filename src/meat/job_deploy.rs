@@ -25,8 +25,9 @@ pub struct DeploymentRecord {
     pub job_runs: BTreeMap<String, u64>,
     /// Apps were positively published before ordinary jobs were admitted.
     pub apps_committed: bool,
-    /// Cancellation wins over later success and prevents app publication.
-    pub cancelled: bool,
+    /// When cancellation was requested, if it was. Cancellation wins over
+    /// later success and prevents app publication.
+    pub cancelled_at: Option<u64>,
     /// Terminal receipts remain bounded for idempotency and disconnected clients.
     pub completed: bool,
     /// Immutable terminal outcome and settlement time.
@@ -36,6 +37,10 @@ pub struct DeploymentRecord {
     pub submitted_at_epoch_secs: u64,
 }
 impl DeploymentRecord {
+    /// Whether cancellation was requested.
+    pub fn cancelled(&self) -> bool {
+        self.cancelled_at.is_some()
+    }
     /// Workload ownership survives leader changes and unknown execution outcomes.
     pub fn blocks(&self, name: &str, namespace: &str) -> bool {
         if self.completed {

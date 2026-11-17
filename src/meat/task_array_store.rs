@@ -1694,7 +1694,7 @@ impl TaskArrays {
                     hook_runs: BTreeMap::new(),
                     job_runs: BTreeMap::new(),
                     apps_committed: false,
-                    cancelled: false,
+                    cancelled_at: None,
                     completed: false,
                     outcome: None,
                     finished_at: None,
@@ -1740,7 +1740,7 @@ impl TaskArrays {
                     .get(operation_id)
                     .cloned()
                     .ok_or_else(|| refuse("unknown deployment"))?;
-                if record.cancelled {
+                if record.cancelled() {
                     return Err(refuse("cancelled deployment cannot publish apps"));
                 }
                 if record.apps_committed {
@@ -1799,7 +1799,8 @@ impl TaskArrays {
                 if record.completed {
                     return Ok(TaskArrayApplied::JobRecorded);
                 }
-                record.cancelled = true;
+                // A repeated cancel keeps the time of the first (#2047).
+                record.cancelled_at.get_or_insert(*now_epoch_secs);
                 for id in record.runs() {
                     self.record_mut(id)?.state.cancel();
                     self.mark_terminal(id, *now_epoch_secs)?;
@@ -1825,7 +1826,7 @@ impl TaskArrays {
                             && run.state.status() != TaskArrayStatus::Succeeded
                     })
                 });
-                if !terminal || (!record.apps_committed && !record.cancelled && !failed) {
+                if !terminal || (!record.apps_committed && !record.cancelled() && !failed) {
                     return Err(refuse("deployment has not positively settled"));
                 }
                 let any_failed = record.runs().any(|id| {
@@ -1843,7 +1844,7 @@ impl TaskArrays {
                     .unwrap_or(record.submitted_at_epoch_secs);
                 let outcome = if any_failed {
                     super::job_deploy::DeploymentOutcome::Failed
-                } else if record.cancelled {
+                } else if record.cancelled() {
                     super::job_deploy::DeploymentOutcome::Cancelled
                 } else {
                     super::job_deploy::DeploymentOutcome::Completed

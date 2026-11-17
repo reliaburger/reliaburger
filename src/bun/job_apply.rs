@@ -223,7 +223,7 @@ pub(crate) async fn apply(
                     .await;
                 return;
             };
-            if record.apps_committed && !record.cancelled {
+            if record.apps_committed && !record.cancelled() {
                 let instances: Vec<_> = record
                     .job_runs
                     .values()
@@ -237,7 +237,7 @@ pub(crate) async fn apply(
                     .await;
                 return;
             }
-            if record.cancelled {
+            if record.cancelled() {
                 let _ = tx.send(ApplyEvent::Error { message: format!("deployment {operation_id} cancelled or a hook failed; apps remain gated") }).await;
                 return;
             }
@@ -349,7 +349,7 @@ pub(crate) async fn settle(state: &ApiState) {
                 run.state.status().is_terminal() && run.state.status() != TaskArrayStatus::Succeeded
             })
         });
-        if failed && !record.cancelled {
+        if failed && !record.cancelled() {
             let _ = write_task_array(
                 state,
                 TaskArrayWrite::DeployCancel {
@@ -360,7 +360,7 @@ pub(crate) async fn settle(state: &ApiState) {
             .await;
             continue;
         }
-        if record.apps_committed || record.cancelled {
+        if record.apps_committed || record.cancelled() {
             if record.runs().all(|run| {
                 arrays
                     .get(run)
@@ -404,7 +404,7 @@ pub(crate) async fn settle(state: &ApiState) {
             let latest = read_task_arrays(state).await;
             if latest
                 .deployment(id)
-                .is_none_or(|current| current.cancelled || current.apps_committed)
+                .is_none_or(|current| current.cancelled() || current.apps_committed)
             {
                 continue;
             }

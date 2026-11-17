@@ -216,14 +216,14 @@ fn durable_operation(
         started_at: record.submitted_at_epoch_secs,
         phase_changed_at: record.finished_at.unwrap_or(record.submitted_at_epoch_secs),
         finished_at: record.finished_at,
-        cancellation_requested_at: record.cancelled.then_some(record.submitted_at_epoch_secs),
+        cancellation_requested_at: record.cancelled_at,
         targets,
         current_target: None,
         message: if record.completed {
             "durable deployment settled"
         } else if unknown {
             "unknown run ownership; inspect runs before acknowledging replay"
-        } else if record.cancelled {
+        } else if record.cancelled() {
             "cancellation recorded; waiting for positive retirement"
         } else if record.apps_committed {
             "apps published; jobs admitted"
@@ -547,4 +547,53 @@ pub(super) async fn rollback_handler(
         )
     });
     Sse::new(stream).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::meat::task_array_store::{TaskArrayWrite, TaskArrays};
+
+    /// A cancelled deployment reports when the cancel was requested, not
+    /// when the deployment was submitted, and a second cancel doesn't move
+    /// that time (#2047).
+    #[test]
+    fn a_cancelled_deployment_reports_its_cancel_time() {
+        let mut arrays = TaskArrays::default();
+        let mut next = 0;
+        let mut ids = move || {
+            next += 1;
+            next
+        };
+        let operation_id = "c".repeat(32);
+        let config = crate::config::Config::parse(
+            "[app.web]\nimage='web:v1'\n[job.migrate]\nruntime='process'\nexec='/bin/true'\nrun_before=['app.web']",
+        )
+        .unwrap();
+        arrays
+            .apply(
+                &TaskArrayWrite::DeployBegin {
+                    operation_id: operation_id.clone(),
+                    config: Box::new(config),
+                    now_epoch_secs: 2,
+                },
+                &mut ids,
+            )
+            .unwrap();
+        for now_epoch_secs in [50, 90] {
+            arrays
+                .apply(
+                    &TaskArrayWrite::DeployCancel {
+                        operation_id: operation_id.clone(),
+                        now_epoch_secs,
+                    },
+                    &mut ids,
+                )
+                .unwrap();
+        }
+        let record = arrays.deployment(&operation_id).unwrap();
+        let operation = durable_operation(&operation_id, record, &arrays);
+        assert_eq!(operation.started_at, 2);
+        assert_eq!(operation.cancellation_requested_at, Some(50));
+    }
 }

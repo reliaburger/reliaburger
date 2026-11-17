@@ -254,6 +254,8 @@ pub struct Compatibility {
 /// or supersedes, and `/v1/version` carries `os_trial`.
 /// OIDC signing-key rotation (#709): `SecurityState::retiring_oidc_keys`, and
 /// the `RotateOidcSigningKey` and `RetireOidcSigningKeys` Raft requests.
+/// A deployment record keeps when its cancel was requested
+/// (`DeploymentRecord::cancelled_at` replaces `cancelled`, #2047).
 ///
 /// Bumping either number makes the checked-in gossip and Raft fuzz seeds
 /// stale: run `make fuzz-corpus-seed` in the same change (#1941). Keep the
