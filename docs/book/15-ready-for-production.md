@@ -8927,6 +8927,83 @@ that. The snapshot uploader still needs its own fixture: it needs Btrfs
 volumes. Its export receipts are written atomically and durably now, and an
 upload is only receipted once the destination has confirmed the archive.
 
+### What does pulling the plug on a VM actually pull?
+
+Every one of those records says "a VM forced off isn't a real power loss",
+and for a long time nobody could say exactly how it differed. When we started
+planning a run that cuts power thousands of times
+([#2067](https://github.com/reliaburger/reliaburger/issues/2067)), that
+stopped being good enough. If the cut is gentler than a real one, a thousand
+passes prove less than they seem to.
+
+So before building anything, we measured. `scripts/release/power_cut/calibrate.sh`
+creates a throwaway Ubuntu VM, the size of a quickstart node, and runs a
+writer in it with three threads. Each thread writes numbered 4 KiB records
+into its own file and prints `ACK n` once a record has gone as far as its mode
+takes it:
+
+- **fsync**: a buffered write, then `fdatasync`. As far as the guest can
+  tell, it's on stable storage.
+- **direct**: an `O_DIRECT` write and no flush. The virtual disk has the
+  record, but nobody asked it to make the write durable.
+- **buffered**: a plain write. It's in the guest's page cache and nowhere
+  else.
+
+A few seconds in, the script cuts the power, brings the VM back, and asks how
+many acknowledged records each file still holds. Every record carries the
+run's id, its number and a CRC, so a stale record from an earlier run, or one
+half written, never counts as a survivor. It does that 50 times for each of
+three ways to cut: `limactl stop --force`, a `SIGKILL` straight to the
+Virtualization.framework process that holds the disk, and `echo b >
+/proc/sysrq-trigger` inside the guest, which reboots the kernel on the spot
+with no sync.
+
+The answer was the same for all three. Every `fsync` record and every
+`O_DIRECT` record survived every cut, and every buffered record the cut
+caught was gone. So the line falls between the guest's page cache and the
+virtual disk, not at the flush: whatever the guest handed to the disk is
+safe, flushed or not, because the macOS host keeps it in its own page cache,
+and the host never loses power. That's a disk without a volatile write cache,
+or one with power-loss protection. It's fair for a good SSD and generous for
+an SD card, which is exactly what an edge site runs on. A store that forgot an
+`fsync` and wrote with `O_DIRECT` would pass every cut we can make with a
+hypervisor.
+
+`sysrq b` had one surprise: the VM doesn't stop. Virtualization.framework
+treats the guest's reset as a reboot, so the VM stays running and the guest is
+back in about ten seconds. That makes it the cut to use when timing matters,
+since it fires from inside the guest within milliseconds of whatever it's
+watching for.
+
+To get the harsher cut, we need to lose what the disk hadn't flushed, and the
+kernel can already record that. `dm-log-writes` is a device-mapper target
+that passes every write through to the real device and logs it, with every
+flush and every named mark, on a second device. The detail that matters is
+*when* it logs a plain write: only once a later flush completes. Until then
+the write sits on a list in memory, just like a drive's write cache. So a
+copy of the log taken at the moment of the cut, replayed from the start onto
+the disk as it was when logging began, gives exactly the disk a drive with a
+volatile cache must have kept. We expected to need to find the last flush in
+the log and replay up to it. We don't: the log has already done it.
+
+The proof runs in the same guest. It puts ext4 on a `dm-log-writes` device,
+writes one file and syncs it, writes a second with `O_DIRECT` and no flush,
+and copies the log. Replayed, that copy has the first file and not the
+second's bytes, though the real device has both, and `e2fsck` calls it clean.
+A copy taken after one more `sync` has both. Ubuntu doesn't package
+xfstests' `replay-log`, so `logwrites.py` reads the log format straight from
+the kernel's `drivers/md/dm-log-writes.c` with nothing but `struct`. There
+was one false start: `mkfs.ext4` zeroes its inode tables lazily, in the
+background, after the mount, and those writes bring their own flushes. Any
+one of them can legitimately make the "unflushed" file durable halfway
+through the proof. `-E lazy_itable_init=0,lazy_journal_init=0` does the
+zeroing up front instead.
+
+The [calibration record](../qualification/2026-11-18-power-cut-calibration.md)
+has the numbers. What it changes is the wording of every power-cut record we
+publish from here on: a hypervisor cut tests "lose the page cache", and the
+write-cache cut built on `dm-log-writes` is what earns the stronger claim.
+
 ## A thousand nodes that aren't there
 
 How big a cluster have we actually run? Three VMs. The whitepaper's 10,000-node

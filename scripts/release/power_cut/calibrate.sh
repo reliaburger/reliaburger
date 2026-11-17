@@ -20,7 +20,8 @@
 #                   sync; records whether VZ reboots the guest or stops the VM
 #   --logwrites     instead of cuts, run logwrites-proof.sh in the guest: can
 #                   the guest kernel record a dm-log-writes log, and does a
-#                   replay to the last flush drop exactly the unflushed writes
+#                   copy of it taken at a cut, replayed, drop exactly the
+#                   writes no flush covered
 #
 # Never touches the development VM reliaburger-test, never adopts a VM it
 # didn't create, and stops (keeping the evidence) when quiet.py says a
@@ -71,8 +72,23 @@ gsh() { limactl shell --workdir / "$vm" sudo "$@"; }
 random_between() { python3 -c 'import random,sys; r=random.Random(int(sys.argv[1])); print(r.randint(int(sys.argv[2]), int(sys.argv[3])))' "$1" "$2" "$3"; }
 now() { python3 -c 'import time; print(f"{time.time():.3f}")'; }
 since() { python3 -c 'import sys,time; print(f"{time.time() - float(sys.argv[1]):.1f}")' "$1"; }
+# bounded SECONDS COMMAND...: run COMMAND, killing it and everything it
+# started after SECONDS (status 124). Not `perl -e 'alarm; exec'`: limactl is
+# a Go program, and Go catches SIGALRM and ignores it, so an ssh to a guest
+# that rebooted under it hung there for good. The command gets its own
+# process group, so the ssh it starts dies with it and can't hold a pipe open.
+bounded() {
+    perl -e '
+        my $seconds = shift;
+        my $pid = fork() // die "fork: $!\n";
+        if ($pid == 0) { setpgrp(0, 0); exec(@ARGV) or die "exec: $!\n"; }
+        $SIG{ALRM} = sub { kill("KILL", -$pid); waitpid($pid, 0); exit(124); };
+        alarm($seconds);
+        waitpid($pid, 0);
+        exit($? & 127 ? 128 + ($? & 127) : $? >> 8);' "$@"
+}
 # Does the guest answer a shell? Bounded: ssh to a rebooting guest can hang.
-answers() { perl -e 'alarm shift; exec @ARGV or die' 15 limactl shell --workdir / "$vm" true > /dev/null 2>&1; }
+answers() { bounded 15 limactl shell --workdir / "$vm" true < /dev/null > /dev/null 2>&1; }
 status() { limactl list --format '{{.Status}}' "$vm" 2> /dev/null || echo missing; }
 
 reason=$(quiet) || fail "not starting: $reason"
@@ -127,8 +143,8 @@ fi
 # a shell answered.
 revive() {
     local cut_at=$1 how=started retries=0 waited=0 state
-    # A guest reboot may leave the VM running; give VZ a moment to decide.
-    while [[ $waited -lt 90 ]]; do
+    # Only a guest reboot can leave the VM running; give it time to boot.
+    while [[ $kind == sysrq && $waited -lt 90 ]]; do
         state=$(status)
         [[ $state == Running ]] || break
         if answers; then
@@ -199,7 +215,17 @@ for (( i = 1; i <= cuts; i++ )); do
     read -r how retries back_seconds < <(revive "$cut_at")
     kill "$writer" 2> /dev/null || true
     wait "$writer" 2> /dev/null || true
-    gsh python3 /var/lib/pcut/calibrate.py scan --dir /var/lib/pcut --run "$run" > "$evidence/$run.scan.json"
+    # A guest that has only just come back can refuse a shell for a moment.
+    scanned=no
+    for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+        if bounded 120 limactl shell --workdir / "$vm" sudo python3 /var/lib/pcut/calibrate.py scan --dir /var/lib/pcut --run "$run" > "$evidence/$run.scan.json" 2>> "$evidence/$run.err" \
+            && [[ -s $evidence/$run.scan.json ]]; then
+            scanned=yes
+            break
+        fi
+        sleep 5
+    done
+    [[ $scanned == yes ]] || fail "could not scan $vm after cut $i; see $evidence/$run.err"
     detail=$(printf '{"hold_seconds": %s, "cut_seconds": %s, "back_seconds": %s, "came_back": "%s", "start_retries": %s}' \
         "$hold" "$cut_seconds" "$back_seconds" "$how" "$retries")
     python3 "$here/calibrate.py" record --kind "$kind" --cut "$i" --acks "$acks" --scan "$evidence/$run.scan.json" \
@@ -207,7 +233,7 @@ for (( i = 1; i <= cuts; i++ )); do
     say "cut $i/$cuts: held $hold s, $how in $back_seconds s; $(tail -n 1 "$evidence/cuts.jsonl" | python3 -c '
 import json, sys
 line = json.load(sys.stdin)
-print(", ".join(f"{m} acked {r[\"acked\"]} lost {r[\"lost_acked\"]}" for m, r in line["modes"].items()))')"
+print(", ".join("%s acked %d lost %d" % (m, r["acked"], r["lost_acked"]) for m, r in line["modes"].items()))')"
 done
 python3 "$here/calibrate.py" tally "$evidence/cuts.jsonl" > "$evidence/summary.json"
 say "summary: $evidence/summary.json"

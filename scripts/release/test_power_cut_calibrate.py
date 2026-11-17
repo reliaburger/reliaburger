@@ -15,9 +15,11 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 HERE = Path(__file__).resolve().parent
+DRIVER = HERE / "power_cut" / "calibrate.sh"
 sys.path.insert(0, str(HERE / "power_cut"))
 
 import calibrate  # noqa: E402
@@ -250,6 +252,30 @@ class LogWrites(unittest.TestCase):
                                     check=True, stdout=subprocess.PIPE, text=True)
             self.assertEqual(json.loads(result.stdout)["replayed"], 2)
             self.assertEqual(Path(target).read_bytes()[:512], self.A)
+
+
+class Bounded(unittest.TestCase):
+    """calibrate.sh's `bounded` must stop a command that ignores SIGALRM, as Go's limactl does."""
+
+    def run_bounded(self, seconds, command):
+        lines = DRIVER.read_text().splitlines()
+        start = next(i for i, line in enumerate(lines) if line.startswith("bounded() {"))
+        end = next(i for i in range(start, len(lines)) if lines[i] == "}")
+        script = "\n".join(lines[start:end + 1]) + f'\nbounded {seconds} {command}\necho "status=$?"\n'
+        started = time.monotonic()
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+        return result.stdout, time.monotonic() - started
+
+    def test_a_command_that_ignores_sigalrm_is_killed_at_the_deadline(self):
+        # A grandchild holding stdout must not keep the caller waiting either.
+        output, took = self.run_bounded(1, "sh -c 'trap \"\" ALRM TERM; (sleep 20; echo late) & sleep 20'")
+        self.assertIn("status=124", output)
+        self.assertNotIn("late", output)
+        self.assertLess(took, 10)
+
+    def test_a_command_that_finishes_keeps_its_status_and_output(self):
+        output, _ = self.run_bounded(5, "sh -c 'echo hello; exit 3'")
+        self.assertIn("hello\nstatus=3", output)
 
 
 if __name__ == "__main__":

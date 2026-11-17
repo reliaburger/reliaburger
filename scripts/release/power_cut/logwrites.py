@@ -6,9 +6,16 @@ The kernel's `log-writes` device-mapper target
 writes through to a data device and records each one, with every flush, FUA
 and named mark, on a log device. Replaying a prefix of the log onto a copy of
 the data device as it was when logging began gives the disk as it stood at
-that point. Replaying up to the last flush gives what a disk with a volatile
-write cache could have kept after a power cut: fault model 2 in
-docs/plans/2026-11-18-plan-power-cut-endurance.md.
+that point.
+
+The target logs a plain write only when a later flush completes (a FUA write
+at once), so a copy of the log taken at a power cut already leaves out
+everything no flush covered: replayed to its end, it's the disk a drive with
+a volatile write cache must have kept, fault model 2 in
+docs/plans/2026-11-18-plan-power-cut-endurance.md. A prefix ending between
+the last two flushes is a state such a drive could also have left, if it
+wrote its cache back in order. The calibration record
+(docs/qualification/2026-11-18-power-cut-calibration.md) has the proof.
 
 This is the stdlib equivalent of xfstests' `replay-log`, which Ubuntu doesn't
 package. The on-disk format, from drivers/md/dm-log-writes.c:

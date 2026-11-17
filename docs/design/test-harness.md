@@ -122,6 +122,16 @@ are `#[ignore]`d with a reason naming the target or script that runs them:
 | `power_cut::actual_power_cut_*` | A disposable Linux VM whose power can be cut while workers write | `scripts/release/qualify-storage-power-cut.sh --vm VM --fixture exporter\|leases\|backups --iterations N` |
 | All of the above, for a release candidate | Lima on the host; it creates and deletes the VM | `scripts/release/qualify-power-cut-reboot.sh --commit SHA --iterations N --record-dir DIR` |
 
+One more script cuts power without a Rust test behind it.
+`scripts/release/power_cut/calibrate.sh` measures what each way of cutting a
+Lima VM's power loses (`--kind stop|kill|sysrq --cuts N`), and whether the guest
+kernel can record and replay a `dm-log-writes` log (`--logwrites`), on a
+disposable VM it creates and deletes. Its decisions (the record scan, the tally,
+the log parser and replay) are tested against fixtures in
+`scripts/release/test_power_cut_calibrate.py`, part of `make test-ci-scripts`.
+The [calibration record](../qualification/2026-11-18-power-cut-calibration.md)
+says which fault model each cut gives.
+
 `.github/workflows/v02-loops.yml` is the other long-running lane. It runs only when
 someone pushes the `v02-loops` branch or dispatches it by hand, and loops the upgrade,
 council, lease-recovery and exporter-lock suites for hours on Linux x86-64, Linux
