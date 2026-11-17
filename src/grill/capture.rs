@@ -27,6 +27,14 @@ use crate::ketchup::types::{
 /// starved startup adoption for eleven minutes.
 pub const CAPTURE_CHUNK_BYTES: usize = 64 * 1024;
 
+/// The longest line a [`CaptureReader`] hands on, in bytes.
+///
+/// A workload that writes with no newline (a `\r` progress bar, a binary
+/// dump) would otherwise make the reader buffer all of its output. A longer
+/// line is cut to this many bytes, and the rest of it is skipped up to the
+/// next newline.
+pub const MAX_CAPTURED_LINE_BYTES: usize = 64 * 1024;
+
 /// How often a follower looks for new output.
 pub const FOLLOW_POLL: Duration = Duration::from_millis(200);
 
@@ -555,37 +563,55 @@ impl CaptureReader {
     /// Offsets count raw bytes, so a line with invalid UTF-8 (replaced when
     /// the line becomes a `String`) doesn't shift the positions after it.
     ///
+    /// A line longer than [`MAX_CAPTURED_LINE_BYTES`] comes out cut to that
+    /// length, and the bytes past the cut are counted as consumed but never
+    /// held, so the reader buffers at most that much between calls. A reader
+    /// resumed from an offset inside a skipped line hands its rest on as one
+    /// more line, also cut to the cap.
+    ///
     /// The cost is linear in the bytes fed in: bytes already waiting hold no
-    /// newline, so only the new ones are searched, and the finished lines
-    /// leave the buffer in one step at the end.
+    /// newline, so only the new ones are searched, and each new byte is
+    /// copied at most once.
     pub fn push(&mut self, bytes: &[u8]) -> Vec<CapturedLine> {
-        let bytes = if self.discarding {
-            let Some(newline) = bytes.iter().position(|byte| *byte == b'\n') else {
-                self.consumed += bytes.len() as u64;
-                return Vec::new();
-            };
-            self.consumed += newline as u64 + 1;
-            self.discarding = false;
-            &bytes[newline + 1..]
-        } else {
-            bytes
-        };
-        let mut search_from = self.partial.len();
-        self.partial.extend_from_slice(bytes);
         let mut lines = Vec::new();
-        let mut line_start = 0;
-        while let Some(found) = self.partial[search_from..]
-            .iter()
-            .position(|byte| *byte == b'\n')
-        {
-            let newline = search_from + found;
-            self.consumed += (newline + 1 - line_start) as u64;
-            lines.push(self.line(&self.partial[line_start..newline]));
-            line_start = newline + 1;
-            search_from = line_start;
+        let mut rest = bytes;
+        loop {
+            if self.discarding {
+                let Some(newline) = rest.iter().position(|byte| *byte == b'\n') else {
+                    self.consumed += rest.len() as u64;
+                    return lines;
+                };
+                self.consumed += newline as u64 + 1;
+                self.discarding = false;
+                rest = &rest[newline + 1..];
+            }
+            let room = MAX_CAPTURED_LINE_BYTES.saturating_sub(self.partial.len());
+            let Some(newline) = rest.iter().position(|byte| *byte == b'\n') else {
+                if rest.len() <= room {
+                    self.partial.extend_from_slice(rest);
+                    return lines;
+                }
+                // Over the cap with no newline in sight: hand on the prefix
+                // and skip the rest of the line, here and in later chunks.
+                self.partial.extend_from_slice(&rest[..room]);
+                lines.push(self.take_line(rest.len() - room));
+                self.discarding = true;
+                return lines;
+            };
+            let kept = newline.min(room);
+            self.partial.extend_from_slice(&rest[..kept]);
+            lines.push(self.take_line(newline - kept + 1));
+            rest = &rest[newline + 1..];
         }
-        self.partial.drain(..line_start);
-        lines
+    }
+
+    /// Hand on the buffered line, counting `skipped` more bytes of it (the
+    /// part past the cap, and its newline) as consumed.
+    fn take_line(&mut self, skipped: usize) -> CapturedLine {
+        self.consumed += (self.partial.len() + skipped) as u64;
+        let line = self.line(&self.partial);
+        self.partial.clear();
+        line
     }
 
     /// Take a trailing line that never got its newline, once the stream has
@@ -868,6 +894,53 @@ mod tests {
             elapsed < std::time::Duration::from_secs(10),
             "splitting {LINES} lines took {elapsed:?}"
         );
+    }
+
+    /// Output that never ends a line must not grow the reader without bound.
+    /// The line in progress is kept to its first `MAX_CAPTURED_LINE_BYTES`,
+    /// and the rest is skipped up to the next newline.
+    #[test]
+    fn a_stream_with_no_newline_stays_within_the_line_cap() {
+        const STREAM: usize = 100 * 1024 * 1024;
+        let chunk = vec![b'x'; CAPTURE_CHUNK_BYTES];
+        let mut reader = file_reader();
+        let mut lines = Vec::new();
+        for _ in 0..STREAM / CAPTURE_CHUNK_BYTES {
+            lines.extend(reader.push(&chunk));
+            assert!(
+                reader.partial.len() <= MAX_CAPTURED_LINE_BYTES,
+                "{} bytes buffered",
+                reader.partial.len()
+            );
+        }
+        assert_eq!(lines.len(), 1, "one truncated line, then nothing");
+        assert_eq!(lines[0].line.len(), MAX_CAPTURED_LINE_BYTES);
+        // Every byte is accounted for, so the capture offset keeps moving.
+        assert_eq!(reader.read_offset(), STREAM as u64);
+
+        // The next newline ends the skipped line; the one after it is whole.
+        let lines = reader.push(b"tail\nnext\n");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].line, "next");
+        assert_eq!(ends(&lines), vec![STREAM as u64 + 10]);
+    }
+
+    #[test]
+    fn a_line_at_the_cap_is_kept_whole_and_a_longer_one_is_cut() {
+        let mut reader = file_reader();
+        let mut exact = vec![b'a'; MAX_CAPTURED_LINE_BYTES];
+        exact.push(b'\n');
+        let lines = reader.push(&exact);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].line.len(), MAX_CAPTURED_LINE_BYTES);
+
+        let mut long = vec![b'b'; MAX_CAPTURED_LINE_BYTES + 10];
+        long.extend_from_slice(b"\nok\n");
+        let lines = reader.push(&long);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].line.len(), MAX_CAPTURED_LINE_BYTES);
+        assert_eq!(lines[1].line, "ok");
+        assert_eq!(reader.read_offset(), (exact.len() + long.len()) as u64);
     }
 
     #[tokio::test]

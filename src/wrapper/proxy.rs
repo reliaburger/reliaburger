@@ -511,6 +511,27 @@ pub(super) fn generate_request_id() -> String {
     format!("{:032x}", rand::random::<u128>())
 }
 
+/// The host a request is for, as the routing table matches it.
+///
+/// HTTP/1.1 names the host in the `Host` header. HTTP/2 names it in the
+/// `:authority` pseudo-header, which hyper puts in the request URI, and a
+/// client usually sends no `Host` header at all. Browsers and curl negotiate
+/// HTTP/2 on the HTTPS listener, so the URI's authority is the fallback.
+/// An empty string matches no route.
+fn request_host(req: &Request<Body>) -> String {
+    if let Some(host) = req
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+    {
+        return host.to_string();
+    }
+    req.uri()
+        .authority()
+        .map(|authority| authority.host().to_string())
+        .unwrap_or_default()
+}
+
 /// Route and proxy a single request.
 async fn do_proxy(
     state: &ProxyState,
@@ -522,13 +543,7 @@ async fn do_proxy(
     // Check for WebSocket upgrade before anything else
     let is_ws = super::websocket::is_websocket_upgrade(&req);
 
-    // Extract host from the Host header
-    let host = req
-        .headers()
-        .get("host")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    let host = request_host(&req);
 
     let path = req.uri().path().to_string();
 

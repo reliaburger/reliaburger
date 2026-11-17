@@ -2793,6 +2793,13 @@ default_duration_secs = 600   # applied when a fault names no duration
 max_duration_secs = 3600      # a fault asking for longer is rejected
 ```
 
+Two numbers can disagree, though. Set `max_duration_secs = 300` and leave the
+default alone, and every fault without `--duration` is refused, because the
+600 s default is over the limit. Set the maximum to two days, and the 24-hour
+backstop quietly cuts every fault to one day anyway. So Bun checks
+`0 < default <= max <= 86400` at startup and refuses the node config with the
+field named, instead of leaving you to find out at the first injection.
+
 The decision worth dwelling on is *where* to enforce them. The CLI already
 defaulted a missing `--duration` to ten minutes, so it would have been easy to
 call it done there. But the CLI is one client among possible many — a script

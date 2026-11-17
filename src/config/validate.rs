@@ -758,6 +758,18 @@ fn validate_app_honoured_fields(name: &str, app: &super::app::AppSpec) -> Result
     if let Some((field, _)) = zero.iter().find(|(_, is_zero)| *is_zero) {
         return Err(refuse(field, format!("{field} must be at least 1")));
     }
+    // A delay near u64::MAX seconds overflows the probe scheduler's clock.
+    let max = crate::bun::health::MAX_HEALTH_DELAY_SECS;
+    let long = [
+        ("health.interval", health.interval),
+        ("health.initial_delay", health.initial_delay),
+    ];
+    if let Some((field, Some(value))) = long.iter().find(|(_, v)| v.is_some_and(|v| v > max)) {
+        return Err(refuse(
+            field,
+            format!("{field} ({value}s) must be at most {max}s (one day)"),
+        ));
+    }
     let interval = health
         .interval
         .unwrap_or(crate::bun::health::DEFAULT_HEALTH_INTERVAL_SECS);
@@ -1196,6 +1208,10 @@ impl NodeConfig {
                 self.metrics.app_scrape_interval_secs,
             ),
             ("logs.export_interval_secs", self.logs.export_interval_secs),
+            (
+                "reporting_tree.report_interval_secs",
+                self.reporting_tree.report_interval_secs,
+            ),
         ] {
             if value == 0 {
                 return Err(ConfigError::Validation {
@@ -1206,7 +1222,74 @@ impl NodeConfig {
             }
         }
 
-        Ok(())
+        self.validate_stale_report_timeout()?;
+        if self.reporting_tree.stale_node_grace_secs == 0 {
+            return Err(ConfigError::Validation {
+                field: "reporting_tree.stale_node_grace_secs".to_string(),
+                context: "node config".to_string(),
+                reason: "must be greater than zero".to_string(),
+            });
+        }
+        self.validate_smoker_durations()
+    }
+
+    /// Fault durations must satisfy `0 < default <= max <= 1 day`. A default
+    /// above the maximum refuses every fault injected without `--duration`,
+    /// a zero refuses every timed fault, and `FaultRule::new` would silently
+    /// cut anything over a day to 24 h.
+    fn validate_smoker_durations(&self) -> Result<(), ConfigError> {
+        let smoker = &self.smoker;
+        let max_secs = crate::smoker::types::MAX_FAULT_DURATION_NS / 1_000_000_000;
+        let (field, reason) = if smoker.default_duration_secs == 0 {
+            (
+                "default_duration_secs",
+                "must be greater than zero".to_string(),
+            )
+        } else if smoker.default_duration_secs > smoker.max_duration_secs {
+            (
+                "default_duration_secs",
+                format!(
+                    "must be at most smoker.max_duration_secs ({}s)",
+                    smoker.max_duration_secs
+                ),
+            )
+        } else if smoker.max_duration_secs > max_secs {
+            (
+                "max_duration_secs",
+                format!("must be at most {max_secs}s (one day)"),
+            )
+        } else {
+            return Ok(());
+        };
+        Err(ConfigError::Validation {
+            field: format!("smoker.{field}"),
+            context: "node config".to_string(),
+            reason,
+        })
+    }
+
+    /// A stale timeout at or below the report interval marks every node
+    /// stale between two of its own reports, and the report worker
+    /// multiplies the timeout into a `Duration`, which overflows near
+    /// u64::MAX seconds.
+    fn validate_stale_report_timeout(&self) -> Result<(), ConfigError> {
+        let tree = &self.reporting_tree;
+        let max = super::node::MAX_STALE_REPORT_TIMEOUT_SECS;
+        let reason = if tree.stale_report_timeout_secs <= tree.report_interval_secs {
+            format!(
+                "must be greater than reporting_tree.report_interval_secs ({}s)",
+                tree.report_interval_secs
+            )
+        } else if tree.stale_report_timeout_secs > max {
+            format!("must be at most {max}s (one day)")
+        } else {
+            return Ok(());
+        };
+        Err(ConfigError::Validation {
+            field: "reporting_tree.stale_report_timeout_secs".to_string(),
+            context: "node config".to_string(),
+            reason,
+        })
     }
 }
 
@@ -1363,6 +1446,103 @@ mod tests {
                 if field == "metrics.collection_interval_secs"),
             "expected a collection-interval validation error, got {err:?}"
         );
+    }
+
+    #[test]
+    fn node_config_rejects_a_zero_report_interval() {
+        // `tokio::time::interval` panics on a zero period, which would take
+        // the report worker down as soon as it starts.
+        let mut node = crate::config::NodeConfig::default();
+        node.reporting_tree.report_interval_secs = 0;
+        let err = node.validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation { ref field, .. }
+                if field == "reporting_tree.report_interval_secs"),
+            "expected a report-interval validation error, got {err:?}"
+        );
+    }
+
+    fn stale_report_timeout_error(stale: u64, interval: u64) -> Option<ConfigError> {
+        let mut node = crate::config::NodeConfig::default();
+        node.reporting_tree.report_interval_secs = interval;
+        node.reporting_tree.stale_report_timeout_secs = stale;
+        node.validate().err()
+    }
+
+    fn is_stale_timeout_error(error: Option<ConfigError>) -> bool {
+        matches!(error, Some(ConfigError::Validation { ref field, .. })
+            if field == "reporting_tree.stale_report_timeout_secs")
+    }
+
+    #[test]
+    fn node_config_rejects_a_zero_stale_report_timeout() {
+        assert!(is_stale_timeout_error(stale_report_timeout_error(0, 5)));
+    }
+
+    #[test]
+    fn stale_report_timeout_must_be_longer_than_the_report_interval() {
+        // A timeout at or below the interval marks every node stale between
+        // two of its own reports.
+        assert!(is_stale_timeout_error(stale_report_timeout_error(5, 5)));
+        assert!(is_stale_timeout_error(stale_report_timeout_error(4, 5)));
+        assert!(stale_report_timeout_error(6, 5).is_none());
+    }
+
+    #[test]
+    fn stale_report_timeout_is_capped() {
+        // The report worker multiplies the timeout into a `Duration`, which
+        // panics on overflow near u64::MAX seconds.
+        let max = crate::config::node::MAX_STALE_REPORT_TIMEOUT_SECS;
+        assert!(is_stale_timeout_error(stale_report_timeout_error(
+            u64::MAX,
+            5
+        )));
+        assert!(is_stale_timeout_error(stale_report_timeout_error(
+            max + 1,
+            5
+        )));
+        assert!(stale_report_timeout_error(max, 5).is_none());
+    }
+
+    fn refused_field(node: &crate::config::NodeConfig) -> Option<String> {
+        match node.validate() {
+            Err(ConfigError::Validation { field, .. }) => Some(field),
+            Err(other) => panic!("unexpected error {other:?}"),
+            Ok(()) => None,
+        }
+    }
+
+    #[test]
+    fn node_config_rejects_a_zero_stale_node_grace() {
+        // Zero would move a live node's replicas the moment its reports go
+        // stale.
+        let mut node = crate::config::NodeConfig::default();
+        node.reporting_tree.stale_node_grace_secs = 0;
+        assert_eq!(
+            refused_field(&node).as_deref(),
+            Some("reporting_tree.stale_node_grace_secs")
+        );
+    }
+
+    #[test]
+    fn smoker_durations_must_satisfy_zero_below_default_below_max_below_a_day() {
+        let smoker = |default, max| {
+            let mut node = crate::config::NodeConfig::default();
+            node.smoker.default_duration_secs = default;
+            node.smoker.max_duration_secs = max;
+            refused_field(&node)
+        };
+        let default_field = Some("smoker.default_duration_secs".to_string());
+        let max_field = Some("smoker.max_duration_secs".to_string());
+        // A default above the maximum refuses every fault given no duration.
+        assert_eq!(smoker(600, 300), default_field);
+        assert_eq!(smoker(0, 3600), default_field);
+        // Zero refuses every timed fault.
+        assert_eq!(smoker(0, 0), default_field);
+        // Over a day, FaultRule::new would silently cut it to 24 h.
+        assert_eq!(smoker(600, 86_401), max_field);
+        assert_eq!(smoker(300, 300), None);
+        assert_eq!(smoker(1, 86_400), None);
     }
 
     #[test]
@@ -2904,6 +3084,17 @@ exec = "/usr/bin/python3""#,
         assert_app_refused(&format!("{health}\ntimeout = 11"), "timeout");
         // Seconds are whole, so a 1 s interval must allow a 1 s timeout.
         validate_app_toml(&format!("{health}\ninterval = 1\ntimeout = 1")).unwrap();
+    }
+
+    #[test]
+    fn health_delays_longer_than_a_day_are_refused() {
+        let health = "image = \"web:v1\"\nport = 8080\n[app.web.health]\npath = \"/healthz\"";
+        for field in ["interval", "initial_delay"] {
+            assert_app_refused(&format!("{health}\n{field} = 9223372036854775807"), field);
+            assert_app_refused(&format!("{health}\n{field} = 86401"), field);
+            validate_app_toml(&format!("{health}\n{field} = 86400"))
+                .unwrap_or_else(|error| panic!("{field} = 86400: {error}"));
+        }
     }
 
     #[test]

@@ -325,8 +325,10 @@ impl<T: ReportingTransport> ReportWorker<T> {
         if self.snapshot_tx.is_closed() {
             return None;
         }
-        let grace =
-            Duration::from_secs(self.config.stale_report_timeout_secs) * BUSY_LOOP_STALE_WINDOWS;
+        // Validation caps the timeout; saturating keeps an unvalidated config
+        // from panicking the worker.
+        let grace = Duration::from_secs(self.config.stale_report_timeout_secs)
+            .saturating_mul(BUSY_LOOP_STALE_WINDOWS);
         self.last_observed
             .as_ref()
             .filter(|observed| observed.observed_at.elapsed() <= grace)

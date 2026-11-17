@@ -18,6 +18,21 @@ pub const DEFAULT_HEALTH_INTERVAL_SECS: u64 = 10;
 /// interval is shorter: see [`timeout_secs`].
 pub const DEFAULT_HEALTH_TIMEOUT_SECS: u64 = 5;
 
+/// The longest `health.interval` or `health.initial_delay` validation
+/// accepts, in seconds: one day.
+pub const MAX_HEALTH_DELAY_SECS: u64 = 86_400;
+
+/// When a probe `delay` after `now` falls due.
+///
+/// The delay is cut to [`MAX_HEALTH_DELAY_SECS`]: `Instant + Duration`
+/// panics on overflow, and a delay near `u64::MAX` seconds would take the
+/// agent loop down with it. Validation already refuses such a delay; this
+/// keeps a config that skipped validation from panicking.
+fn deadline_after(now: Instant, delay: Duration) -> Instant {
+    let delay = delay.min(Duration::from_secs(MAX_HEALTH_DELAY_SECS));
+    now.checked_add(delay).unwrap_or(now)
+}
+
 /// The probe timeout, in seconds, for a check that probes every
 /// `interval_secs`: the `timeout` the user wrote, or else
 /// [`DEFAULT_HEALTH_TIMEOUT_SECS`] cut to the interval, so an app that sets
@@ -248,7 +263,7 @@ impl HealthChecker {
     ///
     /// The first probe is scheduled at `now + config.initial_delay`.
     pub fn register(&mut self, instance_id: InstanceId, config: HealthCheckConfig, now: Instant) {
-        let deadline = now + config.initial_delay;
+        let deadline = deadline_after(now, config.initial_delay);
         self.configs.insert(instance_id.clone(), config);
         self.heap.push(Reverse(HealthCheckEntry {
             deadline,
@@ -291,7 +306,7 @@ impl HealthChecker {
     /// Call this after processing a health check result.
     pub fn schedule_next(&mut self, instance_id: InstanceId, now: Instant) {
         if let Some(config) = self.configs.get(&instance_id) {
-            let deadline = now + config.interval;
+            let deadline = deadline_after(now, config.interval);
             self.heap.push(Reverse(HealthCheckEntry {
                 deadline,
                 instance_id,
@@ -750,6 +765,40 @@ mod tests {
 
         let deadline = checker.next_deadline().unwrap();
         assert_eq!(deadline, now + Duration::from_secs(10));
+    }
+
+    #[test]
+    fn an_initial_delay_past_the_clock_is_cut_to_the_maximum() {
+        // Validation refuses this, but a config that skipped it must not
+        // panic the agent loop on `Instant + Duration` overflow.
+        let mut checker = HealthChecker::new();
+        let now = Instant::now();
+        let mut config = default_config();
+        config.initial_delay = Duration::from_secs(i64::MAX as u64);
+
+        checker.register(InstanceId("web-0".to_string()), config, now);
+
+        assert_eq!(
+            checker.next_deadline().unwrap(),
+            now + Duration::from_secs(MAX_HEALTH_DELAY_SECS)
+        );
+    }
+
+    #[test]
+    fn an_interval_past_the_clock_is_cut_to_the_maximum() {
+        let mut checker = HealthChecker::new();
+        let now = Instant::now();
+        let mut config = default_config();
+        config.interval = Duration::from_secs(u64::MAX);
+
+        checker.register(InstanceId("web-0".to_string()), config, now);
+        let _ = checker.pop_due(now).unwrap();
+        checker.schedule_next(InstanceId("web-0".to_string()), now);
+
+        assert_eq!(
+            checker.next_deadline().unwrap(),
+            now + Duration::from_secs(MAX_HEALTH_DELAY_SECS)
+        );
     }
 
     #[test]

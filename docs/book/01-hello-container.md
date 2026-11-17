@@ -1451,7 +1451,7 @@ Every method on `HealthChecker` that deals with time takes a `now: Instant` para
 
 ```rust
 pub fn register(&mut self, instance_id: InstanceId, config: HealthCheckConfig, now: Instant) {
-    let deadline = now + config.initial_delay;
+    let deadline = deadline_after(now, config.initial_delay);
     // ...
 }
 ```
@@ -1459,6 +1459,8 @@ pub fn register(&mut self, instance_id: InstanceId, config: HealthCheckConfig, n
 This makes tests completely deterministic. You create an `Instant`, advance it by known amounts, and assert on the results. No flaky tests from timing races. No need for time-mocking libraries. Just pass the time you want.
 
 This is a general pattern worth adopting for any code that depends on the clock: make time a parameter, not a hidden dependency.
+
+Why `deadline_after` and not plain `now + config.initial_delay`? Because `Instant + Duration` panics when the sum doesn't fit in the clock. In C that would be silent wraparound; Rust's standard library chooses a loud failure instead. Rust gives you the quiet version too, `checked_add`, which returns an `Option<Instant>`: `None` means overflow, and you decide what happens. A review found that `initial_delay = 9223372036854775807` sailed through validation and then took the whole agent loop down on the first `register`. Now validation refuses any `interval` or `initial_delay` over a day, and `deadline_after` cuts the delay to that day and uses `checked_add`, so even a config that skipped validation can't panic the loop.
 
 ### evaluate_result: a pure function
 
