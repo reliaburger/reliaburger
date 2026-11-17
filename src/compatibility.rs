@@ -254,8 +254,9 @@ pub struct Compatibility {
 /// or supersedes, and `/v1/version` carries `os_trial`.
 /// OIDC signing-key rotation (#709): `SecurityState::retiring_oidc_keys`, and
 /// the `RotateOidcSigningKey` and `RetireOidcSigningKeys` Raft requests.
-/// Gossip `Sync` datagrams carry `floors`, the sequence floors a node keeps
-/// for reaped members, so a 0.2.8 node can't decode a 0.3.0 push-pull.
+/// Gossip `Sync` datagrams carry `floors`, the (incarnation, sequence)
+/// floors a node keeps for reaped members, and a dropped datagram draws the
+/// new `GossipPayload::Stale` answer, so a 0.2.8 node can't decode either.
 ///
 /// Bumping either number makes the checked-in gossip and Raft fuzz seeds
 /// stale: run `make fuzz-corpus-seed` in the same change (#1941). Keep the

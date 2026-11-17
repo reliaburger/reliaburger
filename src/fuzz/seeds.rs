@@ -89,10 +89,15 @@ fn gossip() -> Vec<Seed> {
         entries: vec![update("a", NodeState::Alive), update("b", NodeState::Left)],
         floors: vec![SequenceFloor {
             node_id: NodeId::new("departed"),
+            incarnation: 2,
             sequence: 41,
             expires_in_secs: 3600,
         }],
         wants_reply: true,
+    });
+    let stale = message(GossipPayload::Stale {
+        held_incarnation: 4,
+        updates: vec![update("c", NodeState::Suspect)],
     });
     let mut with_directory = message(GossipPayload::Ping { updates: vec![] });
     with_directory.extension = Some(DirectoryExtension {
@@ -118,6 +123,7 @@ fn gossip() -> Vec<Seed> {
         ("ping-req", ping_req),
         ("ack", ack),
         ("sync", sync),
+        ("stale", stale),
         ("ping-with-directory", with_directory),
     ]
     .into_iter()

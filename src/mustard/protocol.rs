@@ -68,11 +68,34 @@ const MAX_SEQUENCE_FLOORS: usize = 1024;
 /// set goes out as a rotating window, like the membership table.
 const MAX_SYNC_FLOORS: usize = MAX_PIGGYBACK_UPDATES * 2;
 
+/// Shortest gap between two [`GossipPayload::Stale`] answers to one sender,
+/// so a stream of old datagrams draws one answer a second, not one each.
+const STALE_ANSWER_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How fresh a sender's datagram is: its incarnation, then its sequence.
+/// The derived ordering compares the fields in declaration order, so a
+/// higher incarnation wins whatever the sequence. That's what lets a
+/// restarted node, whose counter may start lower, refute its way back in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Freshness {
+    incarnation: u64,
+    sequence: u64,
+}
+
+impl Freshness {
+    fn of(message: &GossipMessage) -> Self {
+        Self {
+            incarnation: message.incarnation,
+            sequence: message.sequence,
+        }
+    }
+}
+
 /// A reaped member's sequence floor, as this node keeps it.
 #[derive(Debug, Clone)]
 struct RetainedFloor {
-    /// The highest sequence accepted from the member.
-    sequence: u64,
+    /// The freshest datagram accepted from the member.
+    freshness: Freshness,
     /// When the floor stops applying.
     expires: Instant,
     /// Whether we've already logged a datagram dropped below this floor,
@@ -258,16 +281,18 @@ pub struct MustardNode<T: MustardTransport> {
     /// Where the next outgoing window of the membership table starts, for
     /// tables larger than one exchange carries (`MAX_SYNC_ENTRIES`).
     sync_cursor: usize,
-    /// The highest message sequence accepted from each sender. A message
-    /// at or below it is a replay or a duplicate and is dropped. Moved to
-    /// `sequence_floors` when the sender is reaped from membership.
-    sequences: HashMap<NodeId, u64>,
+    /// The freshest datagram accepted from each sender, by incarnation and
+    /// then sequence. A datagram no fresher is a replay or a duplicate and
+    /// is dropped. Moved to `sequence_floors` when the sender is reaped.
+    sequences: HashMap<NodeId, Freshness>,
     /// Sequence floors for reaped members, ours and those learned in
     /// anti-entropy. A reap forgets the member, not what it last sent, so an
     /// old datagram from it is still old after the reap.
     sequence_floors: HashMap<NodeId, RetainedFloor>,
     /// Where the next outgoing window of `sequence_floors` starts.
     floor_cursor: usize,
+    /// When we last sent each sender a `Stale` answer.
+    stale_answers: HashMap<NodeId, Instant>,
     /// Indirect probes this node is relaying, waiting for the target's ACK.
     pending_relays: VecDeque<PendingRelay>,
     /// Failed sends, reported at a bounded rate.
@@ -336,6 +361,7 @@ impl<T: MustardTransport> MustardNode<T> {
             sequences: HashMap::new(),
             sequence_floors: HashMap::new(),
             floor_cursor: 0,
+            stale_answers: HashMap::new(),
             pending_relays: VecDeque::new(),
             send_failures: SendFailureLog::default(),
             oversize_extension_logged: false,
@@ -575,42 +601,73 @@ impl<T: MustardTransport> MustardNode<T> {
         }
     }
 
-    /// Whether `message` is the newest we've seen from its sender. Records
-    /// its sequence if so. A replayed or duplicated datagram carries a
-    /// sequence at or below the last one we accepted from that sender, or
-    /// at or below its floor if the sender has been reaped since.
-    fn admit_sequence(&mut self, message: &GossipMessage, now: Instant) -> bool {
+    /// Whether `message` is the freshest we've seen from its sender, by
+    /// incarnation and then sequence, and records it if so. A replayed or
+    /// duplicated datagram is no fresher than the last one we accepted from
+    /// that sender, or than its floor if the sender has been reaped since.
+    /// On a drop, returns what we hold, for the `Stale` answer.
+    fn admit_sequence(&mut self, message: &GossipMessage, now: Instant) -> Result<(), Freshness> {
+        let fresh = Freshness::of(message);
         if let Some(floor) = self.sequence_floors.get_mut(&message.sender)
             && floor.expires > now
         {
-            if message.sequence <= floor.sequence {
+            if fresh <= floor.freshness {
                 if !floor.logged {
                     floor.logged = true;
                     eprintln!(
-                        "mustard: dropping gossip from departed node {}: its sequence is at or \
-                         below the last one heard before it was reaped (if it restarted, its \
-                         clock went backwards; it is heard again when the floor expires)",
-                        message.sender
+                        "mustard: dropping an old datagram from departed node {} (at or below \
+                         what we heard before reaping it); answering with incarnation {}",
+                        message.sender, floor.freshness.incarnation
                     );
                 }
-                return false;
+                return Err(floor.freshness);
             }
-            // A newer sequence: the member really is back. Track it as a
-            // live sender from here on.
+            // Fresher: the member really is back. Track it as a live sender
+            // from here on.
             self.sequence_floors.remove(&message.sender);
         }
         match self.sequences.get_mut(&message.sender) {
-            Some(last) if message.sequence <= *last => false,
+            Some(last) if fresh <= *last => Err(*last),
             Some(last) => {
-                *last = message.sequence;
-                true
+                *last = fresh;
+                Ok(())
             }
             None => {
-                self.sequences
-                    .insert(message.sender.clone(), message.sequence);
-                true
+                self.sequences.insert(message.sender.clone(), fresh);
+                Ok(())
             }
         }
+    }
+
+    /// Tell the sender of a dropped datagram what we hold for it, at most
+    /// once per [`STALE_ANSWER_INTERVAL`] per sender. If it's the node
+    /// itself, restarted, it refutes past `held` and its next datagram is
+    /// heard; if it's a recording, nobody acts on the answer.
+    async fn answer_stale(
+        &mut self,
+        to: SocketAddr,
+        sender: &NodeId,
+        held: Freshness,
+        now: Instant,
+    ) {
+        if let Some(last) = self.stale_answers.get(sender)
+            && now.duration_since(*last) < STALE_ANSWER_INTERVAL
+        {
+            return;
+        }
+        if self.stale_answers.len() >= MAX_SEQUENCE_FLOORS {
+            self.stale_answers
+                .retain(|_, last| now.duration_since(*last) < STALE_ANSWER_INTERVAL);
+        }
+        self.stale_answers.insert(sender.clone(), now);
+        let answer = self.probe_message(
+            GossipPayload::Stale {
+                held_incarnation: held.incarnation,
+                updates: vec![],
+            },
+            None,
+        );
+        self.send(to, &answer).await;
     }
 
     /// Fold a received extension into the directory and publish on change.
@@ -914,9 +971,12 @@ impl<T: MustardTransport> MustardNode<T> {
             return;
         }
         for node in &reaped {
-            if let Some(sequence) = self.sequences.remove(node) {
-                self.retain_floor(node.clone(), sequence, now + SEQUENCE_FLOOR_RETENTION);
+            if let Some(freshness) = self.sequences.remove(node) {
+                self.retain_floor(node.clone(), freshness, now + SEQUENCE_FLOOR_RETENTION);
             }
+        }
+        for node in &reaped {
+            self.stale_answers.remove(node);
         }
         if self.directory.prune(&reaped) {
             self.publish_directory();
@@ -925,9 +985,9 @@ impl<T: MustardTransport> MustardNode<T> {
 
     /// Keep a sequence floor for `node`, raising an existing one. When the
     /// table is full, the floor closest to expiring makes room.
-    fn retain_floor(&mut self, node: NodeId, sequence: u64, expires: Instant) {
+    fn retain_floor(&mut self, node: NodeId, freshness: Freshness, expires: Instant) {
         if let Some(floor) = self.sequence_floors.get_mut(&node) {
-            floor.sequence = floor.sequence.max(sequence);
+            floor.freshness = floor.freshness.max(freshness);
             floor.expires = floor.expires.max(expires);
             return;
         }
@@ -944,7 +1004,7 @@ impl<T: MustardTransport> MustardNode<T> {
         self.sequence_floors.insert(
             node,
             RetainedFloor {
-                sequence,
+                freshness,
                 expires,
                 logged: false,
             },
@@ -964,13 +1024,17 @@ impl<T: MustardTransport> MustardNode<T> {
             if floor.node_id == self.node_id {
                 continue;
             }
+            let freshness = Freshness {
+                incarnation: floor.incarnation,
+                sequence: floor.sequence,
+            };
             if let Some(last) = self.sequences.get_mut(&floor.node_id) {
                 let departing = self
                     .membership
                     .get(&floor.node_id)
                     .is_some_and(|member| member.state.is_down());
                 if departing {
-                    *last = (*last).max(floor.sequence);
+                    *last = (*last).max(freshness);
                 }
                 continue;
             }
@@ -979,7 +1043,7 @@ impl<T: MustardTransport> MustardNode<T> {
             if remaining.is_zero() {
                 continue;
             }
-            self.retain_floor(floor.node_id.clone(), floor.sequence, now + remaining);
+            self.retain_floor(floor.node_id.clone(), freshness, now + remaining);
         }
     }
 
@@ -999,9 +1063,10 @@ impl<T: MustardTransport> MustardNode<T> {
             .filter_map(|member| {
                 self.sequences
                     .get(&member.node_id)
-                    .map(|&sequence| SequenceFloor {
+                    .map(|freshness| SequenceFloor {
                         node_id: member.node_id.clone(),
-                        sequence,
+                        incarnation: freshness.incarnation,
+                        sequence: freshness.sequence,
                         expires_in_secs: retention_secs,
                     })
             })
@@ -1012,7 +1077,8 @@ impl<T: MustardTransport> MustardNode<T> {
             .filter(|(_, floor)| floor.expires > now)
             .map(|(node, floor)| SequenceFloor {
                 node_id: node.clone(),
-                sequence: floor.sequence,
+                incarnation: floor.freshness.incarnation,
+                sequence: floor.freshness.sequence,
                 expires_in_secs: u32::try_from(floor.expires.duration_since(now).as_secs())
                     .unwrap_or(u32::MAX),
             })
@@ -1057,7 +1123,8 @@ impl<T: MustardTransport> MustardNode<T> {
         // a captured datagram replayed from another socket would otherwise
         // move the sender's address there, and an old extension would roll
         // its directory fields (recovery epoch included) back.
-        if !self.admit_sequence(&message, now) {
+        if let Err(held) = self.admit_sequence(&message, now) {
+            self.answer_stale(from, &message.sender, held, now).await;
             return false;
         }
 
@@ -1191,6 +1258,17 @@ impl<T: MustardTransport> MustardNode<T> {
                 // or two nodes would bounce their tables back and forth.
                 if *wants_reply {
                     self.send_membership(from, false).await;
+                }
+            }
+            GossipPayload::Stale {
+                held_incarnation, ..
+            } => {
+                // A peer dropped one of our datagrams as no fresher than
+                // what it holds: we restarted, and our counter may have
+                // started lower. Refute past what it holds so our next
+                // datagram is heard. Already past it, there's nothing to do.
+                if !self.left && *held_incarnation >= self.incarnation {
+                    self.refute(*held_incarnation);
                 }
             }
             GossipPayload::Ack { relayed_for, .. } => {
@@ -3511,8 +3589,15 @@ mod tests {
         assert_eq!(member.state, NodeState::Alive);
         assert_eq!(member.address, addr(7));
         assert_eq!(member.incarnation, 2);
-        // From here on it's an ordinary live sender.
-        assert!(node.handle_message(addr(7), ping_from("peer")).await);
+        // From here on it's an ordinary live sender at its new incarnation,
+        // and its old one is behind it.
+        let next = GossipMessage::new(
+            NodeId::new("peer"),
+            2,
+            GossipPayload::Ping { updates: vec![] },
+        );
+        assert!(node.handle_message(addr(7), next).await);
+        assert!(!node.handle_message(addr(7), ping_from("peer")).await);
     }
 
     #[tokio::test]
@@ -3578,17 +3663,152 @@ mod tests {
         assert!(a.membership.get(&NodeId::new("peer")).is_none());
     }
 
+    /// The restarted "peer": a fresh process at incarnation 1 whose wall
+    /// clock went backwards, so its sequences start below everything its
+    /// previous run sent. `sequence` stands in for that clock.
+    fn from_the_restarted(
+        node: &mut MustardNode<InMemoryTransport>,
+        sequence: u64,
+    ) -> GossipMessage {
+        let mut message = node.probe_message(GossipPayload::Ping { updates: vec![] }, None);
+        message.sequence = sequence;
+        message
+    }
+
+    /// Deliver everything waiting for `node`.
+    async fn deliver(node: &mut MustardNode<InMemoryTransport>) {
+        while let Some((from, message)) = node.transport.try_recv() {
+            node.handle_message(from, message).await;
+        }
+    }
+
+    async fn restart_with_the_clock_set_back(reap_first: bool) {
+        let net = InMemoryNetwork::new();
+        let ta = net.register(addr(1)).await;
+        let tb = net.register(addr(2)).await;
+        let mut a = MustardNode::new(NodeId::new("a"), addr(1), fast_config(), ta);
+        let recorded: Vec<_> = (0..3).map(|_| ping_from("peer")).collect();
+        if reap_first {
+            hear_then_reap(&mut a, &recorded).await;
+        } else {
+            for datagram in &recorded {
+                assert!(a.handle_message(addr(2), datagram.clone()).await);
+            }
+        }
+        let mut restarted = MustardNode::new(NodeId::new("peer"), addr(2), fast_config(), tb);
+        // The old process's ACKs from `a` are no concern of the new one.
+        while restarted.transport.try_recv().is_some() {}
+
+        // Its first datagram is older than what `a` holds, so it's dropped,
+        // and `a` answers with the incarnation it holds.
+        let first = from_the_restarted(&mut restarted, 1);
+        assert!(!a.handle_message(addr(2), first).await);
+        deliver(&mut restarted).await;
+        assert!(
+            restarted.incarnation > 1,
+            "the restarted node must refute the incarnation its peer holds"
+        );
+
+        // Its next datagram, still from the clock that went back, is heard.
+        let next = from_the_restarted(&mut restarted, 2);
+        assert!(
+            a.handle_message(addr(2), next).await,
+            "a restart whose clock went backwards was not heard"
+        );
+        let member = a.membership.get(&NodeId::new("peer")).unwrap();
+        assert_eq!(member.state, NodeState::Alive);
+        assert_eq!(member.address, addr(2));
+
+        // The old run's datagrams carry the old incarnation: still refused.
+        for datagram in recorded {
+            assert!(!a.handle_message(addr(66), datagram).await);
+        }
+        assert_eq!(
+            a.membership.get(&NodeId::new("peer")).unwrap().address,
+            addr(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restart_with_its_clock_set_back_is_heard_after_its_reap() {
+        restart_with_the_clock_set_back(true).await;
+    }
+
+    #[tokio::test]
+    async fn a_restart_with_its_clock_set_back_is_heard_before_its_reap() {
+        restart_with_the_clock_set_back(false).await;
+    }
+
+    #[tokio::test]
+    async fn stale_answers_are_rate_limited() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let reflector = net.register(addr(66)).await;
+        let mut node = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        let recorded: Vec<_> = (0..10).map(|_| ping_from("peer")).collect();
+        hear_then_reap(&mut node, &recorded).await;
+
+        for datagram in recorded {
+            assert!(!node.handle_message(addr(66), datagram).await);
+        }
+        let mut answers = 0;
+        while let Some((_, message)) = reflector.try_recv() {
+            assert!(matches!(message.payload, GossipPayload::Stale { .. }));
+            answers += 1;
+        }
+        assert_eq!(answers, 1, "one answer per sender per interval");
+    }
+
+    #[tokio::test]
+    async fn a_stale_answer_only_raises_our_incarnation_when_it_has_to() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        node.incarnation = 5;
+        let stale = |held_incarnation| {
+            GossipMessage::new(
+                NodeId::new("peer"),
+                1,
+                GossipPayload::Stale {
+                    held_incarnation,
+                    updates: vec![],
+                },
+            )
+        };
+        assert!(node.handle_message(addr(2), stale(3)).await);
+        assert_eq!(
+            node.incarnation, 5,
+            "we're already past what the peer holds"
+        );
+        assert!(node.handle_message(addr(2), stale(5)).await);
+        assert_eq!(node.incarnation, 6);
+
+        // A node that has left stays left.
+        node.leave().await;
+        let left_at = node.incarnation;
+        assert!(node.handle_message(addr(2), stale(40)).await);
+        assert_eq!(node.incarnation, left_at);
+    }
+
     #[tokio::test]
     async fn a_shared_floor_keeps_its_original_expiry() {
         let net = InMemoryNetwork::new();
         let t1 = net.register(addr(1)).await;
         let mut node = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
         let now = Instant::now();
-        node.retain_floor(NodeId::new("gone"), 5, now + Duration::from_secs(100));
+        let freshness = Freshness {
+            incarnation: 2,
+            sequence: 5,
+        };
+        node.retain_floor(
+            NodeId::new("gone"),
+            freshness,
+            now + Duration::from_secs(100),
+        );
 
         let window = node.floor_window(now + Duration::from_secs(40));
         assert_eq!(window.len(), 1);
-        assert_eq!(window[0].sequence, 5);
+        assert_eq!((window[0].incarnation, window[0].sequence), (2, 5));
         assert_eq!(
             window[0].expires_in_secs, 60,
             "a floor must travel with its remaining time, not a fresh one"
@@ -3607,6 +3827,7 @@ mod tests {
         assert!(node.handle_message(addr(2), ping_from("live")).await);
         let floor = |name: &str| SequenceFloor {
             node_id: NodeId::new(name),
+            incarnation: u64::MAX,
             sequence: u64::MAX,
             expires_in_secs: u32::MAX,
         };
@@ -3633,7 +3854,10 @@ mod tests {
         for i in 0..=MAX_SEQUENCE_FLOORS as u64 {
             node.retain_floor(
                 NodeId::new(format!("gone-{i}")),
-                i,
+                Freshness {
+                    incarnation: 1,
+                    sequence: i,
+                },
                 now + Duration::from_secs(i + 1),
             );
         }

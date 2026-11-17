@@ -236,20 +236,35 @@ pub enum GossipPayload {
         /// Whether the receiver should answer with its own table.
         wants_reply: bool,
     },
+    /// "Your datagram was no newer than what I hold for you." The answer to
+    /// a datagram dropped by the freshness check, so a node that restarted
+    /// (at incarnation 1, with a counter that may have started lower if its
+    /// clock went backwards) refutes past `held_incarnation` and is heard
+    /// on its next datagram. Only the node itself can act on it: a recorded
+    /// datagram can't refute.
+    Stale {
+        /// The incarnation the sender holds for the receiver.
+        held_incarnation: u64,
+        /// Piggybacked membership updates.
+        updates: Vec<MembershipUpdate>,
+    },
 }
 
-/// The highest sequence a node accepted from a member that has since been
-/// reaped, shared in anti-entropy so a node that never heard the member
+/// The freshest (incarnation, sequence) a node accepted from a member that
+/// has since been reaped, shared in anti-entropy so a node that never heard the member
 /// (one that joined later, or restarted) learns it too.
 ///
-/// A receiver drops any later datagram from `node_id` at or below
-/// `sequence` until the floor expires. A genuinely restarted member's
-/// counter starts above it, so the floor only stops old datagrams.
+/// A receiver drops any later datagram from `node_id` that isn't newer, by
+/// incarnation and then sequence, until the floor expires. A genuinely
+/// restarted member is told the incarnation and refutes past it (see
+/// [`GossipPayload::Stale`]), so the floor only stops old datagrams.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SequenceFloor {
     /// The departed member.
     pub node_id: NodeId,
-    /// The highest sequence accepted from it.
+    /// The incarnation of the freshest datagram accepted from it.
+    pub incarnation: u64,
+    /// That datagram's sequence.
     pub sequence: u64,
     /// Seconds left before the floor expires. A floor travels with its
     /// remaining time, not a fresh one, so passing it around never makes
@@ -264,6 +279,7 @@ impl GossipPayload {
             GossipPayload::Ping { updates }
             | GossipPayload::PingReq { updates, .. }
             | GossipPayload::Ack { updates, .. }
+            | GossipPayload::Stale { updates, .. }
             | GossipPayload::Sync {
                 entries: updates, ..
             } => updates,
@@ -276,6 +292,7 @@ impl GossipPayload {
             GossipPayload::Ping { updates }
             | GossipPayload::PingReq { updates, .. }
             | GossipPayload::Ack { updates, .. }
+            | GossipPayload::Stale { updates, .. }
             | GossipPayload::Sync {
                 entries: updates, ..
             } => updates,
@@ -751,6 +768,7 @@ mod tests {
         let floors = (0..MAX_PIGGYBACK_UPDATES as u64)
             .map(|i| SequenceFloor {
                 node_id: long_name(i),
+                incarnation: u64::MAX,
                 sequence: u64::MAX,
                 expires_in_secs: u32::MAX,
             })

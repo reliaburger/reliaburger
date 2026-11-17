@@ -303,8 +303,8 @@ struct GossipMessage {
     incarnation: u64,
     /// The sender's message counter (§8.1): seeded from wall-clock
     /// microseconds at process start, +1 per message. Receivers drop a
-    /// message at or below the highest sequence seen from its sender, or
-    /// below its floor once it has been reaped.
+    /// message no fresher, by (incarnation, sequence), than the freshest
+    /// seen from its sender, or than its floor once it has been reaped.
     sequence: u64,
     /// HMAC-SHA256 over the message with this field zeroed, keyed by the
     /// gossip key derived from the cluster master key.
@@ -349,12 +349,21 @@ enum GossipPayload {
         floors: Vec<SequenceFloor>,
         wants_reply: bool,
     },
+    /// The answer to a datagram dropped as no fresher than what the
+    /// sender holds (§8.1): the receiver, if it's the node itself, refutes
+    /// past `held_incarnation`.
+    Stale {
+        held_incarnation: u64,
+        updates: Vec<MembershipUpdate>,
+    },
 }
 
-/// A reaped member's last accepted sequence, with the seconds left before
-/// it expires (a floor travels with its remaining time, never a fresh one).
+/// A reaped member's freshest accepted (incarnation, sequence), with the
+/// seconds left before it expires (a floor travels with its remaining
+/// time, never a fresh one).
 struct SequenceFloor {
     node_id: NodeId,
+    incarnation: u64,
     sequence: u64,
     expires_in_secs: u32,
 }
@@ -1230,13 +1239,15 @@ When the node has a cluster master key (`[security] master_key_path`, produced b
 
 A node started without a master key (single-node and pre-security configurations) gossips unauthenticated. Generated secure clusters always have one.
 
-**Replay protection.** An HMAC proves the sender wrote a datagram once, not that it wrote it just now. Before #696 a captured, validly signed PING replayed from another host moved the sender's recorded address to the attacker's socket (so probes went there and the real node was declared dead), and an old directory extension rolled the sender's recovery epoch back. Every message now carries a `sequence` inside the HMAC: a process-wide counter seeded from wall-clock microseconds at start and incremented per message, so it rises across restarts. A receiver keeps the highest sequence it has accepted from each sender and drops any message at or below it before applying anything, so an address change or directory update can only come from a newer message. A receiver also ignores a directory extension that names anyone but the sender, so directory fields are bound to that sequence too. A relay forwards an indirect-probe ACK in its own name (`relayed_for`), so every message has exactly one stamping node.
+**Replay protection.** An HMAC proves the sender wrote a datagram once, not that it wrote it just now. Before #696 a captured, validly signed PING replayed from another host moved the sender's recorded address to the attacker's socket (so probes went there and the real node was declared dead), and an old directory extension rolled the sender's recovery epoch back. Every message now carries a `sequence` inside the HMAC: a process-wide counter seeded from wall-clock microseconds at start and incremented per message, so it usually rises across restarts ("Restarts" below covers a clock that went backwards). A receiver keeps the freshest `(incarnation, sequence)` it has accepted from each sender, compared incarnation first, and drops any message no fresher before applying anything, so an address change or directory update can only come from a newer message. A receiver also ignores a directory extension that names anyone but the sender, so directory fields are bound to that sequence too. A relay forwards an indirect-probe ACK in its own name (`relayed_for`), so every message has exactly one stamping node.
 
-**Sequence floors.** Reaping a member (60 s after it goes Dead or Left) removes it from the table, but not what it last sent. Its highest accepted sequence becomes a *floor*, kept for 24 hours (`SEQUENCE_FLOOR_RETENTION`), and any datagram from that sender at or below the floor is dropped. So the freshness check doesn't reset with the reap: an old datagram from a departed node stays old, and only the node itself can bring it back. The same node really coming back is unaffected, since its counter carries on, or restarts from the wall clock, above the floor; its first newer datagram turns the floor back into an ordinary per-sender sequence. A node that never heard the departed member (one that joined, or restarted, after the reap) learns the floor in anti-entropy (§3.2): each side of a push-pull sends its floors after its entries, each with its remaining time, so passing a floor on never extends it. Members that are down but not yet reaped go too, and a node raises its own sequence for such a member to the highest it hears, so by the reap the whole cluster agrees on the highest sequence any node accepted, including datagrams the member sent to someone else. A node keeps at most 1,024 floors (`MAX_SEQUENCE_FLOORS`), dropping the one closest to expiry first, ignores a floor about itself or about a sender it hears directly, and caps a received floor's lifetime at the retention.
+**Sequence floors.** Reaping a member (60 s after it goes Dead or Left) removes it from the table, but not what it last sent. Its freshest accepted `(incarnation, sequence)` becomes a *floor*, kept for 24 hours (`SEQUENCE_FLOOR_RETENTION`), and any datagram from that sender no fresher than the floor is dropped. So the freshness check doesn't reset with the reap: an old datagram from a departed node stays old, and only the node itself can bring it back. The same node really coming back is heard straight away, whatever its clock says (see "Restarts" below); its first fresher datagram turns the floor back into an ordinary per-sender record. A node that never heard the departed member (one that joined, or restarted, after the reap) learns the floor in anti-entropy (§3.2): each side of a push-pull sends its floors after its entries, each with its remaining time, so passing a floor on never extends it. Members that are down but not yet reaped go too, and a node raises its own record for such a member to the freshest it hears, so by the reap the whole cluster agrees on the highest sequence any node accepted, including datagrams the member sent to someone else. A node keeps at most 1,024 floors (`MAX_SEQUENCE_FLOORS`), dropping the one closest to expiry first, ignores a floor about itself or about a sender it hears directly, and caps a received floor's lifetime at the retention.
 
 **Datagrams in our own name.** A node drops any datagram whose `sender` is itself, before anything is applied. It keeps no sequence for itself to check such a datagram against, and nothing in one can be news: applying it could only move the node's own address or roll its own directory entry back. The only legitimate case is a seed list that names the node's own address, and a reply from itself tells it nothing.
 
-The sequence is a counter, not a timestamp check, so receivers need no clock agreement and no acceptance window: a timestamp would have to tolerate skew between hosts, and anything inside that tolerance could be replayed. The cost is that strict ordering drops a datagram that UDP delivers out of order behind a newer one from the same sender; gossip already tolerates loss, so that's a lost datagram, not an error. A node whose clock stepped backwards across a restart (by more than its downtime) is not heard until its floor expires, up to 24 hours after its peers reaped it; each peer logs the first datagram it drops for that reason, naming the node.
+**Restarts.** A node starts every run at incarnation 1, and its counter is seeded from the wall clock, so a node that boots with its clock behind (an appliance before NTP settles) sends datagrams that look older than its previous run's. A receiver that drops a datagram as stale answers the sender, at most once a second per sender, with `Stale { held_incarnation }`: the incarnation it holds for it. The node itself refutes past that, exactly as it refutes a `Suspect` or `Dead` about itself, and its next datagram carries a higher incarnation, so it's fresher whatever its sequence. A restarted node is heard after one round trip to each peer, with no dependence on its clock and nothing persisted, and that holds after a wiped data directory too. A recorded datagram can't refute: the answer goes to whoever sent it, and it carries the old incarnation however often it's replayed. A node that's already past `held_incarnation`, or has left, ignores the answer.
+
+The sequence is a counter, not a timestamp check, so receivers need no clock agreement and no acceptance window: a timestamp would have to tolerate skew between hosts, and anything inside that tolerance could be replayed. The cost is that strict ordering drops a datagram that UDP delivers out of order behind a newer one from the same sender; gossip already tolerates loss, so that's a lost datagram, not an error (and at most one `Stale` answer a second, which the sender ignores unless it has to refute).
 
 **TODO (not yet implemented):** gossip key rotation. The key is fixed for the life of the master key; there's no rotation command and no dual-key acceptance window.
 
