@@ -169,11 +169,14 @@ async fn release_when_settled(
         let Some(deadline) = *until.borrow() else {
             return;
         };
+        // Read the leader before `send_if_modified` takes the hold's write
+        // lock, so the two watch locks are never held together (#1273,
+        // #1433).
+        let leader = metrics.borrow().current_leader;
         let released = until.send_if_modified(|held| {
             let Some(deadline) = *held else {
                 return false;
             };
-            let leader = metrics.borrow().current_leader;
             if !hold_ends(self_id, leader, Instant::now(), deadline) {
                 return false;
             }

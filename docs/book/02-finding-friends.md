@@ -1762,6 +1762,7 @@ pub struct DirectoryExtension {
 pub struct LeaderHint {
     pub node_id: NodeId,
     pub term: u64,
+    pub recovery_epoch: u64,
     pub api_address: SocketAddr,
     pub reporting_address: SocketAddr,
 }
@@ -1772,6 +1773,44 @@ The endpoints are the sender's own, straight from its config. No more "the API i
 The leader hint is the interesting part. Only the actual leader *originates* a hint: the cluster runtime watches the local Raft metrics and, while this node leads, publishes `Some(LeaderHint { me, my term, my endpoints })` into the gossip node. Everyone else just relays the highest-term hint they've seen. Raft terms only ever grow, so failover resolves itself: the new leader's hint carries a higher term and displaces the old one everywhere within a few gossip rounds, and a deposed leader's stale hint (or a replayed datagram) always loses the comparison. There's no retraction protocol, no invalidation message. Just max-by-term, the same trick incarnation numbers pull in SWIM.
 
 On the receiving side, every node folds extensions into a `NodeDirectory` (a map of node to endpoints plus the best hint) and publishes it on a `watch` channel. The reporting worker's leader-target maintainer and the placement reconciler now resolve the leader through one shared function: Raft metrics stay authoritative when they know a leader (voters, same term or newer), and the gossip directory answers for everyone else. A worker outside the council learns the leader from its very first gossip exchange with anyone who knows.
+
+### Whose term is it?
+
+"Raft metrics stay authoritative, the hint answers for everyone else" hides a question: how far do you trust a hint? A hint claiming term `u64::MAX` would, if a voter believed it, carry that voter's reporting epoch to a number no real election will ever reach. So since July a node took a hint only if its term was at most ten above the node's own Raft term (`MAX_LEADER_HINT_TERM_LEAD`). An election bumps the term by one, so ten absorbs gossip outrunning Raft and still refuses nonsense.
+
+Now ask what "the node's own Raft term" is on the eighth node, the one this whole section exists for. It never joins Raft. It never hears an AppendEntries. Its metrics say term 0, today and forever. The check reads `hint.term <= 0 + 10`, which holds until the cluster's eleventh election. Failovers, rolling upgrades, handovers, a voter deposed for a full disk: a long-lived cluster gets there. From then on every worker past the council cap finds no leader, stops polling for placements and stops reporting, and the leader, hearing nothing, places their replicas a second time while the old ones still run. The unit test passed a local term of 5, which no real non-member ever has, so it never saw this ([#1996](https://github.com/reliaburger/reliaburger/issues/1996)).
+
+The fix is to admit that a non-member has no term to judge by. `raft_leader` now reports the local term only when this node sits in the Raft membership (voters and learners both do), and `resolve_leader_view` takes it as an `Option<u64>`:
+
+```rust
+let hint_plausible = |hint: &LeaderHint| {
+    hint.recovery_epoch != local_epoch
+        || local_term.is_none_or(|local| {
+            hint.term <= local.saturating_add(MAX_LEADER_HINT_TERM_LEAD)
+        })
+};
+```
+
+`Option::is_none_or(f)` is `true` for `None` and `f(value)` for `Some(value)`: no term, no bound. A member keeps the bound, because its term is real, but only for hints from its own recovery epoch (more on epochs in a moment). A voter that a recovery has fenced still holds the old council's term, and comparing that with the new council's fresh term line would make it refuse the new leader for no reason. A non-member takes the newest hint gossip has shown it. Isn't that the forged-term problem again? Not really. Forging a hint takes the cluster's gossip key, since every extension carries an HMAC, and the reporting epoch a hint can move only gates anything on the leader, which is a member and judges hints by its own term.
+
+The same review found a second way for a hint to lie about its term. `relish council recover` builds a new council at a new *recovery epoch*, and its terms start again from the bottom. For a while, surviving workers still relay the old council's last hint: epoch 0, term 9, say, against the recovered leader's epoch 1, term 3. The directory ordered hints by `(recovery_epoch, term)`, but `resolve_leader_view` compared terms alone, so 9 beat 3 and the recovered leader's reporting epoch jumped to 9. The maintainer only ever let that epoch grow, and the scheduler skips every pass while the epoch differs from the leader's own term. Nothing would ever bring it back down ([#1997](https://github.com/reliaburger/reliaburger/issues/1997)).
+
+Two changes close it. The gossip directory now holds a *recovery floor*, the newest epoch the node's own recovery fence knows. `observe_hint` refuses a hint from below the floor, and `raise_recovery_floor` drops one already held when the floor rises, so a node never resolves the old council at all. And the reporting epoch is keyed on the pair, not the term:
+
+```rust
+pub fn next_reporting_epoch(last: Option<(u64, u64)>, view: &LeaderView) -> Option<(u64, u64)> {
+    let key = (view.recovery_epoch, view.term);
+    let publish = match view.source {
+        LeaderSource::Raft => last != Some(key),
+        LeaderSource::Gossip => last.is_none_or(|last| key > last),
+    };
+    publish.then_some(key)
+}
+```
+
+Tuples compare field by field, so a newer recovery epoch wins whatever the terms. The new `LeaderSource` enum records where a view came from. A node's own Raft metrics are the truth about its own term, so they always set the epoch, even downwards; a gossip hint may only move it forward. That's the half that rescues a node whose epoch an old hint has already raised.
+
+While we were here, we also fixed three places that held two `watch` borrows at once, the pattern behind the deadlocks in Chapter 14. The leader-hint publisher read the recovery fence inside its metrics borrow. The fenced metrics filter borrowed both channels in one expression. And the handover hold read the metrics inside `send_if_modified`, which holds the hold's write lock. None of them had a partner taking the locks the other way round yet. Each now copies one value out before it takes the next lock.
 
 ### Keeping the extension out of the message body
 
