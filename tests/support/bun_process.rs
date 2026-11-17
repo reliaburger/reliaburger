@@ -312,6 +312,20 @@ pub fn reserve_address() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], reserve_port_block(1)))
 }
 
+/// A `[network] port_range` that holds none of the test ports.
+///
+/// A clustered Bun on rootful Linux applies the perimeter, which answers
+/// ports inside the host-port range for cluster members only, so Bun refuses
+/// to start when its API or cluster ports fall there. The test ports come
+/// from 27000–29999, inside the default range (10000–32767); a fixture that
+/// runs such a Bun gives it this range instead, which ends below them.
+pub fn host_port_range_clear_of_test_ports() -> reliaburger::config::node::PortRange {
+    reliaburger::config::node::PortRange {
+        start: 10000,
+        end: TEST_PORTS.start - 1,
+    }
+}
+
 /// Three free loopback ports for gossip, Raft and reporting.
 pub fn reserve_ports() -> [u16; 3] {
     let base = reserve_port_block(3);
