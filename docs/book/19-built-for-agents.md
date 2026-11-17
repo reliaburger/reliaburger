@@ -5039,7 +5039,10 @@ Three details in `write`, each from a way it could go wrong:
 - **Rename, don't overwrite.** The new text goes to `<file>.relish-setup.tmp`
   beside the original, then `fs::rename` moves it over. On one filesystem a
   rename is atomic, so a crash leaves the old file or the new one, never half
-  of each. The temporary file is created owner-only (`0600`) before a byte
+  of each. That holds only if the bytes reach the disk before the rename
+  does: a filesystem may commit the rename first, and a crash then leaves an
+  empty config. So `sync_all` flushes the copy before the rename, and the
+  directory, which holds the rename itself, is synced after it. The temporary file is created owner-only (`0600`) before a byte
   goes in, with `OpenOptions` and `create_new`: `~/.claude.json` holds other
   MCP servers' tokens, and `fs::write` would have created the copy with the
   umask's mode, usually `0644`, readable by every local user until the

@@ -633,7 +633,9 @@ fn write(path: &Path, before: Option<&str>, after: Option<&str>) -> io::Result<(
 /// Write `contents` to `temporary`, give it `path`'s permissions and rename
 /// it over `path`. An agent's config can hold other servers' tokens, so the
 /// copy is created owner-only before a byte goes in; a leftover from a
-/// killed run is removed first rather than reused with its old mode.
+/// killed run is removed first rather than reused with its old mode. The
+/// copy is synced before the rename and the directory after it, so a crash
+/// leaves the old config or the whole new one, never an empty file.
 fn replace_through(temporary: &Path, path: &Path, contents: &str) -> io::Result<()> {
     use std::io::Write as _;
     match fs::remove_file(temporary) {
@@ -649,11 +651,18 @@ fn replace_through(temporary: &Path, path: &Path, contents: &str) -> io::Result<
     }
     let mut file = options.open(temporary)?;
     file.write_all(contents.as_bytes())?;
+    file.sync_all()?;
     drop(file);
     if let Ok(meta) = fs::metadata(path) {
         fs::set_permissions(temporary, meta.permissions())?;
     }
-    fs::rename(temporary, path)
+    fs::rename(temporary, path)?;
+    // The rename lives in the directory; without this a crash can undo it.
+    #[cfg(unix)]
+    if let Some(directory) = path.parent() {
+        fs::File::open(directory)?.sync_all()?;
+    }
+    Ok(())
 }
 
 /// What setup knows about the token the agents' `relish mcp` will send,
