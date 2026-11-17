@@ -336,7 +336,7 @@ impl RaftLogReader<TypeConfig> for DurableLogReader {
         &mut self,
         range: RB,
     ) -> Result<Vec<Entry<TypeConfig>>, StorageError<u64>> {
-        self.store.read_range(range)
+        self.store.read_range_blocking(range).await
     }
 }
 
@@ -345,7 +345,25 @@ impl RaftLogReader<TypeConfig> for DurableLogStore {
         &mut self,
         range: RB,
     ) -> Result<Vec<Entry<TypeConfig>>, StorageError<u64>> {
-        self.read_range(range)
+        self.read_range_blocking(range).await
+    }
+}
+
+impl DurableLogStore {
+    /// [`Self::read_range`] on the blocking pool. A read is redb I/O plus
+    /// decryption and decoding per entry, and after a restart openraft can
+    /// ask for thousands of entries at once from its core loop, which sends
+    /// no heartbeats while it waits.
+    async fn read_range_blocking<RB: RangeBounds<u64>>(
+        &self,
+        range: RB,
+    ) -> Result<Vec<Entry<TypeConfig>>, StorageError<u64>> {
+        let bounds = (
+            copy_bound(range.start_bound()),
+            copy_bound(range.end_bound()),
+        );
+        let store = self.clone();
+        run_blocking(move || store.read_range(bounds)).await
     }
 }
 

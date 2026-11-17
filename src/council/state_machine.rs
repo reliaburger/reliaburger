@@ -3852,9 +3852,15 @@ impl RaftStateMachine<TypeConfig> for CouncilStateMachine {
         meta: &SnapshotMeta<u64, CouncilNodeInfo>,
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<u64>> {
+        // Decoding the whole desired state is CPU work that grows with the
+        // cluster: off the runtime, so the worker keeps serving heartbeats.
         let data = snapshot.into_inner();
-        let new_state: DesiredState = serde_json::from_slice(&data)
-            .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?;
+        let (new_state, data) = tokio::task::spawn_blocking(move || {
+            serde_json::from_slice::<DesiredState>(&data).map(|state| (state, data))
+        })
+        .await
+        .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?
+        .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?;
 
         let (db, index) = {
             let mut guard = self.inner.write().await;
@@ -3911,22 +3917,30 @@ pub struct MemSnapshotBuilder {
 
 impl RaftSnapshotBuilder<TypeConfig> for MemSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<u64>> {
-        let (data, index, db, last_log_id, last_membership) = {
-            let mut guard = self.inner.write().await;
-            let data = serde_json::to_vec(&guard.state)
-                .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?;
-            guard.snapshot_index += 1;
-            guard.snapshot_data = Some(data.clone());
-            guard.snapshot_last_log_id = guard.state.last_applied_log;
-            guard.snapshot_membership = guard.state.last_membership.clone();
-            (
-                data,
-                guard.snapshot_index,
-                guard.db.clone(),
-                guard.state.last_applied_log,
-                guard.state.last_membership.clone(),
-            )
-        };
+        // Encoding the whole desired state is CPU work that grows with the
+        // cluster, so it runs on a blocking thread, which takes the lock
+        // there: `apply` waits for it asynchronously instead of a runtime
+        // worker stalling while it encodes.
+        let inner = Arc::clone(&self.inner);
+        let (data, index, db, last_log_id, last_membership) =
+            tokio::task::spawn_blocking(move || {
+                let mut guard = inner.blocking_write();
+                let data = serde_json::to_vec(&guard.state)?;
+                guard.snapshot_index += 1;
+                guard.snapshot_data = Some(data.clone());
+                guard.snapshot_last_log_id = guard.state.last_applied_log;
+                guard.snapshot_membership = guard.state.last_membership.clone();
+                Ok::<_, serde_json::Error>((
+                    data,
+                    guard.snapshot_index,
+                    guard.db.clone(),
+                    guard.state.last_applied_log,
+                    guard.state.last_membership.clone(),
+                ))
+            })
+            .await
+            .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?
+            .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?;
 
         // Persist so applied state survives a restart, off the async runtime
         // (M7): the lock is released before the fsync.
