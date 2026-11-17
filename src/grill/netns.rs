@@ -905,11 +905,11 @@ async fn ensure_nft_table(executor: &impl RuntimeCommandExecutor) -> Result<(), 
 
     // The single lookup rule that consults the map. `add rule` appends, so
     // probe first. A chain holding an older version of the rule (the kernel
-    // keeps it across a Bun upgrade) is emptied and rewritten.
+    // keeps it across a Bun upgrade) is emptied and rewritten, in one nft
+    // transaction.
     let prerouting = list_chain(executor, "prerouting").await?;
     if !portmap::prerouting_is_current(&prerouting) {
-        run_nft(executor, &portmap::flush_prerouting()).await?;
-        run_nft(executor, &portmap::map_rule()).await?;
+        run_nft(executor, &portmap::replace_map_rule()).await?;
     }
 
     Ok(())
@@ -1258,13 +1258,19 @@ mod tests {
         };
         ensure_nft_table(&older).await.unwrap();
         let calls = older.calls.lock().unwrap().clone();
-        let flush = calls
+        // One nft invocation is one transaction: the chain is never left
+        // empty between the flush and the new rule.
+        let replacements: Vec<_> = calls
             .iter()
-            .position(|call| call == "flush chain ip reliaburger prerouting")
-            .expect("older rule must be flushed");
+            .filter(|call| call.contains("prerouting") && !call.starts_with("-a list"))
+            .filter(|call| !call.starts_with("add chain"))
+            .collect();
         assert_eq!(
-            calls[flush + 1],
-            "add rule ip reliaburger prerouting fib daddr type local dnat ip addr . port to tcp dport map @portmap"
+            replacements,
+            vec![
+                "flush chain ip reliaburger prerouting ; add rule ip reliaburger prerouting fib daddr type local dnat ip addr . port to tcp dport map @portmap"
+            ],
+            "{calls:?}"
         );
 
         let current = ScriptedNft {

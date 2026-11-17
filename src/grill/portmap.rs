@@ -106,13 +106,18 @@ pub fn map_rule() -> Vec<String> {
     .collect()
 }
 
-/// Argv emptying the prerouting chain. The chain holds nothing but the map
-/// rule, and the elements live in the map, so flushing it loses no mapping.
-pub fn flush_prerouting() -> Vec<String> {
-    ["flush", "chain", "ip", TABLE, "prerouting"]
+/// Argv emptying the prerouting chain and writing [`map_rule`] into it, in
+/// one `nft` invocation. nft applies every command of an invocation as one
+/// transaction, so the chain is never seen empty and a failure leaves the
+/// old rule in place. The chain holds nothing but the map rule, and the
+/// elements live in the map, so the flush loses no mapping.
+pub fn replace_map_rule() -> Vec<String> {
+    let mut args: Vec<String> = ["flush", "chain", "ip", TABLE, "prerouting", ";"]
         .into_iter()
         .map(String::from)
-        .collect()
+        .collect();
+    args.extend(map_rule());
+    args
 }
 
 /// Whether a `nft list chain` listing of the prerouting chain holds the map
@@ -415,10 +420,17 @@ pub(crate) mod tests {
         assert!(!prerouting_is_current(unscoped));
         assert!(!prerouting_is_current(both));
         assert!(!prerouting_is_current("table ip reliaburger {\n}\n"));
+        // nft runs every command of one invocation as one transaction, and
+        // `;` separates them.
+        let replace = replace_map_rule();
         assert_eq!(
-            flush_prerouting().join(" "),
-            "flush chain ip reliaburger prerouting"
+            replace.join(" "),
+            format!(
+                "flush chain ip reliaburger prerouting ; {}",
+                map_rule().join(" ")
+            )
         );
+        assert_eq!(replace.iter().filter(|word| *word == ";").count(), 1);
     }
 
     #[test]

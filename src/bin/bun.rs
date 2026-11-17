@@ -1587,6 +1587,13 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         config.security.bootstrap_peers.clone(),
         config.security.operator_cidrs.clone(),
     );
+    // The perimeter answers host ports for cluster members only, so a port
+    // Bun serves on can't sit inside the host-port range.
+    if agent.perimeter_enabled() {
+        config
+            .check_service_ports_outside_port_range(api_port)
+            .context("the node's ports clash with [network] port_range")?;
+    }
     agent.set_smoker_config(config.smoker.to_smoker_config());
     agent.set_node_leaf_lifetime(config.security.node_leaf_lifetime());
     agent.set_stop_confirmation_timeout(config.runtime.stop_confirmation_timeout());

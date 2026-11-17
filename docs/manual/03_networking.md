@@ -44,7 +44,11 @@ refuses to start and names `[dns] upstream`.
 Apps in the same namespace can reach each other; other namespaces can't. That
 holds for every address a workload has, not just its VIP: a backend's
 container address (any port), and a published host port on any node, which is
-what `relish resolve` prints. Open a specific cross-namespace path with
+what `relish resolve` prints. Those host ports are for traffic inside the
+cluster: on a node running the perimeter, they answer cluster members and the
+node's own containers only, so `curl node:port` from a laptop outside the
+cluster times out. Reach an app from outside through [ingress](#ingress). Open
+a specific cross-namespace path with
 `allow_from`, naming apps as `namespace/app`:
 
 ```toml

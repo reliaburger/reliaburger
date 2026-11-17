@@ -206,6 +206,8 @@ The fix is four words in the rule: `fib daddr type local`. `fib` asks the kernel
 
 One wrinkle: the kernel keeps nftables state across a Bun upgrade, so an upgraded node could still hold the old rule. The probe that guards `add rule` against duplicates now checks for the current rule exactly, via `portmap::prerouting_is_current`, and if the chain holds anything else it flushes the chain and writes the rule again. The chain holds nothing but this one rule and the elements live in the map, so the flush loses no mapping.
 
+The flush and the add go to nft as one command line, `flush chain ip reliaburger prerouting ; add rule …`, and that detail matters. nft applies everything in one invocation as a single transaction. Run them as two invocations and there's a moment when the chain is empty, and a failed add leaves it empty for good: every published port on the node stops answering until the next setup. With one transaction, the kernel sees either the old rule or the new one, never neither.
+
 ## Deleting data without losing it
 
 Before this chapter's peer-to-peer downloads can exist, the registry needs three things it didn't have at the end of Phase 5: a catalogue every node agrees on, more than one copy of each image, and a garbage collector that can't destroy the last copy. All three landed with the big wiring pass, and the design that shipped differs from what we'd sketched in ways worth studying. This section describes what's actually in the tree, then hardens its weakest part.
