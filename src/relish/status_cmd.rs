@@ -38,6 +38,7 @@ pub struct StatusArgs {
     /// Skip `wtf`'s checks.
     pub quick: bool,
     /// Exit 1 on `DEGRADED` and 2 on `DOWN`, for scripts and monitoring.
+    /// No answer exits with [`no_answer_exit_code`] either way.
     pub check: bool,
     /// Human, JSON or YAML.
     pub output: OutputFormat,
@@ -77,22 +78,28 @@ pub async fn run_with_client(
     });
     let summary = match summary {
         Ok(summary) => summary,
-        Err(error) if args.output == OutputFormat::Json => {
-            // An agent reads the envelope whether or not the cluster
-            // answered; the exit code is the envelope's own.
+        Err(error) if args.output == OutputFormat::Human => return Err(error),
+        Err(error) => {
+            // A script reads the envelope whether or not the cluster
+            // answered, and every format exits with the same code (#2013).
             let envelope: Envelope<()> = Envelope::failed(
                 CommandName::Status,
                 BuildInfo::current(),
                 AgentError::from(&error),
             );
             let exit = envelope.exit_status().code();
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&envelope).map_err(RelishError::SerialiseJson)?
-            );
+            match args.output {
+                OutputFormat::Yaml => print!(
+                    "{}",
+                    yaml_serde::to_string(&envelope).map_err(RelishError::SerialiseYaml)?
+                ),
+                _ => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&envelope).map_err(RelishError::SerialiseJson)?
+                ),
+            }
             return Ok(CommandOutcome::Exited(exit));
         }
-        Err(error) => return Err(error),
     };
     let data = status_data(summary, wtf);
     match args.output {
@@ -111,6 +118,15 @@ pub async fn run_with_client(
     } else {
         CommandOutcome::Clean
     })
+}
+
+/// The exit code of `relish status` when the cluster didn't answer: the
+/// agent envelope's own, so `3` for a cluster it couldn't reach or
+/// authenticate to, `4` for a refusal and `5` for anything else. Never `1`
+/// or `2`, which `--check` keeps for `DEGRADED` and `DOWN` (#2013). Human
+/// output prints the error on stderr and exits with this code too.
+pub fn no_answer_exit_code(error: &RelishError) -> u8 {
+    AgentError::from(error).code.exit_status().code()
 }
 
 /// Run `wtf`'s checks within `budget`.

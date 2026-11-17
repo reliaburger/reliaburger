@@ -626,7 +626,7 @@ relish --help                       # Print help and exit
 # Core operations
 relish status                       # The whole cluster on one screen: a verdict, then one line per part
 relish status --quick               # The same without wtf's checks (otherwise run with a 2 s budget)
-relish status --check               # Exit 1 on DEGRADED, 2 on DOWN
+relish status --check               # Exit 1 on DEGRADED, 2 on DOWN, 3 if unreachable
 relish apps                         # One row per app (state, ready, restarts, nodes, age), problems first
 relish apps <app>                   # That app's instances (node, state, PID, restarts, age) and why any isn't running
 relish apps --instances             # Every instance of every app

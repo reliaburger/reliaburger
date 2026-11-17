@@ -685,7 +685,8 @@ enum Command {
         #[arg(long)]
         quick: bool,
         /// Exit 1 when the cluster is DEGRADED and 2 when it's DOWN, for
-        /// scripts and monitoring.
+        /// scripts and monitoring. A cluster that doesn't answer exits 3
+        /// with or without it.
         #[arg(long)]
         check: bool,
     },
@@ -2511,14 +2512,22 @@ async fn main() -> ExitCode {
             Ok(source) => commands::apply(&source, cli.output, dry_run, break_lease).await,
         },
         Command::Status { quick, check } => {
-            return finish_outcome(
-                reliaburger::relish::status_cmd::run(reliaburger::relish::status_cmd::StatusArgs {
-                    quick,
-                    check,
-                    output: cli.output,
-                })
-                .await,
-            );
+            use reliaburger::relish::status_cmd;
+            let outcome = status_cmd::run(status_cmd::StatusArgs {
+                quick,
+                check,
+                output: cli.output,
+            })
+            .await;
+            // No answer exits 3 (unreachable), as the JSON envelope does,
+            // never 1, which `--check` keeps for DEGRADED (#2013).
+            return match outcome {
+                Err(error) => {
+                    report(&error);
+                    ExitCode::from(status_cmd::no_answer_exit_code(&error))
+                }
+                outcome => finish_outcome(outcome),
+            };
         }
         Command::Apps {
             ref name,
@@ -3258,7 +3267,7 @@ async fn main() -> ExitCode {
         },
         Command::Identity { action } => match action {
             IdentityAction::RotateSigningKey => {
-                reliaburger::relish::ca_cmd::identity_rotate_signing_key().await
+                reliaburger::relish::ca_cmd::identity_rotate_signing_key(cli.output).await
             }
         },
         Command::Ca { action } => match &action {
@@ -3573,8 +3582,10 @@ async fn main() -> ExitCode {
             OsAction::Abort => reliaburger::relish::os::abort(cli.output).await,
         },
         Command::JoinToken { action } => match &action {
-            JoinTokenAction::List => commands::join_token_list().await,
-            JoinTokenAction::Revoke { node_id } => commands::join_token_revoke(node_id).await,
+            JoinTokenAction::List => commands::join_token_list(cli.output).await,
+            JoinTokenAction::Revoke { node_id } => {
+                commands::join_token_revoke(node_id, cli.output).await
+            }
             JoinTokenAction::Create { node_id, ttl } => {
                 commands::join_token_create(node_id, *ttl, cli.output).await
             }
