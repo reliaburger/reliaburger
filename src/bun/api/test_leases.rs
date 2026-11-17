@@ -248,11 +248,16 @@ pub(super) async fn test_lease_get_handler(
     if let Some(council) = &state.council
         && !confirmed_lease_leader(council).await
     {
+        let path =
+            match crate::cluster::http::peer_path(&["v1", "test", "leases", lease_id.as_str()]) {
+                Ok(path) => path,
+                Err(error) => return peer_path_refusal(&error),
+            };
         return forward_test_lease_request::<()>(
             &state,
             council,
             reqwest::Method::GET,
-            &format!("/v1/test/leases/{lease_id}"),
+            &path,
             &headers,
             None,
         )
@@ -307,11 +312,21 @@ pub(super) async fn test_lease_renew_handler(
     if let Some(council) = &state.council
         && !crate::bun::leadership::leads(council).await
     {
+        let path = match crate::cluster::http::peer_path(&[
+            "v1",
+            "test",
+            "leases",
+            lease_id.as_str(),
+            "renew",
+        ]) {
+            Ok(path) => path,
+            Err(error) => return peer_path_refusal(&error),
+        };
         return forward_test_lease_request(
             &state,
             council,
             reqwest::Method::POST,
-            &format!("/v1/test/leases/{lease_id}/renew"),
+            &path,
             &headers,
             Some(&request),
         )
@@ -377,11 +392,16 @@ pub(super) async fn test_lease_release_handler(
     if let Some(council) = &state.council
         && !crate::bun::leadership::leads(council).await
     {
+        let path =
+            match crate::cluster::http::peer_path(&["v1", "test", "leases", lease_id.as_str()]) {
+                Ok(path) => path,
+                Err(error) => return peer_path_refusal(&error),
+            };
         return forward_test_lease_request::<()>(
             &state,
             council,
             reqwest::Method::DELETE,
-            &format!("/v1/test/leases/{lease_id}"),
+            &path,
             &headers,
             None,
         )
@@ -466,6 +486,8 @@ pub(super) const MAX_LEASE_FORWARD_RESPONSE_BYTES: usize = 64 * 1024;
 /// Forward a lease mutation to the current leader while retaining the
 /// caller's own credentials. The leader repeats authentication and policy
 /// checks; a follower never replaces user authority with the service token.
+///
+/// `path` is a constant or comes from [`crate::cluster::http::peer_path`].
 pub(super) async fn forward_test_lease_request<T: Serialize + ?Sized>(
     state: &ApiState,
     council: &crate::council::CouncilNode,
@@ -502,7 +524,8 @@ pub(super) async fn forward_test_lease_request<T: Serialize + ?Sized>(
             .cluster_http
             .client()
             .request(method, format!("{leader_url}{path}"))
-            .header("x-reliaburger-lease-forwarded", "1"),
+            .header("x-reliaburger-lease-forwarded", "1")
+            .header(FORWARDED_FOR_USER_HEADER, "1"),
     );
     for name in [
         axum::http::header::AUTHORIZATION,

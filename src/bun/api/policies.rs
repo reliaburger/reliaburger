@@ -54,11 +54,15 @@ pub(super) async fn policy_delete_handler(
         )
             .into_response();
     };
+    let path = match crate::cluster::http::peer_path(&["v1", "policies", name.as_str(), "delete"]) {
+        Ok(path) => path,
+        Err(error) => return peer_path_refusal(&error),
+    };
     if let Some(forwarded) = super::upgrade::forward_upgrade_to_leader(
         &state,
         council,
         directory.as_deref(),
-        &format!("/v1/policies/{name}/delete"),
+        &path,
         &headers,
         "",
     )

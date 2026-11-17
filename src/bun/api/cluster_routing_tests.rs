@@ -3,8 +3,13 @@
 //! cross-node routing paths without starting gossip or Raft.
 
 use super::faults::ClusterFaultList;
-use super::nodes::relay_allows;
+use super::nodes::relay_peer_path;
 use super::*;
+
+/// Whether the relay forwards `method /path` (`path` decoded, no leading `/`).
+fn relay_allows(method: &axum::http::Method, path: &str) -> bool {
+    relay_peer_path(method, path).is_some()
+}
 use crate::smoker::types::{FaultRequest, FaultSummary, FaultType, ReplicaEvidence};
 use tokio_util::sync::CancellationToken;
 
@@ -1062,6 +1067,48 @@ async fn the_relay_forwards_only_the_diagnostic_reads() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert!(body.contains("node-9"), "{body}");
+}
+
+/// An encoded `\` decodes into one segment, which a URL would read as `/`
+/// and then resolve its `..`s: the relay refuses it at the entry node, so it
+/// never leaves for the peer as `GET /v1/token/list`. The same goes
+/// for encoded tabs and newlines, which a URL drops.
+#[tokio::test]
+async fn the_relay_refuses_encoded_backslashes_tabs_and_newlines() {
+    let cluster = start_cluster(vec![
+        ("node-1", vec![]),
+        ("node-2", vec![instance("default/web-0", "web", "running")]),
+    ])
+    .await;
+    let operator = Some(cluster.operator.as_str());
+    for path in [
+        "/v1/nodes/node-2/relay/v1/deploys/history/..%5C..%5Ctoken%5Clist",
+        "/v1/nodes/node-2/relay/v1/deploys/history/..%5c..%5cstatus",
+        "/v1/nodes/node-2/relay/v1/deploys/history/.%09.",
+        "/v1/nodes/node-2/relay/v1/deploys/history/.%0A.",
+        "/v1/nodes/node-2/relay/v1/status%09",
+    ] {
+        let (status, body) = relay(&cluster, reqwest::Method::GET, path, operator).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "GET {path} was relayed: {body}"
+        );
+        assert!(
+            body.contains("does not forward"),
+            "GET {path} was not refused by the relay: {body}"
+        );
+    }
+
+    // The ordinary relay still works beside them.
+    let (status, body) = relay(
+        &cluster,
+        reqwest::Method::GET,
+        "/v1/nodes/node-2/relay/v1/status",
+        operator,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 #[tokio::test]

@@ -53,10 +53,20 @@ pub(super) async fn deploy_cancel_handler(
         if let Some(council) = &state.council
             && !crate::bun::leadership::leads(council).await
         {
+            let path = match crate::cluster::http::peer_path(&[
+                "v1",
+                "deploys",
+                "operations",
+                id.as_str(),
+                "cancel",
+            ]) {
+                Ok(path) => path,
+                Err(error) => return peer_path_refusal(&error),
+            };
             return crate::bun::batch::forward_to_leader(
                 &state,
                 council,
-                &format!("/v1/deploys/operations/{id}/cancel"),
+                &path,
                 String::new(),
                 &headers,
             )
@@ -311,17 +321,26 @@ pub(super) async fn cluster_deploy_history(
     let mut answers = vec![(local_node_name(state), local)];
     let mut warnings = Vec::new();
     if !local_only {
-        let app_segment: String = url::form_urlencoded::byte_serialize(app.as_bytes()).collect();
         let namespace_value: String =
             url::form_urlencoded::byte_serialize(namespace.as_bytes()).collect();
-        let path =
-            format!("/v1/deploys/history/{app_segment}?namespace={namespace_value}&local=true");
-        let (peers, failures) = fan_out_to_peers::<crate::bun::cluster_view::ClusterDeployHistory>(
-            state,
-            &path,
-            CLUSTER_STATUS_TIMEOUT,
-        )
-        .await;
+        let (peers, failures) =
+            match crate::cluster::http::peer_path(&["v1", "deploys", "history", app]) {
+                Ok(app_path) => {
+                    let path = format!("{app_path}?namespace={namespace_value}&local=true");
+                    fan_out_to_peers::<crate::bun::cluster_view::ClusterDeployHistory>(
+                        state,
+                        &path,
+                        CLUSTER_STATUS_TIMEOUT,
+                    )
+                    .await
+                }
+                // No peer can hold history for an app whose name can't be
+                // a path segment.
+                Err(error) => (
+                    Vec::new(),
+                    vec![format!("history not asked of peers: {error}")],
+                ),
+            };
         answers.extend(peers.into_iter().map(|(node, view)| {
             let entries = view.history.into_iter().map(|entry| entry.row).collect();
             (node, entries)
