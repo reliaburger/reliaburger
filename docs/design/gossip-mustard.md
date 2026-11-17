@@ -350,10 +350,11 @@ enum GossipPayload {
         wants_reply: bool,
     },
     /// The answer to a datagram dropped as no fresher than what the
-    /// sender holds (§8.1): the receiver, if it's the node itself, refutes
-    /// past `held_incarnation`.
+    /// sender holds (§8.1): the receiver refutes past `held_incarnation`
+    /// only if what's held is fresher than anything it has sent this run.
     Stale {
         held_incarnation: u64,
+        held_sequence: u64,
         updates: Vec<MembershipUpdate>,
     },
 }
@@ -1245,9 +1246,11 @@ A node started without a master key (single-node and pre-security configurations
 
 **Datagrams in our own name.** A node drops any datagram whose `sender` is itself, before anything is applied. It keeps no sequence for itself to check such a datagram against, and nothing in one can be news: applying it could only move the node's own address or roll its own directory entry back. The only legitimate case is a seed list that names the node's own address, and a reply from itself tells it nothing.
 
-**Restarts.** A node starts every run at incarnation 1, and its counter is seeded from the wall clock, so a node that boots with its clock behind (an appliance before NTP settles) sends datagrams that look older than its previous run's. A receiver that drops a datagram as stale answers the sender, at most once a second per sender, with `Stale { held_incarnation }`: the incarnation it holds for it. The node itself refutes past that, exactly as it refutes a `Suspect` or `Dead` about itself, and its next datagram carries a higher incarnation, so it's fresher whatever its sequence. A restarted node is heard after one round trip to each peer, with no dependence on its clock and nothing persisted, and that holds after a wiped data directory too. A recorded datagram can't refute: the answer goes to whoever sent it, and it carries the old incarnation however often it's replayed. A node that's already past `held_incarnation`, or has left, ignores the answer.
+**Restarts.** A node starts every run at incarnation 1, and its counter is seeded from the wall clock, so a node that boots with its clock behind (an appliance before NTP settles) sends datagrams that look older than its previous run's. A receiver that drops a datagram as stale answers the sender, at most once a second per sender, with `Stale { held_incarnation, held_sequence }`: the freshest datagram it holds from it. If that's fresher than anything the node has sent this run (its incarnation, then the highest sequence it has sent), it's from an earlier run, and the node refutes past `held_incarnation`, exactly as it refutes a `Suspect` or `Dead` about itself. Its next datagram carries a higher incarnation, so it's fresher whatever its sequence. A duplicate, a reordered datagram, or one of a live node's own datagrams sent again is at most the newest it sent, so the answer changes nothing. A restarted node is heard after one round trip to each peer, with no dependence on its clock and nothing persisted, and that holds after a wiped data directory too. A recorded datagram can't refute: the answer goes to whoever sent it, and it carries the old incarnation however often it's replayed. A node that has left ignores the answer.
 
-The sequence is a counter, not a timestamp check, so receivers need no clock agreement and no acceptance window: a timestamp would have to tolerate skew between hosts, and anything inside that tolerance could be replayed. The cost is that strict ordering drops a datagram that UDP delivers out of order behind a newer one from the same sender; gossip already tolerates loss, so that's a lost datagram, not an error (and at most one `Stale` answer a second, which the sender ignores unless it has to refute).
+Peers can hold different incarnations for the old run: one that heard it last at 3 and another at 5. The restarted node refutes past each answer in turn, so it can sit briefly between them. While it does (at 4, say), the peer it refuted for holds 4, and a recording from the old run at incarnation 5 is fresher there than the node's own datagrams: the replay window is open again for that peer until the node's datagram to the other peer draws its answer and the node refutes past 5. So the window is bounded by one `Stale` round trip per disagreeing peer, and only after a restart.
+
+The sequence is a counter, not a timestamp check, so receivers need no clock agreement and no acceptance window: a timestamp would have to tolerate skew between hosts, and anything inside that tolerance could be replayed. The cost is that strict ordering drops a datagram that UDP delivers out of order behind a newer one from the same sender; gossip already tolerates loss, so that's a lost datagram, not an error (and at most one `Stale` answer a second, which changes nothing at the sender).
 
 **TODO (not yet implemented):** gossip key rotation. The key is fixed for the life of the master key; there's no rotation command and no dual-key acceptance window.
 

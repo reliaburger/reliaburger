@@ -97,6 +97,7 @@ fn gossip() -> Vec<Seed> {
     });
     let stale = message(GossipPayload::Stale {
         held_incarnation: 4,
+        held_sequence: 40,
         updates: vec![update("c", NodeState::Suspect)],
     });
     let mut with_directory = message(GossipPayload::Ping { updates: vec![] });

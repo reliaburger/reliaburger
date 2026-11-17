@@ -293,6 +293,9 @@ pub struct MustardNode<T: MustardTransport> {
     floor_cursor: usize,
     /// When we last sent each sender a `Stale` answer.
     stale_answers: HashMap<NodeId, Instant>,
+    /// The highest sequence this node has sent, to tell a `Stale` answer
+    /// that means we restarted from one about a duplicate of our own.
+    highest_sent: u64,
     /// Indirect probes this node is relaying, waiting for the target's ACK.
     pending_relays: VecDeque<PendingRelay>,
     /// Failed sends, reported at a bounded rate.
@@ -362,6 +365,7 @@ impl<T: MustardTransport> MustardNode<T> {
             sequence_floors: HashMap::new(),
             floor_cursor: 0,
             stale_answers: HashMap::new(),
+            highest_sent: 0,
             pending_relays: VecDeque::new(),
             send_failures: SendFailureLog::default(),
             oversize_extension_logged: false,
@@ -594,11 +598,29 @@ impl<T: MustardTransport> MustardNode<T> {
     /// rate, never dropped silently: a node whose ACKs can't leave looks
     /// dead to its peers, and the log is how an operator finds out why.
     async fn send(&mut self, target: SocketAddr, message: &GossipMessage) {
+        self.note_sent(message);
         if let Err(error) = self.transport.send(target, message).await
             && let Some(line) = self.send_failures.record(Instant::now(), target, &error)
         {
             eprintln!("{line}");
         }
+    }
+
+    /// Remember `message` as sent, for [`Self::behind`].
+    fn note_sent(&mut self, message: &GossipMessage) {
+        self.highest_sent = self.highest_sent.max(message.sequence);
+    }
+
+    /// Whether a peer holds a fresher datagram from us than anything this
+    /// run has sent: then it's from an earlier run, and we restarted. A
+    /// duplicate or a reordered datagram of ours is at most our newest, so
+    /// it never counts, and nor does one of ours sent again.
+    fn behind(&self, held: Freshness) -> bool {
+        let ours = Freshness {
+            incarnation: self.incarnation,
+            sequence: self.highest_sent,
+        };
+        ours < held
     }
 
     /// Whether `message` is the freshest we've seen from its sender, by
@@ -663,6 +685,7 @@ impl<T: MustardTransport> MustardNode<T> {
         let answer = self.probe_message(
             GossipPayload::Stale {
                 held_incarnation: held.incarnation,
+                held_sequence: held.sequence,
                 updates: vec![],
             },
             None,
@@ -1261,13 +1284,21 @@ impl<T: MustardTransport> MustardNode<T> {
                 }
             }
             GossipPayload::Stale {
-                held_incarnation, ..
+                held_incarnation,
+                held_sequence,
+                ..
             } => {
                 // A peer dropped one of our datagrams as no fresher than
-                // what it holds: we restarted, and our counter may have
-                // started lower. Refute past what it holds so our next
-                // datagram is heard. Already past it, there's nothing to do.
-                if !self.left && *held_incarnation >= self.incarnation {
+                // what it holds. If what it holds is fresher than anything
+                // we've sent, it's from an earlier run: we restarted, and our
+                // counter may have started lower. Refute past it so our next
+                // datagram is heard. Otherwise it was a duplicate or a
+                // reordered datagram of ours, and there's nothing to do.
+                let held = Freshness {
+                    incarnation: *held_incarnation,
+                    sequence: *held_sequence,
+                };
+                if !self.left && self.behind(held) {
                     self.refute(*held_incarnation);
                 }
             }
@@ -3672,6 +3703,8 @@ mod tests {
     ) -> GossipMessage {
         let mut message = node.probe_message(GossipPayload::Ping { updates: vec![] }, None);
         message.sequence = sequence;
+        // As `send` would: this is now the newest datagram the node sent.
+        node.note_sent(&message);
         message
     }
 
@@ -3739,6 +3772,101 @@ mod tests {
         restart_with_the_clock_set_back(false).await;
     }
 
+    /// A duplicate, a reordered datagram, or one of a live node's own
+    /// datagrams sent again from its address is dropped, and the answer
+    /// must not make the healthy node refute.
+    #[tokio::test]
+    async fn a_duplicated_datagram_from_a_live_node_does_not_raise_its_incarnation() {
+        let net = InMemoryNetwork::new();
+        let ta = net.register(addr(1)).await;
+        let tb = net.register(addr(2)).await;
+        let mut a = MustardNode::new(NodeId::new("a"), addr(1), fast_config(), ta);
+        let mut b = MustardNode::new(NodeId::new("b"), addr(2), fast_config(), tb);
+        let older = b.probe_message(GossipPayload::Ping { updates: vec![] }, None);
+        b.send(addr(1), &older).await;
+        let newest = b.probe_message(GossipPayload::Ping { updates: vec![] }, None);
+        b.send(addr(1), &newest).await;
+        deliver(&mut a).await;
+        deliver(&mut b).await;
+
+        for again in [newest, older] {
+            assert!(!a.handle_message(addr(2), again).await);
+            deliver(&mut b).await;
+            assert_eq!(
+                b.incarnation, 1,
+                "a live node refuted over its own duplicated datagram"
+            );
+            // Let the next one draw an answer too.
+            a.stale_answers.clear();
+        }
+    }
+
+    /// The old run reached different incarnations at different peers'
+    /// view; the restarted node refutes past each in turn.
+    #[tokio::test]
+    async fn a_restart_recovers_when_peers_hold_different_incarnations() {
+        let net = InMemoryNetwork::new();
+        let ta = net.register(addr(1)).await;
+        let tc = net.register(addr(3)).await;
+        let tb = net.register(addr(2)).await;
+        let mut a = MustardNode::new(NodeId::new("a"), addr(1), fast_config(), ta);
+        let mut c = MustardNode::new(NodeId::new("c"), addr(3), fast_config(), tc);
+        let at = |incarnation| {
+            GossipMessage::new(
+                NodeId::new("peer"),
+                incarnation,
+                GossipPayload::Ping { updates: vec![] },
+            )
+        };
+        assert!(a.handle_message(addr(2), at(3)).await);
+        assert!(c.handle_message(addr(2), at(5)).await);
+        let mut restarted = MustardNode::new(NodeId::new("peer"), addr(2), fast_config(), tb);
+        while restarted.transport.try_recv().is_some() {}
+
+        let mut sequence = 1;
+        for peer in [&mut a, &mut c] {
+            let first = from_the_restarted(&mut restarted, sequence);
+            sequence += 1;
+            assert!(!peer.handle_message(addr(2), first).await);
+            deliver(&mut restarted).await;
+        }
+        assert!(restarted.incarnation > 5);
+        for peer in [&mut a, &mut c] {
+            let next = from_the_restarted(&mut restarted, sequence);
+            sequence += 1;
+            assert!(
+                peer.handle_message(addr(2), next).await,
+                "a restart wasn't heard by every peer"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_restart_recovers_at_a_peer_that_learned_its_floor_in_push_pull() {
+        let net = InMemoryNetwork::new();
+        let ta = net.register(addr(1)).await;
+        let tj = net.register(addr(3)).await;
+        let tb = net.register(addr(2)).await;
+        let mut old_hand = MustardNode::new(NodeId::new("a"), addr(1), fast_config(), ta);
+        let mut joiner = MustardNode::new(NodeId::new("j"), addr(3), fast_config(), tj);
+        let recorded = ping_from("peer");
+        hear_then_reap(&mut old_hand, std::slice::from_ref(&recorded)).await;
+        old_hand.send_membership(addr(3), false).await;
+        deliver(&mut joiner).await;
+
+        let mut restarted = MustardNode::new(NodeId::new("peer"), addr(2), fast_config(), tb);
+        while restarted.transport.try_recv().is_some() {}
+        let first = from_the_restarted(&mut restarted, 1);
+        assert!(!joiner.handle_message(addr(2), first).await);
+        deliver(&mut restarted).await;
+        let next = from_the_restarted(&mut restarted, 2);
+        assert!(
+            joiner.handle_message(addr(2), next).await,
+            "a restart wasn't heard by a peer that only had the floor from push-pull"
+        );
+        assert!(!joiner.handle_message(addr(66), recorded).await);
+    }
+
     #[tokio::test]
     async fn stale_answers_are_rate_limited() {
         let net = InMemoryNetwork::new();
@@ -3771,6 +3899,7 @@ mod tests {
                 1,
                 GossipPayload::Stale {
                     held_incarnation,
+                    held_sequence: u64::MAX,
                     updates: vec![],
                 },
             )

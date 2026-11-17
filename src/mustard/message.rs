@@ -243,8 +243,13 @@ pub enum GossipPayload {
     /// on its next datagram. Only the node itself can act on it: a recorded
     /// datagram can't refute.
     Stale {
-        /// The incarnation the sender holds for the receiver.
+        /// The incarnation of the freshest datagram the sender holds from
+        /// the receiver.
         held_incarnation: u64,
+        /// That datagram's sequence. The receiver refutes only if it's
+        /// fresher than anything the receiver has sent this run, so a
+        /// duplicate of a live node's datagram never makes it refute.
+        held_sequence: u64,
         /// Piggybacked membership updates.
         updates: Vec<MembershipUpdate>,
     },
