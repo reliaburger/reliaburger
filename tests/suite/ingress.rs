@@ -449,13 +449,9 @@ async fn ingress_serves_https_with_self_signed_cert() {
     .unwrap();
     harness.client.apply(&config).await.unwrap();
 
-    // Self-signed cert: the client must opt out of verification. HTTP/1.1,
-    // because the request names its host in a `Host` header while the URL
-    // says 127.0.0.1: over HTTP/2 that disagreement is refused (see
-    // `ingress_refuses_http2_requests_whose_host_disagrees_with_the_authority`).
+    // Self-signed cert: the client must opt out of verification.
     let http_client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
-        .http1_only()
         .build()
         .unwrap();
     let response = wait_for_status(
@@ -586,6 +582,31 @@ async fn ingress_refuses_http2_requests_whose_host_disagrees_with_the_authority(
         .send()
         .await
         .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+
+    test_app.shutdown();
+}
+
+/// `curl -k https://<node-ip>/ -H 'Host: app.example'` is how people test an
+/// ingress before DNS points at it, and curl and reqwest speak HTTP/2 to do
+/// it. An IP literal names no host, so over HTTP/2 a `Host` header next to
+/// one still routes. (The listener is IPv4 only; the IPv6 and portless
+/// forms are unit tests of `request_host` in `src/wrapper/proxy.rs`.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ingress_routes_http2_requests_by_host_when_the_authority_is_an_ip() {
+    let (test_app, harness) = harness_with_secure_route().await;
+    let http_client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .http2_prior_knowledge()
+        .build()
+        .unwrap();
+    let response = http_client
+        .get(harness.https_url("/healthz"))
+        .header("host", "secure.test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.version(), reqwest::Version::HTTP_2);
     assert_eq!(response.status().as_u16(), 200);
 
     test_app.shutdown();

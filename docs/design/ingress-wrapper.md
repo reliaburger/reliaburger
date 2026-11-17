@@ -468,8 +468,13 @@ Every inbound HTTPS request follows this path:
 3.  HTTP/1.1 or HTTP/2 request parsed (via hyper's auto builder). Wrapper's rustls config advertises ALPN `h2, http/1.1`, so browsers and curl negotiate HTTP/2 over TLS. (hyper's auto builder also speaks h2 on cleartext prior-knowledge.)
 4.  Host extracted. HTTP/2 uses the `:authority` pseudo-header, which hyper
     puts in the request URI (RFC 9113 §8.3.1); a request whose `Host` header
-    disagrees with it is malformed and gets 400. HTTP/1.1 uses the `Host`
-    header, falling back to the URI's authority. The SNI hostname is not used.
+    names a different host or port is malformed and gets 400. Hosts compare
+    case-insensitively, and a missing port means the scheme's default (443
+    for https, 80 for http). When the authority is an IP literal (v4 or v6,
+    with or without a port) a `Host` header decides instead, so
+    `curl -k https://<node-ip>/ -H 'Host: app.example'` routes. HTTP/1.1 uses
+    the `Host` header, falling back to the URI's authority. The SNI hostname
+    is not used.
 5.  Routing table lookup:
     a. Exact match on Host → Vec<PathRoute>
     b. Longest path prefix match → PathRoute
