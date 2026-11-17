@@ -465,8 +465,10 @@ Every inbound HTTPS request follows this path:
     - A cluster leaf is minted/served only for a configured ingress host;
       an unknown SNI (or none) is served the self-signed default, which a
       hostname-validating client rejects
-3.  HTTP/1.1 or HTTP/2 request parsed (via hyper's auto builder). NOTE: Wrapper's rustls config does not set `alpn_protocols`, so it does **not** advertise `h2` over TLS — HTTP/2-over-TLS/ALPN negotiation is planned, not shipped. (hyper's auto builder can still speak h2 on cleartext prior-knowledge.)
-4.  Host header extracted (falls back to SNI hostname)
+3.  HTTP/1.1 or HTTP/2 request parsed (via hyper's auto builder). Wrapper's rustls config advertises ALPN `h2, http/1.1`, so browsers and curl negotiate HTTP/2 over TLS. (hyper's auto builder also speaks h2 on cleartext prior-knowledge.)
+4.  Host taken from the `Host` header; when there is none (HTTP/2 sends the
+    host as the `:authority` pseudo-header, which hyper puts in the request
+    URI), from the URI's authority. The SNI hostname is not used.
 5.  Routing table lookup:
     a. Exact match on Host → Vec<PathRoute>
     b. Longest path prefix match → PathRoute
