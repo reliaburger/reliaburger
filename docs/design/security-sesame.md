@@ -853,6 +853,30 @@ so the API listener permits an absent client certificate and authorises those
 requests with bearer tokens or session cookies. Gossip is UDP and uses the
 cluster-master-key-derived HMAC instead of TLS.
 
+A node certificate gets a peer through the Raft handshake, but every node
+holds one, workers included, so the Raft listener also checks council
+membership on every RPC (`council::admission`). An `AppendEntries` or
+`InstallSnapshot` comes from a leader and a `Vote` from a candidate, and both
+are voters, so the node the RPC names as its leader or candidate must be a
+voter in the receiver's council (the voters of its committed and effective
+Raft membership, never gossip) and must be the node named in the
+connection's certificate. Anything else is closed without reaching Raft, and
+its recovery epoch never moves the receiver's fence; a sender on an older
+epoch is still told the newer one. Two cases keep legitimate members in:
+
+- A fresh node with no membership serves whoever replicates to it, because
+  that is how a learner joins. It holds no Raft state yet.
+- A member whose membership is behind (the leader joined while it was away)
+  asks the voters it knows, over node-id-bound mTLS, whether the sender is a
+  voter in their councils. If one names it, under the same node name, the
+  member admits it for 60 seconds while it catches up from the log.
+
+A fresh node's first contact is therefore trusted on first use, and a node
+that still counts a former voter as a voter admits that node's RPCs until
+its own log catches up. Plaintext clusters have no certificate to bind, so
+there the RPC's claimed sender must still be a voter but is not
+authenticated.
+
 **Output to admin:**
 
 ```
@@ -1881,7 +1905,7 @@ The threat model assumes:
 - Forge certificates for arbitrary workloads — **not yet guaranteed:** CA private keys are currently derivable on every node.
 - Decrypt secrets for other namespaces — **not yet guaranteed:** a namespace with `secret_key = true` has its own age key (§5.5), but every node can still unwrap every namespace's key until the master key is split (F03b).
 - Access the age private key, CA private keys, or OIDC signing key — **not yet guaranteed** (see the note above).
-- Modify the Raft log or cluster state (requires council consensus — this *is* enforced).
+- Modify the Raft log or cluster state through Raft (requires council consensus — this *is* enforced: the Raft listener serves only RPCs that a council voter sends under its own certificate, so a compromised non-member node can neither append entries, collect votes nor move the recovery epoch fence over Raft; see the transport contract in §5.1 and `council::admission`). It still holds the master key and the bootstrap state, so this doesn't stop it reading or decrypting what those protect, and a fresh node joining the council trusts the first node that replicates to it.
 - Bypass nftables perimeter rules on other nodes.
 
 **Response:**

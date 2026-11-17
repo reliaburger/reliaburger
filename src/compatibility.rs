@@ -254,6 +254,9 @@ pub struct Compatibility {
 /// or supersedes, and `/v1/version` carries `os_trial`.
 /// OIDC signing-key rotation (#709): `SecurityState::retiring_oidc_keys`, and
 /// the `RotateOidcSigningKey` and `RetireOidcSigningKeys` Raft requests.
+/// The council membership check on the Raft port: the `CouncilVoters` Raft
+/// RPC and its answer, which an earlier 0.3.0 build can't decode, and a
+/// server that refuses Raft RPCs from nodes outside its council.
 ///
 /// Bumping either number makes the checked-in gossip and Raft fuzz seeds
 /// stale: run `make fuzz-corpus-seed` in the same change (#1941). Keep the

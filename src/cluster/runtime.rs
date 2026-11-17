@@ -24,7 +24,7 @@ use crate::bun::agent::ClusterHandle;
 use crate::cluster::identity;
 use crate::config::node::ReportingTreeSection;
 use crate::council::handover::{HANDOVER_HOLD, pressured_voter_holds};
-use crate::council::network::{TcpRaftNetworkFactory, serve_raft_rpc_with_node_gate};
+use crate::council::network::{TcpRaftNetworkFactory, serve_raft_rpc_with_admission};
 use crate::council::node::CouncilNode;
 use crate::council::selection::{
     CouncilAction, CouncilObservation, CouncilSelectionConfig, HealthTracker, ObservedMember,
@@ -429,6 +429,9 @@ pub async fn start(
     // Same for the Raft RPC blocklist — a partition must cut both the
     // gossip and Raft transports or SWIM half-detects the peer.
     let raft_blocklist = factory.blocklist();
+    // The council membership check dials the voters this node knows with
+    // the node's own identity, to ask about a leader it has never heard of.
+    let raft_admission = crate::council::admission::RaftAdmission::new(factory.clone());
     let council = CouncilNode::new(
         raft_id,
         CouncilConfig::default(),
@@ -512,7 +515,7 @@ pub async fn start(
     // "partitioned" node over the connections it opens (#1810).
     let rpc_blocklist = raft_blocklist.clone();
     spawn_supervised("cluster:raft-rpc", supervision.clone(), async move {
-        serve_raft_rpc_with_node_gate(
+        serve_raft_rpc_with_admission(
             raft_listener,
             raft,
             rpc_contact,
@@ -522,6 +525,7 @@ pub async fn start(
             rpc_node_gate,
             Some(rpc_crl),
             rpc_blocklist,
+            raft_admission,
         )
         .await;
     });
