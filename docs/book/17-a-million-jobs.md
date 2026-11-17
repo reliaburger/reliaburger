@@ -4499,6 +4499,16 @@ that), so a chunk resumed after a restart reports the retries it can't explain
 as exactly that. The node only counts a cause once the next attempt has really
 started, which keeps the sum equal to `attempts - 1` on every early return.
 
+The duration buckets get the same treatment. The state's decoder refuses any
+array whose buckets hold more samples than tasks that ran, so a report that
+broke that rule would be applied live and then fail on the next snapshot
+install, and no new follower could load the state. `complete` now sums the
+report's buckets with `checked_add` and refuses the report, before it changes
+anything, when the total exceeds `succeeded + failed_count`. The live apply
+and the decoder now enforce one invariant, not two, and
+`accepted_duration_counts_survive_a_snapshot_round_trip` checks that what one
+accepts the other can read.
+
 The other was start lag. The reusable pools already time the command itself,
 so the gap between the pool taking an attempt and the command starting falls
 out of a subtraction, binned into the same power-of-two millisecond buckets as
