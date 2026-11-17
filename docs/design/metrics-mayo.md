@@ -83,7 +83,7 @@ Each node stores its own metrics locally. There is no central metrics database. 
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-Inserts land in an in-memory buffer. On flush the buffer becomes an Arrow `RecordBatch`, is written to a new `metrics_NNNNNN.parquet` file, and dropped from memory. Queries see the Parquet files plus the unflushed buffer as a DataFusion `metrics` table (columns `timestamp UInt64`, `metric_name Utf8`, `labels Utf8` (a JSON object), `value Float64`) and run SQL over the union, streamed as §3.1.1 describes. A corrupt or truncated Parquet file is skipped with a log rather than failing the whole query.
+Inserts land in an in-memory buffer. On flush the buffer becomes an Arrow `RecordBatch`, is written to a new `metrics_NNNNNN.parquet` file, and dropped from memory. The write goes to a `.mayo-pending-*` temporary file, which is synced and renamed into place; `MayoStore::new` deletes any such file a crash left behind, since nothing else would (the size cap doesn't count it). Rollup files are written the same way, and a rollup flush whose directory sync fails reports the failure and keeps its rows for the next flush, because a rename that isn't synced can vanish in a power cut. Queries see the Parquet files plus the unflushed buffer as a DataFusion `metrics` table (columns `timestamp UInt64`, `metric_name Utf8`, `labels Utf8` (a JSON object), `value Float64`) and run SQL over the union, streamed as §3.1.1 describes. A corrupt or truncated Parquet file is skipped with a log rather than failing the whole query.
 
 #### 3.1.1 Streamed queries
 
@@ -105,7 +105,7 @@ Every read path streams (#377): `/v1/metrics` by name or `*`, `/v1/metrics/app/�
 Retention is a single `retention_days` value (default **7**). Two paths prune Parquet files:
 
 - `MayoStore::prune(before)` deletes any file whose **newest datapoint** is older than the cutoff. The newest timestamp is read from the file's Parquet row-group statistics, not the file's mtime, so a touched/copied file with old data is still pruned and a file with recent data is kept regardless of mtime.
-- The disk-pressure task (`src/bun/disk_pressure.rs`) prunes oldest-first by file **mtime** when either `retention_days` has elapsed or `max_storage_mb` is exceeded (see §7.1). When an export destination is configured it exports a file before pruning it.
+- The disk-pressure task (`src/bun/disk_pressure.rs`) prunes oldest-first by file **mtime** when either `retention_days` has elapsed or `max_storage_mb` is exceeded (see §7.1). When an export destination is configured it exports a file before pruning it, and a tick whose export fails prunes nothing at all, so a broken destination holds both the cap and `retention_days` until an export succeeds. `relish wtf` reports that as `export-failing`.
 
 ### 3.3 Rollup Push to Council Members
 
