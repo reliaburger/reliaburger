@@ -34,6 +34,11 @@ use crate::reporting::aggregator::AggregatedState;
 /// assignments.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
 const RECONCILE_IO_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long one scheduler or autoscaler write may wait to commit before
+/// the loop moves on. The loop replans from committed state next tick, so a
+/// write that later commits is picked up then, and one that never does
+/// can't hold up every other app's placement.
+const SCHEDULER_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How many retirements one reconcile cycle has in flight at once.
 const MAX_CONCURRENT_RETIREMENTS: usize = 4;
 
@@ -396,10 +401,13 @@ pub fn spawn_leader_scheduler(
                 )
             {
                 match council
-                    .write(RaftRequest::PublishEndpoints {
-                        expected_generation: desired.endpoint_withdrawals.generation,
-                        catalog: Box::new(catalog),
-                    })
+                    .write_within(
+                        SCHEDULER_WRITE_TIMEOUT,
+                        RaftRequest::PublishEndpoints {
+                            expected_generation: desired.endpoint_withdrawals.generation,
+                            catalog: Box::new(catalog),
+                        },
+                    )
                     .await
                 {
                     // A committed request can still be refused by the state
@@ -421,7 +429,10 @@ pub fn spawn_leader_scheduler(
                     app_id: app_id.clone(),
                     spec: Box::new(spec),
                 };
-                match council.write(released).await {
+                match council
+                    .write_within(SCHEDULER_WRITE_TIMEOUT, released)
+                    .await
+                {
                     Ok(CouncilResponse::Refused { reason }) => {
                         eprintln!("scheduler: rollout of {app_id} not recorded: {reason}");
                     }
@@ -576,7 +587,7 @@ pub fn spawn_leader_scheduler(
                 })
             {
                 match tokio::time::timeout(
-                    Duration::from_secs(5),
+                    SCHEDULER_WRITE_TIMEOUT,
                     council.write(RaftRequest::SchedulingDecisions {
                         expected_log_id: desired.last_applied_log,
                         decisions,
@@ -604,7 +615,7 @@ pub fn spawn_leader_scheduler(
             // Why an app isn't placed is durable council state, so any node
             // can answer `relish status`. Written only when it changes.
             if let Some(update) = quota_blocked_update(&desired.quota_blocked, &quota_blocked) {
-                match council.write(update).await {
+                match council.write_within(SCHEDULER_WRITE_TIMEOUT, update).await {
                     Ok(_) => {
                         let blocked = quota_blocked_events(&desired.quota_blocked, &quota_blocked);
                         record_placement_events(blocked, events.as_ref()).await
@@ -616,7 +627,7 @@ pub fn spawn_leader_scheduler(
             // starts, changes or clears, not every tick (#702).
             let changes = shortfall_changes(&desired.unschedulable, &unschedulable, &desired);
             if let Some(update) = unschedulable_update(&desired.unschedulable, &unschedulable) {
-                match council.write(update).await {
+                match council.write_within(SCHEDULER_WRITE_TIMEOUT, update).await {
                     Ok(_) => {
                         record_placement_events(shortfall_events(&changes), events.as_ref()).await
                     }
@@ -2037,11 +2048,14 @@ pub fn spawn_autoscaler(
                     // so a failed write would suppress the next real attempt
                     // for a whole cooldown while nothing actually scaled.
                     let written = council
-                        .write(RaftRequest::AutoscaleOverride {
-                            app_id: app_id.clone(),
-                            replicas: decision.to,
-                            reason: decision.reason.clone(),
-                        })
+                        .write_within(
+                            SCHEDULER_WRITE_TIMEOUT,
+                            RaftRequest::AutoscaleOverride {
+                                app_id: app_id.clone(),
+                                replicas: decision.to,
+                                reason: decision.reason.clone(),
+                            },
+                        )
                         .await;
                     record_autoscale_write(&mut tracker, &decision, now, written);
                 }

@@ -151,6 +151,21 @@ impl std::fmt::Display for AppliedBinding {
 /// Every image slot of app `name`, labelled for errors: its own, then each
 /// init container's and each sidecar's (#1120). One left empty inherits
 /// the app's image and binds nothing.
+/// How many distinct images [`ImageBinder::bind_config`] would bind for
+/// `config`, each at most one upstream lookup.
+pub fn distinct_images(config: &crate::config::Config) -> usize {
+    let mut config = config.clone();
+    let images: std::collections::BTreeSet<String> = config
+        .app
+        .iter_mut()
+        .flat_map(|(name, spec)| app_image_slots(name, spec))
+        .map(|(_, image)| image.clone())
+        .chain(config.job.values().map(|spec| spec.image.clone()))
+        .flatten()
+        .collect();
+    images.len()
+}
+
 fn app_image_slots<'a>(
     name: &'a str,
     spec: &'a mut crate::config::app::AppSpec,

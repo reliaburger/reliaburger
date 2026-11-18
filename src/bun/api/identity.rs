@@ -627,8 +627,11 @@ pub(super) async fn token_create_handler(
 }
 
 /// How long a follower waits for the leader to answer a forwarded token or
-/// join-token write. Longer than the 5 s the apply path allows, because the
-/// leader may spend 3 s proving it leads before it even writes.
+/// join-token write. Longer than everything the leader may spend on it: 3 s
+/// proving it leads, up to 10 s for the council write
+/// ([`crate::council::node::WRITE_TIMEOUT`]) and 2 s waiting for its own
+/// replica ([`TOKEN_REPLICATION_WAIT`]), so a slow but healthy leader's
+/// answer, and the secret in it, gets through.
 ///
 /// It's only a backstop, because the write may have committed anyway and
 /// what that costs depends on the route, which is why each caller of
@@ -637,7 +640,7 @@ pub(super) async fn token_create_handler(
 /// - a create or a rotation loses the only copy of the new secret;
 /// - a revoke loses nothing: it's safe to repeat;
 /// - a join token leaves a hash nobody has the plaintext for, which expires.
-const LEADER_FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+pub(super) const LEADER_FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// How long the answering node waits for its own replica to apply a write the
 /// leader committed. Replication takes a few heartbeats. The write has
@@ -648,7 +651,7 @@ const LEADER_FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// - the old secret of a rotation without grace keeps working here;
 /// - a revoked token is out of the store, but a refresh from the lagging
 ///   replica can bring it back, so the answer says the node is behind.
-const TOKEN_REPLICATION_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+pub(super) const TOKEN_REPLICATION_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Forward a token or join-token write to the leader with the caller's own
 /// credential, so the leader repeats every check and forwarding grants

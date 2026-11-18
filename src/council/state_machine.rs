@@ -3971,6 +3971,8 @@ impl RaftStateMachine<TypeConfig> for CouncilStateMachine {
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
         MemSnapshotBuilder {
             inner: Arc::clone(&self.inner),
+            #[cfg(test)]
+            lock_free_while_encoding: None,
         }
     }
 
@@ -3985,9 +3987,15 @@ impl RaftStateMachine<TypeConfig> for CouncilStateMachine {
         meta: &SnapshotMeta<u64, CouncilNodeInfo>,
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<u64>> {
+        // Decoding the whole desired state is CPU work that grows with the
+        // cluster: off the runtime, so the worker keeps serving heartbeats.
         let data = snapshot.into_inner();
-        let new_state: DesiredState = serde_json::from_slice(&data)
-            .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?;
+        let (new_state, data) = tokio::task::spawn_blocking(move || {
+            serde_json::from_slice::<DesiredState>(&data).map(|state| (state, data))
+        })
+        .await
+        .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?
+        .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?;
 
         let (db, index) = {
             let mut guard = self.inner.write().await;
@@ -4041,31 +4049,87 @@ impl RaftStateMachine<TypeConfig> for CouncilStateMachine {
 #[derive(Debug)]
 pub struct MemSnapshotBuilder {
     inner: Arc<RwLock<StateMachineInner>>,
+    /// Test hook: set to whether the state lock was free just before the
+    /// encode started.
+    #[cfg(test)]
+    lock_free_while_encoding: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+/// What [`MemSnapshotBuilder::build_snapshot`] stored, and the store to
+/// persist it to (`None` when there is nothing new to persist).
+struct BuiltSnapshot {
+    data: Vec<u8>,
+    snapshot_id: String,
+    index: u64,
+    db: Option<Arc<Database>>,
+    last_log_id: Option<LogId<u64>>,
+    last_membership: StoredMembership<u64, CouncilNodeInfo>,
 }
 
 impl RaftSnapshotBuilder<TypeConfig> for MemSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<u64>> {
-        let (data, snapshot_id, index, db, last_log_id, last_membership) = {
-            let mut guard = self.inner.write().await;
-            let data = serde_json::to_vec(&guard.state)
-                .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?;
+        // Encoding the whole desired state is CPU work that grows with the
+        // cluster: on a slow CPU it takes seconds. It runs on a blocking
+        // thread, from a copy taken under a short read lock, and takes the
+        // write lock only to store the result, so `apply`, and every council
+        // write behind it, never waits for the encode.
+        let inner = Arc::clone(&self.inner);
+        #[cfg(test)]
+        let lock_free_while_encoding = self.lock_free_while_encoding.clone();
+        let built = tokio::task::spawn_blocking(move || {
+            let state = inner.blocking_read().state.clone();
+            #[cfg(test)]
+            if let Some(flag) = &lock_free_while_encoding {
+                flag.store(
+                    inner.try_write().is_ok(),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+            }
+            let data = serde_json::to_vec(&state)?;
+            let mut guard = inner.blocking_write();
+            // A snapshot installed from the leader while this one encoded
+            // is newer: keep it, and hand it back instead of this one.
+            if guard.snapshot_last_log_id > state.last_applied_log
+                && let Some(newer) = &guard.snapshot_data
+            {
+                return Ok::<_, serde_json::Error>(BuiltSnapshot {
+                    data: newer.clone(),
+                    snapshot_id: guard.snapshot_id.clone(),
+                    index: guard.snapshot_index,
+                    db: None,
+                    last_log_id: guard.snapshot_last_log_id,
+                    last_membership: guard.snapshot_membership.clone(),
+                });
+            }
             guard.snapshot_index += 1;
             guard.snapshot_data = Some(data.clone());
-            guard.snapshot_last_log_id = guard.state.last_applied_log;
-            guard.snapshot_membership = guard.state.last_membership.clone();
-            guard.snapshot_id = snapshot_id_for(guard.snapshot_last_log_id, guard.snapshot_index);
-            (
+            guard.snapshot_last_log_id = state.last_applied_log;
+            guard.snapshot_membership = state.last_membership.clone();
+            guard.snapshot_id = snapshot_id_for(state.last_applied_log, guard.snapshot_index);
+            Ok(BuiltSnapshot {
                 data,
-                guard.snapshot_id.clone(),
-                guard.snapshot_index,
-                guard.db.clone(),
-                guard.state.last_applied_log,
-                guard.state.last_membership.clone(),
-            )
-        };
+                snapshot_id: guard.snapshot_id.clone(),
+                index: guard.snapshot_index,
+                db: guard.db.clone(),
+                last_log_id: state.last_applied_log,
+                last_membership: state.last_membership,
+            })
+        })
+        .await
+        .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?
+        .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?;
+        let BuiltSnapshot {
+            data,
+            snapshot_id,
+            index,
+            db,
+            last_log_id,
+            last_membership,
+        } = built;
 
         // Persist so applied state survives a restart, off the async runtime
-        // (M7): the lock is released before the fsync.
+        // (M7): the lock is released before the fsync. A newer installed
+        // snapshot was persisted by its install.
         if let Some(db) = db {
             persist_snapshot_blocking(db, data.clone(), index).await?;
         }
@@ -6719,6 +6783,25 @@ mod tests {
         let held: DesiredState = serde_json::from_slice(&data).unwrap();
         assert!(held.config.contains_key("in-snapshot"));
         assert!(!held.config.contains_key("after-snapshot"));
+    }
+
+    /// Encoding a big desired state takes seconds on a slow CPU. If the
+    /// builder held the state lock meanwhile, every apply, and so every
+    /// council write, waited behind it, long enough to hit the write
+    /// timeout. It encodes a copy instead and locks only to store it.
+    #[tokio::test]
+    async fn a_snapshot_build_leaves_the_state_lock_free_while_it_encodes() {
+        let sm = CouncilStateMachine::new();
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut builder = MemSnapshotBuilder {
+            inner: Arc::clone(&sm.inner),
+            lock_free_while_encoding: Some(Arc::clone(&flag)),
+        };
+        builder.build_snapshot().await.unwrap();
+        assert!(
+            flag.load(std::sync::atomic::Ordering::SeqCst),
+            "the builder held the state lock while it encoded"
+        );
     }
 
     #[tokio::test]

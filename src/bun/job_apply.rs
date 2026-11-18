@@ -52,7 +52,9 @@ pub(crate) async fn apply(
     lease: Option<&crate::testkit::lease::TestLease>,
 ) -> Response {
     if let Some(council) = super::leadership::council_to_forward_to(&state).await {
-        return super::batch::forward_to_leader(&state, council, "/v1/apply", body, headers).await;
+        let images = crate::pickle::binding::distinct_images(&config);
+        return super::batch::forward_job_apply_to_leader(&state, council, body, headers, images)
+            .await;
     }
     let _gate = if state.council.is_none() {
         Some(state.task_arrays.apply_gate.clone().lock_owned().await)

@@ -382,6 +382,29 @@ pub(crate) async fn forward_to_leader(
     body: String,
     headers: &axum::http::HeaderMap,
 ) -> Response {
+    forward_post_to_leader(state, council, path, body, headers, 0).await
+}
+
+/// Forward a job apply naming `images` distinct images to the leader and
+/// stream its events back (see [`job_apply_header_deadline`]).
+pub(crate) async fn forward_job_apply_to_leader(
+    state: &ApiState,
+    council: &crate::council::CouncilNode,
+    body: String,
+    headers: &axum::http::HeaderMap,
+    images: usize,
+) -> Response {
+    forward_post_to_leader(state, council, "/v1/apply", body, headers, images).await
+}
+
+async fn forward_post_to_leader(
+    state: &ApiState,
+    council: &crate::council::CouncilNode,
+    path: &str,
+    body: String,
+    headers: &axum::http::HeaderMap,
+    images: usize,
+) -> Response {
     let leader_url = match super::api::leader_api_url(state, council, headers).await {
         Ok(url) => url,
         Err(refusal) => return refusal.into_response(),
@@ -404,23 +427,38 @@ pub(crate) async fn forward_to_leader(
             request = request.header(key, value.as_bytes());
         }
     }
+    // A job apply answers with an event stream that runs until the
+    // deployment settles: only the wait for its headers is bounded, and the
+    // leader binds every image before it sends them.
     if path == "/v1/apply" {
-        return match request.send().await {
-            Ok(response) => {
-                let mut builder = Response::builder().status(response.status());
-                if let Some(content_type) = response.headers().get(axum::http::header::CONTENT_TYPE)
-                {
-                    builder = builder.header(axum::http::header::CONTENT_TYPE, content_type);
-                }
-                builder
-                    .body(axum::body::Body::from_stream(response.bytes_stream()))
-                    .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
-            }
-            Err(error) => (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
-        };
+        return relay_leader_stream(request, job_apply_header_deadline(images)).await;
     }
-    proxy_response(request.send().await).await
+    relay_leader_answer(request, LEADER_FORWARD_TIMEOUT).await
 }
+
+/// The longest a follower waits for the headers of a job apply it
+/// forwarded, when the manifest names `images` distinct images.
+///
+/// Before the leader starts its event stream it binds each image against
+/// its upstream registry, one after another and up to
+/// [`crate::pickle::binding::UPSTREAM_BIND_TIMEOUT`] each, proves it leads
+/// and writes the deployment to the council. A fixed deadline would answer
+/// 504 for a manifest with a few slow images while the leader goes on to
+/// commit it. Never less than [`LEADER_FORWARD_TIMEOUT`], and never more
+/// than [`JOB_APPLY_HEADER_CAP`].
+pub(crate) fn job_apply_header_deadline(images: usize) -> std::time::Duration {
+    let images = u32::try_from(images).unwrap_or(u32::MAX);
+    crate::pickle::binding::UPSTREAM_BIND_TIMEOUT
+        .saturating_mul(images)
+        .saturating_add(crate::council::node::LEADER_CONFIRMATION)
+        .saturating_add(crate::council::node::WRITE_TIMEOUT.saturating_mul(2))
+        .clamp(LEADER_FORWARD_TIMEOUT, JOB_APPLY_HEADER_CAP)
+}
+
+/// The cap on [`job_apply_header_deadline`]: under the five minutes
+/// `relish` waits for an answer, so the caller hears the 504 and its
+/// "outcome unknown" rather than a client timeout.
+pub(crate) const JOB_APPLY_HEADER_CAP: std::time::Duration = std::time::Duration::from_secs(280);
 
 pub(crate) async fn forward_get_to_leader(
     state: &ApiState,
@@ -441,28 +479,119 @@ pub(crate) async fn forward_get_to_leader(
         ),
         headers,
     );
-    proxy_response(request.send().await).await
+    relay_leader_answer(request, LEADER_FORWARD_TIMEOUT).await
 }
 
-async fn proxy_response(result: Result<reqwest::Response, reqwest::Error>) -> Response {
-    match result {
-        Ok(response) => {
-            let status =
-                StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-            let body = response.bytes().await.unwrap_or_default();
-            (status, body).into_response()
+/// How long a follower waits for the leader to answer a request it
+/// forwarded. Past it the follower answers 504 and the outcome is unknown:
+/// the leader may still finish the request.
+///
+/// The leader's own work is bounded (a council write gives up at
+/// [`crate::council::node::WRITE_TIMEOUT`], an upstream image bind at
+/// [`crate::pickle::binding::UPSTREAM_BIND_TIMEOUT`]), so a leader that
+/// is merely slow answers well inside this. One that never answers, behind
+/// a blackholed path or a stalled process, used to hold the caller for as
+/// long as the TCP connection lived.
+pub(crate) const LEADER_FORWARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Send `request`, already addressed to the leader, and relay its status,
+/// content type and body. The whole exchange, body included, must finish
+/// within `deadline`: 502 when the leader can't be reached or its answer
+/// breaks off, 504 when it doesn't answer in time.
+pub(crate) async fn relay_leader_answer(
+    request: reqwest::RequestBuilder,
+    deadline: std::time::Duration,
+) -> Response {
+    let exchange = async {
+        let response = request.send().await?;
+        let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .cloned();
+        let body = response.bytes().await?;
+        Ok::<_, reqwest::Error>((status, content_type, body))
+    };
+    match tokio::time::timeout(deadline, exchange).await {
+        Ok(Ok((status, content_type, body))) => {
+            let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+            let mut response = (status, body).into_response();
+            if let Some(content_type) = content_type
+                && let Ok(value) = axum::http::HeaderValue::from_bytes(content_type.as_bytes())
+            {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::CONTENT_TYPE, value);
+            }
+            response
         }
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({ "error": format!("leader forward failed: {e}") })),
-        )
-            .into_response(),
+        Ok(Err(error)) => leader_unreachable(&error),
+        Err(_) => leader_timed_out(deadline),
     }
+}
+
+/// Send `request`, already addressed to the leader, and stream its answer
+/// back. Only the wait for the leader's status line and headers is bounded
+/// by `deadline`; the body then streams for as long as the leader writes
+/// it, since an event stream legitimately runs for minutes.
+pub(crate) async fn relay_leader_stream(
+    request: reqwest::RequestBuilder,
+    deadline: std::time::Duration,
+) -> Response {
+    let response = match tokio::time::timeout(deadline, request.send()).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => return leader_unreachable(&error),
+        Err(_) => return leader_timed_out(deadline),
+    };
+    let mut builder = Response::builder().status(response.status().as_u16());
+    if let Some(content_type) = response.headers().get(reqwest::header::CONTENT_TYPE) {
+        builder = builder.header(axum::http::header::CONTENT_TYPE, content_type.as_bytes());
+    }
+    builder
+        .body(axum::body::Body::from_stream(response.bytes_stream()))
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+}
+
+fn leader_unreachable(error: &reqwest::Error) -> Response {
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(serde_json::json!({ "error": format!("leader forward failed: {error}") })),
+    )
+        .into_response()
+}
+
+fn leader_timed_out(deadline: std::time::Duration) -> Response {
+    (
+        StatusCode::GATEWAY_TIMEOUT,
+        Json(serde_json::json!({
+            "error": format!(
+                "the leader didn't answer within {}s; the outcome is unknown, so check \
+                 before repeating a request that isn't idempotent",
+                deadline.as_secs()
+            ),
+        })),
+    )
+        .into_response()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_job_apply_header_deadline_grows_with_its_images_up_to_the_cap() {
+        assert_eq!(job_apply_header_deadline(0), LEADER_FORWARD_TIMEOUT);
+        assert_eq!(job_apply_header_deadline(1), LEADER_FORWARD_TIMEOUT);
+        let three = job_apply_header_deadline(3);
+        assert!(
+            three
+                >= 3 * crate::pickle::binding::UPSTREAM_BIND_TIMEOUT
+                    + 2 * crate::council::node::WRITE_TIMEOUT
+        );
+        assert!(three < JOB_APPLY_HEADER_CAP);
+        assert_eq!(job_apply_header_deadline(50), JOB_APPLY_HEADER_CAP);
+        assert_eq!(job_apply_header_deadline(usize::MAX), JOB_APPLY_HEADER_CAP);
+    }
 
     #[test]
     fn submit_request_serde_round_trip() {

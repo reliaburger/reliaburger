@@ -554,9 +554,17 @@ pub async fn backup_tick(
         .await
         .map_err(|e| BackupError::NotLeader(e.to_string()))?;
     let key = BackupKey::for_state(&desired, now);
-    let payload =
-        serde_json::to_vec(&desired).map_err(|e| BackupError::Serialise(e.to_string()))?;
-    let sealed = seal_snapshot(master_key, &payload, config)?;
+    // Encoding and encrypting the whole desired state is CPU work that grows
+    // with the cluster: off the runtime.
+    let master_key = *master_key;
+    let seal_config = config.clone();
+    let sealed = tokio::task::spawn_blocking(move || {
+        let payload =
+            serde_json::to_vec(&desired).map_err(|e| BackupError::Serialise(e.to_string()))?;
+        seal_snapshot(&master_key, &payload, &seal_config)
+    })
+    .await
+    .map_err(|e| BackupError::Serialise(e.to_string()))??;
     store.put(&key, &sealed).await?;
     store.prune(config.retain).await?;
     Ok(())

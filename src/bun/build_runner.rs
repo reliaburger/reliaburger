@@ -345,20 +345,31 @@ async fn forward_track_to_leader(
     if let Some(token) = &state.service_token {
         proxied = proxied.bearer_auth(token);
     }
-    let response = proxied
-        .send()
+    let exchange = async {
+        let response = proxied
+            .send()
+            .await
+            .map_err(|e| format!("leader forward failed: {e}"))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!("leader refused the tracking op ({status}): {body}"));
+        }
+        let value: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| format!("leader track response unreadable: {e}"))?;
+        Ok(value["build_id"].as_u64())
+    };
+    let deadline = super::batch::LEADER_FORWARD_TIMEOUT;
+    tokio::time::timeout(deadline, exchange)
         .await
-        .map_err(|e| format!("leader forward failed: {e}"))?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!("leader refused the tracking op ({status}): {body}"));
-    }
-    let value: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|e| format!("leader track response unreadable: {e}"))?;
-    Ok(value["build_id"].as_u64())
+        .map_err(|_| {
+            format!(
+                "the leader didn't answer the tracking op within {}s",
+                deadline.as_secs()
+            )
+        })?
 }
 
 // ---------------------------------------------------------------------------

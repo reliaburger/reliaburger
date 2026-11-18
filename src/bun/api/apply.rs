@@ -47,6 +47,13 @@ async fn binding_catalog(state: &ApiState) -> ManifestCatalog {
 /// the `Complete` or `Error` event.
 pub(super) const CAPACITY_PROBE_HEADER: &str = "x-reliaburger-capacity-probe";
 
+/// How long each of an apply's council writes may take to commit. A person
+/// is waiting on `relish apply`, and an apply that stops halfway leaves them
+/// to work out where it got to, so a slow disk gets longer here than the
+/// [`crate::council::node::WRITE_TIMEOUT`] background loops use. Applying
+/// the same file again is safe, which is what the error says to do.
+pub(super) const APPLY_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub(super) async fn apply_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     capacity_admission: Option<axum::Extension<crate::cluster::capacity::CapacityAdmission>>,
@@ -1016,7 +1023,7 @@ pub(super) async fn cluster_apply(
                 }
                 _ => request.clone(),
             };
-            match council.write(write).await {
+            match council.write_within(APPLY_WRITE_TIMEOUT, write).await {
                 // A lease was taken, released or broken since the leader
                 // checked: check again, and stop if one is now in the way.
                 Ok(crate::council::CouncilResponse::LeaseGenerationMoved { .. }) => {
@@ -1118,6 +1125,19 @@ pub(super) async fn cluster_apply(
                     if let Some(message) = notice {
                         let _ = event_tx.send(ApplyEvent::Progress { message }).await;
                     }
+                }
+                Err(crate::council::CouncilError::WriteTimedOut { waited }) => {
+                    let _ = event_tx
+                        .send(ApplyEvent::Error {
+                            message: format!(
+                                "{describe}: outcome unknown: the write didn't commit within \
+                                 {}s; the {committed} writes before it in this apply were \
+                                 committed; re-run apply (it's safe to repeat)",
+                                waited.as_secs()
+                            ),
+                        })
+                        .await;
+                    return;
                 }
                 Err(e) => {
                     let _ = event_tx

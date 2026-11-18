@@ -1986,8 +1986,9 @@ async fn a_follower_refuses_token_writes_another_node_already_forwarded() {
 async fn a_forwarded_write_that_times_out_says_what_it_may_have_cost() {
     let cluster = TokenCluster::start().await;
     let _silent = cluster.point_the_follower_at_a_silent_leader().await;
+    // Past the follower's 20 s backstop, so its 504 arrives first.
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(40))
         .build()
         .unwrap();
     let ask = |path: &'static str, body: serde_json::Value| {
