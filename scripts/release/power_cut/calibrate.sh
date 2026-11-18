@@ -10,7 +10,7 @@
 # EVIDENCE/summary.json from `calibrate.py tally` and deletes the VM.
 #
 # Usage:
-#   scripts/release/power_cut/calibrate.sh --kind KIND --cuts N --evidence DIR [--vm NAME] [--seed N] [--keep]
+#   scripts/release/power_cut/calibrate.sh --kind KIND --cuts N --evidence DIR [--raw] [--vm NAME] [--seed N] [--keep]
 #   scripts/release/power_cut/calibrate.sh --logwrites --evidence DIR [--vm NAME] [--keep]
 #
 #   --kind stop     `limactl stop --force` (SIGKILL to the host agent and driver)
@@ -18,6 +18,10 @@
 #                   (Virtualization.framework's VM process)
 #   --kind sysrq    `echo b > /proc/sysrq-trigger` in the guest: reboot with no
 #                   sync; records whether VZ reboots the guest or stops the VM
+#   --raw           write only O_DIRECT records, alone, to the VM's second
+#                   disk (no filesystem), with the disk's flush count, so a
+#                   cut shows whether a completed write no flush covered
+#                   survives (fault model 1) or not (model 2)
 #   --logwrites     instead of cuts, run logwrites-proof.sh in the guest: can
 #                   the guest kernel record a dm-log-writes log, and does a
 #                   copy of it taken at a cut, replayed, drop exactly the
@@ -39,10 +43,12 @@ vm=
 seed=$RANDOM
 keep=no
 logwrites=no
+raw=no
 while [[ $# -gt 0 ]]; do
     case $1 in
         --keep) keep=yes; shift; continue ;;
         --logwrites) logwrites=yes; shift; continue ;;
+        --raw) raw=yes; shift; continue ;;
         --kind | --cuts | --evidence | --vm | --seed) [[ $# -ge 2 ]] || usage ;;
         *) usage ;;
     esac
@@ -60,7 +66,11 @@ if [[ $logwrites == no ]]; then
     case $kind in stop | kill | sysrq) ;; *) usage ;; esac
     [[ $cuts =~ ^[1-9][0-9]*$ ]] || usage
 fi
-vm=${vm:-pc-cal-${kind:-logwrites}}
+if [[ $raw == yes ]]; then
+    vm=${vm:-pc-cal-raw-$kind}
+else
+    vm=${vm:-pc-cal-${kind:-logwrites}}
+fi
 [[ $vm != reliaburger-test ]] || fail 'the development VM reliaburger-test is never cut'
 [[ $vm =~ ^pc-cal-[A-Za-z0-9-]+$ ]] || fail "VM names start with pc-cal- ($vm doesn't)"
 [[ $seed =~ ^[0-9]+$ ]] || usage
@@ -87,6 +97,11 @@ bounded() {
         waitpid($pid, 0);
         exit($? & 127 ? 128 + ($? & 127) : $? >> 8);' "$@"
 }
+# "${in_own_group[@]}" COMMAND... &: COMMAND leads a new process group, so
+# `kill -- -$!` reaches it and everything under it (macOS has no setsid(1)).
+# An array, not a function: bash runs a backgrounded function in a subshell,
+# and $! would be that subshell, outside the group.
+in_own_group=(perl -e 'setpgrp(0, 0); exec(@ARGV) or die "exec: $!\n";')
 # Does the guest answer a shell? Bounded: ssh to a rebooting guest can hang.
 answers() { bounded 15 limactl shell --workdir / "$vm" true < /dev/null > /dev/null 2>&1; }
 status() { limactl list --format '{{.Status}}' "$vm" 2> /dev/null || echo missing; }
@@ -94,31 +109,53 @@ status() { limactl list --format '{{.Status}}' "$vm" 2> /dev/null || echo missin
 reason=$(quiet) || fail "not starting: $reason"
 [[ ! -e $evidence/cuts.jsonl ]] || fail "$evidence already has cuts; evidence is never overwritten"
 mkdir -p "$evidence"
-if limactl list --format '{{.Name}}' | grep -qx -- "$vm"; then
+# Captured first: `grep -q` exits at its first match, and limactl writing
+# the rest of the list into the closed pipe would fail the pipeline.
+existing=$(limactl list --format '{{.Name}}')
+if grep -qx -- "$vm" <<< "$existing"; then
     fail "VM $vm already exists; delete it (limactl delete --force $vm) or name another with --vm"
+fi
+disk_name=$vm-raw
+if [[ -e $lima_home/_disks/$disk_name ]]; then
+    fail "disk $disk_name already exists; delete it (limactl disk delete $disk_name) or name another VM with --vm"
 fi
 
 made_vm=no
+made_disk=no
 cleanup() {
-    [[ $made_vm == yes ]] || return 0
     if [[ $keep == yes ]]; then
-        echo "kept VM $vm; delete it with: limactl delete --force $vm" >&2
-    else
+        [[ $made_vm == no ]] || echo "kept VM $vm; delete it with: limactl delete --force $vm" >&2
+        [[ $made_disk == no ]] || echo "kept disk $disk_name; delete it with: limactl disk delete $disk_name" >&2
+        return 0
+    fi
+    if [[ $made_vm == yes ]]; then
         limactl delete --force "$vm" > /dev/null 2>&1 || echo "could not delete VM $vm" >&2
+    fi
+    if [[ $made_disk == yes ]]; then
+        limactl disk delete "$disk_name" > /dev/null 2>&1 || echo "could not delete disk $disk_name" >&2
     fi
 }
 trap cleanup EXIT
 
 say "creating $vm"
+# The raw disk: 1 GiB (calibrate.py's RAW_SECTORS finds it by that size),
+# raw format for VZ, attached unformatted by calibrate-vm.yaml under this VM's
+# own name so two calibration VMs never share one.
+limactl disk create "$disk_name" --size 1GiB --format raw > "$evidence/disk.log" 2>&1 \
+    || fail "creating disk $disk_name failed; see $evidence/disk.log"
+made_disk=yes
+# Only a VM this run created is ever deleted, so made_vm flips only once the
+# start has worked; a failed start may leave a half-made $vm to delete by hand.
+limactl start --tty=false --name "$vm" --set ".additionalDisks[0].name = \"$disk_name\"" \
+    "$here/calibrate-vm.yaml" > "$evidence/create.log" 2>&1 \
+    || fail "creating $vm failed; see $evidence/create.log (delete any half-made VM with: limactl delete --force $vm)"
 made_vm=yes
-limactl start --tty=false --name "$vm" "$here/calibrate-vm.yaml" > "$evidence/create.log" 2>&1 \
-    || fail "creating $vm failed; see $evidence/create.log"
 limactl copy "$here/calibrate.py" "$here/logwrites.py" "$here/logwrites-proof.sh" "$vm:/tmp/"
 gsh bash -c 'install -d /var/lib/pcut && install -m 755 /tmp/calibrate.py /tmp/logwrites.py /tmp/logwrites-proof.sh /var/lib/pcut/ \
     && python3 /var/lib/pcut/calibrate.py prepare --dir /var/lib/pcut && sync'
 {
-    printf '{"vm": "%s", "kind": "%s", "seed": %s, "lima": "%s", "host": "%s %s", ' \
-        "$vm" "${kind:-logwrites}" "$seed" "$(limactl --version | awk '{print $NF}')" "$(sw_vers -productName 2> /dev/null || uname -s)" "$(sw_vers -productVersion 2> /dev/null || uname -r)"
+    printf '{"vm": "%s", "kind": "%s", "raw": "%s", "seed": %s, "lima": "%s", "host": "%s %s", ' \
+        "$vm" "${kind:-logwrites}" "$raw" "$seed" "$(limactl --version | awk '{print $NF}')" "$(sw_vers -productName 2> /dev/null || uname -s)" "$(sw_vers -productVersion 2> /dev/null || uname -r)"
     printf '"kernel": "%s", "write_cache": "%s", "sysrq": "%s"}\n' \
         "$(gsh uname -r)" "$(gsh cat /sys/block/vda/queue/write_cache)" "$(gsh cat /proc/sys/kernel/sysrq)"
 } > "$evidence/run.json"
@@ -177,10 +214,12 @@ cut() {
             local pids
             pids=$(lsof -t "$lima_home/$vm/disk" 2> /dev/null || true)
             [[ -n $pids ]] || fail "no process holds $lima_home/$vm/disk"
-            # shellcheck disable=SC2086  # one pid per word
-            ps -o pid=,comm= -p $(echo $pids | tr ' ' ',') >> "$evidence/killed.txt"
-            # shellcheck disable=SC2086
-            kill -9 $pids ;;
+            # One VM, one Virtualization.framework process: more than one
+            # holder means something else has the disk open, and killing it
+            # wouldn't be the cut this measures.
+            [[ $(wc -w <<< "$pids") -eq 1 ]] || fail "more than one process holds $lima_home/$vm/disk: $(echo $pids)"
+            ps -o pid=,comm= -p "$pids" >> "$evidence/killed.txt"
+            kill -9 "$pids" ;;
         sysrq)
             # The shell never returns from a reboot; don't wait for it.
             (limactl shell --workdir / "$vm" sudo sh -c 'echo 1 > /proc/sys/kernel/sysrq; echo b > /proc/sysrq-trigger' \
@@ -195,15 +234,31 @@ cut() {
     esac
 }
 
-say "$cuts $kind cuts on $vm, seed $seed"
+if [[ $raw == yes ]]; then
+    scan_args=(scan-raw)
+    acknowledged() { grep -q '^ACK raw' "$1" 2> /dev/null; }
+else
+    scan_args=(scan --dir /var/lib/pcut)
+    acknowledged() { grep -q '^ACK fsync' "$1" 2> /dev/null && grep -q '^ACK direct' "$1" && grep -q '^ACK buffered' "$1"; }
+fi
+
+say "$cuts $kind cuts on $vm, seed $seed$([[ $raw == no ]] || echo ', raw disk')"
 for (( i = 1; i <= cuts; i++ )); do
     reason=$(quiet) || fail "stopping after $(( i - 1 )) cuts: $reason"
     run=$(printf 'c%04d' "$i")
     acks=$evidence/$run.acks
-    gsh python3 /var/lib/pcut/calibrate.py write --dir /var/lib/pcut --run "$run" --seconds 60 > "$acks" 2> "$evidence/$run.err" &
+    # The writer's limactl and the ssh under it lead their own process
+    # group, so the kill after the cut reaches all of them, not just a subshell.
+    if [[ $raw == yes ]]; then
+        "${in_own_group[@]}" limactl shell --workdir / "$vm" sudo python3 /var/lib/pcut/calibrate.py write-raw --run "$run" --seconds 60 \
+            > "$acks" 2> "$evidence/$run.err" &
+    else
+        "${in_own_group[@]}" limactl shell --workdir / "$vm" sudo python3 /var/lib/pcut/calibrate.py write --dir /var/lib/pcut --run "$run" --seconds 60 \
+            > "$acks" 2> "$evidence/$run.err" &
+    fi
     writer=$!
     deadline=$(( $(date +%s) + 60 ))
-    until grep -q '^ACK fsync' "$acks" 2> /dev/null && grep -q '^ACK direct' "$acks" && grep -q '^ACK buffered' "$acks"; do
+    until acknowledged "$acks"; do
         [[ $(date +%s) -lt $deadline ]] || fail "the writer for $run never acknowledged in every mode"
         sleep 0.2
     done
@@ -213,12 +268,12 @@ for (( i = 1; i <= cuts; i++ )); do
     cut
     cut_seconds=$(since "$cut_at")
     read -r how retries back_seconds < <(revive "$cut_at")
-    kill "$writer" 2> /dev/null || true
+    kill -KILL -- "-$writer" 2> /dev/null || true
     wait "$writer" 2> /dev/null || true
     # A guest that has only just come back can refuse a shell for a moment.
     scanned=no
     for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
-        if bounded 120 limactl shell --workdir / "$vm" sudo python3 /var/lib/pcut/calibrate.py scan --dir /var/lib/pcut --run "$run" > "$evidence/$run.scan.json" 2>> "$evidence/$run.err" \
+        if bounded 120 limactl shell --workdir / "$vm" sudo python3 /var/lib/pcut/calibrate.py "${scan_args[@]}" --run "$run" > "$evidence/$run.scan.json" 2>> "$evidence/$run.err" \
             && [[ -s $evidence/$run.scan.json ]]; then
             scanned=yes
             break
