@@ -168,13 +168,18 @@ pub(crate) fn write_batch_parquet(
 /// Whether a failed directory sync means the filesystem can't sync
 /// directories at all, rather than that this sync failed.
 fn directory_sync_unsupported(error: &std::io::Error) -> bool {
+    // ENOTSUP and EOPNOTSUPP are one value on Linux and two on macOS, so
+    // they can't share a pattern without one arm being unreachable.
     error.kind() == std::io::ErrorKind::Unsupported
-        || matches!(
-            error.raw_os_error(),
-            Some(
-                nix::libc::EINVAL | nix::libc::ENOTSUP | nix::libc::EOPNOTSUPP | nix::libc::ENOSYS
-            )
-        )
+        || error.raw_os_error().is_some_and(|code| {
+            [
+                nix::libc::EINVAL,
+                nix::libc::ENOTSUP,
+                nix::libc::EOPNOTSUPP,
+                nix::libc::ENOSYS,
+            ]
+            .contains(&code)
+        })
 }
 
 /// Prefix of the temporary file a local Mayo flush writes before renaming
