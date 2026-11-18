@@ -634,6 +634,22 @@ profile with a warning and only fails when none can be read. Skipping one killed
 partial counts can pull coverage down a hair. It can't push it up, so the floor still means
 what it says.
 
+Those files add up. cargo-llvm-cov names each one after the process that wrote it (`%p`, the
+pid, in LLVM's pattern), and nextest runs every test in its own process, so 9,600 tests leave
+about 11,800 profiles behind. The lib tests' binary is big, and each of its 8,500 processes
+writes 5 MB of counters: 44 GB, on a hosted runner that starts with 74 GB free. On
+18 November 2026 the runner lost contact with GitHub three times, with no log. A watcher on a
+run that passed showed memory was fine, and free disk down to 5 GB. A slower runner fills it.
+
+LLVM can merge as it goes instead: drop `%p` and every process of one binary adds its counts
+into a small pool of shared files. We tried that and didn't take it. A process killed halfway
+through writing leaves the pool file truncated, and after that every later process fails to
+merge into it, so one SIGKILL from a crash-recovery test would silently throw away thousands
+of tests' coverage. So the job makes room instead. It deletes the runner image's Android,
+.NET, Haskell and other SDKs that nothing here uses, stops nextest if free disk drops under
+2 GiB, and fails its report when the low point is under 10 GiB. A shrinking margin now turns a
+step red with a number on it, long before it costs us a runner.
+
 Coverage finds unvisited code. It does not tell us whether an assertion is useful, whether a
 webhook test accidentally exercised startup, or whether a five-second performance limit is
 portable. The audit found all three in a suite with lots of coverage. Read the uncovered

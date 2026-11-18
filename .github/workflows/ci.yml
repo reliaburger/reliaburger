@@ -275,6 +275,14 @@ jobs:
     timeout-minutes: 62
     steps:
       - uses: actions/checkout@v4
+      - name: Free the runner's disk
+        # The coverage run needs about 70 GB of the image's 74 GB free: 24 GB
+        # of instrumented build, then one .profraw per test process, 46 GB
+        # in all. On 18 Nov 2026 a full / lost the runner three times. This
+        # frees 25 GB or more of SDKs nothing here uses, in the
+        # background beside the cache restore and the build.
+        run: |
+          nohup scripts/ci/free-runner-disk > "$RUNNER_TEMP/free-runner-disk.log" 2>&1 < /dev/null &
       - uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: llvm-tools-preview
@@ -321,8 +329,10 @@ jobs:
           swapon --show
           df -h / /mnt 2>/dev/null || df -h /
       - name: Watch disk and memory during the coverage run
+        # Under 2 GiB free, the watcher stops nextest: a failed step with a
+        # log beats a runner lost to a full disk.
         run: |
-          nohup scripts/ci/watch-runner "$RUNNER_TEMP/runner-pids" > "$RUNNER_TEMP/portable-linux-resources.log" 2>&1 < /dev/null &
+          WATCH_DISK_FLOOR_KB=2097152 WATCH_STOP=cargo-nextest nohup scripts/ci/watch-runner "$RUNNER_TEMP/runner-pids" > "$RUNNER_TEMP/portable-linux-resources.log" 2>&1 < /dev/null &
           echo $! > "$RUNNER_TEMP/portable-linux-resources.pid"
       - name: Portable tests with line coverage
         id: portable_linux
@@ -331,15 +341,17 @@ jobs:
         run: |
           choom -n 0 -- python3 scripts/ci/workflow_adapter.py produce --root . --manifest tests/contracts/manifest.json --gate portable-linux --host linux --directory target/contracts/linux/portable-linux --commit "$EXPECTED_CHECKOUT_COMMIT" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --github-output "$GITHUB_OUTPUT"
       - name: Report the coverage run's headroom
+        # Fails under 10 GiB at the low point, while the margin shrinks and
+        # the runner still answers, rather than when it's gone.
         if: always()
         timeout-minutes: 3
         run: |
           kill "$(cat "$RUNNER_TEMP/portable-linux-resources.pid")" 2>/dev/null || true
-          echo "Lowest free disk and memory during the coverage run:"
-          grep ' disk_kb=' "$RUNNER_TEMP/portable-linux-resources.log" | sort -t '=' -k2 -n | head -1 || true
-          grep ' disk_kb=' "$RUNNER_TEMP/portable-linux-resources.log" | sort -t '=' -k3 -n | head -1 || true
+          echo "Disk freed before the build:"
+          cat "$RUNNER_TEMP/free-runner-disk.log" || true
           echo "Kernel OOM lines:"
           sudo dmesg -T | grep -iE 'oom|killed process' || echo "none"
+          scripts/ci/assert-headroom "$RUNNER_TEMP/portable-linux-resources.log" 10485760
       - name: Keep the coverage run's resource log
         if: always()
         uses: actions/upload-artifact@v4

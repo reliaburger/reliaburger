@@ -902,7 +902,12 @@ class PortableLinuxRunnerTests(unittest.TestCase):
     nothing protecting the runner's own processes. That is #1943's
     mechanism, unverified here, so it gets #1943's guards: the runner out
     of the OOM killer's reach, swap for the peak, and the headroom watched
-    and kept."""
+    and kept.
+
+    The watcher then named the real cause: memory was fine, but free disk
+    on / fell to 5.1 GiB in a passing run, so a slower one fills it. The job
+    now frees the image's unused SDKs first, stops nextest under 2 GiB and
+    fails its report under 10 GiB."""
 
     def setUp(self):
         self.job = jobs((WORKFLOWS / "ci.yml").read_text())["portable"]
@@ -942,12 +947,39 @@ class PortableLinuxRunnerTests(unittest.TestCase):
         report = self.step('kill "$(cat "$RUNNER_TEMP/portable-linux-resources.pid")"')
         self.assertGreater(report, self.producer())
         self.assertIn("if: always()", self.steps[report])
-        self.assertIn("sort -t '=' -k3 -n", self.steps[report])
         self.assertIn("'oom|killed process'", self.steps[report])
         keep = self.step("name: portable-linux-resources\n")
         self.assertGreater(keep, report)
         self.assertIn("if: always()", self.steps[keep])
         self.assertIn("portable-linux-resources.log", self.steps[keep])
+
+    # On 18 Nov 2026 the passing run of #2100 (44293229949) showed why the
+    # runner went: free disk on / fell from 74 GB to 5.1 GiB, 24 GB in the
+    # instrumented build and 46 GB in the tests' one .profraw per process.
+    def test_unused_preinstalled_toolchains_are_deleted_before_the_build(self):
+        free = self.step("scripts/ci/free-runner-disk")
+        self.assertLess(free, self.producer())
+        self.assertLess(free, self.step("Swatinem/rust-cache"))
+        self.assertNotIn("if: always()", self.steps[free])
+        # In the background, beside the cache restore and the build, so it
+        # costs the critical path nothing; the report prints what it freed.
+        self.assertIn('nohup scripts/ci/free-runner-disk > "$RUNNER_TEMP/free-runner-disk.log"', self.steps[free])
+        report = self.steps[self.step('kill "$(cat "$RUNNER_TEMP/portable-linux-resources.pid")"')]
+        self.assertIn('cat "$RUNNER_TEMP/free-runner-disk.log"', report)
+
+    def test_the_watcher_stops_the_tests_before_a_full_disk_takes_the_runner(self):
+        watch = self.steps[self.step('scripts/ci/watch-runner "$RUNNER_TEMP/runner-pids"')]
+        self.assertIn("WATCH_DISK_FLOOR_KB=2097152", watch)
+        self.assertIn("WATCH_STOP=cargo-nextest", watch)
+
+    def test_the_report_fails_when_the_low_water_mark_is_under_ten_gibibytes(self):
+        report = self.steps[self.step('kill "$(cat "$RUNNER_TEMP/portable-linux-resources.pid")"')]
+        check = 'scripts/ci/assert-headroom "$RUNNER_TEMP/portable-linux-resources.log" 10485760'
+        self.assertIn(check, report)
+        # The check is the step's last command, so the kernel lines print
+        # whatever it decides and its exit status is the step's.
+        self.assertTrue(report.rstrip().endswith(check), report)
+        self.assertNotIn(check + " ||", report)
 
 
 class ArtifactDownloadTests(unittest.TestCase):
