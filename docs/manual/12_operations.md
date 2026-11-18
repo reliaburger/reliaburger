@@ -228,7 +228,7 @@ cluster can roll onto it in place
 0.2.8 moves the pair to protocol 58 and state format 74, and a 0.2.7
 cluster's leader refuses it
 ([upgrading from 0.2.7](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-027)).
-0.3.0 moves the pair to protocol 59 and state format 75, and a 0.2.8
+0.3.0 moves the pair to protocol 60 and state format 76, and a 0.2.8
 cluster's leader refuses it; its fresh cluster also keeps the root CA
 offline
 ([upgrading from 0.2.8](https://github.com/reliaburger/reliaburger/blob/main/docs/releasing.md#upgrading-from-028)).

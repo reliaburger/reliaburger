@@ -756,6 +756,11 @@ pub enum AttestationMode {
 }
 ```
 
+A token names one node id. The council refuses to create or consume a token, or
+to allocate a node leaf serial, for a node id with the same Raft id
+(`raft_id_from_name`, a djb2 hash of the name) as a different node in `SecurityState::node_leaves` or the CRL's retired
+nodes, so two nodes never share a seat in the council directory (#2050).
+
 ### 4.10 Raft Log Encryption
 
 ```rust
@@ -923,7 +928,7 @@ commits only its SHA-256 hash, expiry and attestation mode through
 `RaftRequest::CreateJoinToken`. The response carries the plaintext once. A
 follower forwards the request with the caller's own credential (#1506) and
 generates nothing itself; the leader repeats every check. If the leader doesn't
-answer within 10 seconds the caller gets a `504`, and a token may have
+answer within 20 seconds the caller gets a `504`, and a token may have
 committed: only its hash, which nobody holds the plaintext for, so it can't be
 used and it expires by itself. A retired node id gets a `409`.
 
@@ -995,7 +1000,7 @@ its token store, so the secret works there on the next request. A follower
 finds the record by hashing the secret in the leader's answer and waits up to
 two seconds for its replica to apply it. A follower lagging further answers
 anyway and gets the token from the five-second refresh, as every other node
-does. A leader that doesn't answer a forwarded create within 10 seconds gets
+does. A leader that doesn't answer a forwarded create within 20 seconds gets
 the caller a `504`; the token may have committed with its secret lost.
 
 **Verification.** `sesame::auth::authenticate` turns away a bearer that
@@ -1192,7 +1197,7 @@ $ relish token rotate ci-deploy [--grace-hours 24]
    the caller and the grace end, never the secret. Role, scope and the
    `[permission]` spec stay with the name.
 
-If the leader doesn't answer a forwarded rotation within 10 seconds the caller
+If the leader doesn't answer a forwarded rotation within 20 seconds the caller
 gets a `504`, and the rotation may have committed with its new secret lost.
 Rotating again isn't a clean retry: the lost secret becomes the previous one,
 so the secret clients still hold stops at once whatever the grace. The error
@@ -1216,7 +1221,7 @@ authenticated request would then wait on the state machine's. A follower
 lagging past the two seconds still drops the token, but a refresh can restore
 it until its replica catches up, so the answer says the node is behind. The
 other nodes drop the token on their refresh, within five seconds. A forwarded
-revoke the leader doesn't answer within 10 seconds is a `504`, and repeating it
+revoke the leader doesn't answer within 20 seconds is a `504`, and repeating it
 is safe.
 
 **Expiry:** A token with a set `expires_at` is rejected at authentication time once that time has passed (a `401 token expired`). A token with no expiry is never rejected on age grounds. Revocation is explicit via `relish token revoke`.
@@ -2061,6 +2066,7 @@ The nftables ruleset is kept minimal by design:
 | Rule Category | Typical Count |
 |---------------|--------------|
 | Perimeter rules (input chain) | 5-10 static rules |
+| Perimeter rules (forward filter chain, for connections the port map rewrote) | 4 static rules |
 | Cluster nodes set | 1 set, N entries (N = cluster size) |
 | Admin CIDRs set | 1 set, typically < 10 entries |
 | Per-app egress sets | 1 set per app with egress config |

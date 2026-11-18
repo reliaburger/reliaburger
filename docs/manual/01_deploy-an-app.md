@@ -58,7 +58,7 @@ path = "/data"            # a managed volume; see `images-and-volumes`
 CPU follows Kubernetes: a bare number is cores (`cpu = "2"`, `cpu = "0.5-2"`)
 and the `m` suffix is millicores (`"250m"` is a quarter of a core). Memory takes
 `Ki`/`Mi`/`Gi`/`Ti`, and a bare number is bytes. A single value sets the request
-and the limit to the same thing.
+and the limit to the same thing. A CPU limit can't be more than 65,536 cores.
 
 The request only reserves memory on a node; the limit is the container's
 ceiling. An app with an `image`, and each of its sidecars, needs a memory limit

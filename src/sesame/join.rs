@@ -44,6 +44,10 @@ pub enum JoinError {
     InvalidTtl { seconds: u64 },
     #[error("join token is bound to a different node id")]
     NodeIdMismatch,
+    #[error(
+        "node id {node_id:?} has the same Raft id as existing node {existing:?}; join under another name"
+    )]
+    RaftIdCollision { node_id: String, existing: String },
     #[error("join token node id must not be empty")]
     EmptyNodeId,
     #[error("no Node CA found in security state")]
@@ -409,6 +413,12 @@ pub fn check_join_token(
     if state.crl.retired_nodes.contains_key(requested_node_id) {
         return Err(JoinError::NodeRetired);
     }
+    if let Some(existing) = raft_id_taken_by(state, requested_node_id) {
+        return Err(JoinError::RaftIdCollision {
+            node_id: requested_node_id.to_string(),
+            existing: existing.to_string(),
+        });
+    }
     let join_token = state
         .join_tokens
         .iter()
@@ -427,6 +437,28 @@ pub fn check_join_token(
         return Err(JoinError::NodeIdMismatch);
     }
     Ok(join_token.token_hash)
+}
+
+/// The existing node, if any, whose Raft id `node_id` would share.
+///
+/// Raft ids are a hash of the node name
+/// ([`crate::cluster::identity::raft_id_from_name`]), and short names that
+/// differ in their last two characters can collide (`worker-c0` and
+/// `worker-ar`). Two nodes under one id would merge in the council
+/// directory, so a dead voter could look alive through the other. Every
+/// node that has held a leaf counts, and so does every retired node, whose
+/// id still names its registry writes. The same name is not a collision:
+/// that's the node itself enrolling again.
+pub fn raft_id_taken_by<'a>(state: &'a SecurityState, node_id: &str) -> Option<&'a str> {
+    let raft_id = crate::cluster::identity::raft_id_from_name(node_id);
+    state
+        .node_leaves
+        .keys()
+        .chain(state.crl.retired_nodes.keys())
+        .map(String::as_str)
+        .find(|existing| {
+            *existing != node_id && crate::cluster::identity::raft_id_from_name(existing) == raft_id
+        })
 }
 
 /// Sign a joiner's CSR into a node certificate (PKI4/PKI5).
@@ -998,6 +1030,51 @@ mod tests {
         let hashes = join_tokens_to_revoke(&state, "node-02");
         assert_eq!(hashes, vec![state.join_tokens[0].token_hash]);
         assert!(join_tokens_to_revoke(&state, "node-09").is_empty());
+    }
+
+    /// `worker-c0` and `worker-ar` share a Raft id. A join under the second
+    /// name is refused, naming the member it collides with. The same name
+    /// joining again (a re-enrolment) is not a collision.
+    #[test]
+    fn check_join_token_refuses_a_node_whose_raft_id_is_taken() {
+        let (mut state, token, _master_secret) = setup_with_known_key();
+        state.join_tokens[0].node_id = "worker-ar".to_string();
+        crate::sesame::ca_rotation::record_node_leaf(&mut state, "worker-c0", 3);
+
+        let err = check_join_token(&token, "worker-ar", &state).unwrap_err();
+        assert!(
+            matches!(&err, JoinError::RaftIdCollision { existing, .. } if existing == "worker-c0"),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("worker-c0"), "{err}");
+
+        crate::sesame::ca_rotation::record_node_leaf(&mut state, "worker-ar", 4);
+        state.node_leaves.remove("worker-c0");
+        check_join_token(&token, "worker-ar", &state).unwrap();
+    }
+
+    /// A retired node's id still names its registry writes, so a new node
+    /// can't take it either.
+    #[test]
+    fn check_join_token_refuses_the_raft_id_of_a_retired_node() {
+        let (mut state, token, _master_secret) = setup_with_known_key();
+        state.join_tokens[0].node_id = "worker-ar".to_string();
+        state.crl.retired_nodes.insert(
+            "worker-c0".into(),
+            crate::cluster::retirement::NodeRetirement {
+                node_id: "worker-c0".into(),
+                retired_by: "operator".into(),
+                reason: "disk died".into(),
+                retired_at_unix_ms: 30,
+                released_placements: Default::default(),
+                released_registry_writers: Default::default(),
+                released_node_fault: None,
+                released_endpoint_consumer: false,
+            },
+        );
+
+        let err = check_join_token(&token, "worker-ar", &state).unwrap_err();
+        assert!(matches!(err, JoinError::RaftIdCollision { .. }), "{err:?}");
     }
 
     #[test]

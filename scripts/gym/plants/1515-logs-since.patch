@@ -1,14 +1,18 @@
 --- a/src/relish/client.rs
 +++ b/src/relish/client.rs
-@@ -1925,7 +1925,6 @@
+@@ -2283,11 +2283,10 @@
          // In single-node mode it queries the local LogStore.
-         let url = format!("{}/v1/logs/query/{}/{}", self.base_url, app, namespace);
+         let url = format!(
+             "{}{}",
+             self.base_url,
+             app_path("/v1/logs/query", app, namespace)?
+         );
  
 -        let mut store_answered = false;
          if let Ok(response) = self
              .http()?
              .get(&url)
-@@ -1937,7 +1936,6 @@
+@@ -2298,7 +2297,6 @@
                  .json::<crate::ketchup::types::LogQueryResult>()
                  .await
          {
@@ -16,7 +20,7 @@
              // Filters also apply client-side: json_field has no server-side
              // equivalent, and grep re-checking is harmless when the server
              // already filtered.
-@@ -1959,32 +1957,25 @@
+@@ -2319,32 +2317,25 @@
              }
          }
  

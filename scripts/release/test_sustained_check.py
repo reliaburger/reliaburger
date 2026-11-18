@@ -6,7 +6,9 @@ import json
 import os
 import re
 from pathlib import Path
+import subprocess
 import tempfile
+import textwrap
 import time
 import unittest
 
@@ -246,6 +248,319 @@ class WriterAndRedis(Evidence):
         self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 41\n"}))
         code, verdict = self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 41\nERR Could not connect\nINCR 42\n"}))
         self.assertEqual(self.failures(verdict), [])
+
+
+class ResumePoints(Evidence):
+    """Where each writer and Redis client start resumed, against the highest
+    acknowledged value before it. The file and counter checks alone can't see
+    a loss after a power cut: by the next check the writer has appended past
+    the lost lines and the client has counted past them (found by the
+    power-cut endurance work, #2094)."""
+
+    def power_cut(self, *restarts):
+        arguments = ["power-cut", str(self.evidence)]
+        for kind in restarts:
+            arguments += ["--restarts", kind]
+        with contextlib.redirect_stdout(io.StringIO()):
+            checker.main(arguments)
+
+    def window(self, action, label="power-off", at=NOW):
+        with contextlib.redirect_stdout(io.StringIO()):
+            checker.main(["window", str(self.evidence), action] + ([label] if action == "open" else [])
+                         + ["--at", str(at)])
+
+    def mark(self, **files):
+        directory = self.snapshot(**files)
+        with contextlib.redirect_stdout(io.StringIO()):
+            checker.main(["resume-mark", str(self.evidence), str(directory)])
+
+    def lose_lines_across_a_cut(self, with_resumes):
+        """ACK 1000 logged, power cut, the writer comes back on a file ending
+        at 900 and appends on to 1500: 1..1500, whole, by the next check."""
+        resumes = {"writer__resumes_txt": "0\n"} if with_resumes else {}
+        self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 999\nACK 1000\n"}, **resumes))
+        self.power_cut("writer")
+        resumes = {"writer__resumes_txt": "0\n900\n"} if with_resumes else {}
+        return self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 1499\nACK 1500\n",
+                                              "writer__file_txt": "MAX 1500\nLAST 1500\n"}, **resumes))
+
+    def test_a_lost_write_passes_the_file_check_and_fails_the_resume_check(self):
+        # The old check: the file holds 1..1500 and 1500 >= every ACK seen.
+        self.assertEqual(checker.writer_file_findings("MAX 1500\nLAST 1500\n", 1500), [])
+        code, verdict = self.lose_lines_across_a_cut(with_resumes=False)
+        self.assertNotEqual(code, 1)
+        self.assertEqual(self.failures(verdict), [])
+        # The same run with the resume record fails it.
+        self.setUp()
+        code, verdict = self.lose_lines_across_a_cut(with_resumes=True)
+        self.assertEqual(code, 1)
+        self.assertEqual(self.failures(verdict), ["writer-resume"])
+        detail = next(item["detail"] for item in verdict["findings"] if item["check"] == "writer-resume")
+        self.assertIn("resumed at 900", detail)
+        self.assertIn("ACK 1000", detail)
+
+    def test_a_start_at_or_past_the_last_ack_passes(self):
+        self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 1000\n", "writer__resumes_txt": "0\n"}))
+        self.power_cut("writer")
+        _, verdict = self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 1400\n", "writer__resumes_txt": "0\n1000\n",
+                                                    "writer__file_txt": "MAX 1400\nLAST 1400\n"}))
+        self.assertEqual(self.failures(verdict), [])
+
+    def test_a_start_is_judged_against_the_acks_read_before_it_not_its_own(self):
+        # The tail is read before the record, so the new run's own ACKs in this
+        # snapshot's tail never count against its resume point.
+        self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 1000\n", "writer__resumes_txt": "0\n"}))
+        _, verdict = self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 1001\nACK 1050\n",
+                                                    "writer__resumes_txt": "0\n1000\n"}))
+        self.assertEqual(self.failures(verdict), [])
+        # Once judged, a start is not judged again against later ACKs.
+        _, verdict = self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 1300\n", "writer__resumes_txt": "0\n1000\n"}))
+        self.assertEqual(self.failures(verdict), [])
+
+    def test_the_ack_just_before_a_cut_raises_the_bar(self):
+        # The last check saw ACK 1000; the mark taken just before the cut saw
+        # 1200. A start at 1100 lost a hundred acknowledged lines.
+        self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 1000\n", "writer__resumes_txt": "0\n"}))
+        self.mark(**{"writer__log_txt": "ACK 1199\nACK 1200\n", "writer__resumes_txt": "0\n"})
+        self.power_cut("writer")
+        _, verdict = self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 1300\n", "writer__resumes_txt": "0\n1100\n"}))
+        self.assertIn("writer-resume", self.failures(verdict))
+
+    def test_a_power_cut_of_the_writers_node_needs_a_new_start_once_settled(self):
+        self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 1000\n", "writer__resumes_txt": "0\n"}))
+        self.window("open")
+        self.power_cut("writer")
+        # Inside the window the writer may not be back yet.
+        _, verdict = self.evaluate(self.snapshot(**{"writer__resumes_txt": "0\n"}))
+        self.assertEqual(self.failures(verdict), [])
+        self.window("settled", at=NOW)
+        # Nothing restarted it, so nothing acknowledged past ACK 1000 either;
+        # past the grace period that's a start that never came.
+        _, verdict = self.evaluate(self.snapshot(ts=NOW + checker.RESTART_GRACE, **{
+            "writer__log_txt": "ACK 1000\n", "writer__resumes_txt": "0\n"}))
+        self.assertIn("writer-restart", self.failures(verdict))
+        _, verdict = self.evaluate(self.snapshot(ts=NOW + 200, **{
+            "writer__log_txt": "ACK 1200\n", "writer__resumes_txt": "0\n1000\n"}))
+        self.assertEqual(self.failures(verdict), [])
+
+    def test_a_start_late_after_the_window_closes_is_within_the_grace_period(self):
+        # The settle checks don't wait for the writer, so it may come back
+        # after the window closes; 120 s later it must have.
+        self.assertEqual(checker.RESTART_GRACE, 120)
+        self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 1000\n", "writer__resumes_txt": "0\n"}))
+        self.window("open")
+        self.power_cut("writer")
+        self.window("settled", at=NOW + 300)
+        _, verdict = self.evaluate(self.snapshot(ts=NOW + 330, **{"writer__resumes_txt": "0\n"}))
+        self.assertEqual(self.failures(verdict), [])
+        _, verdict = self.evaluate(self.snapshot(ts=NOW + 419, **{"writer__resumes_txt": "0\n"}))
+        self.assertEqual(self.failures(verdict), [])
+        _, verdict = self.evaluate(self.snapshot(ts=NOW + 330 + 120, **{"writer__resumes_txt": "0\n1000\n"}))
+        self.assertEqual(self.failures(verdict), [])
+        # A start that came late still had to resume at or past ACK 1000.
+        self.assertEqual(checker.load_state(self.evidence)["resumes"]["writer"]["seen"], 2)
+
+    def test_a_redis_client_that_never_restarts_fails_after_the_grace_period(self):
+        self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 42\n", "redis__starts_txt": "0\n"}))
+        self.window("open")
+        self.power_cut("redis")
+        self.window("close", at=NOW + 100)
+        _, verdict = self.evaluate(self.snapshot(ts=NOW + 130, **{"redis__starts_txt": "0\n"}))
+        self.assertEqual(self.failures(verdict), [])
+        _, verdict = self.evaluate(self.snapshot(ts=NOW + 230, **{"redis__starts_txt": "0\n"}))
+        self.assertIn("redis-restart", self.failures(verdict))
+
+    def test_a_cut_elsewhere_needs_no_new_start(self):
+        self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 1000\n", "writer__resumes_txt": "0\n"}))
+        self.power_cut()
+        _, verdict = self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 1100\n", "writer__resumes_txt": "0\n"}))
+        self.assertEqual(self.failures(verdict), [])
+
+    def test_a_redis_client_start_below_the_last_incr_fails(self):
+        self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 41\nINCR 42\n", "redis__starts_txt": "0\n"}))
+        self.power_cut("redis")
+        code, verdict = self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 80\n", "redis__starts_txt": "0\n40\n"}))
+        self.assertEqual(code, 1)
+        self.assertIn("redis-resume", self.failures(verdict))
+
+    def test_a_counter_the_client_saw_go_back_fails_once(self):
+        self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 42\n", "redis__regressions_txt": ""}))
+        _, verdict = self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 90\n", "redis__regressions_txt": "42 38\n"}))
+        self.assertEqual(self.failures(verdict), ["redis-regression"])
+        detail = next(item["detail"] for item in verdict["findings"] if item["check"] == "redis-regression")
+        self.assertIn("from 42 to 38", detail)
+        _, verdict = self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 91\n", "redis__regressions_txt": "42 38\n"}))
+        self.assertEqual(self.failures(verdict), [])
+
+    def test_redis_loading_its_aof_is_an_unreadable_record_not_a_regression(self):
+        # Just after node 3 powers on, Redis replays its AOF and redis-cli
+        # prints this with exit status 0.
+        self.evaluate(self.snapshot(**{"redis__log_txt": "INCR 42\n", "redis__regressions_txt": ""}))
+        _, verdict = self.evaluate(self.snapshot(**{
+            "redis__regressions_txt": "LOADING Redis is loading the dataset in memory\n"}))
+        self.assertEqual(self.failures(verdict), [])
+        warnings = [item for item in verdict["findings"] if item["check"] == "redis-regression"]
+        self.assertEqual([item["severity"] for item in warnings], ["warn"])
+        self.assertIn("unreadable", warnings[0]["detail"])
+        self.assertEqual(checker.load_state(self.evidence)["resumes"]["redis"]["regressions"], 0)
+        # A mixed answer is unreadable too, and judges nothing.
+        _, verdict = self.evaluate(self.snapshot(**{"redis__regressions_txt": "42 38\nLOADING\n"}))
+        self.assertEqual(self.failures(verdict), [])
+        self.assertEqual(checker.load_state(self.evidence)["resumes"]["redis"]["regressions"], 0)
+        # Once Redis answers, the entry is judged.
+        _, verdict = self.evaluate(self.snapshot(**{"redis__regressions_txt": "42 38\n"}))
+        self.assertEqual(self.failures(verdict), ["redis-regression"])
+
+    def test_an_unreadable_record_warns_and_judges_nothing(self):
+        self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 1000\n", "writer__resumes_txt": "0\n"}))
+        _, verdict = self.evaluate(self.snapshot(**{"writer__resumes_txt": "error: no such instance\n"}))
+        self.assertEqual(self.failures(verdict), [])
+        self.assertIn("writer-resume", [item["check"] for item in verdict["findings"]])
+        # The next readable record is still judged against ACK 1000.
+        _, verdict = self.evaluate(self.snapshot(**{"writer__resumes_txt": "0\n950\n"}))
+        self.assertIn("writer-resume", self.failures(verdict))
+
+    def test_the_record_counts_the_starts_checked(self):
+        self.evaluate(self.snapshot(**{"writer__log_txt": "ACK 10\n", "writer__resumes_txt": "0\n",
+                                        "redis__log_txt": "INCR 3\n", "redis__starts_txt": "0\n",
+                                        "redis__regressions_txt": ""}))
+        self.evaluate(self.snapshot(**{"writer__resumes_txt": "0\n10\n", "redis__starts_txt": "0\n3\n"}))
+        lines = checker.resume_record_lines(checker.load_state(self.evidence))
+        self.assertIn("- Volume writer resumes: 2 starts, each checked against the highest ACK logged before it", lines)
+        self.assertIn("- Redis client starts: 2, each checked against the highest INCR logged before it; "
+                      "counter regressions the client saw: 0", lines)
+
+
+def workload_script(app):
+    """The shell script an app in soak-workloads.toml runs."""
+    import tomllib
+    command = tomllib.loads(SOAK_WORKLOADS_FILE.read_text())["app"][app]["command"]
+    assert command[:2] == ["/bin/sh", "-c"], command
+    return command[2]
+
+
+SOAK_WORKLOADS_FILE = Path(__file__).resolve().parent / "sustained" / "soak-workloads.toml"
+
+
+class WorkloadResumeRecords(unittest.TestCase):
+    """The writer and the Redis client record each start before their first
+    acknowledgement, which is what the resume checks above rely on."""
+
+    def run_for(self, script, seconds, env=None):
+        process = subprocess.Popen(["sh", "-c", script], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   text=True, env={**os.environ, **(env or {})})
+        time.sleep(seconds)
+        process.terminate()
+        output, _ = process.communicate(timeout=10)
+        return output
+
+    def test_the_writer_records_where_it_resumed_before_its_first_ack(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory)
+            # A torn last line in both files, as a power cut mid-append leaves.
+            (data / "seq").write_text("1\n2\n3\n4")
+            (data / "resumes").write_text("0\n2")
+            output = self.run_for(workload_script("soak-writer").replace("/data", directory), 0.5)
+            self.assertRegex(output, r"RESUME 3 after +3 lines")
+            self.assertEqual((data / "resumes").read_text(), "0\n3\n")
+            first_ack = int(re.search(r"ACK (\d+)", output).group(1))
+            self.assertEqual(first_ack, 4)
+
+    def fake_redis_cli(self, directory, incr_answers):
+        """A redis-cli on PATH that keeps lists in files and answers INCR from INCR_ANSWERS in turn."""
+        bin_directory = Path(directory) / "bin"
+        bin_directory.mkdir()
+        (Path(directory) / "incr").write_text("".join(f"{value}\n" for value in incr_answers))
+        script = bin_directory / "redis-cli"
+        script.write_text(textwrap.dedent(f"""\
+            #!/bin/sh
+            shift 4
+            state={directory}
+            case $1 in
+              GET) cat "$state/counter" 2>/dev/null || echo ;;
+              RPUSH) printf '%s\\n' "$3" >> "$state/$2"; wc -l < "$state/$2" | tr -d ' ' ;;
+              INCR) v=$(head -n 1 "$state/incr"); sed -i.bak 1d "$state/incr"; echo "${{v:-ERR done}}"; echo "$v" > "$state/counter" ;;
+            esac
+            """))
+        script.chmod(0o755)
+        return {"PATH": f"{bin_directory}:{os.environ['PATH']}"}
+
+    def test_the_redis_client_records_its_start_and_any_step_back(self):
+        script = workload_script("soak-redis-client").replace("sleep 1", "sleep 0.05")
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "counter").write_text("41\n")
+            env = self.fake_redis_cli(directory, [42, 43, 39, 40])
+            output = self.run_for(script, 1.5, env)
+            self.assertIn("START 41", output)
+            self.assertEqual((Path(directory) / "soak:starts").read_text(), "41\n")
+            self.assertIn("BACK 43 39", output)
+            self.assertEqual((Path(directory) / "soak:regressions").read_text(), "43 39\n")
+
+
+class HarnessResumeWiring(unittest.TestCase):
+    """qualify-sustained.sh reads the resume records the way the checks above assume."""
+
+    def functions(self):
+        source = (Path(__file__).resolve().parent / "qualify-sustained.sh").read_text()
+        bodies = {}
+        for header in re.finditer(r"\n([a-z_]+)\(\) \{\n", source):
+            body = source[header.end():]
+            bodies[header.group(1)] = body[:body.index("\n}\n")]
+        return bodies
+
+    def test_every_check_reads_the_records_after_the_tails(self):
+        body = self.functions()["collect_light"]
+        self.assertLess(body.index("log_tails"), body.index("resume_records"))
+        mark = self.functions()["resume_cut_mark"]
+        self.assertLess(mark.index("log_tails"), mark.index("resume_records"))
+        self.assertLess(mark.index("resume_records"), mark.index("check resume-mark"))
+
+    def test_every_power_cut_is_marked_first(self):
+        bodies = self.functions()
+        for name in ("slot_power_off", "special_all_off"):
+            with self.subTest(function=name):
+                self.assertLess(bodies[name].index("resume_cut_mark"), bodies[name].index("power_off "))
+
+    def test_a_cut_of_the_writers_node_expects_a_new_writer_start(self):
+        body = self.functions()["power_off"]
+        self.assertIn('[ "$node" != 2 ] || restarts+=(--restarts writer)', body)
+        self.assertIn('check power-cut "$evidence" ${restarts[@]+"${restarts[@]}"}', body)
+
+
+class BoundedCommands(unittest.TestCase):
+    """with_timeout must stop a command that ignores SIGALRM, as Go's limactl
+    does: `perl -e 'alarm; exec'` left a `limactl shell` to a guest that went
+    away hanging for good (#2094's calibration run, 17 November 2026)."""
+
+    def run_bounded(self, seconds, command, stdin=None):
+        source = (Path(__file__).resolve().parent / "qualify-sustained.sh").read_text().splitlines()
+        start = next(i for i, line in enumerate(source) if line.startswith("with_timeout() {"))
+        end = start if source[start].endswith("}") else next(i for i in range(start, len(source)) if source[i] == "}")
+        function = "\n".join(source[start:end + 1]) + "\n"
+        started = time.monotonic()
+        result = subprocess.run(["bash", "-c", function + f'with_timeout {seconds} {command}\necho "status=$?"\n'],
+                                input=stdin, capture_output=True, text=True, timeout=30)
+        return result.stdout, time.monotonic() - started
+
+    def test_a_command_that_ignores_sigalrm_is_killed_at_the_deadline(self):
+        # A grandchild holding stdout must not keep the caller waiting either.
+        output, took = self.run_bounded(1, "sh -c 'trap \"\" ALRM TERM; (sleep 20; echo late) & sleep 20'")
+        self.assertIn("status=124", output)
+        self.assertNotIn("late", output)
+        self.assertLess(took, 10)
+
+    def test_a_command_that_finishes_keeps_its_status_and_output(self):
+        output, _ = self.run_bounded(5, "sh -c 'echo hello; exit 3'")
+        self.assertIn("hello\nstatus=3", output)
+
+    def test_a_command_still_reads_a_piped_standard_input(self):
+        # gsh_in feeds the guest its script on standard input.
+        output, _ = self.run_bounded(5, "cat", stdin="guest script\n")
+        self.assertIn("guest script\nstatus=0", output)
+
+    def test_a_command_killed_by_a_signal_reports_it(self):
+        output, _ = self.run_bounded(5, "sh -c 'kill -9 $$'")
+        self.assertIn("status=137", output)
 
 
 class Certificates(Evidence):
@@ -2718,7 +3033,7 @@ class LogStoreAB(Evidence):
         import subprocess
         script = (self.release / "qualify-sustained.sh").read_text()
         functions = ""
-        for name in ("log_tail() {", "collect_light() {"):
+        for name in ("log_tail() {", "log_tails() {", "collect_light() {"):
             function = script[script.index(name):]
             functions += function[:function.index("\n}\n") + 3]
         calls = self.evidence / "calls.txt"
@@ -2735,6 +3050,7 @@ api_get() {{ echo "api_get $*" >> {calls}; echo '{entries}'; }}
 rel() {{ echo "rel $*" >> {calls}; }}
 probe_forwards() {{ :; }}
 slo_reads() {{ :; }}
+resume_records() {{ :; }}
 """
         directory = self.evidence / "snap"
         directory.mkdir()

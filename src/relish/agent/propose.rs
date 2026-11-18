@@ -283,7 +283,7 @@ pub fn request_for(
 
 /// Run `relish agent propose`.
 pub async fn run_propose(args: &ProposeArgs, max_bytes: usize, rerun: &str) -> Rendered {
-    let client = BunClient::default_local();
+    let client = BunClient::local().await;
     let result = propose(&client, args).await;
     render_answer(
         CommandName::Propose,
@@ -318,7 +318,7 @@ async fn propose(
 
 /// Run `relish agent proposals [ID]`.
 pub async fn run_proposals(args: &ProposalsArgs, max_bytes: usize, rerun: &str) -> Rendered {
-    let client = BunClient::default_local();
+    let client = BunClient::local().await;
     let result = async {
         let views = match args.id {
             Some(id) => vec![
@@ -358,7 +358,7 @@ pub async fn run_proposals(args: &ProposalsArgs, max_bytes: usize, rerun: &str) 
 
 /// Run `relish agent withdraw ID`.
 pub async fn run_withdraw(id: u64, max_bytes: usize, rerun: &str) -> Rendered {
-    let client = BunClient::default_local();
+    let client = BunClient::local().await;
     let result = client
         .withdraw_proposal(id)
         .await
@@ -376,7 +376,7 @@ pub async fn run_withdraw(id: u64, max_bytes: usize, rerun: &str) -> Rendered {
 
 /// Run `relish agent undo ID`: propose the undo, for a person to approve.
 pub async fn run_undo(args: &UndoArgs, max_bytes: usize, rerun: &str) -> Rendered {
-    let client = BunClient::default_local();
+    let client = BunClient::local().await;
     let request = ProposalRequest {
         kind: RequestKind::Undo,
         namespace: None,

@@ -157,8 +157,11 @@ fn qualify_process_catalogue(filter: &str) {
         "--timeout",
         match filter {
             "jobs" => "90s",
-            // The job cases take about 5 s; a passing case ends early.
-            PROCESS_JOB_CASES => "30s",
+            // The job cases take about 5 s idle. A failing job's three
+            // attempts each start and retire a process owner through
+            // fsync'd journal writes, which ran past 30 s at load 25
+            // (#2035). A passing case ends early.
+            PROCESS_JOB_CASES => "60s",
             _ => "15s",
         },
     ]);

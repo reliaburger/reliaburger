@@ -45,6 +45,16 @@ The Bun API also has to listen on a routable address (`bun --listen
   (`192.168.0.17/24`; the error names `192.168.0.0/24`).
 - It's read at startup; there's no live reload.
 
+Container host ports (`[network] port_range`, 10000-32767 by default) answer
+only cluster members and the node itself. That holds for ports published to
+containers too, which the node's own containers can also reach. Clients
+outside the cluster reach apps through Wrapper's ingress ports instead.
+
+Bun never publishes a workload on one of its own ports, and its own ports keep
+their usual policy inside the range. Put the API port there
+(`--listen 0.0.0.0:29117`, say) and `operator_cidrs` still reach it; put
+ingress there (`http_port = 28080`) and it answers everyone, as it would on 80.
+
 Rootless Bun and macOS don't run the perimeter, so the setting has no effect
 there. The laptop quickstart doesn't need it either: it reaches each node's API
 through a port forward that arrives on the node's loopback.
@@ -111,7 +121,7 @@ you asked and on the leader, and on the others within about five seconds. If
 the node you asked is more than two seconds behind the leader, the message says
 so, and that node may accept the token until it catches up.
 
-If the leader doesn't answer within 10 seconds you get a `504`, and the write
+If the leader doesn't answer within 20 seconds you get a `504`, and the write
 may have happened anyway. Repeating a `revoke` is safe, and a lost join token
 expires by itself. Check `relish token list` before repeating a `create` or a
 `rotate`, because a secret may be lost (see Rotation below).
@@ -403,10 +413,11 @@ per author and one per app.
 An agent may hold a short **lease** on an app or a namespace while it
 works (`relish lease list` shows them). Someone else's lease stops your own
 `relish apply`, `deploy`, `stop`, `delete`, `rollback` or `release` of that
-app, naming the holder, why and for how long:
+app, naming the holder and for how long (`relish lease list` shows why;
+the reason is the holder's own words, so the refusal doesn't quote it):
 
 ```text
-app:shop/web is held by holmes for 87s more (rolling back); repeat with --break-lease to take it over
+app:shop/web is held by holmes for 87s more; repeat with --break-lease to take it over
 ```
 
 Repeat the command with `--break-lease` and the cluster ends the lease,

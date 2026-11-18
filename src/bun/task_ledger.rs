@@ -211,7 +211,7 @@ pub(crate) fn decode(bytes: &[u8; RECORD_BYTES], offset: u64) -> Result<TaskReco
     })?;
     let exit_code = u32_at(6) as i32;
     Ok(TaskRecord {
-        grant_attempt: u64::from_le_bytes(bytes[14..22].try_into().expect("record width")),
+        grant_attempt: u64::from_le_bytes(std::array::from_fn(|i| bytes[14 + i])),
         index: u32_at(0),
         attempts: bytes[4],
         outcome,
@@ -297,8 +297,9 @@ pub fn scan(
             replayed.torn_tail = true;
             break;
         }
-        let count = u32::from_le_bytes(header[..4].try_into().expect("header count"));
-        let checksum = u32::from_le_bytes(header[4..].try_into().expect("header checksum"));
+        let [c0, c1, c2, c3, k0, k1, k2, k3] = header;
+        let count = u32::from_le_bytes([c0, c1, c2, c3]);
+        let checksum = u32::from_le_bytes([k0, k1, k2, k3]);
         if count == 0 || count > MAX_BLOCK_RECORDS {
             return torn_or_corrupt(&mut replayed, at as usize, length as usize, at);
         }

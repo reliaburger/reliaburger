@@ -255,6 +255,19 @@ async fn seeded_council_with_log(
     Arc<crate::council::CouncilNode>,
     crate::council::log_store::MemLogStore,
 ) {
+    let (node, log, _) = seeded_council_with_init(tag).await;
+    (node, log)
+}
+
+/// [`seeded_council_with_log`], with the cluster's init result too: its
+/// `node_certificate` is a valid TLS identity for `node-1`.
+async fn seeded_council_with_init(
+    tag: &str,
+) -> (
+    Arc<crate::council::CouncilNode>,
+    crate::council::log_store::MemLogStore,
+    crate::sesame::init::InitResult,
+) {
     use std::collections::BTreeMap;
 
     use crate::council::log_store::MemLogStore;
@@ -305,7 +318,7 @@ async fn seeded_council_with_log(
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    (Arc::new(node), log)
+    (Arc::new(node), log, init)
 }
 
 /// Send a GET to `uri` against `app` and return (status, body bytes).
@@ -1489,7 +1502,7 @@ async fn leased_apply_with_jobs_uses_the_common_job_lifecycle() {
         desired
             .task_arrays
             .deployments()
-            .all(|(_, record)| record.cancelled || record.completed),
+            .all(|(_, record)| record.cancelled() || record.completed),
         "cleanup cancels the leased deployment"
     );
     assert!(
@@ -1578,7 +1591,7 @@ schedule = "* * * * *"
     assert!(
         after
             .deployments()
-            .all(|(_, record)| record.cancelled || record.completed)
+            .all(|(_, record)| record.cancelled() || record.completed)
     );
     for name in ["batch", "scheduled"] {
         assert!(after.jobs().definition(&lease.namespace, name).is_none());
@@ -2016,14 +2029,28 @@ async fn follower_with_history_of_a_recording_leader(
     Arc<tokio::sync::Mutex<Vec<SeenAtLeader>>>,
     Vec<Arc<crate::council::CouncilNode>>,
 ) {
+    let leader_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let leader_port = leader_listener.local_addr().unwrap().port();
+    let seen = serve_recording_leader(leader_listener);
+    let (follower, nodes) = follower_of_the_leader_api_on(token, history, leader_port).await;
+    (follower, seen, nodes)
+}
+
+/// A three-node council led by node 1, whose API is whatever listens on
+/// `leader_port`. Returns node 2's real router (a follower) with `token` in
+/// its store and `history` as its deploy records, and the council nodes to
+/// shut down.
+async fn follower_of_the_leader_api_on(
+    token: crate::sesame::types::ApiToken,
+    history: Option<Arc<RwLock<Vec<DeployHistoryEntry>>>>,
+    leader_port: u16,
+) -> (Router, Vec<Arc<crate::council::CouncilNode>>) {
     use crate::council::CouncilNode;
     use crate::council::log_store::MemLogStore;
     use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
     use crate::council::state_machine::CouncilStateMachine;
     use crate::council::types::{CouncilConfig, CouncilNodeInfo};
 
-    let leader_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let leader_port = leader_listener.local_addr().unwrap().port();
     let network = InMemoryRaftRouter::new();
     let mut nodes = Vec::new();
     let mut members = std::collections::BTreeMap::new();
@@ -2061,8 +2088,6 @@ async fn follower_with_history_of_a_recording_leader(
     .await
     .unwrap();
 
-    let seen = serve_recording_leader(leader_listener);
-
     let (commands, _receiver) = mpsc::channel(4);
     let store = crate::sesame::auth::new_token_store();
     *store.write().await = vec![token];
@@ -2082,7 +2107,7 @@ async fn follower_with_history_of_a_recording_leader(
         leader_port,
         None,
     );
-    (follower, seen, nodes)
+    (follower, nodes)
 }
 
 /// #1442: a follower forwards stop, delete and release as the caller, not
@@ -3333,6 +3358,172 @@ async fn a_follower_marks_every_request_it_forwards_to_the_leader() {
     }
 }
 
+/// Send `request` to `app` and read the whole answer, waiting up to
+/// `within`. Paused-clock tests pass more than the forward timeout.
+async fn send_within(
+    app: Router,
+    request: axum::http::Request<Body>,
+    within: std::time::Duration,
+) -> (StatusCode, String) {
+    let what = format!("{} {}", request.method(), request.uri());
+    let response = tokio::time::timeout(within, async {
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&body).to_string())
+    })
+    .await;
+    response.unwrap_or_else(|_| panic!("{what} didn't answer in {within:?}"))
+}
+
+/// A leader that accepts the connection and never answers (a stalled
+/// process, or a path that drops its replies) used to hold every request a
+/// follower forwarded to it for as long as the TCP connection lived. Each
+/// forward now gives up at the forward timeout and answers 504.
+#[tokio::test(start_paused = true)]
+async fn a_follower_answers_504_when_the_leader_never_answers() {
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    // Bound, never accepted: the kernel completes the handshake and holds
+    // the request, and no answer ever comes back.
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let leader_port = silent.local_addr().unwrap().port();
+    let (follower, nodes) = follower_of_the_leader_api_on(admin, None, leader_port).await;
+
+    let forwarded = [
+        // `forward_to_leader`'s plain answer, and its streamed job apply.
+        (
+            "POST",
+            "/v1/batch",
+            r#"{"jobs":[{"name":"render","namespace":"default","spec":{"image":"x:1","command":["true"]}}]}"#,
+        ),
+        (
+            "POST",
+            "/v1/apply",
+            "[job.render]\nimage = \"x:1\"\ncommand = [\"true\"]\n",
+        ),
+        // `forward_get_to_leader`.
+        ("GET", "/v1/batch/1", ""),
+        // An app change's own forward.
+        ("POST", "/v1/stop/web/default", ""),
+    ];
+    for (method, path, body) in forwarded {
+        let mut request = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("authorization", format!("Bearer {admin_key}"));
+        if path != "/v1/apply" && !body.is_empty() {
+            request = request.header("content-type", "application/json");
+        }
+        let started = tokio::time::Instant::now();
+        let (status, reply) = send_within(
+            follower.clone(),
+            request.body(Body::from(body)).unwrap(),
+            crate::bun::batch::LEADER_FORWARD_TIMEOUT * 3,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::GATEWAY_TIMEOUT,
+            "{method} {path}: {reply}"
+        );
+        assert!(
+            reply.contains("outcome is unknown"),
+            "{method} {path}: {reply}"
+        );
+        assert!(started.elapsed() >= crate::bun::batch::LEADER_FORWARD_TIMEOUT);
+    }
+    drop(silent);
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// The forward timeout bounds only the wait for a job apply's headers: the
+/// leader's event stream then runs until the deployment settles, which can
+/// be far longer, and the follower relays every event of it.
+#[tokio::test(start_paused = true)]
+async fn a_forwarded_job_apply_streams_past_the_forward_timeout() {
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let leader_port = listener.local_addr().unwrap().port();
+    let leader = axum::Router::new().fallback(|| async {
+        let events = futures_util::stream::unfold(0, |sent| async move {
+            match sent {
+                0 => Some((Ok::<_, std::convert::Infallible>("data: accepted\n\n"), 1)),
+                1 => {
+                    tokio::time::sleep(crate::bun::batch::LEADER_FORWARD_TIMEOUT * 2).await;
+                    Some((Ok("data: complete\n\n"), 2))
+                }
+                _ => None,
+            }
+        });
+        (
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            Body::from_stream(events),
+        )
+    });
+    tokio::spawn(async move { axum::serve(listener, leader).await.unwrap() });
+    let (follower, nodes) = follower_of_the_leader_api_on(admin, None, leader_port).await;
+
+    let request = axum::http::Request::post("/v1/apply")
+        .header("authorization", format!("Bearer {admin_key}"))
+        .body(Body::from(
+            "[job.render]\nimage = \"x:1\"\ncommand = [\"true\"]\n",
+        ))
+        .unwrap();
+    let (status, reply) = send_within(
+        follower,
+        request,
+        crate::bun::batch::LEADER_FORWARD_TIMEOUT * 4,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert_eq!(reply, "data: accepted\n\ndata: complete\n\n");
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
+/// Before its event stream starts, the leader binds each of a job apply's
+/// images against its upstream registry, up to 20 s apiece, and then writes
+/// to the council. With three slow registries that runs past the plain
+/// forward timeout, so the follower waits for the headers in proportion to
+/// the images instead of answering 504 while the leader goes on to commit.
+#[tokio::test(start_paused = true)]
+async fn a_forwarded_job_apply_waits_for_the_leader_to_bind_each_image() {
+    let (admin, admin_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let leader_port = listener.local_addr().unwrap().port();
+    // Three upstream binds that each run to their limit, then the write.
+    let binding =
+        3 * crate::pickle::binding::UPSTREAM_BIND_TIMEOUT + crate::council::node::WRITE_TIMEOUT;
+    let leader = axum::Router::new().fallback(move || async move {
+        tokio::time::sleep(binding).await;
+        (
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            "data: accepted\n\n",
+        )
+    });
+    tokio::spawn(async move { axum::serve(listener, leader).await.unwrap() });
+    let (follower, nodes) = follower_of_the_leader_api_on(admin, None, leader_port).await;
+    assert!(binding > crate::bun::batch::LEADER_FORWARD_TIMEOUT);
+
+    let request = axum::http::Request::post("/v1/apply")
+        .header("authorization", format!("Bearer {admin_key}"))
+        .body(Body::from(
+            "[job.a]\nimage = \"a:1\"\ncommand = [\"true\"]\n\
+             [job.b]\nimage = \"b:1\"\ncommand = [\"true\"]\n\
+             [job.c]\nimage = \"c:1\"\ncommand = [\"true\"]\n",
+        ))
+        .unwrap();
+    let (status, reply) = send_within(follower, request, binding * 4).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert_eq!(reply, "data: accepted\n\n");
+    for node in nodes {
+        node.shutdown().await.unwrap();
+    }
+}
+
 #[tokio::test]
 async fn lease_created_through_a_lagging_follower_is_in_its_replica_when_returned() {
     use crate::council::CouncilNode;
@@ -3756,6 +3947,55 @@ async fn placements_expose_only_the_consumers_original_withdrawal_generations() 
     assert_eq!(
         instructions[1]["services"]["default__web"]["retire_vip"],
         true
+    );
+    shutdown.cancel();
+    council.shutdown().await.unwrap();
+}
+
+/// A node reports only its own failed rollouts: with a TLS identity, the
+/// report must name the node that identity belongs to.
+#[tokio::test]
+async fn a_rollout_failure_must_name_the_reporting_node() {
+    let (council, _log, init) = seeded_council_with_init("rollout-failed-peer").await;
+    let (app, shutdown) = setup_with_auth_leases_events_and_council(
+        vec![],
+        Some("internal".into()),
+        crate::bun::readiness::ReadinessTracker::new(),
+        lease_static_capabilities(),
+        None,
+        None,
+        Some(council.clone()),
+    )
+    .await;
+    let as_node_1 = app.layer(axum::Extension(crate::sesame::renewal::TlsPeerCertificate(
+        init.node_certificate.certificate_der.clone().into(),
+    )));
+    let report = |node: &str| {
+        format!(
+            r#"{{"app_name":"web","namespace":"default","node":"{node}","fingerprint":"0","reason":"test"}}"#
+        )
+    };
+    assert_eq!(
+        post_status(
+            as_node_1.clone(),
+            "/v1/rollouts/failed",
+            "internal",
+            &report("node-2")
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    // Its own report gets past the identity check; the state machine then
+    // refuses it because no app `web` exists.
+    assert_eq!(
+        post_status(
+            as_node_1,
+            "/v1/rollouts/failed",
+            "internal",
+            &report("node-1")
+        )
+        .await,
+        StatusCode::CONFLICT
     );
     shutdown.cancel();
     council.shutdown().await.unwrap();
@@ -5619,7 +5859,6 @@ async fn workload_admission_fixture(
             policy: crate::config::process_workloads::ProcessWorkloadsConfig {
                 mount_isolation: false,
                 allowed_binaries: vec!["/bin/sh".into(), "/bin/true".into()],
-                ..Default::default()
             },
             default_concurrency: 8,
             backoff: (std::time::Duration::ZERO, std::time::Duration::ZERO),
@@ -10051,6 +10290,77 @@ async fn a_node_that_isnt_an_appliance_refuses_to_stage_an_os() {
     shutdown.cancel();
 }
 
+/// Serve `council`'s router on a local port and return a client for it,
+/// the token that stops the server, and the server task.
+async fn served_client_for_council(
+    council: Arc<crate::council::CouncilNode>,
+) -> (
+    crate::relish::client::BunClient,
+    CancellationToken,
+    tokio::task::JoinHandle<()>,
+) {
+    let (app, shutdown, token) = router_for_council(council).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client = crate::relish::client::BunClient::new_with_token(
+        &format!("http://{}", listener.local_addr().unwrap()),
+        Some(&token),
+    );
+    let serving = shutdown.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move { serving.cancelled().await })
+            .await
+            .unwrap();
+    });
+    (client, shutdown, server)
+}
+
+/// `relish apply` is a person waiting on a slow disk, not a loop that can
+/// try again next tick: a commit slower than the background write timeout
+/// still completes the apply instead of aborting it halfway.
+#[tokio::test(start_paused = true)]
+async fn a_commit_slower_than_the_write_timeout_still_completes_an_apply() {
+    let council = seeded_council("slow-apply").await;
+    let (client, shutdown, server) = served_client_for_council(council.clone()).await;
+    council.slow_writes(crate::council::node::WRITE_TIMEOUT + std::time::Duration::from_secs(5));
+    let permission = crate::config::Config::parse(
+        "[permission.reader]\nactions = ['logs']\napps = ['web']\nnamespaces = ['default']\n",
+    )
+    .unwrap();
+    let result = client.apply(&permission).await;
+    assert!(
+        result.is_ok(),
+        "a slow commit aborted the apply: {result:?}"
+    );
+    assert!(
+        council
+            .desired_state()
+            .await
+            .permissions
+            .contains_key("reader")
+    );
+    shutdown.cancel();
+    server.await.unwrap();
+}
+
+/// A write that never commits ends the apply with an answer that says what
+/// the caller can do: the outcome is unknown, and applying again is safe.
+#[tokio::test(start_paused = true)]
+async fn an_apply_whose_write_never_commits_says_it_is_safe_to_repeat() {
+    let council = seeded_council("hung-apply").await;
+    let (client, shutdown, server) = served_client_for_council(council.clone()).await;
+    council.hang_writes();
+    let permission = crate::config::Config::parse(
+        "[permission.reader]\nactions = ['logs']\napps = ['web']\nnamespaces = ['default']\n",
+    )
+    .unwrap();
+    let error = client.apply(&permission).await.unwrap_err().to_string();
+    assert!(error.contains("outcome unknown"), "{error}");
+    assert!(error.contains("safe to repeat"), "{error}");
+    shutdown.cancel();
+    server.await.unwrap();
+}
+
 #[tokio::test]
 async fn apply_uses_committed_namespace_context_before_any_resource_write() {
     use crate::council::RaftRequest;
@@ -10735,7 +11045,7 @@ async fn assert_stalled_settlement_is_bounded(settlement: StalledSettlement) {
     let run = seed_finished_hook(&council, failed).await;
     let before = council.desired_state().await;
     let record = before.task_arrays.deployment(HUNG_DEPLOYMENT_ID).unwrap();
-    assert!(!record.apps_committed && !record.cancelled && !record.completed);
+    assert!(!record.apps_committed && !record.cancelled() && !record.completed);
     assert_eq!(
         before.task_arrays.get(run).unwrap().state.status(),
         if failed {
@@ -11843,4 +12153,47 @@ async fn a_hold_request_holds_this_nodes_elections() {
     assert_eq!(response.status(), StatusCode::OK);
     assert!(nodes[0].elections_held());
     nodes[0].shutdown().await.unwrap();
+}
+
+/// Ending a paused upgrade is two council writes. One that doesn't commit
+/// in time hasn't been refused: the answer is a 503 that says the outcome
+/// is unknown, not a 409 that says the run can't be ended.
+#[tokio::test(start_paused = true)]
+async fn ending_an_upgrade_whose_write_times_out_answers_503_outcome_unknown() {
+    let council = seeded_council("hung-archive").await;
+    council.hang_writes();
+    let aborted = crate::upgrade::types::ClusterUpgradeState {
+        upgrade_id: "up-1".to_string(),
+        target_version: "v0.2.0".parse().unwrap(),
+        binaries: Vec::new(),
+        parallel: 1,
+        direction: crate::upgrade::types::UpgradeDirection::Upgrade,
+        phase: crate::upgrade::types::ClusterUpgradePhase::Aborted {
+            reason: "aborted by the operator".to_string(),
+        },
+        registry_address: String::new(),
+        allow_downgrade: false,
+        nodes: vec![],
+    };
+    let response = super::upgrade::archive_aborted_upgrade(&council, aborted)
+        .await
+        .unwrap_err();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body = String::from_utf8_lossy(&body);
+    assert!(body.contains("outcome unknown"), "{body}");
+}
+
+/// A follower's backstop for a forwarded token write must outlast what the
+/// leader may spend on it: proving it leads, the council write, and the
+/// wait for its own replica. Otherwise a slow but healthy leader commits a
+/// token whose only copy of the secret the follower has already given up on.
+#[test]
+fn the_token_forward_backstop_outlasts_the_leaders_own_deadlines() {
+    assert!(
+        super::identity::LEADER_FORWARD_TIMEOUT
+            > crate::council::node::LEADER_CONFIRMATION
+                + crate::council::node::WRITE_TIMEOUT
+                + super::identity::TOKEN_REPLICATION_WAIT
+    );
 }

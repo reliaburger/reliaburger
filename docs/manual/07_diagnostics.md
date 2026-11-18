@@ -161,6 +161,7 @@ means, the numbers that decide it and the line of code that does (see
 | `council-member-down` | warning | A council member is missing, quorum holds |
 | `active-faults` | warning | Smoker faults are active |
 | `disk-high` | warning, critical | A filesystem is 85% full (critical at 95%) |
+| `export-failing` | warning | A node can't export its logs or metrics, so their caps and retention are on hold |
 | `cert-expired` | critical | A certificate has expired |
 | `cert-expiring` | warning | A certificate expires within 14 days without healthy rotation |
 | `registry-lost-images` | critical | No live node holds every layer of an image |

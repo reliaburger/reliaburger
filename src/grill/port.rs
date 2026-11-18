@@ -22,6 +22,9 @@ pub struct PortAllocator {
     /// Skip ports a host process already listens on. Always on outside
     /// test fixtures.
     probe_host: bool,
+    /// Ports the node itself serves on, never handed out even before
+    /// they're listening.
+    excluded: Arc<HashSet<u16>>,
 }
 
 /// Errors from port allocation operations.
@@ -45,7 +48,17 @@ impl PortAllocator {
             range_end,
             allocated: Arc::new(Mutex::new(HashSet::new())),
             probe_host: true,
+            excluded: Arc::new(HashSet::new()),
         }
+    }
+
+    /// Never hand out these ports: the node's own service ports (API,
+    /// cluster, registry, ingress, DNS). The host probe skips them once
+    /// they listen, but a listener that binds after the first workload
+    /// starts would otherwise race its own port.
+    pub fn excluding(mut self, ports: impl IntoIterator<Item = u16>) -> Self {
+        self.excluded = Arc::new(ports.into_iter().collect());
+        self
     }
 
     /// Trust the bookkeeping alone, without probing the host. For test
@@ -75,9 +88,10 @@ impl PortAllocator {
         // `reserve()` accepts out-of-range ports (adopted workloads), and
         // counting those against the cap made `allocate` report the pool
         // exhausted while in-range ports were still free.
+        let range = self.range_start..self.range_end;
         let in_range = allocated
-            .iter()
-            .filter(|p| (self.range_start..self.range_end).contains(p))
+            .union(&self.excluded)
+            .filter(|p| range.contains(p))
             .count();
         if in_range >= self.total_ports() {
             return Err(PortError::Exhausted {
@@ -92,7 +106,10 @@ impl PortAllocator {
         let first = rng.random_range(0..self.total_ports());
         for offset in 0..self.total_ports() {
             let port = self.range_start + ((first + offset) % self.total_ports()) as u16;
-            if !allocated.contains(&port) && (!self.probe_host || host_port_is_free(port)) {
+            if !allocated.contains(&port)
+                && !self.excluded.contains(&port)
+                && (!self.probe_host || host_port_is_free(port))
+            {
                 allocated.insert(port);
                 return Ok(port);
             }
@@ -318,6 +335,27 @@ mod tests {
         assert!(alloc.allocate().await.is_ok());
         assert!(alloc.allocate().await.is_ok());
         assert!(alloc.allocate().await.is_err());
+    }
+
+    /// A port Bun serves on may not be listening yet when the first workload
+    /// starts (ingress binds late), so the host probe alone can't keep the
+    /// allocator off it.
+    #[tokio::test]
+    async fn the_allocator_never_hands_out_a_service_port() {
+        let alloc = PortAllocator::new(10000, 10004)
+            .without_host_probe()
+            .excluding([10001, 10003, 9117]);
+        let mut handed_out = Vec::new();
+        while let Ok(port) = alloc.allocate().await {
+            handed_out.push(port);
+        }
+        handed_out.sort_unstable();
+        assert_eq!(handed_out, vec![10000, 10002]);
+        // Excluded ports still count as taken for exhaustion.
+        assert!(matches!(
+            alloc.allocate().await,
+            Err(PortError::Exhausted { .. })
+        ));
     }
 
     #[tokio::test]

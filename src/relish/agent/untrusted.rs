@@ -226,6 +226,37 @@ const ESC: char = '\x1b';
 /// The one-character form of `ESC [` some terminals accept.
 const C1_CSI: char = '\u{9b}';
 
+/// Take the text an agent wrote out of an audit record's or event's
+/// `details` and wrap it: a lease's `purpose`, or a proposal's `reason`.
+///
+/// Both are the author's own words, and the server checks only that they're
+/// printable, so they travel inside [`Untrusted`] like any workload text.
+/// `action` is the record's audited action: a proposal's own records
+/// (`proposal.*`) and the app records a proposal made (which carry its
+/// `author_kind`) hold its reason; a lease's records carry its `holder` and
+/// `purpose`. Any other `reason` is the cluster's own and stays put.
+pub fn take_author_text(
+    action: Option<&str>,
+    details: &mut std::collections::BTreeMap<String, String>,
+    app: Option<&str>,
+    namespace: Option<&str>,
+) -> Option<Untrusted> {
+    let (origin, text) = if details.contains_key("holder") && details.contains_key("purpose") {
+        (Origin::LeasePurpose, details.remove("purpose")?)
+    } else if action.is_some_and(|action| action.starts_with("proposal."))
+        || details.contains_key("author_kind")
+    {
+        (Origin::ProposalReason, details.remove("reason")?)
+    } else {
+        return None;
+    };
+    let text = Untrusted::new(origin, [text]);
+    Some(match app {
+        Some(app) => text.for_app(app, namespace.unwrap_or("default")),
+        None => text,
+    })
+}
+
 /// `line` without ANSI escape sequences, control characters (except tab)
 /// or Unicode bidirectional overrides.
 ///

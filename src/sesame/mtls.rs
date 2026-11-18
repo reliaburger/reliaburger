@@ -762,6 +762,8 @@ pub mod gossip_hmac {
 
         let mut key_bytes = [0u8; 32];
         let info = [b"gossip-hmac" as &[u8]];
+        // HKDF-SHA256 expands to at most 255 * 32 bytes, and `fill` gets the
+        // 32 that `HkdfLen` declares, so neither call can fail.
         let okm = prk.expand(&info, HkdfLen).expect("HKDF expand");
         okm.fill(&mut key_bytes).expect("HKDF fill");
 

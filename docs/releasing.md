@@ -683,9 +683,11 @@ cluster-wide council size are new Raft requests and new fields in council
 state, and OIDC signing-key rotation adds two more requests and a field in
 the security state
 ([#709](https://github.com/reliaburger/reliaburger/issues/709)); the full
-list is in `src/compatibility.rs`. So the protocol moved from 58 to 59 and
-the state format from 74 to 75, once for the whole release, and a 0.2.8
-leader refuses `relish upgrade start v0.3.0` before it records a run.
+list is in `src/compatibility.rs`. So the protocol moved from 58 to 60 and
+the state format from 74 to 76, and a 0.2.8 leader refuses
+`relish upgrade start v0.3.0` before it records a run. The train bumped
+twice: once at its first format change (59/75) and once at its end, so a
+pre-release build made between the two is refused like any other format.
 
 The move is a fresh cluster, as [from 0.2.0](#upgrading-from-020), with the
 same steps and the same losses, and one change to how you start it: the root

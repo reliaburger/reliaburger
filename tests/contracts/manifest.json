@@ -3319,6 +3319,33 @@
       ]
     },
     {
+      "id": "issue-555-legacy-oci-owned_network-published_ports_answer_members_only_and_rewrite_only_local_destinations",
+      "issue": 555,
+      "promise": "Complete the exact retained legacy OCI case through its finite owned driver.",
+      "supported_paths": [
+        "Exact original ignored test identity and declared Make owner."
+      ],
+      "refused_paths": [
+        "No generic aliases or success from another test or owner."
+      ],
+      "boundaries": [
+        "Source binding only; real isolated Linux OCI execution and current receipt are required."
+      ],
+      "cases": [
+        {
+          "id": "legacy-oci-owned_network-published_ports_answer_members_only_and_rewrite_only_local_destinations",
+          "binary": "reliaburger::owned_network",
+          "test": "published_ports_answer_members_only_and_rewrite_only_local_destinations",
+          "requires": [
+            "oci-interruptions"
+          ],
+          "sources": [
+            "tests/owned_network.rs"
+          ]
+        }
+      ]
+    },
+    {
       "id": "issue-555-legacy-oci-owned_runc-runc_owned_preparation_recovers_original_intent_and_retires_without_adoption",
       "issue": 555,
       "promise": "Complete the exact retained legacy OCI case through its finite owned driver.",
@@ -3552,6 +3579,60 @@
           "id": "legacy-oci-owned_runc-a_memory_request_smaller_than_runc_init_does_not_hold_the_start",
           "binary": "reliaburger::owned_runc",
           "test": "a_memory_request_smaller_than_runc_init_does_not_hold_the_start",
+          "requires": [
+            "oci-interruptions"
+          ],
+          "sources": [
+            "tests/owned_runc.rs"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "issue-2041-legacy-oci-owned_runc-runc_container_paused_by_smoker_takes_its_stop_signal_at_once",
+      "issue": 2041,
+      "promise": "Complete the exact retained legacy OCI case through its finite owned driver.",
+      "supported_paths": [
+        "Exact original ignored test identity and declared Make owner."
+      ],
+      "refused_paths": [
+        "No generic aliases or success from another test or owner."
+      ],
+      "boundaries": [
+        "Source binding only; real isolated Linux OCI execution and current receipt are required."
+      ],
+      "cases": [
+        {
+          "id": "legacy-oci-owned_runc-runc_container_paused_by_smoker_takes_its_stop_signal_at_once",
+          "binary": "reliaburger::owned_runc",
+          "test": "runc_container_paused_by_smoker_takes_its_stop_signal_at_once",
+          "requires": [
+            "oci-interruptions"
+          ],
+          "sources": [
+            "tests/owned_runc.rs"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "issue-2041-legacy-oci-owned_runc-runc_container_with_a_paused_init_takes_its_stop_signal_at_once",
+      "issue": 2041,
+      "promise": "Complete the exact retained legacy OCI case through its finite owned driver.",
+      "supported_paths": [
+        "Exact original ignored test identity and declared Make owner."
+      ],
+      "refused_paths": [
+        "No generic aliases or success from another test or owner."
+      ],
+      "boundaries": [
+        "Source binding only; real isolated Linux OCI execution and current receipt are required."
+      ],
+      "cases": [
+        {
+          "id": "legacy-oci-owned_runc-runc_container_with_a_paused_init_takes_its_stop_signal_at_once",
+          "binary": "reliaburger::owned_runc",
+          "test": "runc_container_with_a_paused_init_takes_its_stop_signal_at_once",
           "requires": [
             "oci-interruptions"
           ],

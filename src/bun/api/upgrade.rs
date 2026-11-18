@@ -738,18 +738,23 @@ pub(super) async fn archive_aborted_upgrade(
         crate::council::types::RaftRequest::UpgradeClear { upgrade_id },
     ];
     for write in writes {
-        let error = match council.write(write).await {
-            Ok(crate::council::CouncilResponse::Refused { reason }) => reason,
+        // A refusal is a conflict. A council that didn't answer in time
+        // refused nothing: the write may still commit, so that's a 503 and
+        // repeating the abort is how to find out.
+        let (status, error) = match council.write(write).await {
+            Ok(crate::council::CouncilResponse::Refused { reason }) => (
+                StatusCode::CONFLICT,
+                format!("could not end the paused upgrade: {reason}"),
+            ),
             Ok(_) => continue,
-            Err(e) => e.to_string(),
+            Err(e) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "ending the paused upgrade: {e}; check `relish upgrade status` and abort again if it's still paused"
+                ),
+            ),
         };
-        return Err((
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": format!("could not end the paused upgrade: {error}")
-            })),
-        )
-            .into_response());
+        return Err((status, Json(serde_json::json!({ "error": error }))).into_response());
     }
     Ok(())
 }

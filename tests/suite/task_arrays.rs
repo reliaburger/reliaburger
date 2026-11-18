@@ -196,7 +196,6 @@ impl Harness {
                 policy: ProcessWorkloadsConfig {
                     allowed_binaries: options.allowed.iter().map(PathBuf::from).collect(),
                     mount_isolation: options.mount_isolation,
-                    ..ProcessWorkloadsConfig::default()
                 },
                 default_concurrency: options.slots,
                 backoff: (Duration::from_millis(1), Duration::from_millis(5)),

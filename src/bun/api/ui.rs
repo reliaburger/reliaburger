@@ -305,7 +305,10 @@ pub(super) async fn forbid_framing(mut response: Response) -> Response {
 
 pub(super) fn html_response(html: String) -> Response {
     let mut headers = HeaderMap::new();
-    headers.insert("content-type", "text/html; charset=utf-8".parse().unwrap());
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/html; charset=utf-8"),
+    );
     (StatusCode::OK, headers, html).into_response()
 }
 

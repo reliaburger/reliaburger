@@ -52,7 +52,9 @@ pub(crate) async fn apply(
     lease: Option<&crate::testkit::lease::TestLease>,
 ) -> Response {
     if let Some(council) = super::leadership::council_to_forward_to(&state).await {
-        return super::batch::forward_to_leader(&state, council, "/v1/apply", body, headers).await;
+        let images = crate::pickle::binding::distinct_images(&config);
+        return super::batch::forward_job_apply_to_leader(&state, council, body, headers, images)
+            .await;
     }
     let _gate = if state.council.is_none() {
         Some(state.task_arrays.apply_gate.clone().lock_owned().await)
@@ -235,7 +237,7 @@ pub(crate) async fn apply(
                     .await;
                 return;
             };
-            if record.apps_committed && !record.cancelled {
+            if record.apps_committed && !record.cancelled() {
                 let instances: Vec<_> = record
                     .job_runs
                     .values()
@@ -249,7 +251,7 @@ pub(crate) async fn apply(
                     .await;
                 return;
             }
-            if record.cancelled {
+            if record.cancelled() {
                 let _ = tx.send(ApplyEvent::Error { message: format!("deployment {operation_id} cancelled or a hook failed; apps remain gated") }).await;
                 return;
             }
@@ -277,6 +279,7 @@ pub(crate) async fn apply(
             Event::default().data(serde_json::to_string(&event).unwrap_or_default()),
         )
     }))
+    .keep_alive(axum::response::sse::KeepAlive::default())
     .into_response()
 }
 
@@ -361,7 +364,7 @@ pub(crate) async fn settle(state: &ApiState) {
                 run.state.status().is_terminal() && run.state.status() != TaskArrayStatus::Succeeded
             })
         });
-        if failed && !record.cancelled {
+        if failed && !record.cancelled() {
             let _ = write_task_array(
                 state,
                 TaskArrayWrite::DeployCancel {
@@ -372,7 +375,7 @@ pub(crate) async fn settle(state: &ApiState) {
             .await;
             continue;
         }
-        if record.apps_committed || record.cancelled {
+        if record.apps_committed || record.cancelled() {
             if record.runs().all(|run| {
                 arrays
                     .get(run)
@@ -416,7 +419,7 @@ pub(crate) async fn settle(state: &ApiState) {
             let latest = read_task_arrays(state).await;
             if latest
                 .deployment(id)
-                .is_none_or(|current| current.cancelled || current.apps_committed)
+                .is_none_or(|current| current.cancelled() || current.apps_committed)
             {
                 continue;
             }

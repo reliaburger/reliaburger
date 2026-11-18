@@ -209,6 +209,7 @@ pub async fn run(cases: Vec<TestCase>, config: RunConfig) -> Result<TestReport, 
         let handle = set.spawn(async move {
             // Acquire *inside* the task, not before spawning: the semaphore is
             // meant to bound how many run at once, not how many we queue up.
+            // The runner owns the semaphore and never closes it.
             let _permit = semaphore
                 .acquire()
                 .await
@@ -546,6 +547,8 @@ async fn run_one(
         append_reason(&mut outcome, &note);
     }
 
+    // `Deadline::after` refuses only a zero or overflowing budget, and the
+    // teardown budget is a constant margin on top of the lease release bound.
     let cleanup_deadline = Deadline::after(teardown_timeout()).expect("non-zero cleanup timeout");
     let cleanup = context.teardown(cleanup_deadline).await;
     let finished_at = now_rfc3339();

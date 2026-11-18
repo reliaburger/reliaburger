@@ -291,6 +291,18 @@ pub struct DiskObservation {
     pub used_percent: f64,
 }
 
+/// A node's store whose export is failing, so the node prunes none of it:
+/// its size cap and retention are on hold until an export works (#2062).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportHoldObservation {
+    /// Node identifier.
+    pub node_id: String,
+    /// `logs` or `metrics`.
+    pub storage_domain: String,
+    /// Unix seconds of the first failed export since one last worked.
+    pub failing_since: u64,
+}
+
 /// Observed cgroup CPU throttling for one application.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CpuThrottleObservation {
@@ -379,6 +391,8 @@ pub struct ClusterEvidence {
     pub faults: Evidence<Vec<FaultObservation>>,
     /// Per-node disk capacity evidence.
     pub disks: Evidence<Vec<DiskObservation>>,
+    /// Stores whose export is failing, so their retention is on hold.
+    pub export_holds: Evidence<Vec<ExportHoldObservation>>,
     /// Safe public certificate metadata.
     pub certificates: Evidence<Vec<CertificateObservation>>,
     /// Per-node Pickle readiness and redundancy evidence.

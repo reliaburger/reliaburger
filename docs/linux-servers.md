@@ -71,8 +71,8 @@ Ensure the following ports are open:
 | `80`, `443` | TCP | Ingress HTTP/HTTPS proxy (Wrapper) | External |
 
 Bun manages its own nftables perimeter on top of that: once it's running, only
-cluster members (and the `bootstrap_peers` you list in `node.toml`) can reach
-the API, cluster and container host ports. Your laptop gets in to the API port,
+cluster members can reach the container host ports, and only they and the
+`bootstrap_peers` you list in `node.toml` can reach the API and cluster ports. Your laptop gets in to the API port,
 and only that port, through `operator_cidrs` (see §5.3). Your host firewall
 still has to let that traffic in. With UFW, run this on every node:
 
@@ -92,6 +92,17 @@ chain's policy to `DROP`. Bun enables IPv4 forwarding but doesn't override
 another firewall's rules, so a node can reach its containers while
 container-to-container traffic is still dropped. The
 [runc notes](README.md#runc-linux) cover what to check.
+
+Bun's own check for published container ports is a forward-hook chain at
+priority -10 in its `reliaburger_fw` table. nftables runs every table's chain
+on a hook independently: an `accept` in one only hands the packet to the next,
+while a `drop` anywhere is final. So on a host that also runs Docker or UFW,
+Docker's rules can't let an outsider past Bun's chain to a published port, and
+Bun's chain can't override a drop in theirs (that's the `FORWARD` trap above).
+It touches only connections Bun's port map rewrote to its own containers
+(`ct status dnat`, out through a `veth-…` link), never Docker's. To see every
+forward chain and its priority, run `sudo nft list ruleset | grep -B1 'hook
+forward'`; `sudo nft list chain ip reliaburger_fw forward` shows Bun's.
 
 ---
 

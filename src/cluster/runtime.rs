@@ -1043,13 +1043,24 @@ fn spawn_leader_target_maintainer(
     });
 }
 
+/// How long each of a fresh council's bootstrap writes may take to commit.
+/// A new node's first fsyncs can be slow (eMMC on a small box at first
+/// boot), and nothing else is waiting on it yet, so it gets far longer than
+/// the [`crate::council::node::WRITE_TIMEOUT`] other writes get.
+const BOOTSTRAP_WRITE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How long the whole bootstrap may take: initialisation, then up to two
+/// writes.
+const BOOTSTRAP_TIMEOUT: Duration =
+    Duration::from_secs(10).saturating_add(BOOTSTRAP_WRITE_TIMEOUT.saturating_mul(2));
+
 async fn initialise_bootstrap(
     council: &CouncilNode,
     members: BTreeMap<u64, CouncilNodeInfo>,
     security: Option<&crate::sesame::types::SecurityState>,
     council_size: Option<crate::council::CouncilSize>,
 ) -> std::io::Result<()> {
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(BOOTSTRAP_TIMEOUT, async {
         council.initialize(members).await.map_err(|error| {
             std::io::Error::other(format!("failed to initialise fresh council: {error}"))
         })?;
@@ -1064,7 +1075,10 @@ async fn initialise_bootstrap(
         }
         if let Some(voters) = council_size {
             council
-                .write(crate::council::types::RaftRequest::CouncilSize { voters })
+                .write_within(
+                    BOOTSTRAP_WRITE_TIMEOUT,
+                    crate::council::types::RaftRequest::CouncilSize { voters },
+                )
                 .await
                 .map_err(|error| {
                     std::io::Error::other(format!("failed to commit the council size: {error}"))
@@ -1137,7 +1151,8 @@ async fn compact_recovered_log(council: &CouncilNode) -> std::io::Result<()> {
 /// Called once, on the bootstrap node, immediately after `initialize`. Retries
 /// briefly while leadership settles: `client_write` can race the election that
 /// `initialize` kicks off and briefly return `ForwardToLeader` before this node
-/// finishes becoming leader.
+/// finishes becoming leader. A write that is merely slow to commit isn't
+/// retried: it gets [`BOOTSTRAP_WRITE_TIMEOUT`] on its own.
 async fn seed_bootstrap_state(
     council: &CouncilNode,
     state: &crate::sesame::types::SecurityState,
@@ -1146,8 +1161,9 @@ async fn seed_bootstrap_state(
     loop {
         let request =
             crate::council::types::RaftRequest::SecurityStateInit(Box::new(state.clone()));
-        match council.write(request).await {
+        match council.write_within(BOOTSTRAP_WRITE_TIMEOUT, request).await {
             Ok(_) => return Ok(()),
+            Err(e @ crate::council::CouncilError::WriteTimedOut { .. }) => return Err(e),
             Err(e) => {
                 if tokio::time::Instant::now() >= deadline {
                     return Err(e);
@@ -1900,6 +1916,51 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("initialise"));
+        council.shutdown().await.unwrap();
+    }
+
+    /// A fresh node's first commits can be slow: on a small box's eMMC at
+    /// first boot an fsync can take many seconds. The bootstrap used to give
+    /// the whole sequence 10 s and the seed write a 5 s retry window, so a
+    /// slow disk failed the bootstrap. The writes now get
+    /// [`BOOTSTRAP_WRITE_TIMEOUT`] each.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_first_commit_still_bootstraps_the_council() {
+        use crate::council::log_store::MemLogStore;
+        use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+        let log = MemLogStore::new();
+        // Longer than the write timeout every other write gets.
+        log.slow_entry_writes(crate::council::node::WRITE_TIMEOUT + Duration::from_secs(5));
+        let router = InMemoryRaftRouter::new();
+        let council = CouncilNode::new(
+            1,
+            CouncilConfig::default(),
+            InMemoryRaftNetworkFactory::new(1, router.clone()),
+            log,
+            CouncilStateMachine::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        router.register(1, &council).await;
+        let members = BTreeMap::from([(1, info("bootstrap", 9444))]);
+        let security = crate::sesame::types::SecurityState {
+            next_serial: 42,
+            ..Default::default()
+        };
+        initialise_bootstrap(
+            &council,
+            members,
+            Some(&security),
+            Some(crate::council::CouncilSize::APPLIANCE),
+        )
+        .await
+        .unwrap();
+        assert_eq!(council.security_state().await.next_serial, 42);
+        assert_eq!(
+            council.council_size().await,
+            Some(crate::council::CouncilSize::APPLIANCE)
+        );
         council.shutdown().await.unwrap();
     }
 

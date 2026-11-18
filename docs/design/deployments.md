@@ -23,7 +23,8 @@ This subsystem is cross-cutting. It doesn't live in a single component; it coord
 > (`RolloutReleased`) and the spec whose rollout failed (`RolloutFailed`,
 > decision D11-B). A node whose rollout aborts posts `/v1/rollouts/failed` to
 > the leader; the leader stops releasing that spec until a different one is
-> applied. Full leader-coordinated rollouts, with one cluster-wide surge and
+> applied. A node reports only for itself: over mTLS the report's `node` must
+> match the caller's certificate identity, as for placements. Full leader-coordinated rollouts, with one cluster-wide surge and
 > unavailable budget, remain the target described below.
 >
 > We expose each node's real work through a separate `DeployOperation`: a

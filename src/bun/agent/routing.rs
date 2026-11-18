@@ -607,7 +607,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // Readers may retain old request guards. This commits the new views,
         // but is not evidence that those older requests have drained.
         let mut table = self.routing_table.write().await;
-        *table = candidate;
+        table.replace(candidate);
         self.cluster_catalog = catalog;
         self.cluster_catalog_generation = Some(generation);
         self.cluster_ingress_configs = cluster_ingress;

@@ -14,6 +14,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::http::StatusCode;
+use axum::response::Response;
 
 /// Process-global ingress metrics, initialised on first access.
 ///
@@ -30,6 +31,22 @@ static GLOBAL: OnceLock<IngressMetrics> = OnceLock::new();
 /// request to record it; the Mayo collector calls it to read the counters.
 pub fn global_ingress_metrics() -> &'static IngressMetrics {
     GLOBAL.get_or_init(IngressMetrics::new)
+}
+
+/// Count `handler` as one request: in the total, in flight while it runs,
+/// and by its response's status class once it answers.
+///
+/// A handler dropped before it answers leaves the in-flight gauge through
+/// [`InFlight`]'s `Drop`, and records no status, since it sent none.
+pub async fn counted(
+    metrics: &IngressMetrics,
+    handler: impl std::future::Future<Output = Response>,
+) -> Response {
+    metrics.record_request();
+    let _in_flight = metrics.enter();
+    let response = handler.await;
+    metrics.record_response(response.status());
+    response
 }
 
 /// Atomic request counters for the ingress proxy.
@@ -55,6 +72,22 @@ pub struct IngressMetrics {
     status_5xx: AtomicU64,
     /// Requests currently being handled (a live gauge).
     in_flight: AtomicU64,
+}
+
+/// A request in [`IngressMetrics`]'s in-flight gauge. Dropping it, on any
+/// path, takes the request out again.
+///
+/// The `'a` lifetime ties the guard to the metrics it counts in: the
+/// compiler won't let it outlive them.
+#[derive(Debug)]
+pub struct InFlight<'a> {
+    metrics: &'a IngressMetrics,
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.metrics.dec_in_flight();
+    }
 }
 
 /// A point-in-time copy of the ingress counters.
@@ -101,6 +134,16 @@ impl IngressMetrics {
             _ => &self.status_5xx,
         };
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Mark a request as in flight until the returned guard drops.
+    ///
+    /// The guard leaves the in-flight set in its `Drop`, so a request whose
+    /// handler future is dropped mid-await (a client reset or disconnect, a
+    /// drained connection) still leaves it (#2044).
+    pub fn enter(&self) -> InFlight<'_> {
+        self.inc_in_flight();
+        InFlight { metrics: self }
     }
 
     /// Mark a request as entering the in-flight set.
@@ -197,6 +240,31 @@ mod tests {
         // Never incremented — a decrement must not wrap to u64::MAX.
         metrics.dec_in_flight();
         assert_eq!(metrics.in_flight(), 0);
+    }
+
+    /// A request whose handler is dropped before it answers leaves the
+    /// in-flight gauge (#2044).
+    #[tokio::test]
+    async fn a_cancelled_request_leaves_the_in_flight_gauge() {
+        let metrics = IngressMetrics::new();
+        let mut handler = Box::pin(counted(&metrics, std::future::pending::<Response>()));
+        assert!(futures_util::poll!(handler.as_mut()).is_pending());
+        assert_eq!(metrics.in_flight(), 1);
+        drop(handler);
+        assert_eq!(metrics.in_flight(), 0);
+        assert_eq!(metrics.snapshot().status_5xx, 0);
+    }
+
+    #[tokio::test]
+    async fn an_answered_request_is_counted_and_leaves_the_gauge() {
+        let metrics = IngressMetrics::new();
+        let response = counted(&metrics, async {
+            axum::response::IntoResponse::into_response(StatusCode::OK)
+        })
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(metrics.in_flight(), 0);
+        assert_eq!(metrics.snapshot().status_2xx, 1);
     }
 
     #[test]

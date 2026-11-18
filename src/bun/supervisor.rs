@@ -1100,7 +1100,6 @@ mod tests {
             crate::config::process_workloads::ProcessWorkloadsConfig {
                 allowed_binaries: binaries,
                 mount_isolation: false,
-                script_dir: std::env::temp_dir().join("reliaburger-sup-test-scripts"),
             },
         )
     }
@@ -1842,7 +1841,6 @@ mod tests {
             crate::config::process_workloads::ProcessWorkloadsConfig {
                 allowed_binaries: vec![std::path::PathBuf::from("/usr/bin/python3")],
                 mount_isolation: true,
-                script_dir: std::env::temp_dir().join("reliaburger-sup-iso-test"),
             },
         );
         let spec = exec_app_spec("/usr/bin/python3");
@@ -2209,7 +2207,6 @@ mod tests {
         sup.set_process_config(crate::config::process_workloads::ProcessWorkloadsConfig {
             allowed_binaries: vec!["/bin/sh".into()],
             mount_isolation: false,
-            script_dir: root.path().join("scripts"),
         });
         sup.admit_app("host", &host).unwrap();
         host.memory = Some(crate::config::types::ResourceRange::parse_memory("64Mi").unwrap());
@@ -2266,7 +2263,6 @@ mod tests {
             crate::config::process_workloads::ProcessWorkloadsConfig {
                 allowed_binaries: vec!["/bin/sh".into()],
                 mount_isolation: false,
-                script_dir: root.path().join("scripts"),
             },
         );
         let host = |init: &str| {
@@ -2312,7 +2308,6 @@ mod tests {
             crate::config::process_workloads::ProcessWorkloadsConfig {
                 allowed_binaries: vec!["/bin/sh".into()],
                 mount_isolation: false,
-                script_dir: root.path().join("scripts"),
             },
         );
         sup.set_capabilities(PlatformCapabilities {

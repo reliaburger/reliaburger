@@ -43,6 +43,13 @@ env.SOAK_TEAM = "soak"
 # `ACK n`. On start it drops a torn last line (a power cut mid-append) and
 # carries on from the last whole one, so the file must always hold 1..N with
 # N at least the highest ACK ever logged.
+#
+# The file alone can't show a loss after a power cut: by the time the checks
+# read it again the writer has appended past the lost lines, and 1..N is whole
+# again. So each start first appends where it resumed to /data/resumes and
+# syncs it, and the checker requires every start to resume at or past the
+# highest ACK logged before it (the power-cut endurance harness's approach,
+# scripts/release/power_cut/workloads.toml).
 [app.soak-writer]
 image = "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028"
 command = ["/bin/sh", "-c", '''
@@ -54,6 +61,12 @@ head -n "$lines" "$f" > "$f.tmp" && mv "$f.tmp" "$f" && sync
 n=$(tail -n 1 "$f")
 echo "RESUME ${n:-0} after $lines lines"
 n=${n:-0}
+r=/data/resumes
+touch "$r"
+starts=$(wc -l < "$r")
+head -n "$starts" "$r" > "$r.tmp" && mv "$r.tmp" "$r"
+echo "$n" >> "$r"
+sync
 while true; do
   n=$((n + 1))
   echo "$n" >> "$f"
@@ -86,15 +99,43 @@ size = "256Mi"
 required = ["soak-volume=redis"]
 
 # INCR once a second, logging `INCR n`. The counter must never go backwards.
+# Like the writer's file, the counter after a settle can't show a loss: the
+# client has counted past it. So before its first INCR each start pushes the
+# counter it found onto soak:starts, which must be at or past the highest INCR
+# logged before it. The client usually runs on another node than Redis and
+# lives through a cut of Redis's node, so it also pushes `LAST NOW` onto
+# soak:regressions whenever an INCR answers no more than the one before; any
+# entry there is a loss. Both lists live in Redis, written after it is back.
 [app.soak-redis-client]
 image = "public.ecr.aws/docker/library/redis@sha256:234c902a2db49461a129e2d4aeff85b28cf20187ed274a67f6e50995fa713c7b"
 command = ["/bin/sh", "-c", '''
 trap 'exit 0' TERM
+# Before the first INCR: record the counter as this start found it.
+until start=$(redis-cli -h soak-redis -p 6379 GET soak:counter 2>&1) \
+  && case $start in ''|*[!0-9]*) [ -z "$start" ] ;; *) true ;; esac \
+  && pushed=$(redis-cli -h soak-redis -p 6379 RPUSH soak:starts "${start:-0}" 2>&1) \
+  && case $pushed in ''|*[!0-9]*) false ;; *) true ;; esac; do
+  echo "ERR start $start $pushed"
+  sleep 1
+done
+echo "START ${start:-0}"
+last=${start:-0}
 while true; do
   v=$(redis-cli -h soak-redis -p 6379 INCR soak:counter 2>&1)
   case $v in
     ''|*[!0-9]*) echo "ERR $v" ;;
-    *) echo "INCR $v" ;;
+    *)
+      echo "INCR $v"
+      if [ "$v" -le "$last" ]; then
+        echo "BACK $last $v"
+        until pushed=$(redis-cli -h soak-redis -p 6379 RPUSH soak:regressions "$last $v" 2>&1) \
+          && case $pushed in ''|*[!0-9]*) false ;; *) true ;; esac; do
+          echo "ERR regression $pushed"
+          sleep 1
+        done
+      fi
+      last=$v
+      ;;
   esac
   sleep 1
 done

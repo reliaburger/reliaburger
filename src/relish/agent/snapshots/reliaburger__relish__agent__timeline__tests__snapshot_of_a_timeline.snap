@@ -10,6 +10,7 @@ expression: render(answer)
       {
         "action": null,
         "app": "web",
+        "author_text": null,
         "details": {
           "attempt": "1",
           "backoff_seconds": "1",
@@ -44,6 +45,7 @@ expression: render(answer)
       {
         "action": null,
         "app": "web",
+        "author_text": null,
         "details": {
           "image": "web:v2",
           "result": "completed",
@@ -77,6 +79,7 @@ expression: render(answer)
       {
         "action": null,
         "app": "web",
+        "author_text": null,
         "details": {},
         "kind": "deploy",
         "message": {
@@ -105,6 +108,7 @@ expression: render(answer)
       {
         "action": "app.applied",
         "app": "web",
+        "author_text": null,
         "details": {},
         "kind": "operation",
         "message": {

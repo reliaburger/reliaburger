@@ -163,10 +163,13 @@ pub fn initialize_cluster(cluster_name: &str, node_id: &str) -> Result<InitResul
 pub fn format_init_output(result: &InitResult, root_backup: &Path) -> String {
     let state = &result.security_state;
 
-    let root = state.active_ca(super::types::CaRole::Root).unwrap();
-    let node_ca = state.active_ca(super::types::CaRole::Node).unwrap();
-    let workload_ca = state.active_ca(super::types::CaRole::Workload).unwrap();
-    let ingress_ca = state.active_ca(super::types::CaRole::Ingress).unwrap();
+    // `init` makes all four CAs, so "missing" only shows for a result built
+    // some other way.
+    let serial = |role| {
+        state
+            .active_ca(role)
+            .map_or_else(|| "missing".to_string(), |ca| ca.serial.to_string())
+    };
 
     format!(
         "Cluster initialised.\n\
@@ -189,10 +192,10 @@ pub fn format_init_output(result: &InitResult, root_backup: &Path) -> String {
          \x20 to that node's id:\n\
          \x20   relish join-token create --node-id <node-id>\n",
         cluster = result.cluster_name,
-        root_serial = root.serial,
-        node_serial = node_ca.serial,
-        workload_serial = workload_ca.serial,
-        ingress_serial = ingress_ca.serial,
+        root_serial = serial(super::types::CaRole::Root),
+        node_serial = serial(super::types::CaRole::Node),
+        workload_serial = serial(super::types::CaRole::Workload),
+        ingress_serial = serial(super::types::CaRole::Ingress),
         root_backup = root_backup.display(),
         oidc_kid = result.oidc_key_id,
     )

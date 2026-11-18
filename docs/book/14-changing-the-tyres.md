@@ -608,7 +608,7 @@ Here's the part to read twice. The Raft log entries and the council's Raft RPC b
 
 For 0.1.0 the promise is deliberately narrow:
 
-- **Fresh clusters only.** 0.1.0 doesn't load data written by pre-release development builds. Each node writes a `state-format.json` stamp into its data directory before opening any subsystem, and refuses unmarked or mismatched data rather than guessing, leaving it untouched so you can keep a copy.
+- **Fresh clusters only.** 0.1.0 doesn't load data written by pre-release development builds. Each node writes a `state-format.json` stamp into its data directory before opening any subsystem, and refuses unmarked or mismatched data rather than guessing, leaving it untouched so you can keep a copy. The stamp is written through a temporary file and renamed into place. That file is named `.state-format-*` because a crash between the two steps leaves it behind; the next start removes it instead of mistaking it for unversioned state (#2053).
 - **Two generations, not one version.** Every binary advertises a *protocol* generation (what it speaks on the wire) and a *state* generation (what it writes to disk: Raft snapshots, backups, the stamp). They're plain integers in `src/compatibility.rs`, independent of the product version.
 - **Rolling upgrades and rollbacks need an exact match of both.** Product versions may differ; the generations may not. An incompatible change bumps the relevant generation, and migration between generations is designed separately when we need it.
 

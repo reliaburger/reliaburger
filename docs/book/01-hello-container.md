@@ -874,13 +874,23 @@ CPU limits use two parameters. `cpu.max` is a hard limit: "this container can us
 The conversion from millicores (what users write in config) to microseconds (what the kernel expects) is straightforward:
 
 ```rust
+pub(crate) fn cpu_quota_us(millicores: u64) -> Option<u64> {
+    millicores
+        .checked_mul(CGROUP_PERIOD_US)
+        .map(|product| product / 1000)
+}
+
 pub fn cpu_max_from_millicores(millicores: u64) -> String {
-    let quota_us = millicores * CGROUP_PERIOD_US / 1000;
-    format!("{quota_us} {CGROUP_PERIOD_US}")
+    match cpu_quota_us(millicores) {
+        Some(quota_us) => format!("{quota_us} {CGROUP_PERIOD_US}"),
+        None => format!("max {CGROUP_PERIOD_US}"),
+    }
 }
 ```
 
 500 millicores means "half a CPU." With a 100ms (100,000 microsecond) period, that's 50,000 microseconds of quota: `"50000 100000"`. 1000 millicores is a full CPU: `"100000 100000"`. 2000 millicores is two CPUs: `"200000 100000"`. The kernel allows quota larger than the period.
+
+The first version multiplied with a plain `*`, and the 0.3.0 review found the hole in that ([#2042](https://github.com/reliaburger/reliaburger/issues/2042)). Parsing bounded a CPU limit only by `u64`, so `cpu = "1-200000000000000"` passed, and multiplying it by 100,000 overflows. What happens then depends on the build: a debug build panics, and a release build wraps around silently, which here meant a garbage quota, or a negative one once the OCI spec cast it to `i64`. `checked_mul` is the standard library's way of saying "multiply, or tell me it didn't fit": it returns `Option<u64>`, `None` on overflow. There are siblings for other policies, `wrapping_mul` and `saturating_mul`, and choosing one says in the code what overflow should mean. Here it means no limit (`max`). It can't happen through config any more, though, because `ResourceRange::parse_cpu` now refuses a limit above `MAX_CPU_LIMIT_MILLICORES`, 65,536 cores. Linux builds for at most 8,192 CPUs, so no real node is anywhere near it.
 
 For `cpu.weight`, we convert millicores to the kernel's 1-10000 range using `.clamp()`:
 
@@ -1766,7 +1776,7 @@ pub enum OutputFormat {
 }
 ```
 
-`#[derive(clap::ValueEnum)]` teaches clap how to parse this enum from command-line text. `--output human`, `--output json`, and `--output yaml` all just work. Anything else gets a clear error message. No string matching, no `if output == "json"` scattered through your code.
+`#[derive(clap::ValueEnum)]` teaches clap how to parse this enum from command-line text. `--output human`, `--output json`, and `--output yaml` all just work. Anything else gets a clear error message. No string matching, no `if output == "json"` scattered through your code. Bun's `--runtime` flag was a `String` until 0.3.0, matched against `"auto"`, `"process"`, `"runc"` and `"mixed"` deep in start-up, so `bun --runtime rnuc` loaded its config and set up storage before saying "unknown runtime". It's now a `RuntimeChoice` enum with the same derive, and clap refuses the typo before `main` does anything.
 
 The `#[default]` attribute on `Human` means you don't even need to specify `--output`: it defaults to human-readable text. This is a Rust enum feature that works with the `Default` trait. In Go you'd check for an empty string; in Python you'd pass `default=` to `argparse`. Here the default is part of the type definition itself.
 
@@ -3239,6 +3249,8 @@ Testing the same thing against the real process runtime turned up a second race,
 "Runs in its own task" had one more consequence, and it took a CI flake to find it ([#877](https://github.com/reliaburger/reliaburger/issues/877)). Startup adoption walks the node's records one by one. When it retires a launch it won't adopt, it spawns the forget and moves on to the next record, and on a cluster node that next record starts by reading the runtime's whole inventory. The inventory lists the `records` directory, then reads each entry it found. If the forget renames an entry away between those two steps, the inventory used to find a name with nothing behind it, call that corruption, and refuse. Bun refuses to start on any adoption error, so a node in the middle of an upgrade exited instead of coming back. On CI it took down one node of the three-node upgrade-and-rollback qualification test, which then waited a minute for an upgrade that never settled.
 
 The forget isn't wrong to run there, and the inventory isn't wrong to be strict about corruption. It just had the wrong idea of what a vanished record means. Only a forget removes a published record, it only does that to a retired generation, and it renames the whole directory away in one step. So a record that disappears mid-read owned nothing, and the inventory now leaves it out, exactly as it would have a moment later. A directory that's still there but has no readable intent in it is still corruption, and still refuses. The process runtime's owner inventory had the same gap and got the same fix. `record_forgotten_after_enumeration_is_absent_from_the_inventory` and its process twin list a retired record, forget it, then read what they listed.
+
+The single-instance status read had it too, and another flake found it ([#2032](https://github.com/reliaburger/reliaburger/issues/2032)). `ProcessControl::status_if_present` checks that the owner's directory exists and then reads its journal. A reader in another process, such as a test's own `ProcessGrill` looking at the same data directory while a restarted Bun forgets the initialiser it just retired, could pass the first check and then lose the journal with the directory, and the read failed with "No such file or directory". It now treats that the way the inventory does: if the journal is missing because the whole directory has gone, the owner was forgotten and the answer is "not found"; if the directory is still there without its journal, that's corruption and it refuses. `optional_status_reads_a_generation_forgotten_under_it_as_absent` runs three readers against a forget a hundred times; before the fix it failed within the first thirty.
 
 For a while this owned path was opt-in, and rootful Runc without eBPF quietly took the old spawn-and-record path with all of the crash windows above still open. Nothing had been released, so nobody depended on it, and we deleted it (about 1,900 lines). `RuncGrill::new` now takes the owner executable as a plain argument:
 

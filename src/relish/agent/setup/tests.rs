@@ -528,6 +528,25 @@ fn a_private_file_stays_private() {
     assert_eq!(mode & 0o777, 0o600);
 }
 
+/// The new content can hold the agent's other secrets, so it is never
+/// readable by anyone else, not even before it takes the original's mode.
+#[cfg(unix)]
+#[test]
+fn a_new_file_and_its_temporary_copy_are_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = TestHome::new();
+    let path = home.path(".gemini/settings.json");
+    let temporary = home.path(".gemini/settings.json.relish-setup.tmp");
+    // A killed run's leftover, readable by everyone.
+    home.write(".gemini/settings.json.relish-setup.tmp", "stale");
+    fs::set_permissions(&temporary, fs::Permissions::from_mode(0o644)).unwrap();
+    write(&path, None, Some("{}\n")).unwrap();
+    assert_eq!(home.read(".gemini/settings.json"), "{}\n");
+    let mode = fs::metadata(&path).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
+    assert!(!temporary.exists());
+}
+
 #[cfg(unix)]
 #[test]
 fn a_symlinked_config_stays_a_symlink() {

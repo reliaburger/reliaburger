@@ -30,6 +30,9 @@ impl ClusterHttp {
     pub fn plaintext() -> Self {
         Self {
             scheme: "http",
+            // `build` fails only on a TLS identity or root that won't load.
+            // This client adds neither, and `http_client` keeps only the
+            // bundled roots that parsed, so it can't fail here.
             client: crate::http_client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()

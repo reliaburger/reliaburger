@@ -142,7 +142,7 @@ nft add chain ip reliaburger prerouting { type nat hook prerouting priority -100
 nft add rule ip reliaburger prerouting tcp dport {host_port} dnat to {container_ip}:{service_port}
 ```
 
-This is kernel-level forwarding. Zero copies, zero userspace overhead. We reuse this same nftables table later for the perimeter firewall.
+This is kernel-level forwarding. Zero copies, zero userspace overhead. The perimeter firewall, later in this chapter, gets a table of its own, `reliaburger_fw`, so that rebuilding it never touches these NAT chains.
 
 **Rootless mode uses a Rust TCP proxy.** We can't touch nftables without root, so we spawn a tokio task that binds the host port and forwards connections to the container:
 
@@ -709,6 +709,8 @@ if !decoder.is_empty()
 
 The Rust-flavoured part is how the responder reads the service map. The agent *owns* its `ServiceMap` — it mutates it freely inside its event loop, no locks. Sharing it with the DNS task via `Arc<RwLock<…>>` would have meant threading lock acquisitions through dozens of agent call sites. Instead the agent publishes a *snapshot* on a `tokio::sync::watch` channel every time the map changes (the same moment it rebuilds the routing table). A watch channel holds exactly one value — the latest — and the responder reads it with `borrow()`, no await, no contention. The cost is a clone of the map per change; deploys are rare and maps are small, so that's a bargain for keeping the agent lock-free. Go programmers will recognise the shape: don't share memory, communicate — except here the borrow checker enforces it.
 
+A `borrow()` isn't free in one way, though: the `watch::Ref` it returns holds the channel's read lock until it's dropped, and a reader queues behind a waiting writer. Two tasks that each hold one channel's borrow while taking another's, in opposite orders, can deadlock their worker threads, which is why the project's rule is never to hold two at once (#1273, #1433). The responder broke it quietly until the 0.3.0 review ([#2045](https://github.com/reliaburger/reliaburger/issues/2045)): it kept the source-namespace borrow alive to the end of `answer_internal` while it took the fault and service-map borrows. No writer held them the other way round, so it never hung, but nothing stopped one from starting to. Now it copies the namespace out in one statement, `.borrow().namespace(src).map(str::to_owned)`, and the temporary `Ref` is dropped at the semicolon, before the next borrow. The borrow checker can't catch this one, because each borrow is fine on its own; only the order across tasks is wrong.
+
 Containers find the responder through an old-fashioned mechanism: `/etc/resolv.conf`. Runc writes a per-instance file in the OCI bundle and bind-mounts it read-only at `/etc/resolv.conf`; it never edits the shared unpacked image rootfs. The file names the node-side veth gateway, not host loopback. `resolv.conf` has no port syntax, so only port 53 is valid.
 
 Kubernetes manifests don't say `redis.internal`, though. They say `redis:6379`, or `redis.default` to cross a namespace, because a pod's `resolv.conf` carries a search list. Ours does too now, for a container in `payments`:
@@ -906,7 +908,7 @@ Onion handles traffic inside the cluster. But when a browser hits `myapp.com`, t
 
 ### Why not just expose the containers directly?
 
-Each container gets a dynamically allocated host port (30000-31000). You could map DNS to `node-ip:30891` and call it a day. Three problems:
+Each container gets a dynamically allocated host port (from `[network] port_range`, 10000-32767 by default). You could map DNS to `node-ip:30891` and call it a day. Three problems:
 
 1. The port changes every time the container restarts or moves to a different node.
 2. You'd need one DNS record per container per app. With 10 replicas across 5 nodes, that's 50 records to manage.
@@ -946,7 +948,11 @@ The prefix match has a sharp edge that's easy to get wrong. If `/api` is a route
 
 One more subtlety in the lookup: stripping the port off the `Host` header. `myapp.com:8080` should look up `myapp.com`. The obvious `host.split(':').next()` works — right up until someone sends an IPv6 literal like `[::1]:8080`, where splitting on the first colon gives you `[`. You have to notice the bracket and keep everything up to the closing `]`. IPv6 punishes every parser that assumes a colon means "port".
 
-And where does the host come from in the first place? Over HTTP/1.1 it's the `Host` header. HTTP/2 moved it into a pseudo-header, `:authority`, and Hyper hands that to us as part of the request URI, not as a header. Most HTTP/2 clients send no `Host` header at all. Wrapper advertises `h2` in the TLS handshake, so every browser and every `curl https://...` speaks HTTP/2 to it. For a while our proxy read only the `Host` header, found an empty string and answered every one of those requests with a 404. No test caught it, because every test client was built HTTP/1-only. So `request_host` takes the `Host` header when there is one and the URI's authority when there isn't, and `ingress_routes_http2_requests_by_authority` in `tests/suite/ingress.rs` sends a real HTTP/2 request with the host only in the URL.
+And where does the host come from in the first place? Over HTTP/1.1 it's the `Host` header. HTTP/2 moved it into a pseudo-header, `:authority`, and Hyper hands that to us as part of the request URI, not as a header. Most HTTP/2 clients send no `Host` header at all. Wrapper advertises `h2` in the TLS handshake, so every browser and every `curl https://...` speaks HTTP/2 to it. For a while our proxy read only the `Host` header, found an empty string and answered every one of those requests with a 404. No test caught it, because every test client was built HTTP/1-only. So `request_host` asks which protocol it's looking at. Over HTTP/2 the authority is the target, as RFC 9113 §8.3.1 says. A client may still send a `Host` header, but if it names a different host, the request is malformed: we answer 400 instead of picking one. (Picking `Host` would route by a name the TLS session never mentioned.) "Different" needs care, though. `a.test` and `a.test:443` are the same place over HTTPS, so hosts compare case-insensitively and a missing port counts as the scheme's default.
+
+There's one deliberate exception. Before DNS points at a new ingress, people test it with `curl -k https://203.0.113.7/ -H 'Host: app.example'`, and curl speaks HTTP/2 to do it. The authority is then an IP address, which names no host at all, so the strict reading would turn the most common smoke test into a 400. When the authority is an IP literal, `Host` decides. Over HTTP/1.1, `Host` always decides, and the URI's authority is only the fallback. `ingress_routes_http2_requests_by_authority` in `tests/suite/ingress.rs` sends a real HTTP/2 request with the host only in the URL, and further tests cover a disagreeing `Host` over each protocol and an IP authority with a `Host` over HTTP/2.
+
+Notice the return type: `Result<String, StatusCode>`. The `Err` side isn't an error in the `thiserror` sense. It's the response the caller should send, and the `?`-free `match` at the call site turns it straight into one.
 
 ### What happens when things go wrong
 
@@ -1066,7 +1072,7 @@ The config side is a new `[ingress]` section in node.toml, disabled by default �
 
 ### What we're protecting
 
-A Reliaburger node exposes a lot of ports: container host ports (30000-31000), gossip (9443), Raft (9444), reporting (9445), the management API (9117), plus whatever the operator runs (SSH, monitoring, etc.). Not all of these should be reachable from the outside.
+A Reliaburger node exposes a lot of ports: container host ports (10000-32767 by default), gossip (9443), Raft (9444), reporting (9445), the management API (9117), plus whatever the operator runs (SSH, monitoring, etc.). Not all of these should be reachable from the outside.
 
 The obvious approach would be a default-deny firewall: block everything, then poke holes for what's needed. We tried that. Turns out, blocking *everything* also blocks SSH, and the first time you apply a default-deny ruleset on a remote server without an out-of-band console, you learn that lesson the hard way.
 
@@ -1074,9 +1080,9 @@ So we took a different approach. We only block *our* ports. SSH, the operator's 
 
 ### What gets blocked
 
-The nftables input chain in the `reliaburger` table has `policy accept` (everything passes by default) and explicit `drop` rules for three port ranges:
+The nftables input chain in the `reliaburger_fw` table has `policy accept` (everything passes by default) and explicit `drop` rules for three port ranges:
 
-1. **Container host ports (30000-31000)**: Dynamically allocated by the port allocator. External clients should reach containers through Wrapper (ports 80/443), not by hitting these ports directly.
+1. **Container host ports (`[network] port_range`, 10000-32767 by default)**: Dynamically allocated by the port allocator. External clients should reach containers through Wrapper (ports 80/443), not by hitting these ports directly.
 
 2. **Cluster ports (9443, 9444, 9445)**: Gossip, Raft consensus, and reporting tree communication. Only cluster node IPs should reach these.
 
@@ -1085,6 +1091,41 @@ The nftables input chain in the `reliaburger` table has `policy accept` (everyth
 Cluster nodes get a blanket `accept` rule that comes *before* all the `drop` rules. So inter-node traffic is never blocked — gossip, scheduling, state replication all work normally. Operator CIDRs (`[security] operator_cidrs`, wired up in Chapter 4) get access to the management port specifically.
 
 The order matters in nftables: first match wins. Cluster node accept → operator CIDR accept → drop rules → everything else passes.
+
+### The packets that never reach input
+
+Here's a question worth pausing on. A client outside the cluster connects to `node-ip:21000`, and 21000 is a port Bun published for a container. Which chain sees that packet?
+
+Not the input chain. The `reliaburger` table's prerouting rule rewrites the destination to the container's address before the kernel decides where the packet goes. After the rewrite it isn't addressed to the node any more, so the kernel routes it down the *forward* path, past the input chain and its `tcp dport 10000-32767 drop`, and into the container. The input chain only ever saw the host ports nothing had rewritten.
+
+So the `reliaburger_fw` table has a second chain, a filter chain on the forward hook, where those packets do go:
+
+```
+chain forward {
+    type filter hook forward priority -10; policy accept;
+    ct direction reply ct state established,related accept
+    iifname "veth-*" accept
+    ip saddr { 10.0.1.1, 10.0.1.2 } accept
+    ct status dnat oifname "veth-*" drop
+}
+```
+
+It holds published ports to the input chain's policy: replies, this node's own containers (every host-side veth is `veth-…`) and cluster members get through. Any other connection the port map rewrote (`ct status dnat`: conntrack remembers that this connection's destination was translated) on its way to one of our containers (`oifname "veth-*"`) is dropped. Operator CIDRs and bootstrap peers aren't on the list, just as they aren't for host ports in the input chain.
+
+Our first version of this chain sat on the prerouting hook, ahead of the rewrite, and dropped `tcp dport 10000-32767` for every local address. It did the job for published ports, and broke something else. The release soak runs Bun's API on 29117, ingress on 28080 and the registry on 25050, all inside the default range. Those ports are Bun's own listeners, not published ones, and the input chain lets operators reach the API port before its host-port drop. The prerouting chain had no such allowance, so it dropped them first. We briefly made Bun refuse to start with a service port inside the range, which would have refused the soak's own nodes. The fix was to stop matching a range at all. Only ports in `@portmap` are ever rewritten, so matching the rewrite drops exactly the published ports and leaves every other port in the range to the input chain's rules. Port numbers were the wrong question; "did the port map touch this?" was the right one.
+
+The allocator got the matching half of the fix. It probes the host and skips ports something already listens on, but ingress binds late, after the first workloads may have started. So `PortAllocator::excluding` takes the node's own service ports (`NodeConfig::service_ports()` plus the `--listen` port), and those are never handed out, listening or not.
+
+The same list closes one more gap, this time in the input chain. Its `tcp dport 10000-32767 drop` was written for container host ports, but it doesn't know which ports in the range are containers' and which are Bun's. Ingress on 28080 would have answered only cluster members, while on 80 it answers the world. So the perimeter now takes the service ports too, and the input chain accepts them just before the range drop:
+
+```
+tcp dport { 25050, 28080 } accept
+tcp dport 10000-32767 drop
+```
+
+The API and cluster ports are left off that line on purpose. Their own `tcp dport 9117 drop` and friends come later, after the operator and member accepts, and a blanket accept ahead of them would open the API to everyone. Each port keeps the policy it would have anywhere else; being inside the range no longer changes it.
+
+Legitimate traffic still flows. Wrapper on another node reaches a backend at `node-ip:host-port` from that node's address, a cluster member. A container calling a remote backend through Onion leaves its node masqueraded behind the node's address too. Local backends never need the host port at all: Onion and Wrapper send them to the container's own address.
 
 ### Two address families, two tables
 
@@ -1112,7 +1153,7 @@ fn cluster_nodes_bypass_all_blocks() {
     let rules = generate_ruleset(&config, &nodes);
     // Accept comes before drop
     let accept_pos = rules.find("10.0.1.1 } accept").unwrap();
-    let drop_pos = rules.find("30000-31000 drop").unwrap();
+    let drop_pos = rules.find("10000-32767 drop").unwrap();
     assert!(accept_pos < drop_pos);
 }
 ```
@@ -1168,7 +1209,20 @@ match (mode, server_name) {
 
 A `match` arm can carry a guard (`if ...`) that must also hold for the arm to win, so the first two arms say "this mode, and the node has what it needs". When it doesn't, the host gets the self-signed certificate and one warning, never the other mode's certificate. A client that checks names rejects the self-signed one, which is the honest answer from a misconfigured node. Everything else (a plain-HTTP route reached over HTTPS, an unknown host, a handshake with no SNI) gets the operator pair when there is one, and the self-signed certificate when there isn't. That last part is a change: a cluster-mode node with no disk pair used to mint an Ingress CA leaf for any routed host, plain routes included. Now only a `tls = "cluster"` host gets one, which is what the mode says.
 
-The resolver holds the two sources as `Option<Arc<FileCertResolver>>` and `Option<Arc<dyn ResolvesServerCert>>`. The second is a trait object: Bun wraps the Ingress CA resolver in a `ReloadableCertResolver` so a CA rotation can swap it, and the listener doesn't need to know which concrete type it got. `resolve` is a synchronous callback on the handshake path, so it reads the routing table with `try_read()` rather than `.await`. While a rebuild holds the table, we can't know the host's mode, so that one handshake gets the self-signed certificate. Falling back to the operator pair there would hand a `cluster` host the other mode's certificate, the very thing the fix is meant to prevent.
+The resolver holds the two sources as `Option<Arc<FileCertResolver>>` and `Option<Arc<dyn ResolvesServerCert>>`. The second is a trait object: Bun wraps the Ingress CA resolver in a `ReloadableCertResolver` so a CA rotation can swap it, and the listener doesn't need to know which concrete type it got. `resolve` is a synchronous callback on the handshake path, so it can't `.await` the routing table's tokio lock. Our first version used `try_read()` and served self-signed when that failed. Review caught the hole: tokio's `RwLock` is fair, so `try_read()` fails not only while a rebuild holds the write lock but also while one is merely waiting for it, and a proxy handler can hold a read lock across an `.await`. Every `explicit` host then got a certificate a validating client rejects, for as long as that lasted.
+
+So the table publishes a snapshot instead. `CertificateModes` holds an `Arc<HashMap<String, TlsMode>>` behind a `std::sync::RwLock`, and every `rebuild` ends by building a fresh map and swapping it in. The resolvers read the last one:
+
+```rust
+pub fn get(&self, host: &str) -> Option<TlsMode> {
+    let current = Arc::clone(&self.current.read().unwrap_or_else(|p| p.into_inner()));
+    current.get(&normalise_host(host)).copied()
+}
+```
+
+This is the one place a std lock beats tokio's. It's held only long enough to clone an `Arc` (a reference-count bump), never across an `.await`, and the code reading it is synchronous anyway. Writers build the whole map first and swap the pointer, so a reader sees either the old map or the new one, never half of each. `unwrap_or_else(|p| p.into_inner())` recovers a poisoned lock: Rust marks a lock poisoned when a thread panics holding it, but a panic mid-swap can't leave a torn `Arc`.
+
+The resolver takes the `Arc<CertificateModes>` once, when the listener binds. That only works if the table keeps the same one for life, and the agent sometimes swaps in a whole new table (`*table = candidate`), which would leave the resolver watching an orphan. `RoutingTable::replace` takes the new routes but keeps its own handle and publishes to it, and the agent's three swap sites use it.
 
 SNI names a host, not a path, so two routes on one host share a certificate. When they disagree, `explicit` wins over `cluster`, since the operator chose that certificate for that name on purpose. `RoutingTable::certificate_mode` makes that call, and its test pins it.
 
@@ -1230,11 +1284,15 @@ Once the ingress proxy was actually serving traffic, an audit caught it copying 
 
 The WebSocket path had a subtler hole. Our handler read the backend's `101 Switching Protocols`, then returned its own hand-written `101` to the client — without the `Sec-WebSocket-Accept` header the client needs to finish the handshake, and while quietly dropping the backend socket. It looked done in a code review and worked in no real browser. The real version takes the client's upgrade future (`hyper::upgrade::on`), relays the backend's *actual* handshake response verbatim, and then splices the two raw streams with `tokio::io::copy_bidirectional`. After the upgrade, Wrapper is a dumb pipe — it doesn't parse WebSocket frames, it just moves bytes. The lesson: a handshake stub that returns the right status code but the wrong headers is worse than no stub, because the tests that only check the status code go green.
 
+The upgrade request kept a smaller version of the first hole until the 0.3.0 review ([#2046](https://github.com/reliaburger/reliaburger/issues/2046)). `build_upgrade_request` writes the backend's request by hand, and it dropped the forwarding headers and the session cookie but copied the rest, so `Proxy-Authorization`, the proxy's own credential, reached the backend, along with `Keep-Alive`, `TE` and anything the client named in `Connection`. It now skips the same set with the same two helpers as the HTTP path, `is_hop_by_hop` and `connection_tokens`, and then writes this leg's own `connection: upgrade` and the client's `Upgrade` value. An upgrade is the one case where `Connection` and `Upgrade` must reach the next hop, so they're set on purpose instead of copied by accident.
+
 ### Holding the permit for as long as it matters (post-audit fix)
 
 The connection limit I described earlier had a leak. The counter went up when the handler started and down when it *returned* — fine for a normal request, badly wrong for a WebSocket. A WebSocket handler returns at the `101`, the moment the splice *begins*. So the count dropped to zero while thousands of live WebSockets were still spliced, and the 10,000-connection ceiling protected nothing.
 
 The clean way to tie "resource held" to "work in progress" in Rust is a *permit* whose lifetime you control. We switched the counter to a `tokio::sync::Semaphore`: a handler acquires an owned permit (`try_acquire_owned` — it returns immediately with a 503 when the pool is empty rather than queueing), and the permit is a value that lives on the stack until it's dropped. For a normal request that's when the handler returns. For a WebSocket, we *move the permit into the splice task* — the same task running `copy_bidirectional` — so it's dropped only when the splice actually closes. Same trick for the drain guard, so a draining backend's WebSocket count stays honest for the life of the connection, not just the handshake. This is ownership doing exactly what it's for: the permit is released precisely when the last thing holding it goes away, and you can't forget to release it because there's no explicit release to forget.
+
+The request gauge had the opposite problem ([#2044](https://github.com/reliaburger/reliaburger/issues/2044)). The handler bumped `ingress_requests_in_flight` on the way in and lowered it after `do_proxy(...).await` returned. But hyper drops a handler's future when the client resets an HTTP/2 stream or disconnects, or when a drained connection is closed, and a dropped future runs none of the code after its `.await`. Each of those added one to the gauge for good. The fix is the same ownership trick as the permit: `IngressMetrics::enter` returns an `InFlight` guard whose `Drop` lowers the gauge, and `counted` holds it while the handler runs. Rust runs `Drop` when a value goes out of scope on every path, including a future dropped half-way through, so there's no path left that forgets. `InFlight<'a>` carries a lifetime, `'a`, which says the guard borrows the metrics it counts in, and the compiler won't let it outlive them. The test polls a handler that never finishes, drops it, and checks the gauge is back to zero.
 
 The `101`-then-splice tests are the ones that pin this down. It's not enough to check that a WebSocket connects. You open a WebSocket, hold it, and assert that a *second* connection is refused while the first is live — proving the permit didn't come back at the 101. Then close the first and assert the second now succeeds. A test that only opens one connection would pass against the buggy code.
 
