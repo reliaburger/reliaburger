@@ -346,6 +346,8 @@ impl<G: Grill + Clone> OwnedRunner<G> {
     /// up to 32. It counts every slot, not just the free ones, so a pool
     /// first built while fresh attempts hold most slots isn't stuck small
     /// until Bun restarts (#2043).
+    // Only Linux builds pools; the unit test checks the size everywhere.
+    #[cfg(any(target_os = "linux", test))]
     fn executor_pool_size(&self) -> usize {
         (self.slot_total as usize).clamp(1, 32)
     }
