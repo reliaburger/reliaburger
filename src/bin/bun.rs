@@ -1107,11 +1107,18 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         .validate_storage_caps(data_filesystem.total_bytes)
         .map_err(|e| anyhow::anyhow!("invalid config: {e}"))?;
 
-    // Create port allocator from config
+    // Create port allocator from config. It never hands out a port Bun
+    // itself serves on, even one inside the range that isn't listening yet.
+    let api_listen_port = cli
+        .listen
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+        .filter(|port| *port != 0);
     let port_allocator = PortAllocator::new(
         config.network.port_range.start,
         config.network.port_range.end,
-    );
+    )
+    .excluding(config.service_ports().into_iter().chain(api_listen_port));
 
     // Writable base for node-local runtime state (instance records,
     // upgrade markers). Prefers the configured data dir, falls back to the
@@ -1590,14 +1597,10 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         api_port,
         config.security.bootstrap_peers.clone(),
         config.security.operator_cidrs.clone(),
+        // Bun's own listeners keep their usual policy inside the host-port
+        // range.
+        config.service_ports(),
     );
-    // The perimeter answers host ports for cluster members only, so a port
-    // Bun serves on can't sit inside the host-port range.
-    if agent.perimeter_enabled() {
-        config
-            .check_service_ports_outside_port_range(api_port)
-            .context("the node's ports clash with [network] port_range")?;
-    }
     agent.set_smoker_config(config.smoker.to_smoker_config());
     agent.set_node_leaf_lifetime(config.security.node_leaf_lifetime());
     agent.set_stop_confirmation_timeout(config.runtime.stop_confirmation_timeout());

@@ -586,7 +586,8 @@ fn nft_in(namespace: &str, args: &[String]) {
 /// real port map rule and perimeter ruleset inside throwaway namespaces: a
 /// node, one container behind a `veth-…` link, and a network holding a
 /// cluster member (which also listens on the same port number) and an
-/// outsider.
+/// outsider, who is also an operator allowed to the API port. That port sits
+/// inside the host-port range and must stay reachable.
 #[test]
 #[ignore = "requires root, ip and nft; applies the port map and perimeter inside isolated namespaces; run with make test-linux or scripts/release/qualify-oci-interruptions.sh"]
 fn published_ports_answer_members_only_and_rewrite_only_local_destinations() {
@@ -749,7 +750,16 @@ fn published_ports_answer_members_only_and_rewrite_only_local_destinations() {
     let outsider = Ipv4Addr::new(198, 18, 78, 3);
     let container = Ipv4Addr::new(10, 98, 0, 2);
     let nodes: ClusterNodes = [std::net::IpAddr::V4(member)].into();
-    let ruleset = generate_ruleset(&PerimeterConfig::default(), &nodes).unwrap();
+    // The API port sits inside the host-port range, as the soak's 29117
+    // does, and the outsider is an operator allowed to reach it.
+    let config = PerimeterConfig {
+        management_port: 29117,
+        operator_cidrs: vec![format!("{outsider}/32")],
+        // Ingress, also inside the range, answers everyone.
+        service_ports: vec![29117, 28080],
+        ..PerimeterConfig::default()
+    };
+    let ruleset = generate_ruleset(&config, &nodes).unwrap();
     let mut nft = std::process::Command::new("ip")
         .args(["netns", "exec", &node_ns, "nft", "-f", "-"])
         .stdin(std::process::Stdio::piped())
@@ -766,19 +776,54 @@ fn published_ports_answer_members_only_and_rewrite_only_local_destinations() {
     // service on the same port number.
     greeter(&container_ns, container, 8080, b'L');
     greeter(&network_ns, member, 21000, b'R');
+    // Bun's own API, on the node, on a port inside the range.
+    greeter(&node_ns, node, 29117, b'A');
+    greeter(&node_ns, node, 28080, b'I');
+    // A third address on the network: neither member nor operator.
+    ip(&[
+        "-n",
+        &network_ns,
+        "addr",
+        "add",
+        "198.18.78.4/24",
+        "dev",
+        &peer,
+    ]);
+    let stranger = Ipv4Addr::new(198, 18, 78, 4);
 
-    let (member_reached, outsider_reached) = in_namespace(&network_ns, move || {
-        (
-            greeting_from(member, node, 21000),
-            greeting_from(outsider, node, 21000),
-        )
-    });
+    let (member_reached, outsider_reached, operator_reached_api, stranger_reached) =
+        in_namespace(&network_ns, move || {
+            (
+                greeting_from(member, node, 21000),
+                greeting_from(outsider, node, 21000),
+                greeting_from(outsider, node, 29117),
+                (
+                    greeting_from(stranger, node, 28080),
+                    greeting_from(stranger, node, 29117),
+                    greeting_from(stranger, node, 21000),
+                ),
+            )
+        });
     let container_reached = in_namespace(&container_ns, move || {
         greeting_from(container, member, 21000)
     });
     assert_eq!(
-        (member_reached, outsider_reached, container_reached),
-        (Some(b'L'), None, Some(b'R')),
-        "(member→published port, outsider→published port, container→member's port)"
+        (
+            member_reached,
+            outsider_reached,
+            container_reached,
+            operator_reached_api,
+            stranger_reached,
+        ),
+        (
+            Some(b'L'),
+            None,
+            Some(b'R'),
+            Some(b'A'),
+            (Some(b'I'), None, None)
+        ),
+        "(member→published port, outsider→published port, container→member's port, \
+         operator→API port inside the range, \
+         stranger→(ingress inside the range, API, published port))"
     );
 }

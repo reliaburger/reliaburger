@@ -778,7 +778,7 @@ pub async fn teardown_container_network_with_commands(
 /// accepted only as a reply, or when a published port's DNAT sent it there,
 /// so the rest of the network can't route into container addresses. Who may
 /// reach a published port at all is the perimeter's call, made in its
-/// prerouting chain before the DNAT (`firewall::rules`).
+/// forward chain after the DNAT (`firewall::rules`).
 const FORWARD_ACCEPT_RULES: [&[&str]; 2] = [
     &["-i", "veth-+", "-j", "ACCEPT"],
     &[

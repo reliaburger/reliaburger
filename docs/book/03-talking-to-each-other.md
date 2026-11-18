@@ -1092,20 +1092,32 @@ Here's a question worth pausing on. A client outside the cluster connects to `no
 
 Not the input chain. The `reliaburger` table's prerouting rule rewrites the destination to the container's address before the kernel decides where the packet goes. After the rewrite it isn't addressed to the node any more, so the kernel routes it down the *forward* path, past the input chain and its `tcp dport 10000-32767 drop`, and into the container. The input chain only ever saw the host ports nothing had rewritten.
 
-So the `reliaburger_fw` table has a second chain, a filter chain on the prerouting hook at priority -150. nftables runs hooks in priority order, lowest first, and the port map's NAT chain sits at -100, so this one sees every packet before the rewrite:
+So the `reliaburger_fw` table has a second chain, a filter chain on the forward hook, where those packets do go:
 
 ```
-chain prerouting {
-    type filter hook prerouting priority -150; policy accept;
-    iif "lo" accept
-    iifname "veth-*" accept
+chain forward {
+    type filter hook forward priority -10; policy accept;
     ct direction reply ct state established,related accept
+    iifname "veth-*" accept
     ip saddr { 10.0.1.1, 10.0.1.2 } accept
-    fib daddr type local tcp dport 10000-32767 drop
+    ct status dnat oifname "veth-*" drop
 }
 ```
 
-It holds published ports to the input chain's policy: loopback, this node's own containers (every host-side veth is `veth-…`), replies to connections the node opened, and cluster members get through. Everyone else's connection to a host port on this node is dropped. Operator CIDRs and bootstrap peers aren't on the list, just as they aren't for host ports in the input chain. `fib daddr type local` asks the routing table whether the destination is one of this node's own addresses, so traffic passing through to somewhere else on the same port number (a container talking to MongoDB on 27017, say) is none of this chain's business.
+It holds published ports to the input chain's policy: replies, this node's own containers (every host-side veth is `veth-…`) and cluster members get through. Any other connection the port map rewrote (`ct status dnat`: conntrack remembers that this connection's destination was translated) on its way to one of our containers (`oifname "veth-*"`) is dropped. Operator CIDRs and bootstrap peers aren't on the list, just as they aren't for host ports in the input chain.
+
+Our first version of this chain sat on the prerouting hook, ahead of the rewrite, and dropped `tcp dport 10000-32767` for every local address. It did the job for published ports, and broke something else. The release soak runs Bun's API on 29117, ingress on 28080 and the registry on 25050, all inside the default range. Those ports are Bun's own listeners, not published ones, and the input chain lets operators reach the API port before its host-port drop. The prerouting chain had no such allowance, so it dropped them first. We briefly made Bun refuse to start with a service port inside the range, which would have refused the soak's own nodes. The fix was to stop matching a range at all. Only ports in `@portmap` are ever rewritten, so matching the rewrite drops exactly the published ports and leaves every other port in the range to the input chain's rules. Port numbers were the wrong question; "did the port map touch this?" was the right one.
+
+The allocator got the matching half of the fix. It probes the host and skips ports something already listens on, but ingress binds late, after the first workloads may have started. So `PortAllocator::excluding` takes the node's own service ports (`NodeConfig::service_ports()` plus the `--listen` port), and those are never handed out, listening or not.
+
+The same list closes one more gap, this time in the input chain. Its `tcp dport 10000-32767 drop` was written for container host ports, but it doesn't know which ports in the range are containers' and which are Bun's. Ingress on 28080 would have answered only cluster members, while on 80 it answers the world. So the perimeter now takes the service ports too, and the input chain accepts them just before the range drop:
+
+```
+tcp dport { 25050, 28080 } accept
+tcp dport 10000-32767 drop
+```
+
+The API and cluster ports are left off that line on purpose. Their own `tcp dport 9117 drop` and friends come later, after the operator and member accepts, and a blanket accept ahead of them would open the API to everyone. Each port keeps the policy it would have anywhere else; being inside the range no longer changes it.
 
 Legitimate traffic still flows. Wrapper on another node reaches a backend at `node-ip:host-port` from that node's address, a cluster member. A container calling a remote backend through Onion leaves its node masqueraded behind the node's address too. Local backends never need the host port at all: Onion and Wrapper send them to the container's own address.
 
