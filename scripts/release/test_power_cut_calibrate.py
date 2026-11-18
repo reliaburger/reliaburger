@@ -265,6 +265,23 @@ class RawDevice(unittest.TestCase):
         self.assertEqual((row["cuts"], row["not_counted"], row["cuts_losing_acked"]), (1, 1, 1))
         self.assertEqual(row["verdict"], "lost acknowledged records in every cut")
 
+    def test_the_raw_disks_write_cache_mode_reaches_the_record_and_the_tally(self):
+        def cut(n, mode):
+            (self.path / "scan.json").write_text(json.dumps(
+                {"boot": "b2", "disk": "vdb", "write_cache": mode, "modes": {"raw": self.survived(2)}}))
+            (self.path / "acks").write_text("BOOT b1\nACK raw 1 0\nFLUSHES 0\nACK raw 2 0\nFLUSHES 0\n")
+            return calibrate.record("sysrq", n, self.path / "acks", self.path / "scan.json", {})
+        lines = [cut(1, "write back"), cut(2, "write through"), cut(3, "write back")]
+        self.assertEqual(lines[1]["modes"]["raw"]["write_cache"], "write through")
+        row = calibrate.tally(lines)["kinds"]["sysrq"]["modes"]["raw"]
+        self.assertEqual(row["write_cache"], ["write back", "write through"])
+
+    def test_a_raw_scan_without_a_write_cache_reading_says_unknown(self):
+        (self.path / "scan.json").write_text(json.dumps({"boot": "b2", "modes": {"raw": self.survived(1)}}))
+        (self.path / "acks").write_text("BOOT b1\nACK raw 1 0\nFLUSHES 0\n")
+        line = calibrate.record("stop", 1, self.path / "acks", self.path / "scan.json", {})
+        self.assertEqual(line["modes"]["raw"]["write_cache"], "unknown")
+
     def test_a_raw_run_where_every_cut_saw_a_flush_has_no_data(self):
         (self.path / "scan.json").write_text(json.dumps({"boot": "b2", "modes": {"raw": self.survived(1)}}))
         (self.path / "acks").write_text("BOOT b1\nACK raw 1 0\nFLUSHES 1\n")
@@ -544,6 +561,57 @@ class OwnGroup(unittest.TestCase):
             time.sleep(3)
             self.assertIn("status=137", result.stdout)
             self.assertFalse(marker.exists(), "a process the writer started outlived the kill")
+
+
+FAKE_LIMACTL = """#!/bin/sh
+# Logs every call; lists nothing; refuses to start a VM, so calibrate.sh
+# stops right after building its start command and cleans up.
+printf '%s\\n' "$*" >> "$FAKE_LIMACTL_LOG"
+case $1 in
+    start) exit 1 ;;
+esac
+exit 0
+"""
+
+
+class DriverCommands(unittest.TestCase):
+    """The limactl commands calibrate.sh builds before its first cut, against a fake limactl."""
+
+    def run_driver(self, *arguments):
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(directory)]))
+        bin_dir = directory / "bin"
+        bin_dir.mkdir()
+        fake = bin_dir / "limactl"
+        fake.write_text(FAKE_LIMACTL)
+        fake.chmod(0o755)
+        log = directory / "limactl.log"
+        environment = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}", FAKE_LIMACTL_LOG=str(log),
+                           LIMA_HOME=str(directory / "lima"), RELIABURGER_QUIET_LOCK=str(directory / "quiet.lock"),
+                           RELIABURGER_GATE_CHAINS=str(directory / "gate-*" / "chain.log"))
+        result = subprocess.run(["bash", str(DRIVER), *arguments, "--evidence", str(directory / "evidence")],
+                                env=environment, capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("creating", result.stderr)
+        return log.read_text().splitlines()
+
+    def test_a_plain_run_starts_the_vm_from_the_template_alone(self):
+        calls = self.run_driver("--kind", "stop", "--cuts", "1")
+        self.assertFalse([call for call in calls if call.startswith("disk ")], calls)
+        start = next(call for call in calls if call.startswith("start "))
+        self.assertNotIn("--set", start)
+        self.assertTrue(start.endswith("calibrate-vm.yaml"), start)
+
+    def test_a_logwrites_run_has_no_raw_disk_either(self):
+        calls = self.run_driver("--logwrites")
+        self.assertFalse([call for call in calls if call.startswith("disk ") or "--set" in call], calls)
+
+    def test_a_raw_run_creates_attaches_and_deletes_its_own_disk(self):
+        calls = self.run_driver("--kind", "sysrq", "--cuts", "1", "--raw")
+        self.assertIn("disk create pc-cal-raw-sysrq-raw --size 1GiB --format raw", calls)
+        start = next(call for call in calls if call.startswith("start "))
+        self.assertIn('--set .additionalDisks = [{"name": "pc-cal-raw-sysrq-raw", "format": false}]', start)
+        self.assertEqual(calls[-1], "disk delete pc-cal-raw-sysrq-raw")
 
 
 if __name__ == "__main__":
