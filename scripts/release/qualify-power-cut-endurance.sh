@@ -6,12 +6,13 @@
 # after every cut check that it came back by itself with nothing
 # acknowledged lost. Step 1 of docs/plans/2026-11-18-plan-power-cut-endurance.md.
 #
-# After each cut the harness only powers the VM on (`relish local start`)
-# and reads; it never repairs anything. The checks (numbered as in the plan):
-#   I1  /data/seq holds 1..N, and the writer, started again, resumed at or
-#       past the last ACK read before the cut
-#   I2  the Redis counter never goes backwards, and the client, started
-#       again, found it at or past the last INCR read before the cut
+# After each cut the harness only powers the VM on (`limactl start`) and
+# reads; it never repairs anything. The checks (numbered as in the plan):
+#   I1  /data/seq holds 1..N, and the writer, at every start since the
+#       previous check, resumed at or past the last ACK read before the cut
+#   I2  the Redis counter never goes backwards, and the client, at every
+#       start since the previous check, found it at or past the last INCR
+#       read before the cut
 #   I4  Bun started once since boot, never exited, logged no panic or store error
 #   I6  Bun answered within 120 s of power-on; the cluster settled within 300 s
 #   I7  every workload runs exactly once
@@ -20,7 +21,9 @@
 # ~/.reliaburger and ~/.local/bin/relish are never used. It refuses to start,
 # and stops between cuts (powering the cluster off cleanly), when
 # power_cut/quiet.py says a release gate holds the host; --resume picks the
-# run up again.
+# run up again. Any other early exit (a harness error, a failed install, an
+# interrupt) powers the VM off, marks the run aborted and prints where the
+# cluster and the evidence are; an aborted run doesn't resume.
 #
 # Usage:
 #   scripts/release/qualify-power-cut-endurance.sh (--release X.Y.Z | --base-url URL --qualified-digest SHA) [options]
@@ -146,7 +149,13 @@ else
 fi
 mkdir -p "$evidence/cuts" "$evidence/logs"
 reason=$(quiet) || fail "not starting: $reason"
-run_get() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2]) or "")' "$evidence/run.json" "$1"; }
+# A key from run.json, or nothing when it isn't there (a stored 0 prints 0).
+run_get() {
+    python3 -c '
+import json, sys
+value = json.load(open(sys.argv[1])).get(sys.argv[2])
+print("" if value is None else value)' "$evidence/run.json" "$1"
+}
 run_set() {
     python3 - "$evidence/run.json" "$1" "$2" <<'PY'
 import json, os, sys
@@ -191,10 +200,11 @@ install_cluster() {
 }
 
 discover() {
-    home=$(run_get home)
-    case $home in
-        /tmp/rbpc.*) ;;
-        *) fail "refusing to use RELIABURGER_HOME=$home: this harness only adopts a home it made" ;;
+    local adopted
+    adopted=$(run_get home)
+    case $adopted in
+        /tmp/rbpc.*) home=$adopted ;;
+        *) fail "refusing to use RELIABURGER_HOME=$adopted: this harness only adopts a home it made" ;;
     esac
     [ -f "$home/clusters/laptop/state.json" ] || fail "no quickstart cluster in $home"
     export RELIABURGER_HOME=$home RELIABURGER_NO_MODIFY_PATH=1 LIMA_HOME=$home/lima
@@ -214,23 +224,40 @@ want='soak-writer=1,soak-redis=1,soak-redis-client=1'
 
 apply_workloads() {
     rel apply -f "$workloads" > "$evidence/logs/apply.log" 2>&1 || fail "applying $workloads failed"
-    local deadline=$(( $(now) + 600 ))
+    take_baseline
+}
+
+# Stop the run for something that isn't the cluster's to answer for: a cut
+# the harness can't judge. The EXIT trap (cleanup) powers the VM off.
+abort_run() {
+    run_set aborted "$*"
+    fail "$*"
+}
+
+# Wait for every workload to run and acknowledge something, then record how
+# many starts each has made so far, so the next cut can tell its own. Before
+# the first cut, and again after a resume (whose `relish local start` started
+# them again).
+take_baseline() {
+    local deadline=$(( $(now) + 600 )) starts
     until rel --output json apps --instances > "$evidence/logs/instances.json" 2> /dev/null \
         && endurance instances "$evidence/logs/instances.json" --want "$want" > /dev/null; do
-        [ "$(now)" -lt "$deadline" ] || fail 'the workloads were not all running after 600 s'
+        [ "$(now)" -lt "$deadline" ] || abort_run 'the workloads were not all running after 600 s'
         sleep 10
     done
-    # The first ACK and INCR before the first cut, so I1 and I2 have something to hold.
     deadline=$(( $(now) + 120 ))
-    until [ "$(acked_now writer)" -gt 0 ] && [ "$(acked_now redis)" -gt 0 ]; do
-        [ "$(now)" -lt "$deadline" ] || fail 'the writer or the Redis client acknowledged nothing in 120 s'
+    until read_acked writer > /dev/null && read_acked redis > /dev/null; do
+        [ "$(now)" -lt "$deadline" ] || abort_run 'the writer or the Redis client acknowledged nothing in 120 s'
         sleep 5
     done
-    # Each start's resume point so far, so the first cut can tell a new one.
     read_resumes writer "$evidence/logs/resumes-writer.txt"
     read_resumes redis "$evidence/logs/resumes-redis.txt"
-    run_set writer_starts "$(starts_in "$evidence/logs/resumes-writer.txt")"
-    run_set redis_starts "$(starts_in "$evidence/logs/resumes-redis.txt")"
+    starts=$(starts_in "$evidence/logs/resumes-writer.txt")
+    [ -n "$starts" ] || abort_run "couldn't read where the writer resumed (/data/resumes)"
+    run_set writer_starts "$starts"
+    starts=$(starts_in "$evidence/logs/resumes-redis.txt")
+    [ -n "$starts" ] || abort_run "couldn't read where the Redis client resumed (soak:starts)"
+    run_set redis_starts "$starts"
 }
 
 # Where the writer resumed (/data/resumes) or the Redis client found the
@@ -242,16 +269,35 @@ read_resumes() {
         rel exec soak-redis redis-cli LRANGE soak:starts 0 -1 > "$2" 2>&1 || true
     fi
 }
+# How many starts FILE records; nothing when it can't be read or records none.
 starts_in() {
-    endurance resumed "$1" --acked 0 | python3 -c 'import json,sys; print(json.load(sys.stdin).get("starts", ""))' || true
+    endurance resumed "$1" --acked 0 \
+        | python3 -c 'import json,sys; r = json.load(sys.stdin); print(r["starts"] if r["pass"] else "")' || true
 }
 
-# The highest ACK (writer) or INCR (redis) in the app's recent log.
+# The highest ACK (writer) or INCR (redis) in the app's recent log. Fails
+# when the log can't be read, holds none, or is below the last value read
+# (run.json's writer_acked or redis_acked).
 acked_now() {
-    local app=soak-writer
+    local app=soak-writer previous
     [ "$1" = writer ] || app=soak-redis-client
-    rel logs "$app" --tail 50 > "$evidence/logs/acked-$1.txt" 2>&1 || true
-    endurance acked "$1" "$evidence/logs/acked-$1.txt"
+    previous=$(run_get "$1_acked")
+    rel logs "$app" --tail 50 > "$evidence/logs/acked-$1.txt" 2>&1 || return 1
+    endurance acked "$1" "$evidence/logs/acked-$1.txt" ${previous:+--previous "$previous"}
+}
+
+# acked_now, three tries 5 s apart; prints the value and keeps it in run.json.
+read_acked() {
+    local value attempt
+    for attempt in 1 2 3; do
+        if value=$(acked_now "$1" 2> /dev/null); then
+            run_set "$1_acked" "$value"
+            echo "$value"
+            return 0
+        fi
+        [ "$attempt" -eq 3 ] || sleep 5
+    done
+    return 1
 }
 
 # --- power (sustained/power.sh) ---------------------------------------------------
@@ -260,7 +306,6 @@ acked_now() {
 . "$repository/scripts/release/sustained/power.sh"
 power_log_dir=$evidence/logs
 power_before_off() { :; }
-power_after_on() { :; }
 settle_streak=2
 settle_interval=5
 settle_probe() {
@@ -273,15 +318,32 @@ settle_timed_out() { settled_seconds=; }
 
 # --- one cut ---------------------------------------------------------------------
 
-# Power on, with Lima's one known VZ start retry ("storage device attachment
-# is invalid" after a forced stop), counted as an environment event.
+# I6's bound on Bun answering after power-on (API_BOUND_SECONDS in endurance.py).
+api_bound=120
+
+# Power the VM back on with `limactl start` alone, then wait until Bun's API
+# answers a read, at most api_bound seconds after power-on. Not `relish local
+# start`: it also starts Bun's service, and it fails when Bun isn't ready
+# within its own 45 s, which a retry would turn into a second, unrecorded cut
+# mid-recovery. The one retry is Lima's known VZ refusal straight after a
+# forced stop ("storage device attachment is invalid"), when the VM never
+# booted; it counts as an environment event. Any other failure is left to I6
+# and I4 to judge.
 power_back() {
+    local log
+    log=$power_log_dir/power-on-1-$(now).log
     start_retries=0
-    if ! power_on 1; then
+    if ! with_timeout 300 "$limactl" start --tty=false "${vm[1]}" > "$log" 2>&1; then
+        grep -q 'storage device attachment is invalid' "$log" || return 1
         start_retries=1
-        "$limactl" stop --force "${vm[1]}" > /dev/null 2>&1 || true
-        power_on 1 || return 1
+        with_timeout 120 "$limactl" stop --force "${vm[1]}" >> "$log" 2>&1 || true
+        with_timeout 300 "$limactl" start --tty=false "${vm[1]}" >> "$log" 2>&1 || return 1
     fi
+    down[1]=0
+    until with_timeout 15 "$relish" --output json apps --instances > /dev/null 2>&1; do
+        [ "$(now)" -lt $(( powered_on_at + api_bound )) ] || return 1
+        sleep 2
+    done
 }
 
 verify() {
@@ -318,9 +380,12 @@ one_cut() {
     off=$(endurance hold --seed "$seed" --cut "$cut" --what off --min "$off_min" --max "$off_max")
     say "cut $cut: working for $hold s"
     sleep "$hold"
-    writer_acked=$(acked_now writer)
-    redis_acked=$(acked_now redis)
+    # With no last ACK and INCR, I1 and I2 would hold whatever the cut did,
+    # while the cut still counted towards the bound: don't make it.
+    writer_acked=$(read_acked writer) && redis_acked=$(read_acked redis) \
+        || abort_run "cut $cut wasn't made: no last ACK or INCR to hold it to (see $evidence/logs/acked-*.txt)"
     cut_at=$(now)
+    run_set cuts_started "$cut"
     power_off 1
     say "cut $cut: power off (acked: writer $writer_acked, redis $redis_acked); back in $off s"
     sleep "$off"
@@ -352,19 +417,36 @@ print(json.dumps({"topology": "1", "kind": "site", "cut_at": int(sys.argv[1]), "
 
 # --- the run ---------------------------------------------------------------------
 
+# A finished run tears the cluster down (unless --keep). A violation and a
+# pause keep it as it is (stopping=keep-off). Any other exit once there is a
+# cluster powers the VM off, marks the run aborted and says where things are.
 cleanup() {
     local status=$?
     [ "${stopping:-}" = keep-off ] && return "$status"
-    if [ "$keep" = false ] && [ -n "${relish:-}" ] && [ "${finished:-false}" = true ]; then
-        "$relish" local destroy --yes > "$evidence/logs/teardown.log" 2>&1 \
-            && "$relish" uninstall --yes >> "$evidence/logs/teardown.log" 2>&1 \
-            && rm -rf "$home" || say "teardown failed; see $evidence/logs/teardown.log"
+    if [ "${finished:-false}" = true ]; then
+        if [ "$keep" = false ] && [ -n "${relish:-}" ]; then
+            "$relish" local destroy --yes > "$evidence/logs/teardown.log" 2>&1 \
+                && "$relish" uninstall --yes >> "$evidence/logs/teardown.log" 2>&1 \
+                && rm -rf "$home" || say "teardown failed; see $evidence/logs/teardown.log"
+        fi
+        return "$status"
     fi
+    [ -n "${home:-}" ] || return "$status"
+    if [ -n "${limactl:-}" ] && [ -n "${vm[1]:-}" ]; then
+        with_timeout 120 "$limactl" stop --force "${vm[1]}" > "$evidence/logs/abort-stop.log" 2>&1 || true
+    fi
+    if [ -f "$evidence/run.json" ]; then
+        [ -n "$(run_get aborted)" ] || run_set aborted "the harness exited early with status $status"
+        run_set ended "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        endurance summary --evidence "$evidence" > /dev/null 2>&1 || true
+    fi
+    say "stopped early (status $status) with the VM powered off; cluster home: $home; evidence: $evidence" >&2
     return "$status"
 }
 trap cleanup EXIT
 
 if [ "$resume" = true ]; then
+    [ -z "$(run_get aborted)" ] || fail "this run was aborted ($(run_get aborted)); start a new one"
     seed=$(run_get seed)
     duration_seconds=$(run_get duration_seconds)
     work_min=$(run_get work_min); work_max=$(run_get work_max)
@@ -376,7 +458,9 @@ if [ "$resume" = true ]; then
         run_set paused_at ''
     fi
     say "resuming in $evidence"
-    "$relish" local start > "$evidence/logs/resume-start.log" 2>&1 || fail "relish local start failed on resume"
+    with_timeout 600 "$relish" local start > "$evidence/logs/resume-start.log" 2>&1 \
+        || abort_run "relish local start failed on resume"
+    take_baseline
 else
     seed=${seed:-$(python3 -c 'import random; print(random.randrange(2**31))')}
     duration_seconds=$(seconds "$duration")
@@ -388,6 +472,7 @@ else
     run_set release "${release:-$base_url}"
     run_set started "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     run_set paused_seconds 0
+    run_set cuts_started 0
     run_set host "$(sw_vers -productName 2> /dev/null || uname -s) $(sw_vers -productVersion 2> /dev/null || uname -r), $(sysctl -n machdep.cpu.brand_string 2> /dev/null || uname -m)"
     install_cluster
     discover
@@ -414,7 +499,7 @@ print(total)' "$evidence/cuts.jsonl"; }
 while [ "$(elapsed)" -lt "$duration_seconds" ]; do
     if ! reason=$(quiet); then
         say "pausing: $reason; resume with --resume --evidence $evidence"
-        "$relish" local stop --yes > "$evidence/logs/pause-stop.log" 2>&1 || true
+        with_timeout 300 "$relish" local stop --yes > "$evidence/logs/pause-stop.log" 2>&1 || true
         run_set paused_at "$(now)"
         stopping=keep-off
         exit 75
@@ -422,7 +507,7 @@ while [ "$(elapsed)" -lt "$duration_seconds" ]; do
     cut=$(( $(cuts_done) + 1 ))
     if ! one_cut "$cut"; then
         say "cut $cut violated an invariant; powering the VM off and keeping everything for diagnosis"
-        "$limactl" stop --force "${vm[1]}" > /dev/null 2>&1 || true
+        with_timeout 120 "$limactl" stop --force "${vm[1]}" > /dev/null 2>&1 || true
         stopping=keep-off
         run_set ended "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
         endurance summary --evidence "$evidence" || true

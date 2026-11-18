@@ -501,6 +501,12 @@ class HarnessRefusals(unittest.TestCase):
         self.assertEqual(first.stdout, again.stdout)
         self.assertRegex(first.stdout, r"^cut 1: after \d+ s of work")
 
+    def test_resume_refuses_an_aborted_run(self):
+        with tempfile.TemporaryDirectory() as evidence:
+            Path(evidence, "run.json").write_text(json.dumps({"seed": 1, "home": "/tmp/rbpc.gone",
+                                                              "aborted": "cut 3 wasn't made"}))
+            self.assert_refused(self.run_harness("--resume", "--evidence", evidence), "this run was aborted")
+
     def test_resume_refuses_an_adopted_home_it_did_not_make(self):
         with tempfile.TemporaryDirectory() as evidence:
             Path(evidence, "run.json").write_text(json.dumps({"seed": 1, "home": os.path.expanduser("~/.reliaburger"),
@@ -512,6 +518,8 @@ def shell_function(script, name):
     """The text of one shell function from SCRIPT, `name() {` to the `}` that closes it."""
     lines = script.read_text().splitlines()
     start = next(i for i, line in enumerate(lines) if line.startswith(f"{name}() {{"))
+    if lines[start].rstrip().endswith("}"):
+        return lines[start] + "\n"
     end = next(i for i in range(start, len(lines)) if lines[i] == "}")
     return "\n".join(lines[start:end + 1]) + "\n"
 
@@ -537,12 +545,264 @@ class BoundedCommands(unittest.TestCase):
         self.assertIn("hello\nstatus=3", output)
 
 
+class HarnessShell(unittest.TestCase):
+    """The harness's own shell functions, run against a fake limactl and relish.
+
+    The fakes log every call to `calls` and answer from files in the
+    temporary directory, the way the shared power functions' tests do.
+    """
+
+    FUNCTIONS = ("with_timeout", "now", "endurance", "run_get", "run_set", "rel", "read_resumes", "starts_in",
+                 "acked_now", "read_acked", "abort_run", "take_baseline", "power_back", "verify", "one_cut",
+                 "cleanup")
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.path = Path(self.directory.name)
+        self.evidence = self.path / "evidence"
+        (self.evidence / "logs").mkdir(parents=True)
+        (self.evidence / "cuts").mkdir()
+        self.calls = self.path / "calls"
+        self.calls.touch()
+        self.fake("limactl", """
+            echo "limactl $*" >> "$FAKE/calls"
+            if [ "$1" = start ]; then
+                n=$(grep -c '^limactl start' "$FAKE/calls")
+                if [ -f "$FAKE/start-$n" ]; then cat "$FAKE/start-$n" >&2; exit 1; fi
+            fi
+            """)
+        self.fake("relish", """
+            echo "relish $*" >> "$FAKE/calls"
+            answer() { [ -f "$FAKE/$1" ] || exit 1; cat "$FAKE/$1"; }
+            case "$*" in
+                "--output json apps --instances")
+                    n=$(grep -c 'apps --instances' "$FAKE/calls")
+                    [ ! -f "$FAKE/api-after" ] || [ "$n" -ge "$(cat "$FAKE/api-after")" ] || exit 1
+                    answer instances ;;
+                "logs soak-writer"*) answer log-writer ;;
+                "logs soak-redis-client"*) answer log-redis ;;
+                "exec soak-writer awk"*) answer seq ;;
+                "exec soak-writer cat /data/resumes") answer resumes-writer ;;
+                "exec soak-redis redis-cli GET soak:counter") answer counter ;;
+                "exec soak-redis redis-cli LRANGE soak:starts 0 -1") answer resumes-redis ;;
+                *) exit 1 ;;
+            esac
+            """)
+
+    def fake(self, name, body):
+        path = self.path / name
+        path.write_text("#!/usr/bin/env bash\n" + textwrap.dedent(body))
+        path.chmod(0o755)
+
+    def answer(self, name, text):
+        (self.path / name).write_text(text)
+
+    def run_json(self):
+        return json.loads((self.evidence / "run.json").read_text())
+
+    def run_shell(self, script, run=None):
+        if run is not None:
+            (self.evidence / "run.json").write_text(json.dumps(run))
+        functions = "".join(shell_function(HARNESS, name) for name in self.FUNCTIONS)
+        prelude = textwrap.dedent(f"""
+            set -uo pipefail
+            export FAKE={self.path}
+            here={HERE / "power_cut"}; evidence={self.evidence}; power_log_dir={self.evidence}/logs
+            limactl={self.path}/limactl; relish={self.path}/relish; vm=(none node-a); down=(0 1)
+            api_bound=120; want='soak-writer=1,soak-redis=1,soak-redis-client=1'
+            fail() {{ printf 'power-cut: %s\\n' "$*" >&2; exit 1; }}
+            say() {{ printf '%s\\n' "$*"; }}
+            sleep() {{ :; }}
+            gsh() {{ printf '%s\\n' '2026-11-18T10:00:01+00:00 n systemd[1]: Started reliaburger.service - x.'; }}
+            """)
+        return subprocess.run(["bash", "-c", prelude + functions + textwrap.dedent(script)], stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True, timeout=60)
+
+    def calls_made(self):
+        return self.calls.read_text().splitlines()
+
+    # run_get and run_set
+
+    def test_a_stored_zero_reads_back_as_zero(self):
+        result = self.run_shell("""
+            run_set seed 0; run_set off_min 0; run_set paused_at ''
+            echo "seed=$(run_get seed) off_min=$(run_get off_min) paused=$(run_get paused_at) none=$(run_get nothing)"
+            """, run={})
+        self.assertEqual(result.stdout.strip(), "seed=0 off_min=0 paused= none=", result.stderr)
+
+    # power_back (finding 1)
+
+    def test_power_back_starts_the_vm_and_waits_for_the_api_without_relish_local_start(self):
+        self.answer("instances", "[]")
+        self.answer("api-after", "3")
+        result = self.run_shell("""
+            powered_on_at=$(now)
+            power_back && echo "back retries=$start_retries down=${down[1]}"
+            """)
+        self.assertEqual(result.stdout.strip(), "back retries=0 down=0", result.stderr)
+        calls = self.calls_made()
+        self.assertEqual(calls[0], "limactl start --tty=false node-a")
+        self.assertEqual(calls.count("relish --output json apps --instances"), 3)
+        self.assertFalse([call for call in calls if call.startswith("relish local")], calls)
+
+    def test_power_back_retries_only_the_known_vz_disk_refusal(self):
+        self.answer("instances", "[]")
+        self.answer("start-1", "level=fatal msg=\"VZErrorDomain: The storage device attachment is invalid.\"\n")
+        result = self.run_shell("powered_on_at=$(now)\npower_back && echo \"back retries=$start_retries\"\n")
+        self.assertEqual(result.stdout.strip(), "back retries=1", result.stderr)
+        self.assertEqual([call for call in self.calls_made() if call.startswith("limactl")],
+                         ["limactl start --tty=false node-a", "limactl stop --force node-a",
+                          "limactl start --tty=false node-a"])
+
+    def test_any_other_start_failure_is_not_retried(self):
+        self.answer("instances", "[]")
+        self.answer("start-1", "level=fatal msg=\"exiting, status={Running:false Degraded:false}\"\n")
+        result = self.run_shell("powered_on_at=$(now)\npower_back || echo \"failed retries=$start_retries\"\n")
+        self.assertEqual(result.stdout.strip(), "failed retries=0", result.stderr)
+        self.assertEqual(self.calls_made(), ["limactl start --tty=false node-a"])
+
+    def test_bun_not_answering_by_the_bound_fails_without_a_second_power_cycle(self):
+        # No instances answer: the API never comes up.
+        result = self.run_shell("""
+            api_bound=2; powered_on_at=$(now)
+            power_back || echo failed
+            """)
+        self.assertEqual(result.stdout.strip(), "failed", result.stderr)
+        self.assertEqual([call for call in self.calls_made() if call.startswith("limactl")],
+                         ["limactl start --tty=false node-a"])
+
+    # The last ACK and INCR (finding 3)
+
+    def test_read_acked_keeps_the_last_value_and_refuses_none_or_less(self):
+        self.answer("log-writer", "RESUME 40\nACK 41\nACK 42\n")
+        result = self.run_shell('read_acked writer && echo "kept $(run_get writer_acked)"\n', run={"writer_acked": 30})
+        self.assertEqual(result.stdout.split(), ["42", "kept", "42"], result.stderr)
+        result = self.run_shell("read_acked writer || echo refused\n", run={"writer_acked": 50})
+        self.assertEqual(result.stdout.split(), ["refused"])
+        self.assertEqual(self.run_json()["writer_acked"], 50)
+        (self.path / "log-writer").unlink()
+        result = self.run_shell("read_acked writer || echo refused\n", run={})
+        self.assertEqual(result.stdout.split(), ["refused"])
+
+    def test_a_cut_with_no_ack_to_hold_is_not_made_and_aborts_the_run(self):
+        self.answer("log-writer", "")
+        self.answer("log-redis", "INCR 9\n")
+        result = self.run_shell("""
+            seed=1 work_min=1 work_max=1 off_min=1 off_max=1
+            power_off() { echo "power_off $1" >> "$FAKE/calls"; }
+            one_cut 4
+            echo "returned $?"
+            """, run={"cuts_started": 3, "writer_acked": 100, "redis_acked": 8})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("returned", result.stdout)
+        self.assertIn("wasn't made", result.stderr)
+        self.assertNotIn("power_off 1", self.calls_made())
+        run = self.run_json()
+        self.assertEqual(run["cuts_started"], 3)
+        self.assertIn("wasn't made", run["aborted"])
+
+    # Where each start resumed (finding 2)
+
+    def test_verify_judges_every_new_start_and_records_how_many_there_are(self):
+        self.answer("seq", "MAX 500\nLAST 500\n")
+        self.answer("resumes-writer", "0\n90\n400\n")
+        self.answer("counter", "130\n")
+        self.answer("resumes-redis", "0\n100\n")
+        self.answer("instances", json.dumps([{"app_name": app, "state": "running"} for app in
+                                             ("soak-writer", "soak-redis", "soak-redis-client")]))
+        cut = self.evidence / "cuts" / "00002"
+        cut.mkdir()
+        result = self.run_shell(f"cut_dir={cut}\nverify 100 100\n",
+                                run={"writer_starts": 1, "redis_starts": 1, "counter": 110})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        writer = json.loads((cut / "I1.json").read_text())
+        self.assertFalse(writer["pass"])
+        self.assertIn("start 2 resumed at 90", writer["reason"])
+        self.assertTrue(json.loads((cut / "I2.json").read_text())["pass"])
+        self.assertTrue(json.loads((cut / "I7.json").read_text())["pass"])
+        run = self.run_json()
+        self.assertEqual((run["writer_starts"], run["redis_starts"], run["counter"]), (3, 2, 130))
+
+    def test_the_baseline_records_each_workloads_starts_and_last_values(self):
+        self.answer("instances", json.dumps([{"app_name": app, "state": "running"} for app in
+                                             ("soak-writer", "soak-redis", "soak-redis-client")]))
+        self.answer("log-writer", "ACK 7\n")
+        self.answer("log-redis", "INCR 3\n")
+        self.answer("resumes-writer", "0\n")
+        self.answer("resumes-redis", "0\n2\n")
+        result = self.run_shell("take_baseline\n", run={})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        run = self.run_json()
+        self.assertEqual((run["writer_starts"], run["redis_starts"], run["writer_acked"], run["redis_acked"]),
+                         (1, 2, 7, 3))
+
+    def test_a_baseline_without_resume_records_aborts(self):
+        self.answer("instances", json.dumps([{"app_name": app, "state": "running"} for app in
+                                             ("soak-writer", "soak-redis", "soak-redis-client")]))
+        self.answer("log-writer", "ACK 7\n")
+        self.answer("log-redis", "INCR 3\n")
+        result = self.run_shell("take_baseline\n", run={})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("resumed", self.run_json()["aborted"])
+
+    # Stopping early (finding 5)
+
+    def test_an_unfinished_exit_powers_the_vm_off_and_says_where_everything_is(self):
+        result = self.run_shell("""
+            home=/tmp/rbpc.test keep=false
+            trap cleanup EXIT
+            fail 'something broke'
+            """, run={"cuts_started": 0})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("limactl stop --force node-a", self.calls_made())
+        self.assertIn("/tmp/rbpc.test", result.stderr)
+        self.assertIn(str(self.evidence), result.stderr)
+        self.assertIn("status 1", self.run_json()["aborted"])
+        self.assertEqual(json.loads((self.evidence / "summary.json").read_text())["verdict"], "aborted")
+
+    def test_a_violation_or_a_pause_keeps_the_cluster_as_it_is(self):
+        result = self.run_shell("""
+            home=/tmp/rbpc.test keep=false stopping=keep-off
+            trap cleanup EXIT
+            exit 75
+            """, run={})
+        self.assertEqual(result.returncode, 75)
+        self.assertEqual(self.calls_made(), [])
+
+    def test_a_refusal_before_any_cluster_touches_nothing(self):
+        result = self.run_shell("""
+            unset home; keep=false
+            trap cleanup EXIT
+            fail 'give --release or --base-url'
+            """, run={})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.calls_made(), [])
+        self.assertNotIn("aborted", self.run_json())
+
+
 class SharedPowerFunctions(unittest.TestCase):
     """sustained/power.sh: the soak and the endurance harness cut and settle the same way."""
 
+    # The callers' with_timeout, standing in: it says what bound it was given.
+    # It writes to descriptor 3 (the test's stderr), which the functions' log
+    # redirections leave alone.
+    BOUND = 'exec 3>&2\nwith_timeout() { echo "bound $1" >&3; shift; "$@"; }\n'
+
     def run_bash(self, script):
-        return subprocess.run(["bash", "-c", f". {POWER}\n{textwrap.dedent(script)}"], stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE, text=True, timeout=60)
+        return subprocess.run(["bash", "-c", f". {POWER}\n{self.BOUND}{textwrap.dedent(script)}"],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+
+    def test_both_vm_commands_are_bounded(self):
+        # limactl stop --force and relish local start each run under with_timeout,
+        # so a hung one can't stall the soak or the endurance run.
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_bash(f"""
+                limactl=true; relish=true; power_log_dir={directory}; vm=(none node-a); down=(0 0)
+                power_before_off() {{ :; }}; power_after_on() {{ :; }}
+                power_off 1; power_on 1
+                """)
+            self.assertEqual(result.stderr.split("\n")[:2], ["bound 120", "bound 600"])
 
     def test_power_off_runs_the_hook_marks_the_node_down_and_force_stops_its_vm(self):
         with tempfile.TemporaryDirectory() as directory:

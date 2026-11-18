@@ -9046,9 +9046,22 @@ the state long after it. Each start of the writer now appends the number it
 resumed from to `/data/resumes` and syncs it before writing anything else;
 each start of the Redis client reads the counter and pushes that value onto
 a list before its first `INCR`. I1 passes only if there's a new start since
-the last cut and it resumed at or past the `ACK`. The unit test for it is the
-exact scenario above: a file that's whole to 500 and a resume point of 90
-against an `ACK` of 100 must fail. The lesson isn't new, but it's worth
+the last cut and every start since then resumed at or past the `ACK`. Every
+one, not the latest: if the writer resumes at 90 after the cut and then
+restarts again during the settle, at 400, the second start is past the `ACK`
+and the first one still lost writes. The unit tests are the exact scenarios:
+a file that's whole to 500 and a resume point of 90 against an `ACK` of 100
+must fail, and so must resume points 90 then 400.
+
+The same review found two more ways for the run to pass without checking
+anything. If the log read before a cut failed or held no `ACK`, the harness
+took the last `ACK` as 0, which every resume point beats; now it refuses to
+make that cut and stops the run. And powering back on with `relish local
+start` counted as a failure whenever Bun took more than the command's own
+45 s to get ready, which made the harness force the VM off and start it
+again: a second power cut, mid-recovery, that the record never mentioned.
+Now the harness runs `limactl start` alone, retries only Lima's one known
+refusal (the VM never booted then), and leaves a slow Bun to I6. The lesson isn't new, but it's worth
 repeating every time you write an invariant: make it fail on purpose at least
 once, or you don't know what it checks.
 

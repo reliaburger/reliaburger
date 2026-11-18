@@ -8,7 +8,8 @@
 #   vm[N]               node N's Lima instance name
 #   down[N]             1 while node N is powered off (this file keeps it)
 #   power_log_dir       where each limactl and `relish local start` log goes
-# and defines these hooks:
+# and defines with_timeout SECONDS COMMAND... (each harness has its own) and
+# these hooks:
 #   power_before_off N        just before node N's power is cut
 #   power_after_on N          just after `relish local start N` returns
 #   settle_probe              one settle check; status 0 when the cluster is clean
@@ -25,13 +26,17 @@ power_off() {
     local node=$1
     power_before_off "$node"
     down[node]=1
-    "$limactl" stop --force "${vm[node]}" > "$power_log_dir/power-off-$node-$(date +%s).log" 2>&1 || true
+    with_timeout 120 "$limactl" stop --force "${vm[node]}" > "$power_log_dir/power-off-$node-$(date +%s).log" 2>&1 || true
 }
 
-# Power node N back on and wait for its API (`relish local start N`).
+# Power node N back on and wait for its API (`relish local start N`). The
+# endurance harness doesn't use this: it powers on with `limactl start` alone
+# (power_back there), so a slow Bun is I6's to judge rather than a reason to
+# cut again.
 power_on() {
     local node=$1 result=0
-    "$relish" local start "$node" > "$power_log_dir/power-on-$node-$(date +%s).log" 2>&1 || result=$?
+    with_timeout 600 "$relish" local start "$node" > "$power_log_dir/power-on-$node-$(date +%s).log" 2>&1 \
+        || result=$?
     down[node]=0
     power_after_on "$node"
     return "$result"
